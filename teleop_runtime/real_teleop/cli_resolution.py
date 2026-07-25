@@ -1,0 +1,509 @@
+"""CLI parsing, cross-option resolution, and admission validation.
+
+Argument declaration remains in :mod:`teleop_runtime.real_teleop.cli`; this
+module owns the ordered post-parse resolution that was formerly embedded in
+the canonical debug entrypoint.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping
+import inspect
+import sys
+
+import numpy as np
+
+
+_SUPPORT_NAMES = (
+    "ANNOTATED_DUAL_RM65_BASE_DISTANCE_M",
+    "DEFAULT_CALIBRATION_PROFILE_DIR",
+    "DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ",
+    "HAND_BACKEND_INSPIRE",
+    "LEGACY_POSITION_CONTROL_PROFILE_NAME",
+    "POSITION_15_60_120HZ_PROFILE_NAME",
+    "POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED",
+    "POSITION_COMMAND_PLANNER_LINEAR",
+    "TOOL_TCP_FRAME",
+    "_active_sides_from_args",
+    "_apply_default_arm_ips",
+    "_apply_default_q6_ports",
+    "_apply_formal_dataset_layout",
+    "_apply_real_loop_timing_defaults",
+    "_argv_has_option",
+    "_dmtac_sides",
+    "_hand_backend_mode_for_side",
+    "_init_arm_qpos_speed_scale_for_side",
+    "_latest_vive_calibration_profile_path",
+    "_parse_hand_tactile_regions",
+    "_resolve_gripper_input_source",
+    "_resolve_movement_multiple_args",
+    "_resolve_workspace_override_args",
+    "_resolved_gripper_policy",
+    "_run_gui_device_preflight",
+    "_save_explicit_arm_ips_latest",
+    "_validate_required_arm_ips",
+    "apply_rm65_position_profile_defaults",
+    "build_real_teleop_argument_parser",
+    "configured_foot_pad_count",
+    "default_rm65_workspace_near_boundary_collection_pose_frame_contract",
+    "normalize_dmtac_tactile_fields",
+    "normalize_position_command_planner",
+    "resolve_control_debug_config",
+    "resolve_real_arm_execution_config",
+    "resolve_special_arm_control_mode",
+    "validate_human_shadow_arguments",
+)
+
+
+class _LegacyFunctionProxy:
+    __slots__ = ("_namespace", "_name")
+
+    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
+        self._namespace = namespace
+        self._name = str(name)
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        target = self._namespace[self._name]
+        if target is self:
+            raise RuntimeError(f"recursive CLI-resolution support proxy: {self._name}")
+        return target(*args, **kwargs)  # type: ignore[operator]
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(self._namespace[self._name], attribute)
+
+
+def bind_legacy_support(namespace: Mapping[str, object]) -> None:
+    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
+    if missing:
+        raise RuntimeError(
+            "real-teleop CLI resolution support is incomplete: "
+            + ", ".join(sorted(missing))
+        )
+    globals().update(
+        {
+            name: (
+                _LegacyFunctionProxy(namespace, name)
+                if inspect.isroutine(namespace[name])
+                else namespace[name]
+            )
+            for name in _SUPPORT_NAMES
+        }
+    )
+
+
+def parse_real_teleop_args() -> argparse.Namespace:
+    parser = build_real_teleop_argument_parser()
+    raw_argv = list(sys.argv[1:])
+    args = parser.parse_args()
+    if not str(getattr(args, "dataset_root", "")).strip():
+        parser.error(
+            "--dataset-root must not be empty; omit it to use the configured default."
+        )
+    if bool(getattr(args, "plus_episode_curation", False)) and not str(
+        getattr(args, "plus_annotation_root", "") or ""
+    ).strip():
+        parser.error("--plus-annotation-root is required with --plus-episode-curation")
+    raw_arg_set = set(raw_argv)
+    if bool(getattr(args, "no_debug_disk_write", False)):
+        args.control_debug = "off"
+        args.actuator_trace = False
+        args.debug_action = False
+        args.debug_timing_log = False
+        args.debug_timing_auto_log = False
+        args.no_record = True
+        args.no_episode_recording = True
+        args.debug_trajectory_recording = False
+    validate_human_shadow_arguments(args, parser)
+    try:
+        requested_arm_profile = str(getattr(args, "arm_execution_profile", "") or "")
+        tentative_arm_mode = (
+            "position"
+            if requested_arm_profile.startswith("position")
+            else "impedance"
+            if requested_arm_profile == "impedance_40hz"
+            else str(getattr(args, "arm_control_mode", "impedance"))
+        )
+        explicit_compatibility_arm_profile = (
+            _argv_has_option(raw_argv, "--arm-execution-profile")
+            and requested_arm_profile
+            not in ("", POSITION_15_60_120HZ_PROFILE_NAME)
+        )
+        if explicit_compatibility_arm_profile:
+            if (
+                _argv_has_option(raw_argv, "--position-control-profile")
+                and args.position_control_profile
+                != LEGACY_POSITION_CONTROL_PROFILE_NAME
+            ):
+                raise ValueError(
+                    "a compatibility --arm-execution-profile conflicts with the formal "
+                    "--position-control-profile; use --position-control-profile legacy"
+                )
+            args.position_control_profile_resolved = (
+                LEGACY_POSITION_CONTROL_PROFILE_NAME
+            )
+            args.position_control_profile_metadata = {
+                "name": LEGACY_POSITION_CONTROL_PROFILE_NAME,
+                "compatibility_mode": True,
+                "reason": f"explicit_arm_execution_profile:{requested_arm_profile}",
+            }
+        else:
+            apply_rm65_position_profile_defaults(
+                args,
+                raw_argv=raw_argv,
+                mode=tentative_arm_mode,
+                include_source_shaping=True,
+            )
+        args.arm_execution_config = resolve_real_arm_execution_config(
+            args,
+            raw_argv=raw_argv,
+            impedance_default_outer_control_hz=DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ,
+        )
+        args.control_debug_config = resolve_control_debug_config(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    # A named profile may select a mode without requiring the legacy mode flag.
+    # Fine-grained legacy fields retain their original raw values so callers can
+    # still distinguish explicit overrides from mode-derived defaults.
+    args.arm_control_mode = args.arm_execution_config.mode
+    if bool(getattr(args, "actuator_trace", False)):
+        if args.arm_control_mode != "position":
+            parser.error("--actuator-trace requires position arm control mode.")
+        if not args.arm_execution_config.position_background_streaming_enabled:
+            parser.error(
+                "--actuator-trace requires the position background command stream."
+            )
+        if bool(args.control_debug_config.enabled):
+            parser.error(
+                "--actuator-trace must be used with --control-debug off; summary/full retain "
+                "their existing audit overhead and would invalidate the low-disturbance capture."
+            )
+    if (
+        args.arm_control_mode == "position"
+        and not args.arm_execution_config.position_background_streaming_enabled
+        and not _argv_has_option(raw_argv, "--position-command-planner")
+    ):
+        # Explicitly disabling the follow stream is a supported compatibility
+        # override.  The formal 60->120 planner cannot run without that stream,
+        # so retain the legacy direct-reference planner unless the caller
+        # explicitly requested another (and therefore invalid) combination.
+        args.position_command_planner = POSITION_COMMAND_PLANNER_LINEAR
+        if not _argv_has_option(raw_argv, "--position-max-command-step-deg"):
+            args.position_max_command_step_deg = None
+        metadata = getattr(args, "position_control_profile_metadata", None)
+        if isinstance(metadata, dict):
+            metadata.setdefault("runtime_deviations", []).append(
+                "follow_stream_disabled_use_linear_command_planner"
+            )
+    requested_collection_worker_mode = str(args.collection_worker_mode)
+    args.collection_worker_mode_resolved = (
+        "process"
+        if requested_collection_worker_mode == "auto"
+        and args.arm_control_mode == "position"
+        else "thread"
+        if requested_collection_worker_mode == "auto"
+        else requested_collection_worker_mode
+    )
+    if (
+        args.collection_worker_mode_resolved == "process"
+        and args.arm_control_mode != "position"
+    ):
+        parser.error(
+            "--collection-worker-mode process is currently position-only; "
+            "force/impedance collection intentionally retains the established thread path."
+        )
+    if int(args.position_ik_solve_min_iterations) > int(
+        args.position_ik_solve_max_iterations
+    ):
+        parser.error(
+            "--position-ik-solve-min-iterations must be <= "
+            "--position-ik-solve-max-iterations."
+        )
+    if float(args.position_ik_candidate_certification_reserve_ms) > float(
+        args.position_ik_iteration_reserve_ms
+    ):
+        parser.error(
+            "--position-ik-candidate-certification-reserve-ms must be <= "
+            "--position-ik-iteration-reserve-ms."
+        )
+    if args.arm_control_mode != "position" and (
+        args.position_ik_orientation_weight is not None
+        or int(args.position_ik_solve_max_iterations) != 2
+        or int(args.position_ik_solve_min_iterations) != 2
+        or float(args.position_ik_damping) != 0.03
+        or bool(args.position_ik_adaptive_iterations)
+        or float(args.position_ik_iteration_reserve_ms) != 5.0
+        or float(args.position_ik_candidate_certification_reserve_ms) != 0.0
+        or bool(args.position_singularity_candidate_certificate)
+        or float(args.position_ik_local_step_clip_scale) != 1.0
+        or str(args.position_joint_velocity_limit_profile) != "rm65"
+        or float(args.position_inactive_enter_threshold_scale) != 1.0
+    ):
+        parser.error(
+            "--position-ik-orientation-weight, --position-ik-solve-max-iterations, "
+            "--position-ik-solve-min-iterations, --position-ik-damping, "
+            "--position-ik-adaptive-iterations, --position-ik-iteration-reserve-ms, "
+            "--position-ik-candidate-certification-reserve-ms, "
+            "--position-singularity-candidate-certificate, "
+            "--position-ik-local-step-clip-scale, and "
+            "--position-joint-velocity-limit-profile, and "
+            "--position-inactive-enter-threshold-scale are position-mode options and "
+            "cannot alter force/impedance IK."
+        )
+    args.position_command_planner = normalize_position_command_planner(
+        args.position_command_planner
+    )
+    if (
+        args.position_command_planner
+        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        and args.arm_control_mode != "position"
+    ):
+        parser.error(
+            "--position-command-planner acceleration_limited requires position arm control mode."
+        )
+    if args.position_max_command_step_deg is not None and args.arm_control_mode != "position":
+        parser.error(
+            "--position-max-command-step-deg is a position-mode option and cannot alter "
+            "force/impedance control."
+        )
+    if (
+        args.position_max_command_step_deg is not None
+        and args.position_command_planner
+        != POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+    ):
+        parser.error(
+            "--position-max-command-step-deg requires "
+            "--position-command-planner acceleration_limited."
+        )
+    if (
+        args.position_command_planner
+        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        and not args.arm_execution_config.position_background_streaming_enabled
+    ):
+        parser.error(
+            "--position-command-planner acceleration_limited requires the high-rate position "
+            "background stream."
+        )
+    if (
+        args.position_command_planner
+        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        and float(args.arm_execution_config.position_background_streaming_hz)
+        < float(args.arm_execution_config.position_reference_hz)
+    ):
+        parser.error(
+            "--position-command-planner acceleration_limited requires the final command "
+            "rate to be at least the position reference rate; otherwise safe references "
+            "can be preempted before any qcmd sample is emitted."
+        )
+    for compatibility_warning in args.arm_execution_config.compatibility_warnings:
+        print(f"WARNING: arm execution profile: {compatibility_warning}", file=sys.stderr)
+    _apply_real_loop_timing_defaults(args, raw_argv=raw_argv)
+    args._dataset_name_explicit = _argv_has_option(raw_argv, "--dataset-name")
+    try:
+        _resolve_movement_multiple_args(args, raw_arg_set=raw_arg_set)
+        _resolve_workspace_override_args(args)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    _apply_formal_dataset_layout(args)
+    args.pose_frame_contract_source = (
+        "explicit" if args.pose_frame_contract is not None else "disabled"
+    )
+    if (
+        args.pose_frame_contract is None
+        and not bool(args.no_pose_frame_contract)
+        and not bool(args.no_collection)
+    ):
+        if (
+            _active_sides_from_args(args) == ("left", "right")
+            and not np.isclose(
+                float(args.left_right_base_distance),
+                float(ANNOTATED_DUAL_RM65_BASE_DISTANCE_M),
+                rtol=0.0,
+                atol=1e-9,
+            )
+        ):
+            parser.error(
+                "The default RM65 workspace-near-boundary pose contract is calibrated for "
+                f"--left-right-base-distance {ANNOTATED_DUAL_RM65_BASE_DISTANCE_M}. "
+                "Provide the matching --pose-frame-contract for another station, or "
+                "use --no-pose-frame-contract for the legacy v2.2/raw path."
+            )
+        default_contract = default_rm65_workspace_near_boundary_collection_pose_frame_contract(
+            _active_sides_from_args(args)
+        )
+        if default_contract is not None:
+            args.pose_frame_contract = default_contract
+            args.pose_frame_contract_source = "default_rm65_dual_arm_workspace_near_boundary_v1"
+            if not str(args.policy_io_layout).strip():
+                args.policy_io_layout = "auto"
+    if args.pose_frame_contract is not None and not str(args.policy_io_layout).strip():
+        parser.error(
+            "--pose-frame-contract requires --policy-io-layout auto or an explicit layout JSON."
+        )
+    if args.pose_frame_contract is not None:
+        if not bool(args.record_actual_wrist_camera_pose):
+            parser.error(
+                "--pose-frame-contract requires measured arm feedback; remove "
+                "--no-record-actual-wrist-camera-pose."
+            )
+        contract_sides = tuple(args.pose_frame_contract.source.active_sides)
+        requested_sides = _active_sides_from_args(args)
+        if contract_sides != requested_sides:
+            parser.error(
+                "--pose-frame-contract active_sides disagree with collection --active-sides: "
+                f"{contract_sides!r} != {requested_sides!r}."
+            )
+    args.gui_requested = bool(getattr(args, "open_browser_gui", True)) and not (
+        "--no-gui" in raw_arg_set or "--headless" in raw_arg_set
+    )
+    if not bool(args.headless):
+        args.skip_renderer = False
+    if int(args.tactile_vis_size) <= 0:
+        parser.error("--tactile-vis-size must be positive.")
+    if bool(args.no_camera) and bool(args.vis_cam):
+        parser.error("--vis_cam requires cameras; remove --no-camera.")
+    if float(args.wrist_depth_max_m) <= float(args.wrist_depth_min_m):
+        parser.error("--wrist-depth-max-m must be greater than --wrist-depth-min-m.")
+    wrist_cam_width = getattr(args, "wrist_cam_width", None)
+    wrist_cam_height = getattr(args, "wrist_cam_height", None)
+    if (wrist_cam_width is None) != (wrist_cam_height is None):
+        parser.error("--wrist-cam-width and --wrist-cam-height must be set together.")
+    if bool(args.no_camera) and (bool(args.wrist_depth_mask) or bool(args.wrist_depth_raw)):
+        parser.error("--wrist-depth-mask/--wrist-depth-raw require cameras; remove --no-camera.")
+    # The saved foot-pad topology only selects an additional input mapping.
+    # It must not enable/disable Fix/Init controllers or GUI capabilities.
+    args.init_arm_requested = bool(getattr(args, "init_arm_available", False))
+    args.foot_pad_config_count = configured_foot_pad_count()
+    args.init_arm_disabled_reason = ""
+    if bool(getattr(args, "init_arm_available", False)) and not str(
+        getattr(args, "init_arm_profile", "") or ""
+    ).strip():
+        parser.error("--init-arm-available requires --init-arm-profile.")
+    for side in ("left", "right"):
+        try:
+            _init_arm_qpos_speed_scale_for_side(args, side)
+        except ValueError as exc:
+            parser.error(str(exc))
+    active_sides_for_special_arm = set(_active_sides_from_args(args))
+    explicit_fix_arm = bool({"--fix-arm", "--no-fix-arm"} & raw_arg_set)
+    explicit_init_arm = bool(
+        {
+            "--init-arm-available",
+            "--init-arm-availabe",
+            "--no-init-arm-available",
+            "--no-init-arm-availabe",
+        }
+        & raw_arg_set
+    )
+    # The default special-arm controllers are meaningful only for the dual-arm
+    # topology.  Preserve the historical single-arm behavior unless the user
+    # explicitly requests one of them (which is rejected below with the clear
+    # active-sides error).
+    if active_sides_for_special_arm != {"left", "right"}:
+        if not explicit_fix_arm:
+            args.fix_arm = False
+        if not explicit_init_arm:
+            args.init_arm_available = False
+    args.special_arm_control_mode_requested = getattr(args, "special_arm_control_mode", None)
+    try:
+        args.special_arm_control_mode = resolve_special_arm_control_mode(
+            getattr(args, "special_arm_control_mode", None),
+            fix_arm_enabled=bool(getattr(args, "fix_arm", False)),
+            init_arm_enabled=bool(getattr(args, "init_arm_available", False)),
+            foot_pad_count=getattr(args, "foot_pad_config_count", None),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    special_arm_modes = {
+        flag
+        for flag, enabled in (
+            ("--fix-arm", bool(getattr(args, "fix_arm", False))),
+            ("--init-arm-available", bool(getattr(args, "init_arm_available", False))),
+        )
+        if enabled
+    }
+    if special_arm_modes and set(_active_sides_from_args(args)) != {"left", "right"}:
+        parser.error(
+            f"{', '.join(sorted(special_arm_modes))} requires --active-sides both."
+        )
+    if not str(getattr(args, "load_profile", "") or "").strip():
+        latest_profile = _latest_vive_calibration_profile_path()
+        if latest_profile is None:
+            parser.error(
+                "--load-profile was not provided and no calibration profile JSON was found in "
+                f"{DEFAULT_CALIBRATION_PROFILE_DIR}"
+            )
+        args.load_profile = str(latest_profile)
+    args.requested_tcp_mode = str(getattr(args, "tcp_mode", TOOL_TCP_FRAME))
+    args.tcp_mode = TOOL_TCP_FRAME
+    active_sides = _active_sides_from_args(args)
+    try:
+        for side in active_sides:
+            _hand_backend_mode_for_side(args, side)
+        if _dmtac_sides(args, active_sides):
+            _resolved_gripper_policy(args)
+        _resolve_gripper_input_source(args, active_sides)
+        _apply_default_arm_ips(args, active_sides=active_sides)
+        _validate_required_arm_ips(args, active_sides)
+        _save_explicit_arm_ips_latest(args, raw_argv=raw_argv)
+        _run_gui_device_preflight(args, active_sides=active_sides, parser=parser)
+        _apply_default_q6_ports(args, parser=parser)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if bool(args.visualize_tactile):
+        if _dmtac_sides(args, active_sides):
+            if getattr(args, "dmtac_tactile", None) is False:
+                parser.error(
+                    "--visualize-tactile with --hand-backend dmtac-gripper requires "
+                    "DMTAC tactile reads; remove --dmtac-no-tactile."
+                )
+            args.dmtac_tactile = True
+            requested_fields = tuple(getattr(args, "dmtac_tactile_fields", None) or ())
+            args.dmtac_tactile_fields = normalize_dmtac_tactile_fields(
+                (*requested_fields, "distributed_force")
+            )
+            args.dmtac_tactile_compute_profile = "dist-only"
+            if getattr(args, "dmtac_tactile_calibration_policy", None) is None:
+                args.dmtac_tactile_calibration_policy = "required"
+        if any(
+            _hand_backend_mode_for_side(args, side) == HAND_BACKEND_INSPIRE
+            for side in active_sides
+        ):
+            tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions)
+            if not tactile_regions:
+                parser.error(
+                    "--visualize-tactile requires non-empty --hand-tactile-regions, "
+                    "for example 'thumb_1,index_1,palm' or 'all'."
+                )
+            missing_hand_ip_sides = [
+                side
+                for side in active_sides
+                if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_INSPIRE
+                and not str(getattr(args, f"{side}_hand_ip") or "")
+            ]
+            if missing_hand_ip_sides:
+                parser.error(
+                    "--visualize-tactile requires real InspireTac hand IPs for active sides; "
+                    f"missing={missing_hand_ip_sides}."
+                )
+    if not 0 <= int(args.vive_clock_sync_port) <= 65535:
+        parser.error("--vive-clock-sync-port must be in [0, 65535].")
+    if (
+        int(args.vive_clock_sync_port)
+        and int(args.vive_clock_sync_port) == int(args.port)
+    ):
+        parser.error("--vive-clock-sync-port must differ from the VIVE --port.")
+    if bool(args.vive_clock_sync_required) and int(args.vive_clock_sync_port) <= 0:
+        parser.error("--vive-clock-sync-required requires --vive-clock-sync-port.")
+    if int(args.vive_clock_sync_min_samples) < 1:
+        parser.error("--vive-clock-sync-min-samples must be >= 1.")
+    if float(args.vive_clock_sync_max_rtt_ms) < 0.0:
+        parser.error("--vive-clock-sync-max-rtt-ms must be >= 0.")
+    if float(args.vive_clock_sync_stale_after_sec) < 0.0:
+        parser.error("--vive-clock-sync-stale-after-sec must be >= 0.")
+    if float(args.vive_clock_sync_startup_timeout_sec) < 0.0:
+        parser.error("--vive-clock-sync-startup-timeout-sec must be >= 0.")
+    return args
+
+__all__ = ["bind_legacy_support", "parse_real_teleop_args"]
+

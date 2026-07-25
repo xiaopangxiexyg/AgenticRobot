@@ -121,7 +121,19 @@ from ..action.replay_proposal import (
 )
 from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
 from .rtc_frontend import RtcPolicyShadowConfig, RtcPolicyShadowFrontend
-from .rtc_step_fanout import RtcFrontendStepFanout
+from .rtc_debug import (
+    RTC_DEBUG_LEVEL_OFF,
+    RTC_DEBUG_LEVEL_SUMMARY,
+    RTC_DEBUG_LEVEL_TRACE,
+    RTC_DEBUG_LEVELS,
+    RtcDebugEventObserver,
+    normalize_rtc_debug_level,
+)
+from .rtc_step_fanout import (
+    PolicyActionEmissionFanout,
+    RtcFrontendStepFanout,
+    RtcPolicyEmissionPublisher,
+)
 from deployments.client.rtc_frontend import build_rtc_model_shadow_frontend
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
@@ -212,6 +224,12 @@ from .startup_init import StartupInitializer, resolve_startup_init_action
 DEFAULT_CAMERA_CONFIG_PATH = (
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 )
+# Deployment runs the vision policy at roughly 15 Hz on the RM65 profile.  A
+# 100 ms observation gate leaves only one half-frame of jitter budget at that
+# rate, so keep a deployment-specific margin without changing collection's
+# stricter sampling contract.
+DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC = 0.2
+DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST = 4
 HAND_BACKEND_INSPIRE = "inspire"
 HAND_BACKEND_DMTAC_GRIPPER = "dmtac-gripper"
 HAND_BACKEND_CHOICES = (HAND_BACKEND_INSPIRE, HAND_BACKEND_DMTAC_GRIPPER)
@@ -665,6 +683,8 @@ class DeploymentDebugLogger:
         enabled: bool,
         root_dir: Path | None,
         active_sides: tuple[str, ...],
+        flush_every_events: int = 1,
+        flush_interval_sec: float = 0.0,
     ):
         self.enabled = bool(enabled)
         self.active_sides = tuple(active_sides)
@@ -672,6 +692,17 @@ class DeploymentDebugLogger:
         self._handle: Any = None
         self._lock = threading.RLock()
         self._write_failed = False
+        self._flush_every_events = int(flush_every_events)
+        self._flush_interval_sec = float(flush_interval_sec)
+        if self._flush_every_events <= 0:
+            raise ValueError("flush_every_events must be positive.")
+        if (
+            not math.isfinite(self._flush_interval_sec)
+            or self._flush_interval_sec < 0.0
+        ):
+            raise ValueError("flush_interval_sec must be finite and non-negative.")
+        self._pending_flush_events = 0
+        self._last_flush_at = time.monotonic()
         if not self.enabled:
             return
         debug_root = root_dir if root_dir is not None else repo_path("teleop_records", "deployment_debug")
@@ -711,7 +742,19 @@ class DeploymentDebugLogger:
                     )
                     + "\n"
                 )
-                self._handle.flush()
+                self._pending_flush_events += 1
+                now = time.monotonic()
+                if (
+                    self._pending_flush_events >= self._flush_every_events
+                    or (
+                        self._flush_interval_sec > 0.0
+                        and now - self._last_flush_at
+                        >= self._flush_interval_sec
+                    )
+                ):
+                    self._handle.flush()
+                    self._pending_flush_events = 0
+                    self._last_flush_at = now
             except Exception as exc:  # noqa: BLE001
                 if not self._write_failed:
                     print(f"[DeployDebug] disabled after write failure: {type(exc).__name__}: {exc}", flush=True)
@@ -1852,6 +1895,24 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Directory for --debug JSONL logs. Relative paths resolve under the DexTeleop repo.",
     )
     parser.add_argument(
+        "--rtc-debug-level",
+        choices=RTC_DEBUG_LEVELS,
+        default=None,
+        help=(
+            "RTC JSONL detail when --debug and an RTC profile are enabled. "
+            "Default: summary. trace records every RTC control tick."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-debug-queue-capacity",
+        type=_positive_int,
+        default=2048,
+        help=(
+            "Bounded non-blocking RTC debug event queue capacity. "
+            "Full queues drop diagnostic events, never control work."
+        ),
+    )
+    parser.add_argument(
         "--ik-recovery-stable-frames",
         type=_positive_int,
         default=3,
@@ -2317,10 +2378,27 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=720)
     parser.add_argument("--camera-fps", type=int, default=30)
-    parser.add_argument("--camera-keep-last", type=int, default=4)
+    parser.add_argument(
+        "--camera-keep-last",
+        type=int,
+        default=DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST,
+        help=(
+            "Minimum causal frame history retained by deployment camera sources. "
+            "The value also applies when cameras are loaded from --camera-config."
+        ),
+    )
     parser.add_argument("--camera-color-space", choices=["rgb", "bgr"], default="rgb")
     parser.add_argument("--camera-wait-timeout-ms", type=int, default=1000)
     parser.add_argument("--camera-stale-after-sec", type=float, default=2.0)
+    parser.add_argument(
+        "--camera-frame-max-age-sec",
+        type=_positive_float,
+        default=DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC,
+        help=(
+            "Maximum causal camera source age accepted by the deployment observation "
+            f"firewall (default: {DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC:.3f}s)."
+        ),
+    )
     parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
     parser.add_argument(
         "--camera-startup-hardware-reset",
@@ -2408,6 +2486,22 @@ def validate_args(
     rtc_profile_id = str(getattr(args, "rtc_profile", "off")).strip()
     rtc_profile_enabled = rtc_profile_id != "off"
     rtc_real_shadow = bool(getattr(args, "rtc_real_shadow", False))
+    requested_rtc_debug_level = getattr(args, "rtc_debug_level", None)
+    if requested_rtc_debug_level is None:
+        rtc_debug_level = (
+            RTC_DEBUG_LEVEL_SUMMARY
+            if bool(getattr(args, "debug", False)) and rtc_profile_enabled
+            else RTC_DEBUG_LEVEL_OFF
+        )
+    else:
+        rtc_debug_level = normalize_rtc_debug_level(requested_rtc_debug_level)
+    if rtc_debug_level != RTC_DEBUG_LEVEL_OFF and not bool(
+        getattr(args, "debug", False)
+    ):
+        raise ValueError("--rtc-debug-level summary/trace requires --debug.")
+    if rtc_debug_level != RTC_DEBUG_LEVEL_OFF and not rtc_profile_enabled:
+        raise ValueError("--rtc-debug-level summary/trace requires an RTC profile.")
+    setattr(args, "_rtc_debug_level", rtc_debug_level)
     if rtc_real_shadow and rtc_profile_id != RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
         raise ValueError(
             "--rtc-real-shadow requires the explicit raw final-chunk RTC profile; "
@@ -2801,6 +2895,8 @@ def validate_args(
             raise ValueError("--camera-fps must be positive.")
         if int(args.camera_keep_last) <= 0:
             raise ValueError("--camera-keep-last must be positive.")
+        if float(args.camera_frame_max_age_sec) <= 0.0:
+            raise ValueError("--camera-frame-max-age-sec must be positive.")
         if int(args.camera_wait_timeout_ms) <= 0:
             raise ValueError("--camera-wait-timeout-ms must be positive.")
         if float(args.camera_stale_after_sec) <= 0.0:
@@ -3438,6 +3534,17 @@ def build_camera_sources(
         camera_configs = {
             key: config for key, config in camera_configs.items() if key in selected
         }
+    # Config files historically omitted keep_last, which left deployment with
+    # the source default of two frames even though --camera-keep-last already
+    # defaulted to four for the single-camera CLI path.  Apply the deployment
+    # setting to config-backed sources as a minimum while preserving a larger
+    # value explicitly requested by a config file.
+    requested_keep_last = int(
+        getattr(args, "camera_keep_last", DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST)
+    )
+    for config in camera_configs.values():
+        if isinstance(config, RealSenseRGBCameraConfig):
+            config.keep_last = max(int(config.keep_last), requested_keep_last)
     if bool(getattr(args, "camera_startup_hardware_reset", False)):
         for config in camera_configs.values():
             config.startup_hardware_reset = True
@@ -3807,6 +3914,8 @@ def main(
     argv: list[str] | None = None,
     *,
     rtc_step_fanout: RtcFrontendStepFanout | None = None,
+    rtc_emission_fanout: PolicyActionEmissionFanout | None = None,
+    rtc_emission_publisher: RtcPolicyEmissionPublisher | None = None,
     rtc_model_adapter_factory: Callable[..., Any] | None = None,
 ) -> int:
     if rtc_step_fanout is not None and not isinstance(
@@ -3814,6 +3923,29 @@ def main(
         RtcFrontendStepFanout,
     ):
         raise TypeError("rtc_step_fanout must be an RtcFrontendStepFanout or None.")
+    if rtc_emission_fanout is not None and not isinstance(
+        rtc_emission_fanout,
+        PolicyActionEmissionFanout,
+    ):
+        raise TypeError(
+            "rtc_emission_fanout must be a PolicyActionEmissionFanout or None."
+        )
+    if rtc_emission_publisher is not None and not isinstance(
+        rtc_emission_publisher,
+        RtcPolicyEmissionPublisher,
+    ):
+        raise TypeError(
+            "rtc_emission_publisher must be an "
+            "RtcPolicyEmissionPublisher or None."
+        )
+    if (
+        rtc_emission_fanout is not None
+        and rtc_emission_publisher is not None
+    ):
+        raise ValueError(
+            "Use rtc_emission_publisher or the compatibility "
+            "rtc_emission_fanout, not both."
+        )
     parser = argparse.ArgumentParser(
         description="Deploy a policy on teleop_runtime RM65 arms, optional InspireTac hands, and RealSense."
     )
@@ -3863,6 +3995,10 @@ def main(
         RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
     ):
         raise ValueError("rtc_step_fanout requires the explicit RTC-3c profile.")
+    if rtc_emission_fanout is not None and str(args.rtc_profile) == "off":
+        raise ValueError("rtc_emission_fanout requires an explicit RTC profile.")
+    if rtc_emission_publisher is not None and str(args.rtc_profile) == "off":
+        raise ValueError("rtc_emission_publisher requires an explicit RTC profile.")
     if rtc_model_adapter_factory is not None and not callable(
         rtc_model_adapter_factory
     ):
@@ -4185,6 +4321,17 @@ def main(
         hands_enabled=bool(hands_enabled),
     )
     rtc_frontend: RtcPolicyShadowFrontend | None = None
+    rtc_debug_observer: RtcDebugEventObserver | None = None
+
+    def observe_rtc_transport_exchange(bundle: Any) -> None:
+        observer = rtc_debug_observer
+        if observer is None or not observer.accepts(RTC_DEBUG_LEVEL_SUMMARY):
+            return
+        observer.offer(
+            "rtc_transport_exchange",
+            rtc_client_inference_bundle_debug_payload(bundle),
+        )
+
     if str(args.rtc_profile) == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1:
         rtc_session_id = f"deploy-rtc-shadow-{uuid.uuid4()}"
         runtime_frame_hash = getattr(
@@ -4245,8 +4392,8 @@ def main(
             ),
             deploy_runtime=policy_deploy_runtime,
             policy=policy,
-            preparer=canonical_action_pipeline,
             created_at=time.monotonic(),
+            emission_adapter=canonical_action_pipeline.action_adapter,
         )
         if rtc_step_fanout is not None:
             rtc_step_fanout.bind_frontend(rtc_frontend)
@@ -4277,13 +4424,16 @@ def main(
             profile=RAW_RTC_FINAL_CHUNK_PROFILE_V1,
             request_validity_steps=int(args.rtc_request_validity_steps),
             worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
-            observe_bundle=(
-                lambda bundle: debug_logger.log_event(
-                    "rtc_transport_exchange",
-                    rtc_client_inference_bundle_debug_payload(bundle),
-                )
-            ),
+            observe_bundle=observe_rtc_transport_exchange,
         )
+    if rtc_emission_fanout is not None:
+        if rtc_frontend is None:
+            raise RuntimeError("RTC emission fanout has no RTC frontend.")
+        rtc_emission_fanout.bind_frontend(rtc_frontend)
+    if rtc_emission_publisher is not None:
+        if rtc_frontend is None:
+            raise RuntimeError("RTC emission publisher has no RTC frontend.")
+        rtc_emission_publisher.bind_frontend(rtc_frontend)
     ik_action_gate = IKActionChunkGate(stable_frames_required=int(args.ik_recovery_stable_frames))
     startup_initializer = StartupInitializer(
         duration_s=float(args.init_time_s),
@@ -4349,7 +4499,59 @@ def main(
         enabled=bool(args.debug),
         root_dir=args.debug_dir,
         active_sides=active_sides,
+        flush_every_events=16,
+        flush_interval_sec=0.25,
     )
+    if rtc_frontend is not None:
+        rtc_debug_observer = RtcDebugEventObserver(
+            level=str(getattr(args, "_rtc_debug_level", RTC_DEBUG_LEVEL_OFF)),
+            sink=debug_logger.log_event,
+            queue_capacity=int(args.rtc_debug_queue_capacity),
+        )
+    if rtc_debug_observer is not None and rtc_debug_observer.enabled:
+        source_binding = rtc_frontend.source_binding_candidate
+        rtc_debug_observer.offer(
+            "rtc_source_binding_candidate_prepared",
+            {
+                "schema": "dexteleop_rtc_source_binding_candidate_debug_v1",
+                "source_binding_hash": source_binding.semantic_content_hash,
+                "source_descriptor_hash": source_binding.descriptor_hash,
+                "source_slot_id": source_binding.source_slot_id,
+                "producer_id": source_binding.producer_id,
+                "producer_epoch": source_binding.producer_epoch,
+                "binding_generation": source_binding.binding_generation,
+                "runtime_session_id": source_binding.runtime_session_id,
+                "control_domain_id": source_binding.control_domain_id,
+            },
+        )
+        if (
+            rtc_emission_publisher is not None
+            and rtc_emission_publisher.active_binding is not None
+        ):
+            rtc_debug_observer.offer(
+                "rtc_source_binding_activated",
+                {
+                    "schema": (
+                        "dexteleop_rtc_source_binding_activation_debug_v1"
+                    ),
+                    "source_binding_hash": (
+                        rtc_emission_publisher.active_binding.semantic_content_hash
+                    ),
+                    "source_descriptor_hash": (
+                        rtc_emission_publisher.active_binding.descriptor_hash
+                    ),
+                    "producer_id": (
+                        rtc_emission_publisher.active_binding.producer_id
+                    ),
+                    "producer_epoch": (
+                        rtc_emission_publisher.active_binding.producer_epoch
+                    ),
+                    "binding_generation": (
+                        rtc_emission_publisher.active_binding.binding_generation
+                    ),
+                    "activation_owner": "application_publisher",
+                },
+            )
     position_deploy_executor: PositionDeployExecutor | None = None
     if (
         bool(args.arms_enabled)
@@ -5054,6 +5256,7 @@ def main(
                     last_action=last_action,
                     timestamp=loop_started_at,
                     require_images=bool(args.require_camera_frame),
+                    camera_frame_max_age_sec=float(args.camera_frame_max_age_sec),
                     hand_state_max_age_sec=DEFAULT_HAND_STATE_MAX_AGE_SEC,
                     metadata={
                         "control_hz": control_hz,
@@ -5361,11 +5564,82 @@ def main(
                         )
                         if rtc_step_fanout is not None:
                             rtc_step_fanout.put_nowait(rtc_step)
-                        action_step = rtc_step.action_preparation
-                        debug_logger.log_event(
-                            "rtc_frontend_step",
-                            rtc_step.to_debug_payload(),
+                        emission = rtc_step.emission_result.emission
+                        if (
+                            rtc_emission_publisher is not None
+                            and emission is not None
+                        ):
+                            publication_receipt = (
+                                rtc_emission_publisher.publish_committed_emission(
+                                    emission,
+                                    rtc_step.emission_commit_receipt,
+                                    now=control_loop_started_at,
+                                )
+                            )
+                            if (
+                                rtc_debug_observer is not None
+                                and rtc_debug_observer.accepts(
+                                    RTC_DEBUG_LEVEL_SUMMARY
+                                )
+                            ):
+                                rtc_debug_observer.offer(
+                                    "rtc_emission_publication",
+                                    {
+                                        "schema": (
+                                            "dexteleop_rtc_emission_publication_debug_v1"
+                                        ),
+                                        **publication_receipt.to_payload(),
+                                        "publication_receipt_hash": (
+                                            publication_receipt.semantic_content_hash
+                                        ),
+                                    },
+                                )
+                            if not publication_receipt.accepted:
+                                raise RuntimeError(
+                                    "RTC committed emission publication was "
+                                    "rejected: "
+                                    f"{publication_receipt.reasons}"
+                                )
+                        if rtc_emission_fanout is not None and emission is not None:
+                            commit = rtc_step.emission_commit_transition
+                            if (
+                                commit is None
+                                or not commit.receipt.accepted
+                                or commit.receipt.emission_id != emission.emission_id
+                            ):
+                                raise RuntimeError(
+                                    "RTC emission publication requires exact "
+                                    "accepted producer commit evidence."
+                                )
+                            rtc_emission_fanout.put_nowait(emission)
+                        action_step = (
+                            policy_deploy_runtime.prepare_emission_result(
+                                rtc_step.emission_result,
+                                observation,
+                                preparer=canonical_action_pipeline,
+                                policy_name=policy.name,
+                            )
                         )
+                        if rtc_debug_observer is not None:
+                            summary_worthy = bool(
+                                rtc_step.completion is not None
+                                or rtc_step.result_transition is not None
+                                or rtc_step.emission_result.emission is not None
+                                or rtc_step.request_transition is not None
+                                or rtc_step.lifecycle_transition is not None
+                                or rtc_step.budget_exceeded
+                            )
+                            minimum_level = (
+                                RTC_DEBUG_LEVEL_SUMMARY
+                                if summary_worthy
+                                else RTC_DEBUG_LEVEL_TRACE
+                            )
+                            if rtc_debug_observer.accepts(minimum_level):
+                                rtc_debug_observer.offer(
+                                    "rtc_frontend_step",
+                                    rtc_step.to_debug_payload(),
+                                    minimum_level=minimum_level,
+                                )
                         if (
                             rtc_step.result_transition is not None
                             and not rtc_step.result_transition.receipt.accepted
@@ -5828,16 +6102,34 @@ def main(
         if rtc_frontend is not None:
             try:
                 rtc_stop = rtc_frontend.close(now=time.monotonic())
-                debug_logger.log_event(
-                    "rtc_frontend_close",
-                    {
-                        "worker_stop_hash": rtc_stop.semantic_content_hash,
-                        "worker_session_state": rtc_stop.session_state,
-                        "thread_exited": rtc_stop.thread_exited,
-                    },
-                )
+                if rtc_debug_observer is not None:
+                    rtc_debug_observer.offer(
+                        "rtc_frontend_close",
+                        {
+                            "worker_stop_hash": rtc_stop.semantic_content_hash,
+                            "worker_session_state": rtc_stop.session_state,
+                            "thread_exited": rtc_stop.thread_exited,
+                            "execution_drain_evidence": (
+                                rtc_stop.execution_drain_evidence
+                            ),
+                            "stop_status": rtc_stop.status,
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001 - continue all cleanup.
                 error = f"rtc_frontend: {type(exc).__name__}: {exc}"
+                cleanup_errors.append(error)
+                print(f"[DeployCleanup] {error}", file=sys.stderr)
+        if rtc_debug_observer is not None:
+            try:
+                rtc_debug_was_enabled = rtc_debug_observer.enabled
+                rtc_debug_status = rtc_debug_observer.close()
+                if rtc_debug_was_enabled:
+                    debug_logger.log_event(
+                        "rtc_debug_observer_status",
+                        rtc_debug_status.to_payload(),
+                    )
+            except Exception as exc:  # noqa: BLE001 - diagnostic shutdown only.
+                error = f"rtc_debug_observer: {type(exc).__name__}: {exc}"
                 cleanup_errors.append(error)
                 print(f"[DeployCleanup] {error}", file=sys.stderr)
         if position_deploy_executor is not None:

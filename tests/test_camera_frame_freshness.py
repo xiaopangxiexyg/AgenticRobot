@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from robot_motion.deploy.observation import build_deployment_observation
 from teleop_runtime.collection.build_collect_components import CollectorComponents
@@ -13,6 +14,7 @@ from teleop_runtime.collection.video_frame import NearestFrameBuffer, VideoFrame
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.schemas import TeleopObservation
 from teleop_runtime.session import SessionStepResult
+from teleop_runtime.real_teleop.recording_admission import recording_warmup_status
 
 
 def _frame(
@@ -85,6 +87,85 @@ def test_collection_rejects_missing_required_camera_frame() -> None:
     assert builder.sample_index == 0
 
 
+def test_recording_resume_gate_uses_camera_availability_age() -> None:
+    """Resume must not reopen a segment the collector will reject immediately."""
+
+    buffer = NearestFrameBuffer(keep_last=2)
+    # The frame was captured recently, but became available to the collector
+    # 110 ms before T0.  CollectorSampleBuilder therefore rejects it at the
+    # 100 ms contract boundary.
+    buffer.push(_frame(9.95, frame_index=1, available_timestamp=9.89))
+    source = SimpleNamespace(frame_buffer=lambda: buffer)
+    args = SimpleNamespace(no_camera=False, ignore_camera=(), ignore_tactile=())
+    components = SimpleNamespace(active_sides=())
+    clutch = SimpleNamespace(
+        hold_active=lambda: False,
+        publish_camera_status=lambda **_kwargs: {},
+    )
+    step = _step(10.0)
+    step = SessionStepResult(
+        timestamp=step.timestamp,
+        state=step.state,
+        control_hz=step.control_hz,
+        observation=step.observation,
+        command=SimpleNamespace(timestamp=10.0),
+    )
+
+    ready, message = recording_warmup_status(
+        10.0,
+        step_result=step,
+        args=args,
+        components=components,
+        clutch_input=clutch,
+        dataset_recorder=None,
+        camera_sources={"front": source},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=lambda _state: None,
+        gripper_warmup_probe_status=lambda **_kwargs: (True, "ready"),
+        camera_status_blocking_message=lambda _status: None,
+    )
+
+    assert ready is False
+    assert "front" in message
+    assert "0.11" in message
+
+
+def test_recording_resume_gate_rejects_future_availability_timestamp() -> None:
+    buffer = NearestFrameBuffer(keep_last=2)
+    buffer.push(_frame(9.99, frame_index=1, available_timestamp=10.10))
+    source = SimpleNamespace(frame_buffer=lambda: buffer)
+    args = SimpleNamespace(no_camera=False, ignore_camera=(), ignore_tactile=())
+    step = SessionStepResult(
+        timestamp=10.0,
+        state=TeleopRunState.RUNNING,
+        control_hz=15.0,
+        observation=TeleopObservation(timestamp=10.0),
+        command=SimpleNamespace(timestamp=10.0),
+    )
+
+    ready, message = recording_warmup_status(
+        10.0,
+        step_result=step,
+        args=args,
+        components=SimpleNamespace(active_sides=()),
+        clutch_input=SimpleNamespace(
+            hold_active=lambda: False,
+            publish_camera_status=lambda **_kwargs: {},
+        ),
+        dataset_recorder=None,
+        camera_sources={"front": source},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=lambda _state: None,
+        gripper_warmup_probe_status=lambda **_kwargs: (True, "ready"),
+        camera_status_blocking_message=lambda _status: None,
+    )
+
+    assert ready is False
+    assert message == "等待相机 front 时间戳稳定。"
+
+
 def test_collection_camera_lookup_requires_source_and_availability_before_t0() -> None:
     buffer = NearestFrameBuffer(keep_last=3)
     buffer.push(_frame(9.90, frame_index=1, available_timestamp=9.95))
@@ -135,6 +216,24 @@ def test_deployment_observation_marks_frame_over_100ms_stale() -> None:
     )
     assert any(fault.startswith("camera_frame_stale:front:") for fault in observation.faults)
     assert observation.metadata["camera_frame_max_age_sec"] == 0.1
+
+
+def test_deployment_camera_margin_accepts_normal_15hz_jitter() -> None:
+    observation = build_deployment_observation(
+        active_sides=(),
+        arms_enabled=False,
+        hands_enabled=False,
+        step_index=0,
+        arm_states={},
+        hand_states={},
+        camera_sources={"front": _CameraSource(_frame(9.82))},
+        timestamp=10.0,
+        require_images=True,
+        camera_frame_max_age_sec=0.2,
+    )
+
+    assert observation.faults == []
+    assert observation.metadata["camera_frame_max_age_sec"] == 0.2
 
 
 def test_deployment_observation_requires_a_configured_fresh_camera() -> None:

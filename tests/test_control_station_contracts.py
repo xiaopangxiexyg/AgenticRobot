@@ -7,14 +7,18 @@ from types import SimpleNamespace
 
 import pytest
 
+from control_composition.lifecycle import (
+    CompositionSessionOperationSpec,
+    CompositionSessionRearmReceipt,
+    CompositionSessionRearmSpec,
+    advance_composition_session,
+    initial_composition_session_state,
+)
 from control_station import (
     COMPOSITION_SESSION_OPERATION_READY_STATUS_V1,
     COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1,
     COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1,
     CompositionSessionController,
-    CompositionSessionOperationSpec,
-    CompositionSessionRearmReceipt,
-    CompositionSessionRearmSpec,
     ControlStationRunManifest,
     ControlStationRuntime,
     ExecutionDomainBinding,
@@ -30,9 +34,9 @@ from control_station import (
     admit_station_intent,
     apply_station_operation_result,
     apply_station_intent,
-    advance_composition_session,
-    initial_composition_session_state,
     initial_control_station_state,
+)
+from dataset_interface.composition_control_trace import (
     project_composition_session_rearm_receipt,
     project_composition_session_rearm_spec,
 )

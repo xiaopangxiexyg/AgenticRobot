@@ -91,6 +91,22 @@ immutable arbitration-cut snapshot; only authoritative decisions may
 materialize an actual selected-action view. Formal-sim episode profiles remain
 fail-closed until their durability and branch-specific capture lineage are integrated.
 
+The additive formal-component records keep semantic and implementation
+contracts distinct: `component_composition_rule_set` stores the complete
+pose/qpos component rules, while `formal_component_composition_binding` links
+their hash to one CompositionSpec and one formal strategy spec. Completeness
+validation requires every v2 formal-component spec to resolve exactly one such
+binding and requires that binding to resolve its three typed facts. Historical
+spec/strategy v1 record schemas are unchanged.
+
+Formal compound execution adds two records without widening those composition
+facts. `conservative_compound_authority_profile` binds the exact spec,
+rule-set, strategy, producer, components, groups, TTL/fallback class, and
+atomic activation contract. `compound_authority_failure` records the failed
+safety/resolution/downstream stage before the standard control-domain HOLD
+cancellation. Completeness resolves the profile back to the exact three-way
+formal binding and every failure back to that profile and its causal facts.
+
 The scoped CS-6b2 component branch adds an explicit
 `component_mixing_shadow` arbitration-output record and the fixture-only
 `deployable_sim_component_mixing_shadow_v1` profile. It records immutable

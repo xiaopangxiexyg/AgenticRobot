@@ -1007,7 +1007,7 @@ button.stop-ready {
         <div class="control-title">脚踏板安全测试</div>
         <div class="foot-pad-test-banner">
           <div class="foot-pad-test-title">可选映射测试（不阻塞控制）</div>
-        <div class="foot-pad-test-detail">双踏板模式：F13/踏板1 进入仅左臂遥操（Fix 右臂），F14/踏板2 进入仅右臂遥操（Fix 左臂），不执行 Init。四踏板模式保持原映射：F13/F14 固定左右臂，F15/F16 启动左右臂精确 Init qpos。测试模式始终检查踏板 1–4，只显示键位，不执行机械臂动作或写入数采。</div>
+        <div class="foot-pad-test-detail">双踏板模式：F13/踏板1 进入仅左臂遥操（Fix 右臂），F14/踏板2 进入仅右臂遥操（Fix 左臂），不执行 Init。四踏板模式保持原映射：F13/F14 固定左右臂，F15/F16 启动左右臂精确 Init qpos。测试模式按当前识别的踏板数量检查有效键位：双踏板完成 1、2 后自动结束，四踏板仍检查 1–4；测试只显示键位，不执行机械臂动作或写入数采。</div>
         </div>
         <div class="button-grid">
           <button id="footPadTestStartButton" class="warn" data-event="foot_pad_test_start">开始测试踏板</button>

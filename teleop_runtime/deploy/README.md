@@ -80,15 +80,23 @@ production application只检查过`--help`，没有以RTC profile启动camera/ba
 observation/transport shadow、typed preview receipt、M1C drain或motion authority。RTC-3d完成typed preview
 identity/TTL/safety/downstream acceptance/reference lineage/promotion之前，RTC lookahead必须保持关闭。
 
-现有control loop还提供一个仅供application composition注入的
-`RtcFrontendStepFanout`参数：它在唯一一次`rtc_frontend.step()`返回后，将同一个immutable
-`RtcFrontendStep`以`put_nowait`方式送往显式有界subscriber。full/error只计入对应observer状态，不传播到deploy；
-fanout不拥有worker、plan、predict、merge、pop、emission commit或execution。根级Control Station的CS-3a fixture可用
-target-neutral source binding消费该seam，并以同队列有序fence开关passive shadow，但当前没有CLI开关、production
-composition、target owner、capture owner或motion authority。
-当fanout被显式注入时，`run_policy`会在RTC frontend构造完成后一次性发布由真实frontend/runtime/preparer生成的
-source binding；root bootstrap可以在此之前只准备queue，不能靠重复CLI参数猜测binding hash。该握手仍不启动Station
-server，也不改变camera/backend或RTC producer lifecycle。
+现有control loop提供默认关闭、仅供application root注入的`RtcPolicyEmissionPublisher`。正式
+`publish_committed_emission()`验证typed producer commit、active source binding、producer epoch、TTL和幂等publication
+key后才发布`PolicyActionEmission`。observer queue满时只drop并计数；首版最多一个required control subscriber，其
+queue满或异常会拒绝publication并使publisher fail closed。该commit只证明pop后的动作已固化为emission，不代表
+safety/reference/backend接纳。
+
+producer缓存stable descriptor对应的epoch binding candidate；publisher拥有active binding。rearm生成新binding和
+backend-neutral activation-readiness receipt。首版publisher支持显式suspend、单required subscriber typed ACK及
+原子rebind；具体application/consumer自动协调和多subscriber rotation仍是后续gate。旧
+`PolicyActionEmissionFanout`只保留passive/debug兼容，`RtcFrontendStepFanout`（canonical alias
+`RtcProducerDebugStepFanout`）只传producer诊断事实。它们都不拥有worker、plan、execution或motion authority。
+
+RTC配合`--debug`时默认启用低频`summary`事件；`--rtc-debug-level trace`才记录每个RTC control tick。
+`--rtc-debug-level off`可只保留普通deploy debug。RTC事件经`--rtc-debug-queue-capacity`指定的bounded observer queue
+异步写入，满队列只增加drop count，不反压control loop或model worker；退出时记录
+`rtc_debug_observer_status`。当前事件覆盖source binding、transport exchange、request/result/worker/plan摘要、
+emission commit、publisher publication和frontend close，且只记录identity/hash/timing，不复制sensor或完整chunk。
 
 RTC-4a另在`robot_motion.deploy.rtc_protocol`与`deployments.client.rtc`提供模型/transport/sim/real无关的
 capability、envelope、conditioning receipt和local/remote backend seam。它目前只有纯本地迁移fixture，没有接到本

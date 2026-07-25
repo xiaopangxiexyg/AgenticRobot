@@ -6,9 +6,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from control_station import (
+from control_composition.lifecycle import (
     HumanTakeoverOperationSpec,
-    HumanTakeoverReadinessCandidate,
+    MixedControlBoundaryPolicy,
+)
+from control_station import (
     SideEffectStationOperationCoordinator,
     StationIntentDraft,
 )
@@ -19,8 +21,8 @@ from control_station.composition import (
     build_scoped_cs6b1_mujoco_human_replay_station,
 )
 from control_station.composition.mujoco_replay import ReplaySourceObserverBinding
-from control_station.handoff import MixedControlBoundaryPolicy
 from control_station.sources import (
+    HumanTakeoverReadinessCandidate,
     SyntheticHumanQposSource,
     SyntheticHumanQposSourceSpec,
 )

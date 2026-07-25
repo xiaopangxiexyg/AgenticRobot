@@ -61,6 +61,11 @@ from .proposal import (
     action_proposal_semantic_payload,
 )
 from .components import ActionComponentCatalog, ActionComponentSpec
+from .compound_authority import (
+    CONSERVATIVE_COMPOUND_AUTHORITY_ATOMICITY_V1,
+    CONSERVATIVE_COMPOUND_AUTHORITY_PROFILE_HASH_DOMAIN_V1,
+    ConservativeCompoundAuthorityProfile,
+)
 from .candidate_authorization import (
     CandidateAuthorizationAdmissionReceipt,
     CandidateAuthorizationDraft,
@@ -305,6 +310,9 @@ __all__ = [
     "BIMANUAL_MIXED_V1",
     "CompoundDispatchGroupBinding",
     "CompoundDispatchManifest",
+    "CONSERVATIVE_COMPOUND_AUTHORITY_ATOMICITY_V1",
+    "CONSERVATIVE_COMPOUND_AUTHORITY_PROFILE_HASH_DOMAIN_V1",
+    "ConservativeCompoundAuthorityProfile",
     "BIMANUAL_QPOS_HAND16_V1",
     "BIMANUAL_QPOS_V1",
     "CallableActionSource",

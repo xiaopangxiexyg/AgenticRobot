@@ -5,7 +5,7 @@ import inspect
 
 import pytest
 
-from control_station import (
+from control_composition.lifecycle import (
     AuthorityReleaseReceipt,
     ExecutionHoldReceipt,
     ExecutionReadyReceipt,
@@ -422,7 +422,7 @@ def test_episode_boundary_policy_is_explicit_and_handoff_contract_is_pure() -> N
     assert legacy.episode_boundary_motion_policy == "capture_only"
     assert mixed.episode_boundary_motion_policy == "hold_before_unbind"
 
-    import control_station.handoff as handoff
+    import control_composition.lifecycle.handoff as handoff
 
     tree = ast.parse(inspect.getsource(handoff))
     imports = {

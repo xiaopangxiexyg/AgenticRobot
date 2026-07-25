@@ -452,6 +452,18 @@ class RM65ArmBackendConfig:
     # must be bound to the exact final qref emitted by the coupled selector.
     # False preserves direct/replay compatibility and the previous gate.
     require_position_singularity_candidate_certificate: bool = False
+    # When a certificate explicitly claims that no clean branch was
+    # available, enter the singular neighborhood with a smaller position
+    # step.  The limit is released only after several normal frames so the
+    # SDK boundary cannot chatter between hold and pass.
+    position_singularity_fallback_step_scale: float = 0.25
+    position_singularity_fallback_release_frames: int = 3
+    # Formal position teleop may treat the SDK singularity result as advisory
+    # when the local J3/J5 proxy and a valid coupled-candidate certificate say
+    # the selected qref is outside the local singularity neighborhood.  This
+    # never applies to force/replay/direct commands and never bypasses the
+    # hard joint, collision, or force guards.
+    position_sdk_singularity_advisory: bool = False
     configure_singularity_thresholds: bool = True
     singularity_elbow_threshold_deg: float = 3.0
     singularity_wrist_threshold_deg: float = 3.0
@@ -602,6 +614,14 @@ class RM65ArmBackendConfig:
             raise ValueError("singularity_qpos_init_slowdown must be in (0, 1].")
         if not 0.0 < float(self.singularity_replay_slowdown) <= 1.0:
             raise ValueError("singularity_replay_slowdown must be in (0, 1].")
+        if not 0.0 < float(self.position_singularity_fallback_step_scale) <= 1.0:
+            raise ValueError(
+                "position_singularity_fallback_step_scale must be in (0, 1]."
+            )
+        if int(self.position_singularity_fallback_release_frames) <= 0:
+            raise ValueError(
+                "position_singularity_fallback_release_frames must be positive."
+            )
         self.ik_framework = normalize_rm65_ik_framework(self.ik_framework)
         if self.ik_tuning is None:
             self.ik_tuning = load_ik_tuning_config(self.ik_tuning_json_path)
@@ -799,6 +819,9 @@ class RM65ArmBackend(EffectorBackend):
         }
         self._last_singularity_warning_time = 0.0
         self._last_singularity_warning_key: tuple[object, ...] | None = None
+        self._position_singularity_fallback_active = False
+        self._position_singularity_fallback_normal_frames = 0
+        self._position_singularity_fallback_entry_count = 0
         self._base_control_dt = float(config.control_dt)
         self._base_max_joint_step = self._position_max_command_step_rad()
         self._last_send_time: float | None = None
@@ -2162,6 +2185,7 @@ class RM65ArmBackend(EffectorBackend):
         allow_position_elbow_fallback: bool = False,
         allow_position_shoulder_fallback: bool = False,
         position_singularity_fallback_metadata: Mapping[str, object] | None = None,
+        position_sdk_singularity_advisory_used: bool = False,
         position_candidate_certificate_validation: Mapping[str, object] | None = None,
     ) -> np.ndarray:
         target = np.asarray(qpos_target, dtype=float).reshape(6)
@@ -2200,7 +2224,10 @@ class RM65ArmBackend(EffectorBackend):
         replay_slow_source = _is_replay_slow_singularity_source(source)
         current_status = (
             self._analyze_singularity(reference)
-            if target_singular or qpos_init_slow_source or (
+            if target_singular
+            or qpos_init_slow_source
+            or self._position_singularity_fallback_active
+            or (
                 replay_slow_source and replay_slowdown_preapplied
             )
             else {"status_code": 0, "label": "normal"}
@@ -2236,6 +2263,57 @@ class RM65ArmBackend(EffectorBackend):
             gate_status = "allow_position_elbow_singular"
         elif allow_shoulder_fallback:
             gate_status = "allow_position_shoulder_singular"
+        position_sdk_singularity_advisory_used = bool(
+            position_sdk_singularity_advisory_used and allow_position_fallback
+        )
+        certificate_bound_fallback = bool(
+            position_candidate_certificate_validation is not None
+            and position_candidate_certificate_validation.get("valid", False)
+            and position_candidate_certificate_validation.get(
+                "singular_fallback_claimed", False
+            )
+        )
+        certificate_context_valid = bool(
+            position_candidate_certificate_validation is not None
+            and position_candidate_certificate_validation.get("valid", False)
+        )
+        explicit_position_fallback = bool(
+            allow_position_fallback
+            and not position_sdk_singularity_advisory_used
+            and certificate_bound_fallback
+        )
+        with self._state_lock:
+            fallback_active_before = bool(self._position_singularity_fallback_active)
+            if fallback_active_before and not certificate_context_valid:
+                # A direct/replay command does not carry the coupled position
+                # certificate.  Never let a previous formal-teleop latch
+                # change that command's historical singularity semantics.
+                self._position_singularity_fallback_active = False
+                self._position_singularity_fallback_normal_frames = 0
+                fallback_active_before = False
+            if entering_singularity and explicit_position_fallback:
+                self._position_singularity_fallback_active = True
+                self._position_singularity_fallback_normal_frames = 0
+                self._position_singularity_fallback_entry_count += 1
+            elif target_singular or current_singular:
+                if fallback_active_before:
+                    self._position_singularity_fallback_normal_frames = 0
+            elif fallback_active_before:
+                self._position_singularity_fallback_normal_frames += 1
+                if self._position_singularity_fallback_normal_frames >= int(
+                    self.config.position_singularity_fallback_release_frames
+                ):
+                    self._position_singularity_fallback_active = False
+                    self._position_singularity_fallback_normal_frames = 0
+            fallback_active = bool(self._position_singularity_fallback_active)
+            fallback_normal_frames = int(self._position_singularity_fallback_normal_frames)
+            fallback_entry_count = int(self._position_singularity_fallback_entry_count)
+        rate_limited_position_fallback = bool(
+            fallback_active
+            and certificate_context_valid
+            and not position_sdk_singularity_advisory_used
+            and (target_singular or current_singular)
+        )
         slow_singularity_mode: str | None = None
         if (
             qpos_init_slow_source
@@ -2266,7 +2344,15 @@ class RM65ArmBackend(EffectorBackend):
             else:
                 gate_status = "slow_replay_exiting_singularity"
         elif target_singular and current_code not in (0, None):
-            gate_status = "allow_current_singular"
+            # Remaining inside a singular neighborhood is not a safe normal
+            # tracking state. Only an explicit certified fallback (which is
+            # rate-limited below) or a dedicated qpos-init/replay slow path
+            # may continue. A normal position target must hold until it points
+            # outside the neighborhood; that exit path remains unchanged.
+            if not allow_position_fallback and not rate_limited_position_fallback:
+                gate_status = "hold_current_singular"
+            else:
+                gate_status = "allow_current_singular"
         elif target_code is None:
             gate_status = "analysis_unavailable"
         metadata: dict[str, object] = {
@@ -2294,6 +2380,25 @@ class RM65ArmBackend(EffectorBackend):
                 allow_shoulder_fallback
             ),
             "position_singularity_fallback_allowed": bool(allow_position_fallback),
+            "position_singularity_fallback_explicit": bool(explicit_position_fallback),
+            "position_singularity_fallback_certificate_context_valid": bool(
+                certificate_context_valid
+            ),
+            "position_singularity_fallback_rate_limited": bool(
+                rate_limited_position_fallback
+            ),
+            "position_singularity_fallback_hysteresis_active": bool(fallback_active),
+            "position_singularity_fallback_normal_frames": int(fallback_normal_frames),
+            "position_singularity_fallback_release_frames": int(
+                self.config.position_singularity_fallback_release_frames
+            ),
+            "position_singularity_fallback_entry_count": int(fallback_entry_count),
+            "position_sdk_singularity_advisory": bool(
+                self.config.position_sdk_singularity_advisory
+            ),
+            "position_sdk_singularity_advisory_used": bool(
+                position_sdk_singularity_advisory_used
+            ),
         }
         if position_candidate_certificate_validation is not None:
             metadata["position_candidate_certificate_validation"] = dict(
@@ -2335,12 +2440,42 @@ class RM65ArmBackend(EffectorBackend):
                 metadata["singularity_replay_requested_target"] = target.tolist()
                 metadata["singularity_replay_slow_target"] = slow_target.tolist()
             target = slow_target
+        if rate_limited_position_fallback and not slow_singularity:
+            fallback_scale = float(self.config.position_singularity_fallback_step_scale)
+            if max_joint_step is None:
+                limited_target = target.copy()
+            else:
+                step_limit = np.maximum(0.0, np.asarray(max_joint_step, dtype=float).reshape(6))
+                step_limit *= fallback_scale
+                limited_target = reference + np.clip(target - reference, -step_limit, step_limit)
+            metadata.update(
+                {
+                    "position_singularity_fallback_step_scale": fallback_scale,
+                    "position_singularity_fallback_requested_target": target.tolist(),
+                    "position_singularity_fallback_limited_target": limited_target.tolist(),
+                }
+            )
+            target = limited_target
         if "wrist_center_distance_m" in target_status:
             metadata["target_wrist_center_distance_m"] = target_status["wrist_center_distance_m"]
         if "wrist_center_distance_m" in current_status:
             metadata["current_wrist_center_distance_m"] = current_status["wrist_center_distance_m"]
         self._record_singularity_metadata(metadata)
-        if entering_singularity and not slow_singularity and not allow_position_fallback:
+        if (
+            entering_singularity
+            and not slow_singularity
+            and not allow_position_fallback
+            and not rate_limited_position_fallback
+        ):
+            self._emit_singularity_warning(metadata)
+            return reference.copy()
+        if (
+            target_singular
+            and current_singular
+            and not slow_singularity
+            and not allow_position_fallback
+            and not rate_limited_position_fallback
+        ):
             self._emit_singularity_warning(metadata)
             return reference.copy()
         return target
@@ -2588,6 +2723,10 @@ class RM65ArmBackend(EffectorBackend):
             (certificate_valid and certificate_claims_singular_fallback)
             or not self.config.require_position_singularity_candidate_certificate
         )
+        certificate_allows_sdk_advisory = bool(
+            self.config.position_sdk_singularity_advisory
+            and certificate_valid
+        )
         wrist_preference = _metadata_mapping(
             candidate_selection.get("wrist_singularity_preference")
         )
@@ -2609,6 +2748,24 @@ class RM65ArmBackend(EffectorBackend):
             and wrist_preference.get("fallback_to_singular", False)
             and fallback_side_wrist.get("is_wrist_singular", False)
             and certificate_allows_fallback
+        )
+        # The SDK is the final hardware safety signal, but its boundary is not
+        # identical to the local J5 proxy used by the coupled position
+        # selector.  For the formal position path, a valid candidate
+        # certificate allows that local classification to take priority when
+        # it is explicitly outside the local wrist neighborhood.  The SDK
+        # result remains recorded; the backend still requires the explicit
+        # position fallback capability and an exact final-qref certificate.
+        position_sdk_wrist_advisory_candidate = bool(
+            certificate_allows_sdk_advisory
+            and wrist_preference.get("enabled", False)
+            and selected_side_wrist.get("is_wrist_singular") is False
+            # Candidate selection is followed by post-IK qref smoothing.  A
+            # valid certificate for the pre-smoothed candidate must not allow
+            # the actually emitted qref to enter the local J5 neighborhood at
+            # full speed merely because the SDK boundary is advisory.
+            and abs(float(np.rad2deg(qpos_target[4])))
+            >= float(self.config.singularity_wrist_threshold_deg)
         )
         position_singularity_preference = _metadata_mapping(
             candidate_selection.get("position_singularity_preference")
@@ -2634,6 +2791,12 @@ class RM65ArmBackend(EffectorBackend):
         fallback_position_side = (
             certified_position_side if certificate_valid else selected_position_side
         )
+        position_sdk_singularity_advisory_used = False
+        if (
+            position_sdk_wrist_advisory_candidate
+        ):
+            allow_position_wrist_fallback = True
+            position_sdk_singularity_advisory_used = True
         allow_position_elbow_fallback = bool(
             position_singularity_preference.get("enabled", False)
             and position_singularity_preference.get("fallback_to_singular", False)
@@ -2647,6 +2810,27 @@ class RM65ArmBackend(EffectorBackend):
             and fallback_position_side.get("is_elbow_singular", False)
             and certificate_allows_fallback
         )
+        if (
+            certificate_allows_sdk_advisory
+            and position_singularity_preference.get("enabled", False)
+            and selected_position_side.get("elbow_margin_deg") is not None
+        ):
+            try:
+                local_elbow_non_singular = float(
+                    selected_position_side["elbow_margin_deg"]
+                ) >= 0.0
+            except (TypeError, ValueError):
+                local_elbow_non_singular = False
+            # The shared solver uses a one-degree selection margin above the
+            # SDK elbow threshold. Re-check the final emitted qref too, since
+            # output smoothing can move it inside that local neighborhood.
+            final_qref_elbow_non_singular = (
+                abs(float(np.rad2deg(qpos_target[2])))
+                >= float(self.config.singularity_elbow_threshold_deg) + 1.0
+            )
+            if local_elbow_non_singular and final_qref_elbow_non_singular:
+                allow_position_elbow_fallback = True
+                position_sdk_singularity_advisory_used = True
         allow_position_shoulder_fallback = bool(
             position_singularity_preference.get("enabled", False)
             and position_singularity_preference.get("fallback_to_singular", False)
@@ -2672,6 +2856,7 @@ class RM65ArmBackend(EffectorBackend):
             allow_position_elbow_fallback=allow_position_elbow_fallback,
             allow_position_shoulder_fallback=allow_position_shoulder_fallback,
             position_singularity_fallback_metadata=position_singularity_preference,
+            position_sdk_singularity_advisory_used=position_sdk_singularity_advisory_used,
             position_candidate_certificate_validation=(
                 candidate_certificate_validation
             ),

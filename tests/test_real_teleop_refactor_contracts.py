@@ -10,18 +10,67 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from teleop_runtime import calibration_flow as shared_calibration_flow
+from teleop_runtime import cli_value_parsers as shared_cli_value_parsers
+from teleop_runtime import log_utils as shared_log_utils
+from teleop_runtime.debug import calibration_flow as legacy_calibration_flow
 from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy_entrypoint
+from teleop_runtime.debug import run_vive_sapien_virtual as virtual_entrypoint
+from teleop_runtime.debug import log_utils as legacy_log_utils
 from teleop_runtime.gui import collection_tasks as gui_collection_tasks
 from teleop_runtime.gui import status_payloads
 from teleop_runtime.real_teleop import (
     action_debug_payload,
+    arm_runtime,
+    arm_state_sync,
+    arm_tool_config,
+    camera_runtime,
+    cli,
+    cli_resolution,
+    cli_runtime_config,
     cli_value_parsers,
+    command_filters,
+    component_builder,
     components,
+    control_loop,
     dataset_finalize,
     dataset_layout,
     debug_payload_primitives,
     debug_ik_payload,
+    debug_log_frames,
     debug_timing_payload,
+    defaults,
+    diagnostic_setup,
+    device_retry_runtime,
+    dmtac_config,
+    episode_runtime,
+    episode_recording_runtime,
+    gripper_control,
+    gripper_policy,
+    gripper_recovery,
+    gripper_status,
+    gripper_warmup_runtime,
+    hand_config,
+    hand_cli,
+    hand_runtime,
+    impedance_force_runtime,
+    movement,
+    position_force_guard,
+    position_episode_debug,
+    position_tuning,
+    recording_admission,
+    runtime,
+    runtime_debug,
+    runtime_health,
+    runtime_metadata,
+    session_recording,
+    shutdown_runtime,
+    special_arm_runtime,
+    startup_runtime,
+    tactile_visualization,
+    vive_calibration_runtime,
+    vive_calibration_profiles,
+    visualization_runtime,
 )
 
 
@@ -31,6 +80,9 @@ ENTRYPOINT = ROOT / "teleop_runtime/debug/run_vive_rm65_real_teleop.py"
 
 def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
     debug_source = ENTRYPOINT.read_text(encoding="utf-8")
+    real_recorder_source = (
+        ROOT / "teleop_runtime/real_teleop/dataset_recorder.py"
+    ).read_text(encoding="utf-8")
     collection_runtime_source = (
         ROOT / "teleop_runtime/collection/runtime.py"
     ).read_text(encoding="utf-8")
@@ -39,14 +91,18 @@ def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
     ).read_text(encoding="utf-8")
 
     assert "from ..collection.writer_runtime import CollectionWriterRuntime" in debug_source
-    assert "self.writer_runtime = CollectionWriterRuntime(" in debug_source
+    assert "from ..collection.writer_runtime import CollectionWriterRuntime" in real_recorder_source
+    assert "self.writer_runtime = CollectionWriterRuntime(" in real_recorder_source
     assert "self.writer_runtime = CollectionWriterRuntime(" in collection_runtime_source
+    assert "from teleop_runtime.debug" not in real_recorder_source
+    assert "from ..debug" not in real_recorder_source
     assert "run_vive_rm65_real_teleop" not in writer_runtime_source
     assert "teleop_runtime.debug" not in writer_runtime_source
 
 
 def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
     assert list(inspect.signature(legacy_entrypoint.parse_args).parameters) == []
+    assert list(inspect.signature(cli_resolution.parse_real_teleop_args).parameters) == []
     assert list(inspect.signature(legacy_entrypoint.main).parameters) == []
     assert list(inspect.signature(legacy_entrypoint._build_components).parameters) == ["args"]
     control_parameters = list(
@@ -76,16 +132,44 @@ def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
     )
     for method_name in recorder_methods:
         assert callable(getattr(legacy_entrypoint.RealTeleopDatasetRecorder, method_name))
+    from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
+
+    assert legacy_entrypoint.RealTeleopDatasetRecorder is RealTeleopDatasetRecorder
+    assert legacy_entrypoint.RealTeleopDatasetRecorder.__module__ == legacy_entrypoint.__name__
+    cli_resolution_source = (
+        ROOT / "teleop_runtime/real_teleop/cli_resolution.py"
+    ).read_text(encoding="utf-8")
+    assert "from teleop_runtime.debug" not in cli_resolution_source
+    assert "from ..debug" not in cli_resolution_source
 
 
 def test_batch_one_payload_modules_preserve_legacy_names_and_do_not_reverse_import() -> None:
     assert legacy_entrypoint._json_safe_value is status_payloads._json_safe_value
     assert legacy_entrypoint._build_tactile_camera_status is status_payloads._build_tactile_camera_status
+    assert legacy_entrypoint._camera_status_for_source is status_payloads._camera_status_for_source
+    assert legacy_entrypoint._build_camera_status is status_payloads._build_camera_status
+    assert legacy_entrypoint._wrist_depth_requested is status_payloads._wrist_depth_requested
+    assert (
+        legacy_entrypoint._with_expected_wrist_depth_camera_statuses
+        is status_payloads._with_expected_wrist_depth_camera_statuses
+    )
+    assert legacy_entrypoint.WRIST_DEPTH_CAMERA_KEYS is status_payloads.WRIST_DEPTH_CAMERA_KEYS
     assert legacy_entrypoint._action_debug_jitter_focus is action_debug_payload._action_debug_jitter_focus
     assert (
         legacy_entrypoint._action_debug_backend_snapshot_from_state
         is action_debug_payload._action_debug_backend_snapshot_from_state
     )
+    for name in (
+        "_action_debug_backend_snapshot",
+        "_preloaded_action_debug_backend_snapshot",
+        "_dataset_storage_debug_text",
+        "_dataset_recording_debug_text",
+        "_debug_timing_report",
+        "_debug_timing_maybe_report",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(runtime_debug, name)
+    assert legacy_entrypoint._DEBUG_TIMING_RED == gripper_status._DEBUG_TIMING_RED
+    assert legacy_entrypoint._DEBUG_TIMING_RESET == gripper_status._DEBUG_TIMING_RESET
 
     for path in (
         ROOT / "teleop_runtime/gui/status_payloads.py",
@@ -96,10 +180,39 @@ def test_batch_one_payload_modules_preserve_legacy_names_and_do_not_reverse_impo
         ROOT / "teleop_runtime/real_teleop/debug_payload_primitives.py",
         ROOT / "teleop_runtime/real_teleop/debug_ik_payload.py",
         ROOT / "teleop_runtime/real_teleop/debug_timing_payload.py",
+        ROOT / "teleop_runtime/real_teleop/runtime_debug.py",
     ):
         source = path.read_text(encoding="utf-8")
         assert "run_vive_rm65_real_teleop" not in source
         assert "teleop_runtime.debug" not in source
+
+
+def test_extracted_debug_timing_report_keeps_legacy_ansi_frame() -> None:
+    messages: list[str] = []
+    state = legacy_entrypoint.RealDebugTimingState(
+        enabled=True,
+        console_writer=SimpleNamespace(submit=messages.append),
+    )
+
+    legacy_entrypoint._debug_timing_report(
+        state,
+        reason="contract",
+        elapsed_sec=0.1,
+        phases=(),
+        step_index=3,
+        result=None,
+        active_command=None,
+        left_hw_state={},
+        right_hw_state={},
+        left_command_state={},
+        right_command_state={},
+        target_step_scale=1.0,
+        force=True,
+    )
+
+    assert len(messages) == 1
+    assert messages[0].startswith(legacy_entrypoint._DEBUG_TIMING_RED)
+    assert messages[0].endswith(legacy_entrypoint._DEBUG_TIMING_RESET)
 
 
 def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None:
@@ -158,6 +271,1194 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
         "_pose_delta_compact_debug",
     ):
         assert getattr(legacy_entrypoint, name) is getattr(debug_payload_primitives, name)
+
+
+def test_hand_and_gripper_config_modules_preserve_legacy_identity_and_boundaries() -> None:
+    for legacy_name, module_name in (
+        ("_hand_backend_mode", "hand_backend_mode"),
+        ("_hand_backend_mode_for_side", "hand_backend_mode_for_side"),
+        ("_dmtac_sides", "dmtac_sides"),
+    ):
+        assert getattr(legacy_entrypoint, legacy_name) is getattr(hand_config, module_name)
+
+    for name in (
+        "HAND_BACKEND_INSPIRE",
+        "HAND_BACKEND_DMTAC_GRIPPER",
+        "HAND_BACKEND_NONE",
+        "HAND_BACKEND_CHOICES",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(hand_config, name)
+
+    for legacy_name, module_name in (
+        ("_profile_value", "profile_value"),
+        ("_strip_side_gripper_overrides", "strip_side_gripper_overrides"),
+        ("_side_gripper_overrides_from_profile", "side_gripper_overrides_from_profile"),
+        ("_merge_gripper_profile", "merge_gripper_profile"),
+        ("_load_gripper_task_profile", "load_gripper_task_profile"),
+        ("_resolved_gripper_policy", "resolved_gripper_policy"),
+        ("_gripper_side_override", "gripper_side_override"),
+        ("_resolved_gripper_policy_for_side", "resolved_gripper_policy_for_side"),
+        ("_resolved_gripper_policies_by_side", "resolved_gripper_policies_by_side"),
+        (
+            "_current_gripper_force_dataset_contract",
+            "current_gripper_force_dataset_contract",
+        ),
+        (
+            "_gripper_force_dataset_contract_from_args",
+            "gripper_force_dataset_contract_from_args",
+        ),
+        ("_gripper_force_dataset_metadata", "gripper_force_dataset_metadata"),
+        ("_clear_gripper_policy_cache", "clear_gripper_policy_cache"),
+    ):
+        assert getattr(legacy_entrypoint, legacy_name) is getattr(gripper_policy, module_name)
+    assert legacy_entrypoint.GRIPPER_POLICY_DEFAULTS is gripper_policy.GRIPPER_POLICY_DEFAULTS
+    assert (
+        legacy_entrypoint._dmtac_tactile_enabled
+        is dmtac_config.dmtac_tactile_enabled
+    )
+    assert (
+        legacy_entrypoint._apply_gripper_policy_to_dmtac_config
+        is dmtac_config.apply_gripper_policy_to_dmtac_config
+    )
+
+    args = SimpleNamespace(
+        hand_backend="inspire",
+        left_hand_backend="none",
+        right_hand_backend="dmtac-gripper",
+    )
+    assert hand_config.hand_backend_mode(args) == "inspire"
+    assert hand_config.dmtac_sides(args, ("left", "right")) == ("right",)
+    with pytest.raises(ValueError, match="Unsupported hand backend side"):
+        hand_config.hand_backend_mode_for_side(args, "center")
+
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/dmtac_config.py",
+        ROOT / "teleop_runtime/real_teleop/hand_config.py",
+        ROOT / "teleop_runtime/real_teleop/hand_cli.py",
+        ROOT / "teleop_runtime/real_teleop/gripper_policy.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "run_vive_rm65_real_teleop" not in source
+        assert "teleop_runtime.debug" not in source
+
+
+def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() -> None:
+    for name in (
+        "_active_sides_from_args",
+        "_alpha_float",
+        "_non_negative_int",
+        "_parse_active_sides",
+        "_parse_arm_max_angvel",
+        "_parse_joint_order",
+        "_positive_float",
+    ):
+        shared = getattr(shared_cli_value_parsers, name)
+        assert getattr(legacy_entrypoint, name) is shared
+        assert getattr(virtual_entrypoint, name) is shared
+
+    parser = argparse.ArgumentParser()
+    hand_cli.add_hand_backend_arguments(parser)
+    hand_cli.add_dmtac_arguments(parser)
+    hand_cli.add_gripper_policy_arguments(parser)
+    hand_cli.add_inspire_hand_arguments(parser)
+    args = parser.parse_args([])
+    assert args.hand_backend == "inspire"
+    assert args.q6_config == "latest"
+    assert args.dmtac_tactile_backend == "cpu"
+    assert args.gripper_warmup_probe is True
+    assert args.hand_joint_order == legacy_entrypoint.DEFAULT_INSPIRE_HAND_JOINT_ORDER
+    assert legacy_entrypoint.DEFAULT_TASKS_CONFIG_PATH is hand_cli.DEFAULT_TASKS_CONFIG_PATH
+
+    source = (ROOT / "teleop_runtime/cli_value_parsers.py").read_text(encoding="utf-8")
+    assert "teleop_runtime.debug" not in source
+    assert "run_vive" not in source
+
+
+def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
+    parser = cli.build_real_teleop_argument_parser()
+    assert len(parser._actions) == 383
+    assert sum(len(action.option_strings) for action in parser._actions) == 426
+    assert parser._actions[0].dest == "help"
+    assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
+
+    for name in (
+        "DEFAULT_CAMERA_CONFIG_PATH",
+        "DEFAULT_DATASET_ROOT",
+        "DEFAULT_INIT_ARM_PROFILE_PATH",
+        "DEFAULT_INIT_ARM_QPOS_SPEED_SCALE",
+        "DEFAULT_POSITION_MAX_ACCELERATION_RAD_S2",
+        "DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG",
+        "DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M",
+        "INIT_ARM_QPOS_SPEED_BASELINE_PROFILE",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(defaults, name)
+
+    source = (ROOT / "teleop_runtime/real_teleop/cli.py").read_text(encoding="utf-8")
+    assert "parse_args(" not in source
+    assert "parse_known_args(" not in source
+    assert "run_vive_rm65_real_teleop" not in source
+    assert "teleop_runtime.debug" not in source
+
+
+def test_runtime_metadata_and_movement_modules_preserve_legacy_contracts() -> None:
+    assert (
+        legacy_entrypoint._arm_execution_profile_metadata
+        is runtime_metadata.arm_execution_profile_metadata
+    )
+    assert (
+        legacy_entrypoint._position_ik_iteration_metadata
+        is runtime_metadata.position_ik_iteration_metadata
+    )
+    assert legacy_entrypoint._movement_multiple_value is movement.movement_multiple_value
+    assert legacy_entrypoint._movement_multiple_ui_state is movement.movement_multiple_ui_state
+    assert legacy_entrypoint._apply_movement_multiple is movement.apply_movement_multiple
+    assert (
+        legacy_entrypoint._resolve_movement_multiple_args
+        is movement.resolve_movement_multiple_args
+    )
+    for name in (
+        "MOVEMENT_MULTIPLE_DEFAULT",
+        "MOVEMENT_MULTIPLE_GUI_EVENTS",
+        "MOVEMENT_MULTIPLE_GUI_MAX",
+        "MOVEMENT_MULTIPLE_GUI_MIN",
+        "MOVEMENT_MULTIPLE_GUI_STEP",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(movement, name)
+
+    args = SimpleNamespace(movement_multiple=None, translation_scale=1.25)
+    assert movement.movement_multiple_value(args) == 1.25
+    assert movement.movement_multiple_ui_state(args) == {
+        "movement_multiple": 1.25,
+        "movement_multiple_min": 0.05,
+        "movement_multiple_max": 10.0,
+        "movement_multiple_step": 0.1,
+    }
+
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/movement.py",
+        ROOT / "teleop_runtime/real_teleop/runtime_metadata.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "run_vive_rm65_real_teleop" not in source
+        assert "teleop_runtime.debug" not in source
+
+
+def test_component_configuration_helpers_preserve_legacy_identity_and_boundaries() -> None:
+    for name in (
+        "_alignment_qpos_pair",
+        "_force_tare_sec_arg",
+        "_impedance_mode_arg",
+        "_start_state_summary",
+        "_strict_tool_profile_arg",
+        "_tool_profile_arg",
+        "_tool_tcp_pose_flange_arg",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(arm_tool_config, name)
+
+    for name in (
+        "_compose_real_command_filter",
+        "_compose_real_command_guard",
+        "_compose_real_fault_filter",
+        "_filter_manual_real_command",
+        "_fix_arm_required_effectors_by_side",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(command_filters, name)
+
+    for name in (
+        "_impedance_bimanual_ik_safety_profile",
+        "_position_ik_tuning_for_args",
+        "_position_tracker_motion_intent_config",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(position_tuning, name)
+
+    for name in (
+        "_command_backend_health_signature",
+        "_command_backend_status_text",
+        "_short_status_text",
+        "_temporary_safety_health_signature",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(runtime_health, name)
+
+    for name in (
+        "_session_record_root_dir",
+        "_session_recording_config",
+        "_session_recording_enabled",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(session_recording, name)
+    assert (
+        legacy_entrypoint._position_force_guard_config
+        is position_force_guard.position_force_guard_config
+    )
+
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/arm_tool_config.py",
+        ROOT / "teleop_runtime/real_teleop/command_filters.py",
+        ROOT / "teleop_runtime/real_teleop/position_tuning.py",
+        ROOT / "teleop_runtime/real_teleop/runtime_health.py",
+        ROOT / "teleop_runtime/real_teleop/session_recording.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "run_vive_rm65_real_teleop" not in source
+        assert "teleop_runtime.debug" not in source
+        assert "from ..debug" not in source
+
+    assert legacy_log_utils.log_event is shared_log_utils.log_event
+    assert legacy_log_utils.log_stage is shared_log_utils.log_stage
+    assert legacy_log_utils.ChangeGate is shared_log_utils.ChangeGate
+
+
+def test_runtime_setup_helpers_live_in_non_authoritative_modules() -> None:
+    for name in (
+        "_attach_position_audit_sink",
+        "_attach_actuator_command_trace_sink",
+        "_attach_singularity_transition_trace_sink",
+        "_new_actuator_command_trace_recorder",
+        "_new_position_debug_recorder",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(diagnostic_setup, name)
+    assert (
+        legacy_entrypoint._build_tactile_visualizer
+        is tactile_visualization._build_tactile_visualizer
+    )
+
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/diagnostic_setup.py",
+        ROOT / "teleop_runtime/real_teleop/tactile_visualization.py",
+        ROOT / "teleop_runtime/real_teleop/cli_runtime_config.py",
+        ROOT / "teleop_runtime/real_teleop/shutdown_runtime.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "from teleop_runtime.debug" not in source
+        assert "from ..debug" not in source
+
+    assert list(
+        inspect.signature(cli_runtime_config._run_gui_device_preflight).parameters
+    ) == ["args", "active_sides", "parser"]
+    assert list(
+        inspect.signature(cli_runtime_config._discover_runtime_q6_ports).parameters
+    ) == ["args", "active_sides"]
+
+
+def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
+    labels: list[str] = []
+
+    def closeable() -> SimpleNamespace:
+        return SimpleNamespace(close=lambda: None)
+
+    runtime_state = {
+        "args": SimpleNamespace(),
+        "startup_progress": closeable(),
+        "position_force_guard_monitor": None,
+        "episode_recorder": closeable(),
+        "clutch_input": closeable(),
+        "dataset_recorder": closeable(),
+        "camera_previewer": closeable(),
+        "camera_sources": {"camera": object()},
+        "tactile_visualizer": closeable(),
+        "actuator_trace_recorder": None,
+        "components": SimpleNamespace(
+            human_shadow_frontend=closeable(),
+            session=closeable(),
+            arm_state_read_executor=SimpleNamespace(shutdown=lambda **kwargs: None),
+            right_hand_backend=closeable(),
+            right_hand_control_via_rig=False,
+            left_hand_backend=closeable(),
+            left_hand_control_via_rig=False,
+            right_state_backend=closeable(),
+            left_state_backend=closeable(),
+        ),
+        "position_audit_fanout": None,
+        "position_debug_session_recorder": None,
+        "position_debug_close_threads": [],
+        "position_episode_debug_runtime": None,
+        "original_stdout": None,
+        "silenced_stdout": None,
+        "update_control_debug_runtime_metadata": lambda **kwargs: None,
+    }
+    support = {
+        "_arm_control_mode_arg": lambda args: "position",
+        "_attach_actuator_command_trace_sink": lambda *args: None,
+        "_attach_position_audit_sink": lambda *args: None,
+        "_attach_singularity_transition_trace_sink": lambda *args: None,
+        "_close_camera_sources": lambda sources: None,
+        "_log": lambda *args: None,
+        "_position_force_guard_collision_summary": lambda fault: {},
+        "_terminal_force_collision_summary": lambda *args, **kwargs: {},
+        "run_best_effort_cleanup": (
+            lambda _name, steps: labels.extend(label for label, _action in steps)
+        ),
+    }
+
+    shutdown_runtime.shutdown_real_teleop_runtime(
+        runtime_state,
+        terminal_error=None,
+        support=support,
+    )
+
+    assert labels == [
+        "startup_progress",
+        "episode_recorder",
+        "clutch_input",
+        "dataset_recorder",
+        "camera_previewer",
+        "camera_sources",
+        "tactile_visualizer",
+        "position_audit.detach",
+        "position_audit.metadata_detach",
+        "human_action_shadow",
+        "teleop_session",
+        "arm_state_read_executor",
+        "right_hand_backend",
+        "left_hand_backend",
+        "right_state_backend",
+        "left_state_backend",
+    ]
+
+
+def test_real_component_builder_preserves_legacy_wrapper_and_import_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel_args = SimpleNamespace()
+    sentinel_components = object()
+    sentinel_dmtac_resolver = object()
+    captured: dict[str, object] = {}
+
+    def fake_builder(
+        args: argparse.Namespace,
+        *,
+        dmtac_backend_configs,
+    ):
+        captured["args"] = args
+        captured["dmtac_backend_configs"] = dmtac_backend_configs
+        return sentinel_components
+
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_dmtac_backend_configs",
+        sentinel_dmtac_resolver,
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "build_real_teleop_components",
+        fake_builder,
+    )
+
+    assert legacy_entrypoint._build_components(sentinel_args) is sentinel_components
+    assert captured == {
+        "args": sentinel_args,
+        "dmtac_backend_configs": sentinel_dmtac_resolver,
+    }
+    assert list(
+        inspect.signature(component_builder.build_real_teleop_components).parameters
+    ) == ["args", "dmtac_backend_configs"]
+
+    source = (
+        ROOT / "teleop_runtime/real_teleop/component_builder.py"
+    ).read_text(encoding="utf-8")
+    assert "run_vive_rm65_real_teleop" in source
+    assert "from teleop_runtime.debug" not in source
+    assert "from ..debug" not in source
+
+
+def test_extracted_application_runtime_preserves_entrypoint_support_contract() -> None:
+    runtime.bind_legacy_support(vars(legacy_entrypoint))
+    assert list(inspect.signature(runtime.run_real_teleop).parameters) == ["args"]
+    assert list(inspect.signature(legacy_entrypoint.main).parameters) == []
+
+    source = (ROOT / "teleop_runtime/real_teleop/runtime.py").read_text(
+        encoding="utf-8"
+    )
+    assert "def run_real_teleop(args: argparse.Namespace) -> None:" in source
+    assert "from teleop_runtime.debug" not in source
+    assert "from ..debug" not in source
+    assert set(runtime._REQUIRED_SUPPORT_NAMES).issubset(vars(legacy_entrypoint))
+
+
+def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime.bind_legacy_support(vars(legacy_entrypoint))
+    events: list[str] = []
+
+    class FakeWatchdog:
+        def start(self) -> None:
+            events.append("watchdog.start")
+
+        def beat(self, stage: str, step_index: int) -> None:
+            events.append(f"watchdog.beat:{stage}:{step_index}")
+
+    class FakeClutch:
+        should_quit = True
+
+        def poll(self) -> None:
+            events.append("clutch.poll")
+
+        def consume_plus_curation_request(self) -> None:
+            return None
+
+        def consume_ik_debug_log_toggle_request(self) -> bool:
+            return False
+
+        def consume_device_retry_request(self) -> bool:
+            return False
+
+        def consume_camera_visualization_toggle_request(self) -> bool:
+            return False
+
+        def consume_tactile_solving_enable_request(self) -> bool:
+            return False
+
+        def consume_tactile_visualization_toggle_request(self) -> bool:
+            return False
+
+    noop = lambda *args, **kwargs: None
+    values = {
+        item.name: noop
+        for item in fields(control_loop.RealTeleopControlLoopContext)
+    }
+    values.update(
+        {
+            "action_debug_log_recorder": SimpleNamespace(active=False),
+            "args": SimpleNamespace(),
+            "camera_sources": {},
+            "clutch_input": FakeClutch(),
+            "components": SimpleNamespace(),
+            "control_ui": None,
+            "debug_timing_log_recorder": SimpleNamespace(),
+            "debug_timing_modules": SimpleNamespace(
+                needs_loop_phase_timer=False,
+            ),
+            "debug_timing_state": SimpleNamespace(),
+            "episode_recorder": SimpleNamespace(),
+            "ik_debug_log_recorder": SimpleNamespace(active=False),
+            "ik_debug_profile_base_enabled": False,
+            "main_loop_watchdog": FakeWatchdog(),
+            "outer_control_hz": 15.0,
+            "position_audit_fanout": None,
+            "position_force_guard_monitor": None,
+            "preview_camera_sources": {},
+            "recording_active": lambda: False,
+            "dataset_recorder": lambda: None,
+            "visualization_state": lambda: (None, False, None),
+            "episode_start_countdown_deadline": lambda: None,
+            "episode_last_state": lambda: None,
+            "step_index": lambda: 0,
+            "sync_foot_pad_runtime_status": lambda: events.append("foot_pad.sync"),
+            "poll_dataset_finalize": lambda now: events.append("dataset.poll_finalize"),
+            "cancel_recording_countdown": (
+                lambda now, *, reason: events.append(f"countdown.cancel:{reason}")
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        control_loop,
+        "_emergency_stop_real_arms",
+        lambda components, *, reason, now: events.append(f"estop:{reason}"),
+    )
+
+    control_loop.run_real_teleop_control_loop(
+        control_loop.RealTeleopControlLoopContext(**values)
+    )
+
+    assert events == [
+        "watchdog.start",
+        "watchdog.beat:loop.start:0",
+        "clutch.poll",
+        "watchdog.beat:loop.control_input_poll:0",
+        "foot_pad.sync",
+        "dataset.poll_finalize",
+        "estop:quit_requested",
+        "countdown.cancel:quit_requested",
+    ]
+
+
+def test_device_retry_runtime_keeps_optional_foot_pad_status_dynamic() -> None:
+    errors = {"foot_pad": "offline", "camera.overhead": "camera failed"}
+    foot_pad_slot = [None]
+    published: list[dict[str, object]] = []
+    args = SimpleNamespace(
+        foot_pad_requested=True,
+        foot_pad_startup_error="offline",
+        ignore_camera=(),
+    )
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: (),
+    )
+    ui = SimpleNamespace(
+        publish=lambda **kwargs: published.append(kwargs),
+    )
+    component_snapshot = SimpleNamespace(
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    retry_runtime = device_retry_runtime.build_device_retry_runtime(
+        args=args,
+        components=component_snapshot,
+        control_ui=ui,
+        clutch_input=clutch,
+        camera_sources={"overhead": object()},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: None,
+        set_dataset_recorder=lambda value: None,
+        foot_pad_input_provider=lambda: foot_pad_slot[0],
+        set_foot_pad_input=lambda value: foot_pad_slot.__setitem__(0, value),
+        dataset_recorder_type=object,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=SimpleNamespace,
+        foot_pad_control_mode="foot_pad",
+        has_dmtac_gripper_backend=lambda components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *args, **kwargs: (
+            False,
+            "",
+        ),
+        log=lambda *args, **kwargs: None,
+    )
+
+    foot_pad_status = retry_runtime.hardware_status_item("foot_pad")
+    assert foot_pad_status["status_level"] == "warn"
+    assert foot_pad_status["requirement"] == "optional_input"
+    assert retry_runtime.collection_startup_blockers() == {
+        "camera.overhead": "camera failed"
+    }
+
+    foot_pad_slot[0] = SimpleNamespace(is_online=True)
+    retry_runtime.sync_foot_pad_runtime_status()
+    assert "foot_pad" not in errors
+    assert args.foot_pad_startup_error == ""
+    assert published
+
+
+def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:
+    outer_states: list[tuple[object | None, bool, object | None]] = []
+    visualization_updates: list[dict[str, object]] = []
+
+    class FakeVisualizer:
+        def close(self) -> None:
+            visualization_updates.append({"closed": True})
+
+    visualizer = FakeVisualizer()
+    clutch = SimpleNamespace(
+        set_visualization_state=lambda **kwargs: visualization_updates.append(
+            kwargs
+        ),
+    )
+    preview = visualization_runtime.build_visualization_runtime(
+        args=SimpleNamespace(tactile_visualization_available=False),
+        components=SimpleNamespace(active_sides=()),
+        clutch_input=clutch,
+        control_ui=None,
+        preview_camera_sources={},
+        camera_preview_rate=SimpleNamespace(reset=lambda: None),
+        tactile_preview_rate=SimpleNamespace(reset=lambda: None),
+        initial_camera_previewer=None,
+        initial_camera_preview_active=False,
+        initial_tactile_visualizer=visualizer,
+        set_outer_state=lambda camera, active, tactile: outer_states.append(
+            (camera, active, tactile)
+        ),
+        retry_failed_devices=lambda: None,
+        start_camera_sources=lambda sources: None,
+        camera_previewer_type=object,
+        camera_preview_config_type=object,
+        build_tactile_visualizer=lambda *args, **kwargs: None,
+        enable_gui_tactile_solving=lambda *args, **kwargs: 0,
+        tactile_solving_active=lambda *args, **kwargs: False,
+        tactile_visualization_available=lambda *args, **kwargs: False,
+        dmtac_visualizer_types=(type("D1", (), {}), type("D2", (), {})),
+        dmtac_visualization_snapshot=lambda *args, **kwargs: ({}, {}),
+        tactile_snapshot=lambda *args, **kwargs: {},
+        gripper_backend_for_side=lambda *args, **kwargs: None,
+        hand_backend_for_side=lambda *args, **kwargs: None,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert preview.current_state() == (None, False, visualizer)
+    preview.open_camera_preview(1.0)
+    assert preview.current_state() == (None, False, visualizer)
+    preview.close_tactile_preview("closed")
+    assert preview.current_state() == (None, False, None)
+    assert outer_states[-1] == (None, False, None)
+    assert {"closed": True} in visualization_updates
+
+
+def test_episode_recording_runtime_refreshes_external_recorder_slot() -> None:
+    dataset_slot: list[object | None] = [None]
+    episode_state_slot: list[str | None] = [None]
+    step_slot = [0]
+    position_sidecar = SimpleNamespace(
+        start=lambda *args, **kwargs: False,
+        stop=lambda *args, **kwargs: None,
+        start_close=lambda action: None,
+        current_recorder=lambda: None,
+    )
+    episode_recorder_snapshot = SimpleNamespace(
+        is_recording=False,
+        frame_count=2,
+        episode_dir=None,
+    )
+    support = {
+        name: getattr(legacy_entrypoint, name)
+        for name in (
+            "CaptureModalityContract",
+            "DEFAULT_EPISODE_START_COUNTDOWN_SEC",
+            "RealTeleopDatasetRecorder",
+            "_arm_control_mode_arg",
+            "_build_episode_metadata",
+            "_dataset_recording_debug_text",
+            "_episode_root_dir",
+            "_episode_start_countdown_ready_to_record",
+            "_episode_start_countdown_remaining",
+            "_log",
+            "_start_episode_recording",
+            "_stop_episode_recording",
+            "bind_capture_modality_contract",
+        )
+    }
+    recording = episode_recording_runtime.build_episode_recording_runtime(
+        args=SimpleNamespace(collection_warning_hz=15.0),
+        components=SimpleNamespace(),
+        clutch_input=SimpleNamespace(),
+        episode_recorder=episode_recorder_snapshot,
+        camera_sources={},
+        control_ui=None,
+        startup_device_errors={},
+        fix_hold_coordinator=SimpleNamespace(),
+        position_episode_debug_runtime=position_sidecar,
+        update_control_debug_runtime_metadata=lambda **kwargs: None,
+        publish_runtime_hardware_status=lambda: None,
+        collection_startup_blockers=lambda: {},
+        recording_warmup_status=lambda *args, **kwargs: (True, "ready"),
+        reset_gripper_warmup_probe=lambda reason: None,
+        dataset_recorder_provider=lambda: dataset_slot[0],
+        set_dataset_recorder=lambda value: dataset_slot.__setitem__(0, value),
+        camera_previewer_provider=lambda: None,
+        episode_last_state_provider=lambda: episode_state_slot[0],
+        set_episode_last_state=lambda value: episode_state_slot.__setitem__(0, value),
+        step_index_provider=lambda: step_slot[0],
+        support=support,
+    )
+
+    assert recording.recording_active() is False
+    assert recording.recording_frame_count() == 2
+    dataset_slot[0] = SimpleNamespace(
+        is_recording=True,
+        is_paused=False,
+        frame_count=7,
+        dataset_root=Path("/tmp/dexteleop-recording-slot"),
+        collection_frequency_status=lambda: {"sample_hz": 15.0},
+    )
+    assert recording.recording_active() is True
+    assert recording.recording_frame_count() == 7
+    assert recording.recording_path() == "/tmp/dexteleop-recording-slot"
+    assert recording.recording_frequency_status() == {"sample_hz": 15.0}
+    assert recording.cancel_recording_countdown(1.0, reason="unit_test") is False
+
+
+def test_camera_episode_and_special_arm_modules_preserve_legacy_seams() -> None:
+    for name in (
+        "_build_camera_sources",
+        "_close_camera_sources",
+        "_select_preview_camera_sources",
+        "_start_camera_sources",
+        "_start_camera_sources_best_effort",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(camera_runtime, name)
+    assert (
+        legacy_entrypoint.CAMERA_START_STAGGER_SEC
+        is camera_runtime.CAMERA_START_STAGGER_SEC
+    )
+
+    for name in (
+        "_build_episode_metadata",
+        "_debug_episode_recording_enabled",
+        "_episode_root_dir",
+        "_fix_arm_pose_snapshot_recorder",
+        "_start_episode_recording",
+        "_stop_episode_recording",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(episode_runtime, name)
+
+    for name in (
+        "_cancel_special_arm_modes_for_hold",
+        "_disengage_position_backends_for_manual_interaction",
+        "_fresh_gui_init_qpos_by_side",
+        "_init_arm_qpos_speed_scale_for_side",
+        "_normalize_init_arm_qpos_speed_scale",
+        "_release_gui_qpos_init_transit",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(special_arm_runtime, name)
+    assert list(inspect.signature(legacy_entrypoint._start_gui_qpos_init).parameters) == [
+        "args",
+        "components",
+        "now",
+    ]
+
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/camera_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/episode_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/special_arm_runtime.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "from teleop_runtime.debug" not in source
+        assert "from ..debug" not in source
+
+
+def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "_run_camera_startup_self_check",
+        "_update_init_arm_arrival_from_hardware",
+        "_release_runtime_state_readers",
+        "_log_dual_arm_readiness",
+        "_startup_gui_qpos_seed_command",
+        "_finish_startup_gui_qpos_terminal",
+        "_advance_startup_gui_qpos_maintenance",
+        "_wait_for_real_teleop_start_request",
+        "_runtime_home_failure_message",
+        "_restore_init_arm_after_foot_pad_fallback",
+        "_arm_after_start_calibration",
+    ):
+        assert getattr(legacy_entrypoint, name).__module__ == startup_runtime.__name__
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_advance_startup_gui_qpos_maintenance",
+        lambda **kwargs: calls.append("advance") or False,
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_handle_ik_debug_log_toggle_request",
+        lambda **kwargs: calls.append("debug"),
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_impedance_force_control_not_ready_sides",
+        lambda args, components: [],
+    )
+    startup_runtime.bind_legacy_support(vars(legacy_entrypoint))
+    clutch = SimpleNamespace(
+        enabled=True,
+        args=SimpleNamespace(),
+        poll=lambda: calls.append("poll"),
+        should_quit=True,
+        set_startup_qpos_maintenance_enabled=lambda enabled: calls.append(
+            f"maintenance:{enabled}"
+        ),
+        consume_init_qpos_emergency_stop_request=lambda: False,
+    )
+    assert legacy_entrypoint._wait_for_real_teleop_start_request(
+        SimpleNamespace(),
+        clutch,
+        arm_mode="position",
+        args=SimpleNamespace(),
+        control_ui=None,
+        ik_debug_log_recorder=SimpleNamespace(),
+        ik_debug_profile_base_enabled=False,
+    ) is None
+    assert calls == [
+        "maintenance:True",
+        "poll",
+        "advance",
+        "debug",
+        "maintenance:False",
+    ]
+
+    source = (
+        ROOT / "teleop_runtime/real_teleop/startup_runtime.py"
+    ).read_text(encoding="utf-8")
+    assert "from teleop_runtime.debug" not in source
+    assert "from ..debug" not in source
+
+
+def test_arm_force_gripper_and_debug_frame_modules_preserve_legacy_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "_acceleration_limited_position_execution_active",
+        "_active_command_backend",
+        "_active_impedance_force_backends",
+        "_apply_active_arm_command_to_preview_real",
+        "_command_backend_for_side",
+        "_estimate_impedance_force_control_warmup_sec",
+        "_impedance_force_control_warmup_backends",
+        "_runtime_arm_backend_state",
+        "_sync_dual_arm_retargeter_for_real_control",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(arm_runtime, name)
+
+    for name in (
+        "_reset_runtime_motion_state_from_real_qpos",
+        "_run_initial_alignment_start_check",
+        "_sync_preview_from_real_state_real",
+        "_sync_real_execution_step_limits",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(arm_state_sync, name)
+
+    for name in (
+        "_emergency_stop_real_arms",
+        "_enable_impedance_force_control_after_runtime_home",
+        "_exception_chain_messages",
+        "_force_collision_recording_summary",
+        "_force_guard_recording_stop_context",
+        "_handle_init_qpos_emergency_stop",
+        "_impedance_force_control_issue",
+        "_position_force_guard_collision_summary",
+        "_terminal_force_collision_summary",
+        "_warm_start_impedance_force_control_before_home",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(
+            impedance_force_runtime,
+            name,
+        )
+
+    for name in (
+        "_dispatch_q6_gripper_control",
+        "_probe_gripper_backend_motion",
+        "_run_gripper_warmup_probe_for_side",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(gripper_control, name)
+
+    assert list(
+        inspect.signature(legacy_entrypoint._promote_angle_trigger_gripper_input_to_q6).parameters
+    ) == ["args", "components", "ready_timeout_sec"]
+    assert callable(gripper_recovery.promote_angle_trigger_gripper_input_to_q6)
+
+    for name in (
+        "_command_for_side",
+        "_build_ik_debug_log_frame",
+        "_camera_status_log_payload",
+        "_backend_timing_log_payload",
+        "_build_debug_timing_log_frame",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(debug_log_frames, name)
+    assert (
+        legacy_entrypoint._build_pose_quality_display_payload
+        is status_payloads._build_pose_quality_display_payload
+    )
+
+    sentinel_status = {"overhead": {"status_level": "ok", "frame_count": 7}}
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_build_camera_status",
+        lambda *args, **kwargs: sentinel_status,
+    )
+    debug_log_frames.bind_legacy_support(vars(legacy_entrypoint))
+    assert legacy_entrypoint._camera_status_log_payload(
+        {},
+        preview_camera_sources={},
+        camera_previewer=None,
+        now=1.0,
+    ) == {"overhead": {"status_level": "ok", "frame_count": 7}}
+
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/arm_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/arm_state_sync.py",
+        ROOT / "teleop_runtime/real_teleop/impedance_force_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/gripper_control.py",
+        ROOT / "teleop_runtime/real_teleop/gripper_recovery.py",
+        ROOT / "teleop_runtime/real_teleop/gripper_warmup_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/recording_admission.py",
+        ROOT / "teleop_runtime/real_teleop/position_episode_debug.py",
+        ROOT / "teleop_runtime/real_teleop/device_retry_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/control_loop.py",
+        ROOT / "teleop_runtime/real_teleop/visualization_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/episode_recording_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/debug_log_frames.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "from teleop_runtime.debug" not in source
+        assert "from ..debug" not in source
+
+
+def test_gripper_warmup_runtime_keeps_probe_state_inside_one_closure() -> None:
+    probe_called = threading.Event()
+    logs: list[tuple[str, str, float | None]] = []
+    backend = SimpleNamespace(config=SimpleNamespace(connect_hardware=True))
+    args = SimpleNamespace(
+        gripper_warmup_probe=True,
+        gripper_warmup_probe_tolerance=0.18,
+        gripper_warmup_probe_step_timeout_sec=0.01,
+        gripper_warmup_probe_settle_sec=0.0,
+        gripper_warmup_probe_poll_sec=0.01,
+    )
+    components_snapshot = SimpleNamespace(active_sides=("left",))
+
+    def run_probe(side: str, candidate: object, **kwargs: object) -> dict[str, object]:
+        assert side == "left"
+        assert candidate is backend
+        assert kwargs["targets"] == (0.0, 0.5, 0.0)
+        probe_called.set()
+        return {"ok": True, "reconnected": False}
+
+    probe = gripper_warmup_runtime.build_gripper_warmup_probe_runtime(
+        args,
+        components_snapshot,
+        gripper_backend_for_side=lambda _components, side: (
+            backend if side == "left" else None
+        ),
+        run_probe_for_side=run_probe,
+        safe_float_value=lambda value: (
+            None if value is None else float(value)
+        ),
+        log=lambda stage, message, *, now=None: logs.append((stage, message, now)),
+    )
+
+    assert probe.enabled()
+    assert probe.start(1.0, reason="unit_test") == (
+        False,
+        "等待 gripper warmup probe 完成。",
+    )
+    assert probe_called.wait(1.0)
+    for _ in range(100):
+        ready, message = probe.status(1.1, reason="unit_test")
+        if ready:
+            break
+        threading.Event().wait(0.005)
+    assert ready
+    assert message == "gripper warmup probe 通过：open->half->open state matched。"
+    assert any(stage == "GripperWarmup" for stage, _message, _now in logs)
+
+    probe.reset("next_episode")
+    assert probe.status(2.0, reason="next_episode")[0] is False
+
+
+def test_recording_admission_keeps_fail_closed_check_order() -> None:
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+    )
+    components_snapshot = SimpleNamespace(active_sides=())
+    clutch = SimpleNamespace(hold_active=lambda: False)
+    common = {
+        "args": args,
+        "components": components_snapshot,
+        "clutch_input": clutch,
+        "dataset_recorder": None,
+        "camera_sources": {},
+        "preview_camera_sources": {},
+        "camera_previewer": None,
+        "recording_auto_stop_reason_fn": recording_admission.recording_auto_stop_reason,
+        "gripper_warmup_probe_status": lambda now, *, reason: (True, "ready"),
+        "camera_status_blocking_message": lambda status: None,
+    }
+
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=None,
+        **common,
+    ) == (False, "等待首个控制帧。")
+
+    fault_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.FAULT,
+        observation=object(),
+        command=object(),
+        channels={},
+    )
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=fault_step,
+        **common,
+    ) == (False, "等待恢复，当前状态会自动停止数采：runtime_fault。")
+
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=object(),
+        channels={},
+    )
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
+
+def test_position_episode_debug_detaches_before_deferred_close(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    metadata_updates: list[dict[str, object]] = []
+
+    class FakeRecorder:
+        output_dir = tmp_path / "episode-sidecar"
+
+        def close(self, *, timeout_sec: float) -> None:
+            events.append(f"close:{timeout_sec}")
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "closed": True,
+                "enqueue_drop_count": 0,
+                "writer_error": None,
+            }
+
+    recorder = FakeRecorder()
+
+    class FakeFanout:
+        def add_sink(self, candidate: object) -> bool:
+            assert candidate is recorder
+            events.append("add")
+            return True
+
+        def remove_sink(self, candidate: object) -> bool:
+            assert candidate is recorder
+            events.append("remove")
+            return True
+
+    runtime_snapshot = position_episode_debug.build_position_episode_debug_runtime(
+        SimpleNamespace(
+            control_debug_config=SimpleNamespace(enabled=True),
+            control_debug_episode_sidecar=True,
+        ),
+        SimpleNamespace(),
+        position_audit_fanout=FakeFanout(),
+        position_debug_close_threads=[],
+        update_runtime_metadata=lambda **kwargs: metadata_updates.append(kwargs),
+        new_position_debug_recorder=lambda *args, **kwargs: recorder,
+        log=lambda *args, **kwargs: None,
+    )
+    dataset = SimpleNamespace(dataset_root=tmp_path)
+
+    assert runtime_snapshot.start(3, dataset_recorder=dataset)
+    assert runtime_snapshot.current_recorder() is recorder
+    close_action = runtime_snapshot.stop(reason="unit_test")
+    assert close_action is not None
+    assert runtime_snapshot.current_recorder() is None
+    assert events == ["add", "remove"]
+
+    result = close_action()
+    assert result is not None and result["closed"] is True
+    assert events == ["add", "remove", "close:5.0"]
+    assert metadata_updates[-1]["episode_sidecar_detach_reason"] == "unit_test"
+
+
+def test_vive_calibration_runtime_and_shared_math_preserve_legacy_contracts() -> None:
+    for name in (
+        "_capture_dual_wrist_offsets_from_gui",
+        "_capture_single_vive_channel_from_gui",
+        "_channel_for_tracker_role",
+        "_channel_sample_key",
+        "_clear_runtime_home_state",
+        "_consume_vive_capture_events",
+        "_default_gui_vive_calibration_side",
+        "_format_vive_source_rates",
+        "_format_vive_sweep_quality",
+        "_format_wall_time",
+        "_publish_vive_capture_state",
+        "_resolve_virtual_desk_channel_name",
+        "_select_gui_vive_coordinate_sweep_hand",
+        "_source_debug_stats",
+        "_tracker_role_for_channel",
+        "_virtual_desk_post_rotation_pose",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(
+            vive_calibration_runtime,
+            name,
+        )
+    assert list(
+        inspect.signature(
+            legacy_entrypoint._calibrate_gui_vive_coordinate_profile
+        ).parameters
+    ) == ["args", "components", "ui"]
+    for name in (
+        "_calibration_profile_latest_sort_key",
+        "_calibration_profile_payload_without_workspace",
+        "_runtime_home_was_available",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(
+            vive_calibration_profiles,
+            name,
+        )
+    for name in (
+        "_latest_vive_calibration_profile_path",
+        "_gui_vive_calibration_load_path",
+        "_save_gui_vive_calibration_profile",
+        "_load_gui_vive_calibration_profile",
+    ):
+        assert list(inspect.signature(getattr(legacy_entrypoint, name)).parameters) == list(
+            inspect.signature(getattr(vive_calibration_profiles, name)).parameters
+        )
+
+    for name in (
+        "AxisFitQuality",
+        "SignedAxisFit",
+        "VirtualDeskCalibrationResult",
+        "average_pose",
+        "compose_tracker_offset",
+        "euler_xyz_deg_to_matrix",
+        "fit_signed_axis_from_poses",
+        "fit_virtual_desk_frame",
+        "pose_from_rotation_translation",
+        "tracker_offset_from_neutral_pose",
+    ):
+        assert getattr(legacy_calibration_flow, name) is getattr(
+            shared_calibration_flow,
+            name,
+        )
+
+    for path in (
+        ROOT / "teleop_runtime/calibration_flow.py",
+        ROOT / "teleop_runtime/real_teleop/vive_calibration_profiles.py",
+        ROOT / "teleop_runtime/real_teleop/vive_calibration_runtime.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "from teleop_runtime.debug" not in source
+        assert "from ..debug" not in source
+
+
+def test_hand_runtime_and_gripper_status_preserve_legacy_identity_and_boundaries() -> None:
+    for name in (
+        "_build_runtime_hand_command_for_recovery",
+        "_dmtac_command_contract_configured",
+        "_dmtac_tactile_backends",
+        "_emit_tactile_sum_only_status",
+        "_enable_gui_tactile_solving",
+        "_extract_hand_command_from_command",
+        "_gripper_backend_for_side",
+        "_gripper_gui_available",
+        "_gripper_input_channel_name",
+        "_gripper_input_source_from_components",
+        "_gripper_retargeter_for_side",
+        "_gripper_state_scalar_from_payload",
+        "_hand_backend_for_side",
+        "_hand_q6_source_from_components",
+        "_hand_tactile_sum",
+        "_has_dmtac_gripper_backend",
+        "_has_q6_gripper_control",
+        "_hold_requested_pause_reason",
+        "_merge_runtime_hand_command",
+        "_parse_hand_tactile_regions",
+        "_read_gripper_backend_scalar_now",
+        "_tactile_solving_active",
+        "_tactile_solving_available",
+        "_tactile_visualization_available",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(hand_runtime, name)
+
+    for name in (
+        "_build_gripper_status",
+        "_gripper_runtime_health_signature",
+        "_gripper_runtime_status_signature",
+        "_gripper_status_for_side",
+        "_gripper_status_signature",
+        "_hand_channel_status",
+        "_q6_channel_status",
+        "_q6_retarget_status",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(gripper_status, name)
+
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/hand_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/gripper_status.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "run_vive_rm65_real_teleop" not in source
+        assert "teleop_runtime.debug" not in source
 
 
 def test_dataset_layout_module_preserves_legacy_adapters_and_import_boundary() -> None:

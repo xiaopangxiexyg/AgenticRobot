@@ -21,6 +21,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import normalize_action_pose_mode
 
 from .action_representation import PolicyActionRepresentationContext
+from .action_adapter import DeployRobotActionAdapter
 from .async_producer import (
     POLICY_ASYNC_PRODUCER_ELIGIBLE,
     POLICY_ASYNC_PRODUCER_FAULT,
@@ -51,7 +52,12 @@ from .inference import (
 )
 from .observation import DeploymentObservation
 from .observation_view import PolicyObservationView
-from .runtime import PolicyActionPreparationResult, PolicyDeployRuntime
+from .runtime import (
+    PolicyActionEmission,
+    PolicyActionEmissionResult,
+    PolicyActionPreparationResult,
+    PolicyDeployRuntime,
+)
 
 from .policy_worker import (
     BoundedPolicyInferenceWorker,
@@ -61,6 +67,7 @@ from .policy_worker import (
     PolicyWorkerStopReceipt,
     PolicyWorkerSubmissionReceipt,
 )
+from .rtc.profile import RtcProducerProfile
 
 
 RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V1 = (
@@ -72,6 +79,24 @@ RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V2 = (
 RTC_3C_LOCAL_POLICY_PROTOCOL_V1 = "rtc_3c_local_policy_worker_v1"
 RTC_OBSERVATION_CUT_IDENTITY_HASH_DOMAIN_V2 = (
     "dexteleop.rtc_observation_cut_identity.v2"
+)
+RTC_POLICY_EMISSION_SOURCE_BINDING_HASH_DOMAIN_V1 = (
+    "dexteleop.deploy.rtc_frontend_step_source_binding.v1"
+)
+RTC_POLICY_RUNTIME_SOURCE_CONFIG_HASH_DOMAIN_V1 = (
+    "dexteleop.deploy.rtc_policy_runtime_source_config.v1"
+)
+RTC_TYPED_CANONICAL_SOURCE_ADAPTER_CONTRACT_HASH_V1 = (
+    "not-applicable:rtc-typed-canonical-source-adapter-v1"
+)
+RTC_POLICY_EMISSION_SOURCE_DESCRIPTOR_HASH_DOMAIN_V1 = (
+    "dexteleop.deploy.rtc_policy_emission_source_descriptor.v1"
+)
+POLICY_ACTION_EMISSION_COMMIT_RECEIPT_HASH_DOMAIN_V1 = (
+    "dexteleop.deploy.policy_action_emission_commit_receipt.v1"
+)
+RTC_PRODUCER_ACTIVATION_READINESS_HASH_DOMAIN_V1 = (
+    "dexteleop.deploy.rtc_producer_activation_readiness.v1"
 )
 
 
@@ -252,11 +277,146 @@ class RtcPolicyShadowConfig:
             domain = RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V2
         return canonical_content_hash(payload, domain=domain)
 
+    @property
+    def producer_profile(self) -> RtcProducerProfile:
+        """Target-neutral schedule used by the lower RTC producer."""
+
+        return self.profile.producer_profile
+
 
 @dataclass(frozen=True)
 class RtcFrontendLifecycleTransition:
     producer_transition: PolicyAsyncProducerTransitionOutcome
     worker_stop_receipt: PolicyWorkerStopReceipt
+
+
+@dataclass(frozen=True)
+class PolicyActionEmissionCommitReceipt:
+    """Producer-local proof that one popped keyframe became one emission."""
+
+    accepted: bool
+    emission_id: str
+    emission_semantic_content_hash: str
+    source_binding_hash: str
+    producer_id: str
+    producer_epoch: int
+    committed_at: float
+    producer_transition_receipt_hash: str
+    semantic_content_hash: str
+
+    def __post_init__(self) -> None:
+        if not self.accepted:
+            raise ValueError("Emission commit receipts represent accepted commits only.")
+        for name in (
+            "emission_id",
+            "emission_semantic_content_hash",
+            "source_binding_hash",
+            "producer_id",
+            "producer_transition_receipt_hash",
+            "semantic_content_hash",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _required(getattr(self, name), field_name=name),
+            )
+        object.__setattr__(
+            self,
+            "producer_epoch",
+            _nonnegative_integer(self.producer_epoch, field_name="producer_epoch"),
+        )
+        object.__setattr__(
+            self,
+            "committed_at",
+            _finite(self.committed_at, field_name="committed_at"),
+        )
+        expected_hash = canonical_content_hash(
+            {
+                "accepted": True,
+                "emission_id": self.emission_id,
+                "emission_semantic_content_hash": (
+                    self.emission_semantic_content_hash
+                ),
+                "source_binding_hash": self.source_binding_hash,
+                "producer_id": self.producer_id,
+                "producer_epoch": self.producer_epoch,
+                "committed_at": self.committed_at,
+                "producer_transition_receipt_hash": (
+                    self.producer_transition_receipt_hash
+                ),
+            },
+            domain=POLICY_ACTION_EMISSION_COMMIT_RECEIPT_HASH_DOMAIN_V1,
+        )
+        if self.semantic_content_hash != expected_hash:
+            raise ValueError("Emission commit receipt semantic hash mismatch.")
+
+
+@dataclass(frozen=True)
+class RtcProducerActivationReadinessReceipt:
+    """Backend-neutral evidence that a new producer epoch may be activated."""
+
+    ready: bool
+    readiness_kind: str
+    producer_id: str
+    old_producer_epoch: int
+    new_producer_epoch: int
+    occurred_at: float
+    evidence_hashes: tuple[str, ...]
+    reasons: tuple[str, ...]
+    semantic_content_hash: str
+
+    def __post_init__(self) -> None:
+        for name in ("readiness_kind", "producer_id", "semantic_content_hash"):
+            object.__setattr__(
+                self,
+                name,
+                _required(getattr(self, name), field_name=name),
+            )
+        old_epoch = _nonnegative_integer(
+            self.old_producer_epoch,
+            field_name="old_producer_epoch",
+        )
+        new_epoch = _nonnegative_integer(
+            self.new_producer_epoch,
+            field_name="new_producer_epoch",
+        )
+        if new_epoch <= old_epoch:
+            raise ValueError("new_producer_epoch must advance.")
+        object.__setattr__(self, "old_producer_epoch", old_epoch)
+        object.__setattr__(self, "new_producer_epoch", new_epoch)
+        object.__setattr__(
+            self,
+            "occurred_at",
+            _finite(self.occurred_at, field_name="occurred_at"),
+        )
+        evidence = tuple(
+            _required(value, field_name="evidence_hash")
+            for value in self.evidence_hashes
+        )
+        reasons = tuple(
+            _required(value, field_name="reason") for value in self.reasons
+        )
+        if self.ready and reasons:
+            raise ValueError("A ready receipt cannot carry rejection reasons.")
+        if not self.ready and not reasons:
+            raise ValueError("A non-ready receipt requires rejection reasons.")
+        object.__setattr__(self, "evidence_hashes", evidence)
+        object.__setattr__(self, "reasons", reasons)
+        expected_hash = canonical_content_hash(
+            {
+                "ready": self.ready,
+                "readiness_kind": self.readiness_kind,
+                "producer_id": self.producer_id,
+                "old_producer_epoch": self.old_producer_epoch,
+                "new_producer_epoch": self.new_producer_epoch,
+                "occurred_at": self.occurred_at,
+                "evidence_hashes": self.evidence_hashes,
+                "reasons": self.reasons,
+            },
+            domain=RTC_PRODUCER_ACTIVATION_READINESS_HASH_DOMAIN_V1,
+        )
+        if self.semantic_content_hash != expected_hash:
+            raise ValueError("Producer activation readiness semantic hash mismatch.")
 
 
 @dataclass(frozen=True)
@@ -266,9 +426,10 @@ class RtcFrontendStep:
     result_transition: PolicyAsyncProducerTransitionOutcome | None
     pop_transition: PolicyAsyncProducerTransitionOutcome | None
     emission_commit_transition: PolicyAsyncProducerTransitionOutcome | None
+    emission_commit_receipt: PolicyActionEmissionCommitReceipt | None
     request_transition: PolicyAsyncProducerTransitionOutcome | None
     worker_submission: PolicyWorkerSubmissionReceipt | None
-    action_preparation: PolicyActionPreparationResult
+    emission_result: PolicyActionEmissionResult
     lifecycle_transition: RtcFrontendLifecycleTransition | None
     underrun: bool
     control_duration_sec: float
@@ -280,8 +441,27 @@ class RtcFrontendStep:
     def budget_exceeded(self) -> bool:
         return self.control_duration_sec > self.control_budget_sec
 
+    @property
+    def action_preparation(self) -> PolicyActionPreparationResult:
+        """Compatibility view with no downstream prepared action.
+
+        RTC now terminates at the formal emission.  Embedding applications
+        explicitly prepare that emission after ``step()`` returns.
+        """
+
+        return PolicyActionPreparationResult(
+            raw_action=self.emission_result.raw_action,
+            raw_lookahead_action=None,
+            prepared_action=None,
+            emission=self.emission_result.emission,
+            emission_error=self.emission_result.emission_error,
+            queue_len_before=self.emission_result.queue_len_before,
+            queue_len_after=self.emission_result.queue_len_after,
+            canonical_action=self.emission_result.canonical_action,
+        )
+
     def to_debug_payload(self) -> dict[str, Any]:
-        emission = self.action_preparation.emission
+        emission = self.emission_result.emission
         pop = None if self.pop_transition is None else self.pop_transition.pop_outcome
         result_receipt = (
             None if self.result_transition is None else self.result_transition.receipt
@@ -309,6 +489,22 @@ class RtcFrontendStep:
             ),
             "completion_hash": (
                 None if self.completion is None else self.completion.semantic_content_hash
+            ),
+            "completion_status": (
+                None if self.completion is None else self.completion.status
+            ),
+            "completion_worker_started_at": (
+                None
+                if self.completion is None
+                else self.completion.worker_started_at
+            ),
+            "completion_worker_completed_at": (
+                None
+                if self.completion is None
+                else self.completion.worker_completed_at
+            ),
+            "completion_released_at": (
+                None if self.completion is None else self.completion.released_at
             ),
             "result_transition_hash": (
                 None
@@ -338,10 +534,55 @@ class RtcFrontendStep:
                 if self.emission_commit_transition is None
                 else self.emission_commit_transition.receipt.semantic_content_hash
             ),
+            "emission_commit_receipt_hash": (
+                None
+                if self.emission_commit_receipt is None
+                else self.emission_commit_receipt.semantic_content_hash
+            ),
             "request_transition_hash": (
                 None
                 if self.request_transition is None
                 else self.request_transition.receipt.semantic_content_hash
+            ),
+            "request_transition_accepted": (
+                None
+                if self.request_transition is None
+                else self.request_transition.receipt.accepted
+            ),
+            "request_transition_reasons": (
+                []
+                if self.request_transition is None
+                else list(self.request_transition.receipt.reasons)
+            ),
+            "worker_submission_hash": (
+                None
+                if self.worker_submission is None
+                else self.worker_submission.semantic_content_hash
+            ),
+            "worker_submission_accepted": (
+                None
+                if self.worker_submission is None
+                else self.worker_submission.accepted
+            ),
+            "worker_submission_status": (
+                None
+                if self.worker_submission is None
+                else self.worker_submission.status
+            ),
+            "worker_submission_request_id": (
+                None
+                if self.worker_submission is None
+                else self.worker_submission.request_id
+            ),
+            "lifecycle_transition_hash": (
+                None
+                if self.lifecycle_transition is None
+                else self.lifecycle_transition.producer_transition.receipt.semantic_content_hash
+            ),
+            "lifecycle_transition_reason": (
+                None
+                if self.lifecycle_transition is None
+                else self.lifecycle_transition.producer_transition.receipt.event
             ),
             "selected_target_effective_at": (
                 None if pop is None else pop.selected_target_effective_at
@@ -353,6 +594,9 @@ class RtcFrontendStep:
                 None if pop is None else pop.selected_lateness_sec
             ),
             "emission_id": None if emission is None else emission.emission_id,
+            "emission_source_binding_hash": (
+                None if emission is None else emission.source_binding_hash
+            ),
             "underrun": self.underrun,
             "control_duration_sec": self.control_duration_sec,
             "control_budget_sec": self.control_budget_sec,
@@ -364,6 +608,208 @@ class RtcFrontendStep:
             "position_lookahead_enabled": False,
             "send_actions": False,
         }
+
+
+@dataclass(frozen=True)
+class RtcPolicyEmissionSourceDescriptor:
+    """Stable policy/action description shared by multiple producer epochs."""
+
+    source_id: str
+    policy_node_id: str
+    policy_runtime_config_hash: str
+    action_adapter_contract_hash: str
+    rtc_profile_hash: str
+    artifact_hash: str
+    action_codec_hash: str
+    frame_contract_hash: str
+    layout_hash: str
+    normalization_hash: str
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "source_id": self.source_id,
+                "policy_node_id": self.policy_node_id,
+                "policy_runtime_config_hash": self.policy_runtime_config_hash,
+                "action_adapter_contract_hash": self.action_adapter_contract_hash,
+                "rtc_profile_hash": self.rtc_profile_hash,
+                "artifact_hash": self.artifact_hash,
+                "action_codec_hash": self.action_codec_hash,
+                "frame_contract_hash": self.frame_contract_hash,
+                "layout_hash": self.layout_hash,
+                "normalization_hash": self.normalization_hash,
+            },
+            domain=RTC_POLICY_EMISSION_SOURCE_DESCRIPTOR_HASH_DOMAIN_V1,
+        )
+
+
+@dataclass(frozen=True)
+class RtcPolicyEmissionSourceBinding:
+    """Immutable identity for one RTC producer epoch and emission stream."""
+
+    source_slot_id: str
+    runtime_session_id: str
+    control_domain_id: str
+    producer_id: str
+    producer_epoch: int
+    policy_node_id: str
+    policy_clock_domain_id: str
+    policy_runtime_config_hash: str
+    action_adapter_contract_hash: str
+    rtc_frontend_config_hash: str
+    rtc_profile_hash: str
+    artifact_hash: str
+    action_codec_hash: str
+    frame_contract_hash: str
+    layout_hash: str
+    normalization_hash: str
+
+    @property
+    def source_descriptor(self) -> RtcPolicyEmissionSourceDescriptor:
+        return RtcPolicyEmissionSourceDescriptor(
+            source_id=self.source_slot_id,
+            policy_node_id=self.policy_node_id,
+            policy_runtime_config_hash=self.policy_runtime_config_hash,
+            action_adapter_contract_hash=self.action_adapter_contract_hash,
+            rtc_profile_hash=self.rtc_profile_hash,
+            artifact_hash=self.artifact_hash,
+            action_codec_hash=self.action_codec_hash,
+            frame_contract_hash=self.frame_contract_hash,
+            layout_hash=self.layout_hash,
+            normalization_hash=self.normalization_hash,
+        )
+
+    @property
+    def descriptor_hash(self) -> str:
+        return self.source_descriptor.semantic_content_hash
+
+    @property
+    def binding_generation(self) -> int:
+        """V1 compatibility generation; explicit generation starts at epoch."""
+
+        return self.producer_epoch
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "source_slot_id": self.source_slot_id,
+                "runtime_session_id": self.runtime_session_id,
+                "control_domain_id": self.control_domain_id,
+                "producer_id": self.producer_id,
+                "producer_epoch": self.producer_epoch,
+                "policy_node_id": self.policy_node_id,
+                "policy_clock_domain_id": self.policy_clock_domain_id,
+                "policy_runtime_config_hash": self.policy_runtime_config_hash,
+                "action_adapter_contract_hash": self.action_adapter_contract_hash,
+                "rtc_frontend_config_hash": self.rtc_frontend_config_hash,
+                "rtc_profile_hash": self.rtc_profile_hash,
+                "artifact_hash": self.artifact_hash,
+                "action_codec_hash": self.action_codec_hash,
+                "frame_contract_hash": self.frame_contract_hash,
+                "layout_hash": self.layout_hash,
+                "normalization_hash": self.normalization_hash,
+            },
+            domain=RTC_POLICY_EMISSION_SOURCE_BINDING_HASH_DOMAIN_V1,
+        )
+
+    def validate_emission(
+        self,
+        emission: PolicyActionEmission,
+    ) -> PolicyActionEmission:
+        if not isinstance(emission, PolicyActionEmission):
+            raise TypeError("emission must be PolicyActionEmission.")
+        if emission.source_binding_hash != self.semantic_content_hash:
+            raise ValueError("RTC emission source binding identity mismatch.")
+        if emission.policy_node_id != self.policy_node_id:
+            raise ValueError("RTC emission belongs to another policy node.")
+        if (
+            emission.produced_clock_domain_id != self.policy_clock_domain_id
+            or emission.effective_clock_domain_id != self.policy_clock_domain_id
+        ):
+            raise ValueError("RTC emission clock domain does not match source binding.")
+        if emission.queue_pop_count <= 0:
+            raise ValueError("RTC emission has no lower-owned plan-pop evidence.")
+        receipt = emission.representation_receipt
+        if receipt is not None and (
+            receipt.adapter_contract_hash != self.action_adapter_contract_hash
+        ):
+            raise ValueError("RTC emission used another action adapter contract.")
+        return emission
+
+    def validate_step(self, step: RtcFrontendStep) -> PolicyActionEmission | None:
+        """Compatibility/debug validation of producer pop and commit evidence."""
+
+        if not isinstance(step, RtcFrontendStep):
+            raise TypeError("step must be an RtcFrontendStep.")
+        plan = step.state.plan
+        if (
+            plan.session_id != self.runtime_session_id
+            or plan.control_domain_id != self.control_domain_id
+            or plan.producer_id != self.producer_id
+            or plan.producer_epoch != self.producer_epoch
+            or plan.policy_node_id != self.policy_node_id
+            or plan.clock_domain_id != self.policy_clock_domain_id
+        ):
+            raise ValueError("RTC step producer state does not match source binding.")
+        request = step.state.active_request
+        if request is not None and (
+            request.session_id != self.runtime_session_id
+            or request.control_domain_id != self.control_domain_id
+            or request.producer_id != self.producer_id
+            or request.producer_epoch != self.producer_epoch
+            or request.policy_node_id != self.policy_node_id
+            or request.clock_domain_id != self.policy_clock_domain_id
+            or request.artifact_hash != self.artifact_hash
+            or request.action_codec_hash != self.action_codec_hash
+            or request.frame_contract_hash != self.frame_contract_hash
+            or request.layout_hash != self.layout_hash
+            or request.normalization_hash != self.normalization_hash
+        ):
+            raise ValueError("RTC active request does not match source binding.")
+        completion = step.completion
+        if completion is not None:
+            result = completion.result
+            if (
+                result.session_id != self.runtime_session_id
+                or result.control_domain_id != self.control_domain_id
+                or result.producer_id != self.producer_id
+                or result.producer_epoch != self.producer_epoch
+                or result.policy_node_id != self.policy_node_id
+                or result.clock_domain_id != self.policy_clock_domain_id
+                or result.artifact_hash != self.artifact_hash
+                or result.action_codec_hash != self.action_codec_hash
+                or result.frame_contract_hash != self.frame_contract_hash
+                or result.layout_hash != self.layout_hash
+                or result.normalization_hash != self.normalization_hash
+            ):
+                raise ValueError("RTC worker completion does not match source binding.")
+        emission = step.emission_result.emission
+        if emission is None:
+            if step.emission_commit_transition is not None:
+                raise ValueError("RTC step committed an emission that is not present.")
+            return None
+        pop_transition = step.pop_transition
+        commit_transition = step.emission_commit_transition
+        if pop_transition is None or not pop_transition.receipt.accepted:
+            raise ValueError("RTC emission lacks an accepted lower-owned due-pop.")
+        pop = pop_transition.pop_outcome
+        if pop is None or pop.keyframe is None:
+            raise ValueError("RTC emission due-pop selected no keyframe.")
+        if commit_transition is None or not commit_transition.receipt.accepted:
+            raise ValueError("RTC emission lacks accepted commit-through evidence.")
+        if commit_transition.receipt.emission_id != emission.emission_id:
+            raise ValueError("RTC emission/commit identity mismatch.")
+        keyframe = pop.keyframe
+        if (
+            keyframe.inference_id != emission.inference_id
+            or keyframe.chunk_id != emission.chunk_id
+            or keyframe.chunk_keyframe_index != emission.chunk_keyframe_index
+            or keyframe.target_effective_at != emission.target_effective_at
+        ):
+            raise ValueError("RTC due-pop keyframe/emission lineage mismatch.")
+        return self.validate_emission(emission)
 
 
 class RtcDecodedPolicyExecutor:
@@ -464,8 +910,9 @@ class RtcPolicyShadowFrontend:
         config: RtcPolicyShadowConfig,
         deploy_runtime: PolicyDeployRuntime,
         policy: Any,
-        preparer: Any,
+        preparer: Any | None = None,
         created_at: float,
+        emission_adapter: DeployRobotActionAdapter | None = None,
         clock: Callable[[], float] = time.monotonic,
         executor_factory: Callable[[str], PolicyInferenceExecutor] | None = None,
         representation_context_builder: Callable[
@@ -479,10 +926,28 @@ class RtcPolicyShadowFrontend:
             raise TypeError("deploy_runtime must be PolicyDeployRuntime.")
         if not callable(clock):
             raise TypeError("clock must be callable.")
+        legacy_adapter = (
+            None if preparer is None else getattr(preparer, "action_adapter", None)
+        )
+        if emission_adapter is None:
+            emission_adapter = legacy_adapter
+        elif (
+            isinstance(legacy_adapter, DeployRobotActionAdapter)
+            and isinstance(emission_adapter, DeployRobotActionAdapter)
+            and legacy_adapter.contract_hash != emission_adapter.contract_hash
+        ):
+            raise ValueError("preparer and emission_adapter contracts differ.")
+        if emission_adapter is not None and not isinstance(
+            emission_adapter,
+            DeployRobotActionAdapter,
+        ):
+            raise TypeError(
+                "emission_adapter must be DeployRobotActionAdapter or None."
+            )
         self.config = config
         self.deploy_runtime = deploy_runtime
         self.policy = policy
-        self.preparer = preparer
+        self.emission_adapter = emission_adapter
         self.clock = clock
         self._executor_factory = executor_factory
         if representation_context_builder is not None and not callable(
@@ -509,6 +974,17 @@ class RtcPolicyShadowFrontend:
             worker_session_id=worker_session_id,
             created_at=created_at,
         )
+        self._source_binding_candidate = (
+            build_rtc_policy_emission_source_binding_from_contracts(
+                config=config,
+                deploy_runtime=deploy_runtime,
+                emission_adapter=emission_adapter,
+                producer_epoch=plan.producer_epoch,
+            )
+        )
+        self._last_activation_readiness_receipt: (
+            RtcProducerActivationReadinessReceipt | None
+        ) = None
         self._worker = self._build_worker(worker_session_id)
         self._delay_state = InferenceDelayEstimatorState.empty(
             config.delay_estimator_spec
@@ -524,6 +1000,18 @@ class RtcPolicyShadowFrontend:
     @property
     def state(self) -> PolicyAsyncProducerSnapshot:
         return self._state
+
+    @property
+    def source_binding_candidate(self) -> RtcPolicyEmissionSourceBinding:
+        """Current producer-owned candidate; activation belongs to the publisher."""
+
+        return self._source_binding_candidate
+
+    @property
+    def last_activation_readiness_receipt(
+        self,
+    ) -> RtcProducerActivationReadinessReceipt | None:
+        return self._last_activation_readiness_receipt
 
     @property
     def selected_emission_count(self) -> int:
@@ -615,14 +1103,14 @@ class RtcPolicyShadowFrontend:
         )
         if not valid:
             return 0
-        period = 1.0 / self.config.profile.action_hz
+        period = self.config.producer_profile.action_period_sec
         return max(0, math.ceil((valid[-1].effective_until - now) / period))
 
     def _should_request(self, now: float) -> bool:
         observation_due = (
             self._last_request_triggered_at is None
             or now - self._last_request_triggered_at
-            >= 1.0 / self.config.profile.observation_hz - 1e-12
+            >= 1.0 / self.config.producer_profile.observation_hz - 1e-12
         )
         return (
             self._state.lifecycle_state == POLICY_ASYNC_PRODUCER_ELIGIBLE
@@ -644,7 +1132,8 @@ class RtcPolicyShadowFrontend:
         forecast_steps = self._delay_state.forecast_steps(
             self.config.delay_estimator_spec
         )
-        period = 1.0 / self.config.profile.action_hz
+        producer_profile = self.config.producer_profile
+        period = producer_profile.action_period_sec
         first_target = max(now, self._state.plan.cursor_at) + forecast_steps * period
         request_id = f"rtc-request:{self.config.runtime_session_id}:{sequence}"
         observation_cut_id = self._observation_cut_id(
@@ -706,7 +1195,7 @@ class RtcPolicyShadowFrontend:
         return PolicyInferenceRequest(
             request_id=request_id,
             inference_id=f"{self.config.policy_node_id}:rtc-inference:{sequence}",
-            rtc_mode=self.config.profile.rtc_mode,
+            rtc_mode=producer_profile.rtc_mode,
             session_id=self._state.plan.session_id,
             control_domain_id=self._state.plan.control_domain_id,
             producer_id=self._state.plan.producer_id,
@@ -809,6 +1298,7 @@ class RtcPolicyShadowFrontend:
     def rearm(self, *, now: float, reason: str) -> PolicyAsyncProducerTransitionOutcome:
         self._require_running()
         occurred = _finite(now, field_name="now")
+        old_epoch = self._source_binding_candidate.producer_epoch
         retired_completion = self._worker.poll_completion()
         if retired_completion is not None:
             rejected = admit_policy_chunk_result(
@@ -838,6 +1328,33 @@ class RtcPolicyShadowFrontend:
         self._worker = self._build_worker(worker_session_id)
         self._worker.start()
         self._state = transition.state
+        self._source_binding_candidate = (
+            build_rtc_policy_emission_source_binding_from_contracts(
+                config=self.config,
+                deploy_runtime=self.deploy_runtime,
+                emission_adapter=self.emission_adapter,
+                producer_epoch=self._state.plan.producer_epoch,
+            )
+        )
+        readiness_payload = {
+            "ready": True,
+            "readiness_kind": "same_thread_worker_drained_v1",
+            "producer_id": self._state.plan.producer_id,
+            "old_producer_epoch": old_epoch,
+            "new_producer_epoch": self._state.plan.producer_epoch,
+            "occurred_at": occurred,
+            "evidence_hashes": (transition.receipt.semantic_content_hash,),
+            "reasons": (),
+        }
+        self._last_activation_readiness_receipt = (
+            RtcProducerActivationReadinessReceipt(
+                **readiness_payload,
+                semantic_content_hash=canonical_content_hash(
+                    readiness_payload,
+                    domain=RTC_PRODUCER_ACTIVATION_READINESS_HASH_DOMAIN_V1,
+                ),
+            )
+        )
         self._last_request_triggered_at = None
         return transition
 
@@ -888,7 +1405,8 @@ class RtcPolicyShadowFrontend:
 
         pop_transition = None
         emission_commit_transition = None
-        action_preparation = PolicyActionPreparationResult()
+        emission_commit_receipt = None
+        emission_result = PolicyActionEmissionResult()
         underrun = False
         if (
             allow_output
@@ -914,29 +1432,32 @@ class RtcPolicyShadowFrontend:
                     raise RuntimeError("RTC keyframe was selected more than once.")
                 self._emitted_keyframe_ids.add(keyframe_identity)
                 self._selected_emission_count += 1
-                action_preparation = (
-                    self.deploy_runtime.prepare_timed_action_keyframe(
+                emission_result = (
+                    self.deploy_runtime.emit_timed_action_keyframe(
                         pop.keyframe,
                         observation,
-                        preparer=self.preparer,
+                        emission_adapter=self.emission_adapter,
                         policy_name=str(getattr(self.policy, "name", "rtc_policy")),
                         plan_keyframe_count_before=before,
                         plan_keyframe_count_after=len(self._state.plan.keyframes),
                         plan_pop_count=self._selected_emission_count,
+                        source_binding_hash=(
+                            self._source_binding_candidate.semantic_content_hash
+                        ),
                     )
                 )
-                if action_preparation.emission is None:
+                if emission_result.emission is None:
                     lifecycle_transition = self.fault(
                         now=decision_at,
                         reason="formal_emission_failed",
                     )
-                    action_preparation = PolicyActionPreparationResult()
+                    emission_result = PolicyActionEmissionResult()
                 else:
                     emission_commit_transition = (
                         commit_emitted_policy_async_producer_action(
                             self._state,
                             pop_outcome=pop,
-                            emission_id=action_preparation.emission.emission_id,
+                            emission_id=emission_result.emission.emission_id,
                             committed_at=decision_at,
                         )
                     )
@@ -946,7 +1467,37 @@ class RtcPolicyShadowFrontend:
                             now=decision_at,
                             reason="emission_commit_rejected",
                         )
-                        action_preparation = PolicyActionPreparationResult()
+                        emission_result = PolicyActionEmissionResult()
+                    else:
+                        emission = emission_result.emission
+                        assert emission is not None
+                        commit_payload = {
+                            "accepted": True,
+                            "emission_id": emission.emission_id,
+                            "emission_semantic_content_hash": (
+                                emission.semantic_content_hash
+                            ),
+                            "source_binding_hash": (
+                                self._source_binding_candidate.semantic_content_hash
+                            ),
+                            "producer_id": self._state.plan.producer_id,
+                            "producer_epoch": self._state.plan.producer_epoch,
+                            "committed_at": decision_at,
+                            "producer_transition_receipt_hash": (
+                                emission_commit_transition.receipt.semantic_content_hash
+                            ),
+                        }
+                        emission_commit_receipt = (
+                            PolicyActionEmissionCommitReceipt(
+                                **commit_payload,
+                                semantic_content_hash=canonical_content_hash(
+                                    commit_payload,
+                                    domain=(
+                                        POLICY_ACTION_EMISSION_COMMIT_RECEIPT_HASH_DOMAIN_V1
+                                    ),
+                                ),
+                            )
+                        )
 
         request_transition = None
         worker_submission = None
@@ -997,13 +1548,14 @@ class RtcPolicyShadowFrontend:
             result_transition=result_transition,
             pop_transition=pop_transition,
             emission_commit_transition=emission_commit_transition,
+            emission_commit_receipt=emission_commit_receipt,
             request_transition=request_transition,
             worker_submission=worker_submission,
-            action_preparation=action_preparation,
+            emission_result=emission_result,
             lifecycle_transition=lifecycle_transition,
             underrun=underrun,
             control_duration_sec=duration,
-            control_budget_sec=1.0 / self.config.profile.decision_hz,
+            control_budget_sec=1.0 / self.config.producer_profile.decision_hz,
             selected_emission_count=self._selected_emission_count,
             late_completion_rejection_count=(
                 self._late_completion_rejection_count
@@ -1030,12 +1582,147 @@ class RtcPolicyShadowFrontend:
         return stop
 
 
+def build_rtc_policy_emission_source_binding(
+    frontend: RtcPolicyShadowFrontend,
+) -> RtcPolicyEmissionSourceBinding:
+    """Capture the current RTC producer epoch without starting or stepping it."""
+
+    if not isinstance(frontend, RtcPolicyShadowFrontend):
+        raise TypeError("frontend must be an RtcPolicyShadowFrontend.")
+    if frontend.emission_adapter is not None and not isinstance(
+        frontend.emission_adapter,
+        DeployRobotActionAdapter,
+    ):
+        raise TypeError(
+            "RTC frontend emission_adapter must be DeployRobotActionAdapter or None."
+        )
+    config = frontend.config
+    plan = frontend.state.plan
+    if (
+        plan.session_id != config.runtime_session_id
+        or plan.control_domain_id != config.control_domain_id
+        or plan.producer_id != config.producer_id
+        or plan.policy_node_id != config.policy_node_id
+        or plan.clock_domain_id != config.clock_domain_id
+    ):
+        raise ValueError("RTC frontend plan/config identity differs.")
+    binding = frontend.source_binding_candidate
+    if (
+        binding.runtime_session_id != plan.session_id
+        or binding.control_domain_id != plan.control_domain_id
+        or binding.producer_id != plan.producer_id
+        or binding.producer_epoch != plan.producer_epoch
+    ):
+        raise RuntimeError("RTC cached source binding is stale.")
+    return binding
+
+
+def build_rtc_policy_emission_source_binding_from_contracts(
+    *,
+    config: RtcPolicyShadowConfig,
+    deploy_runtime: PolicyDeployRuntime,
+    emission_adapter: DeployRobotActionAdapter | None,
+    producer_epoch: int,
+) -> RtcPolicyEmissionSourceBinding:
+    """Build the same source identity before a concrete frontend is supplied."""
+
+    if not isinstance(config, RtcPolicyShadowConfig):
+        raise TypeError("config must be an RtcPolicyShadowConfig.")
+    if not isinstance(deploy_runtime, PolicyDeployRuntime):
+        raise TypeError("deploy_runtime must be a PolicyDeployRuntime.")
+    if emission_adapter is not None and not isinstance(
+        emission_adapter,
+        DeployRobotActionAdapter,
+    ):
+        raise TypeError(
+            "emission_adapter must be a DeployRobotActionAdapter or None."
+        )
+    epoch = _nonnegative_integer(producer_epoch, field_name="producer_epoch")
+    runtime_config = deploy_runtime.config
+    if (
+        runtime_config.policy_node_id != config.policy_node_id
+        or runtime_config.policy_clock_domain_id != config.clock_domain_id
+    ):
+        raise ValueError("RTC frontend/runtime policy identity differs.")
+    if emission_adapter is not None and (
+        tuple(emission_adapter.active_sides) != tuple(runtime_config.active_sides)
+        or emission_adapter.arms_enabled != runtime_config.arms_enabled
+        or emission_adapter.hands_enabled != runtime_config.hands_enabled
+    ):
+        raise ValueError("RTC frontend action adapter/runtime coverage differs.")
+    runtime_payload = {
+        "active_sides": runtime_config.active_sides,
+        "arms_enabled": runtime_config.arms_enabled,
+        "hands_enabled": runtime_config.hands_enabled,
+        "policy_action_pose_mode": runtime_config.policy_action_pose_mode,
+        "policy_absolute_frame": runtime_config.policy_absolute_frame,
+        "policy_node_id": runtime_config.policy_node_id,
+        "policy_clock_domain_id": runtime_config.policy_clock_domain_id,
+        "action_keyframe_period_sec": runtime_config.action_keyframe_period_sec,
+        "action_maximum_hold_sec": runtime_config.action_maximum_hold_sec,
+        "action_emission_admission_mode": (
+            runtime_config.action_emission_admission_mode
+        ),
+        "action_chunk_execution_steps": runtime_config.action_chunk_execution_steps,
+        "policy_observation_contract_hash": (
+            runtime_config.policy_observation_contract.semantic_content_hash
+        ),
+    }
+    return RtcPolicyEmissionSourceBinding(
+        source_slot_id=f"rtc-policy-source:{config.producer_id}",
+        runtime_session_id=config.runtime_session_id,
+        control_domain_id=config.control_domain_id,
+        producer_id=config.producer_id,
+        producer_epoch=epoch,
+        policy_node_id=config.policy_node_id,
+        policy_clock_domain_id=config.clock_domain_id,
+        policy_runtime_config_hash=canonical_content_hash(
+            runtime_payload,
+            domain=RTC_POLICY_RUNTIME_SOURCE_CONFIG_HASH_DOMAIN_V1,
+        ),
+        action_adapter_contract_hash=(
+            RTC_TYPED_CANONICAL_SOURCE_ADAPTER_CONTRACT_HASH_V1
+            if emission_adapter is None
+            else emission_adapter.contract_hash
+        ),
+        rtc_frontend_config_hash=config.semantic_content_hash,
+        rtc_profile_hash=config.profile.semantic_content_hash,
+        artifact_hash=config.artifact_hash,
+        action_codec_hash=config.action_codec_hash,
+        frame_contract_hash=config.frame_contract_hash,
+        layout_hash=config.layout_hash,
+        normalization_hash=config.normalization_hash,
+    )
+
+
+# Canonical functional names.  Existing Shadow/Frontend names remain import
+# aliases and retain the same class object and serialized contracts.
+RtcPolicyProducerConfig = RtcPolicyShadowConfig
+RtcProducerTickResult = RtcFrontendStep
+RtcPolicyProducerRuntime = RtcPolicyShadowFrontend
+
+
 __all__ = [
+    "POLICY_ACTION_EMISSION_COMMIT_RECEIPT_HASH_DOMAIN_V1",
     "RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V1",
     "RTC_3C_LOCAL_POLICY_PROTOCOL_V1",
+    "RTC_POLICY_EMISSION_SOURCE_BINDING_HASH_DOMAIN_V1",
+    "RTC_POLICY_EMISSION_SOURCE_DESCRIPTOR_HASH_DOMAIN_V1",
+    "RTC_POLICY_RUNTIME_SOURCE_CONFIG_HASH_DOMAIN_V1",
+    "RTC_PRODUCER_ACTIVATION_READINESS_HASH_DOMAIN_V1",
+    "RTC_TYPED_CANONICAL_SOURCE_ADAPTER_CONTRACT_HASH_V1",
+    "PolicyActionEmissionCommitReceipt",
     "RtcDecodedPolicyExecutor",
     "RtcFrontendLifecycleTransition",
     "RtcFrontendStep",
+    "RtcPolicyEmissionSourceDescriptor",
+    "RtcPolicyEmissionSourceBinding",
+    "RtcPolicyProducerConfig",
+    "RtcPolicyProducerRuntime",
     "RtcPolicyShadowConfig",
     "RtcPolicyShadowFrontend",
+    "RtcProducerActivationReadinessReceipt",
+    "RtcProducerTickResult",
+    "build_rtc_policy_emission_source_binding",
+    "build_rtc_policy_emission_source_binding_from_contracts",
 ]

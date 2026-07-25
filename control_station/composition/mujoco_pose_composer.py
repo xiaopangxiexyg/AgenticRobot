@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from typing import Callable, Mapping
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from control_composition.activation import (
+    ACTIVATION_LOCAL_STRICT_SOURCE_FRESHNESS_POLICY_V2,
+    CompositionActivationScope,
+    build_composition_activation_scope,
+)
 from control_composition.composition import (
     CompositionAuthorityDisposition,
     CompositionAuthorityGateSpec,
@@ -35,7 +40,16 @@ from robot_motion.action import (
     ExecutionProfileExclusion,
     build_control_execution_manifest,
 )
-from control_composition.trace import project_composition_authority_disposition
+from dataset_interface.composition_control_trace import (
+    project_composition_activation_scope,
+    project_composition_authority_disposition,
+)
+from control_composition.lifecycle import (
+    CompositionSessionOperationSpec,
+    CompositionSessionRearmReceipt,
+    CompositionSessionRearmSpec,
+    CompositionSessionState,
+)
 from robot_motion.replay import ReplayProposalSource, ReplaySourceFrameEmission
 from robot_motion.replay.control_trace import (
     project_replay_adapter_result,
@@ -51,13 +65,7 @@ from teleop_runtime.control_trace.projection import (
 )
 
 from ..adapters import StationOperationAdapter
-from ..composition_session import (
-    CompositionSessionController,
-    CompositionSessionOperationSpec,
-    CompositionSessionRearmReceipt,
-    CompositionSessionRearmSpec,
-    CompositionSessionState,
-)
+from ..composition_session import CompositionSessionController
 from ..contracts import (
     ControlStationRunManifest,
     ExecutionDomainBinding,
@@ -90,6 +98,7 @@ from .mujoco_human import build_mujoco_pose_human_proposal_adapter
 CS6B1H_HUMAN_POSE_ROLE_V1 = "human_pose"
 CS6B1H_REPLAY_POSE_ROLE_V1 = "replay_pose"
 CS6B1H_BINDING_HASH_DOMAIN_V1 = "dexteleop.cs6b1h_pose_composer_binding.v1"
+CS6B1H_BINDING_HASH_DOMAIN_V2 = "dexteleop.cs6b1h_pose_composer_binding.v2"
 CS6B1H_STEP_HASH_DOMAIN_V1 = "dexteleop.cs6b1h_pose_composer_step.v1"
 CS6B1I_COMPOSITION_SESSION_MANIFEST_ID_V1 = (
     "control_station_cs6b1i_pose_composition_session_mujoco_v1"
@@ -123,6 +132,7 @@ class CS6b1hPoseComposerBinding:
     target_runtime_contract_hash: str
     semantic_content_hash: str
     source_difference_spec_hash: str | None = None
+    formal_strategy_spec_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -191,8 +201,10 @@ class MujocoPoseComposerAuthorityComposition:
         ] = {}
         self._human_fact_time_by_emission_id: dict[str, float] = {}
         self._step_by_decision_key: dict[str, CS6b1hFormalCompositionStep] = {}
-        self._activation_input_barrier_time: float | None = None
-        self._require_activation_local_inputs = False
+        self._composition_activation_scope: (
+            CompositionActivationScope | None
+        ) = None
+        self._legacy_unscoped_input_barrier_time: float | None = None
         self.binding = self._validate_binding()
 
     @property
@@ -206,6 +218,13 @@ class MujocoPoseComposerAuthorityComposition:
     ) -> Mapping[str, CompositionInputAdmissionReceipt]:
         with self._lock:
             return dict(self._input_receipt_by_role)
+
+    @property
+    def composition_activation_scope(
+        self,
+    ) -> CompositionActivationScope | None:
+        with self._lock:
+            return self._composition_activation_scope
 
     def _validate_binding(self) -> CS6b1hPoseComposerBinding:
         runtime = self.runtime
@@ -281,6 +300,20 @@ class MujocoPoseComposerAuthorityComposition:
         target_hash = runtime.target_runtime_action_contract.semantic_content_hash
         if replay.target_runtime_contract.semantic_content_hash != target_hash:
             raise ValueError("Replay contributor was assessed against another target.")
+        formal_strategy = runtime.policy_topology.composition_strategy
+        formal_strategy_spec_hash = (
+            None
+            if formal_strategy is None
+            else formal_strategy.spec.semantic_content_hash
+        )
+        if (
+            formal_strategy is not None
+            and formal_strategy.spec.composition_spec_hash
+            != spec.semantic_content_hash
+        ):
+            raise ValueError(
+                "Formal strategy is bound to another composition spec."
+            )
         payload = {
             "runtime_session_id": config.runtime_session_id,
             "control_domain_id": config.control_domain_id,
@@ -300,13 +333,20 @@ class MujocoPoseComposerAuthorityComposition:
         )
         if difference_spec_hash is not None:
             hash_payload["source_difference_spec_hash"] = difference_spec_hash
+        binding_hash_domain = CS6B1H_BINDING_HASH_DOMAIN_V1
+        if formal_strategy_spec_hash is not None:
+            hash_payload["formal_strategy_spec_hash"] = (
+                formal_strategy_spec_hash
+            )
+            binding_hash_domain = CS6B1H_BINDING_HASH_DOMAIN_V2
         return CS6b1hPoseComposerBinding(
             **payload,
             semantic_content_hash=canonical_content_hash(
                 hash_payload,
-                domain=CS6B1H_BINDING_HASH_DOMAIN_V1,
+                domain=binding_hash_domain,
             ),
             source_difference_spec_hash=difference_spec_hash,
+            formal_strategy_spec_hash=formal_strategy_spec_hash,
         )
 
     def start(self) -> None:
@@ -324,7 +364,10 @@ class MujocoPoseComposerAuthorityComposition:
                 self.runtime.close()
                 raise
             self._started = True
-            self._activation_input_barrier_time = float(self.runtime.clock())
+            self._composition_activation_scope = None
+            self._legacy_unscoped_input_barrier_time = float(
+                self.runtime.clock()
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -332,6 +375,8 @@ class MujocoPoseComposerAuthorityComposition:
                 return
             self.runtime.close()
             self._started = False
+            self._composition_activation_scope = None
+            self._legacy_unscoped_input_barrier_time = None
 
     def _require_started(self) -> None:
         if not self._started:
@@ -342,22 +387,31 @@ class MujocoPoseComposerAuthorityComposition:
     def begin_composition_activation(
         self,
         *,
-        activated_at: float,
-        require_fresh_inputs: bool = False,
+        scope: CompositionActivationScope,
     ) -> float:
-        """Reset activation-local inputs without restarting devices or the rig."""
+        """Bind formal inputs to one explicit start/rearm activation."""
 
-        timestamp = float(activated_at)
-        if not math.isfinite(timestamp):
-            raise ValueError("activated_at must be finite.")
+        if not isinstance(scope, CompositionActivationScope):
+            raise TypeError("scope must be a CompositionActivationScope.")
+        if scope.clock_domain_id != self.runtime.config.clock_domain_id:
+            raise ValueError("Composition activation uses another control clock.")
+        if scope.required_roles != self.composition_spec.required_roles:
+            raise ValueError("Composition activation required roles mismatch.")
         with self._lock:
             self._require_started()
             self._input_receipt_by_role.clear()
             self._human_fact_time_by_emission_id.clear()
             self._step_by_decision_key.clear()
-            self._activation_input_barrier_time = timestamp
-            self._require_activation_local_inputs = bool(require_fresh_inputs)
-        return timestamp
+            self._composition_activation_scope = scope
+            self.runtime.core.record_external_facts(
+                (
+                    project_composition_activation_scope(
+                        self.runtime.core.trace_context,
+                        scope,
+                    ),
+                )
+            )
+        return scope.input_barrier_at
 
     def _submit_input(
         self,
@@ -377,19 +431,17 @@ class MujocoPoseComposerAuthorityComposition:
         parent_fact_id: str,
         parent_fact_hash: str,
     ) -> CompositionInputAdmissionReceipt:
-        barrier_time = self._activation_input_barrier_time
-        if barrier_time is None:
-            raise RuntimeError("Composition activation input barrier is not armed.")
-        produced = float(produced_at)
-        predates_activation = (
-            produced <= barrier_time
-            if self._require_activation_local_inputs
-            else produced < barrier_time
-        )
-        if predates_activation:
-            raise ValueError(
-                "Composition input predates the current activation barrier."
-            )
+        activation_scope = self._composition_activation_scope
+        if activation_scope is None:
+            barrier_time = self._legacy_unscoped_input_barrier_time
+            if barrier_time is None:
+                raise RuntimeError(
+                    "Composition activation input barrier is not armed."
+                )
+            if float(produced_at) < barrier_time:
+                raise ValueError(
+                    "Composition input predates the legacy activation barrier."
+                )
         previous = self._input_receipt_by_role.get(role)
         if (
             previous is not None
@@ -420,6 +472,16 @@ class MujocoPoseComposerAuthorityComposition:
                 policy_output_id=None,
                 source_fact_ids=source_fact_ids,
                 source_fact_hashes=source_fact_hashes,
+                composition_activation_id=(
+                    None
+                    if activation_scope is None
+                    else activation_scope.activation_id
+                ),
+                composition_activation_hash=(
+                    None
+                    if activation_scope is None
+                    else activation_scope.semantic_content_hash
+                ),
                 authority_candidate=False,
                 audit_metadata={
                     "formal_composition_contributor": True,
@@ -429,9 +491,11 @@ class MujocoPoseComposerAuthorityComposition:
                     "parent_fact_id": parent_fact_id,
                     "parent_fact_hash": parent_fact_hash,
                 },
-            )
+            ),
+            activation_scope=activation_scope,
         )
-        self._input_receipt_by_role[role] = receipt
+        if receipt.accepted:
+            self._input_receipt_by_role[role] = receipt
         return receipt
 
     def submit_human_emission(
@@ -634,23 +698,7 @@ class MujocoPoseComposerAuthorityComposition:
             gate_snapshot = self.runtime.core.capture_execution_gate_snapshot(
                 now=target
             )
-            missing_roles = tuple(
-                role
-                for role in self.composition_spec.required_roles
-                if role not in self._input_receipt_by_role
-                or not self._input_receipt_by_role[role].accepted
-            )
-            if self._require_activation_local_inputs and missing_roles:
-                blocked_reason = (
-                    "activation_inputs_missing:" + ",".join(missing_roles)
-                )
-                hold = self.runtime.transition_execution_gate(
-                    "hold",
-                    reason="cs6b1h:activation_inputs_missing",
-                    source_event_ids=(),
-                    force_cancellation=True,
-                )
-            elif gate_snapshot.status != "ready":
+            if gate_snapshot.status != "ready":
                 blocked_reason = (
                     f"execution_gate_not_ready:{gate_snapshot.status}"
                 )
@@ -660,6 +708,7 @@ class MujocoPoseComposerAuthorityComposition:
                         spec=self.composition_spec,
                         target_effective_at=target,
                         source_difference_spec=self.source_difference_spec,
+                        activation_scope=self._composition_activation_scope,
                     )
                     disposition = decide_composition_authority_disposition(
                         evaluation.input_snapshot,
@@ -736,6 +785,16 @@ class MujocoPoseComposerAuthorityComposition:
                 ),
                 "blocked_reason": blocked_reason,
                 "error": error_text,
+                "composition_activation_id": (
+                    None
+                    if self._composition_activation_scope is None
+                    else self._composition_activation_scope.activation_id
+                ),
+                "composition_activation_hash": (
+                    None
+                    if self._composition_activation_scope is None
+                    else self._composition_activation_scope.semantic_content_hash
+                ),
             }
             if self.source_difference_spec is not None:
                 payload.update(
@@ -1480,9 +1539,20 @@ class ScopedMujocoPoseCompositionSession:
             receiver_before.current_authority_epoch
         ):
             raise RuntimeError("Composition rearm authority epoch did not advance.")
-        activation_time = self.data_plane.begin_composition_activation(
+        activation_scope = build_composition_activation_scope(
+            operation_spec_id=spec.logical_operation_spec_id,
+            operation_spec_hash=spec.logical_operation_spec_hash,
+            session_epoch=state.session_epoch + 1,
             activated_at=measurement.measured_at,
-            require_fresh_inputs=True,
+            clock_domain_id=runtime.config.clock_domain_id,
+            input_barrier_at=measurement.measured_at,
+            required_roles=self.data_plane.composition_spec.required_roles,
+            freshness_policy=(
+                ACTIVATION_LOCAL_STRICT_SOURCE_FRESHNESS_POLICY_V2
+            ),
+        )
+        activation_time = self.data_plane.begin_composition_activation(
+            scope=activation_scope,
         )
         ready = runtime.transition_execution_gate(
             "ready",
@@ -1601,8 +1671,29 @@ class ScopedMujocoPoseCompositionSession:
         )
         if kind == "start_composition_session":
             if completion.accepted and completion.result.succeeded:
+                spec = self.session_controller.require_registered_spec(
+                    transition.intent.operation_spec_id
+                )
+                state = self.current_session_state
+                if state is None or state.phase != "registered":
+                    raise RuntimeError(
+                        "Composition start lacks a registered activation."
+                    )
+                activation_scope = build_composition_activation_scope(
+                    operation_spec_id=spec.operation_spec_id,
+                    operation_spec_hash=spec.semantic_content_hash,
+                    session_epoch=state.session_epoch,
+                    activated_at=completion.result.available_at,
+                    clock_domain_id=(
+                        self.data_plane.runtime.config.clock_domain_id
+                    ),
+                    input_barrier_at=completion.result.available_at,
+                    required_roles=(
+                        self.data_plane.composition_spec.required_roles
+                    ),
+                )
                 self.data_plane.begin_composition_activation(
-                    activated_at=completion.result.available_at
+                    scope=activation_scope,
                 )
             self.session_controller.complete_start_operation(
                 operation_spec_id=transition.intent.operation_spec_id,
@@ -1820,6 +1911,7 @@ def build_scoped_cs6b1h_mujoco_pose_composer_authority(
 
 __all__ = [
     "CS6B1H_BINDING_HASH_DOMAIN_V1",
+    "CS6B1H_BINDING_HASH_DOMAIN_V2",
     "CS6B1H_HUMAN_POSE_ROLE_V1",
     "CS6B1H_REPLAY_POSE_ROLE_V1",
     "CS6B1H_STEP_HASH_DOMAIN_V1",

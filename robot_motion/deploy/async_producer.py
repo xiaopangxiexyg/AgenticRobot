@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.position_control.config import PositionControlRates
@@ -30,6 +31,9 @@ from .inference import (
     PolicyChunkResult,
     PolicyInferenceRequest,
 )
+
+if TYPE_CHECKING:
+    from .rtc.profile import RtcProducerProfile
 
 
 POLICY_ASYNC_PRODUCER_STATE_HASH_DOMAIN_V1 = (
@@ -108,11 +112,13 @@ def _nonnegative_integer(value: object, *, field_name: str) -> int:
 
 @dataclass(frozen=True)
 class PolicyAsyncExecutionProfile:
-    """Versioned RTC cadence and default-off profile binding.
+    """Legacy composed RTC/application profile retained for compatibility.
 
-    Position rates reuse the existing shared ``PositionControlRates`` contract.
-    This profile adds only the policy decision/action clocks and the explicit
-    RTC lookahead/send gates.
+    The serialized contract predates the target-neutral
+    :class:`robot_motion.deploy.rtc.RtcProducerProfile`, so its position rates
+    and application send/lookahead gates cannot be removed or reinterpreted.
+    New RTC producer code must consume :attr:`producer_profile`; embedding
+    applications remain responsible for the additional execution settings.
     """
 
     profile_id: str
@@ -210,6 +216,18 @@ class PolicyAsyncExecutionProfile:
             },
             domain=POLICY_ASYNC_EXECUTION_PROFILE_HASH_DOMAIN_V1,
         )
+
+    @property
+    def producer_profile(self) -> "RtcProducerProfile":
+        """Return the target-neutral producer projection.
+
+        The local import avoids an initialization cycle while keeping the
+        legacy execution-profile hash and public fields unchanged.
+        """
+
+        from .rtc.profile import RtcProducerProfile
+
+        return RtcProducerProfile.from_legacy_execution_profile(self)
 
 
 RTC_3C_VIRTUAL_SHADOW_PROFILE_V1 = PolicyAsyncExecutionProfile(

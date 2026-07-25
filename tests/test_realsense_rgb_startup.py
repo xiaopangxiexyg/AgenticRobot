@@ -127,7 +127,7 @@ def test_realsense_startup_resets_and_warms_up_front_without_depth() -> None:
     assert fake_rs.last_config.device == "FRONT123"
     assert fake_rs.last_config.streams == [("color", 640, 480, "yuyv", 15)]
     assert pipeline.stop_calls == 1
-    assert pipeline.wait_timeouts == [1000, 1000, 1000]
+    assert pipeline.wait_timeouts == [5000, 5000, 5000]
     sleep_mock.assert_called_once_with(0.2)
 
 
@@ -292,7 +292,7 @@ def test_realsense_startup_aborts_warmup_after_timeout_threshold() -> None:
     with pytest.raises(RuntimeError, match="no_frames_after=10"):
         source._start_pipeline(fake_rs)
 
-    assert fake_rs.pipelines[0].wait_timeouts == [1000, 1000, 1000]
+    assert fake_rs.pipelines[0].wait_timeouts == [5000, 5000, 5000]
 
 
 def test_realsense_warmup_honours_shutdown_request() -> None:
@@ -317,6 +317,9 @@ def test_realsense_startup_reset_defaults_are_serialized() -> None:
     payload = RealSenseRGBCameraConfig(serial="ABC").to_dict()
 
     assert payload["color_format"] == "yuyv"
+    assert payload["wait_timeout_ms"] == 1000
+    assert payload["startup_wait_timeout_ms"] == 5000
+    assert payload["startup_frame_grace_sec"] == 5.0
     assert payload["startup_reset"] is True
     assert payload["restart_on_runtime_error"] is True
     assert payload["startup_reset_sleep_sec"] == 0.2
@@ -363,6 +366,7 @@ def test_realsense_frame_timeouts_mark_stale_and_request_restart() -> None:
             camera_key="left_wrist",
             enable_depth=True,
             stale_after_sec=0.01,
+            startup_frame_grace_sec=0.0,
             restart_after_timeouts=2,
             restart_on_stale_timeout=True,
         )
@@ -402,6 +406,31 @@ def test_realsense_frame_timeout_before_stale_is_runtime_warning_only() -> None:
     assert info["consecutive_timeout_count"] == 1
     assert info["last_error"] is None
     assert message in str(info["last_runtime_error"])
+
+
+def test_realsense_first_frame_grace_suppresses_restart_before_startup_deadline() -> None:
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            stale_after_sec=0.01,
+            startup_frame_grace_sec=5.0,
+            restart_after_timeouts=1,
+            restart_on_stale_timeout=True,
+        )
+    )
+    with source._lock:
+        source._started_at = time.time()
+
+    message = "frame didn't arrive within 1000ms"
+    assert source._set_transient_or_stale_timeout_error(message) is False
+    info = source.device_info()
+    assert info["timeout_count"] == 1
+    assert info["consecutive_timeout_count"] == 1
+    assert info["last_error"] is None
+
+    with source._lock:
+        source._started_at = time.time() - 6.0
+    assert source._set_transient_or_stale_timeout_error(message) is True
 
 
 def test_realsense_classifies_disconnect_errors_for_pipeline_restart() -> None:

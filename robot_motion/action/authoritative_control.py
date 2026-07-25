@@ -66,6 +66,8 @@ from .authoritative_trace import (
     project_authority_event,
     project_candidate_authorization_admission,
     project_command,
+    project_compound_authority_failure,
+    project_conservative_compound_authority_profile,
     project_dispatch_permit_validation,
     project_dispatch_owner_validation,
     project_dispatch_receipts,
@@ -82,6 +84,7 @@ from .authoritative_trace import (
     project_shared_safety_result,
 )
 from .components import ActionComponentCatalog
+from .compound_authority import ConservativeCompoundAuthorityProfile
 from .dispatch_context import (
     AuthoritativeCommandDispatchContext,
     AuthoritativeReceiverStateSnapshot,
@@ -137,6 +140,9 @@ class AuthoritativeControlConfig:
     initial_execution_epoch: int = 0
     initial_control_mode: str = "policy"
     defer_selected_segment_activation: bool = False
+    compound_authority_profiles: tuple[
+        ConservativeCompoundAuthorityProfile, ...
+    ] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -179,6 +185,27 @@ class AuthoritativeControlConfig:
         if any(not value for value in kinds):
             raise ValueError("required authorization producer kinds must be non-empty.")
         object.__setattr__(self, "required_authorization_producer_kinds", kinds)
+        profiles = tuple(self.compound_authority_profiles)
+        if any(
+            not isinstance(profile, ConservativeCompoundAuthorityProfile)
+            for profile in profiles
+        ):
+            raise TypeError(
+                "compound_authority_profiles must contain only "
+                "ConservativeCompoundAuthorityProfile values."
+            )
+        producer_ids = tuple(profile.producer_id for profile in profiles)
+        if len(producer_ids) != len(set(producer_ids)):
+            raise ValueError(
+                "Only one compound authority profile may bind each producer."
+            )
+        for profile in profiles:
+            profile.validate_runtime_binding(
+                component_catalog=self.component_catalog,
+                active_selection_groups=groups,
+                authority_policy=self.authority_policy,
+            )
+        object.__setattr__(self, "compound_authority_profiles", profiles)
 
 
 @dataclass(frozen=True)
@@ -374,6 +401,11 @@ class AuthoritativeControlRuntime:
         self._previous_selection_by_group: dict[str, str] = {}
         self._facts: list[ControlTraceFact] = []
         self._terminal = False
+        self._compound_authority_profile_by_producer = {
+            profile.producer_id: profile
+            for profile in config.compound_authority_profiles
+        }
+        self._compound_authority_profiles_recorded = False
 
     @staticmethod
     def _validate_injected_dispatch_owner(
@@ -784,13 +816,52 @@ class AuthoritativeControlRuntime:
             admitted.append(fact)
         self._emit(admitted)
 
+    def record_compound_authority_profiles(self) -> tuple[ControlTraceFact, ...]:
+        """Record configured profile identities once before authoritative use."""
+
+        if self._compound_authority_profiles_recorded:
+            return ()
+        occurred_at = float(self.clock())
+        facts = tuple(
+            project_conservative_compound_authority_profile(
+                self.trace_context,
+                profile,
+                occurred_at=occurred_at,
+            )
+            for profile in self.config.compound_authority_profiles
+        )
+        self._emit(facts)
+        self._compound_authority_profiles_recorded = True
+        return facts
+
     def admit_proposal(
         self,
         draft: ActionProposalDraft,
         *,
         source_event_id: str,
     ) -> ProposalAdmissionReceipt:
-        receipt = self.proposals.admit(draft)
+        compound_profile = self._compound_authority_profile_by_producer.get(
+            draft.producer_id
+        )
+        compound_rejection = (
+            None
+            if compound_profile is None
+            else compound_profile.validate_proposal_draft(
+                draft,
+                component_catalog=self.config.component_catalog,
+            )
+        )
+        if compound_rejection is None:
+            receipt = self.proposals.admit(draft)
+        else:
+            receipt = ProposalAdmissionReceipt(
+                accepted=False,
+                rejection_code="compound_authority_scope_mismatch",
+                message=(
+                    "Conservative compound authority rejected a non-atomic "
+                    f"proposal: {compound_rejection}."
+                ),
+            )
         self._emit(
             project_proposal_admission(
                 self.trace_context,
@@ -800,6 +871,40 @@ class AuthoritativeControlRuntime:
             )
         )
         return receipt
+
+    def _compound_profile_for_decision(
+        self,
+        decision: AuthoritativeArbitrationDecision,
+    ) -> ConservativeCompoundAuthorityProfile | None:
+        selected_ids = set(dict(decision.selected_by_group).values())
+        if len(selected_ids) != 1:
+            return None
+        proposal = self.proposals.get(next(iter(selected_ids)))
+        if proposal is None:
+            return None
+        profile = self._compound_authority_profile_by_producer.get(
+            proposal.producer_id
+        )
+        if profile is None:
+            return None
+        if set(decision.selected_by_group) != set(profile.selection_groups):
+            return None
+        return profile
+
+    def _compound_failure_fact(
+        self,
+        profile: ConservativeCompoundAuthorityProfile,
+        *,
+        stage: str,
+        source_event_ids: tuple[str, ...],
+    ) -> ControlTraceFact:
+        return project_compound_authority_failure(
+            self.trace_context,
+            profile,
+            stage=stage,
+            source_event_ids=source_event_ids,
+            occurred_at=float(self.clock()),
+        )
 
     def admit_replay_candidate_authorization(
         self,
@@ -1171,10 +1276,56 @@ class AuthoritativeControlRuntime:
                 trace_facts=tuple(step_facts),
             )
 
-        safety_result = self.shared_safety(
-            decision.selected_action,
-            decision.decision_id,
-        )
+        compound_profile = self._compound_profile_for_decision(decision)
+        try:
+            safety_result = self.shared_safety(
+                decision.selected_action,
+                decision.decision_id,
+            )
+        except Exception:
+            if compound_profile is None:
+                raise
+            failure_fact = self._compound_failure_fact(
+                compound_profile,
+                stage="shared_safety_exception",
+                source_event_ids=(
+                    computation.result_id,
+                    publication_attempt.publication_attempt_id,
+                    directive.directive_id,
+                ),
+            )
+            step_facts.append(failure_fact)
+            (
+                cancellation,
+                cancellation_receipt,
+                cancellation_validation,
+                cancellation_facts,
+            ) = self._cancel_execution(
+                reason="hold",
+                authority_epoch=decision.authority_epoch,
+                selection_group_ids=self.config.active_selection_groups,
+                source_event_ids=(
+                    computation.result_id,
+                    publication_attempt.publication_attempt_id,
+                    directive.directive_id,
+                    failure_fact.fact_id,
+                ),
+                force_domain_scope=True,
+            )
+            step_facts.extend(cancellation_facts)
+            self._emit(step_facts)
+            return AuthoritativeControlStep(
+                status="compound_safety_exception_hold",
+                snapshot=snapshot,
+                computation=computation,
+                publication_attempt=publication_attempt,
+                decision=decision,
+                directive=directive,
+                cancellation=cancellation,
+                cancellation_receipt=cancellation_receipt,
+                cancellation_dispatch_validation=cancellation_validation,
+                trace_facts=tuple(step_facts),
+            )
         if safety_result.input_action_id != decision.decision_id:
             raise ValueError("Shared safety result does not reference this decision action.")
         safety_id, safety_fact = project_shared_safety_result(
@@ -1237,7 +1388,106 @@ class AuthoritativeControlRuntime:
                 trace_facts=tuple(step_facts),
             )
 
-        command = self.resolver.resolve(safety_result.safe_action)
+        if compound_profile is not None:
+            expected_effectors = tuple(
+                component.effector_name
+                for component in self.config.component_catalog.components
+            )
+            if (
+                tuple(safety_result.safe_action.active_effectors)
+                != expected_effectors
+            ):
+                failure_fact = self._compound_failure_fact(
+                    compound_profile,
+                    stage="safe_action_scope_mismatch",
+                    source_event_ids=(
+                        computation.result_id,
+                        directive.directive_id,
+                        safety_id,
+                    ),
+                )
+                step_facts.append(failure_fact)
+                (
+                    cancellation,
+                    cancellation_receipt,
+                    cancellation_validation,
+                    cancellation_facts,
+                ) = self._cancel_execution(
+                    reason="hold",
+                    authority_epoch=decision.authority_epoch,
+                    selection_group_ids=self.config.active_selection_groups,
+                    source_event_ids=(
+                        computation.result_id,
+                        publication_attempt.publication_attempt_id,
+                        directive.directive_id,
+                        safety_id,
+                        failure_fact.fact_id,
+                    ),
+                    force_domain_scope=True,
+                )
+                step_facts.extend(cancellation_facts)
+                self._emit(step_facts)
+                return AuthoritativeControlStep(
+                    status="compound_safety_scope_hold",
+                    snapshot=snapshot,
+                    computation=computation,
+                    publication_attempt=publication_attempt,
+                    decision=decision,
+                    directive=directive,
+                    safety_result=safety_result,
+                    cancellation=cancellation,
+                    cancellation_receipt=cancellation_receipt,
+                    cancellation_dispatch_validation=cancellation_validation,
+                    trace_facts=tuple(step_facts),
+                )
+        try:
+            command = self.resolver.resolve(safety_result.safe_action)
+        except Exception:
+            if compound_profile is None:
+                raise
+            failure_fact = self._compound_failure_fact(
+                compound_profile,
+                stage="resolution_failure",
+                source_event_ids=(
+                    computation.result_id,
+                    directive.directive_id,
+                    safety_id,
+                ),
+            )
+            step_facts.append(failure_fact)
+            (
+                cancellation,
+                cancellation_receipt,
+                cancellation_validation,
+                cancellation_facts,
+            ) = self._cancel_execution(
+                reason="hold",
+                authority_epoch=decision.authority_epoch,
+                selection_group_ids=self.config.active_selection_groups,
+                source_event_ids=(
+                    computation.result_id,
+                    publication_attempt.publication_attempt_id,
+                    directive.directive_id,
+                    safety_id,
+                    failure_fact.fact_id,
+                ),
+                force_domain_scope=True,
+            )
+            step_facts.extend(cancellation_facts)
+            self._emit(step_facts)
+            return AuthoritativeControlStep(
+                status="compound_resolution_failure_hold",
+                snapshot=snapshot,
+                computation=computation,
+                publication_attempt=publication_attempt,
+                decision=decision,
+                directive=directive,
+                safety_result=safety_result,
+                cancellation=cancellation,
+                cancellation_receipt=cancellation_receipt,
+                cancellation_dispatch_validation=cancellation_validation,
+                trace_facts=tuple(step_facts),
+            )
         created_at = float(self.clock())
         command_id, _command_hash, command_fact = project_command(
             self.trace_context,
@@ -1354,6 +1604,43 @@ class AuthoritativeControlRuntime:
         backend_accepted = bool(receipts) and set(command.commands).issubset(receipts) and all(
             item.accepted for item in receipts.values()
         )
+        cancellation = None
+        cancellation_receipt = None
+        cancellation_validation = None
+        if compound_profile is not None and not (
+            validation.accepted and backend_accepted
+        ):
+            failure_sources = tuple(
+                value
+                for value in (
+                    computation.result_id,
+                    publication_attempt.publication_attempt_id,
+                    directive.directive_id,
+                    safety_id,
+                    command_id,
+                    dispatch_receipt_id,
+                )
+                if value is not None
+            )
+            failure_fact = self._compound_failure_fact(
+                compound_profile,
+                stage="downstream_admission_failure",
+                source_event_ids=failure_sources,
+            )
+            step_facts.append(failure_fact)
+            (
+                cancellation,
+                cancellation_receipt,
+                cancellation_validation,
+                cancellation_facts,
+            ) = self._cancel_execution(
+                reason="hold",
+                authority_epoch=decision.authority_epoch,
+                selection_group_ids=self.config.active_selection_groups,
+                source_event_ids=(*failure_sources, failure_fact.fact_id),
+                force_domain_scope=True,
+            )
+            step_facts.extend(cancellation_facts)
         if validation.accepted and backend_accepted:
             for group, group_directive in directive.directive_by_selection_group.items():
                 if group_directive.directive != "publish_selected":
@@ -1380,6 +1667,8 @@ class AuthoritativeControlRuntime:
             status=(
                 "dispatched"
                 if validation.accepted and backend_accepted
+                else "compound_downstream_failure_hold"
+                if cancellation is not None
                 else "dispatch_failed"
                 if validation.accepted
                 else "dispatch_rejected"
@@ -1396,6 +1685,9 @@ class AuthoritativeControlRuntime:
             dispatch_receipts=receipts,
             command_id=command_id,
             dispatch_receipt_id=dispatch_receipt_id,
+            cancellation=cancellation,
+            cancellation_receipt=cancellation_receipt,
+            cancellation_dispatch_validation=cancellation_validation,
             trace_facts=tuple(step_facts),
         )
 

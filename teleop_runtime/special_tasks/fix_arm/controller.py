@@ -53,7 +53,7 @@ class _RecalibrationState:
 @dataclass
 class _PassiveHomeCache:
     stability: HomeCaptureStabilityState = field(
-        default_factory=HomeCaptureStabilityState
+        default_factory=HomeCaptureStabilityState.transition_profile
     )
     pose: np.ndarray | None = None
     source_timestamp: float = 0.0
@@ -483,6 +483,11 @@ class FixArmCommandController:
             min_samples=max(1, int(min_samples)),
         )
         if transition.ok:
+            # Two-pedal handoffs use a bounded transition profile.  Regular
+            # C/Home recapture keeps the strict default profile.
+            self._recalibration.stability = (
+                HomeCaptureStabilityState.transition_profile()
+            )
             self._post_recalibration_fixed_side = target
             self._two_pedal_transition_pending = True
             cache = self._passive_home_cache.get(current)
@@ -493,6 +498,15 @@ class FixArmCommandController:
                 and 0.0 <= float(now) - float(cache.source_timestamp) <= 0.5
             ):
                 self._recalibration.samples = [cache.pose.copy()]
+                # The passive cache has already passed the stillness dwell.
+                # Carry its stability state into the active capture so the
+                # transition can commit on the next fresh sample instead of
+                # waiting for a duplicate dwell window.
+                self._recalibration.stability.prime_from_stable_sample(
+                    cache.pose,
+                    source_timestamp=float(cache.source_timestamp),
+                    reason="stable_home_cache_reused",
+                )
             target_text = target or "live"
             if self._recalibration.samples:
                 self._status_message = (

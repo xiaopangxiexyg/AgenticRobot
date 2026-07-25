@@ -7,6 +7,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from control_composition.activation import (
+    ACTIVATION_LOCAL_STRICT_SOURCE_FRESHNESS_POLICY_V2,
+    build_composition_activation_scope,
+    evaluate_composition_input_activation,
+)
 from control_composition.composition import (
     CompositionAuthorityGateSpec,
     CompositionInputDraft,
@@ -237,6 +242,271 @@ def test_internal_inputs_are_not_authority_candidates_and_only_composite_is_prop
     assert proposal.composition_spec_hash == result.composition_spec_hash
     assert proposal.semantic_hash_domain == ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V2
     assert proposal.context_ids == ("slow-context-7",)
+
+
+def test_unscoped_v1_composition_hashes_remain_compatible() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    receipt = store.admit(
+        input_draft(
+            producer="slow-base",
+            role="base",
+            action=qpos_action(0.1),
+        )
+    )
+    assert receipt.accepted
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    spec = residual_spec()
+    snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+    result = DeterministicComposer().compose(snapshot, spec=spec)
+
+    assert receipt.semantic_content_hash == (
+        "bf3aaee5b15ae1150823bb40494187789175cd520fda37916c304e2a36813734"
+    )
+    assert snapshot.semantic_content_hash == (
+        "9a8cbe7d83088554c9b192154d04df2698cd3c4b99000de8592ac49117ecf8be"
+    )
+    assert result.semantic_content_hash == (
+        "b83a57d777de2d671a467abed0cbb833b481474f54e475d30101bf8d6e501d4e"
+    )
+    assert snapshot.expected_activation_id is None
+    assert result.composition_activation_id is None
+
+
+def test_activation_v2_excludes_unbound_and_prior_activation_inputs() -> None:
+    clock, coordinator, epochs, store, _, _ = runtime()
+    old = store.admit(
+        input_draft(
+            producer="slow-base",
+            role="base",
+            action=qpos_action(0.1),
+        )
+    )
+    assert old.accepted
+    clock.value = 10.2
+    spec = CompositionSpec(
+        spec_id="activation-local-component-union-v2",
+        algebra="component_union",
+        input_roles=("base",),
+        required_roles=("base",),
+    )
+    activation = build_composition_activation_scope(
+        operation_spec_id="composition-session-spec:test",
+        operation_spec_hash="operation-spec-hash:test",
+        session_epoch=1,
+        activated_at=10.2,
+        clock_domain_id="control.monotonic",
+        input_barrier_at=10.1,
+        required_roles=spec.required_roles,
+    )
+    bound_draft = replace(
+        input_draft(
+            producer="slow-base",
+            role="base",
+            action=qpos_action(0.2),
+            sequence=1,
+        ),
+        produced_at=10.2,
+        effective_from=10.2,
+        effective_until=11.2,
+        composition_activation_id=activation.activation_id,
+        composition_activation_hash=activation.semantic_content_hash,
+    )
+    bound = store.admit(bound_draft)
+    assert bound.accepted
+    assert bound.semantic_content_hash != old.semantic_content_hash
+    cut = coordinator.capture_cut(cutoff_at=10.2).cut
+    snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+        activation_scope=activation,
+    )
+    assert snapshot.selected_input_by_role["base"].composition_input_id == (
+        bound.composition_input_id
+    )
+    assert snapshot.expected_activation_id == activation.activation_id
+    result = DeterministicComposer().compose(snapshot, spec=spec)
+    assert result.composition_activation_id == activation.activation_id
+    assert result.composition_activation_hash == activation.semantic_content_hash
+
+    next_activation = build_composition_activation_scope(
+        operation_spec_id=activation.operation_spec_id,
+        operation_spec_hash=activation.operation_spec_hash,
+        session_epoch=2,
+        activated_at=10.2,
+        clock_domain_id=activation.clock_domain_id,
+        input_barrier_at=10.1,
+        required_roles=spec.required_roles,
+    )
+    assert next_activation.activation_id != activation.activation_id
+    missing = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+        activation_scope=next_activation,
+    )
+    assert missing.selected_input_by_role == {}
+    assert missing.missing_roles == ("base",)
+    blocked = DeterministicComposer().compose(missing, spec=spec)
+    assert blocked.output_status == "no_action"
+    assert blocked.reason == "missing_required:base"
+
+
+def test_activation_freshness_is_receiver_local_and_strict_source_is_same_clock() -> None:
+    receiver_scope = build_composition_activation_scope(
+        operation_spec_id="composition-session-spec:freshness",
+        operation_spec_hash="operation-spec-hash:freshness",
+        session_epoch=0,
+        activated_at=10.0,
+        clock_domain_id="control.monotonic",
+        input_barrier_at=10.0,
+        required_roles=("base",),
+    )
+    receiver_local = evaluate_composition_input_activation(
+        receiver_scope,
+        composition_activation_id=receiver_scope.activation_id,
+        composition_activation_hash=receiver_scope.semantic_content_hash,
+        produced_at=1.0,
+        produced_clock_domain_id="producer.monotonic",
+        available_at=10.0,
+        available_clock_domain_id="control.monotonic",
+        effective_from=10.0,
+        effective_clock_domain_id="control.monotonic",
+    )
+    assert receiver_local.accepted
+
+    stale_effective = evaluate_composition_input_activation(
+        receiver_scope,
+        composition_activation_id=receiver_scope.activation_id,
+        composition_activation_hash=receiver_scope.semantic_content_hash,
+        produced_at=10.1,
+        produced_clock_domain_id="control.monotonic",
+        available_at=10.1,
+        available_clock_domain_id="control.monotonic",
+        effective_from=9.99,
+        effective_clock_domain_id="control.monotonic",
+    )
+    assert not stale_effective.accepted
+    assert (
+        stale_effective.rejection_code
+        == "activation_effective_barrier_violation"
+    )
+
+    strict_scope = build_composition_activation_scope(
+        operation_spec_id=receiver_scope.operation_spec_id,
+        operation_spec_hash=receiver_scope.operation_spec_hash,
+        session_epoch=1,
+        activated_at=10.0,
+        clock_domain_id=receiver_scope.clock_domain_id,
+        input_barrier_at=10.0,
+        required_roles=receiver_scope.required_roles,
+        freshness_policy=(
+            ACTIVATION_LOCAL_STRICT_SOURCE_FRESHNESS_POLICY_V2
+        ),
+    )
+    cross_clock = evaluate_composition_input_activation(
+        strict_scope,
+        composition_activation_id=strict_scope.activation_id,
+        composition_activation_hash=strict_scope.semantic_content_hash,
+        produced_at=10.1,
+        produced_clock_domain_id="producer.monotonic",
+        available_at=10.1,
+        available_clock_domain_id="control.monotonic",
+        effective_from=10.1,
+        effective_clock_domain_id="control.monotonic",
+    )
+    assert not cross_clock.accepted
+    assert cross_clock.rejection_code == "activation_source_clock_mismatch"
+
+    on_barrier = evaluate_composition_input_activation(
+        strict_scope,
+        composition_activation_id=strict_scope.activation_id,
+        composition_activation_hash=strict_scope.semantic_content_hash,
+        produced_at=10.0,
+        produced_clock_domain_id="control.monotonic",
+        available_at=10.0,
+        available_clock_domain_id="control.monotonic",
+        effective_from=10.0,
+        effective_clock_domain_id="control.monotonic",
+    )
+    assert not on_barrier.accepted
+    assert on_barrier.rejection_code == "activation_source_barrier_violation"
+
+
+def test_activation_freshness_is_enforced_by_generic_input_admission() -> None:
+    _, coordinator, _, store, _, _ = runtime()
+    receiver_scope = build_composition_activation_scope(
+        operation_spec_id="composition-session-spec:store-freshness",
+        operation_spec_hash="operation-spec-hash:store-freshness",
+        session_epoch=0,
+        activated_at=10.0,
+        clock_domain_id="control.monotonic",
+        input_barrier_at=10.0,
+        required_roles=("base",),
+    )
+    receiver_local = store.admit(
+        replace(
+            input_draft(
+                producer="slow-base",
+                role="base",
+                action=qpos_action(0.05),
+            ),
+            produced_at=1.0,
+            produced_clock_domain_id="producer.monotonic",
+            composition_activation_id=receiver_scope.activation_id,
+            composition_activation_hash=(
+                receiver_scope.semantic_content_hash
+            ),
+        ),
+        activation_scope=receiver_scope,
+    )
+    assert receiver_local.accepted
+
+    scope = build_composition_activation_scope(
+        operation_spec_id="composition-session-spec:store-freshness",
+        operation_spec_hash="operation-spec-hash:store-freshness",
+        session_epoch=1,
+        activated_at=10.0,
+        clock_domain_id="control.monotonic",
+        input_barrier_at=10.0,
+        required_roles=("base",),
+        freshness_policy=(
+            ACTIVATION_LOCAL_STRICT_SOURCE_FRESHNESS_POLICY_V2
+        ),
+    )
+    draft = replace(
+        input_draft(
+            producer="slow-base",
+            role="base",
+            action=qpos_action(0.1),
+        ),
+        produced_at=10.0,
+        produced_clock_domain_id="control.monotonic",
+        composition_activation_id=scope.activation_id,
+        composition_activation_hash=scope.semantic_content_hash,
+    )
+
+    rejected = store.admit(draft, activation_scope=scope)
+
+    assert not rejected.accepted
+    assert rejected.rejection_code == "activation_source_barrier_violation"
+    assert coordinator.committed_high_watermark == 4
+    assert len(store) == 1
+
+    fresh = store.admit(
+        replace(draft, produced_at=10.01),
+        activation_scope=scope,
+    )
+    assert fresh.accepted
+    assert coordinator.committed_high_watermark == 5
+    assert len(store) == 2
 
 
 def test_snapshot_is_immutable_and_late_residual_only_changes_next_cut() -> None:
@@ -877,6 +1147,9 @@ def test_input_snapshot_closes_time_window_without_losing_sequence_tombstone() -
     assert health.retained_record_count == 0
     assert health.pruned_record_count == 1
     assert health.producer_epoch_tombstone_count == 1
+    assert selected.selected_input_by_role["base"].action.action_space == (
+        BIMANUAL_QPOS_V1
+    )
 
     duplicate = store.admit(
         replace(

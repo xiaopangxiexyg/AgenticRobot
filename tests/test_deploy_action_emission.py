@@ -160,6 +160,7 @@ def test_one_queue_pop_creates_one_immutable_emission_and_peek_is_passive() -> N
     )
     assert step0.emission_error is None
     assert step0.emission is not None
+    assert step0.emission.source_binding_hash is None
     assert step0.raw_lookahead_action is not None
     assert runtime.action_queue_pop_count() == 1
     assert step0.emission.queue_pop_count == 1

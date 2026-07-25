@@ -23,7 +23,7 @@ from control_composition.composition import (
     CompositionResult,
     CompositionSpec,
 )
-from control_composition.trace import (
+from dataset_interface.composition_control_trace import (
     project_composition_input as _project_composition_input,
     project_composition_input_admission as _project_composition_input_admission,
     project_composition_input_snapshot as _project_composition_input_snapshot,
@@ -467,7 +467,7 @@ def project_composition_spec(
     occurred_at: float,
     clock_domain_id: str,
 ) -> ControlTraceFact:
-    """Compatibility projection; canonical implementation lives in the package."""
+    """Compatibility projection; implementation lives in the dataset adapter."""
 
     return _project_composition_spec(
         AuthoritativeTraceContext(

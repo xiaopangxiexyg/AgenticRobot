@@ -59,6 +59,12 @@ authority. OpenPI satisfies this structural protocol directly, without a
 registry entry or a framework-name branch. A local Torch policy, HTTP service,
 IPC process or another model server can expose the same four pieces.
 
+New integrations should use the canonical aliases
+`build_rtc_model_producer_runtime()` and
+`rtc_producer_config_from_model_adapter()`.  The existing
+Shadow/Frontend names remain identical callable compatibility surfaces; this
+is a naming migration, not a second runtime or producer.
+
 For a sessionless local/HTTP/IPC runtime, `SimpleRtcModelRuntimeAdapter`
 packages the four pieces directly, so no adapter subclass is necessary.
 Frameworks that need reconnect, metadata refresh or worker-session setup

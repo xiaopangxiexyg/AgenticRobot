@@ -182,6 +182,14 @@ class FixArmCommandControllerTests(unittest.TestCase):
             ).ok
         )
         self.assertEqual(controller.sample_count, 1)
+        controller.observe_recalibration_sample(
+            pose,
+            source_timestamp=1.40,
+        )
+        self.assertEqual(
+            controller.recalibration_stability_reason,
+            "stable_tracker_sample_accepted",
+        )
 
     def test_single_arm_mode_caches_both_sides_for_immediate_followup_switch(self) -> None:
         controller = _controller("right")

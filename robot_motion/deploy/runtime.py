@@ -18,6 +18,7 @@ from robot_motion.runtime.immutable import deep_freeze
 from .actions import ActionChunkBuffer, NormalizedAction, normalize_policy_output
 from .action_adapter import (
     DeployActionRepresentationReceipt,
+    DeployRobotActionAdapter,
     DeployRobotActionAdapterResult,
 )
 from .chunk import ActionChunkExecutionPolicy
@@ -262,9 +263,16 @@ class PolicyActionEmission:
     queue_pop_count: int
     semantic_content_hash: str
     canonical_action: CanonicalPolicyAction | None = None
+    source_binding_hash: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "pre_safety_faults", tuple(self.pre_safety_faults))
+        source_binding_hash = self.source_binding_hash
+        if source_binding_hash is not None:
+            source_binding_hash = str(source_binding_hash).strip()
+            if not source_binding_hash:
+                raise ValueError("source_binding_hash must be non-empty when supplied.")
+            object.__setattr__(self, "source_binding_hash", source_binding_hash)
         if (self.decoded_absolute_action is None) == (self.canonical_action is None):
             raise ValueError(
                 "A policy action emission must carry exactly one action payload."
@@ -554,6 +562,22 @@ class PolicyChunkPredictionResult:
 
 
 @dataclass(frozen=True)
+class PolicyActionEmissionResult:
+    """One formally emitted action before any downstream preparation."""
+
+    raw_action: NormalizedAction | None = None
+    emission: PolicyActionEmission | None = None
+    emission_error: BaseException | None = None
+    queue_len_before: int = 0
+    queue_len_after: int = 0
+    canonical_action: CanonicalPolicyAction | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "queue_len_before", int(self.queue_len_before))
+        object.__setattr__(self, "queue_len_after", int(self.queue_len_after))
+
+
+@dataclass(frozen=True)
 class PolicyActionPreparationResult:
     """One queued action after the shared canonical preparation boundary."""
 
@@ -757,18 +781,63 @@ class PolicyDeployRuntime:
         plan_keyframe_count_after: int,
         plan_pop_count: int,
     ) -> PolicyActionPreparationResult:
-        """Prepare one already-popped RTC keyframe through the formal emission seam.
+        """Compatibility composition of emission and downstream preparation.
 
         This method never reads or mutates the legacy ``ActionChunkBuffer`` and
-        deliberately exposes no passive successor.  The returned
-        ``PolicyActionEmission`` is the same typed admission fact used by the
-        synchronous queue path.
+        deliberately exposes no passive successor.  New asynchronous producers
+        call ``emit_timed_action_keyframe`` and leave this second stage to the
+        embedding application.
         """
+
+        emission_adapter = getattr(preparer, "action_adapter", None)
+        if emission_adapter is not None and not isinstance(
+            emission_adapter,
+            DeployRobotActionAdapter,
+        ):
+            raise TypeError(
+                "preparer.action_adapter must be DeployRobotActionAdapter."
+            )
+        emission_result = self.emit_timed_action_keyframe(
+            keyframe,
+            observation,
+            emission_adapter=emission_adapter,
+            policy_name=policy_name,
+            plan_keyframe_count_before=plan_keyframe_count_before,
+            plan_keyframe_count_after=plan_keyframe_count_after,
+            plan_pop_count=plan_pop_count,
+        )
+        return self.prepare_emission_result(
+            emission_result,
+            observation,
+            preparer=preparer,
+            policy_name=policy_name,
+        )
+
+    def emit_timed_action_keyframe(
+        self,
+        keyframe: TimedPolicyActionKeyframe,
+        observation: DeploymentObservation,
+        *,
+        emission_adapter: DeployRobotActionAdapter | None,
+        policy_name: str = "",
+        plan_keyframe_count_before: int,
+        plan_keyframe_count_after: int,
+        plan_pop_count: int,
+        source_binding_hash: str | None = None,
+    ) -> PolicyActionEmissionResult:
+        """Formally emit one popped keyframe without preparing any target."""
 
         if not isinstance(keyframe, TimedPolicyActionKeyframe):
             raise TypeError("keyframe must be TimedPolicyActionKeyframe.")
         if not isinstance(observation, DeploymentObservation):
             raise TypeError("observation must be DeploymentObservation.")
+        if emission_adapter is not None and not isinstance(
+            emission_adapter,
+            DeployRobotActionAdapter,
+        ):
+            raise TypeError(
+                "emission_adapter must be DeployRobotActionAdapter or None."
+            )
         before = int(plan_keyframe_count_before)
         after = int(plan_keyframe_count_after)
         pop_count = int(plan_pop_count)
@@ -785,32 +854,12 @@ class PolicyDeployRuntime:
                 plan_keyframe_count_before=before,
                 plan_keyframe_count_after=after,
                 plan_pop_count=pop_count,
+                source_binding_hash=source_binding_hash,
             )
-            prepare_canonical = getattr(preparer, "prepare_canonical", None)
-            prepared_action = None
-            emission_error: BaseException | None = None
-            if callable(prepare_canonical):
-                try:
-                    prepared_action = prepare_canonical(
-                        typed_action,
-                        observation,
-                        policy_name=policy_name,
-                        input_action_id=emission.emission_id,
-                        target_effective_at=keyframe.target_effective_at,
-                    )
-                except Exception as exc:  # noqa: BLE001 - typed path fails closed.
-                    emission_error = exc
-            else:
-                emission_error = RuntimeError(
-                    "Typed canonical preparation is unavailable; "
-                    "the formal emission remains no-action."
-                )
-            return PolicyActionPreparationResult(
+            return PolicyActionEmissionResult(
                 raw_action=None,
-                raw_lookahead_action=None,
-                prepared_action=prepared_action,
                 emission=emission,
-                emission_error=emission_error,
+                emission_error=None,
                 queue_len_before=before,
                 queue_len_after=after,
                 canonical_action=typed_action,
@@ -818,15 +867,26 @@ class PolicyDeployRuntime:
         assert raw_action is not None
         pre_safety: DeployRobotActionAdapterResult | None = None
         emission_error: BaseException | None = None
-        adapt_pre_safety = getattr(preparer, "adapt_pre_safety", None)
-        if callable(adapt_pre_safety):
+        if emission_adapter is None:
+            return PolicyActionEmissionResult(
+                raw_action=raw_action,
+                emission=None,
+                emission_error=RuntimeError(
+                    "Legacy decoded timed action requires a "
+                    "DeployRobotActionAdapter."
+                ),
+                queue_len_before=before,
+                queue_len_after=after,
+            )
+        else:
             try:
-                pre_safety = adapt_pre_safety(
+                pre_safety = emission_adapter.adapt(
                     raw_action,
                     observation,
                     policy_name=policy_name,
+                    input_stage="decoded_absolute_pre_safety",
                 )
-            except Exception as exc:  # noqa: BLE001 - passive tap matches sync seam.
+            except Exception as exc:  # noqa: BLE001 - formal emission fails closed.
                 emission_error = exc
                 pre_safety = None
         emission = None
@@ -837,23 +897,72 @@ class PolicyDeployRuntime:
                 plan_keyframe_count_before=before,
                 plan_keyframe_count_after=after,
                 plan_pop_count=pop_count,
+                source_binding_hash=source_binding_hash,
             )
         except Exception as exc:  # noqa: BLE001 - canonical prepare still reports faults.
             if emission_error is None:
                 emission_error = exc
-        prepared_action = preparer.prepare(
-            raw_action,
-            observation,
-            policy_name=policy_name,
+        return PolicyActionEmissionResult(
+            raw_action=raw_action,
+            emission=emission,
+            emission_error=emission_error,
+            queue_len_before=before,
+            queue_len_after=after,
         )
+
+    def prepare_emission_result(
+        self,
+        emission_result: PolicyActionEmissionResult,
+        observation: DeploymentObservation,
+        *,
+        preparer: ActionPreparer,
+        policy_name: str = "",
+    ) -> PolicyActionPreparationResult:
+        """Apply an embedding application's downstream preparation policy."""
+
+        if not isinstance(emission_result, PolicyActionEmissionResult):
+            raise TypeError("emission_result must be PolicyActionEmissionResult.")
+        if not isinstance(observation, DeploymentObservation):
+            raise TypeError("observation must be DeploymentObservation.")
+        prepared_action = None
+        preparation_error = emission_result.emission_error
+        emission = emission_result.emission
+        typed_action = emission_result.canonical_action
+        raw_action = emission_result.raw_action
+        if typed_action is not None:
+            if emission is not None and preparation_error is None:
+                prepare_canonical = getattr(preparer, "prepare_canonical", None)
+                if callable(prepare_canonical):
+                    try:
+                        prepared_action = prepare_canonical(
+                            typed_action,
+                            observation,
+                            policy_name=policy_name,
+                            input_action_id=emission.emission_id,
+                            target_effective_at=emission.target_effective_at,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - target path fails closed.
+                        preparation_error = exc
+                else:
+                    preparation_error = RuntimeError(
+                        "Typed canonical preparation is unavailable; "
+                        "the formal emission remains no-action."
+                    )
+        elif raw_action is not None:
+            prepared_action = preparer.prepare(
+                raw_action,
+                observation,
+                policy_name=policy_name,
+            )
         return PolicyActionPreparationResult(
             raw_action=raw_action,
             raw_lookahead_action=None,
             prepared_action=prepared_action,
             emission=emission,
-            emission_error=emission_error,
-            queue_len_before=before,
-            queue_len_after=after,
+            emission_error=preparation_error,
+            queue_len_before=emission_result.queue_len_before,
+            queue_len_after=emission_result.queue_len_after,
+            canonical_action=typed_action,
         )
 
     def _build_timed_action_emission(
@@ -864,6 +973,7 @@ class PolicyDeployRuntime:
         plan_keyframe_count_before: int,
         plan_keyframe_count_after: int,
         plan_pop_count: int,
+        source_binding_hash: str | None,
     ) -> PolicyActionEmission:
         observed_at = float(self._clock())
         if not math.isfinite(observed_at):
@@ -924,6 +1034,13 @@ class PolicyDeployRuntime:
             "queue_len_after": plan_keyframe_count_after,
             "queue_pop_count": plan_pop_count,
         }
+        if source_binding_hash is not None:
+            source_binding_hash = str(source_binding_hash).strip()
+            if not source_binding_hash:
+                raise ValueError(
+                    "source_binding_hash must be non-empty when supplied."
+                )
+            payload["source_binding_hash"] = source_binding_hash
         if typed_action is None:
             assert frozen_action is not None
             payload["decoded_absolute_action"] = {
@@ -973,6 +1090,7 @@ class PolicyDeployRuntime:
             queue_pop_count=plan_pop_count,
             semantic_content_hash=semantic_hash,
             canonical_action=typed_action,
+            source_binding_hash=source_binding_hash,
         )
 
     def _build_action_emission(

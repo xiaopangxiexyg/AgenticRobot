@@ -325,7 +325,7 @@ def _advance_station_to_authority(station) -> None:
             assert execution.completion_transition.accepted is True
 
 
-def test_cs2d_consumes_exact_external_rtc_step_without_owning_pop() -> None:
+def test_cs2d_consumes_bound_external_rtc_emission_without_owning_pop() -> None:
     clock = ManualClock()
     policy_runtime = _policy_runtime(clock)
     pipeline = _pipeline()
@@ -363,7 +363,7 @@ def test_cs2d_consumes_exact_external_rtc_step_without_owning_pop() -> None:
         emission = frontend_step.action_preparation.emission
         assert emission is not None
         pop_count = emission.queue_pop_count
-        submission = composition.submit_frontend_step(frontend_step)
+        submission = composition.submit_emission(emission)
         assert submission.accepted
         assert submission.source_emission is emission
         assert emission.queue_pop_count == pop_count
@@ -385,7 +385,7 @@ def test_cs2d_consumes_exact_external_rtc_step_without_owning_pop() -> None:
         )
         assert np.all(scene.physics_commands[-1]["right"] < 0.0)
 
-        with pytest.raises(RuntimeError, match="complete immutable RtcFrontendStep"):
+        with pytest.raises(ValueError, match="submitted only once"):
             composition.submit_emission(emission)
         with pytest.raises(ValueError, match="submitted only once"):
             composition.submit_frontend_step(frontend_step)
@@ -445,7 +445,9 @@ def test_cs2d_station_gates_downstream_without_owning_rtc_lifecycle() -> None:
             target_clock_origin=target_clock_origin,
         )
         pop_count = policy_runtime.action_queue_pop_count()
-        submission = station.submit_frontend_step(first)
+        first_emission = first.emission_result.emission
+        assert first_emission is not None
+        submission = station.submit_emission(first_emission)
         assert submission.accepted
         assert policy_runtime.action_queue_pop_count() == pop_count
         decision = station.step(now=clock(), physics_ticks_after_dispatch=12)
@@ -471,7 +473,7 @@ def test_cs2d_station_gates_downstream_without_owning_rtc_lifecycle() -> None:
         assert frontend.state.semantic_content_hash == producer_state_before_release
         with pytest.raises(RuntimeError, match="authority is not active"):
             station.submit_frontend_step(second)
-        with pytest.raises(RuntimeError, match="complete immutable RtcFrontendStep"):
+        with pytest.raises(RuntimeError, match="authority is not active"):
             station.submit_emission(second.action_preparation.emission)
     finally:
         frontend.close(now=clock())

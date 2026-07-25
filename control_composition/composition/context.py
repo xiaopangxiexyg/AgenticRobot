@@ -381,7 +381,11 @@ class CompositionContextSnapshot:
         return tuple(
             self.selected_context_by_channel[channel].to_strategy_view()
             for channel in self.required_channels
-            if channel in self.selected_context_by_channel
+            if (
+                channel in self.selected_context_by_channel
+                and self.selected_context_by_channel[channel].availability
+                == "available"
+            )
         )
 
 

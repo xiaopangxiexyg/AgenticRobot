@@ -1,8 +1,8 @@
 # DexTeleop 实时 Action Chunk 推理（RTC）落地计划
 
-状态：`OpenPI relative R-R2 live synthetic no-action complete / T2h final-chunk composition kit local complete / TX1 target compatibility pure complete / T3 raw-RTC caller default-off / R-R4 real observation no-action + drain passed / no-hardware-authorization`
+状态：`raw-RTC producer implemented / OpenPI final-chunk connected / R-R4 real observation no-action + drain passed / downstream target and HITL explicitly out of RTC scope / no-hardware-authorization`
 
-最后审计日期：2026-07-24
+最后审计日期：2026-07-25
 
 本文只规划 action-producing policy 的异步 chunk execution 与 flow/diffusion RTC。严格区分：raw-RTC 保持模型
 既有 `observation -> final action chunk` 接口，由客户端执行异步 timed-plan；model-RTC 才允许模型消费未来
@@ -10,7 +10,57 @@
 production entrypoint，不改变当前真机 dispatch owner，不授权任何设备动作，也不把 RTC 变成 M5.8/M6
 已有 gate 的隐含前提。
 
-## 当前实施状态（2026-07-24）
+### 2026-07-25 ownership correction
+
+raw-RTC 的正式终点冻结为 `PolicyActionEmission`。RTC 只拥有 request、worker、result、producer-plan
+admission、timed mutable plan、due-pop、emission commit、TTL/epoch/session 与 producer lifecycle；它不拥有
+proposal、Control Composition、Control Station、canonical safety、IK、reference、target admission、HOLD物理执行、
+dispatch或设备receipt。
+
+```text
+raw-RTC -> PolicyActionEmission
+             |-> ordinary deploy consumer
+             |-> optional control_composition contributor adapter
+             `-> passive trace/status observer
+```
+
+文中历史 `RTC-TX*` 名称只记录曾完成的下游兼容性探索，不再属于 raw-RTC gate。后续实现不得为了接入普通部署或HITL
+把target/composition receipt反向加入producer commit-through。
+
+### 本轮模块调整后的规划冻结
+
+本轮已完成的结构调整：
+
+- canonical RTC coordinator、frontend config/step及source binding统一归
+  `robot_motion.deploy.rtc_runtime`；`teleop_runtime.deploy.rtc_frontend`只保留import-compatible re-export；
+- 正式producer输出统一为`PolicyActionEmissionResult.emission`。`RtcFrontendStep.action_preparation`只是无lookahead、
+  无target preparation的兼容视图，完整step不再是下游必需契约；
+- `RtcPolicyEmissionSourceBinding`是唯一binding实现，既有Station/step binding名称只保持同一class identity的alias。
+  为避免无意义迁移，历史deploy v1 hash domain保持不变，不新增仅用于改名的v2；
+- RTC emission把exact epoch-scoped `source_binding_hash`纳入自身semantic hash；同步queue emission该字段保持
+  `None`，因此`sync_queue_v1`既有hash、顺序、pop count与lookahead行为不变；
+- production seam改为committed-only `RtcPolicyEmissionPublisher`；旧
+  `PolicyActionEmissionFanout`仅保留passive/debug兼容。完整
+  `RtcFrontendStepFanout`只允许debug/producer observability，不得重新进入Station、Composition或target正式数据面。
+
+据此，下一步只保留以下可落地gate：
+
+1. **R-B0 compatibility/evidence refresh：**固定旧import alias、历史hash domain、sync emission hash及
+   default-off/no-action矩阵；不改teleop/replay链路；
+2. **R-B1 cross-rearm binding rotation：**当前stable descriptor与epoch binding已分层，producer缓存candidate，
+   publisher拥有initial active binding；rearm后旧consumer会正确fail closed，并产生backend-neutral activation-readiness
+   receipt。publisher侧显式suspend、单required subscriber typed ACK、原子rebind/resume已实现；具体consumer自动协调、
+   timeout/restart与多subscriber ordered rotation仍未实现。
+   production fanout前需由lower RTC owner显式发布“旧binding→新epoch binding”的typed transition，并保证新binding
+   在该epoch首条emission前可见；Station/consumer不得自己递增epoch、复制config或猜hash；
+3. **D-P1 ordinary policy contributor adapter：**若主线需要policy参与多源composition，只在
+   `PolicyActionEmission`终点之后适配为普通composition input，保留emission/source lineage；不得把
+   `RtcFrontendStep`、worker、timed plan或model字段加入`control_composition`；
+4. **D-TX2/D-TX3/D-LA：**typed trace、target receiver、scheduled preview/lookahead继续是下游部署gate，不属于
+   RTC producer完成条件；immediate/current-only consumer不被D-LA阻塞；
+5. **RTC-4b-B：**model continuation仍是可选独立分支，不阻塞任何final-chunk raw-RTC provider。
+
+## 当前实施状态（2026-07-25）
 
 RTC-1 已按 deployment-only 边界形成第一版 local-only 实现：
 
@@ -84,8 +134,9 @@ RTC-3c 已把上述边界以显式、默认关闭的profile接入现有deploy ap
   dispatcher或position reference authority，也不写legacy deque；该模块不导入teleop、replay、Control Station、sim、
   hardware或任何model family；
 - `teleop_runtime/deploy/rtc_frontend.py`只保留兼容re-export，现有`run_policy`调用方和测试无需同时迁移；
-- `robot_motion/deploy/runtime.py`：新增already-popped timed keyframe preparation seam，复用现有
-  `PolicyActionEmission` schema、canonical pre-safety与prepare，不产生RTC专用第二种正式emission；
+- `robot_motion/deploy/runtime.py`：already-popped timed keyframe先经target-neutral emission seam形成现有
+  `PolicyActionEmission`；embedding application在RTC `step()`返回后才可选调用canonical preparation，不产生RTC专用
+  第二种正式emission，也不让RTC调用下游safety/target；
 - 正式emission成功后才以绑定同一pop receipt/emission identity的独立producer transition推进
   `producer_plan_committed_through`到当前已pop keyframe；future successor无法形成合法due-pop receipt（并保留
   `target_not_popped`防御检查），未emission successor持续保持mutable；
@@ -335,11 +386,11 @@ T2h 只提升“不同 final-chunk 模型框架接入 raw-RTC”的通用性，�
 T2h scoped evidence见
 [`todos/evidence/rtc/rtc_4b_t2h_raw_rtc_final_chunk_composition_local_evidence_v1.json`](evidence/rtc/rtc_4b_t2h_raw_rtc_final_chunk_composition_local_evidence_v1.json)。
 
-### 下一执行主线：source portability 与 target intersection 分轨收敛
+### 下游部署附录：不属于 RTC 完成门槛
 
 2026-07-24 对“OpenPI raw-RTC → canonical pose/hand → MuJoCo scheduled target”建议进行代码级复核后，保留其
-raw-RTC 定义、canonical pre-safety 边界、target acceptance 独立性、latency-aware coverage、protocol-smoke/visual-alignment
-分证据和跨 provider/target 验收方向，但不原样执行其阶段顺序。当前代码事实要求分为两轨：
+raw-RTC 定义、canonical pre-safety 边界、target acceptance 独立性、latency-aware coverage和跨 provider/target
+验收方向仍有参考价值，但target intersection是独立下游部署工作，不得再作为RTC阶段或完成度。当前代码事实分为：
 
 ```text
 S: model/source portability
@@ -352,7 +403,8 @@ T: target intersection
    -> early target admission
    -> scheduled pose+DMTAC target
 
-S + T -> OpenPI+MuJoCo raw-RTC shadow -> sim authority
+S -> raw-RTC producer portability
+T -> independent downstream deploy integration
 ```
 
 以下已有主线事实不得重复实现：
@@ -365,7 +417,7 @@ S + T -> OpenPI+MuJoCo raw-RTC shadow -> sim authority
   execution manifest/target contract；在首个 sim authority gate 前不先做三套 profile 的大范围重构；
 - Control Station 只组合已存在的 RTC source 与 target，不拥有 worker、plan、pop、canonicalizer 或 target safety。
 
-当前存在两个必须先闭合的真实阻塞：
+当前下游target接线存在两个必须先闭合的真实阻塞；它们不阻塞raw-RTC producer：
 
 1. typed `PolicyActionEmission` 已以 canonicalization receipt 表达 source representation，但现有 MuJoCo emission
    admission仍要求 legacy receipt；更早的阻塞是 `policy_action_emission` ControlTrace v1 使用精确字段集，typed payload
@@ -373,35 +425,35 @@ S + T -> OpenPI+MuJoCo raw-RTC shadow -> sim authority
    teleop/replay 已提交记录；
 2. 当前 keyframe 在 due-pop 时才形成唯一正式 emission，而 scheduled pose target 要求在生效前提交并满足 activation
    lead。仅增大 `first_target_effective_at` 无效，因为 submission 仍发生在 due 时刻；提前使用 future successor 又违反
-   RTC-3c A 的 no-lookahead/no-hidden-reference 决定。因此 scheduled pose+DMTAC 必须等待 RTC-3d typed early-admission
+   RTC-3c A 的 no-lookahead/no-hidden-reference 决定。因此 scheduled pose+DMTAC 必须等待下游D-LA typed early-admission
    gate，或一个等价、唯一且可 promotion 的正式提前 emission 协议。
 
-据此冻结后续 gate：
+据此重新分类后续工作：
 
 1. **RTC-4b-T2i source factory context：** 在 `run_policy`/OpenPI launcher 主线接口稳定后，把 opaque kwargs 收敛为
    typed、向后兼容的 adapter-factory context；不改变 sync caller、server payload 或模型；
-2. **RTC-TX1 target compatibility pure gate（已完成）：** `robot_motion/deploy/emission_target.py`只复用既有 target
+2. **下游D-TX1 target compatibility pure gate（已完成）：** `robot_motion/deploy/emission_target.py`只复用既有 target
    contract/catalog/activation spec，评估 action space、clock、component scope、coupled group、pose frame/transform、
    activation lead和 legacy/typed representation proof；assessment 只允许进入后续 target preflight，不调用
    target、trace、IK、安全或 dispatch。assessment现同时绑定exact emission ID/hash；legacy pose frame contract/hash
    必须与独立binding hash成对提供；
-3. **RTC-TX3a target-neutral proposal preparation（已完成）：** accepted assessment可形成绑定emission、
+3. **下游D-TX3a proposal preparation（已完成）：** accepted assessment可形成绑定emission、
    assessment、target/catalog/activation、representation proof和producer identity的`ActionProposalDraft`；target
    control-domain/embodiment只能来自`TargetRuntimeActionContract`，固定`authority_request=none`。rejected assessment
    不产生draft。真实`ProposalBuffer`伪target已验证首次admission和重复identity拒绝；本层不写ControlTrace、不调用
    Arbiter/safety/IK/target/dispatch，也不接Control Station/HITL；
-4. **RTC-TX2 typed emission trace：** 新增 typed `policy_action_emission` schema/version及 committed-reader
+4. **数据投影D-TX2 typed emission trace：** 新增 typed `policy_action_emission` schema/version及 committed-reader
    characterization；legacy v1 hash/字段/reader保持不变。该项需等待并行 ControlTrace 主线稳定；
-5. **RTC-TX3b target receiver admission：** 待shared target seam稳定后，MuJoCo消费TX3a preparation，使用catalog
+5. **下游D-TX3b target receiver admission：** 待shared target seam稳定后，MuJoCo消费TX3a preparation，使用catalog
    而非双臂字面量，并接受legacy representation receipt或typed canonicalization receipt；两者都只证明source
    representation，不等于target safety receipt。不得在此步骤旁路TX2 formal trace要求；
-6. **RTC-3d early-admission：** typed identity、valid-until、canonical safety verdict、target acceptance receipt、
-   reference generation/source index、commit-through 与 later promotion 全部闭合后，才允许 scheduled target lead；
-7. **RTC-TX4 OpenPI+MuJoCo shadow：** 先用 `protocol_smoke`、`send_actions=false`，记录 target preflight、seam jump、
+6. **下游D-LA scheduled lookahead：** typed identity、valid-until、canonical safety verdict、target acceptance receipt、
+   reference generation/source index与later promotion属于target-side preview协议；不得控制raw-RTC producer commit；
+7. **下游D-TX4 OpenPI+MuJoCo shadow：** 先用 `protocol_smoke`、`send_actions=false`，记录 target preflight、seam jump、
    p50/p95/p99 latency、coverage/underrun、target rejection 和 drain；不授权 MuJoCo dispatch；
-8. **RTC-TX5 sim authority：** warm-up、startup coverage、latency-derived trigger、zero duplicate/catch-up、HOLD/rearm、
+8. **下游D-TX5 sim authority：** warm-up、startup coverage、latency-derived trigger、zero duplicate/catch-up、HOLD/rearm、
    target safety/IK/reference receipts 和 DRAINED 全部满足后，仅授权 MuJoCo；
-9. **RTC-TX6 visual/generalization：** 独立 `visual_alignment` profile；再接一个非 OpenPI final-chunk provider和一个
+9. **下游D-TX6 visual/generalization：** 独立 `visual_alignment` profile；再接一个非 OpenPI final-chunk provider和一个
    非 MuJoCo deterministic target。sim authority 不推导 real authority。
 
 coverage trigger 的初始配置不得继续假设 `2 steps` 可覆盖 OpenPI 延迟；启用 TX4 前必须按同一 transport/profile
@@ -411,7 +463,7 @@ admitted coverage、committed prefix 与 mutable future。冷启动结果只用�
 
 本次审计曾尝试验证“typed canonical + immediate MuJoCo pose”，但现有安全契约明确禁止 production typed qpos，且
 MuJoCo pose profile明确只允许 scheduled reference；随后 target-only probe又被 typed ControlTrace v1字段检查拒绝。
-相关未闭合代码已撤回，没有在 runtime 留下 bypass。该 negative characterization 是上述 TX2/RTC-3d 排序的依据，
+相关未闭合代码已撤回，没有在 runtime 留下 bypass。该 negative characterization 是上述D-TX2/D-LA排序的依据，
 不得表述为 target admission 已完成。
 
 TX1 scoped evidence见
@@ -436,20 +488,28 @@ deploy聚焦回归`103 passed`及sync兼容矩阵`94 passed, 1 skipped`保留为
 RTC-3c machine-readable manifest见
 [`todos/evidence/rtc/rtc_3c_local_evidence_v1.json`](evidence/rtc/rtc_3c_local_evidence_v1.json)。
 
-Control Station的CS-2d现已作为独立application-leaf fixture消费RTC-3c返回的完整immutable `RtcFrontendStep`：逐项验证
-lower-owned due-pop与emission commit后才将同一`PolicyActionEmission`送入既有immediate-qref MuJoCo authority。
+Control Station的CS-2d现已作为独立application-leaf fixture消费正式
+`PolicyActionEmission + RtcPolicyEmissionSourceBinding`，并将同一emission送入既有immediate-qref MuJoCo authority。
+完整immutable `RtcFrontendStep`只保留为debug compatibility入口，用于核验lower-owned due-pop与commit后提取同一emission，
+不是下游数据面要求。
 Station不调用frontend step/predict/merge/pop，且其lifecycle只开关downstream publication；release不改变RTC producer
 snapshot、worker session、plan或epoch。RTC专用formal profile已完成WAL/seal/commit/read，但仍无真实observation、
 OpenPI transport、production caller或SDK authority，因此不提升RTC-3c本身的real/production成熟度。
 
-CS-3a又为现有deploy control loop增加了默认关闭、注入式`RtcFrontendStepFanout`：唯一`rtc_frontend.step()`返回的同一
-immutable object只经bounded `put_nowait`进入root application subscriber，full/error不反压lower loop。target-neutral
-source binding与null-target/shadow-only Station fixture已验证producer/session/epoch/config、due-pop和emission-commit lineage；
+CS-3a历史上为现有deploy control loop增加了默认关闭、注入式`PolicyActionEmissionFanout`；当前正式路径已收敛为
+`RtcPolicyEmissionPublisher.publish_committed_emission()`，由publisher验证typed commit/binding/TTL/idempotency。
+observer full/error不反压lower loop，required control subscriber失败则拒绝publication并保持fail closed。
+target-neutral source binding与null-target/shadow-only Station fixture已验证producer/session/epoch/config及emission lineage；
 同队列ordered fence保证pre-start backlog不会在start后冒充active observation。Station不接收frontend对象，也没有
 predict/merge/pop、producer lifecycle、candidate/authority、dispatcher、episode owner或target。该scope仍不提供OpenPI
 transport、真实observation、production startup owner、正式capture或RTC-6 real shadow evidence。
-为避免root重复配置，显式fanout还会在lower frontend构造后一次性发布target-neutral binding；root bootstrap可预先分配
-queue并等待该binding，但不启动deploy、设备或producer。未收到binding时Station构造fail closed。
+application root从producer candidate激活target-neutral binding，并把bounded queue和binding显式注入passive Station；
+Control Station不再import或构造teleop publisher。root bootstrap可预先分配queue并等待binding，但不启动deploy、设备或
+producer；未收到binding时Station构造fail closed。
+`RtcFrontendStepFanout`继续作为debug-only兼容观察面，不得重新成为Station、Composition或target正式输入。
+RTC timed emission现将epoch-scoped source binding hash纳入自身semantic hash；sync queue emission保持`None`，因此不改变
+既有同步顺序或hash。producer rearm会产生新binding hash，旧fanout/consumer fail closed；自动binding rotation尚未实现，
+不得把单epochpassive fixture表述为跨rearm production lifecycle完成。
 
 本轮实施中主线再次推进：M5.8-b1无硬件范围已完成typed worker、唯一fake composition、quick-stop新epoch、
 deadline/FAULT、trace projection及canonical deploy default-off注入seam；M5.8-b1-real-A的独立idle-worker
@@ -468,8 +528,8 @@ RTC-3c local virtual/no-action wiring、RTC-4a generic capability、RTC-4b-A fin
 transport lifecycle、RTC-4b-T2a model-neutral deadline/no-model localhost loopback与RTC-4b-T2b existing OpenPI
 model server synthetic/no-action loopback与T2c caller-free live worker→timed-plan healthy admission均已满足；下一门槛是
 独立授权的T3真实observation no-action shadow，或并行的
-可选RTC-4b-B真实continuation model-side prefix→suffix round-trip与RTC-6真实observation/transport shadow。RTC-3d
-typed preview/lookahead仍是独立gate，不阻塞RTC-4b，且RTC profile在
+可选RTC-4b-B真实continuation model-side prefix→suffix round-trip与RTC-6真实observation/transport shadow。下游D-LA
+typed preview/lookahead仍是独立target gate，不阻塞RTC-4b，且RTC profile在
 该gate完成前持续禁用lookahead。
 
 ## 0. 文档权威与冲突处理
@@ -592,23 +652,28 @@ sync_queue_v1:
   position_lookahead behavior unchanged
 ```
 
-RTC-3c 的唯一合法顺序是：
+RTC-3c producer内部的唯一合法顺序是：
 
 ```text
 TimedPolicyActionPlan
   -> select/pop exactly one due keyframe
   -> PolicyActionEmission
-  -> proposal/admission/shadow safety
+  -> accepted producer emission commit
+  -> return formal emission
+
+optional downstream
+  -> source-binding validation
+  -> proposal/admission/canonical safety
   -> optional position reference processing
 ```
 
 本阶段不得把尚未正式 emission 的 future successor 传给 position resampler。开关 RTC profile 不得改变
 `sync_queue_v1` 的 lookahead 数值、顺序、pop count、chunk lineage 或 emission hash。
 
-RTC lookahead 不永久取消；它被移到独立 `RTC-3d / pre-motion-lookahead gate`。只有 typed preview identity、
-`valid_until`、canonical safety verdict、downstream acceptance receipt、reference generation/source index、producer
-commit-through advancement，以及 later identity promotion without duplicate admission 全部落地并验收后，RTC profile
-才可重新启用 lookahead。
+RTC lookahead 不永久取消；它被移到独立下游 `D-LA / pre-motion-lookahead gate`。只有 typed preview identity、
+`valid_until`、canonical safety verdict、downstream acceptance receipt、reference generation/source index及
+later identity promotion without duplicate admission全部落地并验收后，RTC profile才可重新启用lookahead。
+preview acceptance不得反向推进或定义raw-RTC producer commit-through。
 
 ### 1.8 RTC-4 core 必须独立于模型、transport、sim/real backend
 
@@ -699,17 +764,17 @@ already_popped_current
 `ReferenceSegmentAdmission`、safe-anchor commit、backend accepted 或 measured execution。Trace 和命名必须保持这几类
 receipt 分离。
 
-RTC-3c 不沿用上述 compatibility lookahead。其 producer boundary 只覆盖已经 pop 的当前 keyframe，以及已经形成唯一
-正式 emission/admission、因而不能被未来 result 重写的当前 keyframe；它不包含尚未 emission 的 future successor：
+RTC-3c 不沿用上述 compatibility lookahead。其 producer boundary 只覆盖已经 pop、形成唯一正式emission并完成producer
+commit的当前keyframe；它不包含尚未emission的future successor：
 
 ```text
 RTC-3c producer_plan_committed_through
-  = popped/current formally emitted-and-admitted keyframe only
+  = popped/current formally emitted-and-producer-committed keyframe only
   != passive future successor
 ```
 
-因此新 result 可以替换所有尚未 pop 的 mutable future，不会撞上 hidden staged successor。RTC-3d 才重新定义并验收
-preview acceptance 如何扩大 committed boundary。
+因此新 result 可以替换所有尚未 pop 的 mutable future，不会撞上 hidden staged successor。D-LA只定义下游
+preview/reference acceptance与identity promotion，不扩大或重定义raw-RTC producer committed boundary。
 
 ### 2.4 OpenPI remote policy
 
@@ -958,7 +1023,7 @@ pop -> emission -> proposal/admission -> canonical safety
     -> safe RobotAction -> resolver/reference/backend -> downstream receipt
 ```
 
-downstream receipt不阻塞current emission；只有RTC-3d future preview/lookahead需要pre-emission acceptance。不得把native
+downstream receipt不阻塞current emission；只有下游D-LA future preview/lookahead需要pre-emission acceptance。不得把native
 end-effector target改写为hand qpos；RTC lookahead仍保持disabled。
 
 ### 4.3 absolute raw-RTC
@@ -1029,8 +1094,35 @@ model-RTC 需要从 canonical future 生成模型 continuation prefix：
 
 只有 pose component 参与 re-anchor；end-effector qpos/position target 和 discrete token 必须使用各自 typed
 prefix/mask。hard prefix 应来自 downstream-accepted reference，producer-local mutable overlap 只能是 soft prefix。
-这要求 encode/decode round-trip、conditioning receipt 和后续 identity promotion，属于 model-RTC/RTC-3d 之后的
-独立验收，不阻塞 absolute 或 relative raw-RTC。
+这要求 encode/decode round-trip、conditioning receipt 和后续 identity promotion，分别属于model-RTC与下游D-LA
+独立验收，不阻塞absolute或relative raw-RTC。
+
+#### 4.6.1 model-RTC 代码组织与首批时间契约
+
+RTC是跨层feature，不新增跨`robot_motion`、`deployments`、`teleop_runtime`、`sim`或`control_station`的顶级
+`rtc/` package。新通用语义进入`robot_motion.deploy.rtc`内部子包；model-neutral client仍在
+`deployments.client`，具体模型provider仍在`deployments/<model>/client`，dataset派生view仍在
+`dataset_contracts`/`dataset_interface`。现有`rtc_protocol.py`、`rtc_runtime.py`等flat module保持兼容并渐进迁移，
+不得一次性搬迁或建立新production entrypoint。
+
+`PolicyAsyncExecutionProfile`历史上同时绑定producer cadence与position/send/lookahead application设置，其字段和hash
+保持不变。新producer代码只消费target-neutral `RtcProducerProfile`投影；position sample/reference/IK/command rate、
+lookahead和send authorization继续由embedding application拥有。
+
+model-RTC首批冻结唯一generation/execution lattice：
+
+```text
+generation_start_at
+    + forecast_delay_steps * action_period_sec
+    = first_target_effective_at
+
+model generates full_chunk[0:H]
+client returns executable suffix full_chunk[delay:H]
+```
+
+runtime与model adapter不得各自再次应用delay crop。首批prefix source只允许
+`producer_local_overlap_v1`；sampler的clamped/weighted数值约束强度不构成downstream target acceptance、reference commit或
+motion authority。相关pure contract位于`robot_motion.deploy.rtc.continuation`。
 
 ### 4.7 表示 gate
 
@@ -1408,7 +1500,7 @@ completion 随后按新 epoch/session fail closed。不得先 merge 再依赖后
 candidate，control thread只做 cheap validation/snapshot swap。任何这种优化都必须保留 receiver-side current epoch/commit
 二次检查。
 
-### 8.3 RTC-3c lookahead disabled；RTC-3d 才做 typed preview
+### 8.3 RTC-3c lookahead disabled；下游D-LA才做typed preview
 
 RTC-3c profile 不形成或不消费 position lookahead；传给 position processing 的 successor 必须是 `None`。因此当前批次
 不修改 `PositionDeployExecutor`、canonical safety 的 preview 分支或 resampler staging contract，也不需要用兼容
@@ -1421,10 +1513,10 @@ handshake 推进 future successor 的 `commit_through`。
 3. 新 result 可替换全部尚未 pop 的 mutable future，不撞上 hidden staged successor；
 4. 开关 RTC profile 不改变 `sync_queue_v1` 的 lookahead 数值、顺序、pop count 和 emission hash。
 
-RTC-3d 再引入 typed preview receipt。其 receipt 至少绑定 preview identity/`valid_until`、canonical safety verdict、
-downstream acceptance、reference generation/source index、producer commit-through 与 later identity promotion；没有这些
-字段时，RTC lookahead 保持关闭。现有 `PositionDeployExecutor.submit()` 仍不能被改称 shared target-time reference
-admission。
+D-LA再引入typed preview receipt。其receipt至少绑定preview identity/`valid_until`、canonical safety verdict、
+downstream acceptance、reference generation/source index与later identity promotion；没有这些字段时，RTC lookahead
+保持关闭。该receipt不得推进raw-RTC producer commit-through；现有`PositionDeployExecutor.submit()`仍不能被改称
+shared target-time reference admission。
 
 ### 8.4 dry-run/shadow 限制
 
@@ -1686,11 +1778,11 @@ transport ready、real shadow或motion authority。production application的`--h
 启动camera/backend，因此“无新增SDK/backend/dispatcher call”由isolated frontend fixture与`send_actions=false`
 fail-closed验证，不宣称完整应用资源初始化已经过无硬件现场审计。
 
-#### RTC-3d：pre-motion lookahead gate（后续独立批次）
+#### 下游D-LA：pre-motion lookahead gate（后续独立批次）
 
 只在 typed preview identity/TTL、canonical safety verdict、downstream acceptance、reference generation/source index、
-producer commit-through 和 later identity promotion/no-duplicate fixture全部完成后，允许 RTC profile重新启用 position
-lookahead。该批可以修改position deployment协议，但不得反向改变RTC-3c或`sync_queue_v1`基线。
+later identity promotion/no-duplicate fixture全部完成后，允许RTC profile重新启用position lookahead。该批可以修改
+position deployment协议，但不得反向改变RTC producer commit、RTC-3c或`sync_queue_v1`基线。
 
 ### RTC-4：通用 capability/protocol 与模型 adapter
 
@@ -1781,8 +1873,8 @@ unsupported reason。不得根据名称猜测能力，也不得为了让某个 c
    原 `Policy.infer()`、`model.sample_actions()`、websocket request/response和registry语义保持原样；
 2. **legacy request完全旁路：** 即使server显式启用RTC，未携带版本化RTC envelope的普通observation仍只调用一次原
    `Policy.infer()`；不得提前消费RNG、transform observation、构造prefix或改变返回字段；
-3. **新 sampler独立：** 保留原 `sample_actions()` 函数体与JIT入口，新增RTC专用sampling seam；RTC hard-prefix
-   projection不能以optional branch塞进legacy compiled path；
+3. **新 sampler独立：** 保留原 `sample_actions()` 函数体与JIT入口，新增RTC专用sampling seam；RTC clamped-prefix
+   数值projection不能以optional branch塞进legacy compiled path；这里的clamped只描述sampler，不表示downstream hard prefix；
 4. **server core保持通用：** 优先以一个可选policy wrapper区分legacy payload和RTC payload，继续复用现有
    `WebsocketPolicyServer -> policy.infer()`；若wrapper不能在不复制/访问私有transform状态的前提下实现，才在
    `Policy`增加独立`infer_rtc()`，但不得重写legacy `infer()`；
@@ -1799,7 +1891,7 @@ unsupported reason。不得根据名称猜测能力，也不得为了让某个 c
 `implementation_parameters_hash`。若未来artifact正式声明同一字段，两者必须一致。该方案不修改dataset schema、checkpoint或
 legacy server配置；在该字段来源未确认前不进入模型侧代码实施。
 
-推荐的最小模型侧算法是独立的 hard flow-inpaint provider，而不是通用post-hoc blend：
+推荐的最小模型侧算法是独立的clamped flow-inpaint provider，而不是通用post-hoc blend：
 
 ```text
 external model-space prefix [Hp, Dexternal]
@@ -2008,7 +2100,7 @@ RTC-specific manifest至少重新绑定：
 - 所有 emitted action继续走同一 canonical safety；
 - future chunk不提前参与 Arbiter authority；
 - RTC-3c每个keyframe首次影响position reference前已有唯一正式emission，future successor不被passive staged；
-- RTC-3d之前lookahead producer commit与shared reference admission保持未实现/关闭；
+- D-LA之前RTC lookahead与shared reference preview admission保持未实现/关闭；
 - no action/TTL/underrun有显式 hold/pause/fault语义；
 - RTC不能取得或携带 dispatch token；
 - real authority需要新的 exact execution manifest和硬件验收。
@@ -2143,7 +2235,7 @@ rtc_flow_inpaint_v1
 
 以下问题不阻塞 RTC-3c，但已有明确后续 gate：
 
-- RTC position lookahead 的 typed preview receipt：移到 RTC-3d；
+- RTC position lookahead 的 typed preview receipt：移到下游D-LA；
 - downstream-accepted hard prefix 与 producer-local soft overlap：后续model-RTC typed component capability；
 - scheduler/continuation algorithm 两轴协议：RTC-4 protocol v2，保留v1映射；
 - async-aligned chunk boundary continuity gate：模型/轨迹profile实测后再冻结，不自动取得motion authority；
@@ -2176,7 +2268,7 @@ rtc_flow_inpaint_v1
 | process worker、transport half-open/reconnect | 部分延后 | RTC-3c先验证virtual policy与session状态；OpenPI接线前必须有transport deadline，local process取决于backend测量 |
 | property/soak/evidence | 分阶段采纳 | 先用无新依赖的race table、virtual long-run与machine-readable non-formal manifest；formal trace复用既有WAL owner |
 | 直接把candidate接入deque作为RTC-3c | 拒绝 | 会保留两套request/admission truth并绕开timed plan committed boundary |
-| RTC-3c立即实现typed preview receipt | 拒绝为本阶段内容 | 会扩大为position reference预接纳协议重构；保留为RTC-3d必要gate |
+| RTC-3c立即实现typed preview receipt | 拒绝为RTC内容 | 会扩大为position reference预接纳协议重构；保留为下游D-LA必要gate |
 | 立即批量rename delay/horizon/mode字段 | 拒绝破坏式修改 | v1字段已进入semantic hash与fixture；只允许v2 additive contract和compatibility mapping |
 | `async_aligned_chunk_v1`自动具备motion authority | 拒绝 | 它只证明调度/因果；real authority仍需独立manifest、连续性、安全、worker drain与现场证据 |
 | RTC按absolute/relative source pose明确分支 | 调整后采纳 | 两条分支只负责plan前canonicalization，共用worker/timed-plan/one-pop/emission；不复制scheduler |
@@ -2232,7 +2324,7 @@ OpenPI raw-RTC caller接线；不新增或修改OpenPI server进程，不接mode
     `44 passed`；
 16. 已完成RTC-4b-A OpenPI final-chunk `continuation=none` offline adapter与28项伪transport/policy鲁棒fixture；RTC聚焦
     回归`130 passed`，兼容回归`152 passed, 1 skipped`；
-17. 已完成caller-free RTC-4b-B1 OpenPI offline model seam：独立Pi0/Pi0.5 hard-prefix sampler与`Policy.infer_rtc()`默认
+17. 已完成caller-free RTC-4b-B1 OpenPI offline model seam：独立Pi0/Pi0.5 clamped-prefix sampler与`Policy.infer_rtc()`默认
     关闭，原sampler/infer/server均不改；远端pure/fake测试16 passed、2 deselected，V22回归10 passed、3 skipped；
 18. RTC-4b-T1已完成session cancel-close-drain-reconnect local contract；RTC-4b-T2a已完成model-neutral deadline、
     fake socket鲁棒矩阵和no-model localhost final-chunk loopback；RTC-4b-T2b已用现有OpenPI
@@ -2241,7 +2333,7 @@ OpenPI raw-RTC caller接线；不新增或修改OpenPI server进程，不接mode
     caller-free live synthetic worker→timed-plan shadow、wire-thaw、cold TTL拒绝、warm 44-keyframe single admission与完整drain，之后才做可选RTC-4b-B capability-driven prefix→canonical suffix
     continuation provider。后者按loaded instance
     的model/artifact/transform/norm/sampling facts协商，不绑定特定checkpoint/config/horizon/dimension；typed preview独立
-    留在RTC-3d，正式trace和真实shadow分别复核，继续不修改遥操/replay链路。T3只在显式
+    留在下游D-LA，正式trace和真实shadow分别复核，继续不修改遥操/replay链路。T3只在显式
     `raw_rtc_final_chunk_15_30_60_120_v1`下复用现有OpenPI transport/client创建shared frontend，仍不改变默认同步调用；
     model-RTC prefix/mask/receipt/identity promotion继续留在后续RTC-4b-B gate；
 19. Control Station的CS-0/CS-1c pure contract、null/fake composition、loopback状态、typed intent与独立no-I/O operation

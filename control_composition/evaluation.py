@@ -9,16 +9,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from dataset_contracts.control_trace import ControlTraceFact
 from robot_motion.runtime.control_admission import ControlCut
 from robot_motion.runtime.producer_epoch import ProducerEpochSnapshot
 
+from .events import CompositionDomainEvent
+from .information import CompositionInformationPlan
+from .eligibility import (
+    CompositionSourceEligibilitySnapshot,
+    CompositionSourceEligibilitySpec,
+)
 from .composition import (
     CompositionInputRecord,
     CompositionInputSnapshot,
     CompositionContextSnapshot,
     CompositionResult,
     CompositionSpec,
+    FormalCompositionStrategyInput,
+    FormalCompositionStrategyResultBinding,
+    FormalCompositionStrategySpec,
 )
 from .observability import (
     ActionDifference,
@@ -54,11 +62,12 @@ class CompositionDiagnostic:
 class CompositionEvaluationRecord:
     """Self-contained causal record returned for one composition decision.
 
-    ``trace_facts_emitted`` is the exact batch accepted by the injected trace
-    sink for this evaluation.  Proposal admission is deliberately outside this
-    record because it is a later authority-boundary operation.
+    ``domain_events_emitted`` is the exact protocol-neutral batch accepted by
+    the injected observer for this evaluation. Proposal admission is outside
+    this record because it is a later authority-boundary operation.
     """
 
+    information_plan: CompositionInformationPlan | None
     composition_spec: CompositionSpec
     control_cut: ControlCut
     producer_epoch_snapshot: ProducerEpochSnapshot
@@ -66,12 +75,24 @@ class CompositionEvaluationRecord:
     composition_result: CompositionResult
     required_context_channels: tuple[str, ...]
     context_snapshot: CompositionContextSnapshot | None
+    source_eligibility_spec: CompositionSourceEligibilitySpec | None
+    source_eligibility_snapshot: CompositionSourceEligibilitySnapshot | None
+    strategy_spec: FormalCompositionStrategySpec | None
+    strategy_input: FormalCompositionStrategyInput | None
+    strategy_result_binding: FormalCompositionStrategyResultBinding | None
     source_difference_spec: SourceDifferenceSpec | None
     source_difference_observation: SourceDifferenceObservation | None
     diagnostics: tuple[CompositionDiagnostic, ...]
-    trace_facts_emitted: tuple[ControlTraceFact, ...]
+    domain_events_emitted: tuple[CompositionDomainEvent, ...]
 
     def __post_init__(self) -> None:
+        if self.information_plan is not None and not isinstance(
+            self.information_plan,
+            CompositionInformationPlan,
+        ):
+            raise TypeError(
+                "information_plan must be a CompositionInformationPlan or None."
+            )
         if not isinstance(self.composition_spec, CompositionSpec):
             raise TypeError("composition_spec must be a CompositionSpec.")
         if not isinstance(self.control_cut, ControlCut):
@@ -120,6 +141,30 @@ class CompositionEvaluationRecord:
         )
         if len(channels) != len(set(channels)):
             raise ValueError("required_context_channels must be unique.")
+        if (
+            self.information_plan is not None
+            and channels != self.information_plan.required_context_channels
+        ):
+            raise ValueError(
+                "Evaluation channels do not match CompositionInformationPlan."
+            )
+        expected_difference_hash = (
+            None
+            if self.information_plan is None
+            else self.information_plan.source_difference_spec_hash
+        )
+        actual_difference_hash = (
+            None
+            if self.source_difference_spec is None
+            else self.source_difference_spec.semantic_content_hash
+        )
+        if (
+            self.information_plan is not None
+            and expected_difference_hash != actual_difference_hash
+        ):
+            raise ValueError(
+                "Evaluation difference spec does not match the information plan."
+            )
         if channels and self.context_snapshot is None:
             raise ValueError("Required context channels need a context snapshot.")
         if self.context_snapshot is not None:
@@ -137,6 +182,100 @@ class CompositionEvaluationRecord:
                 raise ValueError(
                     "Composition context snapshot channels do not match the request."
                 )
+        eligibility_spec = self.source_eligibility_spec
+        eligibility = self.source_eligibility_snapshot
+        if eligibility_spec is not None:
+            if not isinstance(
+                eligibility_spec,
+                CompositionSourceEligibilitySpec,
+            ):
+                raise TypeError(
+                    "source_eligibility_spec must be a "
+                    "CompositionSourceEligibilitySpec or None."
+                )
+            eligibility_spec.validate_composition_spec(self.composition_spec)
+        if eligibility is None:
+            if (
+                eligibility_spec is not None
+                or self.input_snapshot.source_eligibility_snapshot_id
+                is not None
+            ):
+                raise ValueError(
+                    "Composition input snapshot eligibility lineage is missing."
+                )
+        elif (
+            eligibility_spec is None
+            or eligibility.source_eligibility_spec_hash
+            != eligibility_spec.semantic_content_hash
+            or eligibility.control_domain_id
+            != self.control_cut.control_domain_id
+            or eligibility.cutoff_at != self.control_cut.cutoff_at
+            or eligibility.cutoff_admission_sequence
+            != self.control_cut.cutoff_admission_sequence
+            or eligibility.target_effective_at
+            != self.input_snapshot.target_effective_at
+            or eligibility.source_eligibility_snapshot_id
+            != self.input_snapshot.source_eligibility_snapshot_id
+            or eligibility.semantic_content_hash
+            != self.input_snapshot.source_eligibility_snapshot_hash
+        ):
+            raise ValueError(
+                "Composition source eligibility snapshot does not share the cut."
+            )
+        strategy_values = (
+            self.strategy_spec,
+            self.strategy_input,
+            self.strategy_result_binding,
+        )
+        if any(value is not None for value in strategy_values):
+            if any(value is None for value in strategy_values):
+                raise ValueError(
+                    "Formal strategy evaluation lineage must be complete."
+                )
+            if not isinstance(
+                self.strategy_spec,
+                FormalCompositionStrategySpec,
+            ):
+                raise TypeError(
+                    "strategy_spec must be a FormalCompositionStrategySpec."
+                )
+            if not isinstance(
+                self.strategy_input,
+                FormalCompositionStrategyInput,
+            ):
+                raise TypeError(
+                    "strategy_input must be a FormalCompositionStrategyInput."
+                )
+            if not isinstance(
+                self.strategy_result_binding,
+                FormalCompositionStrategyResultBinding,
+            ):
+                raise TypeError(
+                    "strategy_result_binding must be a "
+                    "FormalCompositionStrategyResultBinding."
+                )
+            if (
+                self.strategy_input.strategy_spec != self.strategy_spec
+                or self.composition_result.strategy_spec_hash
+                != self.strategy_spec.semantic_content_hash
+                or self.composition_result.strategy_input_id
+                != self.strategy_input.strategy_input_id
+                or self.composition_result.strategy_input_hash
+                != self.strategy_input.semantic_content_hash
+                or self.strategy_result_binding.strategy_input_id
+                != self.strategy_input.strategy_input_id
+                or self.strategy_result_binding.composition_result_id
+                != self.composition_result.composition_result_id
+                or self.strategy_result_binding.composition_result_hash
+                != self.composition_result.semantic_content_hash
+            ):
+                raise ValueError(
+                    "Formal strategy evaluation lineage does not match."
+                )
+        elif self.composition_result.strategy_id is not None:
+            raise ValueError(
+                "Formal composition result requires strategy evaluation lineage."
+            )
         if self.source_difference_spec is None:
             if self.source_difference_observation is not None:
                 raise ValueError(
@@ -165,12 +304,14 @@ class CompositionEvaluationRecord:
         diagnostics = tuple(self.diagnostics)
         if any(not isinstance(item, CompositionDiagnostic) for item in diagnostics):
             raise TypeError("diagnostics must contain CompositionDiagnostic values.")
-        facts = tuple(self.trace_facts_emitted)
-        if any(not isinstance(item, ControlTraceFact) for item in facts):
-            raise TypeError("trace_facts_emitted must contain ControlTraceFact values.")
+        events = tuple(self.domain_events_emitted)
+        if any(not isinstance(item, CompositionDomainEvent) for item in events):
+            raise TypeError(
+                "domain_events_emitted must contain CompositionDomainEvent values."
+            )
         object.__setattr__(self, "required_context_channels", channels)
         object.__setattr__(self, "diagnostics", diagnostics)
-        object.__setattr__(self, "trace_facts_emitted", facts)
+        object.__setattr__(self, "domain_events_emitted", events)
 
     @property
     def selected_inputs_by_role(self) -> dict[str, CompositionInputRecord]:

@@ -244,6 +244,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
             camera_mode="multi",
             camera_serial="",
             camera_config="unused.json",
+            camera_keep_last=4,
         )
         configs = {
             "front": object(),
@@ -263,6 +264,43 @@ class OpenPICommonDeployTest(unittest.TestCase):
             )
 
         self.assertEqual(sources, {"left_wrist": configs["left_wrist"]})
+
+    def test_runtime_applies_deployment_camera_history_minimum_to_config_sources(self) -> None:
+        args = argparse.Namespace(
+            camera_mode="multi",
+            camera_serial="",
+            camera_config="unused.json",
+            camera_keep_last=4,
+        )
+        config = run_policy.RealSenseRGBCameraConfig(
+            serial="123",
+            camera_key="left_wrist",
+            keep_last=2,
+        )
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.load_realsense_camera_config_map",
+            return_value={"left_wrist": config},
+        ), mock.patch(
+            "teleop_runtime.deploy.run_policy.RealSenseRGBSource",
+            side_effect=lambda value: value,
+        ):
+            sources = run_policy.build_camera_sources(
+                args,
+                selected_camera_keys=("left_wrist",),
+            )
+
+        self.assertEqual(sources["left_wrist"].keep_last, 4)
+
+    def test_deployment_camera_age_default_has_jitter_margin(self) -> None:
+        parser = argparse.ArgumentParser()
+        run_policy.add_args(parser)
+
+        args = parser.parse_args([])
+
+        self.assertEqual(
+            args.camera_frame_max_age_sec,
+            run_policy.DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC,
+        )
 
     def test_validate_server_metadata_accepts_current_dual_rm65_contract(self) -> None:
         result = validate_server_metadata(
@@ -891,6 +929,12 @@ class OpenPICommonDeployTest(unittest.TestCase):
                     "--api-key",
                     "secret-token",
                     "--debug",
+                    "--debug-dir",
+                    "logs/rtc-debug-test",
+                    "--rtc-debug-level",
+                    "trace",
+                    "--rtc-debug-queue-capacity",
+                    "32",
                     "--max-steps",
                     "1",
                 ]
@@ -902,6 +946,20 @@ class OpenPICommonDeployTest(unittest.TestCase):
         kwargs = json.loads(kwargs_json)
         self.assertEqual(kwargs["api_key"], "secret-token")
         self.assertIn("--debug", launched_args)
+        self.assertEqual(
+            launched_args[launched_args.index("--debug-dir") + 1],
+            "logs/rtc-debug-test",
+        )
+        self.assertEqual(
+            launched_args[launched_args.index("--rtc-debug-level") + 1],
+            "trace",
+        )
+        self.assertEqual(
+            launched_args[
+                launched_args.index("--rtc-debug-queue-capacity") + 1
+            ],
+            "32",
+        )
         self.assertIn("--max-steps", launched_args)
 
 

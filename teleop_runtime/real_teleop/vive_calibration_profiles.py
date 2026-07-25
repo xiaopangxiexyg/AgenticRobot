@@ -1,0 +1,235 @@
+"""VIVE calibration profile discovery, persistence, and runtime loading."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from ..calibration import TeleopCalibration
+from .components import RealTeleopComponents
+
+
+_REQUIRED_SUPPORT_NAMES = (
+    "DEFAULT_CALIBRATION_PROFILE_DIR",
+    "_apply_workspace_config",
+    "_apply_workspace_overrides",
+    "_arm_workspace_config_path",
+    "_movement_multiple_value",
+    "_tracker_source_side_for_logical_side",
+    "datetime",
+)
+
+
+def bind_legacy_support(namespace: Mapping[str, Any]) -> None:
+    missing = [name for name in _REQUIRED_SUPPORT_NAMES if name not in namespace]
+    if missing:
+        raise RuntimeError(
+            "VIVE calibration profile support is incomplete: " + ", ".join(missing)
+        )
+    module_globals = globals()
+    for name in _REQUIRED_SUPPORT_NAMES:
+        module_globals[name] = namespace[name]
+
+
+def _calibration_profile_latest_sort_key(path: Path) -> tuple[int, str, float, str]:
+    match = re.match(r"^(\d{8}_\d{6})", path.name)
+    timestamp_key = match.group(1) if match else ""
+    return (
+        1 if timestamp_key else 0,
+        timestamp_key,
+        path.stat().st_mtime,
+        path.name,
+    )
+
+
+def _latest_vive_calibration_profile_path() -> Path | None:
+    if not DEFAULT_CALIBRATION_PROFILE_DIR.exists():
+        return None
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for path in DEFAULT_CALIBRATION_PROFILE_DIR.glob("*.json"):
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=_calibration_profile_latest_sort_key)
+
+
+def _gui_vive_calibration_load_path(args: argparse.Namespace) -> Path:
+    explicit = str(getattr(args, "load_profile", "") or "").strip()
+    if explicit:
+        return Path(os.path.expandvars(explicit)).expanduser()
+    last_saved = str(getattr(args, "gui_last_vive_calibration_profile", "") or "").strip()
+    if last_saved:
+        return Path(os.path.expandvars(last_saved)).expanduser()
+    latest = _latest_vive_calibration_profile_path()
+    if latest is None:
+        raise FileNotFoundError(
+            f"No VIVE calibration profile found in {DEFAULT_CALIBRATION_PROFILE_DIR}"
+        )
+    return latest
+
+
+def _runtime_home_was_available(calibration: TeleopCalibration) -> bool:
+    if calibration.captured_home_qpos:
+        return True
+    for arm in calibration.arms.values():
+        if arm.home_qpos is not None or arm.home_pose_for_tcp_mode() is not None:
+            return True
+    return False
+
+
+def _calibration_profile_payload_without_workspace(
+    calibration: TeleopCalibration,
+    *,
+    workspace_config_path: Path | None,
+) -> dict[str, Any]:
+    payload = calibration.to_dict()
+    for arm_payload in payload.get("arms", {}).values():
+        if not isinstance(arm_payload, dict):
+            continue
+        arm_payload.pop("workspace_min", None)
+        arm_payload.pop("workspace_max", None)
+        metadata = arm_payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata.pop("workspace_config_source", None)
+            metadata.pop("workspace_override_runtime", None)
+    metadata = payload.setdefault("metadata", {})
+    if isinstance(metadata, dict):
+        metadata.pop("workspace_config_runtime", None)
+        metadata.pop("workspace_override_runtime", None)
+        metadata["workspace_policy"] = "managed_by_teleop_runtime_config"
+        metadata["workspace_config_path"] = (
+            None if workspace_config_path is None else str(workspace_config_path)
+        )
+    return payload
+
+def _save_gui_vive_calibration_profile(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> Path:
+    calibration = components.session.calibration
+    if calibration is None:
+        raise RuntimeError("No active calibration is attached to the teleop session.")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = DEFAULT_CALIBRATION_PROFILE_DIR / f"{timestamp}_vive_rm65_real_teleop.json"
+    profile = TeleopCalibration.from_dict(calibration.to_dict())
+    runtime_home_was_available = _runtime_home_was_available(profile)
+    profile.clear_home_state()
+    profile.metadata.update(
+        {
+            "profile_scope": "tracker_station_only",
+            "runtime_home_used_for_visual_check": runtime_home_was_available,
+            "home_policy": (
+                "session home anchors are intentionally not saved; real teleop must recapture wrist home"
+            ),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "saved_from_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
+            "saved_from_gui": True,
+            "active_sides": list(components.active_sides),
+            "movement_multiple": _movement_multiple_value(args),
+            "translation_scale": _movement_multiple_value(args),
+            "tracker_input_mapping": {
+                side: _tracker_source_side_for_logical_side(args, side)
+                for side in components.active_sides
+            },
+        }
+    )
+    payload = _calibration_profile_payload_without_workspace(
+        profile,
+        workspace_config_path=_arm_workspace_config_path(args),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    setattr(args, "gui_last_vive_calibration_profile", str(output_path))
+    return output_path
+
+
+def _load_gui_vive_calibration_profile(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> Path:
+    path = _gui_vive_calibration_load_path(args)
+    loaded = TeleopCalibration.load_json(path)
+    current = components.session.calibration
+    if current is None:
+        current = loaded
+        components.session.calibration = current
+    else:
+        current.T_W_O = None if loaded.T_W_O is None else loaded.T_W_O.copy()
+        current.T_O_D = None if loaded.T_O_D is None else loaded.T_O_D.copy()
+        current.tracker_offsets = {
+            str(role): np.asarray(offset, dtype=float).copy()
+            for role, offset in loaded.tracker_offsets.items()
+        }
+        for arm_name, loaded_arm in loaded.arms.items():
+            current_arm = current.arms.get(arm_name)
+            if current_arm is None:
+                continue
+            current_arm.workspace_min = (
+                None
+                if loaded_arm.workspace_min is None
+                else np.asarray(loaded_arm.workspace_min, dtype=float).copy()
+            )
+            current_arm.workspace_max = (
+                None
+                if loaded_arm.workspace_max is None
+                else np.asarray(loaded_arm.workspace_max, dtype=float).copy()
+            )
+        calibration_metadata_keys = (
+            "calibration_mode",
+            "world_to_desk_mode",
+            "virtual_desk",
+            "virtual_desk_tracker_role",
+            "virtual_desk_channel_name",
+            "virtual_desk_sweep_convention_version",
+            "virtual_desk_post_yaw_deg",
+            "virtual_desk_scene_alignment_defaulted",
+            "tracker_offset_calibration",
+            "profile_scope",
+            "home_policy",
+            "workspace_policy",
+            "workspace_config_path",
+            "saved_at",
+        )
+        for key in calibration_metadata_keys:
+            if key in loaded.metadata:
+                current.metadata[key] = loaded.metadata[key]
+            else:
+                current.metadata.pop(key, None)
+    current.clear_home_state()
+    current.metadata.update(
+        {
+            "runtime_gui_loaded_profile": str(path),
+            "runtime_gui_loaded_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    _apply_workspace_config(args, current)
+    _apply_workspace_overrides(args, current)
+    components.left_retargeter.clear_home_anchors()
+    components.right_retargeter.clear_home_anchors()
+    setattr(args, "load_profile", str(path))
+    setattr(args, "gui_last_vive_calibration_profile", str(path))
+    return path
+
+__all__ = [
+    "_calibration_profile_latest_sort_key",
+    "_calibration_profile_payload_without_workspace",
+    "_gui_vive_calibration_load_path",
+    "_latest_vive_calibration_profile_path",
+    "_load_gui_vive_calibration_profile",
+    "_runtime_home_was_available",
+    "_save_gui_vive_calibration_profile",
+    "bind_legacy_support",
+]
+

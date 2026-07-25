@@ -152,6 +152,8 @@ IMPEDANCE_40HZ_ARGS=(
 # --position-ik-candidate-certification-reserve-ms 0 和
 # --no-position-singularity-candidate-certificate；默认正式profile使用3.5 ms候选认证
 # reserve，并校验最终qref指纹。
+# 正式位控在证书有效时将 SDK 的 J3/J5 奇异边界作为 advisory，优先采用
+# 本地候选分类；力控、回放和无证书直发路径仍保留 SDK 进入式保护。
 POSITION_FORMAL_V1_ARGS=(
   --position-control-profile rm65_bimanual_position_v1
   --arm-control-mode position

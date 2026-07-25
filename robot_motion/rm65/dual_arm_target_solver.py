@@ -3759,6 +3759,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 self.config.prefer_non_wrist_singular_branch
                 and selected_classification is not None
                 and bool(selected_classification["any_wrist_singular"])
+                and sum(count == 0 for count in counts) == 0
             ),
             "selected": selected_classification,
             "candidates": [
@@ -4202,8 +4203,34 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             and base_selected_singularity.get("any_shoulder_singular", False)
             and not candidate_eval_stopped_early
         )
+        expand_for_wrist_singularity = bool(
+            base_selection is not None
+            and self.config.prefer_non_wrist_singular_branch
+            and base_selected_singularity.get("any_wrist_singular", False)
+            and not candidate_eval_stopped_early
+        )
+        base_local_singularity = (
+            {}
+            if base_selection is None
+            else self._local_proxy_singularity_metadata(base_selection[0])
+        )
+        expand_for_local_singularity_escape = bool(
+            base_selection is not None
+            and bool(
+                getattr(
+                    safety_profile,
+                    "local_step_singularity_escape_enabled",
+                    False,
+                )
+            )
+            and bool(base_local_singularity.get("any_singular", False))
+            and not candidate_eval_stopped_early
+        )
         expand_for_position_singularity = bool(
-            expand_for_elbow_singularity or expand_for_shoulder_singularity
+            expand_for_elbow_singularity
+            or expand_for_wrist_singularity
+            or expand_for_shoulder_singularity
+            or expand_for_local_singularity_escape
         )
         if base_selection is not None and not expand_for_position_singularity:
             base_selection[4]["candidate_eval_mode"] = (
@@ -4231,6 +4258,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             include_limit_escape=True,
             include_posture_escape=not candidate_eval_stopped_early,
             include_wrist_unload=not candidate_eval_stopped_early,
+            include_singularity_escape=expand_for_local_singularity_escape,
+            singularity_seed_qpos=(None if base_selection is None else base_selection[0]),
         )
         all_candidates = list(base_candidates) + list(auxiliary_candidates)
         if auxiliary_candidates and not candidate_eval_stopped_early:
@@ -4270,6 +4299,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             )
             auxiliary_selection[4]["expanded_for_shoulder_singularity"] = bool(
                 expand_for_shoulder_singularity
+            )
+            auxiliary_selection[4]["expanded_for_wrist_singularity"] = bool(
+                expand_for_wrist_singularity
+            )
+            auxiliary_selection[4]["expanded_for_local_singularity_escape"] = bool(
+                expand_for_local_singularity_escape
             )
             auxiliary_selection[4]["expanded_for_position_singularity"] = bool(
                 expand_for_position_singularity
@@ -4341,6 +4376,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         include_limit_escape: bool = True,
         include_posture_escape: bool = True,
         include_wrist_unload: bool = True,
+        include_singularity_escape: bool = False,
+        singularity_seed_qpos: np.ndarray | None = None,
     ) -> tuple[list[_DualArmCandidate], dict[str, object]]:
         candidates: list[_DualArmCandidate] = []
         seen: list[np.ndarray] = []
@@ -4409,10 +4446,236 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             candidates.append(candidate)
             seen.append(candidate.qpos.copy())
 
+        if include_singularity_escape:
+            singularity_candidates, singularity_metadata = (
+                self._dual_arm_singularity_escape_candidates(
+                    reference_full_q=reference_full_q,
+                    current_targets=current_targets,
+                    seed_full_q=singularity_seed_qpos,
+                )
+            )
+        else:
+            singularity_candidates = []
+            singularity_metadata = {
+                "enabled": False,
+                "status": "deferred",
+                "candidate_count": 0,
+            }
+        for candidate in singularity_candidates:
+            if any(np.allclose(candidate.qpos, existing, atol=1e-9) for existing in seen):
+                continue
+            candidates.append(candidate)
+            seen.append(candidate.qpos.copy())
+
         combined_metadata = dict(limit_metadata)
         combined_metadata["posture_escape"] = dict(posture_metadata)
         combined_metadata["wrist_unload"] = dict(wrist_metadata)
+        combined_metadata["singularity_escape"] = dict(singularity_metadata)
         return candidates, combined_metadata
+
+    def _local_proxy_singularity_metadata(self, full_qpos: np.ndarray) -> dict[str, object]:
+        """Return the cheap, vendor-independent J3/J5 singularity proxy.
+
+        The SDK analyzer remains a diagnostic/final-gate input.  Local escape
+        candidates deliberately use only these two joint proxies so a vendor
+        boundary classification cannot prevent a one-step move away from a
+        known local singular neighborhood.
+        """
+
+        left_q, right_q = self._split_solution(np.asarray(full_qpos, dtype=float).reshape(-1))
+        elbow_threshold = float(
+            self.config.elbow_singularity_threshold_deg
+            + self.config.elbow_singularity_selection_margin_deg
+        )
+        wrist_threshold = float(self.config.wrist_singularity_threshold_deg)
+        sides: dict[str, dict[str, object]] = {}
+        for side, arm_q in (("left", left_q), ("right", right_q)):
+            joint_deg = np.rad2deg(np.asarray(arm_q, dtype=float).reshape(6))
+            j3_deg = float(joint_deg[2])
+            j5_deg = float(joint_deg[4])
+            elbow_singular = bool(
+                self.config.prefer_non_elbow_singular_branch
+                and elbow_threshold > 0.0
+                and abs(j3_deg) < elbow_threshold
+            )
+            wrist_singular = bool(
+                self.config.prefer_non_wrist_singular_branch
+                and wrist_threshold > 0.0
+                and abs(j5_deg) < wrist_threshold
+            )
+            elbow_depth = (
+                max(0.0, elbow_threshold - abs(j3_deg)) / max(elbow_threshold, 1e-12)
+                if elbow_singular
+                else 0.0
+            )
+            wrist_depth = (
+                max(0.0, wrist_threshold - abs(j5_deg)) / max(wrist_threshold, 1e-12)
+                if wrist_singular
+                else 0.0
+            )
+            sides[side] = {
+                "j3_deg": j3_deg,
+                "j5_deg": j5_deg,
+                "elbow_margin_deg": abs(j3_deg) - elbow_threshold,
+                "wrist_margin_deg": abs(j5_deg) - wrist_threshold,
+                "is_elbow_singular": elbow_singular,
+                "is_wrist_singular": wrist_singular,
+                "is_singular": bool(elbow_singular or wrist_singular),
+                "singularity_depth_score": float(elbow_depth + wrist_depth),
+            }
+        singular_sides = [side for side, values in sides.items() if values["is_singular"]]
+        return {
+            "criterion": "local J3 elbow proxy and J5 wrist proxy",
+            "elbow_threshold_deg": elbow_threshold,
+            "wrist_threshold_deg": wrist_threshold,
+            "sides": sides,
+            "singular_sides": singular_sides,
+            "singular_side_count": len(singular_sides),
+            "singularity_depth_score": float(
+                sum(float(values["singularity_depth_score"]) for values in sides.values())
+            ),
+            "any_singular": bool(singular_sides),
+        }
+
+    def _dual_arm_singularity_escape_candidates(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray],
+        seed_full_q: np.ndarray | None = None,
+    ) -> tuple[list[_DualArmCandidate], dict[str, object]]:
+        safety_profile = self.ik_safety_profile
+        metadata: dict[str, object] = {
+            "enabled": bool(
+                safety_profile is not None
+                and getattr(safety_profile, "local_step_singularity_escape_enabled", False)
+            ),
+            "candidate_count": 0,
+        }
+        if safety_profile is None or not bool(
+            getattr(safety_profile, "local_step_singularity_escape_enabled", False)
+        ):
+            metadata["status"] = "disabled"
+            return [], metadata
+        if self._full_execution_joint_step is None:
+            metadata["status"] = "joint_step_unavailable"
+            return [], metadata
+
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        seed = reference if seed_full_q is None else np.asarray(seed_full_q, dtype=float).reshape(reference.shape)
+        reference_local = self._local_proxy_singularity_metadata(seed)
+        metadata["reference_singularity"] = reference_local
+        if not bool(reference_local["any_singular"]):
+            metadata["status"] = "inactive_reference_not_singular"
+            return [], metadata
+        max_candidates = max(
+            0,
+            int(getattr(safety_profile, "local_step_singularity_escape_max_candidates", 6)),
+        )
+        step_fraction = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_singularity_escape_step_fraction",
+                        1.0,
+                    )
+                ),
+            ),
+        )
+        if max_candidates <= 0 or step_fraction <= 0.0:
+            metadata["status"] = "max_candidates_zero" if max_candidates <= 0 else "step_fraction_zero"
+            return [], metadata
+
+        q_min = np.asarray(self.ik_solver.robot.model.lowerPositionLimit, dtype=float).reshape(reference.shape)
+        q_max = np.asarray(self.ik_solver.robot.model.upperPositionLimit, dtype=float).reshape(reference.shape)
+        full_step = np.asarray(self._full_execution_joint_step, dtype=float).reshape(reference.shape) * step_fraction
+        before_metrics = self._dual_pose_metrics(seed, current_targets)
+        before_score = self._dual_pose_score(before_metrics)
+        scored: list[tuple[int, int, float, float, int, int, str, np.ndarray, dict[str, object]]] = []
+        for side, local_index, full_index in self._arm_joint_entries(seed):
+            # J3/J5 are the local singularity coordinates.  The remaining
+            # joints can only be searched by the vendor analyzer and are not
+            # used for this intentionally cheap escape path.
+            if local_index not in (2, 4):
+                continue
+            step = float(full_step[full_index])
+            if step <= 1e-12:
+                continue
+            for direction in (-1, 1):
+                candidate_q = seed.copy()
+                candidate_q[full_index] += float(direction) * step
+                if candidate_q[full_index] < q_min[full_index] - 1e-9 or candidate_q[full_index] > q_max[full_index] + 1e-9:
+                    continue
+                candidate_local = self._local_proxy_singularity_metadata(candidate_q)
+                candidate_side = dict(candidate_local["sides"][side])
+                before_side = dict(reference_local["sides"][side])
+                count_progress = int(reference_local["singular_side_count"]) - int(
+                    candidate_local["singular_side_count"]
+                )
+                depth_progress = float(reference_local["singularity_depth_score"]) - float(
+                    candidate_local["singularity_depth_score"]
+                )
+                after_metrics = self._dual_pose_metrics(candidate_q, current_targets)
+                pose_progress = before_score - self._dual_pose_score(after_metrics)
+                scored.append(
+                    (
+                        0 if int(candidate_local["singular_side_count"]) == 0 else 1,
+                        -count_progress,
+                        -depth_progress,
+                        -float(pose_progress),
+                        int(local_index),
+                        int(direction),
+                        side,
+                        candidate_q,
+                        {
+                            "local_step_singularity_escape_candidate": True,
+                            "local_step_singularity_escape_side": side,
+                            "local_step_singularity_escape_joint_index": int(local_index),
+                            "local_step_singularity_escape_full_joint_index": int(full_index),
+                            "local_step_singularity_escape_direction": int(direction),
+                            "local_step_singularity_escape_step_deg": float(np.rad2deg(step)),
+                            "local_step_singularity_escape_step_fraction": float(step_fraction),
+                            "local_step_singularity_escape_reference": reference_local,
+                            "local_step_singularity_escape_candidate_local": candidate_local,
+                            "local_step_singularity_escape_side_reference": before_side,
+                            "local_step_singularity_escape_side_candidate": candidate_side,
+                            "local_step_singularity_escape_singular_side_count_progress": int(count_progress),
+                            "local_step_singularity_escape_depth_progress": float(depth_progress),
+                            "local_step_singularity_escape_predicted_pose_progress": float(pose_progress),
+                        },
+                    )
+                )
+        scored.sort(key=lambda item: item[:7])
+        candidates: list[_DualArmCandidate] = []
+        seen: list[np.ndarray] = []
+        for _rank, _count, _depth, _pose, local_index, direction, side, candidate_q, candidate_metadata in scored:
+            if len(candidates) >= max_candidates:
+                break
+            if any(np.allclose(candidate_q, existing, atol=1e-9) for existing in seen):
+                continue
+            seen.append(candidate_q.copy())
+            candidates.append(
+                _DualArmCandidate(
+                    name=f"singularity_escape_{side}_j{local_index + 1}_{'pos' if direction > 0 else 'neg'}",
+                    qpos=candidate_q.copy(),
+                    source="singularity_escape",
+                    method=f"singularity_escape_{side}_j{local_index + 1}_{'pos' if direction > 0 else 'neg'}",
+                    metadata=candidate_metadata,
+                )
+            )
+        metadata.update(
+            {
+                "status": "active" if candidates else "no_candidates",
+                "candidate_count": len(candidates),
+                "max_candidates": int(max_candidates),
+                "step_fraction": float(step_fraction),
+                "emitted_methods": [candidate.method for candidate in candidates],
+            }
+        )
+        return candidates, metadata
 
     def _dual_arm_posture_escape_candidates(
         self,
@@ -5020,6 +5283,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             )
             return False, output_q, metadata
         limit_escape_candidate = bool(candidate.metadata.get("local_step_limit_escape_candidate", False))
+        singularity_escape_candidate = bool(
+            candidate.metadata.get("local_step_singularity_escape_candidate", False)
+        )
         posture_escape_candidate = bool(candidate.metadata.get("local_step_posture_escape_candidate", False))
         wrist_unload_candidate = bool(candidate.metadata.get("local_step_wrist_unload_candidate", False))
         limit_escape_margin_progress_deg = float(
@@ -5039,6 +5305,63 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 float(worsen_limits["orientation_deg"]),
                 max(0.0, float(getattr(safety_profile, "local_step_limit_escape_max_orientation_worsen_deg", 10.0))),
             ),
+        )
+        singularity_escape_local_before = dict(
+            candidate.metadata.get("local_step_singularity_escape_reference", {}) or {}
+        )
+        singularity_escape_local_after = (
+            self._local_proxy_singularity_metadata(output_q)
+            if singularity_escape_candidate
+            else {}
+        )
+        singularity_escape_count_progress = (
+            int(singularity_escape_local_before.get("singular_side_count", 0) or 0)
+            - int(singularity_escape_local_after.get("singular_side_count", 0) or 0)
+            if singularity_escape_candidate
+            else 0
+        )
+        singularity_escape_depth_progress = (
+            float(singularity_escape_local_before.get("singularity_depth_score", 0.0) or 0.0)
+            - float(singularity_escape_local_after.get("singularity_depth_score", 0.0) or 0.0)
+            if singularity_escape_candidate
+            else 0.0
+        )
+        singularity_escape_bounded = self._dual_bounded_worsening(
+            before_metrics=before_metrics,
+            after_metrics=after_metrics,
+            max_position_worsen_m=max(
+                float(worsen_limits["position_m"]),
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            safety_profile,
+                            "local_step_singularity_escape_max_position_worsen_m",
+                            0.02,
+                        )
+                    ),
+                ),
+            ),
+            max_orientation_worsen_deg=max(
+                float(worsen_limits["orientation_deg"]),
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            safety_profile,
+                            "local_step_singularity_escape_max_orientation_worsen_deg",
+                            8.0,
+                        )
+                    ),
+                ),
+            ),
+        )
+        singularity_escape_active = bool(
+            singularity_escape_candidate
+            and (
+                singularity_escape_count_progress > 0
+                or singularity_escape_depth_progress > 0.0
+            )
         )
         posture_escape_bounded = False
         posture_escape_active = False
@@ -5113,6 +5436,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             and limit_escape_bounded
         ):
             progress_accept_reason = "joint_limit_escape_bounded_worsening"
+        elif singularity_escape_active and singularity_escape_bounded:
+            progress_accept_reason = "singularity_escape_bounded_worsening"
         elif posture_escape_active and posture_escape_bounded:
             progress_accept_reason = "posture_escape_bounded_worsening"
         elif wrist_unload_active and wrist_unload_bounded:
@@ -5138,6 +5463,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "dual_max_position_progress_m": float(max_position_progress_m),
                     "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                     "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
+                    "dual_singularity_escape_active": bool(singularity_escape_active),
+                    "dual_singularity_escape_bounded_worsening": bool(
+                        singularity_escape_bounded
+                    ),
+                    "dual_singularity_escape_count_progress": int(
+                        singularity_escape_count_progress
+                    ),
+                    "dual_singularity_escape_depth_progress": float(
+                        singularity_escape_depth_progress
+                    ),
                     "dual_posture_escape_active": bool(posture_escape_active),
                     "dual_posture_escape_bounded_worsening": bool(posture_escape_bounded),
                     "dual_wrist_unload_active": bool(wrist_unload_active),
@@ -5172,6 +5507,18 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "dual_max_position_progress_m": float(max_position_progress_m),
                 "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                 "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
+                "dual_singularity_escape_active": bool(singularity_escape_active),
+                "dual_singularity_escape_bounded_worsening": bool(
+                    singularity_escape_bounded
+                ),
+                "dual_singularity_escape_count_progress": int(
+                    singularity_escape_count_progress
+                ),
+                "dual_singularity_escape_depth_progress": float(
+                    singularity_escape_depth_progress
+                ),
+                "dual_singularity_escape_local_before": singularity_escape_local_before,
+                "dual_singularity_escape_local_after": singularity_escape_local_after,
                 "dual_posture_escape_active": bool(posture_escape_active),
                 "dual_posture_escape_bounded_worsening": bool(posture_escape_bounded),
                 "dual_wrist_unload_active": bool(wrist_unload_active),
@@ -5184,18 +5531,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "joint_limit_escape"
                     if progress_accept_reason.startswith("joint_limit_escape")
                     else (
-                        "orientation_recovery"
-                        if progress_accept_reason.startswith("dual_orientation_recovery")
+                        "singularity_escape"
+                        if progress_accept_reason.startswith("singularity_escape")
                         else (
-                            "component_progress"
-                            if progress_accept_reason.startswith("dual_component_progress")
+                            "orientation_recovery"
+                            if progress_accept_reason.startswith("dual_orientation_recovery")
                             else (
-                                "posture_escape"
-                                if progress_accept_reason.startswith("posture_escape")
+                                "component_progress"
+                                if progress_accept_reason.startswith("dual_component_progress")
                                 else (
-                                    "wrist_unload"
-                                    if progress_accept_reason.startswith("wrist_unload")
-                                    else "tracking"
+                                    "posture_escape"
+                                    if progress_accept_reason.startswith("posture_escape")
+                                    else (
+                                        "wrist_unload"
+                                        if progress_accept_reason.startswith("wrist_unload")
+                                        else "tracking"
+                                    )
                                 )
                             )
                         )
@@ -5212,6 +5563,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     + (
                         -min(10_000_000.0, 5_000_000.0 + max(0.0, limit_escape_margin_progress_deg) * 1_000_000.0)
                         if progress_accept_reason.startswith("joint_limit_escape")
+                        else 0.0
+                    )
+                    + (
+                        -min(
+                            4_000_000.0,
+                            150_000.0
+                            + max(0.0, singularity_escape_depth_progress) * 500_000.0
+                            + max(0, singularity_escape_count_progress) * 1_000_000.0,
+                        )
+                        if progress_accept_reason.startswith("singularity_escape")
                         else 0.0
                     )
                     + (

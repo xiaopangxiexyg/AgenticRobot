@@ -107,6 +107,18 @@ accepted only when the caller explicitly constructs the DMTAC compound target
 profile (including its shared safety callback), so gripper commands cannot be
 silently dropped or routed through an arms-only runtime.
 
+Formal composer-owned compound motion has an additional default-off gate:
+`ConservativeCompoundAuthorityProfile` must bind the exact composition spec,
+component rule set, formal strategy, complete component catalog, and every
+active selection group. The composer must be the only authorized proposal
+producer, while raw policy and replay authority stay disabled. One proposal is
+valid for one decision period; missing/stale input selects domain HOLD.
+Canonical safety, pose resolution, receiver admission, and all backend
+receipts are fail-closed: any failure cancels every pending/active compound
+group, and the receiver activates arms and required hands only as one guarded
+generation bundle. This profile currently remains MuJoCo + bilateral DM-Tac
+q6 only and does not authorize real hardware.
+
 The RM65-specific accepted-qcmd/delay/filter state machine now lives in
 `sim/rm65/actuation`; this package only maps its target to MuJoCo position
 actuators and reads measured qpos. The historical v3 free-motion profile used

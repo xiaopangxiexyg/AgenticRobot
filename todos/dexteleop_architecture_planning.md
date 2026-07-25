@@ -1,6 +1,6 @@
 # DexTeleop：多源动作、多速率策略与 sim/真机统一控制架构规划
 
-更新日期：2026-07-24
+更新日期：2026-07-25
 
 ## 阅读导航
 
@@ -37,16 +37,20 @@ canonical safety 或 motion permit。
 canonical action、proposal admission、authority、epoch、cancellation、safety、reference 和 execution；
 `control_station` 继续持有 application operation、publication barrier、GUI/API 与具体装配；MuJoCo、
 VIVE、RM65、OpenPI、checkpoint 和 task adapter 留在各自 owner。首批 package、ports、依赖守卫和文档
-已经落地；`composition`、`observability`、composition专属trace projection、synthetic policy-node protocol
-及`ControlCompositionRuntime`均已完成唯一实现的物理迁移。旧
+已经落地；`composition`、`observability`、protocol-neutral domain events、synthetic policy-node protocol
+及`ControlCompositionRuntime`均已完成唯一实现的物理迁移；composition→v2.4投影由
+`dataset_interface.composition_control_trace`独立持有。旧
 `robot_motion.action.{composition,mixing_strategy,source_difference,guidance_feedback}`、
 `robot_motion.deploy.{PolicyTopologyRuntime,policy_node}`路径已删除；本仓库调用方及唯一仓库外调用方
 远端OpenPI均已审计，因此不保留会反转依赖方向的shim。
 pure handoff contract/reducer 已首次物理迁入
-`control_composition.lifecycle`，旧 `control_station.handoff` 只保留显式兼容导出。
+`control_composition.lifecycle`；本仓库已无production或仓库外调用者依赖旧路径，因此
+`control_station.handoff`兼容转发已删除。
 composition-session拆分也已完成：operation spec、activation state/transition、re-arm spec/receipt/validation
 及backend-neutral registry均归`control_composition.lifecycle`；Station controller仅继承registry并持有
 `StationOperationResult`、publication barrier和lower HOLD/cancel的应用边界。
+composition-session的四类v2.4 projector也已迁入同一dataset adapter；Station bridge只负责注入
+runtime/embodiment及trace sink，不再拥有重复投影。
 
 本轮进一步冻结其“完整框架”接口，而不扩大motion authority：`CompositionContext`现为representation-neutral
 不可变上下文，可承载history/state/future-action/vision/label或任意新模态的contract-bound payload；
@@ -54,9 +58,16 @@ composition-session拆分也已完成：operation spec、activation state/transi
 context cut，context必须同时满足receiver clock、admission sequence和target-time TTL，不能读取live backend。
 `CompositionEvaluationRecord`把本次spec、`ControlCut`、active producer epoch snapshot、selected input record
 （含source lineage/audit metadata）、composition context snapshot、result、difference、typed diagnostic及实际emit的
-trace batch作为单一只读返回接口；proposal admission仍是后续独立边界。v2.4 ControlTrace新增完整
-`composition_spec`事实，离线不再只有spec hash。该改动保持空context下既有pose/qpos hash与数值行为，并未改动
+domain-event batch作为单一只读返回接口；proposal admission仍是后续独立边界。外部dataset adapter可将这些
+领域事件投影为v2.4事实；该改动保持空context下既有pose/qpos hash与数值行为，并未改动
 teleop/replay/deploy默认控制链。
+
+`CompositionInformationPlan`作为独立、加法式信息需求契约，不进入现有activation v2/hash。它在source
+acquire/copy/freeze/admit之前声明composition真正需要的context channel、payload contract、maximum age及
+`metadata_only/inline/blob_ref`访问方式，并可绑定optional difference spec。无plan时保持既有行为；有plan时
+undeclared channel在进入store前拒绝。数据集单独需要的视觉/触觉不得绕行composition，应直接进入capture owner；
+两边都需要时共享同一immutable sample，composition只接轻量view/ref。遇到资源紧张、复制/序列化争用或source
+频率不足时，应优先用该plan收紧信息需求，而不是降低控制安全、扩大TTL或让control loop等待source。
 
 不同来源频率的统一语义也明确为target-time selection而非package内线程/插值器：每个input声明receiver-clock
 `[effective_from,effective_until)`；同一cut排除late/inactive-epoch/expired事实，再按role选择确定性最新有效值。
@@ -110,6 +121,50 @@ backpressure仍是后续production hardening gate，不能把时间窗口等同�
    两层使用独立queue/quota，debug failure不得阻塞control/core persistence。
 8. **visualization/haptic/force feedback后续解决。** 它只通过独立adapter消费第6项
    两类difference，不得隐式改变authority或dispatch。
+
+### Control Composition增量规划修正（2026-07-25）
+
+本次代码调整后，以下内容从“待规划”改为“已落地、待稳定”：`CompositionActivationScope` v2已经覆盖
+input→snapshot→result的同activation选择与v1兼容hash；`CompositionInformationPlan`已经能在source acquisition前
+声明latest-value context channel、payload contract、access mode、maximum age及optional difference；runtime已只发
+protocol-neutral `CompositionDomainEvent`，v2.4投影移至`dataset_interface.composition_control_trace`。当前最小
+activation/information/context/boundary契约测试为42 passed。后续不得把上述边界重新合并回Station、dataset writer或
+RobotMotion。
+
+基于当前实现，后续优先级修正为：
+
+1. **P0纯层已落地：第一类source eligibility/liveness。** `CompositionSourceEligibilitySpec`显式冻结
+   role→source slot→producer绑定；独立State/Store/Snapshot已覆盖receiver admission、status epoch、source lease、
+   fault/rearm及同一`ControlCut`。资格关闭时不进入input v1/v2；开启时input snapshot使用additive v3并由独立typed
+   binding连接资格snapshot。它只决定input能否参与composition，不拥有authority、HOLD、cancel或dispatch。
+2. **P0验证与首个sim shadow已落地。** 已覆盖动作TTL仍有效但source为paused/fault/disconnected/rearming或
+   lease-expired时立即missing并由formal gate HOLD、旧status epoch/late heartbeat不能复活来源、同epoch heartbeat只能
+   延长lease不能改变状态、`rearm_required`恢复需要新status epoch及receipt、producer restart、retention tombstone、
+   activation+eligibility组合，以及unscoped/default-off hash/数值不变。MuJoCo仅在显式
+   `enable_composition_source_eligibility=True`时复用现有唯一`policy_topology`；虚拟policy source pause的shadow结果为
+   no-action，且无proposal、command或physics motion。VIVE/Q6/replay/真实policy adapter仍未接线，它们后续只负责把设备/
+   worker状态翻译成该契约，不得在通用包硬编码设备字段。
+3. **P1通用化：activation向proposal后的透明lineage。** 当前formal MuJoCo re-arm会同时推进composer producer epoch，
+   所以旧proposal已被现有Arbiter epoch过滤；activation并未构成当前profile的新TOCTOU缺口。但
+   `ActionProposal`目前只保存composition input/spec lineage，没有activation ID/hash，跨profile审计和未来“同producer
+   epoch多activation”仍不完整。实施前单独冻结additive proposal hash策略：无composition保持semantic v1，未绑定
+   activation的既有composition proposal保持v2，activation-bound proposal只能新增v3或独立typed relation，禁止修改
+   v1/v2 payload/hash。最终执行继续复用现有authority/execution epoch、one-shot `MotionDispatchPermit`、
+   cancellation receipt和execution-target admission，不增加第二套execution lease。
+4. **P1 policy emission汇入门槛：异步结果freshness。** observation/request/result generation、
+   observation/result age、late completion、timed-plan pop与emission commit仍由deployment/RTC owner检查；
+   composition只消费经epoch-scoped source binding验证、已经固定anchor解码的正式
+   `PolicyActionEmission`所适配出的absolute `RobotAction`。完整`RtcFrontendStep`只用于producer诊断兼容，
+   不进入通用composition接口；model、chunk queue、RTC plan与resampling字段也不进入通用source-state。
+5. **P1资源硬化。** 时间窗口语义保持不变；per-producer/global record、rate、inline payload和byte quota作为独立
+   admission circuit breaker补充，超限显式拒绝并保留诊断，不使用lossy ring overwrite，也不以debug recorder成功作为
+   控制正确性的隐式条件。
+
+当前上述source-eligibility pure store/snapshot、外部ControlTrace投影/完整性校验和default-off sim
+source-loss fixture均已通过；聚焦组合、dataset contract与MuJoCo回归为119 passed。下一顺序固定为：先保持
+teleop/replay/policy deploy默认链路不变并审查P0 adapter映射契约；再冻结proposal v3/typed activation relation；
+最后以普通policy contributor adapter接入已绑定的formal emission。该adapter不得读取`RtcFrontendStep`或管理RTC
+epoch/plan。任何一步都不改变`sync_queue_v1`、现有teleop/replay、policy deploy或真机motion authority。
 
 ### 当前一句话状态
 
@@ -232,6 +287,21 @@ composition result/disposition、唯一composer proposal、Station barrier及pos
 epoch、再次正式emission/dispatch及seal/commit。该profile仍是
 deterministic sim/default-off，无GUI、真机、policy/RTC contributor或production入口，且不复用`human_takeover`。
 
+2026-07-25进一步把先前隐藏在MuJoCo wrapper中的“本次activation输入”升级为通用
+`CompositionActivationScope` v2。scope精确冻结operation spec ID/hash、session epoch、receiver clock、
+activation/input barrier、freshness policy与required roles；它独立于producer/authority/execution epoch和episode。
+正式start/re-arm输入必须携带exact activation ID/hash，snapshot只选择同scope且满足receiver
+`available_at/effective_from`屏障的记录，result继续显式携带同一identity；missing或mismatch形成no-action并由formal
+gate HOLD。scoped input identity与sequence tombstone均以activation为namespace，因此producer epoch可保持不变且不会发生
+跨activation ID碰撞；带旧activation的late completion不能进入新snapshot。2026-07-25后freshness判定已从MuJoCo wrapper迁入
+`control_composition`的统一admission/snapshot evaluator：receiver policy只比较同一receiver clock上的
+`available_at/effective_from`，strict-source policy还要求producer显式声明同一clock domain并满足
+`produced_at > input_barrier_at`，跨clock无映射时fail closed；MuJoCo仅保留未建立scope调用方的隔离legacy
+start-time shim。未绑定input/snapshot/result继续使用原v1
+ID/hash domain与数值行为。v2.4 trace不改写既有v1 record schema，而以
+`composition_activation_scope`和`composition_activation_binding`把input/snapshot/result逐一关联，completeness验证
+scope→operation spec、binding→typed subject及input→snapshot→result同activation闭环。
+
 CS-6b1f现把这一pose分支推进到一个明确的sim-only、default-off human-in-the-loop formal capture slice：
 `build_scoped_cs6b1f_mujoco_pose_human_replay_station()`复用CS-6b1d data plane、typed
 `request_human_takeover`、Station publication barriers、SideEffect coordinator和外部
@@ -252,6 +322,36 @@ preview，并通过`project_component_mixing_shadow`写入显式、`non_authorit
 episode owner验证HOLD/no-action、abort/restart、WAL failure和terminal closure。该实现仍只作为virtual-policy/component
 shadow的可替换分支，未改变任何现有sim/real/replay/deploy行为；正式compound execution仍需hand spec/joint-order/units/
 active-mask/bounds/safety与downstream admission receipt gate。
+
+2026-07-25已在上述shadow之外增加第一段正式、backend-neutral component composition协议，但仍为default-off。
+`CompositionSpec`只拥有输入/required roles、component representation、权重、missing/fallback和分歧限制；
+`FormalCompositionStrategySpec`只拥有实现ID/version、所需context、实现依赖和inline latency，禁止在
+`parameter_payload`重复定义component语义。新`formal_component_strategy_v2`使用独立
+`dexteleop.composition_spec.v2` hash域并绑定typed `ComponentCompositionRuleSet`；原三种v1 algebra的payload/hash及
+`DeterministicComposer`行为不变。参考`FormalComponentCompositionStrategyV2`已在单个same-cut
+`CompositionResult`中完成单臂pose与Q6/q16 active-mask qpos融合；缺正式策略、contract不匹配、策略重复定义语义、缺输入、
+frame/action-space冲突或数值异常均fail closed。v2.4 ControlTrace以additive
+`component_composition_rule_set`和`formal_component_composition_binding`事实记录完整规则以及
+CompositionSpec→rule-set→strategy三方绑定，不修改既有spec/strategy v1 record。当前验证只使用虚拟human/policy，
+未接GUI、RTC worker、replay cursor、sim authority、真机或末端驱动器；下一门是MuJoCo shadow profile兼容验证及显式
+promotion scope，而不是复用旧post-Arbiter shadow作为production路径。该门随后已以真实`MujocoDeployRuntime`
+完成：composer authority关闭时只产生formal result/trace，不产生proposal或physics command；MuJoCo promotion API现允许
+显式component/group scope，但按当前`ActionComponentCatalog`校验catalog顺序、active effectors及coupled group完整性，
+默认仍为原双臂`("left_arm","right_arm")/("arms",)`。因此单臂+hand shadow不会被隐式提升；正式compound authority仍须
+单独冻结含hand的catalog、canonical hand safety、resolver/reference capability和执行receipt。
+
+该正式门现已按保守语义落地为sim-only、default-off的
+`ConservativeCompoundAuthorityProfile`。profile不绑定模型/ckpt，而是绑定
+CompositionSpec→component rule set→formal strategy三方hash、唯一composer producer以及完整catalog/group scope。
+启用时raw primary policy与replay authority必须关闭，AuthorityPolicy对每个required group只能授权该composer且fallback
+必须为domain HOLD；backend-neutral `AuthoritativeControlRuntime.admit_proposal()`再次校验完整coverage/group/action
+effectors和formal composition lineage，绕过MuJoCo wrapper提交partial proposal同样被拒绝。proposal TTL收紧为一个
+decision period；缺失/过期不沿用更久的旧composition。single proposal经Arbiter、整份canonical safety、
+pose→qpos+hand passthrough和完整`CompoundDispatchManifest`后才进入receiver；safety异常、safe-action缩减scope、
+resolution失败或任一downstream receipt失败均生成additive v2.4 `compound_authority_failure`并执行control-domain
+cancellation/HOLD，清空全部pending/active group。成功时receiver仍只在START guard一次性提升arms和required hands。
+当前真实MuJoCo fixture已验证唯一proposal三组选择、partial proposal拒绝、缺proposal HOLD和partial receipt全组取消；
+它仍限双RM65+双DM-Tac q6 sim，不接GUI/RTC/replay cursor/真机，也不改变现有arms-only composer和sync路径。
 
 CS-6b2a现补齐了正式接线前的passive source边界，但没有扩大执行面。
 `PassiveTeleopComponentSessionSource`与pose-only facade共享唯一non-dispatching `TeleopSession` lifecycle和observer
@@ -287,7 +387,8 @@ proposal，但下发前必须生成immutable `CompoundDispatchManifest`，精确
 context/manifest/resolution，再接纳arm target；START时core先校验全部pending group/generation，随后原子提升三组，rig才将
 DMTAC目标送入transport。START前HOLD会同时清除三组pending、receiver reservation和未入队hand target。MuJoCo profile以
 空`compound_hand_action_specs_by_side`保持default-off；启用时要求显式canonical shared safety、scheduled pose execution和
-已有DMTAC q6 profile，暂拒绝replay/composer authority及非DMTAC hand spec。formal sim fixture已覆盖独立VIVE-arm、
+已有DMTAC q6 profile。独立human/replay-style多proposal compound fixture仍保持原语义；composer authority仅可通过上述
+额外typed conservative profile开启，replay authority和非DMTAC hand spec仍拒绝。formal sim fixture已覆盖独立VIVE-arm、
 left-Q6、right-Q6 emission→proposal→Arbiter→safety→manifest→guarded activation与HOLD-before-START。
 
 CS-6b2d现补齐sim范围内的causal input/native stream第一段。通用`ReceiverObservationCutBuilder`将任意lower source sample
@@ -350,8 +451,9 @@ invalidation/drain完成后，可在HOLD下转移authority；只有post-takeover
 fixture证据，不能升级为真实human或policy→human语义；第一批实现限定为root `control_station`纯契约、虚拟source与MuJoCo
 scoped验证，不改teleop/replay legacy执行和episode行为，也不接RTC producer或真机。
 
-该第一批CS-6b0实现现已按上述边界完成scoped落地。`control_station/handoff.py`是纯receipt reducer，不导入model、sim、
-hardware或teleop；MuJoCo bridge只增加一个显式单向`replay→synthetic human`入口，原CS-6a immediate-READY入口与既有
+该第一批CS-6b0实现现已按上述边界完成scoped落地。纯receipt reducer现唯一位于
+`control_composition.lifecycle.handoff`，不导入model、sim、hardware或teleop；MuJoCo bridge只增加一个显式单向
+`replay→synthetic human`入口，原CS-6a immediate-READY入口与既有
 human/replay submission保持不变。bridge在publication关闭后消费真实HOLD/cancellation ack并推进旧replay producer epoch，
 所以历史proposal只保留为trace fact，不再进入active-epoch arbitration cut；随后在HOLD下完成release/takeover。post-takeover
 human adapter/canonical-safety仅作为non-publishing preview，真实MuJoCo qpos作为fresh measurement；READY后必须由同一emission
@@ -856,19 +958,23 @@ lineage进入MuJoCo proposal；它不调用predict/merge/pop，也不拥有actio
 Station lifecycle：completion后才开放publication，release先关闭barrier再由同一lower core接纳HOLD/cancellation。当前尚未
 接artifact preflight；policy-specific formal fixture已用专用profile把exact emission/validation设为required，并完成
 scheduled execution的WAL/seal/commit/read与ActualDecisionView重建。该结果仍不是production policy source。下一RTC
-Station slice的data plane现已接通lower-owned完整`RtcFrontendStep`：root composition逐项验证RTC due-pop、emission commit、
-producer/plan identity与exact `PolicyActionEmission`，拒绝裸emission绕过和scheduled-segment伪装，然后复用同一MuJoCo
-authoritative core。异步推理期间deterministic fixture只同步推进既有target physics clock，不新增policy scheduler。
+Station slice的正式data plane现已改为lower-owned
+`RtcPolicyEmissionSourceBinding + PolicyActionEmission`：binding验证epoch/config/source identity，emission自身绑定
+同一`source_binding_hash`，然后复用同一MuJoCo authoritative core。完整`RtcFrontendStep`只保留debug compatibility
+验证，不再是Station、Control Composition或target的正式输入。异步推理期间deterministic fixture只同步推进既有target
+physics clock，不新增policy scheduler。
 downstream publication的Station lifecycle现已按该边界接入：connect/preflight不启动producer，release先关闭barrier再
 HOLD execution core，且不改变RTC producer snapshot/worker session/plan/epoch。专用immediate-qref formal profile又将
 exact emission、source validation、Station lifecycle、execution manifest、receipt和measurement纳入真实WAL/seal/commit/
 committed-reader闭环，并把scheduled-reference family显式标为不适用。human/replay/sync-policy/RTC policy仍须按
 单source分别验收；该fixture不是artifact/transport/production/real证据，不能接真机或替换现有GUI。
-CS-3a现又把existing deploy的唯一RTC frontend返回点暴露为default-off bounded passive fanout；root Station只接收
-target-neutral source binding和同一个immutable `RtcFrontendStep`，不接收frontend对象。null-target manifest仅允许shadow，
-同队列ordered fence界定observer可见区间；connect/preflight/start/stop已验证不会改变producer snapshot、worker/plan、
-selected-emission count或lower queue-pop。该seam没有artifact/transport/real-observation preflight、target execution、
-ControlTrace episode或motion authority，不能由“existing frontend已接”外推为RTC-6 real shadow或production Station。
+CS-3a现又把existing deploy唯一正式emission seam暴露为default-off、bounded、
+committed-only `PolicyActionEmissionFanout`；root Station只接收target-neutral binding与同一个immutable emission，
+不接收frontend或完整step。null-target manifest仅允许shadow，同队列ordered fence界定observer可见区间；
+connect/preflight/start/stop已验证不会改变producer snapshot、worker/plan、selected-emission count或lower queue-pop。
+当前binding按producer epoch冻结，rearm后旧binding fail closed；自动binding rotation尚未完成。该seam没有
+artifact/transport/real-observation preflight、target execution、ControlTrace episode或motion authority，不能由
+“existing frontend已接”外推为RTC-6 real shadow或production Station。
 CS-3b-a现已在root application层增加纯OpenPI RTC source assessment：只比较已有artifact preflight、
 capability/request negotiation、backend构造时已验证的server metadata与CS-3a source binding，并绑定到仍为null-target、
 shadow-only的manifest。该assessment固定将live transport、real observation和target binding标为`not_assessed`，将execution/
@@ -3142,6 +3248,7 @@ authority epoch。
 
 ```text
 control_composition/
+├── activation.py           # formal start/re-arm activation identity + receiver barrier
 ├── composition/
 │   ├── core.py              # immutable input/snapshot/spec/result + deterministic composer
 │   ├── strategies.py        # replaceable pose and hand/gripper-qpos strategies
@@ -3151,9 +3258,10 @@ control_composition/
 │   ├── difference.py        # source/output difference facts
 │   └── feedback.py          # bounded non-authoritative guidance
 ├── lifecycle/               # handoff/session/rearm reducers and registry
+├── events.py                # protocol-neutral composition domain events
+├── information.py           # predeclared composition-only information demand
 ├── policy_node.py           # composition-aware synthetic node protocol
-├── runtime.py               # receiver-side evaluation and proposal promotion
-└── trace.py                 # composition-specific ControlTrace projections
+└── runtime.py               # receiver-side evaluation and proposal promotion
 
 robot_motion/
 ├── action/
@@ -3198,6 +3306,9 @@ teleop_runtime/
     ├── runtime.py          # deploy/collection 共用 subordinate journal/spool
     ├── lifecycle.py       # EpisodeLifecycleOwner adapter / RuntimeTraceSession
     └── projection.py      # 当前 generic；M4B 前改 explicit event projection
+
+dataset_interface/
+└── composition_control_trace.py # composition domain event -> v2.4 projection
 
 control_composition/
 ├── composition/context.py # generic CompositionContext admission/store/snapshot
@@ -3372,14 +3483,25 @@ immutable emission 与 legacy-execution tap，不能重新读取输入、再次�
 
 当前状态：M5.2 pure contract/harness 已完成并已继续泛化。当前工作树已有transport-neutral `PolicyNodeRuntime`、
 receiver-admitted `CompositionContextStore`/snapshot、internal-only `CompositionInputStore`/snapshot、显式
-`TimeWindowRetentionSpec`、版本化
-`CompositionSpec` 与 `DeterministicComposer`；context/composition event 已有 explicit ControlTrace schema/projection。
+`TimeWindowRetentionSpec`、版本化`CompositionSpec`与`DeterministicComposer`；
+`CompositionInformationPlan`已能预声明latest-value context demand，composition runtime只发protocol-neutral domain
+events，ControlTrace projection由外部dataset adapter持有；activation v2已冻结input→snapshot→result的同activation
+identity及v1兼容hash。新增的opt-in formal strategy v2已冻结strategy spec、精确action/context/information-plan
+input、v4 result和result binding；framework统一生成result identity，strategy只返回status/reason/action及实际
+使用的context IDs。MuJoCo runtime现已提供不进入config/hash的显式strategy注入端口，CS6b1h formal pose
+fixture已验证同一input snapshot下v1/v2左右臂pose/action hash一致、v2 application binding、v4
+trace/proposal lineage及既有authority→safety→reference→dispatch链不变。默认仍走deterministic兼容分支；
+下一迁移门是选定一个命名的default-off sim运行profile做持续parity，而不是直接切换现有入口；最终仍要废弃v1，
+不长期维护两套production composer。
 fixture 验证 15 Hz RGBD stable-ID reuse、100 Hz tactile latest sample、10 Hz slow context、40 Hz fast residual、
 context sequence rollback/stale/restart/cut isolation，以及 30/45/60 Hz Arbiter。v1 composer 只支持 component
-union 和 qpos base-plus-bounded-residual；没有 production caller、PolicyOrchestrator、通用 DAG/RPC、真实第二模型
-或 pose/SE(3) residual。普通 proposal 的 `semantic.v1` payload/hash 保持不变，带 composition lineage 的 proposal
-使用显式 `semantic.v2` domain。source/embodiment 可替换性目前也只是 test-local fake conformance，不是正式 backend
-binding contract。
+union、qpos base-plus-bounded-residual及weighted SE(3) pose fusion；当前唯一具体runtime binding在MuJoCo，
+composer authority默认关闭，尚无真机或OpenPI正式接线，也没有PolicyOrchestrator、通用DAG/RPC或真实第二模型。
+普通 proposal 的 `semantic.v1` payload/hash 保持不变，带composition lineage的proposal使用显式
+`semantic.v2` domain；activation尚未作为proposal独立字段存在，但已通过v2/v4 result identity间接进入
+`policy_output_id` hash lineage。source eligibility/liveness纯层和
+default-off MuJoCo shadow已经落地，但真实设备、replay与policy worker的状态adapter尚未接线；source/embodiment
+可替换性仍需后续多backend conformance，不是正式production binding结论。
 
 使用 injected fake clock 和 fake producers：
 

@@ -97,7 +97,8 @@
 - policy暂停分型为`suspend_policy_keep_reference`与`hold_and_release_authority`两种不同操作语义。
   前者不允许handoff；后者必须关闭publication、推进execution epoch、清除scheduled work并取得backend HOLD evidence，随后才
   能开始显式authority transaction。policy error、RTC underrun/late completion和worker stop不能自动授权human；
-- 根级`control_station/handoff.py`现已将上述语义落为模型、本体和backend无关的纯事务：typed request依次消费
+- `control_composition.lifecycle.handoff`现唯一持有上述模型、本体和backend无关的纯事务；旧
+  `control_station.handoff`转发层已在调用审计后删除。typed request依次消费
   `ExecutionHoldReceipt`、`SourceInvalidationReceipt`、release/takeover、post-takeover readiness与READY receipt；任一乱序、
   request/epoch错配、stale input、unsafe verdict或failed ack都fail closed，且相同receipt幂等。`capture_only`不能被偷偷解释为
   motion stop，`suspend_policy_keep_reference`也不能进入handoff；
@@ -162,13 +163,14 @@
   `PolicyActionEmission`与`source_validation`设为required，并以lower runtime自己的两帧lookahead/两次唯一pop完成真实
   WAL、seal/commit、committed reader与ActualDecisionView重建；Station没有predict/merge/pop。当前明确排除artifact
   preflight、RTC、production entrypoint与真机；
-- `teleop_runtime.deploy.rtc_step_fanout`现已在唯一`RtcPolicyShadowFrontend.step()`返回点提供默认关闭、注入式、
-  bounded/nonblocking的passive fanout；每个subscriber的full/error独立计数，不改变lower control loop。CS-3a新增
-  target-neutral `RtcFrontendStepSourceBinding`、根级`RtcPolicyStationConsumer`和`target_kind=null`/shadow-only manifest：
+- `teleop_runtime.deploy.rtc_step_fanout`现已在唯一正式emission返回点提供默认关闭、注入式、
+  bounded/nonblocking的`PolicyActionEmissionFanout`；只有同一due-pop已经形成accepted emission commit时才发布，
+  每个subscriber的full/error独立计数，不改变lower control loop。CS-3a直接复用lower-owned
+  `RtcPolicyEmissionSourceBinding`、根级`RtcPolicyStationConsumer`和`target_kind=null`/shadow-only manifest：
   Station只通过同队列有序fence决定observer可见区间，不持有frontend、worker、plan、predict/merge/pop、emission commit、
   candidate、dispatcher、episode或motion authority。scoped fixture已证明connect/preflight/start/stop不改变producer state hash、
-  selected-emission count或lower queue-pop，且回调收到同一个immutable step；尚无production composition、OpenPI transport、
-  real target或正式capture；
+  selected-emission count或lower queue-pop，且回调收到同一个immutable emission；`RtcFrontendStepFanout`仅保留debug兼容，
+  尚无production composition、OpenPI transport、real target或正式capture；
   root `RtcPolicyPassiveStationBootstrap`还可先准备subscriber queue/fanout，再等待lower frontend一次性发布真实binding后构造
   Station，避免application层重复RTC config猜hash；它不启动deploy或Station server；
 - CS-3a专用loopback Web builder已复用`SideEffectStationOperationCoordinator`异步执行connect/preflight/start/stop；
@@ -234,6 +236,48 @@ policy deployment     python -m teleop_runtime.deploy
 在完成 sim vertical slice、三类 source 单独验收和 legacy-real passive parity 之前，不新增或宣传新的 production
 entrypoint。`teleop_runtime/core/kernel.py` 继续保持 experimental，不作为本平台基础。
 
+### 1.1 GUI/control-plane ownership修正（2026-07-25）
+
+`control_station`冻结为面向GUI的application control plane。它不只是HTML/status格式化：
+typed operator intent admission、application lifecycle state、operation coordination、声明式profile
+选择和source/target窄端口绑定继续保留。它也不是action data plane，不得持有可复用动作算法、设备/模型实现、
+simulator execution、dataset projection或capture writer。
+
+当前依赖方向保持不变：下层package不得导入`control_station`。实际结构问题是若干Station文件仍物理持有可复用的
+下层实现；其目标ownership现冻结为：
+
+| 当前实现 | 目标ownership |
+|---|---|
+| composition cut/TTL/context/eligibility/strategy/fallback/difference/session/handoff | `control_composition` |
+| human proposal/cut admission, passive emission ingress/fanout and passive teleop session | `teleop_runtime.action` |
+| replay binding and passive emission consumption | existing `teleop_runtime.replay` / `robot_motion.replay` seams |
+| policy/RTC emission binding and formal emission validation | `robot_motion.deploy`；application fanout留在`teleop_runtime.deploy` |
+| OpenPI artifact and RTC protocol assessment | `deployments.openpi` |
+| MuJoCo measurement, target readiness/re-arm, resolution and execution evidence | `sim.mujoco` |
+| authority, safety, IK, reference scheduling and dispatch | `robot_motion` |
+| ControlTrace/v2.4 projection and capture persistence | `dataset_interface` and the unique capture owner |
+
+`control_station/composition/`暂时作为compatibility-scoped application fixture保留。首先从中移除可复用数值、
+source-specific、target-specific以及dataset/model逻辑；余下的GUI可选接线再改名为声明式
+`control_station/profiles/`。由于Station是application leaf，profile可以导入多个下层package，但只能绑定已有typed
+port和manifest，不得创建第二套source queue、cursor、worker、authority/epoch owner、safety stage、
+reference scheduler、dispatcher或episode lifecycle。
+
+落地顺序：
+
+1. **CS-B0 boundary gate：**冻结reverse dependency、stable core、dataset/model/sim/numerical debt
+   allowlist及hash/行为parity；当前dataset debt精确限于`control_trace.py`和已有
+   `composition/mujoco_pose_composer.py`投影接线；
+2. **CS-B1 source去重：**RTC重复binding实现已删除，Station旧名称保持同一canonical type alias；
+   replay继续直接复用下层binding。下一批只迁出passive human/teleop/synthetic source，且等待并行real-teleop
+   ownership接口稳定；
+3. **CS-B2 data/model分离：**用protocol-neutral receipt/event和外部adapter替换Station持有的ControlTrace与OpenPI投影；
+4. **CS-B3 profile减薄：**将MuJoCo readiness/execution和残留通用composition实现迁回owner；
+5. **CS-B4 package收口：**把薄application assembly改名为`profiles/`，移除无caller兼容导出，最后再评估正式GUI入口迁移。
+
+每一步都保持semantic hash及现有human/replay/deploy入口，不授予motion authority，也不改变真机设备启动。
+正在进行的`teleop_runtime/real_teleop` ownership重构视为并行主线；发生重叠的B1迁移等待其接口稳定。
+
 ---
 
 ## 2. 当前代码事实与需要解决的问题
@@ -266,7 +310,7 @@ entrypoint。`teleop_runtime/core/kernel.py` 继续保持 experimental，不作�
 
 ### 2.3 异步 action chunk 当前进度（已核验）
 
-截至 2026-07-21，异步部署不是概念规划，已有以下落地：
+截至 2026-07-25，异步部署不是概念规划，已有以下落地：
 
 ```text
 RTC-1  immutable inference request/result + target-time plan/merge       ✅ pure
@@ -274,9 +318,9 @@ RTC-2  delayed chunk → due pop → authoritative MuJoCo                  ✅ d
 RTC-3a bounded OS-thread inference carrier                              ✅ isolated
 RTC-3b split predict/admit sync-parity seam                             ✅ local-only
 RTC-3b.5 timed-plan single admission truth closure                      ✅ pure/local only
-RTC-3c virtual-policy/default-off/send_actions=false frontend           ⏳ not connected
-RTC-3d typed preview/lookahead gate                                     ⏳ later
-RTC-4  OpenPI model-side true flow/diffusion guidance                  ⏳ not implemented
+RTC-3c virtual-policy/default-off/send_actions=false frontend           ✅ local/no-action
+D-LA target-side typed preview/lookahead gate                           ⏳ downstream
+RTC-4 raw final-chunk adapters/transport                                🟡 connected/no authority
 ```
 
 实际模块：
@@ -779,8 +823,10 @@ CS-2a现拆成两个明确成熟度：
    已完成scoped contract；CS-2b-c又复用production loader/preflight/GUI worker的同一checked group与immutable emission，
    完成replay专用formal fixture。`qpos_target` GUI branch继续因缺lower-owned emission seam而fail closed；
 3. policy sync data plane、Station lifecycle与policy-specific formal capture已scoped接通；
-4. async aligned chunk虚拟policy已只消费完整immutable `RtcFrontendStep`，并逐项验证lower-owned due-pop与emission
-   commit；Station不能直接提交裸emission，也不能推进RTC prediction/merge/pop。downstream publication lifecycle与
+4. async aligned chunk虚拟policy正式只消费
+   `RtcPolicyEmissionSourceBinding + PolicyActionEmission`；source binding和emission hash证明lower-owned epoch/config/
+   commit identity。完整`RtcFrontendStep`仅作debug compatibility验证；Station不能推进RTC prediction/merge/pop。
+   downstream publication lifecycle与
    immediate-qref专用formal capture均已scoped闭合；connect/preflight/release不驱动RTC producer lifecycle；
 5.真实OpenPI loopback（后续）。
 
@@ -797,9 +843,11 @@ inference/pop/merge。
 
 当前子状态：
 
-- **CS-3a deploy RTC passive source（scoped complete）**：唯一lower `rtc_frontend.step()`之后的注入式fanout、
-  target-neutral binding、null-target shadow-only Station与有序启停fence已落地；没有target adapter side effect、producer lifecycle、
-  ControlTrace episode或real authority；loopback-only typed API已用bounded side-effect worker验证同一启停语义，但无production caller；
+- **CS-3a deploy RTC passive source（scoped complete / rearm rotation pending）**：唯一lower formal emission之后的
+  committed-only fanout、target-neutral epoch-scoped binding、null-target shadow-only Station与有序启停fence已落地；
+  没有target adapter side effect、producer lifecycle、ControlTrace episode或real authority；loopback-only typed API已用
+  bounded side-effect worker验证同一启停语义，但无production caller。旧binding在producer rearm后fail closed，
+  production接线前必须由lower owner显式发布下一epoch binding transition，Station不得自行推导；
 - **CS-3b-a OpenPI RTC source preflight projection（scoped complete）**：root application只消费下层已经构造完成的
   artifact preflight、RTC capability/request negotiation、server-metadata validation与CS-3a source binding，生成按维度分型的
   immutable assessment；Control Station不得据此创建websocket、加载artifact、启动policy producer，也不得把
@@ -894,7 +942,11 @@ inference/pop/merge。
   input不会自动READY或预发恢复proposal。ControlTrace新增`composition_authority_disposition`闭合publish/HOLD原因。
   human/replay contributor另记录`composition_contributor_input`，其source fact ID/hash必须精确解析到既有source/
   representation事实；无source lineage的旧`composition_input`事件和hash不变。
-  当前没有Station manifest/operation、episode capture profile、policy/RTC contributor或real binding，旧CS-6b1f/1g不变；
+  formal strategy v2现可通过`MujocoDeployRuntime`构造参数显式注入，不进入sim config或默认profile hash。
+  deterministic migration adapter在同一input snapshot上与v1 composer左右臂pose/action hash一致，但生成独立v4
+  result/proposal lineage；CS-6b1h application binding仅在注入时升级到含strategy-spec hash的v2 domain，未注入时v1
+  binding hash保持不变。该结果已覆盖唯一composer proposal→既有Arbiter/safety/reference/dispatch全链，错误spec在profile
+  build阶段拒绝。当前仍没有operational GUI入口、policy/RTC contributor或real binding，旧CS-6b1f/1g不变；
 
   共享数值层已补充两个后端无关增量，但未改变该concrete profile：pose strategy/composer可由manifest声明
   `left_arm`/`right_arm`非空subset，默认双臂hash、顺序和行为不变；当前CS-6b1i MuJoCo target仍保持双臂能力。
@@ -903,7 +955,7 @@ inference/pop/merge。
   diagnostic失败不得影响result/disposition/HOLD；重复decision幂等。pose差异还可映射为bounded、TTL约束的
   `guidance_haptic_non_force`虚拟cue；当前只有no-I/O adapter与可选ControlTrace，GUI、真实触觉、HOLD clear和真机均pending。
 
-  | formal v1 条件 | disposition |
+  | formal composer 条件 | disposition |
   |---|---|
   | human + replay同cut有效，融合ready | 发布唯一composer proposal |
   | required contributor TTL过期或producer epoch失效 | HOLD + cancellation |
@@ -1020,11 +1072,13 @@ RTC继续按其独立计划推进：
 ```text
 RTC-3b predict/admit拆分与sync parity
 → RTC-3b.5 timed-plan唯一admission / transition-first / worker session ✅
-→ RTC-3c virtual-policy default-off no-hardware wiring（RTC-only lookahead disabled）
-→ RTC-4 OpenPI capability
-→ RTC-5 model-guided MuJoCo
-→ RTC-6 real no-motion shadow
-→ RTC-7独立real authority
+→ RTC-3c target-neutral PolicyActionEmission boundary（RTC-only lookahead disabled）✅
+→ RTC-4 raw final-chunk provider/transport/real no-action evidence
+
+independent downstream:
+PolicyActionEmission → ordinary deploy or contributor adapter
+→ target compatibility / canonical safety / reference / sim authority
+→ D-LA typed preview（仅在需要scheduled lookahead时）
 ```
 
 Control Station可在RTC-3完成前实现CS-0/CS-1；CS-2的异步source先接RTC-2 virtual runner。真实部署source接入条件：
@@ -1035,6 +1089,8 @@ Control Station可在RTC-3完成前实现CS-0/CS-1；CS-2的异步source先接RT
 - 每tick最多一个due emission；
 - passive station observer不改变worker mailbox；
 - producer epoch变化拒绝旧completion；
+- emission携带exact epoch-scoped `source_binding_hash`；
+- rearm后由lower owner显式发布新binding，Station不得猜测或沿用旧binding；
 - worker stop不冒充execution drain；
 - RTC mode、artifact、codec、frame和layout hash全部显示并进入manifest。
 
@@ -1126,7 +1182,8 @@ CS-2c  MuJoCo sync policy-only data plane                                       
 CS-2d  MuJoCo RTC-3c virtual policy-only data plane                              ✅ scoped
          Station downstream-publication lifecycle                                ✅ scoped
          RTC-specific immediate-qref formal capture                               ✅ scoped fixture
-CS-3a  existing deploy RTC exact-step passive fanout + null-target Station        ✅ scoped
+CS-3a  existing deploy committed-emission fanout + null-target Station             ✅ scoped
+         cross-rearm source-binding rotation                                        ⏳
          loopback typed passive-shadow API                                         ✅ scoped
 CS-3b-a artifact/protocol/source-binding coherence projection                       ✅ scoped pure
 CS-3b-T live transport session + real-observation readiness                         ⏳
@@ -1138,7 +1195,7 @@ CS-6b1e device-neutral passive pose session + replay-only-authority integration 
          typed lower deadman/rebase receipts + real readiness provider                ⛔ real-only blocked
 CS-6b1f opt-in sim pose HIL + external-recorder formal capture                         ✅ scoped; virtual readiness only
 CS-6b1g fixed-weight SE(3) shared-receiver human+replay sim shadow                    ✅ scoped/default-off
-CS-6b1h composer-only formal pose fusion + fail-closed gate                           ✅ deterministic sim/default-off
+CS-6b1h composer-only formal pose fusion + formal-strategy-v2 parity                  ✅ deterministic sim/default-off
 CS-6b1i generic typed composition session + formal episode capture                     ✅ deterministic sim/default-off
          typed re-arm + GUI/real + policy/RTC contributor                              ⏳
 CS-6b2a passive pose/hand-qpos component source + catalog-bound adaptation        ✅ scoped
@@ -1169,18 +1226,20 @@ WAL或reader。它不提供production application root、真机replay authority�
 lower-owned emission seam仍在启动前fail closed。CS-2c首个data-plane slice现已只消费既有`PolicyActionEmission`并保持
 queue-pop count不变；typed Station lifecycle也已scoped验证authority完成后开放、release前关闭publication。下一policy
 formal fixture又用专用profile完成emission→Station→scheduled execution的WAL/seal/commit/read；这仍不是artifact-ready或
-production policy source。CS-2d首个data-plane slice现已消费RTC-3c返回的完整immutable frontend step：只有带accepted
-due-pop、exact keyframe lineage和accepted emission-commit的同一`PolicyActionEmission`可进入既有MuJoCo authority；
-直接裸emission提交、第二次提交和scheduled-segment伪装均fail closed。Station lifecycle现只约束downstream
+production policy source。CS-2d首个data-plane slice现已消费
+`RtcPolicyEmissionSourceBinding + PolicyActionEmission`：只有binding与emission内嵌`source_binding_hash`精确一致的
+正式emission可进入既有MuJoCo authority；完整frontend step仅保留debug compatibility检查，第二次提交和
+scheduled-segment伪装仍fail closed。Station lifecycle现只约束downstream
 publication；connect/preflight不启动worker，release关闭barrier并HOLD execution core，但RTC producer state hash保持不变。
 RTC专用immediate-qref profile又完成真实WAL/seal/commit/read与ActualDecisionView重建，且明确把scheduled segment family
 标为`NOT_APPLICABLE`。predict/plan/merge/pop所有权继续完全位于RTC lower runtime；该结果仍不是artifact/transport/
 production/real source evidence。
-CS-3a又在不改变上述CS-2d authority fixture的前提下，把现有deploy control loop唯一返回的完整`RtcFrontendStep`送入
+CS-3a又在不改变上述CS-2d authority fixture的前提下，把现有deploy control loop已commit的正式emission送入
 default-off bounded fanout。根级consumer只持有subscriber queue和target-neutral source binding；start/stop shadow使用与
-step同一队列的fence，避免启用前backlog在启用后被误记。manifest没有candidate/authority intent且target为null；测试证明
+emission同一队列的fence，避免启用前backlog在启用后被误记。manifest没有candidate/authority intent且target为null；测试证明
 Station lifecycle不改变RTC producer snapshot、selected-emission count或queue-pop。该结果仅关闭existing deploy passive
-source seam，不是production Station入口、OpenPI/transport evidence、real target preflight、capture或motion authorization。
+source seam；binding仍是epoch-scoped且尚无跨rearm rotation，不是production Station入口、OpenPI/transport evidence、
+real target preflight、capture或motion authorization。
 与此并行，RTC主线已完成RTC-3c virtual-policy、default-off、`send_actions=false` frontend wiring，且仅RTC profile禁用
 position lookahead。M5.8主线继续
 target-bearing无硬件race/drain，再按单独授权进入真机微动。

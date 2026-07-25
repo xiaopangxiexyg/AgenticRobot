@@ -10,11 +10,22 @@ monkeypatch behavior stays visible at the compatibility boundary.
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping, Sequence
 import inspect
 import time
 
 import numpy as np
+
+from ..collection.camera_preview import CameraPreviewer
+from ..collection.sample_assembler import (
+    _build_pose_quality_metadata as _collection_build_pose_quality_metadata,
+)
+from ..real_teleop.wrist_depth_freshness import (
+    WRIST_DEPTH_CAMERA_KEYS,
+    WristDepthFreshnessMonitor,
+)
+from ..sources.camera import RealSenseRGBSource
 
 
 _SUPPORT_NAMES = ("_command_backend_status_text",)
@@ -97,6 +108,264 @@ def _compact_runtime_bool(value: object) -> str:
 def _as_status_error_text(value: object) -> str:
     text = str(value or "").strip()
     return text if text and text.lower() not in {"none", "false"} else ""
+
+
+def _camera_status_for_source(
+    camera_key: str,
+    source: RealSenseRGBSource,
+    *,
+    now: float,
+    preview_selected: bool,
+    preview_active: bool,
+    depth_monitor: WristDepthFreshnessMonitor | None = None,
+) -> dict[str, object]:
+    config = getattr(source, "config", None)
+    fallback_serial = getattr(config, "serial", None)
+    try:
+        info = source.device_info()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "camera_key": str(camera_key),
+            "status_level": "error",
+            "status_label": "状态读取失败",
+            "status_message": f"{type(exc).__name__}: {exc}",
+            "serial": fallback_serial,
+            "preview_selected": bool(preview_selected),
+            "preview_active": bool(preview_active and preview_selected),
+        }
+    if not isinstance(info, Mapping):
+        info = {}
+
+    frame_count = _safe_int_value(info.get("frame_count"))
+    frame_count = 0 if frame_count is None else max(0, int(frame_count))
+    timeout_count = _safe_int_value(info.get("timeout_count"))
+    consecutive_timeout_count = _safe_int_value(info.get("consecutive_timeout_count"))
+    restart_count = _safe_int_value(info.get("restart_count"))
+    restart_attempt_count = _safe_int_value(info.get("restart_attempt_count"))
+    restart_failure_count = _safe_int_value(info.get("restart_failure_count"))
+    last_frame_age_sec = _safe_float_value(info.get("last_frame_age_sec"))
+    stale_after_sec = _safe_float_value(info.get("stale_after_sec"))
+    if stale_after_sec is None or stale_after_sec <= 0.0:
+        stale_after_sec = 2.0
+    last_error = _as_status_error_text(info.get("last_error"))
+    last_runtime_error = _as_status_error_text(info.get("last_runtime_error"))
+    depth_enabled = bool(info.get("depth_enabled") or getattr(config, "enable_depth", False))
+    depth_required = bool(depth_enabled and str(camera_key) in WRIST_DEPTH_CAMERA_KEYS)
+    depth_scale = _safe_float_value(info.get("depth_scale_m_per_unit"))
+    depth_frame_present: bool | None = None
+    depth_status_level = "off"
+    depth_status_label = "未启用"
+    depth_status_message = ""
+    latest_depth_metadata: Mapping[str, object] = {}
+    depth_freshness: dict[str, object] = {}
+    if depth_required:
+        latest_frame = None
+        try:
+            latest_frame = source.frame_buffer().get_latest()
+        except Exception as exc:  # noqa: BLE001
+            depth_status_level = "error"
+            depth_status_label = "Depth 状态失败"
+            depth_status_message = f"{type(exc).__name__}: {exc}"
+        else:
+            if latest_frame is None:
+                depth_status_level = "waiting"
+                depth_status_label = "等待 Wrist Depth"
+                depth_status_message = "wrist depth 已启用，但还没有 color+depth 同步帧。"
+            else:
+                raw_depth_metadata = getattr(latest_frame, "depth_metadata", {})
+                if isinstance(raw_depth_metadata, Mapping):
+                    latest_depth_metadata = raw_depth_metadata
+                depth_frame_present = getattr(latest_frame, "depth_image", None) is not None
+                frame_depth_scale = _safe_float_value(latest_depth_metadata.get("depth_scale_m_per_unit"))
+                if depth_scale is None and frame_depth_scale is not None:
+                    depth_scale = frame_depth_scale
+                if not depth_frame_present:
+                    depth_status_level = "error"
+                    depth_status_label = "Wrist Depth 失效"
+                    depth_status_message = "最新 wrist 相机帧缺少 depth_image。"
+                elif depth_scale is None and frame_depth_scale is None:
+                    depth_status_level = "warn"
+                    depth_status_label = "Depth scale 缺失"
+                    depth_status_message = "depth frame 存在，但缺少有效 depth_scale_m_per_unit，mask 不能可靠生成。"
+                else:
+                    if depth_monitor is not None:
+                        depth_freshness = depth_monitor.update(
+                            str(camera_key),
+                            latest_frame,
+                            now=float(now),
+                            depth_metadata=latest_depth_metadata,
+                        )
+                    freshness_level = str(depth_freshness.get("depth_freshness_status_level") or "ok")
+                    freshness_label = str(depth_freshness.get("depth_freshness_status_label") or "")
+                    freshness_message = str(depth_freshness.get("depth_freshness_status_message") or "")
+                    if freshness_level in {"error", "warn", "waiting"}:
+                        depth_status_level = freshness_level
+                        depth_status_label = freshness_label or "Wrist Depth 检查中"
+                        depth_status_message = freshness_message
+                    else:
+                        depth_status_level = "ok"
+                        depth_status_label = "Wrist Depth 正常"
+
+    status_level = "ok"
+    status_label = "正常"
+    status_message = ""
+    if last_error:
+        status_level = "error"
+        status_label = "异常"
+        status_message = last_error
+    elif frame_count <= 0:
+        status_level = "waiting"
+        status_label = "等待首帧"
+        status_message = last_runtime_error
+    elif last_frame_age_sec is None:
+        status_level = "warn"
+        status_label = "缺少时间戳"
+    elif last_frame_age_sec >= stale_after_sec:
+        status_level = "error"
+        status_label = "数据停滞"
+        status_message = f"last frame age {last_frame_age_sec:.2f}s >= stale {stale_after_sec:.2f}s"
+    elif last_frame_age_sec >= max(0.5, stale_after_sec * 0.5):
+        status_level = "warn"
+        status_label = "帧延迟"
+        status_message = f"last frame age {last_frame_age_sec:.2f}s"
+    elif (consecutive_timeout_count or 0) > 0 or last_runtime_error:
+        status_level = "warn"
+        status_label = "临时 timeout"
+        status_message = last_runtime_error
+    if depth_required:
+        severity_rank = {"off": 0, "ok": 0, "waiting": 1, "warn": 2, "error": 3}
+        if severity_rank.get(depth_status_level, 0) > severity_rank.get(status_level, 0):
+            status_level = depth_status_level
+            status_label = depth_status_label
+            status_message = depth_status_message
+        elif depth_status_message and depth_status_message not in status_message:
+            status_message = (
+                f"{status_message}; {depth_status_message}"
+                if status_message
+                else depth_status_message
+            )
+
+    metadata = info.get("metadata") if isinstance(info.get("metadata"), Mapping) else {}
+    return {
+        "camera_key": str(camera_key),
+        "status_level": status_level,
+        "status_label": status_label,
+        "status_message": status_message,
+        "name": info.get("name") or getattr(source, "name", str(camera_key)),
+        "serial": info.get("serial") or fallback_serial,
+        "serial_number": info.get("serial_number"),
+        "device_name": info.get("device_name"),
+        "product_line": info.get("product_line"),
+        "firmware_version": info.get("firmware_version"),
+        "width": info.get("width") if info.get("width") is not None else getattr(config, "width", None),
+        "height": info.get("height") if info.get("height") is not None else getattr(config, "height", None),
+        "fps": info.get("fps") if info.get("fps") is not None else getattr(config, "fps", None),
+        "color_space": info.get("color_space") or getattr(config, "color_space", None),
+        "depth_enabled": depth_enabled,
+        "depth_required": depth_required,
+        "depth_width": info.get("depth_width") if info.get("depth_width") is not None else getattr(config, "depth_width", None),
+        "depth_height": info.get("depth_height") if info.get("depth_height") is not None else getattr(config, "depth_height", None),
+        "depth_fps": info.get("depth_fps") if info.get("depth_fps") is not None else getattr(config, "depth_fps", None),
+        "depth_scale_m_per_unit": depth_scale,
+        "depth_frame_present": depth_frame_present,
+        "depth_status_level": depth_status_level,
+        "depth_status_label": depth_status_label,
+        "depth_status_message": depth_status_message,
+        "depth_metadata": _json_safe_value(dict(latest_depth_metadata)),
+        "depth_frame_number": latest_depth_metadata.get("frame_number"),
+        "depth_camera_timestamp_sec": latest_depth_metadata.get("camera_timestamp_sec"),
+        "depth_sensor_timestamp_ms": latest_depth_metadata.get("sensor_timestamp_ms"),
+        **depth_freshness,
+        "frame_count": frame_count,
+        "last_frame_age_sec": last_frame_age_sec,
+        "stale_after_sec": stale_after_sec,
+        "timeout_count": timeout_count,
+        "consecutive_timeout_count": consecutive_timeout_count,
+        "restart_count": restart_count,
+        "restart_attempt_count": restart_attempt_count,
+        "restart_failure_count": restart_failure_count,
+        "last_error": last_error,
+        "last_runtime_error": last_runtime_error,
+        "last_restart_timestamp": info.get("last_restart_timestamp"),
+        "preview_selected": bool(preview_selected),
+        "preview_active": bool(preview_active and preview_selected),
+        "metadata": _json_safe_value(metadata),
+        "updated_at": float(now),
+    }
+
+
+def _build_camera_status(
+    camera_sources: Mapping[str, RealSenseRGBSource] | None,
+    *,
+    preview_camera_sources: Mapping[str, RealSenseRGBSource] | None = None,
+    camera_previewer: CameraPreviewer | None = None,
+    now: float | None = None,
+    depth_monitor: WristDepthFreshnessMonitor | None = None,
+) -> dict[str, object]:
+    if not camera_sources:
+        return {}
+    current_time = time.time() if now is None else float(now)
+    preview_keys = set(preview_camera_sources or {})
+    preview_active = camera_previewer is not None
+    return {
+        str(camera_key): _camera_status_for_source(
+            str(camera_key),
+            source,
+            now=current_time,
+            preview_selected=str(camera_key) in preview_keys,
+            preview_active=preview_active,
+            depth_monitor=depth_monitor,
+        )
+        for camera_key, source in sorted(camera_sources.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _wrist_depth_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "wrist_depth_mask", False)) or bool(
+        getattr(args, "wrist_depth_raw", False)
+    )
+
+
+def _with_expected_wrist_depth_camera_statuses(
+    camera_status: Mapping[str, object],
+    *,
+    args: argparse.Namespace,
+    now: float,
+) -> dict[str, object]:
+    merged = dict(camera_status)
+    if not _wrist_depth_requested(args):
+        return merged
+    for camera_key in WRIST_DEPTH_CAMERA_KEYS:
+        if camera_key in merged:
+            continue
+        merged[camera_key] = {
+            "camera_key": camera_key,
+            "status_level": "error",
+            "status_label": "Wrist 相机缺失",
+            "status_message": (
+                f"--wrist-depth-mask/--wrist-depth-raw requested but {camera_key} "
+                "is absent from camera_sources/config."
+            ),
+            "name": camera_key,
+            "serial": None,
+            "depth_enabled": True,
+            "depth_required": True,
+            "depth_frame_present": False,
+            "depth_status_level": "error",
+            "depth_status_label": "Wrist Depth 缺失",
+            "depth_status_message": f"{camera_key} 没有可用 RealSense source，无法生成 wrist depth mask。",
+            "frame_count": 0,
+            "last_frame_age_sec": None,
+            "stale_after_sec": None,
+            "timeout_count": None,
+            "consecutive_timeout_count": None,
+            "restart_count": None,
+            "preview_selected": False,
+            "preview_active": False,
+            "updated_at": float(now),
+        }
+    return merged
+
 
 def _camera_status_blocking_message(
     camera_status: Mapping[str, Mapping[str, object]] | None,
@@ -366,6 +635,48 @@ def _pose_quality_level(status: object, *, available: bool, bad: bool) -> str:
     if not available or status_text == "unknown":
         return "off"
     return "ok"
+
+
+def _build_pose_quality_display_payload(active_command: object | None) -> dict[str, object]:
+    quality = _collection_build_pose_quality_metadata(active_command)
+    if not isinstance(quality, Mapping):
+        quality = {}
+    metrics = quality.get("metrics")
+    metrics_dict = dict(metrics) if isinstance(metrics, Mapping) else {}
+    pose_error = metrics_dict.get("ik_solve_pose_error")
+    pose_error_dict = dict(pose_error) if isinstance(pose_error, Mapping) else {}
+    joint_margin = metrics_dict.get("joint_limit_margin")
+    joint_margin_dict = dict(joint_margin) if isinstance(joint_margin, Mapping) else {}
+    available = bool(quality.get("available", False))
+    status = str(quality.get("status") or "unknown")
+    bad = bool(quality.get("bad", False))
+    score = _float_or_none(quality.get("score"))
+    return {
+        "available": available,
+        "status": status,
+        "score": score,
+        "bad": bad,
+        "level": _pose_quality_level(status, available=available, bad=bad),
+        "source": str(quality.get("source") or ""),
+        "reasons": _pose_quality_reason_list(quality.get("reasons")),
+        "bad_reasons": _pose_quality_reason_list(quality.get("bad_reasons")),
+        "warning_reasons": _pose_quality_reason_list(quality.get("warning_reasons")),
+        "metrics": {
+            "collision_avoidance_status": metrics_dict.get("collision_avoidance_status"),
+            "collision_distance_m": _float_or_none(metrics_dict.get("collision_distance_m")),
+            "collision_min_distance_m": _float_or_none(metrics_dict.get("collision_min_distance_m")),
+            "collision_margin_m": _float_or_none(metrics_dict.get("collision_margin_m")),
+            "ik_jump_gate_status": metrics_dict.get("ik_jump_gate_status"),
+            "ik_branch_candidate": metrics_dict.get("ik_branch_candidate"),
+            "ik_translation_error_m": _float_or_none(pose_error_dict.get("max_translation_m")),
+            "ik_rotation_error_deg": _float_or_none(pose_error_dict.get("max_rotation_deg")),
+            "joint_nearest_margin_deg": _float_or_none(joint_margin_dict.get("nearest_margin_deg")),
+            "joint_near_limit": bool(joint_margin_dict.get("near_limit", False)),
+            "execution_step_limited": bool(metrics_dict.get("execution_step_limited", False)),
+            "ik_time_budget_exceeded": bool(metrics_dict.get("ik_time_budget_exceeded", False)),
+        },
+    }
+
 
 def _pose_quality_status_text(payload: Mapping[str, object] | None) -> str:
     if not isinstance(payload, Mapping):
@@ -864,6 +1175,7 @@ __all__ = [
     "_ik_timing_status_text",
     "_pose_quality_reason_list",
     "_pose_quality_level",
+    "_build_pose_quality_display_payload",
     "_pose_quality_status_text",
     "_runtime_fault_label",
     "_debug_timing_arm_text",

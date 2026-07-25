@@ -450,19 +450,26 @@ policy output
   -> backend dispatcher
 ```
 
-RTC逐项执行的顺序固定为：
+RTC producer与下游执行必须分开：
 
 ```text
 timed-plan due-pop
   -> PolicyActionEmission
+
+--- async timed-plan producer ownership ends here ---
+
+application publisher
+  -> validate producer commit / binding / TTL / idempotency
+
+optional downstream consumer
   -> proposal/source admission
   -> canonical safety (safe | modified | fault)
   -> resolver/reference/backend
   -> downstream receipt
 ```
 
-Emission记录pre-safety intent，不以safety或backend receipt为前置条件；只有RTC-3d future preview/lookahead需要在正式
-emission前取得独立preview acceptance。
+Emission记录pre-safety intent，不以safety、composition、target或backend receipt为前置条件。position preview/lookahead
+是独立target协议，不得反向成为raw-RTC producer commit条件。
 
 `RobotAction` 是 action semantic boundary，`TeleopCommand` 是 dispatch boundary。model adapter 不得 merge/pop plan、调用
 safety/reference/SDK 或取得 dispatch authority。
@@ -491,6 +498,17 @@ safety/reference/SDK 或取得 dispatch authority。
 
 RTC 是 `dexteleop_deploy_v2` 的可选推理扩展，默认关闭，不新增 state/action tensor 语义。
 
+正式协议以两个正交维度为准：
+
+```text
+scheduler_mode    = sync_queue | async_timed_plan
+continuation_mode = none | flow_inpaint | trained_prefix_conditioning | native_continuation
+```
+
+本文继续用 raw-RTC / model-RTC 作严格区分的讨论简称：raw-RTC =
+`async_timed_plan + none`；model-RTC = `async_timed_plan + non-none continuation`。简称不得进入新的
+class/hash domain/profile API；历史兼容 ID 保持不变。
+
 ### 9.1 raw-RTC
 
 ```text
@@ -503,6 +521,36 @@ continuation=none
 raw-RTC 的模型不消费 future action prefix；request 不得携带 prefix/mask/conditioning receipt，且必须声明
 `continuation=none`。OpenPI 当前 final-chunk 接入属于 raw-RTC。raw-RTC adapter 只负责 input preparation、
 blocking model call、response validation 和 model-space decode，不能拥有 worker、plan、safety、reference 或 dispatch authority。
+
+正式下游数据面是“已接受 commit 的 `PolicyActionEmission` + 不可变 producer/source binding”。同一 due keyframe
+只能发布一次；无 emission 或 commit identity 不一致时不得发布。完整 `RtcFrontendStep` 只用于 producer
+诊断和兼容验证，不是 Control Station、Control Composition 或 execution target 的必需输入。RTC timed emission
+必须将 epoch-scoped `source_binding_hash` 纳入自身 hash；同步 queue emission 保持该字段为 `null`。rearm 后 binding
+hash 必须变化，旧 binding consumer 必须 fail-closed；跨 epoch binding rotation 属于后续 application lifecycle gate。
+
+source identity 分两层：`RtcPolicyEmissionSourceDescriptor`只绑定稳定的模型/artifact、组件覆盖、表示、codec/frame/layout、
+normalization 与 cadence；`RtcPolicyEmissionSourceBinding`再绑定 runtime session、control domain 和 producer epoch。
+producer 只缓存 immutable binding candidate；application publisher 才拥有 active binding。普通 request、plan generation、
+chunk merge 或 worker completion 不得重建 binding。
+
+正式发布 API 是
+`RtcPolicyEmissionPublisher.publish_committed_emission(emission, PolicyActionEmissionCommitReceipt)`。publisher 必须验证
+exact emission hash/ID、active binding、producer/epoch、TTL 与 publication-key 幂等性；该 commit 仅证明 popped keyframe
+已固化为 emission，不证明 safety、reference、backend 或 measured execution。旧 `PolicyActionEmissionFanout`仅为
+observer/debug 兼容面，不是正式 commit validator。
+
+subscriber 必须分类：
+
+| role | queue full/error |
+|---|---|
+| observer（UI/debug/metrics） | 可 drop 并计数，不得阻塞 control loop |
+| required Control Adapter | 不得静默 drop；publication rejected 并 fail closed |
+
+首版最多一个 required subscriber。跨 epoch 恢复必须依赖 backend-neutral
+`RtcProducerActivationReadinessReceipt`；当前同线程 worker 实现仍保守要求旧 session drained。自动 stop-and-rebind、
+consumer orchestration 与多 required subscriber rotation 尚未完成。publisher 已提供显式
+`suspend_publication()`、typed `RtcPolicyEmissionBindingAck` 和 `activate_rebound_binding()`；任一校验失败必须保持
+suspended，不能由旧 fanout 代替。
 
 RTC 的 `observation_cut_id` 是 versioned causal identity，不是大体积 sensor payload 的内容哈希。v2 identity 必须绑定
 runtime session、control domain、producer/epoch、policy node、单调 request sequence、observation contract、timestamp 和
@@ -541,6 +589,11 @@ model-RTC 才允许模型实际消费 versioned future-action prefix/mask，并�
 `RtcConditioningReceiptV2`，证明实际使用的 prefix、mask、delay、implementation parameters 和 execution horizon。
 `continuation != none` 必须走 `async_timed_plan`；当前 typed prefix 不支持离散 token continuation 时必须拒绝。
 model-RTC 的 receipt/identity promotion 不得回写 raw-RTC 的 legacy model/server 调用。
+prefix使用完整generation lattice，满足
+`generation_start_at + forecast_delay_steps * action_period_sec = first_target_effective_at`；model adapter只返回
+`full_chunk[forecast_delay_steps:]`供timed-plan admission，runtime不得再次crop。首批仅允许producer-local overlap；
+sampler约束强度不证明target/reference acceptance。通用contract位于`robot_motion.deploy.rtc`，model client/provider仍分别
+位于`deployments.client`与`deployments/<model>/client`。
 
 ### 9.3 通用 adapter boundary
 
@@ -570,6 +623,9 @@ activation spec、representation proof 和 producer identity；target 的 contro
 `TargetRuntimeActionContract`。它固定 `authority_request=none`，不写 ControlTrace，也不等于 proposal admission、
 target admission、safety receipt 或 dispatch。assessment rejected 时不得产生 proposal draft。
 
+以上两个函数是可选的下游policy-to-proposal bridge，不属于RTC capability、worker、plan、admission、emission或完成
+门槛；普通部署、Control Composition和passive observer均可选择不同consumer，raw-RTC不得 import或调用这些consumer。
+
 RTC capability/negotiation 至少绑定：`capability_id`/`provider_id`/`artifact_hash`/`protocol_version`、scheduler modes、
 continuation mode、implementation id/`implementation_parameters_hash`、model action space 与 float/token dims、支持的 pose modes
 和 component scope、`action_codec_hash`/`frame_contract_hash`/`layout_hash`/`normalization_hash`、prediction/execution
@@ -587,7 +643,7 @@ payload、sync queue 顺序和 existing action-chunk behavior 不得改变。Ope
 ```text
 real arm/hand/camera observation
   -> existing model/server transport
-  -> RTC worker/timed-plan/admission/safety shadow
+  -> RTC worker/timed-plan/admission/emission shadow
   -> no actuator dispatch
 ```
 
@@ -603,6 +659,11 @@ live shadow 下 backend MUST expose measured observation while `observation_only
 若开启 `--debug`，raw-RTC 还会记录 model-neutral 的 `rtc_transport_exchange` 事件，包含 observation cut、输入/输出
 identity hash、chunk horizon 以及 inference/result latency；该事件只用于观测，不能替代 plan admission、safety、dispatch
 或 worker-drain evidence。
+
+RTC debug默认使用`summary`，只记录binding、request/result transition、transport exchange、emission/publication、
+fault和close；显式`--rtc-debug-level trace`才记录每个control tick。RTC事件必须经bounded observer queue非阻塞提交；
+队列满只丢诊断并计数，不得阻塞control/model worker。debug关闭或level不满足时不得构造payload。JSONL允许小批量
+flush，shutdown必须最终flush。所有RTC debug event均为non-authoritative，不得写入或替代共享ControlTrace/WAL。
 
 `--rtc-request-validity-steps`和`--rtc-worker-stop-timeout-sec`只在显式RTC profile下有效，分别绑定request/plan TTL和
 frontend close的bounded worker wait；默认值`10`/`0`保持既有fail-closed与non-waiting语义。模型包、checkpoint名称或

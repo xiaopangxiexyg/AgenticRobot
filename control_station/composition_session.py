@@ -13,19 +13,9 @@ from __future__ import annotations
 from typing import Callable
 
 from control_composition.lifecycle.session import (
-    COMPOSITION_SESSION_PHASES_V1,
-    COMPOSITION_SESSION_REARM_RECEIPT_HASH_DOMAIN_V1,
-    COMPOSITION_SESSION_REARM_SPEC_HASH_DOMAIN_V1,
-    COMPOSITION_SESSION_SPEC_HASH_DOMAIN_V1,
-    COMPOSITION_SESSION_STATE_HASH_DOMAIN_V1,
-    COMPOSITION_SESSION_TRANSITION_HASH_DOMAIN_V1,
-    CompositionSessionOperationSpec,
     CompositionSessionRearmReceipt,
-    CompositionSessionRearmSpec,
     CompositionSessionRegistry,
-    CompositionSessionState,
     CompositionSessionTransition,
-    advance_composition_session,
     initial_composition_session_state,
     validate_composition_session_rearm,
 )
@@ -401,19 +391,5 @@ class CompositionSessionController(CompositionSessionRegistry):
 
 
 __all__ = [
-    "COMPOSITION_SESSION_PHASES_V1",
-    "COMPOSITION_SESSION_REARM_RECEIPT_HASH_DOMAIN_V1",
-    "COMPOSITION_SESSION_REARM_SPEC_HASH_DOMAIN_V1",
-    "COMPOSITION_SESSION_SPEC_HASH_DOMAIN_V1",
-    "COMPOSITION_SESSION_STATE_HASH_DOMAIN_V1",
-    "COMPOSITION_SESSION_TRANSITION_HASH_DOMAIN_V1",
-    "CompositionSessionOperationSpec",
     "CompositionSessionController",
-    "CompositionSessionRearmReceipt",
-    "CompositionSessionRearmSpec",
-    "CompositionSessionState",
-    "CompositionSessionTransition",
-    "advance_composition_session",
-    "initial_composition_session_state",
-    "validate_composition_session_rearm",
 ]

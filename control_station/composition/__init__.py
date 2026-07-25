@@ -1,134 +1,17 @@
 """Application-level Control Station compositions."""
 
-from .mujoco_human import (
-    CS2A1_MUJOCO_HUMAN_MANIFEST_ID_V1,
-    CS2A2A_SYNTHETIC_HUMAN_EXECUTION_MANIFEST_ID_V1,
-    CS2A2B_SYNTHETIC_HUMAN_EXECUTION_MANIFEST_ID_V1,
-    CS2A2B_MUJOCO_HUMAN_STATION_MANIFEST_ID_V1,
-    MujocoHumanOnlyBindingReceipt,
-    MujocoHumanOnlyComposition,
-    MujocoHumanSubmission,
-    build_cs2a1_mujoco_human_manifest,
-    build_cs2a2a_synthetic_human_execution_manifest,
-    build_cs2a2b_synthetic_human_execution_manifest,
-    build_cs2a2b_mujoco_human_station_manifest,
-    build_mujoco_component_human_proposal_adapter,
-    build_mujoco_human_proposal_adapter,
-    build_mujoco_pose_human_proposal_adapter,
-)
-from .mujoco_human_station import (
-    MujocoHumanStationSourceAdapter,
-    MujocoHumanStationTargetAdapter,
-    MujocoStationOperationEvidence,
-    ScopedMujocoHumanStationComposition,
-    build_scoped_cs2a2b_mujoco_human_station,
-)
-from .mujoco_replay import (
-    CS2B_CANONICAL_DESK_POSE_MUJOCO_REPLAY_STATION_MANIFEST_ID_V1,
-    CS2B_MUJOCO_REPLAY_STATION_MANIFEST_ID_V1,
-    CS2B_POSE_MUJOCO_REPLAY_STATION_MANIFEST_ID_V1,
-    CS2BC_REPLAY_GUI_EXECUTION_MANIFEST_ID_V1,
-    MujocoReplayOnlyBindingReceipt,
-    MujocoReplayOnlyComposition,
-    MujocoReplayStationSourceAdapter,
-    MujocoReplayStationTargetAdapter,
-    ReplaySourceObserverBinding,
-    ScopedMujocoReplayStationComposition,
-    build_cs2b_mujoco_replay_station_manifest,
-    build_cs2bc_replay_gui_execution_manifest,
-    build_cs2bc_replay_source_from_gui_binding,
-    build_scoped_cs2b_mujoco_replay_station,
-    build_scoped_cs2bc_mujoco_replay_gui_station,
-)
-from .mujoco_human_replay import (
-    CS6A_HUMAN_REPLAY_EXECUTION_MANIFEST_ID_V1,
-    CS6A_HUMAN_REPLAY_HANDOFF_MANIFEST_ID_V1,
-    CS6A_HUMAN_REPLAY_TRACE_PROFILE_ID_V1,
-    CS6B1D_POSE_HUMAN_REPLAY_HANDOFF_MANIFEST_ID_V1,
-    CS6B1D_POSE_HUMAN_REPLAY_TRACE_PROFILE_ID_V1,
-    CS6B1D_POSE_MIXING_SHADOW_HASH_DOMAIN_V1,
-    CS6B1F_POSE_HUMAN_REPLAY_EXECUTION_MANIFEST_ID_V1,
-    CS6B1F_POSE_HUMAN_REPLAY_STATION_MANIFEST_ID_V1,
-    CS6B1F_POSE_HUMAN_REPLAY_TRACE_PROFILE_ID_V1,
-    HumanReplayAuthorityHandoffReceipt,
-    MujocoHumanReplayBindingReceipt,
-    MujocoHumanReplayHandoffComposition,
-    MujocoHumanReplayHumanSubmission,
-    PoseMixingShadowEvaluation,
-    MujocoHumanReplayStationSourceAdapter,
-    MujocoHumanReplayStationTargetAdapter,
-    ScopedMujocoHumanReplayStationComposition,
-    VirtualSimHumanTakeoverReadinessProvider,
-    build_cs6a_human_replay_execution_manifest,
-    build_cs6a_human_replay_handoff_manifest,
-    build_cs6b1d_pose_human_replay_handoff_manifest,
-    build_cs6b1f_pose_human_replay_execution_manifest,
-    build_cs6b1f_pose_human_replay_station_manifest,
-    build_scoped_cs6a_mujoco_human_replay_handoff,
-    build_scoped_cs6b1_mujoco_human_replay_station,
-    build_scoped_cs6b1d_mujoco_pose_human_replay_handoff,
-    build_scoped_cs6b1d_mujoco_pose_human_replay_station,
-    build_scoped_cs6b1f_mujoco_pose_human_replay_station,
-)
-from .mujoco_pose_composer import (
-    CS6B1H_BINDING_HASH_DOMAIN_V1,
-    CS6B1H_HUMAN_POSE_ROLE_V1,
-    CS6B1H_REPLAY_POSE_ROLE_V1,
-    CS6B1H_STEP_HASH_DOMAIN_V1,
-    CS6B1I_COMPOSITION_SESSION_EXECUTION_MANIFEST_ID_V1,
-    CS6B1I_COMPOSITION_SESSION_MANIFEST_ID_V1,
-    CS6B1I_COMPOSITION_SESSION_TRACE_PROFILE_ID_V1,
-    CS6B1I_SIM_REARM_READINESS_CHECKS_V1,
-    CS6b1hFormalCompositionStep,
-    CS6b1hPoseComposerBinding,
-    MujocoPoseComposerAuthorityComposition,
-    ScopedMujocoPoseCompositionSession,
-    build_cs6b1i_pose_composition_session_execution_manifest,
-    build_cs6b1i_pose_composition_session_manifest,
-    build_scoped_cs6b1i_mujoco_pose_composition_session,
-    build_scoped_cs6b1h_mujoco_pose_composer_authority,
-)
-from .mujoco_policy import (
-    CS2C_SYNC_POLICY_EXECUTION_MANIFEST_ID_V1,
-    CS2C_SYNC_POLICY_MUJOCO_MANIFEST_ID_V1,
-    CS2C_SYNC_POLICY_MUJOCO_STATION_MANIFEST_ID_V1,
-    MujocoPolicyOnlyBindingReceipt,
-    MujocoPolicyOnlyComposition,
-    MujocoPolicyStationSourceAdapter,
-    MujocoPolicyStationTargetAdapter,
-    ScopedMujocoPolicyStationComposition,
-    SyncPolicyEmissionBinding,
-    build_cs2c_sync_policy_mujoco_manifest,
-    build_cs2c_sync_policy_mujoco_station_manifest,
-    build_cs2c_sync_policy_execution_manifest,
-    build_scoped_cs2c_sync_policy_mujoco,
-    build_scoped_cs2c_sync_policy_mujoco_station,
-    build_sync_policy_emission_binding,
-)
-from .mujoco_rtc_policy import (
-    CS2D_RTC_POLICY_EXECUTION_MANIFEST_ID_V1,
-    CS2D_RTC_POLICY_MUJOCO_MANIFEST_ID_V1,
-    CS2D_RTC_POLICY_MUJOCO_STATION_MANIFEST_ID_V1,
-    MujocoRtcPolicyOnlyComposition,
-    MujocoRtcPolicyStationSourceAdapter,
-    MujocoRtcPolicyStationTargetAdapter,
-    RtcPolicyEmissionBinding,
-    ScopedMujocoRtcPolicyStationComposition,
-    build_cs2d_rtc_policy_mujoco_manifest,
-    build_cs2d_rtc_policy_mujoco_station_manifest,
-    build_cs2d_rtc_policy_execution_manifest,
-    build_rtc_policy_emission_binding,
-    build_scoped_cs2d_rtc_policy_mujoco,
-    build_scoped_cs2d_rtc_policy_mujoco_station,
-)
-from .rtc_policy_shadow import (
-    CS3_RTC_POLICY_PASSIVE_SHADOW_MANIFEST_ID_V1,
-    RtcPolicyPassiveStationOperationEvidence,
-    RtcPolicyPassiveStationBootstrap,
-    RtcPolicyPassiveStationSourceAdapter,
-    ScopedRtcPolicyPassiveStationComposition,
-    build_cs3_rtc_policy_passive_shadow_manifest,
-    build_scoped_cs3_rtc_policy_passive_station,
+from importlib import import_module
+
+
+_PROFILE_MODULES = (
+    "mujoco_human",
+    "mujoco_human_station",
+    "mujoco_replay",
+    "mujoco_human_replay",
+    "mujoco_pose_composer",
+    "mujoco_policy",
+    "mujoco_rtc_policy",
+    "rtc_policy_shadow",
 )
 
 _OPENPI_PREFLIGHT_EXPORTS = frozenset(
@@ -142,7 +25,7 @@ _OPENPI_PREFLIGHT_EXPORTS = frozenset(
 
 
 def __getattr__(name: str):
-    """Load optional OpenPI preflight dependencies only when requested."""
+    """Load concrete profiles only when their public symbol is requested."""
 
     if name in _OPENPI_PREFLIGHT_EXPORTS:
         from ..preflight import openpi_rtc
@@ -150,6 +33,13 @@ def __getattr__(name: str):
         value = getattr(openpi_rtc, name)
         globals()[name] = value
         return value
+    if name in __all__:
+        for module_name in _PROFILE_MODULES:
+            module = import_module(f"{__name__}.{module_name}")
+            if hasattr(module, name):
+                value = getattr(module, name)
+                globals()[name] = value
+                return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -179,6 +69,7 @@ __all__ = [
     "CS6B1F_POSE_HUMAN_REPLAY_STATION_MANIFEST_ID_V1",
     "CS6B1F_POSE_HUMAN_REPLAY_TRACE_PROFILE_ID_V1",
     "CS6B1H_BINDING_HASH_DOMAIN_V1",
+    "CS6B1H_BINDING_HASH_DOMAIN_V2",
     "CS6B1H_HUMAN_POSE_ROLE_V1",
     "CS6B1H_REPLAY_POSE_ROLE_V1",
     "CS6B1H_STEP_HASH_DOMAIN_V1",

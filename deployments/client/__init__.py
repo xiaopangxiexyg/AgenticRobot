@@ -51,7 +51,9 @@ from .rtc_frontend import (
     RtcModelPolicyIdentity,
     RtcModelRuntimeAdapter,
     SimpleRtcModelRuntimeAdapter,
+    build_rtc_model_producer_runtime,
     build_rtc_model_shadow_frontend,
+    rtc_producer_config_from_model_adapter,
     rtc_shadow_config_from_model_adapter,
 )
 from .rtc_transport import (
@@ -100,10 +102,12 @@ __all__ = [
     "ServerMetadataError",
     "UnifiedActionChunk",
     "validate_server_metadata",
+    "build_rtc_model_producer_runtime",
     "build_rtc_model_shadow_frontend",
     "create_final_chunk_rtc_runtime_adapter",
     "deploy_contract_from_policy_artifact",
     "load_policy_artifact",
     "load_policy",
+    "rtc_producer_config_from_model_adapter",
     "rtc_shadow_config_from_model_adapter",
 ]

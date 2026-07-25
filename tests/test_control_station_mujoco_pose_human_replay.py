@@ -11,13 +11,22 @@ import pytest
 from control_composition.composition import (
     CompositionAuthorityGateSpec,
     CompositionSpec,
+    DeterministicComposer,
+    DeterministicCompositionStrategyV2,
+    FormalCompositionStrategySpec,
 )
-from control_composition.observability import SourceDifferenceSpec
-from control_station import (
+from control_composition.activation import (
+    ACTIVATION_LOCAL_INPUT_FRESHNESS_POLICY_V2,
+    ACTIVATION_LOCAL_STRICT_SOURCE_FRESHNESS_POLICY_V2,
+)
+from control_composition.lifecycle import (
     CompositionSessionOperationSpec,
     CompositionSessionRearmSpec,
     HumanTakeoverOperationSpec,
-    HumanTakeoverReadinessCandidate,
+    MixedControlBoundaryPolicy,
+)
+from control_composition.observability import SourceDifferenceSpec
+from control_station import (
     SideEffectStationOperationCoordinator,
     StationIntentDraft,
     StationControlTraceBridge,
@@ -36,8 +45,8 @@ from control_station.composition import (
     build_cs6b1f_pose_human_replay_execution_manifest,
     build_scoped_cs6b1d_mujoco_pose_human_replay_station,
 )
-from control_station.handoff import MixedControlBoundaryPolicy
 from control_station.sources import (
+    HumanTakeoverReadinessCandidate,
     PassiveTeleopPoseSessionSource,
     PassiveTeleopPoseSourceSpec,
     SyntheticHumanPoseSource,
@@ -163,6 +172,7 @@ def _runtime(
     *,
     trace_sink=None,
     composer_authority: bool = False,
+    composition_strategy=None,
 ) -> MujocoDeployRuntime:
     scene = DeterministicScene()
     rig = MujocoPositionExecutionRig(
@@ -223,6 +233,7 @@ def _runtime(
             if composer_authority
             else None
         ),
+        composition_strategy=composition_strategy,
         clock=clock,
     )
 
@@ -555,14 +566,30 @@ def _build_cs6b1h_pose_composer(
     *,
     translation_limit: float = 0.2,
     source_differences: bool = False,
+    formal_v2: bool = False,
 ):
-    runtime = _runtime(clock, composer_authority=True)
+    spec = _pose_fusion_shadow_spec(translation_limit=translation_limit)
+    strategy = (
+        DeterministicCompositionStrategyV2(
+            FormalCompositionStrategySpec(
+                strategy_id="cs6b1h-deterministic-migration-v2",
+                strategy_version="2.0",
+                composition_spec_hash=spec.semantic_content_hash,
+            )
+        )
+        if formal_v2
+        else None
+    )
+    runtime = _runtime(
+        clock,
+        composer_authority=True,
+        composition_strategy=strategy,
+    )
     source_spec = PassiveTeleopPoseSourceSpec(source_id="human-slot")
     passive_source = _passive_pose_session_source(
         source_spec,
         timestamp=clock(),
     )
-    spec = _pose_fusion_shadow_spec(translation_limit=translation_limit)
     difference_spec = (
         SourceDifferenceSpec(
             spec_id="cs6b1h-human-replay-difference-v1",
@@ -992,6 +1019,7 @@ def test_cs6b1h_composer_is_the_only_formal_pose_producer(
         assert formal.source_difference_observation is None
         assert formal.source_difference_error is None
         assert composition.binding.source_difference_spec_hash is None
+        assert composition.binding.formal_strategy_spec_hash is None
         binding = composition.binding
         assert binding.semantic_content_hash == canonical_content_hash(
             {
@@ -1065,6 +1093,135 @@ def test_cs6b1h_composer_is_the_only_formal_pose_producer(
     finally:
         passive_source.close()
         composition.close()
+
+
+def test_cs6b1h_formal_v2_is_opt_in_and_preserves_pose_numerics(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    composition, runtime, passive_source = _build_cs6b1h_pose_composer(
+        clock,
+        formal_v2=True,
+    )
+    try:
+        composition.start()
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        replay = composition.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1h-formal-v2.parquet", clock)
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission_valid and human_step.emission is not None
+        human = composition.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        assert replay.accepted and human.accepted
+
+        formal = composition.compose_at(
+            decision_key="cs6b1h-formal-v2-decision-0",
+            target_effective_at=clock(),
+        )
+        assert formal.error is None
+        assert formal.evaluation is not None
+        result = formal.evaluation.composition_result
+        strategy = runtime.policy_topology.composition_strategy
+        assert strategy is not None
+        assert result.strategy_id == strategy.spec.strategy_id
+        assert result.strategy_spec_hash == strategy.spec.semantic_content_hash
+        assert composition.binding.formal_strategy_spec_hash == (
+            strategy.spec.semantic_content_hash
+        )
+        binding = composition.binding
+        assert binding.semantic_content_hash == canonical_content_hash(
+            {
+                "runtime_session_id": binding.runtime_session_id,
+                "control_domain_id": binding.control_domain_id,
+                "embodiment_instance_id": binding.embodiment_instance_id,
+                "composer_producer_id": binding.composer_producer_id,
+                "human_producer_id": binding.human_producer_id,
+                "replay_producer_id": binding.replay_producer_id,
+                "composition_spec_hash": binding.composition_spec_hash,
+                "authority_gate_spec_hash": (
+                    binding.authority_gate_spec_hash
+                ),
+                "target_runtime_contract_hash": (
+                    binding.target_runtime_contract_hash
+                ),
+                "formal_strategy_spec_hash": (
+                    binding.formal_strategy_spec_hash
+                ),
+            },
+            domain="dexteleop.cs6b1h_pose_composer_binding.v2",
+        )
+
+        legacy = DeterministicComposer().compose(
+            formal.evaluation.input_snapshot,
+            spec=composition.composition_spec,
+        )
+        assert legacy.composed_action_hash == result.composed_action_hash
+        for side in ("left", "right"):
+            np.testing.assert_array_equal(
+                legacy.composed_action.arm_pose_by_side[side],
+                result.composed_action.arm_pose_by_side[side],
+            )
+        assert legacy.semantic_content_hash != result.semantic_content_hash
+
+        assert formal.proposal_admission is not None
+        assert formal.proposal_admission.accepted
+        proposal = formal.proposal_admission.proposal
+        assert proposal is not None
+        assert proposal.policy_output_id == result.composition_result_id
+        assert len(runtime.core.proposals) == 1
+        event_types = tuple(fact.event_type for fact in runtime.trace_facts)
+        assert event_types.count("formal_composition_strategy_spec") == 1
+        assert "formal_composition_strategy_input" in event_types
+        assert "formal_composition_strategy_result_binding" in event_types
+
+        dispatched = runtime.step(
+            now=clock(),
+            physics_ticks_after_dispatch=1,
+        )
+        assert dispatched.status == "dispatched"
+        assert dispatched.decision is not None
+        assert dispatched.decision.selected_by_group == {
+            "arms": proposal.proposal_id,
+        }
+    finally:
+        passive_source.close()
+        composition.close()
+
+
+def test_cs6b1h_rejects_a_formal_strategy_bound_to_another_spec() -> None:
+    clock = ManualClock(30.0)
+    expected_spec = _pose_fusion_shadow_spec()
+    other_spec = _pose_fusion_shadow_spec(translation_limit=0.19)
+    runtime = _runtime(
+        clock,
+        composer_authority=True,
+        composition_strategy=DeterministicCompositionStrategyV2(
+            FormalCompositionStrategySpec(
+                strategy_id="wrong-spec-migration-v2",
+                strategy_version="2.0",
+                composition_spec_hash=other_spec.semantic_content_hash,
+            )
+        ),
+    )
+    source_spec = PassiveTeleopPoseSourceSpec(source_id="human-slot")
+    try:
+        with pytest.raises(
+            ValueError,
+            match="another composition spec",
+        ):
+            build_scoped_cs6b1h_mujoco_pose_composer_authority(
+                runtime,
+                source_spec,
+                _replay_source(runtime),
+                expected_spec,
+                _pose_composer_authority_gate(expected_spec),
+            )
+    finally:
+        runtime.close()
 
 
 def test_cs6b1h_missing_or_conflicting_contributor_forces_hold(
@@ -1472,7 +1629,7 @@ def test_cs6b1i_missing_contributor_holds_without_fresh_input_rearm(
     tmp_path: Path,
 ) -> None:
     clock = ManualClock(30.0)
-    station, _, passive_source, session_spec = (
+    station, runtime, passive_source, session_spec = (
         _build_cs6b1i_pose_composition_session(tmp_path, clock)
     )
     try:
@@ -1488,6 +1645,23 @@ def test_cs6b1i_missing_contributor_holds_without_fresh_input_rearm(
         )
         assert held.disposition is not None
         assert held.disposition.action == "hold"
+        assert held.evaluation is not None
+        activation = station.data_plane.composition_activation_scope
+        assert activation is not None
+        assert (
+            held.evaluation.input_snapshot.expected_activation_id
+            == activation.activation_id
+        )
+        assert (
+            held.evaluation.composition_result.composition_activation_id
+            == activation.activation_id
+        )
+        activation_binding_kinds = {
+            fact.payload["subject_kind"]
+            for fact in runtime.trace_facts
+            if fact.event_type == "composition_activation_binding"
+        }
+        assert activation_binding_kinds == {"input", "snapshot", "result"}
         assert station.current_session_state is not None
         assert station.current_session_state.phase == "held"
         assert not station.publication_barrier.snapshot().enabled
@@ -1530,6 +1704,13 @@ def test_cs6b1i_typed_rearm_creates_new_activation_and_rejects_old_inputs(
             station,
             session_spec,
             clock,
+        )
+        initial_activation = station.data_plane.composition_activation_scope
+        assert initial_activation is not None
+        assert initial_activation.session_epoch == 0
+        assert (
+            initial_activation.freshness_policy
+            == ACTIVATION_LOCAL_INPUT_FRESHNESS_POLICY_V2
         )
         station.submit_replay_emission(
             _replay_emission(
@@ -1634,6 +1815,18 @@ def test_cs6b1i_typed_rearm_creates_new_activation_and_rejects_old_inputs(
         assert active_state is not None and active_state.phase == "active"
         assert active_state.operation_spec_id == session_spec.operation_spec_id
         assert active_state.session_epoch == held_state.session_epoch + 1
+        rearmed_activation = station.data_plane.composition_activation_scope
+        assert rearmed_activation is not None
+        assert rearmed_activation.session_epoch == active_state.session_epoch
+        assert (
+            rearmed_activation.freshness_policy
+            == ACTIVATION_LOCAL_STRICT_SOURCE_FRESHNESS_POLICY_V2
+        )
+        assert rearmed_activation.activation_id != initial_activation.activation_id
+        assert (
+            rearmed_activation.operation_spec_id
+            == initial_activation.operation_spec_id
+        )
         assert station.station.state.lifecycle_state == "running"
         assert station.publication_barrier.snapshot().enabled
         receipt = station._rearm_receipt_by_spec_id[rearm_spec.rearm_spec_id]
@@ -1657,14 +1850,18 @@ def test_cs6b1i_typed_rearm_creates_new_activation_and_rejects_old_inputs(
             (held_state.session_epoch, "supersede"),
             (active_state.session_epoch, "start"),
         ]
-        with pytest.raises(ValueError, match="predates"):
-            station.submit_replay_emission(
-                _replay_emission(
-                    tmp_path / "cs6b1i-stale-after-rearm.parquet",
-                    clock,
-                    source_action_index=4,
-                )
+        stale_receipt = station.submit_replay_emission(
+            _replay_emission(
+                tmp_path / "cs6b1i-stale-after-rearm.parquet",
+                clock,
+                source_action_index=4,
             )
+        )
+        assert not stale_receipt.accepted
+        assert (
+            stale_receipt.rejection_code
+            == "activation_source_barrier_violation"
+        )
         assert station.data_plane.input_receipt_by_role == {}
 
         stale_only = station.step(now=clock())

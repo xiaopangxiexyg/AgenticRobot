@@ -14,7 +14,7 @@ from control_composition.retention import TimeWindowRetentionSpec
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
 from robot_motion.runtime.identity import ClockDomainDescriptor
 from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
-from control_composition.trace import (
+from dataset_interface.composition_control_trace import (
     project_composition_context,
     project_composition_context_admission,
     project_composition_context_snapshot,
@@ -303,6 +303,10 @@ def test_atomic_snapshot_advances_time_window_and_prunes_full_payload() -> None:
     assert health.retained_record_count == 0
     assert health.pruned_record_count == 1
     assert health.producer_epoch_tombstone_count == 1
+    np.testing.assert_allclose(
+        selected.strategy_contexts[0].semantic_payload["target_xyz"][0],
+        0.3,
+    )
 
     duplicate = store.admit(
         draft(sequence=0, effective_from=10.25, effective_until=10.5)
@@ -324,3 +328,59 @@ def test_retention_rejects_unbounded_future_and_duration() -> None:
     )
     assert not too_long.accepted
     assert too_long.rejection_code == "retention_window_violation"
+
+
+def test_missing_and_fault_contexts_preserve_lineage_but_not_strategy_payload() -> None:
+    clock, coordinator, epochs, store = runtime()
+    missing_receipt = store.admit(
+        replace(
+            draft(sequence=0),
+            availability="missing",
+            semantic_payload={"reason": "camera_frame_absent"},
+        )
+    )
+    assert missing_receipt.accepted
+    clock.value = 10.1
+    cut = coordinator.capture_cut(cutoff_at=clock.value).cut
+    missing_snapshot = store.capture_snapshot(
+        cut,
+        producer_epochs=epochs.snapshot(cut),
+        target_effective_at=clock.value,
+        required_channels=("motion-plan",),
+    )
+    assert missing_snapshot.missing_channels == ("motion-plan",)
+    assert missing_snapshot.unavailable_channels == ("motion-plan",)
+    assert missing_snapshot.selected_context_id_by_channel["motion-plan"] == (
+        missing_receipt.context_id
+    )
+    assert missing_snapshot.strategy_contexts == ()
+
+    clock.value = 10.2
+    fault_receipt = store.admit(
+        replace(
+            draft(sequence=1, effective_from=10.2, effective_until=10.8),
+            availability="fault",
+            fault_code="producer_timeout",
+            semantic_payload={"last_valid_context_id": missing_receipt.context_id},
+        )
+    )
+    assert fault_receipt.accepted
+    fault_cut = coordinator.capture_cut(cutoff_at=clock.value).cut
+    fault_snapshot = store.capture_snapshot(
+        fault_cut,
+        producer_epochs=epochs.snapshot(fault_cut),
+        target_effective_at=clock.value,
+        required_channels=("motion-plan",),
+    )
+    assert fault_snapshot.unavailable_channels == ("motion-plan",)
+    assert fault_snapshot.strategy_contexts == ()
+
+    invalid_fault = store.admit(
+        replace(
+            draft(sequence=2, effective_from=10.2, effective_until=10.8),
+            availability="fault",
+            fault_code=None,
+        )
+    )
+    assert not invalid_fault.accepted
+    assert invalid_fault.rejection_code == "invalid_availability"

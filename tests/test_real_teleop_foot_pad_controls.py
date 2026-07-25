@@ -496,7 +496,7 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertTrue(control._foot_pad_test_completed)
         self.assertIn("本次检测到 1/4", control._foot_pad_test_status)
 
-    def test_gui_test_mode_auto_completes_after_all_four_key_positions(self) -> None:
+    def test_gui_test_mode_two_pedals_auto_completes_after_both_pedals(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.ui = SimpleNamespace(
             published=[],
@@ -519,18 +519,78 @@ class FootPadControlModeTests(unittest.TestCase):
         control._control_hint = lambda: "normal"
         control.args = SimpleNamespace(foot_pad_requested=True)
 
+        for index, event in enumerate(("fix_arm_left", "fix_arm_right"), start=1):
+            control._record_foot_pad_test_event(event, now=float(index))
+
+        self.assertFalse(control._foot_pad_test_active)
+        self.assertTrue(control._foot_pad_test_completed)
+        self.assertEqual(len(control._foot_pad_test_seen_events), 2)
+        self.assertIn("自动完成", control._foot_pad_test_status)
+        self.assertTrue(control.ui.published[-1]["foot_pad_test_completed"])
+        self.assertEqual(control.ui.published[-1]["foot_pad_test_seen_count"], 2)
+
+    def test_gui_test_mode_two_pedal_ignores_nonexistent_init_keys(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.ui = SimpleNamespace(
+            published=[],
+            messages=[],
+            publish=lambda **updates: control.ui.published.append(updates),
+            append_message=lambda tag, message: control.ui.messages.append(
+                (tag, message)
+            ),
+        )
+        control.foot_pad_input = SimpleNamespace(foot_pad_count=2, is_online=True)
+        control._foot_pad_test_active = True
+        control._foot_pad_test_completed = False
+        control._foot_pad_test_seen_events = set()
+        control._foot_pad_test_last_event = ""
+        control._foot_pad_test_status = ""
+        control._current_active_controls = lambda: ["q"]
+        control._control_hint = lambda: "normal"
+        control.args = SimpleNamespace(foot_pad_requested=True)
+
+        control._record_foot_pad_test_event("init_arm_left", now=1.0)
+        self.assertTrue(control._foot_pad_test_active)
+        self.assertEqual(control._foot_pad_test_seen_events, set())
+
+        control._record_foot_pad_test_event("fix_arm_left", now=2.0)
+        self.assertTrue(control._foot_pad_test_active)
+        control._record_foot_pad_test_event("fix_arm_right", now=3.0)
+        self.assertFalse(control._foot_pad_test_active)
+        self.assertTrue(control._foot_pad_test_completed)
+        self.assertEqual(len(control._foot_pad_test_seen_events), 2)
+
+    def test_gui_test_mode_four_pedals_keeps_four_key_completion(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.ui = SimpleNamespace(
+            published=[],
+            messages=[],
+            publish=lambda **updates: control.ui.published.append(updates),
+            append_message=lambda tag, message: control.ui.messages.append(
+                (tag, message)
+            ),
+        )
+        control.foot_pad_input = SimpleNamespace(foot_pad_count=4, is_online=True)
+        control._foot_pad_test_active = True
+        control._foot_pad_test_completed = False
+        control._foot_pad_test_seen_events = set()
+        control._foot_pad_test_last_event = ""
+        control._foot_pad_test_status = ""
+        control._current_active_controls = lambda: ["q"]
+        control._control_hint = lambda: "normal"
+        control.args = SimpleNamespace(foot_pad_requested=True)
+
         for index, event in enumerate(
             ("fix_arm_left", "fix_arm_right", "init_arm_left", "init_arm_right"),
             start=1,
         ):
             control._record_foot_pad_test_event(event, now=float(index))
-
+            if index < 4:
+                self.assertTrue(control._foot_pad_test_active)
         self.assertFalse(control._foot_pad_test_active)
         self.assertTrue(control._foot_pad_test_completed)
         self.assertEqual(len(control._foot_pad_test_seen_events), 4)
         self.assertIn("自动完成", control._foot_pad_test_status)
-        self.assertTrue(control.ui.published[-1]["foot_pad_test_completed"])
-        self.assertEqual(control.ui.published[-1]["foot_pad_test_seen_count"], 4)
 
     def test_fourth_pedal_routes_to_exact_qpos_not_legacy_init_pose(self) -> None:
         class InitController:

@@ -8,6 +8,7 @@ re-armed; restarting the runtime is required.
 
 from __future__ import annotations
 
+import argparse
 import math
 import threading
 import time
@@ -76,6 +77,33 @@ class PositionForceGuardConfig:
             "stale_timeout_sec": self.stale_timeout_sec,
             "startup_timeout_sec": self.startup_timeout_sec,
         }
+
+
+def position_force_guard_config(
+    args: argparse.Namespace,
+) -> PositionForceGuardConfig:
+    return PositionForceGuardConfig(
+        source=str(getattr(args, "position_force_guard_source", "tool")),
+        max_force_n=float(
+            getattr(args, "position_force_guard_max_force_n", 15.0)
+        ),
+        max_torque_nm=float(
+            getattr(args, "position_force_guard_max_torque_nm", 2.0)
+        ),
+        poll_hz=float(getattr(args, "position_force_guard_hz", 20.0)),
+        consecutive_limit_samples=int(
+            getattr(args, "position_force_guard_consecutive_samples", 1)
+        ),
+        max_consecutive_read_errors=int(
+            getattr(args, "position_force_guard_max_read_errors", 3)
+        ),
+        stale_timeout_sec=float(
+            getattr(args, "position_force_guard_stale_sec", 0.25)
+        ),
+        startup_timeout_sec=float(
+            getattr(args, "position_force_guard_startup_timeout_sec", 2.0)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -519,4 +547,5 @@ __all__ = [
     "PositionForceGuardMonitor",
     "PositionForceGuardTripped",
     "PositionForceReading",
+    "position_force_guard_config",
 ]

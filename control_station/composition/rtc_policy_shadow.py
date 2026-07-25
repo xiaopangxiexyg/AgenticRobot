@@ -7,16 +7,16 @@ policy worker, timed plan, queue pop, emission commit, or episode lifecycle.
 
 from __future__ import annotations
 
+import math
 import queue
 import threading
 from dataclasses import dataclass
 from typing import Callable
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from teleop_runtime.deploy.rtc_frontend import RtcFrontendStep
-from teleop_runtime.deploy.rtc_step_fanout import (
-    RtcFrontendStepFanout,
-    RtcFrontendStepSourceBinding,
+from robot_motion.deploy import (
+    PolicyActionEmission,
+    RtcPolicyEmissionSourceBinding,
 )
 
 from ..adapters import NullExecutionTargetAdapter, StationOperationAdapter
@@ -56,12 +56,12 @@ class RtcPolicyPassiveStationOperationEvidence:
 
 
 def build_cs3_rtc_policy_passive_shadow_manifest(
-    binding: RtcFrontendStepSourceBinding,
+    binding: RtcPolicyEmissionSourceBinding,
 ) -> ControlStationRunManifest:
     """Freeze a target-neutral, shadow-only Station run."""
 
-    if not isinstance(binding, RtcFrontendStepSourceBinding):
-        raise TypeError("binding must be an RtcFrontendStepSourceBinding.")
+    if not isinstance(binding, RtcPolicyEmissionSourceBinding):
+        raise TypeError("binding must be an RtcPolicyEmissionSourceBinding.")
     producer_epoch_policy_hash = canonical_content_hash(
         {
             "producer_id": binding.producer_id,
@@ -108,7 +108,7 @@ def build_cs3_rtc_policy_passive_shadow_manifest(
                 producer_epoch_policy_hash=producer_epoch_policy_hash,
                 supported_uses=("shadow",),
                 expected_emission_seam=(
-                    "teleop_runtime.deploy.rtc_frontend.RtcFrontendStep"
+                    "robot_motion.deploy.runtime.PolicyActionEmission"
                 ),
                 required_binding_refs=(
                     binding.semantic_content_hash,
@@ -181,7 +181,7 @@ class RtcPolicyPassiveStationSourceAdapter:
 
     @property
     def adapter_id(self) -> str:
-        return "cs3-existing-rtc-step-passive-source-adapter"
+        return "cs3-existing-rtc-emission-passive-source-adapter"
 
     @property
     def subject_id(self) -> str:
@@ -217,7 +217,7 @@ class RtcPolicyPassiveStationSourceAdapter:
         kind = intent.intent_kind
         if kind == "connect_source":
             self.consumer.start()
-            status = "existing_rtc_step_fanout_source_connected"
+            status = "existing_rtc_emission_fanout_source_connected"
             fence_sequence = self.consumer.status().fence_sequence
         elif kind == "run_preflight":
             snapshot = self.consumer.status()
@@ -233,14 +233,14 @@ class RtcPolicyPassiveStationSourceAdapter:
                     status="passive_rtc_source_preflight_failed",
                     fence_sequence=snapshot.fence_sequence,
                 )
-            status = "passive_rtc_step_source_binding_preflighted"
+            status = "passive_rtc_emission_source_binding_preflighted"
             fence_sequence = snapshot.fence_sequence
         elif kind == "start_shadow":
             fence_sequence = self.consumer.set_shadow_enabled(True)
-            status = "passive_rtc_step_observation_enabled"
+            status = "passive_rtc_emission_observation_enabled"
         elif kind == "stop_shadow":
             fence_sequence = self.consumer.set_shadow_enabled(False)
-            status = "passive_rtc_step_observation_disabled"
+            status = "passive_rtc_emission_observation_disabled"
         else:
             snapshot = self.consumer.status()
             if snapshot.shadow_enabled:
@@ -250,7 +250,7 @@ class RtcPolicyPassiveStationSourceAdapter:
                     status="passive_rtc_shadow_must_stop_before_disconnect",
                     fence_sequence=snapshot.fence_sequence,
                 )
-            status = "passive_rtc_step_source_disconnected"
+            status = "passive_rtc_emission_source_disconnected"
             fence_sequence = snapshot.fence_sequence
         return self._result(
             intent,
@@ -365,10 +365,10 @@ class ScopedRtcPolicyPassiveStationComposition:
             "producer_lifecycle_owned": False,
             "queue_size": status.queue_size,
             "queue_capacity": status.queue_capacity,
-            "observed_step_count": status.observed_step_count,
+            "received_emission_count": status.received_emission_count,
             "observed_emission_count": status.observed_emission_count,
-            "inactive_step_count": status.inactive_step_count,
-            "rejected_step_count": status.rejected_step_count,
+            "inactive_emission_count": status.inactive_emission_count,
+            "rejected_emission_count": status.rejected_emission_count,
             "error_count": status.error_count,
         }
 
@@ -377,24 +377,66 @@ class ScopedRtcPolicyPassiveStationComposition:
 
 
 class RtcPolicyPassiveStationBootstrap:
-    """Prepare root wiring before the lower deploy frontend exists.
+    """Prepare an injected passive endpoint without importing its publisher.
 
-    A future application root passes ``fanout`` into ``run_policy.main``.  The
-    lower runtime publishes its source binding exactly once; only then can the
-    root construct the null-target Station around the already-supplied queue.
-    This object neither starts deploy nor waits on policy inference.
+    The application root owns the concrete publisher, installs its immutable
+    source binding here, and gives that publisher ``emission_queue`` as an
+    observer endpoint.  This object neither inspects a producer frontend nor
+    starts deploy or policy inference.
     """
 
-    def __init__(self, *, queue_capacity: int = 256) -> None:
+    def __init__(
+        self,
+        *,
+        queue_capacity: int = 256,
+        emission_queue: queue.Queue[object] | None = None,
+    ) -> None:
         capacity = int(queue_capacity)
         if capacity <= 0:
             raise ValueError("RTC Station bootstrap queue_capacity must be positive.")
-        self.step_queue: queue.Queue[object] = queue.Queue(maxsize=capacity)
-        self.fanout = RtcFrontendStepFanout(
-            {"control_station:rtc-policy-passive": self.step_queue}
+        if emission_queue is not None and not isinstance(emission_queue, queue.Queue):
+            raise TypeError("emission_queue must be a queue.Queue or None.")
+        if emission_queue is not None and int(emission_queue.maxsize) <= 0:
+            raise ValueError("Injected RTC Station emission_queue must be bounded.")
+        self.emission_queue: queue.Queue[object] = (
+            queue.Queue(maxsize=capacity)
+            if emission_queue is None
+            else emission_queue
         )
         self._lock = threading.RLock()
+        self._binding_condition = threading.Condition(self._lock)
+        self._source_binding: RtcPolicyEmissionSourceBinding | None = None
         self._station: ScopedRtcPolicyPassiveStationComposition | None = None
+
+    def install_source_binding(
+        self,
+        binding: RtcPolicyEmissionSourceBinding,
+    ) -> RtcPolicyEmissionSourceBinding:
+        """Install an application-activated binding exactly once."""
+
+        if not isinstance(binding, RtcPolicyEmissionSourceBinding):
+            raise TypeError("binding must be an RtcPolicyEmissionSourceBinding.")
+        with self._binding_condition:
+            if self._source_binding is not None:
+                raise RuntimeError("RTC passive Station source is already bound.")
+            self._source_binding = binding
+            self._binding_condition.notify_all()
+            return binding
+
+    def wait_for_source_binding(
+        self,
+        *,
+        timeout_sec: float,
+    ) -> RtcPolicyEmissionSourceBinding | None:
+        timeout = float(timeout_sec)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError("timeout_sec must be finite and non-negative.")
+        with self._binding_condition:
+            self._binding_condition.wait_for(
+                lambda: self._source_binding is not None,
+                timeout=timeout,
+            )
+            return self._source_binding
 
     @property
     def station(self) -> ScopedRtcPolicyPassiveStationComposition | None:
@@ -403,13 +445,13 @@ class RtcPolicyPassiveStationBootstrap:
 
     def build_station_after_source_binding(
         self,
-        observe_step: Callable[[RtcFrontendStep], object],
+        observe_emission: Callable[[PolicyActionEmission], object],
         *,
         station_clock: Callable[[], float],
         timeout_sec: float,
         station_clock_domain_id: str = "control-station-rtc-passive-monotonic",
     ) -> ScopedRtcPolicyPassiveStationComposition:
-        binding = self.fanout.wait_for_source_binding(timeout_sec=timeout_sec)
+        binding = self.wait_for_source_binding(timeout_sec=timeout_sec)
         if binding is None:
             raise TimeoutError("RTC deploy source binding was not published in time.")
         with self._lock:
@@ -417,22 +459,22 @@ class RtcPolicyPassiveStationBootstrap:
                 raise RuntimeError("RTC passive Station was already constructed.")
             station = build_scoped_cs3_rtc_policy_passive_station(
                 binding,
-                observe_step,
+                observe_emission,
                 station_clock=station_clock,
                 station_clock_domain_id=station_clock_domain_id,
-                step_queue=self.step_queue,
+                emission_queue=self.emission_queue,
             )
             self._station = station
             return station
 
 
 def build_scoped_cs3_rtc_policy_passive_station(
-    binding: RtcFrontendStepSourceBinding,
-    observe_step: Callable[[RtcFrontendStep], object],
+    binding: RtcPolicyEmissionSourceBinding,
+    observe_emission: Callable[[PolicyActionEmission], object],
     *,
     station_clock: Callable[[], float],
     station_clock_domain_id: str = "control-station-rtc-passive-monotonic",
-    step_queue: queue.Queue[object] | None = None,
+    emission_queue: queue.Queue[object] | None = None,
     queue_capacity: int = 256,
 ) -> ScopedRtcPolicyPassiveStationComposition:
     """Build a passive Station fixture without receiving an RTC frontend."""
@@ -440,8 +482,8 @@ def build_scoped_cs3_rtc_policy_passive_station(
     manifest = build_cs3_rtc_policy_passive_shadow_manifest(binding)
     consumer = RtcPolicyStationConsumer(
         binding,
-        observe_step,
-        step_queue=step_queue,
+        observe_emission,
+        emission_queue=emission_queue,
         queue_capacity=queue_capacity,
     )
     station = ControlStationRuntime(

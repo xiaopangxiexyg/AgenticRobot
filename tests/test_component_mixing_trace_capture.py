@@ -15,7 +15,9 @@ from robot_motion.action import (
     HandActionSpec,
 )
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
-from control_composition.trace import project_component_mixing_shadow
+from dataset_interface.composition_control_trace import (
+    project_component_mixing_shadow,
+)
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,
     ControlTraceSpool,

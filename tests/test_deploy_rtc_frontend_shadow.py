@@ -6,6 +6,7 @@ import json
 import queue
 import threading
 import time
+from dataclasses import replace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -40,6 +41,7 @@ from robot_motion.deploy import (
     PolicyDeployRuntime,
     PolicyDeployRuntimeConfig,
     build_deployment_observation,
+    build_rtc_policy_emission_source_binding,
     nan_vector,
 )
 from teleop_runtime.deploy.rtc_frontend import (
@@ -48,7 +50,10 @@ from teleop_runtime.deploy.rtc_frontend import (
     RtcPolicyShadowFrontend,
 )
 from teleop_runtime.deploy.rtc_step_fanout import (
+    PolicyActionEmissionFanout,
     RtcFrontendStepFanout,
+    RtcPolicyEmissionPublisher,
+    build_rtc_policy_emission_binding_ack,
 )
 from teleop_runtime.deploy import run_policy
 
@@ -168,9 +173,43 @@ def _parse_deploy_args(*argv: str):
 def test_rtc_profile_is_default_off_and_does_not_change_sync_lookahead() -> None:
     args = _parse_deploy_args()
     assert args.rtc_profile == "off"
+    assert args.rtc_debug_level is None
     assert args.position_chunk_lookahead is True
     run_policy.validate_args(args)
+    assert args._rtc_debug_level == "off"
     assert args.position_chunk_lookahead is True
+
+
+def test_rtc_debug_defaults_to_summary_and_requires_explicit_debug() -> None:
+    profile_id = "rtc_3c_virtual_shadow_15_30_60_120_v1"
+    args = _parse_deploy_args(
+        "--rtc-profile",
+        profile_id,
+        "--debug",
+    )
+    run_policy.validate_args(args)
+    assert args._rtc_debug_level == "summary"
+
+    trace_args = _parse_deploy_args(
+        "--rtc-profile",
+        profile_id,
+        "--debug",
+        "--rtc-debug-level",
+        "trace",
+        "--rtc-debug-queue-capacity",
+        "8",
+    )
+    run_policy.validate_args(trace_args)
+    assert trace_args._rtc_debug_level == "trace"
+
+    missing_debug = _parse_deploy_args(
+        "--rtc-profile",
+        profile_id,
+        "--rtc-debug-level",
+        "trace",
+    )
+    with pytest.raises(ValueError, match="requires --debug"):
+        run_policy.validate_args(missing_debug)
 
 
 def test_rtc_profile_forces_dry_run_cadence_and_disables_lookahead() -> None:
@@ -306,21 +345,231 @@ def test_rtc_step_fanout_is_default_off_and_only_called_at_exact_step_seam() -> 
     fanout = RtcFrontendStepFanout(
         {"control_station": queue.Queue(maxsize=1)}
     )
+    emission_fanout = PolicyActionEmissionFanout(
+        {"control_station": queue.Queue(maxsize=1)}
+    )
+    emission_publisher = RtcPolicyEmissionPublisher(
+        observers={"control_station": queue.Queue(maxsize=1)}
+    )
     with pytest.raises(ValueError, match="explicit RTC-3c profile"):
         run_policy.main([], rtc_step_fanout=fanout)
+    with pytest.raises(ValueError, match="explicit RTC profile"):
+        run_policy.main([], rtc_emission_fanout=emission_fanout)
+    with pytest.raises(ValueError, match="explicit RTC profile"):
+        run_policy.main([], rtc_emission_publisher=emission_publisher)
 
     source = inspect.getsource(run_policy.main)
     assert source.count("rtc_step_fanout.put_nowait(rtc_step)") == 1
     assert source.count("rtc_step_fanout.bind_frontend(rtc_frontend)") == 1
+    assert source.count("rtc_emission_fanout.put_nowait(emission)") == 1
+    assert source.count("rtc_emission_fanout.bind_frontend(rtc_frontend)") == 1
+    assert source.count(
+        "rtc_emission_publisher.publish_committed_emission("
+    ) == 1
+    assert source.count(
+        "rtc_emission_publisher.bind_frontend(rtc_frontend)"
+    ) == 1
     assert "control_station" not in inspect.getsource(
         __import__(
             "teleop_runtime.deploy.rtc_step_fanout",
             fromlist=["RtcFrontendStepFanout"],
         )
     )
+    assert "teleop_runtime" not in inspect.getsource(
+        __import__(
+            "control_station.composition.rtc_policy_shadow",
+            fromlist=["RtcPolicyPassiveStationBootstrap"],
+        )
+    )
 
 
-def test_cs3_passive_station_observes_exact_rtc_step_without_owning_producer() -> None:
+def test_policy_emission_fanout_is_bounded_bound_and_emission_only() -> None:
+    runtime = _runtime()
+    frontend = RtcPolicyShadowFrontend(
+        config=_config(session="rtc-3c-emission-fanout"),
+        deploy_runtime=runtime,
+        policy=_ChunkPolicy(),
+        preparer=_pipeline(),
+        created_at=time.monotonic(),
+    )
+    output: queue.Queue = queue.Queue(maxsize=2)
+    fanout = PolicyActionEmissionFanout({"consumer": output})
+    with pytest.raises(RuntimeError, match="not bound"):
+        fanout.put_nowait(object())
+    binding = fanout.bind_frontend(frontend)
+    frontend.start()
+    base = frontend.state.plan.cursor_at
+    try:
+        step = None
+        for index in range(120):
+            candidate = frontend.step(
+                _observation(timestamp=50.0 + index / 30.0, step_index=index),
+                now=base + index / 30.0,
+            )
+            if candidate.emission_result.emission is not None:
+                step = candidate
+                break
+            time.sleep(0.001)
+        assert step is not None
+        emission = step.emission_result.emission
+        assert emission is not None
+        assert emission.source_binding_hash == binding.semantic_content_hash
+        with pytest.raises(ValueError, match="source binding identity"):
+            binding.validate_emission(
+                replace(emission, source_binding_hash="binding:another-epoch")
+            )
+        assert step.emission_commit_transition is not None
+        assert step.emission_commit_transition.receipt.accepted
+        fanout.put_nowait(emission)
+        assert output.get_nowait() is emission
+        assert fanout.status()["source_binding_hash"] == binding.semantic_content_hash
+        with pytest.raises(TypeError, match="PolicyActionEmission"):
+            fanout.put_nowait(step)
+    finally:
+        frontend.close(now=base + 5.0)
+
+
+def test_committed_emission_publisher_validates_commit_ttl_and_idempotency() -> None:
+    runtime = _runtime()
+    frontend = RtcPolicyShadowFrontend(
+        config=_config(session="rtc-committed-publisher"),
+        deploy_runtime=runtime,
+        policy=_ChunkPolicy(),
+        preparer=_pipeline(),
+        created_at=time.monotonic(),
+    )
+    accepted_queue: queue.Queue = queue.Queue(maxsize=1)
+    full_queue: queue.Queue = queue.Queue(maxsize=1)
+    full_queue.put_nowait(object())
+    publisher = RtcPolicyEmissionPublisher(
+        observers={
+            "accepted_observer": accepted_queue,
+            "dropping_observer": full_queue,
+        }
+    )
+    binding = publisher.bind_frontend(frontend)
+    assert publisher.active_binding is binding
+    frontend.start()
+    base = frontend.state.plan.cursor_at
+    try:
+        step = None
+        for index in range(120):
+            candidate = frontend.step(
+                _observation(timestamp=55.0 + index / 30.0, step_index=index),
+                now=base + index / 30.0,
+            )
+            if candidate.emission_result.emission is not None:
+                step = candidate
+                break
+            time.sleep(0.001)
+        assert step is not None
+        emission = step.emission_result.emission
+        commit = step.emission_commit_receipt
+        assert emission is not None
+        assert commit is not None
+        assert commit.emission_semantic_content_hash == emission.semantic_content_hash
+
+        receipt = publisher.publish_committed_emission(
+            emission,
+            commit,
+            now=emission.emitted_at,
+        )
+        assert receipt.accepted
+        assert not receipt.idempotent_replay
+        assert accepted_queue.get_nowait() is emission
+        assert receipt.observer_outcomes[1].dropped
+
+        replay = publisher.publish_committed_emission(
+            emission,
+            commit,
+            now=emission.emitted_at,
+        )
+        assert replay.accepted
+        assert replay.idempotent_replay
+        assert accepted_queue.empty()
+        assert replay.publication_key == receipt.publication_key
+
+        mismatched_emission = replace(
+            emission,
+            semantic_content_hash="emission:forged-different-content",
+        )
+        mismatch = publisher.publish_committed_emission(
+            mismatched_emission,
+            commit,
+            now=emission.emitted_at,
+        )
+        assert not mismatch.accepted
+        assert "producer_commit_emission_hash_mismatch" in mismatch.reasons
+
+        expired_publisher = RtcPolicyEmissionPublisher(
+            observers={"expired_observer": queue.Queue(maxsize=1)}
+        )
+        expired_publisher.bind_frontend(frontend)
+        expired = expired_publisher.publish_committed_emission(
+            emission,
+            commit,
+            now=emission.effective_until + 1e-6,
+        )
+        assert not expired.accepted
+        assert "emission_ttl_expired" in expired.reasons
+    finally:
+        frontend.close(now=base + 5.0)
+
+
+def test_required_control_subscriber_failure_is_not_silently_dropped() -> None:
+    runtime = _runtime()
+    frontend = RtcPolicyShadowFrontend(
+        config=_config(session="rtc-required-control-publisher"),
+        deploy_runtime=runtime,
+        policy=_ChunkPolicy(),
+        preparer=_pipeline(),
+        created_at=time.monotonic(),
+    )
+    required_queue: queue.Queue = queue.Queue(maxsize=1)
+    required_queue.put_nowait(object())
+    observer_queue: queue.Queue = queue.Queue(maxsize=1)
+    publisher = RtcPolicyEmissionPublisher(
+        observers={"passive_observer": observer_queue},
+        required_control_subscriber=("control_adapter", required_queue),
+    )
+    publisher.bind_frontend(frontend)
+    frontend.start()
+    base = frontend.state.plan.cursor_at
+    try:
+        step = None
+        for index in range(120):
+            candidate = frontend.step(
+                _observation(timestamp=57.0 + index / 30.0, step_index=index),
+                now=base + index / 30.0,
+            )
+            if candidate.emission_result.emission is not None:
+                step = candidate
+                break
+            time.sleep(0.001)
+        assert step is not None
+        emission = step.emission_result.emission
+        commit = step.emission_commit_receipt
+        assert emission is not None
+        assert commit is not None
+        receipt = publisher.publish_committed_emission(
+            emission,
+            commit,
+            now=emission.emitted_at,
+        )
+        assert not receipt.accepted
+        assert receipt.required_control_outcome is not None
+        assert not receipt.required_control_outcome.accepted
+        assert not receipt.required_control_outcome.dropped
+        assert observer_queue.empty()
+        status = publisher.status()
+        assert status["suspended"]
+        assert status["accepted_publication_count"] == 0
+        assert status["rejected_publication_count"] == 1
+    finally:
+        frontend.close(now=base + 5.0)
+
+
+def test_cs3_passive_station_observes_committed_emission_without_owning_producer() -> None:
     runtime = _runtime()
     frontend = RtcPolicyShadowFrontend(
         config=_config(session="rtc-3c-cs3-passive"),
@@ -330,8 +579,9 @@ def test_cs3_passive_station_observes_exact_rtc_step_without_owning_producer() -
         created_at=time.monotonic(),
     )
     bootstrap = RtcPolicyPassiveStationBootstrap(queue_capacity=16)
-    fanout = bootstrap.fanout
-    binding = fanout.bind_frontend(frontend)
+    binding = bootstrap.install_source_binding(
+        build_rtc_policy_emission_source_binding(frontend)
+    )
     observed: list[object] = []
     station = bootstrap.build_station_after_source_binding(
         observed.append,
@@ -339,7 +589,7 @@ def test_cs3_passive_station_observes_exact_rtc_step_without_owning_producer() -
         timeout_sec=0.0,
     )
     assert bootstrap.station is station
-    assert station.consumer.step_queue is bootstrap.step_queue
+    assert station.consumer.emission_queue is bootstrap.emission_queue
 
     manifest = station.station.manifest
     assert manifest.manifest_id == CS3_RTC_POLICY_PASSIVE_SHADOW_MANIFEST_ID_V1
@@ -406,16 +656,20 @@ def test_cs3_passive_station_observes_exact_rtc_step_without_owning_producer() -
                 break
             time.sleep(0.001)
         assert emitting_step is not None
+        emission = emitting_step.emission_result.emission
+        assert emission is not None
 
         # A pre-activation item is ordered before the activation fence and is
         # therefore discarded as inactive, never replayed after start_shadow.
-        fanout.put_nowait(emitting_step)
-        _wait_for(lambda: station.consumer.status().inactive_step_count == 1)
+        bootstrap.emission_queue.put_nowait(emission)
+        _wait_for(
+            lambda: station.consumer.status().inactive_emission_count == 1
+        )
         submit("start_shadow", source_id)
-        fanout.put_nowait(emitting_step)
-        _wait_for(lambda: station.consumer.status().observed_step_count == 1)
-        assert observed == [emitting_step]
-        assert observed[0] is emitting_step
+        bootstrap.emission_queue.put_nowait(emission)
+        _wait_for(lambda: station.consumer.status().observed_emission_count == 1)
+        assert observed == [emission]
+        assert observed[0] is emission
 
         rtc_state_at_station_stop = frontend.state.semantic_content_hash
         rtc_selected_at_station_stop = frontend.selected_emission_count
@@ -423,13 +677,15 @@ def test_cs3_passive_station_observes_exact_rtc_step_without_owning_producer() -
         assert frontend.state.semantic_content_hash == rtc_state_at_station_stop
         assert frontend.selected_emission_count == rtc_selected_at_station_stop
 
-        fanout.put_nowait(emitting_step)
-        _wait_for(lambda: station.consumer.status().inactive_step_count == 2)
-        assert observed == [emitting_step]
+        bootstrap.emission_queue.put_nowait(emission)
+        _wait_for(
+            lambda: station.consumer.status().inactive_emission_count == 2
+        )
+        assert observed == [emission]
         status = station.consumer.status()
         assert not status.shadow_enabled
         assert status.observed_emission_count == 1
-        assert status.rejected_step_count == 0
+        assert status.rejected_emission_count == 0
         assert status.error_count == 0
 
         rejected, _completion = submit("request_candidate", source_id)
@@ -462,7 +718,9 @@ def test_cs3_loopback_api_only_coordinates_passive_shadow_lifecycle() -> None:
         created_at=time.monotonic(),
     )
     bootstrap = RtcPolicyPassiveStationBootstrap(queue_capacity=8)
-    bootstrap.fanout.bind_frontend(frontend)
+    bootstrap.install_source_binding(
+        build_rtc_policy_emission_source_binding(frontend)
+    )
     station = bootstrap.build_station_after_source_binding(
         lambda _step: None,
         station_clock=time.monotonic,
@@ -598,12 +856,13 @@ def test_cs3_loopback_api_only_coordinates_passive_shadow_lifecycle() -> None:
 
 def test_virtual_policy_long_run_emits_each_timed_keyframe_once_without_lookahead() -> None:
     runtime = _runtime()
+    emission_adapter = _pipeline().action_adapter
     frontend = RtcPolicyShadowFrontend(
         config=_config(),
         deploy_runtime=runtime,
         policy=_ChunkPolicy(),
-        preparer=_pipeline(),
         created_at=time.monotonic(),
+        emission_adapter=emission_adapter,
     )
     frontend.start()
     emissions = []
@@ -623,17 +882,19 @@ def test_virtual_policy_long_run_emits_each_timed_keyframe_once_without_lookahea
                 and step.request_transition.receipt.accepted
             ):
                 request_steps.append(step_index)
-            if step.action_preparation.emission is not None:
-                emissions.append(step.action_preparation.emission)
+            if step.emission_result.emission is not None:
+                emissions.append(step.emission_result.emission)
                 assert step.emission_commit_transition is not None
                 assert step.emission_commit_transition.receipt.accepted
+                assert step.emission_result.raw_action is not None
+                assert step.action_preparation.prepared_action is None
                 assert step.action_preparation.raw_lookahead_action is None
                 assert (
-                    step.action_preparation.emission.emitted_at
-                    >= step.action_preparation.emission.produced_at
+                    step.emission_result.emission.emitted_at
+                    >= step.emission_result.emission.produced_at
                 )
                 assert step.state.plan.producer_committed_through == (
-                    step.action_preparation.emission.target_effective_at
+                    step.emission_result.emission.target_effective_at
                 )
                 assert all(
                     keyframe.target_effective_at
@@ -697,6 +958,14 @@ def test_blocking_worker_never_blocks_control_step_and_late_completion_cannot_re
         executor_factory=executor_factory,
     )
     frontend.start()
+    binding_before_rearm = build_rtc_policy_emission_source_binding(frontend)
+    publisher = RtcPolicyEmissionPublisher(
+        required_control_subscriber=(
+            "control_adapter",
+            queue.Queue(maxsize=2),
+        )
+    )
+    assert publisher.bind_frontend(frontend) is binding_before_rearm
     first = frontend.step(_observation(timestamp=10.0, step_index=0), now=base)
     assert first.worker_submission is not None
     assert first.worker_submission.accepted
@@ -713,6 +982,7 @@ def test_blocking_worker_never_blocks_control_step_and_late_completion_cannot_re
     assert max(durations) < 0.02
 
     held = frontend.hold(now=base + 1.0, reason="operator_hold")
+    publisher.suspend_publication(reason="producer_rearm")
     assert frontend.state.lifecycle_state == POLICY_ASYNC_PRODUCER_HOLD
     assert held.worker_stop_receipt.session_state == (
         POLICY_WORKER_SESSION_ABANDONED_UNDRAINED
@@ -742,6 +1012,43 @@ def test_blocking_worker_never_blocks_control_step_and_late_completion_cannot_re
     rearmed = frontend.rearm(now=base + 1.2, reason="explicit_rearm")
     assert rearmed.receipt.accepted
     assert frontend.state.worker_session_id != old_session
+    binding_after_rearm = build_rtc_policy_emission_source_binding(frontend)
+    assert binding_after_rearm.producer_epoch > binding_before_rearm.producer_epoch
+    assert (
+        binding_after_rearm.descriptor_hash
+        == binding_before_rearm.descriptor_hash
+    )
+    assert (
+        binding_after_rearm.semantic_content_hash
+        != binding_before_rearm.semantic_content_hash
+    )
+    readiness = frontend.last_activation_readiness_receipt
+    assert readiness is not None
+    assert readiness.ready
+    assert readiness.old_producer_epoch == binding_before_rearm.producer_epoch
+    assert readiness.new_producer_epoch == binding_after_rearm.producer_epoch
+    with pytest.raises(ValueError, match="ACK is missing"):
+        publisher.activate_rebound_binding(
+            binding_after_rearm,
+            readiness_receipt=readiness,
+            required_control_ack=None,
+        )
+    ack = build_rtc_policy_emission_binding_ack(
+        binding_after_rearm,
+        subscriber_id="control_adapter",
+        accepted=True,
+        acknowledged_at=base + 1.2,
+    )
+    assert (
+        publisher.activate_rebound_binding(
+            binding_after_rearm,
+            readiness_receipt=readiness,
+            required_control_ack=ack,
+        )
+        is binding_after_rearm
+    )
+    assert publisher.active_binding is binding_after_rearm
+    assert not publisher.status()["suspended"]
     frontend.close(now=base + 1.3)
 
 

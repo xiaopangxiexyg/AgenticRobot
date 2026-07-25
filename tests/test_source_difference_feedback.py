@@ -30,7 +30,7 @@ from robot_motion.action import (
     RobotAction,
 )
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
-from control_composition.trace import (
+from dataset_interface.composition_control_trace import (
     project_guidance_feedback_command,
     project_guidance_feedback_receipt,
     project_source_difference_observation,

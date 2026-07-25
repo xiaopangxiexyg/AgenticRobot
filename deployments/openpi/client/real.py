@@ -254,6 +254,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Write deploy action/pose debug JSONL through teleop_runtime.deploy.",
     )
     parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        help="Directory for deployment debug JSONL.",
+    )
+    parser.add_argument(
+        "--rtc-debug-level",
+        choices=("off", "summary", "trace"),
+        default=None,
+        help="RTC debug detail; requires --debug. Default for RTC is summary.",
+    )
+    parser.add_argument(
+        "--rtc-debug-queue-capacity",
+        type=int,
+        default=None,
+        help="Bounded non-blocking RTC debug event queue capacity.",
+    )
+    parser.add_argument(
         "--runtime-help",
         action="store_true",
         help="Show the delegated real-runtime mode, rate, safety, and hardware options.",
@@ -337,6 +355,17 @@ def main(argv: list[str] | None = None) -> int:
         runtime_args.extend(("--policy-artifact-json", str(artifact_path)))
     if args.debug:
         runtime_args.append("--debug")
+    if args.debug_dir is not None:
+        runtime_args.extend(("--debug-dir", str(args.debug_dir)))
+    if args.rtc_debug_level is not None:
+        runtime_args.extend(("--rtc-debug-level", str(args.rtc_debug_level)))
+    if args.rtc_debug_queue_capacity is not None:
+        runtime_args.extend(
+            (
+                "--rtc-debug-queue-capacity",
+                str(args.rtc_debug_queue_capacity),
+            )
+        )
 
     if args.rtc_profile is not None:
         runtime_args.extend(("--rtc-profile", str(args.rtc_profile)))

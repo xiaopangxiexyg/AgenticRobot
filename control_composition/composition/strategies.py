@@ -308,7 +308,11 @@ def build_pose_mixing_input_snapshot(
     contexts: tuple[CompositionContext, ...] = (),
     component_dependencies: tuple[str, ...] | None = None,
 ) -> PoseMixingInputSnapshot:
-    """Project one arbitration cut into the model/device-independent seam."""
+    """Project one legacy arbitration cut for compatibility-shadow evaluation.
+
+    New production integrations must enter through ``CompositionInputDraft``
+    and the receiver-owned formal runtime instead of this post-proposal seam.
+    """
 
     proposal_snapshot = arbitration_input.proposal_snapshot
     authority_snapshot = arbitration_input.authority_state_snapshot
@@ -1501,12 +1505,13 @@ def evaluate_component_mixing_shadow(
     hand_spec_by_side: Mapping[str, HandActionSpec] | None = None,
     contexts: tuple[CompositionContext, ...] = (),
 ) -> ComponentMixingShadowDecision:
-    """Evaluate replaceable arm and hand strategies at one causal cut.
+    """Evaluate legacy-compatible arm and hand strategies at one causal cut.
 
     This function only builds immutable snapshots, executes pure strategies and
     performs a strict structural join.  It intentionally does not admit a new
     proposal, mutate an authority/epoch, run safety/IK, enqueue a reference or
-    dispatch a command.
+    dispatch a command. New production orchestration must use the formal
+    ``CompositionInputDraft`` path.
     """
 
     if not callable(getattr(arm_strategy, "decide", None)):

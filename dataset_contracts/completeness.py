@@ -1048,6 +1048,26 @@ def evaluate_control_trace_lineage(
         event_type="composition_spec",
         payload_key="semantic_content_hash",
     )
+    component_rule_set_by_hash = _payload_index(
+        ordered,
+        event_type="component_composition_rule_set",
+        payload_key="semantic_content_hash",
+    )
+    formal_strategy_spec_by_hash = _payload_index(
+        ordered,
+        event_type="formal_composition_strategy_spec",
+        payload_key="semantic_content_hash",
+    )
+    formal_component_binding_by_spec_hash = _payload_index(
+        ordered,
+        event_type="formal_component_composition_binding",
+        payload_key="composition_spec_hash",
+    )
+    compound_authority_profile_by_hash = _payload_index(
+        ordered,
+        event_type="conservative_compound_authority_profile",
+        payload_key="semantic_content_hash",
+    )
     for input_id, facts in _payload_index(
         ordered,
         event_type="composition_contributor_input",
@@ -1081,6 +1101,31 @@ def evaluate_control_trace_lineage(
         ordered,
         event_type="composition_session_rearm_spec",
         payload_key="rearm_spec_id",
+    )
+    composition_activation_scope_by_id = _payload_index(
+        ordered,
+        event_type="composition_activation_scope",
+        payload_key="activation_id",
+    )
+    composition_activation_binding_by_subject_id = _payload_index(
+        ordered,
+        event_type="composition_activation_binding",
+        payload_key="subject_id",
+    )
+    composition_source_eligibility_spec_by_hash = _payload_index(
+        ordered,
+        event_type="composition_source_eligibility_spec",
+        payload_key="semantic_content_hash",
+    )
+    composition_source_eligibility_state_by_id = _payload_index(
+        ordered,
+        event_type="composition_source_eligibility_state",
+        payload_key="source_eligibility_state_id",
+    )
+    composition_source_eligibility_snapshot_by_id = _payload_index(
+        ordered,
+        event_type="composition_source_eligibility_snapshot",
+        payload_key="source_eligibility_snapshot_id",
     )
     reference_segment_by_id = _payload_index(
         ordered,
@@ -1265,6 +1310,212 @@ def evaluate_control_trace_lineage(
                         "Context snapshot must resolve each selected context and hash.",
                         str(context_id),
                     )
+        elif (
+            fact.event_type == "composition_source_eligibility_admission"
+            and bool(payload["accepted"])
+        ):
+            state_id = str(payload["source_eligibility_state_id"])
+            states = composition_source_eligibility_state_by_id.get(
+                state_id,
+                (),
+            )
+            if len(states) != 1 or states[0].payload[
+                "state_semantic_content_hash"
+            ] != payload["state_semantic_content_hash"]:
+                issue(
+                    "composition_source_eligibility_admission_missing_state",
+                    fact.fact_id,
+                    "Accepted eligibility admission must resolve its exact state.",
+                    state_id,
+                )
+        elif fact.event_type == "composition_source_eligibility_snapshot":
+            spec_hash = str(payload["source_eligibility_spec_hash"])
+            if (
+                len(
+                    composition_source_eligibility_spec_by_hash.get(
+                        spec_hash,
+                        (),
+                    )
+                )
+                != 1
+            ):
+                issue(
+                    "composition_source_eligibility_snapshot_missing_spec",
+                    fact.fact_id,
+                    "Eligibility snapshot must resolve its exact spec.",
+                    spec_hash,
+                )
+            state_ids = payload["selected_state_ids_by_role"]
+            state_hashes = payload["selected_state_hashes_by_role"]
+            for role, state_id in state_ids.items():
+                states = composition_source_eligibility_state_by_id.get(
+                    str(state_id),
+                    (),
+                )
+                if len(states) != 1 or states[0].payload[
+                    "state_semantic_content_hash"
+                ] != state_hashes[role]:
+                    issue(
+                        "composition_source_eligibility_snapshot_missing_state",
+                        fact.fact_id,
+                        "Eligibility snapshot must resolve each selected state.",
+                        str(state_id),
+                    )
+        elif fact.event_type == "composition_source_eligibility_binding":
+            input_snapshot_id = str(
+                payload["composition_input_snapshot_id"]
+            )
+            input_snapshots = composition_snapshot_by_id.get(
+                input_snapshot_id,
+                (),
+            )
+            if len(input_snapshots) != 1 or input_snapshots[0].payload[
+                "semantic_content_hash"
+            ] != payload["composition_input_snapshot_hash"]:
+                issue(
+                    "composition_source_eligibility_binding_missing_input_snapshot",
+                    fact.fact_id,
+                    "Eligibility binding must resolve the input snapshot.",
+                    input_snapshot_id,
+                )
+            eligibility_snapshot_id = str(
+                payload["source_eligibility_snapshot_id"]
+            )
+            eligibility_snapshots = (
+                composition_source_eligibility_snapshot_by_id.get(
+                    eligibility_snapshot_id,
+                    (),
+                )
+            )
+            if (
+                len(eligibility_snapshots) != 1
+                or eligibility_snapshots[0].payload[
+                    "semantic_content_hash"
+                ]
+                != payload["source_eligibility_snapshot_hash"]
+            ):
+                issue(
+                    "composition_source_eligibility_binding_missing_snapshot",
+                    fact.fact_id,
+                    "Eligibility binding must resolve the eligibility snapshot.",
+                    eligibility_snapshot_id,
+                )
+        elif fact.event_type == "composition_spec" and payload[
+            "algebra"
+        ] == "formal_component_strategy_v2":
+            bindings = formal_component_binding_by_spec_hash.get(
+                str(payload["semantic_content_hash"]),
+                (),
+            )
+            if len(bindings) != 1:
+                issue(
+                    "formal_component_spec_missing_binding",
+                    fact.fact_id,
+                    "Formal component CompositionSpec must resolve exactly one "
+                    "rule-set/strategy binding.",
+                    str(payload["semantic_content_hash"]),
+                )
+        elif fact.event_type == "formal_component_composition_binding":
+            spec_hash = str(payload["composition_spec_hash"])
+            rule_set_hash = str(payload["component_rule_set_hash"])
+            strategy_spec_hash = str(payload["formal_strategy_spec_hash"])
+            specs = composition_spec_by_hash.get(spec_hash, ())
+            if len(specs) != 1 or specs[0].payload[
+                "algebra"
+            ] != "formal_component_strategy_v2":
+                issue(
+                    "formal_component_binding_missing_spec",
+                    fact.fact_id,
+                    "Formal component binding must resolve one v2 "
+                    "CompositionSpec.",
+                    spec_hash,
+                )
+            if len(component_rule_set_by_hash.get(rule_set_hash, ())) != 1:
+                issue(
+                    "formal_component_binding_missing_rule_set",
+                    fact.fact_id,
+                    "Formal component binding must resolve one typed rule set.",
+                    rule_set_hash,
+                )
+            strategy_specs = formal_strategy_spec_by_hash.get(
+                strategy_spec_hash,
+                (),
+            )
+            if (
+                len(strategy_specs) != 1
+                or strategy_specs[0].payload["composition_spec_hash"]
+                != spec_hash
+            ):
+                issue(
+                    "formal_component_binding_missing_strategy_spec",
+                    fact.fact_id,
+                    "Formal component binding must resolve one strategy bound "
+                    "to the same CompositionSpec.",
+                    strategy_spec_hash,
+                )
+        elif fact.event_type == "conservative_compound_authority_profile":
+            spec_hash = str(payload["composition_spec_hash"])
+            rule_set_hash = str(payload["component_rule_set_hash"])
+            strategy_spec_hash = str(payload["formal_strategy_spec_hash"])
+            if len(composition_spec_by_hash.get(spec_hash, ())) != 1:
+                issue(
+                    "compound_authority_profile_missing_composition_spec",
+                    fact.fact_id,
+                    "Compound authority profile must resolve one CompositionSpec.",
+                    spec_hash,
+                )
+            if len(component_rule_set_by_hash.get(rule_set_hash, ())) != 1:
+                issue(
+                    "compound_authority_profile_missing_rule_set",
+                    fact.fact_id,
+                    "Compound authority profile must resolve one component rule set.",
+                    rule_set_hash,
+                )
+            if len(formal_strategy_spec_by_hash.get(strategy_spec_hash, ())) != 1:
+                issue(
+                    "compound_authority_profile_missing_strategy_spec",
+                    fact.fact_id,
+                    "Compound authority profile must resolve one formal strategy spec.",
+                    strategy_spec_hash,
+                )
+            bindings = formal_component_binding_by_spec_hash.get(spec_hash, ())
+            if (
+                len(bindings) != 1
+                or bindings[0].payload["component_rule_set_hash"]
+                != rule_set_hash
+                or bindings[0].payload["formal_strategy_spec_hash"]
+                != strategy_spec_hash
+            ):
+                issue(
+                    "compound_authority_profile_binding_mismatch",
+                    fact.fact_id,
+                    "Compound authority profile hashes must resolve one exact "
+                    "formal component binding.",
+                    spec_hash,
+                    rule_set_hash,
+                    strategy_spec_hash,
+                )
+        elif fact.event_type == "compound_authority_failure":
+            profile_hash = str(payload["profile_hash"])
+            if len(compound_authority_profile_by_hash.get(profile_hash, ())) != 1:
+                issue(
+                    "compound_authority_failure_missing_profile",
+                    fact.fact_id,
+                    "Compound authority failure must resolve its exact profile.",
+                    profile_hash,
+                )
+            missing_sources = tuple(
+                source_id
+                for source_id in payload["source_event_ids"]
+                if str(source_id) not in by_id
+            )
+            if missing_sources:
+                issue(
+                    "compound_authority_failure_missing_source",
+                    fact.fact_id,
+                    "Compound authority failure sources must resolve in this trace.",
+                    *missing_sources,
+                )
         elif fact.event_type == "composition_input_admission" and bool(
             payload["accepted"]
         ):
@@ -1385,6 +1636,111 @@ def evaluate_control_trace_lineage(
                         fact.fact_id,
                         "Composition result input lineage is absent or hash-mismatched.",
                         str(input_id),
+                    )
+        elif fact.event_type == "composition_activation_scope":
+            operation_spec_id = str(payload["operation_spec_id"])
+            specs = composition_session_spec_by_id.get(operation_spec_id, ())
+            if (
+                len(specs) != 1
+                or specs[0].payload["semantic_content_hash"]
+                != payload["operation_spec_hash"]
+            ):
+                issue(
+                    "composition_activation_missing_operation_spec",
+                    fact.fact_id,
+                    "Composition activation must resolve its exact operation spec.",
+                    operation_spec_id,
+                )
+        elif fact.event_type == "composition_activation_binding":
+            activation_id = str(payload["activation_id"])
+            scopes = composition_activation_scope_by_id.get(
+                activation_id,
+                (),
+            )
+            if (
+                len(scopes) != 1
+                or scopes[0].payload["semantic_content_hash"]
+                != payload["activation_hash"]
+            ):
+                issue(
+                    "composition_activation_binding_missing_scope",
+                    fact.fact_id,
+                    "Activation binding must resolve its exact scope.",
+                    activation_id,
+                )
+            subject_id = str(payload["subject_id"])
+            subject_kind = str(payload["subject_kind"])
+            subject_hash_field = {
+                "input": "input_semantic_content_hash",
+                "snapshot": "semantic_content_hash",
+                "result": "semantic_content_hash",
+            }.get(subject_kind)
+            subject_index = {
+                "input": composition_input_by_id,
+                "snapshot": composition_snapshot_by_id,
+                "result": composition_result_by_id,
+            }.get(subject_kind)
+            subjects = () if subject_index is None else subject_index.get(
+                subject_id,
+                (),
+            )
+            if (
+                subject_hash_field is None
+                or len(subjects) != 1
+                or subjects[0].payload[subject_hash_field]
+                != payload["subject_hash"]
+            ):
+                issue(
+                    "composition_activation_binding_missing_subject",
+                    fact.fact_id,
+                    "Activation binding must resolve its exact typed subject.",
+                    subject_id,
+                )
+            if subject_kind == "snapshot" and len(subjects) == 1:
+                for selected_input_id in subjects[0].payload[
+                    "selected_input_ids_by_role"
+                ].values():
+                    input_bindings = (
+                        composition_activation_binding_by_subject_id.get(
+                            str(selected_input_id),
+                            (),
+                        )
+                    )
+                    if (
+                        len(input_bindings) != 1
+                        or input_bindings[0].payload["activation_id"]
+                        != activation_id
+                        or input_bindings[0].payload["activation_hash"]
+                        != payload["activation_hash"]
+                    ):
+                        issue(
+                            "composition_activation_snapshot_input_mismatch",
+                            fact.fact_id,
+                            "Activation-bound snapshot must select only inputs from the same activation.",
+                            str(selected_input_id),
+                        )
+            if subject_kind == "result" and len(subjects) == 1:
+                snapshot_id = str(
+                    subjects[0].payload["composition_input_snapshot_id"]
+                )
+                snapshot_bindings = (
+                    composition_activation_binding_by_subject_id.get(
+                        snapshot_id,
+                        (),
+                    )
+                )
+                if (
+                    len(snapshot_bindings) != 1
+                    or snapshot_bindings[0].payload["activation_id"]
+                    != activation_id
+                    or snapshot_bindings[0].payload["activation_hash"]
+                    != payload["activation_hash"]
+                ):
+                    issue(
+                        "composition_activation_result_snapshot_mismatch",
+                        fact.fact_id,
+                        "Activation-bound result must resolve a snapshot from the same activation.",
+                        snapshot_id,
                     )
         elif fact.event_type == "composition_authority_disposition":
             result_id = str(payload["composition_result_id"])

@@ -1,6 +1,6 @@
 # DexTeleop 控制、数据与训练闭环图示
 
-更新日期：2026-07-24
+更新日期：2026-07-25
 
 ## 文档用途
 
@@ -29,25 +29,29 @@
 flowchart TD
     A["control_station / sim / teleop / deployment adapters"] --> B["control_composition<br/>cut / strategy / session / lineage / difference"]
     B --> C["robot_motion<br/>proposal admission / authority / safety / execution"]
-    B --> D["dataset_contracts<br/>typed ControlTrace facts"]
+    B --> D["dataset_interface adapter<br/>optional v2.4 projection"]
+    D --> E["dataset_contracts / teleop_runtime<br/>schema + WAL + episode + writer"]
 ```
 
 `control_composition`不拥有最终动作许可，也不导入MuJoCo、硬件、遥操设备或模型实现。当前package/ports/
-依赖守卫已落地；composition、pose/qpos strategy、observability、专属trace、runtime及composition-aware
+依赖守卫已落地；composition、pose/qpos strategy、observability、domain events、runtime及composition-aware
 policy-node协议均已物理迁入，旧RobotMotion实现/API已删除；pure handoff reducer已经物理迁入lifecycle，
 composition-session contract/re-arm/registry也已迁入；
 Station controller只保留operation/
-publication/HOLD适配，旧路径维持exact identity。其余逻辑只有通过hash、数值和default-off回归后才物理迁移。
+publication/HOLD适配；旧handoff转发路径已在调用审计后删除。其余逻辑只有通过hash、数值和default-off回归后才物理迁移。
 
 ```mermaid
 flowchart LR
-    S["human / replay / policy / RTC / synthetic"] --> A["source adapters<br/>canonical RobotAction + lineage"]
+    S["human / replay / sync or async policy / synthetic"] --> A["source adapters<br/>canonical RobotAction + lineage"]
     M["history / state / future / vision / labels"] --> XA["generic context admission<br/>clock + TTL + contract + lineage"]
+    P["CompositionInformationPlan<br/>predeclared channels/contracts/access"] --> XA
     XA --> X["StrategyContextView<br/>same-cut latest/window"]
     A --> C["receiver admission + one ControlCut"]
     X --> C
     C --> F["replaceable pose/qpos strategy"]
     F --> R["CompositionEvaluationRecord<br/>spec + cut + epochs + inputs + result + diagnostics"]
+    R --> O["protocol-neutral domain events"]
+    O --> T["optional dataset_interface v2.4 projection"]
     F --> D["Immediate difference<br/>off / summary / full"]
     R --> P["optional proposal admission"]
     P --> Q["authority + canonical safety + resolver/reference + dispatch"]
@@ -56,17 +60,49 @@ flowchart LR
     E --> V
 ```
 
+Formal composition的start/re-arm不再依靠Station私有布尔量判定“新输入”：
+
+```mermaid
+flowchart LR
+    O["operation spec + session epoch"] --> A["CompositionActivationScope v2"]
+    A --> I["activation-bound inputs<br/>receiver time barrier"]
+    I --> S["same-activation snapshot"]
+    S --> R["same-activation result"]
+    R --> G{"formal authority gate"}
+    G -->|ready| P["one proposal"]
+    G -->|missing / mismatch / invalid| H["HOLD + cancel"]
+    A -. domain event .-> T["external trace projection<br/>activation scope + bindings"]
+    I -. domain event .-> T
+    S -. domain event .-> T
+    R -. domain event .-> T
+```
+
+producer、authority和execution epoch仍各自负责原有失效边界；activation identity只解决逻辑session一次
+start/re-arm内部的输入归属。未启用formal scope的既有composition继续使用v1 ID/hash。
+
+当前增量门槛：
+
+| 优先级 | 当前事实 | 下一门槛 |
+|---|---|---|
+| 已落地待稳定 | activation v2覆盖input→snapshot→result；information plan预声明context需求；domain event与dataset projection已分离 | 保持v1 hash/default-off和依赖防火墙，完成回归 |
+| P0纯层+sim shadow已落地 | 独立eligibility state/store/snapshot与action共享cut；status epoch、lease、rearm、retention tombstone及外部trace已覆盖 | 保持default-off；后续设备/replay/policy adapter只翻译状态，不改变通用契约或authority |
+| P1 | 当前formal re-arm通过composer producer epoch推进阻止旧proposal；activation尚未进入proposal lineage | 仅以additive v3或typed relation贯通，禁止修改proposal v1/v2，不新增execution lease |
+| P1/RTC gate | composition不判断model observation/result generation age | 由RTC/deploy adapter和proposal admission校验；composition继续只接absolute RobotAction |
+| P1 hardening | semantic time window已落地，窗口内rate/bytes仍无硬上限 | 增加显式quota/rejection，禁止lossy ring overwrite |
+
 多频对齐不是在该包内启动额外loop：input/context以receiver clock声明有效区间，同一cut只选择覆盖
 `target_effective_at`且在active epoch内的最新事实；slow source在TTL内复用，fast/late source只进入后续cut。
 `CompositionEvaluationRecord`现让调用方一次取得exact spec/cut/epoch/selected lineage/context/result/difference/
-diagnostic/trace batch；ControlTrace同时保存完整`composition_spec`。高频reference、canonical safety和物理下发仍由
+diagnostic/domain-event batch；外部adapter可选投影ControlTrace。高频reference、canonical safety和物理下发仍由
 RobotMotion拥有。当前长期store pruning/backpressure、动态任意effector拓扑、formal compound hand execution、
 真实可视化/触觉适配和多backend/真机验收仍为后续gate。
 
 ```text
 context现状：formal runtime、synthetic policy node、MuJoCo统一使用CompositionContextRecord/Store/Snapshot
-旧兼容：PolicyContext runtime已删除；v2.4 policy_context_*只保留离线读取，新事实写composition_context_*
 禁止：live backend/model读取、hidden latest cache、composer等待慢模型
+
+information plan：独立于activation和dataset；source acquisition前声明channel/contract/access/max age
+资源紧张或source频率不足：先收紧plan；dataset-only媒体绕行composition；shared媒体只传轻量ref
 
 inline strategy：pure/no-I/O，profile声明deadline；初始建议p99 <= min(2 ms, 10% composition period)
 slow/model mixer：独立异步producer -> typed time-bound advisory context -> local deterministic strategy
@@ -290,11 +326,12 @@ CS-6b1f sim pose HIL formal capture    ✅ opt-in; virtual readiness + external 
 CS-6b1g weighted SE(3) pose fusion     ✅ shared receiver human+replay sim shadow; default-off
 CS-6b1h composer-only formal pose fusion ✅ deterministic sim data plane/default-off
 CS-6b1i typed composition session        ✅ Station + formal sim capture/default-off; re-arm/real pending
-CS-6b2 component shadow + trace/lifecycle fixture ✅ scoped; authoritative compound gate pending
+CS-6b2 component shadow + trace/lifecycle fixture ✅ scoped
 CS-6b2e native stream same-episode seal/commit ✅ scoped
 CS-6b2f bounded inline pose/qpos process seam ✅ scoped; RGBD/tactile SHM pending
 CS-6b2g external receipt + two-stage native seal ✅ scoped/local fake
 CS-6b2h selected RGB process receipt bridge ✅ scoped/default-off
+CS-6b2i conservative formal compound authority ✅ sim/default-off; real and non-DMTAC pending
 CS-6c composer/policy/RTC mixed       ⛔ after independent source gates
 ```
 
@@ -594,6 +631,10 @@ pose topology：共享v1 strategy/composer接受left/right arm的显式非空sub
 当前formal sim seam：CS-6b1h关闭raw human/replay/primary-policy authority，只允许pose composer proposal；
                     contributor input绑定source fact ID/hash；exact result promotion幂等，
                     TTL/epoch/conflict/error→HOLD，HOLD后不自动恢复
+正式compound authority：typed profile绑定spec/rule-set/strategy hash与完整components/groups；
+                    一个composer proposal覆盖arms+required hands，proposal仅存活一个decision period；
+                    safety/IK/receiver/任一receipt失败→ControlTrace failure + domain cancellation/HOLD；
+                    START guard后才原子提升全部group；当前仅MuJoCo双RM65+双DM-Tac q6、默认关闭
 session control：CS-6b1i用独立composition_session spec冻结composer/contributors/gate/boundary；
                 generic controller持有registry/epoch/lifecycle/trace/barrier，MuJoCo wrapper只做backend接线；
                 start READY后才开composer barrier，pause/end/error先barrier-off→HOLD/cancel；

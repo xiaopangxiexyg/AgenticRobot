@@ -17,6 +17,18 @@ HOME_CAPTURE_MAX_SAMPLE_GAP_SEC = 0.5
 HOME_CAPTURE_MAX_POSITION_SPREAD_M = 0.003
 HOME_CAPTURE_MAX_ROTATION_SPREAD_DEG = 0.75
 
+# A two-pedal transition already has an atomic command/fix boundary and a
+# one-second total budget.  Use a bounded, less conservative profile for that
+# short handoff only; ordinary runtime Home and Init/Home remain strict.
+# Transition-time Home capture is intentionally more permissive than the
+# ordinary Home/Init capture.  These are speed limits only; freshness and
+# spatial/rotational spread limits remain unchanged.
+HOME_TRANSITION_STILL_TRANSLATION_SPEED_M_S = 0.09
+HOME_TRANSITION_STILL_ROTATION_SPEED_DEG_S = 15.0
+HOME_TRANSITION_STILL_DWELL_SEC = 0.12
+HOME_TRANSITION_MAX_POSITION_SPREAD_M = 0.006
+HOME_TRANSITION_MAX_ROTATION_SPREAD_DEG = 1.5
+
 
 @dataclass(frozen=True)
 class HomeCaptureSampleDecision:
@@ -27,11 +39,53 @@ class HomeCaptureSampleDecision:
 
 @dataclass
 class HomeCaptureStabilityState:
+    still_translation_speed_m_s: float = HOME_CAPTURE_STILL_TRANSLATION_SPEED_M_S
+    still_rotation_speed_deg_s: float = HOME_CAPTURE_STILL_ROTATION_SPEED_DEG_S
+    still_dwell_sec: float = HOME_CAPTURE_STILL_DWELL_SEC
+    max_position_spread_m: float = HOME_CAPTURE_MAX_POSITION_SPREAD_M
+    max_rotation_spread_deg: float = HOME_CAPTURE_MAX_ROTATION_SPREAD_DEG
     last_pose: np.ndarray | None = None
     last_timestamp: float | None = None
     stable_since: float | None = None
     stable_anchor_pose: np.ndarray | None = None
     reason: str = "waiting_for_first_tracker_sample"
+
+    @classmethod
+    def transition_profile(cls) -> "HomeCaptureStabilityState":
+        return cls(
+            still_translation_speed_m_s=HOME_TRANSITION_STILL_TRANSLATION_SPEED_M_S,
+            still_rotation_speed_deg_s=HOME_TRANSITION_STILL_ROTATION_SPEED_DEG_S,
+            still_dwell_sec=HOME_TRANSITION_STILL_DWELL_SEC,
+            max_position_spread_m=HOME_TRANSITION_MAX_POSITION_SPREAD_M,
+            max_rotation_spread_deg=HOME_TRANSITION_MAX_ROTATION_SPREAD_DEG,
+        )
+
+    def prime_from_stable_sample(
+        self,
+        pose: np.ndarray,
+        *,
+        source_timestamp: float,
+        reason: str = "stable_tracker_sample_reused",
+    ) -> None:
+        """Seed a new capture window from an already accepted stable sample.
+
+        A passive transition cache has already satisfied the stillness dwell.
+        Reusing it must also carry over the stability state; copying only the
+        pose into the sample list would otherwise force the next transition to
+        wait through a second dwell window.
+        """
+
+        candidate = np.asarray(pose, dtype=float)
+        timestamp = float(source_timestamp)
+        if candidate.shape != (4, 4) or not np.all(np.isfinite(candidate)):
+            raise ValueError("tracker Home sample must be a finite 4x4 pose")
+        if not np.isfinite(timestamp):
+            raise ValueError("tracker Home sample timestamp must be finite")
+        self.last_pose = candidate.copy()
+        self.last_timestamp = timestamp
+        self.stable_since = timestamp - self.still_dwell_sec
+        self.stable_anchor_pose = candidate.copy()
+        self.reason = str(reason)
 
     def _restart_dwell(
         self,
@@ -102,8 +156,8 @@ class HomeCaptureStabilityState:
         # speed over a short accumulated window instead, while the absolute
         # capture spread remains bounded on every sample.
         spread_exceeded = bool(
-            moved_m > HOME_CAPTURE_MAX_POSITION_SPREAD_M
-            or moved_deg > HOME_CAPTURE_MAX_ROTATION_SPREAD_DEG
+            moved_m > self.max_position_spread_m
+            or moved_deg > self.max_rotation_spread_deg
         )
         speed_window_ready = dwell_sec >= HOME_CAPTURE_SPEED_EVALUATION_MIN_SEC
         translation_speed = (
@@ -117,8 +171,8 @@ class HomeCaptureStabilityState:
             or (
                 speed_window_ready
                 and (
-                    translation_speed > HOME_CAPTURE_STILL_TRANSLATION_SPEED_M_S
-                    or rotation_speed > HOME_CAPTURE_STILL_ROTATION_SPEED_DEG_S
+                    translation_speed > self.still_translation_speed_m_s
+                    or rotation_speed > self.still_rotation_speed_deg_s
                 )
             )
         ):
@@ -129,15 +183,15 @@ class HomeCaptureStabilityState:
                 reset_samples=first_accepted_pose is not None,
             )
 
-        if dwell_sec < HOME_CAPTURE_STILL_DWELL_SEC:
+        if dwell_sec < self.still_dwell_sec:
             self.reason = "tracker_stillness_dwell_in_progress"
             return HomeCaptureSampleDecision(False, reason=self.reason)
 
         if first_accepted_pose is not None:
             spread_m, spread_deg = pose_delta_metrics(first_accepted_pose, candidate)
             if (
-                spread_m > HOME_CAPTURE_MAX_POSITION_SPREAD_M
-                or spread_deg > HOME_CAPTURE_MAX_ROTATION_SPREAD_DEG
+                spread_m > self.max_position_spread_m
+                or spread_deg > self.max_rotation_spread_deg
             ):
                 self.stable_since = timestamp
                 self.reason = "tracker_capture_window_spread_reset"
@@ -155,4 +209,9 @@ __all__ = [
     "HomeCaptureSampleDecision",
     "HomeCaptureStabilityState",
     "HOME_CAPTURE_SPEED_EVALUATION_MIN_SEC",
+    "HOME_TRANSITION_STILL_TRANSLATION_SPEED_M_S",
+    "HOME_TRANSITION_STILL_ROTATION_SPEED_DEG_S",
+    "HOME_TRANSITION_STILL_DWELL_SEC",
+    "HOME_TRANSITION_MAX_POSITION_SPREAD_M",
+    "HOME_TRANSITION_MAX_ROTATION_SPREAD_DEG",
 ]

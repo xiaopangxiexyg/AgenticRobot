@@ -1,5 +1,34 @@
 # Dataset Interface
 
+## Control-composition projection boundary
+
+`dataset_interface.composition_control_trace` is the optional adapter from
+protocol-neutral `CompositionDomainEvent` values to v2.4 `ControlTraceFact`
+values. `control_composition` owns the input/context/result/difference domain
+objects; this adapter owns only their dataset projection. WAL admission,
+episode membership, seal/commit, native media streams, and the final dataset
+remain in their existing runtime/collection owners.
+
+Opt-in source eligibility is projected as separate spec, admission, state,
+snapshot, and input-snapshot binding facts. Existing composition input and
+input-snapshot record schemas remain unchanged; the binding preserves exact
+same-cut lineage without mutating their historical payloads.
+
+Formal component composition follows the same additive rule. The adapter
+projects one complete `component_composition_rule_set` fact and one
+`formal_component_composition_binding` fact linking the exact
+CompositionSpec, rule set, and FormalCompositionStrategySpec hashes. Existing
+`composition_spec` and `formal_composition_strategy_spec` v1 records retain
+their original field sets and hashes.
+
+`CompositionInformationPlan` is not a dataset capture profile. A camera or
+tactile stream needed only for recording should go directly to the capture
+path. If the same immutable sample is also needed by a composition strategy,
+composition should receive only its declared inline view or stable blob
+reference. Disabling a dataset modality must not change the numerical
+composition result, and enabling one must not force its heavy payload through
+the composition return interface.
+
 ## v2.4 ControlTrace logical readers
 
 `dataset_interface.control_trace` implements the scoped M4C.1 read boundary.

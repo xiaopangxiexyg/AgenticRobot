@@ -25,19 +25,30 @@ is experimental.
   but must not import concrete sim, hardware, teleop, deployment, or
   `control_station` modules. It owns no authority, canonical safety, execution,
   device/model worker, replay cursor, or episode lifecycle.
-- `control_station/`: top-level application/control plane for composing human,
-  replay, policy, dataset, sim, and real-target modules. It may depend on the
-  active lower-level packages, but none of those packages may import it.
+- `control_station/`: GUI-facing application control plane. It owns typed
+  operator intents, application lifecycle coordination, rebuildable UI state,
+  profile selection, and thin source/target integration. It may coordinate
+  lower-owned runtimes through typed ports and receipts, but must not
+  reimplement reusable composition algorithms, source/model workers, replay
+  cursors, simulator/backend execution, dataset writers, canonical safety,
+  reference generation, or dispatch. Concrete application bindings may depend
+  on active lower-level packages, but none of those packages may import
+  `control_station`. Existing migration exceptions must remain explicit in
+  boundary tests or documentation.
 - `robot_motion/`: shared motion semantics, Rig, Safety, Planner, position
   control, and runtime contracts; no vendor-device initialization or training.
 - `hardware/`: vendor SDKs and device backends; no dataset schema or learner.
 - `sim/`: simulation-only backends, tasks, and adapters; may use `robot_motion`,
   but must not depend on `teleop_runtime` or real hardware.
-- `teleop_runtime/`: real////-robot teleop, GUI/headless orchestration, collection,
+- `teleop_runtime/`: real-robot teleop, GUI/headless orchestration, collection,
   and policy deployment frontends.
 - `deployments/`: model client, protocol, and artifact integration.
-- `dataset_contracts/` and `dataset_interface/`: pure data contracts and
-  trajectory/window/batch adapters; no hardware or training implementation.
+- `dataset_contracts/`: pure schemas, identities, hash domains, and validation
+  contracts; no runtime, device, GUI, or control ownership.
+- `dataset_interface/`: data adaptation, projection, reader, window/batch, and
+  validation interfaces. It may depend on `dataset_contracts` and pure domain
+  contracts, but must not become a device/control runtime or authoritative
+  episode owner, and must not import `control_station`.
 - `model/`: future policy/learner/DAgger/RL package, not a current runtime entrypoint.
 - `legacy/`: confirmed-archived code/docs only; production code must not import it.
 - `tests/` and `todos/`: verification and planning; neither is runtime code.
@@ -47,6 +58,16 @@ data contracts. `control_composition` depends downward on `robot_motion`; the
 reverse dependency is forbidden. `sim` must not reverse-depend on
 `teleop_runtime`. `control_station` is an application leaf: dependencies point
 into it from no lower-level package.
+
+Import legality does not imply semantic ownership. Code belongs to the package
+that owns its reusable domain semantics or resource lifecycle, not merely to
+the highest-level caller that currently uses it.
+
+For one logical runtime resource or stream, source production, cursor or plan
+advancement, authority, canonical safety, dispatch, and episode commitment each
+have one authoritative owner. Passive bounded observers, fanout queues, and UI
+caches are allowed, but they must not mutate or independently reconstruct the
+owned state.
 
 ## Safety and change protocol
 

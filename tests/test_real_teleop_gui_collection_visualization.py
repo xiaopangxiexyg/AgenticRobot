@@ -5370,6 +5370,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         recorder._pause_started_last_state = None
         recorder._pause_segments = []
         recorder._paused_accumulated_sec = 0.0
+        recorder._sample_modality_reason = "camera_frame_stale:front:0.102755"
         recorder.writer = SimpleNamespace(tactile_frame_counts=lambda _episode_index: {})
         recorder.camera_sources = {}
         recorder.dataset_root = Path("/tmp/dataset")
@@ -5407,6 +5408,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(resumed)
         self.assertFalse(recorder.is_paused)
         self.assertTrue(recorder.can_record_samples)
+        self.assertEqual(recorder.collection_modality_reason, "")
         self.assertEqual(recorder.continuity_segment_index, 1)
         self.assertEqual(
             recorder.pause_summary()["collection_continuity_segment_count"],

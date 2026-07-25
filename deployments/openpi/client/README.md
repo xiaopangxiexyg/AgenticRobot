@@ -169,7 +169,9 @@ python -m deployments.openpi.client.real \
   --rtc-profile raw_rtc_final_chunk_15_30_60_120_v1 \
   --rtc-real-shadow \
   --rtc-normalization-hash <artifact-normalization-hash> \
-  --checkpoint-dir <checkpoint-dir>
+  --checkpoint-dir <checkpoint-dir> \
+  --debug --rtc-debug-level summary \
+  --debug-dir logs/openpi_raw_rtc
 ```
 
 This consumes live arm/hand/camera observations and the existing OpenPI
@@ -191,3 +193,7 @@ With `--debug`, each accepted model exchange also records a
 `rtc_transport_exchange` event containing the request/input/response hashes,
 chunk horizon and inference/result latency. This event is observational only;
 it is not plan-admission, safety, dispatch, or worker-drain evidence.
+`summary` is the default RTC level; use `trace` only for bounded reproductions
+that require every control tick. RTC events use a bounded non-blocking queue;
+queue pressure drops debug events and is reported at shutdown rather than
+blocking policy or control work.

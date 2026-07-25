@@ -6,6 +6,7 @@ from __future__ import annotations
 DEXTELEOP_DATASET_SCHEMA_V24 = "dexteleop_dataset_v2.4"
 V24_CAPABILITY_CONTROL_TRACE_CORE = "control_trace_core"
 V24_CAPABILITY_NATIVE_STREAMS = "native_streams"
+# Read compatibility for traces written before generic composition context.
 V24_CAPABILITY_POLICY_CONTEXT = "policy_context"
 V24_CAPABILITY_COMPOSITION_CONTEXT = "composition_context"
 V24_CAPABILITY_REWARD_OVERLAY = "reward_overlay"

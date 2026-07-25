@@ -2,7 +2,7 @@
 
 `control_composition` is the reusable, backend-neutral framework for combining
 multiple control sources. It turns immutable contributor facts from human,
-replay, policy, RTC, or synthetic producers into one time-bound composition
+replay, synchronous/asynchronous policy, or synthetic producers into one time-bound composition
 result with exact causal lineage.
 
 It is a library, not a production entrypoint.
@@ -29,6 +29,8 @@ This package owns:
 
 - contributor roles, immutable inputs, receiver-side causal cuts, TTL,
   missing-input and fallback semantics;
+- opt-in source eligibility/liveness facts, leases, status epochs and
+  fail-closed re-arm lineage, kept independent from action TTL;
 - immutable, payload-contract-bound strategy context for history, state,
   future action, vision and arbitrary new modalities;
 - replaceable arm-pose and hand/gripper-qpos composition strategies;
@@ -37,15 +39,16 @@ This package owns:
 - source/output difference observations and non-authoritative feedback facts;
 - a complete evaluation return record containing the exact spec, cut, active
   producer epochs, selected inputs, contexts, result, differences, diagnostics,
-  and trace facts emitted for that evaluation;
-- narrow ports for trace emission and canonical proposal admission.
+  and protocol-neutral domain events emitted for that evaluation;
+- an independent `CompositionInformationPlan` and narrow ports for domain-event
+  observation and canonical proposal admission.
 
 This package does **not** own:
 
 - canonical `RobotAction` component schemas, authority, arbitration, producer
   or execution epochs, cancellation, safety, IK, reference generation,
   dispatch, or a hardware/sim target;
-- a teleoperation device, replay cursor, model worker, RTC queue, dataset
+- a teleoperation device, replay cursor, model worker or action-chunk queue, dataset
   episode, WAL, GUI, or web server.
 
 The output boundary is a proposal candidate plus lineage, never a motion
@@ -81,6 +84,47 @@ resample robot commands, or own a worker queue. High-rate reference generation
 and physical dispatch remain downstream in `robot_motion`, bound to the
 result's target time and lineage.
 
+Formal start/re-arm additionally uses `CompositionActivationScope`. The scope
+binds one operation spec and session epoch to an explicit receiver-clock input
+barrier and required roles. Scoped inputs carry its exact ID/hash; a snapshot
+selects only records from that activation whose receiver availability and
+effective start meet the barrier, and the result preserves the same identity.
+Input admission and snapshot selection use the same canonical activation
+freshness evaluator. The receiver-local policy compares `available_at` and
+`effective_from` on the activation clock. The strict-source policy additionally
+requires `produced_clock_domain_id` to equal that clock and requires
+`produced_at > input_barrier_at`; cross-clock source timestamps are never
+implicitly compared or converted. Failed admission returns a typed activation
+identity, clock, or barrier rejection without advancing the admission
+high-watermark.
+This identity is independent of producer, authority, and execution epochs.
+Unscoped callers retain the v1 input/snapshot/result ID and hash domains.
+
+An explicitly enabled `CompositionSourceEligibilitySpec` adds a second,
+orthogonal gate before numerical composition. It binds every composition role
+to one stable source slot and producer. `CompositionSourceEligibilityState`
+then records receiver-admitted `available`, `paused`, `fault`, `disconnected`,
+or `rearming` status, a source lease, status epoch, and optional re-arm
+requirement. The action and source-state stores share the same `ControlCut`.
+Consequently, a still-unexpired action is missing immediately when its source
+is unavailable or its lease has expired.
+
+Source-state heartbeats may extend a lease only without changing status inside
+one status epoch. A status transition requires a newer epoch; an old epoch or
+late heartbeat is rejected. Once any state declares `rearm_required=True`, the
+requirement remains latched across later unavailable states and producer-epoch
+restart; returning to `available` requires a typed re-arm receipt ID/hash.
+Profiles may permit an explicit new-status-epoch automatic recovery only if no
+re-arm requirement was latched. The generic package validates
+the reference and ordering; the adapter/profile owns device-specific health
+translation and the meaning of the referenced readiness evidence.
+
+Eligibility is default-off. Without a configured store and an evaluation-time
+eligibility spec, existing input selection and v1/v2 hashes are unchanged.
+Eligibility only converts contributors to missing roles; it does not grant
+authority or execute HOLD. The existing formal authority gate remains the
+owner of the downstream HOLD disposition.
+
 ## Input, safety, and fallback layers
 
 Source-specific values are normalized by adapters into canonical
@@ -99,6 +143,9 @@ availability; it can never bypass canonical safety or grant motion authority.
 ## Public data flow
 
 - `CompositionInputDraft/Record` is the admitted action contribution.
+- `CompositionSourceEligibilityDraft/State/Store/Snapshot` is the opt-in
+  source-control-plane path. Its spec binds role→source slot→producer without
+  adding device fields to action records.
 - `CompositionContextDraft/Record/Store/Snapshot` is the generic,
   receiver-admitted context path. `CompositionContext` is its
   representation-neutral frozen strategy view; `PoseMixingContext` remains an
@@ -115,10 +162,10 @@ availability; it can never bypass canonical safety or grant motion authority.
 - `SourceDifferenceObservation` reports pose translation/SO(3) residuals and
   finite-slot qpos residuals. Visualization and feedback adapters consume these
   non-authoritative facts; they do not feed motion implicitly.
-- ControlTrace records the full `composition_spec`, admissions, selected
-  snapshot, result, source-difference spec/observation, disposition, and
-  optional guidance facts. The evaluation record also returns the exact trace
-  batch emitted by the current call.
+- `CompositionDomainEvent` exposes immutable domain occurrences without
+  choosing a dataset schema. An external adapter may project them to
+  ControlTrace, visualization, metrics, or no-op observation. The evaluation
+  record returns the exact domain-event batch emitted by the current call.
 
 ## Dependency rule
 
@@ -126,17 +173,20 @@ Allowed dependency direction:
 
 ```text
 control_station / sim adapters / teleop adapters / deployment adapters
+                  / dataset_interface projection adapters
                               |
                               v
                     control_composition
                               |
                               v
-              robot_motion + dataset_contracts
+                         robot_motion
 ```
 
 `control_composition` must not import `control_station`, `sim`, `hardware`,
-`teleop_runtime`, or `deployments`. `robot_motion`, `dataset_contracts`, and
-`dataset_interface` must not import `control_composition`.
+`teleop_runtime`, `deployments`, `dataset_interface`, or dataset protocol
+modules. `robot_motion` and `dataset_contracts` must not import
+`control_composition`; pure `dataset_interface` adapters may depend on both the
+domain contracts and dataset contracts to project between them.
 
 Concrete MuJoCo, VIVE, robot-vendor, OpenPI, checkpoint, task, and device
 bindings stay in their existing owner packages and implement narrow ports.
@@ -183,19 +233,92 @@ The runtime now has one receiver-admitted `CompositionContextRecord` with:
 
 Policy-specific fields are optional lineage, never generic admission
 requirements. `ControlCompositionRuntime`, the synthetic policy-node protocol,
-and the MuJoCo adapter all use this generic path. The old
-`robot_motion.deploy.PolicyContextRecord/Store` runtime has been removed after
-local and the known external OpenPI source tree were audited. Existing
-v2.4 `policy_context_*` event schemas remain offline-readable legacy data;
-new runtime facts are emitted as `composition_context_*`. They are not
-silently rehashed or presented as the same identity.
+and the MuJoCo adapter all use this generic path. Dataset compatibility and
+event-schema migration remain external projection concerns.
 
 The canonical store performs validation, epoch/sequence admission, cut
-selection, retention, and trace once. Adapters may normalize sensor, replay,
+selection and retention once. Adapters may normalize sensor, replay,
 human, policy, model-feature, and task-state inputs, but may not maintain
 parallel hidden “latest context” state.
 
+## Predeclared information demand
+
+`CompositionInformationPlan` is independent of activation identity and dataset
+capture. Before optional sources acquire, copy, freeze, or admit data, it
+declares the latest-value context channels accepted by the current composition
+runtime, their payload-contract hashes, maximum age, and whether access is
+metadata-only, inline, or through stable blob references. It may also bind one
+optional source-difference spec and the requested diagnostic level.
+
+When no plan is supplied, existing callers retain their established behavior.
+When a plan is supplied, undeclared channels and incompatible payload contracts
+are rejected before entering the context store. Source adapters should query
+the plan before acquisition; runtime rejection is a final guard, not a reason
+to acquire unused camera or tactile payloads first.
+
+If control-loop resources are tight, a source frequency cannot be sustained,
+or copying/serialization competes with control work, first use
+`CompositionInformationPlan` to narrow channels, payload access, maximum age,
+and optional derived computations. This optimization must not change action
+authority, safety, activation-v2 identity, or dataset capture requirements.
+Data needed only by a dataset should bypass composition; data needed by both
+paths should share one immutable sample while composition receives only the
+declared lightweight view/reference.
+
 ## Strategy input and latency contract
+
+### Composition semantics versus strategy implementation
+
+`CompositionSpec` and `FormalCompositionStrategySpec` are separate protocol
+layers and must never become interchangeable configuration containers:
+
+| Contract | Owns | Must not own |
+| --- | --- | --- |
+| `CompositionSpec` | input/required roles, algebra, component representations, weights or allowed weighting policy, missing/fallback behavior, disagreement limits, and the typed component-rule-set hash | implementation/module/model identity, context acquisition, latency budget, authority, safety, or dispatch |
+| `FormalCompositionStrategySpec` | strategy ID/version, the exact `CompositionSpec` hash it implements, required context channels, implementation dependency hashes, implementation-only parameters, and inline latency budget | a second copy of component weights, fallback behavior, disagreement limits, authority, safety, or dispatch |
+
+The binding is one-way:
+
+```text
+ComponentCompositionRuleSet
+        |
+        | semantic_content_hash
+        v
+CompositionSpec v2
+        |
+        | semantic_content_hash
+        v
+FormalCompositionStrategySpec
+```
+
+The component rule set is the single semantic source of truth. A formal
+strategy may declare the same rule-set hash in
+`implementation_contract_hashes` to prove that its implementation binds that
+contract, but it may not redefine the rules in `parameter_payload`. The
+framework-built result binds the exact composition spec, strategy spec,
+strategy input cut, and output action.
+
+The protocol-neutral event stream emits the complete
+`component_composition_rule_set` followed by one
+`formal_component_composition_binding` that binds the composition-spec,
+rule-set, and formal-strategy hashes. The external v2.4 ControlTrace projection
+uses additive record kinds with the same names; established v1 spec and
+strategy records are not widened or rehashed.
+
+`formal_component_strategy_v2` is additive. Existing v1 algebras retain their
+exact payload and `dexteleop.composition_spec.v1` hash. The v2 mode uses
+`dexteleop.composition_spec.v2`, requires one typed component-rule-set hash,
+forbids deterministic-v1 numerical fields, and fails closed when no matching
+formal strategy is installed. This does not grant the strategy authority:
+proposal admission, canonical safety, target resolution, reference generation,
+and dispatch remain downstream.
+
+The first formal compound authority profile is consequently defined in
+`robot_motion`, not in this package. It binds the hashes emitted here, but
+`control_composition` remains unaware of the backend, Arbiter ownership,
+safety result, group generation, receiver admission, or dispatch receipts.
+This preserves the same composition runtime for sim, real, replay, synchronous
+policy chunks, and RTC-produced action streams.
 
 An advanced strategy may use every admitted information class, including
 current source actions, bounded action/decision history, future policy chunks,
@@ -240,7 +363,7 @@ model/artifact/input-cut identity, and payload contract hash. A small local
 deterministic strategy consumes that advisory. The model output never owns
 authority, bypasses safety, or directly dispatches; request/result epoch,
 deadline, late completion, and default-off behavior follow the same causal
-rules as RTC producers.
+rules as other asynchronous admitted producers.
 
 Integration sequence:
 
@@ -256,7 +379,8 @@ Integration sequence:
 
 ## Time-window retention
 
-`CompositionInputStore` and `CompositionContextStore` use an explicit
+`CompositionInputStore`, `CompositionContextStore`, and the opt-in
+`CompositionSourceEligibilityStore` use an explicit
 `TimeWindowRetentionSpec`; the former fixed `4096` lifetime capacity and
 `capacity_exhausted` behavior are removed. Every profile declares:
 
@@ -272,12 +396,15 @@ exact same-cut selected records, then advances a monotonic
 and evaluation records own their immutable selected record objects, so store
 pruning cannot alter an already returned result. A compact last-sequence
 tombstone per producer epoch survives pruning and continues to reject duplicate
-or rolled-back identities. `retention_snapshot()` reports the retention-spec
-hash, watermark, retained/pruned counts, and tombstone count.
+or rolled-back identities. The source-state store additionally retains the
+latest state as a fail-closed tombstone, so pruning cannot expose an older
+`available` heartbeat after a later pause or fault. `retention_snapshot()`
+reports the retention-spec hash, watermark, retained/pruned counts, and
+tombstone count.
 
 This is a semantic time window, not a lossy ring overwrite. It does not by
 itself bound a malicious producer's record rate or blob size inside the valid
-window, and it does not replace durable ControlTrace/WAL backpressure. Those
+window, and it does not replace durable recorder backpressure. Those
 resource quotas remain a separate production hardening gate.
 
 ## Difference return levels
@@ -303,26 +430,20 @@ not by composition. Its modes are also independently `off`, `summary`, or
 later consume either stage, but feedback behavior is outside the current
 implementation scope.
 
-## Recording levels
+## Observation versus recording
 
-Recording has two resource-isolated tiers:
+Composition always returns the immutable domain objects needed to explain its
+own numerical decision: selected action/context lineage, cut, epochs, spec,
+result, requested differences, and diagnostics. Optional debug computations
+must be disabled before construction when not requested.
 
-- **Core/actual facts are always retained durably** for an active formal
-  profile: admitted inputs/contexts and their clocks/validity/contracts,
-  selected lineage, spec/result/disposition, and every authority, safety,
-  resolver, reference, dispatch, measurement, fault, fallback, or requested
-  difference fact that affected or describes actual behavior. Large payloads
-  may be retained by stable blob reference rather than copied inline.
-- **Debug facts exist only when debug recording is enabled:** unselected
-  alternative payloads beyond required lineage, full pairwise matrices when a
-  summary suffices, intermediate weights/solver iterations, detailed timing,
-  stack traces, model activations, previews, and duplicate heavy media.
-
-Core and debug use separate queues, quotas, and sinks. `debug=off` means heavy
-debug values are not constructed, copied, serialized, or queued. Debug writer
-failure never blocks control or core persistence. Core persistence failure
-follows the formal profile's fail-closed/seal-ineligible policy. Durable core
-acknowledgement is also one precondition for pruning the in-memory window.
+Durable core/debug tiers, media streams, queues, backpressure, episode
+membership, seal/commit, and final dataset formation are external recorder
+policy. A recorder may subscribe to `CompositionDomainEvent`, but recording
+configuration must not cause composition to acquire an otherwise unused
+modality. Heavy data used by a strategy should normally enter context through a
+stable blob reference; the actual payload is independently captured only when
+an external capture profile requests it.
 
 ## Package layout
 
@@ -338,7 +459,10 @@ The reusable implementation is now physically owned here:
 - `observability/` owns source/output differences and bounded, non-authoritative
   feedback contracts;
 - `evaluation.py` owns the complete per-cut return record and typed diagnostic;
-- `trace.py` owns their ControlTrace projections;
+- `events.py` owns protocol-neutral emitted domain occurrences;
+- `information.py` owns predeclared composition information demand;
+- `eligibility.py` owns opt-in source slot/producer bindings, liveness state,
+  leases, status epochs, re-arm lineage, and same-cut eligibility snapshots;
 - `runtime.py` owns receiver-side composition evaluation and promotion;
 - `policy_node.py` owns the composition-aware synthetic node protocol;
 - `lifecycle/` owns handoff, activation, rearm, and the backend-neutral session
@@ -353,11 +477,64 @@ direction. `control_station` retains only explicit application adapters for
 Station operation results, publication barriers, and HOLD/cancel ordering.
 No concrete simulator, device, robot, or model adapter was copied here.
 
+## Legacy/shadow compatibility path
+
+`composition/strategies.py` still contains the original pose and hand-qpos
+strategy kernels plus `evaluate_component_mixing_shadow()`. This path projects
+an already-built arbitration/proposal snapshot and is retained only as a
+non-authoritative numerical compatibility oracle while the formal input path
+is completed. It may compute an immutable shadow decision, but it must not
+publish a proposal, advance authority or epochs, run canonical safety/IK,
+enqueue a reference, dispatch, or own episode state.
+
+The formal path is:
+
+`CompositionInputDraft -> receiver admission -> causal cut/activation/eligibility/context -> CompositionResult -> optional proposal promotion`.
+
+New device, model, simulator, context, liveness, or lifecycle features belong
+on that formal path. Do not extend the compatibility path with new production
+orchestration. Its reusable SE(3) and active-mask qpos numerical kernels may
+be invoked behind the formal strategy protocol described below. The shadow
+orchestration can be removed after formal pose/qpos result parity, lineage
+parity, and `control_station` caller migration are contract-tested.
+
+## Formal strategy migration
+
+The opt-in v2 seam in `composition/formal_strategy.py` binds four immutable
+facts: a strategy spec, the exact action/context/information-plan input, a
+canonical v4 `CompositionResult`, and a result binding. The framework builds
+the result identity; strategy implementations return only status, reason,
+action, and the context IDs they actually used. This prevents two strategies
+that happen to produce the same action from sharing a result/promotion
+identity.
+
+The runtime default remains the deterministic compatibility composer. A new
+profile must explicitly inject a formal strategy, whose context channels must
+match the runtime `CompositionInformationPlan`. Formal strategies are bounded
+inline computations. A model, RPC, or other slow producer must publish a
+receiver-admitted advisory/context fact rather than run inside the control
+loop. A declared latency overrun is detected and fails closed, but v2 does not
+preempt a blocking implementation.
+
+Retirement sequence:
+
+1. run deterministic-v1 and formal-v2 numerical/parity fixtures (complete);
+2. expose an opt-in MuJoCo strategy injection and verify the CS6b1h v2
+   binding, v4 proposal/trace lineage, and downstream dispatch parity
+   (contract fixture complete; no default profile switch);
+3. make formal-v2 the default only after all active callers and stored trace
+   readers accept it;
+4. remove deterministic-v1 orchestration and exact-hash fixtures after the
+   documented compatibility window; retain explicit readers for historical
+   facts when required.
+
 ## Current implementation boundary
 
 Implemented and locally contract-tested:
 
 - deterministic target-time selection across different source rates;
+- action-TTL/source-lease orthogonality, source pause/fault/disconnect,
+  lease expiry, late-heartbeat rejection, and typed re-arm recovery;
 - single-frame pose owner selection and weighted SE(3) pose fusion;
 - explicit single-arm subset or current coupled left/right arm pose strategy
   inputs (formal current MuJoCo target remains coupled);
@@ -366,15 +543,21 @@ Implemented and locally contract-tested:
 - strict pose-plus-hand structural join in non-authoritative shadow;
 - same-cut pose/qpos source differences, human-role lookup, and no-I/O bounded
   guidance contracts;
-- complete evaluation return records, full composition-spec trace, lifecycle,
+- complete evaluation return records, domain events, lifecycle,
   handoff, re-arm, proposal promotion, and package dependency firewalls.
+- opt-in formal strategy v2 identity, exact context/information-plan lineage,
+  canonical v4 result promotion, strict ControlTrace projection, and a
+  deterministic migration adapter without changing the default v1 path.
+- a backend-neutral MuJoCo strategy injection port and CS6b1h formal-pose
+  parity fixture; strategy identity upgrades the application binding to v2
+  while the default binding remains byte/hash-compatible v1.
 
 Still gated for later work:
 
 - additive component-keyed action carrier/adapters for arbitrary named arm and
   end-effector topology (arm joint DOF remains a downstream resolver concern);
-- declared context windows, strategy latency enforcement, and asynchronous
-  policy-driven mixing advisories;
+- declared context windows, preemptive strategy latency enforcement, and
+  asynchronous policy-driven mixing advisories;
 - a formal compound pose-plus-hand authoritative execution profile and real
   end-effector safety/acceptance receipts;
 - production adapters that admit raw visual/history/state streams as
@@ -389,7 +572,7 @@ Still gated for later work:
   backends, single-arm target capability, and authorized real-device
   verification.
 
-These gaps do not change existing teleop, replay, synchronous policy, RTC, sim,
+These gaps do not change existing teleop, replay, policy, sim,
 or real deployment defaults. New integrations should implement adapters and
 ports around this package rather than add simulator-, model-, robot-, or
 device-specific branches inside it.

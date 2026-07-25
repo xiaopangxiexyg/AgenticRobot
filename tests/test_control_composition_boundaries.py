@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import subprocess
+import sys
 
 import control_composition
 import pytest
@@ -9,8 +11,9 @@ import robot_motion.action as robot_action
 import robot_motion.deploy as robot_deploy
 from control_composition import (
     CompositionClock,
+    CompositionEventEmitter,
+    CompositionInformationPlan,
     CompositionProposalAdmitter,
-    CompositionTraceEmitter,
 )
 from control_composition.evaluation import (
     CompositionDiagnostic,
@@ -28,6 +31,9 @@ from control_composition.runtime import (
     CompositeProposalSubmission,
     ControlCompositionRuntime,
 )
+from dataset_interface.composition_control_trace import (
+    project_composition_session_spec,
+)
 from control_composition.policy_node import PolicyNodeOutput, PolicyNodeSpec
 from control_composition.lifecycle import (
     CompositionSessionOperationSpec,
@@ -41,20 +47,7 @@ from control_composition.lifecycle import (
     initial_composition_session_state,
     validate_composition_session_rearm,
 )
-from control_station.composition_session import (
-    CompositionSessionController,
-    CompositionSessionOperationSpec as HistoricalCompositionSessionOperationSpec,
-    CompositionSessionRearmReceipt as HistoricalCompositionSessionRearmReceipt,
-    CompositionSessionRearmSpec as HistoricalCompositionSessionRearmSpec,
-    CompositionSessionState as HistoricalCompositionSessionState,
-    CompositionSessionTransition as HistoricalCompositionSessionTransition,
-    advance_composition_session as historical_advance_composition_session,
-    initial_composition_session_state as historical_initial_composition_session_state,
-    validate_composition_session_rearm as historical_validate_composition_session_rearm,
-)
-from control_station.handoff import (
-    MixedControlBoundaryPolicy as HistoricalMixedControlBoundaryPolicy,
-)
+from control_station.composition_session import CompositionSessionController
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "control_composition"
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -80,7 +73,11 @@ def _absolute_import_roots(path: Path) -> set[str]:
 def test_control_composition_public_port_imports_are_side_effect_free() -> None:
     assert control_composition.CompositionClock is CompositionClock
     assert control_composition.CompositionProposalAdmitter is CompositionProposalAdmitter
-    assert control_composition.CompositionTraceEmitter is CompositionTraceEmitter
+    assert control_composition.CompositionEventEmitter is CompositionEventEmitter
+    assert (
+        control_composition.CompositionInformationPlan
+        is CompositionInformationPlan
+    )
     assert CompositionDiagnostic.__module__ == "control_composition.evaluation"
     assert (
         CompositionEvaluationRecord.__module__
@@ -128,6 +125,17 @@ def test_runtime_is_owned_only_by_control_composition() -> None:
     assert not (REPO_ROOT / "robot_motion/deploy/topology_runtime.py").exists()
 
 
+def test_formal_runtime_does_not_depend_on_legacy_shadow_orchestration() -> None:
+    source = (PACKAGE_ROOT / "runtime.py").read_text(encoding="utf-8")
+    for legacy_name in (
+        "PoseMixingInputSnapshot",
+        "PoseMixingStrategy",
+        "build_pose_mixing_input_snapshot",
+        "evaluate_component_mixing_shadow",
+    ):
+        assert legacy_name not in source
+
+
 def test_composition_policy_node_is_not_exported_by_robot_motion() -> None:
     assert PolicyNodeOutput.__module__ == "control_composition.policy_node"
     assert PolicyNodeSpec.__module__ == "control_composition.policy_node"
@@ -135,32 +143,44 @@ def test_composition_policy_node_is_not_exported_by_robot_motion() -> None:
     assert not hasattr(robot_deploy, "PolicyNodeSpec")
 
 
-def test_station_handoff_path_reexports_canonical_lifecycle_identity() -> None:
-    assert MixedControlBoundaryPolicy is HistoricalMixedControlBoundaryPolicy
+def test_station_session_path_only_owns_the_application_controller() -> None:
+    import control_station.composition_session as station_session
 
-
-def test_station_session_path_reexports_canonical_activation_identity() -> None:
-    assert (
-        CompositionSessionOperationSpec
-        is HistoricalCompositionSessionOperationSpec
-    )
-    assert CompositionSessionState is HistoricalCompositionSessionState
-    assert CompositionSessionTransition is HistoricalCompositionSessionTransition
-    assert advance_composition_session is historical_advance_composition_session
-    assert (
-        initial_composition_session_state
-        is historical_initial_composition_session_state
-    )
-    assert CompositionSessionRearmSpec is HistoricalCompositionSessionRearmSpec
-    assert (
-        CompositionSessionRearmReceipt
-        is HistoricalCompositionSessionRearmReceipt
-    )
-    assert (
-        validate_composition_session_rearm
-        is historical_validate_composition_session_rearm
-    )
     assert issubclass(CompositionSessionController, CompositionSessionRegistry)
+    assert station_session.__all__ == ["CompositionSessionController"]
+    assert not (REPO_ROOT / "control_station/handoff.py").exists()
+
+
+def test_session_trace_projector_is_owned_by_dataset_adapter() -> None:
+    import control_station.control_trace as station_trace
+
+    assert project_composition_session_spec.__module__ == (
+        "dataset_interface.composition_control_trace"
+    )
+    assert station_trace.project_composition_session_spec is (
+        project_composition_session_spec
+    )
+    assert "project_composition_session_spec" not in station_trace.__all__
+
+
+def test_station_composition_package_does_not_eagerly_load_concrete_stacks() -> None:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import control_station.composition; "
+                "print(sorted(name for name in "
+                "('sim','hardware','teleop_runtime','deployments') "
+                "if name in sys.modules))"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.stdout.strip() == "[]"
 
 
 def test_control_composition_does_not_import_concrete_or_application_packages() -> None:
@@ -181,13 +201,20 @@ def test_control_composition_does_not_import_concrete_or_application_packages() 
     assert violations == {}
 
 
-def test_lower_contract_owners_do_not_reverse_depend_on_control_composition() -> None:
+def test_lower_motion_and_schema_owners_do_not_reverse_depend_on_composition() -> None:
     violations: list[str] = []
-    for package_name in ("robot_motion", "dataset_contracts", "dataset_interface"):
+    for package_name in ("robot_motion", "dataset_contracts"):
         for path in _python_files(REPO_ROOT / package_name):
             if "control_composition" in _absolute_import_roots(path):
                 violations.append(str(path.relative_to(REPO_ROOT)))
     assert violations == []
+
+
+def test_v24_projection_is_outside_control_composition() -> None:
+    assert not (PACKAGE_ROOT / "trace.py").exists()
+    for path in _python_files(PACKAGE_ROOT):
+        source = path.read_text(encoding="utf-8")
+        assert "dataset_contracts.control_trace" not in source
 
 
 def test_control_composition_is_explicitly_packaged() -> None:

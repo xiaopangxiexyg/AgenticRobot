@@ -33,6 +33,7 @@ from .candidate_authorization import (
     CandidateAuthorizationAdmissionReceipt,
     CandidateAuthorizationDraft,
 )
+from .compound_authority import ConservativeCompoundAuthorityProfile
 from .arbitration_runtime import (
     ArbitrationComputationMetrics,
     ArbitrationPublicationAttempt,
@@ -56,6 +57,9 @@ AUTHORITATIVE_SAFETY_HASH_DOMAIN_V1 = "dexteleop.authoritative_safety_result.v1"
 AUTHORITATIVE_DISPATCH_HASH_DOMAIN_V1 = "dexteleop.authoritative_dispatch_result.v1"
 MEASUREMENT_ALIGNMENT_HASH_DOMAIN_V1 = "dexteleop.measurement_alignment.v1"
 PUBLICATION_REJECTION_HASH_DOMAIN_V1 = "dexteleop.publication_rejection.v1"
+COMPOUND_AUTHORITY_FAILURE_HASH_DOMAIN_V1 = (
+    "dexteleop.compound_authority_failure.v1"
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +139,71 @@ def project_control_execution_manifest(
                 for exclusion in manifest.exclusions
             ),
             "semantic_content_hash": manifest.semantic_content_hash,
+        },
+    )
+
+
+def project_conservative_compound_authority_profile(
+    context: AuthoritativeTraceContext,
+    profile: ConservativeCompoundAuthorityProfile,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    """Project the exact fail-closed compound authority contract."""
+
+    if not isinstance(profile, ConservativeCompoundAuthorityProfile):
+        raise TypeError(
+            "profile must be a ConservativeCompoundAuthorityProfile."
+        )
+    return context.fact(
+        fact_id=profile.profile_fact_id,
+        event_type="conservative_compound_authority_profile",
+        occurred_at=occurred_at,
+        payload={
+            **profile.semantic_payload(),
+            "semantic_content_hash": profile.semantic_content_hash,
+        },
+    )
+
+
+def project_compound_authority_failure(
+    context: AuthoritativeTraceContext,
+    profile: ConservativeCompoundAuthorityProfile,
+    *,
+    stage: str,
+    source_event_ids: tuple[str, ...],
+    occurred_at: float,
+) -> ControlTraceFact:
+    """Record why an authoritative compound attempt entered domain HOLD."""
+
+    normalized_stage = str(stage).strip()
+    if not normalized_stage:
+        raise ValueError("Compound authority failure stage must be non-empty.")
+    sources = tuple(dict.fromkeys(str(value) for value in source_event_ids))
+    if not sources or any(not value for value in sources):
+        raise ValueError(
+            "Compound authority failure requires non-empty source_event_ids."
+        )
+    payload = {
+        "profile_hash": profile.semantic_content_hash,
+        "producer_id": profile.producer_id,
+        "stage": normalized_stage,
+        "failure_behavior": "hold_control_domain",
+        "source_event_ids": sources,
+    }
+    semantic_hash = canonical_content_hash(
+        payload,
+        domain=COMPOUND_AUTHORITY_FAILURE_HASH_DOMAIN_V1,
+    )
+    failure_id = f"compound-authority-failure:{semantic_hash}"
+    return context.fact(
+        fact_id=failure_id,
+        event_type="compound_authority_failure",
+        occurred_at=occurred_at,
+        payload={
+            "failure_id": failure_id,
+            **payload,
+            "semantic_content_hash": semantic_hash,
         },
     )
 

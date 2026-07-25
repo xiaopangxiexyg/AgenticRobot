@@ -500,6 +500,16 @@ class RealTeleopControlInput:
     def _foot_pad_count(self) -> int:
         return int(getattr(getattr(self, "foot_pad_input", None), "foot_pad_count", 0) or 0)
 
+    def _foot_pad_test_required_count(self) -> int:
+        """Return the number of valid pedal edges needed by the test.
+
+        A two-pedal virtual keyboard only has the two Fix mappings.  Keep the
+        four-pedal diagnostic contract unchanged, while making the two-pedal
+        test finish as soon as both available pedals have been verified.
+        """
+
+        return 2 if self._foot_pad_count() == 2 else 4
+
     def _two_pedal_mode_active(self) -> bool:
         return bool(
             self._foot_pad_mode_enabled()
@@ -1349,10 +1359,17 @@ class RealTeleopControlInput:
         self._foot_pad_test_completed = False
         self._foot_pad_test_seen_events = set()
         self._foot_pad_test_last_event = ""
-        self._foot_pad_test_status = (
-            "脚踏测试进行中：无论当前识别为 2/4 踏板，都请依次踩踏板 1、2、3、4；"
-            "这里只显示映射，不执行任何臂操作。"
-        )
+        required_count = self._foot_pad_test_required_count()
+        if required_count == 2:
+            self._foot_pad_test_status = (
+                "双踏板测试进行中：请依次踩踏板 1、2；检测到两个踏板后自动完成。"
+                "这里只显示映射，不执行任何臂操作。"
+            )
+        else:
+            self._foot_pad_test_status = (
+                "四踏板测试进行中：请依次踩踏板 1、2、3、4；"
+                "这里只显示映射，不执行任何臂操作。"
+            )
         self._publish_foot_pad_test_state(message="已开启脚踏测试模式；踏板事件不会触发 fix/init。")
 
     def _stop_foot_pad_test(self) -> None:
@@ -1363,14 +1380,23 @@ class RealTeleopControlInput:
         self._foot_pad_test_active = False
         self._foot_pad_test_completed = True
         seen_count = len(getattr(self, "_foot_pad_test_seen_events", set()))
+        required_count = self._foot_pad_test_required_count()
         self._foot_pad_test_status = (
-            f"脚踏测试已完成（本次检测到 {seen_count}/4 个键位）；"
+            f"脚踏测试已完成（本次检测到 {seen_count}/{required_count} 个键位）；"
             "踏板控制与 A/B/C 快捷键均已恢复。"
         )
         self._publish_foot_pad_test_state(message=self._foot_pad_test_status)
 
     def _record_foot_pad_test_event(self, event: str, *, now: float) -> None:
         del now
+        if not bool(getattr(self, "_foot_pad_test_active", False)):
+            return
+        required_count = self._foot_pad_test_required_count()
+        if required_count == 2 and str(event) not in {"fix_arm_left", "fix_arm_right"}:
+            # The diagnostic adapter may expose all four labels for
+            # compatibility, but F15/F16 are not pedals in the live two-pedal
+            # topology and must not satisfy its completion condition.
+            return
         labels = (
             _TWO_PEDAL_TEST_LABELS
             if self._foot_pad_count() == 2
@@ -1386,19 +1412,23 @@ class RealTeleopControlInput:
         seen_events.add(str(event))
         self._foot_pad_test_last_event = label
         seen_count = len(seen_events)
-        if seen_count >= 4:
+        if seen_count >= required_count:
             self._foot_pad_test_active = False
             self._foot_pad_test_completed = True
+            tested_label = "双踏板 1、2" if required_count == 2 else "踏板 1–4"
             self._foot_pad_test_status = (
-                "踏板 1–4 均已检测，测试自动完成；"
+                f"{tested_label} 均已检测，测试自动完成；"
                 "踏板控制与 A/B/C 快捷键均已恢复。"
             )
             self._publish_foot_pad_test_state(
-                message=f"检测到 {label}；4/4 键位齐全，测试已自动完成。"
+                message=(
+                    f"检测到 {label}；{required_count}/{required_count} 键位齐全，"
+                    "测试已自动完成。"
+                )
             )
             return
         self._foot_pad_test_status = (
-            f"最近检测：{label}（已检测 {seen_count}/4）。"
+            f"最近检测：{label}（已检测 {seen_count}/{required_count}）。"
             "测试模式仍开启；可继续测试，或点击“停止测试踏板”确认完成。"
         )
         self._publish_foot_pad_test_state(
@@ -4236,15 +4266,26 @@ class RealTeleopControlInput:
         if self.ui is None:
             return
         current_time = time.time() if now is None else float(now)
-        complete = all(int(sample_counts.get(side, 0)) >= int(min_samples) for side in self.components.active_sides)
+        # A two-pedal Hold -> single-arm transition intentionally captures
+        # only its target fixed side.  Do not mark that one-sided capture
+        # incomplete merely because the other active arm was not requested.
+        captured_sides = tuple(
+            side
+            for side in self.components.active_sides
+            if side in sample_counts
+        )
+        complete = bool(captured_sides) and all(
+            int(sample_counts.get(side, 0)) >= int(min_samples)
+            for side in captured_sides
+        )
         if (
             not complete
             and current_time - self._last_capture_progress_publish_at < self._capture_progress_publish_interval_sec
         ):
             return
         self._last_capture_progress_publish_at = current_time
-        left_samples = int(sample_counts.get("left", 0)) if "left" in self.components.active_sides else None
-        right_samples = int(sample_counts.get("right", 0)) if "right" in self.components.active_sides else None
+        left_samples = int(sample_counts["left"]) if "left" in sample_counts else None
+        right_samples = int(sample_counts["right"]) if "right" in sample_counts else None
         single_count = None
         if len(self.components.active_sides) == 1:
             single_count = int(sample_counts.get(self.components.active_sides[0], 0))
@@ -4258,8 +4299,8 @@ class RealTeleopControlInput:
             capture_right_samples=right_samples,
             capture_min_samples=int(min_samples),
             capture_valid=complete,
-            capture_left_valid=valid_by_side.get("left") if "left" in self.components.active_sides else None,
-            capture_right_valid=valid_by_side.get("right") if "right" in self.components.active_sides else None,
+            capture_left_valid=valid_by_side.get("left") if "left" in sample_counts else None,
+            capture_right_valid=valid_by_side.get("right") if "right" in sample_counts else None,
             capture_elapsed_sec=float(elapsed_sec),
             capture_duration_sec=float(timeout_sec),
             capture_waiting_for_samples=bool(waiting_for_samples and not complete),

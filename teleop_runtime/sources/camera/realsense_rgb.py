@@ -46,7 +46,13 @@ class RealSenseRGBCameraConfig:
     name: str | None = None
     keep_last: int = 2
     color_space: str = "rgb"
+    # Keep the runtime wait short enough for freshness reporting, but give a
+    # newly negotiated multi-camera pipeline its own longer first-frame
+    # budget.  RealSense may take several seconds to produce the first frame
+    # when another camera is already streaming.
     wait_timeout_ms: int = 1000
+    startup_wait_timeout_ms: int = 5000
+    startup_frame_grace_sec: float = 5.0
     stale_after_sec: float = 2.0
     restart_on_stale_timeout: bool = True
     restart_on_runtime_error: bool = True
@@ -87,6 +93,10 @@ class RealSenseRGBCameraConfig:
             raise ValueError("keep_last must be positive.")
         if int(self.wait_timeout_ms) <= 0:
             raise ValueError("wait_timeout_ms must be positive.")
+        if int(self.startup_wait_timeout_ms) <= 0:
+            raise ValueError("startup_wait_timeout_ms must be positive.")
+        if float(self.startup_frame_grace_sec) < 0.0:
+            raise ValueError("startup_frame_grace_sec must be >= 0.")
         if float(self.stale_after_sec) <= 0.0:
             raise ValueError("stale_after_sec must be positive.")
         if int(self.restart_after_timeouts) <= 0:
@@ -134,6 +144,8 @@ class RealSenseRGBCameraConfig:
                 "keep_last": int(self.keep_last),
                 "color_space": self.color_space,
                 "wait_timeout_ms": int(self.wait_timeout_ms),
+                "startup_wait_timeout_ms": int(self.startup_wait_timeout_ms),
+                "startup_frame_grace_sec": float(self.startup_frame_grace_sec),
                 "stale_after_sec": float(self.stale_after_sec),
                 "restart_on_stale_timeout": bool(self.restart_on_stale_timeout),
                 "restart_on_runtime_error": bool(self.restart_on_runtime_error),
@@ -380,7 +392,7 @@ class RealSenseRGBSource(ObservationSource):
         warmup_frames = int(self.config.startup_warmup_frames)
         if warmup_frames <= 0:
             return
-        timeout_ms = int(self.config.wait_timeout_ms)
+        timeout_ms = int(self.config.startup_wait_timeout_ms)
         success_count = 0
         failure_count = 0
         last_error: str | None = None
@@ -402,7 +414,8 @@ class RealSenseRGBSource(ObservationSource):
         if success_count <= 0 and failure_count > 0:
             raise RuntimeError(
                 "startup_warmup_failed:"
-                f"no_frames_after={warmup_frames}:timeout_ms={timeout_ms}:last_error={last_error}"
+                f"no_frames_after={warmup_frames}:startup_timeout_ms={timeout_ms}:"
+                f"last_error={last_error}"
             )
 
     def _hardware_reset_device_if_requested(self, rs: Any, *, reason: str) -> None:
@@ -530,6 +543,8 @@ class RealSenseRGBSource(ObservationSource):
             "color_space": self.config.color_space,
             "color_format": self.config.color_format,
             "wait_timeout_ms": int(self.config.wait_timeout_ms),
+            "startup_wait_timeout_ms": int(self.config.startup_wait_timeout_ms),
+            "startup_frame_grace_sec": float(self.config.startup_frame_grace_sec),
             "stale_after_sec": float(self.config.stale_after_sec),
             "restart_on_stale_timeout": bool(self.config.restart_on_stale_timeout),
             "restart_on_runtime_error": bool(self.config.restart_on_runtime_error),
@@ -633,7 +648,20 @@ class RealSenseRGBSource(ObservationSource):
             self._last_runtime_error = str(message)
             last_frame_at = self._last_frame_receive_timestamp
             started_at = self._started_at
-            if last_frame_at is not None:
+            # A pipeline can be successfully started before its first frame is
+            # available.  During this bounded startup grace period, record the
+            # timeout for diagnostics but do not mark the camera stale or
+            # rebuild the native pipeline.  Repeated stop/start cycles while
+            # sibling RealSense devices are negotiating can corrupt the SDK's
+            # native heap (the observed ``free(): corrupted unsorted chunks``).
+            startup_grace_active = (
+                last_frame_at is None
+                and started_at is not None
+                and now - float(started_at) < float(self.config.startup_frame_grace_sec)
+            )
+            if startup_grace_active:
+                is_stale = False
+            elif last_frame_at is not None:
                 is_stale = now - float(last_frame_at) >= stale_after_sec
             elif started_at is not None:
                 is_stale = now - float(started_at) >= stale_after_sec
@@ -923,6 +951,8 @@ class RealSenseRGBSource(ObservationSource):
                 else float(now - float(self._last_frame_receive_timestamp))
             )
             info["stale_after_sec"] = float(self.config.stale_after_sec)
+            info["startup_wait_timeout_ms"] = int(self.config.startup_wait_timeout_ms)
+            info["startup_frame_grace_sec"] = float(self.config.startup_frame_grace_sec)
             info["running"] = bool(self._running)
         return info
 

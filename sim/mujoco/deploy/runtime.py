@@ -9,10 +9,20 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
 from dataset_contracts.control_trace import ControlTraceFact
+from dataset_interface.composition_control_trace import (
+    CompositionControlTraceEmitter,
+)
+from control_composition.activation import CompositionActivationScope
+from control_composition.information import CompositionInformationPlan
+from control_composition.eligibility import (
+    CompositionSourceEligibilityDraft,
+    CompositionSourceEligibilitySpec,
+)
 from control_composition.composition import (
     CompositionContextDraft,
     CompositionInputDraft,
     CompositionSpec,
+    FormalCompositionStrategy,
 )
 from control_composition.observability import SourceDifferenceSpec
 from control_composition.retention import TimeWindowRetentionSpec
@@ -33,6 +43,7 @@ from robot_motion.action import (
     ActionProposalDraft,
     CandidateAuthorizationAdmissionReceipt,
     CompoundDispatchManifest,
+    ConservativeCompoundAuthorityProfile,
     AuthorityPolicySpec,
     AuthoritativeControlConfig,
     AuthoritativeControlRuntime,
@@ -147,6 +158,18 @@ class MujocoDeployConfig:
     # profile sets this false so raw contributor/policy proposals cannot race
     # the single composer proposal for actuator authority.
     enable_primary_policy_authority: bool = True
+    # Optional, additive declaration of context/difference information needed
+    # by the composer. It does not select dataset streams or change authority.
+    composition_information_plan: CompositionInformationPlan | None = None
+    # Explicitly opt-in shadow source-liveness admission. Existing MuJoCo
+    # composition profiles keep their action-only behavior and hashes.
+    enable_composition_source_eligibility: bool = False
+    # Default-off formal gate for composer-owned compound motion.  The typed
+    # profile binds exact composition semantics and an all-required scope; it
+    # is intentionally independent from any model/checkpoint identity.
+    compound_composer_authority_profile: (
+        ConservativeCompoundAuthorityProfile | None
+    ) = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -177,6 +200,7 @@ class MujocoDeployConfig:
             "enable_primary_policy_authority",
             "enable_composer_authority",
             "enable_replay_authority",
+            "enable_composition_source_eligibility",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool.")
@@ -245,6 +269,25 @@ class MujocoDeployConfig:
             "compound_hand_action_specs_by_side",
             MappingProxyType(dict(sorted(hand_specs.items()))),
         )
+        if self.composition_information_plan is not None and not isinstance(
+            self.composition_information_plan,
+            CompositionInformationPlan,
+        ):
+            raise TypeError(
+                "composition_information_plan must be a "
+                "CompositionInformationPlan or None."
+            )
+        if (
+            self.compound_composer_authority_profile is not None
+            and not isinstance(
+                self.compound_composer_authority_profile,
+                ConservativeCompoundAuthorityProfile,
+            )
+        ):
+            raise TypeError(
+                "compound_composer_authority_profile must be a "
+                "ConservativeCompoundAuthorityProfile or None."
+            )
         rate = float(self.decision_hz)
         if not math.isfinite(rate) or rate <= 0.0 or rate > 60.0:
             raise ValueError("deployable sim ActionArbiter rate must be in (0, 60].")
@@ -391,6 +434,7 @@ class MujocoDeployRuntime:
         trace_sink: Callable[[ControlTraceFact], None] | None = None,
         pose_resolver: MujocoCoupledPoseToQposResolver | None = None,
         shared_safety=None,
+        composition_strategy: FormalCompositionStrategy | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.rig = rig
@@ -403,6 +447,9 @@ class MujocoDeployRuntime:
             config.compound_hand_action_specs_by_side
         )
         self._compound_execution_enabled = bool(self._compound_hand_specs)
+        self._compound_composer_authority_profile = (
+            config.compound_composer_authority_profile
+        )
         if self._compound_execution_enabled:
             if not self._pose_execution_enabled:
                 raise ValueError(
@@ -413,10 +460,34 @@ class MujocoDeployRuntime:
                     "Compound hand execution requires an explicit shared_safety "
                     "implementation."
                 )
-            if config.enable_replay_authority or config.enable_composer_authority:
+            if config.enable_replay_authority:
                 raise ValueError(
-                    "The first compound profile does not yet enable replay or "
-                    "composer authority."
+                    "The conservative compound profile does not enable replay "
+                    "authority."
+                )
+            if (
+                config.enable_composer_authority
+                and self._compound_composer_authority_profile is None
+            ):
+                raise ValueError(
+                    "Compound composer authority requires an explicit "
+                    "ConservativeCompoundAuthorityProfile."
+                )
+            if (
+                self._compound_composer_authority_profile is not None
+                and not config.enable_composer_authority
+            ):
+                raise ValueError(
+                    "A compound composer authority profile requires "
+                    "enable_composer_authority=True."
+                )
+            if (
+                self._compound_composer_authority_profile is not None
+                and config.enable_primary_policy_authority
+            ):
+                raise ValueError(
+                    "Conservative compound composer authority requires raw "
+                    "primary policy authority to be disabled."
                 )
             gripper_profile = rig.config.gripper_actuation_profile
             if gripper_profile is None:
@@ -430,6 +501,40 @@ class MujocoDeployRuntime:
                 raise ValueError(
                     "Compound hand specs must exactly match configured MuJoCo "
                     "gripper sides."
+                )
+        elif self._compound_composer_authority_profile is not None:
+            raise ValueError(
+                "Compound composer authority requires explicit compound hand specs."
+            )
+        if self._compound_composer_authority_profile is not None:
+            if composition_strategy is None:
+                raise ValueError(
+                    "Compound composer authority requires a formal component "
+                    "composition strategy."
+                )
+            strategy_spec = composition_strategy.spec
+            component_rule_set = getattr(
+                composition_strategy,
+                "component_rule_set",
+                None,
+            )
+            if component_rule_set is None:
+                raise ValueError(
+                    "Compound composer authority requires a typed component "
+                    "rule set."
+                )
+            profile = self._compound_composer_authority_profile
+            if (
+                strategy_spec.composition_spec_hash
+                != profile.composition_spec_hash
+                or strategy_spec.semantic_content_hash
+                != profile.formal_strategy_spec_hash
+                or component_rule_set.semantic_content_hash
+                != profile.component_rule_set_hash
+            ):
+                raise ValueError(
+                    "Compound composer authority profile does not bind the "
+                    "configured formal composition strategy."
                 )
         if self._pose_execution_enabled:
             if config.pose_frame_contract_hash is None:
@@ -630,7 +735,12 @@ class MujocoDeployRuntime:
                         for group in self.catalog.selection_group_ids
                     },
                     fallback_by_group={
-                        group: "no_action"
+                        group: (
+                            "hold"
+                            if self._compound_composer_authority_profile
+                            is not None
+                            else "no_action"
+                        )
                         for group in self.catalog.selection_group_ids
                     },
                     takeover_allowed_producers=(
@@ -652,6 +762,11 @@ class MujocoDeployRuntime:
                 defer_selected_segment_activation=(
                     self.reference_activation_spec.activation_mode
                     == "scheduled_segment"
+                ),
+                compound_authority_profiles=(
+                    ()
+                    if self._compound_composer_authority_profile is None
+                    else (self._compound_composer_authority_profile,)
                 ),
             ),
             dispatcher=rig.send_commands,
@@ -696,6 +811,10 @@ class MujocoDeployRuntime:
                     rig,
                     **receiver_args,
                 )
+        self._composition_trace_emitter = CompositionControlTraceEmitter(
+            trace_context=self.core.trace_context,
+            trace_sink=self.core.record_external_facts,
+        )
         self.policy_topology = ControlCompositionRuntime(
             runtime_session_id=config.runtime_session_id,
             control_domain_id=config.control_domain_id,
@@ -703,8 +822,7 @@ class MujocoDeployRuntime:
             coordinator=self.core.coordinator,
             producer_epochs=self.core.producer_epochs,
             component_catalog=self.catalog,
-            trace_context=self.core.trace_context,
-            trace_emitter=self.core.record_external_facts,
+            event_emitter=self._composition_trace_emitter,
             proposal_admitter=self.core.admit_proposal,
             context_retention_spec=TimeWindowRetentionSpec(
                 spec_id="mujoco-composition-context-latest-v1",
@@ -720,6 +838,19 @@ class MujocoDeployRuntime:
                 max_effective_duration_sec=1.0,
                 max_late_arrival_sec=0.0,
             ),
+            source_eligibility_retention_spec=(
+                TimeWindowRetentionSpec(
+                    spec_id="mujoco-composition-source-eligibility-latest-v1",
+                    history_window_sec=0.0,
+                    max_future_lead_sec=1.0,
+                    max_effective_duration_sec=1.0,
+                    max_late_arrival_sec=0.0,
+                )
+                if config.enable_composition_source_eligibility
+                else None
+            ),
+            information_plan=config.composition_information_plan,
+            composition_strategy=composition_strategy,
             clock=clock,
         )
         self._started = False
@@ -830,6 +961,7 @@ class MujocoDeployRuntime:
         if self._started:
             return
         self.rig.start()
+        self.core.record_compound_authority_profiles()
         self.core.activate_producer(
             producer_id=self.config.producer_id,
             producer_epoch=self.config.producer_epoch,
@@ -1374,10 +1506,26 @@ class MujocoDeployRuntime:
             required_channels=required_channels,
         )
 
-    def submit_composition_input(self, draft: CompositionInputDraft):
+    def submit_composition_input(
+        self,
+        draft: CompositionInputDraft,
+        *,
+        activation_scope: CompositionActivationScope | None = None,
+    ):
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.admit_composition_input(draft)
+        return self.policy_topology.admit_composition_input(
+            draft,
+            activation_scope=activation_scope,
+        )
+
+    def submit_composition_source_eligibility(
+        self,
+        draft: CompositionSourceEligibilityDraft,
+    ):
+        if not self._started:
+            raise RuntimeError("MujocoDeployRuntime.start() is required.")
+        return self.policy_topology.admit_source_eligibility(draft)
 
     def evaluate_composition_shadow(
         self,
@@ -1388,6 +1536,8 @@ class MujocoDeployRuntime:
         cutoff_at: float | None = None,
         control_cut: ControlCut | None = None,
         source_difference_spec: SourceDifferenceSpec | None = None,
+        activation_scope: CompositionActivationScope | None = None,
+        source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
     ):
         """Evaluate a composition cut without proposal, authority, or dispatch."""
 
@@ -1400,6 +1550,8 @@ class MujocoDeployRuntime:
             cutoff_at=cutoff_at,
             control_cut=control_cut,
             source_difference_spec=source_difference_spec,
+            activation_scope=activation_scope,
+            source_eligibility_spec=source_eligibility_spec,
         )
         if submission.proposal_admission is not None:
             raise RuntimeError("Shadow composition unexpectedly admitted a proposal.")
@@ -1413,36 +1565,158 @@ class MujocoDeployRuntime:
         policy_node_id: str = "fast-composer",
         required_context_channels: tuple[str, ...] = (),
         source_difference_spec: SourceDifferenceSpec | None = None,
+        component_coverage: tuple[str, ...] | None = None,
+        selection_groups: tuple[str, ...] | None = None,
     ):
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
         if not self.config.enable_composer_authority:
             raise RuntimeError("Composer authority is not enabled for this sim runtime.")
-        submission = self.policy_topology.compose_and_admit_proposal(
+        evaluation = self.policy_topology.evaluate_composition(
             spec=spec,
             target_effective_at=target_effective_at,
-            producer_id=self.config.composer_producer_id,
-            producer_epoch=self._composer_producer_epoch,
-            sequence=self._next_composite_proposal_sequence,
-            effective_until=target_effective_at + self.config.proposal_horizon_sec,
-            component_coverage=("left_arm", "right_arm"),
-            selection_groups=("arms",),
-            policy_node_id=policy_node_id,
             required_context_channels=required_context_channels,
             source_difference_spec=source_difference_spec,
         )
         if (
-            submission.proposal_admission is not None
-            and submission.proposal_admission.accepted
+            evaluation.composition_result.output_status != "ready"
+            or evaluation.composition_result.composed_action is None
         ):
-            self._next_composite_proposal_sequence += 1
-        return submission
+            return evaluation
+        return self.submit_evaluated_composition(
+            evaluation,
+            policy_node_id=policy_node_id,
+            component_coverage=component_coverage,
+            selection_groups=selection_groups,
+        )
+
+    def _validate_composition_promotion_scope(
+        self,
+        *,
+        component_coverage: tuple[str, ...] | None,
+        selection_groups: tuple[str, ...] | None,
+        action: RobotAction,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        if component_coverage is None and selection_groups is None:
+            if self._compound_composer_authority_profile is None:
+                coverage = ("left_arm", "right_arm")
+                groups = ("arms",)
+            else:
+                coverage = (
+                    self._compound_composer_authority_profile.component_coverage
+                )
+                groups = (
+                    self._compound_composer_authority_profile.selection_groups
+                )
+        elif component_coverage is None or selection_groups is None:
+            raise ValueError(
+                "component_coverage and selection_groups must be provided "
+                "together."
+            )
+        else:
+            coverage = tuple(str(value).strip() for value in component_coverage)
+            groups = tuple(str(value).strip() for value in selection_groups)
+        if (
+            not coverage
+            or not groups
+            or any(not value for value in (*coverage, *groups))
+            or len(coverage) != len(set(coverage))
+            or len(groups) != len(set(groups))
+        ):
+            raise ValueError(
+                "Composition promotion scope must be non-empty and unique."
+            )
+        catalog_by_component = self.catalog.component_by_id
+        unknown_components = tuple(
+            component
+            for component in coverage
+            if component not in catalog_by_component
+        )
+        if unknown_components:
+            raise ValueError(
+                "Composition promotion scope contains components outside the "
+                f"active MuJoCo catalog: {unknown_components!r}."
+            )
+        catalog_order = tuple(
+            component.component_id
+            for component in self.catalog.components
+            if component.component_id in coverage
+        )
+        if coverage != catalog_order:
+            raise ValueError(
+                "Composition component_coverage must follow catalog order."
+            )
+        expected_groups = tuple(
+            dict.fromkeys(
+                catalog_by_component[component].selection_group_id
+                for component in coverage
+            )
+        )
+        if groups != expected_groups:
+            raise ValueError(
+                "Composition selection_groups must exactly match component "
+                "catalog ownership."
+            )
+        for group in groups:
+            members = self.catalog.components_for_group(group)
+            if members and members[0].coupled:
+                covered_members = {
+                    component for component in coverage
+                    if catalog_by_component[component].selection_group_id
+                    == group
+                }
+                required_members = {
+                    component.component_id for component in members
+                }
+                if covered_members != required_members:
+                    raise ValueError(
+                        "Composition promotion cannot partially cover coupled "
+                        f"selection group {group!r}."
+                    )
+        active_effectors = set(action.active_effectors)
+        unmapped_effectors = tuple(
+            effector
+            for effector in action.active_effectors
+            if effector
+            not in {
+                component.effector_name
+                for component in self.catalog.components
+            }
+        )
+        if unmapped_effectors:
+            raise ValueError(
+                "Composed action contains effectors outside the active MuJoCo "
+                f"catalog: {unmapped_effectors!r}."
+            )
+        action_coverage = tuple(
+            component.component_id
+            for component in self.catalog.components
+            if component.effector_name in active_effectors
+        )
+        if coverage != action_coverage:
+            raise ValueError(
+                "Composition promotion scope must exactly match the composed "
+                "action components."
+            )
+        if self._compound_composer_authority_profile is not None and (
+            coverage
+            != self._compound_composer_authority_profile.component_coverage
+            or groups
+            != self._compound_composer_authority_profile.selection_groups
+        ):
+            raise ValueError(
+                "Conservative compound composer authority requires the exact "
+                "all-required component/group scope."
+            )
+        return coverage, groups
 
     def submit_evaluated_composition(
         self,
         evaluation: CompositeProposalSubmission,
         *,
         policy_node_id: str = "formal-composer",
+        component_coverage: tuple[str, ...] | None = None,
+        selection_groups: tuple[str, ...] | None = None,
     ) -> CompositeProposalSubmission:
         """Promote the exact gated result without capturing a later cut."""
 
@@ -1450,6 +1724,19 @@ class MujocoDeployRuntime:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
         if not self.config.enable_composer_authority:
             raise RuntimeError("Composer authority is not enabled for this sim runtime.")
+        action = evaluation.composition_result.composed_action
+        if (
+            evaluation.composition_result.output_status != "ready"
+            or action is None
+        ):
+            raise ValueError(
+                "Only a ready composition evaluation may be promoted."
+            )
+        coverage, groups = self._validate_composition_promotion_scope(
+            component_coverage=component_coverage,
+            selection_groups=selection_groups,
+            action=action,
+        )
         submission = self.policy_topology.admit_evaluated_composition(
             evaluation,
             runtime_session_id=self.config.runtime_session_id,
@@ -1458,10 +1745,14 @@ class MujocoDeployRuntime:
             sequence=self._next_composite_proposal_sequence,
             effective_until=(
                 evaluation.input_snapshot.target_effective_at
-                + self.config.proposal_horizon_sec
+                + (
+                    1.0 / self.config.decision_hz
+                    if self._compound_composer_authority_profile is not None
+                    else self.config.proposal_horizon_sec
+                )
             ),
-            component_coverage=("left_arm", "right_arm"),
-            selection_groups=("arms",),
+            component_coverage=coverage,
+            selection_groups=groups,
             policy_node_id=policy_node_id,
         )
         if (

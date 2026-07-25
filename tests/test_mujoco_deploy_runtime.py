@@ -14,6 +14,14 @@ from control_composition.composition import (
     CompositionSpec,
 )
 from control_composition.observability import SourceDifferenceSpec
+from control_composition.information import (
+    CompositionContextRequirement,
+    CompositionInformationPlan,
+)
+from control_composition.eligibility import (
+    CompositionSourceEligibilityDraft,
+    CompositionSourceEligibilitySpec,
+)
 from dataset_contracts.replay import (
     REPLAY_ACTION_STAGE_SELECTED,
     REPLAY_BINDING_USE_EXECUTION_CANDIDATE,
@@ -1536,7 +1544,7 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
         "residual",
     }
     assert {
-        fact.event_type for fact in shadow.trace_facts_emitted
+        event.event_kind for event in shadow.domain_events_emitted
     } == {
         "composition_spec",
         "composition_input_snapshot",
@@ -1565,11 +1573,25 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
     assert invalid_diagnostic.diagnostics[0].stage == "source_difference"
     assert invalid_diagnostic.diagnostics[0].recoverable
     assert "composition_spec" not in {
-        fact.event_type for fact in invalid_diagnostic.trace_facts_emitted
+        event.event_kind for event in invalid_diagnostic.domain_events_emitted
     }
     assert sum(
         fact.event_type == "composition_spec" for fact in runtime.trace_facts
     ) == 1
+    assert len(runtime.core.proposals) == 0
+
+    with pytest.raises(ValueError, match="partially cover coupled"):
+        runtime.submit_evaluated_composition(
+            shadow,
+            component_coverage=("left_arm",),
+            selection_groups=("arms",),
+        )
+    with pytest.raises(ValueError, match="outside the active MuJoCo catalog"):
+        runtime.submit_evaluated_composition(
+            shadow,
+            component_coverage=("left_arm", "right_arm", "left_hand"),
+            selection_groups=("arms", "left_hand"),
+        )
     assert len(runtime.core.proposals) == 0
 
     submission = runtime.submit_evaluated_composition(
@@ -1625,6 +1647,314 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
         runtime.trace_facts,
         profile=profile,
     ) == ()
+
+
+def test_information_plan_rejects_unrequested_context_before_retention() -> None:
+    clock = ManualClock()
+    scene = FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+        monotonic_clock=clock,
+    )
+    plan = CompositionInformationPlan(
+        plan_id="motion-plan-only-v1",
+        context_requirements=(
+            CompositionContextRequirement(
+                channel="motion-plan",
+                accepted_payload_contract_hashes=("synthetic-motion-plan-v1",),
+                payload_access="inline",
+                maximum_age_sec=0.1,
+            ),
+        ),
+    )
+    runtime = MujocoDeployRuntime(
+        rig,
+        MujocoDeployConfig(
+            runtime_session_id="information-plan-session",
+            control_domain_id="information-plan-domain",
+            embodiment_instance_id="information-plan-embodiment",
+            composition_information_plan=plan,
+        ),
+        clock=clock,
+    )
+    runtime.start()
+    runtime.activate_policy_node_producer("context-source")
+
+    def context_draft(*, channel: str, contract: str, sequence: int):
+        return CompositionContextDraft(
+            runtime_session_id=runtime.config.runtime_session_id,
+            control_domain_id=runtime.config.control_domain_id,
+            producer_id="context-source",
+            producer_epoch=runtime.config.producer_epoch,
+            sequence=sequence,
+            context_channel=channel,
+            context_kind="fixture",
+            semantic_payload={"value": sequence},
+            produced_at=clock.value,
+            produced_clock_domain_id=runtime.config.clock_domain_id,
+            effective_from=clock.value,
+            effective_until=clock.value + 0.5,
+            effective_clock_domain_id=runtime.config.clock_domain_id,
+            payload_contract_hash=contract,
+        )
+
+    unrequested = runtime.submit_composition_context(
+        context_draft(
+            channel="vision-frame",
+            contract="synthetic-vision-v1",
+            sequence=0,
+        )
+    )
+    assert not unrequested.accepted
+    assert unrequested.rejection_code == "information_channel_not_requested"
+    assert len(runtime.policy_topology.contexts) == 0
+
+    wrong_contract = runtime.submit_composition_context(
+        context_draft(
+            channel="motion-plan",
+            contract="unexpected-contract",
+            sequence=1,
+        )
+    )
+    assert not wrong_contract.accepted
+    assert wrong_contract.rejection_code == (
+        "information_payload_contract_mismatch"
+    )
+    assert len(runtime.policy_topology.contexts) == 0
+
+    accepted = runtime.submit_composition_context(
+        context_draft(
+            channel="motion-plan",
+            contract="synthetic-motion-plan-v1",
+            sequence=2,
+        )
+    )
+    assert accepted.accepted
+    assert len(runtime.policy_topology.contexts) == 1
+    assert (
+        runtime.policy_topology.context_requirement_for_channel("motion-plan")
+        is plan.context_requirements[0]
+    )
+    runtime.activate_policy_node_producer("input-source")
+    input_receipt = runtime.submit_composition_input(
+        CompositionInputDraft(
+            runtime_session_id=runtime.config.runtime_session_id,
+            control_domain_id=runtime.config.control_domain_id,
+            producer_id="input-source",
+            producer_epoch=runtime.config.producer_epoch,
+            sequence=0,
+            input_role="base",
+            action=RobotAction.bimanual_qpos(
+                left_arm=np.zeros(6, dtype=np.float32),
+                right_arm=np.zeros(6, dtype=np.float32),
+                timestamp=clock.value,
+                source="information-plan-fixture",
+            ),
+            produced_at=clock.value,
+            produced_clock_domain_id=runtime.config.clock_domain_id,
+            effective_from=clock.value,
+            effective_until=clock.value + 0.5,
+            effective_clock_domain_id=runtime.config.clock_domain_id,
+            context_ids=(accepted.context_id,),
+        )
+    )
+    assert input_receipt.accepted
+    spec = CompositionSpec(
+        spec_id="information-plan-component-union-v1",
+        algebra="component_union",
+        input_roles=("base",),
+        required_roles=("base",),
+    )
+    fresh = runtime.evaluate_composition_shadow(
+        spec=spec,
+        target_effective_at=clock.value,
+    )
+    assert fresh.composition_result.output_status == "ready"
+    assert fresh.evaluation_record is not None
+    assert fresh.evaluation_record.information_plan is plan
+    assert fresh.evaluation_record.required_context_channels == ("motion-plan",)
+
+    clock.value += 0.15
+    stale = runtime.evaluate_composition_shadow(
+        spec=spec,
+        target_effective_at=clock.value,
+    )
+    assert stale.composition_result.output_status == "no_action"
+    assert stale.composition_result.reason == "stale_context:motion-plan"
+    composition_event_types = [
+        fact.event_type
+        for fact in runtime.trace_facts
+        if fact.event_type.startswith("composition_")
+    ]
+    assert composition_event_types.count("composition_information_plan") == 1
+    assert composition_event_types.index("composition_information_plan") < (
+        composition_event_types.index("composition_context_admission")
+    )
+    runtime.close()
+
+
+def test_source_eligibility_is_default_off_and_opt_in_shadow_holds_no_motion() -> None:
+    default_runtime, default_scene, _ = build_runtime(
+        domain="source-eligibility-default-off"
+    )
+    default_runtime.start()
+    default_runtime.activate_policy_node_producer("virtual-policy")
+    disabled = default_runtime.submit_composition_source_eligibility(
+        CompositionSourceEligibilityDraft(
+            runtime_session_id=default_runtime.config.runtime_session_id,
+            control_domain_id=default_runtime.config.control_domain_id,
+            source_slot_id="virtual-policy-slot",
+            producer_id="virtual-policy",
+            producer_epoch=default_runtime.config.producer_epoch,
+            status_epoch=1,
+            sequence=0,
+            status="available",
+            observed_at=10.0,
+            observed_clock_domain_id=default_runtime.config.clock_domain_id,
+            effective_from=10.0,
+            lease_expires_at=10.2,
+            effective_clock_domain_id=default_runtime.config.clock_domain_id,
+        )
+    )
+    assert not disabled.accepted
+    assert disabled.rejection_code == "source_eligibility_disabled"
+    assert default_scene.physics_commands == []
+    default_runtime.close()
+
+    clock = ManualClock()
+    scene = FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+        monotonic_clock=clock,
+    )
+    runtime = MujocoDeployRuntime(
+        rig,
+        MujocoDeployConfig(
+            runtime_session_id="source-eligibility-shadow-session",
+            control_domain_id="source-eligibility-shadow-domain",
+            embodiment_instance_id="source-eligibility-shadow-embodiment",
+            enable_composition_source_eligibility=True,
+        ),
+        clock=clock,
+    )
+    runtime.start()
+    runtime.activate_policy_node_producer("virtual-policy")
+    spec = CompositionSpec(
+        spec_id="virtual-policy-source-eligibility-v1",
+        algebra="component_union",
+        input_roles=("policy",),
+        required_roles=("policy",),
+    )
+    source_spec = CompositionSourceEligibilitySpec(
+        spec_id="virtual-policy-source-slot-v1",
+        composition_spec_hash=spec.semantic_content_hash,
+        source_slot_by_role={"policy": "virtual-policy-slot"},
+        producer_id_by_source_slot={
+            "virtual-policy-slot": "virtual-policy",
+        },
+    )
+    action_receipt = runtime.submit_composition_input(
+        CompositionInputDraft(
+            runtime_session_id=runtime.config.runtime_session_id,
+            control_domain_id=runtime.config.control_domain_id,
+            producer_id="virtual-policy",
+            producer_epoch=runtime.config.producer_epoch,
+            sequence=0,
+            input_role="policy",
+            action=RobotAction.bimanual_qpos(
+                left_arm=np.full(6, 0.1, dtype=np.float32),
+                right_arm=np.full(6, -0.1, dtype=np.float32),
+                timestamp=clock.value,
+                source="virtual-policy",
+            ),
+            produced_at=clock.value,
+            produced_clock_domain_id=runtime.config.clock_domain_id,
+            effective_from=clock.value,
+            effective_until=clock.value + 0.5,
+            effective_clock_domain_id=runtime.config.clock_domain_id,
+        )
+    )
+    assert action_receipt.accepted
+    available = runtime.submit_composition_source_eligibility(
+        CompositionSourceEligibilityDraft(
+            runtime_session_id=runtime.config.runtime_session_id,
+            control_domain_id=runtime.config.control_domain_id,
+            source_slot_id="virtual-policy-slot",
+            producer_id="virtual-policy",
+            producer_epoch=runtime.config.producer_epoch,
+            status_epoch=1,
+            sequence=0,
+            status="available",
+            observed_at=clock.value,
+            observed_clock_domain_id=runtime.config.clock_domain_id,
+            effective_from=clock.value,
+            lease_expires_at=clock.value + 0.2,
+            effective_clock_domain_id=runtime.config.clock_domain_id,
+        )
+    )
+    assert available.accepted
+    ready = runtime.evaluate_composition_shadow(
+        spec=spec,
+        source_eligibility_spec=source_spec,
+        target_effective_at=clock.value,
+    )
+    assert ready.composition_result.output_status == "ready"
+    assert ready.proposal_admission is None
+
+    clock.value += 0.01
+    paused = runtime.submit_composition_source_eligibility(
+        CompositionSourceEligibilityDraft(
+            runtime_session_id=runtime.config.runtime_session_id,
+            control_domain_id=runtime.config.control_domain_id,
+            source_slot_id="virtual-policy-slot",
+            producer_id="virtual-policy",
+            producer_epoch=runtime.config.producer_epoch,
+            status_epoch=2,
+            sequence=0,
+            status="paused",
+            observed_at=clock.value,
+            observed_clock_domain_id=runtime.config.clock_domain_id,
+            effective_from=clock.value,
+            lease_expires_at=clock.value + 0.2,
+            effective_clock_domain_id=runtime.config.clock_domain_id,
+            rearm_required=True,
+        )
+    )
+    assert paused.accepted
+    blocked = runtime.evaluate_composition_shadow(
+        spec=spec,
+        source_eligibility_spec=source_spec,
+        target_effective_at=clock.value,
+    )
+    assert blocked.composition_result.output_status == "no_action"
+    assert blocked.input_snapshot.missing_roles == ("policy",)
+    assert blocked.input_snapshot.source_ineligibility_reason_by_role[
+        "policy"
+    ] == "source_status:paused"
+    assert blocked.proposal_admission is None
+    assert len(runtime.core.proposals) == 0
+    assert scene.physics_commands == []
+    assert {
+        "composition_source_eligibility_spec",
+        "composition_source_eligibility_state",
+        "composition_source_eligibility_snapshot",
+        "composition_source_eligibility_binding",
+    }.issubset({fact.event_type for fact in runtime.trace_facts})
+    runtime.close()
 
 
 def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:

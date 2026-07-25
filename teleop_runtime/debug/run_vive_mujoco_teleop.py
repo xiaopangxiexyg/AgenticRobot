@@ -52,7 +52,7 @@ from ..configs.pose_smoothing import (
     build_bimanual_pose_smoother,
     load_default_pose_smoothing_config,
 )
-from ..debug.calibration_flow import average_pose
+from ..calibration_flow import average_pose
 from ..hand_tcp_alignment import (
     DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
     tracker_hand_to_rm65_tcp_rotation,

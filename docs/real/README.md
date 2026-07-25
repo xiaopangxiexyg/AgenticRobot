@@ -54,8 +54,15 @@ Q6、真手或任何持久配置。
 左右关系检查只在当前 GUI 进程第一次开始遥操时执行一次：首次通过或经人工二次
 确认后，本进程后续的普通 Home、Q6 重采和双踏板切换不再重复计算左右关系，避免
 把它变成持续运行监控。后续 Home 仍会独立检查 Tracker 新鲜度和稳定性。首次操作
-若来自双踏板 Hold 恢复，则左右检查通过后仍走原有快速 Home，Tracker 等待与稳定
-Home 采样共享 1 秒总时限；超时会取消切换并显示 3 秒红色提醒。人工处理首次左右
+若来自双踏板 Hold 恢复，则左右检查通过后仍走原有快速 Home。双踏板切换的稳定判定为
+平移速度 ≤90 mm/s、旋转速度 ≤15°/s、连续稳定 120 ms，窗口漂移 ≤6 mm/1.5°；普通
+runtime Home 仍使用更严格的 15 mm/s、2.5°/s、250 ms、3 mm/0.75°。Init 单臂
+到位判定另采用平移速度 ≤30 mm/s、旋转速度 ≤5°/s、连续稳定 2 s；这些阈值不改变
+Tracker/相机新鲜度要求。
+进入指定单臂时只采集即将 Fix 的目标侧 Home，另一侧沿用已有 runtime anchor，不会因其
+Tracker 仍在运动而阻塞切换；从单臂恢复双臂时只采集需要释放的固定侧，Hold 直接恢复
+双臂时仍采集双侧。
+Tracker 等待与稳定 Home 采样共享 1 秒总时限；超时会取消切换并显示 3 秒红色提醒。人工处理首次左右
 警告弹窗的时间不计入，二次确认后重新开始这 1 秒窗口。普通 Home 与 Q6 Home
 不会被双踏板模式误识别为快速 Home。
 
@@ -98,8 +105,14 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --q6-config latest --q6-config-required \
   --dmtac-config latest --require-dmtac-config \
   --camera-config teleop_runtime/configs/devices/realsense.json \
+  --camera-color-format bgr8 \
   --write-parquet --write-video
 ```
+
+真机多相机默认使用 `bgr8` 颜色传输；它不改变 640×480 等请求分辨率，只避免多台
+RealSense 同时协商 `yuyv` 时出现首帧迟到和底层 SDK 重启。启动首帧等待（5 秒）与
+运行期新鲜度等待（1 秒）分开，启动期间不会因首帧迟到反复重建 pipeline。只有在
+已验证的单站环境中才应显式改用 `--camera-color-format yuyv`。
 
 `POSITION_FORMAL_V1_ARGS` 会强制启用独立的双臂位控受力急停：通过左右 RM65
 状态连接以 20 Hz 读取 tool-zero 六维力，默认任一侧 `|F| > 15 N` 或

@@ -20,6 +20,11 @@ ObservationSource -> Policy -> CanonicalActionPipeline -> Dispatcher
   worker-thread drain.
 - `rtc_runtime.py`: target-neutral RTC request/result/timed-plan coordinator;
   independent of teleop, replay, Control Station, sim and hardware.
+- `rtc/`: canonical home for new target-neutral RTC domain contracts.  It
+  starts with the producer-only cadence projection and model-RTC continuation
+  timeline/encoding lineage; existing flat RTC modules remain compatibility
+  surfaces during incremental migration.  See
+  [`rtc/README.md`](rtc/README.md).
 
 RTC request identity is deliberately split. `observation_cut_id` is a small,
 versioned causal identity covering session/domain/producer epoch/request
@@ -77,6 +82,15 @@ Migration notes:
 
 - Large action/deploy types still live in `teleop_runtime.deploy` during this
   transition. Do not move them in one large edit.
+- RTC is a cross-layer feature, not a new top-level package.  Shared
+  request/plan/producer/continuation semantics belong under
+  `robot_motion.deploy.rtc`; generic model clients remain in
+  `deployments.client`, and application execution/publication remains in the
+  embedding real/sim/control application.
+- `PolicyAsyncExecutionProfile` retains its historical position/send/lookahead
+  fields and hash for compatibility.  New RTC producer logic consumes its
+  target-neutral `producer_profile` projection instead of treating those
+  application settings as producer-owned facts.
 - New motion-control common code should be added here first.
 - Generic model-server client code belongs in `deployments.client`.
 - Model-family-specific client code belongs in `deployments/<model>/client`.

@@ -47,7 +47,9 @@ from teleop_runtime.debug.run_vive_rm65_real_teleop import (
     _run_gripper_warmup_probe_for_side,
     _tracker_name_for_source_side,
     _tracker_source_side_for_logical_side,
-    main as real_teleop_main,
+)
+from teleop_runtime.real_teleop.episode_recording_runtime import (
+    build_episode_recording_runtime,
 )
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
@@ -224,7 +226,7 @@ class TeleopRecoveryTests(unittest.TestCase):
         )
 
     def test_gripper_warmup_probe_is_not_reset_inside_an_open_episode(self) -> None:
-        source = inspect.getsource(real_teleop_main)
+        source = inspect.getsource(build_episode_recording_runtime)
 
         self.assertNotIn(
             'reset_gripper_warmup_probe("recording_started")',

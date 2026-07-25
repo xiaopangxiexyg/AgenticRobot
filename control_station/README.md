@@ -11,6 +11,55 @@ side-effect coordination, publication barriers, GUI/API state, and binding
 concrete source/target adapters. It must not duplicate composition strategies
 or canonical motion authority.
 
+Formal composition start/re-arm creates a backend-neutral
+`CompositionActivationScope` in `control_composition`; Station supplies the
+operation/session identity and concrete readiness timestamp, but does not
+implement a second input-freshness reducer. Contributor admission, snapshot
+selection, result identity, and trace lineage consume the same scope.
+The concrete MuJoCo migration profile still has one isolated start-time
+barrier for callers that have not created an explicit scope. It is an unscoped
+compatibility shim, is not reusable Station semantics, and must be deleted once
+all formal callers establish `CompositionActivationScope`.
+
+## GUI/control-plane boundary freeze
+
+Control Station is the GUI-facing application control plane, not a
+presentation-only package and not an action data plane. Its stable core owns
+typed operator intents, application lifecycle state, operation coordination,
+rebuildable UI status/events, declarative run profiles, and thin bindings to
+already-constructed source/target ports.
+
+The stable core must not implement or import concrete teleop, replay, policy,
+RTC, simulator, hardware, numerical-composition, or dataset-writer behavior.
+Those owners expose typed emissions, receipts, status, and lifecycle ports;
+Station selects a profile and coordinates operations over those ports.
+
+Current concrete-profile and migration debt is frozen as follows:
+
+| Current Station area | Long-term owner |
+|---|---|
+| action/context selection, TTL, fallback, difference, handoff/session semantics | `control_composition` |
+| human admission, passive teleop session, human emission fanout | `teleop_runtime.action` |
+| replay binding/fanout/cursor-owned status | `teleop_runtime.replay` / `robot_motion.replay` |
+| sync/RTC policy binding and step validation | `teleop_runtime.deploy` / `robot_motion.deploy` |
+| OpenPI artifact/protocol assessment | `deployments.openpi` |
+| MuJoCo measurement, readiness, resolution and execution evidence | `sim.mujoco` |
+| authority, safety, IK, reference and dispatch | `robot_motion` |
+| ControlTrace/v2.4 projection and capture | `dataset_interface` and the existing capture owner |
+
+`control_station/composition/` is therefore a transitional name. After the
+concrete algorithms above have returned to their owners, the remaining thin,
+GUI-selectable application assemblies should become declarative
+`control_station/profiles/`; they may import multiple lower packages but may
+not recreate their queues, workers, cursors, epochs, safety, or dispatch.
+
+The boundary tests keep current migration debt explicit: dataset projection is
+confined to `control_trace.py` and the existing
+`composition/mujoco_pose_composer.py` profile, OpenPI knowledge to
+`preflight/openpi_rtc.py`, MuJoCo imports to concrete profiles, and numerical
+source code to the two source modules scheduled for extraction. New debt may
+not spread while those files are migrated.
+
 ## Reuse model
 
 Keep extension work on the narrowest stable seam:
@@ -85,6 +134,17 @@ become authoritative only after a separate versioned proposal/admission,
 ControlTrace, safety, latency/fallback, and shadow-parity gate. Unversioned
 pose averaging or GUI-controlled blend weights remain forbidden.
 
+CS-6b1h now also has an explicit opt-in formal-strategy-v2 contract fixture.
+The strategy is injected into `MujocoDeployRuntime` rather than stored in a sim
+configuration, and the Station binding includes its strategy-spec hash under a
+v2 binding domain. The deterministic migration adapter has exact pose/action
+parity with the compatibility composer on the same frozen input snapshot, but
+produces a distinct v4 result and proposal lineage before entering the existing
+single authority, safety, reference, and dispatch chain. With no injected
+strategy, the established v1 binding and behavior remain unchanged. This is
+not yet a default operational profile or permission to run a slow model/RPC in
+the control loop.
+
 The shared pose strategy/composer now accepts an explicit non-empty subset of
 the current v1 arm components (`left_arm`, `right_arm`). A one-arm profile
 projects every candidate to that declared subset before strategy evaluation;
@@ -106,9 +166,9 @@ an SO(3) rotation vector; qpos uses only jointly finite slots. Action-space,
 representation, shape, or pose-frame mismatch fails explicitly.
 
 `ControlCompositionRuntime.evaluate_composition()` now accepts that optional spec,
-returns the observation on `CompositeProposalSubmission`, and emits the exact
-hash-linked `source_difference_spec` and `source_difference_observation` v2.4
-ControlTrace facts through its existing backend-neutral trace sink. Diagnostic
+returns the observation on `CompositeProposalSubmission`, and emits exact
+protocol-neutral source-difference domain events. The injected dataset adapter
+may project them into hash-linked v2.4 ControlTrace facts. Diagnostic
 failure is returned separately and cannot rewrite the
 composition result. CS-6b1h/1i only forward the opt-in spec and expose the same
 observation on their step result. With the default `None`, no observation,

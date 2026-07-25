@@ -1,9 +1,10 @@
 """Scoped RTC-3c emission → immediate-qref MuJoCo data-plane fixture.
 
 The caller drives ``RtcPolicyShadowFrontend.step()`` outside Control Station.
-This module accepts only the immutable returned step whose due-pop and
-emission-commit evidence identify the exact ``PolicyActionEmission``.  It does
-not run inference, merge a timed plan, pop a keyframe, or own the RTC worker.
+The formal input is a committed ``PolicyActionEmission`` plus an immutable
+source binding.  A complete frontend step remains a debug compatibility input,
+not a downstream data-plane requirement.  This module does not run inference,
+merge a timed plan, pop a keyframe, or own the RTC worker.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from robot_motion.deploy import (
     CanonicalDeployActionPipeline,
     PolicyActionEmission,
     PolicyDeployRuntime,
+    build_rtc_policy_emission_source_binding_from_contracts,
 )
 from sim.mujoco.deploy import MujocoDeployRuntime, MujocoPolicyEmissionSubmission
 from teleop_runtime.deploy.rtc_frontend import (
@@ -33,7 +35,6 @@ from ..contracts import ControlStationRunManifest
 from ..publication_barrier import StationPublicationBarrier
 from ..runtime import ControlStationRuntime
 from ..sources.rtc_policy import (
-    RTC_POLICY_BINDING_HASH_DOMAIN_V1,
     RtcPolicyEmissionBinding,
 )
 from ..targets.authoritative import StationAuthoritativeTargetAdapterBase
@@ -96,28 +97,11 @@ def build_rtc_policy_emission_binding(
         or rtc_config.clock_domain_id != base.policy_clock_domain_id
     ):
         raise ValueError("RTC frontend config targets another control runtime.")
-    payload = {
-        "source_slot_id": f"rtc-policy-source:{base.producer_id}",
-        "producer_id": base.producer_id,
-        "producer_epoch": base.producer_epoch,
-        "policy_node_id": base.policy_node_id,
-        "policy_clock_domain_id": base.policy_clock_domain_id,
-        "policy_runtime_config_hash": base.policy_runtime_config_hash,
-        "action_adapter_contract_hash": base.action_adapter_contract_hash,
-        "rtc_frontend_config_hash": rtc_config.semantic_content_hash,
-        "rtc_profile_hash": rtc_config.profile.semantic_content_hash,
-        "artifact_hash": rtc_config.artifact_hash,
-        "action_codec_hash": rtc_config.action_codec_hash,
-        "frame_contract_hash": rtc_config.frame_contract_hash,
-        "layout_hash": rtc_config.layout_hash,
-        "normalization_hash": rtc_config.normalization_hash,
-    }
-    return RtcPolicyEmissionBinding(
-        **payload,
-        semantic_content_hash=canonical_content_hash(
-            payload,
-            domain=RTC_POLICY_BINDING_HASH_DOMAIN_V1,
-        ),
+    return build_rtc_policy_emission_source_binding_from_contracts(
+        config=rtc_config,
+        deploy_runtime=policy_runtime,
+        emission_adapter=pipeline.action_adapter,
+        producer_epoch=base.producer_epoch,
     )
 
 
@@ -147,8 +131,7 @@ def build_cs2d_rtc_policy_mujoco_manifest(
     source_slot = replace(
         base.source_slots[0],
         expected_emission_seam=(
-            "teleop_runtime.deploy.rtc_frontend.RtcFrontendStep."
-            "action_preparation.emission"
+            "robot_motion.deploy.runtime.PolicyActionEmission"
         ),
         required_binding_refs=(
             binding.semantic_content_hash,
@@ -161,7 +144,6 @@ def build_cs2d_rtc_policy_mujoco_manifest(
             "control_station_policy_merge",
             "control_station_policy_pop",
             "control_station_policy_predict",
-            "control_station_rtc_frontend_step",
             "sync_policy_queue_source",
         ),
     )
@@ -338,7 +320,7 @@ def build_cs2d_rtc_policy_execution_manifest(
 
 
 class MujocoRtcPolicyOnlyComposition(MujocoPolicyOnlyComposition):
-    """Accept exact lower RTC steps while leaving all producer work outside."""
+    """Accept bound formal emissions while leaving all producer work outside."""
 
     binding: RtcPolicyEmissionBinding
 
@@ -370,18 +352,23 @@ class MujocoRtcPolicyOnlyComposition(MujocoPolicyOnlyComposition):
             scope_label="CS-2d RTC-policy",
         )
 
-    def submit_emission(self, emission: PolicyActionEmission):
-        del emission
-        raise RuntimeError("CS-2d requires the complete immutable RtcFrontendStep.")
+    def submit_emission(
+        self,
+        emission: PolicyActionEmission,
+    ) -> MujocoPolicyEmissionSubmission:
+        if not self.started:
+            raise RuntimeError("MujocoRtcPolicyOnlyComposition.start() is required.")
+        validated = self.binding.validate_emission(emission)
+        return self.runtime.submit_policy_action_emission(validated)
 
     def submit_frontend_step(
         self,
         step: RtcFrontendStep,
     ) -> MujocoPolicyEmissionSubmission:
-        if not self.started:
-            raise RuntimeError("MujocoRtcPolicyOnlyComposition.start() is required.")
-        emission = self.binding.validate_frontend_step(step)
-        return self.runtime.submit_policy_action_emission(emission)
+        emission = self.binding.validate_step(step)
+        if emission is None:
+            raise ValueError("RTC frontend step has no formal emission.")
+        return self.submit_emission(emission)
 
 
 class MujocoRtcPolicyStationTargetAdapter(MujocoPolicyStationTargetAdapter):
@@ -431,7 +418,7 @@ class MujocoRtcPolicyStationSourceAdapter(MujocoPolicyStationSourceAdapter):
 class ScopedMujocoRtcPolicyStationComposition(
     ScopedMujocoPolicyStationComposition
 ):
-    """Gate exact RTC frontend steps without driving the lower producer."""
+    """Gate bound RTC emissions without driving the lower producer."""
 
     def __init__(self, *, station, data_plane, clock, clock_domain_id) -> None:
         super().__init__(
@@ -458,13 +445,9 @@ class ScopedMujocoRtcPolicyStationComposition(
     def data_plane(self) -> MujocoRtcPolicyOnlyComposition:
         return self._data_plane
 
-    def submit_emission(self, emission: PolicyActionEmission):
-        del emission
-        raise RuntimeError("CS-2d requires the complete immutable RtcFrontendStep.")
-
-    def submit_frontend_step(
+    def submit_emission(
         self,
-        step: RtcFrontendStep,
+        emission: PolicyActionEmission,
     ) -> MujocoPolicyEmissionSubmission:
         initial = self._station.state
         if (
@@ -482,9 +465,18 @@ class ScopedMujocoRtcPolicyStationComposition(
                 != "active"
             ):
                 raise RuntimeError("Station RTC-policy authority is not active.")
-            return self._data_plane.submit_frontend_step(step)
+            return self._data_plane.submit_emission(emission)
 
         return self.publication_barrier.execute_if_enabled(submit)
+
+    def submit_frontend_step(
+        self,
+        step: RtcFrontendStep,
+    ) -> MujocoPolicyEmissionSubmission:
+        emission = self.data_plane.binding.validate_step(step)
+        if emission is None:
+            raise ValueError("RTC frontend step has no formal emission.")
+        return self.submit_emission(emission)
 
 
 def build_scoped_cs2d_rtc_policy_mujoco(

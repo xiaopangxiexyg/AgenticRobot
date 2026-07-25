@@ -1,6 +1,6 @@
 # DexTeleop 实时 Action Chunk（RTC）实现与规划图示
 
-更新日期：2026-07-23
+更新日期：2026-07-25
 
 ## 文档用途
 
@@ -27,18 +27,39 @@ default-off、`send_actions=false` 的部署接线：
 
 所有“完成”都有作用域。本地测试通过不等于已合并、production ready、真机 shadow ready 或 motion authorized。
 
+### RTC terminal boundary
+
+```mermaid
+flowchart LR
+    R["raw-RTC producer<br/>request / worker / plan / pop / commit"] --> E["PolicyActionEmission"]
+    SD["stable source descriptor"] --> B["epoch-scoped<br/>binding candidate"]
+    B --> P["RtcPolicyEmissionPublisher<br/>commit / binding / TTL / idempotency"]
+    E --> P
+    P --> D["required Control Adapter<br/>no silent drop"]
+    P --> O["optional Observer<br/>bounded best-effort"]
+    S["RtcFrontendStep"] -. "debug compatibility only" .-> O
+    D --> T["authority / safety / IK / reference / target"]
+```
+
+正式publisher只接收同一emission的typed `PolicyActionEmissionCommitReceipt`；commit不代表target acceptance。
+descriptor跨同配置rearm保持稳定，binding随epoch变化并进入emission hash。observer允许drop且不得阻塞control loop；
+required Control Adapter不允许静默drop。当前完成initial binding和单required delivery语义；stop-and-rebind、consumer
+typed ACK与原子active-binding替换已在publisher纯协议中完成；具体consumer自动协调及多subscriber ordered rotation仍是
+后续gate。RTC不拥有右侧consumer/target。
+
 ### 两种 RTC 的冻结定义
 
 ```text
 raw-RTC   = existing observation -> final action chunk
-            model/server unchanged; client worker -> timed plan/admission/emission
+            scheduler=async_timed_plan, continuation=none
 
 model-RTC = model consumes versioned future-action prefix/mask/conditioning
-            and returns a conditioning receipt; independent future branch
+            scheduler=async_timed_plan, continuation=flow_inpaint/trained/native
 ```
 
 本图中凡 `continuation=none`、final-chunk、异步 worker 或 timed-plan 接线均只能称为 raw-RTC；凡
-prefix/mask、conditioning receipt 或 identity promotion 均属于 model-RTC。model-RTC 默认关闭，不能作为
+prefix/mask、conditioning receipt 或 identity promotion 均属于 model-RTC。raw/model是讨论简称；正式协议与新增
+API只使用`scheduler_mode × continuation_mode`。model-RTC 默认关闭，不能作为
 raw-RTC 的隐含前置条件；两者均不取得 teleop/replay 或真机 dispatch authority。
 
 ---
@@ -54,7 +75,7 @@ raw-RTC 的隐含前置条件；两者均不取得 teleop/replay 或真机 dispa
 | RTC-3b `predict_chunk()` / `admit_prediction_result()` | ✅ sync-parity seam | 已拆分模型计算与控制线程 queue mutation；正式 caller 仍走原同步方法 |
 | RTC-3b.5 single admission truth closure | ✅ pure/local only | timed plan唯一merge、transition-first、worker session、RTC-only lookahead-disabled profile与due-pop observability已闭合 |
 | RTC-3c default-off frontend | ✅ local virtual dry-run | existing deploy入口显式profile接线；builtin hold、`send_actions=false`、RTC-only lookahead disabled，sync lookahead不变 |
-| RTC-3d pre-motion lookahead gate | ⏳ later | typed preview receipt完成前，RTC profile不得重新启用position lookahead |
+| downstream D-LA pre-motion lookahead gate | ⏳ later | 属于target-side preview协议；完成前RTC profile不得重新启用position lookahead |
 | RTC-4a generic protocol/client seam | ✅ pure/local only | scheduler/continuation分轴、capability/envelope/receipt与两个local backend迁移fixture；无具体模型或transport |
 | RTC-4b-A OpenPI raw-RTC final-chunk adapter | ✅ offline/fake transport | artifact/server/input/output/V22 codec完整绑定；只声明`continuation=none`；adapter本身不创建websocket、worker或frontend |
 | RTC-4b-T3 OpenPI raw-RTC caller | 🟡 real no-action shadow / authority pending | 既有OpenPI launcher仅在显式raw profile创建adapter；`--rtc-real-shadow`才允许live endpoints，并将RM65/DMTAC/hand置为observation-only；R-R4已验证真实observation→transport→timed-plan/emission→bounded drain，仍无action send authority；[local evidence](evidence/rtc/rtc_4b_t3_openpi_raw_rtc_local_evidence_v1.json) · [R-R4 default](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json) · [R-R4 drain](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json) |
@@ -658,8 +679,8 @@ flowchart TB
     subgraph RTC3C["RTC-3c virtual-policy / send_actions=false"]
         Plan["TimedPolicyActionPlan"] --> Pop["select/pop one due keyframe"]
         Pop --> Emit["unique PolicyActionEmission"]
-        Emit --> Shadow["proposal/admission/shadow safety"]
-        Shadow --> Optional["optional position processing"]
+        Emit --> Boundary["RTC terminal boundary"]
+        Boundary --> Optional["optional downstream consumer"]
         Future["un-popped mutable future"] -. "not consumed / not staged" .-> Optional
     end
 
@@ -679,15 +700,14 @@ RTC-3c: position_lookahead = disabled, scope = RTC profile only
 sync_queue_v1: lookahead values/order/pop count/emission hash unchanged
 ```
 
-RTC lookahead重新启用属于独立`RTC-3d / pre-motion-lookahead gate`：
+position preview/lookahead属于独立下游target gate，不再命名为RTC阶段：
 
 ```mermaid
 flowchart LR
     Identity["typed preview identity + valid_until"] --> Safety["canonical safety verdict"]
     Safety --> Accept["downstream acceptance receipt"]
     Accept --> Ref["reference generation / source index"]
-    Ref --> Commit["producer commit-through"]
-    Commit --> Promote["later identity promotion<br/>without duplicate admission"]
+    Ref --> Promote["later identity promotion<br/>without duplicate admission"]
     Promote --> Enable["RTC lookahead may be enabled"]
 ```
 
@@ -812,7 +832,7 @@ flowchart LR
     Rel --> TargetSim
     TargetSim --> RealShadow["RTC-6 real observation / no action shadow ⏳"]
     RealShadow --> Authority["RTC-7 independent real authority ⛔"]
-    Dry -. "independent gate" .-> Preview["RTC-3d typed preview/lookahead ⏳"]
+    Dry -. "downstream-only gate" .-> Preview["target typed preview/lookahead ⏳"]
     Abs -. "optional later" .-> Server["RTC-4b-B model continuation ⏳"]
     Rel -. "optional later" .-> Server
 
@@ -1083,6 +1103,8 @@ cancellation/epoch/owner transition。RTC worker 不建立第二个 writer lifec
 | isolated OS worker | `robot_motion/deploy/policy_worker.py` | RTC-3a shared core；bounded、无plan/target |
 | unique producer state/profile | `robot_motion/deploy/async_producer.py` | RTC-3b.5 pure/local-only；无I/O |
 | default-off coordinator | `robot_motion/deploy/rtc_runtime.py` | RTC-3c shared core；无设备/dispatcher/reference owner；teleop路径仅兼容shim |
+| source descriptor / epoch binding / commit receipt | `robot_motion/deploy/rtc_runtime.py` | producer-owned immutable candidate；descriptor稳定、binding按epoch隔离 |
+| committed application publisher | `teleop_runtime/deploy/rtc_step_fanout.py` | active binding、commit/TTL/idempotency验证；observer可drop，单required subscriber fail closed |
 | generic RTC v2 capability/protocol | `robot_motion/deploy/rtc_protocol.py`（RTC-4a） | pure；模型/transport/sim/real无关 |
 | model-neutral RTC client seam | `deployments/client/rtc.py`（RTC-4a） | local或remote backend + codec；无具体模型字段 |
 | model-neutral worker executor | `deployments/client/rtc_executor.py`（RTC-4b-T0） | prepared input→client→result；不创建thread/plan/target |

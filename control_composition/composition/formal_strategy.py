@@ -1,0 +1,546 @@
+"""Formal, receiver-bound strategy seam for control composition.
+
+Version 2 is additive to the legacy deterministic composer. A formal strategy
+receives one immutable invocation containing the exact action/context cut and
+returns a small decision. The framework, not the strategy implementation,
+builds the canonical ``CompositionResult`` and its promotion identity.
+
+Only bounded inline strategies belong behind this protocol. Slow model or
+remote strategy computation must arrive through an admitted context/advisory
+producer so it cannot block the control loop.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Protocol
+
+from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.action.proposal import (
+    freeze_robot_action,
+    robot_action_semantic_payload,
+)
+from robot_motion.action.schema import RobotAction
+from robot_motion.runtime.immutable import deep_freeze
+
+from control_composition.information import CompositionInformationPlan
+
+from .context import CompositionContextSnapshot
+from .core import (
+    COMPOSITION_RESULT_HASH_DOMAIN_V4,
+    CompositionInputSnapshot,
+    CompositionResult,
+    CompositionSpec,
+    DeterministicComposer,
+)
+
+
+FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V2 = (
+    "dexteleop.formal_composition_strategy_spec.v2"
+)
+FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V2 = (
+    "dexteleop.formal_composition_strategy_input.v2"
+)
+FORMAL_COMPOSITION_STRATEGY_RESULT_BINDING_HASH_DOMAIN_V2 = (
+    "dexteleop.formal_composition_strategy_result_binding.v2"
+)
+
+
+def _required(value: object, *, name: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{name} must be non-empty.")
+    return text
+
+
+@dataclass(frozen=True)
+class FormalCompositionStrategySpec:
+    """Immutable identity and declared inputs for one inline strategy.
+
+    This spec identifies *which implementation* evaluates a composition
+    contract. It must not redefine component weights, fallback behavior, or
+    safety limits owned by ``CompositionSpec``. Optional implementation
+    contract hashes only prove that the implementation binds the exact typed
+    contracts already referenced by the composition semantics.
+    """
+
+    strategy_id: str
+    strategy_version: str
+    composition_spec_hash: str
+    required_context_channels: tuple[str, ...] = ()
+    implementation_contract_hashes: tuple[str, ...] = ()
+    parameter_payload: Mapping[str, Any] = field(default_factory=dict)
+    maximum_decision_latency_sec: float | None = None
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        strategy_id = _required(self.strategy_id, name="strategy_id")
+        strategy_version = _required(
+            self.strategy_version,
+            name="strategy_version",
+        )
+        composition_spec_hash = _required(
+            self.composition_spec_hash,
+            name="composition_spec_hash",
+        )
+        channels = tuple(
+            _required(value, name="required_context_channel")
+            for value in self.required_context_channels
+        )
+        if len(channels) != len(set(channels)):
+            raise ValueError("required_context_channels must be unique.")
+        implementation_contract_hashes = tuple(
+            _required(value, name="implementation_contract_hash")
+            for value in self.implementation_contract_hashes
+        )
+        if len(implementation_contract_hashes) != len(
+            set(implementation_contract_hashes)
+        ):
+            raise ValueError("implementation_contract_hashes must be unique.")
+        parameters = deep_freeze(dict(self.parameter_payload))
+        maximum_latency = self.maximum_decision_latency_sec
+        if maximum_latency is not None:
+            maximum_latency = float(maximum_latency)
+            if not math.isfinite(maximum_latency) or maximum_latency <= 0.0:
+                raise ValueError(
+                    "maximum_decision_latency_sec must be finite and positive."
+                )
+        payload = {
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+            "execution_class": "inline_bounded",
+            "composition_spec_hash": composition_spec_hash,
+            "required_context_channels": channels,
+            "parameter_payload": parameters,
+            "maximum_decision_latency_sec": maximum_latency,
+        }
+        if implementation_contract_hashes:
+            payload["implementation_contract_hashes"] = (
+                implementation_contract_hashes
+            )
+        object.__setattr__(self, "strategy_id", strategy_id)
+        object.__setattr__(self, "strategy_version", strategy_version)
+        object.__setattr__(
+            self,
+            "composition_spec_hash",
+            composition_spec_hash,
+        )
+        object.__setattr__(self, "required_context_channels", channels)
+        object.__setattr__(
+            self,
+            "implementation_contract_hashes",
+            implementation_contract_hashes,
+        )
+        object.__setattr__(self, "parameter_payload", parameters)
+        object.__setattr__(
+            self,
+            "maximum_decision_latency_sec",
+            maximum_latency,
+        )
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V2,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class FormalCompositionStrategyInput:
+    """Exact immutable action/context cut presented to one strategy."""
+
+    runtime_session_id: str
+    control_domain_id: str
+    clock_domain_id: str
+    strategy_spec: FormalCompositionStrategySpec
+    composition_spec: CompositionSpec
+    input_snapshot: CompositionInputSnapshot
+    context_snapshot: CompositionContextSnapshot | None
+    information_plan: CompositionInformationPlan | None
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        runtime_session_id = _required(
+            self.runtime_session_id,
+            name="runtime_session_id",
+        )
+        control_domain_id = _required(
+            self.control_domain_id,
+            name="control_domain_id",
+        )
+        clock_domain_id = _required(
+            self.clock_domain_id,
+            name="clock_domain_id",
+        )
+        if not isinstance(self.strategy_spec, FormalCompositionStrategySpec):
+            raise TypeError(
+                "strategy_spec must be a FormalCompositionStrategySpec."
+            )
+        if not isinstance(self.composition_spec, CompositionSpec):
+            raise TypeError("composition_spec must be a CompositionSpec.")
+        if not isinstance(self.input_snapshot, CompositionInputSnapshot):
+            raise TypeError(
+                "input_snapshot must be a CompositionInputSnapshot."
+            )
+        composition_spec_hash = self.composition_spec.semantic_content_hash
+        if (
+            self.strategy_spec.composition_spec_hash
+            != composition_spec_hash
+            or self.input_snapshot.composition_spec_hash
+            != composition_spec_hash
+        ):
+            raise ValueError(
+                "Formal strategy, composition spec, and input snapshot mismatch."
+            )
+        if self.input_snapshot.control_domain_id != control_domain_id:
+            raise ValueError("Formal strategy input belongs to another domain.")
+        channels = self.strategy_spec.required_context_channels
+        context_snapshot_id: str | None = None
+        context_snapshot_hash: str | None = None
+        if channels:
+            if self.information_plan is None:
+                raise ValueError(
+                    "Formal strategy context requires a CompositionInformationPlan."
+                )
+            if self.information_plan.required_context_channels != channels:
+                raise ValueError(
+                    "Formal strategy channels do not match the information plan."
+                )
+            if self.context_snapshot is None:
+                raise ValueError(
+                    "Formal strategy context requires one context snapshot."
+                )
+        if self.context_snapshot is not None:
+            if not isinstance(
+                self.context_snapshot,
+                CompositionContextSnapshot,
+            ):
+                raise TypeError(
+                    "context_snapshot must be a CompositionContextSnapshot."
+                )
+            if (
+                self.context_snapshot.control_domain_id != control_domain_id
+                or self.context_snapshot.cutoff_at
+                != self.input_snapshot.cutoff_at
+                or self.context_snapshot.cutoff_admission_sequence
+                != self.input_snapshot.cutoff_admission_sequence
+                or self.context_snapshot.target_effective_at
+                != self.input_snapshot.target_effective_at
+                or self.context_snapshot.required_channels != channels
+            ):
+                raise ValueError(
+                    "Formal strategy action/context snapshots must share one cut."
+                )
+            context_snapshot_id = self.context_snapshot.context_snapshot_id
+            context_snapshot_hash = (
+                self.context_snapshot.semantic_content_hash
+            )
+        information_plan_hash = (
+            None
+            if self.information_plan is None
+            else self.information_plan.semantic_content_hash
+        )
+        payload = {
+            "runtime_session_id": runtime_session_id,
+            "control_domain_id": control_domain_id,
+            "clock_domain_id": clock_domain_id,
+            "strategy_id": self.strategy_spec.strategy_id,
+            "strategy_spec_hash": self.strategy_spec.semantic_content_hash,
+            "composition_spec_hash": composition_spec_hash,
+            "composition_input_snapshot_id": (
+                self.input_snapshot.composition_input_snapshot_id
+            ),
+            "composition_input_snapshot_hash": (
+                self.input_snapshot.semantic_content_hash
+            ),
+            "context_snapshot_id": context_snapshot_id,
+            "context_snapshot_hash": context_snapshot_hash,
+            "information_plan_hash": information_plan_hash,
+        }
+        object.__setattr__(
+            self,
+            "runtime_session_id",
+            runtime_session_id,
+        )
+        object.__setattr__(self, "control_domain_id", control_domain_id)
+        object.__setattr__(self, "clock_domain_id", clock_domain_id)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V2,
+            ),
+        )
+
+    @property
+    def strategy_input_id(self) -> str:
+        return f"formal-composition-strategy-input:{self.semantic_content_hash}"
+
+
+@dataclass(frozen=True)
+class CompositionStrategyDecision:
+    """Minimal semantic output returned by a formal strategy."""
+
+    output_status: str
+    reason: str
+    composed_action: RobotAction | None
+    used_context_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        status = _required(self.output_status, name="output_status")
+        if status not in {"ready", "no_action", "invalid"}:
+            raise ValueError("Unsupported composition strategy output status.")
+        reason = _required(self.reason, name="reason")
+        if (status == "ready") != (self.composed_action is not None):
+            raise ValueError(
+                "Only a ready strategy decision may contain an action."
+            )
+        action = (
+            None
+            if self.composed_action is None
+            else freeze_robot_action(self.composed_action)
+        )
+        used_context_ids = tuple(
+            _required(value, name="used_context_id")
+            for value in self.used_context_ids
+        )
+        if len(used_context_ids) != len(set(used_context_ids)):
+            raise ValueError("used_context_ids must be unique.")
+        object.__setattr__(self, "output_status", status)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "composed_action", action)
+        object.__setattr__(self, "used_context_ids", used_context_ids)
+
+
+class FormalCompositionStrategy(Protocol):
+    @property
+    def spec(self) -> FormalCompositionStrategySpec: ...
+
+    def decide(
+        self,
+        strategy_input: FormalCompositionStrategyInput,
+    ) -> CompositionStrategyDecision: ...
+
+
+class DeterministicCompositionStrategyV2:
+    """Migration adapter that reproduces deterministic-v1 numerical behavior."""
+
+    def __init__(self, spec: FormalCompositionStrategySpec) -> None:
+        if not isinstance(spec, FormalCompositionStrategySpec):
+            raise TypeError(
+                "spec must be a FormalCompositionStrategySpec."
+            )
+        if spec.required_context_channels:
+            raise ValueError(
+                "The deterministic migration strategy does not consume context."
+            )
+        self._spec = spec
+        self._composer = DeterministicComposer()
+
+    @property
+    def spec(self) -> FormalCompositionStrategySpec:
+        return self._spec
+
+    def decide(
+        self,
+        strategy_input: FormalCompositionStrategyInput,
+    ) -> CompositionStrategyDecision:
+        if strategy_input.strategy_spec != self.spec:
+            raise ValueError("Formal strategy input uses another strategy spec.")
+        result = self._composer.compose(
+            strategy_input.input_snapshot,
+            spec=strategy_input.composition_spec,
+        )
+        return CompositionStrategyDecision(
+            output_status=result.output_status,
+            reason=result.reason,
+            composed_action=result.composed_action,
+        )
+
+
+def build_formal_strategy_composition_result(
+    strategy_input: FormalCompositionStrategyInput,
+    decision: CompositionStrategyDecision,
+) -> CompositionResult:
+    """Build the canonical v4 result for one exact formal strategy input."""
+
+    if not isinstance(strategy_input, FormalCompositionStrategyInput):
+        raise TypeError(
+            "strategy_input must be a FormalCompositionStrategyInput."
+        )
+    if not isinstance(decision, CompositionStrategyDecision):
+        raise TypeError("decision must be a CompositionStrategyDecision.")
+    context_snapshot = strategy_input.context_snapshot
+    available_context_ids = (
+        set()
+        if context_snapshot is None
+        else set(context_snapshot.selected_context_id_by_channel.values())
+    )
+    if not set(decision.used_context_ids).issubset(available_context_ids):
+        raise ValueError(
+            "Strategy decision references context outside its frozen snapshot."
+        )
+    snapshot = strategy_input.input_snapshot
+    spec = strategy_input.composition_spec
+    ordered_inputs = tuple(
+        snapshot.selected_input_by_role[role]
+        for role in spec.input_roles
+        if role in snapshot.selected_input_by_role
+    )
+    input_ids = tuple(item.composition_input_id for item in ordered_inputs)
+    input_hashes = tuple(item.semantic_content_hash for item in ordered_inputs)
+    context_ids = tuple(
+        dict.fromkeys(
+            context_id
+            for item in ordered_inputs
+            for context_id in item.context_ids
+        )
+    )
+    action_hash = (
+        None
+        if decision.composed_action is None
+        else canonical_content_hash(
+            robot_action_semantic_payload(decision.composed_action),
+            domain="dexteleop.composed_robot_action.v1",
+        )
+    )
+    context_snapshot_id = (
+        None
+        if context_snapshot is None
+        else context_snapshot.context_snapshot_id
+    )
+    context_snapshot_hash = (
+        None
+        if context_snapshot is None
+        else context_snapshot.semantic_content_hash
+    )
+    information_plan_hash = (
+        None
+        if strategy_input.information_plan is None
+        else strategy_input.information_plan.semantic_content_hash
+    )
+    payload = {
+        "composition_input_snapshot_id": (
+            snapshot.composition_input_snapshot_id
+        ),
+        "composition_input_snapshot_hash": snapshot.semantic_content_hash,
+        "composition_spec_hash": spec.semantic_content_hash,
+        "output_status": decision.output_status,
+        "reason": decision.reason,
+        "composed_action_hash": action_hash,
+        "input_ids": input_ids,
+        "input_hashes": input_hashes,
+        "context_ids": context_ids,
+        "strategy_id": strategy_input.strategy_spec.strategy_id,
+        "strategy_spec_hash": (
+            strategy_input.strategy_spec.semantic_content_hash
+        ),
+        "strategy_input_id": strategy_input.strategy_input_id,
+        "strategy_input_hash": strategy_input.semantic_content_hash,
+        "strategy_context_snapshot_id": context_snapshot_id,
+        "strategy_context_snapshot_hash": context_snapshot_hash,
+        "strategy_information_plan_hash": information_plan_hash,
+        "strategy_used_context_ids": decision.used_context_ids,
+    }
+    if snapshot.expected_activation_id is not None:
+        payload["composition_activation_id"] = (
+            snapshot.expected_activation_id
+        )
+        payload["composition_activation_hash"] = (
+            snapshot.expected_activation_hash
+        )
+    digest = canonical_content_hash(
+        payload,
+        domain=COMPOSITION_RESULT_HASH_DOMAIN_V4,
+    )
+    return CompositionResult(
+        composition_result_id=f"composition-result:{digest}",
+        composed_action=decision.composed_action,
+        semantic_content_hash=digest,
+        **payload,
+    )
+
+
+@dataclass(frozen=True)
+class FormalCompositionStrategyResultBinding:
+    """Traceable relation between one strategy input and its canonical result."""
+
+    strategy_input_id: str
+    strategy_input_hash: str
+    composition_result_id: str
+    composition_result_hash: str
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        payload = {
+            "strategy_input_id": _required(
+                self.strategy_input_id,
+                name="strategy_input_id",
+            ),
+            "strategy_input_hash": _required(
+                self.strategy_input_hash,
+                name="strategy_input_hash",
+            ),
+            "composition_result_id": _required(
+                self.composition_result_id,
+                name="composition_result_id",
+            ),
+            "composition_result_hash": _required(
+                self.composition_result_hash,
+                name="composition_result_hash",
+            ),
+        }
+        for name, value in payload.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=(
+                    FORMAL_COMPOSITION_STRATEGY_RESULT_BINDING_HASH_DOMAIN_V2
+                ),
+            ),
+        )
+
+    @property
+    def binding_id(self) -> str:
+        return (
+            "formal-composition-strategy-result-binding:"
+            f"{self.semantic_content_hash}"
+        )
+
+
+def build_formal_strategy_result_binding(
+    strategy_input: FormalCompositionStrategyInput,
+    result: CompositionResult,
+) -> FormalCompositionStrategyResultBinding:
+    if result.strategy_input_id != strategy_input.strategy_input_id or (
+        result.strategy_input_hash != strategy_input.semantic_content_hash
+    ):
+        raise ValueError("Composition result does not match the strategy input.")
+    return FormalCompositionStrategyResultBinding(
+        strategy_input_id=strategy_input.strategy_input_id,
+        strategy_input_hash=strategy_input.semantic_content_hash,
+        composition_result_id=result.composition_result_id,
+        composition_result_hash=result.semantic_content_hash,
+    )
+
+
+__all__ = [
+    "FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V2",
+    "FORMAL_COMPOSITION_STRATEGY_RESULT_BINDING_HASH_DOMAIN_V2",
+    "FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V2",
+    "CompositionStrategyDecision",
+    "DeterministicCompositionStrategyV2",
+    "FormalCompositionStrategy",
+    "FormalCompositionStrategyInput",
+    "FormalCompositionStrategyResultBinding",
+    "FormalCompositionStrategySpec",
+    "build_formal_strategy_composition_result",
+    "build_formal_strategy_result_binding",
+]

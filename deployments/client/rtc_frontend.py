@@ -289,23 +289,33 @@ def build_rtc_model_shadow_frontend(
             "A relative RTC model adapter must provide "
             "representation_context_builder."
         )
+    emission_adapter = getattr(preparer, "action_adapter", None)
 
     return RtcPolicyShadowFrontend(
         config=config,
         deploy_runtime=deploy_runtime,
         policy=identity,
-        preparer=preparer,
         created_at=created_at,
+        emission_adapter=emission_adapter,
         clock=clock,
         executor_factory=executor_factory,
         representation_context_builder=representation_context_builder,
     )
 
 
+# Canonical functional names for new raw/model RTC integrations.  The existing
+# Shadow/Frontend names remain the same callable objects for import and
+# behavior compatibility.
+rtc_producer_config_from_model_adapter = rtc_shadow_config_from_model_adapter
+build_rtc_model_producer_runtime = build_rtc_model_shadow_frontend
+
+
 __all__ = [
     "RtcModelPolicyIdentity",
     "RtcModelRuntimeAdapter",
     "SimpleRtcModelRuntimeAdapter",
+    "build_rtc_model_producer_runtime",
     "build_rtc_model_shadow_frontend",
+    "rtc_producer_config_from_model_adapter",
     "rtc_shadow_config_from_model_adapter",
 ]

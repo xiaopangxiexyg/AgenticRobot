@@ -77,88 +77,16 @@ _TRACKER_AFTER_CORRECTION_COLOR_RGBA = (0.05, 0.75, 1.0, 1.0)
 DEFAULT_RUNTIME_HOME_START_DELAY_SEC = 2.0
 
 
-def _positive_float(text: str) -> float:
-    value = float(text)
-    if value <= 0.0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return value
-
-
-def _non_negative_int(text: str) -> int:
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("value must be >= 0")
-    return value
-
-
-def _alpha_float(text: str) -> float:
-    value = float(text)
-    if not 0.0 < value <= 1.0:
-        raise argparse.ArgumentTypeError("alpha must be in (0, 1]")
-    return value
-
-
-def _parse_joint_order(text: str) -> tuple[int, ...]:
-    parts = [part.strip() for part in str(text).split(",") if part.strip()]
-    if len(parts) != 6:
-        raise argparse.ArgumentTypeError("joint order must contain 6 comma-separated indices")
-    try:
-        order = tuple(int(part) for part in parts)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid joint order: {text}") from exc
-    if sorted(order) != [0, 1, 2, 3, 4, 5]:
-        raise argparse.ArgumentTypeError("joint order must be a permutation of 0,1,2,3,4,5")
-    return order
-
-
-def _parse_arm_max_angvel(text: str) -> tuple[float, ...]:
-    parts = [part.strip() for part in str(text).split(",") if part.strip()]
-    if not parts:
-        raise argparse.ArgumentTypeError("arm max angvel must be a float or 6 comma-separated floats")
-    try:
-        values = [float(part) for part in parts]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid arm max angvel: {text}") from exc
-    if len(values) == 1:
-        value = float(values[0])
-        if value <= 0.0:
-            raise argparse.ArgumentTypeError("arm max angvel must be positive")
-        return (value,) * 6
-    if len(values) != 6:
-        raise argparse.ArgumentTypeError("arm max angvel must contain 1 or 6 floats")
-    if any(value <= 0.0 for value in values):
-        raise argparse.ArgumentTypeError("arm max angvel must be positive")
-    return tuple(float(value) for value in values)
-
-
-def _parse_active_sides(text: str) -> tuple[str, ...]:
-    value = str(text).strip().lower()
-    if value == "both":
-        return ("left", "right")
-    if value in {"left", "right"}:
-        return (value,)
-    raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
-
-
-def _normalize_active_sides(value: object) -> tuple[str, ...]:
-    if value is None:
-        return ("left", "right")
-    if isinstance(value, str):
-        return _parse_active_sides(value)
-    sides = tuple(str(side).strip().lower() for side in value if str(side).strip())
-    if sides == ("both",):
-        return ("left", "right")
-    invalid = set(sides) - {"left", "right"}
-    if invalid:
-        raise ValueError(f"Unsupported active side(s): {sorted(invalid)}")
-    ordered = tuple(side for side in ("left", "right") if side in set(sides))
-    if not ordered:
-        raise ValueError("At least one active side is required.")
-    return ordered
-
-
-def _active_sides_from_args(args: argparse.Namespace) -> tuple[str, ...]:
-    return _normalize_active_sides(getattr(args, "active_sides", ("left", "right")))
+from ..cli_value_parsers import (
+    _active_sides_from_args,
+    _alpha_float,
+    _non_negative_int,
+    _normalize_active_sides,
+    _parse_active_sides,
+    _parse_arm_max_angvel,
+    _parse_joint_order,
+    _positive_float,
+)
 
 
 def _active_side_set(components) -> set[str]:
@@ -1582,20 +1510,33 @@ def _runtime_home_calibration(
     num_samples: int,
     progress_callback=None,
     require_stable: bool = False,
+    capture_sides: tuple[str, ...] | None = None,
+    stability_profile: str = "strict",
 ) -> None:
     calibration = components.session.calibration
     assert calibration is not None
     active_sides = components.active_sides
+    if capture_sides is None:
+        home_sides = tuple(active_sides)
+    else:
+        requested_sides = tuple(dict.fromkeys(str(side) for side in capture_sides))
+        invalid_sides = tuple(side for side in requested_sides if side not in active_sides)
+        if invalid_sides or not requested_sides:
+            raise ValueError(
+                "runtime Home capture_sides must be a non-empty subset of active sides; "
+                f"requested={requested_sides!r} active={active_sides!r}"
+            )
+        home_sides = requested_sides
     tracker_expectations = ", ".join(
         f"{side}_wrist_pose<-{calibration.metadata.get(f'{side}_tracker_name') or f'{side}_wrist role'}"
-        for side in active_sides
+        for side in home_sides
     )
     _log(
         "Calibration",
         f"expecting {tracker_expectations}",
     )
     mapping_summary = ", ".join(
-        f"{side}_wrist_pose -> {side}_arm" for side in active_sides
+        f"{side}_wrist_pose -> {side}_arm" for side in home_sides
     )
     _log(
         "Calibration",
@@ -1646,13 +1587,26 @@ def _runtime_home_calibration(
         )
     calibration_timing_start = time.perf_counter()
     start_time = time.time()
-    samples: dict[str, list[np.ndarray]] = {side: [] for side in active_sides}
-    stability_by_side = {
-        side: HomeCaptureStabilityState() for side in active_sides
-    }
+    samples: dict[str, list[np.ndarray]] = {side: [] for side in home_sides}
+    profile_name = str(stability_profile or "strict").strip().lower()
+    if profile_name not in {"strict", "transition"}:
+        raise ValueError(
+            "runtime Home stability_profile must be 'strict' or 'transition', "
+            f"got {stability_profile!r}"
+        )
+    _log(
+        "Calibration",
+        f"stability_profile={profile_name} capture_sides={','.join(home_sides)}",
+    )
+    stability_factory = (
+        HomeCaptureStabilityState.transition_profile
+        if profile_name == "transition"
+        else HomeCaptureStabilityState
+    )
+    stability_by_side = {side: stability_factory() for side in home_sides}
     observed_channels: set[str] = set()
     sample_markers = sorted({1, max(1, num_samples // 2), num_samples})
-    reported: dict[str, set[int]] = {side: set() for side in active_sides}
+    reported: dict[str, set[int]] = {side: set() for side in home_sides}
 
     def publish_progress(*, now: float, channels=None, waiting: bool = False) -> None:
         if progress_callback is None:
@@ -1664,10 +1618,10 @@ def _runtime_home_calibration(
                     channels.get(f"{side}_wrist_pose") is not None
                     and channels[f"{side}_wrist_pose"].valid
                 )
-                for side in active_sides
+                for side in home_sides
             }
         progress_callback(
-            sample_counts={side: len(samples[side]) for side in active_sides},
+            sample_counts={side: len(samples[side]) for side in home_sides},
             valid_by_side=valid,
             min_samples=int(num_samples),
             elapsed_sec=max(0.0, now - start_time),
@@ -1678,10 +1632,10 @@ def _runtime_home_calibration(
 
     publish_progress(now=start_time, waiting=False)
 
-    while any(len(samples[side]) < num_samples for side in active_sides):
+    while any(len(samples[side]) < num_samples for side in home_sides):
         now = time.time()
         if now - start_time > timeout_sec:
-            counts = {side: len(samples[side]) for side in active_sides}
+            counts = {side: len(samples[side]) for side in home_sides}
             publish_progress(now=now, waiting=True)
             raise TimeoutError(
                 "Timed out waiting for active wrist tracker(s) during runtime calibration. "
@@ -1716,7 +1670,7 @@ def _runtime_home_calibration(
                 right_qpos_hand=_hand_render_qpos(components.right_hand_backend, "right"),
                 capture_image=False,
             )
-        for side in active_sides:
+        for side in home_sides:
             channel = channels.get(f"{side}_wrist_pose")
             if channel is None:
                 continue
@@ -1754,7 +1708,7 @@ def _runtime_home_calibration(
                             f"{side} progress {len(samples[side])}/{num_samples}",
                             now=now,
                         )
-        if any(len(samples[side]) < num_samples for side in active_sides):
+        if any(len(samples[side]) < num_samples for side in home_sides):
             publish_progress(
                 now=now,
                 channels=channels,
@@ -1780,7 +1734,7 @@ def _runtime_home_calibration(
     qpos_summaries: list[str] = []
     side_timing_summaries: list[str] = []
     post_sample_start = time.perf_counter()
-    for side in active_sides:
+    for side in home_sides:
         side_start = time.perf_counter()
         mean_start = time.perf_counter()
         human_home = _mean_pose(samples[side])

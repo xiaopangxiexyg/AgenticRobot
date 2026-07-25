@@ -2,7 +2,7 @@
 
 The protocols deliberately expose existing immutable lower-runtime objects.
 They do not grant authority or motion permission: proposal admission remains a
-RobotMotion responsibility and trace persistence remains an injected owner.
+RobotMotion responsibility and observation/persistence remains an injected owner.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from dataset_contracts.control_trace import ControlTraceFact
+    from .events import CompositionDomainEvent
     from robot_motion.action.proposal import (
         ActionProposalDraft,
         ProposalAdmissionReceipt,
@@ -26,10 +26,10 @@ class CompositionClock(Protocol):
 
 
 @runtime_checkable
-class CompositionTraceEmitter(Protocol):
-    """Publish an atomic batch of non-owning ControlTrace facts."""
+class CompositionEventEmitter(Protocol):
+    """Publish an atomic batch of protocol-neutral composition events."""
 
-    def __call__(self, facts: tuple["ControlTraceFact", ...]) -> None:
+    def __call__(self, events: tuple["CompositionDomainEvent", ...]) -> None:
         ...
 
 
@@ -49,5 +49,5 @@ class CompositionProposalAdmitter(Protocol):
 __all__ = [
     "CompositionClock",
     "CompositionProposalAdmitter",
-    "CompositionTraceEmitter",
+    "CompositionEventEmitter",
 ]

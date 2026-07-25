@@ -982,6 +982,11 @@ def test_real_teleop_wrist_depth_resolution_also_sets_wrist_rgb_resolution(tmp_p
     front_config = sources["front"].config
     left_config = sources["left_wrist"].config
     right_config = sources["right_wrist"].config
+    assert front_config.color_format == "bgr8"
+    assert left_config.color_format == "bgr8"
+    assert right_config.color_format == "bgr8"
+    assert left_config.metadata["configured_color_format"] == "yuyv"
+    assert left_config.metadata["real_teleop_color_format_override"] == "bgr8"
     assert front_config.enable_depth is False
     assert front_config.width == 640
     assert front_config.height == 480
@@ -998,6 +1003,13 @@ def test_real_teleop_wrist_depth_resolution_also_sets_wrist_rgb_resolution(tmp_p
     assert right_config.height == 240
     assert right_config.depth_width == 424
     assert right_config.depth_height == 240
+
+
+def test_real_teleop_camera_color_format_defaults_to_bgr8_and_allows_explicit_yuyv() -> None:
+    assert _parse_real_teleop_args(["--no-camera"]).camera_color_format == "bgr8"
+    assert _parse_real_teleop_args(
+        ["--no-camera", "--camera-color-format", "yuyv"]
+    ).camera_color_format == "yuyv"
 
 
 def test_real_teleop_wrist_cam_resolution_args_parse_to_wrist_cam_fields() -> None:

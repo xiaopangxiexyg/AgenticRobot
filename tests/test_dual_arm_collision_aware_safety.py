@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -838,6 +839,41 @@ def test_position_candidate_layer_accepts_singular_when_no_clean_branch(
     assert preference["fully_non_singular_count"] == 0
     assert preference["fallback_to_singular"] is True
     assert preference["selected"]["sides"]["left"]["is_wrist_singular"] is True
+
+
+def test_local_singularity_escape_emits_one_step_j3_candidate() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    retargeter.ik_safety_profile = replace(
+        retargeter.ik_safety_profile,
+        local_step_singularity_escape_enabled=True,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(3.5)
+    targets = retargeter.current_world_targets()
+
+    candidates, metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=reference,
+        current_targets=targets,
+    )
+
+    assert metadata["status"] == "active"
+    assert candidates
+    assert all(
+        candidate.metadata["local_step_singularity_escape_candidate"]
+        for candidate in candidates
+    )
+    assert any(
+        candidate.metadata["local_step_singularity_escape_depth_progress"] > 0
+        if "local_step_singularity_escape_depth_progress" in candidate.metadata
+        else candidate.metadata["local_step_singularity_escape_side_candidate"][
+            "elbow_margin_deg"
+        ]
+        > 0
+        for candidate in candidates
+    )
 
 
 def test_position_candidate_layer_expands_auxiliary_for_elbow_singularity(
