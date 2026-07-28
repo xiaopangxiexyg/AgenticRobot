@@ -376,10 +376,23 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 383
-    assert sum(len(action.option_strings) for action in parser._actions) == 426
+    assert len(parser._actions) == 389
+    assert sum(len(action.option_strings) for action in parser._actions) == 433
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
+    assert parser.parse_args([]).v25p_native_shadow is False
+    assert parser.parse_args([]).v25p_native_storage_layout == "record_cjson_v1"
+    assert parser.parse_args(["--v25p-native-shadow"]).v25p_native_shadow is True
+    assert (
+        parser.parse_args(
+            [
+                "--v25p-native-shadow",
+                "--v25p-native-storage-layout",
+                "parquet_stream_chunks_v1",
+            ]
+        ).v25p_native_storage_layout
+        == "parquet_stream_chunks_v1"
+    )
 
     for name in (
         "DEFAULT_CAMERA_CONFIG_PATH",
@@ -577,8 +590,9 @@ def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
     }
     support = {
         "_arm_control_mode_arg": lambda args: "position",
-        "_attach_actuator_command_trace_sink": lambda *args: None,
-        "_attach_position_audit_sink": lambda *args: None,
+            "_attach_actuator_command_trace_sink": lambda *args: None,
+            "_attach_ik_shadow_trace_sink": lambda *args: None,
+            "_attach_position_audit_sink": lambda *args: None,
         "_attach_singularity_transition_trace_sink": lambda *args: None,
         "_close_camera_sources": lambda sources: None,
         "_log": lambda *args: None,
@@ -783,6 +797,16 @@ def test_device_retry_runtime_keeps_optional_foot_pad_status_dynamic() -> None:
     )
     clutch = SimpleNamespace(
         _current_active_controls=lambda: (),
+        _foot_pad_test_ui_state=lambda: {
+            "foot_pad_available": bool(
+                foot_pad_slot[0] is not None
+                and getattr(foot_pad_slot[0], "is_online", False)
+            ),
+            "foot_pad_status": "online"
+            if foot_pad_slot[0] is not None
+            and getattr(foot_pad_slot[0], "is_online", False)
+            else "unavailable",
+        },
     )
     ui = SimpleNamespace(
         publish=lambda **kwargs: published.append(kwargs),
@@ -828,6 +852,11 @@ def test_device_retry_runtime_keeps_optional_foot_pad_status_dynamic() -> None:
     assert "foot_pad" not in errors
     assert args.foot_pad_startup_error == ""
     assert published
+    assert any(
+        update.get("foot_pad_available") is True
+        and update.get("foot_pad_status") == "online"
+        for update in published
+    )
 
 
 def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:

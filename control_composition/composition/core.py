@@ -39,6 +39,10 @@ from control_composition.activation import (
     evaluate_composition_input_activation,
 )
 from control_composition.eligibility import CompositionSourceEligibilitySnapshot
+from control_composition.temporal import (
+    DEFAULT_COMPOSITION_TEMPORAL_SELECTION_SPEC,
+    CompositionTemporalSelectionSpec,
+)
 
 from .component_contract import FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2
 from .pose import (
@@ -49,13 +53,21 @@ from .pose import (
 from robot_motion.action.proposal import (
     ActionProposalDraft,
     freeze_robot_action,
-    robot_action_semantic_payload,
+)
+from robot_motion.action.component_action import (
+    ComponentAction,
+    ComponentActionSchema,
+)
+from robot_motion.action.component_action_v1 import (
+    materialize_robot_action_v1,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.schema import RobotAction, split_effector_name
 
 
 COMPOSITION_INPUT_HASH_DOMAIN_V1 = "dexteleop.composition_input.semantic.v1"
 COMPOSITION_INPUT_HASH_DOMAIN_V2 = "dexteleop.composition_input.semantic.v2"
+COMPOSITION_INPUT_HASH_DOMAIN_V3 = "dexteleop.composition_input.semantic.v3"
 COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V1 = (
     "dexteleop.composition_input_snapshot.v1"
 )
@@ -65,12 +77,29 @@ COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V2 = (
 COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V3 = (
     "dexteleop.composition_input_snapshot.v3"
 )
+COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V4 = (
+    "dexteleop.composition_input_snapshot.v4"
+)
+COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V5 = (
+    "dexteleop.composition_input_snapshot.v5"
+)
+COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V6 = (
+    "dexteleop.composition_input_snapshot.v6"
+)
+COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V7 = (
+    "dexteleop.composition_input_snapshot.v7"
+)
 COMPOSITION_SPEC_HASH_DOMAIN_V1 = "dexteleop.composition_spec.v1"
 COMPOSITION_SPEC_HASH_DOMAIN_V2 = "dexteleop.composition_spec.v2"
-COMPOSITION_RESULT_HASH_DOMAIN_V1 = "dexteleop.composition_result.v1"
-COMPOSITION_RESULT_HASH_DOMAIN_V2 = "dexteleop.composition_result.v2"
-COMPOSITION_RESULT_HASH_DOMAIN_V3 = "dexteleop.composition_result.v3"
-COMPOSITION_RESULT_HASH_DOMAIN_V4 = "dexteleop.composition_result.v4"
+COMPOSITION_SPEC_HASH_DOMAIN_V3 = "dexteleop.composition_spec.v3"
+COMPOSITION_SPEC_HASH_DOMAIN_V4 = "dexteleop.composition_spec.v4"
+COMPOSITION_EVALUATION_HASH_DOMAIN_V1 = "dexteleop.composition_evaluation.v1"
+COMPOSITION_EVALUATION_HASH_DOMAIN_V2 = "dexteleop.composition_evaluation.v2"
+COMPOSITION_EVALUATION_HASH_DOMAIN_V3 = "dexteleop.composition_evaluation.v3"
+COMPOSITION_EVALUATION_HASH_DOMAIN_V4 = "dexteleop.composition_evaluation.v4"
+COMPOSITION_EVALUATION_HASH_DOMAIN_V5 = "dexteleop.composition_evaluation.v5"
+COMPOSITION_EVALUATION_HASH_DOMAIN_V6 = "dexteleop.composition_evaluation.v6"
+COMPOSITION_EVALUATION_HASH_DOMAIN_V7 = "dexteleop.composition_evaluation.v7"
 COMPOSITION_AUTHORITY_GATE_SPEC_HASH_DOMAIN_V1 = (
     "dexteleop.composition_authority_gate_spec.v1"
 )
@@ -94,6 +123,10 @@ class CompositionAdmissionError(ValueError):
 
 
 def _required(value: object, *, field_name: str) -> str:
+    if value is None:
+        raise CompositionAdmissionError(
+            "invalid_field", f"{field_name} must be non-empty."
+        )
     normalized = str(value).strip()
     if not normalized:
         raise CompositionAdmissionError(
@@ -119,7 +152,7 @@ class CompositionInputDraft:
     producer_epoch: int
     sequence: int
     input_role: str
-    action: RobotAction
+    action: ComponentAction
     produced_at: float
     produced_clock_domain_id: str
     effective_from: float
@@ -145,7 +178,7 @@ class CompositionInputRecord:
     producer_epoch: int
     sequence: int
     input_role: str
-    action: RobotAction
+    action: ComponentAction
     produced_at: float
     produced_clock_domain_id: str
     available_at: float
@@ -184,7 +217,10 @@ class CompositionSpec:
     spec_id: str
     algebra: str
     input_roles: tuple[str, ...]
-    required_roles: tuple[str, ...]
+    required_roles: tuple[str, ...] | None = None
+    depends_on_roles_by_role: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
     missing_required_behavior: str = "no_action"
     missing_residual_behavior: str = "zero_residual"
     residual_limit_by_component: Mapping[str, float] = field(default_factory=dict)
@@ -195,6 +231,10 @@ class CompositionSpec:
         POSE_MIXING_ARM_COMPONENTS_V1
     )
     component_rule_set_hash: str | None = None
+    action_schema_hash: str | None = None
+    input_action_schema_hash_by_role: Mapping[str, str] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         _required(self.spec_id, field_name="spec_id")
@@ -202,13 +242,72 @@ class CompositionSpec:
         if algebra not in COMPOSITION_ALGEBRAS_V1 | COMPOSITION_ALGEBRAS_V2:
             raise ValueError(f"Unsupported composition algebra {algebra!r}.")
         roles = tuple(_required(value, field_name="input_role") for value in self.input_roles)
-        required = tuple(
-            _required(value, field_name="required_role") for value in self.required_roles
+        required = (
+            roles
+            if self.required_roles is None
+            else tuple(
+                _required(value, field_name="required_role")
+                for value in self.required_roles
+            )
         )
         if not roles or len(roles) != len(set(roles)):
             raise ValueError("Composition input_roles must be non-empty and unique.")
+        if len(required) != len(set(required)):
+            raise ValueError("required_roles must be unique.")
         if not set(required).issubset(roles):
             raise ValueError("required_roles must be a subset of input_roles.")
+        dependencies: dict[str, tuple[str, ...]] = {}
+        for raw_role, raw_dependencies in dict(
+            self.depends_on_roles_by_role
+        ).items():
+            role = _required(raw_role, field_name="dependent_role")
+            if role not in roles:
+                raise ValueError(
+                    "Dependency owners must belong to input_roles."
+                )
+            role_dependencies = tuple(
+                _required(value, field_name=f"dependency for {role}")
+                for value in raw_dependencies
+            )
+            if len(role_dependencies) != len(set(role_dependencies)):
+                raise ValueError(
+                    f"Dependencies for role {role!r} must be unique."
+                )
+            if role in role_dependencies:
+                raise ValueError("A composition role cannot depend on itself.")
+            if not set(role_dependencies).issubset(roles):
+                raise ValueError(
+                    "Role dependencies must belong to input_roles."
+                )
+            if role_dependencies:
+                dependencies[role] = role_dependencies
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(role: str) -> None:
+            if role in visiting:
+                raise ValueError("Composition role dependencies must be acyclic.")
+            if role in visited:
+                return
+            visiting.add(role)
+            for dependency in dependencies.get(role, ()):
+                visit(dependency)
+            visiting.remove(role)
+            visited.add(role)
+
+        for role in roles:
+            visit(role)
+        required_set = set(required)
+        for role in required:
+            stack = list(dependencies.get(role, ()))
+            while stack:
+                dependency = stack.pop()
+                if dependency not in required_set:
+                    raise ValueError(
+                        "A required role may depend only on required roles; "
+                        f"{role!r} depends on optional role {dependency!r}."
+                    )
+                stack.extend(dependencies.get(dependency, ()))
         if self.missing_required_behavior not in {"no_action", "invalid"}:
             raise ValueError("Unsupported missing_required_behavior.")
         if self.missing_residual_behavior not in {
@@ -244,6 +343,25 @@ class CompositionSpec:
             self.pose_component_dependencies
         )
         component_rule_set_hash = self.component_rule_set_hash
+        action_schema_hash = self.action_schema_hash
+        input_schema_hashes: dict[str, str] = {}
+        for raw_role, raw_hash in dict(
+            self.input_action_schema_hash_by_role
+        ).items():
+            role = _required(raw_role, field_name="input schema role")
+            if role not in roles:
+                raise ValueError(
+                    "Input action schema roles must belong to input_roles."
+                )
+            input_schema_hashes[role] = _required(
+                raw_hash,
+                field_name=f"input action schema hash for {role}",
+            )
+        if input_schema_hashes and set(input_schema_hashes) != set(roles):
+            raise ValueError(
+                "input_action_schema_hash_by_role must bind every input role "
+                "when present."
+            )
         if algebra == "weighted_se3_pose_fusion":
             if set(weights) != set(roles) or not any(
                 weight > 0.0 for weight in weights.values()
@@ -275,6 +393,11 @@ class CompositionSpec:
                     "weighted_se3_pose_fusion does not use residual limits."
                 )
         elif algebra == FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2:
+            if action_schema_hash is not None:
+                action_schema_hash = _required(
+                    action_schema_hash,
+                    field_name="action_schema_hash",
+                )
             if component_rule_set_hash is None:
                 raise ValueError(
                     "component_rule_set_hash must be non-empty."
@@ -283,6 +406,11 @@ class CompositionSpec:
                 component_rule_set_hash,
                 field_name="component_rule_set_hash",
             )
+            if input_schema_hashes and action_schema_hash is None:
+                raise ValueError(
+                    "Role-specific input schemas require an explicit output "
+                    "action_schema_hash."
+                )
             if (
                 limits
                 or weights
@@ -311,9 +439,24 @@ class CompositionSpec:
             raise ValueError(
                 "component_rule_set_hash requires formal_component_strategy_v2."
             )
+        if algebra in COMPOSITION_ALGEBRAS_V1 and action_schema_hash is not None:
+            action_schema_hash = _required(
+                action_schema_hash,
+                field_name="action_schema_hash",
+            )
+        if algebra in COMPOSITION_ALGEBRAS_V1 and input_schema_hashes:
+            raise ValueError(
+                "Role-specific input action schemas require "
+                "formal_component_strategy_v2."
+            )
         object.__setattr__(self, "algebra", algebra)
         object.__setattr__(self, "input_roles", roles)
         object.__setattr__(self, "required_roles", required)
+        object.__setattr__(
+            self,
+            "depends_on_roles_by_role",
+            MappingProxyType(dependencies),
+        )
         object.__setattr__(self, "residual_limit_by_component", MappingProxyType(limits))
         object.__setattr__(self, "weight_by_role", MappingProxyType(weights))
         object.__setattr__(
@@ -336,14 +479,54 @@ class CompositionSpec:
             "component_rule_set_hash",
             component_rule_set_hash,
         )
+        object.__setattr__(self, "action_schema_hash", action_schema_hash)
+        object.__setattr__(
+            self,
+            "input_action_schema_hash_by_role",
+            MappingProxyType(input_schema_hashes),
+        )
 
     @property
     def schema_version(self) -> int:
+        if self.input_action_schema_hash_by_role:
+            return 4
+        if self.depends_on_roles_by_role:
+            return 3
         return 2 if self.algebra in COMPOSITION_ALGEBRAS_V2 else 1
 
     @property
+    def participation_requirement_by_role(self) -> Mapping[str, str]:
+        required = set(self.required_roles)
+        return MappingProxyType(
+            {
+                role: ("required" if role in required else "optional")
+                for role in self.input_roles
+            }
+        )
+
+    @property
     def semantic_content_hash(self) -> str:
+        dependency_payload = (
+            {
+                "participation_requirement_by_role": (
+                    self.participation_requirement_by_role
+                ),
+                "depends_on_roles_by_role": self.depends_on_roles_by_role,
+            }
+            if self.depends_on_roles_by_role
+            else {}
+        )
         if self.algebra == FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2:
+            schema_payload = (
+                {
+                    "action_schema_hash": self.action_schema_hash,
+                    "input_action_schema_hash_by_role": (
+                        self.input_action_schema_hash_by_role
+                    ),
+                }
+                if self.input_action_schema_hash_by_role
+                else {}
+            )
             return canonical_content_hash(
                 {
                     "spec_id": self.spec_id,
@@ -354,8 +537,18 @@ class CompositionSpec:
                         self.missing_required_behavior
                     ),
                     "component_rule_set_hash": self.component_rule_set_hash,
+                    **dependency_payload,
+                    **schema_payload,
                 },
-                domain=COMPOSITION_SPEC_HASH_DOMAIN_V2,
+                domain=(
+                    COMPOSITION_SPEC_HASH_DOMAIN_V4
+                    if schema_payload
+                    else (
+                        COMPOSITION_SPEC_HASH_DOMAIN_V3
+                        if dependency_payload
+                        else COMPOSITION_SPEC_HASH_DOMAIN_V2
+                    )
+                ),
             )
         payload = {
             "spec_id": self.spec_id,
@@ -366,6 +559,8 @@ class CompositionSpec:
             "missing_residual_behavior": self.missing_residual_behavior,
             "residual_limit_by_component": self.residual_limit_by_component,
         }
+        if self.action_schema_hash is not None:
+            payload["action_schema_hash"] = self.action_schema_hash
         if self.algebra == "weighted_se3_pose_fusion":
             payload.update(
                 {
@@ -389,19 +584,30 @@ class CompositionSpec:
                     self.pose_component_dependencies
                 )
         return canonical_content_hash(
-            payload,
-            domain=COMPOSITION_SPEC_HASH_DOMAIN_V1,
+            {**payload, **dependency_payload},
+            domain=(
+                COMPOSITION_SPEC_HASH_DOMAIN_V3
+                if dependency_payload
+                else COMPOSITION_SPEC_HASH_DOMAIN_V1
+            ),
         )
 
 
 @dataclass(frozen=True)
 class CompositionAuthorityGateSpec:
-    """Fail-closed promotion policy for one formal composition producer.
+    """Compatibility-named output-disposition policy for one composer.
 
-    Contributors remain internal inputs.  Only a ready ``CompositionResult``
+    Contributors remain internal inputs.  Only a ready ``CompositionEvaluation``
     may be promoted, and that promotion belongs to ``composer_producer_id``.
-    Missing required/deadman-like roles, numerical conflicts, and producer
-    errors are execution-gate events rather than implicit weight fallbacks.
+    Missing required/deadman-like roles and numerical conflicts can request a
+    lower-runtime HOLD instead of becoming implicit weight fallbacks.
+
+    This object neither owns nor performs authority, canonical safety, HOLD,
+    cancellation, or dispatch.  Its historic v1 name and hash payload are kept
+    for trace compatibility.  In particular, ``canonical_safety_required`` is
+    only a fixed legacy capability assertion; the actual target preflight,
+    safety evaluation, execution-gate transition, and receipt remain
+    downstream.
     """
 
     gate_spec_id: str
@@ -517,10 +723,15 @@ class CompositionInputSnapshot:
     cutoff_admission_sequence: int
     target_effective_at: float
     composition_spec_hash: str
+    action_schema_hash: str
+    target_clock_domain_id: str
     selected_input_by_role: Mapping[str, CompositionInputRecord]
     missing_roles: tuple[str, ...]
     producer_epoch_snapshot_hash: str
     semantic_content_hash: str
+    temporal_selection_spec_hash: str = (
+        DEFAULT_COMPOSITION_TEMPORAL_SELECTION_SPEC.semantic_content_hash
+    )
     expected_activation_id: str | None = None
     expected_activation_hash: str | None = None
     source_eligibility_snapshot_id: str | None = None
@@ -528,8 +739,30 @@ class CompositionInputSnapshot:
     source_ineligibility_reason_by_role: Mapping[str, str] = field(
         default_factory=dict
     )
+    selected_input_before_dependency_by_role: Mapping[
+        str, CompositionInputRecord
+    ] = field(default_factory=dict)
+    dependency_ineligibility_reason_by_role: Mapping[str, str] = field(
+        default_factory=dict
+    )
+    required_roles: tuple[str, ...] = ()
+    input_action_schema_hash_by_role: Mapping[str, str] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
+        _required(
+            self.action_schema_hash,
+            field_name="action_schema_hash",
+        )
+        _required(
+            self.target_clock_domain_id,
+            field_name="target_clock_domain_id",
+        )
+        _required(
+            self.temporal_selection_spec_hash,
+            field_name="temporal_selection_spec_hash",
+        )
         object.__setattr__(
             self,
             "selected_input_by_role",
@@ -540,18 +773,55 @@ class CompositionInputSnapshot:
             "source_ineligibility_reason_by_role",
             MappingProxyType(dict(self.source_ineligibility_reason_by_role)),
         )
-
+        object.__setattr__(
+            self,
+            "selected_input_before_dependency_by_role",
+            MappingProxyType(
+                dict(self.selected_input_before_dependency_by_role)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "dependency_ineligibility_reason_by_role",
+            MappingProxyType(
+                dict(self.dependency_ineligibility_reason_by_role)
+            ),
+        )
+        input_schema_hashes = {
+            _required(role, field_name="input schema role"): _required(
+                schema_hash,
+                field_name=f"input schema hash for {role}",
+            )
+            for role, schema_hash in dict(
+                self.input_action_schema_hash_by_role
+            ).items()
+        }
+        object.__setattr__(
+            self,
+            "input_action_schema_hash_by_role",
+            MappingProxyType(input_schema_hashes),
+        )
+        required_roles = tuple(
+            _required(value, field_name="required_role")
+            for value in self.required_roles
+        )
+        if len(required_roles) != len(set(required_roles)):
+            raise ValueError("Snapshot required_roles must be unique.")
+        object.__setattr__(self, "required_roles", required_roles)
 
 @dataclass(frozen=True)
-class CompositionResult:
-    composition_result_id: str
+class CompositionEvaluation:
+    composition_evaluation_id: str
     composition_input_snapshot_id: str
     composition_input_snapshot_hash: str
     composition_spec_hash: str
+    action_schema_hash: str
+    target_effective_at: float
+    target_clock_domain_id: str
     output_status: str
     reason: str
-    composed_action: RobotAction | None
-    composed_action_hash: str | None
+    composed_candidate: ComponentAction | None
+    composed_candidate_hash: str | None
     input_ids: tuple[str, ...]
     input_hashes: tuple[str, ...]
     context_ids: tuple[str, ...]
@@ -566,8 +836,79 @@ class CompositionResult:
     strategy_context_snapshot_hash: str | None = None
     strategy_information_plan_hash: str | None = None
     strategy_used_context_ids: tuple[str, ...] = ()
+    strategy_control_binding_id: str | None = None
+    strategy_control_binding_hash: str | None = None
+    composition_supported_until: float | None = None
 
     def __post_init__(self) -> None:
+        for name in (
+            "composition_evaluation_id",
+            "composition_input_snapshot_id",
+            "composition_input_snapshot_hash",
+            "composition_spec_hash",
+            "action_schema_hash",
+            "target_clock_domain_id",
+            "reason",
+            "semantic_content_hash",
+        ):
+            _required(getattr(self, name), field_name=name)
+        status = _required(self.output_status, field_name="output_status")
+        if status not in {"ready", "no_action", "invalid"}:
+            raise ValueError("Unsupported composition evaluation status.")
+        if (status == "ready") != (self.composed_candidate is not None):
+            raise ValueError(
+                "Only a ready composition evaluation may contain a candidate."
+            )
+        if (self.composed_candidate is None) != (
+            self.composed_candidate_hash is None
+        ):
+            raise ValueError(
+                "Composed candidate and candidate hash must appear together."
+            )
+        target_effective_at = _finite(
+            self.target_effective_at,
+            field_name="target_effective_at",
+        )
+        supported_until = self.composition_supported_until
+        if status == "ready":
+            if supported_until is None:
+                raise ValueError(
+                    "A ready composition evaluation requires "
+                    "composition_supported_until."
+                )
+            supported_until = _finite(
+                supported_until,
+                field_name="composition_supported_until",
+            )
+            if supported_until <= target_effective_at:
+                raise ValueError(
+                    "Composition support must extend beyond the target time."
+                )
+        elif supported_until is not None:
+            raise ValueError(
+                "Only a ready composition evaluation may carry support."
+            )
+        candidate = self.composed_candidate
+        if candidate is not None:
+            if not isinstance(candidate, ComponentAction):
+                raise TypeError(
+                    "CompositionEvaluation candidate must be a ComponentAction."
+                )
+            if (
+                candidate.action_schema.semantic_content_hash
+                != self.action_schema_hash
+            ):
+                raise ValueError("Composed candidate action schema mismatch.")
+            if self.composed_candidate_hash != candidate.semantic_content_hash:
+                raise ValueError("Composed candidate hash mismatch.")
+        object.__setattr__(self, "output_status", status)
+        object.__setattr__(self, "target_effective_at", target_effective_at)
+        object.__setattr__(
+            self,
+            "composition_supported_until",
+            supported_until,
+        )
+        object.__setattr__(self, "composed_candidate", candidate)
         identity_fields = (
             self.strategy_id,
             self.strategy_spec_hash,
@@ -587,6 +928,35 @@ class CompositionResult:
         ):
             raise ValueError(
                 "Strategy lineage requires a formal strategy result identity."
+            )
+        if (
+            self.strategy_control_binding_id is None
+        ) != (
+            self.strategy_control_binding_hash is None
+        ):
+            raise ValueError(
+                "Strategy control binding ID/hash must appear together."
+            )
+        if self.strategy_control_binding_id is not None:
+            if self.strategy_id is None:
+                raise ValueError(
+                    "Strategy control binding requires formal strategy identity."
+                )
+            object.__setattr__(
+                self,
+                "strategy_control_binding_id",
+                _required(
+                    self.strategy_control_binding_id,
+                    field_name="strategy_control_binding_id",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "strategy_control_binding_hash",
+                _required(
+                    self.strategy_control_binding_hash,
+                    field_name="strategy_control_binding_hash",
+                ),
             )
         if (
             self.strategy_context_snapshot_id is None
@@ -611,29 +981,51 @@ class CompositionResult:
 
 @dataclass(frozen=True)
 class CompositionAuthorityDisposition:
+    """Non-authoritative request bound to one exact composition evaluation.
+
+    ``action="hold"`` means ``request_hold``.  It is not evidence that the
+    lower execution gate entered HOLD.  Only a lower-runtime transition and
+    cancellation receipt can establish that fact.  The legacy field names are
+    retained so existing v1 hashes and stored traces remain readable.
+    """
+
     disposition_id: str
     gate_spec_hash: str
-    composition_result_id: str
-    composition_result_hash: str
+    composition_evaluation_id: str
+    composition_evaluation_hash: str
     action: str
     reason: str
     missing_roles: tuple[str, ...]
     semantic_content_hash: str
 
+    @property
+    def downstream_request(self) -> str:
+        if self.action == "publish_proposal":
+            return "submit_candidate"
+        if self.action == "hold":
+            return "request_hold"
+        raise ValueError(
+            f"Unsupported legacy composition disposition action {self.action!r}."
+        )
+
+    @property
+    def authoritative(self) -> bool:
+        return False
+
 
 def decide_composition_authority_disposition(
     snapshot: CompositionInputSnapshot,
-    result: CompositionResult,
+    result: CompositionEvaluation,
     *,
     spec: CompositionSpec,
     gate_spec: CompositionAuthorityGateSpec,
 ) -> CompositionAuthorityDisposition:
-    """Choose proposal promotion or HOLD without reading runtime state."""
+    """Request candidate submission or lower-runtime HOLD without side effects."""
 
     if not isinstance(snapshot, CompositionInputSnapshot):
         raise TypeError("snapshot must be a CompositionInputSnapshot.")
-    if not isinstance(result, CompositionResult):
-        raise TypeError("result must be a CompositionResult.")
+    if not isinstance(result, CompositionEvaluation):
+        raise TypeError("result must be a CompositionEvaluation.")
     gate_spec.validate_composition_spec(spec)
     if (
         snapshot.composition_spec_hash != spec.semantic_content_hash
@@ -649,7 +1041,17 @@ def decide_composition_authority_disposition(
     ):
         raise ValueError("Composition disposition inputs do not share one snapshot.")
     missing = tuple(snapshot.missing_roles)
-    if result.output_status == "ready" and result.composed_action is not None:
+    missing_required = tuple(
+        role for role in spec.required_roles if role in missing
+    )
+    if missing_required:
+        action = "hold"
+        reason = (
+            "all_inputs_missing"
+            if len(missing) == len(spec.input_roles)
+            else "required_contributor_missing"
+        )
+    elif result.output_status == "ready" and result.composed_candidate is not None:
         action = "publish_proposal"
         reason = "ready_composition"
     elif missing:
@@ -675,8 +1077,8 @@ def decide_composition_authority_disposition(
         reason = "composition_not_publishable"
     payload = {
         "gate_spec_hash": gate_spec.semantic_content_hash,
-        "composition_result_id": result.composition_result_id,
-        "composition_result_hash": result.semantic_content_hash,
+        "composition_evaluation_id": result.composition_evaluation_id,
+        "composition_evaluation_hash": result.semantic_content_hash,
         "action": action,
         "reason": reason,
         "missing_roles": missing,
@@ -697,7 +1099,7 @@ class _PreparedInput:
     identity: RuntimeFactIdentity
     fact_id: str
     draft: CompositionInputDraft
-    action: RobotAction
+    action: ComponentAction
     produced_at: float
     effective_from: float
     effective_until: float
@@ -801,11 +1203,16 @@ def _prepare(draft: CompositionInputDraft) -> _PreparedInput:
             domain="dexteleop.composition_input_identity.v2",
         )
         fact_id = f"composition-input:v2:{identity_digest}"
+    if not isinstance(draft.action, ComponentAction):
+        raise CompositionAdmissionError(
+            "invalid_action_carrier",
+            "Composition inputs must use the canonical ComponentAction carrier.",
+        )
     return _PreparedInput(
         identity=identity,
         fact_id=fact_id,
         draft=draft,
-        action=freeze_robot_action(draft.action),
+        action=draft.action,
         produced_at=produced_at,
         effective_from=effective_from,
         effective_until=effective_until,
@@ -825,7 +1232,7 @@ def composition_input_semantic_payload(record: CompositionInputRecord) -> dict[s
         "producer_epoch": record.producer_epoch,
         "sequence": record.sequence,
         "input_role": record.input_role,
-        "action": robot_action_semantic_payload(record.action),
+        "action": record.action.semantic_payload(),
         "produced_at": record.produced_at,
         "produced_clock_domain_id": record.produced_clock_domain_id,
         "available_at": record.available_at,
@@ -858,11 +1265,17 @@ class CompositionInputStore:
         coordinator: ControlAdmissionCoordinator,
         producer_epochs: ProducerEpochRegistry,
         retention_spec: TimeWindowRetentionSpec,
+        action_schema: ComponentActionSchema,
+        input_action_schema_by_role: Mapping[
+            str, ComponentActionSchema
+        ] | None = None,
     ) -> None:
         if producer_epochs.coordinator is not coordinator:
             raise ValueError("Composition store and epochs must share one coordinator.")
         if not isinstance(retention_spec, TimeWindowRetentionSpec):
             raise TypeError("retention_spec must be a TimeWindowRetentionSpec.")
+        if not isinstance(action_schema, ComponentActionSchema):
+            raise TypeError("action_schema must be a ComponentActionSchema.")
         self.runtime_session_id = _required(runtime_session_id, field_name="runtime_session_id")
         if self.runtime_session_id != coordinator.clock_domain.runtime_session_id:
             raise ValueError("Composition store session must match the control clock session.")
@@ -870,6 +1283,19 @@ class CompositionInputStore:
         self.control_domain_id = coordinator.control_domain_id
         self.producer_epochs = producer_epochs
         self.retention_spec = retention_spec
+        self.action_schema = action_schema
+        input_schemas: dict[str, ComponentActionSchema] = {}
+        for raw_role, schema in dict(
+            input_action_schema_by_role or {}
+        ).items():
+            role = _required(raw_role, field_name="input schema role")
+            if not isinstance(schema, ComponentActionSchema):
+                raise TypeError(
+                    "input_action_schema_by_role values must be "
+                    "ComponentActionSchema."
+                )
+            input_schemas[role] = schema
+        self.input_action_schema_by_role = MappingProxyType(input_schemas)
         self._records: list[CompositionInputRecord] = []
         self._by_id: dict[str, CompositionInputRecord] = {}
         self._last_sequence: dict[tuple[str, int, str | None], int] = {}
@@ -902,6 +1328,19 @@ class CompositionInputStore:
                 raise CompositionAdmissionError(
                     "clock_domain_mismatch",
                     "Composition input validity must use the receiver control clock.",
+                )
+            expected_action_schema = self.input_action_schema_by_role.get(
+                draft.input_role,
+                self.action_schema,
+            )
+            if (
+                prepared.action.action_schema.semantic_content_hash
+                != expected_action_schema.semantic_content_hash
+            ):
+                raise CompositionAdmissionError(
+                    "action_schema_mismatch",
+                    "Composition input action schema does not match its runtime "
+                    "role.",
                 )
             if (
                 activation_scope is not None
@@ -985,13 +1424,11 @@ class CompositionInputStore:
                 if not prepared.source_fact_ids:
                     semantic_payload.pop("source_fact_ids")
                     semantic_payload.pop("source_fact_hashes")
-                hash_domain = COMPOSITION_INPUT_HASH_DOMAIN_V1
+                hash_domain = COMPOSITION_INPUT_HASH_DOMAIN_V3
                 if draft.composition_activation_id is None:
                     semantic_payload.pop("composition_activation_id")
                     semantic_payload.pop("composition_activation_hash")
-                else:
-                    hash_domain = COMPOSITION_INPUT_HASH_DOMAIN_V2
-                semantic_payload["action"] = robot_action_semantic_payload(prepared.action)
+                semantic_payload["action"] = prepared.action.semantic_payload()
                 return CompositionInputRecord(
                     **payload,
                     semantic_content_hash=canonical_content_hash(
@@ -1066,6 +1503,9 @@ class CompositionInputStore:
         source_eligibility_snapshot: (
             CompositionSourceEligibilitySnapshot | None
         ) = None,
+        temporal_selection_spec: CompositionTemporalSelectionSpec = (
+            DEFAULT_COMPOSITION_TEMPORAL_SELECTION_SPEC
+        ),
     ) -> CompositionInputSnapshot:
         """Materialize one same-cut snapshot, then close its target-time window."""
 
@@ -1086,6 +1526,17 @@ class CompositionInputStore:
                 target_effective_at=target_effective_at,
                 activation_scope=activation_scope,
                 source_eligibility_snapshot=source_eligibility_snapshot,
+                temporal_selection_spec=temporal_selection_spec,
+                action_schema_hash=self.action_schema.semantic_content_hash,
+                input_action_schema_hash_by_role={
+                    role: schema.semantic_content_hash
+                    for role, schema in (
+                        self.input_action_schema_by_role.items()
+                    )
+                },
+                target_clock_domain_id=(
+                    self.coordinator.clock_domain.clock_domain_id
+                ),
             )
             self._advance_closed_target_locked(float(target_effective_at))
             return snapshot
@@ -1165,8 +1616,26 @@ def build_composition_input_snapshot(
     target_effective_at: float,
     activation_scope: CompositionActivationScope | None = None,
     source_eligibility_snapshot: CompositionSourceEligibilitySnapshot | None = None,
+    temporal_selection_spec: CompositionTemporalSelectionSpec = (
+        DEFAULT_COMPOSITION_TEMPORAL_SELECTION_SPEC
+    ),
+    action_schema_hash: str | None = None,
+    input_action_schema_hash_by_role: Mapping[str, str] | None = None,
+    target_clock_domain_id: str | None = None,
 ) -> CompositionInputSnapshot:
     target = _finite(target_effective_at, field_name="target_effective_at")
+    if not isinstance(
+        temporal_selection_spec,
+        CompositionTemporalSelectionSpec,
+    ):
+        raise TypeError(
+            "temporal_selection_spec must be a "
+            "CompositionTemporalSelectionSpec."
+        )
+    temporal_selection_spec.validate_target(
+        cutoff_at=projection.cutoff_at,
+        target_effective_at=target,
+    )
     if producer_epochs.control_domain_id != projection.control_domain_id:
         raise ValueError("Composition projection and epochs belong to different domains.")
     if producer_epochs.cutoff_admission_sequence != projection.cutoff_admission_sequence:
@@ -1200,7 +1669,9 @@ def build_composition_input_snapshot(
             raise ValueError(
                 "Source eligibility and composition inputs must share one cut."
             )
-    selected: dict[str, CompositionInputRecord] = {}
+    eligible_by_role: dict[str, list[CompositionInputRecord]] = {
+        role: [] for role in spec.input_roles
+    }
     for record in projection.records:
         if record.input_role not in spec.input_roles:
             continue
@@ -1243,14 +1714,113 @@ def build_composition_input_snapshot(
                 continue
         if not record.effective_from <= target < record.effective_until:
             continue
-        current = selected.get(record.input_role)
-        rank = (record.effective_from, record.sequence, record.composition_input_id)
-        if current is None or rank > (
-            current.effective_from,
-            current.sequence,
-            current.composition_input_id,
+        eligible_by_role[record.input_role].append(record)
+    selected: dict[str, CompositionInputRecord] = {}
+    for role, eligible in eligible_by_role.items():
+        if not eligible:
+            continue
+        if (
+            temporal_selection_spec.overlap_behavior
+            == "reject_multiple_covering"
+            and len(eligible) > 1
         ):
-            selected[record.input_role] = record
+            raise ValueError(
+                "Multiple composition inputs cover one role/target under "
+                f"reject_multiple_covering: {role!r}."
+            )
+        selected[role] = max(
+            eligible,
+            key=lambda record: (
+                record.effective_from,
+                record.control_admission_sequence,
+                record.composition_input_id,
+            ),
+        )
+    observed_schema_hashes = {
+        record.action.action_schema.semantic_content_hash
+        for record in projection.records
+    }
+    role_schema_hashes = dict(input_action_schema_hash_by_role or {})
+    if not role_schema_hashes:
+        role_schema_hashes = dict(spec.input_action_schema_hash_by_role)
+    if role_schema_hashes:
+        if set(role_schema_hashes) != set(spec.input_roles):
+            raise ValueError(
+                "Input action schema mapping must bind every composition role."
+            )
+        for record in projection.records:
+            if record.input_role not in role_schema_hashes:
+                continue
+            if (
+                record.action.action_schema.semantic_content_hash
+                != role_schema_hashes[record.input_role]
+            ):
+                raise ValueError(
+                    "Composition projection contains an action schema that "
+                    "does not match its role."
+                )
+    if action_schema_hash is None:
+        if spec.action_schema_hash is not None:
+            action_schema_hash = spec.action_schema_hash
+        elif len(observed_schema_hashes) == 1:
+            action_schema_hash = next(iter(observed_schema_hashes))
+        else:
+            raise ValueError(
+                "action_schema_hash is required when the projection does not "
+                "identify exactly one output action schema."
+            )
+    action_schema_hash = _required(
+        action_schema_hash,
+        field_name="action_schema_hash",
+    )
+    if (
+        not role_schema_hashes
+        and observed_schema_hashes
+        and observed_schema_hashes != {action_schema_hash}
+    ):
+        raise ValueError("Composition projection contains another action schema.")
+    if spec.action_schema_hash is not None and (
+        spec.action_schema_hash != action_schema_hash
+    ):
+        raise ValueError("Composition spec/action schema hash mismatch.")
+    observed_clock_domains = {
+        record.effective_clock_domain_id for record in projection.records
+    }
+    if target_clock_domain_id is None:
+        if len(observed_clock_domains) != 1:
+            raise ValueError(
+                "target_clock_domain_id is required when the projection does "
+                "not identify exactly one receiver clock."
+            )
+        target_clock_domain_id = next(iter(observed_clock_domains))
+    target_clock_domain_id = _required(
+        target_clock_domain_id,
+        field_name="target_clock_domain_id",
+    )
+    if observed_clock_domains and observed_clock_domains != {
+        target_clock_domain_id
+    }:
+        raise ValueError("Composition projection contains another target clock.")
+    selected_before_dependency = dict(selected)
+    dependency_ineligibility: dict[str, str] = {}
+    dependency_changed = True
+    while dependency_changed:
+        dependency_changed = False
+        for role in spec.input_roles:
+            if role not in selected:
+                continue
+            missing_dependencies = tuple(
+                dependency
+                for dependency in spec.depends_on_roles_by_role.get(role, ())
+                if dependency not in selected
+            )
+            if not missing_dependencies:
+                continue
+            del selected[role]
+            dependency_ineligibility[role] = (
+                "prerequisite_unavailable:" + ",".join(missing_dependencies)
+            )
+            dependency_changed = True
     missing = tuple(role for role in spec.input_roles if role not in selected)
     epoch_hash = _epoch_hash(producer_epochs)
     payload = {
@@ -1259,6 +1829,11 @@ def build_composition_input_snapshot(
         "cutoff_admission_sequence": projection.cutoff_admission_sequence,
         "target_effective_at": target,
         "composition_spec_hash": spec.semantic_content_hash,
+        "action_schema_hash": action_schema_hash,
+        "target_clock_domain_id": target_clock_domain_id,
+        "temporal_selection_spec_hash": (
+            temporal_selection_spec.semantic_content_hash
+        ),
         "selected_input_ids_by_role": {
             role: selected[role].composition_input_id for role in spec.input_roles if role in selected
         },
@@ -1268,13 +1843,31 @@ def build_composition_input_snapshot(
         "missing_roles": missing,
         "producer_epoch_snapshot_hash": epoch_hash,
     }
-    snapshot_hash_domain = COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V1
+    snapshot_hash_domain = COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V5
+    if role_schema_hashes:
+        payload["input_action_schema_hash_by_role"] = role_schema_hashes
+        snapshot_hash_domain = COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V7
+    if spec.depends_on_roles_by_role:
+        payload["selected_input_ids_before_dependency_by_role"] = {
+            role: selected_before_dependency[role].composition_input_id
+            for role in spec.input_roles
+            if role in selected_before_dependency
+        }
+        payload["selected_input_hashes_before_dependency_by_role"] = {
+            role: selected_before_dependency[role].semantic_content_hash
+            for role in spec.input_roles
+            if role in selected_before_dependency
+        }
+        payload["dependency_ineligibility_reason_by_role"] = (
+            dependency_ineligibility
+        )
+        if not role_schema_hashes:
+            snapshot_hash_domain = COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V6
     if activation_scope is not None:
         payload["expected_activation_id"] = activation_scope.activation_id
         payload["expected_activation_hash"] = (
             activation_scope.semantic_content_hash
         )
-        snapshot_hash_domain = COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V2
     if source_eligibility_snapshot is not None:
         payload["source_eligibility_snapshot_id"] = (
             source_eligibility_snapshot.source_eligibility_snapshot_id
@@ -1285,7 +1878,6 @@ def build_composition_input_snapshot(
         payload["source_ineligibility_reason_by_role"] = (
             source_eligibility_snapshot.ineligible_reason_by_role
         )
-        snapshot_hash_domain = COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V3
     digest = canonical_content_hash(payload, domain=snapshot_hash_domain)
     return CompositionInputSnapshot(
         composition_input_snapshot_id=f"composition-input-snapshot:{digest}",
@@ -1294,10 +1886,15 @@ def build_composition_input_snapshot(
         cutoff_admission_sequence=projection.cutoff_admission_sequence,
         target_effective_at=target,
         composition_spec_hash=spec.semantic_content_hash,
+        action_schema_hash=action_schema_hash,
+        target_clock_domain_id=target_clock_domain_id,
         selected_input_by_role=selected,
         missing_roles=missing,
         producer_epoch_snapshot_hash=epoch_hash,
         semantic_content_hash=digest,
+        temporal_selection_spec_hash=(
+            temporal_selection_spec.semantic_content_hash
+        ),
         expected_activation_id=(
             None if activation_scope is None else activation_scope.activation_id
         ),
@@ -1321,55 +1918,40 @@ def build_composition_input_snapshot(
             if source_eligibility_snapshot is None
             else source_eligibility_snapshot.ineligible_reason_by_role
         ),
+        selected_input_before_dependency_by_role=(
+            selected_before_dependency
+            if spec.depends_on_roles_by_role
+            else selected
+        ),
+        dependency_ineligibility_reason_by_role=dependency_ineligibility,
+        required_roles=spec.required_roles,
+        input_action_schema_hash_by_role=role_schema_hashes,
     )
 
 
-def _component_union(inputs: tuple[CompositionInputRecord, ...], target: float) -> RobotAction:
+def _component_union(
+    inputs: tuple[CompositionInputRecord, ...],
+    target: float,
+) -> ComponentAction:
     if not inputs:
         raise ValueError("component_union requires at least one input.")
-    action_space = inputs[0].action.action_space
-    arm_pose: dict[str, Any] = {}
-    arm_qpos: dict[str, Any] = {}
-    hand_qpos: dict[str, Any] = {}
-    native: dict[str, Any] = {}
-    frames: dict[str, str] = {}
-    controlled: dict[str, str] = {}
-    metadata: dict[str, dict[str, Any]] = {}
-    effectors: list[str] = []
-    for record in inputs:
-        action = record.action
-        if action.action_space != action_space:
-            raise ValueError("component_union action spaces do not match.")
-        overlap = set(effectors) & set(action.active_effectors)
+    del target
+    action_schema = inputs[0].action.action_schema
+    values_by_component: dict[str, Any] = {}
+    for item in inputs:
+        action = item.action
+        if (
+            action.action_schema.semantic_content_hash
+            != action_schema.semantic_content_hash
+        ):
+            raise ValueError("component_union action schemas do not match.")
+        overlap = set(values_by_component) & set(action.values_by_component)
         if overlap:
             raise ValueError(f"component_union inputs overlap: {sorted(overlap)!r}.")
-        arm_pose.update(action.arm_pose_by_side)
-        arm_qpos.update(action.arm_qpos_by_side)
-        hand_qpos.update(action.hand_qpos_by_side)
-        native.update(action.end_effector_targets_by_side)
-        frames.update(action.frame_by_effector)
-        controlled.update(action.controlled_frame_by_effector)
-        for key, values in action.metadata.items():
-            destination = metadata.setdefault(key, {})
-            for side, value in values.items():
-                if side in destination:
-                    raise ValueError("component_union execution metadata overlaps.")
-                destination[side] = value
-        effectors.extend(action.active_effectors)
-    return freeze_robot_action(
-        RobotAction(
-            action_space=action_space,
-            timestamp=target,
-            arm_pose_by_side=arm_pose,
-            arm_qpos_by_side=arm_qpos,
-            hand_qpos_by_side=hand_qpos,
-            end_effector_targets_by_side=native,
-            active_effectors=tuple(effectors),
-            frame_by_effector=frames,
-            controlled_frame_by_effector=controlled,
-            source="deterministic_composer",
-            metadata=metadata,
-        )
+        values_by_component.update(action.values_by_component)
+    return ComponentAction(
+        action_schema=action_schema,
+        values_by_component=values_by_component,
     )
 
 
@@ -1380,13 +1962,21 @@ def _base_plus_residual(
     spec: CompositionSpec,
     target: float,
 ) -> RobotAction:
-    base_action = base.action
+    base_action = materialize_robot_action_v1(
+        base.action,
+        timestamp=target,
+        source="deterministic_composer:base",
+    )
     if base_action.arm_pose_by_side or base_action.end_effector_targets_by_side:
         raise ValueError("v1 bounded residual supports qpos components only.")
     arm = {side: value.copy() for side, value in base_action.arm_qpos_by_side.items()}
     hand = {side: value.copy() for side, value in base_action.hand_qpos_by_side.items()}
     if residual is not None:
-        residual_action = residual.action
+        residual_action = materialize_robot_action_v1(
+            residual.action,
+            timestamp=target,
+            source="deterministic_composer:residual",
+        )
         if residual_action.action_space != base_action.action_space:
             raise ValueError("Base and residual action spaces do not match.")
         if residual_action.arm_pose_by_side or residual_action.end_effector_targets_by_side:
@@ -1434,7 +2024,11 @@ def _weighted_se3_pose_fusion(
     return freeze_robot_action(
         fuse_weighted_se3_pose_actions(
             {
-                role: inputs_by_role[role].action
+                role: materialize_robot_action_v1(
+                    inputs_by_role[role].action,
+                    timestamp=target,
+                    source=f"deterministic_composer:{role}",
+                )
                 for role in selected_weights
             },
             weights_by_source_slot=selected_weights,
@@ -1457,14 +2051,16 @@ class DeterministicComposer:
         snapshot: CompositionInputSnapshot,
         *,
         spec: CompositionSpec,
-    ) -> CompositionResult:
+        composition_supported_until: float | None = None,
+    ) -> CompositionEvaluation:
         if snapshot.composition_spec_hash != spec.semantic_content_hash:
             raise ValueError("Composition snapshot/spec hash mismatch.")
         selected = snapshot.selected_input_by_role
         missing_required = tuple(role for role in spec.required_roles if role not in selected)
         status = "ready"
         reason = "composed"
-        action: RobotAction | None = None
+        legacy_action: RobotAction | None = None
+        action: ComponentAction | None = None
         if spec.algebra == FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2:
             status = "invalid"
             reason = "formal_component_strategy_required"
@@ -1473,7 +2069,7 @@ class DeterministicComposer:
             reason = "missing_required:" + ",".join(missing_required)
         elif spec.algebra == "base_plus_bounded_residual" and "residual" not in selected:
             if spec.missing_residual_behavior == "zero_residual":
-                action = _base_plus_residual(
+                legacy_action = _base_plus_residual(
                     selected["base"], None, spec=spec, target=snapshot.target_effective_at
                 )
                 reason = "zero_residual"
@@ -1486,16 +2082,19 @@ class DeterministicComposer:
                     selected[role] for role in spec.input_roles if role in selected
                 )
                 if spec.algebra == "component_union":
-                    action = _component_union(ordered, snapshot.target_effective_at)
+                    action = _component_union(
+                        ordered,
+                        snapshot.target_effective_at,
+                    )
                 elif spec.algebra == "base_plus_bounded_residual":
-                    action = _base_plus_residual(
+                    legacy_action = _base_plus_residual(
                         selected["base"],
                         selected["residual"],
                         spec=spec,
                         target=snapshot.target_effective_at,
                     )
                 else:
-                    action = _weighted_se3_pose_fusion(
+                    legacy_action = _weighted_se3_pose_fusion(
                         selected,
                         spec=spec,
                         target=snapshot.target_effective_at,
@@ -1508,6 +2107,11 @@ class DeterministicComposer:
             except (TypeError, ValueError) as exc:
                 status = "invalid"
                 reason = str(exc)
+        if legacy_action is not None:
+            action = project_robot_action_v1_to_component_action(
+                legacy_action,
+                action_schema=next(iter(selected.values())).action.action_schema,
+            )
         ordered_inputs = tuple(
             selected[role] for role in spec.input_roles if role in selected
         )
@@ -1518,26 +2122,39 @@ class DeterministicComposer:
                 context_id for item in ordered_inputs for context_id in item.context_ids
             )
         )
-        action_hash = (
-            None
-            if action is None
-            else canonical_content_hash(
-                robot_action_semantic_payload(action),
-                domain="dexteleop.composed_robot_action.v1",
+        action_hash = None if action is None else action.semantic_content_hash
+        supported_until = None
+        if status == "ready" and ordered_inputs:
+            input_supported_until = min(
+                item.effective_until for item in ordered_inputs
             )
-        )
+            supported_until = (
+                input_supported_until
+                if composition_supported_until is None
+                else min(
+                    input_supported_until,
+                    _finite(
+                        composition_supported_until,
+                        field_name="composition_supported_until",
+                    ),
+                )
+            )
         payload = {
             "composition_input_snapshot_id": snapshot.composition_input_snapshot_id,
             "composition_input_snapshot_hash": snapshot.semantic_content_hash,
             "composition_spec_hash": spec.semantic_content_hash,
+            "action_schema_hash": snapshot.action_schema_hash,
+            "target_effective_at": snapshot.target_effective_at,
+            "target_clock_domain_id": snapshot.target_clock_domain_id,
             "output_status": status,
             "reason": reason,
-            "composed_action_hash": action_hash,
+            "composed_candidate_hash": action_hash,
             "input_ids": input_ids,
             "input_hashes": input_hashes,
             "context_ids": context_ids,
+            "composition_supported_until": supported_until,
         }
-        result_hash_domain = COMPOSITION_RESULT_HASH_DOMAIN_V1
+        result_hash_domain = COMPOSITION_EVALUATION_HASH_DOMAIN_V7
         if snapshot.expected_activation_id is not None:
             payload["composition_activation_id"] = (
                 snapshot.expected_activation_id
@@ -1545,20 +2162,17 @@ class DeterministicComposer:
             payload["composition_activation_hash"] = (
                 snapshot.expected_activation_hash
             )
-            result_hash_domain = COMPOSITION_RESULT_HASH_DOMAIN_V2
-        if snapshot.source_eligibility_snapshot_id is not None:
-            result_hash_domain = COMPOSITION_RESULT_HASH_DOMAIN_V3
         digest = canonical_content_hash(payload, domain=result_hash_domain)
-        return CompositionResult(
-            composition_result_id=f"composition-result:{digest}",
-            composed_action=action,
+        return CompositionEvaluation(
+            composition_evaluation_id=f"composition-evaluation:{digest}",
+            composed_candidate=action,
             semantic_content_hash=digest,
             **payload,
         )
 
 
 def build_composite_action_proposal_draft(
-    result: CompositionResult,
+    result: CompositionEvaluation,
     *,
     runtime_session_id: str,
     control_domain_id: str,
@@ -1571,13 +2185,21 @@ def build_composite_action_proposal_draft(
     effective_from: float,
     effective_until: float,
     effective_clock_domain_id: str,
-    component_schema_hash: str,
-    component_coverage: tuple[str, ...],
-    selection_groups: tuple[str, ...],
     policy_node_id: str | None = None,
 ) -> ActionProposalDraft:
-    if result.output_status != "ready" or result.composed_action is None:
-        raise ValueError("Only a ready composition result can become a proposal draft.")
+    if result.output_status != "ready" or result.composed_candidate is None:
+        raise ValueError("Only a ready composition evaluation can become a proposal draft.")
+    requested_until = _finite(
+        effective_until,
+        field_name="effective_until",
+    )
+    supported_until = result.composition_supported_until
+    if supported_until is None:
+        raise ValueError("Ready composition result has no support deadline.")
+    if requested_until > supported_until:
+        raise ValueError(
+            "Proposal effective_until cannot exceed composition support."
+        )
     return ActionProposalDraft(
         runtime_session_id=runtime_session_id,
         control_domain_id=control_domain_id,
@@ -1586,32 +2208,30 @@ def build_composite_action_proposal_draft(
         producer_id=producer_id,
         producer_epoch=producer_epoch,
         sequence=sequence,
-        action=result.composed_action,
+        action=result.composed_candidate,
         produced_at=produced_at,
         produced_clock_domain_id=produced_clock_domain_id,
         effective_from=effective_from,
-        effective_until=effective_until,
-        target_effective_at=result.composed_action.timestamp,
+        effective_until=requested_until,
+        target_effective_at=result.target_effective_at,
         effective_clock_domain_id=effective_clock_domain_id,
-        component_schema_hash=component_schema_hash,
-        component_coverage=component_coverage,
-        selection_groups=selection_groups,
         policy_node_id=policy_node_id,
         context_ids=result.context_ids,
-        policy_output_id=result.composition_result_id,
+        composition_evaluation_id=result.composition_evaluation_id,
+        composition_evaluation_hash=result.semantic_content_hash,
         composition_input_ids=result.input_ids,
         composition_input_hashes=result.input_hashes,
         composition_spec_hash=result.composition_spec_hash,
     )
 
 
-def build_blocked_composition_result(
+def build_blocked_composition_evaluation(
     snapshot: CompositionInputSnapshot,
     *,
     spec: CompositionSpec,
     status: str,
     reason: str,
-) -> CompositionResult:
+) -> CompositionEvaluation:
     """Build a deterministic non-action result for an external dependency gate.
 
     Context freshness is owned by the policy-topology runtime rather than the
@@ -1641,26 +2261,27 @@ def build_blocked_composition_result(
         "composition_input_snapshot_id": snapshot.composition_input_snapshot_id,
         "composition_input_snapshot_hash": snapshot.semantic_content_hash,
         "composition_spec_hash": spec.semantic_content_hash,
+        "action_schema_hash": snapshot.action_schema_hash,
+        "target_effective_at": snapshot.target_effective_at,
+        "target_clock_domain_id": snapshot.target_clock_domain_id,
         "output_status": normalized_status,
         "reason": normalized_reason,
-        "composed_action_hash": None,
+        "composed_candidate_hash": None,
         "input_ids": input_ids,
         "input_hashes": input_hashes,
         "context_ids": context_ids,
+        "composition_supported_until": None,
     }
-    result_hash_domain = COMPOSITION_RESULT_HASH_DOMAIN_V1
+    result_hash_domain = COMPOSITION_EVALUATION_HASH_DOMAIN_V7
     if snapshot.expected_activation_id is not None:
         payload["composition_activation_id"] = snapshot.expected_activation_id
         payload["composition_activation_hash"] = (
             snapshot.expected_activation_hash
         )
-        result_hash_domain = COMPOSITION_RESULT_HASH_DOMAIN_V2
-    if snapshot.source_eligibility_snapshot_id is not None:
-        result_hash_domain = COMPOSITION_RESULT_HASH_DOMAIN_V3
     digest = canonical_content_hash(payload, domain=result_hash_domain)
-    return CompositionResult(
-        composition_result_id=f"composition-result:{digest}",
-        composed_action=None,
+    return CompositionEvaluation(
+        composition_evaluation_id=f"composition-evaluation:{digest}",
+        composed_candidate=None,
         semantic_content_hash=digest,
         **payload,
     )
@@ -1673,15 +2294,24 @@ __all__ = [
     "COMPOSITION_AUTHORITY_GATE_SPEC_HASH_DOMAIN_V1",
     "COMPOSITION_INPUT_HASH_DOMAIN_V1",
     "COMPOSITION_INPUT_HASH_DOMAIN_V2",
+    "COMPOSITION_INPUT_HASH_DOMAIN_V3",
     "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V1",
     "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V2",
     "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V3",
-    "COMPOSITION_RESULT_HASH_DOMAIN_V1",
-    "COMPOSITION_RESULT_HASH_DOMAIN_V2",
-    "COMPOSITION_RESULT_HASH_DOMAIN_V3",
-    "COMPOSITION_RESULT_HASH_DOMAIN_V4",
+    "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V4",
+    "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V5",
+    "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V6",
+    "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V7",
+    "COMPOSITION_EVALUATION_HASH_DOMAIN_V1",
+    "COMPOSITION_EVALUATION_HASH_DOMAIN_V2",
+    "COMPOSITION_EVALUATION_HASH_DOMAIN_V3",
+    "COMPOSITION_EVALUATION_HASH_DOMAIN_V4",
+    "COMPOSITION_EVALUATION_HASH_DOMAIN_V5",
+    "COMPOSITION_EVALUATION_HASH_DOMAIN_V7",
     "COMPOSITION_SPEC_HASH_DOMAIN_V1",
     "COMPOSITION_SPEC_HASH_DOMAIN_V2",
+    "COMPOSITION_SPEC_HASH_DOMAIN_V3",
+    "COMPOSITION_SPEC_HASH_DOMAIN_V4",
     "CompositionAdmissionError",
     "CompositionAuthorityDisposition",
     "CompositionAuthorityGateSpec",
@@ -1691,11 +2321,11 @@ __all__ = [
     "CompositionInputRecord",
     "CompositionInputSnapshot",
     "CompositionInputStore",
-    "CompositionResult",
+    "CompositionEvaluation",
     "CompositionSpec",
     "DeterministicComposer",
     "build_composite_action_proposal_draft",
-    "build_blocked_composition_result",
+    "build_blocked_composition_evaluation",
     "build_composition_input_snapshot",
     "composition_input_semantic_payload",
     "decide_composition_authority_disposition",

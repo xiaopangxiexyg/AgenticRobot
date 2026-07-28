@@ -1,9 +1,10 @@
-"""Application-level contracts for the future DexTeleop Control Station.
+"""Application-level contracts and thin profiles for the DexTeleop Control Station.
 
-The package is intentionally entrypoint-free.  CS-1a provides a local read-only
-builder, CS-1b adds null-target typed intent admission, and CS-1c adds bounded
-no-I/O operation coordination.  There is still no device construction, policy
-scheduler, dispatcher, motion authorization, or episode lifecycle here.
+CS-1a provides a local read-only builder, CS-1b adds null-target typed intent
+admission, and CS-1c adds bounded no-I/O operation coordination. Concrete
+profiles such as VIVE coordinate calibration may own application lifecycle and
+GUI state, but do not create a robot/sim execution owner, motion authority, or
+episode lifecycle.
 """
 
 from .contracts import (

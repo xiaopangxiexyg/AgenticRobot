@@ -156,6 +156,38 @@ def _through_takeover():
     return apply_human_authority_takeover(state, _takeover())
 
 
+def _through_legacy_safety_takeover():
+    state = begin_human_takeover(
+        MixedControlBoundaryPolicy(
+            policy_id="mixed-boundary:legacy-safety-preview",
+            policy_suspension_mode="hold_and_release_authority",
+            episode_boundary_motion_policy="capture_only",
+            require_canonical_safety=True,
+        ),
+        _request(),
+    )
+    state = apply_execution_hold(state, _hold())
+    state = apply_source_invalidation(state, _invalidation())
+    state = apply_authority_release(state, _release())
+    return apply_human_authority_takeover(state, _takeover())
+
+
+def _through_mainline_source_readiness_takeover():
+    state = begin_human_takeover(
+        MixedControlBoundaryPolicy(
+            policy_id="mixed-boundary:source-readiness-mainline",
+            policy_suspension_mode="hold_and_release_authority",
+            episode_boundary_motion_policy="capture_only",
+            require_canonical_safety=False,
+        ),
+        _request(),
+    )
+    state = apply_execution_hold(state, _hold())
+    state = apply_source_invalidation(state, _invalidation())
+    state = apply_authority_release(state, _release())
+    return apply_human_authority_takeover(state, _takeover())
+
+
 def _operation_spec() -> HumanTakeoverOperationSpec:
     return HumanTakeoverOperationSpec(
         previous_source_slot_id="policy-slot",
@@ -376,7 +408,7 @@ def test_stale_or_pre_takeover_human_readiness_is_rejected(
 @pytest.mark.parametrize("safety_status", ("hold", "fault"))
 def test_unsafe_first_human_command_fails_closed_in_hold(safety_status: str) -> None:
     failed = apply_human_readiness(
-        _through_takeover(),
+        _through_legacy_safety_takeover(),
         _readiness(safety_status=safety_status),
     )
     assert failed.phase == "failed"
@@ -387,11 +419,27 @@ def test_unsafe_first_human_command_fails_closed_in_hold(safety_status: str) -> 
 
 def test_canonical_safety_modified_is_still_an_accepted_safe_verdict() -> None:
     state = apply_human_readiness(
-        _through_takeover(),
+        _through_legacy_safety_takeover(),
         _readiness(safety_status="modified"),
     )
     assert state.phase == "awaiting_ready"
     assert not state.human_publication_enabled
+
+
+def test_mainline_human_source_readiness_does_not_require_safety_preview() -> None:
+    readiness = HumanReadinessReceipt(
+        **{
+            **_readiness().__dict__,
+            "canonical_safety_receipt_id": None,
+            "canonical_safety_status": None,
+        }
+    )
+    state = apply_human_readiness(
+        _through_mainline_source_readiness_takeover(),
+        readiness,
+    )
+    assert state.phase == "awaiting_ready"
+    assert state.readiness_receipt is readiness
 
 
 def test_ready_receipt_cannot_change_epoch_or_bypass_readiness() -> None:

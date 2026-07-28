@@ -9,6 +9,8 @@ from robot_motion.rm65 import (
     RM65_BIMANUAL_POSITION_V1,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_BIMANUAL_POSITION_V1_QREF_PROFILE,
+    RM65_BIMANUAL_POSITION_V2_RESPONSIVE,
+    RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME,
 )
 
 
@@ -47,6 +49,40 @@ def test_main_action_boundary_forbids_reapplying_source_shaping() -> None:
     assert metadata["source_shaping"]["replay_or_deploy_reapply"] is False
     assert metadata["action_execution"]["reapply_source_shaping"] is False
     assert len(metadata["sha256"]) == 64
+
+
+def test_responsive_v2_is_opt_in_and_v1_remains_rollback_profile() -> None:
+    v1_source = RM65_BIMANUAL_POSITION_V1.source_shaping
+    v2 = RM65_BIMANUAL_POSITION_V2_RESPONSIVE
+    v2_source = v2.source_shaping
+
+    assert v2.name == RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME
+    assert v1_source.post_ik_qpos_normal_fast_path is False
+    assert v1_source.wrist_q5_hysteresis_requires_escape_latch is False
+    assert set(v1_source.to_metadata()) == {
+        "inactive_enter_threshold_scale",
+        "post_ik_qpos_smoothing_alpha",
+        "post_ik_qpos_smoothing_fast_alpha",
+        "post_ik_qpos_smoothing_adaptive",
+        "application_scope",
+        "replay_or_deploy_reapply",
+    }
+    assert v2_source.post_ik_qpos_normal_fast_path is True
+    assert v2_source.post_ik_qpos_normal_fast_path_alpha == pytest.approx(0.70)
+    assert v2_source.post_ik_qpos_normal_fast_path_guard_deg == pytest.approx(4.0)
+    assert v2_source.post_ik_qpos_normal_fast_path_quality_grace_sec == pytest.approx(
+        0.05
+    )
+    assert v2_source.wrist_q5_hysteresis_requires_escape_latch is True
+    assert v2_source.to_metadata()["post_ik_qpos_normal_fast_path"] is True
+    assert v2_source.to_metadata()[
+        "post_ik_qpos_normal_fast_path_quality_grace_sec"
+    ] == pytest.approx(0.05)
+    assert v2.command_execution == RM65_BIMANUAL_POSITION_V1.command_execution
+    assert v2.ik_execution == RM65_BIMANUAL_POSITION_V1.ik_execution
+    assert v2.to_metadata()["sha256"] != RM65_BIMANUAL_POSITION_V1.to_metadata()[
+        "sha256"
+    ]
 
 
 def test_production_qref_profile_preserves_validated_numeric_envelope() -> None:

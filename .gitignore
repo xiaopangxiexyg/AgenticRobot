@@ -52,6 +52,7 @@ logs/
 # Local scratch outputs and raw UMI data are not repository artifacts.
 temp/
 remote_data/umi/
+remote_data/
 
 camera_process/wrist_cam_adjust/outputs/
 utils/dataset_postprocess/wrist_cam_adjust/outputs/

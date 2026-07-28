@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .components import ActionComponentCatalog
+from .components import ActionComponentCatalogV2
 from .proposal import ActionProposalDraft
 
 if TYPE_CHECKING:
@@ -164,7 +164,7 @@ class ConservativeCompoundAuthorityProfile:
     def validate_runtime_binding(
         self,
         *,
-        component_catalog: ActionComponentCatalog,
+        component_catalog: ActionComponentCatalogV2,
         active_selection_groups: tuple[str, ...],
         authority_policy: "AuthorityPolicySpec",
     ) -> None:
@@ -217,7 +217,7 @@ class ConservativeCompoundAuthorityProfile:
         self,
         draft: ActionProposalDraft,
         *,
-        component_catalog: ActionComponentCatalog,
+        component_catalog: ActionComponentCatalogV2,
     ) -> str | None:
         """Return a stable rejection reason for a non-exact proposal."""
 
@@ -225,18 +225,25 @@ class ConservativeCompoundAuthorityProfile:
             return "producer_id_mismatch"
         if draft.producer_kind != "composer":
             return "producer_kind_mismatch"
-        if tuple(draft.component_coverage) != self.component_coverage:
+        if tuple(draft.action.component_coverage) != self.component_coverage:
             return "component_coverage_mismatch"
-        if tuple(draft.selection_groups) != self.selection_groups:
-            return "selection_groups_mismatch"
-        expected_effectors = tuple(
-            component.effector_name for component in component_catalog.components
+        selection_groups = tuple(
+            dict.fromkeys(
+                component_catalog.component_by_id[
+                    component_id
+                ].selection_group_id
+                for component_id in draft.action.component_coverage
+            )
         )
-        if tuple(draft.action.active_effectors) != expected_effectors:
-            return "active_effectors_mismatch"
+        if selection_groups != self.selection_groups:
+            return "selection_groups_mismatch"
         if draft.composition_spec_hash != self.composition_spec_hash:
             return "composition_spec_hash_mismatch"
-        if not draft.composition_input_ids or not draft.policy_output_id:
+        if (
+            not draft.composition_input_ids
+            or not draft.composition_evaluation_id
+            or not draft.composition_evaluation_hash
+        ):
             return "formal_composition_lineage_missing"
         return None
 

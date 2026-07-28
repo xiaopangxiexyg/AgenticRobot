@@ -257,6 +257,76 @@ def test_rtc_core_subpackage_has_no_model_target_or_application_imports() -> Non
     assert violations == {}
 
 
+def test_model_rtc_cross_package_dependencies_point_downward() -> None:
+    root = Path(__file__).resolve().parents[1]
+    forbidden_by_path = {
+        "dataset_contracts/model_continuation.py": {
+            "control_composition",
+            "control_station",
+            "dataset_interface",
+            "deployments",
+            "hardware",
+            "model",
+            "robot_motion",
+            "sim",
+            "teleop_runtime",
+        },
+        "dataset_interface/model_continuation.py": {
+            "control_composition",
+            "control_station",
+            "deployments",
+            "hardware",
+            "model",
+            "sim",
+            "teleop_runtime",
+        },
+        "deployments/client/rtc_conditioning.py": {
+            "control_composition",
+            "control_station",
+            "hardware",
+            "model",
+            "sim",
+            "teleop_runtime",
+        },
+        "deployments/client/rtc_conditioning_protocol.py": {
+            "control_composition",
+            "control_station",
+            "hardware",
+            "model",
+            "sim",
+            "teleop_runtime",
+        },
+        "deployments/openpi/client/rtc_conditioned.py": {
+            "control_composition",
+            "control_station",
+            "hardware",
+            "model",
+            "sim",
+            "teleop_runtime",
+        },
+    }
+    violations: dict[str, list[str]] = {}
+    for relative, forbidden_roots in forbidden_by_path.items():
+        path = root / relative
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module
+            ):
+                imported.add(node.module.split(".", 1)[0])
+        forbidden = sorted(imported & forbidden_roots)
+        if forbidden:
+            violations[relative] = forbidden
+    assert violations == {}
+
+
 def test_canonical_model_frontend_names_are_compatibility_aliases() -> None:
     assert build_rtc_model_producer_runtime is build_rtc_model_shadow_frontend
     assert (

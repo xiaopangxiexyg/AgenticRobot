@@ -980,6 +980,22 @@ def build_episode_recording_runtime(
                     dataset_root=dataset_recorder.dataset_root,
                     episode_index=int(task.episode_index),
                 )
+                if task.v25p_error:
+                    sidecar_message = (
+                        f"episode {task.episode_index} 的旧格式数据已保存，但 "
+                        f"v2.5-p sidecar 未完成：{task.v25p_error}"
+                    )
+                    _log("Dataset", sidecar_message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", sidecar_message)
+                if task.v25p_native_error:
+                    native_message = (
+                        f"episode {task.episode_index} 的旧格式数据已保存，但 "
+                        f"v2.5-p native shadow 未完成：{task.v25p_native_error}"
+                    )
+                    _log("Dataset", native_message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", native_message)
             else:
                 message = f"正式数据集 episode {task.episode_index} 保存失败: {task.error}"
                 _log("Dataset", message, now=now)

@@ -69,6 +69,7 @@ def runtime():
 
 def draft(
     *,
+    producer_id: str = "slow-policy",
     sequence: int = 0,
     epoch: int = 1,
     effective_from: float = 10.0,
@@ -79,7 +80,7 @@ def draft(
     return CompositionContextDraft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
-        producer_id="slow-policy",
+        producer_id=producer_id,
         producer_epoch=epoch,
         sequence=sequence,
         producer_node_id="slow-vision-policy",
@@ -208,6 +209,49 @@ def test_context_arriving_after_cut_only_changes_next_snapshot() -> None:
         required_channels=("motion-plan",),
     )
     assert after.selected_context_id_by_channel["motion-plan"] == second.context_id
+
+
+def test_context_overlap_ranks_by_receiver_admission_across_producers() -> None:
+    _, coordinator, epochs, store = runtime()
+    epochs.activate(
+        producer_id="fast-policy",
+        producer_epoch=1,
+        produced_at=1.0,
+        produced_clock_domain_id="fast-policy.monotonic",
+        reason="startup",
+    )
+    earlier = store.admit(
+        draft(
+            producer_id="slow-policy",
+            sequence=100,
+            effective_from=10.0,
+            effective_until=11.0,
+        )
+    ).context
+    later = store.admit(
+        replace(
+            draft(
+                producer_id="fast-policy",
+                sequence=1,
+                effective_from=10.0,
+                effective_until=11.0,
+            ),
+            producer_node_id="fast-vision-policy",
+            produced_clock_domain_id="fast-policy.monotonic",
+        )
+    ).context
+    assert earlier is not None and later is not None
+    assert earlier.sequence > later.sequence
+    assert earlier.control_admission_sequence < later.control_admission_sequence
+
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    snapshot = build_composition_context_snapshot(
+        project_composition_contexts(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        target_effective_at=10.5,
+        required_channels=("motion-plan",),
+    )
+    assert snapshot.selected_context_id_by_channel["motion-plan"] == later.context_id
 
 
 def test_context_sequence_rollback_and_stale_interval_fail_closed() -> None:

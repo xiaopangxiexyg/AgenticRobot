@@ -303,6 +303,8 @@ def build_cs2d_rtc_policy_execution_manifest(
         manifest_id=CS2D_RTC_POLICY_EXECUTION_MANIFEST_ID_V1,
         manifest_version="v1",
         action_space=runtime.catalog.action_space,
+        action_schema=runtime.action_schema,
+        component_target_capability=runtime.component_target_capability,
         catalog=runtime.catalog,
         motion_authority_sources=(
             "policy:lower_owned_rtc_emission_via_control_station",

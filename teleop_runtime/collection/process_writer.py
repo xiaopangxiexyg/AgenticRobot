@@ -24,6 +24,11 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.v25p_native_storage import (
+    V25P_NATIVE_STORAGE_LAYOUTS_V1,
+    V25P_RECORD_CJSON_LAYOUT_V1,
+)
 from dataset_contracts.stream_catalog import (
     NativeStreamContract,
     NativeStreamEpisodeManifest,
@@ -36,6 +41,10 @@ from .sample_assembler import (
     CollectorSampleBuilder,
     CollectorSampleBuilderConfig,
     CollectorSampleSnapshot,
+)
+from .schema_v22 import (
+    StrictV22SampleRejection,
+    validate_strict_v22_measured_state,
 )
 from .stream_sink import NativeStreamEpisodeWriter
 from .video_frame import VideoFrame
@@ -86,6 +95,35 @@ class ProcessCollectionConfig:
 
 
 @dataclass(frozen=True)
+class ProcessV25pShadowConfig:
+    """Minimal opt-in needed to construct the native shadow in the child.
+
+    Stream/profile details are derived from the writer's already-authoritative
+    policy-I/O and pose-frame contracts. Dataset identity and the physical
+    persistence choice cross the process boundary; no second embodiment or
+    component profile surface is introduced.
+    """
+
+    dataset_id: str
+    pose_frame_contract_hash: str
+    physical_storage_layout: str = V25P_RECORD_CJSON_LAYOUT_V1
+
+    def __post_init__(self) -> None:
+        dataset_id = str(self.dataset_id).strip()
+        pose_hash = str(self.pose_frame_contract_hash).strip()
+        if not dataset_id or not pose_hash:
+            raise ValueError(
+                "v2.5-p shadow dataset and pose-frame identity are required."
+            )
+        storage_layout = str(self.physical_storage_layout).strip()
+        if storage_layout not in V25P_NATIVE_STORAGE_LAYOUTS_V1:
+            raise ValueError("Unsupported v2.5-p native physical storage layout.")
+        object.__setattr__(self, "dataset_id", dataset_id)
+        object.__setattr__(self, "pose_frame_contract_hash", pose_hash)
+        object.__setattr__(self, "physical_storage_layout", storage_layout)
+
+
+@dataclass(frozen=True)
 class ProcessExternalNativeStreamBinding:
     """Data-driven projection from one specialized writer source."""
 
@@ -117,6 +155,8 @@ class ProcessLegacyFinalizeResult:
         NativeStreamExternalArtifactReceipt, ...
     ] = ()
     artifact_receipt_error: str = ""
+    v25p_native_shadow_report: Any | None = None
+    v25p_native_shadow_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,6 +164,7 @@ class ProcessCollectionStats:
     submitted_samples: int
     completed_samples: int
     rejected_busy: int
+    sample_rejections: int
     queue_capacity: int
     queue_high_water: int
     slots_available: int
@@ -733,6 +774,7 @@ def _worker_main(
     writer_config: LeRobotV21WriterConfig,
     sample_builder_config: CollectorSampleBuilderConfig,
     process_config: ProcessCollectionConfig,
+    v25p_shadow_config: ProcessV25pShadowConfig | None,
     native_stream_contracts: Mapping[str, NativeStreamContract],
     external_stream_bindings: Mapping[
         str, ProcessExternalNativeStreamBinding
@@ -745,6 +787,9 @@ def _worker_main(
     blocks: dict[str, shared_memory.SharedMemory] = {}
     writer: LeRobotV21Writer | None = None
     native_writer: NativeStreamEpisodeWriter | None = None
+    v25p_native_shadow: Any | None = None
+    v25p_native_shadow_identity: EpisodeCaptureIdentity | None = None
+    v25p_native_shadow_error = ""
     native_ingestion_frozen = False
     next_external_sequence_by_stream: dict[str, int] = {}
     external_intent_and_sample_frame_by_identity: dict[
@@ -757,6 +802,49 @@ def _worker_main(
             for name in shm_names
         }
         writer = LeRobotV21Writer(writer_config)
+        if v25p_shadow_config is not None:
+            if writer_config.policy_io_layout is None:
+                raise ValueError("v2.5-p native shadow requires a policy-I/O layout.")
+            from .v25p_capture_profiles import (
+                V25P_REAL_TELEOP_SOURCE,
+                build_policy_io_v25p_capture_profiles,
+            )
+            from .v25p_dual_write_shadow import V25pDualWriteShadow
+            from .v25p_native_store import V25pNativeEpisodeStore
+            from .v25p_real_teleop_producer import RealTeleopV25pProducer
+
+            bundle = build_policy_io_v25p_capture_profiles(
+                source=V25P_REAL_TELEOP_SOURCE,
+                layout=writer_config.policy_io_layout,
+                pose_frame_contract_hash=v25p_shadow_config.pose_frame_contract_hash,
+                component_sides=tuple(sample_builder_config.active_sides),
+            )
+            v25p_native_shadow = V25pDualWriteShadow(
+                store=V25pNativeEpisodeStore(
+                    dataset_root=writer_config.root_dir,
+                    dataset_id=v25p_shadow_config.dataset_id,
+                    embodiment_profile=bundle.embodiment,
+                    component_stream_profile=bundle.streams,
+                    compatibility_projection_profiles=(bundle.v23_projection,),
+                    physical_storage_layout=(
+                        v25p_shadow_config.physical_storage_layout
+                    ),
+                    defer_sample_file_writes=(
+                        v25p_shadow_config.physical_storage_layout
+                        == V25P_RECORD_CJSON_LAYOUT_V1
+                    ),
+                ),
+                bundle=bundle,
+                producer=RealTeleopV25pProducer(
+                    layout=writer_config.policy_io_layout,
+                    stream_profile=bundle.streams,
+                    bindings=bundle.producer_bindings,
+                    component_action_schema=bundle.component_action_schema,
+                    component_action_projection=(
+                        bundle.component_action_projection
+                    ),
+                ),
+            )
         detached_builder_config = replace(
             sample_builder_config,
             camera_buffers={},
@@ -795,6 +883,20 @@ def _worker_main(
                     }
                     if hydrated_slot is not None:
                         slot_id = int(hydrated_slot)
+                    if (
+                        bool(getattr(writer_config, "strict_v22_policy_io", False))
+                        and writer_config.policy_io_layout is not None
+                    ):
+                        active_stage = "worker.validate_sample_contract"
+                        stage_started = time.perf_counter()
+                        validate_strict_v22_measured_state(
+                            snapshot.hand_states,
+                            layout=writer_config.policy_io_layout,
+                            sample_timestamp=float(snapshot.step_result.timestamp),
+                        )
+                        stage_ms["worker.validate_sample_contract"] = float(
+                            (time.perf_counter() - stage_started) * 1000.0
+                        )
                     active_stage = "worker.build_sample"
                     stage_started = time.perf_counter()
                     sample = builder.build_from_snapshot(snapshot)
@@ -813,6 +915,41 @@ def _worker_main(
                     stage_ms["worker.plan_jobs"] = float(
                         (time.perf_counter() - stage_started) * 1000.0
                     )
+                    if (
+                        v25p_native_shadow is not None
+                        and v25p_native_shadow_identity is not None
+                        and not v25p_native_shadow_error
+                    ):
+                        active_stage = "worker.v25p_native_shadow_append"
+                        stage_started = time.perf_counter()
+                        try:
+                            from .v25p_dual_write_shadow import (
+                                legacy_row_from_planned_jobs,
+                            )
+
+                            v25p_native_shadow.append(
+                                v25p_native_shadow_identity,
+                                source_sample=sample,
+                                legacy_row=legacy_row_from_planned_jobs(jobs),
+                            )
+                        except BaseException as exc:
+                            # The legacy capture stays authoritative.
+                            v25p_native_shadow_error = (
+                                f"append:{type(exc).__name__}: {exc}"
+                            )
+                            try:
+                                v25p_native_shadow.close_unsealed(
+                                    v25p_native_shadow_identity
+                                )
+                            except BaseException as close_exc:
+                                v25p_native_shadow_error += (
+                                    ";close_unsealed:"
+                                    f"{type(close_exc).__name__}: {close_exc}"
+                                )
+                            v25p_native_shadow_identity = None
+                        stage_ms["worker.v25p_native_shadow_append"] = float(
+                            (time.perf_counter() - stage_started) * 1000.0
+                        )
                     if native_writer is not None and external_stream_bindings:
                         active_stage = "worker.stage_external_selected_rgb"
                         stage_started = time.perf_counter()
@@ -856,6 +993,22 @@ def _worker_main(
                             "tactile_frame_counts": writer.tactile_frame_counts(
                                 int(sample.episode_index)
                             ),
+                        }
+                    )
+                except StrictV22SampleRejection as exc:
+                    if slot_id is not None:
+                        ack_queue.put({"kind": "slot_free", "slot_id": slot_id})
+                        slot_id = None
+                    # A strict measured-feedback rejection belongs to this
+                    # sample, not to the writer process.  Keep the worker
+                    # usable for the next valid snapshot.
+                    ack_queue.put(
+                        {
+                            "kind": "sample_rejected",
+                            "reason": str(exc),
+                            "side": str(exc.side),
+                            "rejection_reason": str(exc.reason),
+                            "age_sec": exc.age_sec,
                         }
                     )
                 except BaseException as exc:  # noqa: BLE001
@@ -910,21 +1063,76 @@ def _worker_main(
             try:
                 if kind == "start_episode":
                     episode_uuid = str(message.get("episode_uuid") or "").strip()
+                    identity_payload = message.get("episode_identity")
+                    episode_identity = (
+                        None
+                        if identity_payload is None
+                        else EpisodeCaptureIdentity.from_payload(identity_payload)
+                    )
                     if native_stream_contracts and not episode_uuid:
                         raise ValueError(
                             "Native stream process mode requires an episode UUID."
                         )
-                    if not native_stream_contracts and episode_uuid:
+                    if not native_stream_contracts and episode_uuid and episode_identity is None:
                         raise ValueError(
                             "episode_uuid was provided without native stream contracts."
                         )
+                    if v25p_shadow_config is not None and episode_identity is None:
+                        raise ValueError(
+                            "v2.5-p native shadow requires the owner's episode identity."
+                        )
+                    if v25p_shadow_config is None and episode_identity is not None:
+                        raise ValueError(
+                            "episode_identity was provided without a v2.5-p native shadow."
+                        )
+                    if episode_identity is not None:
+                        if episode_uuid and episode_uuid != episode_identity.episode_uuid:
+                            raise ValueError("Episode UUID and owner identity disagree.")
+                        if (
+                            episode_identity.legacy_episode_index
+                            != int(writer.next_episode_index)
+                        ):
+                            raise ValueError(
+                                "Owner identity index does not match the legacy writer."
+                            )
                     if native_writer is not None:
                         raise RuntimeError(
                             "Previous native stream episode is still active."
                         )
-                    episode_index = writer.start_episode(
-                        metadata=dict(message.get("metadata") or {})
-                    )
+                    if v25p_native_shadow_identity is not None:
+                        raise RuntimeError(
+                            "Previous v2.5-p native shadow episode is still active."
+                        )
+                    v25p_native_shadow_error = ""
+                    if v25p_native_shadow is not None and episode_identity is not None:
+                        v25p_native_shadow.prepare_episode(episode_identity)
+                        v25p_native_shadow_identity = episode_identity
+                    try:
+                        episode_index = writer.start_episode(
+                            metadata=dict(message.get("metadata") or {})
+                        )
+                    except BaseException:
+                        if (
+                            v25p_native_shadow is not None
+                            and v25p_native_shadow_identity is not None
+                        ):
+                            v25p_native_shadow.discard_episode(
+                                v25p_native_shadow_identity
+                            )
+                            v25p_native_shadow_identity = None
+                        raise
+                    if (
+                        episode_identity is not None
+                        and int(episode_index) != episode_identity.legacy_episode_index
+                    ):
+                        writer.discard_episode(int(episode_index))
+                        assert v25p_native_shadow is not None
+                        assert v25p_native_shadow_identity is not None
+                        v25p_native_shadow.discard_episode(v25p_native_shadow_identity)
+                        v25p_native_shadow_identity = None
+                        raise RuntimeError(
+                            "Legacy episode index changed after owner identity preparation."
+                        )
                     if native_stream_contracts:
                         try:
                             native_writer = NativeStreamEpisodeWriter(
@@ -938,6 +1146,31 @@ def _worker_main(
                             )
                         except BaseException:
                             writer.discard_episode(int(episode_index))
+                            if (
+                                v25p_native_shadow is not None
+                                and v25p_native_shadow_identity is not None
+                            ):
+                                v25p_native_shadow.discard_episode(
+                                    v25p_native_shadow_identity
+                                )
+                                v25p_native_shadow_identity = None
+                            raise
+                    if (
+                        v25p_native_shadow is not None
+                        and v25p_native_shadow_identity is not None
+                    ):
+                        try:
+                            v25p_native_shadow.bind_prepared_episode(
+                                v25p_native_shadow_identity,
+                                bound_at=time.monotonic(),
+                                bound_clock_domain_id="python_monotonic",
+                            )
+                        except BaseException:
+                            writer.discard_episode(int(episode_index))
+                            v25p_native_shadow.discard_episode(
+                                v25p_native_shadow_identity
+                            )
+                            v25p_native_shadow_identity = None
                             raise
                     native_ingestion_frozen = False
                     next_external_sequence_by_stream.clear()
@@ -1033,6 +1266,53 @@ def _worker_main(
                             episode_index=int(message["episode_index"]),
                             legacy_finalized=True,
                         )
+                    if v25p_native_shadow is not None:
+                        shadow_report = None
+                        shadow_error = v25p_native_shadow_error
+                        if v25p_native_shadow_identity is not None:
+                            try:
+                                from .v25p_dual_write_shadow import (
+                                    load_finalized_legacy_episode_record,
+                                )
+
+                                shadow_report = v25p_native_shadow.finalize_after_legacy(
+                                    v25p_native_shadow_identity,
+                                    legacy_episode_record=(
+                                        load_finalized_legacy_episode_record(
+                                            writer_config.root_dir,
+                                            int(message["episode_index"]),
+                                        )
+                                    ),
+                                    completed_at=time.time(),
+                                    completed_clock_domain_id="local_wall_clock",
+                                )
+                                if shadow_report.receipt.status != "complete":
+                                    shadow_error = str(
+                                        shadow_report.receipt.message
+                                        or "v2.5-p compatibility projection failed"
+                                    )
+                            except BaseException as exc:  # legacy finalize succeeded
+                                shadow_error = f"finalize:{type(exc).__name__}: {exc}"
+                                if (
+                                    v25p_native_shadow.active_identity
+                                    == v25p_native_shadow_identity
+                                ):
+                                    try:
+                                        v25p_native_shadow.close_unsealed(
+                                            v25p_native_shadow_identity
+                                        )
+                                    except BaseException as close_exc:
+                                        shadow_error += (
+                                            ";close_unsealed:"
+                                            f"{type(close_exc).__name__}: {close_exc}"
+                                        )
+                            finally:
+                                v25p_native_shadow_identity = None
+                        result = replace(
+                            result,
+                            v25p_native_shadow_report=shadow_report,
+                            v25p_native_shadow_error=shadow_error,
+                        )
                 elif kind == "discard_episode":
                     if native_writer is not None:
                         if (
@@ -1047,6 +1327,15 @@ def _worker_main(
                         native_ingestion_frozen = False
                         next_external_sequence_by_stream.clear()
                         external_intent_and_sample_frame_by_identity.clear()
+                    if (
+                        v25p_native_shadow is not None
+                        and v25p_native_shadow_identity is not None
+                    ):
+                        v25p_native_shadow.discard_episode(
+                            v25p_native_shadow_identity
+                        )
+                        v25p_native_shadow_identity = None
+                        v25p_native_shadow_error = ""
                     result = bool(writer.discard_episode(int(message["episode_index"])))
                 elif kind == "native_stream_note_drops":
                     if native_writer is None:
@@ -1181,6 +1470,14 @@ def _worker_main(
                     native_ingestion_frozen = False
                     next_external_sequence_by_stream.clear()
                     external_intent_and_sample_frame_by_identity.clear()
+                    if (
+                        v25p_native_shadow is not None
+                        and v25p_native_shadow_identity is not None
+                    ):
+                        v25p_native_shadow.close_unsealed(
+                            v25p_native_shadow_identity
+                        )
+                        v25p_native_shadow_identity = None
                     reply_queue.put(
                         {
                             "kind": "reply",
@@ -1223,6 +1520,11 @@ def _worker_main(
     finally:
         if native_writer is not None:
             native_writer.close_unsealed()
+        if (
+            v25p_native_shadow is not None
+            and v25p_native_shadow_identity is not None
+        ):
+            v25p_native_shadow.close_unsealed(v25p_native_shadow_identity)
         for block in blocks.values():
             block.close()
 
@@ -1241,8 +1543,14 @@ class ProcessCollectionWorker:
             str, ProcessExternalNativeStreamBinding
         ]
         | None = None,
+        v25p_shadow_config: ProcessV25pShadowConfig | None = None,
     ) -> None:
         self.writer_config = writer_config
+        if v25p_shadow_config is not None and not isinstance(
+            v25p_shadow_config, ProcessV25pShadowConfig
+        ):
+            raise TypeError("v25p_shadow_config must be ProcessV25pShadowConfig.")
+        self.v25p_shadow_config = v25p_shadow_config
         self.native_stream_contracts = dict(
             sorted(dict(native_stream_contracts or {}).items())
         )
@@ -1334,6 +1642,7 @@ class ProcessCollectionWorker:
                 writer_config,
                 self.sample_builder_config,
                 config,
+                self.v25p_shadow_config,
                 self.native_stream_contracts,
                 self.native_external_stream_bindings,
                 self._slots.names,
@@ -1360,6 +1669,8 @@ class ProcessCollectionWorker:
         self._active_episode_frame_count = 0
         self._worker_error: str | None = None
         self._worker_traceback: str | None = None
+        self._sample_rejection_count = 0
+        self._pending_sample_rejections: deque[str] = deque()
         self._sample_process_ms: deque[float] = deque(maxlen=2048)
         self._parent_pack_ms: deque[float] = deque(maxlen=2048)
         self._parent_queue_put_ms: deque[float] = deque(maxlen=2048)
@@ -1454,6 +1765,10 @@ class ProcessCollectionWorker:
                     }
             elif kind == "native_stream_sample_done":
                 self._completed_native_stream_samples += 1
+            elif kind == "sample_rejected":
+                reason = str(message.get("reason") or "collection sample rejected")
+                self._sample_rejection_count += 1
+                self._pending_sample_rejections.append(reason)
             elif kind == "worker_error":
                 if self._worker_error is None:
                     self._worker_error = str(
@@ -1468,6 +1783,14 @@ class ProcessCollectionWorker:
                             file=sys.stderr,
                             flush=True,
                         )
+
+    def consume_sample_rejection(self) -> str | None:
+        """Return one nonfatal sample-contract rejection, if available."""
+
+        self._drain_acks()
+        if not self._pending_sample_rejections:
+            return None
+        return self._pending_sample_rejections.popleft()
 
     def _raise_if_failed(self) -> None:
         self._drain_acks()
@@ -1581,28 +1904,52 @@ class ProcessCollectionWorker:
         metadata: Mapping[str, Any],
         *,
         episode_uuid: str | None = None,
+        episode_identity: EpisodeCaptureIdentity | None = None,
     ) -> int:
         normalized_uuid = str(episode_uuid or "").strip()
         if self.native_stream_contracts and not normalized_uuid:
             raise ValueError(
                 "episode_uuid is required when native streams are configured."
             )
-        if not self.native_stream_contracts and normalized_uuid:
+        if (
+            not self.native_stream_contracts
+            and normalized_uuid
+            and episode_identity is None
+        ):
             raise ValueError(
                 "episode_uuid is only accepted when native streams are configured."
             )
+        if self.v25p_shadow_config is not None and episode_identity is None:
+            raise ValueError(
+                "episode_identity is required when the v2.5-p shadow is configured."
+            )
+        if self.v25p_shadow_config is None and episode_identity is not None:
+            raise ValueError(
+                "episode_identity is only accepted when the v2.5-p shadow is configured."
+            )
+        if episode_identity is not None:
+            if normalized_uuid and normalized_uuid != episode_identity.episode_uuid:
+                raise ValueError("Episode UUID and owner identity disagree.")
+            normalized_uuid = episode_identity.episode_uuid
         episode_index = int(
             self._request(
                 "start_episode",
                 metadata=dict(metadata),
                 episode_uuid=normalized_uuid or None,
+                episode_identity=(
+                    None
+                    if episode_identity is None
+                    else episode_identity.to_payload()
+                ),
             )
         )
         self.next_episode_index = episode_index + 1
         self._active_episode_frame_count = 0
-        self._active_native_episode_uuid = normalized_uuid or None
+        self._active_native_episode_uuid = (
+            normalized_uuid if self.native_stream_contracts else None
+        )
         self._active_native_episode_index = (
-            episode_index if normalized_uuid else None
+            episode_index if self.native_stream_contracts else None
         )
         self._active_native_episode_frozen = False
         return episode_index
@@ -1880,7 +2227,38 @@ class ProcessCollectionWorker:
 
     def flush(self) -> None:
         self._request("flush")
-        self._drain_acks()
+        # Sample terminal acknowledgements and synchronous request replies use
+        # separate multiprocessing queues.  The worker enqueues the sample ack
+        # before replying to this flush request, but independent queue feeder
+        # threads may make the reply visible first.  A single non-blocking
+        # drain therefore does not provide flush semantics.  Wait until every
+        # sample accepted by the parent has a terminal ack, while continuing
+        # to surface worker death/errors fail closed.
+        deadline = time.monotonic() + float(self.config.request_timeout_sec)
+        while True:
+            self._drain_acks()
+            self._raise_if_failed()
+            samples_settled = (
+                self._completed_samples + self._sample_rejection_count
+                >= self._submitted_samples
+            )
+            native_samples_settled = (
+                self._completed_native_stream_samples
+                >= self._submitted_native_stream_samples
+            )
+            if samples_settled and native_samples_settled:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(
+                    "collection worker flush timed out waiting for terminal "
+                    "sample acknowledgements: "
+                    f"samples={self._completed_samples + self._sample_rejection_count}/"
+                    f"{self._submitted_samples} native_samples="
+                    f"{self._completed_native_stream_samples}/"
+                    f"{self._submitted_native_stream_samples}"
+                )
+            time.sleep(min(0.001, remaining))
 
     def reset_temporal_history(self) -> None:
         self._request("reset_temporal_history")
@@ -1954,6 +2332,7 @@ class ProcessCollectionWorker:
             submitted_samples=int(self._submitted_samples),
             completed_samples=int(self._completed_samples),
             rejected_busy=int(self._rejected_busy),
+            sample_rejections=int(self._sample_rejection_count),
             queue_capacity=int(self.config.queue_size),
             queue_high_water=int(self._queue_high_water),
             slots_available=len(self._slots.available),
@@ -1993,6 +2372,8 @@ class ProcessCollectionWorker:
             "worker_alive": bool(self._started and self._process.is_alive()),
             "worker_error": self._worker_error,
             "worker_traceback": self._worker_traceback,
+            "sample_rejection_count": int(self._sample_rejection_count),
+            "pending_sample_rejections": len(self._pending_sample_rejections),
             "active_episode_frame_count": int(self._active_episode_frame_count),
             "parent_pack_ms_latest": (
                 None if not self._parent_pack_ms else float(self._parent_pack_ms[-1])
@@ -2063,6 +2444,7 @@ __all__ = [
     "ProcessLegacyFinalizeResult",
     "ProcessNativeStreamEpisodeCapture",
     "ProcessNativeStreamSubmissionReceipt",
+    "ProcessV25pShadowConfig",
     "SharedArrayRef",
     "camera_shared_slot_bytes",
 ]

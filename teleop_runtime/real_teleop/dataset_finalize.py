@@ -33,6 +33,11 @@ class RealDatasetFinalizeTask:
     control_trace_release: Any | None = field(default=None, repr=False)
     control_trace_finalize_report: Any | None = field(default=None, repr=False)
     control_trace_error: str = ""
+    episode_identity: Any | None = field(default=None, repr=False)
+    v25p_finalize_report: Any | None = field(default=None, repr=False)
+    v25p_error: str = ""
+    v25p_native_finalize_report: Any | None = field(default=None, repr=False)
+    v25p_native_error: str = ""
     _state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property

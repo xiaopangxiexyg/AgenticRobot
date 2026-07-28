@@ -182,6 +182,7 @@ def _start_camera_sources(
             if startup_progress is not None:
                 startup_progress.update(progress_key, message="正在启动视频流")
         _log("Camera", f"starting camera {camera_key}")
+        start_started = time.perf_counter()
         try:
             source.start()
         except Exception as exc:
@@ -192,6 +193,12 @@ def _start_camera_sources(
                 )
             raise
         else:
+            _log(
+                "Camera",
+                f"camera {camera_key} video stream ready; "
+                f"source_start_elapsed={(time.perf_counter() - start_started):.3f}s "
+                f"stages={getattr(source, 'startup_timing', {})}",
+            )
             if startup_progress is not None:
                 startup_progress.succeed(progress_key, message="视频流已启动")
 
@@ -203,7 +210,6 @@ def _start_camera_sources_best_effort(
     startup_progress: GuiStartupProgress | None = None,
 ) -> dict[str, str]:
     """Attempt every configured camera without making cameras a GUI gate."""
-
     errors: dict[str, str] = {}
     for index, (camera_key, source) in enumerate(camera_sources.items()):
         progress_key = f"camera.{camera_key}"
@@ -224,6 +230,7 @@ def _start_camera_sources_best_effort(
             if startup_progress is not None:
                 startup_progress.update(progress_key, message="正在启动视频流")
         _log("Camera", f"starting camera {camera_key}")
+        start_started = time.perf_counter()
         try:
             source.start()
         except Exception as exc:  # noqa: BLE001 - optional-device admission records failure.
@@ -233,6 +240,12 @@ def _start_camera_sources_best_effort(
             if startup_progress is not None:
                 startup_progress.fail(progress_key, detail)
         else:
+            _log(
+                "Camera",
+                f"camera {camera_key} video stream ready; "
+                f"source_start_elapsed={(time.perf_counter() - start_started):.3f}s "
+                f"stages={getattr(source, 'startup_timing', {})}",
+            )
             if startup_progress is not None:
                 startup_progress.succeed(progress_key, message="视频流已启动")
     return errors

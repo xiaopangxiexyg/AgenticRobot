@@ -28,6 +28,15 @@ canonical composition root；实际站点应显式提供设备、profile、datas
 120 Hz qcmd、accepted-qref FK main action、1.0/0.35 IK、adaptive min2/max4、position-only
 奇异 branch 策略和低扰动数采配置。
 
+`rm65_bimanual_position_v2_responsive` 是显式 opt-in 的响应性后继版本，不替换 V1。
+它保持相同硬执行包络，仅增加健康普通区的按侧 post-IK fast path，并要求 q5 逃逸实际
+进入 admitted qref 后才启用 release hysteresis。V2 必须使用独立 task/profile 名称；
+切回 `POSITION_FORMAL_V1_ARGS` 即回退。
+
+`POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS` 是独立的 default-off 测试数组：它以 V1 为基线，
+仅将既有正式 qref 速度/加速度区间下放到 Pink QP。测试数据必须使用独立 task/profile；
+切回 `POSITION_FORMAL_V1_ARGS` 即完整回退。
+
 正式可执行命令只在 [real README 的第 1.3 节](./README.md) 维护；本节负责
 解释该命令选中的 profile 和验收字段。
 
@@ -77,6 +86,8 @@ canonical composition root；实际站点应显式提供设备、profile、datas
 | `DMTAC_TACTILE_WORKER_2CPU_ARGS` | 触觉 worker CPU `12,13` 与 nice | 不改变触觉数据语义 |
 | `DATASET_COMMON_ARGS` | Dataset、相机、sample 公共配置 | 不改变位控参数 |
 | `POSITION_FORMAL_V1_ARGS` | 选择正式 position profile 和 control mode | 不配置 writer/debug |
+| `POSITION_FORMAL_V2_RESPONSIVE_ARGS` | 选择 opt-in 响应性 V2；硬执行包络与 V1 相同 | 不与 V1 task 混写 |
+| `POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS` | 选择 opt-in admitted-anchor QP 约束；其余使用稳定 V1 | 不与 V1/V2 task 混写 |
 | `POSITION_COLLECTION_PROCESS_ARGS` | Spawn writer、共享内存槽、CPU `8-11` | 不改变 main action |
 | `POSITION_COLLECTION_PRODUCTION_ARGS` | 关闭高频 JSON/FK debug，保留预分配数值 trace | 不关闭正式 dataset |
 | `NO_COLLECTION_SENSOR_BASELINE_ARGS` | 禁用 collection/episode writer，形成控制与传感器基线 | 不禁用 RGB 相机或 DMTAC 触觉 |
@@ -171,6 +182,22 @@ GUI 仅在开始前提供有限 `variant` 选择（配置 task profile 时）以
 pending episode token，旁路写入期间不会允许删除/重编号。旧 v2.3 数据和显式的 v2.4
 compatibility view 由同一 reader 读取，缺少 sidecar 时按“无 Plus 标注”处理。v2.4 native
 capture identity 仍由上位 capture adapter 提供，Plus 不从目录名推断。
+
+### 3.7 provisional v2.5-p 分块存储
+
+v2.5-p native shadow 和它的 Parquet 分块物理后端均为 default-off，不改变现有正式命令。
+需要离线/影子验证时，在原命令上同时增加：
+
+```bash
+--v25p-native-shadow \
+--v25p-native-storage-layout parquet_stream_chunks_v1
+```
+
+RealTeleop thread/process writer 与 UMI 使用相同参数名。只启用
+`--v25p-native-shadow` 时仍使用可回退的 `record_cjson_v1`；只指定 Parquet layout 而不启用
+shadow 会直接报配置错误。该开关不声明 native-v2.5 eligibility，也不启用 v2.4 merge 或长程任务
+GUI。启用后 action 经过共享 canonical `ComponentAction` 投影，v2.3 writer 仍是权威输出；
+省略开关时不会构建 native store，也不会生成 `meta/v25p/native/`。
 
 ## 4. Impedance/力控数采
 

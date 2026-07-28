@@ -111,7 +111,7 @@ class ProposalSnapshot:
     included_admission_sequence_min: int | None
     included_admission_sequence_max: int | None
     target_effective_at: float
-    component_schema_hash: str
+    action_schema_hash: str
     producer_epoch_snapshot_hash: str
     reduction_policy_id: str
     candidates: tuple[ProposalCandidate, ...]
@@ -154,7 +154,7 @@ def build_proposal_snapshot(
     *,
     producer_epochs: ProducerEpochSnapshot,
     target_effective_at: float,
-    component_schema_hash: str,
+    action_schema_hash: str,
     active_selection_groups: tuple[str, ...],
     reduction_policy_id: str = "target_interval_latest_per_producer_group_v1",
 ) -> ProposalSnapshot:
@@ -176,9 +176,9 @@ def build_proposal_snapshot(
                 ProposalDisposition(proposal.proposal_id, None, "inactive_producer_epoch")
             )
             continue
-        if proposal.component_schema_hash != component_schema_hash:
+        if proposal.action_schema_hash != action_schema_hash:
             dispositions.append(
-                ProposalDisposition(proposal.proposal_id, None, "component_schema_mismatch")
+                ProposalDisposition(proposal.proposal_id, None, "action_schema_mismatch")
             )
             continue
         if proposal.validity != "valid" or proposal.status != "ready":
@@ -226,7 +226,7 @@ def build_proposal_snapshot(
         "included_admission_sequence_min": projection.included_admission_sequence_min,
         "included_admission_sequence_max": projection.included_admission_sequence_max,
         "target_effective_at": target,
-        "component_schema_hash": component_schema_hash,
+        "action_schema_hash": action_schema_hash,
         "producer_epoch_snapshot_hash": epoch_hash,
         "reduction_policy_id": reduction_policy_id,
         "candidates": tuple(
@@ -256,7 +256,7 @@ def build_proposal_snapshot(
         included_admission_sequence_min=projection.included_admission_sequence_min,
         included_admission_sequence_max=projection.included_admission_sequence_max,
         target_effective_at=target,
-        component_schema_hash=component_schema_hash,
+        action_schema_hash=action_schema_hash,
         producer_epoch_snapshot_hash=epoch_hash,
         reduction_policy_id=reduction_policy_id,
         candidates=tuple(candidates),

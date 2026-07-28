@@ -11,6 +11,7 @@ import pytest
 
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from teleop_runtime.collection.async_writer import AsyncWriterStats
+from teleop_runtime.collection.schema_v22 import StrictV22SampleRejection
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,
     EpisodeTraceRecorderSink,
@@ -275,6 +276,58 @@ def test_finalize_marks_storage_queue_drops_as_integrity_failure(tmp_path: Path)
     ]
 
 
+def test_thread_sample_contract_rejection_does_not_escape_record_step() -> None:
+    recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+        real_teleop.RealTeleopDatasetRecorder
+    )
+    recorder.active_episode_index = 12
+    recorder._pause_started_at = None
+    recorder.collection_worker_mode = "thread"
+    recorder._collection_integrity_reasons = []
+    recorder._sample_overload_reason = None
+    recorder._sample_modality_reason = None
+    recorder.sample_builder = SimpleNamespace(
+        include_debug_metadata=False,
+        include_action_debug_metadata=False,
+        last_camera_rejection=None,
+        frame_index=0,
+    )
+    recorder.writer_observer = SimpleNamespace(
+        handle_step=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            StrictV22SampleRejection(
+                "left measured state stale",
+                side="left",
+                reason="stale_measured_state",
+                age_sec=0.503,
+            )
+        )
+    )
+    recorder.writer_runtime = None
+
+    result = recorder.record_step(SimpleNamespace(timestamp=10.0))
+
+    assert result is None
+    assert recorder.collection_overload_reason.startswith(
+        "collection_sample_rejected:stale_measured_state:left:"
+    )
+    assert recorder._collection_integrity_reasons == [recorder.collection_overload_reason]
+
+
+def test_async_sample_drain_failure_is_recorded_without_raising(tmp_path: Path) -> None:
+    recorder = _new_recorder(tmp_path, [])
+    future = Future()
+    future.set_exception(RuntimeError("worker.plan_jobs failed"))
+    recorder._sample_future = future
+
+    assert recorder._drain_async_sample() is None
+    assert recorder.collection_overload_reason == (
+        "collection_sample_drain_error:RuntimeError:worker.plan_jobs failed"
+    )
+    assert recorder._collection_integrity_reasons == [
+        "collection_sample_drain_error:RuntimeError:worker.plan_jobs failed"
+    ]
+
+
 def test_control_trace_episode_sink_is_subordinate_to_legacy_finalize(
     tmp_path: Path,
 ) -> None:
@@ -513,6 +566,138 @@ def test_process_native_stream_start_uses_trace_episode_uuid(
         writer.started[0][0]["control_trace_episode"]["episode_uuid"]
         == "episode-uuid-process-native"
     )
+
+
+def test_episode_owner_passes_one_identity_to_v25p_and_control_trace(
+    tmp_path: Path,
+) -> None:
+    class _Sidecar:
+        dataset_root = tmp_path
+
+        def __init__(self) -> None:
+            self.prepared = None
+            self.bound = None
+
+        def prepare_episode(self, identity) -> None:
+            self.prepared = identity
+
+        def bind_prepared_episode(self, identity, **_kwargs) -> None:
+            assert identity is self.prepared
+            self.bound = identity
+
+        def discard_episode(self, identity) -> None:
+            assert identity is self.prepared
+
+    recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+        real_teleop.RealTeleopDatasetRecorder
+    )
+    recorder.writer = _FakeWriter([])
+    recorder.collection_worker_mode = "thread"
+    recorder.sample_builder = SimpleNamespace(set_episode=lambda _index: None)
+    recorder.process_worker = SimpleNamespace(native_stream_contracts={})
+    recorder.active_episode_index = None
+    recorder.active_started_at = None
+    recorder.finalize_tasks = []
+    recorder.gripper_force_contract = None
+    recorder.actual_feedback_warmup_status = lambda _now: (True, "ready")
+    recorder._record_timestamps = deque()
+    recorder._episode_uuid_factory = lambda: "episode-owner-uuid"
+    sidecar = _Sidecar()
+    recorder.v25p_sidecar_store = sidecar
+    trace = ControlTraceRuntime(
+        RuntimeTraceSession(
+            trace_session_id="trace-session-shared-identity",
+            runtime_session_id="runtime-session-shared-identity",
+            control_domain_id="robot-0",
+            profile_id="plain_dry_run_v1",
+            started_at=0.0,
+            clock_domain_id="local_monotonic",
+        ),
+        capacity=32,
+    )
+    sink = EpisodeTraceRecorderSink(
+        trace,
+        lifecycle_owner_id="subordinate-control-trace",
+        uuid_factory=lambda: "must-not-be-used",
+    )
+    recorder.control_trace_episode_sink = sink
+    recorder._active_control_trace_preparation = None
+
+    episode_index = recorder.start_episode({}, now=1.0)
+
+    assert episode_index == 12
+    assert sidecar.prepared is sidecar.bound
+    assert recorder.active_episode_identity is sidecar.prepared
+    assert sidecar.prepared.episode_uuid == "episode-owner-uuid"
+    assert trace.episode_membership is not None
+    assert trace.episode_membership.episode_uuid == "episode-owner-uuid"
+    metadata = recorder.writer.started[0]
+    assert metadata["v25p_episode"]["episode_uuid"] == "episode-owner-uuid"
+    assert metadata["control_trace_episode"]["episode_uuid"] == "episode-owner-uuid"
+
+
+def test_v25p_bind_failure_rolls_back_legacy_and_trace_preparation(
+    tmp_path: Path,
+) -> None:
+    class _FailingSidecar:
+        dataset_root = tmp_path
+
+        def __init__(self) -> None:
+            self.prepared = None
+            self.discarded = None
+
+        def prepare_episode(self, identity) -> None:
+            self.prepared = identity
+
+        def bind_prepared_episode(self, identity, **_kwargs) -> None:
+            assert identity is self.prepared
+            raise RuntimeError("sidecar bind failed")
+
+        def discard_episode(self, identity) -> None:
+            self.discarded = identity
+
+    writer = _FakeWriter([])
+    recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+        real_teleop.RealTeleopDatasetRecorder
+    )
+    recorder.writer = writer
+    recorder.collection_worker_mode = "thread"
+    recorder.sample_builder = SimpleNamespace(set_episode=lambda _index: None)
+    recorder.process_worker = SimpleNamespace(native_stream_contracts={})
+    recorder.active_episode_index = None
+    recorder.active_started_at = None
+    recorder.finalize_tasks = []
+    recorder.gripper_force_contract = None
+    recorder.actual_feedback_warmup_status = lambda _now: (True, "ready")
+    recorder._record_timestamps = deque()
+    recorder._episode_uuid_factory = lambda: "episode-bind-failure"
+    sidecar = _FailingSidecar()
+    recorder.v25p_sidecar_store = sidecar
+    trace = ControlTraceRuntime(
+        RuntimeTraceSession(
+            trace_session_id="trace-session-bind-failure",
+            runtime_session_id="runtime-session-bind-failure",
+            control_domain_id="robot-0",
+            profile_id="plain_dry_run_v1",
+            started_at=0.0,
+            clock_domain_id="local_monotonic",
+        ),
+        capacity=32,
+    )
+    sink = EpisodeTraceRecorderSink(
+        trace,
+        lifecycle_owner_id="subordinate-control-trace",
+    )
+    recorder.control_trace_episode_sink = sink
+    recorder._active_control_trace_preparation = None
+
+    with pytest.raises(RuntimeError, match="sidecar bind failed"):
+        recorder.start_episode({}, now=1.0)
+
+    assert writer.discarded == [12]
+    assert sidecar.discarded is sidecar.prepared
+    assert trace.episode_membership is None
+    assert recorder.active_episode_index is None
 
 
 def test_control_trace_post_finalize_failure_does_not_rewrite_legacy_success(

@@ -22,6 +22,7 @@ from ...actuation import (
     rm65_bimanual_udp_feedback_profile,
 )
 from ...control import DIRECT_QPOS_DEBUG_EXECUTION_MODE
+from ...grasp_contact import GripperContactSurfaceSpec
 
 
 CUBE_LIFT_TASK_SCHEMA_VERSION = "dexteleop.sim.mujoco.cube_lift_task.v0"
@@ -45,6 +46,9 @@ NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1 = (
 )
 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2 = (
     "qpos_close_motion_tracking_no_episode_clock.v2"
+)
+NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1 = (
+    "qpos_close_motion_tracking_no_episode_clock_cube_pose.v1"
 )
 PHYSICAL_CONTACT_GRASP_MODE = "physical_contact"
 CONTACT_LATCH_DEBUG_GRASP_MODE = "contact_latch_debug"
@@ -205,6 +209,10 @@ class CubeLiftTaskConfig:
     grasp_latch_acquire_close: float = 0.45
     grasp_latch_release_close: float = 0.20
     grasp_latch_acquire_distance_m: float = 0.06
+    # Generic simulator-only gripper surface contract.  Each entry describes
+    # the inward-facing half-space of one finger; the opposite half-space is
+    # treated as the outer surface by the grasp-contact extractor.
+    gripper_contact_surface_specs: tuple[GripperContactSurfaceSpec, ...] = ()
     object_size_m: tuple[float, ...] = (0.03, 0.03, 0.03)
     cube_center_xy_m: tuple[float, ...] = (-0.472, 0.0)
     table_body_name: str = "table"
@@ -220,6 +228,26 @@ class CubeLiftTaskConfig:
     success_hold_physics_ticks: int = 20
     success_requires_bilateral_contact: bool = False
     pose_target_anti_windup: bool = False
+    # Optional simulator-only reset preparation.  This moves the arm to a
+    # collision-checked pre-grasp pose while keeping the gripper open; unlike
+    # scripted_contact_reset it establishes no contact and exposes all seven
+    # action dimensions to PPO after reset.
+    scripted_pregrasp_reset: bool = False
+    scripted_pregrasp_distance_m: float = 0.035
+    scripted_pregrasp_action_scale: tuple[float, ...] = (1.0,) * 7
+    scripted_pregrasp_action_bias: tuple[float, ...] = (0.0,) * 7
+    # Optional dynamic phase after real bilateral contact.  Unlike the
+    # scripted-contact curriculum, this phase is entered by the environment
+    # only after the policy has acquired contact for several policy ticks.
+    # The public action/learning contract remains the approach contract; the
+    # simulator constrains only the executed action once lifting is safe.
+    post_contact_phase_enabled: bool = False
+    post_contact_phase_activation_steps: int = 3
+    post_contact_phase_min_measured_close: float = 0.55
+    post_contact_phase_loss_grace_steps: int = 3
+    post_contact_action_scale: tuple[float, ...] = (1.0,) * 7
+    post_contact_action_bias: tuple[float, ...] = (0.0,) * 7
+    post_contact_nonnegative_lift_action: bool = False
     scripted_contact_reset: bool = False
     scripted_contact_reset_hold_steps: int = 5
     scripted_contact_reset_min_measured_close: float = 0.60
@@ -354,6 +382,7 @@ class CubeLiftTaskConfig:
             NORMAL_PROPRIO_PROFILE_V0,
             NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1,
             NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
+            NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
         }:
             raise ValueError(
                 "Unsupported normal_proprio_profile: "
@@ -364,11 +393,21 @@ class CubeLiftTaskConfig:
             in {
                 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1,
                 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
+                NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
             }
             and self.policy_class != NORMAL_POLICY_CLASS
         ):
             raise ValueError(
                 "The motion/tracking proprio profile is only valid for normal policies."
+            )
+        if (
+            normal_proprio_profile
+            == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1
+            and wrist_rgb_enabled
+        ):
+            raise ValueError(
+                "The cube-pose proprio contract currently excludes wrist RGB; "
+                "use a dedicated RGB observation layout before enabling both."
             )
         if (
             normal_proprio_profile
@@ -500,6 +539,22 @@ class CubeLiftTaskConfig:
         reward_shaping = dict(self.reward_shaping)
         if any(not isinstance(key, str) or not key.strip() for key in reward_shaping):
             raise ValueError("reward_shaping keys must be non-empty strings.")
+        surface_specs = tuple(
+            spec
+            if isinstance(spec, GripperContactSurfaceSpec)
+            else GripperContactSurfaceSpec.from_dict(spec)
+            for spec in self.gripper_contact_surface_specs
+        )
+        surface_bodies = [spec.body_name for spec in surface_specs]
+        if len(surface_bodies) != len(set(surface_bodies)):
+            raise ValueError(
+                "gripper_contact_surface_specs must contain one entry per finger body."
+            )
+        surface_sides = [spec.side for spec in surface_specs]
+        if len(surface_sides) != len(set(surface_sides)):
+            raise ValueError(
+                "gripper_contact_surface_specs must contain unique finger sides."
+            )
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "base_contract_path", base_contract_path)
         object.__setattr__(self, "base_contract_sha256", base_contract_hash)
@@ -532,6 +587,7 @@ class CubeLiftTaskConfig:
         object.__setattr__(self, "out_of_bounds_xyz_lower_m", lower_xyz)
         object.__setattr__(self, "out_of_bounds_xyz_upper_m", upper_xyz)
         object.__setattr__(self, "initial_gripper_close_by_name", grippers)
+        object.__setattr__(self, "gripper_contact_surface_specs", surface_specs)
         object.__setattr__(self, "reward_shaping", reward_shaping)
         for field_name, value in scalar_values.items():
             object.__setattr__(self, field_name, value)
@@ -549,6 +605,131 @@ class CubeLiftTaskConfig:
             self,
             "pose_target_anti_windup",
             bool(self.pose_target_anti_windup),
+        )
+        scripted_pregrasp_reset = bool(self.scripted_pregrasp_reset)
+        scripted_pregrasp_distance = float(self.scripted_pregrasp_distance_m)
+        if not math.isfinite(scripted_pregrasp_distance) or scripted_pregrasp_distance <= 0.0:
+            raise ValueError("scripted_pregrasp_distance_m must be positive and finite.")
+        if scripted_pregrasp_reset and self.scripted_contact_reset:
+            raise ValueError(
+                "scripted_pregrasp_reset and scripted_contact_reset are mutually exclusive."
+            )
+        object.__setattr__(self, "scripted_pregrasp_reset", scripted_pregrasp_reset)
+        object.__setattr__(self, "scripted_pregrasp_distance_m", scripted_pregrasp_distance)
+        scripted_pregrasp_action_scale = _finite_tuple(
+            self.scripted_pregrasp_action_scale,
+            size=7,
+            name="scripted_pregrasp_action_scale",
+        )
+        if any(value < 0.0 or value > 1.0 for value in scripted_pregrasp_action_scale):
+            raise ValueError(
+                "scripted_pregrasp_action_scale values must lie in [0, 1]."
+            )
+        scripted_pregrasp_action_bias = _finite_tuple(
+            self.scripted_pregrasp_action_bias,
+            size=7,
+            name="scripted_pregrasp_action_bias",
+        )
+        if any(
+            abs(bias) + scale > 1.0
+            for bias, scale in zip(
+                scripted_pregrasp_action_bias,
+                scripted_pregrasp_action_scale,
+            )
+        ):
+            raise ValueError(
+                "scripted_pregrasp_action_bias plus action scale must keep "
+                "every constrained action within [-1, 1]."
+            )
+        object.__setattr__(
+            self,
+            "scripted_pregrasp_action_scale",
+            scripted_pregrasp_action_scale,
+        )
+        object.__setattr__(
+            self,
+            "scripted_pregrasp_action_bias",
+            scripted_pregrasp_action_bias,
+        )
+        post_contact_phase_enabled = bool(self.post_contact_phase_enabled)
+        post_contact_activation_steps = int(self.post_contact_phase_activation_steps)
+        if post_contact_activation_steps <= 0:
+            raise ValueError(
+                "post_contact_phase_activation_steps must be positive."
+            )
+        post_contact_min_close = float(self.post_contact_phase_min_measured_close)
+        if not 0.0 <= post_contact_min_close <= self.right_gripper_max_close:
+            raise ValueError(
+                "post_contact_phase_min_measured_close must lie within the "
+                "configured gripper close range."
+            )
+        post_contact_loss_grace_steps = int(self.post_contact_phase_loss_grace_steps)
+        if post_contact_loss_grace_steps < 0:
+            raise ValueError(
+                "post_contact_phase_loss_grace_steps must be non-negative."
+            )
+        post_contact_action_scale = _finite_tuple(
+            self.post_contact_action_scale,
+            size=7,
+            name="post_contact_action_scale",
+        )
+        if any(value < 0.0 or value > 1.0 for value in post_contact_action_scale):
+            raise ValueError("post_contact_action_scale values must lie in [0, 1].")
+        post_contact_action_bias = _finite_tuple(
+            self.post_contact_action_bias,
+            size=7,
+            name="post_contact_action_bias",
+        )
+        if any(
+            abs(bias) + scale > 1.0
+            for bias, scale in zip(post_contact_action_bias, post_contact_action_scale)
+        ):
+            raise ValueError(
+                "post_contact_action_bias plus action scale must keep every "
+                "constrained action within [-1, 1]."
+            )
+        if post_contact_phase_enabled and not any(
+            value > 0.0 for value in post_contact_action_scale
+        ):
+            raise ValueError(
+                "An enabled post-contact phase must expose at least one action."
+            )
+        if post_contact_phase_enabled and bool(self.scripted_contact_reset):
+            raise ValueError(
+                "post_contact_phase_enabled cannot be combined with "
+                "scripted_contact_reset; use one lift-phase owner."
+            )
+        if not post_contact_phase_enabled and (
+            post_contact_action_scale != (1.0,) * 7
+            or post_contact_action_bias != (0.0,) * 7
+            or bool(self.post_contact_nonnegative_lift_action)
+        ):
+            raise ValueError(
+                "Post-contact action constraints require "
+                "post_contact_phase_enabled=true."
+            )
+        object.__setattr__(self, "post_contact_phase_enabled", post_contact_phase_enabled)
+        object.__setattr__(
+            self,
+            "post_contact_phase_activation_steps",
+            post_contact_activation_steps,
+        )
+        object.__setattr__(
+            self,
+            "post_contact_phase_min_measured_close",
+            post_contact_min_close,
+        )
+        object.__setattr__(
+            self,
+            "post_contact_phase_loss_grace_steps",
+            post_contact_loss_grace_steps,
+        )
+        object.__setattr__(self, "post_contact_action_scale", post_contact_action_scale)
+        object.__setattr__(self, "post_contact_action_bias", post_contact_action_bias)
+        object.__setattr__(
+            self,
+            "post_contact_nonnegative_lift_action",
+            bool(self.post_contact_nonnegative_lift_action),
         )
         object.__setattr__(
             self,
@@ -628,6 +809,14 @@ class CubeLiftTaskConfig:
                 "Scripted-contact curriculum constraints require "
                 "scripted_contact_reset=true."
             )
+        if not self.scripted_pregrasp_reset and (
+            scripted_pregrasp_action_scale != (1.0,) * 7
+            or scripted_pregrasp_action_bias != (0.0,) * 7
+        ):
+            raise ValueError(
+                "Scripted-pregrasp action constraints require "
+                "scripted_pregrasp_reset=true."
+            )
         scripted_min_close = float(
             self.scripted_contact_reset_min_measured_close
         )
@@ -650,11 +839,16 @@ class CubeLiftTaskConfig:
     def policy_active_action_indices(self) -> tuple[int, ...]:
         """Return policy-controlled indices within the public 7-D action."""
 
-        if not self.scripted_contact_reset:
+        if not (self.scripted_contact_reset or self.scripted_pregrasp_reset):
             return tuple(range(self.action_dim))
+        action_scale = (
+            self.scripted_contact_action_scale
+            if self.scripted_contact_reset
+            else self.scripted_pregrasp_action_scale
+        )
         active = tuple(
             index
-            for index, scale in enumerate(self.scripted_contact_action_scale)
+            for index, scale in enumerate(action_scale)
             if scale > 0.0
         )
         if not active:
@@ -716,7 +910,12 @@ class CubeLiftTaskConfig:
                 28
                 if self.normal_proprio_profile
                 == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2
-                else 15
+                else (
+                    35
+                    if self.normal_proprio_profile
+                    == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1
+                    else 15
+                )
             )
         )
 
@@ -737,7 +936,12 @@ class CubeLiftTaskConfig:
                     "proprioceptive_real_motion_tracking_no_episode_clock"
                     if self.normal_proprio_profile
                     == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2
-                    else "proprioceptive_real"
+                    else (
+                        "proprioceptive_real_motion_tracking_no_episode_clock_cube_pose"
+                        if self.normal_proprio_profile
+                        == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1
+                        else "proprioceptive_real"
+                    )
                 )
             )
             if self.policy_class == NORMAL_POLICY_CLASS
@@ -753,6 +957,7 @@ class CubeLiftTaskConfig:
             CUBE_LIFT_NORMAL_RGB_48_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_48_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_RGB_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_PRIVILEGED_OBSERVATION_LAYOUT_VERSION,
@@ -770,7 +975,12 @@ class CubeLiftTaskConfig:
                         CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION
                         if self.normal_proprio_profile
                         == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2
-                        else CUBE_LIFT_NORMAL_OBSERVATION_LAYOUT_VERSION
+                        else (
+                            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION
+                            if self.normal_proprio_profile
+                            == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1
+                            else CUBE_LIFT_NORMAL_OBSERVATION_LAYOUT_VERSION
+                        )
                     )
                 )
             if (
@@ -850,6 +1060,29 @@ class CubeLiftTaskConfig:
             "right_tcp_delta_m": list(self.right_tcp_delta_m),
             "right_tcp_rotation_delta_rad": list(self.right_tcp_rotation_delta_rad),
             "pose_target_anti_windup": self.pose_target_anti_windup,
+            "scripted_pregrasp_reset": self.scripted_pregrasp_reset,
+            "scripted_pregrasp_distance_m": self.scripted_pregrasp_distance_m,
+            "scripted_pregrasp_action_scale": list(
+                self.scripted_pregrasp_action_scale
+            ),
+            "scripted_pregrasp_action_bias": list(
+                self.scripted_pregrasp_action_bias
+            ),
+            "post_contact_phase_enabled": self.post_contact_phase_enabled,
+            "post_contact_phase_activation_steps": (
+                self.post_contact_phase_activation_steps
+            ),
+            "post_contact_phase_min_measured_close": (
+                self.post_contact_phase_min_measured_close
+            ),
+            "post_contact_phase_loss_grace_steps": (
+                self.post_contact_phase_loss_grace_steps
+            ),
+            "post_contact_action_scale": list(self.post_contact_action_scale),
+            "post_contact_action_bias": list(self.post_contact_action_bias),
+            "post_contact_nonnegative_lift_action": (
+                self.post_contact_nonnegative_lift_action
+            ),
             "scripted_contact_reset": self.scripted_contact_reset,
             "scripted_contact_reset_hold_steps": (
                 self.scripted_contact_reset_hold_steps
@@ -892,6 +1125,9 @@ class CubeLiftTaskConfig:
             "success_requires_bilateral_contact": (
                 self.success_requires_bilateral_contact
             ),
+            "gripper_contact_surface_specs": [
+                spec.to_dict() for spec in self.gripper_contact_surface_specs
+            ],
             "reward_shaping": dict(self.reward_shaping),
         }
 
@@ -985,6 +1221,10 @@ class CubeLiftTaskConfig:
             grasp_latch_acquire_distance_m=float(
                 payload.get("grasp_latch_acquire_distance_m", 0.06)
             ),
+            gripper_contact_surface_specs=tuple(
+                GripperContactSurfaceSpec.from_dict(value)
+                for value in payload.get("gripper_contact_surface_specs", ())
+            ),
             object_size_m=tuple(payload["object_size_m"]),
             cube_center_xy_m=tuple(payload["cube_center_xy_m"]),
             table_body_name=str(payload.get("table_body_name", "table")),
@@ -1003,6 +1243,39 @@ class CubeLiftTaskConfig:
             ),
             pose_target_anti_windup=bool(
                 payload.get("pose_target_anti_windup", False)
+            ),
+            scripted_pregrasp_reset=bool(
+                payload.get("scripted_pregrasp_reset", False)
+            ),
+            scripted_pregrasp_distance_m=float(
+                payload.get("scripted_pregrasp_distance_m", 0.035)
+            ),
+            scripted_pregrasp_action_scale=tuple(
+                payload.get("scripted_pregrasp_action_scale", (1.0,) * 7)
+            ),
+            scripted_pregrasp_action_bias=tuple(
+                payload.get("scripted_pregrasp_action_bias", (0.0,) * 7)
+            ),
+            post_contact_phase_enabled=bool(
+                payload.get("post_contact_phase_enabled", False)
+            ),
+            post_contact_phase_activation_steps=int(
+                payload.get("post_contact_phase_activation_steps", 3)
+            ),
+            post_contact_phase_min_measured_close=float(
+                payload.get("post_contact_phase_min_measured_close", 0.55)
+            ),
+            post_contact_phase_loss_grace_steps=int(
+                payload.get("post_contact_phase_loss_grace_steps", 3)
+            ),
+            post_contact_action_scale=tuple(
+                payload.get("post_contact_action_scale", (1.0,) * 7)
+            ),
+            post_contact_action_bias=tuple(
+                payload.get("post_contact_action_bias", (0.0,) * 7)
+            ),
+            post_contact_nonnegative_lift_action=bool(
+                payload.get("post_contact_nonnegative_lift_action", False)
             ),
             scripted_contact_reset=bool(
                 payload.get("scripted_contact_reset", False)
@@ -1093,6 +1366,7 @@ __all__ = [
     "NORMAL_PROPRIO_PROFILE_V0",
     "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1",
     "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2",
+    "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1",
     "PHYSICAL_CONTACT_GRASP_MODE",
     "PRIVILEGED_EXPERT_POLICY_CLASS",
     "SCRIPTED_CONTACT_LOST_REASON",

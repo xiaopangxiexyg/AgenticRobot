@@ -789,6 +789,27 @@ class OpenPIFinalChunkRtcBackend:
         return self._server_metadata_hash
 
     @property
+    def provider_metadata(self) -> Mapping[str, Any]:
+        """Return current provider metadata for additive protocol negotiation."""
+
+        return deep_freeze(dict(self._transport.metadata))
+
+    @property
+    def prediction_horizon_steps(self) -> int:
+        return self._prediction_horizon_steps
+
+    def exchange_provider_request(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Use the existing transport without reinterpreting the raw-RTC path."""
+
+        response = self._transport.infer(dict(payload))
+        if not isinstance(response, Mapping):
+            raise TypeError("OpenPI provider response must be a mapping.")
+        return response
+
+    @property
     def last_transport_lifecycle_receipt(self) -> Any | None:
         """Expose optional transport evidence without making it plan authority."""
 

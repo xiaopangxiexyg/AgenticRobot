@@ -12,6 +12,15 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from .pose_chunk import POSE_ACTION_CHUNK_METADATA_KEY, PoseActionChunkContract
+from .model_continuation import (
+    MODEL_CONTINUATION_DATA_HASH_KEY,
+    MODEL_CONTINUATION_DATA_METADATA_KEY,
+    ModelContinuationContract,
+    ModelContinuationDataContract,
+    ModelContinuationDataContractV2,
+    model_continuation_contract_from_dict,
+    normalize_model_continuation_contract,
+)
 from .pose_training import (
     POSE_TRAINING_DATA_METADATA_KEY,
     PoseTrainingDataContract,
@@ -251,6 +260,7 @@ class PolicyArtifactContract:
     pose_action_chunk: PoseActionChunkContract | Mapping[str, Any] | None = None
     pose_training_data: PoseTrainingDataContract | Mapping[str, Any] | None = None
     pose_frame_contract_hashes: tuple[str, ...] = ()
+    model_continuation: ModelContinuationContract | Mapping[str, Any] | None = None
     state_augmentation: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -300,6 +310,19 @@ class PolicyArtifactContract:
             raise TypeError(
                 "pose_training_data must be a PoseTrainingDataContract, mapping, or None."
             )
+        model_continuation = self.model_continuation
+        if isinstance(model_continuation, Mapping):
+            model_continuation = model_continuation_contract_from_dict(
+                model_continuation
+            )
+        elif model_continuation is not None and not isinstance(
+            model_continuation,
+            (ModelContinuationDataContract, ModelContinuationDataContractV2),
+        ):
+            raise TypeError(
+                "model_continuation must be a v1/v2 model continuation "
+                "contract, mapping, or None."
+            )
         if pose_action_chunk is not None and dataset_schema != DEXTELEOP_DATASET_SCHEMA_V23:
             raise DatasetLayoutBindingError(
                 "A pose action chunk contract requires dexteleop_dataset_v2.3 semantics."
@@ -330,6 +353,59 @@ class PolicyArtifactContract:
                 "A v2.3 pose action chunk artifact must bind at least one "
                 "pose_frame_contract_hash."
             )
+        if model_continuation is not None:
+            continuation_runtime = normalize_model_continuation_contract(
+                model_continuation
+            ).runtime
+            if (
+                continuation_runtime.layout_hash
+                != self.policy_io_layout.layout_hash
+            ):
+                raise DatasetLayoutBindingError(
+                    "Model continuation layout hash must match policy_io_layout."
+                )
+            if (
+                continuation_runtime.model_action_dim
+                != self.policy_io_layout.action_dim
+            ):
+                raise DatasetLayoutBindingError(
+                    "Model continuation action dimension must match policy_io_layout."
+                )
+            if (
+                continuation_runtime.model_action_discrete_dim
+                != self.policy_io_layout.action_discrete_dim
+            ):
+                raise DatasetLayoutBindingError(
+                    "Model continuation discrete action dimension must match "
+                    "policy_io_layout."
+                )
+            if (
+                pose_action_chunk is not None
+                and continuation_runtime.prediction_horizon_steps
+                != pose_action_chunk.action_horizon
+            ):
+                raise DatasetLayoutBindingError(
+                    "Model continuation prediction horizon must match the pose "
+                    "action chunk contract."
+                )
+            if (
+                pose_action_chunk is not None
+                and pose_action_chunk.action_pose_mode
+                not in continuation_runtime.supported_action_pose_modes
+            ):
+                raise DatasetLayoutBindingError(
+                    "Model continuation pose modes do not include the artifact "
+                    "pose action mode."
+                )
+            if (
+                pose_action_chunk is not None
+                and continuation_runtime.frame_contract_hash
+                not in pose_frame_hashes
+            ):
+                raise DatasetLayoutBindingError(
+                    "Model continuation frame contract hash must be bound by "
+                    "the pose artifact."
+                )
         for name in ("state_key", "state_discrete_key", "action_key", "action_discrete_key"):
             value = str(getattr(self, name)).strip()
             if not value:
@@ -349,6 +425,7 @@ class PolicyArtifactContract:
         object.__setattr__(self, "pose_action_chunk", pose_action_chunk)
         object.__setattr__(self, "pose_training_data", pose_training_data)
         object.__setattr__(self, "pose_frame_contract_hashes", pose_frame_hashes)
+        object.__setattr__(self, "model_continuation", model_continuation)
         object.__setattr__(self, "state_augmentation", dict(self.state_augmentation))
         object.__setattr__(self, "metadata", dict(self.metadata))
 
@@ -407,6 +484,13 @@ class PolicyArtifactContract:
             assert self.pose_training_data is not None
             payload[POSE_TRAINING_DATA_METADATA_KEY] = self.pose_training_data.to_dict()
             payload["pose_frame_contract_hashes"] = list(self.pose_frame_contract_hashes)
+        if self.model_continuation is not None:
+            payload[MODEL_CONTINUATION_DATA_METADATA_KEY] = (
+                self.model_continuation.to_dict()
+            )
+            payload[MODEL_CONTINUATION_DATA_HASH_KEY] = (
+                self.model_continuation.contract_hash
+            )
         return payload
 
     @classmethod
@@ -500,6 +584,36 @@ class PolicyArtifactContract:
             raw_pose_frame_hashes, (str, bytes)
         ):
             raise DatasetLayoutBindingError("pose_frame_contract_hashes must be a sequence.")
+        raw_model_continuation = payload.get(
+            MODEL_CONTINUATION_DATA_METADATA_KEY
+        )
+        model_continuation = (
+            None
+            if raw_model_continuation is None
+            else model_continuation_contract_from_dict(
+                _mapping(
+                    raw_model_continuation,
+                    name=MODEL_CONTINUATION_DATA_METADATA_KEY,
+                )
+            )
+        )
+        declared_model_continuation_hash = payload.get(
+            MODEL_CONTINUATION_DATA_HASH_KEY
+        )
+        if model_continuation is None:
+            if declared_model_continuation_hash is not None:
+                raise DatasetLayoutBindingError(
+                    "Policy artifact declares a model continuation hash without "
+                    "its contract."
+                )
+        elif (
+            str(declared_model_continuation_hash or "")
+            != model_continuation.contract_hash
+        ):
+            raise DatasetLayoutBindingError(
+                "Policy artifact model continuation hash does not match its "
+                "contract."
+            )
         return cls(
             policy_io_layout=layout,
             model_id=payload.get("model_id"),
@@ -525,6 +639,7 @@ class PolicyArtifactContract:
             pose_frame_contract_hashes=tuple(
                 str(value) for value in raw_pose_frame_hashes
             ),
+            model_continuation=model_continuation,
             state_augmentation=dict(_mapping(payload.get("state_augmentation", {}), name="state_augmentation")),
             metadata=dict(_mapping(payload.get("metadata", {}), name="policy artifact metadata")),
         )

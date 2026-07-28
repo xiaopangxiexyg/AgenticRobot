@@ -234,5 +234,18 @@ class ActorCritic(nn.Module):
         _distribution, value = self._distribution_and_value(observation)
         return value
 
+    def reset_critic(self) -> None:
+        """Reset only the value head after a task-contract change.
+
+        Warm-starting an actor across a task hash change is useful for the
+        contact curriculum, but the old value estimates describe the old
+        transition/reward dynamics.  Keeping that critic biases the first
+        GAE targets and can move an otherwise good actor away from its
+        checkpoint before the new task has been fit.
+        """
+
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.critic.bias)
+
 
 __all__ = ["ActorCritic", "resolve_device"]

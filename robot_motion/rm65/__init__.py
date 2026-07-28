@@ -25,12 +25,30 @@ from .position_profile import (
     RM65_BIMANUAL_POSITION_V1,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_BIMANUAL_POSITION_V1_QREF_PROFILE,
+    RM65_BIMANUAL_POSITION_V2_RESPONSIVE,
+    RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME,
     RM65_POSITION_CONTROL_PROFILE_CHOICES,
     RM65BimanualPositionProfile,
     RM65PositionCommandExecutionProfile,
     RM65PositionIKExecutionProfile,
     RM65PositionSourceShapingProfile,
     resolve_rm65_bimanual_position_profile,
+)
+from .pose_lift_profile import (
+    RM65_POSE_LIFT_PROFILE_CHOICES,
+    RM65_POSE_LIFT_PROFILE_SCHEMA,
+    RM65_POSE_LIFT_PROFILES,
+    RM65_POSE_LIFT_V1_BASELINE,
+    RM65_POSE_LIFT_V1_BASELINE_NAME,
+    RM65_POSE_LIFT_V2_CONTINUOUS,
+    RM65_POSE_LIFT_V2_CONTINUOUS_NAME,
+    RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS,
+    RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+    RM65PoseLiftProfile,
+    build_rm65_pose_lift_ik_tuning,
+    resolve_rm65_pose_lift_profile,
 )
 from .qpos_layout import (
     as_rm65_qpos,
@@ -65,6 +83,10 @@ from .ik import (
 )
 from .single_arm_ik import SingleArmIKSolver
 from .dual_arm_ik import DualArmIKSolver, MultiTaskIKSolver
+from .wrist_coaxial import (
+    canonicalize_rm65_wrist_coaxial_step,
+    stabilize_rm65_wrist_q5_step,
+)
 from .ik_tuning import (
     BranchNormalizationConfig,
     DualArmRecoveryConfig,
@@ -102,6 +124,9 @@ from .dual_arm_target_solver import (
     DualArmCollisionAwareTargetSolverConfig,
     DualArmQposCollisionCheck,
     DualArmTargetContext,
+    IK_STEP_MODE_CHOICES,
+    IK_STEP_MODE_LEGACY_ITERATIVE,
+    IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE,
 )
 from .tool_profiles import (
     default_tool_profile_dir,
@@ -114,6 +139,7 @@ from .tool_profiles import (
 from .position_collision import (
     DEFAULT_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S,
     DEFAULT_POSITION_COLLISION_REFERENCE_HZ,
+    DEFAULT_RM65_JACOBIAN_CHARACTERISTIC_LENGTH_M,
     RM65PositionCollisionPlanResult,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
@@ -170,6 +196,11 @@ __all__ = [
     "DualArmIKSolver",
     "DualArmCollisionAwareRetargeter",
     "DualArmCollisionAwareRetargeterConfig",
+    "canonicalize_rm65_wrist_coaxial_step",
+    "stabilize_rm65_wrist_q5_step",
+    "IK_STEP_MODE_CHOICES",
+    "IK_STEP_MODE_LEGACY_ITERATIVE",
+    "IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE",
     "DualArmCollisionAwareTargetSolver",
     "DualArmCollisionAwareTargetSolverConfig",
     "DualArmQposCollisionCheck",
@@ -202,6 +233,20 @@ __all__ = [
     "RM65PositionCommandExecutionProfile",
     "RM65PositionIKExecutionProfile",
     "RM65PositionSourceShapingProfile",
+    "DEFAULT_RM65_JACOBIAN_CHARACTERISTIC_LENGTH_M",
+    "RM65PoseLiftProfile",
+    "build_rm65_pose_lift_ik_tuning",
+    "RM65_POSE_LIFT_PROFILE_CHOICES",
+    "RM65_POSE_LIFT_PROFILE_SCHEMA",
+    "RM65_POSE_LIFT_PROFILES",
+    "RM65_POSE_LIFT_V1_BASELINE",
+    "RM65_POSE_LIFT_V1_BASELINE_NAME",
+    "RM65_POSE_LIFT_V2_CONTINUOUS",
+    "RM65_POSE_LIFT_V2_CONTINUOUS_NAME",
+    "RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS",
+    "RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME",
+    "RM65_POSE_LIFT_V4_QP_CONSTRAINED",
+    "RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME",
     "RM65_BIMANUAL_POSITION_PROFILE_SCHEMA",
     "RM65_BIMANUAL_POSITION_PROFILES",
     "RM65_BIMANUAL_POSITION_V1",
@@ -262,6 +307,7 @@ __all__ = [
     "rm65_single_arm_candidate_frames",
     "rm65_urdf_frame_for_controlled_frame",
     "resolve_rm65_bimanual_position_profile",
+    "resolve_rm65_pose_lift_profile",
     "save_qpos_target",
     "solve_rm65_single_arm_ik",
     "tool_tcp_pose_flange_m_rad",

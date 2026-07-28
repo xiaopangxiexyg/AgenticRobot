@@ -88,18 +88,23 @@ data/chunk-*/episode_*.parquet
 会在同 tick hand 下发前 fault/hold。arm queue 前后及每次 hand I/O 前也会检查两侧 120 Hz
 stream readiness/fault/stale 状态。
 
-仅在默认的 coupled position replay 中，若 RM65 位控 backend 的 SDK 判定某侧目标或当前
-qpos 处于奇异区，执行器会先按原本有效关节步幅的 `0.2` 计算该侧的慢速 qpos；随后对这组
-**实际将发送的双臂慢速 qpos** 再执行同一组 12 对 endpoint 碰撞检查。复核不通过时，
-该 reference 不会下发，replay 进入 fault 并保持；只有复核成功的 command 才携带
-`singularity_replay_slowdown_preapplied` 标记，backend 才接受该慢速目标，避免二次限幅改写
-已检查的双臂组合。此规则不进入 deploy 链路，也不改变 qpos-init 的既有慢速规则。
+Pose replay 不再附加 replay-only 的 SDK singularity target rewrite；否则它不能作为 deploy
+Pose→QPOS parity 检查。共享 planner 输出的正式 qref 会直接进入与 deploy 相同的后续
+position execution contract；backend 若试图再次改写已经通过 coupled admission 的 qpos，
+replay 仍 fail-closed。首帧 QPOS init 的既有慢速安全规则不受此变更影响。
 
-这一步用于验证后续模型预测的 action 是否能对齐真机下游接口。显式
-`qpos_target` 模式仅作为低层兼容/调试路径：生产默认的
-`position_collision_required=true` 会明确拒绝它。显式设置
-`--no-position-collision-required` 只允许进入不下发动作的旧 qpos/Cartesian
-backend 兼容检查；position 模式一旦启用真机输出仍会 fail-closed 拒绝该配置。
+这一步用于验证后续模型预测的 action 是否能对齐真机下游接口。GUI/CLI 现在明确提供
+两种 replay：
+
+- `pose` / `action_pose`：首帧 QPOS init，随后用与 deploy 相同的 versioned Pose Lift
+  profile 将 pose action 提升为 qpos；
+- `qpos` / `qpos_target`：首帧 QPOS init，随后严格复现保存的 accepted q_ref。
+
+严格 QPOS replay 不调用 IK 且不改写 qpos，但仍需要默认的
+`position_collision_required=true`：每个显式 qpos endpoint 通过绝对限位和完整双臂碰撞
+准入后才提交为下一 last-safe anchor。它仍不声称相邻 endpoint 间的连续路径已经完成碰撞
+认证。`--no-position-collision-required` 继续只允许不下发动作的兼容检查；position 真机
+输出会 fail-closed 拒绝该配置。
 
 ## 末端 Replay
 
@@ -181,6 +186,8 @@ position 频率和 15 Hz keyframe 安全可在启动时配置：
 --position-collision-scene-profile dual_arm_hand_proxy_open
 --position-collision-min-distance-m 0.03
 --position-collision-distance-epsilon-m 0.0001
+--replay-mode pose
+--pose-lift-profile rm65_pose_lift_v4_qp_constrained
 --position-collision-max-joint-velocity-rad-s 2.967059728,2.967059728,3.316125579,3.665191429,4.188790205,4.188790205
 --no-position-collision-debug
 ```
@@ -191,6 +198,61 @@ orientation cost `0.35`、damping `0.03`、5 ms iteration reserve，并使用
 qref 的 FK pose；replay 不重复采集前 inactive/tracker/post-IK qref 平滑，只执行主
 action 之后的插值、IK、安全限位和下发。命令行仍可显式覆盖逐关节速度值用于 debug，
 也可用 `--position-control-profile legacy` 回退。
+
+Pose Lift 与 live-human source profile 是两个独立合同。默认
+`rm65_pose_lift_v4_qp_constrained` 与 deploy 一致；
+`rm65_pose_lift_v1_baseline` 是 2026-07-28 保存的 deploy 行为和显式回退；
+`rm65_pose_lift_v2_continuous` 当前只增加经过 pose/限位认证的合法 2π unwrap 和共轴腕部
+等价解规范化，不重放 tracker deadband、post-IK smoothing 或遥操 escape 手势。Pose replay
+与 deploy 应选择同一个 Pose Lift profile；严格 QPOS replay 忽略该 profile。
+
+`rm65_pose_lift_v4_qp_constrained` 在 V3 基础上把 qref
+速度/加速度边界放入 Pink QP，并保证同一 reference 内的多次数值迭代共享一份 admitted-anchor
+运动预算。V4 现在允许经过既有 preflight 的 deploy/Pose replay arm output；严格 QPOS replay
+不经过 Pose Lift。V1、V2、V3 的冻结语义不受影响。
+
+### 在 MuJoCo 中对比 Pose Lift 轨迹
+
+只读调试入口 `teleop_runtime.debug.view_rm65_pose_lift_sim_replay` 会读取正式数据集中的
+pose action，以所选片段第一帧保存的 accepted `q_ref` 初始化，再通过与 pose replay/deploy
+相同的 `RM65PositionCollisionPlanner` 生成后续 60 Hz qpos。MuJoCo 只显示已经过 planner
+准入的 qpos，不会再次解 IK、修改轨迹或连接设备。
+
+先查看可用 episode：
+
+```bash
+python -m teleop_runtime.debug.view_rm65_pose_lift_sim_replay \
+  --dataset-root /path/to/dataset \
+  --list-episodes
+```
+
+查看一个版本：
+
+```bash
+python -m teleop_runtime.debug.view_rm65_pose_lift_sim_replay \
+  --dataset-root /path/to/dataset \
+  --episode 81 \
+  --pose-lift-profile rm65_pose_lift_v1_baseline \
+  --hold-viewer-at-end
+```
+
+从同一个初始 `q_ref` 顺序播放所有已注册 profile：
+
+```bash
+python -m teleop_runtime.debug.view_rm65_pose_lift_sim_replay \
+  --dataset-root /path/to/dataset \
+  --episode 81 \
+  --all-profiles \
+  --fixed-solve-iterations 4 \
+  --speed 0.5 \
+  --pause-between-profiles-sec 1 \
+  --hold-viewer-at-end
+```
+
+可用 `--start-frame`/`--max-frames` 选择轨迹片段；可调参数包括
+`--posture-cost`、`--damping`、`--orientation-weight`、IK min/max/fixed iterations、
+逐关节速度/步长和 collision margin。`--no-viewer --summary-json ... --trace-jsonl ...`
+可只生成对比数据；`--pose-lift-profile` 可以重复传入以指定自定义播放顺序。
 
 `--position-collision-max-joint-step-rad` 可选传 1 个或 6 个值；留空时仅使用
 `max_joint_velocity / reference_hz` 生成每个 60 Hz reference 的安全步长上限。

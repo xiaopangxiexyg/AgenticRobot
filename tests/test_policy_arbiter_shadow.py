@@ -9,10 +9,13 @@ import numpy as np
 import pytest
 
 from robot_motion.action import (
+    ActionComponentCatalog,
+    ActionComponentSpec,
     ActionArbiter,
     ActionPersistencePolicy,
     ActiveExecutionSnapshot,
     SharedCanonicalSafetyResult,
+    build_robot_action_v1_runtime_schema,
     evaluate_shared_execution_shadow,
 )
 from robot_motion.deploy import (
@@ -108,7 +111,25 @@ def runtime(clock: Clock) -> PolicyDeployRuntime:
     )
 
 
+def _shadow_contract():
+    catalog = ActionComponentCatalog(
+        catalog_id="policy-shadow-right-arm-v1",
+        action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+        components=(
+            ActionComponentSpec(
+                component_id="right_arm",
+                selection_group_id="right_arm",
+                effector_name="right_arm",
+            ),
+        ),
+    )
+    return catalog, build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
+
+
 def shadow(clock: Clock, *, capacity: int = 32) -> PassivePolicyArbiterShadow:
+    catalog, action_schema = _shadow_contract()
     return PassivePolicyArbiterShadow(
         PolicyArbiterShadowConfig(
             runtime_session_id="shadow-session",
@@ -118,6 +139,8 @@ def shadow(clock: Clock, *, capacity: int = 32) -> PassivePolicyArbiterShadow:
             active_effectors=("right_arm",),
             action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
             decision_hz=15.0,
+            component_catalog=catalog,
+            action_schema=action_schema,
             proposal_capacity=capacity,
         ),
         clock=clock,
@@ -360,6 +383,7 @@ def test_shadow_coordinator_has_no_queue_dispatch_or_owner_capability() -> None:
 
 
 def test_shadow_rate_above_60_is_rejected() -> None:
+    catalog, action_schema = _shadow_contract()
     with pytest.raises(ValueError, match="60"):
         PolicyArbiterShadowConfig(
             runtime_session_id="s",
@@ -369,6 +393,8 @@ def test_shadow_rate_above_60_is_rejected() -> None:
             active_effectors=("right_arm",),
             action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
             decision_hz=60.1,
+            component_catalog=catalog,
+            action_schema=action_schema,
         )
 
 

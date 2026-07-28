@@ -61,22 +61,41 @@ class KinematicCollisionProjector:
         self.oracle = CollisionSafetyOracle(mujoco, model, self.policy)
         self.scratch = mujoco.MjData(model)
 
-    def _check_candidate(self, source_data, controlled_qpos: np.ndarray) -> CollisionCheckResult:
+    def _check_candidate(
+        self,
+        source_data,
+        controlled_qpos: np.ndarray,
+        *,
+        minimum_clearance_m: float | None = None,
+    ) -> CollisionCheckResult:
         self.scratch.qpos[:] = source_data.qpos
         self.scratch.qpos[self.controlled_qpos_indices] = controlled_qpos
         # Distance queries only require body/geom poses. Running the full
         # dynamics/constraint pipeline here would dominate batched RL cost.
         self.mujoco.mj_kinematics(self.model, self.scratch)
-        return self.oracle.check(self.scratch)
+        return self.oracle.check(
+            self.scratch,
+            minimum_clearance_m=minimum_clearance_m,
+        )
 
     def check_current(self, data) -> CollisionCheckResult:
         return self.oracle.check(data)
 
-    def check_qpos(self, source_data, controlled_qpos: np.ndarray) -> CollisionCheckResult:
+    def check_qpos(
+        self,
+        source_data,
+        controlled_qpos: np.ndarray,
+        *,
+        minimum_clearance_m: float | None = None,
+    ) -> CollisionCheckResult:
         values = np.asarray(controlled_qpos, dtype=np.float64).reshape(-1)
         if values.shape != (self.controlled_qpos_indices.size,):
             raise ValueError("Controlled qpos shape does not match projector layout.")
-        return self._check_candidate(source_data, values)
+        return self._check_candidate(
+            source_data,
+            values,
+            minimum_clearance_m=minimum_clearance_m,
+        )
 
     def project(
         self,
@@ -84,6 +103,7 @@ class KinematicCollisionProjector:
         *,
         start_qpos: np.ndarray,
         requested_qpos: np.ndarray,
+        minimum_clearance_m: float | None = None,
     ) -> CollisionProjectionResult:
         start = np.asarray(start_qpos, dtype=np.float64).reshape(-1)
         requested = np.asarray(requested_qpos, dtype=np.float64).reshape(-1)
@@ -93,7 +113,11 @@ class KinematicCollisionProjector:
         if not np.all(np.isfinite(start)) or not np.all(np.isfinite(requested)):
             raise ValueError("Collision projection qpos must be finite.")
 
-        start_check = self._check_candidate(source_data, start)
+        start_check = self._check_candidate(
+            source_data,
+            start,
+            minimum_clearance_m=minimum_clearance_m,
+        )
         if not start_check.safe:
             return CollisionProjectionResult(
                 status="invalid_safe_state",
@@ -117,7 +141,11 @@ class KinematicCollisionProjector:
         upper_check: CollisionCheckResult | None = None
         for sample_index in range(1, sample_count + 1):
             alpha = sample_index / sample_count
-            check = self._check_candidate(source_data, start + alpha * delta)
+            check = self._check_candidate(
+                source_data,
+                start + alpha * delta,
+                minimum_clearance_m=minimum_clearance_m,
+            )
             if not check.safe:
                 upper_alpha = alpha
                 upper_check = check
@@ -138,7 +166,11 @@ class KinematicCollisionProjector:
 
         for _ in range(self.policy.projection_iterations):
             alpha = 0.5 * (lower_alpha + upper_alpha)
-            check = self._check_candidate(source_data, start + alpha * delta)
+            check = self._check_candidate(
+                source_data,
+                start + alpha * delta,
+                minimum_clearance_m=minimum_clearance_m,
+            )
             if check.safe:
                 lower_alpha = alpha
                 lower_check = check

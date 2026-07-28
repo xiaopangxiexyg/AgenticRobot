@@ -131,6 +131,10 @@ _SHADOW_NOT_APPLICABLE = frozenset(
         "arbitration_publication_attempt",
         "arbitration_decision",
         "arbitration_publication_rejected",
+        "action_adaptation_request",
+        "target_capability_assessment",
+        "adapted_action_candidate",
+        "action_adaptation_receipt",
         "execution_directive",
         "dispatch_owner",
     }
@@ -154,6 +158,10 @@ _AUTHORITATIVE_SIM_CORE_REQUIRED = frozenset(
         "arbitration_computation",
         "arbitration_publication_attempt",
         "arbitration_decision",
+        "action_adaptation_request",
+        "target_capability_assessment",
+        "adapted_action_candidate",
+        "action_adaptation_receipt",
         "execution_directive",
         "shared_safety_result",
         "command",
@@ -180,7 +188,7 @@ _COMPOSITION_SESSION_REQUIRED = frozenset(
         "composition_input_admission",
         "composition_contributor_input",
         "composition_input_snapshot",
-        "composition_result",
+        "composition_evaluation",
         "composition_authority_disposition",
     }
 )
@@ -1007,6 +1015,30 @@ def evaluate_control_trace_lineage(
         event_type="arbitration_decision",
         payload_key="decision_id",
     )
+    action_adaptation_request_by_id = _payload_index(
+        ordered,
+        event_type="action_adaptation_request",
+        payload_key="request_id",
+    )
+    target_capability_assessment_by_id = _payload_index(
+        ordered,
+        event_type="target_capability_assessment",
+        payload_key="assessment_id",
+    )
+    adapted_action_candidate_by_id = _payload_index(
+        ordered,
+        event_type="adapted_action_candidate",
+        payload_key="adapted_candidate_id",
+    )
+    action_adaptation_receipt_by_id = _payload_index(
+        ordered,
+        event_type="action_adaptation_receipt",
+        payload_key="receipt_id",
+    )
+    adaptation_protocol_active = bool(
+        action_adaptation_request_by_id
+        or action_adaptation_receipt_by_id
+    )
     cancellation_by_id = _payload_index(
         ordered,
         event_type="execution_cancellation",
@@ -1048,6 +1080,16 @@ def evaluate_control_trace_lineage(
         event_type="composition_spec",
         payload_key="semantic_content_hash",
     )
+    action_payload_schema_by_hash = _payload_index(
+        ordered,
+        event_type="action_payload_schema",
+        payload_key="semantic_content_hash",
+    )
+    component_action_schema_by_hash = _payload_index(
+        ordered,
+        event_type="component_action_schema",
+        payload_key="semantic_content_hash",
+    )
     component_rule_set_by_hash = _payload_index(
         ordered,
         event_type="component_composition_rule_set",
@@ -1082,15 +1124,15 @@ def evaluate_control_trace_lineage(
         event_type="composition_input_snapshot",
         payload_key="composition_input_snapshot_id",
     )
-    composition_result_by_id = _payload_index(
+    composition_evaluation_by_id = _payload_index(
         ordered,
-        event_type="composition_result",
-        payload_key="composition_result_id",
+        event_type="composition_evaluation",
+        payload_key="composition_evaluation_id",
     )
     composition_disposition_by_result_id = _payload_index(
         ordered,
         event_type="composition_authority_disposition",
-        payload_key="composition_result_id",
+        payload_key="composition_evaluation_id",
     )
     composition_session_spec_by_id = _payload_index(
         ordered,
@@ -1148,10 +1190,22 @@ def evaluate_control_trace_lineage(
         payload_key="target_id",
     )
     if execution_manifest is not None:
+        manifest_action_schema_hash = str(
+            execution_manifest.payload["action_schema_hash"]
+        )
         manifest_catalog_hash = str(
             execution_manifest.payload["component_catalog_hash"]
         )
         for fact in ordered:
+            if fact.event_type == "arbitration_input_snapshot" and str(
+                fact.payload["action_schema_hash"]
+            ) != manifest_action_schema_hash:
+                issue(
+                    "execution_manifest_action_schema_mismatch",
+                    fact.fact_id,
+                    "Arbitration input uses another complete action schema.",
+                    execution_manifest.fact_id,
+                )
             if fact.event_type == "arbitration_input_snapshot" and str(
                 fact.payload["component_catalog_hash"]
             ) != manifest_catalog_hash:
@@ -1400,9 +1454,88 @@ def evaluate_control_trace_lineage(
                     "Eligibility binding must resolve the eligibility snapshot.",
                     eligibility_snapshot_id,
                 )
+        elif fact.event_type == "component_action_schema":
+            payload_hash_by_component = dict(
+                payload["payload_schema_hash_by_component"]
+            )
+            catalog_components = tuple(
+                payload["component_catalog"]["components"]
+            )
+            catalog_component_by_id = {
+                str(component["component_id"]): component
+                for component in catalog_components
+            }
+            if set(catalog_component_by_id) != set(
+                payload_hash_by_component
+            ):
+                issue(
+                    "component_action_schema_catalog_mismatch",
+                    fact.fact_id,
+                    "Component action schema and embedded catalog must bind "
+                    "the same component IDs.",
+                )
+            for component_id, payload_schema_hash in (
+                payload_hash_by_component.items()
+            ):
+                schema_hash = str(payload_schema_hash)
+                if len(action_payload_schema_by_hash.get(schema_hash, ())) != 1:
+                    issue(
+                        "component_action_schema_missing_payload_schema",
+                        fact.fact_id,
+                        "Component action schema must resolve each payload "
+                        "schema definition.",
+                        schema_hash,
+                    )
+                component = catalog_component_by_id.get(str(component_id))
+                if (
+                    component is not None
+                    and schema_hash
+                    not in {
+                        str(value)
+                        for value in component[
+                            "accepted_payload_schema_hashes"
+                        ]
+                    }
+                ):
+                    issue(
+                        "component_action_schema_payload_not_accepted",
+                        fact.fact_id,
+                        "Embedded component catalog does not accept the bound "
+                        "payload schema.",
+                        str(component_id),
+                        schema_hash,
+                    )
         elif fact.event_type == "composition_spec" and payload[
             "algebra"
         ] == "formal_component_strategy_v2":
+            role_schema_hashes = dict(
+                payload["input_action_schema_hash_by_role"]
+            )
+            if role_schema_hashes:
+                referenced_schema_hashes = {
+                    str(payload["action_schema_hash"]),
+                    *(
+                        str(value)
+                        for value in role_schema_hashes.values()
+                    ),
+                }
+                for schema_hash in referenced_schema_hashes:
+                    if (
+                        len(
+                            component_action_schema_by_hash.get(
+                                schema_hash,
+                                (),
+                            )
+                        )
+                        != 1
+                    ):
+                        issue(
+                            "formal_component_spec_missing_action_schema",
+                            fact.fact_id,
+                            "Role-specific formal composition must resolve "
+                            "every input and output action schema definition.",
+                            schema_hash,
+                        )
             bindings = formal_component_binding_by_spec_hash.get(
                 str(payload["semantic_content_hash"]),
                 (),
@@ -1534,6 +1667,26 @@ def evaluate_control_trace_lineage(
             "composition_input",
             "composition_contributor_input",
         }:
+            input_action_schema_hash = str(
+                payload["action"]["action_schema_hash"]
+            )
+            if (
+                component_action_schema_by_hash
+                and len(
+                    component_action_schema_by_hash.get(
+                        input_action_schema_hash,
+                        (),
+                    )
+                )
+                != 1
+            ):
+                issue(
+                    "composition_input_missing_action_schema",
+                    fact.fact_id,
+                    "Composition input must resolve its action schema "
+                    "definition when schema facts are active.",
+                    input_action_schema_hash,
+                )
             for context_id in payload["context_ids"]:
                 if len(context_by_id.get(str(context_id), ())) != 1:
                     issue(
@@ -1587,6 +1740,30 @@ def evaluate_control_trace_lineage(
                 )
             selected_ids = payload["selected_input_ids_by_role"]
             selected_hashes = payload["selected_input_hashes_by_role"]
+            role_schema_hashes = dict(
+                payload["input_action_schema_hash_by_role"]
+            )
+            if role_schema_hashes:
+                for schema_hash in {
+                    str(payload["action_schema_hash"]),
+                    *(str(value) for value in role_schema_hashes.values()),
+                }:
+                    if (
+                        len(
+                            component_action_schema_by_hash.get(
+                                schema_hash,
+                                (),
+                            )
+                        )
+                        != 1
+                    ):
+                        issue(
+                            "composition_snapshot_missing_action_schema",
+                            fact.fact_id,
+                            "Role-specific snapshot must resolve every input "
+                            "and output action schema definition.",
+                            schema_hash,
+                        )
             for role, input_id in selected_ids.items():
                 inputs = composition_input_by_id.get(str(input_id), ())
                 if len(inputs) != 1 or inputs[0].payload[
@@ -1598,14 +1775,58 @@ def evaluate_control_trace_lineage(
                         "Composition snapshot must resolve each selected input and hash.",
                         str(input_id),
                     )
-        elif fact.event_type == "composition_result":
+                elif role_schema_hashes:
+                    expected_schema_hash = role_schema_hashes.get(role)
+                    if expected_schema_hash is None or str(
+                        inputs[0].payload["action"]["action_schema_hash"]
+                    ) != str(expected_schema_hash):
+                        issue(
+                            "composition_snapshot_role_action_schema_mismatch",
+                            fact.fact_id,
+                            "Selected input action schema must match the schema "
+                            "declared for its role.",
+                            str(input_id),
+                            (
+                                ""
+                                if expected_schema_hash is None
+                                else str(expected_schema_hash)
+                            ),
+                        )
+        elif fact.event_type == "composition_evaluation":
             spec_hash = str(payload["composition_spec_hash"])
             if len(composition_spec_by_hash.get(spec_hash, ())) != 1:
                 issue(
-                    "composition_result_missing_spec",
+                    "composition_evaluation_missing_spec",
                     fact.fact_id,
                     "Composition result must resolve its exact numerical spec.",
                     spec_hash,
+                )
+            elif (
+                composition_spec_by_hash[spec_hash][0].payload[
+                    "input_action_schema_hash_by_role"
+                ]
+                and (
+                    str(
+                        composition_spec_by_hash[spec_hash][0].payload[
+                            "action_schema_hash"
+                        ]
+                    )
+                    != str(payload["action_schema_hash"])
+                    or len(
+                        component_action_schema_by_hash.get(
+                            str(payload["action_schema_hash"]),
+                            (),
+                        )
+                    )
+                    != 1
+                )
+            ):
+                issue(
+                    "composition_evaluation_output_action_schema_mismatch",
+                    fact.fact_id,
+                    "Relative composition evaluation must use and resolve the "
+                    "absolute output action schema from its spec.",
+                    str(payload["action_schema_hash"]),
                 )
             snapshot_id = str(payload["composition_input_snapshot_id"])
             snapshots = composition_snapshot_by_id.get(snapshot_id, ())
@@ -1613,14 +1834,14 @@ def evaluate_control_trace_lineage(
                 "semantic_content_hash"
             ] != payload["composition_input_snapshot_hash"]:
                 issue(
-                    "composition_result_missing_snapshot",
+                    "composition_evaluation_missing_snapshot",
                     fact.fact_id,
                     "Composition result must resolve its exact input snapshot.",
                     snapshot_id,
                 )
             if len(payload["input_ids"]) != len(payload["input_hashes"]):
                 issue(
-                    "composition_result_input_lineage_length_mismatch",
+                    "composition_evaluation_input_lineage_length_mismatch",
                     fact.fact_id,
                     "Composition result input IDs and hashes must have equal length.",
                 )
@@ -1632,7 +1853,7 @@ def evaluate_control_trace_lineage(
                     "input_semantic_content_hash"
                 ] != input_hash:
                     issue(
-                        "composition_result_missing_input",
+                        "composition_evaluation_missing_input",
                         fact.fact_id,
                         "Composition result input lineage is absent or hash-mismatched.",
                         str(input_id),
@@ -1673,12 +1894,12 @@ def evaluate_control_trace_lineage(
             subject_hash_field = {
                 "input": "input_semantic_content_hash",
                 "snapshot": "semantic_content_hash",
-                "result": "semantic_content_hash",
+                "evaluation": "semantic_content_hash",
             }.get(subject_kind)
             subject_index = {
                 "input": composition_input_by_id,
                 "snapshot": composition_snapshot_by_id,
-                "result": composition_result_by_id,
+                "evaluation": composition_evaluation_by_id,
             }.get(subject_kind)
             subjects = () if subject_index is None else subject_index.get(
                 subject_id,
@@ -1719,7 +1940,7 @@ def evaluate_control_trace_lineage(
                             "Activation-bound snapshot must select only inputs from the same activation.",
                             str(selected_input_id),
                         )
-            if subject_kind == "result" and len(subjects) == 1:
+            if subject_kind == "evaluation" and len(subjects) == 1:
                 snapshot_id = str(
                     subjects[0].payload["composition_input_snapshot_id"]
                 )
@@ -1737,17 +1958,18 @@ def evaluate_control_trace_lineage(
                     != payload["activation_hash"]
                 ):
                     issue(
-                        "composition_activation_result_snapshot_mismatch",
+                        "composition_activation_evaluation_snapshot_mismatch",
                         fact.fact_id,
-                        "Activation-bound result must resolve a snapshot from the same activation.",
+                        "Activation-bound evaluation must resolve a snapshot "
+                        "from the same activation.",
                         snapshot_id,
                     )
         elif fact.event_type == "composition_authority_disposition":
-            result_id = str(payload["composition_result_id"])
-            results = composition_result_by_id.get(result_id, ())
+            result_id = str(payload["composition_evaluation_id"])
+            results = composition_evaluation_by_id.get(result_id, ())
             if len(results) != 1 or results[0].payload[
                 "semantic_content_hash"
-            ] != payload["composition_result_hash"]:
+            ] != payload["composition_evaluation_hash"]:
                 issue(
                     "composition_disposition_missing_result",
                     fact.fact_id,
@@ -2096,6 +2318,121 @@ def evaluate_control_trace_lineage(
                         "Reference terminal last frame belongs to another segment.",
                         str(last_frame_id),
                     )
+        elif fact.event_type == "action_adaptation_request":
+            decision_id = str(payload["authoritative_decision_id"])
+            decisions = decision_by_id.get(decision_id, ())
+            if len(decisions) != 1:
+                issue(
+                    "action_adaptation_missing_decision",
+                    fact.fact_id,
+                    "Action adaptation must resolve one authoritative decision.",
+                    decision_id,
+                )
+            else:
+                decision_payload = decisions[0].payload
+                if (
+                    str(decision_payload["semantic_content_hash"])
+                    != str(payload["authoritative_decision_hash"])
+                    or str(decision_payload["result_id"])
+                    != str(payload["arbitration_result_id"])
+                    or str(decision_payload["selected_action_hash"])
+                    != str(payload["candidate_action_hash"])
+                    or str(
+                        decision_payload["selected_action"][
+                            "action_schema_hash"
+                        ]
+                    )
+                    != str(payload["action_schema_hash"])
+                ):
+                    issue(
+                        "action_adaptation_decision_lineage_mismatch",
+                        fact.fact_id,
+                        "Action adaptation request and decision disagree.",
+                        decision_id,
+                    )
+            if execution_manifest is not None and (
+                str(payload["component_target_capability_hash"])
+                != str(
+                    execution_manifest.payload[
+                        "component_target_capability_hash"
+                    ]
+                )
+            ):
+                issue(
+                    "action_adaptation_manifest_capability_mismatch",
+                    fact.fact_id,
+                    "Action adaptation uses another target capability.",
+                    execution_manifest.fact_id,
+                )
+        elif fact.event_type == "adapted_action_candidate":
+            request_id = str(payload["request_id"])
+            requests = action_adaptation_request_by_id.get(request_id, ())
+            if len(requests) != 1 or str(
+                requests[0].payload["semantic_content_hash"]
+            ) != str(payload["request_hash"]):
+                issue(
+                    "adapted_candidate_missing_request",
+                    fact.fact_id,
+                    "Adapted candidate must resolve its exact request.",
+                    request_id,
+                )
+            elif str(requests[0].payload["candidate_action_hash"]) != str(
+                payload["source_candidate_action_hash"]
+            ):
+                issue(
+                    "adapted_candidate_source_mismatch",
+                    fact.fact_id,
+                    "Adapted candidate references another source action.",
+                    request_id,
+                )
+        elif fact.event_type == "action_adaptation_receipt":
+            request_id = str(payload["request_id"])
+            requests = action_adaptation_request_by_id.get(request_id, ())
+            if len(requests) != 1 or str(
+                requests[0].payload["semantic_content_hash"]
+            ) != str(payload["request_hash"]):
+                issue(
+                    "action_adaptation_receipt_missing_request",
+                    fact.fact_id,
+                    "Adaptation receipt must resolve its exact request.",
+                    request_id,
+                )
+            assessment_id = str(payload["capability_assessment_id"])
+            assessments = target_capability_assessment_by_id.get(
+                assessment_id,
+                (),
+            )
+            if len(assessments) != 1 or str(
+                assessments[0].payload["semantic_content_hash"]
+            ) != str(payload["capability_assessment_hash"]):
+                issue(
+                    "action_adaptation_receipt_missing_assessment",
+                    fact.fact_id,
+                    "Adaptation receipt must resolve its exact assessment.",
+                    assessment_id,
+                )
+            candidate_id = payload["adapted_candidate_id"]
+            if bool(payload["accepted"]):
+                candidates = adapted_action_candidate_by_id.get(
+                    str(candidate_id),
+                    (),
+                )
+                if len(candidates) != 1 or str(
+                    candidates[0].payload["semantic_content_hash"]
+                ) != str(payload["adapted_candidate_hash"]):
+                    issue(
+                        "action_adaptation_receipt_missing_candidate",
+                        fact.fact_id,
+                        "Accepted adaptation must resolve one candidate.",
+                        str(candidate_id),
+                    )
+            elif candidate_id is not None:
+                issue(
+                    "rejected_adaptation_has_candidate",
+                    fact.fact_id,
+                    "Rejected adaptation cannot reference a candidate.",
+                    str(candidate_id),
+                )
         elif fact.event_type == "execution_directive":
             attempt_id = str(payload["publication_attempt_id"])
             attempts = publication_attempt_by_id.get(attempt_id, ())
@@ -2116,12 +2453,56 @@ def evaluate_control_trace_lineage(
                         "Selected ExecutionDirective must resolve one authoritative decision.",
                         str(decision_id),
                     )
+                adaptation_receipt_id = payload[
+                    "action_adaptation_receipt_id"
+                ]
+                if adaptation_protocol_active:
+                    receipts = action_adaptation_receipt_by_id.get(
+                        str(adaptation_receipt_id),
+                        (),
+                    )
+                    if len(receipts) != 1 or str(
+                        receipts[0].payload["semantic_content_hash"]
+                    ) != str(payload["action_adaptation_receipt_hash"]):
+                        issue(
+                            "execution_directive_missing_adaptation_receipt",
+                            fact.fact_id,
+                            "Selected directive must resolve adaptation receipt.",
+                            str(adaptation_receipt_id),
+                        )
+                    elif bool(receipts[0].payload["accepted"]) == (
+                        payload["action_adaptation_fallback"] is not None
+                    ):
+                        issue(
+                            "execution_directive_adaptation_fallback_mismatch",
+                            fact.fact_id,
+                            "Adaptation fallback must exist exactly for rejection.",
+                            str(adaptation_receipt_id),
+                        )
             elif len(attempts) == 1 and bool(attempts[0].payload["accepted"]):
                 issue(
                     "nonselected_directive_has_accepted_publication",
                     fact.fact_id,
                     "A directive without decision_id cannot reference accepted publication.",
                     attempt_id,
+                )
+        elif (
+            fact.event_type == "shared_safety_result"
+            and adaptation_protocol_active
+        ):
+            candidate_id = str(payload["input_action_id"])
+            candidates = adapted_action_candidate_by_id.get(
+                candidate_id,
+                (),
+            )
+            if len(candidates) != 1 or str(
+                candidates[0].payload["semantic_content_hash"]
+            ) != str(payload["input_action_hash"]):
+                issue(
+                    "shared_safety_missing_adapted_candidate",
+                    fact.fact_id,
+                    "Shared safety must resolve its exact adapted input.",
+                    candidate_id,
                 )
         elif fact.event_type == "execution_cancellation":
             cancellation_id = str(payload["cancellation_id"])
@@ -2425,17 +2806,26 @@ def evaluate_control_trace_lineage(
                     "" if representation_trace_id is None else str(representation_trace_id),
                 )
         elif fact.event_type == "action_proposal" and payload["producer_kind"] == "composer":
-            result_id = str(payload["policy_output_id"])
-            results = composition_result_by_id.get(result_id, ())
+            result_id = str(payload["composition_evaluation_id"])
+            results = composition_evaluation_by_id.get(result_id, ())
             if len(results) != 1:
                 issue(
                     "composite_proposal_missing_result",
                     fact.fact_id,
-                    "Composite proposal must resolve one composition result.",
+                    "Composite proposal must resolve one composition evaluation.",
                     result_id,
                 )
             else:
                 result_payload = results[0].payload
+                if payload["composition_evaluation_hash"] != result_payload[
+                    "semantic_content_hash"
+                ]:
+                    issue(
+                        "composite_proposal_evaluation_hash_mismatch",
+                        fact.fact_id,
+                        "Composite proposal and composition evaluation hashes disagree.",
+                        result_id,
+                    )
                 if tuple(payload["composition_input_ids"]) != tuple(
                     result_payload["input_ids"]
                 ) or tuple(payload["composition_input_hashes"]) != tuple(
@@ -2444,7 +2834,7 @@ def evaluate_control_trace_lineage(
                     issue(
                         "composite_proposal_input_lineage_mismatch",
                         fact.fact_id,
-                        "Composite proposal and composition result inputs disagree.",
+                        "Composite proposal and composition evaluation inputs disagree.",
                         result_id,
                     )
                 if payload["composition_spec_hash"] != result_payload[
@@ -2453,7 +2843,7 @@ def evaluate_control_trace_lineage(
                     issue(
                         "composite_proposal_spec_mismatch",
                         fact.fact_id,
-                        "Composite proposal and composition result specs disagree.",
+                        "Composite proposal and composition evaluation specs disagree.",
                         result_id,
                     )
             dispositions = composition_disposition_by_result_id.get(
@@ -2482,8 +2872,8 @@ def evaluate_control_trace_lineage(
                         proposal_id,
                     )
                 elif (
-                    matches[0].payload.get("component_schema_hash")
-                    != payload["component_schema_hash"]
+                    matches[0].payload.get("action_schema_hash")
+                    != payload["action_schema_hash"]
                 ):
                     issue(
                         "snapshot_candidate_schema_mismatch",

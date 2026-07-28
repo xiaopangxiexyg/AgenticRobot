@@ -14,6 +14,29 @@ Deploy 消费 policy 输出并组装真实 observation/action/backend；运行�
 部署 profile、单臂 dry-run、双臂/双手、dataset replay debug 和运行按键见
 [`teleop_runtime/deploy/README.md`](../../teleop_runtime/deploy/README.md)。
 
+## Pose Lift 回退边界
+
+Policy pose 到正式 qpos 的提升使用独立的 versioned profile。默认已提升为：
+
+```bash
+--pose-lift-profile rm65_pose_lift_v4_qp_constrained
+```
+
+V4 保留 V3 的连续等价解与有界腕部搜索，并把正式
+qref 逐关节速度和加速度边界放入 Pink QP，并以“上一条正式 admitted qref + 上一条 admitted
+velocity”为外层锚点。一次 reference 内的 2–4 次 Pink 调用只是数值迭代，不会重复获得
+运动预算；最终 post-QP 关节/碰撞认证仍独立保留。该 qref QP 是部署参考层约束；120 Hz qcmd planner 的既有
+速度/加速度安全合同继续独立生效，不能因 V4 而删除。
+
+结构调整前的 `rm65_pose_lift_v1_baseline` 继续作为冻结的原子回退。需要回退时显式传：
+
+```bash
+--pose-lift-profile rm65_pose_lift_v1_baseline
+```
+
+用于部署 parity 检查的 Pose replay 默认也选择 V4；QPOS replay 是保存 q_ref 的严格复现，
+不经过 Pose Lift。V2/V3 仅保留为中间诊断 profile。
+
 ## 2. OpenPI 两进程部署
 
 OpenPI server 使用 OpenPI 环境，DexTeleop client 使用 `dexteleop310`。Checkpoint 目录必须

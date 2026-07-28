@@ -28,6 +28,7 @@ from .chunk_plan import (
 from .inference import (
     ASYNC_ALIGNED_CHUNK_MODE_V1,
     POLICY_INFERENCE_MODES_V1,
+    RTC_FLOW_INPAINT_MODE_V1,
     PolicyChunkResult,
     PolicyInferenceRequest,
 )
@@ -78,6 +79,9 @@ POLICY_DUE_POP_LATEST_VALID_NO_CATCHUP_V1 = (
 )
 RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1 = "rtc_3c_virtual_shadow_15_30_60_120_v1"
 RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1 = "raw_rtc_final_chunk_15_30_60_120_v1"
+MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1 = (
+    "model_rtc_flow_inpaint_shadow_15_30_60_120_v1"
+)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -236,6 +240,11 @@ RTC_3C_VIRTUAL_SHADOW_PROFILE_V1 = PolicyAsyncExecutionProfile(
 
 RAW_RTC_FINAL_CHUNK_PROFILE_V1 = PolicyAsyncExecutionProfile(
     profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+)
+
+MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1 = PolicyAsyncExecutionProfile(
+    profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+    rtc_mode=RTC_FLOW_INPAINT_MODE_V1,
 )
 
 
@@ -882,6 +891,8 @@ __all__ = [
     "RTC_3C_VIRTUAL_SHADOW_PROFILE_V1",
     "RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1",
     "RAW_RTC_FINAL_CHUNK_PROFILE_V1",
+    "MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1",
+    "MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1",
     "PolicyAsyncExecutionProfile",
     "PolicyAsyncProducerSnapshot",
     "PolicyAsyncProducerTransitionOutcome",

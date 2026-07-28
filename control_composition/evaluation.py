@@ -7,6 +7,7 @@ one object without rereading a live producer, simulator, model, or device.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from robot_motion.runtime.control_admission import ControlCut
@@ -22,11 +23,15 @@ from .composition import (
     CompositionInputRecord,
     CompositionInputSnapshot,
     CompositionContextSnapshot,
-    CompositionResult,
+    CompositionEvaluation,
     CompositionSpec,
     FormalCompositionStrategyInput,
     FormalCompositionStrategyResultBinding,
     FormalCompositionStrategySpec,
+    CompositionStrategyControlBinding,
+    CompositionPreMixPolicyInput,
+    CompositionPreMixPolicyDecision,
+    CompositionPreMixPolicySpec,
 )
 from .observability import (
     ActionDifference,
@@ -72,7 +77,7 @@ class CompositionEvaluationRecord:
     control_cut: ControlCut
     producer_epoch_snapshot: ProducerEpochSnapshot
     input_snapshot: CompositionInputSnapshot
-    composition_result: CompositionResult
+    composition_evaluation: CompositionEvaluation
     required_context_channels: tuple[str, ...]
     context_snapshot: CompositionContextSnapshot | None
     source_eligibility_spec: CompositionSourceEligibilitySpec | None
@@ -80,10 +85,15 @@ class CompositionEvaluationRecord:
     strategy_spec: FormalCompositionStrategySpec | None
     strategy_input: FormalCompositionStrategyInput | None
     strategy_result_binding: FormalCompositionStrategyResultBinding | None
+    strategy_control_binding: CompositionStrategyControlBinding | None
     source_difference_spec: SourceDifferenceSpec | None
     source_difference_observation: SourceDifferenceObservation | None
     diagnostics: tuple[CompositionDiagnostic, ...]
     domain_events_emitted: tuple[CompositionDomainEvent, ...]
+    pre_mix_policy_spec: CompositionPreMixPolicySpec | None = None
+    pre_mix_policy_input: CompositionPreMixPolicyInput | None = None
+    pre_mix_policy_decision: CompositionPreMixPolicyDecision | None = None
+    pre_mix_policy_elapsed_sec: float | None = None
 
     def __post_init__(self) -> None:
         if self.information_plan is not None and not isinstance(
@@ -103,18 +113,18 @@ class CompositionEvaluationRecord:
             )
         if not isinstance(self.input_snapshot, CompositionInputSnapshot):
             raise TypeError("input_snapshot must be a CompositionInputSnapshot.")
-        if not isinstance(self.composition_result, CompositionResult):
-            raise TypeError("composition_result must be a CompositionResult.")
+        if not isinstance(self.composition_evaluation, CompositionEvaluation):
+            raise TypeError("composition_evaluation must be a CompositionEvaluation.")
         spec_hash = self.composition_spec.semantic_content_hash
         if (
             self.input_snapshot.composition_spec_hash != spec_hash
-            or self.composition_result.composition_spec_hash != spec_hash
+            or self.composition_evaluation.composition_spec_hash != spec_hash
         ):
             raise ValueError("Composition evaluation spec lineage does not match.")
         if (
-            self.composition_result.composition_input_snapshot_id
+            self.composition_evaluation.composition_input_snapshot_id
             != self.input_snapshot.composition_input_snapshot_id
-            or self.composition_result.composition_input_snapshot_hash
+            or self.composition_evaluation.composition_input_snapshot_hash
             != self.input_snapshot.semantic_content_hash
         ):
             raise ValueError("Composition evaluation snapshot lineage does not match.")
@@ -256,25 +266,65 @@ class CompositionEvaluationRecord:
                 )
             if (
                 self.strategy_input.strategy_spec != self.strategy_spec
-                or self.composition_result.strategy_spec_hash
+                or self.composition_evaluation.strategy_spec_hash
                 != self.strategy_spec.semantic_content_hash
-                or self.composition_result.strategy_input_id
+                or self.composition_evaluation.strategy_input_id
                 != self.strategy_input.strategy_input_id
-                or self.composition_result.strategy_input_hash
+                or self.composition_evaluation.strategy_input_hash
                 != self.strategy_input.semantic_content_hash
                 or self.strategy_result_binding.strategy_input_id
                 != self.strategy_input.strategy_input_id
-                or self.strategy_result_binding.composition_result_id
-                != self.composition_result.composition_result_id
-                or self.strategy_result_binding.composition_result_hash
-                != self.composition_result.semantic_content_hash
+                or self.strategy_result_binding.composition_evaluation_id
+                != self.composition_evaluation.composition_evaluation_id
+                or self.strategy_result_binding.composition_evaluation_hash
+                != self.composition_evaluation.semantic_content_hash
             ):
                 raise ValueError(
                     "Formal strategy evaluation lineage does not match."
                 )
-        elif self.composition_result.strategy_id is not None:
+        elif self.composition_evaluation.strategy_id is not None:
             raise ValueError(
-                "Formal composition result requires strategy evaluation lineage."
+                "Formal composition evaluation requires strategy evaluation lineage."
+            )
+        control_binding = self.strategy_control_binding
+        if control_binding is not None:
+            if not isinstance(
+                control_binding,
+                CompositionStrategyControlBinding,
+            ):
+                raise TypeError(
+                    "strategy_control_binding must be a "
+                    "CompositionStrategyControlBinding or None."
+                )
+            if (
+                self.strategy_input is None
+                or self.strategy_input.strategy_control_binding_id
+                != control_binding.binding_id
+                or self.strategy_input.strategy_control_binding_hash
+                != control_binding.semantic_content_hash
+                or self.composition_evaluation.strategy_control_binding_id
+                != control_binding.binding_id
+                or self.composition_evaluation.strategy_control_binding_hash
+                != control_binding.semantic_content_hash
+                or control_binding.parameter_snapshot.cutoff_at
+                != self.control_cut.cutoff_at
+                or control_binding.parameter_snapshot.cutoff_admission_sequence
+                != self.control_cut.cutoff_admission_sequence
+                or control_binding.parameter_snapshot.target_effective_at
+                != self.input_snapshot.target_effective_at
+            ):
+                raise ValueError(
+                    "Strategy hot-control binding does not share the evaluation cut."
+                )
+        elif (
+            self.composition_evaluation.strategy_control_binding_id is not None
+            or (
+                self.strategy_input is not None
+                and self.strategy_input.strategy_control_binding_id is not None
+            )
+        ):
+            raise ValueError(
+                "Strategy hot-control evaluation requires its exact binding."
             )
         if self.source_difference_spec is None:
             if self.source_difference_observation is not None:
@@ -291,16 +341,66 @@ class CompositionEvaluationRecord:
                 != self.input_snapshot.composition_input_snapshot_id
                 or observation.composition_input_snapshot_hash
                 != self.input_snapshot.semantic_content_hash
-                or observation.composition_result_id
-                != self.composition_result.composition_result_id
-                or observation.composition_result_hash
-                != self.composition_result.semantic_content_hash
+                or observation.composition_evaluation_id
+                != self.composition_evaluation.composition_evaluation_id
+                or observation.composition_evaluation_hash
+                != self.composition_evaluation.semantic_content_hash
                 or observation.source_difference_spec_hash
                 != self.source_difference_spec.semantic_content_hash
             ):
                 raise ValueError(
                     "Source difference observation does not share the evaluation."
                 )
+        if self.pre_mix_policy_spec is not None and not isinstance(
+            self.pre_mix_policy_spec,
+            CompositionPreMixPolicySpec,
+        ):
+            raise TypeError(
+                "pre_mix_policy_spec must be a CompositionPreMixPolicySpec."
+            )
+        if self.pre_mix_policy_elapsed_sec is not None:
+            elapsed = float(self.pre_mix_policy_elapsed_sec)
+            if not math.isfinite(elapsed) or elapsed < 0.0:
+                raise ValueError(
+                    "pre_mix_policy_elapsed_sec must be finite and non-negative."
+                )
+            object.__setattr__(self, "pre_mix_policy_elapsed_sec", elapsed)
+        policy_values = (
+            self.pre_mix_policy_input,
+            self.pre_mix_policy_decision,
+        )
+        if any(value is not None for value in policy_values):
+            if self.pre_mix_policy_spec is None or any(
+                value is None for value in policy_values
+            ):
+                raise ValueError(
+                    "Pre-mix policy spec/input/decision lineage must be complete."
+                )
+            if not isinstance(
+                self.pre_mix_policy_input,
+                CompositionPreMixPolicyInput,
+            ):
+                raise TypeError(
+                    "pre_mix_policy_input must be a CompositionPreMixPolicyInput."
+                )
+            if not isinstance(
+                self.pre_mix_policy_decision,
+                CompositionPreMixPolicyDecision,
+            ):
+                raise TypeError(
+                    "pre_mix_policy_decision must be a "
+                    "CompositionPreMixPolicyDecision."
+                )
+            policy_input = self.pre_mix_policy_input
+            decision = self.pre_mix_policy_decision
+            if (
+                policy_input.composition_spec != self.composition_spec
+                or policy_input.input_snapshot != self.input_snapshot
+                or decision.policy_spec_hash
+                != self.pre_mix_policy_spec.semantic_content_hash
+                or decision.policy_input_hash != policy_input.semantic_content_hash
+            ):
+                raise ValueError("Pre-mix policy lineage does not match evaluation.")
         diagnostics = tuple(self.diagnostics)
         if any(not isinstance(item, CompositionDiagnostic) for item in diagnostics):
             raise TypeError("diagnostics must contain CompositionDiagnostic values.")

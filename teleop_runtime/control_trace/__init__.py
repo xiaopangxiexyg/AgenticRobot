@@ -38,6 +38,12 @@ from .runtime import (
     TraceAdmissionReceipt,
     summarize_control_trace_admission_latency,
 )
+from .routing import (
+    CONTROL_TRACE_CAPTURE_DISPOSITIONS_V1,
+    ControlTraceCaptureRouter,
+    ControlTraceCaptureRoutingReceipt,
+    ControlTraceCaptureSelection,
+)
 from .spool import (
     SPOOL_APPEND_REJECTION_CODES_V1,
     ControlTraceSpool,
@@ -59,6 +65,10 @@ __all__ = [
     "ControlTraceAdmissionLatencyReport",
     "ControlTraceJournalEntry",
     "ControlTraceRuntimeSnapshot",
+    "CONTROL_TRACE_CAPTURE_DISPOSITIONS_V1",
+    "ControlTraceCaptureRouter",
+    "ControlTraceCaptureRoutingReceipt",
+    "ControlTraceCaptureSelection",
     "ControlTraceSinkFlushReport",
     "ControlTraceSpool",
     "ControlTraceSpoolAppendReceipt",

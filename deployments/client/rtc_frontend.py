@@ -14,7 +14,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, runtime_checkable
 
+from dataset_contracts.model_continuation import (
+    ModelContinuationContract,
+    normalize_model_continuation_contract,
+)
 from robot_motion.deploy.async_producer import (
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
     PolicyAsyncExecutionProfile,
 )
@@ -23,7 +28,10 @@ from robot_motion.deploy.action_representation import (
 )
 from robot_motion.deploy.inference import InferenceDelayEstimatorSpec
 from robot_motion.deploy.observation_view import PolicyObservationView
-from robot_motion.deploy.policy_worker import PolicyInferenceExecutor
+from robot_motion.deploy.policy_worker import (
+    PolicyInferenceExecutor,
+    PolicyInferenceWorkItemExecutor,
+)
 from robot_motion.deploy.rtc_protocol import (
     RtcModelCapability,
     RtcProtocolRequestSpec,
@@ -33,6 +41,7 @@ from robot_motion.deploy.rtc_runtime import (
     RtcPolicyShadowConfig,
     RtcPolicyShadowFrontend,
 )
+from robot_motion.deploy.rtc import RtcModelContinuationRuntimeSpec
 from robot_motion.deploy.runtime import PolicyDeployRuntime
 
 from .rtc import (
@@ -45,6 +54,10 @@ from .rtc import (
 from .rtc_executor import (
     RtcModelClientInferenceExecutor,
     RtcModelInputPreparer,
+)
+from .rtc_conditioning_protocol import (
+    RtcModelContinuationCapabilityV3,
+    validate_rtc_model_continuation_capability_v3_binding,
 )
 
 
@@ -77,6 +90,37 @@ class RtcModelRuntimeAdapter(Protocol):
         *,
         observe_bundle: Callable[[RtcClientInferenceBundle], None] | None = None,
     ) -> PolicyInferenceExecutor:
+        ...
+
+
+@runtime_checkable
+class RtcConditionedModelRuntimeAdapterV3(Protocol):
+    """Composition surface for one artifact-bound model-RTC v3 provider."""
+
+    @property
+    def rtc_continuation_capability(
+        self,
+    ) -> RtcModelContinuationCapabilityV3:
+        ...
+
+    @property
+    def continuation_contract(self) -> ModelContinuationContract:
+        ...
+
+    @property
+    def representation_context_builder(
+        self,
+    ) -> Callable[
+        [PolicyObservationView, str],
+        PolicyActionRepresentationContext,
+    ]:
+        ...
+
+    def create_worker_executor(
+        self,
+        *,
+        observe_bundle: Callable[[Any], None] | None = None,
+    ) -> PolicyInferenceWorkItemExecutor:
         ...
 
 
@@ -271,7 +315,9 @@ def build_rtc_model_shadow_frontend(
         name=(capability.provider_id if policy_name is None else policy_name),
     )
 
-    def executor_factory(_worker_session_id: str) -> PolicyInferenceExecutor:
+    def executor_factory(
+        _worker_session_id: str,
+    ) -> PolicyInferenceWorkItemExecutor:
         executor = adapter.create_worker_executor(observe_bundle=observe_bundle)
         if not callable(executor):
             raise TypeError("adapter.create_worker_executor() must return callable.")
@@ -303,6 +349,201 @@ def build_rtc_model_shadow_frontend(
     )
 
 
+def rtc_conditioned_config_from_model_adapter_v3(
+    adapter: RtcConditionedModelRuntimeAdapterV3,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    producer_id: str,
+    policy_node_id: str,
+    profile: PolicyAsyncExecutionProfile = (
+        MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1
+    ),
+    clock_domain_id: str = "local_monotonic",
+    minimum_execution_horizon_steps: int = 1,
+    request_validity_steps: int = 10,
+    request_trigger_coverage_steps: int | None = None,
+    worker_result_capacity: int = 1,
+    worker_idle_poll_sec: float = 0.001,
+    worker_stop_timeout_sec: float = 0.0,
+    delay_estimator_spec: InferenceDelayEstimatorSpec | None = None,
+) -> RtcPolicyShadowConfig:
+    """Project one v3 provider into the existing bounded RTC coordinator."""
+
+    if not isinstance(adapter, RtcConditionedModelRuntimeAdapterV3):
+        raise TypeError(
+            "adapter must implement RtcConditionedModelRuntimeAdapterV3."
+        )
+    if not isinstance(profile, PolicyAsyncExecutionProfile):
+        raise TypeError("profile must be PolicyAsyncExecutionProfile.")
+    capability = adapter.rtc_continuation_capability
+    if not isinstance(capability, RtcModelContinuationCapabilityV3):
+        raise TypeError(
+            "adapter.rtc_continuation_capability must be "
+            "RtcModelContinuationCapabilityV3."
+        )
+    source_contract = adapter.continuation_contract
+    contract = normalize_model_continuation_contract(source_contract).runtime
+    validate_rtc_model_continuation_capability_v3_binding(
+        capability,
+        continuation_contract=source_contract,
+        selected_prefix_schedule=capability.selected_prefix_schedule,
+    )
+    if "absolute" not in contract.supported_action_pose_modes:
+        raise ValueError("Model-RTC v3 currently requires absolute actions.")
+
+    if delay_estimator_spec is None:
+        period = 1.0 / profile.action_hz
+        delay_estimator_spec = InferenceDelayEstimatorSpec(
+            spec_id=(
+                "model_rtc_v3_shadow_delay_rolling_max:"
+                f"{contract.minimum_forecast_delay_steps}:"
+                f"{contract.maximum_forecast_delay_steps}"
+            ),
+            action_period_sec=period,
+            window_size=32,
+            warmup_latency_sec=period,
+            network_guard_sec=0.0,
+            control_jitter_guard_steps=1,
+            minimum_delay_steps=contract.minimum_forecast_delay_steps,
+            maximum_delay_steps=contract.maximum_forecast_delay_steps,
+        )
+    if request_trigger_coverage_steps is None:
+        request_trigger_coverage_steps = (
+            contract.maximum_forecast_delay_steps
+        )
+
+    return RtcPolicyShadowConfig(
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        producer_id=producer_id,
+        policy_node_id=policy_node_id,
+        artifact_hash=capability.artifact_hash,
+        action_codec_hash=contract.action_codec_hash,
+        frame_contract_hash=contract.frame_contract_hash,
+        layout_hash=contract.layout_hash,
+        normalization_hash=contract.normalization_hash,
+        action_pose_mode="absolute",
+        profile=profile,
+        clock_domain_id=clock_domain_id,
+        prediction_horizon_steps=contract.prediction_horizon_steps,
+        minimum_execution_horizon_steps=minimum_execution_horizon_steps,
+        request_validity_steps=request_validity_steps,
+        request_trigger_coverage_steps=request_trigger_coverage_steps,
+        worker_result_capacity=worker_result_capacity,
+        worker_idle_poll_sec=worker_idle_poll_sec,
+        worker_stop_timeout_sec=worker_stop_timeout_sec,
+        delay_estimator_spec=delay_estimator_spec,
+        model_continuation=RtcModelContinuationRuntimeSpec(
+            continuation_contract=source_contract,
+            prefix_schedule_semantics=(
+                capability.selected_prefix_schedule
+            ),
+        ),
+    )
+
+
+def build_rtc_conditioned_model_shadow_frontend_v3(
+    adapter: RtcConditionedModelRuntimeAdapterV3,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    producer_id: str,
+    policy_node_id: str,
+    deploy_runtime: PolicyDeployRuntime,
+    preparer: Any,
+    created_at: float,
+    policy_name: str | None = None,
+    observe_bundle: Callable[[Any], None] | None = None,
+    profile: PolicyAsyncExecutionProfile = (
+        MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1
+    ),
+    clock_domain_id: str = "local_monotonic",
+    minimum_execution_horizon_steps: int = 1,
+    request_validity_steps: int = 10,
+    request_trigger_coverage_steps: int | None = None,
+    worker_result_capacity: int = 1,
+    worker_idle_poll_sec: float = 0.001,
+    worker_stop_timeout_sec: float = 0.0,
+    delay_estimator_spec: InferenceDelayEstimatorSpec | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> RtcPolicyShadowFrontend:
+    """Build, but do not start, one default-off model-RTC v3 frontend."""
+
+    if not isinstance(deploy_runtime, PolicyDeployRuntime):
+        raise TypeError("deploy_runtime must be PolicyDeployRuntime.")
+    if not callable(clock):
+        raise TypeError("clock must be callable.")
+    if observe_bundle is not None and not callable(observe_bundle):
+        raise TypeError("observe_bundle must be callable or None.")
+    expected_period = 1.0 / profile.action_hz
+    if not math.isclose(
+        deploy_runtime.config.action_keyframe_period_sec,
+        expected_period,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("deploy runtime/action profile period mismatch.")
+    config = rtc_conditioned_config_from_model_adapter_v3(
+        adapter,
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        producer_id=producer_id,
+        policy_node_id=policy_node_id,
+        profile=profile,
+        clock_domain_id=clock_domain_id,
+        minimum_execution_horizon_steps=(
+            minimum_execution_horizon_steps
+        ),
+        request_validity_steps=request_validity_steps,
+        request_trigger_coverage_steps=request_trigger_coverage_steps,
+        worker_result_capacity=worker_result_capacity,
+        worker_idle_poll_sec=worker_idle_poll_sec,
+        worker_stop_timeout_sec=worker_stop_timeout_sec,
+        delay_estimator_spec=delay_estimator_spec,
+    )
+    context_builder = adapter.representation_context_builder
+    if not callable(context_builder):
+        raise TypeError(
+            "Model-RTC v3 adapter must provide a representation context "
+            "builder."
+        )
+    capability = adapter.rtc_continuation_capability
+    identity = RtcModelPolicyIdentity(
+        name=(
+            capability.continuation_implementation_id
+            if policy_name is None
+            else policy_name
+        ),
+    )
+
+    def executor_factory(_worker_session_id: str) -> PolicyInferenceExecutor:
+        executor = adapter.create_worker_executor(
+            observe_bundle=observe_bundle
+        )
+        if not callable(executor):
+            raise TypeError(
+                "adapter.create_worker_executor() must return callable."
+            )
+        if not callable(getattr(executor, "execute_work_item", None)):
+            raise TypeError(
+                "Model-RTC v3 executor must implement callable "
+                "execute_work_item()."
+            )
+        return executor
+
+    return RtcPolicyShadowFrontend(
+        config=config,
+        deploy_runtime=deploy_runtime,
+        policy=identity,
+        created_at=created_at,
+        emission_adapter=getattr(preparer, "action_adapter", None),
+        clock=clock,
+        executor_factory=executor_factory,
+        representation_context_builder=context_builder,
+    )
+
+
 # Canonical functional names for new raw/model RTC integrations.  The existing
 # Shadow/Frontend names remain the same callable objects for import and
 # behavior compatibility.
@@ -311,11 +552,14 @@ build_rtc_model_producer_runtime = build_rtc_model_shadow_frontend
 
 
 __all__ = [
+    "RtcConditionedModelRuntimeAdapterV3",
     "RtcModelPolicyIdentity",
     "RtcModelRuntimeAdapter",
     "SimpleRtcModelRuntimeAdapter",
+    "build_rtc_conditioned_model_shadow_frontend_v3",
     "build_rtc_model_producer_runtime",
     "build_rtc_model_shadow_frontend",
+    "rtc_conditioned_config_from_model_adapter_v3",
     "rtc_producer_config_from_model_adapter",
     "rtc_shadow_config_from_model_adapter",
 ]

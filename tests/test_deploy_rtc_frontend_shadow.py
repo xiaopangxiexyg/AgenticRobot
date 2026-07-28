@@ -889,6 +889,7 @@ def test_virtual_policy_long_run_emits_each_timed_keyframe_once_without_lookahea
                 assert step.emission_result.raw_action is not None
                 assert step.action_preparation.prepared_action is None
                 assert step.action_preparation.raw_lookahead_action is None
+                assert step.action_preparation.next_step_execution_signal is None
                 assert (
                     step.emission_result.emission.emitted_at
                     >= step.emission_result.emission.produced_at

@@ -655,6 +655,7 @@ def _build_pose_quality_display_payload(active_command: object | None) -> dict[s
         "available": available,
         "status": status,
         "score": score,
+        "special_code": quality.get("special_code"),
         "bad": bad,
         "level": _pose_quality_level(status, available=available, bad=bad),
         "source": str(quality.get("source") or ""),
@@ -684,6 +685,9 @@ def _pose_quality_status_text(payload: Mapping[str, object] | None) -> str:
     status = str(payload.get("status") or "unknown")
     score = _compact_runtime_float(payload.get("score"), digits=2)
     bits = [f"pose_quality={status}", f"score={score}"]
+    special_code = payload.get("special_code")
+    if special_code:
+        bits.append(f"special={special_code}")
     if not bool(payload.get("available", False)):
         bits.append("available=0")
     reasons = _pose_quality_reason_list(payload.get("reasons"))

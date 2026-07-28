@@ -68,9 +68,11 @@ flowchart LR
     A --> I["activation-bound inputs<br/>receiver time barrier"]
     I --> S["same-activation snapshot"]
     S --> R["same-activation result"]
-    R --> G{"formal authority gate"}
-    G -->|ready| P["one proposal"]
-    G -->|missing / mismatch / invalid| H["HOLD + cancel"]
+    R --> G{"non-authoritative<br/>downstream disposition"}
+    G -->|ready| P["submit one candidate"]
+    G -->|missing / mismatch / invalid| H["request HOLD"]
+    H --> L["lower execution owner"]
+    L --> X["HOLD/cancel receipt"]
     A -. domain event .-> T["external trace projection<br/>activation scope + bindings"]
     I -. domain event .-> T
     S -. domain event .-> T
@@ -381,7 +383,9 @@ flowchart LR
     I --> A[Release old + takeover human\nexecution remains HOLD]
     A --> F{Fresh human readiness complete?}
     F -->|no / timeout / disconnect| X[Remain HOLD\nno automatic fallback]
-    F -->|post-takeover emission\nfresh measured state\ndeadman re-arm\nretargeter rebase\ncanonical safety| R[READY + open human publication]
+    F -->|post-takeover emission\nfresh measured state\ndeadman re-arm\nretargeter rebase| R[lower READY receipt\n+ open human publication]
+    R --> P2[formal proposal]
+    P2 --> S2[downstream canonical safety]
 ```
 
 ```text
@@ -417,10 +421,11 @@ sequenceDiagram
     H-->>C: fresh post-takeover HumanCommandEmission
     M-->>C: fresh measured qpos
     C-->>C: virtual deadman + rebase evidence
-    C->>A: non-publishing canonical-safety preview
-    C->>A: READY
+    C->>A: source-readiness evidence → READY request
+    A-->>C: execution READY receipt
     H->>C: exact same identity/content/timing promotion
     C->>A: one formal emission + one proposal admission
+    A->>A: authoritative canonical safety
 ```
 
 ```text
@@ -458,7 +463,8 @@ sequenceDiagram
     P-->>C: same immutable emission + deadman/rebase evidence
     W->>S: pending-finalization CAS
     alt pending still current
-        S->>C: bounded safety/measurement/READY finalization
+        S->>C: bounded source-readiness/READY finalization
+        Note over C: no pre-admission canonical-safety preview
         C-->>S: human_takeover_ready + aggregate evidence
         S->>S: old→preflighted; human→active; open human barrier
     else HOLD/ESTOP already won
@@ -597,7 +603,8 @@ flowchart LR
     Y -. no authority / no device I/O .-> T
     W -. exact result .-> B
     B -->|ready| O --> A
-    B -->|fail closed| HLD["Execution HOLD + cancellation"]
+    B -->|not promotable| HR["request HOLD"]
+    HR --> HLD["lower execution owner<br/>HOLD + cancellation receipt"]
     A -. authoritative comparison .-> V
     E -. future .-> G
     V --> J
@@ -630,7 +637,7 @@ pose topology：共享v1 strategy/composer接受left/right arm的显式非空sub
              `component_mixing_shadow` ControlTrace/WAL，但仍未接authority/safety/dispatch
 当前formal sim seam：CS-6b1h关闭raw human/replay/primary-policy authority，只允许pose composer proposal；
                     contributor input绑定source fact ID/hash；exact result promotion幂等，
-                    TTL/epoch/conflict/error→HOLD，HOLD后不自动恢复
+                    TTL/epoch/conflict/error→request-HOLD，由lower receipt确认；HOLD后不自动恢复
 正式compound authority：typed profile绑定spec/rule-set/strategy hash与完整components/groups；
                     一个composer proposal覆盖arms+required hands，proposal仅存活一个decision period；
                     safety/IK/receiver/任一receipt失败→ControlTrace failure + domain cancellation/HOLD；

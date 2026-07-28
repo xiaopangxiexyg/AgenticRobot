@@ -27,6 +27,10 @@ from robot_motion.rm65 import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
 )
+from robot_motion.rm65.wrist_coaxial import (
+    canonicalize_rm65_wrist_coaxial_step,
+    stabilize_rm65_wrist_q5_step,
+)
 from robot_motion.joint_limits import (
     JointVelocityLimitProfile,
     load_joint_velocity_limit_profiles,
@@ -62,6 +66,14 @@ _CURRENT_TARGET_HOLD_TRANSLATION_M = 1e-3
 _CURRENT_TARGET_HOLD_ROTATION_DEG = 0.5
 IK_FRAMEWORK_ROBOT_MOTION = "robot_motion"
 IK_FRAMEWORK_CHOICES = (IK_FRAMEWORK_ROBOT_MOTION,)
+IK_STEP_MODE_LEGACY_ITERATIVE = "legacy_iterative"
+IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE = (
+    "single_step_singularity_aware"
+)
+IK_STEP_MODE_CHOICES = (
+    IK_STEP_MODE_LEGACY_ITERATIVE,
+    IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE,
+)
 
 
 def _normalize_ik_framework(value: object) -> str:
@@ -485,6 +497,35 @@ class DualArmCollisionAwareRetargeterConfig:
     bimanual_result_contract_enabled: bool = False
     solve_max_iterations: int = 1
     solve_min_iterations: int = 1
+    # Rollback boundary for the singularity-aware differential path.  Legacy
+    # mode preserves the historical min/max repeated integration exactly.
+    # The new mode advances physical configuration exactly once per outer
+    # reference tick; additional numerical refinement must not masquerade as
+    # additional elapsed time.
+    solve_step_mode: str = IK_STEP_MODE_LEGACY_ITERATIVE
+    joint_acceleration_limit_rad_s2: np.ndarray | Sequence[float] | None = None
+    # Opt-in successor to the acceleration-only Pink limit.  It constrains the
+    # numerical IK result to the same admitted-qref velocity and acceleration
+    # interval already enforced after IK.  Keep this false by default so the
+    # stable live-teleop profile remains an exact rollback.
+    admitted_reference_motion_limit_enabled: bool = False
+    wrist_coaxial_continuity_enabled: bool = True
+    # The coaxial null-space projection is deliberately confined to the
+    # immediate wrist-singularity neighborhood.  The previous 2--8 degree
+    # band made ordinary wrist motion feel sticky long before the RM65 SDK
+    # gate was relevant.  Keep a small hard floor for numerical conditioning,
+    # but restore most q4/q6 response outside four degrees.
+    wrist_coaxial_soft_threshold_deg: float = 4.0
+    wrist_coaxial_hard_threshold_deg: float = 3.0
+    # Within the narrow band, only a large q4-q6 null-direction step receives
+    # the full attenuation.  Small operator inputs stay responsive while the
+    # branch-jump envelope remains suppressed.
+    wrist_coaxial_null_motion_soft_limit_deg: float = 5.0
+    # Near the wrist coaxial neighborhood, a mathematically equivalent
+    # +/-pi wrist-flip candidate must not compete with the locally continuous
+    # Pink result.  The guard is only active in the opt-in single-step path;
+    # zero disables it and preserves the historical branch ordering.
+    wrist_branch_switch_guard_deg: float = 0.0
     # Position control may opt into running up to solve_max_iterations while
     # there is still time left in the frame budget.  The generic retargeter
     # default remains fixed-one-iteration so force/impedance callers retain
@@ -522,6 +563,38 @@ class DualArmCollisionAwareRetargeterConfig:
     output_qpos_smoothing_angular_speed_high_rad_s: float = 1.5
     output_qpos_smoothing_attack_sec: float = 0.05
     output_qpos_smoothing_release_sec: float = 0.20
+    output_qpos_normal_fast_path_enabled: bool = False
+    output_qpos_normal_fast_path_alpha: float = 1.0
+    output_qpos_normal_fast_path_guard_deg: float = 4.0
+    # A valid tracker motion window can disappear for one scheduling frame
+    # even though the authoritative channel and admission state remain
+    # healthy.  Keep only that soft eligibility bit alive briefly; joint,
+    # null-projection, q5-latch, and admission guards always fail closed.
+    output_qpos_normal_fast_path_quality_grace_sec: float = 0.0
+    # When q5 is in the narrow escape band, use the already safety-bounded
+    # fast EMA endpoint instead of the normal slow alpha.  This only changes
+    # the q5 singular neighborhood; all other joints retain the normal
+    # adaptive smoothing policy.
+    output_qpos_smoothing_singularity_alpha: float | None = None
+    # Keep only a small margin above the 3 deg SDK wrist gate.  A larger
+    # margin makes q5 sit visibly on an artificial boundary and contributes
+    # to the post-singularity "sticky" feel.
+    wrist_q5_escape_margin_deg: float = 0.25
+    # Hysteresis for the position-only q5 escape.  While the previous and
+    # candidate q5 values remain on the same side inside this release band,
+    # an inward candidate keeps the previous escaped value instead of
+    # toggling between the raw IK result and a one-step singularity escape.
+    # Zero is the atomic rollback to the pre-hysteresis behavior.
+    wrist_q5_hysteresis_release_deg: float = 6.0
+    wrist_q5_hysteresis_requires_escape_latch: bool = False
+    # A far Cartesian target should be allowed to pull the wrist out of the
+    # release band instead of waiting for the operator to reverse the hand.
+    # This only relaxes the q5 hysteresis hold; the 3.25 deg escape boundary,
+    # per-cycle velocity cap, collision check, and final admission remain in
+    # force.  Disable the option for an exact rollback to fixed-band behavior.
+    wrist_q5_hysteresis_relax_for_far_target: bool = True
+    wrist_q5_hysteresis_far_target_position_m: float = 0.10
+    wrist_q5_hysteresis_far_target_orientation_deg: float = 20.0
     # Zero preserves the historical hard-limit-only behavior. Runtime may set
     # a mode-specific interior envelope for force control.
     joint_operating_margin_deg: float = 0.0
@@ -601,6 +674,74 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("solve_min_iterations must be positive.")
         if self.solve_min_iterations > self.solve_max_iterations:
             raise ValueError("solve_min_iterations must be <= solve_max_iterations.")
+        self.solve_step_mode = str(self.solve_step_mode).strip().lower()
+        if self.solve_step_mode not in IK_STEP_MODE_CHOICES:
+            raise ValueError(
+                f"solve_step_mode must be one of {IK_STEP_MODE_CHOICES}, "
+                f"got {self.solve_step_mode!r}."
+            )
+        self.wrist_coaxial_continuity_enabled = bool(
+            self.wrist_coaxial_continuity_enabled
+        )
+        for threshold_name in (
+            "wrist_coaxial_soft_threshold_deg",
+            "wrist_coaxial_hard_threshold_deg",
+            "wrist_coaxial_null_motion_soft_limit_deg",
+            "wrist_branch_switch_guard_deg",
+        ):
+            threshold = float(getattr(self, threshold_name))
+            if not np.isfinite(threshold) or (
+                threshold <= 0.0
+                if threshold_name == "wrist_coaxial_null_motion_soft_limit_deg"
+                else threshold < 0.0
+            ):
+                comparison = (
+                    "> 0"
+                    if threshold_name == "wrist_coaxial_null_motion_soft_limit_deg"
+                    else ">= 0"
+                )
+                raise ValueError(f"{threshold_name} must be finite and {comparison}.")
+            setattr(self, threshold_name, threshold)
+        if (
+            self.wrist_coaxial_hard_threshold_deg
+            > self.wrist_coaxial_soft_threshold_deg
+        ):
+            raise ValueError(
+                "wrist_coaxial_hard_threshold_deg must be <= "
+                "wrist_coaxial_soft_threshold_deg."
+            )
+        if self.joint_acceleration_limit_rad_s2 is not None:
+            acceleration = np.asarray(
+                self.joint_acceleration_limit_rad_s2,
+                dtype=float,
+            ).reshape(-1)
+            if acceleration.shape != (6,) or not np.all(np.isfinite(acceleration)):
+                raise ValueError(
+                    "joint_acceleration_limit_rad_s2 must contain 6 finite values."
+                )
+            if np.any(acceleration <= 0.0):
+                raise ValueError(
+                    "joint_acceleration_limit_rad_s2 values must be positive."
+                )
+            self.joint_acceleration_limit_rad_s2 = acceleration.copy()
+        self.admitted_reference_motion_limit_enabled = bool(
+            self.admitted_reference_motion_limit_enabled
+        )
+        if self.admitted_reference_motion_limit_enabled and (
+            self.solve_step_mode
+            != IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+        ):
+            raise ValueError(
+                "admitted_reference_motion_limit_enabled requires "
+                "single_step_singularity_aware."
+            )
+        if self.admitted_reference_motion_limit_enabled and (
+            self.joint_acceleration_limit_rad_s2 is None
+        ):
+            raise ValueError(
+                "admitted_reference_motion_limit_enabled requires "
+                "joint_acceleration_limit_rad_s2."
+            )
         self.solve_adaptive_iterations_enabled = bool(self.solve_adaptive_iterations_enabled)
         if not np.isfinite(float(self.solve_iteration_reserve_ms)) or self.solve_iteration_reserve_ms < 0.0:
             raise ValueError("solve_iteration_reserve_ms must be finite and >= 0.")
@@ -701,6 +842,71 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("output_qpos_smoothing_attack_sec must be positive.")
         if float(self.output_qpos_smoothing_release_sec) <= 0.0:
             raise ValueError("output_qpos_smoothing_release_sec must be positive.")
+        self.output_qpos_normal_fast_path_enabled = bool(
+            self.output_qpos_normal_fast_path_enabled
+        )
+        normal_fast_alpha = float(self.output_qpos_normal_fast_path_alpha)
+        if not np.isfinite(normal_fast_alpha) or not 0.0 <= normal_fast_alpha <= 1.0:
+            raise ValueError("output_qpos_normal_fast_path_alpha must be in [0, 1].")
+        if normal_fast_alpha < float(self.output_qpos_smoothing_fast_alpha):
+            raise ValueError(
+                "output_qpos_normal_fast_path_alpha must be >= the adaptive fast alpha."
+            )
+        self.output_qpos_normal_fast_path_alpha = normal_fast_alpha
+        normal_fast_guard = float(self.output_qpos_normal_fast_path_guard_deg)
+        if not np.isfinite(normal_fast_guard) or normal_fast_guard < 0.0:
+            raise ValueError(
+                "output_qpos_normal_fast_path_guard_deg must be finite and >= 0."
+            )
+        self.output_qpos_normal_fast_path_guard_deg = normal_fast_guard
+        normal_fast_quality_grace_sec = float(
+            self.output_qpos_normal_fast_path_quality_grace_sec
+        )
+        if (
+            not np.isfinite(normal_fast_quality_grace_sec)
+            or normal_fast_quality_grace_sec < 0.0
+        ):
+            raise ValueError(
+                "output_qpos_normal_fast_path_quality_grace_sec must be finite and >= 0."
+            )
+        self.output_qpos_normal_fast_path_quality_grace_sec = (
+            normal_fast_quality_grace_sec
+        )
+        if self.output_qpos_smoothing_singularity_alpha is not None:
+            singularity_alpha = float(self.output_qpos_smoothing_singularity_alpha)
+            if not np.isfinite(singularity_alpha) or not 0.0 <= singularity_alpha <= 1.0:
+                raise ValueError(
+                    "output_qpos_smoothing_singularity_alpha must be in [0, 1] when set."
+                )
+            if singularity_alpha < float(self.output_qpos_smoothing_alpha):
+                raise ValueError(
+                    "output_qpos_smoothing_singularity_alpha must be >= the slow alpha."
+                )
+            self.output_qpos_smoothing_singularity_alpha = singularity_alpha
+        escape_margin = float(self.wrist_q5_escape_margin_deg)
+        if not np.isfinite(escape_margin) or escape_margin < 0.0:
+            raise ValueError("wrist_q5_escape_margin_deg must be finite and >= 0.")
+        self.wrist_q5_escape_margin_deg = escape_margin
+        hysteresis_release = float(self.wrist_q5_hysteresis_release_deg)
+        if not np.isfinite(hysteresis_release) or hysteresis_release < 0.0:
+            raise ValueError(
+                "wrist_q5_hysteresis_release_deg must be finite and >= 0."
+            )
+        self.wrist_q5_hysteresis_release_deg = hysteresis_release
+        self.wrist_q5_hysteresis_requires_escape_latch = bool(
+            self.wrist_q5_hysteresis_requires_escape_latch
+        )
+        self.wrist_q5_hysteresis_relax_for_far_target = bool(
+            self.wrist_q5_hysteresis_relax_for_far_target
+        )
+        for threshold_name in (
+            "wrist_q5_hysteresis_far_target_position_m",
+            "wrist_q5_hysteresis_far_target_orientation_deg",
+        ):
+            threshold = float(getattr(self, threshold_name))
+            if not np.isfinite(threshold) or threshold < 0.0:
+                raise ValueError(f"{threshold_name} must be finite and >= 0.")
+            setattr(self, threshold_name, threshold)
         if not np.isfinite(float(self.joint_operating_margin_deg)) or float(
             self.joint_operating_margin_deg
         ) < 0.0:
@@ -882,6 +1088,54 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._full_execution_joint_step = self._make_full_execution_joint_step(
             self.ik_solver.current_q
         )
+        self._last_admitted_velocity_full = np.zeros_like(
+            np.asarray(self.ik_solver.current_q, dtype=float)
+        )
+        self._acceleration_limit_enabled = False
+        self._admitted_reference_motion_limit_enabled = False
+        if (
+            config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            and config.joint_acceleration_limit_rad_s2 is not None
+        ):
+            full_acceleration_limit = self._make_full_joint_acceleration_limit(
+                np.asarray(config.joint_acceleration_limit_rad_s2, dtype=float)
+            )
+            if config.admitted_reference_motion_limit_enabled:
+                configure_motion_limit = getattr(
+                    self.ik_solver,
+                    "configure_admitted_reference_motion_limit",
+                    None,
+                )
+                if not callable(configure_motion_limit):
+                    raise ValueError(
+                        "admitted-reference motion limiting requires an IK solver "
+                        "that implements configure_admitted_reference_motion_limit()."
+                    )
+                configure_motion_limit(
+                    self._make_full_execution_joint_velocity_limit(
+                        np.asarray(self.ik_solver.current_q, dtype=float)
+                    ),
+                    full_acceleration_limit,
+                )
+                self._admitted_reference_motion_limit_enabled = True
+            else:
+                configure_acceleration_limit = getattr(
+                    self.ik_solver,
+                    "configure_acceleration_limit",
+                    None,
+                )
+                if not callable(configure_acceleration_limit):
+                    raise ValueError(
+                        "single_step_singularity_aware with acceleration limits "
+                        "requires an IK solver that implements configure_acceleration_limit()."
+                    )
+                configure_acceleration_limit(full_acceleration_limit)
+            self._acceleration_limit_enabled = True
+            if self._admitted_reference_motion_limit_enabled:
+                self._set_solver_motion_reference(
+                    np.asarray(self.ik_solver.current_q, dtype=float)
+                )
         self._left_arm_limits = self._split_solution(
             np.asarray(self.ik_solver.robot.model.lowerPositionLimit, dtype=float)
         )[0], self._split_solution(
@@ -909,6 +1163,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._time_budget_warning_frames = 0
         self._last_solve_iteration_budget_exhausted = False
         self._last_solve_iteration_stop_reason: str | None = None
+        self._last_raw_solver_q: np.ndarray | None = None
+        self._last_wrist_coaxial_metadata: dict[str, object] = {
+            "enabled": False,
+            "applied": False,
+            "reason": "not_started",
+        }
+        self._last_directional_singularity_diagnostics: dict[str, object] = {}
         self._target_pose_smoother = config.target_pose_smoother
         self._last_output_qpos_smoothing_full_q: np.ndarray | None = None
         self._output_qpos_smoothing_effective_alpha = {
@@ -918,13 +1179,33 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "left": None,
             "right": None,
         }
+        self._output_qpos_normal_fast_path_last_quality_valid_time: dict[
+            str, float | None
+        ] = {"left": None, "right": None}
         self._position_singularity_analyzers: dict[
             str, Callable[[np.ndarray], Mapping[str, object]]
         ] = {}
         self._position_singularity_metadata_cache: dict[
             tuple[float, ...], dict[str, object]
         ] = {}
+        # Directional singularity escape is intentionally stateful.  A raw
+        # per-frame IK solve can alternate sides while q3/q5 is close to zero;
+        # retaining the admitted outward direction prevents that solver noise
+        # from becoming a physical left/right oscillation.  The latch is only
+        # used by profiles that explicitly opt into the new policy.
+        self._singularity_escape_direction_latch: dict[tuple[str, int], int] = {}
+        self._singularity_escape_direction_failures: dict[tuple[str, int], int] = {}
+        # Once one side/axis (or the coupled J3+J5 pair) is admitted, keep
+        # that axis plan until it leaves the release band.  Sign latching
+        # alone still allowed the selector to alternate between J3 and J5
+        # when both candidates had similar Cartesian scores.
+        self._singularity_escape_axis_latch: dict[str, tuple[int, ...]] = {}
+        self._wrist_q5_hysteresis_escape_latch = {
+            "left": False,
+            "right": False,
+        }
         self._candidate_certificate_sequence = 0
+        self._ik_shadow_trace_sink: Callable[..., object] | None = None
 
         self.set_current_qpos_pair(
             left_qpos=config.left_initial_qpos,
@@ -942,6 +1223,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             reset()
         self._last_target_poses = {"left": None, "right": None}
         self._last_output_qpos_smoothing_full_q = None
+        self._singularity_escape_direction_latch.clear()
+        self._singularity_escape_direction_failures.clear()
+        self._singularity_escape_axis_latch.clear()
+        self._wrist_q5_hysteresis_escape_latch = {
+            "left": False,
+            "right": False,
+        }
         self._reset_output_qpos_smoothing_alpha_state()
         self._clear_hold()
 
@@ -966,6 +1254,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._position_singularity_analyzers = resolved
         self._position_singularity_metadata_cache.clear()
 
+    def set_ik_shadow_trace_sink(
+        self,
+        sink: Callable[..., object] | None,
+    ) -> None:
+        """Attach a passive, non-authoritative fixed-field IK trace sink."""
+
+        if sink is not None and not callable(sink):
+            raise TypeError("IK shadow trace sink must be callable or None.")
+        self._ik_shadow_trace_sink = sink
+
     def _reset_output_qpos_smoothing_alpha_state(self) -> None:
         slow_alpha = float(self.config.output_qpos_smoothing_alpha)
         self._output_qpos_smoothing_effective_alpha = {
@@ -973,6 +1271,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "right": slow_alpha,
         }
         self._output_qpos_smoothing_update_time = {"left": None, "right": None}
+        self._output_qpos_normal_fast_path_last_quality_valid_time = {
+            "left": None,
+            "right": None,
+        }
 
     def set_current_qpos_pair(
         self,
@@ -1003,9 +1305,32 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self.ik_solver.set_configuration_q(full_q)
         self._last_safe_full_q = full_q.copy()
         if reset_tracking:
+            self._last_admitted_velocity_full = np.zeros_like(full_q)
+            self._singularity_escape_direction_latch.clear()
+            self._singularity_escape_direction_failures.clear()
+            self._singularity_escape_axis_latch.clear()
+            self._wrist_q5_hysteresis_escape_latch = {
+                "left": False,
+                "right": False,
+            }
+            self._set_solver_motion_reference(full_q)
             self._last_output_qpos_smoothing_full_q = None
             self._reset_output_qpos_smoothing_alpha_state()
             self._clear_hold()
+        elif (
+            self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+        ):
+            # The real-position loop synchronizes the IK configuration from the
+            # latest transport-accepted qcmd before and after every outer tick.
+            # That synchronization is not a lifecycle reset: keep the velocity
+            # admitted by the previous tick so Pink's acceleration constraint
+            # remains stateful.  Rebase the post-IK smoother to the same
+            # authoritative qcmd; otherwise a stale, ahead-of-transport qref can
+            # reintroduce the q4-q6 null redistribution removed by the coaxial
+            # canonicalizer.
+            self._last_output_qpos_smoothing_full_q = full_q.copy()
+            self._set_solver_motion_reference(full_q)
 
     def current_world_targets(self) -> dict[str, np.ndarray]:
         # Preserve the established solver protocol for current-state FK: older
@@ -1248,13 +1573,35 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "solve_integrate_ms": 0.0,
             "solve_set_configuration_ms": 0.0,
             "solve_iteration_mode": (
-                "adaptive_budget"
+                "single_physical_step"
+                if self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                else "adaptive_budget"
                 if bool(self.config.solve_adaptive_iterations_enabled)
                 else "fixed_max"
             ),
+            "solve_step_mode": str(self.config.solve_step_mode),
             "solve_iteration_max": int(self.config.solve_max_iterations),
             "solve_iteration_min": int(self.config.solve_min_iterations),
+            "solve_iteration_effective_max": (
+                1
+                if self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                else int(self.config.solve_max_iterations)
+            ),
+            "solve_iteration_effective_min": (
+                1
+                if self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                else int(self.config.solve_min_iterations)
+            ),
             "ik_damping": float(self.config.damping),
+            "ik_acceleration_limit_enabled": bool(
+                self._acceleration_limit_enabled
+            ),
+            "ik_admitted_reference_motion_limit_enabled": bool(
+                self._admitted_reference_motion_limit_enabled
+            ),
             "solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
             "candidate_certification_reserve_ms": float(
                 self.config.candidate_certification_reserve_ms
@@ -1711,11 +2058,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         solve_iteration_count = 0
         solve_pose_error: dict[str, dict[str, float]] = {}
         raw_solver_q: np.ndarray | None = None
+        canonical_solver_q: np.ndarray | None = None
         self._last_solve_iteration_budget_exhausted = False
         self._last_solve_iteration_stop_reason = "not_started"
 
         pre_solve_q = self.ik_solver.current_q.copy()
         active_q = pre_solve_q.copy()
+        self._last_raw_solver_q = None
+        self._last_wrist_coaxial_metadata = {
+            "enabled": bool(
+                self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            ),
+            "applied": False,
+            "reason": "target_hold_or_not_solved",
+        }
+        self._last_directional_singularity_diagnostics = {}
         current_target_hold_enabled = bool(self.config.current_target_hold_enabled)
         target_already_reached = current_target_hold_enabled
         for side in ("left", "right"):
@@ -1753,7 +2111,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     profile=profile,
                     frame_start_time=frame_start,
                 )
-                raw_solver_q = np.asarray(solved_q, dtype=float).copy()
+                raw_solver_q = (
+                    np.asarray(solved_q, dtype=float).copy()
+                    if self._last_raw_solver_q is None
+                    else self._last_raw_solver_q.copy()
+                )
+                canonical_solver_q = np.asarray(solved_q, dtype=float).copy()
                 branch_start = time.perf_counter()
                 elapsed_before_selection_ms = (branch_start - frame_start) * 1000.0
                 candidate_q, branch_candidate, branch_score_deg, branch_min_distance, candidate_selection_metadata = (
@@ -1766,6 +2129,63 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                         elapsed_before_selection_ms=elapsed_before_selection_ms,
                     )
                 )
+                # Commit directional escape state only after the candidate
+                # selector has produced its collision-safe admitted qref.  A
+                # rejected probe must not be mistaken for physical progress;
+                # repeated fallback is aged by the bounded latch policy.
+                self._update_singularity_escape_direction_state(
+                    selected_q=candidate_q,
+                    selection_metadata=candidate_selection_metadata,
+                )
+                candidate_q, selected_wrist_coaxial_metadata = (
+                    self._canonicalize_wrist_coaxial_solution(
+                        reference_full_q=pre_solve_q,
+                        candidate_full_q=candidate_q,
+                    )
+                )
+                candidate_q_before_q5_stabilization = candidate_q.copy()
+                candidate_q, selected_wrist_q5_metadata = (
+                    self._stabilize_wrist_q5_candidate(
+                        reference_full_q=pre_solve_q,
+                        candidate_full_q=candidate_q,
+                        current_targets=current_targets,
+                    )
+                )
+                self._last_wrist_coaxial_metadata = (
+                    selected_wrist_coaxial_metadata
+                )
+                canonical_solver_q = np.asarray(candidate_q, dtype=float).copy()
+                candidate_selection_metadata[
+                    "singularity_aware_wrist_canonicalization"
+                ] = dict(selected_wrist_coaxial_metadata)
+                candidate_selection_metadata[
+                    "singularity_aware_wrist_q5_candidate_stabilization"
+                ] = dict(selected_wrist_q5_metadata)
+                if not np.allclose(
+                    candidate_q,
+                    candidate_q_before_q5_stabilization,
+                    rtol=0.0,
+                    atol=1e-12,
+                ):
+                    # q5-only task relaxation happens after candidate scoring;
+                    # re-check the coupled collision envelope before the jump
+                    # gate so the continuity guard cannot weaken safety.
+                    branch_min_distance = self._profiled_min_collision_distance(
+                        candidate_q,
+                        profile,
+                        phase="post_selection_wrist_q5_stabilization",
+                    )
+                if bool(selected_wrist_coaxial_metadata.get("applied", False)):
+                    # Candidate selection may replace the raw Pink result with
+                    # a locally generated branch/escape candidate.  Recompute
+                    # collision distance after constraining that selected
+                    # candidate; the earlier branch distance belongs to the
+                    # uncanonicalized configuration.
+                    branch_min_distance = self._profiled_min_collision_distance(
+                        candidate_q,
+                        profile,
+                        phase="post_selection_wrist_canonicalization",
+                    )
                 if profile is not None:
                     profile["branch_ms"] = float(profile.get("branch_ms", 0.0)) + (
                         time.perf_counter() - branch_start
@@ -1943,16 +2363,135 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 active_q=active_q,
                 left_qpos=left_qpos,
                 right_qpos=right_qpos,
+                reference_full_q=pre_solve_q,
                 target_activity=target_activity_metadata,
+                current_targets=current_targets,
+                admission_status=status,
             )
         )
-        if output_qpos_smoothing.get("enabled", False):
+        if status in {
+            "jump_gate_hold",
+            "hold_last_safe",
+            "unsafe_candidate",
+        }:
+            final_canonical_q = np.asarray(active_q, dtype=float).copy()
+            final_wrist_coaxial_metadata = {
+                "enabled": bool(
+                    self.config.solve_step_mode
+                    == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                ),
+                "applied": False,
+                "reason": "hold_status_preserved",
+                "sides": {},
+            }
+        else:
+            final_canonical_q, final_wrist_coaxial_metadata = (
+                self._canonicalize_wrist_coaxial_solution(
+                    reference_full_q=pre_solve_q,
+                    candidate_full_q=active_q,
+                )
+            )
+        final_canonicalization_changed = not np.allclose(
+            final_canonical_q,
+            active_q,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        active_q = final_canonical_q
+        left_qpos, right_qpos = self._split_solution(active_q)
+        self._last_wrist_coaxial_metadata = final_wrist_coaxial_metadata
+        output_qpos_smoothing["post_smoothing_wrist_canonicalization"] = dict(
+            final_wrist_coaxial_metadata
+        )
+        if final_canonicalization_changed:
+            min_distance_m = self._profiled_min_collision_distance(
+                active_q,
+                profile,
+                phase="post_smoothing_wrist_canonicalization",
+            )
+            final_canonical_fallback = self._fallback_reason_for_distance(
+                min_distance_m
+            )
+            if (
+                final_canonical_fallback is not None
+                and self.config.hold_last_safe_on_failure
+            ):
+                active_q = pre_solve_q.copy()
+                left_qpos, right_qpos = self._split_solution(active_q)
+                status = "hold_last_safe"
+                fallback_reason = final_canonical_fallback
+            else:
+                near_boundary = (
+                    min_distance_m is not None
+                    and min_distance_m
+                    <= float(self.config.collision_min_distance_m)
+                    + float(self.config.collision_distance_epsilon_m)
+                )
+                status = "boundary_active" if near_boundary else "tracking"
+                fallback_reason = None
+        q5_candidate_metadata = candidate_selection_metadata.get(
+            "singularity_aware_wrist_q5_candidate_stabilization"
+        )
+        q5_output_metadata = output_qpos_smoothing.get("wrist_q5_escape")
+        q5_hysteresis_latch_metadata = (
+            self._update_wrist_q5_hysteresis_escape_latch(
+                reference_full_q=pre_solve_q,
+                admitted_full_q=active_q,
+                status=status,
+                candidate_metadata=(
+                    q5_candidate_metadata
+                    if isinstance(q5_candidate_metadata, Mapping)
+                    else None
+                ),
+                output_metadata=(
+                    q5_output_metadata
+                    if isinstance(q5_output_metadata, Mapping)
+                    else None
+                ),
+            )
+        )
+        output_qpos_smoothing["wrist_q5_hysteresis_latch"] = (
+            q5_hysteresis_latch_metadata
+        )
+        if (
+            output_qpos_smoothing.get("enabled", False)
+            or final_canonicalization_changed
+            or bool(
+                isinstance(output_qpos_smoothing.get("wrist_q5_escape"), Mapping)
+                and output_qpos_smoothing["wrist_q5_escape"].get("applied", False)
+            )
+        ):
             self.ik_solver.set_configuration_q(active_q)
             self._last_safe_full_q = active_q.copy()
-        if (
+            # The smoother's internal state must describe the qref that is
+            # actually admitted after the final singularity-aware projection.
+            self._last_output_qpos_smoothing_full_q = active_q.copy()
+        admitted_velocity_metadata = self._commit_admitted_velocity(
+            reference_full_q=pre_solve_q,
+            admitted_full_q=active_q,
+        )
+        self._record_ik_shadow_trace(
+            monotonic_time=time.monotonic(),
+            pre_solve_q=pre_solve_q,
+            raw_solver_q=raw_solver_q,
+            canonical_solver_q=canonical_solver_q,
+            admitted_q=active_q,
+            current_targets=current_targets,
+            status=status,
+        )
+        if self.config.position_singularity_candidate_certificate_enabled and (
             candidate_selection_metadata
-            and self.config.position_singularity_candidate_certificate_enabled
+            or self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
         ):
+            # ``current_pose_hold`` has no branch-selection payload, but it is
+            # still a formal position qref.  The certified single-step path
+            # must keep carrying its qref/traversal certificate while the
+            # robot remains in the wrist coaxial band; otherwise the backend
+            # would clear the fallback latch on an otherwise harmless no-op
+            # frame and immediately re-enter SDK hold.
+            if not isinstance(candidate_selection_metadata, dict):
+                candidate_selection_metadata = {}
             self._candidate_certificate_sequence += 1
             position_preference = dict(
                 candidate_selection_metadata.get(
@@ -1972,6 +2511,65 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 position_preference.get("fallback_to_singular", False)
                 or wrist_preference.get("fallback_to_singular", False)
             )
+            wrist_metadata_sides = self._last_wrist_coaxial_metadata.get(
+                "sides",
+                {},
+            )
+            wrist_metadata_sides = (
+                wrist_metadata_sides
+                if isinstance(wrist_metadata_sides, Mapping)
+                else {}
+            )
+            singularity_aware_wrist_traversal_by_side: dict[str, bool] = {}
+            for side in ("left", "right"):
+                side_metadata = wrist_metadata_sides.get(side, {})
+                side_metadata = (
+                    side_metadata
+                    if isinstance(side_metadata, Mapping)
+                    else {}
+                )
+                null_scale = side_metadata.get("null_scale")
+                try:
+                    within_coaxial_band = (
+                        null_scale is not None
+                        and np.isfinite(float(null_scale))
+                        and float(null_scale) < 1.0 - 1e-12
+                    )
+                except (TypeError, ValueError):
+                    within_coaxial_band = False
+                singularity_aware_wrist_traversal_by_side[side] = bool(
+                    self.config.solve_step_mode
+                    == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                    and bool(
+                        self._last_wrist_coaxial_metadata.get(
+                            "enabled",
+                            False,
+                        )
+                    )
+                    and status
+                    not in {
+                        "jump_gate_hold",
+                        "hold_last_safe",
+                        "unsafe_candidate",
+                    }
+                    and within_coaxial_band
+                )
+            elbow_traversal_metadata = self._singularity_escape_traversal_metadata(
+                reference_full_q=pre_solve_q,
+                admitted_full_q=active_q,
+                selection_metadata=candidate_selection_metadata,
+            )
+            singularity_aware_elbow_traversal_by_side = {
+                side: bool(
+                    dict(elbow_traversal_metadata.get("by_side", {})).get(
+                        side, False
+                    )
+                )
+                for side in ("left", "right")
+            }
+            candidate_selected_singular_fallback_claimed = (
+                singular_fallback_claimed
+            )
             certificate: dict[str, object] = {
                 "schema": "robot_motion.rm65.position_candidate_certificate/v1",
                 "sequence": int(self._candidate_certificate_sequence),
@@ -1984,8 +2582,25 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "selection_status": candidate_selection_metadata.get("status"),
                 "selection_reason": candidate_selection_metadata.get("reason"),
                 "singular_fallback_claimed": singular_fallback_claimed,
+                "candidate_selected_singular_fallback_claimed": (
+                    candidate_selected_singular_fallback_claimed
+                ),
+                "singularity_aware_wrist_traversal_by_side": dict(
+                    singularity_aware_wrist_traversal_by_side
+                ),
+                "singularity_aware_elbow_traversal_by_side": dict(
+                    singularity_aware_elbow_traversal_by_side
+                ),
+                "singularity_aware_elbow_traversal": dict(
+                    elbow_traversal_metadata
+                ),
+                "singularity_aware_wrist_traversal_mode": (
+                    str(self.config.solve_step_mode)
+                ),
             }
-            if singular_fallback_claimed:
+            if singular_fallback_claimed or any(
+                singularity_aware_wrist_traversal_by_side.values()
+            ) or any(singularity_aware_elbow_traversal_by_side.values()):
                 # The SDK-backed shoulder classification is intentionally
                 # repeated only on the rare fallback path.  Normal 60 Hz
                 # tracking pays only the fixed 48-byte qref fingerprint cost.
@@ -2018,8 +2633,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "ik_branch_candidate": branch_candidate,
                 "ik_branch_distance_score_deg": branch_score_deg,
                 "ik_solve_iterations": int(solve_iteration_count),
+                "ik_solve_step_mode": str(self.config.solve_step_mode),
                 "ik_solve_iteration_mode": (
-                    "adaptive_budget"
+                    "single_physical_step"
+                    if self.config.solve_step_mode
+                    == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                    else "adaptive_budget"
                     if bool(self.config.solve_adaptive_iterations_enabled)
                     else "fixed_max"
                 ),
@@ -2039,6 +2658,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     self._last_solve_iteration_budget_exhausted
                 ),
                 "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
+                "ik_wrist_coaxial_continuity": dict(
+                    self._last_wrist_coaxial_metadata
+                ),
+                "ik_directional_singularity": dict(
+                    self._last_directional_singularity_diagnostics
+                ),
+                "ik_admitted_velocity_state": dict(admitted_velocity_metadata),
                 "ik_solve_pose_error": {
                     side: dict(metrics) for side, metrics in solve_pose_error.items()
                 },
@@ -2081,8 +2707,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_branch_candidate": branch_candidate,
             "ik_branch_distance_score_deg": branch_score_deg,
             "ik_solve_iterations": int(solve_iteration_count),
+            "ik_solve_step_mode": str(self.config.solve_step_mode),
             "ik_solve_iteration_mode": (
-                "adaptive_budget"
+                "single_physical_step"
+                if self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                else "adaptive_budget"
                 if bool(self.config.solve_adaptive_iterations_enabled)
                 else "fixed_max"
             ),
@@ -2102,6 +2732,29 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 self._last_solve_iteration_budget_exhausted
             ),
             "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
+            "ik_wrist_coaxial_continuity": dict(
+                self._last_wrist_coaxial_metadata
+            ),
+            "ik_directional_singularity": dict(
+                self._last_directional_singularity_diagnostics.get(
+                    "sides",
+                    {},
+                ).get("left", {})
+                if isinstance(
+                    self._last_directional_singularity_diagnostics.get("sides"),
+                    dict,
+                )
+                else {}
+            ),
+            "ik_admitted_velocity_state": {
+                "enabled": bool(admitted_velocity_metadata["enabled"]),
+                "source": admitted_velocity_metadata["source"],
+                "dt_s": admitted_velocity_metadata["dt_s"],
+                "qdot_rad_s": admitted_velocity_metadata["left_qdot_rad_s"],
+                "max_abs_qdot_rad_s": admitted_velocity_metadata[
+                    "left_max_abs_qdot_rad_s"
+                ],
+            },
             "ik_solve_pose_error": dict(solve_pose_error.get("left", {})),
             "ik_jump_gate_status": jump_gate_status,
             "ik_jump_gate_reason": jump_gate_reason,
@@ -2140,8 +2793,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_branch_candidate": branch_candidate,
             "ik_branch_distance_score_deg": branch_score_deg,
             "ik_solve_iterations": int(solve_iteration_count),
+            "ik_solve_step_mode": str(self.config.solve_step_mode),
             "ik_solve_iteration_mode": (
-                "adaptive_budget"
+                "single_physical_step"
+                if self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                else "adaptive_budget"
                 if bool(self.config.solve_adaptive_iterations_enabled)
                 else "fixed_max"
             ),
@@ -2161,6 +2818,29 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 self._last_solve_iteration_budget_exhausted
             ),
             "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
+            "ik_wrist_coaxial_continuity": dict(
+                self._last_wrist_coaxial_metadata
+            ),
+            "ik_directional_singularity": dict(
+                self._last_directional_singularity_diagnostics.get(
+                    "sides",
+                    {},
+                ).get("right", {})
+                if isinstance(
+                    self._last_directional_singularity_diagnostics.get("sides"),
+                    dict,
+                )
+                else {}
+            ),
+            "ik_admitted_velocity_state": {
+                "enabled": bool(admitted_velocity_metadata["enabled"]),
+                "source": admitted_velocity_metadata["source"],
+                "dt_s": admitted_velocity_metadata["dt_s"],
+                "qdot_rad_s": admitted_velocity_metadata["right_qdot_rad_s"],
+                "max_abs_qdot_rad_s": admitted_velocity_metadata[
+                    "right_max_abs_qdot_rad_s"
+                ],
+            },
             "ik_solve_pose_error": dict(solve_pose_error.get("right", {})),
             "ik_jump_gate_status": jump_gate_status,
             "ik_jump_gate_reason": jump_gate_reason,
@@ -2467,12 +3147,31 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             self._pose_to_target(left_target),
             self._pose_to_target(right_target),
         ]
-        last_q = self.ik_solver.current_q.copy()
+        initial_q = self.ik_solver.current_q.copy()
+        last_q = initial_q.copy()
+        self._last_raw_solver_q = None
+        self._last_wrist_coaxial_metadata = {
+            "enabled": False,
+            "applied": False,
+            "reason": "not_solved",
+        }
+        self._last_directional_singularity_diagnostics = (
+            self._directional_singularity_diagnostics(
+                current_full_q=initial_q,
+            )
+        )
+        self._set_solver_motion_reference(initial_q)
         pose_error: dict[str, dict[str, float]] = {}
         iterations = 0
         self._last_solve_iteration_budget_exhausted = False
         self._last_solve_iteration_stop_reason = None
-        adaptive = bool(self.config.solve_adaptive_iterations_enabled)
+        single_step = bool(
+            self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+        )
+        adaptive = bool(
+            self.config.solve_adaptive_iterations_enabled and not single_step
+        )
         time_budget_ms = float(self.config.solve_time_budget_ms or 0.0)
         iteration_budget_ms = (
             max(0.0, time_budget_ms - float(self.config.solve_iteration_reserve_ms))
@@ -2481,8 +3180,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         budget_start = time.perf_counter() if frame_start_time is None else float(frame_start_time)
         previous_solve_ms: float | None = None
-        min_iterations = int(self.config.solve_min_iterations)
-        for iteration in range(1, int(self.config.solve_max_iterations) + 1):
+        min_iterations = 1 if single_step else int(self.config.solve_min_iterations)
+        max_iterations = 1 if single_step else int(self.config.solve_max_iterations)
+        for iteration in range(1, max_iterations + 1):
             if iteration > min_iterations and iteration_budget_ms is not None:
                 elapsed_ms = (time.perf_counter() - budget_start) * 1000.0
                 estimated_next_ms = max(0.05, float(previous_solve_ms or 0.0))
@@ -2492,6 +3192,15 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     break
             solve_start = time.perf_counter()
             last_q = self.ik_solver.solve(targets=targets)
+            self._last_raw_solver_q = np.asarray(last_q, dtype=float).copy()
+            if single_step:
+                last_q, self._last_wrist_coaxial_metadata = (
+                    self._canonicalize_wrist_coaxial_solution(
+                        reference_full_q=initial_q,
+                        candidate_full_q=last_q,
+                    )
+                )
+                self.ik_solver.set_configuration_q(last_q)
             self._record_solver_profile(profile)
             measured_solve_ms = (time.perf_counter() - solve_start) * 1000.0
             solver_profile = getattr(self.ik_solver, "last_solve_profile", {})
@@ -2539,9 +3248,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     self._last_solve_iteration_budget_exhausted = True
                     self._last_solve_iteration_stop_reason = "iteration_budget_elapsed"
                     break
-        if iterations >= int(self.config.solve_max_iterations) and self._last_solve_iteration_stop_reason is None:
+        if iterations >= max_iterations and self._last_solve_iteration_stop_reason is None:
             self._last_solve_iteration_stop_reason = "max_iterations"
         if profile is not None:
+            profile["solve_step_mode"] = str(self.config.solve_step_mode)
+            profile["solve_iteration_effective_max"] = int(max_iterations)
+            profile["solve_iteration_effective_min"] = int(min_iterations)
             profile["solve_iteration_budget_exhausted"] = bool(
                 self._last_solve_iteration_budget_exhausted
             )
@@ -2595,13 +3307,299 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             return qpos[0:6].copy(), qpos[6:12].copy()
         raise ValueError(f"{self.name} received unsupported solver output shape: {qpos.shape}")
 
+    def _arm_joint_indices(self, vector_size: int) -> dict[str, np.ndarray]:
+        if self.profile.solution_layout == "dual_arm_hand" and vector_size >= 24:
+            return {
+                "left": np.arange(0, 6, dtype=int),
+                "right": np.arange(18, 24, dtype=int),
+            }
+        if vector_size == 14:
+            return {
+                "left": np.arange(1, 7, dtype=int),
+                "right": np.arange(8, 14, dtype=int),
+            }
+        if vector_size == 12:
+            return {
+                "left": np.arange(0, 6, dtype=int),
+                "right": np.arange(6, 12, dtype=int),
+            }
+        raise ValueError(
+            f"{self.name} cannot resolve arm joint indices for vector size {vector_size}."
+        )
+
+    def _make_full_joint_acceleration_limit(
+        self,
+        arm_limit_rad_s2: np.ndarray,
+    ) -> np.ndarray:
+        arm_limit = np.asarray(arm_limit_rad_s2, dtype=float).reshape(-1)
+        if arm_limit.shape != (6,) or not np.all(np.isfinite(arm_limit)):
+            raise ValueError("arm acceleration limits must contain 6 finite values.")
+        if np.any(arm_limit <= 0.0):
+            raise ValueError("arm acceleration limits must be positive.")
+        current_q = np.asarray(self.ik_solver.current_q, dtype=float).reshape(-1)
+        model_nv = int(getattr(self.ik_solver.robot.model, "nv", current_q.size))
+        if current_q.size != model_nv:
+            raise ValueError(
+                "single-step acceleration constraints currently require nq == nv; "
+                f"got nq={current_q.size} nv={model_nv}."
+            )
+        full_limit = np.full(model_nv, np.inf, dtype=float)
+        for indices in self._arm_joint_indices(model_nv).values():
+            full_limit[indices] = arm_limit
+        return full_limit
+
+    def _canonicalize_wrist_coaxial_solution(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        candidate_full_q: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        """Remove only the unobservable q4-q6 redistribution near q5 == 0.
+
+        For the RM65 spherical wrist, q4 and q6 become coaxial at q5 == 0 and
+        the observable combination is q4 + q6.  This projection keeps that sum
+        exactly unchanged while continuously suppressing the null-direction
+        increment q4 - q6.  It is therefore not a per-joint clip and does not
+        alter the first-order wrist motion that remains observable.
+        """
+
+        metadata: dict[str, object] = {
+            "enabled": bool(
+                self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+                and self.config.wrist_coaxial_continuity_enabled
+            ),
+            "applied": False,
+            "observable_combination": "q4_plus_q6",
+            "null_combination": "q4_minus_q6",
+            "soft_threshold_deg": float(
+                self.config.wrist_coaxial_soft_threshold_deg
+            ),
+            "hard_threshold_deg": float(
+                self.config.wrist_coaxial_hard_threshold_deg
+            ),
+            "null_motion_soft_limit_deg": float(
+                self.config.wrist_coaxial_null_motion_soft_limit_deg
+            ),
+            "branch_switch_guard_deg": float(
+                self.config.wrist_branch_switch_guard_deg
+            ),
+            "sides": {},
+        }
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        candidate = np.asarray(candidate_full_q, dtype=float).reshape(-1).copy()
+        if not metadata["enabled"]:
+            metadata["reason"] = "disabled_or_legacy_mode"
+            return candidate, metadata
+        if reference.shape != candidate.shape:
+            raise ValueError(
+                "reference and candidate configurations must have matching shapes."
+            )
+
+        side_metadata: dict[str, object] = {}
+        reference_by_side = dict(zip(("left", "right"), self._split_solution(reference)))
+        candidate_by_side = dict(zip(("left", "right"), self._split_solution(candidate)))
+        canonical_by_side: dict[str, np.ndarray] = {}
+        any_applied = False
+        for side in ("left", "right"):
+            ref = reference_by_side[side]
+            raw = candidate_by_side[side]
+            out, side_result = canonicalize_rm65_wrist_coaxial_step(
+                ref,
+                raw,
+                soft_threshold_deg=float(
+                    self.config.wrist_coaxial_soft_threshold_deg
+                ),
+                hard_threshold_deg=float(
+                    self.config.wrist_coaxial_hard_threshold_deg
+                ),
+                null_motion_soft_limit_deg=float(
+                    self.config.wrist_coaxial_null_motion_soft_limit_deg
+                ),
+            )
+            applied = bool(side_result["applied"])
+            any_applied = any_applied or applied
+            canonical_by_side[side] = out
+            side_metadata[side] = side_result
+        candidate = self._embed_arm_qpos(
+            current_full_q=candidate,
+            left_qpos=canonical_by_side["left"],
+            right_qpos=canonical_by_side["right"],
+        )
+        metadata["applied"] = any_applied
+        metadata["reason"] = "coaxial_projection" if any_applied else "outside_soft_band"
+        metadata["sides"] = side_metadata
+        return candidate, metadata
+
+    def _directional_singularity_diagnostics(
+        self,
+        *,
+        current_full_q: np.ndarray,
+    ) -> dict[str, object]:
+        if (
+            self.config.solve_step_mode
+            != IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+        ):
+            return {"enabled": False, "reason": "legacy_mode"}
+        compute_jacobian = getattr(self.ik_solver, "compute_frame_jacobian", None)
+        if not callable(compute_jacobian):
+            return {"enabled": False, "reason": "solver_jacobian_unavailable"}
+        q = np.asarray(current_full_q, dtype=float).reshape(-1)
+        try:
+            indices_by_side = self._arm_joint_indices(q.size)
+            frames = {
+                "left": self.profile.left_frame_name,
+                "right": self.profile.right_frame_name,
+            }
+            result: dict[str, object] = {
+                "enabled": True,
+                "advisory_only": True,
+                "jacobian_scaling": "raw_pinocchio_unscaled",
+                "threshold_classification": "disabled",
+                "sides": {},
+            }
+            sides: dict[str, object] = {}
+            for side in ("left", "right"):
+                jacobian_full = np.asarray(
+                    compute_jacobian(frames[side], q),
+                    dtype=float,
+                )
+                jacobian = jacobian_full[:, indices_by_side[side]]
+                singular_values = np.linalg.svd(
+                    jacobian,
+                    compute_uv=False,
+                )
+                sigma_min = float(np.min(singular_values))
+                sigma_max = float(np.max(singular_values))
+                sides[side] = {
+                    "singular_values": singular_values.astype(float).tolist(),
+                    "sigma_min": sigma_min,
+                    "sigma_max": sigma_max,
+                    "condition_number": (
+                        float("inf")
+                        if sigma_min <= 1e-12
+                        else float(sigma_max / sigma_min)
+                    ),
+                }
+            result["sides"] = sides
+            return result
+        except Exception as exc:  # diagnostics must never change admission.
+            return {
+                "enabled": False,
+                "reason": f"diagnostic_exception:{type(exc).__name__}",
+            }
+
+    def _commit_admitted_velocity(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        admitted_full_q: np.ndarray,
+    ) -> dict[str, object]:
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        admitted = np.asarray(admitted_full_q, dtype=float).reshape(-1)
+        velocity = (admitted - reference) / float(self._execution_dt_sec)
+        self._last_admitted_velocity_full = velocity.copy()
+        self._set_solver_motion_reference(admitted)
+        left_velocity, right_velocity = self._split_solution(velocity)
+        return {
+            "enabled": bool(self._acceleration_limit_enabled),
+            "admitted_reference_motion_limit_enabled": bool(
+                self._admitted_reference_motion_limit_enabled
+            ),
+            "source": "final_admitted_qref",
+            "dt_s": float(self._execution_dt_sec),
+            "left_qdot_rad_s": left_velocity.astype(float).tolist(),
+            "right_qdot_rad_s": right_velocity.astype(float).tolist(),
+            "left_max_abs_qdot_rad_s": float(np.max(np.abs(left_velocity))),
+            "right_max_abs_qdot_rad_s": float(np.max(np.abs(right_velocity))),
+        }
+
+    def _record_ik_shadow_trace(
+        self,
+        *,
+        monotonic_time: float,
+        pre_solve_q: np.ndarray,
+        raw_solver_q: np.ndarray | None,
+        canonical_solver_q: np.ndarray | None,
+        admitted_q: np.ndarray,
+        current_targets: Mapping[str, np.ndarray],
+        status: str,
+    ) -> None:
+        sink = self._ik_shadow_trace_sink
+        if sink is None:
+            return
+
+        def arm_pair(q: np.ndarray | None) -> np.ndarray | None:
+            if q is None:
+                return None
+            left, right = self._split_solution(np.asarray(q, dtype=float))
+            return np.concatenate((left, right))
+
+        directional_sides = self._last_directional_singularity_diagnostics.get(
+            "sides",
+            {},
+        )
+        directional_sides = (
+            directional_sides if isinstance(directional_sides, Mapping) else {}
+        )
+        wrist_sides = self._last_wrist_coaxial_metadata.get("sides", {})
+        wrist_sides = wrist_sides if isinstance(wrist_sides, Mapping) else {}
+        try:
+            sink(
+                float(monotonic_time),
+                arm_pair(pre_solve_q),
+                arm_pair(raw_solver_q),
+                arm_pair(canonical_solver_q),
+                arm_pair(admitted_q),
+                np.asarray(current_targets["left"], dtype=float),
+                np.asarray(current_targets["right"], dtype=float),
+                (
+                    directional_sides.get("left", {}).get("singular_values")
+                    if isinstance(directional_sides.get("left"), Mapping)
+                    else None
+                ),
+                (
+                    directional_sides.get("right", {}).get("singular_values")
+                    if isinstance(directional_sides.get("right"), Mapping)
+                    else None
+                ),
+                (
+                    (
+                        wrist_sides.get("left", {}).get("effective_null_scale")
+                        if wrist_sides.get("left", {}).get("effective_null_scale")
+                        is not None
+                        else wrist_sides.get("left", {}).get("null_scale")
+                    )
+                    if isinstance(wrist_sides.get("left"), Mapping)
+                    else None
+                ),
+                (
+                    (
+                        wrist_sides.get("right", {}).get("effective_null_scale")
+                        if wrist_sides.get("right", {}).get("effective_null_scale")
+                        is not None
+                        else wrist_sides.get("right", {}).get("null_scale")
+                    )
+                    if isinstance(wrist_sides.get("right"), Mapping)
+                    else None
+                ),
+                str(status),
+            )
+        except Exception:
+            # Debug tracing is strictly observational and cannot affect
+            # admission, collision handling, or command dispatch.
+            return
+
     def _smooth_output_qpos_before_action(
         self,
         *,
         active_q: np.ndarray,
         left_qpos: np.ndarray,
         right_qpos: np.ndarray,
+        reference_full_q: np.ndarray | None = None,
         target_activity: dict[str, object] | None = None,
+        current_targets: dict[str, np.ndarray] | None = None,
+        admission_status: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
         alpha_by_side, alpha_metadata = self._effective_output_qpos_smoothing_alpha(
             target_activity
@@ -2611,13 +3609,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             left_qpos=np.asarray(left_qpos, dtype=float).reshape(6),
             right_qpos=np.asarray(right_qpos, dtype=float).reshape(6),
         )
-        enabled_by_side = {
-            side: bool(self.config.output_command_type == "joint_vector" and alpha < 1.0)
-            for side, alpha in alpha_by_side.items()
-        }
-        enabled = any(enabled_by_side.values())
         metadata: dict[str, object] = {
-            "enabled": enabled,
+            "enabled": False,
             "applied": False,
             "initialized": False,
             "alpha": max(alpha_by_side.values()),
@@ -2628,20 +3621,213 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "final_action_realized_from_joint": True,
             "downstream_command_stage": "interpolation_only",
         }
+        previous = self._last_output_qpos_smoothing_full_q
+        smoothing_state_missing = previous is None
+        if previous is not None and previous.shape != raw_full_q.shape:
+            previous = None
+            smoothing_state_missing = True
+        if previous is None:
+            previous = (
+                None
+                if reference_full_q is None
+                else np.asarray(reference_full_q, dtype=float).reshape(raw_full_q.shape)
+            )
+        if previous is None:
+            previous = raw_full_q.copy()
+
+        # A slow (0.14 by default) post-IK EMA is useful for ordinary tracker
+        # noise, but it becomes visibly sticky when the q5 escape path is
+        # active: the smoother keeps feeding a stale wrist target while the
+        # canonicalizer deliberately holds the observable q4+q6 coordinate.
+        # Raise only the affected side to the already configured fast endpoint
+        # (or an explicit singularity alpha).  The upstream one-step and
+        # downstream transport limits remain unchanged, so this is a tracking
+        # responsiveness change, not a speed-limit bypass.
+        singularity_band_threshold_deg = max(
+            float(self.config.wrist_singularity_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+            float(self.config.wrist_coaxial_hard_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+        )
+        elbow_singularity_band_threshold_deg = max(
+            float(self.config.elbow_singularity_threshold_deg)
+            + float(self.config.elbow_singularity_selection_margin_deg),
+            float(self.config.elbow_singularity_threshold_deg),
+        )
+        singularity_alpha = (
+            float(self.config.output_qpos_smoothing_singularity_alpha)
+            if self.config.output_qpos_smoothing_singularity_alpha is not None
+            else float(self.config.output_qpos_smoothing_fast_alpha)
+        )
+        previous_by_side = dict(zip(("left", "right"), self._split_solution(previous)))
+        raw_target_by_side = {
+            "left": np.asarray(left_qpos, dtype=float).reshape(6),
+            "right": np.asarray(right_qpos, dtype=float).reshape(6),
+        }
+        singularity_boost_by_side: dict[str, dict[str, object]] = {}
+        normal_fast_path_by_side: dict[str, dict[str, object]] = {}
+        wrist_metadata_sides = self._last_wrist_coaxial_metadata.get("sides", {})
+        wrist_metadata_sides = (
+            wrist_metadata_sides if isinstance(wrist_metadata_sides, Mapping) else {}
+        )
+        singularity_mode_enabled = bool(
+            self.config.output_command_type == "joint_vector"
+            and self.config.solve_step_mode == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            and self.config.wrist_coaxial_continuity_enabled
+        )
+        normal_fast_now = time.monotonic()
+        for side in ("left", "right"):
+            reference_q5 = float(previous_by_side[side][4])
+            candidate_q5 = float(raw_target_by_side[side][4])
+            reference_q3 = float(previous_by_side[side][2])
+            candidate_q3 = float(raw_target_by_side[side][2])
+            near_wrist_band = bool(
+                abs(np.rad2deg(reference_q5)) <= singularity_band_threshold_deg
+                or abs(np.rad2deg(candidate_q5)) <= singularity_band_threshold_deg
+                or reference_q5 * candidate_q5 < 0.0
+            )
+            near_elbow_band = bool(
+                abs(np.rad2deg(reference_q3)) <= elbow_singularity_band_threshold_deg
+                or abs(np.rad2deg(candidate_q3)) <= elbow_singularity_band_threshold_deg
+            )
+            near_band = bool(near_wrist_band or near_elbow_band)
+            before_alpha = float(alpha_by_side[side])
+            adaptive_side = alpha_metadata.get(side, {})
+            adaptive_side = (
+                adaptive_side if isinstance(adaptive_side, Mapping) else {}
+            )
+            wrist_side = wrist_metadata_sides.get(side, {})
+            wrist_side = wrist_side if isinstance(wrist_side, Mapping) else {}
+            effective_null_scale = wrist_side.get(
+                "effective_null_scale",
+                wrist_side.get("null_scale"),
+            )
+            null_projection_inactive = bool(
+                effective_null_scale is not None
+                and np.isfinite(float(effective_null_scale))
+                and float(effective_null_scale) >= 1.0 - 1e-9
+            )
+            normal_guard_deg = float(
+                self.config.output_qpos_normal_fast_path_guard_deg
+            )
+            outside_normal_guard = bool(
+                min(
+                    abs(float(np.rad2deg(reference_q3))),
+                    abs(float(np.rad2deg(candidate_q3))),
+                    abs(float(np.rad2deg(reference_q5))),
+                    abs(float(np.rad2deg(candidate_q5))),
+                )
+                >= normal_guard_deg
+            )
+            tracker_quality_valid = bool(adaptive_side.get("quality_valid", False))
+            if (
+                self.config.output_qpos_normal_fast_path_enabled
+                and tracker_quality_valid
+            ):
+                self._output_qpos_normal_fast_path_last_quality_valid_time[side] = (
+                    normal_fast_now
+                )
+            last_quality_valid_time = (
+                self._output_qpos_normal_fast_path_last_quality_valid_time[side]
+            )
+            tracker_quality_age_sec = (
+                None
+                if last_quality_valid_time is None
+                else max(0.0, normal_fast_now - last_quality_valid_time)
+            )
+            tracker_quality_grace_sec = float(
+                self.config.output_qpos_normal_fast_path_quality_grace_sec
+            )
+            tracker_quality_grace_active = bool(
+                not tracker_quality_valid
+                and tracker_quality_age_sec is not None
+                and tracker_quality_grace_sec > 0.0
+                and tracker_quality_age_sec <= tracker_quality_grace_sec
+            )
+            tracker_quality_valid_or_grace = bool(
+                tracker_quality_valid or tracker_quality_grace_active
+            )
+            q5_hysteresis_latch_clear = not bool(
+                self._wrist_q5_hysteresis_escape_latch[side]
+            )
+            normal_fast_eligible = bool(
+                self.config.output_qpos_normal_fast_path_enabled
+                and singularity_mode_enabled
+                and str(admission_status) == "tracking"
+                and tracker_quality_valid_or_grace
+                and outside_normal_guard
+                and null_projection_inactive
+                and q5_hysteresis_latch_clear
+            )
+            if normal_fast_eligible:
+                alpha_by_side[side] = float(
+                    self.config.output_qpos_normal_fast_path_alpha
+                )
+                # The adaptive alpha is evaluated before this opt-in override.
+                # Keep its state aligned with the alpha that was actually
+                # admitted; otherwise one soft dropout uses a stale low alpha
+                # and the following frame snaps back to the fast target.
+                self._output_qpos_smoothing_effective_alpha[side] = float(
+                    alpha_by_side[side]
+                )
+                self._output_qpos_smoothing_update_time[side] = normal_fast_now
+            normal_fast_path_by_side[side] = {
+                "enabled": bool(self.config.output_qpos_normal_fast_path_enabled),
+                "eligible": normal_fast_eligible,
+                "admission_status": admission_status,
+                "tracker_quality_valid": tracker_quality_valid,
+                "tracker_quality_valid_or_grace": tracker_quality_valid_or_grace,
+                "tracker_quality_grace_active": tracker_quality_grace_active,
+                "tracker_quality_grace_sec": tracker_quality_grace_sec,
+                "tracker_quality_age_sec": tracker_quality_age_sec,
+                "outside_joint_guard": outside_normal_guard,
+                "guard_deg": normal_guard_deg,
+                "null_projection_inactive": null_projection_inactive,
+                "effective_null_scale": effective_null_scale,
+                "q5_hysteresis_latch_clear": q5_hysteresis_latch_clear,
+                "alpha_before": before_alpha,
+                "alpha_after": float(alpha_by_side[side]),
+            }
+            boosted = bool(singularity_mode_enabled and near_band and before_alpha < singularity_alpha)
+            if boosted:
+                alpha_by_side[side] = singularity_alpha
+            singularity_boost_by_side[side] = {
+                "enabled": singularity_mode_enabled,
+                "near_band": near_band,
+                "boosted": boosted,
+                "reference_q5_deg": float(np.rad2deg(reference_q5)),
+                "candidate_q5_deg": float(np.rad2deg(candidate_q5)),
+                "reference_q3_deg": float(np.rad2deg(reference_q3)),
+                "candidate_q3_deg": float(np.rad2deg(candidate_q3)),
+                "near_wrist_band": near_wrist_band,
+                "near_elbow_band": near_elbow_band,
+                "band_threshold_deg": singularity_band_threshold_deg,
+                "elbow_band_threshold_deg": elbow_singularity_band_threshold_deg,
+                "alpha_before": before_alpha,
+                "alpha_after": float(alpha_by_side[side]),
+                "alpha_target": singularity_alpha,
+            }
+        enabled_by_side = {
+            side: bool(self.config.output_command_type == "joint_vector" and alpha < 1.0)
+            for side, alpha in alpha_by_side.items()
+        }
+        enabled = any(enabled_by_side.values())
+        metadata["enabled"] = enabled
+        metadata["alpha"] = max(alpha_by_side.values())
+        metadata["alpha_by_side"] = dict(alpha_by_side)
+        metadata["singularity_band_threshold_deg"] = singularity_band_threshold_deg
+        metadata["singularity_smoothing"] = singularity_boost_by_side
+        metadata["normal_fast_path"] = normal_fast_path_by_side
         if self.config.output_command_type != "joint_vector":
             metadata["reason"] = "non_joint_vector_output"
             self._last_output_qpos_smoothing_full_q = None
             return raw_full_q.copy(), left_qpos.copy(), right_qpos.copy(), metadata
         if not enabled:
             metadata["reason"] = "alpha_one"
-            self._last_output_qpos_smoothing_full_q = raw_full_q.copy()
-            return raw_full_q.copy(), left_qpos.copy(), right_qpos.copy(), metadata
-
-        previous = self._last_output_qpos_smoothing_full_q
-        if previous is None or previous.shape != raw_full_q.shape:
             smoothed_full_q = raw_full_q.copy()
-            metadata["initialized"] = True
+            metadata["initialized"] = bool(smoothing_state_missing)
         else:
+            metadata["initialized"] = bool(smoothing_state_missing)
             previous = np.asarray(previous, dtype=float).reshape(raw_full_q.shape)
             previous_left, previous_right = self._split_solution(previous)
             smoothed_left = previous_left + alpha_by_side["left"] * (
@@ -2667,6 +3853,18 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 if raw_full_q.size
                 else 0.0
             )
+
+        # The q4/q6 null projection cannot prevent a later qpos smoother from
+        # blending q5 through the vendor SDK's wrist-singularity band. Apply a
+        # directional, one-step q5 escape after smoothing and before the final
+        # action FK. This path is enabled only for the explicit position-mode
+        # single-step solver; legacy/impedance callers remain unchanged.
+        smoothed_full_q, wrist_q5_escape = self._stabilize_wrist_q5_full_step(
+            reference_full_q=np.asarray(previous, dtype=float).reshape(raw_full_q.shape),
+            candidate_full_q=smoothed_full_q,
+            current_targets=current_targets,
+        )
+        metadata["wrist_q5_escape"] = dict(wrist_q5_escape)
         self._last_output_qpos_smoothing_full_q = smoothed_full_q.copy()
         smoothed_left, smoothed_right = self._split_solution(smoothed_full_q)
         for side, raw_qpos, output_qpos in (
@@ -2682,6 +3880,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "initialized": bool(metadata.get("initialized", False)),
                 "alpha": alpha_by_side[side],
                 "adaptive": dict(alpha_metadata.get(side, {})),
+                "singularity_smoothing": dict(singularity_boost_by_side[side]),
                 "stage": "post_ik_pre_action_fk",
                 "raw_target_joint_deg": np.rad2deg(raw_q).astype(float).tolist(),
                 "output_target_joint_deg": np.rad2deg(out_q).astype(float).tolist(),
@@ -2689,6 +3888,398 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "raw_to_output_max_delta_deg": float(np.rad2deg(np.max(np.abs(out_q - raw_q)))),
             }
         return smoothed_full_q.copy(), smoothed_left, smoothed_right, metadata
+
+    def _wrist_q5_far_target_sides(
+        self,
+        *,
+        current_targets: dict[str, np.ndarray] | None,
+        reference_full_q: np.ndarray,
+    ) -> tuple[dict[str, bool], dict[str, object]]:
+        """Return sides for which a far target should relax q5 hysteresis.
+
+        This is an admission-side relief only.  It never changes the q5
+        escape boundary, the execution velocity cap, collision checks, or the
+        final jump gate.  If pose metrics are unavailable, the conservative
+        fixed release band remains active.
+        """
+
+        sides = {"left": False, "right": False}
+        metadata: dict[str, object] = {
+            "enabled": bool(self.config.wrist_q5_hysteresis_relax_for_far_target),
+            "position_threshold_m": float(
+                self.config.wrist_q5_hysteresis_far_target_position_m
+            ),
+            "orientation_threshold_deg": float(
+                self.config.wrist_q5_hysteresis_far_target_orientation_deg
+            ),
+            "sides": {},
+        }
+        if not metadata["enabled"] or current_targets is None:
+            metadata["reason"] = "disabled_or_targets_unavailable"
+            return sides, metadata
+        try:
+            metrics = self._dual_pose_metrics(
+                np.asarray(reference_full_q, dtype=float).reshape(-1),
+                current_targets,
+            )
+        except Exception as exc:  # noqa: BLE001 - relief is optional.
+            metadata["reason"] = f"metrics_unavailable:{type(exc).__name__}"
+            return sides, metadata
+        position_threshold = float(self.config.wrist_q5_hysteresis_far_target_position_m)
+        orientation_threshold = float(
+            self.config.wrist_q5_hysteresis_far_target_orientation_deg
+        )
+        for side in ("left", "right"):
+            side_metrics = dict(metrics.get(side, {}) or {})
+            position_error = float(side_metrics.get("translation_m", 0.0) or 0.0)
+            orientation_error = float(side_metrics.get("rotation_deg", 0.0) or 0.0)
+            far = bool(
+                position_error >= position_threshold
+                or orientation_error >= orientation_threshold
+            )
+            sides[side] = far
+            metadata["sides"][side] = {
+                "position_error_m": position_error,
+                "orientation_error_deg": orientation_error,
+                "far_target": far,
+            }
+        metadata["reason"] = "target_error"
+        return sides, metadata
+
+    def _stabilize_wrist_q5_full_step(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        candidate_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        """Keep the final position qref outside the RM65 wrist gate.
+
+        This is intentionally separate from q4/q6 canonicalization: q5 is an
+        observable wrist bend, so the only safe intervention is a small,
+        signed task relaxation toward the previous side of the coaxial point.
+        The existing execution profile supplies the per-cycle q5 cap.
+        """
+
+        enabled = bool(
+            self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            and self.config.wrist_coaxial_continuity_enabled
+        )
+        metadata: dict[str, object] = {
+            "enabled": enabled,
+            "applied": False,
+            "reason": "disabled_or_legacy_mode" if not enabled else "outside_escape_band",
+            "escape_threshold_deg": None,
+            "sides": {},
+        }
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        candidate = np.asarray(candidate_full_q, dtype=float).reshape(-1).copy()
+        if not enabled:
+            return candidate, metadata
+
+        # The SDK gate is configured at 3 deg in the real position backend.
+        # Keep a small explicit margin while respecting a user-specified
+        # coaxial hard threshold if it is larger.  The previous fixed 1 deg
+        # margin made the final qref stick at 4 deg even for benign motion;
+        # the default 0.5 deg margin leaves the SDK's 3 deg gate protected
+        # without widening the recovery band unnecessarily.
+        escape_threshold_deg = max(
+            float(self.config.wrist_singularity_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+            float(self.config.wrist_coaxial_hard_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+        )
+        metadata["escape_threshold_deg"] = escape_threshold_deg
+        metadata["hysteresis_requires_escape_latch"] = bool(
+            self.config.wrist_q5_hysteresis_requires_escape_latch
+        )
+        step_by_side: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        if self._full_execution_joint_step is not None:
+            left_step, right_step = self._split_solution(self._full_execution_joint_step)
+            step_by_side = {"left": left_step, "right": right_step}
+        reference_by_side = dict(zip(("left", "right"), self._split_solution(reference)))
+        candidate_by_side = dict(zip(("left", "right"), self._split_solution(candidate)))
+        far_target_sides, far_target_metadata = self._wrist_q5_far_target_sides(
+            current_targets=current_targets,
+            reference_full_q=reference,
+        )
+        metadata["far_target_hysteresis_relaxation"] = far_target_metadata
+        output_by_side: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            max_step = step_by_side[side]
+            latch_armed = bool(self._wrist_q5_hysteresis_escape_latch[side])
+            hysteresis_allowed = bool(
+                not self.config.wrist_q5_hysteresis_requires_escape_latch
+                or latch_armed
+            )
+            release_threshold = (
+                None
+                if far_target_sides.get(side, False) or not hysteresis_allowed
+                else (
+                    None
+                    if float(self.config.wrist_q5_hysteresis_release_deg) <= 0.0
+                    else max(
+                        escape_threshold_deg,
+                        float(self.config.wrist_q5_hysteresis_release_deg),
+                    )
+                )
+            )
+            output_side, side_metadata = stabilize_rm65_wrist_q5_step(
+                reference_by_side[side],
+                candidate_by_side[side],
+                escape_threshold_deg=escape_threshold_deg,
+                max_step_rad=None if max_step is None else float(max_step[4]),
+                hysteresis_release_threshold_deg=release_threshold,
+            )
+            side_metadata["far_target_hysteresis_relaxed"] = bool(
+                far_target_sides.get(side, False)
+            )
+            side_metadata["hysteresis_latch_required"] = bool(
+                self.config.wrist_q5_hysteresis_requires_escape_latch
+            )
+            side_metadata["hysteresis_latch_armed"] = latch_armed
+            side_metadata["hysteresis_allowed"] = hysteresis_allowed
+            output_by_side[side] = output_side
+            metadata["sides"][side] = side_metadata
+        output = self._embed_arm_qpos(
+            current_full_q=candidate,
+            left_qpos=output_by_side["left"],
+            right_qpos=output_by_side["right"],
+        )
+        metadata["applied"] = any(
+            bool(side_metadata.get("applied", False))
+            for side_metadata in metadata["sides"].values()
+        )
+        metadata["reason"] = (
+            "q5_escape" if metadata["applied"] else "outside_escape_band"
+        )
+        return output, metadata
+
+    def _stabilize_wrist_q5_candidate(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        candidate_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        """Apply q5 escape hysteresis before jump-gate admission.
+
+        The post-smoothing q5 guard protects the emitted qref, but the
+        candidate trace can still alternate between a raw near-boundary
+        result and a one-step singularity-escape result.  Apply the same
+        q5-only, step-capped rule to the selected candidate first so the
+        canonical IK trace and the later qref smoother see one continuous
+        side.  This is limited to the opt-in single-step position path and
+        never changes q4/q6 or the ordinary/legacy branch.
+        """
+
+        enabled = bool(
+            self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            and self.config.wrist_coaxial_continuity_enabled
+        )
+        metadata: dict[str, object] = {
+            "enabled": enabled,
+            "applied": False,
+            "reason": "disabled_or_legacy_mode" if not enabled else "outside_escape_band",
+            "escape_threshold_deg": None,
+            "hysteresis_release_threshold_deg": None,
+            "sides": {},
+        }
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        candidate = np.asarray(candidate_full_q, dtype=float).reshape(-1).copy()
+        if not enabled:
+            return candidate, metadata
+
+        escape_threshold_deg = max(
+            float(self.config.wrist_singularity_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+            float(self.config.wrist_coaxial_hard_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+        )
+        release_threshold_deg = (
+            None
+            if float(self.config.wrist_q5_hysteresis_release_deg) <= 0.0
+            else max(
+                escape_threshold_deg,
+                float(self.config.wrist_q5_hysteresis_release_deg),
+            )
+        )
+        metadata["escape_threshold_deg"] = escape_threshold_deg
+        metadata["hysteresis_release_threshold_deg"] = release_threshold_deg
+        metadata["hysteresis_requires_escape_latch"] = bool(
+            self.config.wrist_q5_hysteresis_requires_escape_latch
+        )
+        step_by_side: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        if self._full_execution_joint_step is not None:
+            left_step, right_step = self._split_solution(self._full_execution_joint_step)
+            step_by_side = {"left": left_step, "right": right_step}
+        reference_by_side = dict(zip(("left", "right"), self._split_solution(reference)))
+        candidate_by_side = dict(zip(("left", "right"), self._split_solution(candidate)))
+        far_target_sides, far_target_metadata = self._wrist_q5_far_target_sides(
+            current_targets=current_targets,
+            reference_full_q=reference,
+        )
+        metadata["far_target_hysteresis_relaxation"] = far_target_metadata
+        output_by_side: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            max_step = step_by_side[side]
+            latch_armed = bool(self._wrist_q5_hysteresis_escape_latch[side])
+            hysteresis_allowed = bool(
+                not self.config.wrist_q5_hysteresis_requires_escape_latch
+                or latch_armed
+            )
+            side_release_threshold = (
+                None
+                if far_target_sides.get(side, False) or not hysteresis_allowed
+                else release_threshold_deg
+            )
+            output_side, side_metadata = stabilize_rm65_wrist_q5_step(
+                reference_by_side[side],
+                candidate_by_side[side],
+                escape_threshold_deg=escape_threshold_deg,
+                max_step_rad=None if max_step is None else float(max_step[4]),
+                hysteresis_release_threshold_deg=side_release_threshold,
+            )
+            side_metadata["far_target_hysteresis_relaxed"] = bool(
+                far_target_sides.get(side, False)
+            )
+            side_metadata["hysteresis_latch_required"] = bool(
+                self.config.wrist_q5_hysteresis_requires_escape_latch
+            )
+            side_metadata["hysteresis_latch_armed"] = latch_armed
+            side_metadata["hysteresis_allowed"] = hysteresis_allowed
+            output_by_side[side] = output_side
+            metadata["sides"][side] = side_metadata
+        output = self._embed_arm_qpos(
+            current_full_q=candidate,
+            left_qpos=output_by_side["left"],
+            right_qpos=output_by_side["right"],
+        )
+        metadata["applied"] = bool(
+            not np.allclose(output, candidate, rtol=0.0, atol=1e-12)
+        )
+        metadata["reason"] = (
+            "q5_candidate_hysteresis_or_escape"
+            if metadata["applied"]
+            else "outside_escape_band"
+        )
+        return output, metadata
+
+    def _update_wrist_q5_hysteresis_escape_latch(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        admitted_full_q: np.ndarray,
+        status: str,
+        candidate_metadata: Mapping[str, object] | None,
+        output_metadata: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Commit q5 hysteresis state only from the final admitted qref.
+
+        Candidate probes are intentionally insufficient: collision, jump, or
+        final canonicalization may still reject them.  The latch is armed only
+        when an explicit q5 escape correction is visible in the candidate or
+        post-smoothing metadata *and* the final qref either reached the escape
+        boundary or made real outward progress.  It is released after the
+        admitted q5 leaves the configured release band.
+        """
+
+        required = bool(self.config.wrist_q5_hysteresis_requires_escape_latch)
+        metadata: dict[str, object] = {
+            "enabled": required,
+            "status": str(status),
+            "sides": {},
+        }
+        if not required:
+            metadata["reason"] = "fixed_band_v1"
+            return metadata
+
+        reference_by_side = dict(
+            zip(
+                ("left", "right"),
+                self._split_solution(np.asarray(reference_full_q, dtype=float).reshape(-1)),
+            )
+        )
+        admitted_by_side = dict(
+            zip(
+                ("left", "right"),
+                self._split_solution(np.asarray(admitted_full_q, dtype=float).reshape(-1)),
+            )
+        )
+        escape_threshold_deg = max(
+            float(self.config.wrist_singularity_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+            float(self.config.wrist_coaxial_hard_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+        )
+        release_threshold_deg = max(
+            escape_threshold_deg,
+            float(self.config.wrist_q5_hysteresis_release_deg),
+        )
+
+        def side_reason(payload: Mapping[str, object] | None, side: str) -> str:
+            if not isinstance(payload, Mapping):
+                return ""
+            sides = payload.get("sides")
+            if not isinstance(sides, Mapping):
+                return ""
+            side_payload = sides.get(side)
+            return (
+                str(side_payload.get("reason") or "")
+                if isinstance(side_payload, Mapping)
+                else ""
+            )
+
+        admitted_status = str(status) in {"tracking", "boundary_active"}
+        for side in ("left", "right"):
+            before = bool(self._wrist_q5_hysteresis_escape_latch[side])
+            reference_q5_deg = float(np.rad2deg(reference_by_side[side][4]))
+            admitted_q5_deg = float(np.rad2deg(admitted_by_side[side][4]))
+            reasons = (
+                side_reason(candidate_metadata, side),
+                side_reason(output_metadata, side),
+            )
+            explicit_escape = any(
+                reason.startswith("escape_previous_side") for reason in reasons
+            )
+            outward_progress = bool(
+                abs(admitted_q5_deg) > abs(reference_q5_deg) + 1e-9
+            )
+            reached_boundary = bool(
+                abs(admitted_q5_deg) >= escape_threshold_deg - 1e-9
+            )
+            released = bool(
+                admitted_status
+                and abs(admitted_q5_deg) >= release_threshold_deg - 1e-9
+            )
+            armed = before
+            transition = "unchanged"
+            if released:
+                armed = False
+                transition = "released_outside_band"
+            elif admitted_status and explicit_escape and (
+                outward_progress or reached_boundary
+            ):
+                armed = True
+                transition = "armed_from_admitted_escape"
+            self._wrist_q5_hysteresis_escape_latch[side] = armed
+            metadata["sides"][side] = {
+                "before": before,
+                "after": armed,
+                "transition": transition,
+                "reference_q5_deg": reference_q5_deg,
+                "admitted_q5_deg": admitted_q5_deg,
+                "candidate_reason": reasons[0],
+                "output_reason": reasons[1],
+                "explicit_escape": explicit_escape,
+                "outward_progress": outward_progress,
+                "reached_escape_boundary": reached_boundary,
+                "release_threshold_deg": release_threshold_deg,
+            }
+        metadata["reason"] = "final_admitted_qref"
+        return metadata
 
     def _effective_output_qpos_smoothing_alpha(
         self,
@@ -2951,6 +4542,73 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             right_step=right_step,
         )
 
+    def _make_full_execution_joint_velocity_limit(
+        self,
+        qpos: np.ndarray,
+    ) -> np.ndarray:
+        step = self._make_full_execution_joint_step(qpos)
+        if step is None:
+            raise ValueError(
+                "admitted-reference motion limiting requires a finite execution "
+                "joint-step contract."
+            )
+        velocity = np.full(np.asarray(step).shape, np.inf, dtype=float)
+        active = np.asarray(step, dtype=float) > 0.0
+        velocity[active] = np.asarray(step, dtype=float)[active] / float(
+            self._execution_dt_sec
+        )
+        return velocity
+
+    def _refresh_admitted_reference_motion_limit(self) -> None:
+        if not self._admitted_reference_motion_limit_enabled:
+            return
+        configure = getattr(
+            self.ik_solver,
+            "configure_admitted_reference_motion_limit",
+            None,
+        )
+        if not callable(configure):
+            raise RuntimeError(
+                "configured admitted-reference motion limit lost its configurator."
+            )
+        current_q = np.asarray(self.ik_solver.current_q, dtype=float).reshape(-1)
+        configure(
+            self._make_full_execution_joint_velocity_limit(current_q),
+            self._make_full_joint_acceleration_limit(
+                np.asarray(
+                    self.config.joint_acceleration_limit_rad_s2,
+                    dtype=float,
+                )
+            ),
+        )
+        self._set_solver_motion_reference(current_q)
+
+    def _set_solver_motion_reference(self, anchor_full_q: np.ndarray) -> None:
+        if not self._acceleration_limit_enabled:
+            return
+        if self._admitted_reference_motion_limit_enabled:
+            setter = getattr(
+                self.ik_solver,
+                "set_admitted_reference_motion",
+                None,
+            )
+            if not callable(setter):
+                raise RuntimeError(
+                    "configured admitted-reference motion limit lost its state setter."
+                )
+            setter(
+                np.asarray(anchor_full_q, dtype=float).reshape(-1),
+                self._last_admitted_velocity_full,
+                float(self._execution_dt_sec),
+            )
+            return
+        setter = getattr(self.ik_solver, "set_last_integration_velocity", None)
+        if not callable(setter):
+            raise RuntimeError(
+                "configured acceleration-limited solver lost its velocity-state setter."
+            )
+        setter(self._last_admitted_velocity_full)
+
     def _make_full_step_from_arm_steps(
         self,
         qpos: np.ndarray,
@@ -3003,12 +4661,14 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._full_execution_joint_step = self._make_full_execution_joint_step(
             self.ik_solver.current_q
         )
+        self._refresh_admitted_reference_motion_limit()
 
     def set_execution_dt_sec(self, dt_sec: float) -> None:
         self._execution_dt_sec = max(1e-6, float(dt_sec))
         self._full_execution_joint_step = self._make_full_execution_joint_step(
             self.ik_solver.current_q
         )
+        self._refresh_admitted_reference_motion_limit()
 
     def _limit_to_execution_step(
         self,
@@ -3372,6 +5032,186 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         metadata["side"] = side
         return metadata
 
+    def _wrist_branch_switch_guard_active(
+        self,
+        *,
+        raw_q: np.ndarray,
+        reference_q: np.ndarray,
+        candidate_q: np.ndarray | None = None,
+        side: str | None = None,
+    ) -> bool:
+        """Return whether a wrist +/-pi branch switch must be suppressed.
+
+        Pink's raw result is already a locally integrated configuration.  The
+        explicit flip candidates are useful for recovery and for ordinary
+        poses, but around the RM65 q5 coaxial neighborhood they are equivalent
+        representations of the same tool orientation and can alternate when
+        the candidate scorer applies the per-cycle clip.  Once clipped, the
+        two representations are no longer equivalent and produce the large
+        q4/q5/q6 oscillation visible in the IK shadow trace.  Keep the raw
+        continuous branch while either endpoint is inside this guard band.
+
+        The guard is deliberately opt-in and only applies to the new
+        single-step position path.  A zero threshold is an exact rollback to
+        the historical branch candidate set.
+        """
+
+        if not (
+            self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            and self.config.wrist_coaxial_continuity_enabled
+        ):
+            return False
+        guard_deg = float(self.config.wrist_branch_switch_guard_deg)
+        if guard_deg <= 0.0:
+            return False
+        raw = np.asarray(raw_q, dtype=float).reshape(6)
+        reference = np.asarray(reference_q, dtype=float).reshape(6)
+        if min(
+            abs(float(np.rad2deg(raw[4]))),
+            abs(float(np.rad2deg(reference[4]))),
+        ) <= guard_deg:
+            return True
+
+        # A branch candidate may start outside the guard on both endpoints,
+        # then become a near-zero q5 configuration after the deliberately
+        # enlarged local candidate clip (the formal position profile uses
+        # 8x).  That was the remaining failure seen in the 2026-07-26 trace:
+        # a +/-pi wrist flip was clipped to roughly q5=+4 deg, immediately
+        # entering the SDK coaxial gate, and the next frame flipped back to
+        # the continuous raw branch.  Evaluate the candidate *after the same
+        # one-cycle candidate clip* and suppress only this hazardous crossing.
+        if candidate_q is None:
+            return False
+        candidate = np.asarray(candidate_q, dtype=float).reshape(6)
+
+        # A +/-pi wrist alternative can remain on the same q5 side after the
+        # enlarged candidate clip, while still redistributing q4/q5/q6 by
+        # tens of degrees.  The ordinary raw IK step is the continuity
+        # reference: if it is small but the alternate's *clipped* wrist step
+        # is much larger, suppress the alternate.  Deliberate, large operator
+        # motion is left available (raw wrist motion above the guard), which
+        # preserves an escape route instead of turning the guard into a
+        # blanket hold.
+        if (
+            side in {"left", "right"}
+            and bool(self.config.enforce_realistic_joint_step)
+            and self._full_execution_joint_step is not None
+        ):
+            left_step, right_step = self._split_solution(
+                np.asarray(self._full_execution_joint_step, dtype=float)
+            )
+            arm_step = left_step if str(side) == "left" else right_step
+            max_step_rad = np.asarray(arm_step, dtype=float).reshape(6) * max(
+                1.0,
+                float(self.config.local_step_candidate_clip_scale),
+            )
+            raw_projected = reference + np.clip(
+                raw - reference,
+                -max_step_rad,
+                max_step_rad,
+            )
+            candidate_projected = reference + np.clip(
+                candidate - reference,
+                -max_step_rad,
+                max_step_rad,
+            )
+            wrist_indices = np.asarray((3, 4, 5), dtype=int)
+            raw_wrist_step_deg = float(
+                np.linalg.norm(np.rad2deg(raw_projected[wrist_indices] - reference[wrist_indices]))
+            )
+            candidate_wrist_step_deg = float(
+                np.linalg.norm(
+                    np.rad2deg(
+                        candidate_projected[wrist_indices] - reference[wrist_indices]
+                    )
+                )
+            )
+            if (
+                raw_wrist_step_deg <= guard_deg
+                and candidate_wrist_step_deg > raw_wrist_step_deg + guard_deg
+            ):
+                return True
+
+        reference_q5 = float(reference[4])
+        candidate_q5 = float(candidate[4])
+        if reference_q5 * candidate_q5 >= 0.0:
+            return False
+        if abs(float(np.rad2deg(candidate_q5))) <= guard_deg:
+            return True
+        if (
+            not bool(self.config.enforce_realistic_joint_step)
+            or self._full_execution_joint_step is None
+        ):
+            return False
+        if side not in {"left", "right"}:
+            return False
+        left_step, right_step = self._split_solution(
+            np.asarray(self._full_execution_joint_step, dtype=float)
+        )
+        # This helper is called with one arm's six-joint vector.  The branch
+        # candidate is scored at scale=1 first; use the largest local clip
+        # envelope so a candidate that can enter the guard in that primary
+        # evaluation is never offered as an alternate seed.
+        arm_step = left_step if str(side) == "left" else right_step
+        max_step_rad = float(arm_step[4]) * max(
+            1.0,
+            float(self.config.local_step_candidate_clip_scale),
+        )
+        if not np.isfinite(max_step_rad) or max_step_rad <= 0.0:
+            return False
+        projected_q5 = reference_q5 + float(
+            np.clip(candidate_q5 - reference_q5, -max_step_rad, max_step_rad)
+        )
+        return bool(abs(float(np.rad2deg(projected_q5))) <= guard_deg)
+
+    def _wrist_branch_guard_output_crossing_sides(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        output_full_q: np.ndarray,
+    ) -> tuple[str, ...]:
+        """Find a guarded branch crossing after candidate-local clipping.
+
+        Candidate selection intentionally uses a wider local clip than the
+        final qref admission.  A mathematically equivalent wrist branch can
+        therefore be clipped to the *opposite* side of q5=0 while still
+        looking like a feasible alternate candidate to the pose scorer.
+        Reject that alternate before canonicalization; the locally integrated
+        original result remains available for deliberate operator crossings.
+        Otherwise the canonical trace can contain a large q4/q5/q6 jump even
+        though the final admitted qref is later rate-limited.
+        """
+
+        if not (
+            self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            and self.config.wrist_coaxial_continuity_enabled
+            and float(self.config.wrist_branch_switch_guard_deg) > 0.0
+        ):
+            return ()
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        output = np.asarray(output_full_q, dtype=float).reshape(reference.shape)
+        guard_deg = float(self.config.wrist_branch_switch_guard_deg)
+        reference_left, reference_right = self._split_solution(reference)
+        output_left, output_right = self._split_solution(output)
+        sides: list[str] = []
+        for side, reference_arm, output_arm in (
+            ("left", reference_left, output_left),
+            ("right", reference_right, output_right),
+        ):
+            reference_q5 = float(reference_arm[4])
+            output_q5 = float(output_arm[4])
+            if not np.isfinite(reference_q5) or not np.isfinite(output_q5):
+                continue
+            if (
+                abs(float(np.rad2deg(reference_q5))) > guard_deg
+                and abs(float(np.rad2deg(output_q5))) <= guard_deg
+                and reference_q5 * output_q5 <= 0.0
+            ):
+                sides.append(side)
+        return tuple(sides)
+
     def _branch_candidates(
         self,
         *,
@@ -3384,21 +5224,45 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         ref_left, ref_right = self._split_solution(reference_full)
         left_min, left_max = self._left_arm_limits
         right_min, right_max = self._right_arm_limits
-        left_alt = preferred_wrist_flip_candidate(
+        left_alt_candidate = preferred_wrist_flip_candidate(
             raw_left,
             reference_q=ref_left,
             joint_distance_weights=self._arm_joint_weights,
             q_min=left_min,
             q_max=left_max,
-            limit_tolerance_rad=float(self.ik_tuning.branch_normalization.limit_tolerance_rad),
+            limit_tolerance_rad=float(
+                self.ik_tuning.branch_normalization.limit_tolerance_rad
+            ),
         )
-        right_alt = preferred_wrist_flip_candidate(
+        left_alt = (
+            None
+            if self._wrist_branch_switch_guard_active(
+                raw_q=raw_left,
+                reference_q=ref_left,
+                candidate_q=left_alt_candidate,
+                side="left",
+            )
+            else left_alt_candidate
+        )
+        right_alt_candidate = preferred_wrist_flip_candidate(
             raw_right,
             reference_q=ref_right,
             joint_distance_weights=self._arm_joint_weights,
             q_min=right_min,
             q_max=right_max,
-            limit_tolerance_rad=float(self.ik_tuning.branch_normalization.limit_tolerance_rad),
+            limit_tolerance_rad=float(
+                self.ik_tuning.branch_normalization.limit_tolerance_rad
+            ),
+        )
+        right_alt = (
+            None
+            if self._wrist_branch_switch_guard_active(
+                raw_q=raw_right,
+                reference_q=ref_right,
+                candidate_q=right_alt_candidate,
+                side="right",
+            )
+            else right_alt_candidate
         )
 
         candidates: list[tuple[str, np.ndarray]] = [("original", raw_full.copy())]
@@ -4106,6 +5970,63 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             if not collision_safe_evaluated:
                 return None
             wrist_pool = list(collision_safe_evaluated)
+            directional_escape_pool: list[_DualArmEvaluatedCandidate] = []
+            # In the directional policy an admitted escape is a safety
+            # transition, not merely another pose-scoring alternative.  If a
+            # candidate demonstrably reduces the local J3/J5 singularity
+            # depth, prefer that pool over ordinary tracking candidates;
+            # otherwise the pose score can keep selecting a visually better
+            # but singular target and leave the arm parked in the pocket.
+            if bool(
+                getattr(
+                    safety_profile,
+                    "local_step_singularity_escape_directional_enabled",
+                    False,
+                )
+            ):
+                directional_escape_pool = [
+                    item
+                    for item in wrist_pool
+                    if item.candidate.source == "singularity_escape"
+                    and bool(
+                        item.metadata.get(
+                            "dual_singularity_escape_active",
+                            False,
+                        )
+                    )
+                    and (
+                        int(
+                            item.metadata.get(
+                                "dual_singularity_escape_count_progress",
+                                0,
+                            )
+                            or 0
+                        )
+                        > 0
+                        or float(
+                            item.metadata.get(
+                                "dual_singularity_escape_depth_progress",
+                                0.0,
+                            )
+                            or 0.0
+                        )
+                        > 0.0
+                        or bool(
+                            item.metadata.get(
+                                "dual_singularity_escape_wide_plan_active",
+                                False,
+                            )
+                        )
+                        or bool(
+                            item.metadata.get(
+                                "dual_singularity_escape_directional_outward",
+                                False,
+                            )
+                        )
+                    )
+                ]
+                if directional_escape_pool:
+                    wrist_pool = directional_escape_pool
             if (
                 self.config.prefer_non_elbow_singular_branch
                 or self.config.prefer_non_wrist_singular_branch
@@ -4130,7 +6051,63 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             selection_pool, selection_policy = self._dual_stable_selection_pool(wrist_pool)
             metadata["selection_policy"] = selection_policy
             selection_pool = list(selection_pool)
-            selection_pool.sort(key=lambda item: item.score)
+            if directional_escape_pool:
+                # Once an escape is active, Cartesian score alone is not a
+                # stable selector: two equally good axes can alternate every
+                # frame while the arm remains in the same pocket.  Keep the
+                # direction with the strongest *actual* local progress, then
+                # retain the already latched sign/axis, and use pose score
+                # only as the final tie breaker.
+                def directional_escape_key(item: _DualArmEvaluatedCandidate) -> tuple[object, ...]:
+                    item_metadata = item.metadata
+                    candidate_metadata = dict(
+                        item_metadata.get("candidate_metadata", {}) or {}
+                    )
+                    direction_map = dict(
+                        candidate_metadata.get(
+                            "local_step_singularity_escape_direction_by_joint", {}
+                        )
+                        or {}
+                    )
+                    latch_match = 0
+                    for label, direction in direction_map.items():
+                        try:
+                            side_text, joint_text = str(label).split(":j", 1)
+                            key = (side_text, int(joint_text) - 1)
+                            if int(direction) == int(
+                                self._singularity_escape_direction_latch.get(key, 0)
+                            ):
+                                latch_match += 1
+                        except (TypeError, ValueError):
+                            continue
+                    return (
+                        -int(
+                            item_metadata.get(
+                                "dual_singularity_escape_count_progress", 0
+                            )
+                            or 0
+                        ),
+                        -float(
+                            item_metadata.get(
+                                "dual_singularity_escape_depth_progress", 0.0
+                            )
+                            or 0.0
+                        ),
+                        -int(latch_match),
+                        0
+                        if bool(
+                            item_metadata.get(
+                                "dual_singularity_escape_directional_outward", False
+                            )
+                        )
+                        else 1,
+                        float(item.score),
+                        str(item.candidate.name),
+                    )
+
+                selection_pool.sort(key=directional_escape_key)
+            else:
+                selection_pool.sort(key=lambda item: item.score)
             item = selection_pool[0]
             metadata["wrist_singularity_preference"] = (
                 self._wrist_singularity_selection_metadata(
@@ -4214,6 +6191,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             if base_selection is None
             else self._local_proxy_singularity_metadata(base_selection[0])
         )
+        raw_local_singularity = self._local_proxy_singularity_metadata(
+            np.asarray(raw_full_q, dtype=float).reshape(-1)
+        )
         expand_for_local_singularity_escape = bool(
             base_selection is not None
             and bool(
@@ -4223,7 +6203,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     False,
                 )
             )
-            and bool(base_local_singularity.get("any_singular", False))
+            and bool(
+                base_local_singularity.get("any_singular", False)
+                or raw_local_singularity.get("any_singular", False)
+            )
             and not candidate_eval_stopped_early
         )
         expand_for_position_singularity = bool(
@@ -4259,7 +6242,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             include_posture_escape=not candidate_eval_stopped_early,
             include_wrist_unload=not candidate_eval_stopped_early,
             include_singularity_escape=expand_for_local_singularity_escape,
-            singularity_seed_qpos=(None if base_selection is None else base_selection[0]),
+            # Use the raw one-step IK result as the escape probe.  The base
+            # candidate is already locally clipped and may sit just outside
+            # the proxy band even while the raw target is trying to cross it;
+            # seeding from the base output was the source of the alternating
+            # "ordinary / escape" frames seen in the 2026-07-26 trace.
+            singularity_seed_qpos=raw_full_q,
         )
         all_candidates = list(base_candidates) + list(auxiliary_candidates)
         if auxiliary_candidates and not candidate_eval_stopped_early:
@@ -4537,6 +6525,332 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "any_singular": bool(singular_sides),
         }
 
+    def _singularity_escape_traversal_metadata(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        admitted_full_q: np.ndarray,
+        selection_metadata: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Describe a certified outward J3 traversal for the RM65 backend.
+
+        The SDK gate normally holds a command whenever both the current and
+        requested q3 are inside its elbow-singularity neighborhood.  A local
+        escape candidate is safe to continue only when the *emitted* qref
+        actually moves in the latched outward direction.  This helper keeps
+        that exception narrow: a raw/wide probe, a smoothed no-op, or an
+        ordinary target never receives an elbow-traversal certificate.
+        """
+
+        result: dict[str, object] = {
+            "enabled": bool(
+                self.config.solve_step_mode
+                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            ),
+            "by_side": {"left": False, "right": False},
+            "direction_by_side": {},
+            "delta_q3_deg_by_side": {},
+            "final_local_singularity": {},
+        }
+        if not result["enabled"]:
+            return result
+        metadata = dict(selection_metadata or {})
+        if str(metadata.get("selected_source", "") or "") != "singularity_escape":
+            result["reason"] = "selected_source_not_singularity_escape"
+            return result
+        selected_metadata = dict(metadata.get("selected_metadata", {}) or {})
+        candidate_metadata = dict(
+            selected_metadata.get("candidate_metadata", {}) or {}
+        )
+        direction_map = dict(
+            candidate_metadata.get(
+                "local_step_singularity_escape_direction_by_joint", {}
+            )
+            or {}
+        )
+        if not direction_map:
+            result["reason"] = "escape_direction_metadata_missing"
+            return result
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        admitted = np.asarray(admitted_full_q, dtype=float).reshape(reference.shape)
+        reference_by_side = dict(zip(("left", "right"), self._split_solution(reference)))
+        admitted_by_side = dict(zip(("left", "right"), self._split_solution(admitted)))
+        reference_local = self._local_proxy_singularity_metadata(reference)
+        final_local = self._local_proxy_singularity_metadata(admitted)
+        release_band_deg = max(
+            0.0,
+            float(
+                getattr(
+                    self.ik_safety_profile,
+                    "local_step_singularity_escape_direction_hysteresis_deg",
+                    1.0,
+                )
+            ),
+        )
+        for side in ("left", "right"):
+            label = f"{side}:j3"
+            try:
+                direction = int(direction_map.get(label, 0))
+            except (TypeError, ValueError):
+                direction = 0
+            if direction not in (-1, 1):
+                continue
+            delta_q3 = float(admitted_by_side[side][2] - reference_by_side[side][2])
+            reference_side = dict(reference_local.get("sides", {}).get(side, {}) or {})
+            side_local = dict(final_local.get("sides", {}).get(side, {}) or {})
+            outward = bool(direction * delta_q3 > 1e-6)
+            # The certificate is about a bounded outward traversal, not only
+            # the final sample's local classification.  Permit the last
+            # step(s) that cross the local proxy while the reference remains
+            # inside its release band; the backend still checks the SDK
+            # target/current labels and requires the exact qref fingerprint.
+            singular = bool(
+                reference_side.get("is_elbow_singular", False)
+                or float(reference_side.get("elbow_margin_deg", -1.0))
+                < release_band_deg
+                or side_local.get("is_elbow_singular", False)
+            )
+            result["direction_by_side"][side] = direction
+            result["delta_q3_deg_by_side"][side] = float(np.rad2deg(delta_q3))
+            result["final_local_singularity"][side] = side_local
+            result["by_side"][side] = bool(outward and singular)
+        result["reason"] = (
+            "outward_emitted_qref" if any(result["by_side"].values()) else "no_outward_singular_q3"
+        )
+        return result
+
+    def _singularity_escape_direction_for_axis(
+        self,
+        *,
+        side: str,
+        local_index: int,
+        full_index: int,
+        seed: np.ndarray,
+        current_targets: dict[str, np.ndarray],
+        before_score: float,
+        q_min: np.ndarray,
+        q_max: np.ndarray,
+        step: float,
+    ) -> tuple[int, str]:
+        """Choose one deterministic outward direction for a singular axis.
+
+        The old escape layer emitted both signs on every frame and then let a
+        global singularity-depth score choose between them.  Near q3/q5=0 the
+        vendor IK can change sign by a fraction of a degree, so that policy
+        converted harmless solver noise into a large physical reversal.  A
+        latch is preferred while the local proxy remains singular.  If the
+        coordinate is numerically on zero, the first direction is selected by
+        actual Cartesian target progress (with a deterministic positive tie
+        break), rather than by an arbitrary candidate ordering.
+        """
+
+        key = (str(side), int(local_index))
+        latched = int(self._singularity_escape_direction_latch.get(key, 0))
+        if latched in (-1, 1):
+            return latched, "latched"
+
+        value_deg = float(np.rad2deg(seed[full_index]))
+        # Outside a small numerical band, moving in the sign of the joint
+        # increases |q3|/|q5| and is the only locally meaningful escape
+        # direction.  The old 1e-4 rad cut-over was too small for encoder
+        # noise: a joint reported at +/-0.01 deg could still make the probe
+        # choose the opposite side on successive frames.  Keep the sign
+        # locked unless the joint is genuinely close enough to zero that both
+        # directions have indistinguishable local singularity depth.
+        direction_probe_band_deg = 0.50
+        if abs(value_deg) > direction_probe_band_deg:
+            direction = 1 if value_deg > 0.0 else -1
+            self._singularity_escape_direction_latch[key] = direction
+            self._singularity_escape_direction_failures[key] = 0
+            return direction, "outward_from_zero"
+
+        # Near zero use a one-step probe.  Singularity depth is the primary
+        # objective; Cartesian target progress is only a tie breaker.  The
+        # previous implementation selected by Cartesian progress first, so a
+        # direction that improved the target while moving *deeper* into the
+        # singular pocket could win and then be reversed by the next frame.
+        probe_scores: dict[int, tuple[float, float]] = {}
+        before_local = self._local_proxy_singularity_metadata(seed)
+        before_depth = float(before_local.get("singularity_depth_score", 0.0))
+        before_count = int(before_local.get("singular_side_count", 0) or 0)
+        for direction in (-1, 1):
+            probe_q = seed.copy()
+            probe_q[full_index] += float(direction) * float(step)
+            if (
+                probe_q[full_index] < q_min[full_index] - 1e-9
+                or probe_q[full_index] > q_max[full_index] + 1e-9
+            ):
+                continue
+            probe_local = self._local_proxy_singularity_metadata(probe_q)
+            depth_progress = before_depth - float(
+                probe_local.get("singularity_depth_score", 0.0)
+            )
+            count_progress = before_count - int(
+                probe_local.get("singular_side_count", 0) or 0
+            )
+            pose_progress = before_score - self._dual_pose_score(
+                self._dual_pose_metrics(probe_q, current_targets)
+            )
+            # Count progress is deliberately a large first-class component:
+            # leaving the pocket is more important than a small Cartesian
+            # improvement.  The actual candidate evaluator still applies all
+            # pose, collision, and joint limits before admission.
+            probe_scores[direction] = (
+                float(count_progress) * 10.0 + float(depth_progress),
+                float(pose_progress),
+            )
+        if not probe_scores:
+            direction = 1
+            source = "deterministic_fallback"
+        else:
+            direction = max(
+                probe_scores,
+                key=lambda item: (
+                    float(probe_scores[item][0]),
+                    float(probe_scores[item][1]),
+                    int(item),
+                ),
+            )
+            source = "singularity_depth_probe"
+        self._singularity_escape_direction_latch[key] = int(direction)
+        self._singularity_escape_direction_failures[key] = 0
+        return int(direction), source
+
+    def _update_singularity_escape_direction_state(
+        self,
+        *,
+        selected_q: np.ndarray,
+        selection_metadata: Mapping[str, object] | None,
+    ) -> None:
+        """Commit or age the directional escape latch after admission.
+
+        A proposed direction is not considered successful until it is the
+        selected collision-safe candidate.  If the selector repeatedly falls
+        back to a non-escape candidate while the pocket remains singular, the
+        latch is released after a bounded number of frames so a blocked side
+        can be reconsidered.  Once a side leaves the local singular proxy its
+        latch is removed immediately.
+        """
+
+        profile = self.ik_safety_profile
+        if profile is None or not bool(
+            getattr(profile, "local_step_singularity_escape_directional_enabled", False)
+        ):
+            return
+        metadata = dict(selection_metadata or {})
+        selected_metadata = dict(metadata.get("selected_metadata", {}) or {})
+        candidate_metadata = dict(selected_metadata.get("candidate_metadata", {}) or {})
+        selected_source = str(
+            metadata.get("selected_source", selected_metadata.get("source", ""))
+            or ""
+        )
+        if selected_source == "singularity_escape":
+            direction_map = dict(
+                candidate_metadata.get(
+                    "local_step_singularity_escape_direction_by_joint", {}
+                )
+                or {}
+            )
+            if not direction_map:
+                side = candidate_metadata.get("local_step_singularity_escape_side")
+                local_index = candidate_metadata.get(
+                    "local_step_singularity_escape_joint_index"
+                )
+                direction = candidate_metadata.get(
+                    "local_step_singularity_escape_direction"
+                )
+                if side is not None and local_index is not None and direction in (-1, 1):
+                    direction_map[f"{side}:j{int(local_index) + 1}"] = int(direction)
+            for label, direction in direction_map.items():
+                try:
+                    side_text, joint_text = str(label).split(":j", 1)
+                    key = (side_text, int(joint_text) - 1)
+                    value = int(direction)
+                except (TypeError, ValueError):
+                    continue
+                if value in (-1, 1):
+                    self._singularity_escape_direction_latch[key] = value
+                    self._singularity_escape_direction_failures[key] = 0
+            # Lock the selected axis set as well as its signs.  The coupled
+            # J3+J5 candidate therefore remains coupled until the side exits
+            # the release band; a pose-score tie cannot alternate J3/J5 on
+            # successive frames.
+            axis_by_side: dict[str, list[int]] = {}
+            for label in direction_map:
+                try:
+                    side_text, joint_text = str(label).split(":j", 1)
+                    local_index = int(joint_text) - 1
+                except (TypeError, ValueError):
+                    continue
+                if local_index in (2, 4):
+                    axis_by_side.setdefault(side_text, []).append(local_index)
+            for side_text, indices in axis_by_side.items():
+                self._singularity_escape_axis_latch[side_text] = tuple(
+                    sorted(set(int(index) for index in indices))
+                )
+
+        local = self._local_proxy_singularity_metadata(
+            np.asarray(selected_q, dtype=float).reshape(-1)
+        )
+        release_margin_deg = max(
+            0.0,
+            float(
+                getattr(
+                    profile,
+                    "local_step_singularity_escape_direction_hysteresis_deg",
+                    1.0,
+                )
+            ),
+        )
+        for key in tuple(self._singularity_escape_direction_latch):
+            side, local_index = key
+            side_metadata = dict(local.get("sides", {}).get(side, {}) or {})
+            margin_key = "elbow_margin_deg" if local_index == 2 else "wrist_margin_deg"
+            if not bool(side_metadata.get("is_singular", False)) and float(
+                side_metadata.get(margin_key, -1.0)
+            ) >= release_margin_deg:
+                self._singularity_escape_direction_latch.pop(key, None)
+                self._singularity_escape_direction_failures.pop(key, None)
+                continue
+            if selected_source != "singularity_escape":
+                failures = int(self._singularity_escape_direction_failures.get(key, 0)) + 1
+                self._singularity_escape_direction_failures[key] = failures
+                if failures >= 6:
+                    self._singularity_escape_direction_latch.pop(key, None)
+                    self._singularity_escape_direction_failures.pop(key, None)
+
+        for side, axis_plan in tuple(self._singularity_escape_axis_latch.items()):
+            side_metadata = dict(local.get("sides", {}).get(side, {}) or {})
+            if not axis_plan or (
+                not bool(side_metadata.get("is_singular", False))
+                and all(
+                    float(
+                        side_metadata.get(
+                            "elbow_margin_deg" if index == 2 else "wrist_margin_deg",
+                            -1.0,
+                        )
+                    )
+                    >= release_margin_deg
+                    for index in axis_plan
+                )
+            ):
+                self._singularity_escape_axis_latch.pop(side, None)
+            elif selected_source != "singularity_escape":
+                # Keep a blocked plan for a few frames so a transient
+                # collision query or branch-budget miss cannot immediately
+                # flip the commanded escape axis.
+                if all(
+                    int(self._singularity_escape_direction_failures.get((side, index), 0))
+                    >= 6
+                    for index in axis_plan
+                ):
+                    self._singularity_escape_axis_latch.pop(side, None)
+
+        if not bool(local.get("any_singular", False)):
+            self._singularity_escape_direction_latch.clear()
+            self._singularity_escape_direction_failures.clear()
+            self._singularity_escape_axis_latch.clear()
+
     def _dual_arm_singularity_escape_candidates(
         self,
         *,
@@ -4562,11 +6876,44 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             return [], metadata
 
         reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
-        seed = reference if seed_full_q is None else np.asarray(seed_full_q, dtype=float).reshape(reference.shape)
-        reference_local = self._local_proxy_singularity_metadata(seed)
+        seed = (
+            reference
+            if seed_full_q is None
+            else np.asarray(seed_full_q, dtype=float).reshape(reference.shape)
+        )
+        # ``reference`` is the last admitted qref and is the only state from
+        # which an escape command may be integrated.  The raw IK result is a
+        # useful crossing hint, but must not redefine the singularity depth
+        # used by admission: doing so made a raw 3--4 degree branch appear
+        # already safe and silently removed the escape candidate on the next
+        # frame.  Keep both views in the metadata for offline diagnosis.
+        reference_local = self._local_proxy_singularity_metadata(reference)
+        seed_local = self._local_proxy_singularity_metadata(seed)
         metadata["reference_singularity"] = reference_local
-        if not bool(reference_local["any_singular"]):
-            metadata["status"] = "inactive_reference_not_singular"
+        metadata["seed_singularity"] = seed_local
+        release_band_deg = max(
+            0.0,
+            float(
+                getattr(
+                    safety_profile,
+                    "local_step_singularity_escape_direction_hysteresis_deg",
+                    1.0,
+                )
+            ),
+        )
+        latched_band_active = False
+        for side in ("left", "right"):
+            side_reference = dict(reference_local.get("sides", {}).get(side, {}) or {})
+            for local_index, margin_key in ((2, "elbow_margin_deg"), (4, "wrist_margin_deg")):
+                if (side, local_index) not in self._singularity_escape_direction_latch:
+                    continue
+                if float(side_reference.get(margin_key, -1.0)) < release_band_deg:
+                    latched_band_active = True
+                    break
+            if latched_band_active:
+                break
+        if not bool(reference_local["any_singular"] or seed_local["any_singular"] or latched_band_active):
+            metadata["status"] = "inactive_reference_and_seed_not_singular"
             return [], metadata
         max_candidates = max(
             0,
@@ -4592,77 +6939,597 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         q_min = np.asarray(self.ik_solver.robot.model.lowerPositionLimit, dtype=float).reshape(reference.shape)
         q_max = np.asarray(self.ik_solver.robot.model.upperPositionLimit, dtype=float).reshape(reference.shape)
         full_step = np.asarray(self._full_execution_joint_step, dtype=float).reshape(reference.shape) * step_fraction
-        before_metrics = self._dual_pose_metrics(seed, current_targets)
+        # Progress is measured from the actual admitted qref.  Measuring from
+        # the raw IK branch lets a solver branch flip manufacture artificial
+        # progress and is the main mechanism behind the historical back-and-
+        # forth escape trace.
+        before_metrics = self._dual_pose_metrics(reference, current_targets)
         before_score = self._dual_pose_score(before_metrics)
-        scored: list[tuple[int, int, float, float, int, int, str, np.ndarray, dict[str, object]]] = []
+        max_position_error_m = max(
+            float(before_metrics[side]["translation_m"]) for side in ("left", "right")
+        )
+        max_orientation_error_deg = max(
+            float(before_metrics[side]["rotation_deg"]) for side in ("left", "right")
+        )
+        wide_search_position_threshold_m = max(
+            0.0,
+            float(
+                getattr(
+                    safety_profile,
+                    "local_step_singularity_escape_wide_search_position_m",
+                    0.10,
+                )
+            ),
+        )
+        wide_search_orientation_threshold_deg = max(
+            0.0,
+            float(
+                getattr(
+                    safety_profile,
+                    "local_step_singularity_escape_wide_search_orientation_deg",
+                    20.0,
+                )
+            ),
+        )
+        wide_search_far_target_sides = {
+            side: bool(
+                float(before_metrics[side]["translation_m"])
+                >= wide_search_position_threshold_m
+                or float(before_metrics[side]["rotation_deg"])
+                >= wide_search_orientation_threshold_deg
+            )
+            for side in ("left", "right")
+        }
+        wide_search_enabled = bool(
+            getattr(
+                safety_profile,
+                "local_step_singularity_escape_wide_search_enabled",
+                False,
+            )
+            and any(wide_search_far_target_sides.values())
+        )
+        raw_radius_factors = (
+            getattr(
+                safety_profile,
+                "local_step_singularity_escape_wide_search_radius_factors",
+                (1.0,),
+            )
+            if wide_search_enabled
+            else (1.0,)
+        )
+        radius_factors: list[float] = []
+        max_radius = max(
+            1.0,
+            float(getattr(self.config, "local_step_candidate_clip_scale", 1.0)),
+        )
+        for raw_factor in tuple(raw_radius_factors or ()):
+            try:
+                factor = float(raw_factor)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(factor) or factor <= 0.0:
+                continue
+            factor = min(max_radius, factor)
+            if not any(abs(factor - existing) <= 1e-9 for existing in radius_factors):
+                radius_factors.append(factor)
+        if not radius_factors:
+            radius_factors = [1.0]
+        radius_factors.sort()
+        # Build one outward direction per active singular coordinate.  In the
+        # opt-in policy we never emit both signs for the same axis in one
+        # frame.  This is the key difference from the previous implementation:
+        # selection noise cannot turn into an alternating physical command.
+        axis_by_side: dict[str, list[tuple[int, int, int, float, str]]] = {
+            "left": [],
+            "right": [],
+        }
+        active_axis_plan_by_side = {
+            side: tuple(
+                int(index)
+                for index in self._singularity_escape_axis_latch.get(side, ())
+                if int(index) in (2, 4)
+            )
+            for side in ("left", "right")
+        }
+        directional_enabled = bool(
+            getattr(
+                safety_profile,
+                "local_step_singularity_escape_directional_enabled",
+                False,
+            )
+        )
         for side, local_index, full_index in self._arm_joint_entries(seed):
-            # J3/J5 are the local singularity coordinates.  The remaining
-            # joints can only be searched by the vendor analyzer and are not
-            # used for this intentionally cheap escape path.
             if local_index not in (2, 4):
                 continue
-            step = float(full_step[full_index])
-            if step <= 1e-12:
+            active_axis_plan = active_axis_plan_by_side.get(side, ())
+            side_reference_for_plan = dict(reference_local["sides"].get(side, {}) or {})
+            side_seed_for_plan = dict(seed_local["sides"].get(side, {}) or {})
+            planned_axis_still_active = bool(
+                active_axis_plan
+                and any(
+                    bool(
+                        side_reference_for_plan.get(
+                            "is_elbow_singular" if planned_index == 2 else "is_wrist_singular",
+                            False,
+                        )
+                    )
+                    or bool(
+                        side_seed_for_plan.get(
+                            "is_elbow_singular" if planned_index == 2 else "is_wrist_singular",
+                            False,
+                        )
+                    )
+                    or (
+                        (side, planned_index) in self._singularity_escape_direction_latch
+                        and float(
+                            side_reference_for_plan.get(
+                                "elbow_margin_deg" if planned_index == 2 else "wrist_margin_deg",
+                                -1.0,
+                            )
+                        )
+                        < release_band_deg
+                    )
+                    for planned_index in active_axis_plan
+                )
+            )
+            if planned_axis_still_active and int(local_index) not in active_axis_plan:
                 continue
-            for direction in (-1, 1):
-                candidate_q = seed.copy()
-                candidate_q[full_index] += float(direction) * step
-                if candidate_q[full_index] < q_min[full_index] - 1e-9 or candidate_q[full_index] > q_max[full_index] + 1e-9:
-                    continue
-                candidate_local = self._local_proxy_singularity_metadata(candidate_q)
-                candidate_side = dict(candidate_local["sides"][side])
-                before_side = dict(reference_local["sides"][side])
-                count_progress = int(reference_local["singular_side_count"]) - int(
-                    candidate_local["singular_side_count"]
+            side_reference = dict(reference_local["sides"][side])
+            side_seed = dict(seed_local["sides"].get(side, {}) or {})
+            singular_key = "is_elbow_singular" if local_index == 2 else "is_wrist_singular"
+            margin_key = "elbow_margin_deg" if local_index == 2 else "wrist_margin_deg"
+            latched = (side, local_index) in self._singularity_escape_direction_latch
+            reference_in_release_band = bool(
+                float(side_reference.get(margin_key, -1.0)) < release_band_deg
+            )
+            seed_singular = bool(side_seed.get(singular_key, False))
+            # Keep an already admitted outward plan alive through the small
+            # band between the local proxy and the SDK boundary.  Also create
+            # a pre-emptive candidate when the raw IK result is trying to
+            # cross into the pocket while the admitted qref is still just
+            # outside it.  Neither path can bypass the final step/collision
+            # admission or the certificate-bound RM65 gate.
+            if not bool(
+                side_reference.get(singular_key, False)
+                or (latched and reference_in_release_band)
+                or seed_singular
+            ):
+                continue
+            base_step = float(full_step[full_index])
+            if base_step <= 1e-12:
+                continue
+            if directional_enabled:
+                direction_probe = reference.copy()
+                # The direction must be tied to the admitted/reference qref,
+                # not to a raw IK branch that may cross zero between frames.
+                # Other joints are deliberately kept at the admitted qref as
+                # well: direction selection must not be changed by a branch
+                # flip in an unrelated joint.
+                direction_probe[full_index] = reference[full_index]
+                direction, direction_source = self._singularity_escape_direction_for_axis(
+                    side=side,
+                    local_index=local_index,
+                    full_index=full_index,
+                    seed=direction_probe,
+                    current_targets=current_targets,
+                    before_score=before_score,
+                    q_min=q_min,
+                    q_max=q_max,
+                    step=base_step,
                 )
-                depth_progress = float(reference_local["singularity_depth_score"]) - float(
-                    candidate_local["singularity_depth_score"]
-                )
-                after_metrics = self._dual_pose_metrics(candidate_q, current_targets)
-                pose_progress = before_score - self._dual_pose_score(after_metrics)
-                scored.append(
-                    (
-                        0 if int(candidate_local["singular_side_count"]) == 0 else 1,
-                        -count_progress,
-                        -depth_progress,
-                        -float(pose_progress),
-                        int(local_index),
-                        int(direction),
-                        side,
-                        candidate_q,
-                        {
-                            "local_step_singularity_escape_candidate": True,
-                            "local_step_singularity_escape_side": side,
-                            "local_step_singularity_escape_joint_index": int(local_index),
-                            "local_step_singularity_escape_full_joint_index": int(full_index),
-                            "local_step_singularity_escape_direction": int(direction),
-                            "local_step_singularity_escape_step_deg": float(np.rad2deg(step)),
-                            "local_step_singularity_escape_step_fraction": float(step_fraction),
-                            "local_step_singularity_escape_reference": reference_local,
-                            "local_step_singularity_escape_candidate_local": candidate_local,
-                            "local_step_singularity_escape_side_reference": before_side,
-                            "local_step_singularity_escape_side_candidate": candidate_side,
-                            "local_step_singularity_escape_singular_side_count_progress": int(count_progress),
-                            "local_step_singularity_escape_depth_progress": float(depth_progress),
-                            "local_step_singularity_escape_predicted_pose_progress": float(pose_progress),
-                        },
+            else:
+                # Exact rollback: retain the historical two-sided candidate
+                # generator when the profile does not opt into directionality.
+                direction, direction_source = 0, "legacy_two_sided"
+            axis_by_side[side].append(
+                (int(local_index), int(full_index), int(direction), base_step, direction_source)
+            )
+
+        metadata["active_axis_plan_by_side"] = {
+            side: list(indices)
+            for side, indices in active_axis_plan_by_side.items()
+            if indices
+        }
+
+        scored: list[
+            tuple[int, float, float, int, float, int, int, str, np.ndarray, dict[str, object]]
+        ] = []
+
+        def append_scored_candidate(
+            *,
+            side: str,
+            radius_factor: float,
+            axes: Sequence[tuple[int, int, int, float, str]],
+            direction_override: int | None = None,
+            directions_override: Mapping[int, int] | None = None,
+        ) -> None:
+            # Directional escape is a safety transition, not a second full
+            # IK branch.  Start from the admitted qref for *all* joints so a
+            # raw branch change on the inactive arm (especially in single-arm
+            # fix mode) cannot make the candidate fail the inactive-side hold
+            # or reintroduce a hidden multi-joint jump.
+            candidate_q = reference.copy() if directional_enabled else seed.copy()
+            # A wide search is a *direction probe*, not a permission to send
+            # a multi-step joint jump.  The previous implementation used the
+            # wide radius as the candidate itself; the normal local-step clip
+            # then either erased the probe (clip scale=1) or, when relaxed,
+            # let the escape path jump too far.  Keep the emitted candidate at
+            # one ordinary execution step and carry the farther probe's
+            # singularity progress as a bounded plan certificate.
+            wide_probe = bool(
+                directional_enabled
+                and wide_search_enabled
+                and wide_search_far_target_sides.get(side, False)
+                and float(radius_factor) > 1.0
+            )
+            command_radius_factor = 1.0 if wide_probe else float(radius_factor)
+            probe_q = reference.copy() if directional_enabled else seed.copy()
+            direction_map: dict[str, int] = {}
+            step_degrees: dict[str, float] = {}
+            probe_step_degrees: dict[str, float] = {}
+            for local_index, full_index, direction, base_step, _direction_source in axes:
+                effective_direction = (
+                    int(directions_override.get(int(local_index), direction))
+                    if directions_override is not None
+                    else (
+                        int(direction_override)
+                        if direction_override in (-1, 1)
+                        else int(direction)
                     )
                 )
-        scored.sort(key=lambda item: item[:7])
+                if effective_direction not in (-1, 1):
+                    return
+                probe_step = float(base_step) * float(radius_factor)
+                command_step = float(base_step) * float(command_radius_factor)
+                if probe_step <= 1e-12 or command_step <= 1e-12:
+                    return
+                if directional_enabled:
+                    # Candidate motion is integrated from the last admitted
+                    # qref.  Starting from a raw branch that has crossed the
+                    # singular plane would otherwise make an outward sign
+                    # become an inward clipped command after
+                    # ``_limit_full_joint_step``.
+                    candidate_q[full_index] = reference[full_index]
+                    probe_q[full_index] = reference[full_index]
+                candidate_q[full_index] += float(effective_direction) * command_step
+                probe_q[full_index] += float(effective_direction) * probe_step
+                label = f"{side}:j{int(local_index) + 1}"
+                direction_map[label] = effective_direction
+                step_degrees[label] = float(np.rad2deg(command_step))
+                probe_step_degrees[label] = float(np.rad2deg(probe_step))
+            if any(
+                candidate_q[full_index] < q_min[full_index] - 1e-9
+                or candidate_q[full_index] > q_max[full_index] + 1e-9
+                for _local_index, full_index, _direction, _base_step, _source in axes
+            ):
+                return
+            candidate_local = self._local_proxy_singularity_metadata(candidate_q)
+            candidate_side = dict(candidate_local["sides"][side])
+            before_side = dict(reference_local["sides"][side])
+            # Only the side/joints this candidate is escaping may certify
+            # singularity progress.  A raw branch flip on the other arm must
+            # not make a left-arm escape look better (or worse) and cause the
+            # selector to alternate sides.
+            count_progress = int(bool(before_side.get("is_singular", False))) - int(
+                bool(candidate_side.get("is_singular", False))
+            )
+            depth_progress = float(before_side.get("singularity_depth_score", 0.0)) - float(
+                candidate_side.get("singularity_depth_score", 0.0)
+            )
+            probe_valid = not any(
+                probe_q[full_index] < q_min[full_index] - 1e-9
+                or probe_q[full_index] > q_max[full_index] + 1e-9
+                for _local_index, full_index, _direction, _base_step, _source in axes
+            )
+            if probe_valid:
+                probe_local = self._local_proxy_singularity_metadata(probe_q)
+                probe_side = dict(probe_local["sides"].get(side, {}) or {})
+                probe_count_progress = int(bool(before_side.get("is_singular", False))) - int(
+                    bool(probe_side.get("is_singular", False))
+                )
+                probe_depth_progress = float(
+                    before_side.get("singularity_depth_score", 0.0)
+                ) - float(probe_side.get("singularity_depth_score", 0.0))
+                probe_metrics = self._dual_pose_metrics(probe_q, current_targets)
+                probe_pose_progress = before_score - self._dual_pose_score(probe_metrics)
+            else:
+                probe_local = {}
+                probe_side = {}
+                probe_count_progress = 0
+                probe_depth_progress = 0.0
+                probe_pose_progress = 0.0
+            wide_plan_active = bool(
+                wide_probe
+                and probe_valid
+                and (
+                    probe_count_progress > 0
+                    or probe_depth_progress > 0.0
+                )
+            )
+            after_metrics = self._dual_pose_metrics(candidate_q, current_targets)
+            pose_progress = before_score - self._dual_pose_score(after_metrics)
+            combined = len(axes) > 1
+            local_index = min(int(axis[0]) for axis in axes)
+            signed_direction = (
+                int(axes[0][2]) if len(axes) == 1 else 0
+            )
+            scored.append(
+                (
+                    0 if not bool(candidate_side.get("is_singular", False)) else 1,
+                    -float(pose_progress),
+                    -float(depth_progress),
+                    -int(count_progress),
+                    -float(radius_factor),
+                    -int(combined),
+                    int(local_index),
+                    side,
+                    candidate_q,
+                    {
+                        "local_step_singularity_escape_candidate": True,
+                        "local_step_singularity_escape_side": side,
+                        "local_step_singularity_escape_joint_index": (
+                            int(local_index) if not combined else None
+                        ),
+                        "local_step_singularity_escape_full_joint_index": (
+                            int(axes[0][1]) if not combined else None
+                        ),
+                        "local_step_singularity_escape_direction": (
+                            signed_direction if not combined else None
+                        ),
+                        "local_step_singularity_escape_direction_by_joint": direction_map,
+                        "local_step_singularity_escape_directional": bool(directional_enabled),
+                        "local_step_singularity_escape_combined": bool(combined),
+                        "local_step_singularity_escape_step_deg": (
+                            float(step_degrees[next(iter(step_degrees))])
+                            if not combined
+                            else None
+                        ),
+                        "local_step_singularity_escape_step_degrees_by_joint": step_degrees,
+                        "local_step_singularity_escape_probe_step_degrees_by_joint": (
+                            probe_step_degrees
+                        ),
+                        "local_step_singularity_escape_step_fraction": float(step_fraction),
+                        "local_step_singularity_escape_radius_factor": float(radius_factor),
+                        "local_step_singularity_escape_command_radius_factor": float(
+                            command_radius_factor
+                        ),
+                        "local_step_singularity_escape_wide_search": bool(
+                            wide_search_enabled
+                            and wide_search_far_target_sides.get(side, False)
+                        ),
+                        "local_step_singularity_escape_wide_probe": bool(wide_probe),
+                        "local_step_singularity_escape_wide_probe_valid": bool(
+                            probe_valid
+                        ),
+                        "local_step_singularity_escape_wide_probe_q": (
+                            probe_q.copy() if wide_probe and probe_valid else None
+                        ),
+                        "local_step_singularity_escape_wide_probe_local": (
+                            probe_local if wide_probe and probe_valid else {}
+                        ),
+                        "local_step_singularity_escape_wide_probe_count_progress": int(
+                            probe_count_progress
+                        ),
+                        "local_step_singularity_escape_wide_probe_depth_progress": float(
+                            probe_depth_progress
+                        ),
+                        "local_step_singularity_escape_wide_probe_pose_progress": float(
+                            probe_pose_progress
+                        ),
+                        "local_step_singularity_escape_wide_plan_active": bool(
+                            wide_plan_active
+                        ),
+                        "local_step_singularity_escape_target_error_m": float(
+                            before_metrics[side]["translation_m"]
+                        ),
+                        "local_step_singularity_escape_target_error_deg": float(
+                            before_metrics[side]["rotation_deg"]
+                        ),
+                        "local_step_singularity_escape_reference": reference_local,
+                        "local_step_singularity_escape_candidate_local": candidate_local,
+                        "local_step_singularity_escape_side_reference": before_side,
+                        "local_step_singularity_escape_side_candidate": candidate_side,
+                        "local_step_singularity_escape_singular_side_count_progress": int(count_progress),
+                        "local_step_singularity_escape_depth_progress": float(depth_progress),
+                        "local_step_singularity_escape_side_count_progress": int(
+                            count_progress
+                        ),
+                        "local_step_singularity_escape_side_depth_progress": float(
+                            depth_progress
+                        ),
+                        "local_step_singularity_escape_seed_active": bool(
+                            seed_local.get("sides", {})
+                            .get(side, {})
+                            .get("is_singular", False)
+                        ),
+                        "local_step_singularity_escape_predicted_pose_progress": float(pose_progress),
+                        "local_step_singularity_escape_direction_source": {
+                            f"{side}:j{int(axis[0]) + 1}": str(axis[4]) for axis in axes
+                        },
+                    },
+                )
+            )
+
+        def choose_combined_directions(
+            *,
+            side: str,
+            axes: Sequence[tuple[int, int, int, float, str]],
+            radius_factor: float,
+        ) -> dict[int, int] | None:
+            """Choose one coupled J3/J5 sign pair before scoring candidates.
+
+            A coupled wrist/elbow pocket can require the two coordinates to
+            move with opposite signs.  Emitting all four sign combinations
+            each frame, however, recreates the old oscillating selector.  We
+            therefore evaluate the four bounded FK probes once, rank them by
+            singularity-depth/count progress first and Cartesian progress
+            second, and emit exactly one pair for this radius.  The selected
+            pair is recorded in candidate metadata and latched only after a
+            candidate is admitted.
+            """
+
+            if len(axes) < 2:
+                return None
+            active_axis_plan = tuple(
+                int(index)
+                for index in self._singularity_escape_axis_latch.get(side, ())
+            )
+            if set(active_axis_plan) >= {int(axis[0]) for axis in axes}:
+                latched_directions: dict[int, int] = {}
+                for axis in axes:
+                    local_index = int(axis[0])
+                    latched = int(
+                        self._singularity_escape_direction_latch.get(
+                            (side, local_index),
+                            0,
+                        )
+                    )
+                    if latched not in (-1, 1):
+                        break
+                    latched_directions[local_index] = latched
+                else:
+                    # Once a coupled plan has been admitted, never recompute
+                    # its sign pair from a noisy raw target.
+                    return latched_directions
+            options: list[tuple[tuple[float, float, float, tuple[int, ...]], dict[int, int]]] = []
+            before_side = dict(reference_local.get("sides", {}).get(side, {}) or {})
+            before_depth = float(before_side.get("singularity_depth_score", 0.0) or 0.0)
+            before_count = int(bool(before_side.get("is_singular", False)))
+            for signs in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+                probe_q = reference.copy()
+                direction_map: dict[int, int] = {}
+                valid = True
+                for axis, sign in zip(axes, signs, strict=True):
+                    local_index, full_index, _direction, base_step, _source = axis
+                    value = float(reference[full_index]) + float(sign) * float(base_step) * float(radius_factor)
+                    if value < q_min[full_index] - 1e-9 or value > q_max[full_index] + 1e-9:
+                        valid = False
+                        break
+                    probe_q[full_index] = value
+                    direction_map[int(local_index)] = int(sign)
+                if not valid:
+                    continue
+                probe_local = self._local_proxy_singularity_metadata(probe_q)
+                probe_side = dict(probe_local.get("sides", {}).get(side, {}) or {})
+                depth_progress = before_depth - float(
+                    probe_side.get("singularity_depth_score", 0.0)
+                )
+                count_progress = before_count - int(bool(probe_side.get("is_singular", False)))
+                pose_progress = before_score - self._dual_pose_score(
+                    self._dual_pose_metrics(probe_q, current_targets)
+                )
+                # Prefer actually leaving the local pocket, then choose the
+                # direction that follows the operator target.  The final
+                # candidate evaluator remains authoritative for bounded pose
+                # worsening and collision safety.
+                key = (
+                    0.0 if count_progress > 0 else 1.0,
+                    -float(depth_progress),
+                    -float(pose_progress),
+                    tuple(-int(sign) for sign in signs),
+                )
+                options.append((key, direction_map))
+            if not options:
+                return None
+            options.sort(key=lambda item: item[0])
+            return dict(options[0][1])
+
+        for side in ("left", "right"):
+            axes = axis_by_side[side]
+            if not axes:
+                continue
+            side_radius_factors = (
+                radius_factors
+                if wide_search_enabled and wide_search_far_target_sides.get(side, False)
+                else [1.0]
+            )
+            for radius_factor in side_radius_factors:
+                # A wrist+elbow pocket often cannot be escaped by changing
+                # either coordinate alone.  Search the coupled outward move
+                # as an additional candidate, still under the same final
+                # execution step/collision/admission limits.
+                if bool(
+                    getattr(
+                        safety_profile,
+                        "local_step_singularity_escape_combined_enabled",
+                        False,
+                    )
+                ) and len(axes) > 1:
+                    combined_directions = (
+                        choose_combined_directions(
+                            side=side,
+                            axes=axes,
+                            radius_factor=radius_factor,
+                        )
+                        if directional_enabled
+                        else None
+                    )
+                    append_scored_candidate(
+                        side=side,
+                        radius_factor=radius_factor,
+                        axes=axes,
+                        directions_override=combined_directions,
+                    )
+                for axis in axes:
+                    if directional_enabled:
+                        append_scored_candidate(
+                            side=side,
+                            radius_factor=radius_factor,
+                            axes=(axis,),
+                        )
+                    else:
+                        append_scored_candidate(
+                            side=side,
+                            radius_factor=radius_factor,
+                            axes=(axis,),
+                            direction_override=-1,
+                        )
+                        append_scored_candidate(
+                            side=side,
+                            radius_factor=radius_factor,
+                            axes=(axis,),
+                            direction_override=1,
+                        )
+        scored.sort(key=lambda item: item[:8])
         candidates: list[_DualArmCandidate] = []
         seen: list[np.ndarray] = []
-        for _rank, _count, _depth, _pose, local_index, direction, side, candidate_q, candidate_metadata in scored:
+        for (
+            _rank,
+            _pose,
+            _depth,
+            _count,
+            _radius,
+            _combined,
+            local_index,
+            side,
+            candidate_q,
+            candidate_metadata,
+        ) in scored:
             if len(candidates) >= max_candidates:
                 break
             if any(np.allclose(candidate_q, existing, atol=1e-9) for existing in seen):
                 continue
             seen.append(candidate_q.copy())
+            combined = bool(candidate_metadata.get("local_step_singularity_escape_combined", False))
+            direction = candidate_metadata.get("local_step_singularity_escape_direction")
+            direction_label = (
+                "combined"
+                if combined
+                else "pos"
+                if int(direction or 0) > 0
+                else "neg"
+            )
+            joint_label = (
+                "j3_j5"
+                if combined
+                else f"j{int(local_index) + 1}"
+            )
             candidates.append(
                 _DualArmCandidate(
-                    name=f"singularity_escape_{side}_j{local_index + 1}_{'pos' if direction > 0 else 'neg'}",
+                    name=f"singularity_escape_{side}_{joint_label}_{direction_label}",
                     qpos=candidate_q.copy(),
                     source="singularity_escape",
-                    method=f"singularity_escape_{side}_j{local_index + 1}_{'pos' if direction > 0 else 'neg'}",
+                    method=f"singularity_escape_{side}_{joint_label}_{direction_label}",
                     metadata=candidate_metadata,
                 )
             )
@@ -4672,6 +7539,39 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "candidate_count": len(candidates),
                 "max_candidates": int(max_candidates),
                 "step_fraction": float(step_fraction),
+                "wide_search_enabled": bool(wide_search_enabled),
+                "wide_search_target_error_m": float(max_position_error_m),
+                "wide_search_target_error_deg": float(max_orientation_error_deg),
+                "wide_search_far_target_sides": [
+                    side for side, enabled in wide_search_far_target_sides.items() if enabled
+                ],
+                "wide_search_position_threshold_m": float(
+                    getattr(
+                        safety_profile,
+                        "local_step_singularity_escape_wide_search_position_m",
+                        0.10,
+                    )
+                ),
+                "wide_search_orientation_threshold_deg": float(
+                    getattr(
+                        safety_profile,
+                        "local_step_singularity_escape_wide_search_orientation_deg",
+                        20.0,
+                    )
+                ),
+                "wide_search_radius_factors": [float(value) for value in radius_factors],
+                "directional_enabled": bool(directional_enabled),
+                "combined_enabled": bool(
+                    getattr(
+                        safety_profile,
+                        "local_step_singularity_escape_combined_enabled",
+                        False,
+                    )
+                ),
+                "direction_latches": {
+                    f"{side}:j{int(local_index) + 1}": int(direction)
+                    for (side, local_index), direction in self._singularity_escape_direction_latch.items()
+                },
                 "emitted_methods": [candidate.method for candidate in candidates],
             }
         )
@@ -5041,6 +7941,26 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             **limit_metadata,
         }
 
+        guarded_crossing_sides = self._wrist_branch_guard_output_crossing_sides(
+            reference_full_q=reference_full,
+            output_full_q=output_q,
+        )
+        metadata["wrist_branch_guard_output_crossing_sides"] = list(
+            guarded_crossing_sides
+        )
+        # Keep the locally integrated/original Pink result available so an
+        # operator can deliberately leave the old q5 side.  The guard is for
+        # alternate branches and auxiliary posture candidates, which are the
+        # paths that fabricate the +/-pi jump; a raw crossing is handled by
+        # the existing q5 escape and final SDK admission.
+        if guarded_crossing_sides and candidate.name != "original":
+            metadata["reject_reason"] = (
+                "wrist_branch_guard_output_crossing:"
+                + ",".join(guarded_crossing_sides)
+            )
+            metadata["score"] = 1e18
+            return False, output_q, metadata
+
         raw_left, raw_right = self._split_solution(raw_full)
         ref_left, ref_right = self._split_solution(reference_full)
         for side, ref_q, raw_q in (
@@ -5314,53 +8234,185 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             if singularity_escape_candidate
             else {}
         )
+        singularity_escape_side = str(
+            candidate.metadata.get("local_step_singularity_escape_side", "") or ""
+        )
+        if not singularity_escape_side and singularity_escape_local_before:
+            singular_before_sides = [
+                str(side)
+                for side, side_metadata in dict(
+                    singularity_escape_local_before.get("sides", {}) or {}
+                ).items()
+                if bool(dict(side_metadata or {}).get("is_singular", False))
+            ]
+            if len(singular_before_sides) == 1:
+                # Compatibility for recorded/hand-built candidates created
+                # before the side-specific escape metadata was introduced.
+                singularity_escape_side = singular_before_sides[0]
+        singularity_escape_side_before = dict(
+            singularity_escape_local_before.get("sides", {})
+            .get(singularity_escape_side, {})
+            or {}
+        )
+        singularity_escape_side_after = dict(
+            singularity_escape_local_after.get("sides", {})
+            .get(singularity_escape_side, {})
+            or {}
+        )
+        singularity_escape_wide_search = bool(
+            singularity_escape_candidate
+            and candidate.metadata.get(
+                "local_step_singularity_escape_wide_search", False
+            )
+        )
         singularity_escape_count_progress = (
-            int(singularity_escape_local_before.get("singular_side_count", 0) or 0)
-            - int(singularity_escape_local_after.get("singular_side_count", 0) or 0)
+            int(bool(singularity_escape_side_before.get("is_singular", False)))
+            - int(bool(singularity_escape_side_after.get("is_singular", False)))
             if singularity_escape_candidate
             else 0
         )
         singularity_escape_depth_progress = (
-            float(singularity_escape_local_before.get("singularity_depth_score", 0.0) or 0.0)
-            - float(singularity_escape_local_after.get("singularity_depth_score", 0.0) or 0.0)
+            float(singularity_escape_side_before.get("singularity_depth_score", 0.0) or 0.0)
+            - float(singularity_escape_side_after.get("singularity_depth_score", 0.0) or 0.0)
             if singularity_escape_candidate
             else 0.0
         )
+        if singularity_escape_candidate and not singularity_escape_side:
+            # Legacy/hand-built candidate payloads may not identify a side.
+            # Fall back to the aggregate proxy only for that compatibility
+            # shape; all new directional candidates carry a side and are
+            # evaluated side-locally above.
+            singularity_escape_count_progress = (
+                int(singularity_escape_local_before.get("singular_side_count", 0) or 0)
+                - int(singularity_escape_local_after.get("singular_side_count", 0) or 0)
+            )
+            singularity_escape_depth_progress = (
+                float(singularity_escape_local_before.get("singularity_depth_score", 0.0) or 0.0)
+                - float(singularity_escape_local_after.get("singularity_depth_score", 0.0) or 0.0)
+            )
+        direction_map = dict(
+            candidate.metadata.get(
+                "local_step_singularity_escape_direction_by_joint", {}
+            )
+            or {}
+        )
+        directional_outward = False
+        if singularity_escape_candidate and direction_map:
+            reference_by_side = dict(
+                zip(("left", "right"), self._split_solution(reference_full))
+            )
+            output_by_side = dict(
+                zip(("left", "right"), self._split_solution(output_q))
+            )
+            for label, direction in direction_map.items():
+                try:
+                    side_text, joint_text = str(label).split(":j", 1)
+                    local_index = int(joint_text) - 1
+                    direction_int = int(direction)
+                except (TypeError, ValueError):
+                    continue
+                if side_text not in reference_by_side or direction_int not in (-1, 1):
+                    continue
+                delta = float(
+                    output_by_side[side_text][local_index]
+                    - reference_by_side[side_text][local_index]
+                )
+                if direction_int * delta > 1e-7:
+                    directional_outward = True
+                    break
+        candidate_escape_metadata = dict(candidate.metadata)
+        singularity_escape_wide_probe_count_progress = int(
+            candidate_escape_metadata.get(
+                "local_step_singularity_escape_wide_probe_count_progress",
+                0,
+            )
+            or 0
+        )
+        singularity_escape_wide_probe_depth_progress = float(
+            candidate_escape_metadata.get(
+                "local_step_singularity_escape_wide_probe_depth_progress",
+                0.0,
+            )
+            or 0.0
+        )
+        singularity_escape_wide_plan_active = bool(
+            singularity_escape_candidate
+            and singularity_escape_wide_search
+            and candidate_escape_metadata.get(
+                "local_step_singularity_escape_wide_plan_active",
+                False,
+            )
+            and (
+                singularity_escape_wide_probe_count_progress > 0
+                or singularity_escape_wide_probe_depth_progress > 0.0
+            )
+        )
+        singularity_escape_max_position_worsen_m = max(
+            float(worsen_limits["position_m"]),
+            max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_singularity_escape_max_position_worsen_m",
+                        0.02,
+                    )
+                ),
+            ),
+        )
+        singularity_escape_max_orientation_worsen_deg = max(
+            float(worsen_limits["orientation_deg"]),
+            max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_singularity_escape_max_orientation_worsen_deg",
+                        8.0,
+                    )
+                ),
+            ),
+        )
+        if singularity_escape_wide_search:
+            singularity_escape_max_position_worsen_m = max(
+                singularity_escape_max_position_worsen_m,
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            safety_profile,
+                            "local_step_singularity_escape_wide_search_max_position_worsen_m",
+                            0.05,
+                        )
+                    ),
+                ),
+            )
+            singularity_escape_max_orientation_worsen_deg = max(
+                singularity_escape_max_orientation_worsen_deg,
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            safety_profile,
+                            "local_step_singularity_escape_wide_search_max_orientation_worsen_deg",
+                            18.0,
+                        )
+                    ),
+                ),
+            )
         singularity_escape_bounded = self._dual_bounded_worsening(
             before_metrics=before_metrics,
             after_metrics=after_metrics,
-            max_position_worsen_m=max(
-                float(worsen_limits["position_m"]),
-                max(
-                    0.0,
-                    float(
-                        getattr(
-                            safety_profile,
-                            "local_step_singularity_escape_max_position_worsen_m",
-                            0.02,
-                        )
-                    ),
-                ),
-            ),
-            max_orientation_worsen_deg=max(
-                float(worsen_limits["orientation_deg"]),
-                max(
-                    0.0,
-                    float(
-                        getattr(
-                            safety_profile,
-                            "local_step_singularity_escape_max_orientation_worsen_deg",
-                            8.0,
-                        )
-                    ),
-                ),
-            ),
+            max_position_worsen_m=singularity_escape_max_position_worsen_m,
+            max_orientation_worsen_deg=singularity_escape_max_orientation_worsen_deg,
         )
         singularity_escape_active = bool(
             singularity_escape_candidate
             and (
                 singularity_escape_count_progress > 0
                 or singularity_escape_depth_progress > 0.0
+                or singularity_escape_wide_plan_active
+                or directional_outward
             )
         )
         posture_escape_bounded = False
@@ -5437,7 +8489,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         ):
             progress_accept_reason = "joint_limit_escape_bounded_worsening"
         elif singularity_escape_active and singularity_escape_bounded:
-            progress_accept_reason = "singularity_escape_bounded_worsening"
+            progress_accept_reason = (
+                "singularity_escape_wide_search_bounded_worsening"
+                if singularity_escape_wide_plan_active
+                and singularity_escape_count_progress <= 0
+                and singularity_escape_depth_progress <= 0.0
+                else "singularity_escape_bounded_worsening"
+            )
+            if (
+                directional_outward
+                and singularity_escape_count_progress <= 0
+                and singularity_escape_depth_progress <= 0.0
+                and not singularity_escape_wide_plan_active
+            ):
+                progress_accept_reason = "singularity_escape_outward_traversal"
         elif posture_escape_active and posture_escape_bounded:
             progress_accept_reason = "posture_escape_bounded_worsening"
         elif wrist_unload_active and wrist_unload_bounded:
@@ -5464,6 +8529,15 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                     "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
                     "dual_singularity_escape_active": bool(singularity_escape_active),
+                    "dual_singularity_escape_wide_search": bool(
+                        singularity_escape_wide_search
+                    ),
+                    "dual_singularity_escape_max_position_worsen_m": float(
+                        singularity_escape_max_position_worsen_m
+                    ),
+                    "dual_singularity_escape_max_orientation_worsen_deg": float(
+                        singularity_escape_max_orientation_worsen_deg
+                    ),
                     "dual_singularity_escape_bounded_worsening": bool(
                         singularity_escape_bounded
                     ),
@@ -5472,6 +8546,21 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     ),
                     "dual_singularity_escape_depth_progress": float(
                         singularity_escape_depth_progress
+                    ),
+                    "dual_singularity_escape_wide_probe_count_progress": int(
+                        singularity_escape_wide_probe_count_progress
+                    ),
+                    "dual_singularity_escape_wide_probe_depth_progress": float(
+                        singularity_escape_wide_probe_depth_progress
+                    ),
+                    "dual_singularity_escape_wide_plan_active": bool(
+                        singularity_escape_wide_plan_active
+                    ),
+                    "dual_singularity_escape_directional_outward": bool(
+                        directional_outward
+                    ),
+                    "dual_singularity_escape_directional_pose_progress": float(
+                        progress
                     ),
                     "dual_posture_escape_active": bool(posture_escape_active),
                     "dual_posture_escape_bounded_worsening": bool(posture_escape_bounded),
@@ -5508,6 +8597,15 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                 "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
                 "dual_singularity_escape_active": bool(singularity_escape_active),
+                "dual_singularity_escape_wide_search": bool(
+                    singularity_escape_wide_search
+                ),
+                "dual_singularity_escape_max_position_worsen_m": float(
+                    singularity_escape_max_position_worsen_m
+                ),
+                "dual_singularity_escape_max_orientation_worsen_deg": float(
+                    singularity_escape_max_orientation_worsen_deg
+                ),
                 "dual_singularity_escape_bounded_worsening": bool(
                     singularity_escape_bounded
                 ),
@@ -5516,6 +8614,21 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 ),
                 "dual_singularity_escape_depth_progress": float(
                     singularity_escape_depth_progress
+                ),
+                "dual_singularity_escape_wide_probe_count_progress": int(
+                    singularity_escape_wide_probe_count_progress
+                ),
+                "dual_singularity_escape_wide_probe_depth_progress": float(
+                    singularity_escape_wide_probe_depth_progress
+                ),
+                "dual_singularity_escape_wide_plan_active": bool(
+                    singularity_escape_wide_plan_active
+                ),
+                "dual_singularity_escape_directional_outward": bool(
+                    directional_outward
+                ),
+                "dual_singularity_escape_directional_pose_progress": float(
+                    progress
                 ),
                 "dual_singularity_escape_local_before": singularity_escape_local_before,
                 "dual_singularity_escape_local_after": singularity_escape_local_after,
@@ -5567,10 +8680,17 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     )
                     + (
                         -min(
-                            4_000_000.0,
-                            150_000.0
-                            + max(0.0, singularity_escape_depth_progress) * 500_000.0
-                            + max(0, singularity_escape_count_progress) * 1_000_000.0,
+                            750_000.0,
+                            # Do not give every singularity candidate an
+                            # unconditional priority bonus.  The previous
+                            # 150k floor made an escape that worsened the
+                            # target outrank a smooth tracking candidate and
+                            # was a direct source of hesitation.  Depth/count
+                            # only break ties; actual admitted pose progress
+                            # is the dominant directional signal.
+                            max(0.0, progress) * 500_000.0
+                            + max(0.0, singularity_escape_depth_progress) * 100_000.0
+                            + max(0, singularity_escape_count_progress) * 250_000.0,
                         )
                         if progress_accept_reason.startswith("singularity_escape")
                         else 0.0
@@ -6234,21 +9354,45 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         hold_left, hold_right = self._split_solution(hold_q)
         left_min, left_max = self._left_arm_limits
         right_min, right_max = self._right_arm_limits
-        left_alt = preferred_wrist_flip_candidate(
+        left_alt_candidate = preferred_wrist_flip_candidate(
             hold_left,
             reference_q=hold_left,
             joint_distance_weights=self._arm_joint_weights,
             q_min=left_min,
             q_max=left_max,
-            limit_tolerance_rad=float(self.ik_tuning.branch_normalization.limit_tolerance_rad),
+            limit_tolerance_rad=float(
+                self.ik_tuning.branch_normalization.limit_tolerance_rad
+            ),
         )
-        right_alt = preferred_wrist_flip_candidate(
+        left_alt = (
+            None
+            if self._wrist_branch_switch_guard_active(
+                raw_q=hold_left,
+                reference_q=hold_left,
+                candidate_q=left_alt_candidate,
+                side="left",
+            )
+            else left_alt_candidate
+        )
+        right_alt_candidate = preferred_wrist_flip_candidate(
             hold_right,
             reference_q=hold_right,
             joint_distance_weights=self._arm_joint_weights,
             q_min=right_min,
             q_max=right_max,
-            limit_tolerance_rad=float(self.ik_tuning.branch_normalization.limit_tolerance_rad),
+            limit_tolerance_rad=float(
+                self.ik_tuning.branch_normalization.limit_tolerance_rad
+            ),
+        )
+        right_alt = (
+            None
+            if self._wrist_branch_switch_guard_active(
+                raw_q=hold_right,
+                reference_q=hold_right,
+                candidate_q=right_alt_candidate,
+                side="right",
+            )
+            else right_alt_candidate
         )
         seed_map = {"current": hold_q.copy()}
         if left_alt is not None:

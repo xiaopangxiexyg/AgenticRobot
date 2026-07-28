@@ -1,8 +1,15 @@
-"""Pure source-difference observations bound to one composition cut.
+"""Provisional difference observations bound to one composition cut.
 
 Differences are diagnostic facts, never motion authority.  Signed values use
 ``reference - compared`` semantics.  Pose orientation error is the rotation
 vector of ``R_compared^-1 * R_reference`` in xyzw quaternion convention.
+
+This transitional carrier currently contains two future module boundaries:
+``pairwise_differences`` is the same-cut source-to-source immediate view;
+``output_residuals`` is the post-composition view.  The fields are retained for
+local compatibility while the two observation modules are developed behind
+explicit capabilities.  They are not a promise that this combined shape is a
+long-term public schema.
 """
 
 from __future__ import annotations
@@ -19,10 +26,13 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from ..composition import (
     CompositionInputRecord,
     CompositionInputSnapshot,
-    CompositionResult,
+    CompositionEvaluation,
     CompositionSpec,
 )
-from robot_motion.action.schema import RobotAction, split_effector_name
+from robot_motion.action.component_action import (
+    ComponentAction,
+    ComponentActionValue,
+)
 
 
 SOURCE_DIFFERENCE_OBSERVATION_HASH_DOMAIN_V1 = (
@@ -152,8 +162,8 @@ class SourceDifferenceObservation:
     observation_id: str
     composition_input_snapshot_id: str
     composition_input_snapshot_hash: str
-    composition_result_id: str
-    composition_result_hash: str
+    composition_evaluation_id: str
+    composition_evaluation_hash: str
     composition_spec_hash: str
     source_difference_spec_hash: str
     target_effective_at: float
@@ -167,25 +177,24 @@ class SourceDifferenceObservation:
 
 def _pose_metric(
     component: str,
-    side: str,
-    compared: RobotAction,
-    reference: RobotAction,
+    compared: ComponentActionValue,
+    reference: ComponentActionValue,
 ) -> ComponentDifferenceMetric:
-    compared_frame = compared.arm_frame(side)
-    reference_frame = reference.arm_frame(side)
-    compared_controlled = compared.arm_controlled_frame(side)
-    reference_controlled = reference.arm_controlled_frame(side)
+    compared_frame = compared.payload_schema.reference_frame
+    reference_frame = reference.payload_schema.reference_frame
+    compared_controlled = compared.payload_schema.controlled_frame
+    reference_controlled = reference.payload_schema.controlled_frame
     if (
         compared_frame != reference_frame
         or compared_controlled != reference_controlled
     ):
         raise ValueError(f"source_difference_frame_mismatch:{component}")
     compared_pose = np.asarray(
-        compared.arm_pose_by_side[side],
+        compared.values,
         dtype=np.float64,
     )
     reference_pose = np.asarray(
-        reference.arm_pose_by_side[side],
+        reference.values,
         dtype=np.float64,
     )
     translation = reference_pose[:3] - compared_pose[:3]
@@ -213,6 +222,8 @@ def _qpos_metric(
     component: str,
     compared_values: np.ndarray,
     reference_values: np.ndarray,
+    *,
+    coordinate_indices: tuple[int, ...] | None = None,
 ) -> ComponentDifferenceMetric:
     compared_array = np.asarray(compared_values, dtype=np.float64).reshape(-1)
     reference_array = np.asarray(reference_values, dtype=np.float64).reshape(-1)
@@ -222,6 +233,15 @@ def _qpos_metric(
     indices = np.flatnonzero(active)
     if indices.size == 0:
         raise ValueError(f"source_difference_no_common_qpos_slots:{component}")
+    declared_indices = (
+        np.arange(compared_array.size, dtype=np.int64)
+        if coordinate_indices is None
+        else np.asarray(coordinate_indices, dtype=np.int64)
+    )
+    if declared_indices.shape != compared_array.shape:
+        raise ValueError(
+            f"source_difference_qpos_coordinate_mismatch:{component}"
+        )
     delta = reference_array[indices] - compared_array[indices]
     return ComponentDifferenceMetric(
         component_id=component,
@@ -232,7 +252,9 @@ def _qpos_metric(
         translation_norm_m=None,
         rotation_delta_rotvec_rad=(),
         rotation_angle_rad=None,
-        qpos_active_indices=tuple(int(value) for value in indices),
+        qpos_active_indices=tuple(
+            int(value) for value in declared_indices[indices]
+        ),
         qpos_delta=tuple(float(value) for value in delta),
         qpos_l2_norm=float(np.linalg.norm(delta)),
         qpos_max_abs=float(np.max(np.abs(delta))),
@@ -240,63 +262,64 @@ def _qpos_metric(
 
 
 def _component_metrics(
-    compared: RobotAction,
-    reference: RobotAction,
+    compared: ComponentAction,
+    reference: ComponentAction,
 ) -> tuple[ComponentDifferenceMetric, ...]:
-    if compared.action_space != reference.action_space:
-        raise ValueError("source_difference_action_space_mismatch")
+    if (
+        compared.action_schema.semantic_content_hash
+        != reference.action_schema.semantic_content_hash
+    ):
+        raise ValueError("source_difference_action_schema_mismatch")
     common = tuple(
         component
-        for component in compared.active_effectors
-        if component in set(reference.active_effectors)
+        for component in compared.component_coverage
+        if component in set(reference.component_coverage)
     )
     if not common:
         raise ValueError("source_difference_no_common_components")
     metrics: list[ComponentDifferenceMetric] = []
     for component in common:
-        side, kind = split_effector_name(component)
-        if kind == "arm":
-            compared_pose = side in compared.arm_pose_by_side
-            reference_pose = side in reference.arm_pose_by_side
-            compared_qpos = side in compared.arm_qpos_by_side
-            reference_qpos = side in reference.arm_qpos_by_side
-            if compared_pose and reference_pose:
-                metrics.append(
-                    _pose_metric(component, side, compared, reference)
-                )
-            elif compared_qpos and reference_qpos:
-                metrics.append(
-                    _qpos_metric(
-                        component,
-                        compared.arm_qpos_by_side[side],
-                        reference.arm_qpos_by_side[side],
-                    )
-                )
-            else:
-                raise ValueError(
-                    f"source_difference_representation_mismatch:{component}"
-                )
-        elif (
-            side in compared.hand_qpos_by_side
-            and side in reference.hand_qpos_by_side
+        compared_value = compared.value(component)
+        reference_value = reference.value(component)
+        compared_schema = compared_value.payload_schema
+        reference_schema = reference_value.payload_schema
+        if (
+            compared_schema.semantic_content_hash
+            != reference_schema.semantic_content_hash
         ):
+            raise ValueError(
+                f"source_difference_payload_schema_mismatch:{component}"
+            )
+        family = compared_schema.representation_family
+        if family == "cartesian_pose":
+            metrics.append(
+                _pose_metric(component, compared_value, reference_value)
+            )
+        elif family == "joint_position":
+            coordinate_indices = None
+            hand_spec = compared_schema.semantic_parameters.get(
+                "hand_action_spec"
+            )
+            if isinstance(hand_spec, Mapping):
+                active_mask = np.asarray(
+                    tuple(bool(value) for value in hand_spec["active_mask"]),
+                    dtype=bool,
+                )
+                coordinate_indices = tuple(
+                    int(value) for value in np.flatnonzero(active_mask)
+                )
             metrics.append(
                 _qpos_metric(
                     component,
-                    compared.hand_qpos_by_side[side],
-                    reference.hand_qpos_by_side[side],
+                    compared_value.values,
+                    reference_value.values,
+                    coordinate_indices=coordinate_indices,
                 )
-            )
-        elif (
-            side in compared.end_effector_targets_by_side
-            or side in reference.end_effector_targets_by_side
-        ):
-            raise ValueError(
-                f"source_difference_native_target_unsupported_v1:{component}"
             )
         else:
             raise ValueError(
-                f"source_difference_representation_mismatch:{component}"
+                "source_difference_representation_unsupported:"
+                f"{component}:{family}"
             )
     return tuple(metrics)
 
@@ -305,7 +328,7 @@ def _record_difference(
     compared_role: str,
     compared: CompositionInputRecord,
     reference_role: str,
-    reference_action: RobotAction,
+    reference_action: ComponentAction,
     *,
     reference_record: CompositionInputRecord | None,
     evaluated_at: float,
@@ -372,28 +395,23 @@ def action_difference_semantic_payload(
     }
 
 
-def evaluate_composition_source_differences(
+def evaluate_composition_input_differences(
     snapshot: CompositionInputSnapshot,
-    result: CompositionResult,
     *,
     spec: CompositionSpec,
     difference_spec: SourceDifferenceSpec,
     evaluated_at: float,
     clock_domain_id: str,
-) -> SourceDifferenceObservation:
-    """Evaluate pairwise and source-to-output differences on one exact cut."""
+) -> tuple[ActionDifference, ...]:
+    """Evaluate only same-cut source-to-source differences.
 
-    if (
-        snapshot.composition_spec_hash != spec.semantic_content_hash
-        or result.composition_spec_hash != spec.semantic_content_hash
-        or result.composition_input_snapshot_id
-        != snapshot.composition_input_snapshot_id
-        or result.composition_input_snapshot_hash
-        != snapshot.semantic_content_hash
-    ):
-        raise ValueError(
-            "Source difference inputs must share one composition snapshot."
-        )
+    This is the computation seam for ``CompositionImmediateDifference``.  It
+    deliberately has no composition evaluation argument and therefore cannot
+    accidentally report a post-mix or execution fact.
+    """
+
+    if snapshot.composition_spec_hash != spec.semantic_content_hash:
+        raise ValueError("Source difference snapshot/spec mismatch.")
     if not isinstance(difference_spec, SourceDifferenceSpec):
         raise TypeError("difference_spec must be a SourceDifferenceSpec.")
     difference_spec.validate_composition_spec(spec)
@@ -405,7 +423,7 @@ def evaluate_composition_source_differences(
             raise ValueError(
                 "Source difference evaluation uses another effective clock."
             )
-    pairwise = tuple(
+    return tuple(
         _record_difference(
             compared_role,
             selected[compared_role],
@@ -418,14 +436,47 @@ def evaluate_composition_source_differences(
         in difference_spec.compared_reference_role_pairs
         if compared_role in selected and reference_role in selected
     )
+
+
+def evaluate_composition_source_differences(
+    snapshot: CompositionInputSnapshot,
+    result: CompositionEvaluation,
+    *,
+    spec: CompositionSpec,
+    difference_spec: SourceDifferenceSpec,
+    evaluated_at: float,
+    clock_domain_id: str,
+) -> SourceDifferenceObservation:
+    """Evaluate pairwise and source-to-output differences on one exact cut."""
+
+    if (
+        result.composition_spec_hash != spec.semantic_content_hash
+        or result.composition_input_snapshot_id
+        != snapshot.composition_input_snapshot_id
+        or result.composition_input_snapshot_hash
+        != snapshot.semantic_content_hash
+    ):
+        raise ValueError(
+            "Source difference inputs must share one composition snapshot."
+        )
+    evaluated = _finite(evaluated_at, name="evaluated_at")
+    clock = _required(clock_domain_id, name="clock_domain_id")
+    selected = snapshot.selected_input_by_role
+    pairwise = evaluate_composition_input_differences(
+        snapshot,
+        spec=spec,
+        difference_spec=difference_spec,
+        evaluated_at=evaluated,
+        clock_domain_id=clock,
+    )
     residuals: tuple[ActionDifference, ...] = ()
-    if result.composed_action is not None:
+    if result.composed_candidate is not None:
         residuals = tuple(
             _record_difference(
                 role,
                 selected[role],
                 "composed_output",
-                result.composed_action,
+                result.composed_candidate,
                 reference_record=None,
                 evaluated_at=evaluated,
             )
@@ -449,8 +500,8 @@ def evaluate_composition_source_differences(
     payload = {
         "composition_input_snapshot_id": snapshot.composition_input_snapshot_id,
         "composition_input_snapshot_hash": snapshot.semantic_content_hash,
-        "composition_result_id": result.composition_result_id,
-        "composition_result_hash": result.semantic_content_hash,
+        "composition_evaluation_id": result.composition_evaluation_id,
+        "composition_evaluation_hash": result.semantic_content_hash,
         "composition_spec_hash": spec.semantic_content_hash,
         "source_difference_spec_hash": (
             difference_spec.semantic_content_hash
@@ -491,5 +542,6 @@ __all__ = [
     "SourceDifferenceObservation",
     "SourceDifferenceSpec",
     "action_difference_semantic_payload",
+    "evaluate_composition_input_differences",
     "evaluate_composition_source_differences",
 ]

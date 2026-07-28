@@ -20,12 +20,15 @@ from robot_motion.runtime.immutable import deep_freeze
 from robot_motion.runtime.producer_epoch import ProducerEpochError, ProducerEpochRegistry
 
 from .arm_spec import ArmActionSpec
+from .component_action import ComponentAction
 from .hand_spec import HandActionSpec
 from .schema import EndEffectorTarget, RobotAction
 
 
 ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V1 = "dexteleop.action_proposal.semantic.v1"
 ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V2 = "dexteleop.action_proposal.semantic.v2"
+ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V3 = "dexteleop.action_proposal.semantic.v3"
+ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V4 = "dexteleop.action_proposal.semantic.v4"
 ROBOT_ACTION_SEMANTIC_METADATA_KEYS_V1 = frozenset(
     {"arm_action_specs_by_side", "hand_action_specs_by_side"}
 )
@@ -48,16 +51,13 @@ class ActionProposalDraft:
     producer_id: str
     producer_epoch: int
     sequence: int
-    action: RobotAction
+    action: ComponentAction
     produced_at: float
     produced_clock_domain_id: str
     effective_from: float
     effective_until: float
     target_effective_at: float
     effective_clock_domain_id: str
-    component_schema_hash: str
-    component_coverage: tuple[str, ...] = ()
-    selection_groups: tuple[str, ...] = ()
     authority_priority: int = 0
     authority_request: str = "none"
     validity: str = "valid"
@@ -75,7 +75,29 @@ class ActionProposalDraft:
     composition_input_ids: tuple[str, ...] = ()
     composition_input_hashes: tuple[str, ...] = ()
     composition_spec_hash: str | None = None
+    composition_evaluation_id: str | None = None
+    composition_evaluation_hash: str | None = None
     audit_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def action_schema_hash(self) -> str:
+        return self.action.action_schema.semantic_content_hash
+
+    @property
+    def component_coverage(self) -> tuple[str, ...]:
+        return self.action.component_coverage
+
+    @property
+    def selection_groups(self) -> tuple[str, ...]:
+        catalog = self.action.action_schema.component_catalog
+        return tuple(
+            dict.fromkeys(
+                catalog.component_by_id[
+                    component_id
+                ].selection_group_id
+                for component_id in self.action.component_coverage
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -88,7 +110,7 @@ class ActionProposal:
     producer_id: str
     producer_epoch: int
     sequence: int
-    action: RobotAction
+    action: ComponentAction
     produced_at: float
     produced_clock_domain_id: str
     available_at: float
@@ -98,7 +120,7 @@ class ActionProposal:
     effective_until: float
     target_effective_at: float
     effective_clock_domain_id: str
-    component_schema_hash: str
+    action_schema_hash: str
     component_coverage: tuple[str, ...]
     selection_groups: tuple[str, ...]
     authority_priority: int
@@ -118,6 +140,8 @@ class ActionProposal:
     composition_input_ids: tuple[str, ...]
     composition_input_hashes: tuple[str, ...]
     composition_spec_hash: str | None
+    composition_evaluation_id: str | None
+    composition_evaluation_hash: str | None
     semantic_hash_domain: str
     semantic_content_hash: str
     audit_metadata: Mapping[str, Any]
@@ -309,7 +333,7 @@ def robot_action_semantic_payload(action: RobotAction) -> dict[str, Any]:
 class _PreparedProposal:
     identity: RuntimeFactIdentity
     draft: ActionProposalDraft
-    action: RobotAction
+    action: ComponentAction
     audit_metadata: Mapping[str, Any]
     component_coverage: tuple[str, ...]
     selection_groups: tuple[str, ...]
@@ -327,7 +351,6 @@ def _prepare(draft: ActionProposalDraft) -> _PreparedProposal:
     producer = _required_text(draft.producer_id, field_name="producer_id")
     _required_text(draft.embodiment_instance_id, field_name="embodiment_instance_id")
     _required_text(draft.producer_kind, field_name="producer_kind")
-    _required_text(draft.component_schema_hash, field_name="component_schema_hash")
     _required_text(draft.authority_request, field_name="authority_request")
     _required_text(draft.validity, field_name="validity")
     _required_text(draft.status, field_name="status")
@@ -367,6 +390,8 @@ def _prepare(draft: ActionProposalDraft) -> _PreparedProposal:
         "policy_output_id",
         "chunk_id",
         "representation_trace_id",
+        "composition_evaluation_id",
+        "composition_evaluation_hash",
     ):
         value = getattr(draft, field_name)
         if value is not None:
@@ -394,16 +419,36 @@ def _prepare(draft: ActionProposalDraft) -> _PreparedProposal:
         )
     if draft.composition_spec_hash is not None:
         _required_text(draft.composition_spec_hash, field_name="composition_spec_hash")
+    if (draft.composition_evaluation_id is None) != (
+        draft.composition_evaluation_hash is None
+    ):
+        raise ProposalAdmissionError(
+            "invalid_composition_lineage",
+            "Composition evaluation ID/hash must appear together.",
+        )
+    if draft.producer_kind == "composer" and (
+        draft.composition_evaluation_id is None
+        or not composition_input_ids
+    ):
+        raise ProposalAdmissionError(
+            "invalid_composition_lineage",
+            "Composer proposals require exact evaluation and input lineage.",
+        )
 
-    action = freeze_robot_action(draft.action)
-    coverage = tuple(str(value).strip() for value in (draft.component_coverage or action.active_effectors))
-    groups = tuple(str(value).strip() for value in (draft.selection_groups or coverage))
-    if not coverage or any(not value for value in coverage):
-        raise ProposalAdmissionError("invalid_components", "component_coverage must be non-empty.")
-    if not groups or any(not value for value in groups):
-        raise ProposalAdmissionError("invalid_components", "selection_groups must be non-empty.")
-    if len(coverage) != len(set(coverage)) or len(groups) != len(set(groups)):
-        raise ProposalAdmissionError("invalid_components", "components and selection groups must be unique.")
+    if not isinstance(draft.action, ComponentAction):
+        raise ProposalAdmissionError(
+            "invalid_action",
+            "ActionProposalDraft.action must be a ComponentAction.",
+        )
+    action = draft.action
+    coverage = action.component_coverage
+    catalog = action.action_schema.component_catalog
+    groups = tuple(
+        dict.fromkeys(
+            catalog.component_by_id[component_id].selection_group_id
+            for component_id in coverage
+        )
+    )
     identity = RuntimeFactIdentity(
         runtime_session_id=session,
         control_domain_id=domain,
@@ -444,7 +489,7 @@ def _proposal_semantic_payload(
         "producer_id": prepared.identity.producer_id,
         "producer_epoch": prepared.identity.producer_epoch,
         "sequence": prepared.identity.sequence,
-        "action": robot_action_semantic_payload(prepared.action),
+        "action": prepared.action.semantic_payload(),
         "produced_at": prepared.produced_at,
         "produced_clock_domain_id": prepared.produced_clock_domain_id,
         "available_at": available_at,
@@ -454,7 +499,9 @@ def _proposal_semantic_payload(
         "effective_until": prepared.effective_until,
         "target_effective_at": prepared.target_effective_at,
         "effective_clock_domain_id": prepared.effective_clock_domain_id,
-        "component_schema_hash": draft.component_schema_hash,
+        "action_schema_hash": (
+            prepared.action.action_schema.semantic_content_hash
+        ),
         "component_coverage": prepared.component_coverage,
         "selection_groups": prepared.selection_groups,
         "authority_priority": int(draft.authority_priority),
@@ -478,6 +525,8 @@ def _proposal_semantic_payload(
                 "composition_input_ids": tuple(draft.composition_input_ids),
                 "composition_input_hashes": tuple(draft.composition_input_hashes),
                 "composition_spec_hash": draft.composition_spec_hash,
+                "composition_evaluation_id": draft.composition_evaluation_id,
+                "composition_evaluation_hash": draft.composition_evaluation_hash,
             }
         )
     return payload
@@ -495,7 +544,7 @@ def action_proposal_semantic_payload(proposal: ActionProposal) -> dict[str, Any]
         "producer_id": proposal.producer_id,
         "producer_epoch": proposal.producer_epoch,
         "sequence": proposal.sequence,
-        "action": robot_action_semantic_payload(proposal.action),
+        "action": proposal.action.semantic_payload(),
         "produced_at": proposal.produced_at,
         "produced_clock_domain_id": proposal.produced_clock_domain_id,
         "available_at": proposal.available_at,
@@ -505,7 +554,7 @@ def action_proposal_semantic_payload(proposal: ActionProposal) -> dict[str, Any]
         "effective_until": proposal.effective_until,
         "target_effective_at": proposal.target_effective_at,
         "effective_clock_domain_id": proposal.effective_clock_domain_id,
-        "component_schema_hash": proposal.component_schema_hash,
+        "action_schema_hash": proposal.action_schema_hash,
         "component_coverage": proposal.component_coverage,
         "selection_groups": proposal.selection_groups,
         "authority_priority": proposal.authority_priority,
@@ -529,6 +578,8 @@ def action_proposal_semantic_payload(proposal: ActionProposal) -> dict[str, Any]
                 "composition_input_ids": proposal.composition_input_ids,
                 "composition_input_hashes": proposal.composition_input_hashes,
                 "composition_spec_hash": proposal.composition_spec_hash,
+                "composition_evaluation_id": proposal.composition_evaluation_id,
+                "composition_evaluation_hash": proposal.composition_evaluation_hash,
             }
         )
     return payload
@@ -578,9 +629,9 @@ class ProposalBuffer:
 
             def build(available_at: float, admission_sequence: int) -> ActionProposal:
                 semantic_hash_domain = (
-                    ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V2
-                    if prepared.draft.composition_input_ids
-                    else ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V1
+                    ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V4
+                    if prepared.draft.composition_evaluation_id is not None
+                    else ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V3
                 )
                 semantic_hash = canonical_content_hash(
                     _proposal_semantic_payload(
@@ -610,7 +661,9 @@ class ProposalBuffer:
                         effective_until=prepared.effective_until,
                         target_effective_at=prepared.target_effective_at,
                         effective_clock_domain_id=prepared.effective_clock_domain_id,
-                        component_schema_hash=str(source.component_schema_hash),
+                        action_schema_hash=(
+                            prepared.action.action_schema.semantic_content_hash
+                        ),
                         component_coverage=prepared.component_coverage,
                         selection_groups=prepared.selection_groups,
                         authority_priority=int(source.authority_priority),
@@ -649,6 +702,16 @@ class ProposalBuffer:
                             None
                             if source.composition_spec_hash is None
                             else str(source.composition_spec_hash)
+                        ),
+                        composition_evaluation_id=(
+                            None
+                            if source.composition_evaluation_id is None
+                            else str(source.composition_evaluation_id)
+                        ),
+                        composition_evaluation_hash=(
+                            None
+                            if source.composition_evaluation_hash is None
+                            else str(source.composition_evaluation_hash)
                         ),
                         semantic_hash_domain=semantic_hash_domain,
                         semantic_content_hash=semantic_hash,
@@ -756,6 +819,8 @@ class ProposalBuffer:
 __all__ = [
     "ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V1",
     "ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V2",
+    "ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V3",
+    "ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V4",
     "ROBOT_ACTION_SEMANTIC_METADATA_KEYS_V1",
     "ActionProposal",
     "ActionProposalDraft",

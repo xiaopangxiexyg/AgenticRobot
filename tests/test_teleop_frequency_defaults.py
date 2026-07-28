@@ -11,7 +11,10 @@ import pytest
 
 from dataset_contracts.pose_frames import PoseFrameContract
 from dataset_contracts.pose_training import PoseTrainingDataContract
-from robot_motion.rm65 import RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
+from robot_motion.rm65 import (
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+    RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
+)
 from teleop_runtime.collection import run_collect
 from teleop_runtime.collection.writer_v21 import LeRobotV21WriterConfig
 from teleop_runtime.backends.arms import (
@@ -694,6 +697,7 @@ def test_real_teleop_position_defaults_to_formal_120hz_profile() -> None:
     assert args.arm_control_hz == 120.0
     assert args.arm_canfd_follow is True
     assert args.position_control_profile_resolved == "rm65_bimanual_position_v1"
+    assert args.position_ik_step_mode == "legacy_iterative"
     assert args.position_control_profile_metadata["source_shaping_applied"] is True
     assert args.position_reference_max_age_sec == pytest.approx(0.2)
     assert args.arm_canfd_trajectory_mode == 0
@@ -731,6 +735,80 @@ def test_real_teleop_position_defaults_to_formal_120hz_profile() -> None:
         temp_safety["disabled_reason"]
         == "position_canfd_passthrough_interpolation_only"
     )
+
+
+def test_real_teleop_responsive_v2_enables_only_new_source_shaping_switches() -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_responsive",
+        ]
+    )
+
+    assert args.position_control_profile_resolved == (
+        "rm65_bimanual_position_v2_responsive"
+    )
+    assert args.position_post_ik_qpos_normal_fast_path is True
+    assert args.position_post_ik_qpos_normal_fast_path_alpha == pytest.approx(0.70)
+    assert args.position_post_ik_qpos_normal_fast_path_guard_deg == pytest.approx(4.0)
+    assert args.position_post_ik_qpos_normal_fast_path_quality_grace_sec == pytest.approx(
+        0.05
+    )
+    assert args.position_wrist_q5_hysteresis_requires_escape_latch is True
+    # V2 changes only live source shaping.  The hard 15/60/120 execution
+    # envelope and the existing singular candidate policy remain v1-identical.
+    assert args.position_post_ik_qpos_smoothing_alpha == pytest.approx(0.14)
+    assert args.position_post_ik_qpos_smoothing_fast_alpha == pytest.approx(0.45)
+    assert args.position_reference_hz == pytest.approx(60.0)
+    assert args.arm_control_hz == pytest.approx(120.0)
+
+
+def test_real_teleop_single_step_singularity_mode_has_explicit_rollback() -> None:
+    enabled = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-ik-step-mode",
+            "single_step_singularity_aware",
+        ]
+    )
+    rollback = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-ik-step-mode",
+            "legacy_iterative",
+        ]
+    )
+
+    assert enabled.position_ik_step_mode == "single_step_singularity_aware"
+    assert enabled.position_ik_admitted_motion_limit is False
+    assert rollback.position_ik_step_mode == "legacy_iterative"
+
+
+def test_real_teleop_admitted_motion_limit_is_opt_in_and_requires_single_step() -> None:
+    enabled = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-ik-step-mode",
+            "single_step_singularity_aware",
+            "--position-ik-admitted-motion-limit",
+        ]
+    )
+
+    assert enabled.position_ik_admitted_motion_limit is True
+
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--arm-control-mode",
+                "position",
+                "--position-ik-admitted-motion-limit",
+            ]
+        )
 
 
 def test_position_canfd_keeps_live_retargeter_stability_enabled() -> None:
@@ -1079,6 +1157,7 @@ def test_deploy_default_fallback_action_hz_is_15hz_for_bimanual() -> None:
     assert args.position_ik_damping == pytest.approx(0.03)
     assert args.position_ik_adaptive_iterations is True
     assert args.position_control_profile_resolved == "rm65_bimanual_position_v1"
+    assert args.pose_lift_profile == RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME
     assert args.position_control_profile_metadata["source_shaping_applied"] is False
     assert args.position_control_profile_metadata["source_shaping_reapplied"] is False
     assert args.position_ik_iteration_reserve_ms == pytest.approx(5.0)
@@ -1093,6 +1172,24 @@ def test_deploy_position_chunk_lookahead_has_explicit_rollback_switch() -> None:
     run_policy.validate_args(args)
 
     assert args.position_chunk_lookahead is False
+
+
+def test_deploy_qp_constrained_pose_lift_allows_hardware_and_v1_is_rollback() -> None:
+    hardware = _parse_deploy_args(
+        [
+            "--pose-lift-profile",
+            RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        ]
+    )
+    assert run_policy.validate_args(hardware) == ("left", "right")
+
+    rollback = _parse_deploy_args(
+        [
+            "--pose-lift-profile",
+            "rm65_pose_lift_v1_baseline",
+        ]
+    )
+    assert run_policy.validate_args(rollback) == ("left", "right")
 
 
 def test_deploy_position_ik_iteration_range_is_validated() -> None:

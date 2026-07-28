@@ -13,7 +13,12 @@ from robot_motion.rm65 import (
     BimanualPoseTarget,
     BimanualPoseTargetSource,
 )
-from robot_motion.rm65.dual_arm_ik import MultiTaskIKSolver
+from robot_motion.rm65.dual_arm_ik import (
+    MultiTaskIKSolver,
+    _AdmittedReferenceMotionLimit,
+    _ExplicitVelocityLimit,
+)
+import robot_motion.rm65.dual_arm_target_solver as target_solver_module
 from robot_motion.types import PoseTolerance
 import teleop_runtime.retargeters.dual_arm_collision_aware as dual_module
 from teleop_runtime.retargeters.dual_arm_collision_aware import (
@@ -44,6 +49,8 @@ class _FakeDualArmSolver:
         self.last_solve_profile = {}
         self.last_collision_distance_profile = {}
         self.min_collision_distance = 0.25
+        self.configured_motion_limits: list[tuple[np.ndarray, np.ndarray | None]] = []
+        self.admitted_motion_references: list[tuple[np.ndarray, np.ndarray, float]] = []
 
     @property
     def current_q(self) -> np.ndarray:
@@ -73,6 +80,34 @@ class _FakeDualArmSolver:
         del q
         return float(self.min_collision_distance)
 
+    def configure_admitted_reference_motion_limit(
+        self,
+        velocity: np.ndarray,
+        acceleration: np.ndarray | None,
+    ) -> None:
+        self.configured_motion_limits.append(
+            (
+                np.asarray(velocity, dtype=float).copy(),
+                None
+                if acceleration is None
+                else np.asarray(acceleration, dtype=float).copy(),
+            )
+        )
+
+    def set_admitted_reference_motion(
+        self,
+        anchor: np.ndarray,
+        velocity: np.ndarray,
+        dt_sec: float,
+    ) -> None:
+        self.admitted_motion_references.append(
+            (
+                np.asarray(anchor, dtype=float).copy(),
+                np.asarray(velocity, dtype=float).copy(),
+                float(dt_sec),
+            )
+        )
+
 
 def test_solver_generated_configuration_is_strictly_clamped_before_pink_update() -> None:
     solver = object.__new__(MultiTaskIKSolver)
@@ -86,6 +121,92 @@ def test_solver_generated_configuration_is_strictly_clamped_before_pink_update()
     )
 
     np.testing.assert_allclose(bounded, [2.355, 42.0, -1.0])
+
+
+def test_explicit_velocity_limit_builds_per_step_qp_bounds() -> None:
+    limit = _ExplicitVelocityLimit(np.array([1.0, np.inf, 2.0]))
+
+    inequalities = limit.compute_qp_inequalities(None, 0.02)
+
+    assert inequalities is not None
+    matrix, bound = inequalities
+    np.testing.assert_allclose(
+        matrix,
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ],
+    )
+    np.testing.assert_allclose(bound, [0.02, 0.04, 0.02, 0.04])
+
+
+def test_admitted_reference_limit_does_not_multiply_budget_per_ik_iteration() -> None:
+    model = SimpleNamespace(
+        nq=2,
+        nv=2,
+        lowerPositionLimit=np.array([-2.0, -2.0]),
+        upperPositionLimit=np.array([2.0, 2.0]),
+    )
+    pin = SimpleNamespace(
+        difference=lambda _model, start, end: np.asarray(end) - np.asarray(start)
+    )
+    limit = _AdmittedReferenceMotionLimit(
+        model,
+        pin,
+        np.array([1.0, 2.0]),
+        None,
+    )
+    limit.set_reference(
+        np.zeros(2),
+        np.zeros(2),
+        0.1,
+    )
+
+    first = limit.compute_qp_inequalities(
+        SimpleNamespace(q=np.array([0.01, -0.02])),
+        123.0,
+    )
+    second = limit.compute_qp_inequalities(
+        SimpleNamespace(q=np.array([0.09, -0.18])),
+        456.0,
+    )
+
+    assert first is not None and second is not None
+    np.testing.assert_allclose(first[1], [0.09, 0.22, 0.11, 0.18])
+    np.testing.assert_allclose(second[1], [0.01, 0.38, 0.19, 0.02])
+
+
+def test_admitted_reference_limit_anchors_acceleration_to_prior_admission() -> None:
+    model = SimpleNamespace(
+        nq=2,
+        nv=2,
+        lowerPositionLimit=np.array([-100.0, -100.0]),
+        upperPositionLimit=np.array([100.0, 100.0]),
+    )
+    pin = SimpleNamespace(
+        difference=lambda _model, start, end: np.asarray(end) - np.asarray(start)
+    )
+    limit = _AdmittedReferenceMotionLimit(
+        model,
+        pin,
+        np.array([1.0, 2.0]),
+        np.array([0.5, 1.0]),
+    )
+    limit.set_reference(
+        np.zeros(2),
+        np.array([0.2, -0.4]),
+        0.1,
+    )
+
+    inequalities = limit.compute_qp_inequalities(
+        SimpleNamespace(q=np.array([0.01, -0.02])),
+        999.0,
+    )
+
+    assert inequalities is not None
+    np.testing.assert_allclose(inequalities[1], [0.015, -0.01, -0.005, 0.03])
 
 
 def _rm65_posture_metadata(*, local_escape_enabled: bool = True) -> dict[str, object]:
@@ -271,6 +392,498 @@ def test_dual_arm_solve_min_iterations_precedes_tolerance_and_budget_exit() -> N
     assert solve_calls == 2
     assert iterations == 2
     assert retargeter._last_solve_iteration_stop_reason == "pose_tolerance"
+
+
+def test_single_step_singularity_mode_advances_solver_once_per_outer_tick() -> None:
+    solver = _FakeDualArmSolver()
+    solve_calls = 0
+
+    def solve(*, targets):
+        nonlocal solve_calls
+        del targets
+        solve_calls += 1
+        return solver.current_q
+
+    solver.solve = solve  # type: ignore[attr-defined]
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_max_iterations=4,
+            solve_min_iterations=2,
+            solve_adaptive_iterations_enabled=True,
+            solve_step_mode="single_step_singularity_aware",
+            solve_translation_tolerance_m=100.0,
+            solve_orientation_tolerance_deg=360.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+
+    _, iterations, _ = retargeter._solve_toward_targets(
+        left_target=np.eye(4, dtype=float),
+        right_target=np.eye(4, dtype=float),
+    )
+
+    assert solve_calls == 1
+    assert iterations == 1
+    assert retargeter._last_solve_iteration_stop_reason == "pose_tolerance"
+
+
+def test_single_step_admitted_motion_limit_uses_formal_velocity_and_admitted_anchor() -> None:
+    solver = _FakeDualArmSolver()
+    acceleration = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            joint_acceleration_limit_rad_s2=acceleration,
+            admitted_reference_motion_limit_enabled=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+
+    assert len(solver.configured_motion_limits) == 1
+    velocity_limit, acceleration_limit = solver.configured_motion_limits[-1]
+    np.testing.assert_allclose(velocity_limit, np.deg2rad([10.0] * 12))
+    np.testing.assert_allclose(acceleration_limit, np.tile(acceleration, 2))
+    anchor, previous_velocity, dt_sec = solver.admitted_motion_references[-1]
+    np.testing.assert_allclose(anchor, solver.current_q)
+    np.testing.assert_allclose(previous_velocity, np.zeros(12))
+    assert dt_sec == pytest.approx(1.0 / 60.0)
+
+    admitted = np.deg2rad(np.array([0.1] * 12))
+    retargeter._commit_admitted_velocity(
+        reference_full_q=np.zeros(12),
+        admitted_full_q=admitted,
+    )
+    anchor, previous_velocity, dt_sec = solver.admitted_motion_references[-1]
+    np.testing.assert_allclose(anchor, admitted)
+    np.testing.assert_allclose(previous_velocity, admitted * 60.0)
+    assert dt_sec == pytest.approx(1.0 / 60.0)
+
+
+def test_wrist_coaxial_projection_preserves_q4_plus_q6_and_removes_null_motion() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[3] = np.deg2rad(10.0)
+    candidate[5] = np.deg2rad(-8.0)
+    candidate[9] = np.deg2rad(-7.0)
+    candidate[11] = np.deg2rad(11.0)
+
+    canonical, metadata = retargeter._canonicalize_wrist_coaxial_solution(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+    )
+
+    assert metadata["applied"] is True
+    np.testing.assert_allclose(
+        canonical[[3, 5]],
+        np.deg2rad([1.0, 1.0]),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        canonical[[9, 11]],
+        np.deg2rad([2.0, 2.0]),
+        atol=1e-12,
+    )
+    assert canonical[3] + canonical[5] == pytest.approx(
+        candidate[3] + candidate[5]
+    )
+    assert canonical[9] + canonical[11] == pytest.approx(
+        candidate[9] + candidate[11]
+    )
+
+
+def test_wrist_coaxial_projection_is_noop_outside_soft_band() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[4, 10]] = np.deg2rad(12.0)
+    candidate = reference.copy()
+    candidate[3] = np.deg2rad(10.0)
+    candidate[5] = np.deg2rad(-8.0)
+
+    canonical, metadata = retargeter._canonicalize_wrist_coaxial_solution(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+    )
+
+    np.testing.assert_allclose(canonical, candidate)
+    assert metadata["applied"] is False
+
+
+def test_wrist_branch_guard_keeps_continuous_solver_branch_near_coaxial_band() -> None:
+    solver = _FakeDualArmSolver()
+    guarded = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_branch_switch_guard_deg=12.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    raw = reference.copy()
+    # The left raw/reference q5 pair is inside the explicit branch guard, while
+    # the right pair remains ordinary and may still expose its flip candidate.
+    reference[4] = np.deg2rad(13.0)
+    reference[10] = np.deg2rad(20.0)
+    raw[3] = np.deg2rad(10.0)
+    raw[4] = np.deg2rad(11.0)
+    raw[5] = np.deg2rad(-20.0)
+    raw[6 + 3] = np.deg2rad(10.0)
+    raw[6 + 4] = np.deg2rad(20.0)
+    raw[6 + 5] = np.deg2rad(-20.0)
+
+    names = [
+        name
+        for name, _candidate, _score in guarded._branch_candidates(
+            raw_full_q=raw,
+            reference_full_q=reference,
+        )
+    ]
+    assert "original" in names
+    assert "left_flip" not in names
+    assert "both_flip" not in names
+    assert "right_flip" in names
+
+    rollback = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_branch_switch_guard_deg=0.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    rollback_names = [
+        name
+        for name, _candidate, _score in rollback._branch_candidates(
+            raw_full_q=raw,
+            reference_full_q=reference,
+        )
+    ]
+    assert "left_flip" in rollback_names
+
+
+def test_wrist_branch_guard_blocks_flip_that_candidate_clip_would_pull_into_gate() -> None:
+    # This is the residual pattern from the 2026-07-26 remote trace: both the
+    # raw and reference q5 values are safely outside 12 deg, but the formal
+    # 8x candidate clip turns the +/-pi wrist alternative into roughly +4 deg.
+    # Offering that candidate makes canonical q4/q5/q6 jump, then the next
+    # frame returns to the continuous raw branch.
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_branch_switch_guard_deg=12.0,
+            local_step_candidate_clip_scale=8.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=JointVelocityLimitProfile(
+                name="trace",
+                max_velocity_deg_s=(240.0,) * 6,
+                max_dt_sec=1.0,
+            ),
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    raw = reference.copy()
+    reference[3:6] = np.deg2rad([121.52, -28.02, -120.0])
+    raw[3:6] = np.deg2rad([117.98, -24.35, -120.0])
+
+    names = [
+        name
+        for name, _candidate, _score in retargeter._branch_candidates(
+            raw_full_q=raw,
+            reference_full_q=reference,
+        )
+    ]
+    assert "original" in names
+    assert "left_flip" not in names
+
+
+def test_wrist_branch_guard_rejects_auxiliary_candidate_after_post_clip_crossing() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_branch_switch_guard_deg=12.0,
+            local_step_candidate_clip_scale=8.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=JointVelocityLimitProfile(
+                name="trace",
+                max_velocity_deg_s=(240.0,) * 6,
+                max_dt_sec=1.0,
+            ),
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[3:6] = np.deg2rad([121.52, -28.02, -120.0])
+    # The candidate itself is an equivalent wrist branch.  It is not the
+    # preferred-flip source, so this exercises the common post-clip admission
+    # guard used by posture/wrist-unload/other auxiliary candidates too.
+    candidate = reference.copy()
+    candidate[3:6] = np.deg2rad([-62.02, 24.35, 60.0])
+    accepted, output, metadata = retargeter._evaluate_dual_arm_step_candidate(
+        candidate=dual_module._DualArmCandidate(
+            name="auxiliary_flip",
+            qpos=candidate,
+            source="wrist_unload",
+            method="wrist_unload_left",
+        ),
+        reference_full_q=reference,
+        current_targets=retargeter.current_world_targets(),
+        step_scale=1.0,
+    )
+
+    assert accepted is False
+    assert metadata["reject_reason"] == "wrist_branch_guard_output_crossing:left"
+    assert metadata["wrist_branch_guard_output_crossing_sides"] == ["left"]
+    assert np.rad2deg(output[4]) == pytest.approx(3.98, abs=0.05)
+
+
+def test_wrist_branch_guard_blocks_same_side_large_wrist_flip_after_clip() -> None:
+    """A clipped +/-pi branch must not outrank a small continuous raw step."""
+
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_branch_switch_guard_deg=12.0,
+            local_step_candidate_clip_scale=8.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=JointVelocityLimitProfile(
+                name="trace",
+                max_velocity_deg_s=(240.0,) * 6,
+                max_dt_sec=1.0,
+            ),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(6, dtype=float)
+    raw = np.zeros(6, dtype=float)
+    reference[3:6] = np.deg2rad([-72.111, -46.072, 82.463])
+    raw[3:6] = np.deg2rad([-71.476, -45.455, 81.810])
+    # This is the same-side clipped equivalent branch observed in the latest
+    # remote trace: q5 stays negative, but the wrist step grows to roughly
+    # 50 degrees while the raw step is only a few degrees.
+    candidate = np.zeros(6, dtype=float)
+    candidate[3:6] = np.deg2rad([-46.946, -16.928, 53.558])
+
+    assert retargeter._wrist_branch_switch_guard_active(
+        raw_q=raw,
+        reference_q=reference,
+        candidate_q=candidate,
+        side="right",
+    ) is True
+
+
+def test_far_target_relaxes_q5_hysteresis_but_keeps_escape_boundary() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_q5_hysteresis_release_deg=6.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=JointVelocityLimitProfile(
+                name="trace",
+                max_velocity_deg_s=(240.0,) * 6,
+                max_dt_sec=1.0,
+            ),
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    reference[4] = np.deg2rad(5.0)
+    candidate[4] = np.deg2rad(2.0)
+    targets = {
+        "left": _target_pose(x_m=0.20),
+        "right": _target_pose(),
+    }
+
+    output, metadata = retargeter._stabilize_wrist_q5_candidate(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        current_targets=targets,
+    )
+
+    # The old fixed 6 deg release band would have held +5 deg.  Far-target
+    # relief instead moves to the protected 3.25 deg boundary, never through
+    # the SDK gate and never by more than one q5 execution step.
+    assert np.rad2deg(output[4]) == pytest.approx(3.25, abs=1e-9)
+    assert metadata["far_target_hysteresis_relaxation"]["sides"]["left"][
+        "far_target"
+    ] is True
+    assert metadata["sides"]["left"]["far_target_hysteresis_relaxed"] is True
+
+
+def test_singularity_escape_wide_search_activates_only_for_far_target() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.solve_step_mode = "single_step_singularity_aware"
+    # The fake solver does not infer the elbow preference from the step mode;
+    # enable the same local singularity analyzer flag that the position
+    # runtime supplies before asking for escape candidates.
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.local_step_candidate_clip_scale = 4.0
+    retargeter.ik_safety_profile = replace(
+        retargeter.ik_safety_profile,
+        local_step_singularity_escape_enabled=True,
+        local_step_singularity_escape_directional_enabled=True,
+        local_step_singularity_escape_wide_search_enabled=True,
+        local_step_singularity_escape_wide_search_position_m=0.10,
+        local_step_singularity_escape_wide_search_radius_factors=(1.0, 2.0, 4.0),
+        local_step_singularity_escape_wide_search_max_position_worsen_m=0.05,
+        local_step_singularity_escape_wide_search_max_orientation_worsen_deg=18.0,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(3.5)
+    near_targets = {"left": _target_pose(), "right": _target_pose()}
+    far_targets = {"left": _target_pose(x_m=0.20), "right": _target_pose()}
+
+    near_candidates, near_metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=reference,
+        current_targets=near_targets,
+    )
+    far_candidates, far_metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=reference,
+        current_targets=far_targets,
+    )
+
+    assert near_metadata["wide_search_enabled"] is False
+    assert {candidate.metadata["local_step_singularity_escape_radius_factor"] for candidate in near_candidates} == {1.0}
+    assert far_metadata["wide_search_enabled"] is True
+    assert max(
+        candidate.metadata["local_step_singularity_escape_radius_factor"]
+        for candidate in far_candidates
+    ) > 1.0
+    assert any(
+        candidate.metadata["local_step_singularity_escape_wide_search"] is True
+        for candidate in far_candidates
+    )
+    # Wide search only chooses a direction.  The emitted qref must remain one
+    # ordinary execution step; otherwise a formal clip scale >1 turns the
+    # probe itself into a visible jump.
+    wide_candidates = [
+        candidate
+        for candidate in far_candidates
+        if candidate.metadata["local_step_singularity_escape_radius_factor"] > 1.0
+    ]
+    assert wide_candidates
+    assert all(
+        candidate.metadata["local_step_singularity_escape_command_radius_factor"]
+        == pytest.approx(1.0)
+        for candidate in wide_candidates
+    )
+    assert all(
+        candidate.metadata["local_step_singularity_escape_wide_probe"] is True
+        for candidate in wide_candidates
+    )
+    assert all(
+        candidate.metadata["local_step_singularity_escape_wide_search"]
+        is (candidate.metadata["local_step_singularity_escape_side"] == "left")
+        for candidate in far_candidates
+    )
+
+
+def test_wide_singularity_escape_allows_only_bounded_far_target_regression() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.ik_safety_profile = replace(
+        retargeter.ik_safety_profile,
+        local_step_singularity_escape_enabled=True,
+        local_step_singularity_escape_wide_search_max_position_worsen_m=0.05,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(3.5)
+    candidate_q = reference.copy()
+    candidate_q[2] = np.deg2rad(4.5)
+    local_reference = retargeter._local_proxy_singularity_metadata(reference)
+
+    def pose_metrics(qpos: np.ndarray, _targets: dict[str, np.ndarray]) -> dict[str, dict[str, float]]:
+        worsening = 0.04 if abs(float(qpos[2] - reference[2])) > 1e-8 else 0.0
+        return {
+            "left": {"translation_m": 0.10 + worsening, "rotation_deg": 0.0},
+            "right": {"translation_m": 0.0, "rotation_deg": 0.0},
+        }
+
+    retargeter._dual_pose_metrics = pose_metrics  # type: ignore[method-assign]
+    targets = {"left": _target_pose(), "right": _target_pose()}
+    for wide_search, expected in ((False, False), (True, True)):
+        candidate = dual_module._DualArmCandidate(
+            name="singularity_escape_test",
+            qpos=candidate_q,
+            source="singularity_escape",
+            method="singularity_escape_test",
+            metadata={
+                "local_step_singularity_escape_candidate": True,
+                "local_step_singularity_escape_wide_search": wide_search,
+                "local_step_singularity_escape_reference": local_reference,
+            },
+        )
+        accepted, _output, metadata = retargeter._evaluate_dual_arm_step_candidate(
+            candidate=candidate,
+            reference_full_q=reference,
+            current_targets=targets,
+            step_scale=1.0,
+        )
+        assert accepted is expected
+        assert metadata["dual_singularity_escape_wide_search"] is wide_search
+
+
+def test_ik_shadow_sink_is_observational_and_receives_fixed_arm_pair_layout() -> None:
+    retargeter = _retargeter(_FakeDualArmSolver())
+    observed: list[tuple[object, ...]] = []
+    retargeter.set_ik_shadow_trace_sink(lambda *sample: observed.append(sample))
+    targets = retargeter.current_world_targets()
+    pre_q = np.arange(12, dtype=float) * 0.01
+
+    retargeter._record_ik_shadow_trace(
+        monotonic_time=1.25,
+        pre_solve_q=pre_q,
+        raw_solver_q=pre_q + 0.01,
+        canonical_solver_q=pre_q + 0.005,
+        admitted_q=pre_q + 0.002,
+        current_targets=targets,
+        status="tracking",
+    )
+
+    assert len(observed) == 1
+    assert observed[0][0] == pytest.approx(1.25)
+    np.testing.assert_allclose(observed[0][1], pre_q)
+    np.testing.assert_allclose(observed[0][2], pre_q + 0.01)
+    np.testing.assert_allclose(observed[0][3], pre_q + 0.005)
+    np.testing.assert_allclose(observed[0][4], pre_q + 0.002)
+    assert observed[0][-1] == "tracking"
 
 
 def test_dual_arm_target_activity_prefers_tracker_motion_state_machine() -> None:
@@ -874,6 +1487,201 @@ def test_local_singularity_escape_emits_one_step_j3_candidate() -> None:
         > 0
         for candidate in candidates
     )
+
+
+def test_directional_singularity_escape_latches_outward_sign() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    retargeter.ik_safety_profile = replace(
+        retargeter.ik_safety_profile,
+        local_step_singularity_escape_enabled=True,
+        local_step_singularity_escape_directional_enabled=True,
+    )
+    positive = np.zeros(12, dtype=float)
+    positive[2] = np.deg2rad(3.5)
+    targets = retargeter.current_world_targets()
+    first, first_metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=positive,
+        current_targets=targets,
+    )
+    assert first_metadata["directional_enabled"] is True
+    assert first
+    assert all(
+        candidate.metadata["local_step_singularity_escape_direction"] == 1
+        for candidate in first
+        if candidate.metadata["local_step_singularity_escape_joint_index"] == 2
+    )
+
+    # Simulate the raw IK crossing zero by a small amount.  The admitted
+    # escape direction must remain positive instead of emitting a negative
+    # candidate on the next frame.
+    crossed = positive.copy()
+    crossed[2] = np.deg2rad(-0.2)
+    second, _second_metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=crossed,
+        current_targets=targets,
+    )
+    assert second
+    assert all(
+        candidate.metadata["local_step_singularity_escape_direction"] == 1
+        for candidate in second
+        if candidate.metadata["local_step_singularity_escape_joint_index"] == 2
+    )
+
+
+def test_directional_singularity_escape_can_search_coupled_j3_j5_move() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.prefer_non_wrist_singular_branch = True
+    retargeter.ik_safety_profile = replace(
+        retargeter.ik_safety_profile,
+        local_step_singularity_escape_enabled=True,
+        local_step_singularity_escape_directional_enabled=True,
+        local_step_singularity_escape_combined_enabled=True,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(3.5)
+    reference[4] = np.deg2rad(2.5)
+    candidates, _metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=reference,
+        current_targets=retargeter.current_world_targets(),
+    )
+    combined = [
+        candidate
+        for candidate in candidates
+        if candidate.metadata.get("local_step_singularity_escape_combined") is True
+    ]
+    assert combined
+    directions = combined[0].metadata[
+        "local_step_singularity_escape_direction_by_joint"
+    ]
+    side = next(iter(directions)).split(":", 1)[0]
+    assert directions == {f"{side}:j3": 1, f"{side}:j5": 1}
+
+
+def test_singularity_escape_uses_raw_crossing_hint_without_rebasing_progress() -> None:
+    """A raw IK branch entering the pocket must not erase the admitted escape."""
+
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    retargeter.config.elbow_singularity_selection_margin_deg = 0.25
+    retargeter.ik_safety_profile = replace(
+        retargeter.ik_safety_profile,
+        local_step_singularity_escape_enabled=True,
+        local_step_singularity_escape_directional_enabled=True,
+    )
+    reference = np.zeros(12, dtype=float)
+    # Just outside the local 3.25-degree proxy; the raw solver branch crosses
+    # inward.  This is exactly the frame that previously dropped all escape
+    # candidates because it classified the raw seed instead of qref.
+    reference[2] = np.deg2rad(3.5)
+    raw = reference.copy()
+    raw[2] = np.deg2rad(3.0)
+    candidates, metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=reference,
+        seed_full_q=raw,
+        current_targets=retargeter.current_world_targets(),
+    )
+    assert metadata["status"] == "active"
+    left_j3 = [
+        candidate
+        for candidate in candidates
+        if candidate.metadata.get("local_step_singularity_escape_side") == "left"
+        and candidate.metadata.get("local_step_singularity_escape_joint_index") == 2
+    ]
+    assert left_j3
+    assert all(
+        candidate.metadata["local_step_singularity_escape_direction"] == 1
+        for candidate in left_j3
+    )
+
+
+def test_directional_escape_locks_selected_axis_until_release() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.prefer_non_wrist_singular_branch = True
+    retargeter.ik_safety_profile = replace(
+        retargeter.ik_safety_profile,
+        local_step_singularity_escape_enabled=True,
+        local_step_singularity_escape_directional_enabled=True,
+        local_step_singularity_escape_combined_enabled=True,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(1.0)
+    reference[4] = np.deg2rad(1.0)
+    targets = retargeter.current_world_targets()
+    first, _ = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=reference,
+        current_targets=targets,
+    )
+    j3 = next(
+        candidate
+        for candidate in first
+        if candidate.metadata.get("local_step_singularity_escape_side") == "left"
+        and candidate.metadata.get("local_step_singularity_escape_joint_index") == 2
+        and not candidate.metadata.get("local_step_singularity_escape_combined", False)
+    )
+    retargeter._update_singularity_escape_direction_state(
+        selected_q=j3.qpos,
+        selection_metadata={
+            "selected_source": "singularity_escape",
+            "selected_metadata": {"candidate_metadata": j3.metadata},
+        },
+    )
+    second, metadata = retargeter._dual_arm_singularity_escape_candidates(
+        reference_full_q=j3.qpos,
+        current_targets=targets,
+    )
+    assert metadata["active_axis_plan_by_side"] == {"left": [2]}
+    assert second
+    assert all(
+        set(candidate.metadata["local_step_singularity_escape_direction_by_joint"])
+        <= {"left:j3"}
+        for candidate in second
+        if candidate.metadata.get("local_step_singularity_escape_side") == "left"
+    )
+
+
+def test_directional_escape_certificate_requires_emitted_outward_q3() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.solve_step_mode = "single_step_singularity_aware"
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(2.0)
+    admitted = reference.copy()
+    admitted[2] = np.deg2rad(2.5)
+    selection = {
+        "selected_source": "singularity_escape",
+        "selected_metadata": {
+            "candidate_metadata": {
+                "local_step_singularity_escape_direction_by_joint": {
+                    "left:j3": 1,
+                }
+            }
+        },
+    }
+    metadata = retargeter._singularity_escape_traversal_metadata(
+        reference_full_q=reference,
+        admitted_full_q=admitted,
+        selection_metadata=selection,
+    )
+    assert metadata["by_side"]["left"] is True
+
+    inward = admitted.copy()
+    inward[2] = np.deg2rad(1.5)
+    inward_metadata = retargeter._singularity_escape_traversal_metadata(
+        reference_full_q=reference,
+        admitted_full_q=inward,
+        selection_metadata=selection,
+    )
+    assert inward_metadata["by_side"]["left"] is False
 
 
 def test_position_candidate_layer_expands_auxiliary_for_elbow_singularity(
@@ -1833,6 +2641,71 @@ def test_dual_arm_output_qpos_smoothing_runs_before_action_fk() -> None:
     assert np.isclose(second_metadata["right"]["output_target_joint_deg"][0], -4.0)
 
 
+def test_single_step_output_smoothing_cannot_reenter_wrist_singularity() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+        ),
+        ik_solver=solver,
+    )
+    reference = solver.current_q.copy()
+    reference[4] = np.deg2rad(-2.2)
+    reference[10] = np.deg2rad(-30.0)
+    candidate = reference.copy()
+    candidate[4] = np.deg2rad(-2.9)
+    candidate[10] = np.deg2rad(-29.0)
+
+    output, output_left, _output_right, metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=candidate,
+            left_qpos=candidate[:6],
+            right_qpos=candidate[6:12],
+            reference_full_q=reference,
+        )
+    )
+
+    assert metadata["wrist_q5_escape"]["applied"] is True
+    # The fixture's deliberately small q5 velocity limit makes the escape
+    # progress over multiple outer ticks; it must still move outward rather
+    # than re-entering through zero.
+    assert -4.0 < np.rad2deg(output_left[4]) < -2.2
+    assert abs(np.rad2deg(output[10])) > 3.0
+
+
+def test_single_step_candidate_q5_hysteresis_stabilizes_inward_escape_toggle() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_q5_hysteresis_release_deg=6.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+    reference = solver.current_q.copy()
+    reference[4] = np.deg2rad(-5.0)
+    candidate = reference.copy()
+    candidate[4] = np.deg2rad(-3.7)
+
+    output, metadata = retargeter._stabilize_wrist_q5_candidate(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+    )
+
+    assert metadata["applied"] is True
+    assert metadata["sides"]["left"]["hysteresis_hold"] is True
+    assert np.rad2deg(output[4]) == pytest.approx(-5.0)
+
+
 def test_dual_arm_output_qpos_smoothing_adapts_to_valid_tracker_speed() -> None:
     retargeter = DualArmCollisionAwareRetargeter(
         DualArmCollisionAwareRetargeterConfig(
@@ -1864,6 +2737,373 @@ def test_dual_arm_output_qpos_smoothing_adapts_to_valid_tracker_speed() -> None:
     assert metadata["left"]["requested_alpha"] == 0.7
     assert metadata["left"]["transition"] == "attack"
     assert metadata["right"]["reason"] == "invalid_or_missing_speed"
+
+
+def test_normal_zone_fast_path_bypasses_only_ordinary_tracking_side() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.45,
+            output_qpos_normal_fast_path_enabled=True,
+            output_qpos_normal_fast_path_alpha=1.0,
+            output_qpos_normal_fast_path_guard_deg=4.0,
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[2, 4, 8, 10]] = np.deg2rad([30.0, 20.0, 30.0, 20.0])
+    candidate = reference.copy()
+    candidate[0] += np.deg2rad(2.0)
+    candidate[6] -= np.deg2rad(2.0)
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    retargeter._last_wrist_coaxial_metadata = {
+        "sides": {
+            "left": {"effective_null_scale": 1.0},
+            "right": {"effective_null_scale": 1.0},
+        }
+    }
+    activity = {
+        side: {
+            "evidence": {
+                "quality_valid": True,
+                "linear_speed_p90_m_s": 0.05,
+                "angular_speed_p90_rad_s": 0.2,
+            }
+        }
+        for side in ("left", "right")
+    }
+
+    output, left, right, metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=candidate,
+        left_qpos=candidate[:6],
+        right_qpos=candidate[6:12],
+        reference_full_q=reference,
+        target_activity=activity,
+        admission_status="tracking",
+    )
+
+    np.testing.assert_allclose(output, candidate)
+    np.testing.assert_allclose(left, candidate[:6])
+    np.testing.assert_allclose(right, candidate[6:12])
+    assert metadata["alpha_by_side"] == {"left": 1.0, "right": 1.0}
+    assert metadata["normal_fast_path"]["left"]["eligible"] is True
+    assert metadata["normal_fast_path"]["right"]["eligible"] is True
+    assert metadata["applied"] is False
+
+
+def test_normal_zone_fast_path_filters_micro_reversals_and_syncs_alpha_state() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.45,
+            output_qpos_normal_fast_path_enabled=True,
+            output_qpos_normal_fast_path_alpha=0.70,
+            output_qpos_normal_fast_path_guard_deg=4.0,
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[2, 4, 8, 10]] = np.deg2rad([30.0, 20.0, 30.0, 20.0])
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    retargeter._last_wrist_coaxial_metadata = {
+        "sides": {
+            "left": {"effective_null_scale": 1.0},
+            "right": {"effective_null_scale": 1.0},
+        }
+    }
+    activity = {
+        side: {
+            "evidence": {
+                "quality_valid": True,
+                "linear_speed_p90_m_s": 0.05,
+                "angular_speed_p90_rad_s": 0.2,
+            }
+        }
+        for side in ("left", "right")
+    }
+    positive = reference.copy()
+    positive[0] += np.deg2rad(1.0)
+
+    first, _left, _right, first_metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=positive,
+            left_qpos=positive[:6],
+            right_qpos=positive[6:12],
+            reference_full_q=reference,
+            target_activity=activity,
+            admission_status="tracking",
+        )
+    )
+
+    assert np.rad2deg(first[0] - reference[0]) == pytest.approx(0.70)
+    assert first_metadata["alpha_by_side"]["left"] == pytest.approx(0.70)
+    assert first_metadata["normal_fast_path"]["left"]["eligible"] is True
+    assert retargeter._output_qpos_smoothing_effective_alpha["left"] == pytest.approx(
+        0.70
+    )
+
+    negative = reference.copy()
+    negative[0] -= np.deg2rad(1.0)
+    second, _left, _right, _metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=negative,
+        left_qpos=negative[:6],
+        right_qpos=negative[6:12],
+        reference_full_q=first,
+        target_activity=activity,
+        admission_status="tracking",
+    )
+
+    # The raw target reverses by 2 degrees.  The responsive EMA admits only
+    # 1.19 degrees on this frame instead of passing the full reversal through.
+    assert np.rad2deg(second[0] - first[0]) == pytest.approx(-1.19)
+
+
+def test_normal_zone_fast_path_graces_soft_quality_dropout_but_not_hard_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [10.0]
+    monkeypatch.setattr(target_solver_module.time, "monotonic", lambda: clock[0])
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.45,
+            output_qpos_normal_fast_path_enabled=True,
+            output_qpos_normal_fast_path_alpha=0.70,
+            output_qpos_normal_fast_path_guard_deg=4.0,
+            output_qpos_normal_fast_path_quality_grace_sec=0.05,
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[2, 4, 8, 10]] = np.deg2rad([30.0, 20.0, 30.0, 20.0])
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    retargeter._last_wrist_coaxial_metadata = {
+        "sides": {
+            "left": {"effective_null_scale": 1.0},
+            "right": {"effective_null_scale": 1.0},
+        }
+    }
+    valid_activity = {
+        side: {
+            "evidence": {
+                "quality_valid": True,
+                "linear_speed_p90_m_s": 0.05,
+                "angular_speed_p90_rad_s": 0.2,
+            }
+        }
+        for side in ("left", "right")
+    }
+    invalid_activity = {
+        side: {"evidence": {"quality_valid": False}}
+        for side in ("left", "right")
+    }
+    candidate = reference.copy()
+    candidate[0] += np.deg2rad(1.0)
+    first, _left, _right, _metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=candidate,
+        left_qpos=candidate[:6],
+        right_qpos=candidate[6:12],
+        reference_full_q=reference,
+        target_activity=valid_activity,
+        admission_status="tracking",
+    )
+
+    clock[0] = 10.02
+    candidate[0] += np.deg2rad(1.0)
+    second, _left, _right, grace_metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=candidate,
+            left_qpos=candidate[:6],
+            right_qpos=candidate[6:12],
+            reference_full_q=first,
+            target_activity=invalid_activity,
+            admission_status="tracking",
+        )
+    )
+
+    left_grace = grace_metadata["normal_fast_path"]["left"]
+    assert left_grace["tracker_quality_valid"] is False
+    assert left_grace["tracker_quality_grace_active"] is True
+    assert left_grace["eligible"] is True
+    assert grace_metadata["alpha_by_side"]["left"] == pytest.approx(0.70)
+    assert retargeter._output_qpos_smoothing_effective_alpha["left"] == pytest.approx(
+        0.70
+    )
+
+    # A null projection is a hard singularity guard.  It must disable the
+    # normal fast path immediately even while the tracker-quality grace is live.
+    clock[0] = 10.03
+    retargeter._last_wrist_coaxial_metadata["sides"]["left"] = {
+        "effective_null_scale": 0.5
+    }
+    candidate[0] += np.deg2rad(1.0)
+    _third, _left, _right, hard_metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=candidate,
+            left_qpos=candidate[:6],
+            right_qpos=candidate[6:12],
+            reference_full_q=second,
+            target_activity=invalid_activity,
+            admission_status="tracking",
+        )
+    )
+    left_hard = hard_metadata["normal_fast_path"]["left"]
+    assert left_hard["tracker_quality_grace_active"] is True
+    assert left_hard["null_projection_inactive"] is False
+    assert left_hard["eligible"] is False
+    assert hard_metadata["alpha_by_side"]["left"] < 0.70
+
+    # With all hard guards healthy again, an expired quality window falls back
+    # continuously from the synchronized 0.70 state rather than stale 0.14.
+    clock[0] = 10.10
+    retargeter._last_wrist_coaxial_metadata["sides"]["left"] = {
+        "effective_null_scale": 1.0
+    }
+    candidate[0] += np.deg2rad(1.0)
+    _fourth, _left, _right, expired_metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=candidate,
+            left_qpos=candidate[:6],
+            right_qpos=candidate[6:12],
+            reference_full_q=second,
+            target_activity=invalid_activity,
+            admission_status="tracking",
+        )
+    )
+    left_expired = expired_metadata["normal_fast_path"]["left"]
+    assert left_expired["tracker_quality_grace_active"] is False
+    assert left_expired["eligible"] is False
+    assert 0.14 < expired_metadata["alpha_by_side"]["left"] < 0.70
+
+
+def test_normal_zone_fast_path_stays_off_inside_wrist_guard() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_fast_alpha=0.45,
+            output_qpos_normal_fast_path_enabled=True,
+            output_qpos_normal_fast_path_alpha=1.0,
+            output_qpos_normal_fast_path_guard_deg=4.0,
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[2, 8, 10]] = np.deg2rad([30.0, 30.0, 20.0])
+    reference[4] = np.deg2rad(3.5)
+    candidate = reference.copy()
+    candidate[0] += np.deg2rad(2.0)
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    retargeter._last_wrist_coaxial_metadata = {
+        "sides": {
+            "left": {"effective_null_scale": 0.5},
+            "right": {"effective_null_scale": 1.0},
+        }
+    }
+
+    output, _left, _right, metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=candidate,
+        left_qpos=candidate[:6],
+        right_qpos=candidate[6:12],
+        reference_full_q=reference,
+        target_activity={
+            "left": {
+                "evidence": {
+                    "quality_valid": True,
+                    "linear_speed_p90_m_s": 0.05,
+                    "angular_speed_p90_rad_s": 0.2,
+                }
+            }
+        },
+        admission_status="tracking",
+    )
+
+    assert metadata["normal_fast_path"]["left"]["eligible"] is False
+    assert metadata["normal_fast_path"]["left"]["outside_joint_guard"] is False
+    assert metadata["normal_fast_path"]["left"]["null_projection_inactive"] is False
+    assert not np.allclose(output, candidate)
+
+
+def test_q5_hysteresis_latch_arms_only_after_admitted_escape() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_q5_hysteresis_release_deg=6.0,
+            wrist_q5_hysteresis_requires_escape_latch=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+    ordinary_reference = np.zeros(12, dtype=float)
+    ordinary_reference[4] = np.deg2rad(-5.0)
+    ordinary_candidate = ordinary_reference.copy()
+    ordinary_candidate[4] = np.deg2rad(-3.7)
+
+    ordinary_output, ordinary_metadata = retargeter._stabilize_wrist_q5_candidate(
+        reference_full_q=ordinary_reference,
+        candidate_full_q=ordinary_candidate,
+    )
+
+    assert np.rad2deg(ordinary_output[4]) == pytest.approx(-3.7)
+    assert ordinary_metadata["sides"]["left"]["hysteresis_allowed"] is False
+    assert ordinary_metadata["sides"]["left"]["hysteresis_hold"] is False
+
+    escape_reference = np.zeros(12, dtype=float)
+    escape_reference[4] = np.deg2rad(-3.4)
+    escape_candidate = escape_reference.copy()
+    escape_candidate[4] = np.deg2rad(-2.0)
+    escaped, escape_metadata = retargeter._stabilize_wrist_q5_candidate(
+        reference_full_q=escape_reference,
+        candidate_full_q=escape_candidate,
+    )
+    latch_metadata = retargeter._update_wrist_q5_hysteresis_escape_latch(
+        reference_full_q=escape_reference,
+        admitted_full_q=escaped,
+        status="tracking",
+        candidate_metadata=escape_metadata,
+        output_metadata=None,
+    )
+
+    assert latch_metadata["sides"]["left"]["transition"] == (
+        "armed_from_admitted_escape"
+    )
+    assert retargeter._wrist_q5_hysteresis_escape_latch["left"] is True
+
+    inward_candidate = escaped.copy()
+    inward_candidate[4] = np.deg2rad(-3.0)
+    held, held_metadata = retargeter._stabilize_wrist_q5_candidate(
+        reference_full_q=escaped,
+        candidate_full_q=inward_candidate,
+    )
+
+    assert held_metadata["sides"]["left"]["hysteresis_allowed"] is True
+    assert held_metadata["sides"]["left"]["hysteresis_hold"] is True
+    assert held[4] == pytest.approx(escaped[4])
 
 
 def test_dual_arm_output_qpos_smoothing_uses_motion_window_validity() -> None:
@@ -2010,6 +3250,85 @@ def test_dual_arm_current_qpos_sync_can_preserve_output_qpos_smoothing_state() -
     assert reset_metadata["applied"] is False
     np.testing.assert_allclose(reset_left, np.zeros(6, dtype=float))
     np.testing.assert_allclose(reset_right, np.zeros(6, dtype=float))
+
+
+def test_single_step_runtime_sync_preserves_velocity_and_rebases_smoothing() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.5,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    stale_qref = np.deg2rad(
+        np.array(
+            [
+                0.0,
+                0.0,
+                0.0,
+                15.0,
+                1.0,
+                -15.0,
+                0.0,
+                0.0,
+                0.0,
+                -12.0,
+                -1.0,
+                12.0,
+            ]
+        )
+    )
+    accepted_qcmd = np.deg2rad(
+        np.array(
+            [
+                0.0,
+                0.0,
+                0.0,
+                2.0,
+                3.0,
+                -2.0,
+                0.0,
+                0.0,
+                0.0,
+                -3.0,
+                -3.0,
+                3.0,
+            ]
+        )
+    )
+    admitted_velocity = np.linspace(-0.6, 0.5, 12)
+    retargeter._last_output_qpos_smoothing_full_q = stale_qref.copy()
+    retargeter._last_admitted_velocity_full = admitted_velocity.copy()
+
+    retargeter.set_current_qpos_pair(
+        left_qpos=accepted_qcmd[:6],
+        right_qpos=accepted_qcmd[6:],
+        reset_tracking=False,
+    )
+
+    np.testing.assert_allclose(
+        retargeter._last_admitted_velocity_full,
+        admitted_velocity,
+    )
+    np.testing.assert_allclose(
+        retargeter._last_output_qpos_smoothing_full_q,
+        accepted_qcmd,
+    )
+
+    retargeter.set_current_qpos_pair(
+        left_qpos=accepted_qcmd[:6],
+        right_qpos=accepted_qcmd[6:],
+        reset_tracking=True,
+    )
+
+    np.testing.assert_allclose(
+        retargeter._last_admitted_velocity_full,
+        np.zeros(12),
+    )
+    assert retargeter._last_output_qpos_smoothing_full_q is None
 
 
 def test_dual_arm_explicit_execution_step_is_fallback_without_velocity_profile() -> None:

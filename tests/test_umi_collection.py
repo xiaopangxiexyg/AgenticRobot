@@ -24,6 +24,7 @@ from teleop_runtime.collection.pose_storage import (
 )
 from teleop_runtime.collection.policy_io import load_policy_io_layout
 from teleop_runtime.collection.umi.calibration import UmiCalibrationBinding, UmiCalibrationSet
+from teleop_runtime.collection.umi.cli import build_parser as build_umi_parser
 from teleop_runtime.collection.umi.cli import main as umi_cli_main
 from teleop_runtime.collection.umi.config import load_umi_collection_config
 from teleop_runtime.collection.umi.controller import UmiCollectionController
@@ -95,12 +96,40 @@ def test_default_config_and_layout_are_umi_specific():
     assert config.dmtac_gripper_telemetry_hz == pytest.approx(20.0)
     assert config.dmtac_gripper_telemetry_command_grace_s == pytest.approx(0.02)
     assert config.foot_pad_enabled is True
+    assert config.v25p_native_shadow is False
+    assert config.v25p_native_storage_layout == "record_cjson_v1"
     validate_hand_eye_config_binding(config)
     layout = load_policy_io_layout(config.policy_io_layout)
     assert layout is not None
     assert layout.action_dim == 16
     assert layout.state_dim == 16
     assert layout.arm_reference_frame_by_side == {"left": "desk", "right": "desk"}
+
+
+def test_umi_v25p_physical_layout_is_explicit_and_shadow_gated() -> None:
+    config = load_umi_collection_config(
+        ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
+    )
+    with pytest.raises(ValueError, match="requires v25p_native_shadow"):
+        replace(
+            config,
+            v25p_native_storage_layout="parquet_stream_chunks_v1",
+        )
+    enabled = replace(
+        config,
+        v25p_native_shadow=True,
+        v25p_native_storage_layout="parquet_stream_chunks_v1",
+    )
+    assert enabled.v25p_native_storage_layout == "parquet_stream_chunks_v1"
+    args = build_umi_parser().parse_args(
+        [
+            "--v25p-native-shadow",
+            "--v25p-native-storage-layout",
+            "parquet_stream_chunks_v1",
+        ]
+    )
+    assert args.v25p_native_shadow is True
+    assert args.v25p_native_storage_layout == "parquet_stream_chunks_v1"
 
 
 def test_umi_ignore_policy_is_dataset_scoped_and_normalized():
@@ -640,6 +669,83 @@ def test_umi_recorder_uses_native_encoder_without_arm_sample(tmp_path):
     recorder.stop_episode(reason="empty_after_external_delete")
     recorder.close()
     assert (tmp_path / "dataset/meta/info.json").is_file()
+
+
+def test_umi_recorder_isolates_direct_stale_measured_state(tmp_path):
+    config = load_umi_collection_config(
+        ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
+    )
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(
+        json.dumps(_calibration_payload(datetime.now(timezone.utc)))
+    )
+    binding = UmiCalibrationBinding.load(calibration_path)
+    layout = load_policy_io_layout(config.policy_io_layout)
+    assert layout is not None
+    config = replace(config, dataset_root=tmp_path / "stale_state_dataset")
+    recorder = UmiDatasetRecorder(
+        config=config,
+        calibration=binding,
+        policy_io_layout=layout,
+    )
+    recorder.writer.config.write_parquet = False
+    episode = recorder.start_episode({"test": "stale_state_isolation"})
+
+    def sample(frame_index: int, timestamp: float, joint_timestamp: float) -> UmiSample:
+        poses = {
+            side: UmiPoseMeasurement(
+                side=side,
+                raw_tcp_pose7=np.array(
+                    [timestamp, 0, 0, 0, 0, 0, 1], dtype=float
+                ),
+                desk_tcp_pose7=np.array(
+                    [timestamp, 0, 0, 0, 0, 0, 1], dtype=float
+                ),
+                source_timestamp=timestamp,
+                available_timestamp=timestamp,
+                source_clock="vive_receiver_wall_fallback",
+                available_clock="local_wall_time",
+                sequence=frame_index + 1,
+                tracker_name=f"tracker_{side}",
+                tracker_role=f"{side}_wrist",
+                age_sec=0.0,
+            )
+            for side in ("left", "right")
+        }
+        return UmiSample(
+            episode_index=episode,
+            frame_index=frame_index,
+            timestamp=timestamp,
+            poses=poses,
+            gripper_commands={"left": 0.1, "right": 0.9},
+            hand_states={
+                "left": {
+                    "gripper_measured_scalar": 0.1,
+                    "joint_timestamp": joint_timestamp,
+                },
+                "right": {
+                    "gripper_measured_scalar": 0.9,
+                    "joint_timestamp": joint_timestamp,
+                },
+            },
+            operator_labels=OperatorLabelStateMachine().snapshot(),
+        )
+
+    assert recorder.submit(sample(0, 10.0, 9.0)) is False
+    assert recorder.recording
+    assert recorder.frame_count == 0
+    assert recorder.next_frame_index == 0
+    assert recorder.stats()["sample_attempt_count"] == 1
+    assert recorder.stats()["sample_rejection_count"] == 1
+    assert recorder.stats()["sample_rejection_counts_by_reason"] == {
+        "left:stale_gripper_measurement:1.000": 1
+    }
+
+    assert recorder.submit(sample(0, 10.0, 9.9)) is True
+    assert recorder.submit(sample(1, 10.1, 10.0)) is True
+    recorder.stop_episode(reason="test")
+    assert recorder.last_outcome == "saved"
+    recorder.close()
 
 
 def test_umi_recorder_discards_empty_episode(tmp_path):

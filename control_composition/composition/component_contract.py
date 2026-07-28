@@ -26,7 +26,7 @@ FORMAL_COMPONENT_COMPOSITION_BINDING_HASH_DOMAIN_V1 = (
 )
 HAND_ACTION_SPEC_HASH_DOMAIN_V1 = "dexteleop.hand_action_spec.semantic.v1"
 COMPONENT_MISSING_BEHAVIORS_V1 = frozenset(
-    {"no_action", "invalid", "renormalize_available"}
+    {"no_action", "invalid", "renormalize_available", "use_baseline"}
 )
 COMPONENT_SEMANTIC_PARAMETER_KEYS_V1 = frozenset(
     {
@@ -91,6 +91,24 @@ def _missing_behavior(value: object) -> str:
     return behavior
 
 
+def _weighted_missing_behavior(value: object) -> str:
+    behavior = _missing_behavior(value)
+    if behavior == "use_baseline":
+        raise ValueError(
+            "use_baseline is only valid for relative-overlay rules."
+        )
+    return behavior
+
+
+def _relative_missing_behavior(value: object) -> str:
+    behavior = _missing_behavior(value)
+    if behavior == "renormalize_available":
+        raise ValueError(
+            "renormalize_available is not valid for relative-overlay rules."
+        )
+    return behavior
+
+
 @dataclass(frozen=True)
 class PoseComponentCompositionRule:
     """One pose-valued component fusion rule.
@@ -134,7 +152,7 @@ class PoseComponentCompositionRule:
         object.__setattr__(
             self,
             "missing_behavior",
-            _missing_behavior(self.missing_behavior),
+            _weighted_missing_behavior(self.missing_behavior),
         )
         object.__setattr__(
             self,
@@ -206,7 +224,7 @@ class QposComponentCompositionRule:
         object.__setattr__(
             self,
             "missing_behavior",
-            _missing_behavior(self.missing_behavior),
+            _weighted_missing_behavior(self.missing_behavior),
         )
 
     @property
@@ -225,8 +243,142 @@ class QposComponentCompositionRule:
         }
 
 
+@dataclass(frozen=True)
+class RelativePoseComponentCompositionRule:
+    """Apply one pose delta to a sampled absolute baseline.
+
+    This rule is deliberately stateless. Translation is added in the
+    baseline pose reference frame, while rotation is right-multiplied in the
+    baseline controlled frame:
+
+    ``p_out = p_baseline + delta_p``
+    ``R_out = R_baseline * R_delta``
+
+    Reusing the same delta record therefore never integrates it again.
+    """
+
+    component_id: str
+    baseline_role: str
+    delta_role: str
+    missing_behavior: str = "use_baseline"
+
+    def __post_init__(self) -> None:
+        component_id = _required(self.component_id, field_name="component_id")
+        baseline_role = _required(
+            self.baseline_role,
+            field_name="baseline_role",
+        )
+        delta_role = _required(self.delta_role, field_name="delta_role")
+        if baseline_role == delta_role:
+            raise ValueError(
+                "Relative pose baseline_role and delta_role must differ."
+            )
+        object.__setattr__(self, "component_id", component_id)
+        object.__setattr__(self, "baseline_role", baseline_role)
+        object.__setattr__(self, "delta_role", delta_role)
+        object.__setattr__(
+            self,
+            "missing_behavior",
+            _relative_missing_behavior(self.missing_behavior),
+        )
+
+    @property
+    def representation(self) -> str:
+        return "pose"
+
+    @property
+    def contributing_roles(self) -> tuple[str, ...]:
+        return (self.baseline_role, self.delta_role)
+
+    def semantic_payload(self) -> dict[str, Any]:
+        return {
+            "component_id": self.component_id,
+            "representation": self.representation,
+            "composition": "follow_baseline_relative_delta_v1",
+            "baseline_role": self.baseline_role,
+            "delta_role": self.delta_role,
+            "missing_behavior": self.missing_behavior,
+            "translation_application": "reference_frame_additive",
+            "rotation_application": "baseline_local_right_multiply",
+        }
+
+
+@dataclass(frozen=True)
+class RelativeQposComponentCompositionRule:
+    """Apply one joint-position delta to a sampled absolute baseline."""
+
+    component_id: str
+    baseline_role: str
+    delta_role: str
+    baseline_value_contract_hash: str
+    delta_value_contract_hash: str
+    missing_behavior: str = "use_baseline"
+
+    def __post_init__(self) -> None:
+        component_id = _required(self.component_id, field_name="component_id")
+        baseline_role = _required(
+            self.baseline_role,
+            field_name="baseline_role",
+        )
+        delta_role = _required(self.delta_role, field_name="delta_role")
+        if baseline_role == delta_role:
+            raise ValueError(
+                "Relative qpos baseline_role and delta_role must differ."
+            )
+        object.__setattr__(self, "component_id", component_id)
+        object.__setattr__(self, "baseline_role", baseline_role)
+        object.__setattr__(self, "delta_role", delta_role)
+        object.__setattr__(
+            self,
+            "baseline_value_contract_hash",
+            _required(
+                self.baseline_value_contract_hash,
+                field_name="baseline_value_contract_hash",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "delta_value_contract_hash",
+            _required(
+                self.delta_value_contract_hash,
+                field_name="delta_value_contract_hash",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "missing_behavior",
+            _relative_missing_behavior(self.missing_behavior),
+        )
+
+    @property
+    def representation(self) -> str:
+        return "qpos"
+
+    @property
+    def contributing_roles(self) -> tuple[str, ...]:
+        return (self.baseline_role, self.delta_role)
+
+    def semantic_payload(self) -> dict[str, Any]:
+        return {
+            "component_id": self.component_id,
+            "representation": self.representation,
+            "composition": "follow_baseline_relative_delta_v1",
+            "baseline_role": self.baseline_role,
+            "delta_role": self.delta_role,
+            "missing_behavior": self.missing_behavior,
+            "baseline_value_contract_hash": (
+                self.baseline_value_contract_hash
+            ),
+            "delta_value_contract_hash": self.delta_value_contract_hash,
+            "application": "elementwise_additive",
+        }
+
+
 ComponentCompositionRule = (
-    PoseComponentCompositionRule | QposComponentCompositionRule
+    PoseComponentCompositionRule
+    | QposComponentCompositionRule
+    | RelativePoseComponentCompositionRule
+    | RelativeQposComponentCompositionRule
 )
 
 
@@ -248,7 +400,12 @@ class ComponentCompositionRuleSet:
         if any(
             not isinstance(
                 rule,
-                (PoseComponentCompositionRule, QposComponentCompositionRule),
+                (
+                    PoseComponentCompositionRule,
+                    QposComponentCompositionRule,
+                    RelativePoseComponentCompositionRule,
+                    RelativeQposComponentCompositionRule,
+                ),
             )
             for rule in rules
         ):
@@ -359,5 +516,7 @@ __all__ = [
     "FormalComponentCompositionBinding",
     "PoseComponentCompositionRule",
     "QposComponentCompositionRule",
+    "RelativePoseComponentCompositionRule",
+    "RelativeQposComponentCompositionRule",
     "hand_action_spec_semantic_hash",
 ]

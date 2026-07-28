@@ -16,6 +16,7 @@ from ..schema_v21 import (
     bind_hand_runtime_diagnostic_fields,
     bind_hand_state_snapshot_fields,
 )
+from ..schema_v22 import validate_strict_v22_measured_state
 from .types import UmiSample
 
 
@@ -93,6 +94,15 @@ class UmiV23RowEncoder:
             raise ValueError(
                 f"UMI layout must define 16D action/state, got {layout.action_dim}/{layout.state_dim}"
             )
+        validate_strict_v22_measured_state(
+            sample.hand_states,
+            layout=layout,
+            sample_timestamp=float(sample.timestamp),
+            # UMI snapshot assembly already rejects feedback more than 1 ms
+            # from the causal cutoff in the future.  Preserve that stricter
+            # boundary for direct row-encoder callers as well.
+            future_tolerance_sec=1e-3,
+        )
         if sample.arm_action_poses is None:
             raise ValueError(
                 "UMI arm action requires the next accepted observation; "

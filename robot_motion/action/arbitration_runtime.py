@@ -5,9 +5,11 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.action.component_action import ComponentAction
 
 
 MAX_PRODUCTION_ARBITER_HZ = 60.0
@@ -197,12 +199,69 @@ class AuthoritativeArbitrationDecision:
     decision_id: str
     result_id: str
     arbitration_input_snapshot_id: str
-    selected_action: Any
-    selected_by_group: Any
+    arbitration_result_hash: str
+    selected_action: ComponentAction
+    selected_action_hash: str
+    action_schema_hash: str
+    selected_by_group: Mapping[str, str]
+    target_effective_at: float
+    supported_until: float
+    target_clock_domain_id: str
     published_at: float
     authority_epoch: int
     gate_epoch: int
     semantic_content_hash: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selected_action, ComponentAction):
+            raise TypeError(
+                "Authoritative decision action must be a ComponentAction."
+            )
+        if self.selected_action_hash != self.selected_action.semantic_content_hash:
+            raise ValueError("Authoritative decision action hash mismatch.")
+        if (
+            self.action_schema_hash
+            != self.selected_action.action_schema.semantic_content_hash
+        ):
+            raise ValueError("Authoritative decision action schema mismatch.")
+        for name in (
+            "decision_id",
+            "result_id",
+            "arbitration_result_hash",
+            "arbitration_input_snapshot_id",
+            "selected_action_hash",
+            "action_schema_hash",
+            "target_clock_domain_id",
+            "semantic_content_hash",
+        ):
+            if not str(getattr(self, name)).strip():
+                raise ValueError(f"{name} must be non-empty.")
+        target = float(self.target_effective_at)
+        if not math.isfinite(target):
+            raise ValueError("target_effective_at must be finite.")
+        supported_until = float(self.supported_until)
+        if (
+            not math.isfinite(supported_until)
+            or supported_until <= target
+            or float(self.published_at) >= supported_until
+        ):
+            raise ValueError(
+                "Authoritative decision must be published inside its support "
+                "window."
+            )
+        selected = {
+            str(group).strip(): str(proposal_id).strip()
+            for group, proposal_id in dict(self.selected_by_group).items()
+        }
+        if not selected or any(not key or not value for key, value in selected.items()):
+            raise ValueError("selected_by_group must be non-empty and canonical.")
+        object.__setattr__(
+            self,
+            "selected_by_group",
+            MappingProxyType(selected),
+        )
+        object.__setattr__(self, "target_effective_at", target)
+        object.__setattr__(self, "supported_until", supported_until)
 
 
 @dataclass(frozen=True)
@@ -262,6 +321,11 @@ class ArbitrationRuntime:
         elif getattr(computation, "decision_schedule_spec_hash", None) != self.spec.semantic_content_hash:
             reason = "decision_schedule_mismatch"
             fallback = "hold"
+        elif not str(
+            getattr(computation, "target_clock_domain_id", "")
+        ).strip():
+            reason = "target_clock_domain_missing"
+            fallback = "no_action"
         elif getattr(live_gate_snapshot, "status", None) != "ready":
             reason = "live_execution_gate_not_ready"
             fallback = "hold"
@@ -298,6 +362,12 @@ class ArbitrationRuntime:
         if reason is None and now > float(computation.publication_deadline_at):
             reason = f"publication_deadline_missed:{self.spec.late_decision_policy}"
             fallback = self.spec.late_decision_policy
+        elif reason is None and (
+            getattr(computation, "supported_until", None) is None
+            or now >= float(computation.supported_until)
+        ):
+            reason = "support_expired_before_publication"
+            fallback = "no_action"
         elif reason is None and now - float(computation.target_effective_at) > float(self.spec.max_target_lateness_sec):
             reason = f"target_late:{self.spec.late_decision_policy}"
             fallback = self.spec.late_decision_policy
@@ -330,23 +400,39 @@ class ArbitrationRuntime:
 
         decision_payload = {
             "result_id": computation.result_id,
+            "arbitration_result_hash": computation.semantic_content_hash,
             "arbitration_input_snapshot_id": computation.arbitration_input_snapshot_id,
             "selected_action_hash": computation.selected_action_hash,
+            "action_schema_hash": (
+                computation.composed_candidate.action_schema.semantic_content_hash
+            ),
             "selected_by_group": computation.selected_by_group,
+            "target_effective_at": computation.target_effective_at,
+            "supported_until": computation.supported_until,
+            "target_clock_domain_id": computation.target_clock_domain_id,
             "published_at": now,
             "authority_epoch": computation.authority_epoch,
             "gate_epoch": computation.gate_epoch,
         }
         decision_hash = canonical_content_hash(
-            decision_payload, domain="dexteleop.authoritative_arbitration_decision.v1"
+            decision_payload,
+            domain="dexteleop.authoritative_arbitration_decision.v2",
         )
         self._last_published_at = now
         return attempt, AuthoritativeArbitrationDecision(
             decision_id=f"arbitration-decision:{decision_hash}",
             result_id=computation.result_id,
+            arbitration_result_hash=computation.semantic_content_hash,
             arbitration_input_snapshot_id=computation.arbitration_input_snapshot_id,
-            selected_action=computation.composed_action,
+            selected_action=computation.composed_candidate,
+            selected_action_hash=computation.selected_action_hash,
+            action_schema_hash=(
+                computation.composed_candidate.action_schema.semantic_content_hash
+            ),
             selected_by_group=computation.selected_by_group,
+            target_effective_at=computation.target_effective_at,
+            supported_until=computation.supported_until,
+            target_clock_domain_id=decision_payload["target_clock_domain_id"],
             published_at=now,
             authority_epoch=computation.authority_epoch,
             gate_epoch=computation.gate_epoch,

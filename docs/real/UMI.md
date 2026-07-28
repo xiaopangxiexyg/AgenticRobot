@@ -37,6 +37,16 @@ python -m teleop_runtime.collection umi \
   --no-send-gripper
 ```
 
+可选的 provisional v2.5-p 双写默认关闭。仅做 shadow 验证时在上述命令后追加：
+
+```bash
+--v25p-native-shadow
+```
+
+这会使用默认 `record_cjson_v1`；需要分块 Parquet 时再追加
+`--v25p-native-storage-layout parquet_stream_chunks_v1`。无论是否启用 shadow，既有 v2.3
+episode 仍是权威输出，UMI 的 next-observation action 对齐和每侧 pose 时钟保持不变。
+
 四踏板默认启用；以下写法只用于明确记录本次选择：
 
 ```bash

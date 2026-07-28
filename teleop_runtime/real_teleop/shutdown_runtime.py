@@ -17,6 +17,7 @@ from typing import Any, Callable
 _REQUIRED_SUPPORT_NAMES = (
     "_arm_control_mode_arg",
     "_attach_actuator_command_trace_sink",
+    "_attach_ik_shadow_trace_sink",
     "_attach_position_audit_sink",
     "_attach_singularity_transition_trace_sink",
     "_close_camera_sources",
@@ -81,6 +82,7 @@ def shutdown_real_teleop_runtime(
     _attach_actuator_command_trace_sink = support[
         "_attach_actuator_command_trace_sink"
     ]
+    _attach_ik_shadow_trace_sink = support["_attach_ik_shadow_trace_sink"]
     _attach_position_audit_sink = support["_attach_position_audit_sink"]
     _attach_singularity_transition_trace_sink = support[
         "_attach_singularity_transition_trace_sink"
@@ -217,6 +219,12 @@ def shutdown_real_teleop_runtime(
                 ),
             )
         )
+        shutdown_steps.append(
+            (
+                "actuator_trace.ik_shadow_detach",
+                lambda: _attach_ik_shadow_trace_sink(components, None),
+            )
+        )
     shutdown_steps.extend(
         [
             (
@@ -349,7 +357,21 @@ def shutdown_real_teleop_runtime(
         shutdown_steps.append(("stdout.restore", restore_stdout))
     if silenced_stdout is not None:
         shutdown_steps.append(("stdout.silenced_stream", silenced_stdout.close))
-    run_best_effort_cleanup("run_vive_rm65_real_teleop.shutdown", shutdown_steps)
+    try:
+        run_best_effort_cleanup("run_vive_rm65_real_teleop.shutdown", shutdown_steps)
+    except BaseException as cleanup_error:  # noqa: BLE001 - preserve the primary exit.
+        # Ctrl+C is a normal operator exit, not a reason to replace the
+        # original KeyboardInterrupt with a second lifecycle traceback.  The
+        # individual failures have already been collected by
+        # run_best_effort_cleanup; report them through the normal logger and
+        # let the caller decide how to render the primary terminal error.
+        _log(
+            "Shutdown",
+            "cleanup completed with recoverable failures: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}",
+        )
+        if terminal_error is None:
+            raise
 
 
 __all__ = ["shutdown_real_teleop_runtime"]

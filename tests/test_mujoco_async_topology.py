@@ -7,7 +7,10 @@ from control_composition.composition import (
     CompositionInputDraft,
     CompositionSpec,
 )
-from robot_motion.action import RobotAction
+from robot_motion.action import (
+    RobotAction,
+    project_robot_action_v1_to_component_action,
+)
 from sim.contracts import TimingSpec
 from sim.mujoco.adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRig
 from sim.mujoco.deploy import (
@@ -168,7 +171,14 @@ def input_draft(
         producer_epoch=epoch,
         sequence=sequence,
         input_role=role,
-        action=qpos_action(value, source=f"async_{role}", timestamp=produced_at),
+        action=project_robot_action_v1_to_component_action(
+            qpos_action(
+                value,
+                source=f"async_{role}",
+                timestamp=produced_at,
+            ),
+            action_schema=runtime.action_schema,
+        ),
         produced_at=produced_at,
         produced_clock_domain_id=runtime.config.clock_domain_id,
         effective_from=produced_at,
@@ -267,7 +277,7 @@ def test_async_completion_cutoff_restart_and_burst_remain_receiver_admitted() ->
     first_step = next(item.result for item in first_releases if item.job_id == "decision-0")
     assert first_step.status == "dispatched"
     np.testing.assert_allclose(
-        first_step.decision.selected_action.arm_qpos_by_side["left"],
+        first_step.decision.selected_action.value("left_arm").values,
         np.full(6, 0.11),
     )
     missed = next(item for item in first_releases if item.job_id == "residual-0")
@@ -339,7 +349,7 @@ def test_async_completion_cutoff_restart_and_burst_remain_receiver_admitted() ->
     second_step = next(item.result for item in second_releases if item.job_id == "decision-1")
     assert second_step.status == "dispatched"
     np.testing.assert_allclose(
-        second_step.decision.selected_action.arm_qpos_by_side["left"],
+        second_step.decision.selected_action.value("left_arm").values,
         np.full(6, 0.123),
     )
     assert len(scene.physics_commands) == 2
@@ -405,8 +415,8 @@ def test_stale_context_blocks_composite_proposal_at_one_causal_cut() -> None:
     composition = next(
         item.result for item in releases if item.job_id == "compose-after-context-expiry"
     )
-    assert composition.composition_result.output_status == "no_action"
-    assert composition.composition_result.reason == "missing_context:motion-plan"
+    assert composition.composition_evaluation.output_status == "no_action"
+    assert composition.composition_evaluation.reason == "missing_context:motion-plan"
     assert composition.proposal_admission is None
     assert len(runtime.core.proposals) == 0
     decision = next(item.result for item in releases if item.job_id == "decision-no-context")

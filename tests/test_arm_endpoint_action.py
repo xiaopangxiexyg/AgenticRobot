@@ -1398,6 +1398,221 @@ class ArmEndpointActionTest(unittest.TestCase):
         self.assertFalse(metadata["position_sdk_singularity_advisory_used"])
         self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][4], 6.0, places=6)
 
+    def test_position_backend_allows_certified_single_step_wrist_traversal(self) -> None:
+        target = np.asarray(
+            [0.0, 0.0, 0.0, 0.0, np.deg2rad(1.0), 0.0],
+            dtype=float,
+        )
+        certificate = {
+            "schema": "robot_motion.rm65.position_candidate_certificate/v1",
+            "sequence": 10,
+            "qref_fingerprint_schema": POSITION_QREF_FINGERPRINT_SCHEMA,
+            "qref_fingerprint_by_side": {
+                "left": position_qref_fingerprint(target),
+            },
+            "singular_fallback_claimed": True,
+            "candidate_selected_singular_fallback_claimed": False,
+            "singularity_aware_wrist_traversal_by_side": {
+                "left": True,
+                "right": False,
+            },
+            "singularity_aware_wrist_traversal_mode": (
+                "single_step_singularity_aware"
+            ),
+        }
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=target.copy(),
+            metadata={
+                "ik_candidate_selection": {
+                    "candidate_certificate": certificate,
+                    "wrist_singularity_preference": {
+                        "enabled": True,
+                        "fallback_to_singular": False,
+                        "selected": {
+                            "sides": {
+                                "left": {"is_wrist_singular": False},
+                            },
+                        },
+                    },
+                },
+            },
+        )
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0,) * 6,
+                initial_qpos=(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    np.deg2rad(4.0),
+                    0.0,
+                ),
+                allow_position_wrist_singularity_fallback=True,
+                require_position_singularity_candidate_certificate=True,
+                position_sdk_singularity_advisory=False,
+            )
+        )
+        fake_arm = _WristSingularityFakeArm()
+        backend.arm = fake_arm
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(
+            metadata["singularity_gate_status"],
+            "allow_position_wrist_singular",
+        )
+        self.assertTrue(
+            metadata["position_candidate_certificate_validation"][
+                "singularity_aware_wrist_traversal"
+            ]
+        )
+        self.assertTrue(metadata["position_wrist_singularity_fallback_allowed"])
+        self.assertTrue(
+            metadata["position_singularity_fallback_hysteresis_active"]
+        )
+        self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][4], 1.0, places=6)
+
+    def test_position_backend_allows_certified_single_step_elbow_traversal(self) -> None:
+        target = np.asarray(
+            [0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0],
+            dtype=float,
+        )
+        certificate = {
+            "schema": "robot_motion.rm65.position_candidate_certificate/v1",
+            "sequence": 12,
+            "qref_fingerprint_schema": POSITION_QREF_FINGERPRINT_SCHEMA,
+            "qref_fingerprint_by_side": {
+                "left": position_qref_fingerprint(target),
+            },
+            "singular_fallback_claimed": False,
+            "singularity_aware_elbow_traversal_by_side": {
+                "left": True,
+                "right": False,
+            },
+            "singularity_aware_elbow_traversal": {
+                "reason": "outward_emitted_qref",
+                "by_side": {"left": True, "right": False},
+            },
+        }
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=target.copy(),
+            metadata={
+                "ik_candidate_selection": {
+                    "candidate_certificate": certificate,
+                    "position_singularity_preference": {
+                        "enabled": True,
+                        "fallback_to_singular": False,
+                        "selected": {
+                            "sides": {
+                                "left": {"is_elbow_singular": True},
+                            },
+                        },
+                    },
+                }
+            },
+        )
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0,) * 6,
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                allow_position_elbow_singularity_fallback=True,
+                require_position_singularity_candidate_certificate=True,
+            )
+        )
+        fake_arm = _SingularityFakeArm()
+        backend.arm = fake_arm
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(
+            metadata["singularity_gate_status"],
+            "allow_position_elbow_singular",
+        )
+        self.assertTrue(
+            metadata["position_candidate_certificate_validation"][
+                "singularity_aware_elbow_traversal"
+            ]
+        )
+        self.assertTrue(metadata["position_elbow_singularity_fallback_allowed"])
+        self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 1.0, places=6)
+
+    def test_position_backend_allows_certified_outward_wrist_escape_while_currently_singular(self) -> None:
+        reference_q5 = np.deg2rad(2.0)
+        target = np.asarray(
+            [0.0, 0.0, 0.0, 0.0, np.deg2rad(2.5), 0.0],
+            dtype=float,
+        )
+        certificate = {
+            "schema": "robot_motion.rm65.position_candidate_certificate/v1",
+            "sequence": 11,
+            "qref_fingerprint_schema": POSITION_QREF_FINGERPRINT_SCHEMA,
+            "qref_fingerprint_by_side": {
+                "left": position_qref_fingerprint(target),
+            },
+            "singular_fallback_claimed": False,
+            "singularity_aware_wrist_traversal_by_side": {
+                "left": True,
+                "right": False,
+            },
+            "singularity_aware_wrist_traversal_mode": (
+                "single_step_singularity_aware"
+            ),
+        }
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=target.copy(),
+            metadata={
+                "ik_candidate_selection": {
+                    "candidate_certificate": certificate,
+                }
+            },
+        )
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0,) * 6,
+                initial_qpos=(0.0, 0.0, 0.0, 0.0, reference_q5, 0.0),
+                allow_position_wrist_singularity_fallback=True,
+                require_position_singularity_candidate_certificate=True,
+                position_sdk_singularity_advisory=False,
+            )
+        )
+        fake_arm = _WristSingularityFakeArm()
+        backend.arm = fake_arm
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(
+            metadata["singularity_gate_status"],
+            "allow_position_wrist_singular",
+        )
+        self.assertTrue(metadata["position_wrist_escape_continuation"])
+        self.assertTrue(metadata["position_singularity_fallback_rate_limited"])
+        self.assertGreater(fake_arm.sent_joint_deg[-1][4], 2.0)
+
     def test_position_backend_allows_explicit_no_clean_elbow_branch_fallback(self) -> None:
         command = EffectorCommand(
             effector_name="left_arm",

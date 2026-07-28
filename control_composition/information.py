@@ -16,10 +16,16 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V1 = (
     "dexteleop.composition_information_plan.v1"
 )
+COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V2 = (
+    "dexteleop.composition_information_plan.v2"
+)
 CONTEXT_PAYLOAD_ACCESS_MODES_V1 = frozenset(
     {"metadata_only", "inline", "blob_ref"}
 )
 COMPOSITION_DIAGNOSTIC_LEVELS_V1 = frozenset({"core", "debug"})
+COMPOSITION_CONTEXT_BINDING_MODES_V1 = frozenset(
+    {"same_cut_global", "selected_input_ancestor"}
+)
 
 
 def _required(value: object, *, name: str) -> str:
@@ -42,6 +48,8 @@ class CompositionContextRequirement:
     accepted_payload_contract_hashes: tuple[str, ...]
     payload_access: str = "inline"
     maximum_age_sec: float | None = None
+    binding_mode: str = "same_cut_global"
+    bound_input_roles: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         channel = _required(self.channel, name="channel")
@@ -61,10 +69,25 @@ class CompositionContextRequirement:
             maximum_age = float(maximum_age)
             if not math.isfinite(maximum_age) or maximum_age < 0.0:
                 raise ValueError("maximum_age_sec must be finite and non-negative.")
+        binding_mode = _required(self.binding_mode, name="binding_mode")
+        if binding_mode not in COMPOSITION_CONTEXT_BINDING_MODES_V1:
+            raise ValueError("Unsupported context binding mode.")
+        bound_roles = tuple(
+            _required(role, name="bound_input_role")
+            for role in self.bound_input_roles
+        )
+        if len(bound_roles) != len(set(bound_roles)):
+            raise ValueError("bound_input_roles must be unique.")
+        if binding_mode == "same_cut_global" and bound_roles:
+            raise ValueError(
+                "same_cut_global context must not name bound input roles."
+            )
         object.__setattr__(self, "channel", channel)
         object.__setattr__(self, "accepted_payload_contract_hashes", hashes)
         object.__setattr__(self, "payload_access", access)
         object.__setattr__(self, "maximum_age_sec", maximum_age)
+        object.__setattr__(self, "binding_mode", binding_mode)
+        object.__setattr__(self, "bound_input_roles", bound_roles)
 
     def accepts_payload_contract(self, payload_contract_hash: str) -> bool:
         return (
@@ -125,6 +148,8 @@ class CompositionInformationPlan:
                     ),
                     "payload_access": item.payload_access,
                     "maximum_age_sec": item.maximum_age_sec,
+                    "binding_mode": item.binding_mode,
+                    "bound_input_roles": item.bound_input_roles,
                 }
                 for item in requirements
             ),
@@ -144,7 +169,7 @@ class CompositionInformationPlan:
             "semantic_content_hash",
             canonical_content_hash(
                 payload,
-                domain=COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V1,
+                domain=COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V2,
             ),
         )
 
@@ -169,7 +194,9 @@ class CompositionInformationPlan:
 
 __all__ = [
     "COMPOSITION_DIAGNOSTIC_LEVELS_V1",
+    "COMPOSITION_CONTEXT_BINDING_MODES_V1",
     "COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V1",
+    "COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V2",
     "CONTEXT_PAYLOAD_ACCESS_MODES_V1",
     "CompositionContextRequirement",
     "CompositionInformationPlan",

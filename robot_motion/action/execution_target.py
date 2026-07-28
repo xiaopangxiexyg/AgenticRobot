@@ -1,9 +1,15 @@
-"""Transport-neutral resolved execution-target admission contracts.
+"""RobotAction-v1 compatibility execution-target admission contracts.
 
-This module defines the linearization evidence between shared canonical safety
-and an execution worker.  It deliberately does not enqueue a position source
-keyframe, publish a reference, dispatch a command, or own an anchor registry.
-In particular, frontend queue admission is not execution-target admission.
+This module preserves the existing MuJoCo shared-safety/RobotAction-v1 target
+path while it is migrated.  New target handlers should use the component-keyed
+contracts in :mod:`robot_motion.action.execution_handoff`; those contracts do
+not require a universal safe-action stage.
+
+The compatibility contracts here define linearization evidence between the
+existing shared canonical safety result and an execution worker.  They
+deliberately do not enqueue a position source keyframe, publish a reference,
+dispatch a command, or own an anchor registry.  In particular, frontend queue
+admission is not execution-target admission.
 """
 
 from __future__ import annotations
@@ -73,7 +79,7 @@ def _target_commit_policy(target_kind: str) -> str:
 
 @dataclass(frozen=True)
 class ResolvedExecutionTarget:
-    """Immutable output of a resolver/planner for one selection group.
+    """Legacy RobotAction-v1 resolver output for one selection group.
 
     ``scheduled_from``/``scheduled_until`` form a half-open interval.  The
     payload is stage-specific and interpreted only under

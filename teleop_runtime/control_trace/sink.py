@@ -53,6 +53,7 @@ class ControlTraceSpoolSink:
             item.journal_sequence: item.record_integrity_hash
             for item in spool.recovered_envelopes
         }
+        self._next_runtime_entry_offset = 0
         runtime.register_durable_sink(normalized)
         startup_health: list[WriterHealthAppendReceipt] = []
         recovery = spool.recovery_report
@@ -92,9 +93,13 @@ class ControlTraceSpoolSink:
     def flush_pending(self) -> ControlTraceSinkFlushReport:
         considered: list[int] = []
         durable: list[int] = []
-        for entry in self.runtime.journal_entries():
+        entries = self.runtime.journal_entries_from_offset(
+            self._next_runtime_entry_offset
+        )
+        for entry in entries:
             sequence = entry.journal_sequence
             if sequence in self._acknowledged_sequences:
+                self._next_runtime_entry_offset += 1
                 continue
             record = entry.materialize(
                 trace_session_id=self.runtime.session.trace_session_id
@@ -159,6 +164,7 @@ class ControlTraceSpoolSink:
                     )
                 self._acknowledged_sequences.add(sequence)
                 durable.append(sequence)
+                self._next_runtime_entry_offset += 1
         return ControlTraceSinkFlushReport(
             considered_sequences=tuple(considered),
             newly_durable_sequences=tuple(durable),

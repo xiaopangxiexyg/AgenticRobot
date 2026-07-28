@@ -21,12 +21,34 @@ CompositionSpec, rule set, and FormalCompositionStrategySpec hashes. Existing
 `composition_spec` and `formal_composition_strategy_spec` v1 records retain
 their original field sets and hashes.
 
+## Model continuation derived view
+
+`dataset_interface.model_continuation` implements the first model-RTC offline
+projection. It accepts one episode-local, artifact-bound absolute pose chunk
+and explicit forecast-delay/prefix lengths, then returns continuous
+artifact-action prefix and target arrays with three separate masks:
+
+- float prefix mask: one means conditioned;
+- boolean target padding mask: true means padding;
+- boolean loss mask: true means contributes to loss.
+
+The v1 projection supports only `trajectory_overlap_teacher_v1`. It rejects
+relative actions, discrete actions, non-finite values, unsupported delay or
+prefix lengths, a delay that leaves no real executable suffix, and
+recorded-policy/synthetic provenance without their future typed projections.
+It accepts frozen v1 through its normalized training view and trained-prefix
+v2, but rejects inference-only v2 because `training=null`.
+The sample hash binds the episode/start location, arrays, masks, projection,
+layout, frame, chunk, and continuation contract. It does not normalize values,
+create framework tensors, sample random delays, rewrite source rows, or own a
+dataset episode.
+
 `CompositionInformationPlan` is not a dataset capture profile. A camera or
 tactile stream needed only for recording should go directly to the capture
 path. If the same immutable sample is also needed by a composition strategy,
 composition should receive only its declared inline view or stable blob
 reference. Disabling a dataset modality must not change the numerical
-composition result, and enabling one must not force its heavy payload through
+composition evaluation, and enabling one must not force its heavy payload through
 the composition return interface.
 
 ## v2.4 ControlTrace logical readers
@@ -48,6 +70,76 @@ keeps real variable decision intervals. Its `decided_at` comes from the
 recorded computation completion time rather than the scheduler tick. The row
 uses `selected_action` with `action_stage=selected_pre_safety` and never creates
 an unqualified `action` training target.
+
+## Provisional v2.5-p read boundary
+
+`dataset_interface.task_semantics` rebuilds frame-local subtask state from the
+authoritative append-only attempt events; it does not write labels back into
+source rows. The two v2.5-p read paths are explicit:
+
+- `dataset_interface.v25p_native` verifies the native component records,
+  causal-sample joins, bundle hashes, embodiment/task bindings, compatibility
+  receipts, and optional v2.4 reference. It never reads `meta/episodes.jsonl`.
+  A sealed `native_storage_manifest.cjson` selects the chunked Parquet reader;
+  otherwise the frozen per-record CJSON fallback is used.
+- `dataset_interface.v25p` verifies the frozen v1 sidecar whose base is an
+  exact finalized v2.3 episode-record hash.
+
+`load_v25p_episode(dataset_root, episode_uuid)` additionally verifies the
+canonical sidecar domains, embodiment/projection/task profile bindings, the
+complete task-event bundle, the exact finalized legacy episode-record hash,
+and an optional referenced v2.4 capture commit. Missing or rewritten evidence
+fails closed; the loader performs no repair or source mutation.
+
+`project_native_episode_to_v23_rows(...)` is a read-only compatibility adapter,
+not an episode writer. It accepts only a dataset-bound v2.3 projection profile,
+requires a unique component/role/stage/schema match for each required field,
+and exposes omitted native streams as an explicit lossy result. It never treats
+v2.3 fields as the source of native semantics.
+
+`load_v25p_parquet_sample(...)` is the bounded random-read surface for the
+chunked backend. It resolves the owning chunk from manifest ranges and reads
+only the requested component stream shards, while still checking physical and
+logical hashes. This storage optimization does not add dataset fields or alter
+the generic component/profile contracts.
+
+`component_action_projection` is the version-neutral control-to-data boundary.
+It maps a canonical `ComponentAction` to explicitly bound v2 action streams,
+checks the shared action-space and payload hashes, and preserves partial
+component coverage according to the projection spec. Its result contains no
+episode identity, sample index, or time. The existing episode owner supplies
+causal time through the thin `teleop_runtime.collection.v25p_component_action`
+boundary before persistence. The projector does not compose, arbitrate, route,
+dispatch, or create a second episode lifecycle.
+
+`v25p_component_profile` is the deterministic construction boundary for V2
+capture profiles. A caller supplies the canonical `ComponentActionSchema`, an
+explicit embodiment declaration, ordered action-component-to-stream bindings,
+and explicit state/observation stream declarations. The builder copies action
+dtype/shape/frames/units/value semantics from the canonical payload schemas,
+rejects schema drift or incomplete coverage, and returns the embodiment,
+component-stream, and action-projection profiles as one validated immutable
+bundle. It never guesses left/right, arm/tool, pose/qpos, source, or target
+capability from names. RealTeleop and UMI only provide their source-specific
+declarations; both delegate profile/hash construction to this shared builder.
+
+The default-off producer parity gate has two source adapters:
+`RealTeleopV25pProducer` consumes the already assembled `CollectorSample`, and
+`UmiV25pProducer` consumes the already next-observation-aligned `UmiSample`.
+Both construct the shared canonical `ComponentAction` and use the generic
+projector for action streams; source-specific state streams and original causal
+times are attached only at the collection boundary. Neither adapter starts an
+episode or writes a row. `compare_projected_v23_row`
+then compares the native projection with the independently generated legacy
+row using the projection profile's exact field set and each native stream's
+declared dtype/shape. It also checks the per-episode sample index and reports
+missing fields, shape/representation failures, and maximum numeric error.
+The same comparison is now attached behind default-off switches in UMI and in
+both RealTeleop writer modes. The application episode owner supplies one
+identity, legacy output remains authoritative, and a native compatibility
+receipt becomes `complete` only after the finalized legacy episode record is
+resolved and hashed. This remains provisional shadow evidence, not native-v2.5
+eligibility and not a v2.4 commit merge.
 
 `dataset_interface` 是训练时输入层，不负责离线生成或修复 mask。它读取 DexTeleop dataset
 的 RGB 视频与 wrist final keep-mask，并可在 DataLoader worker 内为 front 派生固定边界 mask，

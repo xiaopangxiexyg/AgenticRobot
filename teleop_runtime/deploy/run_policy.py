@@ -37,7 +37,14 @@ from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from deployments.client import load_policy_artifact
 from project_paths import repo_path
 from robot_motion.rm65.assets import require_asset_path
-from robot_motion.action import HandActionSpec, hand_action_specs_metadata
+from robot_motion.action import (
+    ActionComponentCatalog,
+    ActionComponentSpec,
+    ArmActionSpec,
+    HandActionSpec,
+    build_robot_action_v1_runtime_schema,
+    hand_action_specs_metadata,
+)
 from robot_motion.deploy.actions import (
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
@@ -56,6 +63,7 @@ from robot_motion.deploy.observation import (
     build_deployment_observation,
 )
 from robot_motion.deploy.observation_view import default_deploy_policy_observation_contract
+from robot_motion.deploy.next_step import sync_queue_preserves_same_chunk_successor
 from robot_motion.deploy.pose_adapter import convert_policy_absolute_vector_to_runtime_raw
 from robot_motion.deploy.runtime import (
     PolicyDeployRuntime,
@@ -84,16 +92,18 @@ from robot_motion.rm65 import (
     DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
-    IKObjectiveWeights,
     LEGACY_POSITION_CONTROL_PROFILE_NAME,
     RM65_BIMANUAL_POSITION_V1,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_POSITION_CONTROL_PROFILE_CHOICES,
+    RM65_POSE_LIFT_PROFILE_CHOICES,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65_POSITION_TRACKING_FOLLOW_ALPHA,
     RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
     RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
-    load_ik_tuning_config,
+    build_rm65_pose_lift_ik_tuning,
+    resolve_rm65_pose_lift_profile,
 )
 from robot_motion.position_control import (
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
@@ -202,6 +212,12 @@ from .arbiter_shadow import (
     PolicyArbiterShadowConfig,
 )
 from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
+from .impedance_force_guard import (
+    ImpedanceForceGuardConfig,
+    ImpedanceForceGuardFault,
+    ImpedanceForceGuardMonitor,
+    bimanual_emergency_stop,
+)
 from deployments.client.policy import load_policy
 from deployments.client.rtc_executor import (
     rtc_client_inference_bundle_debug_payload,
@@ -1677,6 +1693,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--pose-lift-profile",
+        choices=RM65_POSE_LIFT_PROFILE_CHOICES,
+        default=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        help=(
+            "Versioned Pose-to-QPOS lift profile. v4_qp_constrained is the "
+            "deployment default and combines bounded continuity with admitted-anchor "
+            "Pink qref velocity/acceleration constraints. v1_baseline remains the "
+            "explicit atomic rollback; v2/v3 preserve intermediate profiles."
+        ),
+    )
+    parser.add_argument(
         "--arm-control-hz",
         type=_positive_float,
         default=None,
@@ -2450,26 +2477,13 @@ def _hands_enabled(args: argparse.Namespace) -> bool:
 def _position_deploy_ik_tuning(args: argparse.Namespace):
     """Bind the formal action-to-qref objective without source-side shaping."""
 
-    if (
-        str(getattr(args, "position_control_profile_resolved", ""))
-        == LEGACY_POSITION_CONTROL_PROFILE_NAME
-    ):
-        return None
-    tuning = load_ik_tuning_config()
-    mode_name = RM65_BIMANUAL_POSITION_V1_NAME
-    position_weight = RM65_BIMANUAL_POSITION_V1.ik_execution.position_weight
-    orientation_weight = float(args.position_ik_orientation_weight)
-    objective_modes = dict(tuning.objective_modes)
-    objective_modes[mode_name] = IKObjectiveWeights(
-        single_arm_position_weight=position_weight,
-        single_arm_orientation_weight=orientation_weight,
-        dual_arm_position_cost=position_weight,
-        dual_arm_orientation_cost=orientation_weight,
-    )
-    return replace(
-        tuning,
-        ik_objective_mode=mode_name,
-        objective_modes=objective_modes,
+    return build_rm65_pose_lift_ik_tuning(
+        position_control_profile=(
+            str(getattr(args, "position_control_profile_resolved", ""))
+            or RM65_BIMANUAL_POSITION_V1_NAME
+        ),
+        pose_lift_profile=str(args.pose_lift_profile),
+        orientation_weight=float(args.position_ik_orientation_weight),
     )
 
 
@@ -2480,6 +2494,12 @@ def validate_args(
 ) -> tuple[str, ...]:
     active_sides = _parse_active_sides(args.active_sides)
     args.active_sides = active_sides
+    pose_lift_profile = resolve_rm65_pose_lift_profile(args.pose_lift_profile)
+    if bool(args.send_actions) and not pose_lift_profile.hardware_dispatch_allowed:
+        raise ValueError(
+            f"pose-lift profile {pose_lift_profile.name!r} forbids hardware "
+            "dispatch; select a profile with hardware_dispatch_allowed=true."
+        )
     observation_firewall_mode = str(
         getattr(args, "policy_observation_firewall_mode", "strict")
     ).strip().lower()
@@ -3232,6 +3252,21 @@ def hold_deploy_arm_backends(
             errors.append(f"{side}: {type(exc).__name__}: {exc}")
     if errors:
         raise RuntimeError("deploy arm hold failed: " + "; ".join(errors))
+
+
+def emergency_stop_deploy_arm_backends(
+    arm_backends: Mapping[str, EffectorBackend],
+    *,
+    reason: str,
+) -> None:
+    """Request a concurrent, latched emergency stop on every active arm."""
+
+    errors = bimanual_emergency_stop(arm_backends, reason=str(reason))
+    if errors:
+        raise RuntimeError(
+            "deploy bimanual emergency stop was not acknowledged by all active arms: "
+            + "; ".join(f"{side}={detail}" for side, detail in sorted(errors.items()))
+        )
 
 
 def build_arm_backends(
@@ -4176,6 +4211,34 @@ def main(
             ]
         )
         runtime_session_id = f"deploy-shadow-{uuid.uuid4()}"
+        shadow_catalog = ActionComponentCatalog(
+            catalog_id=(
+                "deploy-shadow:"
+                f"{'-'.join(shadow_effectors)}:v1"
+            ),
+            action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+            components=tuple(
+                ActionComponentSpec(
+                    component_id=effector,
+                    selection_group_id=effector,
+                    effector_name=effector,
+                )
+                for effector in shadow_effectors
+            ),
+        )
+        shadow_action_schema = build_robot_action_v1_runtime_schema(
+            component_catalog=shadow_catalog,
+            arm_action_specs_by_side={
+                side: ArmActionSpec.tool_tcp(side)
+                for side in active_sides
+                if bool(args.arms_enabled)
+            },
+            hand_action_specs_by_side={
+                side: HandActionSpec.inspire_tac(side)
+                for side in end_effector_sides
+                if hands_enabled
+            },
+        )
         policy_arbiter_shadow = PassivePolicyArbiterShadow(
             PolicyArbiterShadowConfig(
                 runtime_session_id=runtime_session_id,
@@ -4195,6 +4258,8 @@ def main(
                 policy_node_id="single_policy",
                 clock_domain_id="local_monotonic",
                 boot_id=runtime_session_id,
+                component_catalog=shadow_catalog,
+                action_schema=shadow_action_schema,
             )
         )
         print(
@@ -4213,6 +4278,7 @@ def main(
                         embodiment_instance_id="rm65-bimanual-0",
                         producer_id=policy_arbiter_shadow.config.producer_id,
                         producer_epoch=policy_arbiter_shadow.config.producer_epoch,
+                        action_schema=shadow_action_schema,
                         component_schema_hash=(
                             policy_arbiter_shadow.component_catalog.semantic_content_hash
                         ),
@@ -4675,6 +4741,10 @@ def main(
                                 else args.position_qref_max_angvel
                             )
                         ),
+                        max_joint_acceleration_rad_s2=tuple(
+                            float(value)
+                            for value in args.position_max_acceleration_rad_s2
+                        ),
                         max_joint_step_rad=(
                             None
                             if float(args.max_arm_joint_step_rad) <= 0.0
@@ -4693,6 +4763,7 @@ def main(
                         solve_iteration_reserve_ms=float(
                             args.position_ik_iteration_reserve_ms
                         ),
+                        pose_lift_profile=str(args.pose_lift_profile),
                         debug_profile=bool(args.position_collision_debug_profile),
                         ik_tuning=_position_deploy_ik_tuning(args),
                     )
@@ -4858,6 +4929,53 @@ def main(
         == RM65_ARM_CONTROL_MODE_IMPEDANCE
     )
     impedance_force_control_enabled = False
+    impedance_force_guard_monitor: ImpedanceForceGuardMonitor | None = None
+
+    if impedance_force_control_is_deferred:
+        guard_readers: dict[str, Callable[[], Mapping[str, Any]]] = {}
+        for side, backend in arm_backends.items():
+            reader = getattr(backend, "read_impedance_force_guard_data", None)
+            set_callback = getattr(backend, "set_force_hard_stop_callback", None)
+            if not callable(reader) or not callable(set_callback):
+                raise RuntimeError(
+                    f"{side} impedance backend does not expose the force-guard contract"
+                )
+            guard_readers[str(side)] = reader
+
+        def impedance_force_guard_stop(
+            fault: ImpedanceForceGuardFault,
+        ) -> None:
+            reason = (
+                f"impedance_force_guard:{fault.reason}:"
+                f"{fault.side or 'all'}"
+            )
+            print(
+                "[ImpedanceForceGuard] TRIPPED; requesting concurrent bimanual "
+                f"Arm_Stop: {fault.message}",
+                flush=True,
+            )
+            try:
+                emergency_stop_deploy_arm_backends(
+                    arm_backends,
+                    reason=reason,
+                )
+            except Exception as exc:
+                print(
+                    "[ImpedanceForceGuard] CRITICAL: bimanual Arm_Stop "
+                    f"acknowledgement failed: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
+
+        impedance_force_guard_monitor = ImpedanceForceGuardMonitor(
+            readers_by_side=guard_readers,
+            emergency_stop=impedance_force_guard_stop,
+            config=ImpedanceForceGuardConfig(),
+        )
+        for side, backend in arm_backends.items():
+            set_callback = getattr(backend, "set_force_hard_stop_callback")
+            set_callback(impedance_force_guard_monitor.notify_backend_hard_stop)
 
     def enable_deferred_impedance_force_control(*, trigger: str) -> None:
         """Start impedance output only at an explicit policy/init start boundary."""
@@ -4866,6 +4984,15 @@ def main(
         if not impedance_force_control_is_deferred or impedance_force_control_enabled:
             return
         enable_impedance_force_control_backends(arm_backends, ready_timeout_sec=1.0)
+        if impedance_force_guard_monitor is not None:
+            guard_snapshot = impedance_force_guard_monitor.start()
+            guard_config = guard_snapshot.get("config", {})
+            print(
+                "[Deploy] impedance force guard armed "
+                f"config={guard_config} "
+                f"sides={sorted(guard_snapshot.get('last_reading_by_side', {}))}",
+                flush=True,
+            )
         impedance_force_control_enabled = True
         print(
             "[Deploy] impedance periodic output enabled "
@@ -5106,6 +5233,14 @@ def main(
                 loop_started_at = time.time()
                 control_loop_started_at = time.monotonic()
                 position_safety_fault_latched = False
+                impedance_force_guard_fault = (
+                    None
+                    if impedance_force_guard_monitor is None
+                    else impedance_force_guard_monitor.fault
+                )
+                impedance_force_guard_fault_latched = (
+                    impedance_force_guard_fault is not None
+                )
                 if position_deploy_executor is not None:
                     flush_position_executor_debug_events()
                     executor_fault = position_deploy_executor.snapshot()
@@ -5118,6 +5253,13 @@ def main(
                             position_safety_fault_latched = True
                         else:
                             position_deploy_executor.raise_if_fault()
+                if impedance_force_guard_fault_latched:
+                    policy_active = False
+                    policy_deploy_runtime.clear_action_queue()
+                    hold_rtc_if_eligible(
+                        now=control_loop_started_at,
+                        reason="impedance_force_guard_latched",
+                    )
                 key = keyboard.poll()
                 preview_keys: list[str] = []
                 if camera_previewer is not None:
@@ -5126,13 +5268,17 @@ def main(
                     key = preview_keys[0]
                 key = None if key is None else key.lower()
                 rearm_requested = bool(key == "r")
-                if rearm_requested and not position_safety_fault_latched:
+                if (
+                    rearm_requested
+                    and not position_safety_fault_latched
+                    and not impedance_force_guard_fault_latched
+                ):
                     print("[Deploy] r ignored: no manually re-armable safety fault is latched.")
                 elif rearm_requested:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
                 elif key == "g":
-                    if position_safety_fault_latched:
+                    if position_safety_fault_latched or impedance_force_guard_fault_latched:
                         policy_active = False
                         print(
                             "[Deploy] g ignored: a safety fault is latched; press r only after "
@@ -5169,7 +5315,13 @@ def main(
                         policy_active = True
                         print("[Deploy] policy active")
                 elif key == "a":
-                    if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
+                    if impedance_force_guard_fault_latched:
+                        policy_active = False
+                        print(
+                            "[Deploy] ready confirm ignored: impedance force guard is "
+                            "latched; complete manual re-arm with r."
+                        )
+                    elif fixed_init_controller is not None and fixed_init_controller.blocks_policy:
                         print("[Deploy] ready confirm ignored: complete fixed-init H -> H first.")
                     elif policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
                         print("[Deploy] ready confirm ignored: complete policy qpos init first (press g).")
@@ -5280,6 +5432,93 @@ def main(
                     },
                 )
                 faults = list(observation.faults)
+                if impedance_force_guard_fault_latched:
+                    policy_active = False
+                    policy_deploy_runtime.clear_action_queue()
+                    hold_rtc_if_eligible(
+                        now=control_loop_started_at,
+                        reason="impedance_force_guard_latched",
+                    )
+                    guard_reason = (
+                        "unknown"
+                        if impedance_force_guard_fault is None
+                        else impedance_force_guard_fault.reason
+                    )
+                    faults.append(
+                        "impedance_force_guard_manual_rearm_required:"
+                        + guard_reason
+                    )
+                    if rearm_requested and impedance_force_guard_monitor is not None:
+                        try:
+                            for side, backend in arm_backends.items():
+                                state = arm_states.get(side)
+                                if not isinstance(state, Mapping):
+                                    raise RuntimeError(
+                                        f"{side} has no current hardware state for manual re-arm"
+                                    )
+                                if not bool(state.get("hardware_read_success", False)):
+                                    raise RuntimeError(
+                                        f"{side} hardware feedback is not fresh/valid"
+                                    )
+                                qpos = state.get("hardware_qpos")
+                                if qpos is None:
+                                    qpos = state.get("current_qpos")
+                                if qpos is None:
+                                    raise RuntimeError(
+                                        f"{side} has no qpos for manual impedance re-arm"
+                                    )
+                                measured_at = state.get("hardware_measurement_timestamp")
+                                if measured_at is not None:
+                                    measured_age = loop_started_at - float(measured_at)
+                                    if measured_age > 0.5:
+                                        raise RuntimeError(
+                                            f"{side} hardware qpos is stale ({measured_age:.3f}s)"
+                                        )
+                                rearm = getattr(
+                                    backend,
+                                    "manual_rearm_after_emergency_stop",
+                                    None,
+                                )
+                                if not callable(rearm):
+                                    raise RuntimeError(
+                                        f"{side} backend does not expose manual impedance re-arm"
+                                    )
+                                rearm(qpos)
+                            impedance_force_guard_monitor.rearm_after_manual_home(
+                                start=False
+                            )
+                            impedance_force_control_enabled = False
+                        except Exception as exc:  # noqa: BLE001 - keep the latch on failure.
+                            try:
+                                emergency_stop_deploy_arm_backends(
+                                    arm_backends,
+                                    reason="impedance_force_guard_rearm_failed",
+                                )
+                            except Exception as stop_exc:  # noqa: BLE001
+                                print(
+                                    "[Deploy] impedance re-arm fallback stop failed: "
+                                    f"{type(stop_exc).__name__}: {stop_exc}",
+                                    file=sys.stderr,
+                                )
+                            print(
+                                "[Deploy] impedance force guard re-arm rejected; "
+                                f"fresh manual Home is required: {type(exc).__name__}: {exc}"
+                            )
+                        else:
+                            impedance_force_guard_fault = None
+                            impedance_force_guard_fault_latched = False
+                            policy.reset()
+                            startup_initializer.reset()
+                            policy_deploy_runtime.clear_action_queue()
+                            policy_deploy_runtime.reset_prediction_schedule()
+                            ready_confirmed = not wait_for_ready_confirm
+                            faults.append(
+                                "impedance_force_guard_rearmed_press_g_to_resume"
+                            )
+                            print(
+                                "[Deploy] impedance force guard re-armed after fresh "
+                                "hardware qpos; press g to resume."
+                            )
                 if position_safety_fault_latched:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
@@ -5357,6 +5596,18 @@ def main(
                         policy_qpos_completed_this_step = True
                         print("[Deploy] policy qpos init complete; startup init/policy released.")
 
+                live_impedance_force_guard_fault = (
+                    None
+                    if impedance_force_guard_monitor is None
+                    else impedance_force_guard_monitor.fault
+                )
+                if live_impedance_force_guard_fault is not None:
+                    impedance_force_guard_fault = live_impedance_force_guard_fault
+                    impedance_force_guard_fault_latched = True
+                    policy_active = False
+                    policy_deploy_runtime.clear_action_queue()
+                if impedance_force_guard_fault_latched:
+                    policy_active = False
                 if policy_active:
                     position_action_submitted_this_loop = False
                     can_run_policy = not (bool(args.require_ready_observation) and faults)
@@ -5555,6 +5806,12 @@ def main(
                             preparer=canonical_action_pipeline,
                             policy_name=policy.name,
                             allow_output=allow_policy_output,
+                            same_chunk_next_step_will_execute=(
+                                sync_queue_preserves_same_chunk_successor(
+                                    queue_policy=action_queue_policy,
+                                    min_action_queue=args.min_action_queue,
+                                )
+                            ),
                         )
                     else:
                         rtc_step = rtc_frontend.step(
@@ -6040,6 +6297,23 @@ def main(
                             ) else "",
                             policy_status,
                             ik_action_gate.status_text(),
+                            (
+                                "impedance_guard=latched:"
+                                + str(
+                                    impedance_force_guard_fault.reason
+                                    if impedance_force_guard_fault is not None
+                                    else "unknown"
+                                )
+                                if impedance_force_guard_fault_latched
+                                else (
+                                    "impedance_guard=armed"
+                                    if (
+                                        impedance_force_guard_monitor is not None
+                                        and impedance_force_guard_monitor.motion_ready
+                                    )
+                                    else ""
+                                )
+                            ),
                             position_executor_status,
                             (
                                 "rtc="
@@ -6162,6 +6436,8 @@ def main(
                 "position_executor_final_snapshot",
                 position_deploy_executor.snapshot(),
             )
+        if impedance_force_guard_monitor is not None:
+            close_resource("impedance_force_guard", impedance_force_guard_monitor)
         if fixed_init_controller is not None:
             try:
                 fixed_init_controller.restore_speed(arm_backends)

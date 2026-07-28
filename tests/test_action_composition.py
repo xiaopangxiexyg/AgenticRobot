@@ -4,6 +4,7 @@ from dataclasses import replace
 import math
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -20,10 +21,12 @@ from control_composition.composition import (
     DeterministicComposer,
     build_composite_action_proposal_draft,
     build_composition_input_snapshot,
+    build_robot_action_v1_composition_input_draft,
     decide_composition_authority_disposition,
     project_composition_inputs,
 )
 from control_composition.retention import TimeWindowRetentionSpec
+from control_composition.temporal import CompositionTemporalSelectionSpec
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_QPOS_V1,
@@ -31,16 +34,17 @@ from robot_motion.action import (
     ActionComponentSpec,
     ProposalBuffer,
     RobotAction,
+    build_robot_action_v1_runtime_schema,
 )
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
 from robot_motion.runtime.identity import ClockDomainDescriptor
 from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
-from robot_motion.action.proposal import ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V2
+from robot_motion.action.proposal import ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V4
 from teleop_runtime.control_trace.projection import (
     project_composition_input,
     project_composition_input_admission,
     project_composition_input_snapshot,
-    project_composition_result,
+    project_composition_evaluation,
     project_composition_spec,
 )
 
@@ -53,7 +57,29 @@ class Clock:
         return self.value
 
 
-def runtime():
+def component_catalog(
+    *,
+    action_space: str,
+    active_effectors: tuple[str, ...],
+) -> ActionComponentCatalog:
+    return ActionComponentCatalog(
+        catalog_id=(
+            f"action-composition:{action_space}:"
+            f"{'+'.join(active_effectors)}"
+        ),
+        action_space=action_space,
+        components=tuple(
+            ActionComponentSpec(effector, effector, effector)
+            for effector in active_effectors
+        ),
+    )
+
+
+def runtime(
+    *,
+    action_space: str = BIMANUAL_QPOS_V1,
+    active_effectors: tuple[str, ...] = ("left_arm",),
+):
     clock = Clock()
     coordinator = ControlAdmissionCoordinator(
         "robot-0",
@@ -76,6 +102,13 @@ def runtime():
             produced_clock_domain_id=f"{producer}.monotonic",
             reason="startup",
         )
+    catalog = component_catalog(
+        action_space=action_space,
+        active_effectors=active_effectors,
+    )
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
     store = CompositionInputStore(
         runtime_session_id="session-0",
         coordinator=coordinator,
@@ -86,17 +119,13 @@ def runtime():
             max_future_lead_sec=2.0,
             max_effective_duration_sec=2.0,
         ),
+        action_schema=action_schema,
     )
     proposals = ProposalBuffer(
         runtime_session_id="session-0",
         coordinator=coordinator,
         producer_epochs=epochs,
         capacity=16,
-    )
-    catalog = ActionComponentCatalog(
-        catalog_id="left-arm-v1",
-        action_space=BIMANUAL_QPOS_V1,
-        components=(ActionComponentSpec("left_arm", "left_arm", "left_arm"),),
     )
     return clock, coordinator, epochs, store, proposals, catalog
 
@@ -148,8 +177,17 @@ def input_draft(
     context_ids=(),
     source_fact_ids=(),
     source_fact_hashes=(),
+    action_schema=None,
 ) -> CompositionInputDraft:
-    return CompositionInputDraft(
+    bound_action_schema = action_schema
+    if bound_action_schema is None:
+        bound_action_schema = build_robot_action_v1_runtime_schema(
+            component_catalog=component_catalog(
+                action_space=action.action_space,
+                active_effectors=tuple(action.active_effectors),
+            ),
+        )
+    return build_robot_action_v1_composition_input_draft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
         producer_id=producer,
@@ -157,6 +195,7 @@ def input_draft(
         sequence=sequence,
         input_role=role,
         action=action,
+        action_schema=bound_action_schema,
         produced_at=9.9,
         produced_clock_domain_id=f"{producer}.monotonic",
         effective_from=10.0,
@@ -179,6 +218,116 @@ def residual_spec(*, missing: str = "zero_residual") -> CompositionSpec:
         missing_residual_behavior=missing,
         residual_limit_by_component={"left_arm": 0.05},
     )
+
+
+def test_composition_source_participation_defaults_and_dependency_validation() -> None:
+    default_required = CompositionSpec(
+        spec_id="default-required",
+        algebra="component_union",
+        input_roles=("baseline", "overlay"),
+    )
+    assert default_required.required_roles == ("baseline", "overlay")
+    assert dict(default_required.participation_requirement_by_role) == {
+        "baseline": "required",
+        "overlay": "required",
+    }
+
+    optional_overlay = CompositionSpec(
+        spec_id="optional-overlay",
+        algebra="component_union",
+        input_roles=("baseline", "overlay"),
+        required_roles=("baseline",),
+        depends_on_roles_by_role={"overlay": ("baseline",)},
+    )
+    assert dict(optional_overlay.participation_requirement_by_role) == {
+        "baseline": "required",
+        "overlay": "optional",
+    }
+
+    with pytest.raises(ValueError, match="required role may depend"):
+        CompositionSpec(
+            spec_id="invalid-required-dependency",
+            algebra="component_union",
+            input_roles=("baseline", "overlay"),
+            required_roles=("overlay",),
+            depends_on_roles_by_role={"overlay": ("baseline",)},
+        )
+    with pytest.raises(ValueError, match="acyclic"):
+        CompositionSpec(
+            spec_id="cyclic-dependency",
+            algebra="component_union",
+            input_roles=("baseline", "overlay"),
+            required_roles=(),
+            depends_on_roles_by_role={
+                "baseline": ("overlay",),
+                "overlay": ("baseline",),
+            },
+        )
+
+
+def test_dependency_closure_excludes_overlay_but_preserves_preclosure_lineage() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    receipt = store.admit(
+        input_draft(
+            producer="fast-residual",
+            role="overlay",
+            action=qpos_action(0.2),
+        )
+    )
+    assert receipt.accepted
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    spec = CompositionSpec(
+        spec_id="optional-relative-branch",
+        algebra="component_union",
+        input_roles=("baseline", "overlay"),
+        required_roles=(),
+        depends_on_roles_by_role={"overlay": ("baseline",)},
+    )
+    snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+
+    assert snapshot.selected_input_by_role == {}
+    assert tuple(snapshot.selected_input_before_dependency_by_role) == (
+        "overlay",
+    )
+    assert snapshot.dependency_ineligibility_reason_by_role == {
+        "overlay": "prerequisite_unavailable:baseline"
+    }
+    assert snapshot.missing_roles == ("baseline", "overlay")
+
+
+def test_optional_dependent_missing_does_not_remove_available_baseline() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    receipt = store.admit(
+        input_draft(
+            producer="slow-base",
+            role="baseline",
+            action=qpos_action(0.1),
+        )
+    )
+    assert receipt.accepted
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    spec = CompositionSpec(
+        spec_id="optional-relative-branch",
+        algebra="component_union",
+        input_roles=("baseline", "overlay"),
+        required_roles=("baseline",),
+        depends_on_roles_by_role={"overlay": ("baseline",)},
+    )
+    snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+
+    assert tuple(snapshot.selected_input_by_role) == ("baseline",)
+    assert snapshot.missing_roles == ("overlay",)
+    assert snapshot.dependency_ineligibility_reason_by_role == {}
 
 
 def test_internal_inputs_are_not_authority_candidates_and_only_composite_is_proposed() -> None:
@@ -210,9 +359,9 @@ def test_internal_inputs_are_not_authority_candidates_and_only_composite_is_prop
     )
     result = DeterministicComposer().compose(snapshot, spec=residual_spec())
     assert result.output_status == "ready"
-    assert result.composed_action is not None
+    assert result.composed_candidate is not None
     np.testing.assert_allclose(
-        result.composed_action.arm_qpos_by_side["left"],
+        result.composed_candidate.value("left_arm").values,
         np.full(6, 0.15, dtype=np.float32),
     )
     proposal = proposals.admit(
@@ -229,9 +378,6 @@ def test_internal_inputs_are_not_authority_candidates_and_only_composite_is_prop
             effective_from=10.0,
             effective_until=11.0,
             effective_clock_domain_id="control.monotonic",
-            component_schema_hash=catalog.semantic_content_hash,
-            component_coverage=("left_arm",),
-            selection_groups=("left_arm",),
             policy_node_id="fast-composer",
         )
     ).proposal
@@ -240,11 +386,11 @@ def test_internal_inputs_are_not_authority_candidates_and_only_composite_is_prop
     assert proposal.composition_input_ids == result.input_ids
     assert proposal.composition_input_hashes == result.input_hashes
     assert proposal.composition_spec_hash == result.composition_spec_hash
-    assert proposal.semantic_hash_domain == ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V2
+    assert proposal.semantic_hash_domain == ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V4
     assert proposal.context_ids == ("slow-context-7",)
 
 
-def test_unscoped_v1_composition_hashes_remain_compatible() -> None:
+def test_unscoped_composition_evaluation_uses_new_candidate_hash_domain() -> None:
     _, coordinator, epochs, store, _, _ = runtime()
     receipt = store.admit(
         input_draft(
@@ -265,16 +411,80 @@ def test_unscoped_v1_composition_hashes_remain_compatible() -> None:
     result = DeterministicComposer().compose(snapshot, spec=spec)
 
     assert receipt.semantic_content_hash == (
-        "bf3aaee5b15ae1150823bb40494187789175cd520fda37916c304e2a36813734"
+        "18c50efff3a8db702ce2854e1145eb0e39b9b02050ec6bd358b4b86c666d5bb5"
     )
     assert snapshot.semantic_content_hash == (
-        "9a8cbe7d83088554c9b192154d04df2698cd3c4b99000de8592ac49117ecf8be"
+        "9e763408d5a4765305f9d7e13bd40320588267e4cf79b323a667613f96357352"
     )
     assert result.semantic_content_hash == (
-        "b83a57d777de2d671a467abed0cbb833b481474f54e475d30101bf8d6e501d4e"
+        "7304caeee0d3bb0f9fe938506c5eceb7a5bba44f24d7c03b49ccf3232bdefc94"
     )
     assert snapshot.expected_activation_id is None
     assert result.composition_activation_id is None
+
+
+def test_temporal_selection_uses_receiver_admission_for_equal_source_intervals() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    first = store.admit(
+        input_draft(
+            producer="slow-base",
+            role="base",
+            action=qpos_action(0.1),
+        )
+    )
+    second = store.admit(
+        input_draft(
+            producer="fast-residual",
+            role="base",
+            action=qpos_action(0.2),
+        )
+    )
+    assert first.accepted and second.accepted
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    spec = CompositionSpec(
+        spec_id="single-base-temporal-selection",
+        algebra="component_union",
+        input_roles=("base",),
+        required_roles=("base",),
+    )
+    snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+    assert snapshot.selected_input_by_role["base"].producer_id == (
+        "fast-residual"
+    )
+
+    with pytest.raises(ValueError, match="Multiple composition inputs"):
+        build_composition_input_snapshot(
+            project_composition_inputs(store, cut),
+            producer_epochs=epochs.snapshot(cut),
+            spec=spec,
+            target_effective_at=10.5,
+            temporal_selection_spec=CompositionTemporalSelectionSpec(
+                spec_id="reject-overlap",
+                overlap_behavior="reject_multiple_covering",
+            ),
+        )
+
+
+def test_temporal_selection_bounds_target_against_receiver_cut() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    with pytest.raises(ValueError, match="lead bound"):
+        build_composition_input_snapshot(
+            project_composition_inputs(store, cut),
+            producer_epochs=epochs.snapshot(cut),
+            spec=residual_spec(),
+            target_effective_at=10.5,
+            temporal_selection_spec=CompositionTemporalSelectionSpec(
+                spec_id="bounded-target",
+                maximum_target_lead_sec=0.1,
+                maximum_target_lag_sec=0.1,
+            ),
+        )
 
 
 def test_activation_v2_excludes_unbound_and_prior_activation_inputs() -> None:
@@ -573,7 +783,8 @@ def test_missing_residual_has_explicit_zero_or_no_action_semantics() -> None:
     assert zero.output_status == "ready"
     assert zero.reason == "zero_residual"
     np.testing.assert_allclose(
-        zero.composed_action.arm_qpos_by_side["left"], np.full(6, 0.1)
+        zero.composed_candidate.value("left_arm").values,
+        np.full(6, 0.1),
     )
 
     no_action_spec = residual_spec(missing="no_action")
@@ -587,11 +798,13 @@ def test_missing_residual_has_explicit_zero_or_no_action_semantics() -> None:
         no_action_snapshot, spec=no_action_spec
     )
     assert no_action.output_status == "no_action"
-    assert no_action.composed_action is None
+    assert no_action.composed_candidate is None
 
 
 def test_component_union_rejects_overlap_and_preserves_disjoint_components() -> None:
-    _, coordinator, epochs, store, _, _ = runtime()
+    _, coordinator, epochs, store, _, _ = runtime(
+        active_effectors=("left_arm", "left_hand"),
+    )
     arm_only = RobotAction(
         action_space=BIMANUAL_QPOS_V1,
         arm_qpos_by_side={"left": np.ones(6, dtype=np.float32)},
@@ -602,9 +815,21 @@ def test_component_union_rejects_overlap_and_preserves_disjoint_components() -> 
         hand_qpos_by_side={"left": np.full(6, 0.2, dtype=np.float32)},
         source="hand",
     )
-    store.admit(input_draft(producer="slow-base", role="arm", action=arm_only))
     store.admit(
-        input_draft(producer="fast-residual", role="hand", action=hand_only)
+        input_draft(
+            producer="slow-base",
+            role="arm",
+            action=arm_only,
+            action_schema=store.action_schema,
+        )
+    )
+    store.admit(
+        input_draft(
+            producer="fast-residual",
+            role="hand",
+            action=hand_only,
+            action_schema=store.action_schema,
+        )
     )
     spec = CompositionSpec(
         spec_id="component-union-v1",
@@ -621,11 +846,17 @@ def test_component_union_rejects_overlap_and_preserves_disjoint_components() -> 
     )
     result = DeterministicComposer().compose(snapshot, spec=spec)
     assert result.output_status == "ready"
-    assert result.composed_action.active_effectors == ("left_arm", "left_hand")
+    assert result.composed_candidate.component_coverage == (
+        "left_arm",
+        "left_hand",
+    )
 
 
 def test_weighted_se3_pose_composition_is_generic_and_deterministic() -> None:
-    _, coordinator, epochs, store, _, _ = runtime()
+    _, coordinator, epochs, store, _, _ = runtime(
+        action_space=BIMANUAL_EE_POSE_V1,
+        active_effectors=("left_arm", "right_arm"),
+    )
     store.admit(
         input_draft(
             producer="slow-base",
@@ -662,20 +893,23 @@ def test_weighted_se3_pose_composition_is_generic_and_deterministic() -> None:
     assert first.output_status == "ready"
     assert first.reason == "weighted_se3_pose_fusion"
     assert first.semantic_content_hash == second.semantic_content_hash
-    assert first.composed_action is not None
+    assert first.composed_candidate is not None
     np.testing.assert_allclose(
-        first.composed_action.arm_pose_by_side["left"][:3],
+        first.composed_candidate.value("left_arm").values[:3],
         np.asarray([0.3, -0.1, 0.3]),
         atol=1e-6,
     )
     yaw = Rotation.from_quat(
-        first.composed_action.arm_pose_by_side["left"][3:7]
+        first.composed_candidate.value("left_arm").values[3:7]
     ).as_euler("zyx", degrees=True)[0]
     assert math.isclose(yaw, 45.0, abs_tol=1e-4)
 
 
 def test_weighted_pose_composition_supports_single_arm_manifest() -> None:
-    _, coordinator, epochs, store, _, _ = runtime()
+    _, coordinator, epochs, store, _, _ = runtime(
+        action_space=BIMANUAL_EE_POSE_V1,
+        active_effectors=("left_arm",),
+    )
     for producer, role, x in (
         ("slow-base", "policy_pose", 0.2),
         ("fast-residual", "human_pose", 0.4),
@@ -717,11 +951,10 @@ def test_weighted_pose_composition_supports_single_arm_manifest() -> None:
     result = DeterministicComposer().compose(snapshot, spec=spec)
 
     assert result.output_status == "ready"
-    assert result.composed_action is not None
-    assert result.composed_action.active_effectors == ("left_arm",)
-    assert set(result.composed_action.arm_pose_by_side) == {"left"}
+    assert result.composed_candidate is not None
+    assert result.composed_candidate.component_coverage == ("left_arm",)
     np.testing.assert_allclose(
-        result.composed_action.arm_pose_by_side["left"][:3],
+        result.composed_candidate.value("left_arm").values[:3],
         [0.3, -0.1, 0.3],
         atol=1e-7,
     )
@@ -764,7 +997,10 @@ def test_default_weighted_pose_spec_hash_keeps_legacy_payload() -> None:
 
 
 def test_weighted_se3_pose_composition_missing_role_and_conflict_fail_closed() -> None:
-    _, coordinator, epochs, store, _, _ = runtime()
+    _, coordinator, epochs, store, _, _ = runtime(
+        action_space=BIMANUAL_EE_POSE_V1,
+        active_effectors=("left_arm", "right_arm"),
+    )
     store.admit(
         input_draft(
             producer="slow-base",
@@ -858,7 +1094,10 @@ def test_existing_composition_spec_hash_does_not_gain_pose_fusion_fields() -> No
 
 
 def test_formal_composition_gate_publishes_only_ready_result() -> None:
-    _, coordinator, epochs, store, _, _ = runtime()
+    _, coordinator, epochs, store, _, _ = runtime(
+        action_space=BIMANUAL_EE_POSE_V1,
+        active_effectors=("left_arm", "right_arm"),
+    )
     for producer, role, value in (
         ("slow-base", "human_pose", 0.2),
         ("fast-residual", "replay_pose", 0.3),
@@ -910,12 +1149,17 @@ def test_formal_composition_gate_publishes_only_ready_result() -> None:
         gate_spec=gate,
     )
     assert first.action == "publish_proposal"
+    assert first.downstream_request == "submit_candidate"
+    assert not first.authoritative
     assert first.reason == "ready_composition"
     assert first.semantic_content_hash == second.semantic_content_hash
 
 
 def test_formal_composition_gate_holds_on_required_ttl_or_conflict() -> None:
-    _, coordinator, epochs, store, _, _ = runtime()
+    _, coordinator, epochs, store, _, _ = runtime(
+        action_space=BIMANUAL_EE_POSE_V1,
+        active_effectors=("left_arm", "right_arm"),
+    )
     assert store.admit(
         input_draft(
             producer="slow-base",
@@ -960,6 +1204,8 @@ def test_formal_composition_gate_holds_on_required_ttl_or_conflict() -> None:
         gate_spec=gate,
     )
     assert missing.action == "hold"
+    assert missing.downstream_request == "request_hold"
+    assert not missing.authoritative
     assert missing.reason == "required_contributor_missing"
 
     assert store.admit(
@@ -1050,7 +1296,7 @@ def test_composition_trace_records_keep_input_ids_and_hashes() -> None:
         embodiment_instance_id="rm65-pair-0",
         clock_domain_id="control.monotonic",
     )
-    result_fact = project_composition_result(
+    result_fact = project_composition_evaluation(
         result,
         runtime_session_id="session-0",
         control_domain_id="robot-0",
@@ -1083,7 +1329,10 @@ def test_composition_trace_records_keep_input_ids_and_hashes() -> None:
 
 
 def test_generic_contributor_input_has_explicit_source_lineage() -> None:
-    _, _, _, store, _, _ = runtime()
+    _, _, _, store, _, _ = runtime(
+        action_space=BIMANUAL_EE_POSE_V1,
+        active_effectors=("left_arm", "right_arm"),
+    )
     source_ids = ("human-emission:0", "human-adapter-receipt:0")
     source_hashes = ("a" * 64, "b" * 64)
     receipt = store.admit(
@@ -1147,8 +1396,11 @@ def test_input_snapshot_closes_time_window_without_losing_sequence_tombstone() -
     assert health.retained_record_count == 0
     assert health.pruned_record_count == 1
     assert health.producer_epoch_tombstone_count == 1
-    assert selected.selected_input_by_role["base"].action.action_space == (
-        BIMANUAL_QPOS_V1
+    assert (
+        selected.selected_input_by_role["base"]
+        .action.value("left_arm")
+        .payload_schema.representation_family
+        == "joint_position"
     )
 
     duplicate = store.admit(

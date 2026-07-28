@@ -17,6 +17,7 @@ import numpy as np
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import (
     AuthoritativeCommandDispatchContext,
+    AuthoritativeTargetDispatchContext,
     AuthoritativeReceiverStateSnapshot,
     AuthoritativeReceiverValidationReceipt,
     GroupGenerationActivation,
@@ -427,15 +428,23 @@ class MujocoScheduledQposReferenceReceiver:
 
     def _start_parent(
         self,
-        context: AuthoritativeCommandDispatchContext,
+        context: (
+            AuthoritativeCommandDispatchContext
+            | AuthoritativeTargetDispatchContext
+        ),
         *,
         scheduled_from: float,
         admitted_at: float,
     ):
+        execution_sequence = (
+            context.execution_epoch
+            if isinstance(context, AuthoritativeCommandDispatchContext)
+            else context.execution_fence_sequence
+        )
         live = [
             item
             for item in self._segments
-            if item.execution_epoch == context.execution_epoch
+            if item.execution_epoch == execution_sequence
             and item.reference_segment_id
             not in {terminal.reference_segment_id for terminal in self._terminals}
         ]
@@ -494,7 +503,7 @@ class MujocoScheduledQposReferenceReceiver:
         evidence_hash = canonical_content_hash(
             {
                 "control_domain_id": context.control_domain_id,
-                "execution_epoch": context.execution_epoch,
+                "execution_epoch": execution_sequence,
                 "captured_at": admitted_at,
                 "measured_action_hash": measured_hash,
             },

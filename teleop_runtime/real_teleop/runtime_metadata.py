@@ -24,6 +24,293 @@ def position_ik_iteration_metadata(args: argparse.Namespace) -> dict[str, object
     """Return position-only IK tuning settings for audit/config metadata."""
     position_mode = arm_control_mode(args) == "position"
     return {
+        "position_ik_step_mode": (
+            str(getattr(args, "position_ik_step_mode", "legacy_iterative"))
+            if position_mode
+            else None
+        ),
+        "position_ik_effective_physical_steps_per_tick": (
+            1
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_ik_admitted_motion_limit_enabled": (
+            bool(getattr(args, "position_ik_admitted_motion_limit", False))
+            if position_mode
+            else False
+        ),
+        "position_ik_motion_limit_anchor": (
+            "last_formally_admitted_qref_qdot"
+            if (
+                position_mode
+                and bool(
+                    getattr(args, "position_ik_admitted_motion_limit", False)
+                )
+            )
+            else None
+        ),
+        # The single-step position path also protects the final smoothed qref
+        # from crossing the RM65 q5 wrist gate.  The threshold is derived from
+        # the 3 deg SDK boundary plus the narrow 0.25 deg recovery margin used
+        # by the singularity-aware position solver.
+        "position_wrist_q5_escape_enabled": (
+            bool(
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            if position_mode
+            else False
+        ),
+        "position_wrist_q5_escape_threshold_deg": (
+            3.25
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_coaxial_soft_threshold_deg": (
+            4.0
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_coaxial_hard_threshold_deg": (
+            3.0
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_q5_escape_margin_deg": (
+            0.25
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_q5_hysteresis_release_deg": (
+            float(
+                getattr(
+                    args,
+                    "position_wrist_q5_hysteresis_release_deg",
+                    6.0,
+                )
+            )
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_q5_hysteresis_requires_escape_latch": (
+            bool(
+                getattr(
+                    args,
+                    "position_wrist_q5_hysteresis_requires_escape_latch",
+                    False,
+                )
+            )
+            if position_mode
+            else None
+        ),
+        "position_post_ik_qpos_normal_fast_path": (
+            bool(getattr(args, "position_post_ik_qpos_normal_fast_path", False))
+            if position_mode
+            else None
+        ),
+        "position_post_ik_qpos_normal_fast_path_alpha": (
+            float(
+                getattr(args, "position_post_ik_qpos_normal_fast_path_alpha", 1.0)
+            )
+            if position_mode
+            else None
+        ),
+        "position_post_ik_qpos_normal_fast_path_guard_deg": (
+            float(
+                getattr(
+                    args,
+                    "position_post_ik_qpos_normal_fast_path_guard_deg",
+                    4.0,
+                )
+            )
+            if position_mode
+            else None
+        ),
+        "position_post_ik_qpos_normal_fast_path_quality_grace_sec": (
+            float(
+                getattr(
+                    args,
+                    "position_post_ik_qpos_normal_fast_path_quality_grace_sec",
+                    0.0,
+                )
+            )
+            if position_mode
+            else None
+        ),
+        "position_wrist_q5_hysteresis_relax_for_far_target": (
+            True
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        # J3 uses the same narrow 0.25 deg margin as the SDK elbow gate.  The
+        # broader 1 deg branch-selection margin remains available to legacy
+        # callers, but formal single-step teleop must not enter escape mode
+        # during ordinary 4--6 deg motion.
+        "position_elbow_escape_threshold_deg": (
+            3.25
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_elbow_escape_margin_deg": (
+            0.25
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_singularity_escape_policy": (
+            {
+                "directional": True,
+                "combined_j3_j5": True,
+                "selection_priority": "singularity_depth_then_pose_progress",
+                "elbow_margin_deg": 0.25,
+            }
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_q5_hysteresis_far_target_position_m": (
+            0.10
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_q5_hysteresis_far_target_orientation_deg": (
+            20.0
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_singularity_smoothing_alpha": (
+            max(
+                float(getattr(args, "position_post_ik_qpos_smoothing_fast_alpha", 0.45)),
+                0.65,
+            )
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_null_motion_soft_limit_deg": (
+            5.0
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_wrist_branch_switch_guard_deg": (
+            float(
+                getattr(
+                    args,
+                    "position_wrist_branch_switch_guard_deg",
+                    12.0,
+                )
+            )
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
+        "position_singularity_escape_wide_search": (
+            {
+                "enabled": True,
+                "position_error_threshold_m": 0.10,
+                "orientation_error_threshold_deg": 20.0,
+                "radius_factors": [1.0, 2.0, 4.0],
+                "max_position_worsen_m": 0.05,
+                "max_orientation_worsen_deg": 18.0,
+            }
+            if (
+                position_mode
+                and str(
+                    getattr(args, "position_ik_step_mode", "legacy_iterative")
+                )
+                == "single_step_singularity_aware"
+            )
+            else None
+        ),
         "position_ik_orientation_weight": (
             None
             if not position_mode

@@ -69,12 +69,14 @@ def build_position_collision_planner_from_started_backends(
     collision_min_distance_m: float,
     collision_distance_epsilon_m: float,
     max_joint_velocity_rad_s: Sequence[float],
+    max_joint_acceleration_rad_s2: Sequence[float] | None = None,
     max_joint_step_rad: float | Sequence[float] | None = None,
     damping: float = 0.01,
     solve_max_iterations: int = 1,
     solve_min_iterations: int = 1,
     solve_adaptive_iterations_enabled: bool = False,
     solve_iteration_reserve_ms: float = 5.0,
+    pose_lift_profile: str | Any | None = None,
     debug_profile: bool = False,
     ik_tuning: Any | None = None,
 ) -> RM65PositionPlannerProtocol:
@@ -101,6 +103,16 @@ def build_position_collision_planner_from_started_backends(
                 max_joint_velocity_rad_s,
                 name="max_joint_velocity_rad_s",
             ),
+            **(
+                {}
+                if max_joint_acceleration_rad_s2 is None
+                else {
+                    "max_joint_acceleration_rad_s2": _six_positive(
+                        max_joint_acceleration_rad_s2,
+                        name="max_joint_acceleration_rad_s2",
+                    )
+                }
+            ),
             max_joint_step_rad=max_step,
             damping=float(damping),
             solve_max_iterations=int(solve_max_iterations),
@@ -109,6 +121,11 @@ def build_position_collision_planner_from_started_backends(
                 solve_adaptive_iterations_enabled
             ),
             solve_iteration_reserve_ms=float(solve_iteration_reserve_ms),
+            **(
+                {}
+                if pose_lift_profile is None
+                else {"pose_lift_profile": pose_lift_profile}
+            ),
             debug_profile=bool(debug_profile),
             ik_tuning=ik_tuning,
         ),

@@ -933,6 +933,11 @@ def merge_policy_chunk_result(
         and result.conditioning_prefix_hash != request.conditioning_prefix_hash
     ):
         reasons.append("conditioning_prefix_mismatch")
+    if (
+        result.conditioning_binding_hash
+        != request.conditioning_binding_hash
+    ):
+        reasons.append("conditioning_binding_mismatch")
     if result.execution_horizon_steps is not None and (
         result.execution_horizon_steps > result.source_chunk_size
     ):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -33,6 +34,7 @@ def check_task_config_compatibility(
     task_config_path: str | Path,
     *,
     allow_mismatch: bool = False,
+    allow_cube_pose_observation_expansion: bool = False,
 ) -> dict[str, object]:
     """Validate the task boundary, with an explicit diagnostics-only escape hatch."""
 
@@ -46,8 +48,19 @@ def check_task_config_compatibility(
             "Use --allow-task-config-mismatch only for legacy collision diagnostics."
         )
     checkpoint_metadata = payload.get("task_metadata")
+    observation_expansion_migration = False
     if isinstance(checkpoint_metadata, Mapping):
         runtime_task_config = CubeLiftTaskConfig.load(task_config_path)
+        checkpoint_learning = checkpoint_metadata.get("learning_contract")
+        runtime_learning = build_learning_metadata(runtime_task_config)
+        if isinstance(checkpoint_learning, Mapping):
+            observation_expansion_migration = (
+                allow_cube_pose_observation_expansion
+                and _is_cube_pose_observation_expansion(
+                    checkpoint_learning,
+                    runtime_learning,
+                )
+            )
         checkpoint_action_layout = checkpoint_metadata.get("action_layout")
         if checkpoint_action_layout is not None:
             runtime_action_layout = runtime_task_config.action_layout
@@ -61,16 +74,17 @@ def check_task_config_compatibility(
         checkpoint_observation_layout = checkpoint_metadata.get("observation_layout")
         if checkpoint_observation_layout is not None:
             runtime_observation_layout = runtime_task_config.observation_layout
-            if str(checkpoint_observation_layout) != str(runtime_observation_layout):
+            if (
+                str(checkpoint_observation_layout) != str(runtime_observation_layout)
+                and not observation_expansion_migration
+            ):
                 raise ValueError(
                     "Task observation layout does not match checkpoint: "
                     f"checkpoint={checkpoint_observation_layout!r}, "
                     f"runtime={runtime_observation_layout!r}. Retrain the policy; "
                     "a state-only checkpoint cannot be reused as a wrist-RGB policy."
                 )
-        checkpoint_learning = checkpoint_metadata.get("learning_contract")
         if isinstance(checkpoint_learning, Mapping):
-            runtime_learning = build_learning_metadata(runtime_task_config)
             for key in (
                 "model_manifest_version",
                 "policy_class",
@@ -83,6 +97,16 @@ def check_task_config_compatibility(
                 expected = checkpoint_learning.get(key)
                 actual = runtime_learning.get(key)
                 if expected is not None and str(expected) != str(actual):
+                    if (
+                        observation_expansion_migration
+                        and key
+                        in {
+                            "observation_contract_hash",
+                            "model_input_binding_hash",
+                            "model_input_dim",
+                        }
+                    ):
+                        continue
                     raise ValueError(
                         "Learning contract does not match checkpoint: "
                         f"field={key}, checkpoint={expected!r}, runtime={actual!r}."
@@ -91,7 +115,111 @@ def check_task_config_compatibility(
         "task_config_mismatch": mismatch,
         "checkpoint_task_config_sha256": expected_hash,
         "runtime_task_config_sha256": actual_hash,
+        "cube_pose_observation_expansion": observation_expansion_migration,
     }
+
+
+def _is_cube_pose_observation_expansion(
+    checkpoint_learning: Mapping[str, Any],
+    runtime_learning: Mapping[str, Any],
+) -> bool:
+    """Recognize only the additive v4 (28-D) -> v5 (35-D) state migration."""
+
+    return bool(
+        checkpoint_learning.get("policy_class") == "normal"
+        and runtime_learning.get("policy_class") == "normal"
+        and checkpoint_learning.get("model_input_dim") == 28
+        and runtime_learning.get("model_input_dim") == 35
+        and str(checkpoint_learning.get("model_output_dim")) == "7"
+        and str(runtime_learning.get("model_output_dim")) == "7"
+        and str(checkpoint_learning.get("action_binding_id", "")).endswith(
+            "right_tcp_delta_xyz3_rotvec3_right_gripper_delta1.v1"
+        )
+        and checkpoint_learning.get("action_binding_hash")
+        == runtime_learning.get("action_binding_hash")
+        and str(checkpoint_learning.get("observation_contract_id", "")).endswith(
+            "right_target_error6_right_gripper_target_error1_last_action7.v2"
+        )
+        and str(runtime_learning.get("observation_contract_id", "")).endswith(
+            "right_target_error6_right_gripper_target_error1_last_action7_cube_pose7.v1"
+        )
+    )
+
+
+def expand_cube_pose_policy_state(
+    source_policy: ActorCritic,
+    target_policy: ActorCritic,
+) -> None:
+    """Copy a 28-D normal actor into the additive 35-D cube-pose actor.
+
+    Only the first input layer changes shape.  The seven new cube-pose columns
+    start at zero so the warm-start policy initially preserves its old motion;
+    PPO can then learn a non-zero use of the newly exposed pose features.
+    """
+
+    source_state = source_policy.state_dict()
+    target_state = target_policy.state_dict()
+    source_weight = source_state.get("backbone.0.weight")
+    target_weight = target_state.get("backbone.0.weight")
+    if source_weight is None or target_weight is None:
+        raise ValueError("Cube-pose migration requires a plain proprio backbone.")
+    if (
+        source_weight.ndim != 2
+        or target_weight.ndim != 2
+        or target_weight.shape[0] != source_weight.shape[0]
+        or target_weight.shape[1] != source_weight.shape[1] + 7
+    ):
+        raise ValueError(
+            "Unsupported cube-pose policy expansion: "
+            f"source={tuple(source_weight.shape)}, target={tuple(target_weight.shape)}."
+        )
+    for name, target_value in target_state.items():
+        source_value = source_state.get(name)
+        if source_value is None:
+            raise ValueError(f"Checkpoint is missing policy parameter {name!r}.")
+        if name == "backbone.0.weight":
+            expanded = target_value.detach().clone()
+            expanded.zero_()
+            expanded[:, : source_value.shape[1]] = source_value
+            target_state[name] = expanded
+        elif target_value.shape != source_value.shape:
+            raise ValueError(
+                f"Unsupported cube-pose parameter shape change for {name!r}: "
+                f"source={tuple(source_value.shape)}, target={tuple(target_value.shape)}."
+            )
+        else:
+            target_state[name] = source_value
+    target_policy.load_state_dict(target_state)
+
+
+def scale_pose_action_head_for_doubled_step(
+    policy: ActorCritic,
+    *,
+    pre_tanh_scale: float = 0.25,
+) -> None:
+    """Make a v4 actor a conservative transfer policy for v5's larger step.
+
+    The v5 task doubles the physical TCP/rotation increment while keeping the
+    normalized action contract unchanged.  A literal v4 actor would therefore
+    produce roughly twice the physical motion on its first rollout, often
+    entering the collision projector before it has a chance to adapt.  Scale
+    only the six arm outputs (the gripper output remains unchanged).  PPO can
+    subsequently grow the actor head again as the new 35-D observation is
+    learned; the normal PPO exploration schedule remains authoritative.
+
+    ``pre_tanh_scale`` is applied before the actor's tanh, so 0.25 is a
+    deliberately conservative transfer value rather than a claim that tanh
+    outputs are exactly linear.
+    """
+
+    scale = float(pre_tanh_scale)
+    if not math.isfinite(scale) or not 0.0 < scale <= 1.0:
+        raise ValueError("pre_tanh_scale must be finite and lie in (0, 1].")
+    if policy.action_dim < 6:
+        raise ValueError("A pose action policy must expose at least six arm outputs.")
+    with torch.no_grad():
+        policy.actor_mean.weight[:6].mul_(scale)
+        policy.actor_mean.bias[:6].mul_(scale)
 
 
 def save_checkpoint(
@@ -220,6 +348,8 @@ __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "build_policy_from_checkpoint",
     "check_task_config_compatibility",
+    "expand_cube_pose_policy_state",
+    "scale_pose_action_head_for_doubled_step",
     "file_sha256",
     "load_checkpoint_payload",
     "save_checkpoint",

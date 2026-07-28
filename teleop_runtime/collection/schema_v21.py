@@ -442,6 +442,7 @@ def collector_sample_to_row(
         "faults_json": json.dumps(_to_serializable(sample.faults), ensure_ascii=True, sort_keys=True),
         "teleop.pose_quality.score": pose_quality.get("score"),
         "teleop.pose_quality.status": pose_quality.get("status"),
+        "teleop.pose_quality.special_code": pose_quality.get("special_code"),
         "teleop.pose_quality.bad": int(bool(pose_quality.get("bad", False))),
         "teleop.pose_quality.available": int(bool(pose_quality.get("available", False))),
         "teleop.pose_quality_json": json.dumps(

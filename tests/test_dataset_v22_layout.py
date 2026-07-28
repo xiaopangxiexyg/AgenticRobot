@@ -215,6 +215,26 @@ def test_v22_row_adapter_rewrites_dense_model_fields_but_preserves_arm_qpos_audi
     ]
 
 
+def test_v22_row_adapter_preserves_singularity_pose_quality_sentinel() -> None:
+    sample = _collector_sample_for_v22()
+    sample.metadata["pose_quality"] = {
+        "available": True,
+        "status": "singularity",
+        "score": -1.0,
+        "special_code": "singularity",
+        "bad": True,
+    }
+
+    row, _ = collector_sample_to_v22_row(
+        sample,
+        layout=PolicyIOLayout.legacy_v21_q6(),
+    )
+
+    assert row["teleop.pose_quality.status"] == "singularity"
+    assert row["teleop.pose_quality.score"] == -1.0
+    assert row["teleop.pose_quality.special_code"] == "singularity"
+
+
 def test_v22_writer_binds_layout_to_info_episode_and_row(tmp_path) -> None:
     layout = PolicyIOLayout(
         name="left_gripper_right_none",

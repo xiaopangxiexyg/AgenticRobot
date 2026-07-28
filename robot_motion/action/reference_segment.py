@@ -50,6 +50,7 @@ REFERENCE_ENDPOINT_SOURCE_KINDS_V1 = frozenset(
         "committed_safe_endpoint",
         "current_safe_target",
         "resolved_execution_target",
+        "component_execution_target",
     }
 )
 REFERENCE_SEGMENT_AUTHORITY_KINDS_V1 = frozenset(
@@ -163,10 +164,11 @@ class ReferenceEndpointParent:
         if self.role == "end" and self.source_kind not in {
             "current_safe_target",
             "resolved_execution_target",
+            "component_execution_target",
         }:
             raise ValueError(
                 "An END endpoint must be the current shared-safe target or an "
-                "explicit resolved execution target."
+                "explicit execution target."
             )
         object.__setattr__(
             self,

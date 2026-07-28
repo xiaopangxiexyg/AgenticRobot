@@ -17,10 +17,13 @@ from robot_motion.deploy import (
     nan_vector,
 )
 from robot_motion.action import (
+    ActionComponentCatalog,
+    ActionComponentSpec,
     ActionPersistencePolicy,
     ActiveExecutionSnapshot,
     AuthorityEventDraft,
     SharedCanonicalSafetyResult,
+    build_robot_action_v1_runtime_schema,
     evaluate_shared_execution_shadow,
 )
 from robot_motion.action.authoritative_trace import (
@@ -71,6 +74,17 @@ def test_m3_shadow_projects_to_complete_non_authoritative_m4a_trace() -> None:
         ),
         monotonic_clock=clock,
     )
+    catalog = ActionComponentCatalog(
+        catalog_id="trace-shadow-right-arm-v1",
+        action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+        components=(
+            ActionComponentSpec(
+                component_id="right_arm",
+                selection_group_id="right_arm",
+                effector_name="right_arm",
+            ),
+        ),
+    )
     coordinator = PassivePolicyArbiterShadow(
         PolicyArbiterShadowConfig(
             runtime_session_id="shadow-session",
@@ -80,6 +94,10 @@ def test_m3_shadow_projects_to_complete_non_authoritative_m4a_trace() -> None:
             active_effectors=("right_arm",),
             action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
             decision_hz=15.0,
+            component_catalog=catalog,
+            action_schema=build_robot_action_v1_runtime_schema(
+                component_catalog=catalog,
+            ),
         ),
         clock=clock,
     )

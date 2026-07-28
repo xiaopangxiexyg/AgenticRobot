@@ -66,9 +66,11 @@ from dataset_contracts.replay import (
     ReplaySourceContract,
 )
 from robot_motion.action import (
+    ComponentAction,
     RobotAction,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
     SharedCanonicalSafetyResult,
+    materialize_robot_action_v1,
 )
 from robot_motion.action.proposal import robot_action_semantic_payload
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -280,9 +282,7 @@ def _replay_source(runtime: MujocoDeployRuntime) -> ReplayProposalSource:
             embodiment_instance_id=runtime.config.embodiment_instance_id,
             producer_id=runtime.config.replay_producer_id,
             producer_epoch=runtime.config.producer_epoch,
-            component_schema_hash=runtime.catalog.semantic_content_hash,
-            component_coverage=("left_arm", "right_arm"),
-            selection_groups=("arms",),
+            action_schema=runtime.action_schema,
             source_contract=source_contract,
             source_action_contract=action_contract,
             target_runtime_contract=runtime.target_runtime_action_contract,
@@ -751,7 +751,9 @@ def _setup_and_start_cs6b1i_station(
     return sequence
 
 
-def _action_hash(action: RobotAction) -> str:
+def _action_hash(action: RobotAction | ComponentAction) -> str:
+    if isinstance(action, ComponentAction):
+        action = materialize_robot_action_v1(action)
     return canonical_content_hash(
         robot_action_semantic_payload(action),
         domain="test.cs6b1g.authoritative_action.v1",
@@ -822,10 +824,12 @@ def test_cs6b1g_shared_cut_fuses_passive_human_and_replay_without_authority(
     assert fusion.input_snapshot.cutoff_admission_sequence == (
         shadow["cut_sequence"]
     )
-    assert fusion.composition_result.output_status == "ready"
-    assert fusion.composition_result.composed_action is not None
+    assert fusion.composition_evaluation.output_status == "ready"
+    assert fusion.composition_evaluation.composed_candidate is not None
     np.testing.assert_allclose(
-        fusion.composition_result.composed_action.arm_pose_by_side["left"][:3],
+        fusion.composition_evaluation.composed_candidate.value(
+            "left_arm"
+        ).values[:3],
         np.asarray([0.2, -0.09, 0.3]),
         atol=1e-6,
     )
@@ -839,7 +843,7 @@ def test_cs6b1g_shared_cut_fuses_passive_human_and_replay_without_authority(
     )
     assert "composition_contributor_input" in shadow["trace_types"]
     assert "composition_input_snapshot" in shadow["trace_types"]
-    assert "composition_result" in shadow["trace_types"]
+    assert "composition_evaluation" in shadow["trace_types"]
     assert "human_command_emission" in shadow["trace_types"]
     human_input = receipts["human_pose"].composition_input
     assert human_input is not None
@@ -877,8 +881,8 @@ def test_cs6b1g_missing_or_expired_human_input_is_no_action_only_in_shadow(
         assert first.status == "dispatched"
         missing = station.data_plane.last_pose_fusion_shadow_submission
         assert missing is not None
-        assert missing.composition_result.output_status == "no_action"
-        assert missing.composition_result.reason == "missing_required:human_pose"
+        assert missing.composition_evaluation.output_status == "no_action"
+        assert missing.composition_evaluation.reason == "missing_required:human_pose"
     finally:
         station.close()
 
@@ -897,8 +901,8 @@ def test_cs6b1g_missing_or_expired_human_input_is_no_action_only_in_shadow(
         assert dispatched.status == "dispatched"
         expired = station.data_plane.last_pose_fusion_shadow_submission
         assert expired is not None
-        assert expired.composition_result.output_status == "no_action"
-        assert expired.composition_result.reason == "missing_required:human_pose"
+        assert expired.composition_evaluation.output_status == "no_action"
+        assert expired.composition_evaluation.reason == "missing_required:human_pose"
     finally:
         station.close()
 
@@ -923,14 +927,17 @@ def test_cs6b1g_pose_conflict_is_invalid_without_changing_replay_dispatch(
         step = station.step(now=clock(), physics_ticks_after_dispatch=1)
         assert step.status == "dispatched"
         assert step.decision is not None
+        selected = materialize_robot_action_v1(
+            step.decision.selected_action
+        )
         np.testing.assert_allclose(
-            step.decision.selected_action.arm_pose_by_side["left"][:3],
+            selected.arm_pose_by_side["left"][:3],
             np.asarray([0.2, -0.1, 0.3]),
         )
         fusion = station.data_plane.last_pose_fusion_shadow_submission
         assert fusion is not None
-        assert fusion.composition_result.output_status == "invalid"
-        assert "translation_disagreement" in fusion.composition_result.reason
+        assert fusion.composition_evaluation.output_status == "invalid"
+        assert "translation_disagreement" in fusion.composition_evaluation.reason
         assert len(runtime.core.proposals) == 1
         assert station.data_plane.active_source_slot_id == "replay-slot"
     finally:
@@ -971,7 +978,7 @@ def test_cs6b1g_duplicate_passive_emission_is_isolated_from_replay(
         assert len(runtime.core.proposals) == 1
         fusion = station.data_plane.last_pose_fusion_shadow_submission
         assert fusion is not None
-        assert fusion.composition_result.output_status == "ready"
+        assert fusion.composition_evaluation.output_status == "ready"
         assert sum(
             fact.event_type == "human_command_emission"
             for fact in runtime.trace_facts
@@ -1124,7 +1131,7 @@ def test_cs6b1h_formal_v2_is_opt_in_and_preserves_pose_numerics(
         )
         assert formal.error is None
         assert formal.evaluation is not None
-        result = formal.evaluation.composition_result
+        result = formal.evaluation.composition_evaluation
         strategy = runtime.policy_topology.composition_strategy
         assert strategy is not None
         assert result.strategy_id == strategy.spec.strategy_id
@@ -1159,11 +1166,11 @@ def test_cs6b1h_formal_v2_is_opt_in_and_preserves_pose_numerics(
             formal.evaluation.input_snapshot,
             spec=composition.composition_spec,
         )
-        assert legacy.composed_action_hash == result.composed_action_hash
+        assert legacy.composed_candidate_hash == result.composed_candidate_hash
         for side in ("left", "right"):
             np.testing.assert_array_equal(
-                legacy.composed_action.arm_pose_by_side[side],
-                result.composed_action.arm_pose_by_side[side],
+                legacy.composed_candidate.value(f"{side}_arm").values,
+                result.composed_candidate.value(f"{side}_arm").values,
             )
         assert legacy.semantic_content_hash != result.semantic_content_hash
 
@@ -1171,7 +1178,15 @@ def test_cs6b1h_formal_v2_is_opt_in_and_preserves_pose_numerics(
         assert formal.proposal_admission.accepted
         proposal = formal.proposal_admission.proposal
         assert proposal is not None
-        assert proposal.policy_output_id == result.composition_result_id
+        assert proposal.policy_output_id is None
+        assert (
+            proposal.composition_evaluation_id
+            == result.composition_evaluation_id
+        )
+        assert (
+            proposal.composition_evaluation_hash
+            == result.semantic_content_hash
+        )
         assert len(runtime.core.proposals) == 1
         event_types = tuple(fact.event_type for fact in runtime.trace_facts)
         assert event_types.count("formal_composition_strategy_spec") == 1
@@ -1552,11 +1567,11 @@ def test_cs6b1i_optional_source_difference_is_same_cut_and_idempotent(
         assert observation.composition_input_snapshot_hash == (
             composed.evaluation.input_snapshot.semantic_content_hash
         )
-        assert observation.composition_result_id == (
-            composed.evaluation.composition_result.composition_result_id
+        assert observation.composition_evaluation_id == (
+            composed.evaluation.composition_evaluation.composition_evaluation_id
         )
-        assert observation.composition_result_hash == (
-            composed.evaluation.composition_result.semantic_content_hash
+        assert observation.composition_evaluation_hash == (
+            composed.evaluation.composition_evaluation.semantic_content_hash
         )
         assert observation.target_effective_at == clock()
         assert len(observation.pairwise_differences) == 1
@@ -1601,8 +1616,8 @@ def test_cs6b1i_optional_source_difference_is_same_cut_and_idempotent(
         assert facts[0].payload["composition_input_snapshot_id"] == (
             observation.composition_input_snapshot_id
         )
-        assert facts[0].payload["composition_result_id"] == (
-            observation.composition_result_id
+        assert facts[0].payload["composition_evaluation_id"] == (
+            observation.composition_evaluation_id
         )
         duplicate = station.compose_at(
             decision_key="cs6b1i-difference-0",
@@ -1653,7 +1668,7 @@ def test_cs6b1i_missing_contributor_holds_without_fresh_input_rearm(
             == activation.activation_id
         )
         assert (
-            held.evaluation.composition_result.composition_activation_id
+            held.evaluation.composition_evaluation.composition_activation_id
             == activation.activation_id
         )
         activation_binding_kinds = {
@@ -1661,7 +1676,11 @@ def test_cs6b1i_missing_contributor_holds_without_fresh_input_rearm(
             for fact in runtime.trace_facts
             if fact.event_type == "composition_activation_binding"
         }
-        assert activation_binding_kinds == {"input", "snapshot", "result"}
+        assert activation_binding_kinds == {
+            "input",
+            "snapshot",
+            "evaluation",
+        }
         assert station.current_session_state is not None
         assert station.current_session_state.phase == "held"
         assert not station.publication_barrier.snapshot().enabled
@@ -2458,6 +2477,7 @@ def _cs6b1f_takeover_spec(station, provider, *, timeout_sec: float):
             policy_id="cs6b1f-corner-safe-v1",
             policy_suspension_mode="hold_and_release_authority",
             episode_boundary_motion_policy="hold_before_unbind",
+            require_canonical_safety=False,
         ),
         readiness_timeout_sec=timeout_sec,
         capture_boundary_id="episode-boundary:cs6b1f-corner",
@@ -2564,6 +2584,7 @@ def test_cs6b1d_pose_replay_to_human_keeps_pose_until_target_resolution(
             policy_id="cs6b1d-pose-safe-mixed-sim-v1",
             policy_suspension_mode="hold_and_release_authority",
             episode_boundary_motion_policy="hold_before_unbind",
+            require_canonical_safety=False,
         ),
         readiness_timeout_sec=0.2,
         capture_boundary_id="episode-boundary:cs6b1d",
@@ -2902,6 +2923,7 @@ def test_cs6b1f_sim_hil_promotes_passive_pose_and_keeps_publish_seam_unique(
                 policy_id="cs6b1f-passive-hil-safe-v1",
                 policy_suspension_mode="hold_and_release_authority",
                 episode_boundary_motion_policy="hold_before_unbind",
+                require_canonical_safety=False,
             ),
             readiness_timeout_sec=0.2,
             capture_boundary_id="episode-boundary:cs6b1f",
@@ -3417,6 +3439,7 @@ def test_cs6b1f_formal_hil_capture_seals_and_rebuilds_pose_lineage(
                 episode_boundary_motion_policy="hold_before_unbind",
                 human_emission_max_age_sec=10.0,
                 measured_state_max_age_sec=10.0,
+                require_canonical_safety=False,
             ),
             readiness_timeout_sec=0.5,
             capture_boundary_id="episode-boundary:cs6b1f-formal-hil",
@@ -3536,6 +3559,9 @@ def test_cs6b1f_formal_hil_capture_seals_and_rebuilds_pose_lineage(
         decision.decision_id == step.decision.decision_id for decision in decisions
     )
     assert any(
-        decision.selected_action["action_space"] == "bimanual_ee_pose_v1"
+        decision.selected_action["component_coverage"]
+        == ("left_arm", "right_arm")
+        and decision.selected_action["action_schema_hash"]
+        == runtime.action_schema.semantic_content_hash
         for decision in decisions
     )

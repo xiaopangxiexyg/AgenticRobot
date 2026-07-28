@@ -30,6 +30,7 @@ from .constants import (
     SIDES,
     TOOL_TCP_FRAME,
 )
+from .defaults import RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2
 from .ik import (
     DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN,
     DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
@@ -41,6 +42,12 @@ from .ik import (
     canonical_rm65_controlled_frame,
 )
 from .qpos_layout import as_rm65_qpos, normalize_side, validate_qpos_by_side
+from .pose_lift_profile import (
+    RM65_POSE_LIFT_V1_BASELINE_NAME,
+    RM65PoseLiftProfile,
+    resolve_rm65_pose_lift_profile,
+)
+from .wrist_coaxial import canonicalize_rm65_wrist_coaxial_step
 
 
 DEFAULT_POSITION_COLLISION_REFERENCE_HZ = DEFAULT_POSITION_REFERENCE_HZ
@@ -52,6 +59,7 @@ DEFAULT_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S = (
     0.50,
     0.50,
 )
+DEFAULT_RM65_JACOBIAN_CHARACTERISTIC_LENGTH_M = 0.5
 _DEFAULT_MOUNT_JOINT_NAMES = {LEFT: "left_arm", RIGHT: "right_arm"}
 
 
@@ -129,6 +137,48 @@ def _freeze_array_mapping(values: Mapping[str, np.ndarray]) -> Mapping[str, np.n
     return MappingProxyType(frozen)
 
 
+def _rm65_jacobian_metrics(
+    jacobian: np.ndarray,
+    *,
+    characteristic_length_m: float,
+) -> dict[str, Any]:
+    """Return dimensionless RM65 task-Jacobian diagnostics.
+
+    Pinocchio exposes motion rows as linear xyz followed by angular xyz.  The
+    translational block is divided by one declared characteristic length so
+    that its units are comparable with the angular block.  These diagnostics
+    are intentionally observational: no universal singularity threshold is
+    assigned here because thresholds depend on this exact scaling and model.
+    """
+
+    length_m = _finite_positive(
+        characteristic_length_m,
+        name="characteristic_length_m",
+    )
+    raw = np.asarray(jacobian, dtype=float)
+    if raw.shape != (6, ARM_DOF) or not np.all(np.isfinite(raw)):
+        raise ValueError(
+            f"arm Jacobian must be finite with shape (6, {ARM_DOF}); "
+            f"got {raw.shape}."
+        )
+    normalized = raw.copy()
+    normalized[:3, :] /= length_m
+    singular_values = np.linalg.svd(normalized, compute_uv=False)
+    sigma_min = float(np.min(singular_values))
+    sigma_max = float(np.max(singular_values))
+    return {
+        "jacobian_row_order": "linear_xyz_then_angular_xyz",
+        "jacobian_scaling": "linear_rows_divided_by_characteristic_length",
+        "characteristic_length_m": float(length_m),
+        "singular_values": singular_values.astype(float).tolist(),
+        "sigma_min": sigma_min,
+        "sigma_max": sigma_max,
+        "condition_number": (
+            float("inf") if sigma_min <= 1e-12 else float(sigma_max / sigma_min)
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class RM65PositionCollisionPlannerConfig:
     """Configuration for one coupled high-rate pose-to-qpos planning stage.
@@ -142,13 +192,16 @@ class RM65PositionCollisionPlannerConfig:
     reference_hz: float = DEFAULT_POSITION_COLLISION_REFERENCE_HZ
     scene_profile: str = DEFAULT_COLLISION_SCENE
     solver: str | None = None
-    posture_cost: float = DEFAULT_DUAL_ARM_POSTURE_COST
+    posture_cost: float | None = None
     collision_min_distance_m: float = DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M
     collision_distance_epsilon_m: float = DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M
     collision_barrier_gain: float = DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN
     collision_safe_displacement_gain: float = DEFAULT_DUAL_ARM_COLLISION_SAFE_DISPLACEMENT_GAIN
     max_joint_velocity_rad_s: tuple[float, ...] | Sequence[float] = (
         DEFAULT_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S
+    )
+    max_joint_acceleration_rad_s2: tuple[float, ...] | Sequence[float] = (
+        RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2
     )
     max_joint_step_rad: tuple[float, ...] | Sequence[float] | None = None
     joint_lower_rad: tuple[float, ...] | Sequence[float] = RM65_ABSOLUTE_Q_MIN_RAD
@@ -162,6 +215,7 @@ class RM65PositionCollisionPlannerConfig:
     solve_iteration_reserve_ms: float = 5.0
     solve_translation_tolerance_m: float = 2e-3
     solve_orientation_tolerance_deg: float = 0.5
+    pose_lift_profile: str | RM65PoseLiftProfile = RM65_POSE_LIFT_V1_BASELINE_NAME
     debug_profile: bool = False
     ik_tuning: Any | None = field(default=None, repr=False)
 
@@ -170,7 +224,16 @@ class RM65PositionCollisionPlannerConfig:
         scene_profile = str(self.scene_profile or DEFAULT_COLLISION_SCENE).strip()
         if not scene_profile:
             raise ValueError("scene_profile must be non-empty.")
-        posture_cost = float(self.posture_cost)
+        pose_lift_profile = resolve_rm65_pose_lift_profile(self.pose_lift_profile)
+        posture_cost = float(
+            DEFAULT_DUAL_ARM_POSTURE_COST
+            if self.posture_cost is None and pose_lift_profile.ik_posture_cost is None
+            else (
+                pose_lift_profile.ik_posture_cost
+                if self.posture_cost is None
+                else self.posture_cost
+            )
+        )
         if not math.isfinite(posture_cost) or posture_cost < 0.0:
             raise ValueError("posture_cost must be finite and >= 0.")
         min_distance = float(self.collision_min_distance_m)
@@ -256,6 +319,14 @@ class RM65PositionCollisionPlannerConfig:
         )
         object.__setattr__(
             self,
+            "max_joint_acceleration_rad_s2",
+            _six_positive(
+                self.max_joint_acceleration_rad_s2,
+                name="max_joint_acceleration_rad_s2",
+            ),
+        )
+        object.__setattr__(
+            self,
             "max_joint_step_rad",
             None
             if self.max_joint_step_rad is None
@@ -284,6 +355,11 @@ class RM65PositionCollisionPlannerConfig:
             "solve_orientation_tolerance_deg",
             orientation_tolerance_deg,
         )
+        object.__setattr__(
+            self,
+            "pose_lift_profile",
+            pose_lift_profile,
+        )
         object.__setattr__(self, "debug_profile", bool(self.debug_profile))
 
     @property
@@ -296,6 +372,22 @@ class RM65PositionCollisionPlannerConfig:
         if self.max_joint_step_rad is None:
             return velocity_step
         return np.minimum(velocity_step, np.asarray(self.max_joint_step_rad, dtype=float))
+
+    @property
+    def effective_solve_min_iterations(self) -> int:
+        return (
+            int(self.pose_lift_profile.qp_substeps_per_reference)
+            if self.pose_lift_profile.qp_substeps_per_reference > 0
+            else int(self.solve_min_iterations)
+        )
+
+    @property
+    def effective_solve_max_iterations(self) -> int:
+        return (
+            int(self.pose_lift_profile.qp_substeps_per_reference)
+            if self.pose_lift_profile.qp_substeps_per_reference > 0
+            else int(self.solve_max_iterations)
+        )
 
 
 @dataclass(frozen=True)
@@ -428,6 +520,22 @@ class RM65PositionPlannerProtocol(Protocol):
         source: str = "position_reference",
         metadata: Mapping[str, Any] | None = None,
     ) -> RM65PositionCollisionPlanResult:
+        ...
+
+    def admit_qpos_reference(
+        self,
+        qpos_by_side: Mapping[str, Any],
+        *,
+        source: str = "qpos_reference",
+    ) -> RM65QposCollisionValidationResult:
+        ...
+
+    def validate_qpos_reference(
+        self,
+        qpos_by_side: Mapping[str, Any],
+        *,
+        source: str = "qpos_reference",
+    ) -> RM65QposCollisionValidationResult:
         ...
 
 
@@ -598,6 +706,8 @@ class RM65PositionCollisionPlanner:
 
         current_full_q = self._solver_current_q()
         self._arm_slices = self._resolve_arm_slices(current_full_q.size)
+        self._last_admitted_velocity_full = np.zeros_like(current_full_q)
+        self._configure_qp_motion_constraints(current_full_q)
         self._joint_lower_by_side, self._joint_upper_by_side = self._effective_joint_limits(
             current_full_q
         )
@@ -606,6 +716,11 @@ class RM65PositionCollisionPlanner:
         self._last_safe_full_q: np.ndarray | None = None
         self._last_safe_collision_distance_m: float | None = None
         self._next_sequence = 0
+        self._last_pose_lift_metadata: dict[str, Any] = {
+            "profile": self.config.pose_lift_profile.to_metadata(),
+            "applied": False,
+            "reason": "not_planned",
+        }
 
     @property
     def collision_pair_count(self) -> int:
@@ -622,6 +737,81 @@ class RM65PositionCollisionPlanner:
             if self._last_safe_full_q is None:
                 return None
             return _freeze_array_mapping(self._split_arm_qpos(self._last_safe_full_q))
+
+    def analyze_configuration(
+        self,
+        qpos_by_side: Mapping[str, Any],
+        *,
+        characteristic_length_m: float = DEFAULT_RM65_JACOBIAN_CHARACTERISTIC_LENGTH_M,
+    ) -> Mapping[str, Any]:
+        """Observe Jacobian and RM65 structural-singularity metrics for qpos.
+
+        This method performs no planning, admission, reference advancement, or
+        dispatch.  It exists so offline parity tools do not reach through the
+        planner into private solver state.  The solver's Pinocchio data cache is
+        evaluated while holding the planner lock; authoritative qpos and
+        last-safe state are not changed.
+        """
+
+        length_m = _finite_positive(
+            characteristic_length_m,
+            name="characteristic_length_m",
+        )
+        qpos = validate_qpos_by_side(qpos_by_side)
+        if set(qpos) != set(SIDES):
+            missing = sorted(set(SIDES) - set(qpos))
+            raise ValueError(
+                "configuration diagnostics require qpos for both arms; "
+                f"missing={missing}."
+            )
+        with self._lock:
+            full_q = self._embed_arm_qpos(self._solver_current_q(), qpos)
+            sides = self._configuration_singularity_metrics(
+                full_q,
+                characteristic_length_m=length_m,
+            )
+            return _freeze_value(
+                {
+                    "schema": "robot_motion.rm65.configuration_diagnostics/v1",
+                    "observational_only": True,
+                    "threshold_classification": "not_assigned",
+                    "sides": sides,
+                }
+            )
+
+    def _configuration_singularity_metrics(
+        self,
+        full_q: np.ndarray,
+        *,
+        characteristic_length_m: float,
+    ) -> dict[str, dict[str, Any]]:
+        q = np.asarray(full_q, dtype=float).reshape(-1)
+        if q.shape != self._solver_current_q().shape or not np.all(np.isfinite(q)):
+            raise ValueError("diagnostic full qpos must match the finite solver layout.")
+        sides: dict[str, dict[str, Any]] = {}
+        arm_qpos = self._split_arm_qpos(q)
+        for side in SIDES:
+            frame_name = str(getattr(self.scene_profile, f"{side}_frame_name"))
+            jacobian_full = np.asarray(
+                self.solver.compute_frame_jacobian(frame_name, q),
+                dtype=float,
+            )
+            metrics = _rm65_jacobian_metrics(
+                jacobian_full[:, self._arm_slices[side]],
+                characteristic_length_m=characteristic_length_m,
+            )
+            arm_q = arm_qpos[side]
+            abs_q3_deg = abs(float(math.degrees(arm_q[2])))
+            abs_q5_deg = abs(float(math.degrees(arm_q[4])))
+            metrics.update(
+                {
+                    "abs_q3_deg": abs_q3_deg,
+                    "abs_q5_deg": abs_q5_deg,
+                    "min_abs_q3_or_q5_deg": min(abs_q3_deg, abs_q5_deg),
+                }
+            )
+            sides[side] = metrics
+        return sides
 
     def reset(self, current_qpos_by_side: Mapping[str, Any]) -> Mapping[str, Any]:
         """Initialize from the complete measured/authoritative dual-arm qpos."""
@@ -643,6 +833,11 @@ class RM65PositionCollisionPlanner:
             full_q = self._embed_arm_qpos(reference, qpos)
             self._require_arm_qpos_within_limits(full_q, name="initial qpos")
             self.solver.set_configuration_q(full_q.copy())
+            self._last_admitted_velocity_full = np.zeros_like(full_q)
+            self._set_qp_motion_reference(
+                full_q,
+                self._last_admitted_velocity_full,
+            )
             distance, distance_ms = self._collision_distance(full_q)
             safe, reason = self._collision_safe(distance)
             if not safe:
@@ -656,6 +851,11 @@ class RM65PositionCollisionPlanner:
             self._last_safe_full_q = full_q.copy()
             self._last_safe_collision_distance_m = distance
             self._next_sequence = 0
+            self._last_pose_lift_metadata = {
+                "profile": self.config.pose_lift_profile.to_metadata(),
+                "applied": False,
+                "reason": "reset",
+            }
             return MappingProxyType(
                 {
                     "initialized": True,
@@ -700,6 +900,11 @@ class RM65PositionCollisionPlanner:
             solve_iterations = 0
             solve_stop_reason: str | None = None
             solve_pose_error: dict[str, dict[str, float]] = {}
+            self._last_pose_lift_metadata = {
+                "profile": self.config.pose_lift_profile.to_metadata(),
+                "applied": False,
+                "reason": "pending_solver_output",
+            }
             try:
                 if source_timestamp is not None and not math.isfinite(float(source_timestamp)):
                     raise _PlanningFailure(
@@ -736,6 +941,10 @@ class RM65PositionCollisionPlanner:
                     name="last-safe collision-planner qpos",
                 )
                 self.solver.set_configuration_q(reference_full_q.copy())
+                self._set_qp_motion_reference(
+                    reference_full_q,
+                    self._last_admitted_velocity_full
+                )
                 frame_name_by_side = {
                     LEFT: str(self.scene_profile.left_frame_name),
                     RIGHT: str(self.scene_profile.right_frame_name),
@@ -777,9 +986,11 @@ class RM65PositionCollisionPlanner:
                     and float(self.config.solve_time_budget_ms or 0.0) > 0.0
                     else None
                 )
-                for iteration in range(1, int(self.config.solve_max_iterations) + 1):
+                solve_min_iterations = self.config.effective_solve_min_iterations
+                solve_max_iterations = self.config.effective_solve_max_iterations
+                for iteration in range(1, solve_max_iterations + 1):
                     if (
-                        iteration > int(self.config.solve_min_iterations)
+                        iteration > solve_min_iterations
                         and iteration_budget_ms is not None
                     ):
                         elapsed_ms = (time.perf_counter() - frame_started) * 1000.0
@@ -788,10 +999,25 @@ class RM65PositionCollisionPlanner:
                             solve_stop_reason = "iteration_budget_estimate"
                             break
                     iteration_started = time.perf_counter()
+                    substep_reference_q = self._solver_current_q()
                     raw_full_q = np.asarray(
                         self.solver.solve(targets=solver_targets),
                         dtype=float,
                     ).reshape(-1)
+                    if (
+                        self.config.pose_lift_profile.qp_acceleration_limit
+                        and self.config.pose_lift_profile.qp_substeps_per_reference > 0
+                        and raw_full_q.shape == substep_reference_q.shape
+                        and np.all(np.isfinite(raw_full_q))
+                    ):
+                        substep_dt = (
+                            self.config.reference_period_sec
+                            / float(solve_max_iterations)
+                        )
+                        self._set_qp_motion_reference(
+                            raw_full_q,
+                            (raw_full_q - substep_reference_q) / substep_dt
+                        )
                     iteration_ms = (time.perf_counter() - iteration_started) * 1000.0
                     solve_ms += iteration_ms
                     previous_solve_ms = max(0.05, iteration_ms)
@@ -824,7 +1050,7 @@ class RM65PositionCollisionPlanner:
                             <= float(self.config.solve_orientation_tolerance_deg)
                         )
                     if (
-                        iteration >= int(self.config.solve_min_iterations)
+                        iteration >= solve_min_iterations
                         and within_tolerance
                     ):
                         solve_stop_reason = "pose_tolerance"
@@ -840,6 +1066,17 @@ class RM65PositionCollisionPlanner:
                         "invalid_ik_output",
                         "coupled collision IK returned a non-finite or mismatched configuration.",
                     )
+
+                solver_raw_full_q = raw_full_q.copy()
+                raw_full_q, self._last_pose_lift_metadata = (
+                    self._canonicalize_pose_lift_candidate(
+                        reference_full_q=reference_full_q,
+                        solver_candidate_full_q=solver_raw_full_q,
+                        target_endpoint_world=target_endpoint_world,
+                        frame_name_by_side=frame_name_by_side,
+                        active_sides=active_sides,
+                    )
+                )
 
                 raw_arm_qpos = self._split_arm_qpos(raw_full_q)
                 reference_arm_qpos = self._split_arm_qpos(reference_full_q)
@@ -941,9 +1178,13 @@ class RM65PositionCollisionPlanner:
                         )
 
                 self.solver.set_configuration_q(accepted_full_q.copy())
+                self._commit_qp_admitted_velocity(
+                    reference_full_q=reference_full_q,
+                    admitted_full_q=accepted_full_q,
+                )
                 realized_endpoint_world = self._realized_endpoint_poses(accepted_full_q)
                 q_ref_by_side = self._split_arm_qpos(accepted_full_q)
-                q_ik_raw_by_side = self._split_arm_qpos(raw_full_q)
+                q_ik_raw_by_side = self._split_arm_qpos(solver_raw_full_q)
                 self._last_safe_full_q = accepted_full_q.copy()
                 self._last_safe_collision_distance_m = accepted_distance
                 elapsed_ms = (time.perf_counter() - frame_started) * 1000.0
@@ -1111,6 +1352,487 @@ class RM65PositionCollisionPlanner:
                 },
             )
 
+    def admit_qpos_reference(
+        self,
+        qpos_by_side: Mapping[str, Any],
+        *,
+        source: str = "qpos_reference",
+    ) -> RM65QposCollisionValidationResult:
+        """Validate and commit an exact caller-owned qpos endpoint.
+
+        The candidate is never modified.  A safe endpoint becomes the next
+        last-safe anchor; an unsafe endpoint leaves planner state unchanged.
+        """
+
+        with self._lock:
+            result = self.validate_qpos_reference(qpos_by_side, source=source)
+            if not result.safe:
+                return result
+            assert self._last_safe_full_q is not None
+            committed = {
+                side: np.asarray(result.qpos_by_side[side], dtype=float).reshape(ARM_DOF)
+                for side in SIDES
+            }
+            reference_full_q = self._last_safe_full_q.copy()
+            full_q = self._embed_arm_qpos(reference_full_q, committed)
+            self._require_arm_qpos_within_limits(full_q, name="admitted qpos reference")
+            self.solver.set_configuration_q(full_q.copy())
+            self._commit_qp_admitted_velocity(
+                reference_full_q=reference_full_q,
+                admitted_full_q=full_q,
+            )
+            self._last_safe_full_q = full_q.copy()
+            self._last_safe_collision_distance_m = result.collision_distance_m
+            metadata = dict(result.metadata)
+            metadata.update(
+                {
+                    "validation_stage": "explicit_qpos_endpoint_admission",
+                    "mutates_last_safe_state": True,
+                    "qpos_target_modified": False,
+                }
+            )
+            return RM65QposCollisionValidationResult(
+                safe=True,
+                reason=None,
+                active_sides=result.active_sides,
+                qpos_by_side=result.qpos_by_side,
+                collision_distance_m=result.collision_distance_m,
+                metadata=metadata,
+            )
+
+    def _canonicalize_pose_lift_candidate(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        solver_candidate_full_q: np.ndarray,
+        target_endpoint_world: Mapping[str, np.ndarray],
+        frame_name_by_side: Mapping[str, str],
+        active_sides: tuple[str, ...],
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Choose only pose-certified equivalent representations near anchor."""
+
+        profile = self.config.pose_lift_profile
+        metadata: dict[str, Any] = {
+            "profile": profile.to_metadata(),
+            "anchor": "last_formally_admitted_qref",
+            "applied": False,
+            "reason": "baseline_passthrough",
+            "stages": [],
+        }
+        if not (
+            profile.equivalent_joint_unwrap
+            or profile.wrist_coaxial_canonicalization
+        ):
+            return solver_candidate_full_q.copy(), metadata
+
+        reference_by_side = self._split_arm_qpos(reference_full_q)
+        solver_by_side = self._split_arm_qpos(solver_candidate_full_q)
+        unwrapped_by_side: dict[str, np.ndarray] = {}
+        unwrap_applied = False
+        for side in SIDES:
+            candidate = solver_by_side[side].copy()
+            if side in active_sides and profile.equivalent_joint_unwrap:
+                candidate = self._unwrap_qpos_near_reference(
+                    reference_by_side[side],
+                    candidate,
+                    lower=self._joint_lower_by_side[side],
+                    upper=self._joint_upper_by_side[side],
+                )
+                unwrap_applied = bool(
+                    unwrap_applied
+                    or not np.allclose(
+                        candidate,
+                        solver_by_side[side],
+                        atol=1e-12,
+                        rtol=0.0,
+                    )
+                )
+            unwrapped_by_side[side] = candidate
+        unwrapped_full_q = self._embed_arm_qpos(reference_full_q, unwrapped_by_side)
+        metadata["stages"].append(
+            {"name": "legal_joint_unwrap", "applied": unwrap_applied}
+        )
+
+        if profile.wrist_bounded_local_search:
+            return self._bounded_pose_lift_candidate(
+                reference_full_q=reference_full_q,
+                solver_candidate_full_q=solver_candidate_full_q,
+                solver_by_side=solver_by_side,
+                unwrapped_by_side=unwrapped_by_side,
+                target_endpoint_world=target_endpoint_world,
+                frame_name_by_side=frame_name_by_side,
+                active_sides=active_sides,
+                metadata=metadata,
+            )
+
+        candidate_by_side = {
+            side: value.copy() for side, value in unwrapped_by_side.items()
+        }
+        wrist_metadata: dict[str, Any] = {}
+        if profile.wrist_coaxial_canonicalization:
+            for side in active_sides:
+                candidate_by_side[side], wrist_metadata[side] = (
+                    canonicalize_rm65_wrist_coaxial_step(
+                        reference_by_side[side],
+                        candidate_by_side[side],
+                        soft_threshold_deg=profile.wrist_soft_threshold_deg,
+                        hard_threshold_deg=profile.wrist_hard_threshold_deg,
+                        null_motion_soft_limit_deg=(
+                            profile.wrist_null_motion_soft_limit_deg
+                        ),
+                    )
+                )
+        wrist_full_q = self._embed_arm_qpos(reference_full_q, candidate_by_side)
+        wrist_applied = any(
+            bool(value.get("applied", False)) for value in wrist_metadata.values()
+        )
+        metadata["stages"].append(
+            {
+                "name": "wrist_coaxial_equivalent_normalization",
+                "applied": wrist_applied,
+                "sides": wrist_metadata,
+            }
+        )
+
+        for candidate_name, candidate_full_q in (
+            ("wrist_canonicalized", wrist_full_q),
+            ("legal_joint_unwrap", unwrapped_full_q),
+        ):
+            certification = self._pose_lift_candidate_certification(
+                candidate_full_q,
+                target_endpoint_world=target_endpoint_world,
+                frame_name_by_side=frame_name_by_side,
+                active_sides=active_sides,
+            )
+            metadata.setdefault("certification_attempts", []).append(
+                {"candidate": candidate_name, **certification}
+            )
+            if certification["accepted"]:
+                applied = not np.allclose(
+                    candidate_full_q,
+                    solver_candidate_full_q,
+                    atol=1e-12,
+                    rtol=0.0,
+                )
+                metadata.update(
+                    {
+                        "applied": bool(applied),
+                        "reason": (
+                            f"accepted_{candidate_name}"
+                            if applied
+                            else "candidate_already_canonical"
+                        ),
+                    }
+                )
+                return candidate_full_q.copy(), metadata
+
+        metadata["reason"] = "normalization_rejected_pose_or_limits"
+        return solver_candidate_full_q.copy(), metadata
+
+    def _bounded_pose_lift_candidate(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        solver_candidate_full_q: np.ndarray,
+        solver_by_side: Mapping[str, np.ndarray],
+        unwrapped_by_side: Mapping[str, np.ndarray],
+        target_endpoint_world: Mapping[str, np.ndarray],
+        frame_name_by_side: Mapping[str, str],
+        active_sides: tuple[str, ...],
+        metadata: dict[str, Any],
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Select the strongest certified wrist-continuity correction per arm.
+
+        The raw coupled IK solution is the pose baseline.  This is important:
+        an IK solve may already be slightly outside its absolute residual
+        tolerance, and an exactly equivalent representation must not be
+        rejected merely because it inherited that pre-existing residual.
+        Every accepted correction is instead bounded relative to the raw IK
+        pose and may worsen its target residual only by the profile slack.
+        """
+
+        profile = self.config.pose_lift_profile
+        reference_by_side = self._split_arm_qpos(reference_full_q)
+        selected_by_side = {
+            side: np.asarray(solver_by_side[side], dtype=float).copy()
+            for side in SIDES
+        }
+        side_results: dict[str, Any] = {}
+
+        for side in active_sides:
+            reference_side = np.asarray(reference_by_side[side], dtype=float)
+            side_result: dict[str, Any] = {
+                "anchor": "last_formally_admitted_qref",
+                "selected_scale": 0.0,
+                "unwrap_applied": False,
+                "canonicalizer": {},
+                "attempts": [],
+            }
+
+            # Legal 2pi representatives are checked independently so a
+            # problematic arm cannot force the other arm back to the raw
+            # branch.
+            proposed = {
+                name: value.copy() for name, value in selected_by_side.items()
+            }
+            proposed[side] = np.asarray(unwrapped_by_side[side], dtype=float).copy()
+            proposed_full_q = self._embed_arm_qpos(reference_full_q, proposed)
+            unwrap_certification = self._pose_lift_equivalence_certification(
+                proposed_full_q,
+                baseline_full_q=solver_candidate_full_q,
+                target_endpoint_world=target_endpoint_world,
+                frame_name_by_side=frame_name_by_side,
+                active_sides=(side,),
+            )
+            side_result["attempts"].append(
+                {
+                    "candidate": "legal_joint_unwrap",
+                    "scale": 0.0,
+                    **unwrap_certification,
+                }
+            )
+            if unwrap_certification["accepted"]:
+                selected_by_side[side] = proposed[side]
+                side_result["unwrap_applied"] = bool(
+                    not np.allclose(
+                        proposed[side],
+                        solver_by_side[side],
+                        atol=1e-12,
+                        rtol=0.0,
+                    )
+                )
+
+            wrist_target, wrist_metadata = canonicalize_rm65_wrist_coaxial_step(
+                reference_side,
+                selected_by_side[side],
+                soft_threshold_deg=profile.wrist_soft_threshold_deg,
+                hard_threshold_deg=profile.wrist_hard_threshold_deg,
+                null_motion_soft_limit_deg=profile.wrist_null_motion_soft_limit_deg,
+            )
+            side_result["canonicalizer"] = wrist_metadata
+            correction = wrist_target - selected_by_side[side]
+            if bool(wrist_metadata.get("applied", False)):
+                for scale in profile.wrist_local_search_scales:
+                    proposed = {
+                        name: value.copy()
+                        for name, value in selected_by_side.items()
+                    }
+                    proposed[side] = selected_by_side[side] + float(scale) * correction
+                    proposed_full_q = self._embed_arm_qpos(reference_full_q, proposed)
+                    certification = self._pose_lift_equivalence_certification(
+                        proposed_full_q,
+                        baseline_full_q=solver_candidate_full_q,
+                        target_endpoint_world=target_endpoint_world,
+                        frame_name_by_side=frame_name_by_side,
+                        active_sides=(side,),
+                    )
+                    side_result["attempts"].append(
+                        {
+                            "candidate": "wrist_continuity_correction",
+                            "scale": float(scale),
+                            **certification,
+                        }
+                    )
+                    if certification["accepted"]:
+                        selected_by_side[side] = proposed[side]
+                        side_result["selected_scale"] = float(scale)
+                        break
+            side_results[side] = side_result
+
+        selected_full_q = self._embed_arm_qpos(reference_full_q, selected_by_side)
+        final_certification = self._pose_lift_equivalence_certification(
+            selected_full_q,
+            baseline_full_q=solver_candidate_full_q,
+            target_endpoint_world=target_endpoint_world,
+            frame_name_by_side=frame_name_by_side,
+            active_sides=active_sides,
+        )
+        metadata["stages"].append(
+            {
+                "name": "bounded_per_side_wrist_continuity_search",
+                "applied": any(
+                    bool(result.get("unwrap_applied", False))
+                    or float(result.get("selected_scale", 0.0)) > 0.0
+                    for result in side_results.values()
+                ),
+                "sides": side_results,
+                "final_certification": final_certification,
+            }
+        )
+        if not final_certification["accepted"]:
+            metadata["reason"] = "bounded_search_final_certification_failed"
+            return solver_candidate_full_q.copy(), metadata
+
+        applied = not np.allclose(
+            selected_full_q,
+            solver_candidate_full_q,
+            atol=1e-12,
+            rtol=0.0,
+        )
+        selected_scales = {
+            side: float(result.get("selected_scale", 0.0))
+            for side, result in side_results.items()
+        }
+        metadata.update(
+            {
+                "applied": bool(applied),
+                "reason": (
+                    "accepted_bounded_wrist_continuity"
+                    if applied
+                    else "bounded_candidate_already_canonical"
+                ),
+                "selected_scales": selected_scales,
+            }
+        )
+        return selected_full_q.copy(), metadata
+
+    @staticmethod
+    def _unwrap_qpos_near_reference(
+        reference: np.ndarray,
+        candidate: np.ndarray,
+        *,
+        lower: np.ndarray,
+        upper: np.ndarray,
+    ) -> np.ndarray:
+        output = np.asarray(candidate, dtype=float).reshape(ARM_DOF).copy()
+        reference = np.asarray(reference, dtype=float).reshape(ARM_DOF)
+        lower = np.asarray(lower, dtype=float).reshape(ARM_DOF)
+        upper = np.asarray(upper, dtype=float).reshape(ARM_DOF)
+        period = 2.0 * math.pi
+        for index in range(ARM_DOF):
+            center_k = int(round((reference[index] - output[index]) / period))
+            equivalents = [
+                output[index] + period * k
+                for k in range(center_k - 2, center_k + 3)
+                if lower[index] - 1e-12
+                <= output[index] + period * k
+                <= upper[index] + 1e-12
+            ]
+            if equivalents:
+                output[index] = min(
+                    equivalents,
+                    key=lambda value: abs(float(value - reference[index])),
+                )
+        return output
+
+    def _pose_lift_candidate_certification(
+        self,
+        candidate_full_q: np.ndarray,
+        *,
+        target_endpoint_world: Mapping[str, np.ndarray],
+        frame_name_by_side: Mapping[str, str],
+        active_sides: tuple[str, ...],
+    ) -> dict[str, Any]:
+        try:
+            self._require_arm_qpos_within_limits(
+                candidate_full_q,
+                name="pose-lift normalized candidate",
+            )
+        except _PlanningFailure as exc:
+            return {"accepted": False, "reason": exc.code, "pose_error": {}}
+        errors: dict[str, dict[str, float]] = {}
+        accepted = True
+        for side in active_sides:
+            realized = self._compute_frame_pose(
+                frame_name_by_side[side],
+                candidate_full_q,
+            )
+            translation_m, rotation_deg = pose_delta_metrics(
+                realized,
+                target_endpoint_world[side],
+            )
+            errors[side] = {
+                "translation_m": float(translation_m),
+                "rotation_deg": float(rotation_deg),
+            }
+            accepted = bool(
+                accepted
+                and translation_m <= self.config.solve_translation_tolerance_m
+                and rotation_deg <= self.config.solve_orientation_tolerance_deg
+            )
+        return {
+            "accepted": bool(accepted),
+            "reason": "pose_tolerance" if accepted else "pose_tolerance_exceeded",
+            "pose_error": errors,
+        }
+
+    def _pose_lift_equivalence_certification(
+        self,
+        candidate_full_q: np.ndarray,
+        *,
+        baseline_full_q: np.ndarray,
+        target_endpoint_world: Mapping[str, np.ndarray],
+        frame_name_by_side: Mapping[str, str],
+        active_sides: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Certify a V3 candidate against raw IK, not an absolute residual."""
+
+        profile = self.config.pose_lift_profile
+        try:
+            self._require_arm_qpos_within_limits(
+                candidate_full_q,
+                name="pose-lift bounded candidate",
+            )
+        except _PlanningFailure as exc:
+            return {"accepted": False, "reason": exc.code, "sides": {}}
+
+        sides: dict[str, dict[str, float | bool]] = {}
+        accepted = True
+        for side in active_sides:
+            baseline_pose = self._compute_frame_pose(
+                frame_name_by_side[side], baseline_full_q
+            )
+            candidate_pose = self._compute_frame_pose(
+                frame_name_by_side[side], candidate_full_q
+            )
+            target_pose = target_endpoint_world[side]
+            equivalence_translation_m, equivalence_rotation_deg = pose_delta_metrics(
+                candidate_pose,
+                baseline_pose,
+            )
+            baseline_translation_m, baseline_rotation_deg = pose_delta_metrics(
+                baseline_pose,
+                target_pose,
+            )
+            candidate_translation_m, candidate_rotation_deg = pose_delta_metrics(
+                candidate_pose,
+                target_pose,
+            )
+            equivalence_ok = bool(
+                equivalence_translation_m
+                <= profile.equivalence_translation_tolerance_m + 1e-12
+                and equivalence_rotation_deg
+                <= profile.equivalence_rotation_tolerance_deg + 1e-12
+            )
+            target_not_worse = bool(
+                candidate_translation_m
+                <= baseline_translation_m + profile.target_translation_slack_m + 1e-12
+                and candidate_rotation_deg
+                <= baseline_rotation_deg + profile.target_rotation_slack_deg + 1e-12
+            )
+            side_ok = bool(equivalence_ok and target_not_worse)
+            accepted = bool(accepted and side_ok)
+            sides[side] = {
+                "accepted": side_ok,
+                "equivalence_translation_m": float(equivalence_translation_m),
+                "equivalence_rotation_deg": float(equivalence_rotation_deg),
+                "baseline_target_translation_m": float(baseline_translation_m),
+                "baseline_target_rotation_deg": float(baseline_rotation_deg),
+                "candidate_target_translation_m": float(candidate_translation_m),
+                "candidate_target_rotation_deg": float(candidate_rotation_deg),
+                "equivalence_ok": equivalence_ok,
+                "target_not_worse": target_not_worse,
+            }
+        return {
+            "accepted": bool(accepted),
+            "reason": (
+                "equivalent_and_target_not_worse"
+                if accepted
+                else "equivalence_or_target_slack_exceeded"
+            ),
+            "sides": sides,
+        }
+
     def _hold_result(
         self,
         *,
@@ -1133,6 +1855,10 @@ class RM65PositionCollisionPlanner:
         assert self._last_safe_full_q is not None
         hold_q = self._last_safe_full_q.copy()
         self.solver.set_configuration_q(hold_q.copy())
+        self._commit_qp_admitted_velocity(
+            reference_full_q=hold_q,
+            admitted_full_q=hold_q,
+        )
         try:
             realized = self._realized_endpoint_poses(hold_q)
         except Exception:
@@ -1251,6 +1977,38 @@ class RM65PositionCollisionPlanner:
                 side: self._joint_upper_by_side[side].tolist() for side in SIDES
             },
             "max_joint_step_rad": self.config.effective_max_joint_step_rad.tolist(),
+            "qp_motion_constraints": {
+                "substeps_per_reference": int(
+                    self.config.pose_lift_profile.qp_substeps_per_reference
+                ),
+                "substep_dt_sec": (
+                    None
+                    if self.config.pose_lift_profile.qp_substeps_per_reference <= 0
+                    else self.config.reference_period_sec
+                    / float(
+                        self.config.pose_lift_profile.qp_substeps_per_reference
+                    )
+                ),
+                "velocity_limit_enabled": bool(
+                    self.config.pose_lift_profile.qp_velocity_limit
+                ),
+                "acceleration_limit_enabled": bool(
+                    self.config.pose_lift_profile.qp_acceleration_limit
+                ),
+                "velocity_limit_rad_s": list(
+                    self.config.max_joint_velocity_rad_s
+                ),
+                "acceleration_limit_rad_s2": list(
+                    self.config.max_joint_acceleration_rad_s2
+                ),
+                "previous_velocity_source": "last_formally_admitted_qref",
+                "last_admitted_qdot_rad_s_by_side": {
+                    side: self._last_admitted_velocity_full[arm_slice]
+                    .astype(float)
+                    .tolist()
+                    for side, arm_slice in self._arm_slices.items()
+                },
+            },
             "target_reference_frame": reference_frame,
             "target_controlled_frame": controlled_frame,
             "world_from_arm_base_source": self.world_from_arm_base_source,
@@ -1258,12 +2016,26 @@ class RM65PositionCollisionPlanner:
             "passive_side_policy": "freeze_at_last_safe_qpos_in_full_collision_model",
             "solve_ms": float(solve_ms),
             "ik_solve_iterations": int(solve_iterations),
-            "ik_solve_iteration_min": int(self.config.solve_min_iterations),
-            "ik_solve_iteration_max": int(self.config.solve_max_iterations),
+            "ik_solve_iteration_min": int(
+                self.config.effective_solve_min_iterations
+            ),
+            "ik_solve_iteration_max": int(
+                self.config.effective_solve_max_iterations
+            ),
+            "ik_solve_iteration_requested_min": int(
+                self.config.solve_min_iterations
+            ),
+            "ik_solve_iteration_requested_max": int(
+                self.config.solve_max_iterations
+            ),
             "ik_solve_iteration_mode": (
-                "adaptive_budget"
-                if self.config.solve_adaptive_iterations_enabled
-                else "fixed_max"
+                "fixed_differential_substeps"
+                if self.config.pose_lift_profile.qp_substeps_per_reference > 0
+                else (
+                    "adaptive_budget"
+                    if self.config.solve_adaptive_iterations_enabled
+                    else "fixed_max"
+                )
             ),
             "ik_solve_iteration_stop_reason": solve_stop_reason,
             "ik_solve_pose_error": {
@@ -1284,6 +2056,7 @@ class RM65PositionCollisionPlanner:
             "temporal_smoothing_applied": False,
             "target_pose_smoothing": "none",
             "output_qpos_smoothing": "none",
+            "pose_lift": copy.deepcopy(self._last_pose_lift_metadata),
             "failure": None if failure is None else dict(failure),
             "source_metadata": dict(source_metadata),
         }
@@ -1293,6 +2066,97 @@ class RM65PositionCollisionPlanner:
         if current.size == 0 or not np.all(np.isfinite(current)):
             raise ValueError("dual-arm collision solver current_q must be finite and non-empty.")
         return current.copy()
+
+    def _full_arm_tangent_limit(
+        self,
+        arm_limit: Sequence[float],
+        *,
+        full_dof: int,
+    ) -> np.ndarray:
+        values = np.asarray(arm_limit, dtype=float).reshape(ARM_DOF)
+        full = np.full(int(full_dof), np.inf, dtype=float)
+        for arm_slice in self._arm_slices.values():
+            full[arm_slice] = values
+        return full
+
+    def _configure_qp_motion_constraints(self, current_full_q: np.ndarray) -> None:
+        profile = self.config.pose_lift_profile
+        full_dof = int(np.asarray(current_full_q).size)
+        if profile.qp_substeps_per_reference > 0:
+            set_integration_dt = getattr(self.solver, "set_integration_dt", None)
+            if not callable(set_integration_dt):
+                raise ValueError(
+                    f"pose-lift profile {profile.name!r} requires an IK solver "
+                    "with set_integration_dt()."
+                )
+            set_integration_dt(
+                self.config.reference_period_sec
+                / float(profile.qp_substeps_per_reference)
+            )
+        if profile.qp_velocity_limit or profile.qp_acceleration_limit:
+            configure_motion_limit = getattr(
+                self.solver,
+                "configure_admitted_reference_motion_limit",
+                None,
+            )
+            if not callable(configure_motion_limit):
+                raise ValueError(
+                    f"pose-lift profile {profile.name!r} requires an IK solver "
+                    "with configure_admitted_reference_motion_limit()."
+                )
+            configure_motion_limit(
+                self._full_arm_tangent_limit(
+                    self.config.max_joint_velocity_rad_s,
+                    full_dof=full_dof,
+                ),
+                (
+                    self._full_arm_tangent_limit(
+                        self.config.max_joint_acceleration_rad_s2,
+                        full_dof=full_dof,
+                    )
+                    if profile.qp_acceleration_limit
+                    else None
+                ),
+            )
+            self._set_qp_motion_reference(
+                current_full_q,
+                self._last_admitted_velocity_full,
+            )
+
+    def _set_qp_motion_reference(
+        self,
+        anchor_full_q: np.ndarray,
+        velocity_full: np.ndarray,
+    ) -> None:
+        profile = self.config.pose_lift_profile
+        if not (profile.qp_velocity_limit or profile.qp_acceleration_limit):
+            return
+        setter = getattr(self.solver, "set_admitted_reference_motion", None)
+        if not callable(setter):
+            raise RuntimeError(
+                "QP motion-limited solver lost set_admitted_reference_motion()."
+            )
+        anchor = np.asarray(anchor_full_q, dtype=float).reshape(
+            self._last_admitted_velocity_full.shape
+        )
+        velocity = np.asarray(velocity_full, dtype=float).reshape(
+            self._last_admitted_velocity_full.shape
+        )
+        if not np.all(np.isfinite(anchor)) or not np.all(np.isfinite(velocity)):
+            raise ValueError("admitted qref motion anchor must be finite.")
+        setter(anchor, velocity, self.config.reference_period_sec)
+
+    def _commit_qp_admitted_velocity(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        admitted_full_q: np.ndarray,
+    ) -> None:
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        admitted = np.asarray(admitted_full_q, dtype=float).reshape(reference.shape)
+        velocity = (admitted - reference) / float(self.config.reference_period_sec)
+        self._last_admitted_velocity_full = velocity.copy()
+        self._set_qp_motion_reference(admitted, velocity)
 
     def _resolve_arm_slices(self, full_dof: int) -> dict[str, slice]:
         layout = str(getattr(self.scene_profile, "solution_layout", ""))

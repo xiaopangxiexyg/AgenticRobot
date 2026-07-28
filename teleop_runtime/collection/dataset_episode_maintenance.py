@@ -393,6 +393,19 @@ def _delete_episode_and_compact_unlocked(
             "Refusing in-place episode compaction for a committed v2.4 capture; "
             "create a copy-on-write derived dataset with new commit identities instead."
         )
+    v25p_episode_identities = sorted(
+        (root / "meta" / "v25p" / "episodes").glob("*/identity.cjson")
+    ) + sorted(
+        (root / "meta" / "v25p" / "native" / "episodes").glob(
+            "*/identity.cjson"
+        )
+    )
+    if v25p_episode_identities:
+        raise RuntimeError(
+            "Refusing in-place episode compaction for a v2.5-p capture because "
+            "episode UUID/index bindings and base-record hashes are immutable; "
+            "create a copy-on-write derived dataset with new identities instead."
+        )
     operation_id = uuid.uuid4().hex[:10]
     stage = root.with_name(f".{root.name}.episode_delete_stage_{operation_id}")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

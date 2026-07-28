@@ -72,14 +72,22 @@ def test_robot_action_v1_assumptions_do_not_spread_to_new_shared_files() -> None
         # Explicit RobotAction-v1 compatibility inside the otherwise
         # backend-neutral composition package.  Keeping these named prevents
         # current left/right topology debt from spreading to new modules.
-        "control_composition/composition/core.py",
-        "control_composition/composition/strategies.py",
-        "control_composition/observability/difference.py",
-        "robot_motion/action/__init__.py",
+            "control_composition/composition/core.py",
+            # Formal component strategy v2 still materializes its result through
+            # RobotAction v1.  This exception is removed when its component-keyed
+            # result carrier replaces the compatibility materialization.
+            "control_composition/composition/component_strategy.py",
+            "control_composition/composition/strategies.py",
+            "control_composition/observability/difference.py",
+            "robot_motion/action/__init__.py",
         "robot_motion/action/arbiter.py",
         "robot_motion/action/arm_spec.py",
-        "robot_motion/action/codec.py",
-        "robot_motion/action/execution_manifest.py",
+            "robot_motion/action/codec.py",
+            # The sole explicit RobotAction-v1 <-> component-action bridge.
+            # Generic payload/catalog/action contracts remain in the separate
+            # component_action.py module and may not parse left/right names.
+            "robot_motion/action/component_action_v1.py",
+            "robot_motion/action/execution_manifest.py",
         "robot_motion/action/execution_target.py",
         "robot_motion/action/executor.py",
         "robot_motion/action/hand_spec.py",
@@ -120,7 +128,7 @@ def test_vendor_named_shared_contracts_remain_explicit_v1_exceptions() -> None:
     )
 
 
-def test_arbiter_keeps_its_single_documented_v1_name_projection_seam() -> None:
+def test_arbiter_has_no_robot_action_v1_name_projection_seam() -> None:
     path = REPO_ROOT / "robot_motion/action/arbiter.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     call_owners: list[str] = []
@@ -132,4 +140,4 @@ def test_arbiter_keeps_its_single_documented_v1_name_projection_seam() -> None:
             for node in ast.walk(function)
         ):
             call_owners.append(function.name)
-    assert sorted(call_owners) == ["_copy_selected_component"]
+    assert call_owners == []

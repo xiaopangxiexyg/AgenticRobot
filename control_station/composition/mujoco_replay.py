@@ -348,8 +348,8 @@ class MujocoReplayOnlyComposition:
             != self.runtime.config.embodiment_instance_id
             or config.producer_id != self.runtime.config.replay_producer_id
             or config.producer_epoch != self.runtime.config.producer_epoch
-            or config.component_schema_hash
-            != self.runtime.catalog.semantic_content_hash
+            or config.action_schema.semantic_content_hash
+            != self.runtime.action_schema.semantic_content_hash
         ):
             raise ValueError("Replay source is not bound to the exact MuJoCo runtime.")
         if config.target_runtime_contract.semantic_content_hash != (
@@ -828,14 +828,7 @@ def build_cs2bc_replay_source_from_gui_binding(
             embodiment_instance_id=runtime.config.embodiment_instance_id,
             producer_id=runtime.config.replay_producer_id,
             producer_epoch=runtime.config.producer_epoch,
-            component_schema_hash=runtime.catalog.semantic_content_hash,
-            component_coverage=source_components,
-            selection_groups=tuple(
-                dict.fromkeys(
-                    source_action.selection_group_by_component[component]
-                    for component in source_components
-                )
-            ),
+            action_schema=runtime.action_schema,
             source_contract=source_binding.source_contract,
             source_action_contract=source_action,
             target_runtime_contract=runtime.target_runtime_action_contract,
@@ -926,6 +919,8 @@ def build_cs2bc_replay_gui_execution_manifest(
         manifest_id=CS2BC_REPLAY_GUI_EXECUTION_MANIFEST_ID_V1,
         manifest_version="v1",
         action_space=runtime.catalog.action_space,
+        action_schema=runtime.action_schema,
+        component_target_capability=runtime.component_target_capability,
         catalog=runtime.catalog,
         motion_authority_sources=(
             "replay:existing_gui_source_via_control_station",

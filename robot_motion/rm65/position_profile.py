@@ -23,6 +23,9 @@ from robot_motion.position_control.trajectory import (
 
 RM65_BIMANUAL_POSITION_PROFILE_SCHEMA = "robot_motion.rm65_bimanual_position_profile/v1"
 RM65_BIMANUAL_POSITION_V1_NAME = "rm65_bimanual_position_v1"
+RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME = (
+    "rm65_bimanual_position_v2_responsive"
+)
 RM65_BIMANUAL_POSITION_V1_QREF_PROFILE = "rm65_bimanual_position_v1_qref"
 LEGACY_POSITION_CONTROL_PROFILE_NAME = "legacy"
 
@@ -51,6 +54,18 @@ class RM65PositionSourceShapingProfile:
     post_ik_qpos_smoothing_alpha: float = 0.14
     post_ik_qpos_smoothing_fast_alpha: float = 0.45
     post_ik_qpos_smoothing_adaptive: bool = True
+    # V1 deliberately leaves these off.  A later profile may bypass the
+    # broad post-IK EMA only for a per-side, locally ordinary tracking step;
+    # the final qref velocity/acceleration/collision admission is downstream
+    # and remains authoritative.
+    post_ik_qpos_normal_fast_path: bool = False
+    post_ik_qpos_normal_fast_path_alpha: float = 1.0
+    post_ik_qpos_normal_fast_path_guard_deg: float = 4.0
+    post_ik_qpos_normal_fast_path_quality_grace_sec: float = 0.0
+    # V1 preserves the historical fixed release band.  Responsive profiles
+    # require evidence that an escape correction reached admitted qref before
+    # the release-band hysteresis is allowed to hold an inward q5 candidate.
+    wrist_q5_hysteresis_requires_escape_latch: bool = False
 
     def __post_init__(self) -> None:
         scale = _finite(
@@ -68,9 +83,24 @@ class RM65PositionSourceShapingProfile:
             name="post_ik_qpos_smoothing_fast_alpha",
             minimum=0.0,
         )
+        normal_fast = _finite(
+            self.post_ik_qpos_normal_fast_path_alpha,
+            name="post_ik_qpos_normal_fast_path_alpha",
+            minimum=0.0,
+        )
+        normal_guard = _finite(
+            self.post_ik_qpos_normal_fast_path_guard_deg,
+            name="post_ik_qpos_normal_fast_path_guard_deg",
+            minimum=0.0,
+        )
+        normal_quality_grace = _finite(
+            self.post_ik_qpos_normal_fast_path_quality_grace_sec,
+            name="post_ik_qpos_normal_fast_path_quality_grace_sec",
+            minimum=0.0,
+        )
         if scale > 1.0:
             raise ValueError("inactive_enter_threshold_scale must be <= 1.")
-        if slow > 1.0 or fast > 1.0:
+        if slow > 1.0 or fast > 1.0 or normal_fast > 1.0:
             raise ValueError("post-IK smoothing alphas must be <= 1.")
         if fast < slow:
             raise ValueError("fast post-IK smoothing alpha must be >= slow alpha.")
@@ -79,12 +109,37 @@ class RM65PositionSourceShapingProfile:
         object.__setattr__(self, "post_ik_qpos_smoothing_fast_alpha", fast)
         object.__setattr__(
             self,
+            "post_ik_qpos_normal_fast_path_alpha",
+            normal_fast,
+        )
+        object.__setattr__(
+            self,
+            "post_ik_qpos_normal_fast_path_guard_deg",
+            normal_guard,
+        )
+        object.__setattr__(
+            self,
+            "post_ik_qpos_normal_fast_path_quality_grace_sec",
+            normal_quality_grace,
+        )
+        object.__setattr__(
+            self,
             "post_ik_qpos_smoothing_adaptive",
             bool(self.post_ik_qpos_smoothing_adaptive),
         )
+        object.__setattr__(
+            self,
+            "post_ik_qpos_normal_fast_path",
+            bool(self.post_ik_qpos_normal_fast_path),
+        )
+        object.__setattr__(
+            self,
+            "wrist_q5_hysteresis_requires_escape_latch",
+            bool(self.wrist_q5_hysteresis_requires_escape_latch),
+        )
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        payload = {
             "inactive_enter_threshold_scale": self.inactive_enter_threshold_scale,
             "post_ik_qpos_smoothing_alpha": self.post_ik_qpos_smoothing_alpha,
             "post_ik_qpos_smoothing_fast_alpha": self.post_ik_qpos_smoothing_fast_alpha,
@@ -92,6 +147,27 @@ class RM65PositionSourceShapingProfile:
             "application_scope": "live_human_source_before_main_action",
             "replay_or_deploy_reapply": False,
         }
+        # Preserve the established V1 metadata/hash exactly.  New source
+        # semantics become part of the fingerprint only for a profile that
+        # explicitly enables them.
+        if self.post_ik_qpos_normal_fast_path:
+            payload.update(
+                {
+                    "post_ik_qpos_normal_fast_path": True,
+                    "post_ik_qpos_normal_fast_path_alpha": (
+                        self.post_ik_qpos_normal_fast_path_alpha
+                    ),
+                    "post_ik_qpos_normal_fast_path_guard_deg": (
+                        self.post_ik_qpos_normal_fast_path_guard_deg
+                    ),
+                    "post_ik_qpos_normal_fast_path_quality_grace_sec": (
+                        self.post_ik_qpos_normal_fast_path_quality_grace_sec
+                    ),
+                }
+            )
+        if self.wrist_q5_hysteresis_requires_escape_latch:
+            payload["wrist_q5_hysteresis_requires_escape_latch"] = True
+        return payload
 
 
 @dataclass(frozen=True)
@@ -350,11 +426,38 @@ RM65_BIMANUAL_POSITION_V1 = RM65BimanualPositionProfile(
     ),
 )
 
+RM65_BIMANUAL_POSITION_V2_RESPONSIVE = RM65BimanualPositionProfile(
+    name=RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME,
+    rates=PositionControlRates(
+        sample_hz=15.0,
+        reference_hz=60.0,
+        ik_hz=60.0,
+        command_hz=120.0,
+    ),
+    source_shaping=RM65PositionSourceShapingProfile(
+        post_ik_qpos_normal_fast_path=True,
+        # The old 0.14 adaptive endpoint was visibly sticky, while alpha=1
+        # exposed tracker/IK micro-reversals directly to the 120 Hz transport.
+        # 0.70 settles 90% of a step in roughly two 60 Hz reference cycles and
+        # still attenuates frame-alternating joint noise.
+        post_ik_qpos_normal_fast_path_alpha=0.70,
+        post_ik_qpos_normal_fast_path_guard_deg=4.0,
+        # Cover transient motion-window invalidation only.  Hard admission and
+        # singularity guards in the solver remain immediate and fail closed.
+        post_ik_qpos_normal_fast_path_quality_grace_sec=0.05,
+        wrist_q5_hysteresis_requires_escape_latch=True,
+    ),
+)
+
 RM65_BIMANUAL_POSITION_PROFILES = {
     RM65_BIMANUAL_POSITION_V1.name: RM65_BIMANUAL_POSITION_V1,
+    RM65_BIMANUAL_POSITION_V2_RESPONSIVE.name: (
+        RM65_BIMANUAL_POSITION_V2_RESPONSIVE
+    ),
 }
 RM65_POSITION_CONTROL_PROFILE_CHOICES = (
     RM65_BIMANUAL_POSITION_V1_NAME,
+    RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME,
     LEGACY_POSITION_CONTROL_PROFILE_NAME,
 )
 
@@ -377,6 +480,8 @@ __all__ = [
     "RM65_BIMANUAL_POSITION_V1",
     "RM65_BIMANUAL_POSITION_V1_NAME",
     "RM65_BIMANUAL_POSITION_V1_QREF_PROFILE",
+    "RM65_BIMANUAL_POSITION_V2_RESPONSIVE",
+    "RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME",
     "RM65_POSITION_CONTROL_PROFILE_CHOICES",
     "RM65BimanualPositionProfile",
     "RM65PositionCommandExecutionProfile",

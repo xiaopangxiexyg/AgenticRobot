@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from dataclasses import dataclass
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -34,7 +35,6 @@ from teleop_runtime.session import (
     TeleopSession,
     TeleopSessionConfig,
 )
-
 from .human import (
     PassiveHumanCommandEmissionIngress,
     PassiveHumanCommandObserverFanout,
@@ -511,6 +511,7 @@ class _PassiveTeleopSessionSource:
         self._last_observed_sequence: int | None = None
         self._last_accepted_emission: HumanCommandEmission | None = None
         self._last_rejection_reason: str | None = None
+        self._started = False
         self._closed = False
         session.human_command_observer = self._observe_emission
         payload = {
@@ -537,6 +538,32 @@ class _PassiveTeleopSessionSource:
     def session_state(self) -> TeleopRunState:
         return self._session.state_machine.state
 
+    @property
+    def started(self) -> bool:
+        """Whether this passive source has started its lower TeleopSession."""
+
+        with self._lock:
+            return bool(self._started and not self._closed)
+
+    @property
+    def session(self) -> TeleopSession:
+        """Expose the lower-owned session for read-only station readiness.
+
+        The returned object remains owned by ``teleop_runtime``.  This accessor
+        is intentionally observation-only at the Station boundary; callers may
+        inspect state, but source lifecycle transitions still go through this
+        passive source's typed methods.
+        """
+
+        return self._session
+
+    @property
+    def last_emission(self) -> HumanCommandEmission | None:
+        """Return the latest accepted passive emission, if any."""
+
+        with self._lock:
+            return self._last_accepted_emission
+
     def start(self) -> object:
         with self._lock:
             if self._closed:
@@ -546,6 +573,7 @@ class _PassiveTeleopSessionSource:
             self._assert_non_dispatch_state()
             self._session.start()
             self._assert_non_dispatch_state()
+            self._started = True
             return self.binding_receipt
 
     def set_calibration_ready(self) -> None:
@@ -670,6 +698,7 @@ class _PassiveTeleopSessionSource:
             if self._closed:
                 return
             self._closed = True
+            self._started = False
         self._session.close()
 
 
@@ -931,6 +960,60 @@ def build_passive_teleop_component_session_source(
     )
 
 
+class PassiveTeleopComponentClockBridge:
+    """Adapt monotonic composition ticks to the session's wall-clock poll API."""
+
+    def __init__(self, source: PassiveTeleopComponentSessionSource, *, wall_clock=time.time) -> None:
+        if not isinstance(source, PassiveTeleopComponentSessionSource):
+            raise TypeError(
+                "source must be a PassiveTeleopComponentSessionSource."
+            )
+        if not callable(wall_clock):
+            raise TypeError("wall_clock must be callable.")
+        self._source = source
+        self._wall_clock = wall_clock
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+    @property
+    def binding_receipt(self) -> PassiveTeleopComponentBindingReceipt:
+        return self._source.binding_receipt
+
+    @property
+    def spec(self) -> PassiveTeleopComponentSourceSpec:
+        return self._source.spec
+
+    @property
+    def session(self) -> TeleopSession:
+        return self._source.session
+
+    @property
+    def session_state(self) -> TeleopRunState:
+        return self._source.session_state
+
+    @property
+    def started(self) -> bool:
+        return self._source.started
+
+    @property
+    def last_emission(self) -> HumanCommandEmission | None:
+        return self._source.last_emission
+
+    def start(self) -> object:
+        return self._source.start()
+
+    def set_calibration_ready(self) -> None:
+        self._source.set_calibration_ready()
+
+    def step(self, *, now: float | None = None) -> PassiveTeleopComponentStep:
+        del now
+        return self._source.step(now=float(self._wall_clock()))
+
+    def close(self) -> None:
+        self._source.close()
+
+
 __all__ = [
     "PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1",
     "PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
@@ -940,6 +1023,7 @@ __all__ = [
     "PassiveTeleopComponentSourceSpec",
     "PassiveTeleopComponentSpec",
     "PassiveTeleopComponentStep",
+    "PassiveTeleopComponentClockBridge",
     "PassiveTeleopPoseBindingReceipt",
     "PassiveTeleopPoseSessionSource",
     "PassiveTeleopPoseSourceSpec",

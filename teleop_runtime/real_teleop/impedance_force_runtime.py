@@ -140,18 +140,27 @@ def _emergency_stop_real_arms(
     stop_time = time.time() if now is None else float(now)
 
     def stop_one(side: str) -> tuple[str, str | None]:
-        backend = _command_backend_for_side(components, side)
+        label = f"{side}_arm"
+        try:
+            backend = _command_backend_for_side(components, side)
+        except Exception as exc:  # noqa: BLE001 - report one side and continue the other.
+            detail = f"{type(exc).__name__}: {exc}"
+            _log(
+                "EmergencyStop",
+                f"{label} stop lookup failed reason={reason}: {detail}",
+                now=stop_time,
+            )
+            return side, detail
         if backend is None:
             detail = "command backend unavailable"
             _log(
                 "EmergencyStop",
-                f"{side}_arm stop failed reason={reason}: {detail}",
+                f"{label} stop failed reason={reason}: {detail}",
                 now=stop_time,
             )
             return side, detail
-        stop = getattr(backend, "emergency_stop", None)
-        label = f"{side}_arm"
         try:
+            stop = getattr(backend, "emergency_stop", None)
             if callable(stop):
                 stop()
             else:
@@ -179,7 +188,18 @@ def _emergency_stop_real_arms(
             thread_name_prefix="rm65_bimanual_emergency_stop",
         ) as executor:
             futures = [executor.submit(stop_one, side) for side in active_sides]
-            results = [future.result() for future in futures]
+            results = []
+            for side, future in zip(active_sides, futures):
+                try:
+                    results.append(future.result())
+                except Exception as exc:  # noqa: BLE001 - one side cannot mask the other.
+                    detail = f"{type(exc).__name__}: {exc}"
+                    _log(
+                        "EmergencyStop",
+                        f"{side}_arm stop worker failed reason={reason}: {detail}",
+                        now=stop_time,
+                    )
+                    results.append((side, detail))
     errors = {
         side: detail
         for side, detail in results
@@ -496,6 +516,7 @@ def guard_impedance_force_control(
     issue_provider: Callable[..., str | None],
     hold_handler: Callable[..., None],
     log: Callable[..., None],
+    collision_handler: Callable[[str], None] | None = None,
 ) -> bool:
     if context == "main_loop" and components.session.state_machine.state not in {
         TeleopRunState.ARMED,
@@ -503,10 +524,41 @@ def guard_impedance_force_control(
         TeleopRunState.RECOVERING,
     }:
         return True
-    issue = issue_provider(args, components)
+    try:
+        issue = issue_provider(args, components)
+    except Exception as exc:  # noqa: BLE001 - classify raced controller stops below.
+        issue_text = f"{context}: {type(exc).__name__}: {exc}"
+        lowered = issue_text.lower()
+        stop_latch_race = any(
+            marker in lowered
+            for marker in (
+                "emergency_stop is latched",
+                "emergency stop is latched",
+                "emergency_stop_failed",
+                "emergency stop was not acknowledged",
+            )
+        )
+        if collision_handler is not None and (
+            has_force_limit_collision_text((issue_text,)) or stop_latch_race
+        ):
+            collision_handler(issue_text)
+            return False
+        raise
     if issue is None:
         return True
     reason = f"{context}: {issue}"
+    # A controller-side force hard-stop is already a safety event, not an
+    # ordinary impedance-health fault.  Let the real-teleop control loop
+    # perform the bimanual Arm_Stop, close/label the active episode, and enter
+    # the normal GUI Hold path.  Keeping this callback before the generic
+    # ``FAULT`` transition is important: FAULT is terminal for a session and
+    # would strand the GUI even though the hardware stop was acknowledged.
+    if (
+        collision_handler is not None
+        and has_force_limit_collision_text((issue,))
+    ):
+        collision_handler(reason)
+        return False
     if components.session.state_machine.state != TeleopRunState.FAULT:
         log("ForceControl", reason, now=now)
         hold_handler(components, reason=reason, now=now)
@@ -527,4 +579,3 @@ __all__ = [
     "guard_impedance_force_control",
     "hold_motion_after_impedance_guard_issue",
 ]
-

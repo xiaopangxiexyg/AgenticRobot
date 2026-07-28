@@ -31,6 +31,7 @@ from .teleop_pose import (
     PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
     PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1,
     PassiveTeleopComponentBindingReceipt,
+    PassiveTeleopComponentClockBridge,
     PassiveTeleopComponentSessionSource,
     PassiveTeleopComponentSourceSpec,
     PassiveTeleopComponentSpec,
@@ -47,7 +48,12 @@ from .replay_gui import (
     ReplayGuiStationConsumerStatus,
 )
 from .replay import ReplaySourceObserverBinding
-from .policy import SyncPolicyEmissionBinding
+from .policy import (
+    POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1,
+    PolicyCompositionInputAdapter,
+    PolicyCompositionInputBinding,
+    SyncPolicyEmissionBinding,
+)
 from .rtc_policy import (
     RtcPolicyEmissionBinding,
     RtcPolicyStationConsumer,
@@ -73,6 +79,7 @@ __all__ = [
     "admit_human_command_emission",
     "admit_human_observation_cut",
     "PassiveTeleopComponentBindingReceipt",
+    "PassiveTeleopComponentClockBridge",
     "PassiveTeleopComponentSessionSource",
     "PassiveTeleopComponentSourceSpec",
     "PassiveTeleopComponentSpec",
@@ -86,6 +93,9 @@ __all__ = [
     "ReplayGuiStationConsumer",
     "ReplayGuiStationConsumerStatus",
     "ReplaySourceObserverBinding",
+    "POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1",
+    "PolicyCompositionInputAdapter",
+    "PolicyCompositionInputBinding",
     "SyncPolicyEmissionBinding",
     "RtcPolicyStationConsumer",
     "RtcPolicyStationConsumerStatus",

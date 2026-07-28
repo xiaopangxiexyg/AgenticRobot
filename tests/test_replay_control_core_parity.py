@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import numpy as np
 
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
-from robot_motion.action import ActionArbiter
+from robot_motion.action import (
+    ActionArbiter,
+    ActionComponentCatalog,
+    ActionComponentSpec,
+    build_robot_action_v1_runtime_schema,
+)
 from robot_motion.deploy import (
     ACTION_ARM_POSE_SLICES,
     DEPLOY_ACTION_DIM,
@@ -51,6 +56,23 @@ class Clock:
 
     def __call__(self) -> float:
         return self.value
+
+
+def _shadow_contract():
+    catalog = ActionComponentCatalog(
+        catalog_id="replay-shadow-right-arm-v1",
+        action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+        components=(
+            ActionComponentSpec(
+                component_id="right_arm",
+                selection_group_id="right_arm",
+                effector_name="right_arm",
+            ),
+        ),
+    )
+    return catalog, build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
 
 
 def _action(x: float) -> np.ndarray:
@@ -131,6 +153,7 @@ def test_dataset_replay_uses_unique_pop_and_replays_same_frozen_decision(tmp_pat
     assert action_step.raw_action is not None
     pop_count = deploy_runtime.action_queue_pop_count()
 
+    catalog, action_schema = _shadow_contract()
     coordinator = PassivePolicyArbiterShadow(
         PolicyArbiterShadowConfig(
             runtime_session_id="replay-shadow-session",
@@ -140,6 +163,8 @@ def test_dataset_replay_uses_unique_pop_and_replays_same_frozen_decision(tmp_pat
             active_effectors=("right_arm",),
             action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
             decision_hz=15.0,
+            component_catalog=catalog,
+            action_schema=action_schema,
         ),
         clock=clock,
     )
@@ -150,6 +175,7 @@ def test_dataset_replay_uses_unique_pop_and_replays_same_frozen_decision(tmp_pat
             embodiment_instance_id=coordinator.config.embodiment_instance_id,
             producer_id=coordinator.config.producer_id,
             producer_epoch=coordinator.config.producer_epoch,
+            action_schema=action_schema,
             component_schema_hash=coordinator.component_catalog.semantic_content_hash,
             component_coverage=("right_arm",),
             source_path=str(replay.source_path),
@@ -190,7 +216,7 @@ def test_dataset_replay_uses_unique_pop_and_replays_same_frozen_decision(tmp_pat
     assert adapted.replay_action_record.source_action_index == 4
     assert adapted.replay_action_record.source_timestamp == 0.0
     np.testing.assert_allclose(
-        proposal.action.arm_pose_by_side["right"],
+        proposal.action.value("right_arm").values,
         action_step.emission.pre_safety_robot_action.arm_pose_by_side["right"],
     )
     assert proposal.effective_from == action_step.emission.effective_from
@@ -293,6 +319,7 @@ def test_hardware_free_trajectory_action_and_proposal_adapter_have_value_time_pa
             }
         },
     )
+    catalog, action_schema = _shadow_contract()
     coordinator = PassivePolicyArbiterShadow(
         PolicyArbiterShadowConfig(
             runtime_session_id="trajectory-shadow-session",
@@ -302,6 +329,8 @@ def test_hardware_free_trajectory_action_and_proposal_adapter_have_value_time_pa
             active_effectors=("right_arm",),
             action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
             decision_hz=15.0,
+            component_catalog=catalog,
+            action_schema=action_schema,
         ),
         clock=Clock(),
     )
@@ -312,6 +341,7 @@ def test_hardware_free_trajectory_action_and_proposal_adapter_have_value_time_pa
             embodiment_instance_id=coordinator.config.embodiment_instance_id,
             producer_id=coordinator.config.producer_id,
             producer_epoch=coordinator.config.producer_epoch,
+            action_schema=action_schema,
             component_schema_hash=coordinator.component_catalog.semantic_content_hash,
             component_coverage=("right_arm",),
             source_path=str(source_path),
@@ -355,9 +385,9 @@ def test_hardware_free_trajectory_action_and_proposal_adapter_have_value_time_pa
     assert adapted.replay_action_record is not None
     assert adapted.replay_action_record.source_action_index == 4
     assert adapted.replay_action_record.source_timestamp == 0.0
-    assert adapted.proposal_draft.action.timestamp == target_at
+    assert adapted.proposal_draft.target_effective_at == target_at
     np.testing.assert_allclose(
-        adapted.proposal_draft.action.arm_pose_by_side["right"],
+        adapted.proposal_draft.action.value("right_arm").values,
         existing.arm_pose_by_side["right"],
     )
     source_emission = build_replay_source_frame_emission(

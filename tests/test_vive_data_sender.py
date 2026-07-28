@@ -55,6 +55,13 @@ def test_vive_data_sender_defaults_to_300hz(monkeypatch) -> None:
     assert args.clock_sync_mode == "optional"
     assert args.clock_sync_port == 10001
     assert args.clock_sync_port != args.port
+    assert args.allow_single_tracker is False
+
+
+def test_vive_data_sender_single_tracker_compatibility_is_opt_in() -> None:
+    args = vive_data_sender.parse_args(["--single"])
+
+    assert args.allow_single_tracker is True
 
 
 def test_embedded_clock_sync_wire_format_matches_shared_protocol() -> None:
@@ -479,6 +486,35 @@ def test_vive_data_sender_assigns_trackers_by_lexical_device_name() -> None:
     assert [(spec.device_name, spec.tracker_role) for spec in specs] == [
         ("tracker_a", "left_wrist"),
         ("tracker_z", "right_wrist"),
+    ]
+
+
+def test_single_tracker_maps_left_and_synthesizes_invalid_right() -> None:
+    specs = vive_data_sender.auto_tracker_specs(
+        _FakeViveTrackers(["tracker_only"]),
+        allow_single_tracker=True,
+    )
+
+    assert [(spec.device_name, spec.tracker_role) for spec in specs] == [
+        ("tracker_only", "left_wrist"),
+        (vive_data_sender.SINGLE_TRACKER_COMPAT_RIGHT_NAME, "right_wrist"),
+    ]
+
+
+def test_vive_data_sender_single_tracker_wait_is_opt_in(monkeypatch) -> None:
+    vive = _FakeViveTrackers(["tracker_only"])
+    monkeypatch.setattr(vive_data_sender.time, "monotonic", lambda: 0.0)
+
+    specs = vive_data_sender.wait_for_trackers(
+        vive,
+        1.0,
+        allow_single_tracker=True,
+    )
+
+    assert specs is not None
+    assert [(spec.device_name, spec.tracker_role) for spec in specs] == [
+        ("tracker_only", "left_wrist"),
+        (vive_data_sender.SINGLE_TRACKER_COMPAT_RIGHT_NAME, "right_wrist"),
     ]
 
 

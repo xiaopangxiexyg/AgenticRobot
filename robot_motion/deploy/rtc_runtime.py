@@ -18,6 +18,9 @@ from typing import Any, Callable
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.model_continuation import (
+    normalize_model_continuation_contract,
+)
 from robot_motion.relative_action import normalize_action_pose_mode
 
 from .action_representation import PolicyActionRepresentationContext
@@ -49,6 +52,7 @@ from .inference import (
     InferenceDelayEstimatorState,
     PolicyChunkResult,
     PolicyInferenceRequest,
+    RTC_FLOW_INPAINT_MODE_V1,
 )
 from .observation import DeploymentObservation
 from .observation_view import PolicyObservationView
@@ -68,6 +72,15 @@ from .policy_worker import (
     PolicyWorkerSubmissionReceipt,
 )
 from .rtc.profile import RtcProducerProfile
+from .rtc.conditioning import (
+    CanonicalRtcConditioningBundle,
+    RtcModelContinuationRuntimeSpec,
+    build_canonical_rtc_conditioning_bundle,
+)
+from .rtc.continuation import (
+    RtcContinuationTimeline,
+    select_rtc_plan_continuation,
+)
 
 
 RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V1 = (
@@ -75,6 +88,9 @@ RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V1 = (
 )
 RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V2 = (
     "dexteleop.deploy.rtc_3c_frontend_config.v2"
+)
+RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V3 = (
+    "dexteleop.deploy.rtc_3c_frontend_config.v3"
 )
 RTC_3C_LOCAL_POLICY_PROTOCOL_V1 = "rtc_3c_local_policy_worker_v1"
 RTC_OBSERVATION_CUT_IDENTITY_HASH_DOMAIN_V2 = (
@@ -170,6 +186,7 @@ class RtcPolicyShadowConfig:
         default_factory=_default_delay_spec
     )
     action_pose_mode: str | None = None
+    model_continuation: RtcModelContinuationRuntimeSpec | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -233,6 +250,48 @@ class RtcPolicyShadowConfig:
                 "action_pose_mode",
                 normalize_action_pose_mode(self.action_pose_mode),
             )
+        continuation = self.model_continuation
+        if continuation is not None:
+            if not isinstance(
+                continuation,
+                RtcModelContinuationRuntimeSpec,
+            ):
+                raise TypeError(
+                    "model_continuation must be an "
+                    "RtcModelContinuationRuntimeSpec or None."
+                )
+            contract = normalize_model_continuation_contract(
+                continuation.continuation_contract
+            ).runtime
+            if self.profile.rtc_mode != RTC_FLOW_INPAINT_MODE_V1:
+                raise ValueError(
+                    "model_continuation requires rtc_flow_inpaint_v1."
+                )
+            if self.action_pose_mode != "absolute":
+                raise ValueError(
+                    "Model-RTC C1 v1 requires explicit absolute pose mode."
+                )
+            expected = {
+                "prediction_horizon_steps": self.prediction_horizon_steps,
+                "action_codec_hash": self.action_codec_hash,
+                "frame_contract_hash": self.frame_contract_hash,
+                "layout_hash": self.layout_hash,
+                "normalization_hash": self.normalization_hash,
+            }
+            for name, expected_value in expected.items():
+                if getattr(contract, name) != expected_value:
+                    raise ValueError(
+                        f"model_continuation {name} mismatch."
+                    )
+            if (
+                self.delay_estimator_spec.minimum_delay_steps
+                < contract.minimum_forecast_delay_steps
+                or self.delay_estimator_spec.maximum_delay_steps
+                > contract.maximum_forecast_delay_steps
+            ):
+                raise ValueError(
+                    "Delay estimator range exceeds the continuation contract."
+                )
         expected_period = 1.0 / self.profile.action_hz
         if not math.isclose(
             self.delay_estimator_spec.action_period_sec,
@@ -275,6 +334,11 @@ class RtcPolicyShadowConfig:
         if self.action_pose_mode is not None:
             payload["action_pose_mode"] = self.action_pose_mode
             domain = RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V2
+        if self.model_continuation is not None:
+            payload["model_continuation_hash"] = (
+                self.model_continuation.semantic_content_hash
+            )
+            domain = RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V3
         return canonical_content_hash(payload, domain=domain)
 
     @property
@@ -955,6 +1019,13 @@ class RtcPolicyShadowFrontend:
         ):
             raise TypeError("representation_context_builder must be callable or None.")
         self._representation_context_builder = representation_context_builder
+        if (
+            config.model_continuation is not None
+            and representation_context_builder is None
+        ):
+            raise ValueError(
+                "Model-RTC requires a representation context builder."
+            )
         self._worker_session_sequence = 0
         worker_session_id = self._worker_session_id(0)
         plan = empty_policy_action_plan(
@@ -1121,12 +1192,15 @@ class RtcPolicyShadowFrontend:
             <= self.config.request_trigger_coverage_steps
         )
 
-    def _build_request(
+    def _build_request_and_conditioning(
         self,
         actor: PolicyObservationView,
         *,
         now: float,
-    ) -> PolicyInferenceRequest:
+    ) -> tuple[
+        PolicyInferenceRequest,
+        CanonicalRtcConditioningBundle | None,
+    ]:
         sequence = self._next_request_sequence
         self._next_request_sequence += 1
         forecast_steps = self._delay_state.forecast_steps(
@@ -1134,7 +1208,19 @@ class RtcPolicyShadowFrontend:
         )
         producer_profile = self.config.producer_profile
         period = producer_profile.action_period_sec
-        first_target = max(now, self._state.plan.cursor_at) + forecast_steps * period
+        generation_start = max(now, self._state.plan.cursor_at)
+        continuation = self.config.model_continuation
+        if continuation is not None and self._state.plan.keyframes:
+            tolerance = continuation.lattice_tolerance_sec
+            eligible_targets = tuple(
+                keyframe.target_effective_at
+                for keyframe in self._state.plan.keyframes
+                if keyframe.target_effective_at
+                >= generation_start - tolerance
+            )
+            if eligible_targets:
+                generation_start = eligible_targets[0]
+        first_target = generation_start + forecast_steps * period
         request_id = f"rtc-request:{self.config.runtime_session_id}:{sequence}"
         observation_cut_id = self._observation_cut_id(
             actor,
@@ -1192,7 +1278,43 @@ class RtcPolicyShadowFrontend:
             raise ValueError(
                 "Relative RTC request requires a representation context builder."
             )
-        return PolicyInferenceRequest(
+        conditioning_bundle = None
+        if continuation is not None:
+            if representation_context is None:
+                raise ValueError(
+                    "Model-RTC request requires representation context."
+                )
+            timeline = RtcContinuationTimeline(
+                clock_domain_id=self._state.plan.clock_domain_id,
+                generation_start_at=generation_start,
+                first_target_effective_at=first_target,
+                action_period_sec=period,
+                prediction_horizon_steps=self.config.prediction_horizon_steps,
+                forecast_delay_steps=forecast_steps,
+            )
+            selection_spec = continuation.selection_spec_for_timeline(
+                timeline
+            )
+            selection = select_rtc_plan_continuation(
+                self._state.plan,
+                timeline=timeline,
+                spec=selection_spec,
+            )
+            conditioning_bundle = build_canonical_rtc_conditioning_bundle(
+                runtime_session_id=self._state.plan.session_id,
+                control_domain_id=self._state.plan.control_domain_id,
+                artifact_hash=self.config.artifact_hash,
+                timeline=timeline,
+                selection=selection,
+                action_representation_context=representation_context,
+                continuation_contract=(
+                    continuation.continuation_contract
+                ),
+                prefix_schedule_semantics=(
+                    continuation.prefix_schedule_semantics
+                ),
+            )
+        request = PolicyInferenceRequest(
             request_id=request_id,
             inference_id=f"{self.config.policy_node_id}:rtc-inference:{sequence}",
             rtc_mode=producer_profile.rtc_mode,
@@ -1231,7 +1353,25 @@ class RtcPolicyShadowFrontend:
             normalization_hash=self.config.normalization_hash,
             valid_until=first_target + self.config.request_validity_steps * period,
             action_representation_context=representation_context,
+            conditioning_binding_hash=(
+                None
+                if conditioning_bundle is None
+                else conditioning_bundle.conditioning_binding_hash
+            ),
         )
+        return request, conditioning_bundle
+
+    def _build_request(
+        self,
+        actor: PolicyObservationView,
+        *,
+        now: float,
+    ) -> PolicyInferenceRequest:
+        request, _conditioning = self._build_request_and_conditioning(
+            actor,
+            now=now,
+        )
+        return request
 
     def _refresh_worker_session_state(self, *, now: float) -> None:
         worker_snapshot = self._worker.session_snapshot()
@@ -1509,7 +1649,12 @@ class RtcPolicyShadowFrontend:
                 policy_observation
             )
             try:
-                request = self._build_request(actor, now=decision_at)
+                request, conditioning_bundle = (
+                    self._build_request_and_conditioning(
+                        actor,
+                        now=decision_at,
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 - invalid context must fail closed.
                 lifecycle_transition = self.fault(
                     now=decision_at,
@@ -1533,6 +1678,7 @@ class RtcPolicyShadowFrontend:
                         request=request,
                         actor_observation=actor,
                         submitted_at=decision_at,
+                        conditioning_bundle=conditioning_bundle,
                     )
                     worker_submission = self._worker.submit(work_item)
                     if not worker_submission.accepted:

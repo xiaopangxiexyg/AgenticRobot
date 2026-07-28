@@ -32,6 +32,7 @@ from robot_motion.action import (
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
     SharedCanonicalSafetyResult,
     apply_canonical_keyframe_safety,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.position_control import PositionKeyframeSafetyConfig
 from robot_motion.runtime import CommandDispatchReceipt
@@ -178,7 +179,11 @@ def _contracts():
     return hand_specs, composition_spec, strategy, authority_profile
 
 
-def _runtime(*, omit_authority_profile: bool = False):
+def _runtime(
+    *,
+    omit_authority_profile: bool = False,
+    component_execution_handoff: bool = False,
+):
     pytest.importorskip("mujoco")
     clock = ManualClock()
     contract = SimulationContract.load(CONTRACT_PATH)
@@ -250,6 +255,9 @@ def _runtime(*, omit_authority_profile: bool = False):
             compound_composer_authority_profile=(
                 None if omit_authority_profile else authority_profile
             ),
+            enable_component_execution_handoff=(
+                component_execution_handoff
+            ),
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(
             RM65CanonicalIK(scene, Planner(scene))
@@ -292,36 +300,39 @@ def _input(
         producer_epoch=1,
         sequence=0,
         input_role=role,
-        action=RobotAction(
-            action_space=BIMANUAL_EE_POSE_V1,
-            arm_pose_by_side={
-                side: np.asarray(
-                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                    dtype=np.float32,
-                )
-                for side in ("left", "right")
-            },
-            hand_qpos_by_side=hand_by_side,
-            active_effectors=(
-                "left_arm",
-                "right_arm",
-                "left_hand",
-                "right_hand",
+        action=project_robot_action_v1_to_component_action(
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                arm_pose_by_side={
+                    side: np.asarray(
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                        dtype=np.float32,
+                    )
+                    for side in ("left", "right")
+                },
+                hand_qpos_by_side=hand_by_side,
+                active_effectors=(
+                    "left_arm",
+                    "right_arm",
+                    "left_hand",
+                    "right_hand",
+                ),
+                frame_by_effector={
+                    f"{side}_arm": f"{side}_arm_base"
+                    for side in ("left", "right")
+                },
+                controlled_frame_by_effector={
+                    f"{side}_arm": "tool_tcp" for side in ("left", "right")
+                },
+                source=f"formal-compound-{role}",
+                metadata={
+                    "hand_action_specs_by_side": {
+                        side: spec.to_metadata()
+                        for side, spec in hand_specs.items()
+                    }
+                },
             ),
-            frame_by_effector={
-                f"{side}_arm": f"{side}_arm_base"
-                for side in ("left", "right")
-            },
-            controlled_frame_by_effector={
-                f"{side}_arm": "tool_tcp" for side in ("left", "right")
-            },
-            source=f"formal-compound-{role}",
-            metadata={
-                "hand_action_specs_by_side": {
-                    side: spec.to_metadata()
-                    for side, spec in hand_specs.items()
-                }
-            },
+            action_schema=runtime.action_schema,
         ),
         produced_at=10.0,
         produced_clock_domain_id=runtime.config.clock_domain_id,
@@ -419,6 +430,222 @@ def test_formal_compound_authority_dispatches_one_atomic_composer_proposal() -> 
     }
 
 
+def test_component_target_handoff_closes_and_admits_exact_sim_target() -> None:
+    (
+        _clock,
+        _scene,
+        runtime,
+        hand_specs,
+        composition_spec,
+        _authority_profile,
+    ) = _runtime(component_execution_handoff=True)
+    _admit_ready_composition(
+        runtime,
+        composition_spec=composition_spec,
+        hand_specs=hand_specs,
+    )
+
+    step = runtime.step(now=10.0)
+
+    assert step.status == "dispatched"
+    assert step.target_execution_request is not None
+    assert (
+        step.target_submission_receipt is not None
+        and step.target_submission_receipt.accepted_for_processing
+    )
+    assert (
+        step.target_completion_receipt is not None
+        and step.target_completion_receipt.status == "resolved"
+    )
+    assert step.target_dispatch_result is not None
+    target = step.target_dispatch_result.target
+    assert target.component_dependencies == (
+        "left_arm",
+        "right_arm",
+        "left_hand",
+        "right_hand",
+    )
+    assert target.target_execution_request_id == (
+        step.target_execution_request.request_id
+    )
+    assert target.temporal_semantics == "point_target"
+    assert target.scheduled_until is None
+    assert not hasattr(target, "safe_action")
+    assert step.target_dispatch_result.target_admission.accepted
+    trace_count_before_status = len(runtime.trace_facts)
+    pending_status = runtime.capture_target_execution_status_snapshot(now=10.0)
+    assert pending_status is not None
+    assert pending_status.request_id == step.target_execution_request.request_id
+    assert pending_status.submission.status == "accepted_for_processing"
+    assert pending_status.completion.status == "resolved"
+    assert pending_status.admission.status == "accepted"
+    assert pending_status.activation.status == "pending"
+    assert len(runtime.trace_facts) == trace_count_before_status
+    assert runtime.reference_receiver is not None
+    assert runtime.reference_receiver.component_targets == (target,)
+    assert set(runtime.core.pending_execution_segment_by_group) == {
+        "arms",
+        "left_hand",
+        "right_hand",
+    }
+    assert runtime.last_compound_dispatch_manifest is None
+    for _ in range(18):
+        runtime.rig.step_physics()
+    assert set(runtime.core.active_execution_segment_by_group) == {
+        "arms",
+        "left_hand",
+        "right_hand",
+    }
+    activations = runtime.reference_receiver.component_target_activations
+    assert len(activations) == 1
+    assert activations[0].target_id == target.target_id
+    assert activations[0].activation_status == "activated"
+    assert activations[0].effective_from < target.scheduled_for
+    assert activations[0].effective_until == pytest.approx(
+        target.scheduled_for
+    )
+    activated_status = runtime.capture_target_execution_status_snapshot(now=10.0)
+    assert activated_status is not None
+    assert activated_status.request_id == pending_status.request_id
+    assert activated_status.activation.status == "activated"
+    assert activated_status.activation.record_id == activations[0].activation_id
+    runtime.close()
+    assert {
+        "target_execution_request",
+        "target_execution_submission",
+        "target_execution_completion",
+        "component_execution_target",
+        "component_execution_target_admission",
+        "component_execution_target_activation",
+    }.issubset({fact.event_type for fact in runtime.trace_facts})
+
+
+def test_component_target_handoff_closes_rejected_private_safety_work() -> None:
+    (
+        _clock,
+        _scene,
+        runtime,
+        hand_specs,
+        composition_spec,
+        _authority_profile,
+    ) = _runtime(component_execution_handoff=True)
+    _admit_ready_composition(
+        runtime,
+        composition_spec=composition_spec,
+        hand_specs=hand_specs,
+    )
+    runtime.core.shared_safety = lambda _action, input_id: (
+        SharedCanonicalSafetyResult(
+            input_action_id=input_id,
+            safe_action=None,
+            status="hold",
+            reasons=("fixture_target_private_hold",),
+        )
+    )
+
+    step = runtime.step(now=10.0)
+
+    assert step.status == "safety_hold"
+    assert (
+        step.target_submission_receipt is not None
+        and step.target_submission_receipt.accepted_for_processing
+    )
+    assert step.target_completion_receipt is not None
+    assert step.target_completion_receipt.status == "rejected"
+    assert step.target_completion_receipt.outcome_code == (
+        "target_private_safety_hold"
+    )
+    assert step.target_dispatch_result is None
+    assert runtime.reference_receiver is not None
+    assert runtime.reference_receiver.component_targets == ()
+    runtime.close()
+    completions = [
+        fact
+        for fact in runtime.trace_facts
+        if fact.event_type == "target_execution_completion"
+    ]
+    assert len(completions) == 1
+    assert completions[0].payload["status"] == "rejected"
+
+
+def test_component_target_pending_activation_is_terminal_on_cancel() -> None:
+    (
+        _clock,
+        _scene,
+        runtime,
+        hand_specs,
+        composition_spec,
+        _authority_profile,
+    ) = _runtime(component_execution_handoff=True)
+    _admit_ready_composition(
+        runtime,
+        composition_spec=composition_spec,
+        hand_specs=hand_specs,
+    )
+    step = runtime.step(now=10.0)
+    assert step.status == "dispatched"
+    assert runtime.reference_receiver is not None
+
+    runtime.reference_receiver.cancel_all(
+        reason="fixture_hold",
+        effective_at=10.01,
+    )
+
+    activations = runtime.reference_receiver.component_target_activations
+    assert len(activations) == 1
+    assert activations[0].activation_status == "rejected"
+    assert activations[0].rejection_code == (
+        "cancelled_before_activation:fixture_hold"
+    )
+    runtime.close()
+
+
+def test_component_target_backend_schedule_failure_keeps_phase_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        _clock,
+        _scene,
+        runtime,
+        hand_specs,
+        composition_spec,
+        _authority_profile,
+    ) = _runtime(component_execution_handoff=True)
+    _admit_ready_composition(
+        runtime,
+        composition_spec=composition_spec,
+        hand_specs=hand_specs,
+    )
+
+    def fail_schedule(*_args, **_kwargs):
+        raise RuntimeError("fixture_schedule_failure")
+
+    monkeypatch.setattr(
+        runtime.rig,
+        "send_scheduled_commands",
+        fail_schedule,
+    )
+    step = runtime.step(now=10.0)
+
+    assert step.status == "compound_downstream_failure_hold"
+    assert (
+        step.target_completion_receipt is not None
+        and step.target_completion_receipt.status == "resolved"
+    )
+    assert step.target_dispatch_result is not None
+    activation = step.target_dispatch_result.target_activation
+    assert activation is not None
+    assert activation.activation_status == "rejected"
+    assert activation.rejection_code == (
+        "scheduled_backend_exception:RuntimeError"
+    )
+    assert not any(
+        receipt.accepted
+        for receipt in (step.dispatch_receipts or {}).values()
+    )
+    runtime.close()
+
+
 def test_compound_composer_authority_is_rejected_without_typed_profile() -> None:
     with pytest.raises(
         ValueError,
@@ -445,23 +672,26 @@ def test_compound_profile_rejects_direct_partial_composer_proposal() -> None:
         producer_id=runtime.config.composer_producer_id,
         producer_epoch=1,
         sequence=0,
-        action=RobotAction(
-            action_space=BIMANUAL_EE_POSE_V1,
-            arm_pose_by_side={
-                side: np.asarray(
-                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                    dtype=np.float32,
-                )
-                for side in ("left", "right")
-            },
-            active_effectors=("left_arm", "right_arm"),
-            frame_by_effector={
-                f"{side}_arm": f"{side}_arm_base"
-                for side in ("left", "right")
-            },
-            controlled_frame_by_effector={
-                f"{side}_arm": "tool_tcp" for side in ("left", "right")
-            },
+        action=project_robot_action_v1_to_component_action(
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                arm_pose_by_side={
+                    side: np.asarray(
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                        dtype=np.float32,
+                    )
+                    for side in ("left", "right")
+                },
+                active_effectors=("left_arm", "right_arm"),
+                frame_by_effector={
+                    f"{side}_arm": f"{side}_arm_base"
+                    for side in ("left", "right")
+                },
+                controlled_frame_by_effector={
+                    f"{side}_arm": "tool_tcp" for side in ("left", "right")
+                },
+            ),
+            action_schema=runtime.action_schema,
         ),
         produced_at=clock.value,
         produced_clock_domain_id=runtime.config.clock_domain_id,
@@ -469,10 +699,7 @@ def test_compound_profile_rejects_direct_partial_composer_proposal() -> None:
         effective_until=10.08,
         target_effective_at=10.05,
         effective_clock_domain_id=runtime.config.clock_domain_id,
-        component_schema_hash=runtime.catalog.semantic_content_hash,
-        component_coverage=("left_arm", "right_arm"),
-        selection_groups=("arms",),
-        policy_output_id="composition-result:partial-bypass",
+        policy_output_id="composition-evaluation:partial-bypass",
         composition_input_ids=("composition-input:partial-bypass",),
         composition_input_hashes=("partial-bypass-hash",),
         composition_spec_hash=composition_spec.semantic_content_hash,
@@ -555,7 +782,7 @@ def test_compound_profile_is_default_off_and_missing_proposal_holds() -> None:
         spec=composition_spec,
         target_effective_at=10.05,
     )
-    assert evaluation.composition_result.output_status != "ready"
+    assert evaluation.composition_evaluation.output_status != "ready"
     assert evaluation.proposal_admission is None
 
     step = runtime.step(now=10.0)

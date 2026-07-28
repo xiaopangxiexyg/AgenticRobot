@@ -105,6 +105,7 @@ def build_mujoco_human_proposal_adapter(
             produced_clock_domain_id=runtime.config.clock_domain_id,
             effective_clock_domain_id=runtime.config.clock_domain_id,
             component_catalog=runtime.catalog,
+            action_schema=runtime.action_schema,
             action_adapter=TeleopCommandActionAdapterConfig(
                 arm_joint_policy="qpos",
                 source="human",
@@ -182,6 +183,7 @@ def build_mujoco_pose_human_proposal_adapter(
             produced_clock_domain_id=runtime.config.clock_domain_id,
             effective_clock_domain_id=runtime.config.clock_domain_id,
             component_catalog=runtime.catalog,
+            action_schema=runtime.action_schema,
             action_adapter=TeleopCommandActionAdapterConfig(
                 arm_joint_policy="source_pose_when_available",
                 arm_specs=arm_specs,
@@ -195,8 +197,17 @@ def build_mujoco_pose_human_proposal_adapter(
 def build_mujoco_component_human_proposal_adapter(
     runtime: MujocoDeployRuntime,
     source_spec: PassiveTeleopComponentSourceSpec,
+    *,
+    producer_id: str | None = None,
+    producer_epoch: int | None = None,
 ) -> HumanProposalAdapter:
-    """Bind one pose-arm + qpos-hand source to an opt-in compound target."""
+    """Bind one pose-arm + qpos-hand source to an opt-in compound target.
+
+    ``producer_id`` is an application binding override for profiles where the
+    human contributor and the lower policy producer share one MuJoCo runtime.
+    It changes no authority semantics; the returned adapter still only
+    prepares a human action.
+    """
 
     if not isinstance(runtime, MujocoDeployRuntime):
         raise TypeError("runtime must be a MujocoDeployRuntime.")
@@ -246,11 +257,20 @@ def build_mujoco_component_human_proposal_adapter(
             runtime_session_id=runtime.config.runtime_session_id,
             control_domain_id=runtime.config.control_domain_id,
             embodiment_instance_id=runtime.config.embodiment_instance_id,
-            producer_id=runtime.config.producer_id,
-            producer_epoch=runtime.config.producer_epoch,
+            producer_id=(
+                runtime.config.producer_id
+                if producer_id is None
+                else str(producer_id)
+            ),
+            producer_epoch=(
+                runtime.config.producer_epoch
+                if producer_epoch is None
+                else int(producer_epoch)
+            ),
             produced_clock_domain_id=runtime.config.clock_domain_id,
             effective_clock_domain_id=runtime.config.clock_domain_id,
             component_catalog=runtime.catalog,
+            action_schema=runtime.action_schema,
             action_adapter=TeleopCommandActionAdapterConfig(
                 arm_joint_policy="source_pose_when_available",
                 arm_specs=arm_specs,
@@ -468,6 +488,8 @@ def build_cs2a2a_synthetic_human_execution_manifest(
         manifest_id=CS2A2A_SYNTHETIC_HUMAN_EXECUTION_MANIFEST_ID_V1,
         manifest_version="v1",
         action_space=runtime.catalog.action_space,
+        action_schema=runtime.action_schema,
+        component_target_capability=runtime.component_target_capability,
         catalog=runtime.catalog,
         motion_authority_sources=("human:synthetic_fixture",),
         human_motion_proposal_status="authorized",
@@ -528,6 +550,8 @@ def build_cs2a2b_synthetic_human_execution_manifest(
         manifest_id=CS2A2B_SYNTHETIC_HUMAN_EXECUTION_MANIFEST_ID_V1,
         manifest_version="v1",
         action_space=runtime.catalog.action_space,
+        action_schema=runtime.action_schema,
+        component_target_capability=runtime.component_target_capability,
         catalog=runtime.catalog,
         motion_authority_sources=(
             "human:synthetic_fixture_via_control_station",

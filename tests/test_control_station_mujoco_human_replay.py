@@ -214,9 +214,7 @@ def _replay_source(runtime: MujocoDeployRuntime) -> ReplayProposalSource:
             embodiment_instance_id=runtime.config.embodiment_instance_id,
             producer_id=runtime.config.replay_producer_id,
             producer_epoch=runtime.config.producer_epoch,
-            component_schema_hash=runtime.catalog.semantic_content_hash,
-            component_coverage=("left_arm", "right_arm"),
-            selection_groups=("arms",),
+            action_schema=runtime.action_schema,
             source_contract=source_contract,
             source_action_contract=action_contract,
             target_runtime_contract=runtime.target_runtime_action_contract,
@@ -482,6 +480,7 @@ def _safe_mixed_policy() -> MixedControlBoundaryPolicy:
         policy_id="cs6b0-safe-mixed-sim-v1",
         policy_suspension_mode="hold_and_release_authority",
         episode_boundary_motion_policy="hold_before_unbind",
+        require_canonical_safety=False,
     )
 
 
@@ -944,7 +943,7 @@ def test_cs6b0_safe_replay_to_human_stays_hold_until_exact_fresh_promotion(
     assert state.phase == "ready"
     assert state.human_publication_enabled
     assert composition.active_source_slot_id == "human-slot"
-    # The safety preview is deliberately non-publishing.
+    # Source-readiness adaptation is deliberately non-publishing.
     assert not any(
         fact.event_type == "human_command_emission"
         for fact in composition.runtime.trace_facts
@@ -1029,7 +1028,7 @@ def test_cs6b0_requires_explicit_mixed_policy_before_any_lower_mutation(
     composition.close()
 
 
-def test_cs6b0_unsafe_first_human_preview_never_opens_ready(
+def test_cs6b0_mainline_readiness_does_not_run_canonical_safety_preview(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1043,6 +1042,50 @@ def test_cs6b0_unsafe_first_human_preview_never_opens_ready(
     clock.value = 20.2
     composition.begin_safe_replay_to_human_takeover(
         _safe_mixed_policy(),
+        reason="explicit-human-takeover",
+    )
+
+    def unexpected_preview(_action, _input_action_id):
+        raise AssertionError("mainline readiness must not run canonical safety")
+
+    monkeypatch.setattr(composition.runtime.core, "shared_safety", unexpected_preview)
+    clock.value = 20.21
+    state = composition.complete_human_takeover_readiness(
+        _human_emission(human_source, clock),
+        effective_from=clock(),
+        effective_until=clock() + 0.1,
+        target_effective_at=clock(),
+        deadman_rearm_event_id="virtual-deadman:release-press:0",
+        deadman_rearmed_at=clock(),
+        retargeter_rebase_receipt_id="virtual-retargeter-rebase:0",
+        retargeter_rebased_at=clock(),
+    )
+    assert state.phase == "ready"
+    assert state.readiness_receipt is not None
+    assert state.readiness_receipt.canonical_safety_receipt_id is None
+    assert state.readiness_receipt.canonical_safety_status is None
+    composition.close()
+
+
+def test_cs6b0_unsafe_first_human_preview_never_opens_ready(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    clock = ManualClock()
+    composition, human_source, path, _scene = _composition(tmp_path, clock)
+    composition.start()
+    composition.handoff_to("replay-slot", reason="operator-replay-first")
+    composition.submit_replay_source_frame_emission(_replay_emission(path, clock))
+    assert composition.step(now=clock()).status == "dispatched"
+
+    clock.value = 20.2
+    composition.begin_safe_replay_to_human_takeover(
+        MixedControlBoundaryPolicy(
+            policy_id="cs6b0-legacy-safety-preview-v1",
+            policy_suspension_mode="hold_and_release_authority",
+            episode_boundary_motion_policy="hold_before_unbind",
+            require_canonical_safety=True,
+        ),
         reason="explicit-human-takeover",
     )
 

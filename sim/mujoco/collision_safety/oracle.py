@@ -97,7 +97,29 @@ class CollisionSafetyOracle:
                 )
         return tuple(pairs)
 
-    def check(self, data) -> CollisionCheckResult:
+    def check(
+        self,
+        data,
+        *,
+        minimum_clearance_m: float | None = None,
+    ) -> CollisionCheckResult:
+        """Check preventive clearance, optionally with a recovery threshold.
+
+        The normal threshold is the configured preventive margin.  Actuated
+        position control can leave the measured state a small distance inside
+        that margin (or just inside the hard penetration bound) even when the
+        command target itself is valid.  Callers may therefore request a
+        temporary, explicit threshold for that recovery projection; active
+        contact checks remain governed by ``hard_penetration_m``.
+        """
+
+        clearance = (
+            self.policy.minimum_clearance_m
+            if minimum_clearance_m is None
+            else float(minimum_clearance_m)
+        )
+        if not np.isfinite(clearance):
+            raise ValueError("minimum_clearance_m must be finite.")
         minimum = float("inf")
         closest: _ForbiddenGeomPair | None = None
         limit = self.policy.distance_query_limit_m
@@ -135,7 +157,7 @@ class CollisionSafetyOracle:
         if closest is None:
             return CollisionCheckResult(safe=True, minimum_distance_m=limit)
         return CollisionCheckResult(
-            safe=minimum >= self.policy.minimum_clearance_m,
+            safe=minimum >= clearance,
             minimum_distance_m=minimum,
             geom1_id=closest.geom1,
             geom2_id=closest.geom2,

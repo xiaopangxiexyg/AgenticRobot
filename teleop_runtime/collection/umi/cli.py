@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from dataset_contracts.v25p_native_storage import V25P_NATIVE_STORAGE_LAYOUTS_V1
+
 from ..policy_io import load_policy_io_layout
 from .calibration import UmiCalibrationSet
 from .config import load_umi_collection_config
@@ -84,6 +86,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use capability startup by default; strict restores transactional device startup.",
     )
     parser.add_argument(
+        "--v25p-native-shadow",
+        action="store_true",
+        default=None,
+        help=(
+            "Enable provisional native v2.5-p dual-write verification. "
+            "Default off; legacy v2.3 remains authoritative."
+        ),
+    )
+    parser.add_argument(
+        "--v25p-native-storage-layout",
+        choices=V25P_NATIVE_STORAGE_LAYOUTS_V1,
+        default=None,
+        help=(
+            "Physical layout for the explicitly enabled provisional v2.5-p "
+            "shadow; omitted means the config value (record_cjson_v1 by default)."
+        ),
+    )
+    parser.add_argument(
         "--plus-episode-curation",
         action="store_true",
         default=None,
@@ -123,6 +143,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             config.foot_pad_enabled
             if args.foot_pad is None
             else bool(args.foot_pad)
+        ),
+        v25p_native_shadow=(
+            config.v25p_native_shadow
+            if args.v25p_native_shadow is None
+            else bool(args.v25p_native_shadow)
+        ),
+        v25p_native_storage_layout=(
+            config.v25p_native_storage_layout
+            if args.v25p_native_storage_layout is None
+            else args.v25p_native_storage_layout
         ),
         ignored_camera_keys=(
             config.ignored_camera_keys

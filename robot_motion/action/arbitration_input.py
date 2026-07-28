@@ -20,7 +20,7 @@ from .candidate_authorization import (
     build_empty_candidate_authorization_snapshot,
     project_candidate_authorizations,
 )
-from .components import ActionComponentCatalog
+from .component_action import ComponentActionSchema
 from .proposal import ProposalBuffer
 from .snapshot import ProposalSnapshot, build_proposal_snapshot, project_proposals
 
@@ -43,7 +43,7 @@ class ArbitrationInputSnapshot:
     previous_authoritative_decision_id: str | None
     previous_selection_by_group: Mapping[str, str]
     active_selection_groups: tuple[str, ...]
-    component_catalog: ActionComponentCatalog
+    action_schema: ComponentActionSchema
     decision_schedule_tick: DecisionScheduleTick
     semantic_content_hash: str
 
@@ -68,7 +68,7 @@ def build_arbitration_input_snapshot(
     previous_authoritative_decision_id: str | None,
     previous_selection_by_group: Mapping[str, str],
     active_selection_groups: tuple[str, ...],
-    component_catalog: ActionComponentCatalog,
+    action_schema: ComponentActionSchema,
     decision_schedule_tick: DecisionScheduleTick,
     candidate_authorization_snapshot: CandidateAuthorizationSnapshot | None = None,
 ) -> ArbitrationInputSnapshot:
@@ -93,8 +93,8 @@ def build_arbitration_input_snapshot(
         )
     ):
         raise ValueError("Arbitration child snapshots do not share one committed cut.")
-    if proposal_snapshot.component_schema_hash != component_catalog.semantic_content_hash:
-        raise ValueError("Proposal snapshot and component catalog hashes disagree.")
+    if proposal_snapshot.action_schema_hash != action_schema.semantic_content_hash:
+        raise ValueError("Proposal snapshot and runtime action schema hashes disagree.")
     if authority_state_snapshot.authority_policy_hash != authority_policy.semantic_content_hash:
         raise ValueError("Authority snapshot and policy hashes disagree.")
     authorization_snapshot = (
@@ -108,7 +108,9 @@ def build_arbitration_input_snapshot(
     ):
         raise ValueError("Candidate authorization snapshot does not share the arbitration cut.")
     active_groups = tuple(dict.fromkeys(str(value) for value in active_selection_groups))
-    if not set(active_groups).issubset(component_catalog.selection_group_ids):
+    if not set(active_groups).issubset(
+        action_schema.component_catalog.selection_group_ids
+    ):
         raise ValueError("Unknown active selection group.")
     payload = {
         "runtime_session_id": runtime_session_id,
@@ -128,7 +130,7 @@ def build_arbitration_input_snapshot(
         "previous_authoritative_decision_id": previous_authoritative_decision_id,
         "previous_selection_by_group": dict(previous_selection_by_group),
         "active_selection_groups": active_groups,
-        "component_catalog_hash": component_catalog.semantic_content_hash,
+        "action_schema_hash": action_schema.semantic_content_hash,
         "decision_schedule_tick_id": decision_schedule_tick.schedule_tick_id,
         "decision_schedule_tick_hash": decision_schedule_tick.semantic_content_hash,
     }
@@ -147,7 +149,7 @@ def build_arbitration_input_snapshot(
         previous_authoritative_decision_id=previous_authoritative_decision_id,
         previous_selection_by_group=dict(previous_selection_by_group),
         active_selection_groups=active_groups,
-        component_catalog=component_catalog,
+        action_schema=action_schema,
         decision_schedule_tick=decision_schedule_tick,
         semantic_content_hash=semantic_hash,
     )
@@ -162,7 +164,7 @@ def capture_arbitration_input(
     execution_gate_store: ExecutionGateStore,
     scheduler: DecisionScheduler,
     embodiment_instance_id: str,
-    component_catalog: ActionComponentCatalog,
+    action_schema: ComponentActionSchema,
     active_selection_groups: tuple[str, ...],
     previous_authoritative_decision_id: str | None = None,
     previous_selection_by_group: Mapping[str, str] | None = None,
@@ -205,7 +207,7 @@ def capture_arbitration_input(
         capture.projections["proposals"],
         producer_epochs=capture.projections["producer_epochs"],
         target_effective_at=tick.target_effective_at,
-        component_schema_hash=component_catalog.semantic_content_hash,
+        action_schema_hash=action_schema.semantic_content_hash,
         active_selection_groups=active_selection_groups,
     )
     authority_snapshot = authority_store.build_snapshot(
@@ -237,7 +239,7 @@ def capture_arbitration_input(
         previous_authoritative_decision_id=previous_authoritative_decision_id,
         previous_selection_by_group=dict(previous_selection_by_group or {}),
         active_selection_groups=active_selection_groups,
-        component_catalog=component_catalog,
+        action_schema=action_schema,
         decision_schedule_tick=tick,
         candidate_authorization_snapshot=candidate_authorization_snapshot,
     )

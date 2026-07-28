@@ -4,6 +4,20 @@ The test suite is being classified before any bulk path migration.  Keep
 behavior changes, test refactors, and file moves in separate reviewable
 batches.
 
+## Concurrent development mode
+
+When production code or tests are being changed in parallel, use logical
+classification instead of physical migration.  Do not move or split a test
+module while it is modified, untracked, imported by another test, or named by
+an active plan or command.  Marker-only governance changes may proceed when
+they are isolated from the files under active ownership.
+
+A physical migration batch may start only when its exact file list has a short
+exclusive ownership window, every file is tracked, and the relevant pre-move
+baseline is green (or has a reviewed, exact list of unrelated failures).  A
+new failure must be resolved before the move continues; it must not be folded
+into the migration diff.
+
 ## Default suite
 
 From the repository root:
@@ -59,24 +73,62 @@ device-state authorization.  Mocked backend tests must not use the `hardware`
 marker.
 
 Operator scripts that connect to devices or can perform calibration or motion
-are not pytest tests.  Keep them out of `test_*.py` naming and migrate them to
-the owning hardware package's explicit `tools/field_validation/` directory in a
-separate batch with documentation and caller checks.
+are not pytest tests.  Keep them out of both `test_*.py` and `*_test.py` naming
+and migrate them to the owning package's explicit `tools/field_validation/`
+directory in a separate batch with documentation and caller checks.  The
+project config intentionally limits default discovery to `test_*.py` so a
+legacy operator tool cannot be imported merely because its name ends in
+`_test.py`.
+
+## Target layout
+
+Execution risk is the primary directory axis; package ownership is the second
+axis.  `contract` and `optional` remain orthogonal markers rather than competing
+top-level directories.
+
+```text
+tests/
+├── unit/
+│   ├── control_composition/
+│   ├── control_station/
+│   ├── robot_motion/
+│   ├── teleop_runtime/
+│   ├── deployments/
+│   ├── dataset_contracts/
+│   ├── dataset_interface/
+│   ├── sim/
+│   └── hardware/          # mocked backends only
+├── integration/
+│   ├── control_station/
+│   ├── teleop_runtime/
+│   ├── policy_deploy/
+│   ├── dataset_pipeline/
+│   ├── sim/
+│   └── sim_real/
+├── performance/
+├── support/
+└── fixtures/
+```
+
+Real-device/HIL pytest suites, if introduced, require a separately reviewed
+location and retain the `hardware` marker plus explicit execution gate.
 
 ## Safe migration protocol
 
-Migrate one domain at a time only after its files are tracked and stable:
+Migrate one domain at a time only after its files are tracked, stable, and not
+being edited by another owner:
 
 1. Record collection count, test names, parameter IDs, markers, skips, and
    errors.
 2. Remove directory-depth assumptions such as
    `Path(__file__).resolve().parents[1]` before moving the file.
-3. Use `git mv`; update exact test-node references in documentation and scripts.
+3. Record the exact old-to-new path map, then use `git mv`; update exact
+   test-node references in documentation and scripts.
 4. Compare pre/post collection while allowing only the documented path-prefix
    change.
 5. Run the smallest affected tier plus `git diff --check`.
 6. Never use an ordinary test migration as authorization for hardware access.
 
-The long-term directory target is described in `sim/STRUCTURE_PLAN.md`.  Until
-the migration is complete, classification and reliable collection take
-priority over visual directory uniformity.
+The project-wide target above supersedes the narrower simulation-era example
+in `sim/STRUCTURE_PLAN.md`.  Until migration is complete, classification and
+reliable collection take priority over visual directory uniformity.

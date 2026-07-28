@@ -115,7 +115,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
                 total_raw_reward += reward
                 policy_steps += 1
-                safety = info.get("safety") or {}
+                safety = info.get("safety") or {
+                    "status": info.get("safety_status"),
+                    "blocking_body1": info.get("safety_blocking_body1"),
+                    "blocking_body2": info.get("safety_blocking_body2"),
+                    "blocking_minimum_distance_m": info.get(
+                        "safety_blocking_distance_m"
+                    ),
+                }
                 modified = bool(
                     safety.get("modified", info.get("safety_modified", False))
                 )

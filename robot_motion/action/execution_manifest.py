@@ -14,13 +14,24 @@ import math
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.position_control.capability import ExecutionCapabilityProfile
 
+from .component_action import ComponentActionSchema
+from .component_action_v1 import build_robot_action_v1_runtime_schema
 from .components import ActionComponentCatalog
 from .reference_activation import ReferenceActivationSpec
 from .schema import BIMANUAL_QPOS_V1
+from .target_capability import (
+    ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH,
+    ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID,
+    ComponentTargetCapabilitySpec,
+    build_robot_action_v1_target_capability,
+)
 
 
 CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V1 = (
     "dexteleop.control_execution_manifest.v1"
+)
+CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V2 = (
+    "dexteleop.control_execution_manifest.v2"
 )
 EXECUTION_PROFILE_EXCLUSION_HASH_DOMAIN_V1 = (
     "dexteleop.execution_profile_exclusion.v1"
@@ -101,6 +112,8 @@ class ControlExecutionManifest:
     manifest_id: str
     manifest_version: str
     action_space: str
+    action_schema_hash: str
+    component_target_capability_hash: str
     component_catalog_hash: str
     controlled_components: tuple[str, ...]
     selection_groups: tuple[str, ...]
@@ -125,6 +138,8 @@ class ControlExecutionManifest:
             "manifest_id",
             "manifest_version",
             "action_space",
+            "action_schema_hash",
+            "component_target_capability_hash",
             "component_catalog_hash",
             "reference_activation_spec_id",
             "reference_activation_spec_hash",
@@ -200,6 +215,8 @@ def _manifest_payload(
     manifest_id: str,
     manifest_version: str,
     action_space: str,
+    action_schema: ComponentActionSchema,
+    component_target_capability: ComponentTargetCapabilitySpec,
     catalog: ActionComponentCatalog,
     motion_authority_sources: tuple[str, ...],
     human_motion_proposal_status: str,
@@ -216,6 +233,10 @@ def _manifest_payload(
         "manifest_id": _identifier(manifest_id, name="manifest_id"),
         "manifest_version": _identifier(manifest_version, name="manifest_version"),
         "action_space": _identifier(action_space, name="action_space"),
+        "action_schema_hash": action_schema.semantic_content_hash,
+        "component_target_capability_hash": (
+            component_target_capability.semantic_content_hash
+        ),
         "component_catalog_hash": catalog.semantic_content_hash,
         "controlled_components": tuple(
             component.component_id for component in catalog.components
@@ -243,6 +264,8 @@ def build_control_execution_manifest(
     manifest_id: str,
     manifest_version: str,
     action_space: str,
+    action_schema: ComponentActionSchema,
+    component_target_capability: ComponentTargetCapabilitySpec,
     catalog: ActionComponentCatalog,
     motion_authority_sources: tuple[str, ...],
     human_motion_proposal_status: str,
@@ -264,12 +287,39 @@ def build_control_execution_manifest(
 
     if not isinstance(catalog, ActionComponentCatalog):
         raise TypeError("catalog must be an ActionComponentCatalog.")
+    if not isinstance(action_schema, ComponentActionSchema):
+        raise TypeError("action_schema must be a ComponentActionSchema.")
+    if not isinstance(
+        component_target_capability,
+        ComponentTargetCapabilitySpec,
+    ):
+        raise TypeError(
+            "component_target_capability must be a "
+            "ComponentTargetCapabilitySpec."
+        )
     if not isinstance(capability, ExecutionCapabilityProfile):
         raise TypeError("capability must be an ExecutionCapabilityProfile.")
     if not isinstance(activation, ReferenceActivationSpec):
         raise TypeError("activation must be a ReferenceActivationSpec.")
     if str(action_space) != catalog.action_space:
         raise ValueError("Execution manifest action space must match the catalog.")
+    if tuple(action_schema.component_ids) != tuple(
+        component.component_id for component in catalog.components
+    ):
+        raise ValueError("Execution manifest action schema must match the catalog.")
+    if tuple(action_schema.component_catalog.selection_group_ids) != tuple(
+        catalog.selection_group_ids
+    ):
+        raise ValueError(
+            "Execution manifest action schema selection groups must match the catalog."
+        )
+    if (
+        component_target_capability.action_schema_hash
+        != action_schema.semantic_content_hash
+    ):
+        raise ValueError(
+            "Execution manifest target capability binds another action schema."
+        )
     if action_space not in capability.validated_action_spaces:
         raise ValueError("Execution capability does not validate the action space.")
     if not set(catalog.selection_group_ids).issubset(
@@ -285,6 +335,8 @@ def build_control_execution_manifest(
         manifest_id=manifest_id,
         manifest_version=manifest_version,
         action_space=action_space,
+        action_schema=action_schema,
+        component_target_capability=component_target_capability,
         catalog=catalog,
         motion_authority_sources=motion_authority_sources,
         human_motion_proposal_status=human_motion_proposal_status,
@@ -307,7 +359,7 @@ def build_control_execution_manifest(
         **payload,
         semantic_content_hash=canonical_content_hash(
             semantic_payload,
-            domain=CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V1,
+            domain=CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V2,
         ),
     )
 
@@ -371,10 +423,22 @@ def build_m6_candidate_policy_arm_qpos_manifest(
             "human_motion_takeover",
         )
     )
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
+    component_target_capability = build_robot_action_v1_target_capability(
+        capability_id="m6-candidate-robot-action-v1-target",
+        action_schema=action_schema,
+        handler_contract_id=ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID,
+        handler_contract_hash=ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH,
+        output_target_schema_hash=catalog.semantic_content_hash,
+    )
     payload = _manifest_payload(
         manifest_id=M6_CANDIDATE_POLICY_ARM_QPOS_V1,
         manifest_version="v1",
         action_space=BIMANUAL_QPOS_V1,
+        action_schema=action_schema,
+        component_target_capability=component_target_capability,
         catalog=catalog,
         motion_authority_sources=("policy",),
         human_motion_proposal_status="not_applicable",
@@ -399,13 +463,14 @@ def build_m6_candidate_policy_arm_qpos_manifest(
         **payload,
         semantic_content_hash=canonical_content_hash(
             semantic_payload,
-            domain=CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V1,
+            domain=CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V2,
         ),
     )
 
 
 __all__ = [
     "CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V1",
+    "CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V2",
     "EXECUTION_PROFILE_EXCLUSION_HASH_DOMAIN_V1",
     "HUMAN_MOTION_PROPOSAL_STATUSES_V1",
     "M6_CANDIDATE_POLICY_ARM_QPOS_V1",

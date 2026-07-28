@@ -10,6 +10,16 @@ import pytest
 
 from dataset_contracts.pose_chunk import PoseActionChunkContract
 from dataset_contracts.pose_training import PoseTrainingDataContract
+from dataset_contracts.model_continuation import (
+    MODEL_CONTINUATION_FLOW_INPAINT_V1,
+    MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
+    MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,
+    RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
+    TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
+    ModelContinuationDataContract,
+    ModelContinuationDataContractV2,
+    ModelContinuationRuntimeContractV2,
+)
 from dataset_contracts.policy_artifact import (
     PolicyArtifactContract,
     PolicyCameraInputContract,
@@ -23,10 +33,17 @@ from dataset_contracts.v22 import (
 from deployments.client import (
     RemoteModelPolicy,
     RemotePolicyConfig,
+    RtcConditionedModelRuntimeAdapterV3,
     RtcModelRuntimeAdapter,
     build_rtc_model_shadow_frontend,
     rtc_client_inference_bundle_debug_payload,
+    rtc_conditioned_config_from_model_adapter_v3,
     rtc_shadow_config_from_model_adapter,
+    validate_server_metadata,
+)
+from deployments.client.rtc_conditioning import (
+    rtc_binary_mask_hash,
+    rtc_float32_array_hash,
 )
 from deployments.client.artifact import deploy_contract_from_policy_artifact
 from deployments.openpi.client.policy import (
@@ -45,6 +62,15 @@ from deployments.openpi.client.rtc import (
     openpi_v22_relative_native_codec_hash,
     openpi_rtc_artifact_hash,
 )
+from deployments.openpi.client.rtc_conditioned import (
+    OPENPI_CONDITIONED_RTC_METADATA_KEY_V1,
+    OPENPI_CONDITIONED_RTC_OPERATION_V1,
+    OPENPI_CONDITIONED_PROVIDER_CAPABILITY_SCHEMA_V1,
+    OPENPI_CONDITIONED_RTC_WIRE_V1,
+    OpenPIConditionedRtcBackendV3,
+    OpenPIConditionedRtcConfig,
+    openpi_conditioned_provider_capability_hash,
+)
 from robot_motion.deploy import (
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
@@ -55,7 +81,24 @@ from robot_motion.deploy import (
 )
 from robot_motion.deploy.inference import (
     ASYNC_ALIGNED_CHUNK_MODE_V1,
+    RTC_FLOW_INPAINT_MODE_V1,
     PolicyInferenceRequest,
+)
+from robot_motion.deploy.action_representation import (
+    ACTION_ANCHOR_POLICY_NONE_V1,
+    PolicyActionRepresentationContext,
+)
+from robot_motion.deploy.chunk_plan import (
+    POLICY_PLAN_KEYFRAME_MUTABLE,
+    TimedPolicyActionKeyframe,
+    TimedPolicyActionPlanSnapshot,
+)
+from robot_motion.deploy.rtc import (
+    RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1,
+    RtcContinuationSelectionSpec,
+    RtcContinuationTimeline,
+    build_canonical_rtc_conditioning_bundle,
+    select_rtc_plan_continuation,
 )
 from robot_motion.deploy.observation import DeploymentObservation
 from robot_motion.deploy.policy_worker import (
@@ -923,6 +966,7 @@ def test_rtc_client_exchange_debug_payload_is_identity_and_latency_only() -> Non
     payload = rtc_client_inference_bundle_debug_payload(bundle)
 
     assert payload["schema"] == "dexteleop_rtc_client_exchange_v1"
+    assert payload["debug_only"] is True
     assert payload["non_authoritative"] is True
     assert payload["action_send_authority"] is False
     assert payload["request_hash"] == bundle.envelope.request.semantic_content_hash
@@ -955,6 +999,485 @@ def test_openpi_backend_satisfies_generic_frontend_adapter_without_shim() -> Non
         config.prediction_horizon_steps
         == backend.request_spec.prediction_horizon_steps
     )
+
+
+class _FakeConditionedOpenPITransport(_FakeTransport):
+    def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+        marker = observation.get("__openpi_request__")
+        if marker is None:
+            return super().infer(observation)
+        self.requests.append(dict(observation))
+        assert marker == {
+            "wire_protocol": OPENPI_CONDITIONED_RTC_WIRE_V1,
+            "operation": OPENPI_CONDITIONED_RTC_OPERATION_V1,
+        }
+        external = np.asarray(
+            observation["conditioning_actions"],
+            dtype=np.float32,
+        )
+        mask = np.asarray(observation["prefix_mask"], dtype=np.float32)
+        internal = np.zeros((external.shape[0], 32), dtype=np.float32)
+        internal[:, : external.shape[1]] = external * 0.5
+        provider = self._metadata[OPENPI_CONDITIONED_RTC_METADATA_KEY_V1]
+        return {
+            "robot_actions": self.actions.copy(),
+            "rtc_conditioning_receipt": {
+                "wire_protocol": OPENPI_CONDITIONED_RTC_WIRE_V1,
+                "conditioning_mode": observation["conditioning_mode"],
+                "receipt_context": dict(observation["receipt_context"]),
+                "provider_capability_hash": (
+                    provider["provider_capability_hash"]
+                ),
+                "continuation_implementation_id": (
+                    provider["continuation_implementation_id"]
+                ),
+                "continuation_implementation_parameters_hash": (
+                    provider[
+                        "continuation_implementation_parameters_hash"
+                    ]
+                ),
+                "sampler_constraint": provider["sampler_constraint"],
+                "consumed_external_prefix_hash": (
+                    rtc_float32_array_hash(external)
+                ),
+                "consumed_internal_prefix_hash": (
+                    rtc_float32_array_hash(internal)
+                ),
+                "consumed_mask_hash": rtc_binary_mask_hash(mask),
+                "consumed_external_shape": list(external.shape),
+                "consumed_internal_shape": list(internal.shape),
+                "consumed_generation_indices": [
+                    int(index) for index in np.flatnonzero(mask)
+                ],
+            },
+        }
+
+
+def _model_rtc_contract(
+    artifact: PolicyArtifactContract,
+) -> ModelContinuationDataContract:
+    config = _config(
+        artifact,
+        result_action_representation=OPENPI_RTC_RESULT_TYPED_CANONICAL_V1,
+    )
+    return ModelContinuationDataContract(
+        continuation_mode=MODEL_CONTINUATION_FLOW_INPAINT_V1,
+        continuation_implementation_id="openpi.pi0.hard-flow-prefix.v1",
+        continuation_implementation_parameters_hash=(
+            "sha256:" + "a" * 64
+        ),
+        prediction_horizon_steps=HORIZON,
+        minimum_forecast_delay_steps=1,
+        maximum_forecast_delay_steps=3,
+        minimum_prefix_steps=1,
+        maximum_prefix_steps=1,
+        model_action_dim=config.artifact.policy_io_layout.action_dim,
+        model_action_discrete_dim=0,
+        component_scope=config.component_scope,
+        supported_action_pose_modes=("absolute",),
+        sampler_constraints=(MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,),
+        training_prefix_source_kinds=(
+            TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
+        ),
+        runtime_prefix_source_roles=(
+            RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
+        ),
+        action_codec_hash=config.action_codec_hash,
+        layout_hash=config.artifact.layout_hash,
+        frame_contract_hash=config.frame_contract_hash,
+        normalization_hash=config.normalization_hash,
+        training_projection_implementation_id="openpi-teacher.v1",
+        training_projection_parameters_hash="sha256:openpi-teacher",
+        supports_unconditioned_bootstrap=False,
+    )
+
+
+def _conditioned_bundle_and_request(
+    backend: OpenPIFinalChunkRtcBackend,
+):
+    raw_request = _request(backend)
+    canonical_actions = tuple(
+        backend.decoder(
+            _absolute_actions(
+                backend.config.artifact.policy_io_layout.action_dim
+            ),
+            None,
+            raw_request,
+        )
+    )
+    keyframes = tuple(
+        TimedPolicyActionKeyframe(
+            target_effective_at=10.0 + index * 0.1,
+            effective_until=10.1 + index * 0.1,
+            effective_clock_domain_id=raw_request.clock_domain_id,
+            action_period_sec=0.1,
+            decoded_absolute_action=None,
+            canonical_action=action,
+            request_id="request:openpi-old",
+            inference_id="inference:openpi-old",
+            policy_output_id="output:openpi-old",
+            chunk_id=1,
+            chunk_keyframe_index=index,
+            chunk_size=HORIZON,
+            observation_cut_id="observation:openpi-old",
+            producer_epoch=raw_request.producer_epoch,
+            policy_node_id=raw_request.policy_node_id,
+            artifact_hash=raw_request.artifact_hash,
+            produced_at=9.8,
+            schedule_spec_id="schedule:openpi-model-rtc",
+            schedule_spec_hash="schedule-hash:openpi-model-rtc",
+            admitted_plan_generation=3,
+            state=POLICY_PLAN_KEYFRAME_MUTABLE,
+            valid_until=11.0,
+        )
+        for index, action in enumerate(canonical_actions)
+    )
+    plan = TimedPolicyActionPlanSnapshot(
+        plan_id="plan:openpi-model-rtc",
+        session_id=raw_request.session_id,
+        control_domain_id=raw_request.control_domain_id,
+        producer_id=raw_request.producer_id,
+        producer_epoch=raw_request.producer_epoch,
+        policy_node_id=raw_request.policy_node_id,
+        clock_domain_id=raw_request.clock_domain_id,
+        generation=3,
+        cursor_at=9.9,
+        created_at=9.8,
+        keyframes=keyframes,
+    )
+    timeline = RtcContinuationTimeline(
+        clock_domain_id=raw_request.clock_domain_id,
+        generation_start_at=10.0,
+        first_target_effective_at=10.1,
+        action_period_sec=0.1,
+        prediction_horizon_steps=HORIZON,
+        forecast_delay_steps=1,
+    )
+    selection = select_rtc_plan_continuation(
+        plan,
+        timeline=timeline,
+        spec=RtcContinuationSelectionSpec(
+            prefix_horizon_steps=1,
+            minimum_selected_steps=1,
+        ),
+    )
+    context = PolicyActionRepresentationContext(
+        source_pose_mode="absolute",
+        observation_cut_id=raw_request.observation_cut_id,
+        observation_contract_hash="observation-contract:openpi-model-rtc",
+        observation_timestamp=raw_request.observation_timestamp,
+        observation_step_index=raw_request.observation_step_index,
+        active_sides=backend.config.active_sides,
+        anchor_policy=ACTION_ANCHOR_POLICY_NONE_V1,
+        arm_reference_frame_by_side=(
+            backend.config.arm_reference_frame_by_side
+        ),
+        arm_controlled_frame_by_side={
+            side: (
+                backend.config.artifact.policy_io_layout
+                .arm_controlled_frame_by_side[side]
+            )
+            for side in backend.config.active_sides
+        },
+        arm_anchor_pose_by_side={},
+    )
+    contract = backend.config.artifact.model_continuation
+    assert contract is not None
+    bundle = build_canonical_rtc_conditioning_bundle(
+        runtime_session_id=raw_request.session_id,
+        control_domain_id=raw_request.control_domain_id,
+        artifact_hash=raw_request.artifact_hash,
+        timeline=timeline,
+        selection=selection,
+        action_representation_context=context,
+        continuation_contract=contract,
+        prefix_schedule_semantics=(
+            RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+        ),
+    )
+    request = replace(
+        raw_request,
+        rtc_mode=RTC_FLOW_INPAINT_MODE_V1,
+        first_target_effective_at=timeline.first_target_effective_at,
+        source_plan_id=plan.plan_id,
+        source_plan_generation=plan.generation,
+        source_plan_hash=plan.semantic_content_hash,
+        source_plan_cursor_at=plan.cursor_at,
+        forecast_delay_steps=timeline.forecast_delay_steps,
+        action_representation_context=context,
+        conditioning_binding_hash=bundle.conditioning_binding_hash,
+    )
+    return contract, bundle, request
+
+
+def _conditioned_artifact_and_metadata(
+    *,
+    inference_only_v2: bool,
+) -> tuple[PolicyArtifactContract, dict[str, Any]]:
+    base_artifact = _continuous_artifact()
+    contract = _model_rtc_contract(base_artifact)
+    if inference_only_v2:
+        contract = ModelContinuationDataContractV2(
+            conditioning_origin=(
+                MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1
+            ),
+            runtime=ModelContinuationRuntimeContractV2.from_v1(contract),
+        )
+    artifact = replace(base_artifact, model_continuation=contract)
+    metadata = _server_metadata(artifact)
+    runtime = (
+        contract.runtime
+        if isinstance(contract, ModelContinuationDataContractV2)
+        else contract
+    )
+    provider = {
+        "provider_capability_schema": (
+            OPENPI_CONDITIONED_PROVIDER_CAPABILITY_SCHEMA_V1
+        ),
+        "wire_protocol": OPENPI_CONDITIONED_RTC_WIRE_V1,
+        "enabled": True,
+        "conditioning_transform_owner": "provider_v1",
+        "external_action_dim": artifact.policy_io_layout.action_dim,
+        "internal_sampler_action_dim": 32,
+        "prediction_horizon_steps": HORIZON,
+        "sampler_constraint": MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,
+        "supports_unconditioned_bootstrap": True,
+        "continuation_implementation_id": (
+            runtime.continuation_implementation_id
+        ),
+        "continuation_implementation_parameters_hash": (
+            runtime.continuation_implementation_parameters_hash
+        ),
+    }
+    provider["provider_capability_hash"] = (
+        openpi_conditioned_provider_capability_hash(provider)
+    )
+    metadata[OPENPI_CONDITIONED_RTC_METADATA_KEY_V1] = provider
+    return artifact, metadata
+
+
+def _conditioned_base_backend(
+    artifact: PolicyArtifactContract,
+    metadata: dict[str, Any],
+) -> tuple[OpenPIFinalChunkRtcBackend, _FakeConditionedOpenPITransport]:
+    transport = _FakeConditionedOpenPITransport(
+        metadata=metadata,
+        actions=_absolute_actions(artifact.policy_io_layout.action_dim),
+    )
+    backend = OpenPIFinalChunkRtcBackend(
+        transport=transport,
+        config=_config(
+            artifact,
+            result_action_representation=(
+                OPENPI_RTC_RESULT_TYPED_CANONICAL_V1
+            ),
+        ),
+        clock=_CounterClock(),
+    )
+    return backend, transport
+
+
+def test_openpi_conditioned_provider_capability_hash_golden() -> None:
+    _, metadata = _conditioned_artifact_and_metadata(
+        inference_only_v2=True,
+    )
+    provider = metadata[OPENPI_CONDITIONED_RTC_METADATA_KEY_V1]
+
+    assert provider["provider_capability_hash"] == (
+        "sha256:91554d87195a5d4f7c8eb5ff1f0c99abb5f84f7fa446faf8e09ea350b346d9c7"
+    )
+
+
+@pytest.mark.parametrize("inference_only_v2", (False, True))
+def test_openpi_model_rtc_v3_binds_provider_transform_without_raw_regression(
+    inference_only_v2: bool,
+) -> None:
+    artifact, metadata = _conditioned_artifact_and_metadata(
+        inference_only_v2=inference_only_v2,
+    )
+    base, transport = _conditioned_base_backend(
+        artifact,
+        metadata,
+    )
+    contract, canonical_bundle, request = _conditioned_bundle_and_request(
+        base,
+    )
+    assert contract is artifact.model_continuation
+    conditioned = OpenPIConditionedRtcBackendV3(
+        base_backend=base,
+        config=OpenPIConditionedRtcConfig.from_artifact(
+            artifact,
+            selected_prefix_schedule=(
+                RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+            ),
+        ),
+        clock=_CounterClock(),
+    )
+    assert isinstance(conditioned, RtcConditionedModelRuntimeAdapterV3)
+    frontend_config = rtc_conditioned_config_from_model_adapter_v3(
+        conditioned,
+        runtime_session_id="session:openpi-conditioned",
+        control_domain_id="domain:openpi-conditioned",
+        producer_id="producer:openpi-conditioned",
+        policy_node_id="single_policy",
+    )
+    assert frontend_config.artifact_hash == base.config.artifact_hash
+    assert frontend_config.model_continuation is not None
+    assert frontend_config.request_trigger_coverage_steps == 3
+    assert (
+        frontend_config.model_continuation.continuation_contract.contract_hash
+        == artifact.model_continuation.contract_hash
+    )
+    prepared = base.prepare_input(_observation())
+    result = conditioned.create_client().infer(
+        request,
+        canonical_conditioning=canonical_bundle,
+        model_input=prepared,
+        model_input_hash=prepared.semantic_content_hash,
+    )
+
+    assert result.response_validation.accepted
+    assert result.encoded_conditioning.external_prefix.shape == (HORIZON, 26)
+    assert result.encoded_conditioning.prefix_mask.tolist() == [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    receipt = result.response.consumption_receipt
+    assert (
+        receipt.consumed_external_prefix_hash
+        != receipt.consumed_internal_prefix_hash
+    )
+    assert result.policy_chunk_result.effective_delay_steps == 1
+    assert len(result.policy_chunk_result.canonical_actions) == HORIZON - 1
+    assert transport.requests[-1]["__openpi_request__"]["operation"] == (
+        OPENPI_CONDITIONED_RTC_OPERATION_V1
+    )
+
+
+def test_openpi_model_rtc_requires_exact_artifact_bound_contract() -> None:
+    artifact, metadata = _conditioned_artifact_and_metadata(
+        inference_only_v2=True,
+    )
+    source_contract = artifact.model_continuation
+    assert isinstance(source_contract, ModelContinuationDataContractV2)
+
+    unbound_artifact = replace(artifact, model_continuation=None)
+    with pytest.raises(ValueError, match="artifact-bound"):
+        OpenPIConditionedRtcConfig.from_artifact(
+            unbound_artifact,
+            selected_prefix_schedule=(
+                RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+            ),
+        )
+    unbound_base, _ = _conditioned_base_backend(
+        unbound_artifact,
+        metadata,
+    )
+    with pytest.raises(ValueError, match="artifact-bound"):
+        OpenPIConditionedRtcBackendV3(
+            base_backend=unbound_base,
+            config=OpenPIConditionedRtcConfig(
+                selected_prefix_schedule=(
+                    RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+                ),
+            ),
+        )
+
+    mismatched = replace(
+        source_contract,
+        runtime=replace(
+            source_contract.runtime,
+            continuation_implementation_id="other-implementation-v1",
+        ),
+    )
+    mismatched_artifact = replace(artifact, model_continuation=mismatched)
+    mismatched_base, _ = _conditioned_base_backend(
+        mismatched_artifact,
+        metadata,
+    )
+    with pytest.raises(ValueError, match="implementation identity mismatch"):
+        OpenPIConditionedRtcBackendV3(
+            base_backend=mismatched_base,
+            config=OpenPIConditionedRtcConfig(
+                selected_prefix_schedule=(
+                    RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+                ),
+            ),
+        )
+    assert (
+        "continuation_contract"
+        not in OpenPIConditionedRtcConfig.__dataclass_fields__
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper_kind", "message"),
+    (
+        ("declared_hash", "capability hash mismatch"),
+        ("implementation", "implementation identity mismatch"),
+    ),
+)
+def test_openpi_model_rtc_rejects_provider_capability_drift(
+    tamper_kind: str,
+    message: str,
+) -> None:
+    artifact, metadata = _conditioned_artifact_and_metadata(
+        inference_only_v2=True,
+    )
+    provider = dict(metadata[OPENPI_CONDITIONED_RTC_METADATA_KEY_V1])
+    if tamper_kind == "declared_hash":
+        provider["provider_capability_hash"] = "sha256:" + "0" * 64
+    else:
+        provider["continuation_implementation_id"] = "other-provider-v1"
+        provider["provider_capability_hash"] = (
+            openpi_conditioned_provider_capability_hash(provider)
+        )
+    metadata[OPENPI_CONDITIONED_RTC_METADATA_KEY_V1] = provider
+    base, _ = _conditioned_base_backend(artifact, metadata)
+
+    with pytest.raises(ValueError, match=message):
+        OpenPIConditionedRtcBackendV3(
+            base_backend=base,
+            config=OpenPIConditionedRtcConfig.from_artifact(
+                artifact,
+                selected_prefix_schedule=(
+                    RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+                ),
+            ),
+        )
+
+
+def test_openpi_model_rtc_rejects_call_site_capability_tamper() -> None:
+    artifact, metadata = _conditioned_artifact_and_metadata(
+        inference_only_v2=True,
+    )
+    base, transport = _conditioned_base_backend(artifact, metadata)
+    conditioned = OpenPIConditionedRtcBackendV3(
+        base_backend=base,
+        config=OpenPIConditionedRtcConfig.from_artifact(
+            artifact,
+            selected_prefix_schedule=(
+                RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+            ),
+        ),
+        clock=_CounterClock(),
+    )
+    _, canonical_bundle, request = _conditioned_bundle_and_request(base)
+    provider = transport._metadata[
+        OPENPI_CONDITIONED_RTC_METADATA_KEY_V1
+    ]
+    provider["provider_capability_hash"] = "sha256:" + "0" * 64
+    prepared = base.prepare_input(_observation())
+
+    with pytest.raises(ValueError, match="receipt provider capability"):
+        conditioned.create_client().infer(
+            request,
+            canonical_conditioning=canonical_bundle,
+            model_input=prepared,
+            model_input_hash=prepared.semantic_content_hash,
+        )
 
 
 def test_openpi_worker_cancel_drains_blocking_transport_and_rearms_session() -> None:
@@ -1193,7 +1716,6 @@ def test_relative_artifact_and_server_horizon_must_match() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
-        ("model", "model_id_mismatch"),
         ("layout", "policy_io_layout_hash_mismatch"),
         ("float_dim", "output_action_dim_mismatch"),
         ("token_dim", "output_action_discrete_dim_mismatch"),
@@ -1215,6 +1737,21 @@ def test_server_metadata_drift_fails_before_inference(
         metadata["local_robot"]["output_action_discrete_dim"] += 1
     with pytest.raises(ValueError, match=message):
         _backend(artifact, metadata=metadata)
+
+
+def test_artifact_rtc_contract_can_opt_into_strict_model_identity() -> None:
+    artifact = _continuous_artifact()
+    metadata = _server_metadata(artifact)
+    metadata["model_id"] = "switched-model"
+    metadata["deployment"]["checkpoint_step"] = 90000
+    contract = deploy_contract_from_policy_artifact(
+        artifact,
+        protocol_version=OPENPI_LOCAL_PROTOCOL_VERSION,
+        strict_identity=True,
+    )
+
+    with pytest.raises(ValueError, match="model_id_mismatch"):
+        validate_server_metadata(metadata, contract)
 
 
 def test_short_final_chunk_is_rejected_against_declared_horizon() -> None:

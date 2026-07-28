@@ -96,6 +96,9 @@ class ExecutionDirective:
     directive_by_selection_group: Mapping[str, GroupExecutionDirective]
     persistence_policy_hash: str
     publication_fallback: str | None
+    action_adaptation_receipt_id: str | None
+    action_adaptation_receipt_hash: str | None
+    action_adaptation_fallback: str | None
     requires_execution_epoch_increment: bool
     requires_backend_hold: bool
     fault_latched: bool
@@ -117,9 +120,42 @@ def build_execution_directive(
     now: float,
     supports_local_group_stop: bool,
     publication_fallback: str | None = None,
+    action_adaptation_receipt_id: str | None = None,
+    action_adaptation_receipt_hash: str | None = None,
+    action_adaptation_fallback: str | None = None,
 ) -> ExecutionDirective:
     if publication_fallback not in {None, "no_action", "hold"}:
         raise ValueError("publication_fallback must be no_action, hold, or None.")
+    if action_adaptation_fallback not in {None, "no_action", "hold"}:
+        raise ValueError(
+            "action_adaptation_fallback must be no_action, hold, or None."
+        )
+    if publication_fallback is not None and (
+        action_adaptation_receipt_id is not None
+        or action_adaptation_receipt_hash is not None
+        or action_adaptation_fallback is not None
+    ):
+        raise ValueError(
+            "A publication-rejected result cannot have adaptation evidence."
+        )
+    if (action_adaptation_receipt_id is None) != (
+        action_adaptation_receipt_hash is None
+    ):
+        raise ValueError(
+            "Action adaptation receipt ID/hash must be supplied together."
+        )
+    if action_adaptation_fallback is not None and (
+        action_adaptation_receipt_id is None
+    ):
+        raise ValueError(
+            "Action adaptation fallback requires a typed receipt."
+        )
+    for name, value in (
+        ("action_adaptation_receipt_id", action_adaptation_receipt_id),
+        ("action_adaptation_receipt_hash", action_adaptation_receipt_hash),
+    ):
+        if value is not None and not str(value).strip():
+            raise ValueError(f"{name} must be non-empty when set.")
     current_time = float(now)
     directives: dict[str, GroupExecutionDirective] = {}
     global_status = "normal"
@@ -128,10 +164,15 @@ def build_execution_directive(
     fault_latched = False
     effective_output_status = result.output_status
     effective_status_by_group = dict(result.status_by_group)
-    if publication_fallback is not None:
-        effective_output_status = publication_fallback
+    effective_fallback = (
+        publication_fallback
+        if publication_fallback is not None
+        else action_adaptation_fallback
+    )
+    if effective_fallback is not None:
+        effective_output_status = effective_fallback
         effective_status_by_group = {
-            group: publication_fallback for group in result.status_by_group
+            group: effective_fallback for group in result.status_by_group
         }
 
     if effective_output_status in {"hold", "fault"}:
@@ -173,7 +214,11 @@ def build_execution_directive(
                 "publish_selected",
                 proposal_id,
                 None,
-                result.target_effective_at + policy.selected_segment_max_lifetime_sec,
+                min(
+                    result.target_effective_at
+                    + policy.selected_segment_max_lifetime_sec,
+                    result.supported_until,
+                ),
                 generation + 1,
             )
         elif active is not None and current_time < active.expires_at:
@@ -215,6 +260,9 @@ def build_execution_directive(
         },
         "persistence_policy_hash": policy.semantic_content_hash,
         "publication_fallback": publication_fallback,
+        "action_adaptation_receipt_id": action_adaptation_receipt_id,
+        "action_adaptation_receipt_hash": action_adaptation_receipt_hash,
+        "action_adaptation_fallback": action_adaptation_fallback,
         "requires_execution_epoch_increment": requires_epoch,
         "requires_backend_hold": requires_hold,
         "fault_latched": fault_latched,
@@ -227,6 +275,9 @@ def build_execution_directive(
         directive_by_selection_group=directives,
         persistence_policy_hash=policy.semantic_content_hash,
         publication_fallback=publication_fallback,
+        action_adaptation_receipt_id=action_adaptation_receipt_id,
+        action_adaptation_receipt_hash=action_adaptation_receipt_hash,
+        action_adaptation_fallback=action_adaptation_fallback,
         requires_execution_epoch_increment=requires_epoch,
         requires_backend_hold=requires_hold,
         fault_latched=fault_latched,

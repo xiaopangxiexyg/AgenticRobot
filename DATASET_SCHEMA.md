@@ -44,6 +44,16 @@ datasets/<dataset_name>/
   meta/v24/native_stream/
     contracts/<stream_id>.cjson
     episodes/<episode_uuid>/manifest.cjson
+  meta/v25p/native/
+    dataset_manifest.cjson
+    profiles/{embodiment,component_stream,task,compatibility_projection}/<hash>.cjson
+    episodes/<episode_uuid>/
+      identity.cjson
+      embodiment_binding.cjson
+      streams/<stream_id>/<sequence>.cjson
+      samples/<sample_index>.cjson
+      native_capture_manifest.cjson
+      episode_manifest.cjson
 ```
 
 `chunk-000` 按 `meta/info.json` 中的 `chunk_size` 分组。当前数据通常少于一个 chunk，但 reader 不应假设永远只有 `chunk-000`。
@@ -58,6 +68,24 @@ legacy finalize完成后再提交dataset-relative artifact locator、logical pay
 receipt完整并经本地复核后native manifest才seal。reader对external sample返回verified locator，不把容器或压缩块伪装成
 已解码array。当前两阶段路径只有fake video/tactile artifact验证，production specialized writer尚未生成receipt，
 shared-memory sample identity和GUI/真机profile也未接通；因此仅存在stream文件仍不能单独证明完整v2.4 capture。
+
+`meta/v25p/native/` 是默认关闭的 v2.5-p 原生准备层，不以 Parquet 根 `action`/
+`observation.state` 或 v2.3 episode row 作为权威。`EmbodimentCaptureProfile` 描述本体组件，
+`V25pComponentStreamProfile` 再为每个 action/state/observation/audit stream 绑定 component、
+语义阶段、payload schema、表示、dtype/shape/frame 与存储方式。每个 causal sample 只引用在 cut
+时可用的不可变 component record。小向量使用 `inline_tensor`；媒体等大载荷使用带内容哈希、
+encoding 和 selector 的 `external_artifact` 描述符。
+
+旧 `meta/v25p/episodes/` 与 `dataset_contracts.v25p` 属于冻结的 v2.3-based compatibility v1，
+不是上述原生格式。v2.3 输出只能由显式 adapter 从原生 component stream 投影；adapter 必须按
+component/role/stage/schema 唯一匹配并报告被省略的原生 stream。当前原生层仍标记 provisional，
+也不宣称最终 native v2.5。RealTeleop thread/process writer 与 UMI recorder 已接入同一条默认关闭
+的 producer 边界：源 sample 先构造 canonical `ComponentAction`，再由 `dataset_interface` 的显式
+投影器生成 V2 action component streams；state/qpos 仍由各 source adapter 按原始时序附加。只有
+显式传入 `--v25p-native-shadow` 才会创建这些文件，默认正式命令继续只写既有 v2.3。dual-write
+gate 会把原生记录再次显式投影为 v2.3 component fields，并与旧 encoder 独立生成的 row 按声明
+dtype/shape 比较；complete receipt 也只能在既有 episode owner 完成 legacy finalize 后发布。
+后续仍需长时间真机 shadow 证据和 v2.4 commit 合并 gate。
 
 训练用的 wrist final keep-mask 通常是离线后处理派生产物，不要求写回原始
 dataset 目录。默认位置为：
@@ -267,7 +295,8 @@ arm pose slot。
   `teleop.action_source.<side>_wrist_pose_desk_frame="vive_retarget_frame"`；旧数据缺少该
   frame 列时只能按这一历史语义兼容，不能推断为 canonical desk。
 - `teleop.channels.*`: 操作端输入通道时间戳和有效性。
-- `teleop.pose_quality.*`: 从本帧已有 IK/防碰撞 metadata 派生的 pose 质量指标。
+- `teleop.pose_quality.*`: 从本帧已有 IK/防碰撞 metadata 派生的 pose 质量指标；若最终
+  accepted-qref 带有明确的奇异证书，则该帧会保留特殊排除标记。
 - `teleop.arm_mode.*`: 从本帧 command/session metadata 派生的左右臂语义状态标签。
 
 ## v2.3 causal state snapshot contract (`dexteleop_causal_snapshot_v1`)
@@ -580,15 +609,16 @@ hold/re-home 后恢复普通遥操，后续写入帧应从 `teleop` 重新开始
 
 `pose_quality` 是逐帧 pose 质量标注；力/力矩超限碰撞只做 episode 级轨迹标签，用于后续筛选、统计或构造负样本。它们都是采集记录端派生信息，不参与 IK 求解、双臂防碰撞候选选择、轨迹限幅或真实下发逻辑。当前实现不会额外求 IK、不会额外跑 collision query，也不会新增力传感器读取；所有判断都来自该帧已经存在的 command metadata、faults 和硬件诊断文本。
 
-兼容旧数据时，本节所有质量标注都应按可选字段处理。如果 `pose_quality` 或 `trajectory_quality` 不存在，默认不因为缺失而降权或判坏；需要补齐统一字段时，可按正常样本填充 `teleop.pose_quality.score=1.0`, `teleop.pose_quality.status=good`, `teleop.pose_quality.bad=0`, `teleop.pose_quality.available=0`，并在派生 metadata 中注明这是 legacy/default 兼容值。
+兼容旧数据时，本节所有质量标注都应按可选字段处理。如果 `pose_quality` 或 `trajectory_quality` 不存在，默认不因为缺失而降权或判坏；需要补齐统一字段时，可按正常样本填充 `teleop.pose_quality.score=1.0`, `teleop.pose_quality.status=good`, `teleop.pose_quality.special_code=null`, `teleop.pose_quality.bad=0`, `teleop.pose_quality.available=0`，并在派生 metadata 中注明这是 legacy/default 兼容值。
 
 ### 逐帧 `pose_quality`
 
 完整 payload 位于 `sample_metadata_json.pose_quality`，schema 名为
 `dexteleop_pose_quality_v1`。parquet 中同时展开以下常用列：
 
-- `teleop.pose_quality.score`: `0.0` 到 `1.0` 的启发式质量分。`1.0` 表示当前已记录信号下未发现风险；`0.0` 表示风险项较多或较重。
-- `teleop.pose_quality.status`: `good`, `warning`, `bad`, `unknown` 之一。
+- `teleop.pose_quality.score`: 普通帧为 `0.0` 到 `1.0` 的启发式质量分。`1.0` 表示当前已记录信号下未发现风险；`0.0` 表示风险项较多或较重。明确进入奇异 qref 时固定写 `-1.0`，该值是排除标记，不参与 episode 的普通分数均值/最小值。
+- `teleop.pose_quality.status`: `good`, `warning`, `bad`, `singularity`, `unknown` 之一。
+- `teleop.pose_quality.special_code`: 特殊质量代码；当前 `singularity` 表示接受的 qref 带有奇异/奇异逃逸证书。普通帧为 `null`。
 - `teleop.pose_quality.bad`: `0/1`，只要存在 bad 级别原因即为 `1`。
 - `teleop.pose_quality.available`: `0/1`，表示本帧是否有足够 metadata 进行判断。
 - `teleop.pose_quality_json`: 完整 JSON，包含 `schema`, `source`, `reasons`, `bad_reasons`, `warning_reasons`, `metrics`。
@@ -606,6 +636,13 @@ hold/re-home 后恢复普通遥操，后续写入帧应从 `teleop` 重新开始
 - `ik_solve_pose_error.<side>.rotation_deg`
 - `joint_limit_margin.<side>.nearest_margin_deg`
 - `joint_limit_margin.<side>.near_limit`
+
+奇异特殊标记只读取已存在的 accepted-qref metadata，不在采集端重新求 IK：
+`ik_candidate_selection.candidate_certificate` 中的
+`singular_fallback_claimed`、`candidate_selected_singular_fallback_claimed`、
+`singularity_aware_*_traversal_by_side` 和
+`final_qref_*_singularity`，以及兼容的 `singularity_event`/singularity preference
+字段。普通 SDK advisory（未被最终 qref 证书接受）不会单独触发 `-1`。
 
 如果没有 command，记录为 `available=false`, `status=unknown`,
 `score=null`, `reasons=["no_command"]`。如果有 command 但没有上述质量信号，记录为 `available=false`, `status=unknown`,
@@ -677,6 +714,8 @@ torque <value>Nm > hard_stop_torque_nm
 
 - `pose_quality_status_counts`: 各 `status` 的帧数。
 - `pose_quality_bad_count`, `pose_quality_warning_count`: bad/warning 帧数。
+- `pose_quality_special_count`, `pose_quality_singularity_count`: 特殊质量帧及其中奇异帧的数量。
+- `pose_quality_valid_score_count`: 参与普通分数统计的非负有限分数帧数。
 - `pose_quality_min_score`, `pose_quality_mean_score`: 本 episode 的 pose quality 最小/平均分。
 - `force_collision_detected`: episode 内是否出现过力/力矩 hard-stop 超限。
 - `force_collision_label`: 若出现过超限则为 `detected_collision`，否则为 `clean`。

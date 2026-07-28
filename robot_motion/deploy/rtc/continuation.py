@@ -44,6 +44,9 @@ RTC_CONTINUATION_SELECTION_OUTCOME_HASH_DOMAIN_V1 = (
     "dexteleop.deploy.rtc_continuation_selection_outcome.v1"
 )
 
+# Frozen compatibility names used only by the deprecated pre-C1 encoding
+# receipt below.  Canonical sampler/source identities now live in
+# dataset_contracts.model_continuation and deployments.client.
 RTC_CONTINUATION_PREFIX_SOURCE_PRODUCER_LOCAL_OVERLAP_V1 = (
     "producer_local_overlap_v1"
 )
@@ -222,8 +225,6 @@ class RtcContinuationSelectionSpec:
     prefix_horizon_steps: int
     minimum_selected_steps: int = 1
     lattice_tolerance_sec: float = 1e-9
-    require_typed_canonical_actions: bool = True
-    require_contiguous_selection: bool = True
 
     def __post_init__(self) -> None:
         horizon = _positive_int(
@@ -247,16 +248,6 @@ class RtcContinuationSelectionSpec:
         object.__setattr__(self, "prefix_horizon_steps", horizon)
         object.__setattr__(self, "minimum_selected_steps", minimum)
         object.__setattr__(self, "lattice_tolerance_sec", tolerance)
-        object.__setattr__(
-            self,
-            "require_typed_canonical_actions",
-            bool(self.require_typed_canonical_actions),
-        )
-        object.__setattr__(
-            self,
-            "require_contiguous_selection",
-            bool(self.require_contiguous_selection),
-        )
 
     @property
     def semantic_content_hash(self) -> str:
@@ -265,12 +256,6 @@ class RtcContinuationSelectionSpec:
                 "prefix_horizon_steps": self.prefix_horizon_steps,
                 "minimum_selected_steps": self.minimum_selected_steps,
                 "lattice_tolerance_sec": self.lattice_tolerance_sec,
-                "require_typed_canonical_actions": (
-                    self.require_typed_canonical_actions
-                ),
-                "require_contiguous_selection": (
-                    self.require_contiguous_selection
-                ),
             },
             domain=RTC_CONTINUATION_SELECTION_SPEC_HASH_DOMAIN_V1,
         )
@@ -291,6 +276,13 @@ class RtcPlanContinuationEntry:
         )
         if not isinstance(self.keyframe, TimedPolicyActionKeyframe):
             raise TypeError("keyframe must be a TimedPolicyActionKeyframe.")
+        if (
+            self.keyframe.action_payload_kind
+            != POLICY_ACTION_PAYLOAD_TYPED_CANONICAL_V1
+        ):
+            raise ValueError(
+                "A model-RTC continuation entry requires a typed canonical action."
+            )
 
     @property
     def semantic_content_hash(self) -> str:
@@ -364,10 +356,21 @@ class RtcPlanContinuationSlice:
                 )
             if (
                 previous_index is not None
-                and entry.generation_index <= previous_index
+                and entry.generation_index != previous_index + 1
             ):
                 raise ValueError(
-                    "Continuation entry generation indices must strictly increase."
+                    "Continuation entry generation indices must be contiguous."
+                )
+            if entry.keyframe.producer_epoch != self.producer_epoch:
+                raise ValueError("Continuation entry producer epoch mismatch.")
+            if entry.keyframe.policy_node_id != self.policy_node_id:
+                raise ValueError("Continuation entry policy node mismatch.")
+            if (
+                entry.keyframe.admitted_plan_generation
+                > self.source_plan_generation
+            ):
+                raise ValueError(
+                    "Continuation entry admission generation exceeds source plan."
                 )
             previous_index = entry.generation_index
         object.__setattr__(self, "prefix_horizon_steps", horizon)
@@ -450,6 +453,18 @@ class RtcContinuationSelectionOutcome:
                 raise ValueError("Accepted selection requires a continuation slice.")
             if reasons:
                 raise ValueError("Accepted selection cannot carry rejection reasons.")
+            if (
+                self.continuation_slice.source_plan_hash
+                != self.source_plan_hash
+            ):
+                raise ValueError("Selection/source plan hash mismatch.")
+            if self.continuation_slice.timeline_hash != self.timeline_hash:
+                raise ValueError("Selection/timeline hash mismatch.")
+            if (
+                self.continuation_slice.selection_spec_hash
+                != self.selection_spec_hash
+            ):
+                raise ValueError("Selection/spec hash mismatch.")
         elif self.continuation_slice is not None:
             raise ValueError("Rejected selection cannot carry a continuation slice.")
         object.__setattr__(self, "accepted", bool(self.accepted))
@@ -526,6 +541,14 @@ def select_rtc_plan_continuation(
             timeline=timeline,
             spec=spec,
             reasons=("prefix_horizon_exceeds_prediction_horizon",),
+        )
+    if spec.prefix_horizon_steps > timeline.forecast_delay_steps:
+        return _selection_outcome(
+            accepted=False,
+            plan=plan,
+            timeline=timeline,
+            spec=spec,
+            reasons=("prefix_horizon_exceeds_forecast_delay",),
         )
     if plan.in_flight_request_id is not None:
         return _selection_outcome(
@@ -612,8 +635,7 @@ def select_rtc_plan_continuation(
                 reasons=("keyframe_clock_domain_mismatch",),
             )
         if (
-            spec.require_typed_canonical_actions
-            and keyframe.action_payload_kind
+            keyframe.action_payload_kind
             != POLICY_ACTION_PAYLOAD_TYPED_CANONICAL_V1
         ):
             return _selection_outcome(
@@ -645,7 +667,7 @@ def select_rtc_plan_continuation(
             reasons=("no_eligible_overlap",),
         )
     indices = tuple(sorted(entries_by_index))
-    if spec.require_contiguous_selection and indices != tuple(
+    if indices != tuple(
         range(indices[0], indices[-1] + 1)
     ):
         return _selection_outcome(
@@ -686,11 +708,11 @@ def select_rtc_plan_continuation(
 
 @dataclass(frozen=True)
 class RtcContinuationEncodingReceipt:
-    """Lineage for canonical producer overlap encoded into model space.
+    """Deprecated pre-C1 model-space encoding lineage.
 
-    ``sampler_constraint`` describes how strongly a model sampler consumes the
-    prefix.  It never upgrades ``prefix_source_role`` into target acceptance or
-    motion authority.
+    This frozen type remains import-compatible only.  New encoding and actual
+    consumption evidence belongs to ``deployments.client``.  Do not add new
+    callers or fields here.
     """
 
     source_plan_id: str

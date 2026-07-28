@@ -394,6 +394,8 @@ def needed_columns(available: set[str]) -> list[str]:
         "observation.arm.right.actual_tcp_pose",
         "teleop.pose_quality.status",
         "teleop.pose_quality.bad",
+        "teleop.pose_quality.score",
+        "teleop.pose_quality.special_code",
         "teleop.arm_mode.left.label",
         "teleop.arm_mode.right.label",
     }

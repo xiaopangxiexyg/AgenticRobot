@@ -18,6 +18,11 @@ from .builders import (
     build_bimanual_session,
     default_vive_tracker_configs,
 )
+from .passive_vive_q6 import (
+    PassiveViveQ6SessionConfig,
+    build_passive_vive_q6_session,
+    seed_vive_home_anchors,
+)
 from .dmtac_hardware import (
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
@@ -42,6 +47,7 @@ __all__ = [
     "BimanualPoseSmoother",
     "build_bimanual_session",
     "build_bimanual_passive_session",
+    "build_passive_vive_q6_session",
     "build_bimanual_pose_smoother",
     "default_vive_tracker_configs",
     "dmtac_backend_configs_from_assignment",
@@ -56,5 +62,7 @@ __all__ = [
     "load_realsense_camera_config_map",
     "PoseSmoother",
     "PoseSmoothingConfig",
+    "PassiveViveQ6SessionConfig",
     "q6_ports_from_assignment",
+    "seed_vive_home_anchors",
 ]

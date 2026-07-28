@@ -18,6 +18,7 @@ from deployments.client import (
     UnifiedActionChunk,
     validate_server_metadata,
 )
+from deployments.client.artifact import deploy_contract_from_policy_artifact
 from deployments.openpi.client import (
     OPENPI_LOCAL_PROTOCOL_VERSION,
     OpenPIClientPolicy,
@@ -129,7 +130,7 @@ class _V22FakeTransport(_FakeTransport):
 
 
 class OpenPICommonDeployTest(unittest.TestCase):
-    def test_openpi_policy_artifact_selects_strict_v22_keys_and_dimensions(self) -> None:
+    def test_openpi_policy_artifact_selects_protocol_keys_and_dimensions(self) -> None:
         layout = PolicyIOLayout.legacy_v21_q6()
         artifact = PolicyArtifactContract(
             policy_io_layout=layout,
@@ -143,10 +144,92 @@ class OpenPICommonDeployTest(unittest.TestCase):
         config = OpenPIClientPolicyConfig(policy_artifact=artifact)
 
         self.assertEqual(config.deploy_schema_version, "dexteleop_deploy_v2")
-        self.assertEqual(config.expected_model_id, "artifact-model")
+        self.assertIsNone(config.expected_model_id)
+        self.assertIsNone(config.expected_checkpoint_step)
         self.assertEqual(config.action_dim, layout.action_dim)
         self.assertEqual(config.action_key, "robot_actions")
         self.assertEqual(config.policy_io_layout_hash, layout.layout_hash)
+
+    def test_artifact_protocol_contract_does_not_bind_model_identity_by_default(self) -> None:
+        layout = PolicyIOLayout.legacy_v21_q6()
+        artifact = PolicyArtifactContract(
+            policy_io_layout=layout,
+            model_id="artifact-model-150000",
+            checkpoint_step=150000,
+        )
+        contract = deploy_contract_from_policy_artifact(
+            artifact,
+            protocol_version=OPENPI_LOCAL_PROTOCOL_VERSION,
+        )
+
+        metadata = {
+            "protocol_version": OPENPI_LOCAL_PROTOCOL_VERSION,
+            "deploy_schema_version": "dexteleop_deploy_v2",
+            "model_id": "switched-model-90000",
+            "deployment": {"checkpoint_step": 90000},
+            "model": {
+                "action_horizon": 50,
+                "action_discrete_dim": layout.action_discrete_dim,
+            },
+            "local_robot": {
+                "input_state_key": "state",
+                "input_state_dim": layout.state_dim,
+                "input_state_discrete_key": "state_discrete",
+                "input_state_discrete_dim": layout.state_discrete_dim,
+                "output_action_dim": layout.action_dim,
+                "output_action_discrete_dim": layout.action_discrete_dim,
+                "active_sides": ["left", "right"],
+            },
+            "dataset_adapter": {
+                "policy_io_layout_hash": layout.layout_hash,
+            },
+        }
+
+        result = validate_server_metadata(metadata, contract)
+
+        self.assertTrue(result.ok)
+        self.assertIsNone(contract.model_id)
+        self.assertIsNone(contract.checkpoint_step)
+
+    def test_openpi_policy_accepts_switched_checkpoint_with_same_protocol(self) -> None:
+        layout = PolicyIOLayout.legacy_v21_q6()
+        artifact = PolicyArtifactContract(
+            policy_io_layout=layout,
+            model_id="artifact-model-150000",
+            checkpoint_step=150000,
+        )
+        metadata = _server_metadata()
+        metadata.update(
+            {
+                "deploy_schema_version": "dexteleop_deploy_v2",
+                "model_id": "switched-model-90000",
+                "deployment": {"checkpoint_step": 90000},
+            }
+        )
+        metadata["model"]["action_discrete_dim"] = layout.action_discrete_dim
+        metadata["local_robot"].update(
+            {
+                "input_state_key": "state",
+                "input_state_dim": layout.state_dim,
+                "input_state_discrete_key": "state_discrete",
+                "input_state_discrete_dim": layout.state_discrete_dim,
+                "output_action_dim": layout.action_dim,
+                "output_action_discrete_dim": layout.action_discrete_dim,
+            }
+        )
+        metadata["dataset_adapter"]["policy_io_layout_hash"] = layout.layout_hash
+        remote = RemoteModelPolicy(
+            transport=_FakeTransport(metadata=metadata),
+            observation_adapter=lambda observation: {},
+            config=RemotePolicyConfig(action_dim=layout.action_dim),
+        )
+
+        policy = OpenPIClientPolicy(
+            OpenPIClientPolicyConfig(policy_artifact=artifact),
+            remote_policy=remote,
+        )
+
+        self.assertEqual(policy.name, "openpi:switched-model-90000")
 
     def test_openpi_policy_artifact_selects_only_declared_wrist_view(self) -> None:
         artifact = PolicyArtifactContract(
@@ -547,6 +630,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
                     "9000",
                     "--model",
                     "dual_rm65_dmgripper_latest",
+                    "--strict-model-identity",
                     "--active-sides",
                     "both",
                     "--arm-control-mode",
@@ -901,6 +985,24 @@ class OpenPICommonDeployTest(unittest.TestCase):
                     "",
                     "--checkpoint-step",
                     "",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        kwargs_json = launched_args[launched_args.index("--policy-kwargs-json") + 1]
+        kwargs = json.loads(kwargs_json)
+        self.assertNotIn("expected_model_id", kwargs)
+        self.assertNotIn("expected_checkpoint_step", kwargs)
+
+    def test_openpi_real_launcher_ignores_identity_args_without_strict_opt_in(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+            result = openpi_real_launcher.main(
+                [
+                    "--model",
+                    "old-model",
+                    "--checkpoint-step",
+                    "150000",
                 ]
             )
 

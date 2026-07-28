@@ -49,6 +49,23 @@ class _ControlFakeArm:
         return 0
 
 
+class _TransientStopFakeArm(_ControlFakeArm):
+    def __init__(self, *, force_stop_raises: bool = False) -> None:
+        super().__init__()
+        self.force_stop_raises = bool(force_stop_raises)
+        self.stop_results = [-2, 0]
+
+    def Stop_Force_Position_Move(self, _block):
+        self.calls.append("Stop_Force_Position_Move")
+        if self.force_stop_raises:
+            raise RuntimeError("force stop response timeout")
+        return 0
+
+    def Arm_Stop(self):
+        self.calls.append("Arm_Stop")
+        return self.stop_results.pop(0) if self.stop_results else 0
+
+
 class _RecordingControlAdapter:
     def __init__(self, *, invoke_backend: bool = True) -> None:
         self.invoke_backend = bool(invoke_backend)
@@ -115,6 +132,46 @@ def test_emergency_stop_exposes_two_distinct_safety_calls() -> None:
         context.seam_id == "rm65.safety.emergency_stop.force_and_arm"
         for context in adapter.contexts
     )
+
+
+def test_emergency_stop_retries_receive_timeout_and_continues_after_force_stop_error() -> None:
+    backend, _ = _backend()
+    transient_arm = _TransientStopFakeArm(force_stop_raises=True)
+    backend.arm = transient_arm
+    backend._force_position_active = True
+
+    backend.emergency_stop()
+
+    assert transient_arm.calls == [
+        "Stop_Force_Position_Move",
+        "Arm_Stop",
+        "Arm_Stop",
+    ]
+    assert backend.get_state()["send_result_text"] == "emergency_stop:Arm_Stop:0"
+
+
+def test_manual_rearm_clears_emergency_latch_without_repeating_sdk_stop() -> None:
+    backend, arm = _backend()
+    backend._hardware_ready = True
+    backend._emergency_stopped = True
+
+    result = backend.manual_rearm_after_emergency_stop(np.zeros(6))
+
+    assert result["rearmed"] is True
+    assert backend.is_emergency_stopped() is False
+    assert arm.calls == []
+    assert backend.get_state()["send_result_text"] == "manual_rearm_ready"
+
+
+def test_hold_after_emergency_latch_does_not_issue_duplicate_sdk_stop() -> None:
+    backend, arm = _backend()
+    backend._emergency_stopped = True
+
+    backend.hold_motion("collision")
+    backend.disengage_position_command_stream("collision")
+
+    assert arm.calls == []
+    assert "emergency_latched" in str(backend.get_state()["send_result_text"])
 
 
 def test_force_position_start_uses_one_lifecycle_permit_per_sdk_call() -> None:

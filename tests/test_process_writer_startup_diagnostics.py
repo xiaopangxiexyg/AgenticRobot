@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,18 @@ class _WorkerErrorAckQueue:
                 "error": "worker.plan_jobs: DatasetLayoutError: bad sample",
                 "traceback": "Traceback (most recent call last):\n  worker.plan_jobs",
             }
+        ]
+
+    def get_nowait(self):
+        if self._messages:
+            return self._messages.pop(0)
+        raise queue.Empty
+
+
+class _SampleRejectionAckQueue:
+    def __init__(self) -> None:
+        self._messages = [
+            {"kind": "sample_rejected", "reason": "left stale measured state"},
         ]
 
     def get_nowait(self):
@@ -90,6 +103,21 @@ def test_process_worker_retains_and_prints_sample_traceback(capsys) -> None:
         "Traceback (most recent call last):\n  worker.plan_jobs"
     )
     assert "[CollectionWorker] sample processing failed" in capsys.readouterr().err
+
+
+def test_process_worker_sample_rejection_is_nonfatal() -> None:
+    worker = object.__new__(ProcessCollectionWorker)
+    worker._ack_queue = _SampleRejectionAckQueue()
+    worker._worker_error = None
+    worker._worker_traceback = None
+    worker._sample_rejection_count = 0
+    worker._pending_sample_rejections = deque()
+    worker._started = False
+
+    assert worker.consume_sample_rejection() == "left stale measured state"
+    assert worker._worker_error is None
+    assert worker._sample_rejection_count == 1
+    assert worker.consume_sample_rejection() is None
 
 
 def test_process_worker_request_prints_child_traceback(capsys) -> None:

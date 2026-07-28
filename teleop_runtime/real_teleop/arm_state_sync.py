@@ -209,6 +209,18 @@ def _reset_runtime_motion_state_from_real_qpos(
                 )
             continue
         if command_backend is not None:
+            # A position-force collision leaves the command backend latched
+            # and its CANFD worker stopped.  Runtime Home is the explicit
+            # operator authorization to clear that latch; never clear it from
+            # the normal control loop or from a safety callback.
+            rearm = getattr(
+                command_backend,
+                "manual_rearm_after_emergency_stop",
+                None,
+            )
+            is_stopped = getattr(command_backend, "is_emergency_stopped", None)
+            if callable(rearm) and callable(is_stopped) and bool(is_stopped()):
+                rearm(preview_anchor_qpos)
             command_backend.reset_motion_state(preview_anchor_qpos)
         reset_side_elapsed_ms = (time.perf_counter() - reset_side_start) * 1000.0
         synced[side] = True
@@ -316,4 +328,3 @@ __all__ = [
     "_sync_preview_from_real_state_real",
     "_sync_real_execution_step_limits",
 ]
-

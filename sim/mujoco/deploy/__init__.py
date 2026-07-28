@@ -15,12 +15,27 @@ from .measurement import (
     MujocoQposMeasurement,
     capture_mujoco_qpos_measurement,
 )
+from .execution_difference import (
+    MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID,
+    MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH,
+    MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID,
+    build_mujoco_qpos_execution_difference_observation,
+    project_mujoco_execution_measurement_observation,
+    project_mujoco_execution_reference_frame,
+    project_mujoco_execution_reference_sample,
+)
 from .pose_resolution import (
     MujocoCoupledPoseToQposResolver,
     MujocoPoseToQposResolution,
     POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1,
     POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1,
     build_mujoco_pose_qpos_execution_target,
+)
+from .sim_hil_target import (
+    MujocoSimHILTarget,
+    MujocoSimHILTargetConfig,
+    build_mujoco_sim_hil_target,
+    capture_mujoco_sim_hil_safety_anchor,
 )
 from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
@@ -36,6 +51,7 @@ from .rtc_policy import (
     VirtualRtcPlanInvalidationReceipt,
 )
 from .runtime import (
+    build_mujoco_pose_action_schema,
     MujocoDeployConfig,
     MujocoDeployRuntime,
     MujocoPolicyActionChunkSubmission,
@@ -53,6 +69,7 @@ from .policy_rollout import (
 )
 
 __all__ = [
+    "build_mujoco_pose_action_schema",
     "MujocoDeployConfig",
     "MujocoDeployRuntime",
     "MujocoPolicyActionChunkSubmission",
@@ -64,6 +81,13 @@ __all__ = [
     "MUJOCO_QPOS_MEASUREMENT_HASH_DOMAIN_V1",
     "MujocoQposMeasurement",
     "capture_mujoco_qpos_measurement",
+    "MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID",
+    "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH",
+    "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID",
+    "build_mujoco_qpos_execution_difference_observation",
+    "project_mujoco_execution_measurement_observation",
+    "project_mujoco_execution_reference_frame",
+    "project_mujoco_execution_reference_sample",
     "MujocoCoupledPoseToQposResolver",
     "MujocoPoseToQposResolution",
     "MujocoScheduledResolvedQposReferenceReceiver",
@@ -71,6 +95,10 @@ __all__ = [
     "POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1",
     "POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1",
     "build_mujoco_pose_qpos_execution_target",
+    "MujocoSimHILTarget",
+    "MujocoSimHILTargetConfig",
+    "build_mujoco_sim_hil_target",
+    "capture_mujoco_sim_hil_safety_anchor",
     "DeterministicVirtualPolicyRtcRunner",
     "VirtualBimanualQposPolicy",
     "VirtualBimanualQposPolicySpec",

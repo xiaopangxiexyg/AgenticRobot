@@ -1270,9 +1270,15 @@ def test_hold_is_latched_and_cannot_be_cleared_by_connect_or_preflight() -> None
 
 def test_control_station_core_modules_do_not_import_backend_or_sim_packages() -> None:
     package_root = Path(__file__).parents[1] / "control_station"
+    # Concrete application profiles are leaves: they bind one selected lower
+    # runtime and are intentionally allowed to import that runtime lazily.
+    # The stable Station core remains backend-neutral; migration debt in
+    # ``composition/`` is checked separately and must not spread there.
+    concrete_profile_modules = {"sim_hil.py"}
     source = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted(package_root.glob("*.py"))
+        if path.name not in concrete_profile_modules
     )
     assert "from hardware" not in source
     assert "import hardware" not in source

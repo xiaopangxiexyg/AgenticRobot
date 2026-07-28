@@ -36,7 +36,10 @@ from robot_motion.action import (
     DecisionScheduler,
     ProposalBuffer,
     RobotAction,
+    build_robot_action_v1_runtime_schema,
+    project_robot_action_v1_to_component_action,
 )
+from robot_motion.action.component_action import ComponentActionSchema
 from robot_motion.action.arbitration_input import capture_arbitration_input
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
 from robot_motion.runtime.execution_gate import ExecutionGateStore
@@ -104,8 +107,9 @@ class FakeSlowContextNode:
 
 
 class FakeFastActionNode:
-    def __init__(self) -> None:
+    def __init__(self, *, action_schema: ComponentActionSchema) -> None:
         self.sequence = 0
+        self.action_schema = action_schema
         self.spec = PolicyNodeSpec(
             node_id="fast-tactile",
             output_kind="composition_input",
@@ -141,10 +145,13 @@ class FakeFastActionNode:
                 producer_epoch=1,
                 sequence=sequence,
                 input_role="residual",
-                action=RobotAction(
-                    action_space=BIMANUAL_QPOS_V1,
-                    arm_qpos_by_side={"left": np.full(6, residual)},
-                    source="fake_fast_policy",
+                action=project_robot_action_v1_to_component_action(
+                    RobotAction(
+                        action_space=BIMANUAL_QPOS_V1,
+                        arm_qpos_by_side={"left": np.full(6, residual)},
+                        source="fake_fast_policy",
+                    ),
+                    action_schema=self.action_schema,
                 ),
                 produced_at=request.scheduled_at,
                 produced_clock_domain_id="control.monotonic",
@@ -247,6 +254,14 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
             max_effective_duration_sec=1.0,
         ),
     )
+    catalog = ActionComponentCatalog(
+        catalog_id="left-arm-qpos-v1",
+        action_space=BIMANUAL_QPOS_V1,
+        components=(ActionComponentSpec("left_arm", "left_arm", "left_arm"),),
+    )
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
     composition_inputs = CompositionInputStore(
         runtime_session_id="session-0",
         coordinator=coordinator,
@@ -257,17 +272,13 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
             max_future_lead_sec=1.0,
             max_effective_duration_sec=1.0,
         ),
+        action_schema=action_schema,
     )
     proposals = ProposalBuffer(
         runtime_session_id="session-0",
         coordinator=coordinator,
         producer_epochs=epochs,
         capacity=32,
-    )
-    catalog = ActionComponentCatalog(
-        catalog_id="left-arm-qpos-v1",
-        action_space=BIMANUAL_QPOS_V1,
-        components=(ActionComponentSpec("left_arm", "left_arm", "left_arm"),),
     )
     spec = CompositionSpec(
         spec_id="slow-base-fast-residual-v1",
@@ -277,7 +288,7 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
         residual_limit_by_component={"left_arm": 0.05},
     )
     slow: PolicyNodeRuntime = FakeSlowContextNode()
-    fast: PolicyNodeRuntime = FakeFastActionNode()
+    fast: PolicyNodeRuntime = FakeFastActionNode(action_schema=action_schema)
     composer = DeterministicComposer()
     rgbd_ids_seen: list[str] = []
     tactile_ids_seen: list[str] = []
@@ -334,12 +345,15 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
                     producer_epoch=1,
                     sequence=base_sequence,
                     input_role="base",
-                    action=RobotAction(
-                        action_space=BIMANUAL_QPOS_V1,
-                        arm_qpos_by_side={
-                            "left": context.semantic_payload["base_qpos"]
-                        },
-                        source="fake_slow_base",
+                    action=project_robot_action_v1_to_component_action(
+                        RobotAction(
+                            action_space=BIMANUAL_QPOS_V1,
+                            arm_qpos_by_side={
+                                "left": context.semantic_payload["base_qpos"]
+                            },
+                            source="fake_slow_base",
+                        ),
+                        action_schema=action_schema,
                     ),
                     produced_at=at,
                     produced_clock_domain_id="control.monotonic",
@@ -395,13 +409,10 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
                 sequence=proposal_sequence,
                 produced_at=at,
                 produced_clock_domain_id="control.monotonic",
-                effective_from=at,
-                effective_until=at + 0.05,
-                effective_clock_domain_id="control.monotonic",
-                component_schema_hash=catalog.semantic_content_hash,
-                component_coverage=("left_arm",),
-                selection_groups=("left_arm",),
-                policy_node_id="fast-composer",
+                    effective_from=at,
+                    effective_until=at + 0.05,
+                    effective_clock_domain_id="control.monotonic",
+                    policy_node_id="fast-composer",
             )
         )
         assert proposal_receipt.accepted
@@ -447,16 +458,16 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
             proposal_buffer=proposals,
             producer_epochs=epochs,
             authority_store=authority,
-            execution_gate_store=gate,
-            scheduler=scheduler,
-            embodiment_instance_id="rm65-pair-0",
-            component_catalog=catalog,
-            active_selection_groups=("left_arm",),
+                execution_gate_store=gate,
+                scheduler=scheduler,
+                embodiment_instance_id="rm65-pair-0",
+                action_schema=action_schema,
+                active_selection_groups=("left_arm",),
         )
         assert snapshot is not None
         result = ActionArbiter().arbitrate(snapshot)
         assert result.output_status == "selected"
-        assert result.composed_action is not None
+        assert result.composed_candidate is not None
         assert result.attribution["left_arm"]["context_ids"]
 
 

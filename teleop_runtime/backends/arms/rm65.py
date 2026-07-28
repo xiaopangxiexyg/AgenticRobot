@@ -133,6 +133,13 @@ _RM65_LOCAL_QPOS_OBSERVATION_TOLERANCE_RAD = float(np.deg2rad(0.01))
 _BACKGROUND_AUDIT_STATS_MAX_SAMPLES = 20_000
 _BACKGROUND_AUDIT_SNAPSHOT_CACHE_SEC = 1.0
 _BACKGROUND_WORKER_TERMINAL_STAGE = "rm65_background_stream_worker_terminal"
+# A vendor ``-2`` result means that the SDK did not receive the controller
+# acknowledgement.  The command may still have reached the controller, so a
+# bounded idempotent retry is safer than declaring the stop unacknowledged
+# after one response timeout.  Keep this short: the stream is already latched
+# and no new motion can be admitted while these calls run.
+_EMERGENCY_STOP_RETRY_DELAY_SEC = 0.05
+_EMERGENCY_STOP_ARM_STOP_ATTEMPTS = 2
 
 
 def _derive_backend_execution_work_item(
@@ -1709,6 +1716,19 @@ class RM65ArmBackend(EffectorBackend):
         quick_stop_queued = False
         with self._send_lock:
             with self._state_lock:
+                # A force-guard emergency stop is already the authoritative
+                # hardware stop. Repeating Arm_Stop from ordinary Hold can
+                # return the SDK transient -2 and turn a recoverable GUI Hold
+                # into a process exit.
+                if self._emergency_stopped:
+                    self._clear_stream_target_locked()
+                    self._last_target_qpos = None
+                    self._last_target_pose = None
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = (
+                        f"hold_skipped_emergency_latched:{reason}"
+                    )
+                    return
                 stream_thread_alive = bool(
                     self._stream_thread is not None and self._stream_thread.is_alive()
                 )
@@ -1807,6 +1827,12 @@ class RM65ArmBackend(EffectorBackend):
                 self._last_target_qpos = None
                 self._last_target_pose = None
                 arm = self.arm
+                if self._emergency_stopped:
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = (
+                        f"position_stream_disengaged_emergency_latched:{normalized_reason}"
+                    )
+                    return
             if arm is None:
                 with self._state_lock:
                     self._last_send_result_code = 0
@@ -1842,6 +1868,123 @@ class RM65ArmBackend(EffectorBackend):
                     f"{self.name} {stop_label} failed while disengaging the position "
                     f"command stream with return code {stop_text}"
                 )
+
+    def is_emergency_stopped(self) -> bool:
+        """Return whether an emergency stop latch still blocks dispatch."""
+
+        with self._state_lock:
+            return bool(self._emergency_stopped)
+
+    def manual_rearm_after_emergency_stop(
+        self,
+        qpos: Sequence[float] | np.ndarray,
+    ) -> dict[str, object]:
+        """Re-arm this backend after a fresh operator-led runtime Home.
+
+        The method is intentionally explicit and never called by start or a
+        safety callback. It requires a finite, hard-limit-valid qpos captured
+        from the live arm, refuses a background-worker fault, and restarts the
+        high-rate stream only after the old worker has exited.
+        """
+
+        reset_qpos = self._validate_final_joint_target(
+            qpos,
+            label="manual rearm qpos",
+        )
+        if self.config.observation_only:
+            with self._state_lock:
+                self._emergency_stopped = False
+                self._last_send_result_code = 0
+                self._last_send_result_text = "observation_only_manual_rearm"
+            return {"rearmed": True, "observation_only": True}
+
+        # Do not hold _send_lock while waiting for the old sender: a worker
+        # may be completing its final SDK call under that lock.
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError(f"{self.name} is closed; cannot manually re-arm.")
+            if self.arm is None or not self._hardware_ready:
+                raise RuntimeError(
+                    f"{self.name} has no ready RM65 connection for manual re-arm."
+                )
+            if not self._emergency_stopped:
+                return {"rearmed": False, "reason": "not_emergency_stopped"}
+            if self._stream_fault is not None:
+                raise RuntimeError(
+                    f"{self.name} background stream fault requires restart: "
+                    f"{self._stream_fault}"
+                )
+            stream_thread = self._stream_thread
+            self._stream_stop_event.set()
+        if stream_thread is not None and stream_thread is not threading.current_thread():
+            stream_thread.join(
+                timeout=float(self.config.background_streaming_shutdown_timeout_sec)
+            )
+            if stream_thread.is_alive():
+                raise RuntimeError(
+                    f"{self.name} background stream did not stop before manual re-arm."
+                )
+
+        timestamp = time.time()
+        monotonic_time = time.monotonic()
+        with self._send_lock:
+            with self._state_lock:
+                # Recheck after the worker join; no safety callback may clear
+                # this latch concurrently with an operator transition.
+                if self._closed:
+                    raise RuntimeError(f"{self.name} was closed during manual re-arm.")
+                if self.arm is None or not self._hardware_ready:
+                    raise RuntimeError(
+                        f"{self.name} lost its RM65 connection during manual re-arm."
+                    )
+                if not self._emergency_stopped:
+                    return {"rearmed": False, "reason": "latch_cleared_concurrently"}
+                self._stream_thread = None
+                self._stream_stop_event.clear()
+                self._stream_shutdown_requested = False
+                self._stream_shutdown_complete = False
+                self._stream_join_timed_out = False
+                self._emergency_stopped = False
+                self._record_command_accepted_locked(
+                    reset_qpos,
+                    timestamp=timestamp,
+                    monotonic_time=monotonic_time,
+                )
+                self._record_measured_qpos_locked(
+                    reset_qpos,
+                    timestamp=timestamp,
+                    monotonic_time=monotonic_time,
+                )
+                self._clear_stream_target_locked()
+                self._reset_stream_planner_locked(
+                    reset_qpos,
+                    monotonic_time=monotonic_time,
+                )
+                self._reset_background_stream_metrics_locked()
+                self._last_target_qpos = None
+                self._last_target_pose = None
+                self._last_command = None
+                self._last_command_timestamp = None
+                self._last_send_time = None
+                self._smoothed_send_dt = self._base_control_dt
+                self._last_effective_control_dt = self._base_control_dt
+                self._last_effective_step_scale = 1.0
+                self._prepared_effective_max_joint_step = None
+                self._prepared_effective_step_time = None
+                self._last_send_result_code = 0
+                self._last_send_result_text = "manual_rearm_ready"
+                if bool(self.config.background_streaming_enabled):
+                    self._stream_thread = threading.Thread(
+                        target=self._background_stream_loop,
+                        daemon=True,
+                        name=f"{self.name}_stream",
+                    )
+                    self._stream_thread.start()
+        return {
+            "rearmed": True,
+            "background_streaming": bool(self.config.background_streaming_enabled),
+            "qpos_rad": reset_qpos.astype(float).tolist(),
+        }
 
     def reset_motion_state(self, qpos: Sequence[float] | np.ndarray | None = None) -> None:
         reset_qpos = (
@@ -2146,8 +2289,26 @@ class RM65ArmBackend(EffectorBackend):
             "singular_fallback_claimed": bool(
                 certificate.get("singular_fallback_claimed", False)
             ),
+            "singularity_aware_wrist_traversal": bool(
+                _metadata_mapping(
+                    certificate.get(
+                        "singularity_aware_wrist_traversal_by_side"
+                    )
+                ).get(self.config.side, False)
+            ),
+            "singularity_aware_elbow_traversal": bool(
+                _metadata_mapping(
+                    certificate.get(
+                        "singularity_aware_elbow_traversal_by_side"
+                    )
+                ).get(self.config.side, False)
+            ),
         }
-        if not valid or bool(certificate.get("singular_fallback_claimed", False)):
+        if not valid or bool(certificate.get("singular_fallback_claimed", False)) or bool(
+            _metadata_mapping(
+                certificate.get("singularity_aware_elbow_traversal_by_side")
+            ).get(self.config.side, False)
+        ):
             result["certificate"] = certificate
         return result
 
@@ -2235,15 +2396,33 @@ class RM65ArmBackend(EffectorBackend):
         current_code = current_status.get("status_code")
         current_singular = current_code not in (0, None)
         entering_singularity = bool(target_singular and current_code == 0)
+        wrist_escape_continuation = bool(
+            target_singular
+            and current_singular
+            and target_status.get("label") == "wrist_singularity"
+            and current_status.get("label") == "wrist_singularity"
+            and allow_position_wrist_fallback
+            and abs(float(target[4])) > abs(float(reference[4])) + 1e-9
+            and float(target[4]) * float(reference[4]) >= -1e-9
+        )
+        elbow_escape_continuation = bool(
+            target_singular
+            and current_singular
+            and target_status.get("label") == "elbow_singularity"
+            and current_status.get("label") == "elbow_singularity"
+            and allow_position_elbow_fallback
+            and abs(float(target[2])) > abs(float(reference[2])) + 1e-9
+            and float(target[2]) * float(reference[2]) >= -1e-9
+        )
         gate_status = "hold_entry" if entering_singularity else "pass"
         allow_wrist_fallback = bool(
-            entering_singularity
+            (entering_singularity or wrist_escape_continuation)
             and self.config.allow_position_wrist_singularity_fallback
             and allow_position_wrist_fallback
             and target_status.get("label") == "wrist_singularity"
         )
         allow_elbow_fallback = bool(
-            entering_singularity
+            (entering_singularity or elbow_escape_continuation)
             and self.config.allow_position_elbow_singularity_fallback
             and allow_position_elbow_fallback
             and target_status.get("label") == "elbow_singularity"
@@ -2269,8 +2448,16 @@ class RM65ArmBackend(EffectorBackend):
         certificate_bound_fallback = bool(
             position_candidate_certificate_validation is not None
             and position_candidate_certificate_validation.get("valid", False)
-            and position_candidate_certificate_validation.get(
-                "singular_fallback_claimed", False
+            and (
+                position_candidate_certificate_validation.get(
+                    "singular_fallback_claimed", False
+                )
+                or position_candidate_certificate_validation.get(
+                    "singularity_aware_wrist_traversal", False
+                )
+                or position_candidate_certificate_validation.get(
+                    "singularity_aware_elbow_traversal", False
+                )
             )
         )
         certificate_context_valid = bool(
@@ -2291,7 +2478,14 @@ class RM65ArmBackend(EffectorBackend):
                 self._position_singularity_fallback_active = False
                 self._position_singularity_fallback_normal_frames = 0
                 fallback_active_before = False
-            if entering_singularity and explicit_position_fallback:
+            if (
+                (
+                    entering_singularity
+                    or wrist_escape_continuation
+                    or elbow_escape_continuation
+                )
+                and explicit_position_fallback
+            ):
                 self._position_singularity_fallback_active = True
                 self._position_singularity_fallback_normal_frames = 0
                 self._position_singularity_fallback_entry_count += 1
@@ -2351,7 +2545,11 @@ class RM65ArmBackend(EffectorBackend):
             # outside the neighborhood; that exit path remains unchanged.
             if not allow_position_fallback and not rate_limited_position_fallback:
                 gate_status = "hold_current_singular"
-            else:
+            elif not (
+                allow_wrist_fallback
+                or allow_elbow_fallback
+                or allow_shoulder_fallback
+            ):
                 gate_status = "allow_current_singular"
         elif target_code is None:
             gate_status = "analysis_unavailable"
@@ -2362,6 +2560,12 @@ class RM65ArmBackend(EffectorBackend):
             "target_singularity_label": target_status.get("label"),
             "current_singularity_code": current_code,
             "current_singularity_label": current_status.get("label"),
+            "position_wrist_escape_continuation": bool(
+                wrist_escape_continuation
+            ),
+            "position_elbow_escape_continuation": bool(
+                elbow_escape_continuation
+            ),
             "configured_elbow_threshold_deg": float(self.config.singularity_elbow_threshold_deg),
             "configured_wrist_threshold_deg": float(self.config.singularity_wrist_threshold_deg),
             "configured_shoulder_threshold_m": float(self.config.singularity_shoulder_threshold_m),
@@ -2719,9 +2923,29 @@ class RM65ArmBackend(EffectorBackend):
         certificate_claims_singular_fallback = bool(
             candidate_certificate.get("singular_fallback_claimed", False)
         )
+        certificate_claims_wrist_traversal = bool(
+            _metadata_mapping(
+                candidate_certificate.get(
+                    "singularity_aware_wrist_traversal_by_side"
+                )
+            ).get(self.config.side, False)
+        )
+        certificate_claims_elbow_traversal = bool(
+            _metadata_mapping(
+                candidate_certificate.get(
+                    "singularity_aware_elbow_traversal_by_side"
+                )
+            ).get(self.config.side, False)
+        )
         certificate_allows_fallback = bool(
             (certificate_valid and certificate_claims_singular_fallback)
             or not self.config.require_position_singularity_candidate_certificate
+        )
+        certificate_allows_wrist_traversal = bool(
+            certificate_valid and certificate_claims_wrist_traversal
+        )
+        certificate_allows_elbow_traversal = bool(
+            certificate_valid and certificate_claims_elbow_traversal
         )
         certificate_allows_sdk_advisory = bool(
             self.config.position_sdk_singularity_advisory
@@ -2744,10 +2968,16 @@ class RM65ArmBackend(EffectorBackend):
             certified_side_wrist if certificate_valid else selected_side_wrist
         )
         allow_position_wrist_fallback = bool(
-            wrist_preference.get("enabled", False)
-            and wrist_preference.get("fallback_to_singular", False)
-            and fallback_side_wrist.get("is_wrist_singular", False)
-            and certificate_allows_fallback
+            (
+                wrist_preference.get("enabled", False)
+                and wrist_preference.get("fallback_to_singular", False)
+                and fallback_side_wrist.get("is_wrist_singular", False)
+                and certificate_allows_fallback
+            )
+            or (
+                self.config.allow_position_wrist_singularity_fallback
+                and certificate_allows_wrist_traversal
+            )
         )
         # The SDK is the final hardware safety signal, but its boundary is not
         # identical to the local J5 proxy used by the coupled position
@@ -2810,6 +3040,16 @@ class RM65ArmBackend(EffectorBackend):
             and fallback_position_side.get("is_elbow_singular", False)
             and certificate_allows_fallback
         )
+        # A local directional escape can remain inside the SDK elbow band for
+        # several bounded frames.  Permit only the exact, fingerprint-bound
+        # outward q3 traversal certificate; ordinary singular elbow targets
+        # still use the existing explicit fallback branch above.
+        if (
+            self.config.allow_position_elbow_singularity_fallback
+            and certificate_allows_elbow_traversal
+            and position_singularity_preference.get("enabled", False)
+        ):
+            allow_position_elbow_fallback = True
         if (
             certificate_allows_sdk_advisory
             and position_singularity_preference.get("enabled", False)
@@ -4939,39 +5179,98 @@ class RM65ArmBackend(EffectorBackend):
                     self._last_send_result_text = "emergency_stop_no_arm"
                 return
             force_stop_called = bool(self._force_position_active)
+            force_stop_error: str | None = None
             if force_stop_called:
-                self._invoke_pre_sdk_control(
-                    seam_id="rm65.safety.emergency_stop.force_and_arm",
-                    permit_kind="safety_control",
-                    operation="stop",
-                    source="emergency_stop",
-                    sdk_method="Stop_Force_Position_Move",
-                    attempt_sequence=1,
-                    backend_call=lambda: self.arm.Stop_Force_Position_Move(True),
-                )
+                # A failed force-position stop must not prevent the ordinary
+                # arm stop from being attempted.  The two SDK calls are
+                # independent safety actions, and the latter is the final
+                # stop path for both position and force-position modes.
+                try:
+                    force_stop_result = self._invoke_pre_sdk_control(
+                        seam_id="rm65.safety.emergency_stop.force_and_arm",
+                        permit_kind="safety_control",
+                        operation="stop",
+                        source="emergency_stop",
+                        sdk_method="Stop_Force_Position_Move",
+                        attempt_sequence=1,
+                        backend_call=lambda: self.arm.Stop_Force_Position_Move(True),
+                    )
+                    force_stop_code, force_stop_text = _parse_rm65_result(
+                        force_stop_result
+                    )
+                    if force_stop_code not in (0, None):
+                        force_stop_error = (
+                            f"Stop_Force_Position_Move returned {force_stop_text}"
+                        )
+                except Exception as exc:  # noqa: BLE001 - continue to Arm_Stop.
+                    force_stop_error = f"{type(exc).__name__}: {exc}"
                 self._force_position_active = False
-            stop_method = getattr(self.arm, "Arm_Stop", None)
-            stop_label = "Arm_Stop"
-            if stop_method is None:
-                stop_method = getattr(self.arm, "Arm_Slow_Stop", None)
-                stop_label = "Arm_Slow_Stop"
-            if stop_method is None:
+            arm_stop_method = getattr(self.arm, "Arm_Stop", None)
+            slow_stop_method = getattr(self.arm, "Arm_Slow_Stop", None)
+            if not callable(arm_stop_method) and not callable(slow_stop_method):
                 raise RuntimeError(f"{self.name} RM65 SDK exposes no Arm_Stop/Arm_Slow_Stop method")
-            stop_result = self._invoke_pre_sdk_control(
-                seam_id="rm65.safety.emergency_stop.force_and_arm",
-                permit_kind="safety_control",
-                operation="stop",
-                source="emergency_stop",
-                sdk_method=stop_label,
-                attempt_sequence=2 if force_stop_called else 1,
-                backend_call=stop_method,
-            )
-            stop_code, stop_text = _parse_rm65_result(stop_result)
+
+            # Arm_Stop is the fastest stop and is safe to repeat after a
+            # missing acknowledgement.  If both bounded attempts fail, use
+            # Arm_Slow_Stop as a distinct final fallback when available.
+            stop_attempts: list[tuple[str, Callable[[], object]]] = []
+            if callable(arm_stop_method):
+                stop_attempts.extend(
+                    [("Arm_Stop", arm_stop_method)]
+                    * int(_EMERGENCY_STOP_ARM_STOP_ATTEMPTS)
+                )
+            if callable(slow_stop_method):
+                stop_attempts.append(("Arm_Slow_Stop", slow_stop_method))
+            first_stop_sequence = 2 if force_stop_called else 1
+            stop_failures: list[str] = []
+            successful_stop: tuple[str, int | None, str] | None = None
+            for index, (stop_label, stop_method) in enumerate(stop_attempts):
+                if index:
+                    time.sleep(float(_EMERGENCY_STOP_RETRY_DELAY_SEC))
+                try:
+                    stop_result = self._invoke_pre_sdk_control(
+                        seam_id="rm65.safety.emergency_stop.force_and_arm",
+                        permit_kind="safety_control",
+                        operation="stop",
+                        source="emergency_stop",
+                        sdk_method=stop_label,
+                        attempt_sequence=first_stop_sequence + index,
+                        backend_call=stop_method,
+                    )
+                    stop_code, stop_text = _parse_rm65_result(stop_result)
+                    if stop_code in (0, None):
+                        successful_stop = (stop_label, stop_code, stop_text)
+                        break
+                    stop_failures.append(
+                        f"{stop_label} returned {stop_text}"
+                    )
+                except Exception as exc:  # noqa: BLE001 - try the next stop path.
+                    stop_failures.append(
+                        f"{stop_label} {type(exc).__name__}: {exc}"
+                    )
+
+            if successful_stop is not None:
+                stop_label, stop_code, stop_text = successful_stop
+                with self._state_lock:
+                    self._last_send_result_code = stop_code
+                    self._last_send_result_text = (
+                        f"emergency_stop:{stop_label}:{stop_text}"
+                    )
+                return
+
+            details = stop_failures or ["no stop attempt completed"]
+            if force_stop_error is not None:
+                details.insert(0, force_stop_error)
             with self._state_lock:
-                self._last_send_result_code = stop_code
-                self._last_send_result_text = f"emergency_stop:{stop_label}:{stop_text}"
-            if stop_code not in (0, None):
-                raise RuntimeError(f"{self.name} {stop_label} failed with return code {stop_text}")
+                self._last_send_result_code = None
+                self._last_send_result_text = (
+                    "emergency_stop_failed:" + " | ".join(details)
+                )
+            raise RuntimeError(
+                f"{self.name} emergency stop was not acknowledged after "
+                f"{len(stop_attempts)} stop attempt(s): "
+                + "; ".join(details)
+            )
 
     def close(self) -> None:
         with self._send_lock:

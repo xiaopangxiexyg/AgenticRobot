@@ -29,6 +29,7 @@ from teleop_runtime.collection.schema_v21 import collector_sample_to_row
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.session import SessionStepResult
+from dataset_contracts.stats import EpisodeStatsAccumulator
 
 
 class _FakeArmBackend:
@@ -572,6 +573,120 @@ class TeleopCollectionActionRecordTest(unittest.TestCase):
         self.assertTrue(pose_quality["bad"])
         self.assertIn("collision_distance_below_min", pose_quality["bad_reasons"])
         self.assertLess(pose_quality["score"], 0.5)
+
+    def test_accepted_qref_singularity_is_recorded_as_special_action_pose(self) -> None:
+        command = TeleopCommand(
+            timestamp=4.75,
+            metadata={
+                "ik_candidate_selection": {
+                    "candidate_certificate": {
+                        "schema": "robot_motion.rm65.position_candidate_certificate/v1",
+                        "singular_fallback_claimed": True,
+                        "candidate_selected_singular_fallback_claimed": True,
+                        "final_qref_position_singularity": {
+                            "sides": {
+                                "left": {
+                                    "is_elbow_singular": True,
+                                    "is_wrist_singular": False,
+                                    "is_shoulder_singular": False,
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+        )
+        step = SessionStepResult(
+            timestamp=4.75,
+            state=TeleopRunState.RUNNING,
+            control_hz=30.0,
+            observation=TeleopObservation(timestamp=4.7),
+            command=command,
+        )
+
+        builder = CollectorSampleBuilder()
+        metadata = builder._default_metadata(step, None, {}, {}, {})
+        pose_quality = metadata["pose_quality"]
+        self.assertEqual(pose_quality["status"], "singularity")
+        self.assertEqual(pose_quality["score"], -1.0)
+        self.assertEqual(pose_quality["special_code"], "singularity")
+        self.assertTrue(pose_quality["bad"])
+        self.assertIn("left_elbow_singular", pose_quality["reasons"])
+
+        sample = builder.assembler.build_sample(
+            step_result=step,
+            arm_states={},
+            hand_states={},
+            camera_frames={},
+            index=0,
+            episode_index=0,
+            frame_index=0,
+            metadata=metadata,
+        )
+        row, _ = collector_sample_to_row(sample)
+        self.assertEqual(row["teleop.pose_quality.score"], -1.0)
+        self.assertEqual(row["teleop.pose_quality.status"], "singularity")
+        self.assertEqual(row["teleop.pose_quality.special_code"], "singularity")
+
+    def test_sdk_advisory_without_accepted_singularity_is_not_special_quality(self) -> None:
+        command = TeleopCommand(
+            timestamp=4.8,
+            metadata={
+                "ik_candidate_selection": {
+                    "candidate_certificate": {
+                        "schema": "robot_motion.rm65.position_candidate_certificate/v1",
+                        "singular_fallback_claimed": False,
+                    },
+                    "wrist_singularity_preference": {
+                        "enabled": True,
+                        "fallback_to_singular": False,
+                        "selected": {
+                            "sides": {"left": {"is_wrist_singular": True}}
+                        },
+                    },
+                }
+            },
+        )
+        step = SessionStepResult(
+            timestamp=4.8,
+            state=TeleopRunState.RUNNING,
+            control_hz=30.0,
+            observation=TeleopObservation(timestamp=4.7),
+            command=command,
+        )
+
+        metadata = CollectorSampleBuilder._default_metadata(step, None, {}, {}, {})
+        pose_quality = metadata["pose_quality"]
+        self.assertNotEqual(pose_quality.get("special_code"), "singularity")
+        self.assertNotEqual(pose_quality.get("score"), -1.0)
+
+    def test_pose_quality_special_scores_are_excluded_from_episode_mean(self) -> None:
+        accumulator = EpisodeStatsAccumulator(episode_index=0)
+        accumulator.update(
+            {
+                "timestamp": 0.0,
+                "teleop.pose_quality.status": "singularity",
+                "teleop.pose_quality.special_code": "singularity",
+                "teleop.pose_quality.bad": 1,
+                "teleop.pose_quality.score": -1.0,
+            }
+        )
+        accumulator.update(
+            {
+                "timestamp": 0.1,
+                "teleop.pose_quality.status": "good",
+                "teleop.pose_quality.special_code": None,
+                "teleop.pose_quality.bad": 0,
+                "teleop.pose_quality.score": 0.8,
+            }
+        )
+
+        stats = accumulator.finalize(nominal_fps=30.0)
+        self.assertEqual(stats.pose_quality_special_count, 1)
+        self.assertEqual(stats.pose_quality_singularity_count, 1)
+        self.assertEqual(stats.pose_quality_valid_score_count, 1)
+        self.assertEqual(stats.pose_quality_min_score, 0.8)
+        self.assertEqual(stats.pose_quality_mean_score, 0.8)
 
     def test_debug_sample_metadata_keeps_ik_collision_metadata(self) -> None:
         command = TeleopCommand(

@@ -10,6 +10,10 @@ from __future__ import annotations
 import argparse
 
 from dataset_contracts.pose_frames import load_pose_frame_contract
+from dataset_contracts.v25p_native_storage import (
+    V25P_NATIVE_STORAGE_LAYOUTS_V1,
+    V25P_RECORD_CJSON_LAYOUT_V1,
+)
 
 from robot_motion.position_control import (
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
@@ -19,6 +23,8 @@ from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_LINEAR,
 )
 from robot_motion.rm65 import (
+    IK_STEP_MODE_CHOICES,
+    IK_STEP_MODE_LEGACY_ITERATIVE,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_POSITION_CONTROL_PROFILE_CHOICES,
 )
@@ -413,7 +419,9 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         default=RM65_BIMANUAL_POSITION_V1_NAME,
         help=(
             "Versioned RM65 bimanual position behavior. The formal v1 profile "
-            "applies live-human source shaping plus the 15/60/120 execution chain; "
+            "preserves the stable broad source smoothing; v2_responsive keeps the "
+            "same 15/60/120 hard execution envelope but enables a guarded per-side "
+            "normal-zone fast path and escape-latched q5 hysteresis. "
             "legacy preserves fine-grained historical defaults for rollback/debug. "
             "This option is ignored unless position arm control is selected."
         ),
@@ -1272,6 +1280,30 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--position-ik-step-mode",
+        choices=IK_STEP_MODE_CHOICES,
+        default=IK_STEP_MODE_LEGACY_ITERATIVE,
+        help=(
+            "Position-mode IK time semantics. legacy_iterative preserves the current "
+            "min/max repeated integration. single_step_singularity_aware advances one "
+            "physical IK step per reference tick, enables admitted-qdot acceleration "
+            "state, and suppresses only the RM65 q4-q6 coaxial null motion. Switching "
+            "back to legacy_iterative is the atomic rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-ik-admitted-motion-limit",
+        dest="position_ik_admitted_motion_limit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Position single-step IK only: put the formal qref velocity and "
+            "acceleration interval directly into the Pink QP, anchored to the "
+            "last formally admitted qref/qdot. Disabled by default; "
+            "--no-position-ik-admitted-motion-limit is the atomic rollback."
+        ),
+    )
+    parser.add_argument(
         "--position-ik-solve-min-iterations",
         type=_positive_int,
         default=2,
@@ -1339,6 +1371,27 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
             "singular sides. If none exists, accept the best singular candidate at normal "
             "speed. Use --no-position-prefer-non-wrist-singular-branch to atomically "
             "restore the previous branch ordering and backend hold-entry gate."
+        ),
+    )
+    parser.add_argument(
+        "--position-wrist-branch-switch-guard-deg",
+        type=_non_negative_float,
+        default=12.0,
+        help=(
+            "Position single-step mode only: suppress +/-pi wrist-flip "
+            "candidates while either the previous or raw q5 is within this "
+            "guard band (default 12 deg). Set 0 to restore historical branch "
+            "selection; the final execution step limit remains unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--position-wrist-q5-hysteresis-release-deg",
+        type=_non_negative_float,
+        default=6.0,
+        help=(
+            "Position single-step mode only: keep an already escaped q5 on its "
+            "current side when an inward IK candidate remains inside this release "
+            "band (default 6 deg). Set 0 to disable this singularity-only hysteresis."
         ),
     )
     parser.add_argument(
@@ -1662,6 +1715,25 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--write-parquet", dest="write_parquet", action="store_true")
     parser.add_argument("--no-parquet", dest="write_parquet", action="store_false")
     parser.set_defaults(write_parquet=True)
+    parser.add_argument(
+        "--v25p-native-shadow",
+        action="store_true",
+        help=(
+            "Opt in to provisional embodiment-neutral v2.5-p native dual-write "
+            "and exact v2.3 row parity receipts. Legacy collection remains "
+            "authoritative; no v2.4 commit or long-horizon GUI is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--v25p-native-storage-layout",
+        choices=V25P_NATIVE_STORAGE_LAYOUTS_V1,
+        default=V25P_RECORD_CJSON_LAYOUT_V1,
+        help=(
+            "Physical layout for the explicitly enabled provisional v2.5-p "
+            "shadow. Default record_cjson_v1 preserves the current path; "
+            "parquet_stream_chunks_v1 enables bounded background chunks."
+        ),
+    )
     parser.add_argument(
         "--policy-io-layout",
         type=str,

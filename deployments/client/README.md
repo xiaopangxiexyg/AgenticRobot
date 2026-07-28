@@ -41,8 +41,81 @@ and must not scan bulk sensor payloads.
 Its optional `request_cancel()` only forwards a quick backend session signal;
 acceptance is not worker, transport, or execution drain evidence.
 
+The current `robot_motion.deploy.rtc_protocol` path is a compatibility surface
+that predates the model-RTC ownership split.  New model-space prefix encoding,
+capability negotiation, inference envelopes, and conditioning-receipt
+validation canonically belong in this package.  Shared continuation
+training/artifact schemas remain pure in `dataset_contracts`; online timeline,
+old-plan overlap, and epoch/plan advancement remain in
+`robot_motion.deploy.rtc`.  Migration must preserve existing imports and raw-RTC
+hash/behavior through characterization tests rather than moving the whole
+protocol at once.
+
+The canonical raw/final-chunk use of that v2 surface is
+`continuation=none`. Its model-space prefix modes are frozen legacy
+compatibility only; new conditioned providers use the causal-binding/v3
+surface below and must not offer both choices to an adapter author.
+
+The additive R1 causal request seam is
+`PolicyInferenceRequest.conditioning_binding_hash`. It binds a future
+`robot_motion.deploy.rtc` canonical conditioning bundle without placing a
+model-space ndarray in the causal request. It is mutually exclusive with the frozen legacy
+`PolicyInferencePrefix`; the existing RTC v2 envelope continues to use only
+the legacy form. A deployments-owned v3 envelope must validate the exact
+canonical bundle hash before invoking an injected codec, then bind the encoded
+input and actual model-consumption receipt.
+
+The additive C1 implementation is split across:
+
+- `rtc_conditioning.py`: injected canonical/artifact/external codec,
+  full-horizon mask, round-trip validation, and encoding receipt;
+- `rtc_conditioning_protocol.py`: loaded-instance v3 capability, envelope,
+  shared artifact/capability binding validation, actual-consumption receipt,
+  and response validation;
+- `rtc_conditioned_client.py`: full-horizon response validation followed by
+  exactly-once delay cropping and typed `PolicyChunkResult`.
+
+The conditioned inference bundle has one owner for loaded capability and
+encoded prefix: both live in its envelope. Bundle-level accessors are derived
+properties, so an observer cannot construct a second conflicting copy.
+`selected_prefix_schedule` is a loaded runtime choice; the canonical runtime
+spec/bundle retains `prefix_schedule_semantics` for the schedule selected for
+that request.
+
+Debug observation is explicit and lazy. The client/frontend API defaults to
+`observe_bundle=None`; an application that installs a level-gated callback must
+return before payload construction while debug is off. Neither path builds a
+debug payload, computes masked-output error, aggregates debug counters, or
+retains an extra bundle. When an application has explicitly enabled RTC debug,
+the observer may call
+`rtc_client_inference_bundle_debug_payload()` for either raw-RTC or model-RTC.
+The conditioned projection contains only scalar identities, counts, timings,
+and masked-output error derived from the already validated envelope, response,
+and receipts. It is marked `debug_only`, `non_authoritative`, and
+`action_send_authority=False`.
+
+Providers that normalize or pad inside the server declare `provider_v1`
+transform ownership and receipt both the external prefix and the internal
+array actually passed to the sampler. Client-owned identity transforms require
+equal external/internal dimensions and hashes. Echoing the client hash is
+insufficient. The frozen v2/raw client is unchanged.
+The current prefix mask is float32 in representation but strictly binary in
+value (`0.0` or `1.0`); `weighted_v1` describes sampler behavior, not
+fractional mask entries.
+
+Conditioned providers use the separate
+`RtcConditionedModelRuntimeAdapterV3` surface: artifact-bound continuation
+contract, loaded `RtcModelContinuationCapabilityV3`, representation-context
+builder, and blocking work-item executor.
+`build_rtc_conditioned_model_shadow_frontend_v3()` projects those identities
+directly into the existing coordinator and returns an unstarted default-off
+frontend. Its default re-request coverage comes from the continuation
+contract's maximum forecast delay, so a slower provider still has a committed
+old-plan overlap window; callers may override it explicitly. It intentionally
+does not synthesize a legacy v2 request spec.
+
 `rtc_frontend.py` removes the remaining model-family composition boilerplate.
-A framework adapter structurally provides only:
+For raw/final-chunk RTC, a framework adapter structurally provides only:
 
 1. an instance-derived `rtc_capability`;
 2. the exact `request_spec` it intends to run;
@@ -188,9 +261,12 @@ boundary, rather than creating a second loop here.
 `dexteleop_policy_artifact_v1` embeds the canonical `PolicyIOLayout` and its
 hash. Input/output float32 dimensions and independent int64 token dimensions
 are derived from that layout; a sidecar cannot redefine them independently.
-`deploy_contract_from_policy_artifact()` turns it into a strict
-`dexteleop_deploy_v2` server handshake. Dataset, checkpoint/server metadata and
-runtime must agree on `policy_io_layout_hash`.
+`deploy_contract_from_policy_artifact()` turns it into a protocol-level
+`dexteleop_deploy_v2` server handshake. Model id and checkpoint step are
+provenance, not wire compatibility, so they are omitted by default; callers
+performing an explicit instance audit can request `strict_identity=True`.
+Dataset, server metadata and runtime must still agree on `policy_io_layout_hash`
+and the declared tensor/camera/state protocol.
 
 For a state-dropout-trained model, the artifact additionally declares
 `state_input_mode="masked_normalized_concat_v1"`. Its float input dimension is

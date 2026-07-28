@@ -4,7 +4,12 @@ from dataclasses import replace
 
 import numpy as np
 
-from robot_motion.action import BIMANUAL_EE_POSE_V1, RobotAction
+from robot_motion.action import (
+    BIMANUAL_EE_POSE_V1,
+    RobotAction,
+    build_robot_action_v1_runtime_schema,
+    project_robot_action_v1_to_component_action,
+)
 from robot_motion.action.arbitration_input import capture_arbitration_input
 from robot_motion.action.arbitration_runtime import DecisionScheduleSpec, DecisionScheduler
 from robot_motion.action.authority import AuthorityPolicySpec, AuthorityStore
@@ -54,6 +59,9 @@ def build_runtime(*, proposal_capacity: int = 32):
         action_space=BIMANUAL_EE_POSE_V1,
         components=(ActionComponentSpec("left_arm", "left_arm", "left_arm"),),
     )
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog
+    )
     proposals = ProposalBuffer(
         runtime_session_id="session-0",
         coordinator=coordinator,
@@ -70,10 +78,17 @@ def build_runtime(*, proposal_capacity: int = 32):
         ),
     )
     gate = ExecutionGateStore(runtime_session_id="session-0", coordinator=coordinator)
-    return clock, coordinator, epochs, catalog, proposals, authority, gate
+    return clock, coordinator, epochs, action_schema, proposals, authority, gate
 
 
-def draft(catalog, *, sequence: int, effective_from: float, effective_until: float):
+def draft(action_schema, *, sequence: int, effective_from: float, effective_until: float):
+    action = RobotAction.bimanual_ee_pose(
+        left_arm=np.asarray(
+            [0.3 + 0.01 * sequence, 0.0, 0.4, 0.0, 0.0, 0.0, 1.0],
+            dtype=np.float32,
+        ),
+        source="policy",
+    )
     return ActionProposalDraft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
@@ -82,12 +97,9 @@ def draft(catalog, *, sequence: int, effective_from: float, effective_until: flo
         producer_id="policy-main",
         producer_epoch=1,
         sequence=sequence,
-        action=RobotAction.bimanual_ee_pose(
-            left_arm=np.asarray(
-                [0.3 + 0.01 * sequence, 0.0, 0.4, 0.0, 0.0, 0.0, 1.0],
-                dtype=np.float32,
-            ),
-            source="policy",
+        action=project_robot_action_v1_to_component_action(
+            action,
+            action_schema=action_schema,
         ),
         produced_at=4.0,
         produced_clock_domain_id="policy.clock",
@@ -95,9 +107,6 @@ def draft(catalog, *, sequence: int, effective_from: float, effective_until: flo
         effective_until=effective_until,
         target_effective_at=(effective_from + effective_until) / 2.0,
         effective_clock_domain_id="control.monotonic",
-        component_schema_hash=catalog.semantic_content_hash,
-        component_coverage=("left_arm",),
-        selection_groups=("left_arm",),
     )
 
 
@@ -130,14 +139,14 @@ def test_snapshot_uses_target_interval_and_is_input_order_independent() -> None:
         projection,
         producer_epochs=epoch_snapshot,
         target_effective_at=10.5,
-        component_schema_hash=catalog.semantic_content_hash,
+        action_schema_hash=catalog.semantic_content_hash,
         active_selection_groups=("left_arm",),
     )
     second = build_proposal_snapshot(
         replace(projection, proposals=tuple(reversed(projection.proposals))),
         producer_epochs=epoch_snapshot,
         target_effective_at=10.5,
-        component_schema_hash=catalog.semantic_content_hash,
+        action_schema_hash=catalog.semantic_content_hash,
         active_selection_groups=("left_arm",),
     )
 
@@ -164,7 +173,7 @@ def test_complete_capture_freezes_one_committed_cut() -> None:
         execution_gate_store=gate,
         scheduler=scheduler,
         embodiment_instance_id="rm65-pair-0",
-        component_catalog=catalog,
+        action_schema=catalog,
         active_selection_groups=("left_arm",),
     )
 
@@ -196,7 +205,7 @@ def test_high_rate_proposals_are_causally_reduced_without_promising_one_to_one_s
         project_proposals(proposals, cut),
         producer_epochs=epochs.snapshot(cut),
         target_effective_at=10.5,
-        component_schema_hash=catalog.semantic_content_hash,
+        action_schema_hash=catalog.semantic_content_hash,
         active_selection_groups=("left_arm",),
     )
 

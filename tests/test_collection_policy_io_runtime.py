@@ -14,7 +14,9 @@ from teleop_runtime.collection.sample_assembler import CollectorSample
 from teleop_runtime.collection.schema_v22 import (
     LAST_ACTION_INITIALIZATION_METADATA_KEY,
     STRICT_LAST_ACTION_INITIALIZATION_METADATA,
+    StrictV22SampleRejection,
     collector_sample_to_v22_row,
+    validate_strict_v22_measured_state,
 )
 from teleop_runtime.collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from teleop_runtime.retargeters import (
@@ -252,13 +254,23 @@ def test_strict_v22_rejects_missing_or_stale_measured_gripper_state() -> None:
 
     missing = _strict_bimanual_dmtac_sample()
     missing.hand_states["right"].pop("gripper_measured_scalar")
-    with pytest.raises(ValueError, match="required measured field"):
+    with pytest.raises(StrictV22SampleRejection, match="required measured field"):
         collector_sample_to_v22_row(missing, layout=layout, strict=True)
 
     stale = _strict_bimanual_dmtac_sample()
     stale.hand_states["left"]["joint_timestamp"] = 1.0
-    with pytest.raises(ValueError, match="stale"):
+    with pytest.raises(StrictV22SampleRejection, match="stale") as stale_error:
         collector_sample_to_v22_row(stale, layout=layout, strict=True)
+    assert stale_error.value.side == "left"
+    assert stale_error.value.reason == "stale_measured_state"
+    assert stale_error.value.age_sec == pytest.approx(9.0)
+
+    with pytest.raises(StrictV22SampleRejection, match="stale"):
+        validate_strict_v22_measured_state(
+            stale.hand_states,
+            layout=layout,
+            sample_timestamp=10.0,
+        )
 
     commanded_arm = replace(
         _strict_bimanual_dmtac_sample(),
@@ -266,6 +278,63 @@ def test_strict_v22_rejects_missing_or_stale_measured_gripper_state() -> None:
     )
     with pytest.raises(ValueError, match="causal measured arm feedback"):
         collector_sample_to_v22_row(commanded_arm, layout=layout, strict=True)
+
+
+def test_real_process_recorder_rejects_stale_snapshot_before_worker_admission() -> None:
+    left_backend, left_retargeter = _dmtac_pair("left")
+    right_backend, right_retargeter = _dmtac_pair("right")
+    layout = resolve_collection_policy_io_layout(
+        "auto",
+        active_sides=("left", "right"),
+        hand_backends_by_side={"left": left_backend, "right": right_backend},
+        hand_retargeters_by_side={"left": left_retargeter, "right": right_retargeter},
+    ).layout
+    assert layout is not None
+    stale_snapshot = SimpleNamespace(
+        step_result=SimpleNamespace(timestamp=10.0),
+        hand_states={
+            "left": {
+                "gripper_measured_scalar": 0.2,
+                "joint_timestamp": 9.497,
+            },
+            "right": {
+                "gripper_measured_scalar": 0.8,
+                "joint_timestamp": 9.9,
+            },
+        },
+    )
+    recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+        real_teleop.RealTeleopDatasetRecorder
+    )
+    recorder.active_episode_index = 0
+    recorder._pause_started_at = None
+    recorder.collection_worker_mode = "process"
+    recorder.strict_v22_policy_io = True
+    recorder.policy_io_layout = layout
+    recorder.collector_components = SimpleNamespace()
+    recorder._process_episode_submitted_count = 0
+    recorder._sample_process_rejected_busy = 0
+    recorder._sample_overload_reason = None
+    recorder._sample_modality_reason = None
+    recorder._collection_integrity_reasons = []
+    recorder.sample_builder = SimpleNamespace(
+        include_debug_metadata=False,
+        include_action_debug_metadata=False,
+        last_camera_rejection=None,
+        snapshot_inputs=lambda *_args: stale_snapshot,
+    )
+
+    class _MustNotSubmit:
+        def submit_snapshot(self, *_args, **_kwargs):
+            pytest.fail("stale sample entered the process worker")
+
+    recorder.process_worker = _MustNotSubmit()
+
+    assert recorder.record_step(SimpleNamespace(timestamp=10.0)) is None
+    assert recorder._process_episode_submitted_count == 0
+    assert recorder.collection_overload_reason.startswith(
+        "collection_sample_rejected:stale_measured_state:left:"
+    )
 
 
 def test_explicit_layout_must_match_runtime_pair() -> None:

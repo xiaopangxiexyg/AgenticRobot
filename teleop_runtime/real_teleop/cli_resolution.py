@@ -226,8 +226,18 @@ def parse_real_teleop_args() -> argparse.Namespace:
             "--position-ik-candidate-certification-reserve-ms must be <= "
             "--position-ik-iteration-reserve-ms."
         )
+    if (
+        bool(getattr(args, "position_ik_admitted_motion_limit", False))
+        and str(args.position_ik_step_mode) != "single_step_singularity_aware"
+    ):
+        parser.error(
+            "--position-ik-admitted-motion-limit requires "
+            "--position-ik-step-mode single_step_singularity_aware."
+        )
     if args.arm_control_mode != "position" and (
         args.position_ik_orientation_weight is not None
+        or str(args.position_ik_step_mode) != "legacy_iterative"
+        or bool(getattr(args, "position_ik_admitted_motion_limit", False))
         or int(args.position_ik_solve_max_iterations) != 2
         or int(args.position_ik_solve_min_iterations) != 2
         or float(args.position_ik_damping) != 0.03
@@ -236,16 +246,22 @@ def parse_real_teleop_args() -> argparse.Namespace:
         or float(args.position_ik_candidate_certification_reserve_ms) != 0.0
         or bool(args.position_singularity_candidate_certificate)
         or float(args.position_ik_local_step_clip_scale) != 1.0
+        or float(getattr(args, "position_wrist_branch_switch_guard_deg", 12.0)) != 12.0
+        or float(getattr(args, "position_wrist_q5_hysteresis_release_deg", 6.0)) != 6.0
         or str(args.position_joint_velocity_limit_profile) != "rm65"
         or float(args.position_inactive_enter_threshold_scale) != 1.0
     ):
         parser.error(
-            "--position-ik-orientation-weight, --position-ik-solve-max-iterations, "
+            "--position-ik-orientation-weight, --position-ik-step-mode, "
+            "--position-ik-admitted-motion-limit, "
+            "--position-ik-solve-max-iterations, "
             "--position-ik-solve-min-iterations, --position-ik-damping, "
             "--position-ik-adaptive-iterations, --position-ik-iteration-reserve-ms, "
             "--position-ik-candidate-certification-reserve-ms, "
             "--position-singularity-candidate-certificate, "
-            "--position-ik-local-step-clip-scale, and "
+            "--position-ik-local-step-clip-scale, "
+            "--position-wrist-branch-switch-guard-deg, "
+            "--position-wrist-q5-hysteresis-release-deg, and "
             "--position-joint-velocity-limit-profile, and "
             "--position-inactive-enter-threshold-scale are position-mode options and "
             "cannot alter force/impedance IK."
@@ -506,4 +522,3 @@ def parse_real_teleop_args() -> argparse.Namespace:
     return args
 
 __all__ = ["bind_legacy_support", "parse_real_teleop_args"]
-

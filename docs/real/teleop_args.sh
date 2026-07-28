@@ -12,6 +12,9 @@
 #     "${DATASET_COMMON_ARGS[@]}" \
 #     "${IMPEDANCE_40HZ_ARGS[@]}" \
 #     "${CONTROL_DEBUG_OFF_ARGS[@]}"
+# 本文件会为 LEFT_ARM_IP、RIGHT_ARM_IP、DATASET_BASE 提供默认值；如果要做
+# 参数校验，必须放在 source 本文件之后。bash 和 zsh 都支持下面 README 中的
+# `: "${NAME:=default}"` 写法，不要在 source 之前使用 `${NAME:?message}`。
 
 export LEFT_ARM_IP="${LEFT_ARM_IP:-192.168.101.21}"
 export RIGHT_ARM_IP="${RIGHT_ARM_IP:-192.168.1.20}"
@@ -157,6 +160,12 @@ IMPEDANCE_40HZ_ARGS=(
 POSITION_FORMAL_V1_ARGS=(
   --position-control-profile rm65_bimanual_position_v1
   --arm-control-mode position
+  # Stable position baseline: one physical IK step per 60 Hz reference tick,
+  # q5 escape hysteresis, and the guarded wrist-branch candidate set.  The
+  # three options remain individually reversible on the command line.
+  --position-ik-step-mode single_step_singularity_aware
+  --position-wrist-branch-switch-guard-deg 12.0
+  --position-wrist-q5-hysteresis-release-deg 6.0
   --position-force-guard
   --position-force-guard-source tool
   --position-force-guard-max-force-n 15
@@ -165,6 +174,58 @@ POSITION_FORMAL_V1_ARGS=(
   --position-force-guard-consecutive-samples 1
   --position-force-guard-max-read-errors 3
   --position-force-guard-stale-sec 0.25
+)
+
+# Opt-in responsive successor.  V1 above remains the exact rollback profile.
+# V2 preserves the same IK candidate policy, force guard, qref velocity limits,
+# 15/60/60/120 clocks, and high-rate execution planner.  It only bypasses the
+# broad post-IK EMA for a per-side healthy normal tracking step and requires a
+# real admitted q5 escape before release-band hysteresis may hold that wrist.
+POSITION_FORMAL_V2_RESPONSIVE_ARGS=(
+  --position-control-profile rm65_bimanual_position_v2_responsive
+  --arm-control-mode position
+  --position-ik-step-mode single_step_singularity_aware
+  --position-wrist-branch-switch-guard-deg 12.0
+  --position-wrist-q5-hysteresis-release-deg 6.0
+  --position-force-guard
+  --position-force-guard-source tool
+  --position-force-guard-max-force-n 15
+  --position-force-guard-max-torque-nm 2
+  --position-force-guard-consecutive-samples 1
+  --position-force-guard-max-read-errors 3
+  --position-force-guard-stale-sec 0.25
+)
+
+# Opt-in Pink QP motion-envelope probe. This keeps the stable V1 source,
+# singularity-candidate, collision, force-guard, and downstream 120 Hz command
+# semantics, but moves the existing formal qref velocity/acceleration interval
+# into the 60 Hz IK QP as well. POSITION_FORMAL_V1_ARGS remains unchanged and
+# is the complete rollback; do not combine this array with the V2 collection
+# profile until each profile has been validated independently.
+POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS=(
+  "${POSITION_FORMAL_V1_ARGS[@]}"
+  --position-ik-admitted-motion-limit
+)
+
+# 奇异感知单周期 IK 参数数组（正式 profile 已包含同值）。为保留旧链路回退，
+# 非正式 position profile 可显式展开本数组；新模式每个 60 Hz 外层
+# 周期只推进一次 Pink 物理积分，并使用已正式放行 qref 推导的 qdot 作为
+# 下一周期加速度约束状态；q5 共轴带内保持 q4+q6 不变并抑制 q4-q6
+# 等价角重分配。后置 qpos 平滑也沿上一侧把 q5 推向 3.25° 逃逸边界；
+# q4-q6 只有超过 5° 的 null-direction step 才会获得完整抑制，
+# 小幅操作者输入保持跟手，避免正式 qref 被重新平滑回 SDK 奇异带。
+# 另外在 q5 +/-12° guard band 内不让等价 +/-pi 腕部分支参与候选竞争，
+# 并拒绝局部步长裁剪后跨入该 guard 另一侧的辅助候选，防止两个等价解
+# 来回翻转。q5 已逃离 3.25° 边界后，默认在 +/-6° release band 内保持
+# 上一侧的向内候选，防止 singularity_escape 候选在边界两侧开关；设为 0
+# 可单独回退该回滞，guard 设为 0 可单独回退分支保护。
+# 原子回退方式：
+#   --position-ik-step-mode legacy_iterative
+# 或者不要展开本数组。数据集 action 仍为 accepted qref FK，不变。
+POSITION_SINGULARITY_AWARE_SINGLE_STEP_ARGS=(
+  --position-ik-step-mode single_step_singularity_aware
+  --position-wrist-branch-switch-guard-deg 12.0
+  --position-wrist-q5-hysteresis-release-deg 6.0
 )
 
 # 历史兼容/调试数组。显式 --arm-execution-profile position 会选择 legacy 回退，

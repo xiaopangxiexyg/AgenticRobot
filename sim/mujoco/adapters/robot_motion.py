@@ -61,7 +61,11 @@ def _six_positive(values: Sequence[float], *, name: str) -> tuple[float, ...]:
 
 @dataclass(frozen=True)
 class MujocoPositionExecutionConfig:
-    """Real-aligned 15/60/120 settings with a selectable MuJoCo sender."""
+    """Real-aligned position execution with profile-selected independent clocks.
+
+    The canonical profiles are 15->60->120 and the HIL 60->120 input path;
+    both use the same reference/IK/command implementation below.
+    """
 
     timing: TimingSpec
     active_sides: tuple[str, ...] = _SIDES

@@ -20,14 +20,14 @@ from control_composition.composition import (
     CompositionInputAdmissionReceipt,
     CompositionInputRecord,
     CompositionInputSnapshot,
-    CompositionResult,
+    CompositionEvaluation,
     CompositionSpec,
 )
 from dataset_interface.composition_control_trace import (
     project_composition_input as _project_composition_input,
     project_composition_input_admission as _project_composition_input_admission,
     project_composition_input_snapshot as _project_composition_input_snapshot,
-    project_composition_result as _project_composition_result,
+    project_composition_evaluation as _project_composition_evaluation,
     project_composition_spec as _project_composition_spec,
 )
 from robot_motion.action.arbiter import ArbitrationResult
@@ -515,8 +515,8 @@ def project_composition_input_snapshot(
     )
 
 
-def project_composition_result(
-    result: CompositionResult,
+def project_composition_evaluation(
+    result: CompositionEvaluation,
     *,
     runtime_session_id: str,
     control_domain_id: str,
@@ -524,7 +524,7 @@ def project_composition_result(
     occurred_at: float,
     clock_domain_id: str,
 ) -> ControlTraceFact:
-    return _project_composition_result(
+    return _project_composition_evaluation(
         AuthoritativeTraceContext(
             runtime_session_id=runtime_session_id,
             control_domain_id=control_domain_id,
@@ -798,7 +798,7 @@ def _proposal_snapshot_payload(snapshot: ProposalSnapshot) -> dict[str, Any]:
         "included_admission_sequence_min": snapshot.included_admission_sequence_min,
         "included_admission_sequence_max": snapshot.included_admission_sequence_max,
         "target_effective_at": snapshot.target_effective_at,
-        "component_schema_hash": snapshot.component_schema_hash,
+        "action_schema_hash": snapshot.action_schema_hash,
         "producer_epoch_snapshot_hash": snapshot.producer_epoch_snapshot_hash,
         "reduction_policy_id": snapshot.reduction_policy_id,
         "candidates": tuple(
@@ -922,7 +922,10 @@ def _arbitration_input_payload(snapshot: ArbitrationInputSnapshot) -> dict[str, 
         "previous_authoritative_decision_id": snapshot.previous_authoritative_decision_id,
         "previous_selection_by_group": snapshot.previous_selection_by_group,
         "active_selection_groups": snapshot.active_selection_groups,
-        "component_catalog_hash": snapshot.component_catalog.semantic_content_hash,
+        "action_schema_hash": snapshot.action_schema.semantic_content_hash,
+        "component_catalog_hash": (
+            snapshot.action_schema.component_catalog.semantic_content_hash
+        ),
         "decision_schedule_tick_id": snapshot.decision_schedule_tick.schedule_tick_id,
         "decision_schedule_tick_hash": snapshot.decision_schedule_tick.semantic_content_hash,
         "semantic_content_hash": snapshot.semantic_content_hash,
@@ -946,6 +949,7 @@ def _arbitration_computation_payload(result: ArbitrationResult) -> dict[str, Any
         "decision_cutoff_at": result.decision_cutoff_at,
         "decided_at": result.decided_at,
         "target_effective_at": result.target_effective_at,
+        "target_clock_domain_id": result.target_clock_domain_id,
         "publication_deadline_at": result.publication_deadline_at,
         "authority_epoch": result.authority_epoch,
         "control_mode": result.control_mode,
@@ -955,12 +959,13 @@ def _arbitration_computation_payload(result: ArbitrationResult) -> dict[str, Any
         "selected_by_component": result.selected_by_component,
         "owner_by_component": result.owner_by_component,
         "status_by_group": result.status_by_group,
-        "composed_action": (
+        "composed_candidate": (
             None
-            if result.composed_action is None
-            else robot_action_semantic_payload(result.composed_action)
+            if result.composed_candidate is None
+            else result.composed_candidate.semantic_payload()
         ),
         "selected_action_hash": result.selected_action_hash,
+        "supported_until": result.supported_until,
         "output_status": result.output_status,
         "rejections": tuple(
             {
@@ -1112,6 +1117,12 @@ def project_shadow_step(
                         "composition_input_ids": receipt.proposal.composition_input_ids,
                         "composition_input_hashes": receipt.proposal.composition_input_hashes,
                         "composition_spec_hash": receipt.proposal.composition_spec_hash,
+                        "composition_evaluation_id": (
+                            receipt.proposal.composition_evaluation_id
+                        ),
+                        "composition_evaluation_hash": (
+                            receipt.proposal.composition_evaluation_hash
+                        ),
                         "proposal_semantic_hash_domain": (
                             receipt.proposal.semantic_hash_domain
                         ),
@@ -1280,9 +1291,7 @@ def project_shadow_step(
                     "would_select_action": (
                         None
                         if evaluation.would_select_action is None
-                        else robot_action_semantic_payload(
-                            evaluation.would_select_action
-                        )
+                        else evaluation.would_select_action.semantic_payload()
                     ),
                     "would_select_action_hash": evaluation.would_select_action_hash,
                     "would_select_by_group": evaluation.would_select_by_group,
@@ -1400,7 +1409,7 @@ __all__ = [
     "project_composition_input",
     "project_composition_input_admission",
     "project_composition_input_snapshot",
-    "project_composition_result",
+    "project_composition_evaluation",
     "project_composition_spec",
     "project_candidate_binding_eligibility",
     "project_legacy_replay_contract_derivation",

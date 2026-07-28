@@ -50,6 +50,13 @@ from robot_motion.runtime.producer_epoch import (
 from robot_motion.position_control.capability import ExecutionCapabilityProfile
 
 from .arbiter import ActionArbiter, ArbitrationResult
+from .adaptation import (
+    ActionAdaptationResult,
+    ActionRepresentationAdapter,
+    RobotActionV1RepresentationAdapter,
+    build_action_adaptation_request,
+    require_robot_action_v1,
+)
 from .arbitration_input import ArbitrationInputSnapshot, capture_arbitration_input
 from .arbitration_runtime import (
     ArbitrationPublicationAttempt,
@@ -62,6 +69,8 @@ from .authority import AuthorityEvent, AuthorityEventDraft, AuthorityPolicySpec,
 from .authoritative_trace import (
     AuthoritativeTraceContext,
     project_arbitration_computation,
+    project_action_adaptation,
+    project_action_adaptation_request,
     project_arbitration_input,
     project_authority_event,
     project_candidate_authorization_admission,
@@ -82,14 +91,27 @@ from .authoritative_trace import (
     project_publication,
     project_replay_execution_authorization,
     project_shared_safety_result,
+    project_target_execution_completion,
+    project_target_execution_request,
+    project_target_execution_submission,
 )
-from .components import ActionComponentCatalog
+from .component_action import ComponentAction, ComponentActionSchema
 from .compound_authority import ConservativeCompoundAuthorityProfile
 from .dispatch_context import (
     AuthoritativeCommandDispatchContext,
+    AuthoritativeTargetDispatchContext,
     AuthoritativeReceiverStateSnapshot,
     build_authoritative_receiver_state_snapshot,
     build_authoritative_command_dispatch_context,
+    build_authoritative_target_dispatch_context,
+)
+from .execution_handoff import (
+    TargetExecutionCompletionReceipt,
+    TargetExecutionDispatchResult,
+    TargetExecutionPort,
+    TargetExecutionRequest,
+    TargetExecutionSubmissionReceipt,
+    build_target_execution_completion_receipt,
 )
 from .candidate_authorization import (
     CandidateAuthorizationAdmissionReceipt,
@@ -107,13 +129,17 @@ from .persistence import (
 from .proposal import ActionProposalDraft, ProposalAdmissionReceipt, ProposalBuffer
 from .safety import SharedCanonicalSafetyResult
 from .schema import RobotAction
+from .target_capability import ComponentTargetCapabilitySpec
 
 
 TraceSink = Callable[[ControlTraceFact], None]
 CommandDispatcher = Callable[[TeleopCommand], Mapping[str, CommandDispatchReceipt]]
 ContextualCommandDispatcher = Callable[
-    [TeleopCommand, AuthoritativeCommandDispatchContext],
-    Mapping[str, CommandDispatchReceipt],
+    [
+        TeleopCommand,
+        AuthoritativeCommandDispatchContext | AuthoritativeTargetDispatchContext,
+    ],
+    Mapping[str, CommandDispatchReceipt] | TargetExecutionDispatchResult,
 ]
 SharedSafety = Callable[[RobotAction, str], SharedCanonicalSafetyResult]
 BackendHold = Callable[[ExecutionCancellation], Mapping[str, bool]]
@@ -126,12 +152,13 @@ class AuthoritativeControlConfig:
     embodiment_instance_id: str
     owner_runtime_id: str
     clock_domain: ClockDomainDescriptor
-    component_catalog: ActionComponentCatalog
+    action_schema: ComponentActionSchema
     active_selection_groups: tuple[str, ...]
     authority_policy: AuthorityPolicySpec
     decision_schedule: DecisionScheduleSpec
     persistence_policy: ActionPersistencePolicy
     execution_capability: ExecutionCapabilityProfile
+    component_target_capability: ComponentTargetCapabilitySpec
     proposal_capacity: int = 4096
     candidate_authorization_capacity: int = 4096
     target_runtime_contract_hash: str | None = None
@@ -156,7 +183,9 @@ class AuthoritativeControlConfig:
         if self.clock_domain.runtime_session_id != self.runtime_session_id:
             raise ValueError("Control clock and runtime session must match.")
         groups = tuple(dict.fromkeys(str(value) for value in self.active_selection_groups))
-        if not groups or not set(groups).issubset(self.component_catalog.selection_group_ids):
+        if not groups or not set(groups).issubset(
+            self.action_schema.component_catalog.selection_group_ids
+        ):
             raise ValueError("active_selection_groups must be a non-empty catalog subset.")
         object.__setattr__(self, "active_selection_groups", groups)
         if int(self.proposal_capacity) <= 0:
@@ -168,6 +197,21 @@ class AuthoritativeControlConfig:
         ):
             raise ValueError(
                 "Decision schedule exceeds the configured execution capability."
+            )
+        if not isinstance(
+            self.component_target_capability,
+            ComponentTargetCapabilitySpec,
+        ):
+            raise TypeError(
+                "component_target_capability must be a "
+                "ComponentTargetCapabilitySpec."
+            )
+        if (
+            self.component_target_capability.action_schema_hash
+            != self.action_schema.semantic_content_hash
+        ):
+            raise ValueError(
+                "Component target capability binds another action schema."
             )
         if not set(groups).issubset(
             self.execution_capability.validated_selection_groups
@@ -201,7 +245,7 @@ class AuthoritativeControlConfig:
             )
         for profile in profiles:
             profile.validate_runtime_binding(
-                component_catalog=self.component_catalog,
+                component_catalog=self.action_schema.component_catalog,
                 active_selection_groups=groups,
                 authority_policy=self.authority_policy,
             )
@@ -216,9 +260,18 @@ class AuthoritativeControlStep:
     publication_attempt: ArbitrationPublicationAttempt | None = None
     decision: AuthoritativeArbitrationDecision | None = None
     directive: ExecutionDirective | None = None
+    action_adaptation: ActionAdaptationResult | None = None
+    target_execution_request: TargetExecutionRequest | None = None
+    target_submission_receipt: TargetExecutionSubmissionReceipt | None = None
+    target_completion_receipt: TargetExecutionCompletionReceipt | None = None
+    target_dispatch_result: TargetExecutionDispatchResult | None = None
     safety_result: SharedCanonicalSafetyResult | None = None
     command: TeleopCommand | None = None
-    dispatch_context: AuthoritativeCommandDispatchContext | None = None
+    dispatch_context: (
+        AuthoritativeCommandDispatchContext
+        | AuthoritativeTargetDispatchContext
+        | None
+    ) = None
     dispatch_validation: DispatchPermitValidationReceipt | None = None
     dispatch_receipts: Mapping[str, CommandDispatchReceipt] | None = None
     command_id: str | None = None
@@ -280,6 +333,8 @@ class AuthoritativeControlRuntime:
         backend_name: str,
         resolver: RobotActionResolver | None = None,
         shared_safety: SharedSafety | None = None,
+        action_representation_adapter: ActionRepresentationAdapter | None = None,
+        target_execution_port: TargetExecutionPort | None = None,
         trace_sink: TraceSink | None = None,
         contextual_dispatcher: ContextualCommandDispatcher | None = None,
         dispatch_owners: DispatchOwnerRegistry | None = None,
@@ -298,6 +353,51 @@ class AuthoritativeControlRuntime:
         self.backend_name = str(backend_name)
         self.resolver = resolver or RobotActionResolver()
         self.shared_safety = shared_safety or self._identity_safety
+        self.action_representation_adapter = (
+            action_representation_adapter
+            or RobotActionV1RepresentationAdapter(
+                receiver_id=(
+                    f"{config.owner_runtime_id}:robot-action-v1-adapter"
+                ),
+                component_target_capability=(
+                    config.component_target_capability
+                ),
+                output_source="action_arbiter",
+                clock=clock,
+            )
+        )
+        self.target_execution_port = target_execution_port
+        adapter_capability = (
+            self.action_representation_adapter.component_target_capability
+        )
+        if (
+            adapter_capability.capability_id
+            != config.component_target_capability.capability_id
+            or adapter_capability.semantic_content_hash
+            != config.component_target_capability.semantic_content_hash
+        ):
+            raise ValueError(
+                "Action representation adapter binds another target capability."
+            )
+        if target_execution_port is not None:
+            target_capability = target_execution_port.component_target_capability
+            if (
+                target_capability.capability_id
+                != config.component_target_capability.capability_id
+                or target_capability.semantic_content_hash
+                != config.component_target_capability.semantic_content_hash
+            ):
+                raise ValueError(
+                    "Target execution port binds another target capability."
+                )
+            if str(target_execution_port.activation_mode) not in {
+                "required",
+                "omitted",
+            }:
+                raise ValueError(
+                    "Target execution port activation_mode must be required or "
+                    "omitted."
+                )
         self.trace_sink = trace_sink
         self.clock = clock
         self.trace_context = AuthoritativeTraceContext(
@@ -399,7 +499,9 @@ class AuthoritativeControlRuntime:
         self._next_execution_gate_sequence = 0
         self._previous_decision_id: str | None = None
         self._previous_selection_by_group: dict[str, str] = {}
+        self._trace_fact_lock = threading.RLock()
         self._facts: list[ControlTraceFact] = []
+        self._fact_hash_by_id: dict[str, str] = {}
         self._terminal = False
         self._compound_authority_profile_by_producer = {
             profile.producer_id: profile
@@ -485,7 +587,8 @@ class AuthoritativeControlRuntime:
 
     @property
     def trace_facts(self) -> tuple[ControlTraceFact, ...]:
-        return tuple(self._facts)
+        with self._trace_fact_lock:
+            return tuple(self._facts)
 
     @property
     def execution_epoch(self) -> int:
@@ -599,10 +702,14 @@ class AuthoritativeControlRuntime:
             return MappingProxyType(dict(sorted(pending_by_group.items())))
 
     def _emit(self, facts: tuple[ControlTraceFact, ...] | list[ControlTraceFact]) -> None:
-        for fact in facts:
-            self._facts.append(fact)
-            if self.trace_sink is not None:
-                self.trace_sink(fact)
+        with self._trace_fact_lock:
+            for fact in facts:
+                self._facts.append(fact)
+                self._fact_hash_by_id[fact.fact_id] = (
+                    fact.semantic_content_hash
+                )
+                if self.trace_sink is not None:
+                    self.trace_sink(fact)
 
     def activate_producer(
         self,
@@ -655,18 +762,34 @@ class AuthoritativeControlRuntime:
         This is the authoritative runtime seam used by application-level
         handoff compositions.  It carries no action and grants no dispatch
         permit by itself; the next immutable arbitration cut consumes it.
+
+        Authority may change only while the execution receiver is already
+        fenced by a lower-owned HOLD/FAULT/TRANSITIONING state with completed
+        backend acknowledgement.  Callers must establish that fence through
+        :meth:`transition_execution_gate`; this method never inserts an
+        implicit cancellation or backend operation.
         """
 
         with self._authority_admission_lock:
+            event_time = float(self.clock() if produced_at is None else produced_at)
+            gate = self.capture_execution_gate_snapshot(now=event_time)
+            if gate.status not in {"hold", "fault", "transitioning"}:
+                raise RuntimeError(
+                    "Authority transition requires an execution fence in "
+                    "HOLD/FAULT/TRANSITIONING."
+                )
+            if not self._backend_hold_active:
+                raise RuntimeError(
+                    "Authority transition requires completed backend HOLD "
+                    "acknowledgement."
+                )
             event = self.authority_store.admit(
                 AuthorityEventDraft(
                     runtime_session_id=self.config.runtime_session_id,
                     control_domain_id=self.config.control_domain_id,
                     sequence=self._next_authority_sequence,
                     event_type=event_type,
-                    produced_at=float(
-                        self.clock() if produced_at is None else produced_at
-                    ),
+                    produced_at=event_time,
                     produced_clock_domain_id=(
                         self.config.clock_domain.clock_domain_id
                     ),
@@ -798,23 +921,37 @@ class AuthoritativeControlRuntime:
     ) -> None:
         """Attach already-projected pure source facts to this runtime trace."""
 
-        existing = {fact.fact_id: fact.semantic_content_hash for fact in self._facts}
-        admitted: list[ControlTraceFact] = []
-        for fact in facts:
-            if (
-                fact.runtime_session_id != self.config.runtime_session_id
-                or fact.control_domain_id != self.config.control_domain_id
-                or fact.embodiment_instance_id != self.config.embodiment_instance_id
-            ):
-                raise ValueError("External trace fact belongs to another runtime target.")
-            previous_hash = existing.get(fact.fact_id)
-            if previous_hash is not None:
-                if previous_hash != fact.semantic_content_hash:
-                    raise ValueError("External trace fact ID was reused with new content.")
-                continue
-            existing[fact.fact_id] = fact.semantic_content_hash
-            admitted.append(fact)
-        self._emit(admitted)
+        with self._trace_fact_lock:
+            admitted: list[ControlTraceFact] = []
+            pending_hash_by_id: dict[str, str] = {}
+            for fact in facts:
+                if (
+                    fact.runtime_session_id
+                    != self.config.runtime_session_id
+                    or fact.control_domain_id
+                    != self.config.control_domain_id
+                    or fact.embodiment_instance_id
+                    != self.config.embodiment_instance_id
+                ):
+                    raise ValueError(
+                        "External trace fact belongs to another runtime target."
+                    )
+                previous_hash = self._fact_hash_by_id.get(
+                    fact.fact_id,
+                    pending_hash_by_id.get(fact.fact_id),
+                )
+                if previous_hash is not None:
+                    if previous_hash != fact.semantic_content_hash:
+                        raise ValueError(
+                            "External trace fact ID was reused with new "
+                            "content."
+                    )
+                    continue
+                admitted.append(fact)
+                pending_hash_by_id[fact.fact_id] = (
+                    fact.semantic_content_hash
+                )
+            self._emit(admitted)
 
     def record_compound_authority_profiles(self) -> tuple[ControlTraceFact, ...]:
         """Record configured profile identities once before authoritative use."""
@@ -848,7 +985,7 @@ class AuthoritativeControlRuntime:
             if compound_profile is None
             else compound_profile.validate_proposal_draft(
                 draft,
-                component_catalog=self.config.component_catalog,
+                component_catalog=self.config.action_schema.component_catalog,
             )
         )
         if compound_rejection is None:
@@ -1138,7 +1275,7 @@ class AuthoritativeControlRuntime:
             execution_gate_store=self.execution_gate_store,
             scheduler=self.scheduler,
             embodiment_instance_id=self.config.embodiment_instance_id,
-            component_catalog=self.config.component_catalog,
+            action_schema=self.config.action_schema,
             active_selection_groups=self.config.active_selection_groups,
             previous_authoritative_decision_id=self._previous_decision_id,
             previous_selection_by_group=self._previous_selection_by_group,
@@ -1187,6 +1324,111 @@ class AuthoritativeControlRuntime:
             raise RuntimeError(
                 "A rejected selected result requires an explicit publication fallback."
             )
+        compound_profile = (
+            None
+            if decision is None
+            else self._compound_profile_for_decision(decision)
+        )
+        action_adaptation: ActionAdaptationResult | None = None
+        if decision is not None:
+            adaptation_requested_at = float(self.clock())
+            adaptation_request = build_action_adaptation_request(
+                authoritative_decision_id=decision.decision_id,
+                authoritative_decision_hash=decision.semantic_content_hash,
+                arbitration_result_id=computation.result_id,
+                candidate_action=decision.selected_action,
+                component_target_capability=(
+                    self.config.component_target_capability
+                ),
+                target_effective_at=decision.target_effective_at,
+                supported_until=decision.supported_until,
+                authority_sequence=decision.authority_epoch,
+                execution_gate_sequence=decision.gate_epoch,
+                execution_fence_sequence=self.execution_epoch,
+                requested_at=adaptation_requested_at,
+                clock_domain_id=decision.target_clock_domain_id,
+            )
+            step_facts.append(
+                project_action_adaptation_request(
+                    self.trace_context,
+                    adaptation_request,
+                )
+            )
+            try:
+                action_adaptation = (
+                    self.action_representation_adapter.adapt(
+                        adaptation_request
+                    )
+                )
+            except Exception:
+                if compound_profile is None:
+                    raise
+                failure_fact = self._compound_failure_fact(
+                    compound_profile,
+                    stage="representation_adaptation_exception",
+                    source_event_ids=(
+                        computation.result_id,
+                        publication_attempt.publication_attempt_id,
+                        adaptation_request.request_id,
+                    ),
+                )
+                step_facts.append(failure_fact)
+                (
+                    cancellation,
+                    cancellation_receipt,
+                    cancellation_validation,
+                    cancellation_facts,
+                ) = self._cancel_execution(
+                    reason="hold",
+                    authority_epoch=decision.authority_epoch,
+                    selection_group_ids=self.config.active_selection_groups,
+                    source_event_ids=(
+                        computation.result_id,
+                        publication_attempt.publication_attempt_id,
+                        adaptation_request.request_id,
+                        failure_fact.fact_id,
+                    ),
+                    force_domain_scope=True,
+                )
+                step_facts.extend(cancellation_facts)
+                self._emit(step_facts)
+                return AuthoritativeControlStep(
+                    status="compound_adaptation_exception_hold",
+                    snapshot=snapshot,
+                    computation=computation,
+                    publication_attempt=publication_attempt,
+                    decision=decision,
+                    cancellation=cancellation,
+                    cancellation_receipt=cancellation_receipt,
+                    cancellation_dispatch_validation=(
+                        cancellation_validation
+                    ),
+                    trace_facts=tuple(step_facts),
+                )
+            if (
+                action_adaptation.request.request_id
+                != adaptation_request.request_id
+                or action_adaptation.request.semantic_content_hash
+                != adaptation_request.semantic_content_hash
+            ):
+                raise ValueError(
+                    "Action representation adapter returned another request."
+                )
+            step_facts.extend(
+                project_action_adaptation(
+                    self.trace_context,
+                    action_adaptation,
+                )
+            )
+        action_adaptation_fallback = (
+            None
+            if action_adaptation is None
+            or action_adaptation.receipt.accepted
+            else "hold"
+            if compound_profile is not None
+            else "no_action"
+        )
+        directive_at = float(self.clock())
         directive = build_execution_directive(
             computation,
             active_execution=ActiveExecutionSnapshot(
@@ -1197,13 +1439,24 @@ class AuthoritativeControlRuntime:
                 fault_latched=self.execution_epochs.snapshot().fault_latched,
             ),
             policy=self.config.persistence_policy,
-            now=attempted_at,
+            now=directive_at,
             supports_local_group_stop=(
                 self.config.execution_capability.supports_local_group_stop
             ),
             publication_fallback=(
                 None if decision is not None else publication_attempt.required_fallback
             ),
+            action_adaptation_receipt_id=(
+                None
+                if action_adaptation is None
+                else action_adaptation.receipt.receipt_id
+            ),
+            action_adaptation_receipt_hash=(
+                None
+                if action_adaptation is None
+                else action_adaptation.receipt.semantic_content_hash
+            ),
+            action_adaptation_fallback=action_adaptation_fallback,
         )
         step_facts.append(
             project_execution_directive(
@@ -1212,14 +1465,22 @@ class AuthoritativeControlRuntime:
                 decision_id=None if decision is None else decision.decision_id,
                 publication_attempt_id=publication_attempt.publication_attempt_id,
                 execution_epoch=self.execution_epoch,
-                occurred_at=attempted_at,
+                occurred_at=directive_at,
             )
         )
         needs_cancellation = any(
             item.directive == "cancel_group_and_hold"
             for item in directive.directive_by_selection_group.values()
         )
-        if decision is None or directive.global_status != "normal":
+        adaptation_rejected = (
+            action_adaptation is not None
+            and not action_adaptation.receipt.accepted
+        )
+        if (
+            decision is None
+            or adaptation_rejected
+            or directive.global_status != "normal"
+        ):
             cancellation = None
             cancellation_receipt = None
             cancellation_validation = None
@@ -1243,6 +1504,13 @@ class AuthoritativeControlRuntime:
                     source_event_ids=(
                         computation.result_id,
                         publication_attempt.publication_attempt_id,
+                        *(
+                            ()
+                            if action_adaptation is None
+                            else (
+                                action_adaptation.receipt.receipt_id,
+                            )
+                        ),
                         directive.directive_id,
                     ),
                 )
@@ -1260,6 +1528,8 @@ class AuthoritativeControlRuntime:
                 for item in directive.directive_by_selection_group.values()
             ):
                 status = "execution_hold_active"
+            elif adaptation_rejected:
+                status = "action_adaptation_rejected_keep_existing"
             else:
                 status = "execution_kept_existing"
             self._emit(step_facts)
@@ -1270,27 +1540,169 @@ class AuthoritativeControlRuntime:
                 publication_attempt=publication_attempt,
                 decision=decision,
                 directive=directive,
+                action_adaptation=action_adaptation,
                 cancellation=cancellation,
                 cancellation_receipt=cancellation_receipt,
                 cancellation_dispatch_validation=cancellation_validation,
                 trace_facts=tuple(step_facts),
             )
 
-        compound_profile = self._compound_profile_for_decision(decision)
+        if action_adaptation is None or (
+            action_adaptation.adapted_candidate is None
+        ):
+            raise RuntimeError(
+                "Normal execution requires an adapted action candidate."
+            )
+        adapted_candidate = action_adaptation.adapted_candidate
+        target_execution_request = None
+        target_submission_receipt = None
+        if self.target_execution_port is not None:
+            submitted_at = max(
+                float(self.clock()),
+                float(action_adaptation.receipt.processing_completed_at),
+            )
+            target_execution_request = TargetExecutionRequest(
+                control_domain_id=self.config.control_domain_id,
+                target_handler_id=(
+                    self.target_execution_port.target_handler_id
+                ),
+                adaptation_result=action_adaptation,
+                submitted_at=submitted_at,
+                clock_domain_id=self.config.clock_domain.clock_domain_id,
+            )
+            step_facts.append(
+                project_target_execution_request(
+                    self.trace_context,
+                    target_execution_request,
+                )
+            )
+            target_submission_receipt = self.target_execution_port.submit(
+                target_execution_request
+            )
+            if (
+                target_submission_receipt.target_execution_request_id
+                != target_execution_request.request_id
+                or target_submission_receipt.target_execution_request_hash
+                != target_execution_request.semantic_content_hash
+                or target_submission_receipt.target_handler_id
+                != target_execution_request.target_handler_id
+                or target_submission_receipt.control_domain_id
+                != target_execution_request.control_domain_id
+            ):
+                raise ValueError(
+                    "Target execution port returned another request receipt."
+                )
+            step_facts.append(
+                project_target_execution_submission(
+                    self.trace_context,
+                    target_submission_receipt,
+                )
+            )
+            if not target_submission_receipt.accepted_for_processing:
+                cancellation = None
+                cancellation_receipt = None
+                cancellation_validation = None
+                if compound_profile is not None:
+                    (
+                        cancellation,
+                        cancellation_receipt,
+                        cancellation_validation,
+                        cancellation_facts,
+                    ) = self._cancel_execution(
+                        reason="hold",
+                        authority_epoch=decision.authority_epoch,
+                        selection_group_ids=self.config.active_selection_groups,
+                        source_event_ids=(
+                            computation.result_id,
+                            publication_attempt.publication_attempt_id,
+                            directive.directive_id,
+                            target_execution_request.request_id,
+                            target_submission_receipt.receipt_id,
+                        ),
+                        force_domain_scope=True,
+                    )
+                    step_facts.extend(cancellation_facts)
+                self._emit(step_facts)
+                return AuthoritativeControlStep(
+                    status=(
+                        "compound_target_submission_rejected_hold"
+                        if cancellation is not None
+                        else "target_submission_rejected_keep_existing"
+                    ),
+                    snapshot=snapshot,
+                    computation=computation,
+                    publication_attempt=publication_attempt,
+                    decision=decision,
+                    directive=directive,
+                    action_adaptation=action_adaptation,
+                    target_execution_request=target_execution_request,
+                    target_submission_receipt=target_submission_receipt,
+                    cancellation=cancellation,
+                    cancellation_receipt=cancellation_receipt,
+                    cancellation_dispatch_validation=(
+                        cancellation_validation
+                    ),
+                    trace_facts=tuple(step_facts),
+                )
+        target_action = require_robot_action_v1(adapted_candidate)
         try:
             safety_result = self.shared_safety(
-                decision.selected_action,
-                decision.decision_id,
+                target_action,
+                adapted_candidate.adapted_candidate_id,
             )
         except Exception:
-            if compound_profile is None:
+            if (
+                compound_profile is None
+                and target_execution_request is None
+            ):
                 raise
+            target_completion_receipt = None
+            if (
+                target_execution_request is not None
+                and target_submission_receipt is not None
+            ):
+                completed_at = max(
+                    float(self.clock()),
+                    target_submission_receipt.received_at,
+                )
+                target_completion_receipt = (
+                    build_target_execution_completion_receipt(
+                        target_execution_request,
+                        target_submission_receipt,
+                        status="failed",
+                        completed_at=completed_at,
+                        available_at=completed_at,
+                        outcome_code="target_private_safety_exception",
+                    )
+                )
+                step_facts.append(
+                    project_target_execution_completion(
+                        self.trace_context,
+                        target_completion_receipt,
+                    )
+                )
+            if compound_profile is None:
+                self._emit(step_facts)
+                return AuthoritativeControlStep(
+                    status="target_safety_failed_keep_existing",
+                    snapshot=snapshot,
+                    computation=computation,
+                    publication_attempt=publication_attempt,
+                    decision=decision,
+                    directive=directive,
+                    action_adaptation=action_adaptation,
+                    target_execution_request=target_execution_request,
+                    target_submission_receipt=target_submission_receipt,
+                    target_completion_receipt=target_completion_receipt,
+                    trace_facts=tuple(step_facts),
+                )
             failure_fact = self._compound_failure_fact(
                 compound_profile,
                 stage="shared_safety_exception",
                 source_event_ids=(
                     computation.result_id,
                     publication_attempt.publication_attempt_id,
+                    action_adaptation.receipt.receipt_id,
                     directive.directive_id,
                 ),
             )
@@ -1307,6 +1719,7 @@ class AuthoritativeControlRuntime:
                 source_event_ids=(
                     computation.result_id,
                     publication_attempt.publication_attempt_id,
+                    action_adaptation.receipt.receipt_id,
                     directive.directive_id,
                     failure_fact.fact_id,
                 ),
@@ -1321,23 +1734,63 @@ class AuthoritativeControlRuntime:
                 publication_attempt=publication_attempt,
                 decision=decision,
                 directive=directive,
+                action_adaptation=action_adaptation,
+                target_execution_request=target_execution_request,
+                target_submission_receipt=target_submission_receipt,
+                target_completion_receipt=target_completion_receipt,
                 cancellation=cancellation,
                 cancellation_receipt=cancellation_receipt,
                 cancellation_dispatch_validation=cancellation_validation,
                 trace_facts=tuple(step_facts),
             )
-        if safety_result.input_action_id != decision.decision_id:
-            raise ValueError("Shared safety result does not reference this decision action.")
+        if (
+            safety_result.input_action_id
+            != adapted_candidate.adapted_candidate_id
+        ):
+            raise ValueError(
+                "Shared safety result does not reference the adapted candidate."
+            )
         safety_id, safety_fact = project_shared_safety_result(
             self.trace_context,
             safety_result,
             decision_id=decision.decision_id,
             directive_id=directive.directive_id,
-            input_action_hash=str(computation.selected_action_hash),
+            input_action_hash=adapted_candidate.semantic_content_hash,
             occurred_at=float(self.clock()),
         )
         step_facts.append(safety_fact)
         if safety_result.safe_action is None or safety_result.status in {"hold", "fault"}:
+            target_completion_receipt = None
+            if (
+                target_execution_request is not None
+                and target_submission_receipt is not None
+            ):
+                completed_at = max(
+                    float(self.clock()),
+                    target_submission_receipt.received_at,
+                )
+                target_completion_receipt = (
+                    build_target_execution_completion_receipt(
+                        target_execution_request,
+                        target_submission_receipt,
+                        status=(
+                            "failed"
+                            if safety_result.status == "fault"
+                            else "rejected"
+                        ),
+                        completed_at=completed_at,
+                        available_at=completed_at,
+                        outcome_code=(
+                            f"target_private_safety_{safety_result.status}"
+                        ),
+                    )
+                )
+                step_facts.append(
+                    project_target_execution_completion(
+                        self.trace_context,
+                        target_completion_receipt,
+                    )
+                )
             cancellation = None
             cancellation_receipt = None
             cancellation_validation = None
@@ -1381,6 +1834,10 @@ class AuthoritativeControlRuntime:
                 publication_attempt=publication_attempt,
                 decision=decision,
                 directive=directive,
+                action_adaptation=action_adaptation,
+                target_execution_request=target_execution_request,
+                target_submission_receipt=target_submission_receipt,
+                target_completion_receipt=target_completion_receipt,
                 safety_result=safety_result,
                 cancellation=cancellation,
                 cancellation_receipt=cancellation_receipt,
@@ -1390,13 +1847,40 @@ class AuthoritativeControlRuntime:
 
         if compound_profile is not None:
             expected_effectors = tuple(
-                component.effector_name
-                for component in self.config.component_catalog.components
+                component.component_id
+                for component in (
+                    self.config.action_schema.component_catalog.components
+                )
             )
             if (
                 tuple(safety_result.safe_action.active_effectors)
                 != expected_effectors
             ):
+                target_completion_receipt = None
+                if (
+                    target_execution_request is not None
+                    and target_submission_receipt is not None
+                ):
+                    completed_at = max(
+                        float(self.clock()),
+                        target_submission_receipt.received_at,
+                    )
+                    target_completion_receipt = (
+                        build_target_execution_completion_receipt(
+                            target_execution_request,
+                            target_submission_receipt,
+                            status="rejected",
+                            completed_at=completed_at,
+                            available_at=completed_at,
+                            outcome_code="target_component_scope_mismatch",
+                        )
+                    )
+                    step_facts.append(
+                        project_target_execution_completion(
+                            self.trace_context,
+                            target_completion_receipt,
+                        )
+                    )
                 failure_fact = self._compound_failure_fact(
                     compound_profile,
                     stage="safe_action_scope_mismatch",
@@ -1434,6 +1918,10 @@ class AuthoritativeControlRuntime:
                     publication_attempt=publication_attempt,
                     decision=decision,
                     directive=directive,
+                    action_adaptation=action_adaptation,
+                    target_execution_request=target_execution_request,
+                    target_submission_receipt=target_submission_receipt,
+                    target_completion_receipt=target_completion_receipt,
                     safety_result=safety_result,
                     cancellation=cancellation,
                     cancellation_receipt=cancellation_receipt,
@@ -1443,8 +1931,52 @@ class AuthoritativeControlRuntime:
         try:
             command = self.resolver.resolve(safety_result.safe_action)
         except Exception:
-            if compound_profile is None:
+            if (
+                compound_profile is None
+                and target_execution_request is None
+            ):
                 raise
+            target_completion_receipt = None
+            if (
+                target_execution_request is not None
+                and target_submission_receipt is not None
+            ):
+                completed_at = max(
+                    float(self.clock()),
+                    target_submission_receipt.received_at,
+                )
+                target_completion_receipt = (
+                    build_target_execution_completion_receipt(
+                        target_execution_request,
+                        target_submission_receipt,
+                        status="failed",
+                        completed_at=completed_at,
+                        available_at=completed_at,
+                        outcome_code="target_private_resolution_failure",
+                    )
+                )
+                step_facts.append(
+                    project_target_execution_completion(
+                        self.trace_context,
+                        target_completion_receipt,
+                    )
+                )
+            if compound_profile is None:
+                self._emit(step_facts)
+                return AuthoritativeControlStep(
+                    status="target_resolution_failed_keep_existing",
+                    snapshot=snapshot,
+                    computation=computation,
+                    publication_attempt=publication_attempt,
+                    decision=decision,
+                    directive=directive,
+                    action_adaptation=action_adaptation,
+                    target_execution_request=target_execution_request,
+                    target_submission_receipt=target_submission_receipt,
+                    target_completion_receipt=target_completion_receipt,
+                    safety_result=safety_result,
+                    trace_facts=tuple(step_facts),
+                )
             failure_fact = self._compound_failure_fact(
                 compound_profile,
                 stage="resolution_failure",
@@ -1482,6 +2014,10 @@ class AuthoritativeControlRuntime:
                 publication_attempt=publication_attempt,
                 decision=decision,
                 directive=directive,
+                action_adaptation=action_adaptation,
+                target_execution_request=target_execution_request,
+                target_submission_receipt=target_submission_receipt,
+                target_completion_receipt=target_completion_receipt,
                 safety_result=safety_result,
                 cancellation=cancellation,
                 cancellation_receipt=cancellation_receipt,
@@ -1513,30 +2049,50 @@ class AuthoritativeControlRuntime:
             command_lineage_id=command_id,
             directive_lineage_id=directive.directive_id,
         )
-        dispatch_context = build_authoritative_command_dispatch_context(
-            runtime_session_id=self.config.runtime_session_id,
-            control_domain_id=self.config.control_domain_id,
-            embodiment_instance_id=self.config.embodiment_instance_id,
-            decision_id=decision.decision_id,
-            directive_id=directive.directive_id,
-            safety_result_id=safety_id,
-            command_id=command_id,
-            dispatch_permit_id=permit.permit_id,
-            owner_token_id=permit.token_id,
-            owner_generation=permit.owner_generation,
-            target_effective_at=computation.target_effective_at,
-            authority_epoch=decision.authority_epoch,
-            execution_epoch=self.execution_epoch,
-            group_segment_generation_by_group={
-                group: item.group_segment_generation
-                for group, item in selected_directives.items()
-            },
-            selected_action_ref_by_group={
-                group: str(item.selected_action_ref)
-                for group, item in selected_directives.items()
-            },
-            safe_action=safety_result.safe_action,
-        )
+        group_generations = {
+            group: item.group_segment_generation
+            for group, item in selected_directives.items()
+        }
+        selected_action_refs = {
+            group: str(item.selected_action_ref)
+            for group, item in selected_directives.items()
+        }
+        if (
+            target_execution_request is not None
+            and target_submission_receipt is not None
+        ):
+            dispatch_context = build_authoritative_target_dispatch_context(
+                runtime_session_id=self.config.runtime_session_id,
+                embodiment_instance_id=self.config.embodiment_instance_id,
+                directive_id=directive.directive_id,
+                command_id=command_id,
+                dispatch_permit_id=permit.permit_id,
+                owner_token_id=permit.token_id,
+                owner_generation=permit.owner_generation,
+                group_segment_generation_by_group=group_generations,
+                selected_action_ref_by_group=selected_action_refs,
+                target_execution_request=target_execution_request,
+                submission_receipt=target_submission_receipt,
+            )
+        else:
+            dispatch_context = build_authoritative_command_dispatch_context(
+                runtime_session_id=self.config.runtime_session_id,
+                control_domain_id=self.config.control_domain_id,
+                embodiment_instance_id=self.config.embodiment_instance_id,
+                decision_id=decision.decision_id,
+                directive_id=directive.directive_id,
+                safety_result_id=safety_id,
+                command_id=command_id,
+                dispatch_permit_id=permit.permit_id,
+                owner_token_id=permit.token_id,
+                owner_generation=permit.owner_generation,
+                target_effective_at=computation.target_effective_at,
+                authority_epoch=decision.authority_epoch,
+                execution_epoch=self.execution_epoch,
+                group_segment_generation_by_group=group_generations,
+                selected_action_ref_by_group=selected_action_refs,
+                safe_action=safety_result.safe_action,
+            )
         # This is the dispatch linearization point: no trace sink or other
         # mutable control work may occur between authorization and the backend.
         validation = self.dispatch_owners.authorize(
@@ -1545,16 +2101,81 @@ class AuthoritativeControlRuntime:
             current_execution_epoch=self.execution_epoch,
         )
         receipts: Mapping[str, CommandDispatchReceipt] | None = None
+        target_dispatch_result: TargetExecutionDispatchResult | None = None
+        target_completion_receipt: TargetExecutionCompletionReceipt | None = None
         if validation.accepted:
             dispatch_time = float(self.clock())
             try:
                 if self.contextual_dispatcher is None:
                     receipts = dict(self.dispatcher(command))
                 else:
-                    receipts = dict(
-                        self.contextual_dispatcher(command, dispatch_context)
+                    contextual_result = self.contextual_dispatcher(
+                        command,
+                        dispatch_context,
                     )
+                    if isinstance(
+                        contextual_result,
+                        TargetExecutionDispatchResult,
+                    ):
+                        if target_execution_request is None:
+                            raise ValueError(
+                                "Legacy dispatch cannot return a target "
+                                "execution result."
+                            )
+                        if (
+                            contextual_result.target.target_execution_request_id
+                            != target_execution_request.request_id
+                            or contextual_result.target.target_execution_request_hash
+                            != target_execution_request.semantic_content_hash
+                        ):
+                            raise ValueError(
+                                "Target dispatcher returned another request."
+                            )
+                        target_dispatch_result = contextual_result
+                        target_completion_receipt = (
+                            contextual_result.completion_receipt
+                        )
+                        step_facts.append(
+                            project_target_execution_completion(
+                                self.trace_context,
+                                target_completion_receipt,
+                            )
+                        )
+                        receipts = dict(
+                            contextual_result.dispatch_receipts
+                        )
+                    else:
+                        if target_execution_request is not None:
+                            raise TypeError(
+                                "Target-aware contextual dispatcher must return "
+                                "TargetExecutionDispatchResult."
+                            )
+                        receipts = dict(contextual_result)
             except Exception as exc:  # noqa: BLE001 - backend failure becomes typed evidence.
+                if (
+                    target_execution_request is not None
+                    and target_submission_receipt is not None
+                ):
+                    completed_at = max(
+                        float(self.clock()),
+                        target_submission_receipt.received_at,
+                    )
+                    target_completion_receipt = (
+                        build_target_execution_completion_receipt(
+                            target_execution_request,
+                            target_submission_receipt,
+                            status="failed",
+                            completed_at=completed_at,
+                            available_at=completed_at,
+                            outcome_code="target_dispatch_exception",
+                        )
+                    )
+                    step_facts.append(
+                        project_target_execution_completion(
+                            self.trace_context,
+                            target_completion_receipt,
+                        )
+                    )
                 receipts = {
                     name: CommandDispatchReceipt(
                         effector_name=name,
@@ -1582,6 +2203,31 @@ class AuthoritativeControlRuntime:
                         for name in missing_receipts
                     },
                 }
+        if (
+            target_execution_request is not None
+            and target_submission_receipt is not None
+            and target_completion_receipt is None
+        ):
+            completed_at = max(
+                float(self.clock()),
+                target_submission_receipt.received_at,
+            )
+            target_completion_receipt = (
+                build_target_execution_completion_receipt(
+                    target_execution_request,
+                    target_submission_receipt,
+                    status="cancelled",
+                    completed_at=completed_at,
+                    available_at=completed_at,
+                    outcome_code="motion_permit_rejected",
+                )
+            )
+            step_facts.append(
+                project_target_execution_completion(
+                    self.trace_context,
+                    target_completion_receipt,
+                )
+            )
         dispatch_owner_fact = project_dispatch_owner_validation(
             self.trace_context,
             token=self.dispatch_owner_token,
@@ -1678,6 +2324,11 @@ class AuthoritativeControlRuntime:
             publication_attempt=publication_attempt,
             decision=decision,
             directive=directive,
+            action_adaptation=action_adaptation,
+            target_execution_request=target_execution_request,
+            target_submission_receipt=target_submission_receipt,
+            target_completion_receipt=target_completion_receipt,
+            target_dispatch_result=target_dispatch_result,
             safety_result=safety_result,
             command=command,
             dispatch_context=dispatch_context,

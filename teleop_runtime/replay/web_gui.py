@@ -14,7 +14,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 from teleop_runtime.action.replay_shadow_frontend import ReplayGuiShadowProfile
 from robot_motion.rm65 import (
     RM65_BIMANUAL_POSITION_V1_NAME,
+    RM65_POSE_LIFT_PROFILE_CHOICES,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65_POSITION_CONTROL_PROFILE_CHOICES,
+)
+from robot_motion.replay.trajectory import (
+    REPLAY_TRAJECTORY_ACTION_POSE,
+    REPLAY_TRAJECTORY_QPOS_TARGET,
 )
 
 from ..configs.dmtac_hardware import (
@@ -491,6 +497,22 @@ INDEX_HTML = r"""<!doctype html>
               </select>
             </div>
             <div class="form-row">
+              <span class="label">Replay</span>
+              <select id="replayMode">
+                <option value="action_pose">pose</option>
+                <option value="qpos_target">qpos</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <span class="label">Pose Lift</span>
+              <select id="poseLiftProfile">
+                <option value="rm65_pose_lift_v1_baseline">v1 baseline</option>
+                <option value="rm65_pose_lift_v2_continuous">v2 continuous</option>
+                <option value="rm65_pose_lift_v3_bounded_continuous">v3 bounded continuous</option>
+                <option value="rm65_pose_lift_v4_qp_constrained" selected>v4 QP constrained (default)</option>
+              </select>
+            </div>
+            <div class="form-row">
               <span class="label">Command Hz</span>
               <input id="armControlHz" type="number" min="1" step="1" value="150">
             </div>
@@ -604,6 +626,8 @@ INDEX_HTML = r"""<!doctype html>
       leftToolProfile: document.getElementById("leftToolProfile"),
       rightToolProfile: document.getElementById("rightToolProfile"),
       armControlMode: document.getElementById("armControlMode"),
+      replayMode: document.getElementById("replayMode"),
+      poseLiftProfile: document.getElementById("poseLiftProfile"),
       armControlHz: document.getElementById("armControlHz"),
       positionReferenceHz: document.getElementById("positionReferenceHz"),
       positionCollisionScene: document.getElementById("positionCollisionScene"),
@@ -810,6 +834,9 @@ INDEX_HTML = r"""<!doctype html>
         left_tool_profile: els.leftToolProfile.value.trim(),
         right_tool_profile: els.rightToolProfile.value.trim(),
         arm_control_mode: mode,
+        trajectory_source: els.replayMode.value || "action_pose",
+        pose_lift_profile_name:
+          els.poseLiftProfile.value || "rm65_pose_lift_v4_qp_constrained",
         arm_control_hz: Number(hzText || defaultHzForMode(mode)),
         position_reference_hz: Number(referenceHzText || __DEFAULT_POSITION_REFERENCE_HZ__),
         position_collision_required: els.positionCollisionRequired.checked,
@@ -862,6 +889,11 @@ INDEX_HTML = r"""<!doctype html>
       fieldValue(els.leftToolProfile, profiles.left || "");
       fieldValue(els.rightToolProfile, profiles.right || "");
       fieldValue(els.armControlMode, config.arm_control_mode || "position");
+      fieldValue(els.replayMode, settings.trajectory_source || "action_pose");
+      fieldValue(
+        els.poseLiftProfile,
+        settings.pose_lift_profile_name || "rm65_pose_lift_v4_qp_constrained"
+      );
       fieldValue(els.armControlHz, config.arm_control_hz || defaultHzForMode(config.arm_control_mode || "position"));
       fieldValue(
         els.positionReferenceHz,
@@ -918,6 +950,8 @@ INDEX_HTML = r"""<!doctype html>
       kv(els.execInfo, {
         connected: execution.connected,
         output: settings.send_actions_enabled ? "enabled" : "disabled",
+        replay: settings.trajectory_source === "qpos_target" ? "qpos" : "pose",
+        pose_lift: settings.pose_lift_profile_name || "",
         end_effectors: settings.end_effectors_enabled ? "enabled" : "disabled",
         end_effector_backends: JSON.stringify(config.end_effector_backend_by_side || {}),
         qpos_init_vel: Array.isArray(settings.qpos_init_max_angvel_rad_s)
@@ -981,6 +1015,8 @@ INDEX_HTML = r"""<!doctype html>
           els.positionCollisionMaxVelocity,
           els.positionCollisionMaxStep,
           els.positionCollisionRequired,
+          els.replayMode,
+          els.poseLiftProfile,
           els.positionCollisionDebug,
           els.forceTareSec,
           els.qposInitArmMaxAngvel,
@@ -1687,6 +1723,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--replay-mode",
+        choices=("pose", "qpos"),
+        default="pose",
+        help=(
+            "pose: first-frame QPOS init then deploy-parity Pose->QPOS replay; "
+            "qpos: first-frame QPOS init then strict recorded-qref replay."
+        ),
+    )
+    parser.add_argument(
+        "--pose-lift-profile",
+        choices=RM65_POSE_LIFT_PROFILE_CHOICES,
+        default=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        help=(
+            "Pose replay/deploy lift profile. v4 is the deploy-parity default; "
+            "v1 baseline is the explicit rollback and v2/v3 are intermediate profiles."
+        ),
+    )
+    parser.add_argument(
         "--position-workspace-min",
         type=float,
         nargs=3,
@@ -1913,6 +1967,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     execution_settings = ReplayExecutionSettings(
         end_effectors_enabled=bool(args.end_effectors_enabled),
+        trajectory_source=(
+            REPLAY_TRAJECTORY_ACTION_POSE
+            if str(args.replay_mode) == "pose"
+            else REPLAY_TRAJECTORY_QPOS_TARGET
+        ),
         qpos_init_max_angvel_rad_s=normalize_qpos_init_max_angvel(args.qpos_init_arm_max_angvel),
         position_workspace_min=tuple(float(value) for value in args.position_workspace_min),
         position_workspace_max=tuple(float(value) for value in args.position_workspace_max),
@@ -1920,6 +1979,7 @@ def main(argv: list[str] | None = None) -> None:
         position_max_rot_step_deg=float(args.position_max_rot_step_deg),
         position_max_joint_step_rad=float(args.position_max_joint_step_rad),
         position_control_profile_name=str(args.position_control_profile),
+        pose_lift_profile_name=str(args.pose_lift_profile),
         position_collision_required=bool(args.position_collision_required),
         position_collision_scene_profile=str(args.position_collision_scene_profile),
         position_collision_min_distance_m=float(

@@ -7,9 +7,17 @@ import numpy as np
 import pytest
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.action import ArmActionSpec, RobotAction
+from robot_motion.action import (
+    ActionComponentCatalog,
+    ActionComponentSpec,
+    ArmActionSpec,
+    BIMANUAL_EE_POSE_V1,
+    RobotAction,
+    build_robot_action_v1_runtime_schema,
+    project_robot_action_v1_to_component_action,
+)
 from robot_motion.action.proposal import (
-    ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V1,
+    ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V3,
     ActionProposalDraft,
     ProposalBuffer,
     action_proposal_semantic_payload,
@@ -70,7 +78,26 @@ def _action(*, metadata: dict[str, Any] | None = None) -> RobotAction:
     )
 
 
+def _action_schema():
+    arm_spec = ArmActionSpec.tool_tcp("left", reference_frame="left_arm_base")
+    return build_robot_action_v1_runtime_schema(
+        component_catalog=ActionComponentCatalog(
+            catalog_id="proposal-contract-left-arm",
+            action_space=BIMANUAL_EE_POSE_V1,
+            components=(
+                ActionComponentSpec(
+                    "left_arm",
+                    "left_arm",
+                    "left_arm",
+                ),
+            ),
+        ),
+        arm_action_specs_by_side={"left": arm_spec},
+    )
+
+
 def _draft(*, sequence: int, action: RobotAction | None = None, audit: dict[str, Any] | None = None, epoch: int = 1) -> ActionProposalDraft:
+    source_action = _action() if action is None else action
     return ActionProposalDraft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
@@ -79,16 +106,16 @@ def _draft(*, sequence: int, action: RobotAction | None = None, audit: dict[str,
         producer_id="policy-main",
         producer_epoch=epoch,
         sequence=sequence,
-        action=_action() if action is None else action,
+        action=project_robot_action_v1_to_component_action(
+            source_action,
+            action_schema=_action_schema(),
+        ),
         produced_at=3.0,
         produced_clock_domain_id="policy.monotonic",
         effective_from=4.0 + sequence,
         effective_until=5.0 + sequence,
         target_effective_at=4.5 + sequence,
         effective_clock_domain_id="control.monotonic",
-        component_schema_hash="components-v1",
-        component_coverage=("left_arm",),
-        selection_groups=("left_arm",),
         policy_node_id="policy-main",
         observation_cut_id="cut-7",
         inference_id="inference-2",
@@ -112,14 +139,18 @@ def test_receiver_admission_detaches_and_deep_freezes_action() -> None:
     admitted = receipt.proposal
     producer_action.arm_pose_by_side["left"][0] = 99.0
     producer_action.metadata["arm_action_specs_by_side"]["left"]["reference_frame"] = "mutated"
-    assert admitted.action.arm_pose_by_side["left"][0] == pytest.approx(0.3)
-    assert admitted.action.metadata["arm_action_specs_by_side"]["left"]["reference_frame"] == "left_arm_base"
+    assert admitted.action.value("left_arm").values[0] == pytest.approx(0.3)
+    assert (
+        admitted.action.value("left_arm")
+        .payload_schema.semantic_parameters["arm_action_spec"]["reference_frame"]
+        == "left_arm_base"
+    )
     with pytest.raises(ValueError):
-        admitted.action.arm_pose_by_side["left"][0] = 1.0
+        admitted.action.value("left_arm").values[0] = 1.0
     with pytest.raises(ValueError):
-        admitted.action.arm_pose_by_side["left"].setflags(write=True)
+        admitted.action.value("left_arm").values.setflags(write=True)
     with pytest.raises(TypeError):
-        admitted.action.metadata["new"] = "not allowed"
+        admitted.action.values_by_component["new"] = "not allowed"
     assert coordinator.committed_high_watermark == 2
 
 
@@ -129,7 +160,7 @@ def test_draft_cannot_claim_receiver_availability_or_persisted_record_integrity(
     _, _, _, buffer = _runtime()
     proposal = buffer.admit(_draft(sequence=0)).proposal
     assert proposal is not None
-    assert proposal.semantic_hash_domain == ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V1
+    assert proposal.semantic_hash_domain == ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V3
     assert not hasattr(proposal, "record_integrity_hash")
 
 
@@ -148,26 +179,23 @@ def test_runtime_and_dataset_projection_share_one_semantic_hash() -> None:
     assert proposal is not None
     dataset_like_payload = action_proposal_semantic_payload(proposal)
     dataset_like_payload["action"] = dict(dataset_like_payload["action"])
-    dataset_like_payload["action"]["arm_pose_by_side"] = {
-        side: value.copy()
-        for side, value in proposal.action.arm_pose_by_side.items()
-    }
     assert canonical_content_hash(
         dataset_like_payload,
-        domain=ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V1,
+        domain=ACTION_PROPOSAL_SEMANTIC_HASH_DOMAIN_V3,
     ) == proposal.semantic_content_hash
 
 
-def test_invalid_or_unknown_execution_metadata_never_becomes_available() -> None:
+def test_non_action_v1_metadata_does_not_enter_production_proposal() -> None:
     _, coordinator, _, buffer = _runtime()
     action = _action(metadata={"selected_owner": "policy"})
     receipt = buffer.admit(_draft(sequence=0, action=action))
-    assert not receipt.accepted
-    assert receipt.rejection_code == "unsupported_action_metadata"
-    assert receipt.available_at is None
-    assert receipt.control_admission_sequence is None
-    assert coordinator.committed_high_watermark == 1
-    assert len(buffer) == 0
+    assert receipt.accepted
+    assert receipt.proposal is not None
+    assert "selected_owner" not in (
+        receipt.proposal.action.action_schema.semantic_parameters
+    )
+    assert coordinator.committed_high_watermark == 2
+    assert len(buffer) == 1
 
 
 def test_effective_time_must_use_receiver_control_clock_domain() -> None:

@@ -243,6 +243,34 @@ def apply_rm65_position_profile_defaults(
             "--position-post-ik-qpos-smoothing-adaptive",
             "--no-position-post-ik-qpos-smoothing-adaptive",
         )
+        # These switches are versioned source semantics, not an open-ended
+        # tuning surface.  V2 enables them atomically; selecting V1 is the
+        # complete rollback and keeps the public CLI compact.
+        setattr(
+            args,
+            "position_post_ik_qpos_normal_fast_path",
+            source.post_ik_qpos_normal_fast_path,
+        )
+        setattr(
+            args,
+            "position_post_ik_qpos_normal_fast_path_alpha",
+            source.post_ik_qpos_normal_fast_path_alpha,
+        )
+        setattr(
+            args,
+            "position_post_ik_qpos_normal_fast_path_guard_deg",
+            source.post_ik_qpos_normal_fast_path_guard_deg,
+        )
+        setattr(
+            args,
+            "position_post_ik_qpos_normal_fast_path_quality_grace_sec",
+            source.post_ik_qpos_normal_fast_path_quality_grace_sec,
+        )
+        setattr(
+            args,
+            "position_wrist_q5_hysteresis_requires_escape_latch",
+            source.wrist_q5_hysteresis_requires_escape_latch,
+        )
 
     metadata = profile.to_metadata()
     metadata.update(

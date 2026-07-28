@@ -67,10 +67,15 @@ from control_composition.lifecycle import (
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_QPOS_V1,
+    ComponentAction,
     ControlExecutionManifest,
     ExecutionProfileExclusion,
     build_control_execution_manifest,
+    materialize_robot_action_v1,
     split_effector_name,
+)
+from robot_motion.action.component_action_v1 import (
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.proposal import (
     ProposalAdmissionReceipt,
@@ -495,6 +500,8 @@ def build_cs6a_human_replay_execution_manifest(
         manifest_id=CS6A_HUMAN_REPLAY_EXECUTION_MANIFEST_ID_V1,
         manifest_version="v1",
         action_space=runtime.catalog.action_space,
+        action_schema=runtime.action_schema,
+        component_target_capability=runtime.component_target_capability,
         catalog=runtime.catalog,
         motion_authority_sources=(
             "human:synthetic_fixture",
@@ -557,6 +564,8 @@ def build_cs6b1f_pose_human_replay_execution_manifest(
         manifest_id=CS6B1F_POSE_HUMAN_REPLAY_EXECUTION_MANIFEST_ID_V1,
         manifest_version="v1",
         action_space=runtime.catalog.action_space,
+        action_schema=runtime.action_schema,
+        component_target_capability=runtime.component_target_capability,
         catalog=runtime.catalog,
         motion_authority_sources=(
             "human:passive_pose_via_virtual_sim_readiness",
@@ -651,7 +660,7 @@ class _PendingHumanEmissionPromotion:
     effective_from: float
     effective_until: float
     target_effective_at: float
-    canonical_safety_receipt_id: str
+    canonical_safety_receipt_id: str | None
 
 
 class VirtualSimHumanTakeoverReadinessProvider:
@@ -938,6 +947,8 @@ class MujocoHumanReplayHandoffComposition:
             or human_config.producer_epoch != config.producer_epoch
             or human_config.component_catalog.semantic_content_hash
             != self.runtime.catalog.semantic_content_hash
+            or human_config.action_schema.semantic_content_hash
+            != self.runtime.action_schema.semantic_content_hash
         ):
             raise ValueError("Human source is not bound to the exact MuJoCo runtime.")
         if pose_native:
@@ -989,8 +1000,8 @@ class MujocoHumanReplayHandoffComposition:
             or replay_config.embodiment_instance_id != config.embodiment_instance_id
             or replay_config.producer_id != config.replay_producer_id
             or replay_config.producer_epoch != config.producer_epoch
-            or replay_config.component_schema_hash
-            != self.runtime.catalog.semantic_content_hash
+            or replay_config.action_schema.semantic_content_hash
+            != self.runtime.action_schema.semantic_content_hash
         ):
             raise ValueError("Replay source is not bound to the exact MuJoCo runtime.")
         if (
@@ -1101,11 +1112,19 @@ class MujocoHumanReplayHandoffComposition:
             self._handoff_sequence += 1
             previous_slot = self._active_source_slot_id
             self._active_source_slot_id = None
-            hold_event = self.runtime.set_execution_gate(
+            hold_outcome = self.runtime.transition_execution_gate(
                 "hold",
                 reason=f"cs6a_handoff_hold:{normalized_reason}",
                 source_event_ids=(f"cs6a-handoff:{sequence}",),
             )
+            hold_event = hold_outcome.event
+            if (
+                hold_outcome.cancellation_receipt is not None
+                and not hold_outcome.cancellation_receipt.complete
+            ):
+                raise RuntimeError(
+                    "CS6a authority handoff requires completed lower HOLD."
+                )
             release_event = None
             if previous_slot is not None:
                 release_event = self.runtime.core.admit_authority_event(
@@ -1164,7 +1183,7 @@ class MujocoHumanReplayHandoffComposition:
         This incremental path is deliberately one-way and sim-only.  It uses
         the real MuJoCo execution cancellation receipt and producer/authority
         epochs, but stops with both source publication paths closed.  A later
-        :meth:`complete_safe_human_takeover` call must provide the post-
+        :meth:`complete_human_takeover_readiness` call must provide the post-
         takeover human readiness evidence before READY can reopen.
         """
 
@@ -1345,10 +1364,12 @@ class MujocoHumanReplayHandoffComposition:
         retargeter_rebase_receipt_id: str,
         retargeter_rebased_at: float,
     ) -> HumanTakeoverState:
-        """Preview exact post-takeover human readiness, then reopen READY.
+        """Validate exact post-takeover source readiness, then reopen READY.
 
-        Preview adaptation and safety are non-publishing.  The exact emission
-        identity and timing are retained and must later pass once through
+        Adaptation is non-publishing.  Canonical-safety preview is performed
+        only for the legacy compatibility policy; the mainline policy leaves
+        safety to the later authoritative execution path.  The exact emission
+        identity and timing are retained and must still pass once through
         :meth:`submit_human_emission`, which remains the sole formal emission
         and proposal-admission seam.
         """
@@ -1386,48 +1407,55 @@ class MujocoHumanReplayHandoffComposition:
                 raise ValueError(
                     "The post-takeover human emission is not authoritative eligible."
                 )
-            safety_input_id = (
-                f"cs6b0-safety-preview:{state.request.request_id}:"
-                f"{adapter_receipt.source_emission_id}"
-            )
-            safety = self.runtime.core.shared_safety(
-                preview.robot_action,
-                safety_input_id,
-            )
-            if safety.input_action_id != safety_input_id:
-                raise ValueError(
-                    "Canonical safety preview references another human action."
+            safety_receipt_id: str | None = None
+            safety_status: str | None = None
+            if state.policy.require_canonical_safety:
+                safety_input_id = (
+                    f"cs6b0-safety-preview:{state.request.request_id}:"
+                    f"{adapter_receipt.source_emission_id}"
                 )
-            if safety.status in {"safe", "modified"} and safety.safe_action is None:
-                raise ValueError(
-                    "An accepted canonical safety preview requires a safe action."
+                safety = self.runtime.core.shared_safety(
+                    preview.robot_action,
+                    safety_input_id,
                 )
-            safe_action_hash = (
-                None
-                if safety.safe_action is None
-                else canonical_content_hash(
-                    robot_action_semantic_payload(safety.safe_action),
+                if safety.input_action_id != safety_input_id:
+                    raise ValueError(
+                        "Canonical safety preview references another human action."
+                    )
+                if (
+                    safety.status in {"safe", "modified"}
+                    and safety.safe_action is None
+                ):
+                    raise ValueError(
+                        "An accepted canonical safety preview requires a safe action."
+                    )
+                safe_action_hash = (
+                    None
+                    if safety.safe_action is None
+                    else canonical_content_hash(
+                        robot_action_semantic_payload(safety.safe_action),
+                        domain=CS6B0_CANONICAL_SAFETY_PREVIEW_HASH_DOMAIN_V1,
+                    )
+                )
+                safety_hash = canonical_content_hash(
+                    {
+                        "request_id": state.request.request_id,
+                        "source_emission_id": adapter_receipt.source_emission_id,
+                        "input_action_id": safety.input_action_id,
+                        "status": safety.status,
+                        "safe_action_hash": safe_action_hash,
+                        "modified_components": safety.modified_components,
+                        "reasons": safety.reasons,
+                        "safety_contract_id": safety.safety_contract_id,
+                        "safety_contract_hash": safety.safety_contract_hash,
+                        "anchor_id": safety.anchor_id,
+                        "anchor_kind": safety.anchor_kind,
+                        "anchor_hash": safety.anchor_hash,
+                    },
                     domain=CS6B0_CANONICAL_SAFETY_PREVIEW_HASH_DOMAIN_V1,
                 )
-            )
-            safety_hash = canonical_content_hash(
-                {
-                    "request_id": state.request.request_id,
-                    "source_emission_id": adapter_receipt.source_emission_id,
-                    "input_action_id": safety.input_action_id,
-                    "status": safety.status,
-                    "safe_action_hash": safe_action_hash,
-                    "modified_components": safety.modified_components,
-                    "reasons": safety.reasons,
-                    "safety_contract_id": safety.safety_contract_id,
-                    "safety_contract_hash": safety.safety_contract_hash,
-                    "anchor_id": safety.anchor_id,
-                    "anchor_kind": safety.anchor_kind,
-                    "anchor_hash": safety.anchor_hash,
-                },
-                domain=CS6B0_CANONICAL_SAFETY_PREVIEW_HASH_DOMAIN_V1,
-            )
-            safety_receipt_id = f"cs6b0-canonical-safety:{safety_hash}"
+                safety_receipt_id = f"cs6b0-canonical-safety:{safety_hash}"
+                safety_status = safety.status
 
             measurement = self.runtime.capture_qpos_measurement()
             measured_at = measurement.measured_at
@@ -1451,7 +1479,7 @@ class MujocoHumanReplayHandoffComposition:
                 retargeter_rebase_receipt_id=retargeter_rebase_receipt_id,
                 retargeter_rebased_at=retargeter_rebased_at,
                 canonical_safety_receipt_id=safety_receipt_id,
-                canonical_safety_status=safety.status,
+                canonical_safety_status=safety_status,
                 completed_at=float(self.runtime.clock()),
             )
             state = apply_human_readiness(state, readiness)
@@ -1459,13 +1487,32 @@ class MujocoHumanReplayHandoffComposition:
             if state.phase == "failed":
                 return state
 
+            ready_source_event_ids = (
+                (
+                    safety_receipt_id,
+                    state.takeover_receipt.evidence_refs[0],
+                )
+                if safety_receipt_id is not None
+                else (
+                    adapter_receipt.source_emission_id,
+                    deadman_rearm_event_id,
+                    retargeter_rebase_receipt_id,
+                    state.takeover_receipt.evidence_refs[0],
+                )
+            )
+            ready_evidence_refs = (
+                (safety_receipt_id,)
+                if safety_receipt_id is not None
+                else (
+                    adapter_receipt.source_emission_id,
+                    deadman_rearm_event_id,
+                    retargeter_rebase_receipt_id,
+                )
+            )
             ready_event = self.runtime.set_execution_gate(
                 "ready",
                 reason=f"cs6b0_human_ready:{state.request.reason}",
-                source_event_ids=(
-                    safety_receipt_id,
-                    state.takeover_receipt.evidence_refs[0],
-                ),
+                source_event_ids=ready_source_event_ids,
             )
             state = apply_execution_ready(
                 state,
@@ -1475,7 +1522,10 @@ class MujocoHumanReplayHandoffComposition:
                     authority_epoch=state.authority_epoch,
                     accepted=True,
                     completed_at=ready_event.available_at,
-                    evidence_refs=(ready_event.event_id, safety_receipt_id),
+                    evidence_refs=(
+                        ready_event.event_id,
+                        *ready_evidence_refs,
+                    ),
                 ),
             )
             self._safe_human_takeover_state = state
@@ -1494,6 +1544,31 @@ class MujocoHumanReplayHandoffComposition:
             self._active_source_slot_id = self.human_source_spec.source_id
             self._activated_source_slot_ids.add(self.human_source_spec.source_id)
             return state
+
+    def complete_human_takeover_readiness(
+        self,
+        emission: HumanCommandEmission,
+        *,
+        effective_from: float,
+        effective_until: float,
+        target_effective_at: float,
+        deadman_rearm_event_id: str,
+        deadman_rearmed_at: float,
+        retargeter_rebase_receipt_id: str,
+        retargeter_rebased_at: float,
+    ) -> HumanTakeoverState:
+        """Mainline name for source readiness without implied safety ownership."""
+
+        return self.complete_safe_human_takeover(
+            emission,
+            effective_from=effective_from,
+            effective_until=effective_until,
+            target_effective_at=target_effective_at,
+            deadman_rearm_event_id=deadman_rearm_event_id,
+            deadman_rearmed_at=deadman_rearmed_at,
+            retargeter_rebase_receipt_id=retargeter_rebase_receipt_id,
+            retargeter_rebased_at=retargeter_rebased_at,
+        )
 
     def fail_safe_human_takeover(
         self,
@@ -1554,7 +1629,10 @@ class MujocoHumanReplayHandoffComposition:
                 producer_epoch=producer_epoch,
                 sequence=sequence,
                 input_role=role,
-                action=action,
+                action=project_robot_action_v1_to_component_action(
+                    action,
+                    action_schema=self.runtime.action_schema,
+                ),
                 produced_at=produced_at,
                 produced_clock_domain_id=produced_clock_domain_id,
                 effective_from=effective_from,
@@ -1809,7 +1887,12 @@ class MujocoHumanReplayHandoffComposition:
                             producer_id=draft.producer_id,
                             producer_epoch=draft.producer_epoch,
                             sequence=draft.sequence,
-                            action=draft.action,
+                            # The generic composition input remains on its
+                            # existing RobotAction-v1 compatibility contract.
+                            # Proposal adaptation is ComponentAction-native;
+                            # do not feed that production carrier back through
+                            # the legacy composition shadow.
+                            action=emission.action,
                             produced_at=draft.produced_at,
                             produced_clock_domain_id=(
                                 draft.produced_clock_domain_id
@@ -1843,6 +1926,8 @@ class MujocoHumanReplayHandoffComposition:
     def _pose_execution_payload(action) -> dict:
         """Compare executable pose content while ignoring producer/source labels."""
 
+        if isinstance(action, ComponentAction):
+            action = materialize_robot_action_v1(action)
         return {
             "action_space": action.action_space,
             "arm_pose_by_side": action.arm_pose_by_side,
@@ -1904,21 +1989,21 @@ class MujocoHumanReplayHandoffComposition:
                 decision.output_action is None
                 and (
                     authoritative is None
-                    or authoritative.composed_action is None
+                    or authoritative.composed_candidate is None
                 )
             ):
                 output_pose_parity = True
             elif (
                 decision.output_action is not None
                 and authoritative is not None
-                and authoritative.composed_action is not None
+                and authoritative.composed_candidate is not None
             ):
                 shadow_hash = canonical_content_hash(
                     self._pose_execution_payload(decision.output_action),
                     domain="dexteleop.cs6b1d.pose_execution_payload.v1",
                 )
                 authoritative_hash = canonical_content_hash(
-                    self._pose_execution_payload(authoritative.composed_action),
+                    self._pose_execution_payload(authoritative.composed_candidate),
                     domain="dexteleop.cs6b1d.pose_execution_payload.v1",
                 )
                 output_pose_parity = shadow_hash == authoritative_hash
@@ -2605,7 +2690,7 @@ class ScopedMujocoHumanReplayStationComposition:
             assert candidate is not None
 
             def finalize_ready() -> StationOperationResultDraft:
-                final_state = self._data_plane.complete_safe_human_takeover(
+                final_state = self._data_plane.complete_human_takeover_readiness(
                     candidate.emission,
                     effective_from=candidate.effective_from,
                     effective_until=candidate.effective_until,

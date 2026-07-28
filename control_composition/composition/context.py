@@ -882,10 +882,14 @@ def build_composition_context_snapshot(
         if not record.effective_from <= target < record.effective_until:
             continue
         current = selected.get(record.context_channel)
-        rank = (record.effective_from, record.sequence, record.context_id)
+        rank = (
+            record.effective_from,
+            record.control_admission_sequence,
+            record.context_id,
+        )
         if current is None or rank > (
             current.effective_from,
-            current.sequence,
+            current.control_admission_sequence,
             current.context_id,
         ):
             selected[record.context_channel] = record

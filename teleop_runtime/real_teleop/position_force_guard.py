@@ -2,8 +2,9 @@
 
 The guard is intentionally independent of the position command clock.  Force
 samples come from the per-arm observation connections, while a trip invokes a
-single bimanual emergency-stop callback.  Once tripped, the monitor cannot be
-re-armed; restarting the runtime is required.
+single bimanual emergency-stop callback.  A trip remains latched until an
+operator completes a fresh runtime-home calibration and explicitly re-arms
+the monitor; no automatic recovery is permitted.
 """
 
 from __future__ import annotations
@@ -115,6 +116,7 @@ class PositionForceReading:
     torque_norm_nm: float
     monotonic_time_sec: float
     wall_time_sec: float
+    read_elapsed_sec: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -125,6 +127,7 @@ class PositionForceReading:
             "torque_norm_nm": self.torque_norm_nm,
             "monotonic_time_sec": self.monotonic_time_sec,
             "wall_time_sec": self.wall_time_sec,
+            "read_elapsed_sec": self.read_elapsed_sec,
         }
 
 
@@ -187,6 +190,7 @@ class PositionForceGuardMonitor:
         self._watchdog_thread: threading.Thread | None = None
         self._last_reading_by_side: dict[str, PositionForceReading] = {}
         self._last_success_monotonic_by_side: dict[str, float] = {}
+        self._reader_inflight_since_by_side: dict[str, float] = {}
         self._consecutive_limit_by_side = {side: 0 for side in self._readers}
         self._consecutive_errors_by_side = {side: 0 for side in self._readers}
         self._last_error_by_side: dict[str, str] = {}
@@ -346,6 +350,78 @@ class PositionForceGuardMonitor:
             raise PositionForceGuardTripped(fault)
         raise RuntimeError("position force guard stale watchdog arming failed")
 
+    def rearm_after_manual_home(
+        self,
+        *,
+        timeout_sec: float | None = None,
+    ) -> dict[str, object]:
+        """Restart sampling after an acknowledged, operator-led Home.
+
+        This is deliberately a separate lifecycle transition from `start`.
+        The force-trip callback has already latched the monitor and stopped the
+        command backends; clearing that latch without a new Home would allow a
+        stale target to be admitted.  The caller must therefore invoke this
+        only after the real-arm qpos has been refreshed and every command
+        backend has been manually re-armed.
+        """
+
+        with self._lock:
+            fault = self._fault
+            stop_error = self._emergency_stop_error
+        if fault is None:
+            return self.snapshot()
+        if stop_error is not None:
+            raise RuntimeError(
+                "position force guard emergency stop was not acknowledged; "
+                "restart is required before motion can resume: " + stop_error
+            )
+
+        # A fault causes all poll/watchdog loops to leave their normal loop
+        # condition.  Join them before replacing the Events so no old worker
+        # can publish a sample into the new generation.
+        self._stop_event.set()
+        old_threads = tuple(self._threads)
+        old_watchdog = self._watchdog_thread
+        for thread in old_threads:
+            thread.join(timeout=1.0)
+        if old_watchdog is not None:
+            old_watchdog.join(timeout=1.0)
+        alive = [
+            thread.name
+            for thread in (
+                *old_threads,
+                *((old_watchdog,) if old_watchdog is not None else ()),
+            )
+            if thread.is_alive()
+        ]
+        if alive:
+            raise RuntimeError(
+                "position force guard worker(s) did not stop before manual re-arm: "
+                + ", ".join(alive)
+            )
+
+        with self._lock:
+            self._threads = []
+            self._watchdog_thread = None
+            self._stop_event.clear()
+            self._stale_watchdog_armed.clear()
+            self._ready_by_side = {
+                side: threading.Event() for side in self._readers
+            }
+            self._last_reading_by_side.clear()
+            self._last_success_monotonic_by_side.clear()
+            self._reader_inflight_since_by_side.clear()
+            self._consecutive_limit_by_side = {side: 0 for side in self._readers}
+            self._consecutive_errors_by_side = {side: 0 for side in self._readers}
+            self._last_error_by_side.clear()
+            self._fault = None
+            self._emergency_stop_error = None
+
+        # Keep force-limit and read-error protection active immediately, but
+        # require fresh post-Home samples before enabling the stale watchdog.
+        self.start(arm_stale_watchdog=False)
+        return self.arm_stale_watchdog(timeout_sec=timeout_sec)
+
     def close(self) -> None:
         self._stop_event.set()
         for thread in tuple(self._threads):
@@ -382,6 +458,10 @@ class PositionForceGuardMonitor:
                 "consecutive_limit_by_side": dict(self._consecutive_limit_by_side),
                 "consecutive_errors_by_side": dict(self._consecutive_errors_by_side),
                 "last_error_by_side": dict(self._last_error_by_side),
+                "reader_inflight_age_by_side": {
+                    side: max(0.0, time.monotonic() - started)
+                    for side, started in self._reader_inflight_since_by_side.items()
+                },
                 "fault": None if self._fault is None else self._fault.to_dict(),
                 "emergency_stop_error": self._emergency_stop_error,
             }
@@ -394,6 +474,8 @@ class PositionForceGuardMonitor:
         period_sec = 1.0 / float(self.config.poll_hz)
         while not self._stop_event.is_set() and self.fault is None:
             iteration_start = time.monotonic()
+            with self._lock:
+                self._reader_inflight_since_by_side[side] = iteration_start
             try:
                 payload = reader()
                 reading = self._parse_reading(side, payload)
@@ -463,6 +545,9 @@ class PositionForceGuardMonitor:
                     # trips the guard.  Otherwise start() can race the polling
                     # thread and briefly admit an already-over-limit arm.
                     self._ready_by_side[side].set()
+            finally:
+                with self._lock:
+                    self._reader_inflight_since_by_side.pop(side, None)
             remaining = period_sec - (time.monotonic() - iteration_start)
             if remaining > 0.0:
                 self._stop_event.wait(remaining)
@@ -484,6 +569,22 @@ class PositionForceGuardMonitor:
                 ]
             if stale:
                 side, age_sec = max(stale, key=lambda item: item[1])
+                with self._lock:
+                    inflight_since = self._reader_inflight_since_by_side.get(side)
+                    last_reading = self._last_reading_by_side.get(side)
+                inflight_text = (
+                    f"; force read call in flight for "
+                    f"{max(0.0, now - inflight_since):.3f}s"
+                    if inflight_since is not None
+                    else ""
+                )
+                elapsed_text = (
+                    f"; last successful read_elapsed="
+                    f"{float(last_reading.read_elapsed_sec):.3f}s"
+                    if last_reading is not None
+                    and last_reading.read_elapsed_sec is not None
+                    else ""
+                )
                 self._trip(
                     PositionForceGuardFault(
                         reason="force_read_stale",
@@ -492,6 +593,7 @@ class PositionForceGuardMonitor:
                             f"{side} RM65 force reading is stale: "
                             f"{age_sec:.3f}s > "
                             f"{self.config.stale_timeout_sec:.3f}s"
+                            f"{inflight_text}{elapsed_text}"
                         ),
                         monotonic_time_sec=now,
                         wall_time_sec=time.time(),
@@ -529,6 +631,12 @@ class PositionForceGuardMonitor:
         wall_time_sec = float(payload.get("wall_time_sec", time.time()))
         if not math.isfinite(monotonic_time_sec) or not math.isfinite(wall_time_sec):
             raise ValueError("force reader timestamps must be finite")
+        raw_read_elapsed = payload.get("read_elapsed_sec")
+        read_elapsed_sec = None
+        if raw_read_elapsed is not None:
+            read_elapsed_sec = float(raw_read_elapsed)
+            if not math.isfinite(read_elapsed_sec) or read_elapsed_sec < 0.0:
+                raise ValueError("force reader read_elapsed_sec must be finite and non-negative")
         return PositionForceReading(
             side=side,
             source=self.config.source,
@@ -537,6 +645,7 @@ class PositionForceGuardMonitor:
             torque_norm_nm=float(np.linalg.norm(values[3:])),
             monotonic_time_sec=monotonic_time_sec,
             wall_time_sec=wall_time_sec,
+            read_elapsed_sec=read_elapsed_sec,
         )
 
 

@@ -344,7 +344,11 @@ def build_rm65_arms_only_dispatch_inventory(
                 "one_shot_per_call",
                 "worker_drain",
             ),
-            retry_behavior="Stop_Force_Position_Move and Arm_Stop fallback are distinct calls",
+            retry_behavior=(
+                "Stop_Force_Position_Move is independent; Arm_Stop has a bounded "
+                "idempotent retry followed by Arm_Slow_Stop fallback, with a new "
+                "permit for every SDK call"
+            ),
             activation_condition="emergency stop requested",
             integration_status="pure_wrapper_validated",
         ),

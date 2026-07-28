@@ -18,8 +18,10 @@ from robot_motion.action import (
     ArmActionSpec,
     HandActionSpec,
     RobotAction,
+    ComponentActionSchema,
     SourceValidationResult,
     split_effector_name,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.proposal import freeze_robot_action, robot_action_semantic_payload
 from robot_motion.runtime import EffectorCommand, TeleopCommand
@@ -574,6 +576,7 @@ class HumanProposalAdapterConfig:
     produced_clock_domain_id: str
     effective_clock_domain_id: str
     component_catalog: ActionComponentCatalog
+    action_schema: ComponentActionSchema
     action_adapter: TeleopCommandActionAdapterConfig = field(
         default_factory=lambda: TeleopCommandActionAdapterConfig(
             include_command_metadata=False,
@@ -597,6 +600,8 @@ class HumanProposalAdapterConfig:
                 raise ValueError(f"{name} must be non-empty.")
         if int(self.producer_epoch) < 0:
             raise ValueError("producer_epoch must be non-negative.")
+        if not isinstance(self.action_schema, ComponentActionSchema):
+            raise TypeError("action_schema must be a ComponentActionSchema.")
 
 
 class HumanProposalAdapter:
@@ -724,16 +729,20 @@ class HumanProposalAdapter:
                 producer_id=self.config.producer_id,
                 producer_epoch=self.config.producer_epoch,
                 sequence=emission.emission_sequence,
-                action=action,
+                action=project_robot_action_v1_to_component_action(
+                    action,
+                    action_schema=self.config.action_schema,
+                    component_id_by_effector={
+                        item.effector_name: item.component_id
+                        for item in self.config.component_catalog.components
+                    },
+                ),
                 produced_at=emission.emitted_at,
                 produced_clock_domain_id=self.config.produced_clock_domain_id,
                 effective_from=float(effective_from),
                 effective_until=float(effective_until),
                 target_effective_at=float(target_effective_at),
                 effective_clock_domain_id=self.config.effective_clock_domain_id,
-                component_schema_hash=self.config.component_catalog.semantic_content_hash,
-                component_coverage=component_coverage,
-                selection_groups=selection_groups,
                 authority_priority=int(self.config.authority_priority),
                 authority_request=self.config.authority_request,
                 validity=("valid" if authoritative_eligible else "shadow_only"),

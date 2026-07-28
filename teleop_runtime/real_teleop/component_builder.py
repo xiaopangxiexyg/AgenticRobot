@@ -879,6 +879,46 @@ def build_real_teleop_components(
                             if arm_control_mode == "position"
                             else 1
                         ),
+                        solve_step_mode=(
+                            str(
+                                getattr(
+                                    args,
+                                    "position_ik_step_mode",
+                                    "legacy_iterative",
+                                )
+                            )
+                            if arm_control_mode == "position"
+                            else "legacy_iterative"
+                        ),
+                        joint_acceleration_limit_rad_s2=(
+                            np.asarray(
+                                getattr(
+                                    args,
+                                    "position_max_acceleration_rad_s2",
+                                ),
+                                dtype=float,
+                            ).reshape(6)
+                            if (
+                                arm_control_mode == "position"
+                                and str(
+                                    getattr(
+                                        args,
+                                        "position_ik_step_mode",
+                                        "legacy_iterative",
+                                    )
+                                )
+                                == "single_step_singularity_aware"
+                            )
+                            else None
+                        ),
+                        admitted_reference_motion_limit_enabled=bool(
+                            arm_control_mode == "position"
+                            and getattr(
+                                args,
+                                "position_ik_admitted_motion_limit",
+                                False,
+                            )
+                        ),
                         damping=(
                             float(getattr(args, "position_ik_damping", 0.03))
                             if arm_control_mode == "position"
@@ -937,6 +977,52 @@ def build_real_teleop_components(
                                 0.45,
                             )
                         ),
+                        output_qpos_normal_fast_path_enabled=bool(
+                            arm_control_mode == "position"
+                            and getattr(
+                                args,
+                                "position_post_ik_qpos_normal_fast_path",
+                                False,
+                            )
+                        ),
+                        output_qpos_normal_fast_path_alpha=float(
+                            getattr(
+                                args,
+                                "position_post_ik_qpos_normal_fast_path_alpha",
+                                1.0,
+                            )
+                        ),
+                        output_qpos_normal_fast_path_guard_deg=float(
+                            getattr(
+                                args,
+                                "position_post_ik_qpos_normal_fast_path_guard_deg",
+                                4.0,
+                            )
+                        ),
+                        output_qpos_normal_fast_path_quality_grace_sec=float(
+                            getattr(
+                                args,
+                                "position_post_ik_qpos_normal_fast_path_quality_grace_sec",
+                                0.0,
+                            )
+                        ),
+                        # A singular wrist uses a bounded, responsive endpoint
+                        # only inside the narrow q5 escape band.  This avoids
+                        # the normal 0.14 alpha making the guarded wrist feel
+                        # latched, while the existing per-cycle joint step and
+                        # acceleration limits remain authoritative.
+                        output_qpos_smoothing_singularity_alpha=float(
+                            max(
+                                float(
+                                    getattr(
+                                        args,
+                                        "position_post_ik_qpos_smoothing_fast_alpha",
+                                        0.45,
+                                    )
+                                ),
+                                0.65,
+                            )
+                        ),
                         # Force control keeps an interior envelope so an
                         # otherwise valid tracking qpos cannot settle on a
                         # physical joint stop. Position control retains the
@@ -955,6 +1041,40 @@ def build_real_teleop_components(
                             )
                         ),
                         wrist_singularity_threshold_deg=3.0,
+                        # Keep +/-pi wrist-flip candidates out of the local
+                        # candidate pool while q5 is near the coaxial
+                        # neighborhood.  This is position/single-step only;
+                        # zero remains the atomic rollback to old ordering.
+                        wrist_branch_switch_guard_deg=(
+                            float(
+                                getattr(
+                                    args,
+                                    "position_wrist_branch_switch_guard_deg",
+                                    12.0,
+                                )
+                            )
+                            if arm_control_mode == "position"
+                            else 0.0
+                        ),
+                        wrist_q5_hysteresis_release_deg=(
+                            float(
+                                getattr(
+                                    args,
+                                    "position_wrist_q5_hysteresis_release_deg",
+                                    6.0,
+                                )
+                            )
+                            if arm_control_mode == "position"
+                            else 0.0
+                        ),
+                        wrist_q5_hysteresis_requires_escape_latch=bool(
+                            arm_control_mode == "position"
+                            and getattr(
+                                args,
+                                "position_wrist_q5_hysteresis_requires_escape_latch",
+                                False,
+                            )
+                        ),
                         prefer_non_elbow_singular_branch=bool(
                             arm_control_mode == "position"
                             and getattr(
@@ -964,7 +1084,12 @@ def build_real_teleop_components(
                             )
                         ),
                         elbow_singularity_threshold_deg=3.0,
-                        elbow_singularity_selection_margin_deg=1.0,
+                        # Keep the local q3 escape band just above the RM65
+                        # SDK elbow gate.  The previous 1 deg selection
+                        # margin made ordinary 4--6 deg motion compete with
+                        # the escape candidate and produced the alternating
+                        # q3 trajectory seen in the 2026-07-26 trace.
+                        elbow_singularity_selection_margin_deg=0.25,
                         prefer_non_shoulder_singular_branch=bool(
                             arm_control_mode == "position"
                             and getattr(

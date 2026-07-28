@@ -14,6 +14,7 @@ from unittest import mock
 import numpy as np
 
 from hardware.rm65.calibration_profiles import make_profile
+from robot_motion.rm65 import RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME
 from teleop_runtime.action import HandActionSpec
 from teleop_runtime.action.executor import RobotActionResolver
 from teleop_runtime.deploy.replay import (
@@ -40,7 +41,11 @@ from teleop_runtime.replay.checks import (
 from teleop_runtime.replay.executor import ReplayExecutionController, ReplayExecutionSettings
 from teleop_runtime.replay.hardware import ReplayHardwareConfig, ReplayHardwareRig
 from teleop_runtime.replay.session import ReplayGuiSession
-from teleop_runtime.replay.trajectory import REPLAY_TRAJECTORY_QPOS_TARGET, ReplayTrajectoryGroup
+from teleop_runtime.replay.trajectory import (
+    REPLAY_TRAJECTORY_ACTION_POSE,
+    REPLAY_TRAJECTORY_QPOS_TARGET,
+    ReplayTrajectoryGroup,
+)
 from teleop_runtime.replay.web_gui import (
     _resolve_replay_dmtac_fields,
     build_parser as build_replay_web_gui_parser,
@@ -307,6 +312,7 @@ class _FakePositionCollisionPlanner:
         self.reset_inputs: list[dict[str, np.ndarray]] = []
         self.plan_inputs: list[dict[str, object]] = []
         self.validate_inputs: list[dict[str, object]] = []
+        self.admit_inputs: list[dict[str, object]] = []
 
     def reset(self, current_qpos_by_side) -> dict[str, object]:
         self.reset_inputs.append(
@@ -380,6 +386,29 @@ class _FakePositionCollisionPlanner:
                 "endpoint_collision_passed": safe,
                 "segment_collision_checked": False,
                 "segment_collision_certified": False,
+            },
+        )
+
+    validate_qpos_reference = validate_qpos
+
+    def admit_qpos_reference(self, qpos_by_side, *, source: str):
+        qpos = {
+            str(side): np.asarray(value, dtype=float).copy()
+            for side, value in dict(qpos_by_side).items()
+        }
+        self.admit_inputs.append({"qpos": qpos, "source": str(source)})
+        return SimpleNamespace(
+            safe=True,
+            reason=None,
+            qpos_by_side=qpos,
+            metadata={
+                "scene_profile": "dual_arm_hand_proxy_open",
+                "collision_pair_count": self.collision_pair_count,
+                "endpoint_collision_checked": True,
+                "endpoint_collision_passed": True,
+                "segment_collision_checked": False,
+                "segment_collision_certified": False,
+                "qpos_target_modified": False,
             },
         )
 
@@ -934,7 +963,8 @@ class ReplayExecutionChecksTest(unittest.TestCase):
                 trajectory_source=REPLAY_TRAJECTORY_QPOS_TARGET,
             ),
         )
-        with self.assertRaisesRegex(RuntimeError, "accepts target poses only"):
+        qpos_mode._require_position_collision_contract_locked()
+        with self.assertRaisesRegex(RuntimeError, "Connect hardware"):
             qpos_mode.move_to_start()
 
         disabled_real_output = ReplayExecutionController(
@@ -1062,6 +1092,7 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             payload["position_collision_max_joint_velocity_rad_s"],
             [0.3] * 6,
         )
+
         self.assertEqual(
             payload["position_collision_max_joint_step_rad"],
             [0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
@@ -1080,6 +1111,23 @@ class ReplayExecutionChecksTest(unittest.TestCase):
         self.assertEqual(args.position_collision_scene_profile, "test_scene")
         self.assertTrue(args.position_collision_debug)
         self.assertEqual(args.position_control_profile, "rm65_bimanual_position_v1")
+
+    def test_v4_pose_replay_is_deploy_parity_default_and_qpos_replay_ignores_lift(self) -> None:
+        pose_settings = ReplayExecutionSettings(
+            send_actions_enabled=True,
+            trajectory_source=REPLAY_TRAJECTORY_ACTION_POSE,
+        )
+        self.assertEqual(
+            pose_settings.pose_lift_profile_name,
+            RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        )
+
+        settings = ReplayExecutionSettings(
+            send_actions_enabled=True,
+            trajectory_source=REPLAY_TRAJECTORY_QPOS_TARGET,
+            pose_lift_profile_name=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        )
+        self.assertTrue(settings.send_actions_enabled)
 
     def test_replay_hardware_config_passes_qpos_init_singularity_slowdown_to_arm_backend(self) -> None:
         config = ReplayHardwareConfig.from_payload(
@@ -1443,7 +1491,7 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             self.assertFalse(metadata["temporal_smoothing_applied"])
             self.assertNotIn("debug", metadata["position_collision"])
 
-    def test_collision_required_replay_rechecks_singularity_slow_target_before_dispatch(self) -> None:
+    def test_pose_replay_does_not_apply_replay_only_singularity_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             left_profile = _write_profile(
                 Path(tmpdir) / "left.json", side="left", tcp=[0, 0, 0, 0, 0, 0]
@@ -1465,26 +1513,13 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             controller._replay_worker(rig, _dual_group(left_profile, right_profile))  # type: ignore[arg-type]
 
             self.assertEqual(controller.status()["state"], "finished")
-            self.assertGreater(len(planner.validate_inputs), 0)
-            self.assertEqual(len(planner.validate_inputs), len(rig.sent_joint_targets))
-            self.assertTrue(
-                all(
-                    item["source"].startswith("replay_collision_qpos_reference_")
-                    and item["source"].endswith("hz_singularity_slow_recheck")
-                    for item in planner.validate_inputs
-                )
-            )
-            np.testing.assert_allclose(planner.validate_inputs[0]["qpos"]["left"], np.full(6, 0.0) + [0.02, 0, 0, 0, 0, 0])
-            np.testing.assert_allclose(rig.sent_joint_targets[0]["left"], [0.02, 0, 0, 0, 0, 0])
+            self.assertEqual(planner.validate_inputs, [])
+            np.testing.assert_allclose(rig.sent_joint_targets[0]["left"], np.zeros(6))
             metadata = rig.sent_joint_metadata[0]
-            self.assertTrue(metadata["position_singularity_replay_slowdown"]["collision_rechecked"])
-            self.assertEqual(metadata["position_singularity_replay_slowdown"]["sides"], ["left"])
-            self.assertTrue(
-                metadata["position_collision"]["singularity_slow_target_recheck"]
-                ["endpoint_collision_passed"]
-            )
+            self.assertNotIn("position_singularity_replay_slowdown", metadata)
+            self.assertNotIn("singularity_replay_preparation_by_side", metadata)
 
-    def test_collision_required_replay_faults_before_dispatch_when_slow_target_recheck_fails(self) -> None:
+    def test_pose_replay_ignores_retired_replay_only_singularity_recheck(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             left_profile = _write_profile(
                 Path(tmpdir) / "left.json", side="left", tcp=[0, 0, 0, 0, 0, 0]
@@ -1506,11 +1541,9 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             controller._replay_worker(rig, _dual_group(left_profile, right_profile))  # type: ignore[arg-type]
 
             status = controller.status()
-            self.assertEqual(status["state"], "fault")
-            self.assertIn("singularity slow target failed", status["last_error"])
-            self.assertEqual(len(planner.validate_inputs), 1)
-            self.assertEqual(rig.sent_joint_targets, [])
-            self.assertEqual(rig.hold_reasons, ["hardware replay fault"])
+            self.assertEqual(status["state"], "finished")
+            self.assertEqual(planner.validate_inputs, [])
+            self.assertGreater(len(rig.sent_joint_targets), 0)
 
     def test_collision_debug_adds_raw_arrays_only_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1830,7 +1863,7 @@ class ReplayExecutionChecksTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rewrote a coupled collision qpos"):
             rig.send_commands(command)
 
-    def test_collision_required_rejects_qpos_target_legacy_path(self) -> None:
+    def test_collision_required_qpos_replay_is_exact_and_collision_admitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             left_profile = _write_profile(
                 Path(tmpdir) / "left.json", side="left", tcp=[0, 0, 0, 0, 0, 0]
@@ -1850,17 +1883,24 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             )
             rig = _DualFakeReplayWorkerRig()
 
+            planner = _FakePositionCollisionPlanner()
+            controller._position_collision_planner_factory = lambda **_kwargs: planner
+
             controller._replay_worker(  # type: ignore[arg-type]
                 rig,
                 _dual_group(left_profile, right_profile),
             )
 
             status = controller.status()
-            self.assertEqual(status["state"], "fault")
-            self.assertIn("accepts target poses only", status["last_error"])
-            self.assertIn("position_collision_required=false", status["last_error"])
-            self.assertEqual(len(rig.sent_joint_targets), 0)
-            self.assertEqual(rig.begin_count, 0)
+            self.assertEqual(status["state"], "finished")
+            self.assertGreater(len(planner.admit_inputs), 1)
+            self.assertGreater(len(rig.sent_joint_targets), 1)
+            np.testing.assert_allclose(
+                rig.sent_joint_targets[-1]["left"],
+                planner.admit_inputs[-1]["qpos"]["left"],
+            )
+            self.assertEqual(len(planner.plan_inputs), 0)
+            self.assertEqual(len(rig.sent_action_poses), 0)
 
     def test_collision_required_rejects_single_active_arm(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

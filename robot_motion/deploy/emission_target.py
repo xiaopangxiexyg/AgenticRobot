@@ -15,7 +15,9 @@ from dataset_contracts.replay import TargetRuntimeActionContract
 from robot_motion.action import (
     ActionComponentCatalog,
     ActionProposalDraft,
+    ComponentActionSchema,
     ReferenceActivationSpec,
+    project_robot_action_v1_to_component_action,
 )
 
 from .runtime import PolicyActionEmission
@@ -355,13 +357,20 @@ class PolicyEmissionTargetProposalPreparation:
                 raise ValueError(
                     "Proposal representation proof must match the assessment."
                 )
-            if tuple(draft.component_coverage) != (
+            if tuple(draft.action.component_coverage) != (
                 self.assessment.component_coverage
             ):
                 raise ValueError(
                     "Proposal component coverage must match the assessment."
                 )
-            if tuple(draft.selection_groups) != self.assessment.selection_groups:
+            draft_selection_groups = tuple(
+                dict.fromkeys(
+                    draft.action.action_schema.component_catalog
+                    .component_by_id[component_id].selection_group_id
+                    for component_id in draft.action.component_coverage
+                )
+            )
+            if draft_selection_groups != self.assessment.selection_groups:
                 raise ValueError(
                     "Proposal selection groups must match the assessment."
                 )
@@ -379,9 +388,17 @@ class PolicyEmissionTargetProposalPreparation:
                 "effective_until": draft.effective_until,
                 "target_effective_at": draft.target_effective_at,
                 "effective_clock_domain_id": draft.effective_clock_domain_id,
-                "component_schema_hash": draft.component_schema_hash,
-                "component_coverage": draft.component_coverage,
-                "selection_groups": draft.selection_groups,
+                "action_schema_hash": (
+                    draft.action.action_schema.semantic_content_hash
+                ),
+                "component_coverage": draft.action.component_coverage,
+                "selection_groups": tuple(
+                    dict.fromkeys(
+                        draft.action.action_schema.component_catalog
+                        .component_by_id[component_id].selection_group_id
+                        for component_id in draft.action.component_coverage
+                    )
+                ),
                 "authority_priority": draft.authority_priority,
                 "authority_request": draft.authority_request,
                 "validity": draft.validity,
@@ -425,6 +442,7 @@ def prepare_policy_emission_target_proposal(
     *,
     target_contract: TargetRuntimeActionContract,
     component_catalog: ActionComponentCatalog,
+    action_schema: ComponentActionSchema,
     reference_activation_spec: ReferenceActivationSpec,
     target_clock_domain_id: str,
     runtime_session_id: str,
@@ -445,6 +463,8 @@ def prepare_policy_emission_target_proposal(
 
     session = _required_text(runtime_session_id, name="runtime_session_id")
     producer = _required_text(producer_id, name="producer_id")
+    if not isinstance(action_schema, ComponentActionSchema):
+        raise TypeError("action_schema must be a ComponentActionSchema.")
     epoch = int(producer_epoch)
     proposal_sequence = int(sequence)
     if isinstance(producer_epoch, bool) or epoch != producer_epoch or epoch < 0:
@@ -477,16 +497,16 @@ def prepare_policy_emission_target_proposal(
             producer_id=producer,
             producer_epoch=epoch,
             sequence=proposal_sequence,
-            action=action,
+            action=project_robot_action_v1_to_component_action(
+                action,
+                action_schema=action_schema,
+            ),
             produced_at=emission.produced_at,
             produced_clock_domain_id=emission.produced_clock_domain_id,
             effective_from=emission.effective_from,
             effective_until=emission.effective_until,
             target_effective_at=emission.target_effective_at,
             effective_clock_domain_id=emission.effective_clock_domain_id,
-            component_schema_hash=component_catalog.semantic_content_hash,
-            component_coverage=assessment.component_coverage,
-            selection_groups=assessment.selection_groups,
             authority_priority=0,
             authority_request="none",
             validity="valid",

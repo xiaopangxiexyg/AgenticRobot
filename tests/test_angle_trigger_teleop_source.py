@@ -426,6 +426,7 @@ def test_manual_foot_pad_retry_updates_status_provider_atomically() -> None:
     current = {"value": old_input}
     startup_errors = {"foot_pad": "FootPadUnavailableError: missing"}
     published: list[dict[str, object]] = []
+    foot_pad_test_messages: list[str] = []
 
     class Ui:
         def publish(self, **updates: object) -> None:
@@ -439,11 +440,26 @@ def test_manual_foot_pad_retry_updates_status_provider_atomically() -> None:
         _last_foot_pad_online=False,
         _gripper_control_enabled=False,
         foot_pad_input=old_input,
+        _foot_pad_test_active=True,
+        _foot_pad_test_completed=True,
+        _foot_pad_test_seen_events={"fix_arm_left"},
+        _foot_pad_test_last_event="旧连接事件",
+        _foot_pad_test_status="旧连接已完成",
         _episode_busy=lambda: False,
         hold_active=lambda: False,
         device_retry_admission=lambda: (True, ""),
         _current_active_controls=lambda: ["device_retry"],
         publish_gripper_status=lambda **_kwargs: None,
+        _foot_pad_test_ui_state=lambda: {
+            "foot_pad_available": bool(
+                getattr(clutch.foot_pad_input, "is_online", False)
+            ),
+            "foot_pad_test_completed": bool(clutch._foot_pad_test_completed),
+            "foot_pad_test_status": clutch._foot_pad_test_status,
+        },
+        _publish_foot_pad_test_state=lambda **kwargs: foot_pad_test_messages.append(
+            str(kwargs.get("message", ""))
+        ),
     )
     components = SimpleNamespace(
         gripper_input_source="",
@@ -488,6 +504,11 @@ def test_manual_foot_pad_retry_updates_status_provider_atomically() -> None:
     assert old_input.closed is True
     assert current["value"] is replacement
     assert clutch.foot_pad_input is replacement
+    assert clutch._foot_pad_test_completed is False
+    assert clutch._foot_pad_test_seen_events == set()
+    assert clutch._foot_pad_test_last_event == ""
+    assert "脚踏板安全测试" in clutch._foot_pad_test_status
+    assert any("脚踏板安全测试" in message for message in foot_pad_test_messages)
 
     # The periodic synchronizer must observe the replacement, not the stale
     # offline placeholder captured before the manual retry.

@@ -19,6 +19,7 @@ from robot_motion.action import (
     RobotAction,
     apply_canonical_keyframe_safety,
     evaluate_shared_execution_shadow,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.position_control import (
     PositionKeyframeSafetyConfig,
@@ -489,7 +490,8 @@ def test_explicit_anchor_safety_runs_inside_non_authoritative_execution_shadow()
         status_by_group={"arms": "selected"},
         selected_by_group={"arms": "proposal-qpos-0"},
         target_effective_at=10.0,
-        composed_action=action,
+        supported_until=10.1,
+        composed_candidate=project_robot_action_v1_to_component_action(action),
     )
 
     evaluated = evaluate_shared_execution_shadow(

@@ -91,6 +91,43 @@ def test_spool_sink_acknowledges_only_post_fsync_records(tmp_path: Path) -> None
         assert not completeness.capture_commit_eligible
 
 
+def test_spool_sink_scans_only_new_runtime_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace = runtime()
+    offsets: list[int] = []
+    original = trace.journal_entries_from_offset
+
+    def observed(offset: int):
+        offsets.append(offset)
+        return original(offset)
+
+    monkeypatch.setattr(trace, "journal_entries_from_offset", observed)
+    with ControlTraceSpool(
+        tmp_path / "incremental.wal",
+        trace_session_id="trace-1",
+        max_bytes=1 << 20,
+        physical_preallocation=False,
+    ) as spool, ControlTraceWriterHealthLedger(
+        tmp_path / "incremental.health",
+        trace_session_id="trace-1",
+    ) as health:
+        sink = ControlTraceSpoolSink(
+            sink_id="incremental-sink",
+            runtime=trace,
+            spool=spool,
+            health_ledger=health,
+        )
+        assert trace.issue(fact(1)).accepted
+        assert sink.flush_pending().newly_durable_sequences == (1,)
+        assert trace.issue(fact(2)).accepted
+        assert sink.flush_pending().newly_durable_sequences == (2,)
+        assert sink.flush_pending().newly_durable_sequences == ()
+
+    assert offsets == [0, 1, 2]
+
+
 def test_spool_failure_uses_independent_durable_health_ledger(tmp_path: Path) -> None:
     trace = runtime()
     for index in range(1, 8):

@@ -226,6 +226,7 @@ class RealSenseRGBSource(ObservationSource):
         self._restart_failure_count = 0
         self._last_restart_timestamp: float | None = None
         self._device_info: dict[str, Any] = {}
+        self._startup_timing: dict[str, float] = {}
         self._depth_align = None
         self._depth_scale_m_per_unit: float | None = None
         self._active_color_format = self.config.color_format
@@ -237,6 +238,13 @@ class RealSenseRGBSource(ObservationSource):
     @property
     def camera_key(self) -> str:
         return self.config.camera_key
+
+    @property
+    def startup_timing(self) -> dict[str, float]:
+        """Return the most recent native startup stage timings in seconds."""
+
+        with self._lock:
+            return dict(self._startup_timing)
 
     def expected_channel_names(self) -> tuple[str, ...]:
         return ()
@@ -320,6 +328,7 @@ class RealSenseRGBSource(ObservationSource):
         raise RuntimeError("RealSense pipeline start failed without an exception.")
 
     def _start_pipeline_once(self, rs: Any) -> tuple[Any, Any]:
+        startup_started = time.perf_counter()
         pipeline = rs.pipeline()
         stream_config = rs.config()
         stream_config.enable_device(self.config.serial)
@@ -345,7 +354,9 @@ class RealSenseRGBSource(ObservationSource):
             if reset_sleep_sec > 0.0:
                 time.sleep(reset_sleep_sec)
         try:
+            pipeline_start_started = time.perf_counter()
             profile = pipeline.start(stream_config)
+            pipeline_start_elapsed = time.perf_counter() - pipeline_start_started
         except RuntimeError as exc:
             self._stop_pipeline_quietly(pipeline)
             request = self._requested_stream_profile_text()
@@ -358,12 +369,24 @@ class RealSenseRGBSource(ObservationSource):
             ) from exc
         self._active_color_format = self.config.color_format
         try:
+            configure_started = time.perf_counter()
             self._configure_sensor_options(profile)
             self._configure_depth_state(rs, profile)
+            configure_elapsed = time.perf_counter() - configure_started
+            warmup_started = time.perf_counter()
             self._warmup_pipeline(pipeline)
+            warmup_elapsed = time.perf_counter() - warmup_started
         except RuntimeError:
             self._stop_pipeline_quietly(pipeline)
             raise
+        with self._lock:
+            self._startup_timing = {
+                "pipeline_start_sec": float(pipeline_start_elapsed),
+                "sensor_configure_sec": float(configure_elapsed),
+                "warmup_sec": float(warmup_elapsed),
+                "total_sec": float(time.perf_counter() - startup_started),
+                "warmup_frames": float(self.config.startup_warmup_frames),
+            }
         return pipeline, profile
 
     def _requested_stream_profile_text(self) -> str:

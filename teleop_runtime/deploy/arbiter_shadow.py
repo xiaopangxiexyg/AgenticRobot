@@ -30,6 +30,10 @@ from robot_motion.action import (
     ProposalAdmissionReceipt,
     ProposalBuffer,
     RobotAction,
+    ComponentAction,
+    ComponentActionSchema,
+    materialize_robot_action_v1,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.arbitration_input import capture_arbitration_input
 from robot_motion.deploy.runtime import PolicyActionEmission
@@ -71,6 +75,7 @@ class PolicyArbiterShadowConfig:
     active_effectors: tuple[str, ...]
     action_space: str
     decision_hz: float
+    action_schema: ComponentActionSchema
     component_catalog: ActionComponentCatalog | None = None
     producer_epoch: int = 1
     policy_node_id: str = "single_policy"
@@ -104,6 +109,14 @@ class PolicyArbiterShadowConfig:
         if not math.isfinite(rate) or rate <= 0 or rate > 60.0:
             raise ValueError("M3 shadow decision_hz must be in (0, 60].")
         object.__setattr__(self, "decision_hz", rate)
+        if not isinstance(self.action_schema, ComponentActionSchema):
+            raise TypeError("action_schema must be a ComponentActionSchema.")
+        if set(self.active_effectors) != set(
+            self.action_schema.component_ids
+        ):
+            raise ValueError(
+                "Shadow active_effectors must match the runtime action schema."
+            )
         if self.component_catalog is not None:
             if self.component_catalog.action_space != self.action_space:
                 raise ValueError("component_catalog action_space must match shadow action_space.")
@@ -137,7 +150,7 @@ class ArbitrationEvaluationEvent:
     computation_result_id: str
     computation_result_hash: str
     output_status: str
-    would_select_action: RobotAction | None
+    would_select_action: ComponentAction | None
     would_select_action_hash: str | None
     would_select_by_group: Mapping[str, str]
     would_select_by_component: Mapping[str, str]
@@ -556,16 +569,16 @@ class PassivePolicyArbiterShadow:
                 producer_id=self.config.producer_id,
                 producer_epoch=self.config.producer_epoch,
                 sequence=sequence,
-                action=action,
+                action=project_robot_action_v1_to_component_action(
+                    action,
+                    action_schema=self.config.action_schema,
+                ),
                 produced_at=emission.produced_at,
                 produced_clock_domain_id=emission.produced_clock_domain_id,
                 effective_from=emission.effective_from,
                 effective_until=emission.effective_until,
                 target_effective_at=emission.target_effective_at,
                 effective_clock_domain_id=emission.effective_clock_domain_id,
-                component_schema_hash=self.component_catalog.semantic_content_hash,
-                component_coverage=coverage,
-                selection_groups=coverage,
                 authority_priority=100,
                 fallback_policy="no_action",
                 policy_node_id=emission.policy_node_id,
@@ -636,23 +649,21 @@ class PassivePolicyArbiterShadow:
                 emission_id=source_id,
                 emission=emission,
             )
-        if draft.component_schema_hash != self.component_catalog.semantic_content_hash:
+        if (
+            draft.action.action_schema.semantic_content_hash
+            != self.config.action_schema.semantic_content_hash
+        ):
             return self.status(
                 "proposal_rejected",
-                reason="component_catalog_mismatch",
+                reason="action_schema_mismatch",
                 emission_id=source_id,
                 emission=emission,
             )
-        if draft.action.action_space != self.component_catalog.action_space:
-            return self.status(
-                "proposal_rejected",
-                reason="action_space_mismatch",
-                emission_id=source_id,
-                emission=emission,
-            )
-        if not draft.component_coverage or any(
-            component not in self.component_catalog.component_by_id
-            for component in draft.component_coverage
+        coverage = draft.action.component_coverage
+        catalog = self.config.action_schema.component_catalog
+        if not coverage or any(
+            component not in catalog.component_by_id
+            for component in coverage
         ):
             return self.status(
                 "proposal_rejected",
@@ -660,9 +671,17 @@ class PassivePolicyArbiterShadow:
                 emission_id=source_id,
                 emission=emission,
             )
-        if not draft.selection_groups or any(
-            group not in self.component_catalog.selection_group_ids
-            for group in draft.selection_groups
+        selection_groups = tuple(
+            dict.fromkeys(
+                catalog.component_by_id[
+                    component_id
+                ].selection_group_id
+                for component_id in coverage
+            )
+        )
+        if not selection_groups or any(
+            group not in catalog.selection_group_ids
+            for group in selection_groups
         ):
             return self.status(
                 "proposal_rejected",
@@ -697,8 +716,10 @@ class PassivePolicyArbiterShadow:
             execution_gate_store=self.execution_gate_store,
             scheduler=self.scheduler,
             embodiment_instance_id=self.config.embodiment_instance_id,
-            component_catalog=self.component_catalog,
-            active_selection_groups=self.component_catalog.selection_group_ids,
+            action_schema=self.config.action_schema,
+            active_selection_groups=(
+                self.config.action_schema.component_catalog.selection_group_ids
+            ),
             now=decision_now,
         )
         if snapshot is None:
@@ -740,7 +761,7 @@ class PassivePolicyArbiterShadow:
         evaluation = ArbitrationEvaluationEvent(
             evaluation_id=f"arbitration-evaluation:{semantic_hash}",
             **payload,
-            would_select_action=computation.composed_action,
+            would_select_action=computation.composed_candidate,
             semantic_content_hash=semantic_hash,
         )
         self.proposal_buffer.prune_expired(
@@ -775,7 +796,11 @@ class PassivePolicyArbiterShadow:
             if emission.pre_safety_robot_action is not None:
                 parity = compare_action_components(
                     emission.pre_safety_robot_action,
-                    evaluation.would_select_action,
+                    materialize_robot_action_v1(
+                        evaluation.would_select_action,
+                        timestamp=emission.pre_safety_robot_action.timestamp,
+                        source="arbiter_shadow_expected",
+                    ),
                 )
         representation = getattr(canonical_action, "representation_receipt", None)
         command = getattr(canonical_action, "command", None)
@@ -848,7 +873,11 @@ class PassivePolicyArbiterShadow:
             and observed_action is not None
         ):
             parity = compare_action_components(
-                evaluation.would_select_action,
+                materialize_robot_action_v1(
+                    evaluation.would_select_action,
+                    timestamp=observed_action.timestamp,
+                    source="arbiter_shadow_expected",
+                ),
                 observed_action,
             )
         payload = {

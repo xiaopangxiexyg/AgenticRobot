@@ -17,6 +17,11 @@ from typing import Any
 import numpy as np
 from dataclasses import replace
 
+from dataset_contracts.stats import (
+    FORCE_COLLISION_LABEL_DETECTED,
+    has_force_limit_collision_text,
+)
+
 
 _REQUIRED_SUPPORT_NAMES = (
     "AsyncDMTacDistributedForceVisualizer",
@@ -129,6 +134,153 @@ class _LegacyFunctionProxy:
 
     def __getattr__(self, attribute: str) -> object:
         return getattr(self._namespace[self._name], attribute)
+
+
+def _exception_chain_text(error: BaseException) -> tuple[str, ...]:
+    """Return the complete exception chain without re-raising any cause."""
+
+    messages: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    return tuple(messages)
+
+
+def _is_emergency_stop_latch_error(error: BaseException) -> bool:
+    """Recognize a backend stop race that must enter safety Hold, not crash."""
+
+    texts = _exception_chain_text(error)
+    markers = (
+        "emergency_stop is latched",
+        "emergency stop is latched",
+        "emergency_stop_failed",
+        "emergency stop was not acknowledged",
+        "emergency stop was not confirmed",
+    )
+    return any(
+        marker in text.lower()
+        for text in texts
+        for marker in markers
+    )
+
+
+def _stop_recording_best_effort(
+    *,
+    recording_active: Callable[[], bool],
+    stop_recording: Callable[..., Any],
+    now: float,
+    end_reason: str,
+    summary: Mapping[str, object],
+    log: Callable[..., Any],
+    control_ui: Any,
+    ui_tag: str,
+    ui_failure_message: str,
+) -> Exception | None:
+    """Close a safety episode without allowing writer cleanup to resume motion.
+
+    A writer/finalizer failure is recorded and surfaced in the GUI, but it is
+    never allowed to escape a collision path.  The arm stop and Hold request
+    are owned by the caller and therefore still execute after this function
+    returns.
+    """
+
+    try:
+        active = bool(recording_active())
+    except Exception as exc:  # noqa: BLE001 - safety cleanup must remain bounded.
+        active = True
+        log(
+            ui_tag,
+            "cannot determine recording state during safety stop; treating it as active: "
+            f"{type(exc).__name__}: {exc}",
+            now=now,
+        )
+    if not active:
+        return None
+    try:
+        stop_recording(
+            now,
+            end_reason=end_reason,
+            summary=summary,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the safety transition.
+        log(
+            ui_tag,
+            "safety episode stop failed; runtime remains fail-closed in Hold: "
+            f"{type(exc).__name__}: {exc}",
+            now=now,
+        )
+        if control_ui is not None:
+            try:
+                control_ui.append_message(ui_tag, ui_failure_message)
+            except Exception as ui_exc:  # noqa: BLE001 - UI is not the safety owner.
+                log(
+                    ui_tag,
+                    "safety stop failure message could not be published: "
+                    f"{type(ui_exc).__name__}: {ui_exc}",
+                    now=now,
+                )
+        return exc
+    return None
+
+
+def _request_safety_hold_best_effort(
+    clutch_input: Any,
+    *,
+    reason: str,
+    log: Callable[..., Any],
+    now: float,
+) -> None:
+    """Latch Hold even if the normal input/UI callback raises."""
+
+    try:
+        clutch_input.request_hold(reason=reason)
+        return
+    except Exception as exc:  # noqa: BLE001 - safety Hold must still be latched.
+        log(
+            "Hold",
+            "safety Hold request callback failed; forcing the local Hold latch: "
+            f"{type(exc).__name__}: {exc}",
+            now=now,
+        )
+    fallback_values = {
+        "_hold_requested": True,
+        "_hold_active": True,
+        "_hold_request_reason": str(reason),
+        "_gripper_control_enabled": False,
+    }
+    for attribute, value in fallback_values.items():
+        try:
+            setattr(clutch_input, attribute, value)
+        except Exception as exc:  # noqa: BLE001 - report, never clear the stop latch.
+            log(
+                "Hold",
+                f"safety Hold fallback field {attribute} could not be set: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
+
+
+def _cancel_safety_recording_countdown_best_effort(
+    cancel_recording_countdown: Callable[..., Any],
+    *,
+    now: float,
+    reason: str,
+    log: Callable[..., Any],
+) -> None:
+    """Cancel a pending recording start without escaping a safety path."""
+
+    try:
+        cancel_recording_countdown(now, reason=reason)
+    except Exception as exc:  # noqa: BLE001 - Hold/stop remains authoritative.
+        log(
+            "Dataset",
+            "safety recording countdown cancellation failed; "
+            f"continuing with motion blocked: {type(exc).__name__}: {exc}",
+            now=now,
+        )
 
 
 def bind_legacy_support(namespace: Mapping[str, object]) -> None:
@@ -276,6 +428,98 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
 
     main_loop_watchdog.start()
     emergency_stop_sent = False
+    force_guard_fault_handled = False
+
+    def consume_position_force_guard_fault(
+        fault: Any,
+        *,
+        now: float,
+    ) -> bool:
+        """Consume one latched position-force fault in the normal Hold path."""
+
+        nonlocal force_guard_fault_handled
+        if force_guard_fault_handled:
+            # The monitor callback is the authoritative Arm_Stop owner.  A
+            # dispatch race may reach this function after the episode was
+            # already closed; keep the latch and simply prevent another stop
+            # or writer finalization attempt.
+            _request_safety_hold_best_effort(
+                clutch_input,
+                reason="position_force_guard_fault",
+                log=_log,
+                now=now,
+            )
+            return False
+        force_guard_fault_handled = True
+        _cancel_safety_recording_countdown_best_effort(
+            cancel_recording_countdown,
+            now=now,
+            reason="position_force_guard",
+            log=_log,
+        )
+        recording_end_reason, recording_summary = _force_guard_recording_stop_context(
+            fault,
+            fallback_end_reason="position_force_guard",
+            fallback_summary={
+                "last_step_index": step_index,
+                "last_state": episode_last_state,
+            },
+        )
+        _stop_recording_best_effort(
+            recording_active=recording_active,
+            stop_recording=stop_recording,
+            now=now,
+            end_reason=recording_end_reason,
+            summary=recording_summary,
+            log=_log,
+            control_ui=control_ui,
+            ui_tag="PositionForceGuard",
+            ui_failure_message=(
+                "碰撞数采收尾失败，但机械臂仍保持急停；"
+                "请检查数据目录后再重新采集。"
+            ),
+        )
+        fault_reason = str(getattr(fault, "reason", "unknown"))
+        collision_fault = fault_reason == "force_limit_exceeded"
+        hold_reason = (
+            "position_force_guard_collision"
+            if collision_fault
+            else "position_force_guard_fault"
+        )
+        _request_safety_hold_best_effort(
+            clutch_input,
+            reason=hold_reason,
+            log=_log,
+            now=now,
+        )
+        _log(
+            "PositionForceGuard",
+            "active teleop fault consumed; GUI/devices retained in Hold "
+            f"reason={fault_reason}",
+            now=now,
+        )
+        if control_ui is not None:
+            try:
+                if collision_fault:
+                    message = (
+                        "检测到受力碰撞：数采已停止并保留碰撞标签；"
+                        "GUI/设备连接未退出，请人工调整位置后点击“开始遥操”重新采集 Home。"
+                    )
+                else:
+                    message = (
+                        "位控受力安全监控触发停机：数采已停止；"
+                        "GUI/设备连接保持，但需检查设备后重新采集 runtime Home。"
+                    )
+                control_ui.append_message("PositionForceGuard", message)
+            except Exception as exc:  # noqa: BLE001 - UI cannot change safety state.
+                _log(
+                    "PositionForceGuard",
+                    "fault Hold message failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    now=now,
+                )
+        return True
+
     while True:
         loop_start = time.time()
         dataset_recorder = context.dataset_recorder()
@@ -420,64 +664,151 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             context.visualization_state()
         )
         sync_fix_hold(loop_start)
+        # A force-guard trip during an admitted teleop session is a runtime
+        # safety transition, not a process-lifecycle failure.  The monitor
+        # callback has already latched both command backends and issued the
+        # bimanual Arm_Stop.  Close the active episode with the collision
+        # summary, request the normal GUI Hold path, and leave the cameras,
+        # trackers, hands, and GUI alive for a fresh operator-led Home.
+        force_guard_fault = (
+            None
+            if position_force_guard_monitor is None
+            else position_force_guard_monitor.fault
+        )
+        if force_guard_fault is None:
+            # A successful operator-led runtime Home re-arms the monitor;
+            # allow the next independent collision in the same process to be
+            # consumed exactly once as well.
+            force_guard_fault_handled = False
+        if (
+            force_guard_fault is not None
+            and not force_guard_fault_handled
+            and bool(getattr(clutch_input, "_teleop_started", False))
+        ):
+            consume_position_force_guard_fault(force_guard_fault, now=loop_start)
+            continue
         if clutch_input.should_quit:
             if not emergency_stop_sent:
-                _emergency_stop_real_arms(
-                    components,
-                    reason="quit_requested",
-                    now=loop_start,
-                )
-                emergency_stop_sent = True
-            cancel_recording_countdown(loop_start, reason="quit_requested")
-            if recording_active():
-                force_guard_fault = (
-                    None
-                    if position_force_guard_monitor is None
-                    else position_force_guard_monitor.fault
-                )
-                recording_end_reason, recording_summary = (
-                    _force_guard_recording_stop_context(
-                        force_guard_fault,
-                        fallback_end_reason="quit_requested",
-                        fallback_summary={
-                            "last_step_index": step_index,
-                            "last_state": episode_last_state,
-                        },
+                try:
+                    _emergency_stop_real_arms(
+                        components,
+                        reason="quit_requested",
+                        now=loop_start,
                     )
-                )
-                stop_recording(
-                    loop_start,
-                    end_reason=recording_end_reason,
-                    summary=recording_summary,
-                )
+                except Exception as exc:  # noqa: BLE001 - quit remains fail-closed.
+                    _log(
+                        "EmergencyStop",
+                        "quit emergency stop reported a recoverable cleanup error; "
+                        f"runtime will still terminate safely: {type(exc).__name__}: {exc}",
+                        now=loop_start,
+                    )
+            emergency_stop_sent = True
+            _cancel_safety_recording_countdown_best_effort(
+                cancel_recording_countdown,
+                now=loop_start,
+                reason="quit_requested",
+                log=_log,
+            )
+            force_guard_fault = (
+                None
+                if position_force_guard_monitor is None
+                else position_force_guard_monitor.fault
+            )
+            recording_end_reason, recording_summary = _force_guard_recording_stop_context(
+                force_guard_fault,
+                fallback_end_reason="quit_requested",
+                fallback_summary={
+                    "last_step_index": step_index,
+                    "last_state": episode_last_state,
+                },
+            )
+            _stop_recording_best_effort(
+                recording_active=recording_active,
+                stop_recording=stop_recording,
+                now=loop_start,
+                end_reason=recording_end_reason,
+                summary=recording_summary,
+                log=_log,
+                control_ui=control_ui,
+                ui_tag="Dataset",
+                ui_failure_message=(
+                    "退出前数采收尾失败；机械臂保持停机，请检查数据目录。"
+                ),
+            )
             break
         if clutch_input.consume_hold_request():
             hold_reason = clutch_input.hold_request_reason()
+            safety_hold = hold_reason in {
+                "position_force_guard_collision",
+                "position_force_guard_fault",
+                "impedance_force_collision",
+                "emergency_stop_latched",
+            }
             fix_hold_escalation = fix_hold_coordinator.escalate_to_regular_hold()
             if fix_hold_escalation.changed:
-                clutch_input.set_fix_hold_active(
-                    False,
-                    message=(
-                        "Fix-Hold 已由用户升级为常规 Hold；"
-                        "特殊固定状态将清除，之后必须重采双臂 Home。"
-                    ),
-                )
-                if episode_recorder.is_recording:
-                    episode_recorder.record_event(
-                        "fix_hold_escalated_to_regular_hold",
-                        payload={
-                            "step_index": int(step_index),
-                            "locked_sides": list(fix_hold_escalation.locked_sides),
-                            "source_by_side": dict(
-                                fix_hold_escalation.source_by_side
-                            ),
-                        },
-                        timestamp=loop_start,
+                try:
+                    clutch_input.set_fix_hold_active(
+                        False,
+                        message=(
+                            "Fix-Hold 已由用户升级为常规 Hold；"
+                            "特殊固定状态将清除，之后必须重采双臂 Home。"
+                        ),
                     )
+                except Exception as exc:  # noqa: BLE001 - safety Hold remains fail-closed.
+                    if not safety_hold:
+                        raise
+                    _log(
+                        "Hold",
+                        "Fix-Hold UI transition failed during safety Hold: "
+                        f"{type(exc).__name__}: {exc}",
+                        now=loop_start,
+                    )
+                if episode_recorder.is_recording:
+                    try:
+                        episode_recorder.record_event(
+                            "fix_hold_escalated_to_regular_hold",
+                            payload={
+                                "step_index": int(step_index),
+                                "locked_sides": list(fix_hold_escalation.locked_sides),
+                                "source_by_side": dict(
+                                    fix_hold_escalation.source_by_side
+                                ),
+                            },
+                            timestamp=loop_start,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - diagnostics cannot reopen motion.
+                        if not safety_hold:
+                            raise
+                        _log(
+                            "Hold",
+                            "Fix-Hold episode event failed during safety Hold: "
+                            f"{type(exc).__name__}: {exc}",
+                            now=loop_start,
+                        )
             if hold_reason == "q6_gesture":
                 hold_hardware_reason = "q6 gesture hold requested"
             elif hold_reason == "tracker_loss_timeout":
                 hold_hardware_reason = "tracker target loss requires runtime home recalibration"
+            elif hold_reason == "position_force_guard_collision":
+                hold_hardware_reason = (
+                    "position force guard collision emergency stop; "
+                    "runtime home recalibration required"
+                )
+            elif hold_reason == "position_force_guard_fault":
+                hold_hardware_reason = (
+                    "position force guard safety fault; "
+                    "runtime home recalibration required"
+                )
+            elif hold_reason == "impedance_force_collision":
+                hold_hardware_reason = (
+                    "impedance force collision emergency stop; "
+                    "runtime home recalibration required"
+                )
+            elif hold_reason == "emergency_stop_latched":
+                hold_hardware_reason = (
+                    "emergency stop latch observed during command dispatch; "
+                    "runtime home recalibration required"
+                )
             elif hold_reason.startswith("init_qpos_"):
                 hold_hardware_reason = (
                     "Init qpos operation completed; runtime home recalibration required"
@@ -490,24 +821,118 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             else:
                 hold_hardware_reason = "gui hold requested"
             if recording_active():
-                pause_recording(
-                    loop_start,
-                    reason=_hold_requested_pause_reason(hold_reason),
+                try:
+                    pause_recording(
+                        loop_start,
+                        reason=_hold_requested_pause_reason(hold_reason),
+                    )
+                except Exception as exc:  # noqa: BLE001 - safety Hold must still complete.
+                    if not safety_hold:
+                        raise
+                    _log(
+                        "Dataset",
+                        "safety Hold could not pause the active episode; "
+                        f"continuing with arm stop: {type(exc).__name__}: {exc}",
+                        now=loop_start,
+                    )
+                    if control_ui is not None:
+                        try:
+                            control_ui.append_message(
+                                "Dataset",
+                                "碰撞/急停后的数采暂停失败；机械臂保持停机，请检查数据目录。",
+                            )
+                        except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
+                            _log(
+                                "Dataset",
+                                "safety pause failure message could not be published: "
+                                f"{type(ui_exc).__name__}: {ui_exc}",
+                                now=loop_start,
+                            )
+            try:
+                special_cancel_messages = _cancel_special_arm_modes_for_hold(
+                    components,
+                    now=loop_start,
+                    reason="hold_requested",
                 )
-            special_cancel_messages = _cancel_special_arm_modes_for_hold(
-                components,
-                now=loop_start,
-                reason="hold_requested",
-            )
-            cancel_recording_countdown(loop_start, reason="hold_requested")
+            except Exception as exc:  # noqa: BLE001 - safety Hold remains fail-closed.
+                if not safety_hold:
+                    raise
+                special_cancel_messages = [
+                    "特殊控制模式释放异常，已保持停机"
+                ]
+                _log(
+                    "Hold",
+                    "special arm mode cancellation failed during safety Hold; "
+                    f"motion remains blocked: {type(exc).__name__}: {exc}",
+                    now=loop_start,
+                )
+            if safety_hold:
+                _cancel_safety_recording_countdown_best_effort(
+                    cancel_recording_countdown,
+                    now=loop_start,
+                    reason="hold_requested",
+                    log=_log,
+                )
+            else:
+                cancel_recording_countdown(loop_start, reason="hold_requested")
             recovery_plan = None
             if not components.session.home_recalibration_required:
-                components.session.hold_hardware(hold_hardware_reason)
-            _disengage_position_backends_for_manual_interaction(
-                components,
-                now=loop_start,
-                reason=hold_hardware_reason,
-            )
+                if safety_hold:
+                    try:
+                        components.session.hold_hardware(
+                            hold_hardware_reason,
+                            require_home_recalibration=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - stay fail-closed in GUI.
+                        _log(
+                            "Hold",
+                            "safety Hold hardware transition failed; motion remains blocked: "
+                            f"{type(exc).__name__}: {exc}",
+                            now=loop_start,
+                        )
+                        if control_ui is not None:
+                            try:
+                                control_ui.append_message(
+                                    "Hold",
+                                    "急停后的 Hold 下发存在异常；已禁止继续运动，请检查设备并重启。",
+                                )
+                            except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
+                                _log(
+                                    "Hold",
+                                    "safety Hold failure message could not be published: "
+                                    f"{type(ui_exc).__name__}: {ui_exc}",
+                                    now=loop_start,
+                                )
+                else:
+                    components.session.hold_hardware(hold_hardware_reason)
+            try:
+                _disengage_position_backends_for_manual_interaction(
+                    components,
+                    now=loop_start,
+                    reason=hold_hardware_reason,
+                )
+            except Exception as exc:  # noqa: BLE001 - safety Hold remains fail-closed.
+                if not safety_hold:
+                    raise
+                _log(
+                    "Hold",
+                    "safety Hold position-stream disengage failed; "
+                    f"motion remains blocked: {type(exc).__name__}: {exc}",
+                    now=loop_start,
+                )
+                if control_ui is not None:
+                    try:
+                        control_ui.append_message(
+                            "Hold",
+                            "急停后的控制流释放存在异常；已禁止继续运动，请检查设备并重启。",
+                        )
+                    except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
+                        _log(
+                            "Hold",
+                            "safety stream-release failure message could not be published: "
+                            f"{type(ui_exc).__name__}: {ui_exc}",
+                            now=loop_start,
+                        )
             _log(
                 "Hold",
                 f"{hold_hardware_reason}; waiting for explicit runtime home calibration",
@@ -518,6 +943,26 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     message = "机械臂已进入保持状态；松开双手后三维到释放区间 1 秒，再次握紧 1 秒后会重新采集 runtime home。"
                 elif hold_reason == "tracker_loss_timeout":
                     message = "Tracker 目标持续丢失已进入手动 Hold；必须点击“开始遥操”重新采集 runtime home 后才能恢复。"
+                elif hold_reason == "position_force_guard_collision":
+                    message = (
+                        "受力碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。"
+                        "请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。"
+                    )
+                elif hold_reason == "position_force_guard_fault":
+                    message = (
+                        "位控受力安全监控已急停双臂并结束当前数采；"
+                        "请检查设备后点击“开始遥操”重新采集 runtime Home。"
+                    )
+                elif hold_reason == "impedance_force_collision":
+                    message = (
+                        "力控碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。"
+                        "请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。"
+                    )
+                elif hold_reason == "emergency_stop_latched":
+                    message = (
+                        "检测到急停与控制帧竞态，当前数采已结束并进入 Hold；"
+                        "请检查机械臂后重新采集 runtime Home。"
+                    )
                 elif hold_reason.startswith("init_qpos_"):
                     message = (
                         "Init qpos 已完成并进入 Hold；请摆好 VIVE/Q6 后点击“开始遥操”重新采集 runtime Home。"
@@ -529,12 +974,22 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     )
                 else:
                     message = "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。"
-                control_ui.append_message("Hold", message)
-                if special_cancel_messages:
-                    control_ui.append_message(
+                try:
+                    control_ui.append_message("Hold", message)
+                    if special_cancel_messages:
+                        control_ui.append_message(
+                            "Hold",
+                            "；".join(special_cancel_messages)
+                            + "；重新采集 runtime home 后恢复普通遥操。",
+                        )
+                except Exception as exc:  # noqa: BLE001 - UI cannot change safety state.
+                    if not safety_hold:
+                        raise
+                    _log(
                         "Hold",
-                        "；".join(special_cancel_messages)
-                        + "；重新采集 runtime home 后恢复普通遥操。",
+                        "safety Hold message could not be published: "
+                        f"{type(exc).__name__}: {exc}",
+                        now=loop_start,
                     )
             continue
         fast_two_pedal_home, fast_two_pedal_fixed_side = (
@@ -600,6 +1055,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 components,
                 clutch_input,
                 home_captured=True,
+                position_force_guard_monitor=position_force_guard_monitor,
             )
             clutch_input.finish_two_pedal_fast_home(
                 success=True,
@@ -657,6 +1113,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 components,
                 clutch_input,
                 home_captured=True,
+                position_force_guard_monitor=position_force_guard_monitor,
             )
             continue
         if clutch_input.consume_episode_stop_request():
@@ -779,19 +1236,224 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
         _sync_real_execution_step_limits(components, now=loop_start)
         mark_loop_phase("loop.sync_step_limits")
 
-        _guard_impedance_force_control(
+        impedance_collision_consumed = {"value": False}
+
+        def handle_impedance_force_collision(reason: str) -> None:
+            """Consume a controller hard-stop without tearing down runtime."""
+
+            if impedance_collision_consumed["value"]:
+                return
+            impedance_collision_consumed["value"] = True
+            collision_summary = {
+                "last_step_index": int(step_index),
+                "last_state": episode_last_state,
+                "reason": "force_collision",
+                "force_collision_detected": True,
+                "force_collision_label": FORCE_COLLISION_LABEL_DETECTED,
+                "force_collision_event": {
+                    "detected": True,
+                    "source": "controller_hard_stop",
+                    "control_mode": str(
+                        getattr(args, "arm_control_mode", "impedance")
+                    ),
+                    "reason": "force_limit_exceeded",
+                    "message": str(reason),
+                },
+            }
+            _cancel_safety_recording_countdown_best_effort(
+                cancel_recording_countdown,
+                now=loop_start,
+                reason="force_collision",
+                log=_log,
+            )
+            stop_errors: dict[str, str] = {}
+            try:
+                stop_errors = _emergency_stop_real_arms(
+                    components,
+                    reason="controller_hard_stop:force_collision",
+                    now=loop_start,
+                    raise_on_failure=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - fail closed on stop acknowledgement.
+                stop_errors = {"__all__": f"{type(exc).__name__}: {exc}"}
+            if stop_errors:
+                collision_summary["emergency_stop_errors"] = dict(stop_errors)
+            _stop_recording_best_effort(
+                recording_active=recording_active,
+                stop_recording=stop_recording,
+                now=loop_start,
+                end_reason="force_collision",
+                summary=collision_summary,
+                log=_log,
+                control_ui=control_ui,
+                ui_tag="ForceControl",
+                ui_failure_message=(
+                    "碰撞数采收尾失败；机械臂保持急停，请检查数据目录。"
+                ),
+            )
+            if stop_errors and control_ui is not None:
+                try:
+                    control_ui.append_message(
+                        "ForceControl",
+                        "力控碰撞已触发，但至少一侧 Arm_Stop 未确认；"
+                        "已保持 Hold，禁止继续运动；必须检查设备后再决定是否重启。",
+                    )
+                except Exception as exc:  # noqa: BLE001 - UI cannot change the stop latch.
+                    _log(
+                        "ForceControl",
+                        "Arm_Stop failure message could not be published: "
+                        f"{type(exc).__name__}: {exc}",
+                        now=loop_start,
+                    )
+            _request_safety_hold_best_effort(
+                clutch_input,
+                reason="impedance_force_collision",
+                log=_log,
+                now=loop_start,
+            )
+            _log(
+                "ForceControl",
+                "active impedance force collision consumed; GUI/devices retained in Hold "
+                f"reason={reason}",
+                now=loop_start,
+            )
+            if control_ui is not None:
+                try:
+                    control_ui.append_message(
+                        "ForceControl",
+                        "力控碰撞已急停双臂并结束当前数采；GUI/设备连接保持。"
+                        "请人工调整位置后点击“开始遥操”重新采集 runtime Home。",
+                    )
+                except Exception as exc:  # noqa: BLE001 - UI cannot change the stop latch.
+                    _log(
+                        "ForceControl",
+                        "collision Hold message could not be published: "
+                        f"{type(exc).__name__}: {exc}",
+                        now=loop_start,
+                    )
+
+        impedance_guard_ok = _guard_impedance_force_control(
             args,
             components,
             context="main_loop",
             now=loop_start,
+            collision_handler=(
+                handle_impedance_force_collision
+                if bool(getattr(clutch_input, "_teleop_started", False))
+                else None
+            ),
         )
         mark_loop_phase("loop.impedance_guard")
+        if not impedance_guard_ok and impedance_collision_consumed["value"]:
+            # The collision handler has already issued Arm_Stop and closed the
+            # active episode.  Let the next iteration consume the normal GUI
+            # Hold request; no command or hand/gripper dispatch may follow this
+            # frame.
+            continue
+
+        def consume_latched_safety_dispatch(error: BaseException) -> None:
+            """Close an episode after a backend rejected a raced command."""
+
+            _cancel_safety_recording_countdown_best_effort(
+                cancel_recording_countdown,
+                now=loop_start,
+                reason="emergency_stop_latched",
+                log=_log,
+            )
+            safety_summary: dict[str, object] = {
+                "reason": "emergency_stop_latched",
+                "safety_stop_error": " <- ".join(_exception_chain_text(error)),
+            }
+            stop_errors: dict[str, str] = {}
+            try:
+                stop_errors = _emergency_stop_real_arms(
+                    components,
+                    reason="dispatch_safety_race",
+                    now=loop_start,
+                    raise_on_failure=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve the fail-closed path.
+                stop_errors = {"__all__": f"{type(exc).__name__}: {exc}"}
+            if stop_errors:
+                safety_summary["emergency_stop_errors"] = dict(stop_errors)
+            _stop_recording_best_effort(
+                recording_active=recording_active,
+                stop_recording=stop_recording,
+                now=loop_start,
+                end_reason="safety_stop",
+                summary=safety_summary,
+                log=_log,
+                control_ui=control_ui,
+                ui_tag="EmergencyStop",
+                ui_failure_message=(
+                    "急停竞态下数采收尾失败；机械臂保持停机，请检查数据目录。"
+                ),
+            )
+            _request_safety_hold_best_effort(
+                clutch_input,
+                reason="emergency_stop_latched",
+                log=_log,
+                now=loop_start,
+            )
+            _log(
+                "EmergencyStop",
+                "raced command was rejected after an emergency stop latch; "
+                "episode closed and runtime retained in Hold: "
+                + " <- ".join(_exception_chain_text(error)),
+                now=loop_start,
+            )
+            if control_ui is not None:
+                try:
+                    control_ui.append_message(
+                        "EmergencyStop",
+                        "检测到急停与控制帧竞态：当前数采已停止，GUI/设备连接保持在 Hold；"
+                        "请检查机械臂后重新采集 runtime Home。",
+                    )
+                except Exception as exc:  # noqa: BLE001 - UI cannot change safety state.
+                    _log(
+                        "EmergencyStop",
+                        "safety Hold message could not be published: "
+                        f"{type(exc).__name__}: {exc}",
+                        now=loop_start,
+                    )
+
+        def handle_safety_dispatch_exception(error: BaseException) -> bool:
+            """Route only collision/stop races; leave unrelated failures visible."""
+
+            force_guard_fault_now = (
+                None
+                if position_force_guard_monitor is None
+                else position_force_guard_monitor.fault
+            )
+            teleop_active = bool(getattr(clutch_input, "_teleop_started", False))
+            if force_guard_fault_now is not None and teleop_active:
+                consume_position_force_guard_fault(
+                    force_guard_fault_now,
+                    now=loop_start,
+                )
+                return True
+            exception_text = _exception_chain_text(error)
+            if has_force_limit_collision_text(exception_text):
+                handle_impedance_force_collision(
+                    "dispatch rejected after controller force collision: "
+                    + " <- ".join(exception_text)
+                )
+                return True
+            if _is_emergency_stop_latch_error(error):
+                consume_latched_safety_dispatch(error)
+                return True
+            return False
 
         phase_recorder = loop_phase_timer.record if loop_phase_timer is not None else None
-        step_result = components.session.run_step(
-            now=loop_start,
-            phase_recorder=phase_recorder,
-        )
+        try:
+            step_result = components.session.run_step(
+                now=loop_start,
+                phase_recorder=phase_recorder,
+            )
+        except Exception as exc:  # noqa: BLE001 - only safety races are consumed here.
+            if handle_safety_dispatch_exception(exc):
+                continue
+            raise
         mark_loop_phase("loop.session_run_step")
         init_controller = getattr(components, "init_arm_controller", None)
         qpos_terminal = (
@@ -1218,12 +1880,20 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         components,
                         context="recovery_start",
                         now=loop_start,
+                        collision_handler=handle_impedance_force_collision,
                     ):
                         assert components.session.rig is not None
-                        components.session.dispatch_command(active_command)
+                        try:
+                            components.session.dispatch_command(active_command)
+                        except Exception as exc:  # noqa: BLE001 - consume stop races only.
+                            if handle_safety_dispatch_exception(exc):
+                                continue
+                            raise
                         manual_recovery_command_dispatched = True
                         if components.temporary_safety_limiter is not None:
                             components.temporary_safety_limiter.sync_from_command(active_command)
+                    elif impedance_collision_consumed["value"]:
+                        continue
                     else:
                         active_command = None
                 if recovery_done:
@@ -1263,12 +1933,20 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         components,
                         context="recovery_advance",
                         now=loop_start,
+                        collision_handler=handle_impedance_force_collision,
                     ):
                         assert components.session.rig is not None
-                        components.session.dispatch_command(active_command)
+                        try:
+                            components.session.dispatch_command(active_command)
+                        except Exception as exc:  # noqa: BLE001 - consume stop races only.
+                            if handle_safety_dispatch_exception(exc):
+                                continue
+                            raise
                         manual_recovery_command_dispatched = True
                         if components.temporary_safety_limiter is not None:
                             components.temporary_safety_limiter.sync_from_command(active_command)
+                    elif impedance_collision_consumed["value"]:
+                        continue
                     else:
                         active_command = None
                 if recovery_done:

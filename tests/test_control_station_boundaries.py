@@ -83,6 +83,7 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
         "control_station/composition/mujoco_pose_composer.py": [
             "dataset_interface"
         ],
+        "control_station/composition/mujoco_sim_hil.py": ["dataset_interface"],
         "control_station/control_trace.py": ["dataset_interface"],
     }
 
@@ -111,6 +112,8 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/composition/mujoco_pose_composer.py": ["sim"],
         "control_station/composition/mujoco_replay.py": ["sim"],
         "control_station/composition/mujoco_rtc_policy.py": ["sim"],
+        "control_station/composition/mujoco_sim_hil.py": ["sim"],
+        "control_station/sim_hil.py": ["sim"],
     }
 
 
@@ -122,6 +125,14 @@ def test_station_numerical_source_debt_is_explicit_and_cannot_spread() -> None:
         "control_station/sources/synthetic_human.py": ["numpy"],
         "control_station/sources/teleop_pose.py": ["numpy"],
     }
+
+
+def test_generic_passive_teleop_source_does_not_construct_vive_q6() -> None:
+    source_text = (STATION_ROOT / "sources" / "teleop_pose.py").read_text(
+        encoding="utf-8"
+    )
+    assert "passive_vive_q6" not in source_text
+    assert "build_passive_vive_q6_session" not in source_text
 
 
 def test_lower_packages_do_not_reverse_depend_on_control_station() -> None:

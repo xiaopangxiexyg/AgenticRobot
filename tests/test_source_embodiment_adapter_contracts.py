@@ -13,6 +13,9 @@ from robot_motion.action import (
     ActionProposalDraft,
     ProposalBuffer,
     RobotAction,
+    build_robot_action_v1_runtime_schema,
+    materialize_robot_action_v1,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.proposal import robot_action_semantic_payload
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
@@ -86,29 +89,32 @@ class FakeEmbodimentSink:
         sink_id: str,
         command_schema_id: str,
         action_space: str,
-        component_schema_hash: str,
+        action_schema_hash: str,
         arm_dof: int,
     ) -> None:
         self.sink_id = sink_id
         self.command_schema_id = command_schema_id
         self.action_space = action_space
-        self.component_schema_hash = component_schema_hash
+        self.action_schema_hash = action_schema_hash
         self.arm_dof = arm_dof
         self.dispatch_count = 0
 
-    def preflight(self, proposal, *, component_schema_hash: str) -> None:
-        if proposal.action.action_space != self.action_space:
+    def preflight(self, proposal, *, action_schema_hash: str) -> None:
+        action = materialize_robot_action_v1(proposal.action)
+        if action.action_space != self.action_space:
             raise ValueError("embodiment action-space mismatch")
-        if component_schema_hash != self.component_schema_hash:
-            raise ValueError("embodiment component-schema mismatch")
-        qpos = proposal.action.arm_qpos_by_side.get("left")
+        if action_schema_hash != self.action_schema_hash:
+            raise ValueError("embodiment action-schema mismatch")
+        qpos = action.arm_qpos_by_side.get("left")
         if qpos is None or qpos.shape != (self.arm_dof,):
             raise ValueError("embodiment DOF mismatch")
 
-    def dispatch(self, proposal, *, component_schema_hash: str) -> FakeEmbodimentReceipt:
-        self.preflight(proposal, component_schema_hash=component_schema_hash)
+    def dispatch(self, proposal, *, action_schema_hash: str) -> FakeEmbodimentReceipt:
+        self.preflight(proposal, action_schema_hash=action_schema_hash)
         self.dispatch_count += 1
-        qpos = proposal.action.arm_qpos_by_side["left"]
+        qpos = materialize_robot_action_v1(
+            proposal.action
+        ).arm_qpos_by_side["left"]
         if self.command_schema_id == "real-servo-deg-v1":
             payload = tuple(float(value) for value in np.rad2deg(qpos))
         else:
@@ -173,6 +179,9 @@ def test_compatible_embodiment_sinks_keep_proposal_fact_but_change_command_schem
         components=(ActionComponentSpec("left_arm", "left_arm", "left_arm"),),
     )
     action, _ = VectorSourceAdapter().adapt(np.linspace(0.0, 0.5, 6))
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
     proposal = proposal_runtime(catalog).admit(
         ActionProposalDraft(
             runtime_session_id="session-0",
@@ -182,16 +191,16 @@ def test_compatible_embodiment_sinks_keep_proposal_fact_but_change_command_schem
             producer_id="human-canonical",
             producer_epoch=1,
             sequence=0,
-            action=action,
+            action=project_robot_action_v1_to_component_action(
+                action,
+                action_schema=action_schema,
+            ),
             produced_at=9.9,
             produced_clock_domain_id="control.monotonic",
             effective_from=10.0,
             effective_until=11.0,
             target_effective_at=10.5,
             effective_clock_domain_id="control.monotonic",
-            component_schema_hash=catalog.semantic_content_hash,
-            component_coverage=("left_arm",),
-            selection_groups=("left_arm",),
         )
     ).proposal
     assert proposal is not None
@@ -199,21 +208,21 @@ def test_compatible_embodiment_sinks_keep_proposal_fact_but_change_command_schem
         sink_id="fake-real-rm65",
         command_schema_id="real-servo-deg-v1",
         action_space=BIMANUAL_QPOS_V1,
-        component_schema_hash=catalog.semantic_content_hash,
+        action_schema_hash=action_schema.semantic_content_hash,
         arm_dof=6,
     )
     sim = FakeEmbodimentSink(
         sink_id="fake-sim-rm65",
         command_schema_id="sim-qpos-rad-v1",
         action_space=BIMANUAL_QPOS_V1,
-        component_schema_hash=catalog.semantic_content_hash,
+        action_schema_hash=action_schema.semantic_content_hash,
         arm_dof=6,
     )
     real_receipt = real.dispatch(
-        proposal, component_schema_hash=catalog.semantic_content_hash
+        proposal, action_schema_hash=action_schema.semantic_content_hash
     )
     sim_receipt = sim.dispatch(
-        proposal, component_schema_hash=catalog.semantic_content_hash
+        proposal, action_schema_hash=action_schema.semantic_content_hash
     )
     assert real_receipt.command_schema_id != sim_receipt.command_schema_id
     assert real_receipt.command_payload != sim_receipt.command_payload
@@ -227,6 +236,9 @@ def test_incompatible_embodiment_fails_before_dispatch() -> None:
         components=(ActionComponentSpec("left_arm", "left_arm", "left_arm"),),
     )
     action, _ = VectorSourceAdapter().adapt(np.zeros(6))
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
     proposal = proposal_runtime(catalog).admit(
         ActionProposalDraft(
             runtime_session_id="session-0",
@@ -236,16 +248,16 @@ def test_incompatible_embodiment_fails_before_dispatch() -> None:
             producer_id="human-canonical",
             producer_epoch=1,
             sequence=0,
-            action=action,
+            action=project_robot_action_v1_to_component_action(
+                action,
+                action_schema=action_schema,
+            ),
             produced_at=9.9,
             produced_clock_domain_id="control.monotonic",
             effective_from=10.0,
             effective_until=11.0,
             target_effective_at=10.5,
             effective_clock_domain_id="control.monotonic",
-            component_schema_hash=catalog.semantic_content_hash,
-            component_coverage=("left_arm",),
-            selection_groups=("left_arm",),
         )
     ).proposal
     assert proposal is not None
@@ -253,11 +265,11 @@ def test_incompatible_embodiment_fails_before_dispatch() -> None:
         sink_id="fake-7dof",
         command_schema_id="sim-qpos-rad-v1",
         action_space=BIMANUAL_QPOS_V1,
-        component_schema_hash=catalog.semantic_content_hash,
+        action_schema_hash=action_schema.semantic_content_hash,
         arm_dof=7,
     )
     with pytest.raises(ValueError, match="DOF mismatch"):
         incompatible.dispatch(
-            proposal, component_schema_hash=catalog.semantic_content_hash
+            proposal, action_schema_hash=action_schema.semantic_content_hash
         )
     assert incompatible.dispatch_count == 0

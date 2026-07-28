@@ -31,6 +31,10 @@ from robot_motion.action.proposal import (
     freeze_robot_action,
     robot_action_semantic_payload,
 )
+from robot_motion.action.component_action import ComponentActionSchema
+from robot_motion.action.component_action_v1 import (
+    project_robot_action_v1_to_component_action,
+)
 from robot_motion.action.schema import RobotAction
 from robot_motion.deploy.runtime import PolicyActionEmission
 from robot_motion.replay.action_frame import replay_robot_action_at_index
@@ -243,9 +247,7 @@ class ReplayProposalSourceConfig:
     embodiment_instance_id: str
     producer_id: str
     producer_epoch: int
-    component_schema_hash: str
-    component_coverage: tuple[str, ...]
-    selection_groups: tuple[str, ...]
+    action_schema: ComponentActionSchema
     source_contract: ReplaySourceContract
     source_action_contract: ReplaySourceActionContract
     target_runtime_contract: TargetRuntimeActionContract
@@ -263,7 +265,6 @@ class ReplayProposalSourceConfig:
             "control_domain_id",
             "embodiment_instance_id",
             "producer_id",
-            "component_schema_hash",
             "fallback_policy",
         ):
             if not str(getattr(self, name)).strip():
@@ -288,8 +289,8 @@ class ReplayProposalSourceConfig:
             self.embodiment_instance_id
         ):
             raise ValueError("Replay target/embodiment instances disagree.")
-        if self.target_runtime_contract.component_schema_hash != self.component_schema_hash:
-            raise ValueError("Replay target/proposal component schemas disagree.")
+        if not isinstance(self.action_schema, ComponentActionSchema):
+            raise TypeError("action_schema must be a ComponentActionSchema.")
         if self.target_binding_spec.source_action_contract_hash != (
             self.source_action_contract.semantic_content_hash
         ):
@@ -304,16 +305,10 @@ class ReplayProposalSourceConfig:
             raise ValueError("Replay binding assessment does not reference the binding spec.")
         if int(self.producer_epoch) < 0:
             raise ValueError("producer_epoch must be non-negative.")
-        coverage = tuple(str(value).strip() for value in self.component_coverage)
-        groups = tuple(str(value).strip() for value in self.selection_groups)
-        if not coverage or any(not value for value in coverage):
-            raise ValueError("component_coverage must be non-empty.")
-        if not groups or any(not value for value in groups):
-            raise ValueError("selection_groups must be non-empty.")
-        if set(coverage) != set(self.source_action_contract.component_ids):
+        if not set(self.source_action_contract.component_ids).issubset(
+            self.action_schema.component_ids
+        ):
             raise ValueError("Replay source action contract/component coverage disagree.")
-        object.__setattr__(self, "component_coverage", coverage)
-        object.__setattr__(self, "selection_groups", groups)
 
 
 class ReplayProposalSource:
@@ -423,7 +418,9 @@ class ReplayProposalSource:
         reasons: list[str] = []
         if action.action_space != self.config.source_action_contract.action_space:
             reasons.append("source_action_space_mismatch")
-        if set(action.active_effectors) != set(self.config.component_coverage):
+        if set(action.active_effectors) != set(
+            self.config.source_action_contract.component_ids
+        ):
             reasons.append("component_coverage_mismatch")
 
         cleaned_action: RobotAction | None = None
@@ -488,16 +485,16 @@ class ReplayProposalSource:
             producer_id=self.config.producer_id,
             producer_epoch=self.config.producer_epoch,
             sequence=int(sequence),
-            action=cleaned_action,
+            action=project_robot_action_v1_to_component_action(
+                cleaned_action,
+                action_schema=self.config.action_schema,
+            ),
             produced_at=float(produced_at),
             produced_clock_domain_id=str(produced_clock_domain_id),
             effective_from=float(effective_from),
             effective_until=float(effective_until),
             target_effective_at=float(target_effective_at),
             effective_clock_domain_id=str(effective_clock_domain_id),
-            component_schema_hash=self.config.component_schema_hash,
-            component_coverage=self.config.component_coverage,
-            selection_groups=self.config.selection_groups,
             authority_priority=int(self.config.authority_priority),
             fallback_policy=self.config.fallback_policy,
             chunk_id=chunk_id,

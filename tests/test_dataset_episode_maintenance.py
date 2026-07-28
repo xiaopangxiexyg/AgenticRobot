@@ -13,6 +13,8 @@ from dataset_contracts.control_trace_episode import (
     EPISODE_COMMIT_FILE_DOMAIN_V1,
     V24EpisodeCaptureCommit,
 )
+from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.v25p import V25P_EPISODE_IDENTITY_FILE_DOMAIN_V1
 from teleop_runtime.collection.dataset_episode_maintenance import delete_episode_and_compact
 from teleop_runtime.collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from teleop_runtime.gui.calibration_web_ui import CalibrationWebUi, _encode_http_event_payload
@@ -266,4 +268,41 @@ def test_committed_v24_episode_compaction_fails_closed_without_mutation(tmp_path
 
     assert episodes_path.read_bytes() == episodes_before
     assert all(path.read_bytes() == payload for path, payload in commits_before.items())
+    assert not list(tmp_path.glob("dataset.before_delete_episode_*"))
+
+
+def test_v25p_episode_compaction_fails_closed_without_mutation(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _dataset(root)
+    episodes_path = root / "meta" / "episodes.jsonl"
+    identity = EpisodeCaptureIdentity(
+        episode_uuid="v25p-episode-1",
+        legacy_episode_index=1,
+        lifecycle_owner_id="test.owner",
+        prepared_at=1.0,
+        prepared_clock_domain_id="test_clock",
+    )
+    identity_path = (
+        root
+        / "meta"
+        / "v25p"
+        / "episodes"
+        / identity.episode_uuid
+        / "identity.cjson"
+    )
+    identity_path.parent.mkdir(parents=True, exist_ok=True)
+    identity_path.write_bytes(
+        canonical_bytes(
+            identity.to_payload(),
+            domain=V25P_EPISODE_IDENTITY_FILE_DOMAIN_V1,
+        )
+    )
+    episodes_before = episodes_path.read_bytes()
+    identity_before = identity_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="v2.5-p capture"):
+        delete_episode_and_compact(root, 1)
+
+    assert episodes_path.read_bytes() == episodes_before
+    assert identity_path.read_bytes() == identity_before
     assert not list(tmp_path.glob("dataset.before_delete_episode_*"))

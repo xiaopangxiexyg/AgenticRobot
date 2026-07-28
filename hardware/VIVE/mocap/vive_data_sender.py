@@ -282,6 +282,7 @@ def measurement_from_result(
 # The sender remains strict by default: without an explicit CLI override it
 # requires exactly two trackers, preserving the released left/right mapping.
 EXPECTED_TRACKER_COUNT = 2
+SINGLE_TRACKER_COMPAT_RIGHT_NAME = "<right_wrist_unavailable>"
 
 DEFAULT_SEND_BUFFER_BYTES = 1024 * 1024
 DEFAULT_SEND_ERROR_BACKOFF_SEC = 0.25
@@ -417,6 +418,16 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--single",
+        dest="allow_single_tracker",
+        action="store_true",
+        help=(
+            "Compatibility mode: when exactly one GenericTracker is connected, "
+            "send it as left_wrist and send an invalid right_wrist record. "
+            "The default remains strict two-tracker behavior."
+        ),
+    )
+    parser.add_argument(
         "--list-devices",
         action="store_true",
         help="Print discovered VIVE/OpenVR device names and exit.",
@@ -545,12 +556,15 @@ def auto_tracker_specs(
     vive: Any,
     *,
     tracker_count: int = EXPECTED_TRACKER_COUNT,
+    allow_single_tracker: bool = False,
 ) -> list[TrackerSpec]:
     """Assign exactly ``tracker_count`` trackers by lexical device name.
 
     The first two roles retain the historical left/right mapping. Additional
     trackers receive ``auxiliary``, ``auxiliary_2``, ... in the same stable
-    order.
+    order. The explicit single-tracker compatibility mode is the only
+    exception: one connected device becomes ``left_wrist`` and a synthetic
+    unavailable ``right_wrist`` spec is returned.
     """
 
     if tracker_count < EXPECTED_TRACKER_COUNT:
@@ -560,6 +574,18 @@ def auto_tracker_specs(
         )
 
     names = discovered_tracker_names(vive)
+    if (
+        allow_single_tracker
+        and tracker_count == EXPECTED_TRACKER_COUNT
+        and len(names) == 1
+    ):
+        return [
+            TrackerSpec(device_name=names[0], tracker_role="left_wrist"),
+            TrackerSpec(
+                device_name=SINGLE_TRACKER_COMPAT_RIGHT_NAME,
+                tracker_role="right_wrist",
+            ),
+        ]
     if len(names) != tracker_count:
         available = ", ".join(names) or "<none>"
         raise ValueError(
@@ -729,6 +755,7 @@ def wait_for_trackers(
     timeout_sec: float,
     *,
     tracker_count: int = EXPECTED_TRACKER_COUNT,
+    allow_single_tracker: bool = False,
 ) -> list[TrackerSpec] | None:
     if tracker_count < EXPECTED_TRACKER_COUNT:
         raise ValueError(
@@ -744,12 +771,26 @@ def wait_for_trackers(
                 f"more than {tracker_count} GenericTrackers are connected; "
                 f"found {len(names)} ({', '.join(names)})"
             )
-        if len(names) == tracker_count:
-            return auto_tracker_specs(vive, tracker_count=tracker_count)
+        single_tracker_ready = (
+            allow_single_tracker
+            and tracker_count == EXPECTED_TRACKER_COUNT
+            and len(names) == 1
+        )
+        if len(names) == tracker_count or single_tracker_ready:
+            return auto_tracker_specs(
+                vive,
+                tracker_count=tracker_count,
+                allow_single_tracker=allow_single_tracker,
+            )
         now = time.monotonic()
         if now >= next_status:
+            expected_text = (
+                f"exactly {tracker_count} GenericTrackers"
+                if not allow_single_tracker or tracker_count != EXPECTED_TRACKER_COUNT
+                else "exactly 2 GenericTrackers or one compatibility tracker"
+            )
             print(
-                f"[Wait] waiting for exactly {tracker_count} GenericTrackers; "
+                f"[Wait] waiting for {expected_text}; "
                 f"found {len(names)} ({', '.join(names) or '<none>'})"
             )
             next_status = now + 1.0
@@ -1747,12 +1788,14 @@ def main(
         return
 
     tracker_count = int(args.tracker_count)
+    allow_single_tracker = bool(args.allow_single_tracker)
     try:
         if args.wait_for_trackers > 0.0:
             tracker_specs = wait_for_trackers(
                 vive,
                 args.wait_for_trackers,
                 tracker_count=tracker_count,
+                allow_single_tracker=allow_single_tracker,
             )
             if tracker_specs is None:
                 raise ValueError(
@@ -1763,6 +1806,7 @@ def main(
             tracker_specs = auto_tracker_specs(
                 vive,
                 tracker_count=tracker_count,
+                allow_single_tracker=allow_single_tracker,
             )
     except ValueError as exc:
         raise SystemExit(f"[Error] {exc}") from exc
@@ -1857,10 +1901,19 @@ def main(
                         f"found {len(current_tracker_names)} "
                         f"({', '.join(current_tracker_names)})"
                     )
-                if len(current_tracker_names) == tracker_count:
+                single_tracker_compat_ready = (
+                    allow_single_tracker
+                    and tracker_count == EXPECTED_TRACKER_COUNT
+                    and len(current_tracker_names) == 1
+                )
+                if (
+                    len(current_tracker_names) == tracker_count
+                    or single_tracker_compat_ready
+                ):
                     current_specs = auto_tracker_specs(
                         vive,
                         tracker_count=tracker_count,
+                        allow_single_tracker=allow_single_tracker,
                     )
                     if current_specs != tracker_specs:
                         tracker_specs = current_specs

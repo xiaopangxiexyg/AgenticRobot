@@ -173,8 +173,14 @@ def test_cs2a1_synthetic_human_uses_existing_authoritative_mujoco_core() -> None
     assert step.status == "dispatched"
     assert scene.physics_commands
     assert step.decision is not None
-    assert np.allclose(step.decision.selected_action.arm_qpos_by_side["left"], 0.001)
-    assert np.allclose(step.decision.selected_action.arm_qpos_by_side["right"], -0.001)
+    assert np.allclose(
+        step.decision.selected_action.value("left_arm").values,
+        0.001,
+    )
+    assert np.allclose(
+        step.decision.selected_action.value("right_arm").values,
+        -0.001,
+    )
 
     facts = composition.runtime.trace_facts
     event_types = tuple(fact.event_type for fact in facts)

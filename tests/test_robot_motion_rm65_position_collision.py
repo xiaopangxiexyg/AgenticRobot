@@ -7,11 +7,29 @@ import pytest
 from scipy.spatial.transform import Rotation as R
 
 from robot_motion.rm65 import (
+    RM65_POSE_LIFT_V2_CONTINUOUS_NAME,
+    RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
     build_rm65_dual_arm_scene_profile,
     load_world_from_arm_base_transforms,
 )
+from robot_motion.rm65.position_collision import _rm65_jacobian_metrics
+
+
+def test_jacobian_metrics_normalize_linear_rows_by_characteristic_length() -> None:
+    jacobian = np.diag([0.5, 0.5, 0.5, 1.0, 1.0, 1.0])
+
+    metrics = _rm65_jacobian_metrics(
+        jacobian,
+        characteristic_length_m=0.5,
+    )
+
+    np.testing.assert_allclose(metrics["singular_values"], np.ones(6))
+    assert metrics["sigma_min"] == pytest.approx(1.0)
+    assert metrics["condition_number"] == pytest.approx(1.0)
+    assert metrics["jacobian_row_order"] == "linear_xyz_then_angular_xyz"
 
 
 class _FakeModel:
@@ -32,6 +50,7 @@ class _FakeDualSolver:
         lower: np.ndarray | None = None,
         upper: np.ndarray | None = None,
         distance: float | None = 0.10,
+        wrist_null_orientation_gain: float = 0.0,
     ) -> None:
         self.q = np.zeros(12, dtype=float)
         self.solve_output = np.zeros(12, dtype=float)
@@ -39,6 +58,14 @@ class _FakeDualSolver:
         self.distance: float | None | object = distance
         self.solve_targets: list[list[np.ndarray]] = []
         self.distance_q: list[np.ndarray] = []
+        self.wrist_null_orientation_gain = float(wrist_null_orientation_gain)
+        self.configured_velocity_limit: np.ndarray | None = None
+        self.configured_acceleration_limit: np.ndarray | None = None
+        self.previous_velocities: list[np.ndarray] = []
+        self.integration_dt: float | None = None
+        self.admitted_motion_references: list[
+            tuple[np.ndarray, np.ndarray, float]
+        ] = []
         self.robot = _FakeRobot(
             np.full(12, -1.0) if lower is None else lower,
             np.full(12, 1.0) if upper is None else upper,
@@ -58,6 +85,44 @@ class _FakeDualSolver:
         self.q = np.asarray(self.solve_output, dtype=float).reshape(12).copy()
         return self.q.copy()
 
+    def configure_velocity_limit(self, values: np.ndarray) -> None:
+        self.configured_velocity_limit = np.asarray(values, dtype=float).copy()
+
+    def configure_acceleration_limit(self, values: np.ndarray) -> None:
+        self.configured_acceleration_limit = np.asarray(values, dtype=float).copy()
+
+    def set_last_integration_velocity(self, values: np.ndarray) -> None:
+        self.previous_velocities.append(np.asarray(values, dtype=float).copy())
+
+    def set_integration_dt(self, dt_sec: float) -> None:
+        self.integration_dt = float(dt_sec)
+
+    def configure_admitted_reference_motion_limit(
+        self,
+        velocity: np.ndarray,
+        acceleration: np.ndarray | None,
+    ) -> None:
+        self.configured_velocity_limit = np.asarray(velocity, dtype=float).copy()
+        self.configured_acceleration_limit = (
+            None
+            if acceleration is None
+            else np.asarray(acceleration, dtype=float).copy()
+        )
+
+    def set_admitted_reference_motion(
+        self,
+        anchor: np.ndarray,
+        velocity: np.ndarray,
+        dt_sec: float,
+    ) -> None:
+        self.admitted_motion_references.append(
+            (
+                np.asarray(anchor, dtype=float).copy(),
+                np.asarray(velocity, dtype=float).copy(),
+                float(dt_sec),
+            )
+        )
+
     def compute_min_collision_distance(self, q: np.ndarray) -> float | None:
         qpos = np.asarray(q, dtype=float).reshape(12).copy()
         self.distance_q.append(qpos)
@@ -69,11 +134,28 @@ class _FakeDualSolver:
         pose = np.eye(4, dtype=float)
         if frame_name == "left_endpoint":
             pose[0, 3] = qpos[0]
+            wrist_start = 0
         elif frame_name == "right_endpoint":
             pose[0, 3] = qpos[6]
+            wrist_start = 6
         else:
             raise ValueError(frame_name)
+        wrist_angle = (
+            qpos[wrist_start + 3]
+            + qpos[wrist_start + 5]
+            + self.wrist_null_orientation_gain
+            * (qpos[wrist_start + 3] - qpos[wrist_start + 5])
+        )
+        pose[:3, :3] = R.from_rotvec([0.0, 0.0, wrist_angle]).as_matrix()
         return pose
+
+    def compute_frame_jacobian(self, frame_name: str, q: np.ndarray) -> np.ndarray:
+        start = 0 if frame_name == "left_endpoint" else 6
+        jacobian = np.zeros((6, 12), dtype=float)
+        jacobian[:, start : start + 6] = np.diag(
+            [0.5, 0.5, 0.5, 1.0, 1.0, 1.0]
+        )
+        return jacobian
 
 
 def _identity_pair() -> dict[str, np.ndarray]:
@@ -176,6 +258,49 @@ def test_iterative_solve_policy_rejects_invalid_iteration_range() -> None:
             solve_min_iterations=3,
             solve_max_iterations=2,
         )
+
+
+def test_v4_configures_qp_velocity_limit_and_commits_only_admitted_velocity() -> None:
+    solver = _FakeDualSolver()
+    solver.solve_output = np.array(
+        [0.02, 0.0, 0.0, 0.0, 0.0, 0.0] * 2,
+        dtype=float,
+    )
+    velocity = (0.6, 0.7, 0.8, 0.9, 1.0, 1.1)
+    acceleration = (6.0, 7.0, 8.0, 9.0, 10.0, 11.0)
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            reference_hz=50.0,
+            max_joint_velocity_rad_s=velocity,
+            max_joint_acceleration_rad_s2=acceleration,
+            solve_min_iterations=2,
+            solve_max_iterations=4,
+            pose_lift_profile=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+
+    result = planner.plan_pose_reference(
+        {"left": _target(0.02), "right": _target(0.02)}
+    )
+
+    assert len(solver.solve_targets) == 2
+    assert solver.integration_dt is None
+    np.testing.assert_allclose(solver.configured_velocity_limit[:6], velocity)
+    np.testing.assert_allclose(solver.configured_velocity_limit[6:12], velocity)
+    np.testing.assert_allclose(solver.configured_acceleration_limit[:6], acceleration)
+    np.testing.assert_allclose(solver.configured_acceleration_limit[6:12], acceleration)
+    np.testing.assert_allclose(
+        solver.admitted_motion_references[-1][1],
+        np.array([0.6, 0.0, 0.0, 0.0, 0.0, 0.0] * 2),
+    )
+    assert solver.admitted_motion_references[-1][2] == pytest.approx(0.02)
+    assert result.metadata["ik_solve_iteration_mode"] == "fixed_max"
+    assert result.metadata["ik_solve_iteration_requested_max"] == 4
+    assert result.metadata["ik_solve_iteration_max"] == 4
+    assert result.metadata["qp_motion_constraints"]["velocity_limit_enabled"] is True
+    assert result.metadata["qp_motion_constraints"]["acceleration_limit_enabled"] is True
 
 
 def test_reset_requires_complete_dual_qpos_and_fail_closes_unavailable_distance() -> None:
@@ -343,3 +468,102 @@ def test_qpos_endpoint_validation_rejects_absolute_joint_limit() -> None:
     assert result.safe is False
     assert result.reason == "joint_position_limit"
     assert result.collision_distance_m is None
+
+
+def test_qpos_endpoint_admission_commits_exact_reference_without_modification() -> None:
+    solver = _FakeDualSolver()
+    planner = _planner(solver)
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    requested = {
+        "left": np.full(6, 0.005),
+        "right": np.full(6, -0.004),
+    }
+
+    result = planner.admit_qpos_reference(requested, source="strict_qpos_replay")
+
+    assert result.safe is True
+    assert result.metadata["qpos_target_modified"] is False
+    assert result.metadata["mutates_last_safe_state"] is True
+    np.testing.assert_allclose(result.qpos_by_side["left"], requested["left"])
+    np.testing.assert_allclose(result.qpos_by_side["right"], requested["right"])
+    np.testing.assert_allclose(planner.last_safe_qpos_by_side["left"], requested["left"])
+    np.testing.assert_allclose(planner.last_safe_qpos_by_side["right"], requested["right"])
+
+
+def test_pose_lift_v2_unwraps_equivalent_joint_near_last_admitted_anchor() -> None:
+    solver = _FakeDualSolver(lower=np.full(12, -10.0), upper=np.full(12, 10.0))
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            reference_hz=60.0,
+            max_joint_velocity_rad_s=(100.0,) * 6,
+            pose_lift_profile=RM65_POSE_LIFT_V2_CONTINUOUS_NAME,
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    solver.solve_output[0] = 2.0 * np.pi + 0.1
+
+    result = planner.plan_pose_reference({"left": _target(0.1)})
+
+    assert result.valid is True
+    assert result.hold is False
+    assert result.q_ik_raw_by_side["left"][0] == pytest.approx(2.0 * np.pi + 0.1)
+    assert result.q_ref_by_side["left"][0] == pytest.approx(0.1)
+    assert result.metadata["pose_lift"]["applied"] is True
+    assert result.metadata["pose_lift"]["reason"] == "accepted_wrist_canonicalized"
+
+
+def test_pose_lift_v3_accepts_equivalent_candidate_despite_inherited_raw_residual() -> None:
+    solver = _FakeDualSolver()
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            reference_hz=60.0,
+            max_joint_velocity_rad_s=(100.0,) * 6,
+            pose_lift_profile=RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME,
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    solver.solve_output[3] = 0.2
+    solver.solve_output[5] = -0.2
+    target = _target()
+    target[:3, :3] = R.from_euler("z", 2.0, degrees=True).as_matrix()
+
+    result = planner.plan_pose_reference({"left": target})
+
+    assert result.hold is False
+    assert result.q_ik_raw_by_side["left"][3] == pytest.approx(0.2)
+    assert result.q_ref_by_side["left"][3] == pytest.approx(0.0)
+    assert result.q_ref_by_side["left"][5] == pytest.approx(0.0)
+    assert result.metadata["pose_lift"]["reason"] == (
+        "accepted_bounded_wrist_continuity"
+    )
+    assert result.metadata["pose_lift"]["selected_scales"]["left"] == 1.0
+
+
+def test_pose_lift_v3_uses_strongest_per_side_correction_inside_pose_slack() -> None:
+    solver = _FakeDualSolver(wrist_null_orientation_gain=0.01)
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            reference_hz=60.0,
+            max_joint_velocity_rad_s=(100.0,) * 6,
+            pose_lift_profile=RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME,
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    solver.solve_output[3] = 0.2
+    solver.solve_output[5] = -0.2
+    target = _target()
+    target[:3, :3] = R.from_rotvec([0.0, 0.0, 0.004]).as_matrix()
+
+    result = planner.plan_pose_reference({"left": target})
+
+    assert result.hold is False
+    assert result.metadata["pose_lift"]["selected_scales"]["left"] == pytest.approx(
+        0.125
+    )
+    assert result.q_ref_by_side["left"][3] == pytest.approx(0.175)
+    assert result.q_ref_by_side["left"][5] == pytest.approx(-0.175)
+    stage = result.metadata["pose_lift"]["stages"][-1]
+    assert stage["final_certification"]["accepted"] is True

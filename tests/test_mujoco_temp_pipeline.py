@@ -38,6 +38,42 @@ NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_TASK_CONFIG = Path(
 PRIVILEGED_EXPERT_RGB_48_TASK_CONFIG = Path(
     "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_rgb_v2.json"
 )
+PRIVILEGED_NEAR_LIFT_V2_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_grasp_lift_near_v2.json"
+)
+PRIVILEGED_GENERIC_GRIPPER_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_grasp_lift_near_v7_generic_gripper_v1.json"
+)
+PRIVILEGED_CONTACT_GATED_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_grasp_lift_near_v8_contact_gated_v1.json"
+)
+PRIVILEGED_CONTACT_PROGRESS_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_grasp_lift_near_v9_contact_progress_v1.json"
+)
+PRIVILEGED_CONTACT_BALANCED_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_grasp_lift_near_v10_balanced_v1.json"
+)
+PRIVILEGED_SECURE_LIFT_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_grasp_lift_near_v11_secure_lift_v1.json"
+)
+NORMAL_PREGRASP_BRIDGE_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v1.json"
+)
+NORMAL_PREGRASP_BRIDGE_V2_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v2.json"
+)
+NORMAL_PREGRASP_BRIDGE_V3_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v3.json"
+)
+NORMAL_PREGRASP_BRIDGE_V4_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v4.json"
+)
+NORMAL_PREGRASP_BRIDGE_V5_CUBE_POSE_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json"
+)
+NORMAL_FULL_GRASP_STAGE1_V4_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_full_grasp_stage1_v4.json"
+)
 
 
 def test_temp_training_defaults_to_fully_actuated_task() -> None:
@@ -381,6 +417,75 @@ def test_contact_curriculum_v3_scripted_gate_lifts_from_reset() -> None:
     assert result.max_cube_lift_m >= 0.039
 
 
+def test_privileged_near_lift_v2_uses_dynamic_post_contact_phase() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(PRIVILEGED_NEAR_LIFT_V2_TASK_CONFIG)
+    assert config.policy_active_action_indices == (0, 1, 2, 6)
+    assert config.post_contact_phase_enabled is True
+    assert config.post_contact_phase_activation_steps == 5
+    assert config.post_contact_action_scale == pytest.approx(
+        (0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    )
+    assert config.post_contact_action_bias == pytest.approx(
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    )
+
+
+def test_privileged_near_lift_v2_switches_to_lift_only_after_real_contact() -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        PRIVILEGED_NEAR_LIFT_V2_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    try:
+        observation, info = env.reset(seed=1)
+        if info["pose_ik_solver"] != "robot_motion.rm65.position_collision":
+            pytest.skip(
+                "Current process loaded the MuJoCo DLS fallback; the canonical "
+                "Pinocchio runtime is required for this trajectory assertion."
+            )
+        base_rotation = env.kernel.scene.body_pose("right_arm_base_link")[:3, :3]
+        closed_height = 0.022
+        for _step in range(80):
+            state = np.asarray(info["training_reward_state"])
+            cube_position = state[7:10]
+            grasp_position = cube_position - state[20:23]
+            target = cube_position + np.asarray((0.0, 0.0, closed_height))
+            action = np.zeros(7, dtype=np.float32)
+            action[:3] = np.clip(
+                (base_rotation.T @ (target - grasp_position))
+                / np.asarray(env.config.right_tcp_delta_m),
+                -1.0,
+                1.0,
+            )
+            if np.linalg.norm(target - grasp_position) < 0.035:
+                action[6] = 1.0
+            observation, _reward, terminated, truncated, info = env.step(action)
+            if info["post_contact_phase_active"]:
+                constrained = np.asarray(info["requested_action"], dtype=np.float32)
+                executed = np.asarray(
+                    info["training_reward_state"][23:30], dtype=np.float32
+                )
+                assert info["post_contact_phase_action_modified"] is True
+                np.testing.assert_allclose(
+                    executed[[0, 1, 3, 4, 5, 6]],
+                    0.0,
+                    atol=1e-6,
+                )
+                assert executed[2] >= 0.0
+                assert bool(info["bilateral_finger_cube_contact"])
+                assert float(constrained[2]) >= -1.0
+                return
+            if terminated or truncated:
+                break
+    finally:
+        env.close()
+    pytest.fail("near-v2 did not acquire the dynamic post-contact phase")
+
+
 def test_temp_training_progress_line_shows_progress_and_key_metrics() -> None:
     from sim.mujoco_temp_pipeline.train import format_training_progress
 
@@ -468,11 +573,218 @@ def test_temp_training_exploration_schedule_is_explicit() -> None:
         PPOConfig(final_log_std=0.0)
 
 
+def test_temp_training_effective_action_update_is_explicit() -> None:
+    from sim.mujoco_temp_pipeline.config import PPOConfig
+    from sim.mujoco_temp_pipeline.train import build_arg_parser
+
+    assert build_arg_parser().parse_args([]).effective_action_for_ppo is False
+    args = build_arg_parser().parse_args(["--effective-action-for-ppo"])
+    assert args.effective_action_for_ppo is True
+    config = PPOConfig(effective_action_for_ppo=True)
+    assert config.to_dict()["effective_action_for_ppo"] is True
+
+
+def test_temp_training_ppo_numerical_stability_controls_are_explicit() -> None:
+    from sim.mujoco_temp_pipeline.config import PPOConfig
+    from sim.mujoco_temp_pipeline.train import build_arg_parser
+
+    args = build_arg_parser().parse_args([])
+    assert args.target_kl == pytest.approx(0.03)
+    assert args.max_log_ratio == pytest.approx(10.0)
+    assert args.advantage_clip == pytest.approx(10.0)
+    config = PPOConfig()
+    assert config.to_dict()["target_kl"] == pytest.approx(0.03)
+    with pytest.raises(ValueError, match="finite and positive"):
+        PPOConfig(target_kl=0.0)
+
+
 def test_temp_training_rgb_health_guard_is_explicit() -> None:
     from sim.mujoco_temp_pipeline.train import build_arg_parser
 
     args = build_arg_parser().parse_args(["--require-rgb-health"])
     assert args.require_rgb_health is True
+
+
+def test_generic_gripper_reward_config_uses_surface_contract_without_observation_drift() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(PRIVILEGED_GENERIC_GRIPPER_TASK_CONFIG)
+    assert config.observation_dim == 31
+    assert len(config.gripper_contact_surface_specs) == 2
+    assert {spec.side for spec in config.gripper_contact_surface_specs} == {
+        "left",
+        "right",
+    }
+    assert config.reward_shaping["side_contact_reward_scale"] == pytest.approx(0.0)
+    assert config.reward_shaping["top_bottom_contact_penalty"] == pytest.approx(0.0)
+    assert config.reward_shaping["inner_contact_reward_scale"] == pytest.approx(0.8)
+    assert config.reward_shaping["outer_contact_penalty"] == pytest.approx(1.6)
+
+
+def test_contact_gated_profile_removes_precontact_closure_credit() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(PRIVILEGED_CONTACT_GATED_TASK_CONFIG)
+    shaping = config.reward_shaping
+    assert shaping["gripper_reward_scale"] == pytest.approx(0.0)
+    assert shaping["gripper_progress_scale"] == pytest.approx(0.0)
+    assert shaping["gripper_command_reward_scale"] == pytest.approx(0.0)
+    assert shaping["grasp_acquire_bonus"] == pytest.approx(0.0)
+    assert shaping["grasp_region_reward_scale"] == pytest.approx(0.0)
+    assert shaping["gripper_reward_requires_contact"] is True
+    assert shaping["grasp_acquire_requires_contact"] is True
+    assert shaping["contact_reward_onset_only"] is True
+    assert shaping["require_generic_contact_for_lift"] is True
+
+
+def test_contact_progress_profile_uses_potential_shaping_without_hover_credit() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(PRIVILEGED_CONTACT_PROGRESS_TASK_CONFIG)
+    shaping = config.reward_shaping
+    assert shaping["grasp_region_reward_scale"] == pytest.approx(0.0)
+    assert shaping["grasp_region_progress_scale"] == pytest.approx(3.0)
+    assert shaping["gripper_reward_scale"] == pytest.approx(0.0)
+    assert shaping["gripper_progress_scale"] == pytest.approx(0.0)
+
+
+def test_contact_balanced_profile_removes_far_reach_and_soft_safety_dominance() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(PRIVILEGED_CONTACT_BALANCED_TASK_CONFIG)
+    shaping = config.reward_shaping
+    assert shaping["reach_reward_scale"] == pytest.approx(0.0)
+    assert shaping["safety_projection_penalty"] == pytest.approx(0.03)
+    assert shaping["premature_close_state_penalty"] == pytest.approx(0.08)
+    assert shaping["outer_contact_penalty"] == pytest.approx(0.50)
+    assert shaping["approach_alignment_reward_scale"] == pytest.approx(0.15)
+    assert config.scripted_pregrasp_distance_m == pytest.approx(0.05)
+
+
+def test_secure_lift_profile_preserves_grip_force_after_contact() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(PRIVILEGED_SECURE_LIFT_TASK_CONFIG)
+    assert config.post_contact_phase_enabled is True
+    assert config.post_contact_phase_min_measured_close == pytest.approx(0.55)
+    assert config.post_contact_phase_loss_grace_steps == 3
+    assert config.post_contact_action_scale == pytest.approx(
+        (0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    )
+    assert config.post_contact_action_bias[6] == pytest.approx(0.5)
+
+
+def test_full_grasp_bridge_and_stage1_share_normal_action_contract() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    bridge = CubeLiftTaskConfig.load(NORMAL_PREGRASP_BRIDGE_TASK_CONFIG)
+    full = CubeLiftTaskConfig.load(NORMAL_FULL_GRASP_STAGE1_V4_TASK_CONFIG)
+    expected_actions = tuple(range(7))
+    assert bridge.policy_class == "normal"
+    assert bridge.observation_dim == 28
+    assert bridge.policy_active_action_indices == expected_actions
+    assert bridge.scripted_pregrasp_reset is True
+    assert bridge.post_contact_phase_enabled is False
+    assert full.observation_dim == bridge.observation_dim
+    assert full.policy_active_action_indices == expected_actions
+    assert full.scripted_pregrasp_reset is False
+    assert full.post_contact_phase_enabled is False
+    assert full.reward_shaping["gripper_reward_requires_contact"] is False
+    assert full.reward_shaping["inner_contact_reward_scale"] == pytest.approx(0.60)
+
+
+def test_pregrasp_bridge_v2_uses_proximity_gated_closure() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(NORMAL_PREGRASP_BRIDGE_V2_TASK_CONFIG)
+    assert config.observation_dim == 28
+    assert config.policy_active_action_indices == tuple(range(7))
+    assert config.scripted_pregrasp_reset is True
+    assert config.post_contact_phase_enabled is False
+    assert config.reward_shaping["gripper_reward_requires_contact"] is False
+    assert config.reward_shaping["grasp_acquire_requires_contact"] is True
+    assert config.right_tcp_delta_m == pytest.approx((0.006, 0.006, 0.006))
+
+
+def test_pregrasp_bridge_v3_has_contact_owned_lift_phase() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(NORMAL_PREGRASP_BRIDGE_V3_TASK_CONFIG)
+    assert config.observation_dim == 28
+    assert config.policy_active_action_indices == tuple(range(7))
+    assert config.scripted_pregrasp_reset is True
+    assert config.post_contact_phase_enabled is True
+    assert config.post_contact_phase_activation_steps == 5
+    assert config.post_contact_action_scale == pytest.approx(
+        (0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    )
+    assert config.post_contact_action_bias[6] == pytest.approx(0.5)
+    assert config.post_contact_nonnegative_lift_action is True
+
+
+def test_pregrasp_bridge_v4_supplies_positive_lift_and_grip_bias() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(NORMAL_PREGRASP_BRIDGE_V4_TASK_CONFIG)
+    assert config.observation_dim == 28
+    assert config.policy_active_action_indices == tuple(range(7))
+    assert config.post_contact_phase_enabled is True
+    assert config.post_contact_action_scale == pytest.approx(
+        (0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0)
+    )
+    assert config.post_contact_action_bias == pytest.approx(
+        (0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.5)
+    )
+    assert config.post_contact_nonnegative_lift_action is True
+
+
+def test_pregrasp_bridge_v5_adds_cube_pose_and_doubles_pose_step() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import (
+        build_model_input_binding,
+        build_observation_contract,
+    )
+
+    config = CubeLiftTaskConfig.load(NORMAL_PREGRASP_BRIDGE_V5_CUBE_POSE_TASK_CONFIG)
+    contract = build_observation_contract(config)
+    assert config.proprio_observation_dim == 35
+    assert config.observation_dim == 35
+    assert config.normal_proprio_profile.endswith("cube_pose.v1")
+    assert config.observation_layout.endswith("last_action7_cube_pose7.v1")
+    assert "episode_progress" not in contract.field_names
+    assert config.right_tcp_delta_m == pytest.approx((0.012, 0.012, 0.012))
+    assert config.right_tcp_rotation_delta_rad == pytest.approx(
+        (0.0001, 0.0001, 0.0001)
+    )
+    assert config.right_gripper_delta == pytest.approx(0.1)
+    assert config.wrist_rgb_enabled is False
+    assert build_model_input_binding(config, contract).expected_flat_dim(contract) == 35
+    shaping = config.reward_shaping
+    assert shaping["center_proximity_limit_m"] == pytest.approx(0.03)
+    assert shaping["center_proximity_penalty"] == pytest.approx(8.0)
+    assert shaping["gripper_reward_requires_contact"] is True
+    assert shaping["safety_projection_penalty"] == pytest.approx(2.0)
+    assert shaping["outer_contact_penalty"] == pytest.approx(2.0)
+
+
+def test_post_contact_phase_exits_after_configured_contact_loss_grace() -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        PRIVILEGED_SECURE_LIFT_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=1)
+        env.kernel._post_contact_phase_active = True
+        for _ in range(2):
+            env.kernel._update_post_contact_phase()
+            assert env.kernel._post_contact_phase_active is True
+        env.kernel._update_post_contact_phase()
+        assert env.kernel._post_contact_phase_active is False
+    finally:
+        env.close()
 
 
 def test_normal_contact_profile_preserves_identified_free_motion_actuator() -> None:
@@ -750,6 +1062,162 @@ def test_temp_dense_reward_does_not_move_reach_target_when_gripper_closes() -> N
     assert shaped[1] > shaped[0]
 
 
+def test_temp_grasp_region_progress_rewards_approach_and_penalizes_retreat() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((3, 31), dtype=np.float32)
+    current = previous.copy()
+    # With the default offset, the closed-grasp distance is smallest at
+    # cube_to_grasp=(0, 0, -0.025). Keep z fixed and vary only x: sample 0
+    # approaches, sample 1 retreats, and sample 2 stays still.
+    previous[:, 22] = -0.025
+    current[:, 22] = -0.025
+    previous[0, 20], current[0, 20] = 0.06, 0.03
+    previous[1, 20], current[1, 20] = 0.03, 0.06
+    previous[2, 20], current[2, 20] = 0.03, 0.03
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        grasp_region_progress_scale=3.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        premature_close_penalty=0.0,
+        lift_reward_scale=0.0,
+        lift_progress_scale=0.0,
+        latch_reward_scale=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(3, dtype=np.float32),
+        config,
+    )
+    assert terms["grasp_region_progress_term"][0] > 0.0
+    assert terms["grasp_region_progress_term"][1] < 0.0
+    assert terms["grasp_region_progress_term"][2] == pytest.approx(0.0)
+    np.testing.assert_allclose(
+        shaped, terms["grasp_region_progress_term"], atol=1e-6
+    )
+
+
+def test_temp_precontact_close_state_is_penalized_but_contact_is_not() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((2, 31), dtype=np.float32)
+    current = previous.copy()
+    current[:, 6] = 0.75
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        grasp_region_progress_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        premature_close_penalty=0.0,
+        premature_close_state_penalty=0.2,
+        lift_reward_scale=0.0,
+        lift_progress_scale=0.0,
+        latch_reward_scale=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(2, dtype=np.float32),
+        config,
+        inner_contact_score=np.asarray((0.0, 1.0), dtype=np.float32),
+        bilateral_inner_contact_score=np.asarray((0.0, 1.0), dtype=np.float32),
+    )
+    assert terms["premature_close_state_term"].tolist() == pytest.approx(
+        (-0.15, 0.0)
+    )
+    assert shaped.tolist() == pytest.approx((-0.15, 0.0))
+
+
+def test_temp_center_proximity_penalty_blocks_closed_insertion_without_inner_grasp() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((2, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[:, 20] = 0.04
+    current[:, 22] = 0.01
+    current[:, 6] = 0.75
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        grasp_region_progress_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        premature_close_penalty=0.0,
+        premature_close_state_penalty=0.0,
+        center_proximity_limit_m=0.03,
+        center_proximity_penalty=8.0,
+        center_proximity_close_threshold=0.35,
+        lift_reward_scale=0.0,
+        lift_progress_scale=0.0,
+        latch_reward_scale=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(2, dtype=np.float32),
+        config,
+        inner_contact_score=np.asarray((0.0, 1.0), dtype=np.float32),
+        bilateral_inner_contact_score=np.asarray((0.0, 1.0), dtype=np.float32),
+    )
+    assert terms["center_distance_m"].tolist() == pytest.approx((0.01, 0.01))
+    assert terms["center_proximity_term"][0] < -3.0
+    assert terms["center_proximity_term"][1] == pytest.approx(0.0)
+    assert shaped[0] < -3.0
+    assert shaped[1] == pytest.approx(0.0)
+
+
+def test_temp_approach_alignment_rewards_accepted_safe_direction() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((2, 31), dtype=np.float32)
+    current = previous.copy()
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        grasp_region_progress_scale=0.0,
+        approach_alignment_reward_scale=0.15,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        premature_close_penalty=0.0,
+        premature_close_state_penalty=0.0,
+        lift_reward_scale=0.0,
+        lift_progress_scale=0.0,
+        latch_reward_scale=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    accepted = np.asarray(((1.0, 0.0, 0.0, 0, 0, 0, 0), (-1.0, 0.0, 0.0, 0, 0, 0, 0)), dtype=np.float32)
+    teacher = np.asarray(((1.0, 0.0, 0.0, 0, 0, 0, 0), (1.0, 0.0, 0.0, 0, 0, 0, 0)), dtype=np.float32)
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(2, dtype=np.float32),
+        config,
+        accepted_action=accepted,
+        approach_action=teacher,
+    )
+    assert terms["approach_alignment_term"].tolist() == pytest.approx((0.05, 0.0))
+    assert shaped.tolist() == pytest.approx((0.05, 0.0))
+
+
 def test_temp_dense_reward_has_explicit_success_bonus() -> None:
     from sim.mujoco_temp_pipeline.config import RewardShapingConfig
     from sim.mujoco_temp_pipeline.reward import shape_rewards
@@ -963,6 +1431,364 @@ def test_temp_reward_shaping_penalizes_collision_projection() -> None:
     assert terms["safety_projection_term"].tolist() == pytest.approx((0.0, -0.25))
 
 
+def test_temp_reward_command_credit_uses_accepted_gripper_action() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((1, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[0, 20] = -0.03
+    current[0, 20] = -0.03
+    current[0, 6] = 0.8
+    current[0, 29] = 1.0  # requested gripper command in the legacy state.
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(1, dtype=np.float32),
+        RewardShapingConfig(
+            staged_grasp=True,
+            gripper_command_reward_scale=1.0,
+            reach_reward_scale=0.0,
+            reach_progress_scale=0.0,
+            grasp_region_reward_scale=0.0,
+            gripper_reward_scale=0.0,
+            gripper_progress_scale=0.0,
+            premature_close_penalty=0.0,
+            grasp_acquire_bonus=0.0,
+            bilateral_contact_reward_scale=0.0,
+            bilateral_contact_acquire_bonus=0.0,
+            action_penalty=0.0,
+            safety_projection_penalty=0.0,
+        ),
+        accepted_action=np.zeros((1, 7), dtype=np.float32),
+    )
+    assert terms["gripper_command_term"][0] == pytest.approx(0.0)
+    assert shaped[0] == pytest.approx(0.0)
+
+
+def test_contact_gated_reward_does_not_pay_for_precontact_closure() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((1, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[0, 20] = -0.03
+    current[0, 20] = -0.03
+    current[0, 6] = 0.8
+    config = RewardShapingConfig(
+        staged_grasp=True,
+        gripper_reward_scale=1.0,
+        gripper_progress_scale=2.0,
+        gripper_command_reward_scale=3.0,
+        premature_close_penalty=0.5,
+        gripper_reward_requires_contact=True,
+        grasp_acquire_requires_contact=True,
+        grasp_acquire_bonus=4.0,
+    )
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(1, dtype=np.float32),
+        config,
+        bilateral_contact=np.zeros(1, dtype=np.float32),
+        inner_contact_score=np.zeros(1, dtype=np.float32),
+        bilateral_inner_contact_score=np.zeros(1, dtype=np.float32),
+        accepted_action=np.asarray([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+    )
+    assert terms["gripper_term"][0] == pytest.approx(0.0)
+    assert terms["gripper_progress_term"][0] == pytest.approx(0.0)
+    assert terms["gripper_command_term"][0] == pytest.approx(0.0)
+    assert terms["grasp_acquire_term"][0] == pytest.approx(0.0)
+    assert terms["premature_close_term"][0] < 0.0
+    assert shaped[0] < 0.0
+
+
+def test_contact_reward_is_onset_only_and_acquire_requires_bilateral_inner_contact() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((2, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[:, 20] = -0.03
+    current[:, 20] = -0.03
+    previous[:, 6] = (0.2, 0.5)
+    current[:, 6] = 0.5
+    config = RewardShapingConfig(
+        staged_grasp=True,
+        inner_contact_reward_scale=1.0,
+        bilateral_inner_contact_reward_scale=2.0,
+        contact_reward_onset_only=True,
+        grasp_acquire_requires_contact=True,
+        grasp_acquire_bonus=3.0,
+    )
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(2, dtype=np.float32),
+        config,
+        bilateral_contact=np.ones(2, dtype=np.float32),
+        previous_bilateral_contact=np.zeros(2, dtype=np.float32),
+        inner_contact_score=np.asarray((0.8, 0.8), dtype=np.float32),
+        bilateral_inner_contact_score=np.asarray((0.8, 0.8), dtype=np.float32),
+        previous_inner_contact_score=np.asarray((0.0, 0.8), dtype=np.float32),
+        previous_bilateral_inner_contact_score=np.asarray((0.0, 0.8), dtype=np.float32),
+    )
+    assert terms["inner_contact_term"].tolist() == pytest.approx((0.8, 0.0))
+    assert terms["bilateral_inner_contact_term"].tolist() == pytest.approx((1.6, 0.0))
+    assert terms["grasp_acquire_term"].tolist() == pytest.approx((3.0, 0.0))
+    assert shaped[0] > shaped[1]
+
+
+def test_contact_missing_penalty_only_applies_after_previous_contact() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    state = np.zeros((2, 31), dtype=np.float32)
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        bilateral_contact_missing_penalty=1.0,
+        contact_missing_requires_previous=True,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    _shaped, terms = shape_rewards(
+        state,
+        state,
+        np.zeros(2, dtype=np.float32),
+        config,
+        bilateral_contact=np.zeros(2, dtype=np.float32),
+        previous_bilateral_contact=np.asarray((0.0, 1.0), dtype=np.float32),
+    )
+    assert terms["bilateral_contact_missing_term"].tolist() == pytest.approx(
+        (0.0, -1.0)
+    )
+
+
+def test_generic_contact_is_required_for_lift_confidence() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((2, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[:, 9] = 0.025
+    current[:, 9] = 0.065
+    previous[:, 20] = 0.02
+    current[:, 20] = 0.02
+    current[:, 6] = 0.8
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        require_bilateral_contact_for_lift_reward=True,
+        require_generic_contact_for_lift=True,
+        lift_reward_scale=5.0,
+        lift_progress_scale=100.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    _shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(2, dtype=np.float32),
+        config,
+        resting_cube_z_m=np.asarray((0.025, 0.025), dtype=np.float32),
+        bilateral_contact=np.ones(2, dtype=np.float32),
+        inner_contact_score=np.asarray((0.8, 0.8), dtype=np.float32),
+        bilateral_inner_contact_score=np.asarray((0.0, 0.8), dtype=np.float32),
+    )
+    assert terms["lift_term"][0] == pytest.approx(0.0)
+    assert terms["lift_term"][1] > 0.0
+
+
+def test_cube_contact_position_classifies_side_and_top_bottom_faces() -> None:
+    from sim.mujoco.tasks.cube_lift.contacts import (
+        classify_cube_contact_position,
+    )
+
+    center = np.zeros(3, dtype=np.float32)
+    half_extents = np.full(3, 0.015, dtype=np.float32)
+    identity = np.asarray((1.0, 0.0, 0.0, 0.0), dtype=np.float32)
+    side = classify_cube_contact_position(
+        np.asarray((0.015, 0.0, 0.0)), center, identity, half_extents
+    )
+    top = classify_cube_contact_position(
+        np.asarray((0.0, 0.0, 0.015)), center, identity, half_extents
+    )
+    bottom = classify_cube_contact_position(
+        np.asarray((0.0, 0.0, -0.015)), center, identity, half_extents
+    )
+    assert side == pytest.approx((1.0, 0.0))
+    assert top == pytest.approx((0.0, 1.0))
+    assert bottom == pytest.approx((0.0, 1.0))
+
+
+def test_temp_reward_prefers_side_contact_over_top_bottom_contact() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    observations = np.zeros((2, 31), dtype=np.float32)
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        gripper_command_reward_scale=0.0,
+        premature_close_penalty=0.0,
+        grasp_acquire_bonus=0.0,
+        bilateral_contact_reward_scale=0.0,
+        bilateral_contact_acquire_bonus=0.0,
+        bilateral_contact_missing_penalty=0.0,
+        side_contact_reward_scale=1.0,
+        top_bottom_contact_penalty=2.0,
+        latch_reward_scale=0.0,
+        lift_reward_scale=0.0,
+        lift_progress_scale=0.0,
+        success_bonus=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    shaped, terms = shape_rewards(
+        observations,
+        observations,
+        np.zeros(2, dtype=np.float32),
+        config,
+        side_contact_score=np.asarray((1.0, 0.0), dtype=np.float32),
+        top_bottom_contact_score=np.asarray((0.0, 1.0), dtype=np.float32),
+    )
+    assert shaped.tolist() == pytest.approx((1.0, -2.0))
+    assert terms["side_contact_term"].tolist() == pytest.approx((1.0, 0.0))
+    assert terms["top_bottom_contact_penalty_term"].tolist() == pytest.approx(
+        (0.0, -2.0)
+    )
+
+
+def test_generic_gripper_contact_classifies_inner_and_outer_half_spaces() -> None:
+    from sim.mujoco.grasp_contact import (
+        GripperContactSurfaceSpec,
+        classify_gripper_contact_point,
+    )
+
+    spec = GripperContactSurfaceSpec(
+        body_name="finger",
+        side="left",
+        inner_normal_local=(-1.0, 0.0, 0.0),
+        face_margin_m=0.001,
+        score_width_m=0.002,
+    )
+    body_position = np.zeros(3, dtype=np.float32)
+    identity = np.eye(3, dtype=np.float32)
+    inner = classify_gripper_contact_point(
+        np.asarray((-0.005, 0.0, 0.0)), body_position, identity, spec
+    )
+    outer = classify_gripper_contact_point(
+        np.asarray((0.005, 0.0, 0.0)), body_position, identity, spec
+    )
+    assert inner[0] > 0.8 and inner[1] < 0.1
+    assert outer[1] > 0.8 and outer[0] < 0.1
+
+
+def test_generic_gripper_bilateral_score_requires_all_configured_sides() -> None:
+    from types import SimpleNamespace
+
+    from sim.mujoco.grasp_contact import (
+        GripperContactSurfaceSpec,
+        extract_gripper_contact_scores,
+    )
+
+    specs = (
+        GripperContactSurfaceSpec(
+            body_name="left_finger",
+            side="left",
+            inner_normal_local=(-1.0, 0.0, 0.0),
+        ),
+        GripperContactSurfaceSpec(
+            body_name="right_finger",
+            side="right",
+            inner_normal_local=(1.0, 0.0, 0.0),
+        ),
+    )
+    model = SimpleNamespace(geom_bodyid=np.asarray((99, 1, 2), dtype=np.int32))
+    data = SimpleNamespace(
+        ncon=1,
+        contact=[SimpleNamespace(geom1=0, geom2=1, pos=np.asarray((-0.005, 0.0, 0.0)))],
+        xpos=np.zeros((100, 3), dtype=np.float32),
+        xmat=np.tile(np.eye(3, dtype=np.float32).reshape(1, 9), (100, 1)),
+    )
+    one_sided = extract_gripper_contact_scores(
+        model,
+        data,
+        object_body_id=99,
+        surface_specs=specs,
+        surface_body_ids={"left_finger": 1, "right_finger": 2},
+    )
+    assert one_sided.inner_contact_score > 0.8
+    assert one_sided.bilateral_inner_contact_score == pytest.approx(0.0)
+
+    data.contact.append(
+        SimpleNamespace(geom1=0, geom2=2, pos=np.asarray((0.005, 0.0, 0.0)))
+    )
+    data.ncon = 2
+    two_sided = extract_gripper_contact_scores(
+        model,
+        data,
+        object_body_id=99,
+        surface_specs=specs,
+        surface_body_ids={"left_finger": 1, "right_finger": 2},
+    )
+    assert two_sided.bilateral_inner_contact_score > 0.8
+
+
+def test_temp_reward_prefers_generic_inner_contact_and_penalizes_outer_contact() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    observations = np.zeros((2, 31), dtype=np.float32)
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        gripper_command_reward_scale=0.0,
+        premature_close_penalty=0.0,
+        grasp_acquire_bonus=0.0,
+        bilateral_contact_reward_scale=0.0,
+        bilateral_contact_acquire_bonus=0.0,
+        bilateral_contact_missing_penalty=0.0,
+        inner_contact_reward_scale=1.0,
+        bilateral_inner_contact_reward_scale=1.0,
+        outer_contact_penalty=2.0,
+        latch_reward_scale=0.0,
+        lift_reward_scale=0.0,
+        lift_progress_scale=0.0,
+        success_bonus=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    shaped, terms = shape_rewards(
+        observations,
+        observations,
+        np.zeros(2, dtype=np.float32),
+        config,
+        inner_contact_score=np.asarray((1.0, 0.0), dtype=np.float32),
+        bilateral_inner_contact_score=np.asarray((1.0, 0.0), dtype=np.float32),
+        outer_contact_score=np.asarray((0.0, 1.0), dtype=np.float32),
+    )
+    assert shaped.tolist() == pytest.approx((2.0, -2.0))
+    assert terms["inner_contact_term"].tolist() == pytest.approx((1.0, 0.0))
+    assert terms["bilateral_inner_contact_term"].tolist() == pytest.approx(
+        (1.0, 0.0)
+    )
+    assert terms["outer_contact_penalty_term"].tolist() == pytest.approx(
+        (0.0, -2.0)
+    )
+
+
 def test_temp_policy_checkpoint_round_trip(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     from sim.mujoco_temp_pipeline.checkpoint import (
@@ -1024,6 +1850,50 @@ def test_task_config_mismatch_requires_explicit_diagnostic_override() -> None:
     assert result["checkpoint_task_config_sha256"] == "0" * 64
 
 
+def test_cube_pose_checkpoint_migration_preserves_old_actor() -> None:
+    torch = pytest.importorskip("torch")
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import build_learning_metadata
+    from sim.mujoco_temp_pipeline.checkpoint import (
+        check_task_config_compatibility,
+        expand_cube_pose_policy_state,
+        scale_pose_action_head_for_doubled_step,
+    )
+    from sim.mujoco_temp_pipeline.policy import ActorCritic
+
+    old_config = CubeLiftTaskConfig.load(NORMAL_PREGRASP_BRIDGE_V4_TASK_CONFIG)
+    old_metadata = build_learning_metadata(old_config)
+    payload = {
+        "task_config_sha256": "0" * 64,
+        "task_metadata": {
+            "action_layout": old_config.action_layout,
+            "observation_layout": old_config.observation_layout,
+            "learning_contract": old_metadata,
+        },
+    }
+    result = check_task_config_compatibility(
+        payload,
+        NORMAL_PREGRASP_BRIDGE_V5_CUBE_POSE_TASK_CONFIG,
+        allow_mismatch=True,
+        allow_cube_pose_observation_expansion=True,
+    )
+    assert result["cube_pose_observation_expansion"] is True
+
+    torch.manual_seed(7)
+    source = ActorCritic(28, 7, 16, proprio_dim=28, environment_action_dim=7)
+    target = ActorCritic(35, 7, 16, proprio_dim=35, environment_action_dim=7)
+    expand_cube_pose_policy_state(source, target)
+    torch.testing.assert_close(
+        target.backbone[0].weight[:, :28], source.backbone[0].weight
+    )
+    assert torch.count_nonzero(target.backbone[0].weight[:, 28:]) == 0
+    arm_mean_before = target.actor_mean.weight[:6].detach().clone()
+    grip_mean_before = target.actor_mean.weight[6].detach().clone()
+    scale_pose_action_head_for_doubled_step(target)
+    torch.testing.assert_close(target.actor_mean.weight[:6], arm_mean_before * 0.25)
+    torch.testing.assert_close(target.actor_mean.weight[6], grip_mean_before)
+
+
 def test_legacy_collision_diagnostic_cli_flags_are_explicit() -> None:
     from sim.mujoco_temp_pipeline.evaluate import build_arg_parser as eval_parser
     from sim.mujoco_temp_pipeline.play import build_arg_parser as play_parser
@@ -1061,6 +1931,19 @@ def test_temp_policy_actions_and_log_probs_are_finite() -> None:
     torch.testing.assert_close(log_prob, evaluated_log_prob)
     torch.testing.assert_close(value, evaluated_value)
     assert torch.isfinite(entropy).all()
+
+
+def test_temp_policy_can_reset_only_the_critic_head() -> None:
+    torch = pytest.importorskip("torch")
+    from sim.mujoco_temp_pipeline.policy import ActorCritic
+
+    policy = ActorCritic(hidden_dim=16)
+    actor_before = policy.actor_mean.weight.detach().clone()
+    critic_before = policy.critic.weight.detach().clone()
+    policy.reset_critic()
+    torch.testing.assert_close(policy.actor_mean.weight, actor_before)
+    assert not torch.equal(policy.critic.weight, critic_before)
+    torch.testing.assert_close(policy.critic.bias, torch.zeros_like(policy.critic.bias))
 
 
 def test_temp_policy_expands_compact_action_into_public_layout() -> None:

@@ -1,0 +1,79 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "mrtc_s1b1_openpi_gpu_conditioned_sampler_synthetic_2026_07_27",
+  "captured_at": "2026-07-27T13:43:59+08:00",
+  "scope": "remote_openpi_loaded_checkpoint_direct_conditioned_sampler_synthetic_observation_no_action",
+  "repositories": {
+    "dexteleop_head": "2f21f2a69ab0fc84ec66670622d28090a996761a",
+    "dexteleop_worktree": "dirty_concurrent_work_preserved",
+    "openpi_head": "650c5b0283a49c42784fb5055a0507da2c6d347d",
+    "openpi_worktree": "dirty_existing_model_rtc_changes_preserved",
+    "source_or_checkpoint_modified_by_probe": false
+  },
+  "runtime_boundary": {
+    "remote_host_alias": "dex-remote",
+    "openpi_project": "/home/user/zc/openpi",
+    "openpi_environment": "/home/user/zc/openpi/.venv",
+    "checkpoint": "checkpoints/0712-wrist-cube/0712-wrist-cube-wrist-only/92599",
+    "model_config": "0712-wrist-cube",
+    "synthetic_observation": {
+      "state": "zeros_float32_16",
+      "left_wrist": "zeros_uint8_rgb_hwc_224x224",
+      "right_wrist": "zeros_uint8_rgb_hwc_224x224"
+    },
+    "server_listener_started": false,
+    "dexteleop_frontend_started": false,
+    "real_observation_used": false,
+    "hardware_or_camera_initialized": false,
+    "target_or_dispatch_initialized": false,
+    "actions_sent": false
+  },
+  "loaded_capability": {
+    "wire_protocol": "openpi.conditioned_rtc.v1",
+    "continuation_implementation_id": "openpi.pi0.hard-flow-prefix.v1",
+    "continuation_implementation_parameters_hash": "sha256:1ce2fe7611b0a15fad0f340e21ac7f1bca4a8ed958f96956b9d271485d0fba64",
+    "sampler_constraint": "clamped_v1",
+    "conditioning_transform_owner": "provider_v1",
+    "prediction_horizon_steps": 50,
+    "external_action_dim": 16,
+    "internal_sampler_action_dim": 32,
+    "supports_unconditioned_bootstrap": true
+  },
+  "bootstrap_call": {
+    "conditioning_mode": "unconditioned_bootstrap_v1",
+    "consumed_generation_indices": [],
+    "output_shape": [
+      50,
+      16
+    ],
+    "output_finite": true,
+    "duration_sec": 11.095869309996488,
+    "receipt_reports_external_internal_and_mask_hashes": true
+  },
+  "conditioned_call": {
+    "conditioning_mode": "conditioned_prefix_v1",
+    "source": "first_three_external_rows_from_bootstrap_output",
+    "consumed_generation_indices": [
+      0,
+      1,
+      2
+    ],
+    "output_shape": [
+      50,
+      16
+    ],
+    "output_finite": true,
+    "duration_sec": 0.7868435910058906,
+    "conditioned_prefix_max_abs_error": 0.0,
+    "receipt_reports_external_internal_and_mask_hashes": true
+  },
+  "claims": {
+    "real_loaded_model_consumed_hard_prefix": true,
+    "selected_external_prefix_preserved_exactly": true,
+    "model_rtc_training_support_proven": false,
+    "dexteleop_transport_envelope_and_server_receipt_proven": false,
+    "timed_plan_end_to_end_with_real_model_proven": false,
+    "real_observation_or_motion_readiness_proven": false
+  },
+  "next_gate": "run_the_same_loaded_provider_through_openpi_wire_and_build_rtc_conditioned_model_shadow_frontend_v3_with_synthetic_observations_send_actions_false"
+}

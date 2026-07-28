@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,11 @@ from pathlib import Path
 from typing import Any
 
 from dataset_contracts.capture_modalities import CaptureModalityContract
+from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.v25p_native_storage import (
+    V25P_NATIVE_STORAGE_LAYOUTS_V1,
+    V25P_RECORD_CJSON_LAYOUT_V1,
+)
 from dataset_interface.capture_modalities import bind_capture_modality_contract
 from dataset_interface.gripper_force import (
     bind_gripper_force_contract,
@@ -46,6 +52,7 @@ from ..collection.policy_io_runtime import resolve_collection_policy_io_layout
 from ..collection.process_writer import (
     ProcessCollectionConfig,
     ProcessCollectionWorker,
+    ProcessV25pShadowConfig,
     camera_shared_slot_bytes,
 )
 from ..collection.sample_assembler import (
@@ -53,8 +60,24 @@ from ..collection.sample_assembler import (
     CollectorSampleBuilder,
     CollectorSampleBuilderConfig,
 )
+from ..collection.schema_v22 import (
+    StrictV22SampleRejection,
+    validate_strict_v22_measured_state,
+)
 from ..collection.writer_runtime import CollectionWriterRuntime
 from ..collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
+from ..collection.v25p_sidecar import V25pEpisodeSidecarStore
+from ..collection.v25p_capture_profiles import (
+    V25P_REAL_TELEOP_SOURCE,
+    build_policy_io_v25p_capture_profiles,
+)
+from ..collection.v25p_dual_write_shadow import (
+    V25pDualWriteShadow,
+    legacy_row_from_planned_jobs,
+    load_finalized_legacy_episode_record,
+)
+from ..collection.v25p_native_store import V25pNativeEpisodeStore
+from ..collection.v25p_real_teleop_producer import RealTeleopV25pProducer
 from ..control_trace.episode import EpisodeTraceRecorderSink
 from ..sources.camera import RealSenseRGBSource
 from .action_debug_payload import _build_action_debug_metadata
@@ -172,6 +195,8 @@ class RealTeleopDatasetRecorder:
                 }
             ),
         )
+        self.policy_io_layout = policy_io_resolution.layout
+        self.strict_v22_policy_io = bool(self.policy_io_layout is not None)
         writer_config = LeRobotV21WriterConfig(
             root_dir=self.dataset_root,
             nominal_fps=float(args.hz),
@@ -188,7 +213,7 @@ class RealTeleopDatasetRecorder:
             hand_action_specs=_collection_hand_action_specs(args, components.active_sides),
             policy_io_layout=policy_io_resolution.layout,
             policy_io_layout_provenance=policy_io_resolution.provenance,
-            strict_v22_policy_io=bool(policy_io_resolution.layout is not None),
+            strict_v22_policy_io=self.strict_v22_policy_io,
             pose_frame_contract=args.pose_frame_contract,
             wrist_depth_camera_keys=WRIST_DEPTH_CAMERA_KEYS,
             wrist_depth_min_m=float(
@@ -204,6 +229,41 @@ class RealTeleopDatasetRecorder:
             ),
         )
         self.writer_storage_config = writer_config
+        self.v25p_native_shadow: V25pDualWriteShadow | None = None
+        self._v25p_native_shadow_active = False
+        self._v25p_native_shadow_error = ""
+        v25p_shadow_config = None
+        v25p_shadow_enabled = bool(getattr(args, "v25p_native_shadow", False))
+        v25p_storage_layout = str(
+            getattr(
+                args,
+                "v25p_native_storage_layout",
+                V25P_RECORD_CJSON_LAYOUT_V1,
+            )
+        ).strip()
+        if v25p_storage_layout not in V25P_NATIVE_STORAGE_LAYOUTS_V1:
+            raise ValueError("Unsupported v2.5-p native physical storage layout.")
+        if not v25p_shadow_enabled and (
+            v25p_storage_layout != V25P_RECORD_CJSON_LAYOUT_V1
+        ):
+            raise ValueError(
+                "--v25p-native-storage-layout requires --v25p-native-shadow."
+            )
+        if v25p_shadow_enabled:
+            if self.policy_io_layout is None or args.pose_frame_contract is None:
+                raise ValueError(
+                    "--v25p-native-shadow requires policy-I/O and pose-frame contracts."
+                )
+            dataset_id = (
+                "real_teleop:"
+                f"{str(args.dataset_name or args.collection_task_id).strip()}"
+            )
+            pose_frame_contract_hash = args.pose_frame_contract.contract_hash
+            v25p_shadow_config = ProcessV25pShadowConfig(
+                dataset_id=dataset_id,
+                pose_frame_contract_hash=pose_frame_contract_hash,
+                physical_storage_layout=v25p_storage_layout,
+            )
         self.collection_worker_mode = str(
             getattr(args, "collection_worker_mode_resolved", "thread") or "thread"
         )
@@ -343,6 +403,7 @@ class RealTeleopDatasetRecorder:
             self.process_worker = ProcessCollectionWorker(
                 writer_config=writer_config,
                 sample_builder_config=sample_builder_config,
+                v25p_shadow_config=v25p_shadow_config,
                 config=ProcessCollectionConfig(
                     queue_size=int(getattr(args, "collection_process_queue_size", 4)),
                     shared_slot_count=int(
@@ -368,6 +429,42 @@ class RealTeleopDatasetRecorder:
             self.writer = self.process_worker
         else:
             assert isinstance(self.writer, LeRobotV21Writer)
+            if v25p_shadow_config is not None:
+                assert self.policy_io_layout is not None
+                bundle = build_policy_io_v25p_capture_profiles(
+                    source=V25P_REAL_TELEOP_SOURCE,
+                    layout=self.policy_io_layout,
+                    pose_frame_contract_hash=(
+                        v25p_shadow_config.pose_frame_contract_hash
+                    ),
+                    component_sides=tuple(components.active_sides),
+                )
+                self.v25p_native_shadow = V25pDualWriteShadow(
+                    store=V25pNativeEpisodeStore(
+                        dataset_root=self.dataset_root,
+                        dataset_id=v25p_shadow_config.dataset_id,
+                        embodiment_profile=bundle.embodiment,
+                        component_stream_profile=bundle.streams,
+                        compatibility_projection_profiles=(bundle.v23_projection,),
+                        physical_storage_layout=(
+                            v25p_shadow_config.physical_storage_layout
+                        ),
+                        defer_sample_file_writes=(
+                            v25p_shadow_config.physical_storage_layout
+                            == V25P_RECORD_CJSON_LAYOUT_V1
+                        ),
+                    ),
+                    bundle=bundle,
+                    producer=RealTeleopV25pProducer(
+                        layout=self.policy_io_layout,
+                        stream_profile=bundle.streams,
+                        bindings=bundle.producer_bindings,
+                        component_action_schema=bundle.component_action_schema,
+                        component_action_projection=(
+                            bundle.component_action_projection
+                        ),
+                    ),
+                )
             self.writer_pool = AsyncWriterPool(
                 self.writer.handle_job,
                 config=AsyncWriterConfig(
@@ -382,7 +479,7 @@ class RealTeleopDatasetRecorder:
             self.writer_runtime = CollectionWriterRuntime(
                 components=self.collector_components,
                 sample_builder=self.sample_builder,
-                write_planner=lambda sample, _components: self.writer.plan_sample_jobs(sample),
+                write_planner=self._plan_thread_write_jobs,
                 writer_pool=self.writer_pool,
                 config=CollectionWriterObserverConfig(
                     name="real_teleop_dataset_observer",
@@ -395,7 +492,10 @@ class RealTeleopDatasetRecorder:
         self.active_episode_index: int | None = None
         self.active_started_at: float | None = None
         self.control_trace_episode_sink: EpisodeTraceRecorderSink | None = None
+        self.v25p_sidecar_store: V25pEpisodeSidecarStore | None = None
         self._active_control_trace_preparation: Any | None = None
+        self._active_episode_identity: EpisodeCaptureIdentity | None = None
+        self._episode_uuid_factory = uuid.uuid4
         self.finalize_tasks: list[RealDatasetFinalizeTask] = []
         self.saved_episodes = 0
         self.discarded_episodes = 0
@@ -430,6 +530,40 @@ class RealTeleopDatasetRecorder:
         self._sample_modality_reason: str | None = None
         self._process_episode_submitted_count = 0
         self._collection_integrity_reasons: list[str] = []
+
+    def _plan_thread_write_jobs(
+        self,
+        sample: Any,
+        _components: Any,
+    ) -> Any:
+        """Plan legacy jobs once, then observe that exact accepted row."""
+
+        jobs = self.writer.plan_sample_jobs(sample)
+        shadow = self.v25p_native_shadow
+        identity = self._active_episode_identity
+        if (
+            shadow is None
+            or identity is None
+            or not self._v25p_native_shadow_active
+        ):
+            return jobs
+        try:
+            shadow.append(
+                identity,
+                source_sample=sample,
+                legacy_row=legacy_row_from_planned_jobs(jobs),
+            )
+        except BaseException as exc:  # legacy capture stays authoritative
+            self._v25p_native_shadow_error = f"append:{type(exc).__name__}: {exc}"
+            try:
+                shadow.close_unsealed(identity)
+            except BaseException as close_exc:
+                self._v25p_native_shadow_error += (
+                    ";close_unsealed:"
+                    f"{type(close_exc).__name__}: {close_exc}"
+                )
+            self._v25p_native_shadow_active = False
+        return jobs
 
     def _collection_hand_states(
         self,
@@ -540,10 +674,16 @@ class RealTeleopDatasetRecorder:
         if self.is_recording:
             raise RuntimeError("Cannot reconfigure dataset recorder while recording.")
         trace_sink = getattr(self, "control_trace_episode_sink", None)
+        v25p_store = getattr(self, "v25p_sidecar_store", None)
         if trace_sink is not None and desired_root != self.dataset_root:
             raise RuntimeError(
                 "Formal ControlTrace capture cannot move dataset_root within one runtime "
                 "session; restart the frontend for the new root."
+            )
+        if v25p_store is not None and desired_root != self.dataset_root:
+            raise RuntimeError(
+                "v2.5-p sidecars cannot move dataset_root within one runtime session; "
+                "restart the frontend for the new root."
             )
         # Validate/bind before closing the current writer.  A mismatched
         # populated dataset must leave the currently usable recorder intact.
@@ -561,6 +701,8 @@ class RealTeleopDatasetRecorder:
         )
         if trace_sink is not None:
             self.attach_control_trace_episode_sink(trace_sink)
+        if v25p_store is not None:
+            self.attach_v25p_sidecar_store(v25p_store)
         self.start()
         self.write_camera_device_config()
 
@@ -619,6 +761,7 @@ class RealTeleopDatasetRecorder:
         if self.is_recording or self.finalizing:
             raise RuntimeError("Cannot delete an episode while recording or finalizing.")
         trace_sink = getattr(self, "control_trace_episode_sink", None)
+        v25p_store = getattr(self, "v25p_sidecar_store", None)
         self.close()
         result: EpisodeDeleteResult | None = None
         maintenance_error: BaseException | None = None
@@ -633,6 +776,8 @@ class RealTeleopDatasetRecorder:
         )
         if trace_sink is not None:
             self.attach_control_trace_episode_sink(trace_sink)
+        if v25p_store is not None:
+            self.attach_v25p_sidecar_store(v25p_store)
         self.start()
         self.write_camera_device_config()
         if maintenance_error is not None:
@@ -658,6 +803,84 @@ class RealTeleopDatasetRecorder:
         if current is not None and current is not sink:
             raise RuntimeError("A different ControlTrace episode sink is already attached.")
         self.control_trace_episode_sink = sink
+
+    def attach_v25p_sidecar_store(self, store: V25pEpisodeSidecarStore) -> None:
+        """Attach one subordinate v2.5-p store before an episode is active."""
+
+        if not isinstance(store, V25pEpisodeSidecarStore):
+            raise TypeError("store must be V25pEpisodeSidecarStore.")
+        if self.is_recording or self.finalizing:
+            raise RuntimeError("Cannot replace the v2.5-p store during an episode lifecycle.")
+        if store.dataset_root != self.dataset_root.expanduser().resolve():
+            raise ValueError("v2.5-p store dataset_root does not match the recorder.")
+        current = getattr(self, "v25p_sidecar_store", None)
+        if current is not None and current is not store:
+            raise RuntimeError("A different v2.5-p sidecar store is already attached.")
+        self.v25p_sidecar_store = store
+
+    @property
+    def active_episode_identity(self) -> EpisodeCaptureIdentity | None:
+        return getattr(self, "_active_episode_identity", None)
+
+    def begin_subtask_attempt(
+        self,
+        *,
+        track_id: str,
+        attempt_id: str,
+        subtask_id: str,
+        actor_id: str,
+        timestamp: float | None = None,
+    ) -> Any:
+        """Append one task-attempt begin event without owning episode lifecycle."""
+
+        store = getattr(self, "v25p_sidecar_store", None)
+        identity = self.active_episode_identity
+        if store is None or identity is None:
+            raise RuntimeError("No active v2.5-p episode is available.")
+        event_time = time.time() if timestamp is None else float(timestamp)
+        return store.begin_subtask(
+            identity,
+            track_id=track_id,
+            attempt_id=attempt_id,
+            subtask_id=subtask_id,
+            effective_at=event_time,
+            available_at=event_time,
+            effective_clock_domain_id="local_wall_clock",
+            available_clock_domain_id="local_wall_clock",
+            actor_id=actor_id,
+            frame_index=int(self.frame_count),
+        )
+
+    def finish_subtask_attempt(
+        self,
+        *,
+        track_id: str,
+        attempt_id: str,
+        subtask_id: str,
+        outcome: str,
+        actor_id: str,
+        timestamp: float | None = None,
+    ) -> Any:
+        """Append one task-attempt outcome event for the active episode."""
+
+        store = getattr(self, "v25p_sidecar_store", None)
+        identity = self.active_episode_identity
+        if store is None or identity is None:
+            raise RuntimeError("No active v2.5-p episode is available.")
+        event_time = time.time() if timestamp is None else float(timestamp)
+        return store.finish_subtask(
+            identity,
+            track_id=track_id,
+            attempt_id=attempt_id,
+            subtask_id=subtask_id,
+            outcome=outcome,
+            effective_at=event_time,
+            available_at=event_time,
+            effective_clock_domain_id="local_wall_clock",
+            available_clock_domain_id="local_wall_clock",
+            actor_id=actor_id,
+            frame_index=int(self.frame_count),
+        )
 
     @property
     def is_paused(self) -> bool:
@@ -746,17 +969,70 @@ class RealTeleopDatasetRecorder:
         if not ready:
             raise RuntimeError(f"actual TCP feedback is not ready: {message}")
         trace_sink = getattr(self, "control_trace_episode_sink", None)
+        v25p_store = getattr(self, "v25p_sidecar_store", None)
+        v25p_native_shadow = getattr(self, "v25p_native_shadow", None)
         trace_preparation = None
+        v25p_prepared = False
+        v25p_native_prepared = False
+        planned_episode_index = int(self.writer.next_episode_index)
+        episode_uuid_factory = getattr(self, "_episode_uuid_factory", None)
+        if episode_uuid_factory is None:
+            # Compatibility for established constructor-bypassing test doubles.
+            # Fully initialized production recorders always own this factory.
+            episode_uuid_factory = (
+                getattr(trace_sink, "uuid_factory", None) or uuid.uuid4
+            )
+        episode_identity = EpisodeCaptureIdentity(
+            episode_uuid=str(episode_uuid_factory()),
+            legacy_episode_index=planned_episode_index,
+            lifecycle_owner_id="teleop_runtime.real_teleop.dataset_recorder",
+            prepared_at=time.monotonic(),
+            prepared_clock_domain_id="python_monotonic",
+        )
         metadata_payload = dict(metadata)
         force_contract = getattr(self, "gripper_force_contract", None)
         if force_contract is not None:
             metadata_payload["gripper_force_profile"] = force_contract.to_dict()
-        if trace_sink is not None:
-            planned_episode_index = int(self.writer.next_episode_index)
-            trace_preparation = trace_sink.prepare_episode(
-                legacy_episode_index=planned_episode_index,
-                prepared_at=trace_sink.control_now(),
-            )
+        try:
+            if v25p_store is not None:
+                v25p_store.prepare_episode(episode_identity)
+                v25p_prepared = True
+            if v25p_native_shadow is not None:
+                v25p_native_shadow.prepare_episode(episode_identity)
+                v25p_native_prepared = True
+            if trace_sink is not None:
+                trace_preparation = trace_sink.prepare_episode(
+                    legacy_episode_index=planned_episode_index,
+                    prepared_at=trace_sink.control_now(),
+                    episode_identity=episode_identity,
+                )
+        except BaseException as start_error:
+            rollback_steps = []
+            if v25p_store is not None and v25p_prepared:
+                rollback_steps.append(
+                    (
+                        "v25p_preparation",
+                        lambda: v25p_store.discard_episode(episode_identity),
+                    )
+                )
+            if v25p_native_shadow is not None and v25p_native_prepared:
+                rollback_steps.append(
+                    (
+                        "v25p_native_preparation",
+                        lambda: v25p_native_shadow.discard_episode(
+                            episode_identity
+                        ),
+                    )
+                )
+            rollback_failures = collect_lifecycle_failures(rollback_steps)
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    "real_teleop_dataset_recorder.prepare_episode",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
+        if trace_preparation is not None:
             trace_manifest_prefix = (
                 "meta/v24/control_trace/episodes/"
                 f"{trace_preparation.episode_uuid}"
@@ -774,45 +1050,153 @@ class RealTeleopDatasetRecorder:
                     f"{trace_manifest_prefix}/capture_commit.cjson"
                 ),
             }
+        if v25p_store is not None:
+            v25p_prefix = f"meta/v25p/episodes/{episode_identity.episode_uuid}"
+            metadata_payload["v25p_episode"] = {
+                "schema": "dexteleop_v25p_episode_binding_v1",
+                "episode_uuid": episode_identity.episode_uuid,
+                "episode_identity_hash": episode_identity.semantic_content_hash,
+                "identity_ref": f"{v25p_prefix}/identity.cjson",
+                "embodiment_binding_ref": (
+                    f"{v25p_prefix}/embodiment_binding.cjson"
+                ),
+                "episode_manifest_ref": f"{v25p_prefix}/episode_manifest.cjson",
+            }
+        if bool(getattr(getattr(self, "args", None), "v25p_native_shadow", False)):
+            native_prefix = (
+                "meta/v25p/native/episodes/"
+                f"{episode_identity.episode_uuid}"
+            )
+            metadata_payload["v25p_native_episode"] = {
+                "schema": "dexteleop.v25p.native_episode_binding.v1",
+                "episode_uuid": episode_identity.episode_uuid,
+                "episode_identity_hash": episode_identity.semantic_content_hash,
+                "episode_manifest_ref": (
+                    f"{native_prefix}/episode_manifest.cjson"
+                ),
+            }
         writer_start_kwargs: dict[str, Any] = {"metadata": metadata_payload}
         if (
-            trace_preparation is not None
-            and getattr(self, "collection_worker_mode", "thread") == "process"
+            getattr(self, "collection_worker_mode", "thread") == "process"
             and bool(getattr(self.process_worker, "native_stream_contracts", {}))
         ):
-            writer_start_kwargs["episode_uuid"] = trace_preparation.episode_uuid
+            writer_start_kwargs["episode_uuid"] = episode_identity.episode_uuid
+        if (
+            getattr(self, "collection_worker_mode", "thread") == "process"
+            and getattr(self.process_worker, "v25p_shadow_config", None) is not None
+        ):
+            writer_start_kwargs["episode_identity"] = episode_identity
         try:
             episode_index = self.writer.start_episode(**writer_start_kwargs)
-        except BaseException:
+        except BaseException as start_error:
+            rollback_steps = []
+            if trace_sink is not None and trace_preparation is not None:
+                rollback_steps.append(
+                    (
+                        "control_trace_preparation",
+                        lambda: trace_sink.cancel_prepared_episode(trace_preparation),
+                    )
+                )
+            if v25p_store is not None and v25p_prepared:
+                rollback_steps.append(
+                    (
+                        "v25p_preparation",
+                        lambda: v25p_store.discard_episode(episode_identity),
+                    )
+                )
+            if v25p_native_shadow is not None and v25p_native_prepared:
+                rollback_steps.append(
+                    (
+                        "v25p_native_preparation",
+                        lambda: v25p_native_shadow.discard_episode(
+                            episode_identity
+                        ),
+                    )
+                )
+            rollback_failures = collect_lifecycle_failures(rollback_steps)
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    "real_teleop_dataset_recorder.start_episode",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
+        if int(episode_index) != episode_identity.legacy_episode_index:
+            self.writer.discard_episode(int(episode_index))
             if trace_sink is not None and trace_preparation is not None:
                 trace_sink.cancel_prepared_episode(trace_preparation)
-            raise
-        if trace_preparation is not None and int(episode_index) != trace_preparation.legacy_episode_index:
-            self.writer.discard_episode(int(episode_index))
-            trace_sink.cancel_prepared_episode(trace_preparation)
+            if v25p_store is not None and v25p_prepared:
+                v25p_store.discard_episode(episode_identity)
+            if v25p_native_shadow is not None and v25p_native_prepared:
+                v25p_native_shadow.discard_episode(episode_identity)
             raise RuntimeError(
-                "Legacy dataset episode index changed after ControlTrace preparation: "
-                f"planned={trace_preparation.legacy_episode_index} actual={int(episode_index)}"
+                "Legacy dataset episode index changed after owner identity preparation: "
+                f"planned={episode_identity.legacy_episode_index} "
+                f"actual={int(episode_index)}"
             )
-        if trace_sink is not None and trace_preparation is not None:
-            try:
+        try:
+            if v25p_store is not None:
+                v25p_store.bind_prepared_episode(
+                    episode_identity,
+                    bound_at=time.monotonic(),
+                    bound_clock_domain_id="python_monotonic",
+                )
+            if v25p_native_shadow is not None:
+                v25p_native_shadow.bind_prepared_episode(
+                    episode_identity,
+                    bound_at=time.monotonic(),
+                    bound_clock_domain_id="python_monotonic",
+                )
+            if getattr(self, "collection_worker_mode", "thread") == "thread":
+                self.sample_builder.set_episode(episode_index)
+            if trace_sink is not None and trace_preparation is not None:
                 trace_sink.bind_prepared_episode(
                     trace_preparation,
                     bound_at=trace_sink.control_now(),
                 )
-            except BaseException:
-                self.writer.discard_episode(int(episode_index))
-                trace_sink.cancel_prepared_episode(trace_preparation)
-                raise
-        if getattr(self, "collection_worker_mode", "thread") == "thread":
-            self.sample_builder.set_episode(episode_index)
+        except BaseException as start_error:
+            rollback_steps = [("legacy_episode", lambda: self.writer.discard_episode(int(episode_index)))]
+            if v25p_store is not None and v25p_prepared:
+                rollback_steps.append(
+                    (
+                        "v25p_episode",
+                        lambda: v25p_store.discard_episode(episode_identity),
+                    )
+                )
+            if v25p_native_shadow is not None and v25p_native_prepared:
+                rollback_steps.append(
+                    (
+                        "v25p_native_episode",
+                        lambda: v25p_native_shadow.discard_episode(
+                            episode_identity
+                        ),
+                    )
+                )
+            if trace_sink is not None and trace_preparation is not None:
+                rollback_steps.append(
+                    (
+                        "control_trace_preparation",
+                        lambda: trace_sink.cancel_prepared_episode(trace_preparation),
+                    )
+                )
+            rollback_failures = collect_lifecycle_failures(rollback_steps)
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    "real_teleop_dataset_recorder.bind_episode",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
         self._process_episode_submitted_count = 0
+        self._v25p_native_shadow_active = bool(v25p_native_shadow is not None)
+        self._v25p_native_shadow_error = ""
         self._sample_overload_reason = None
         self._sample_modality_reason = None
         self._collection_integrity_reasons = []
         self.active_episode_index = int(episode_index)
         self.active_started_at = float(now)
         self._active_control_trace_preparation = trace_preparation
+        self._active_episode_identity = episode_identity
         self._record_timestamps.clear()
         self._episode_start_monotonic = time.monotonic()
         self._pause_started_at = None
@@ -1123,6 +1507,27 @@ class RealTeleopDatasetRecorder:
             record_wall_time=record_wall_time,
         )
 
+    def _preflight_sample_contract(
+        self,
+        snapshot: Any,
+    ) -> str | None:
+        """Reject known sample-contract failures before process admission."""
+
+        if not self.strict_v22_policy_io or self.policy_io_layout is None:
+            return None
+        try:
+            validate_strict_v22_measured_state(
+                snapshot.hand_states,
+                layout=self.policy_io_layout,
+                sample_timestamp=float(snapshot.step_result.timestamp),
+            )
+        except StrictV22SampleRejection as exc:
+            return (
+                "collection_sample_rejected:"
+                f"{exc.reason}:{exc.side}:{exc}"
+            )
+        return None
+
     def record_step(
         self,
         step_result: SessionStepResult,
@@ -1167,25 +1572,40 @@ class RealTeleopDatasetRecorder:
                 )
                 if snapshot is None:
                     result = None
-                elif self.process_worker.submit_snapshot(
-                    snapshot,
-                    metadata_extra=metadata_extra,
-                ):
-                    self._process_episode_submitted_count += 1
-                    result = True
                 else:
-                    self._sample_process_rejected_busy += 1
-                    self._sample_overload_reason = (
-                        "collection_process_queue_or_shared_slots_busy"
-                    )
-                    self._mark_collection_integrity_issue(self._sample_overload_reason)
-                    result = None
+                    preflight_rejection = self._preflight_sample_contract(snapshot)
+                    if preflight_rejection is not None:
+                        self._sample_overload_reason = preflight_rejection
+                        self._mark_collection_integrity_issue(preflight_rejection)
+                        result = None
+                    elif self.process_worker.submit_snapshot(
+                        snapshot,
+                        metadata_extra=metadata_extra,
+                    ):
+                        self._process_episode_submitted_count += 1
+                        result = True
+                    else:
+                        self._sample_process_rejected_busy += 1
+                        self._sample_overload_reason = (
+                            "collection_process_queue_or_shared_slots_busy"
+                        )
+                        self._mark_collection_integrity_issue(self._sample_overload_reason)
+                        result = None
             else:
-                result = self._writer_lifecycle().handle_step(
-                    step_result,
-                    phase_recorder=phase_recorder,
-                    metadata_extra=metadata_extra,
-                )
+                try:
+                    result = self._writer_lifecycle().handle_step(
+                        step_result,
+                        phase_recorder=phase_recorder,
+                        metadata_extra=metadata_extra,
+                    )
+                except StrictV22SampleRejection as exc:
+                    sample_rejection = (
+                        "collection_sample_rejected:"
+                        f"{exc.reason}:{exc.side}:{exc}"
+                    )
+                    self._sample_overload_reason = sample_rejection
+                    self._mark_collection_integrity_issue(sample_rejection)
+                    result = None
         finally:
             self.sample_builder.include_debug_metadata = previous_include_debug_metadata
             self.sample_builder.include_action_debug_metadata = previous_include_action_debug_metadata
@@ -1202,7 +1622,16 @@ class RealTeleopDatasetRecorder:
         if future is None:
             return None
         self._sample_future = None
-        return future.result()
+        try:
+            return future.result()
+        except Exception as exc:  # noqa: BLE001 - collection failure must not tear down teleop.
+            reason = (
+                "collection_sample_drain_error:"
+                f"{type(exc).__name__}:{exc}"
+            )
+            self._sample_overload_reason = reason
+            self._mark_collection_integrity_issue(reason)
+            return None
 
     def record_step_async(
         self,
@@ -1301,6 +1730,15 @@ class RealTeleopDatasetRecorder:
                     # Camera/reference rejection is accounted by the normal
                     # sample-frequency diagnostics, not process overload.
                     return ""
+        process_worker = getattr(self, "process_worker", None)
+        consume_rejection = getattr(process_worker, "consume_sample_rejection", None)
+        if callable(consume_rejection):
+            rejection = consume_rejection()
+            if rejection:
+                self._sample_overload_reason = (
+                    f"collection_sample_rejected:{rejection}"
+                )
+                self._mark_collection_integrity_issue(self._sample_overload_reason)
         return self.collection_overload_reason
 
     @property
@@ -1477,8 +1915,46 @@ class RealTeleopDatasetRecorder:
                     task.control_trace_error = (
                         f"legacy_finalize_failure_reporting:{type(trace_exc).__name__}: {trace_exc}"
                     )
+            v25p_store = getattr(self, "v25p_sidecar_store", None)
+            if v25p_store is not None and task.episode_identity is not None:
+                try:
+                    v25p_store.close_unsealed(task.episode_identity)
+                except BaseException as sidecar_exc:
+                    task.v25p_error = (
+                        "legacy_finalize_failure_close:"
+                        f"{type(sidecar_exc).__name__}: {sidecar_exc}"
+                    )
+            v25p_native_shadow = getattr(self, "v25p_native_shadow", None)
+            if (
+                v25p_native_shadow is not None
+                and task.episode_identity is not None
+                and v25p_native_shadow.active_identity == task.episode_identity
+            ):
+                try:
+                    v25p_native_shadow.close_unsealed(task.episode_identity)
+                except BaseException as shadow_exc:
+                    task.v25p_native_error = (
+                        "legacy_finalize_failure_close:"
+                        f"{type(shadow_exc).__name__}: {shadow_exc}"
+                    )
             task.mark_done(success=False, error=f"{type(exc).__name__}: {exc}")
             return
+        process_shadow_report = getattr(
+            legacy_finalize_result,
+            "v25p_native_shadow_report",
+            None,
+        )
+        process_shadow_error = str(
+            getattr(
+                legacy_finalize_result,
+                "v25p_native_shadow_error",
+                "",
+            )
+            or ""
+        )
+        if process_shadow_report is not None or process_shadow_error:
+            task.v25p_native_finalize_report = process_shadow_report
+            task.v25p_native_error = process_shadow_error
         trace_sink = getattr(self, "control_trace_episode_sink", None)
         if trace_sink is not None:
             native_stream_artifact_receipts = tuple(
@@ -1528,6 +2004,81 @@ class RealTeleopDatasetRecorder:
                     )
                     if value
                 )
+        v25p_store = getattr(self, "v25p_sidecar_store", None)
+        if v25p_store is not None and task.episode_identity is not None:
+            v24_commit_hash = None
+            trace_report = task.control_trace_finalize_report
+            publish_receipt = getattr(
+                trace_report,
+                "capture_commit_publish_receipt",
+                None,
+            )
+            if publish_receipt is not None and bool(
+                getattr(publish_receipt, "durable", False)
+            ):
+                v24_commit_hash = str(
+                    getattr(publish_receipt, "semantic_content_hash", "") or ""
+                ) or None
+            try:
+                task.v25p_finalize_report = run_stage(
+                    "v25p_post_finalize",
+                    lambda: v25p_store.finalize_after_legacy_episode(
+                        task.episode_identity,
+                        sealed_at=time.time(),
+                        sealed_clock_domain_id="local_wall_clock",
+                        v24_capture_commit_hash=v24_commit_hash,
+                    ),
+                )
+            except BaseException as sidecar_exc:  # legacy finalize remains successful
+                task.v25p_error = (
+                    f"post_finalize:{type(sidecar_exc).__name__}: {sidecar_exc}"
+                )
+                try:
+                    v25p_store.close_unsealed(task.episode_identity)
+                except BaseException as close_exc:
+                    task.v25p_error += (
+                        ";close_unsealed:"
+                        f"{type(close_exc).__name__}: {close_exc}"
+                    )
+        v25p_native_shadow = getattr(self, "v25p_native_shadow", None)
+        if (
+            v25p_native_shadow is not None
+            and task.episode_identity is not None
+            and self._v25p_native_shadow_active
+        ):
+            try:
+                task.v25p_native_finalize_report = run_stage(
+                    "v25p_native_post_finalize",
+                    lambda: v25p_native_shadow.finalize_after_legacy(
+                        task.episode_identity,
+                        legacy_episode_record=load_finalized_legacy_episode_record(
+                            self.dataset_root,
+                            task.episode_index,
+                        ),
+                        completed_at=time.time(),
+                        completed_clock_domain_id="local_wall_clock",
+                    ),
+                )
+                receipt = task.v25p_native_finalize_report.receipt
+                if receipt.status != "complete":
+                    task.v25p_native_error = str(
+                        receipt.message
+                        or "v2.5-p compatibility projection failed"
+                    )
+            except BaseException as shadow_exc:  # legacy finalize remains successful
+                task.v25p_native_error = (
+                    f"post_finalize:{type(shadow_exc).__name__}: {shadow_exc}"
+                )
+                if v25p_native_shadow.active_identity == task.episode_identity:
+                    try:
+                        v25p_native_shadow.close_unsealed(task.episode_identity)
+                    except BaseException as close_exc:
+                        task.v25p_native_error += (
+                            ";close_unsealed:"
+                            f"{type(close_exc).__name__}: {close_exc}"
+                        )
+        elif getattr(self, "_v25p_native_shadow_error", ""):
+            task.v25p_native_error = str(self._v25p_native_shadow_error)
         task.mark_done(success=True)
 
     def _start_finalize_task(self, task: RealDatasetFinalizeTask) -> bool:
@@ -1591,7 +2142,10 @@ class RealTeleopDatasetRecorder:
         frequency_status = self.collection_frequency_status()
         pause_summary = self.pause_summary()
         trace_sink = getattr(self, "control_trace_episode_sink", None)
+        v25p_store = getattr(self, "v25p_sidecar_store", None)
+        v25p_native_shadow = getattr(self, "v25p_native_shadow", None)
         trace_preparation = getattr(self, "_active_control_trace_preparation", None)
+        episode_identity = getattr(self, "_active_episode_identity", None)
         trace_release = None
         trace_release_error = ""
         if trace_sink is not None and trace_preparation is not None:
@@ -1609,6 +2163,7 @@ class RealTeleopDatasetRecorder:
                     f"control_trace_episode_{trace_release_error}"
                 )
         self._active_control_trace_preparation = None
+        self._active_episode_identity = None
         self.active_episode_index = None
         self.active_started_at = None
         self._episode_start_monotonic = None
@@ -1633,6 +2188,27 @@ class RealTeleopDatasetRecorder:
                         "control_trace_episode_discard_reporting:"
                         f"{type(trace_exc).__name__}:{trace_exc}"
                     )
+            if v25p_store is not None and episode_identity is not None:
+                try:
+                    v25p_store.discard_episode(episode_identity)
+                except BaseException as sidecar_exc:
+                    self._mark_collection_integrity_issue(
+                        "v25p_episode_discard:"
+                        f"{type(sidecar_exc).__name__}:{sidecar_exc}"
+                    )
+            if (
+                v25p_native_shadow is not None
+                and episode_identity is not None
+                and v25p_native_shadow.active_identity == episode_identity
+            ):
+                try:
+                    v25p_native_shadow.discard_episode(episode_identity)
+                except BaseException as shadow_exc:
+                    self._mark_collection_integrity_issue(
+                        "v25p_native_episode_discard:"
+                        f"{type(shadow_exc).__name__}:{shadow_exc}"
+                    )
+            self._v25p_native_shadow_active = False
             self.discarded_episodes += 1
             self._record_timestamps.clear()
             self._pause_segments = []
@@ -1646,6 +2222,7 @@ class RealTeleopDatasetRecorder:
             before_finalize=before_finalize,
             control_trace_release=trace_release,
             control_trace_error=trace_release_error,
+            episode_identity=episode_identity,
         )
         task.summary = self._finalize_summary(
             reason=reason,
@@ -1702,11 +2279,18 @@ class RealTeleopDatasetRecorder:
             steps.append(("arm_state_poller", self.arm_state_poller.close))
         if self.hand_state_poller is not None:
             steps.append(("hand_state_poller", self.hand_state_poller.close))
-        steps.extend(
-            [
-                ("finalize_tasks", self.wait_finalize_tasks),
-                ("writer_runtime", lambda: self._writer_lifecycle().close(flush=True)),
-            ]
+        steps.append(("finalize_tasks", self.wait_finalize_tasks))
+        shadow = getattr(self, "v25p_native_shadow", None)
+        if shadow is not None and shadow.active_identity is not None:
+            identity = shadow.active_identity
+            steps.append(
+                (
+                    "v25p_native_shadow",
+                    lambda: shadow.close_unsealed(identity),
+                )
+            )
+        steps.append(
+            ("writer_runtime", lambda: self._writer_lifecycle().close(flush=True))
         )
         run_best_effort_cleanup("real_teleop_dataset_recorder.close", steps)
 

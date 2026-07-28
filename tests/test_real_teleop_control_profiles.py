@@ -13,13 +13,16 @@ from robot_motion.rm65.ik_tuning import load_ik_tuning_config
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_15_60_120_PROFILE,
     POSITION_45_150_PROFILE,
+    POSITION_60_120_PROFILE,
     POSITION_PROFILE,
     PositionControlRates,
 )
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.position_control import (
     ControlDebugConfig,
+    PositionDeployExecutorConfig,
     resolve_control_debug_config,
     resolve_real_arm_execution_config,
 )
@@ -64,6 +67,44 @@ def test_default_common_position_profile_contract_has_independent_15_60_120_cloc
     assert rates.command_hz == 120.0
     assert rates.ordering_warnings == ()
     assert rates.to_metadata()["independent_clocks"] is True
+
+
+def test_hil_position_profile_is_60_input_60_reference_120_command() -> None:
+    rates = POSITION_60_120_PROFILE.rates
+
+    assert rates.sample_hz == 60.0
+    assert rates.reference_hz == 60.0
+    assert rates.ik_hz == 60.0
+    assert rates.command_hz == 120.0
+    assert POSITION_60_120_PROFILE.validate_compose_target_hz(60.0) == 60.0
+    with pytest.raises(ValueError, match="below the controller input rate"):
+        POSITION_60_120_PROFILE.validate_compose_target_hz(15.0)
+
+
+def test_real_executor_can_bind_the_hil_profile_without_copying_control_settings() -> None:
+    config = PositionDeployExecutorConfig.from_position_profile(
+        POSITION_60_120_PROFILE,
+        debug_events_enabled=True,
+    )
+
+    assert (config.sample_hz, config.reference_hz, config.command_hz) == (
+        60.0,
+        60.0,
+        120.0,
+    )
+    assert (
+        POSITION_60_120_PROFILE.rates.reference_hz
+        == POSITION_15_60_120_PROFILE.rates.reference_hz
+    )
+    assert (
+        POSITION_60_120_PROFILE.rates.ik_hz
+        == POSITION_15_60_120_PROFILE.rates.ik_hz
+    )
+    assert (
+        POSITION_60_120_PROFILE.rates.command_hz
+        == POSITION_15_60_120_PROFILE.rates.command_hz
+    )
+    assert config.debug_events_enabled is True
 
 
 def test_real_teleop_velocity_planner_is_explicit_opt_in_with_point_one_second_ramp() -> None:

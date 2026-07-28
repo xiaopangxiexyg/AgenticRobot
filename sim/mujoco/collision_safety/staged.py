@@ -32,6 +32,25 @@ def project_grippers_then_arms(
     )
     start_check = projector.check_qpos(source_data, start)
     if not start_check.safe:
+        # Position-servo tracking can settle a measured arm link a few tenths
+        # of a millimetre inside the preventive envelope.  If it is still
+        # within the hard penetration bound, project the requested command
+        # against that hard bound instead of deadlocking on a soft violation.
+        # The active contact oracle remains unchanged and still terminates
+        # actual hard penetration on every physics tick.
+        if (
+            start_check.minimum_distance_m < 0.0
+            and start_check.penetration_depth_m
+            <= projector.policy.hard_penetration_m
+        ):
+            relaxed = projector.project(
+                source_data,
+                start_qpos=start,
+                requested_qpos=combined_requested,
+                minimum_clearance_m=-projector.policy.hard_penetration_m,
+            )
+            if relaxed.status != "invalid_safe_state":
+                return relaxed
         # Physical measured states may sit just inside the preventive
         # clearance envelope. Preserve independent gripper/arm staging for
         # normal commands, but allow a combined monotonic retreat so a blocked

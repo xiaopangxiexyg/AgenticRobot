@@ -39,6 +39,8 @@ from robot_motion.action.proposal import (
     freeze_robot_action,
     robot_action_semantic_payload,
 )
+from robot_motion.action.component_action import ComponentAction
+from robot_motion.action.component_action_v1 import materialize_robot_action_v1
 from robot_motion.action.execution_target import project_robot_action_to_components
 from robot_motion.action.hand_spec import HandActionSpec
 from robot_motion.action.schema import (
@@ -343,10 +345,16 @@ def build_pose_mixing_input_snapshot(
             continue
         if slot in candidates:
             raise ValueError("One source slot produced multiple pose mixing candidates.")
-        projected_action = None
+        compatibility_action = proposal.action
+        if isinstance(compatibility_action, ComponentAction):
+            compatibility_action = materialize_robot_action_v1(
+                compatibility_action,
+                source=proposal.producer_kind,
+            )
+        projected_action = compatibility_action
         if component_dependencies is not None:
             projected_action = project_robot_action_to_components(
-                proposal.action,
+                compatibility_action,
                 dependencies,
             )
         candidates[slot] = PoseMixingCandidate(
@@ -990,7 +998,13 @@ class HandQposMixingCandidate:
             raise TypeError("proposal must be an admitted ActionProposal.")
         if not isinstance(self.hand_spec, HandActionSpec):
             raise TypeError("hand_spec must be a HandActionSpec.")
-        action = freeze_robot_action(self.proposal.action)
+        proposal_action = self.proposal.action
+        if isinstance(proposal_action, ComponentAction):
+            proposal_action = materialize_robot_action_v1(
+                proposal_action,
+                source=self.proposal.producer_kind,
+            )
+        action = freeze_robot_action(proposal_action)
         side = self.hand_spec.side
         if side not in action.hand_qpos_by_side:
             raise ValueError(

@@ -1,0 +1,36 @@
+{
+  "bound_artifact_hash": "dd3e3a2ac8f7c20886bcc1dcc21ad14cfbdb380277382913639486e2ff74ee68",
+  "checkpoint_step": 92599,
+  "conditioning_origin": "inference_only_projection_v1",
+  "continuation_contract_hash": "sha256:9b60d7fed3a4fc5e4cd4e5f9e5bbda06b8d4148dfbf0fe7787105f3a3fc988f3",
+  "frame_binding": {
+    "hash": "2806625bbe44739327e5c64b4465ac87bdcf92d79af31a8553a3c54cadf735d7",
+    "policy_absolute_frame": "runtime_raw",
+    "runtime_pose_frame_contract": null
+  },
+  "model_id": "0712-wrist-cube",
+  "normalization_binding": {
+    "hash": "7da40f2c0af1034c06f1dcb6532a55f6946caee523a1d317b3ee1271517b11cc",
+    "registry_profile": "dual_rm65_dmgripper_v22_quantile_v1"
+  },
+  "provider_capability_hash": "sha256:d09d85b2e6fc24828c2537c25fc6c41ba853e084e34bd88aceecc76eb2aaf7ff",
+  "provider_capability": {
+    "conditioning_transform_owner": "provider_v1",
+    "continuation_implementation_id": "openpi.pi0.hard-flow-prefix.v1",
+    "continuation_implementation_parameters_hash": "sha256:1ce2fe7611b0a15fad0f340e21ac7f1bca4a8ed958f96956b9d271485d0fba64",
+    "enabled": true,
+    "external_action_dim": 16,
+    "internal_sampler_action_dim": 32,
+    "prediction_horizon_steps": 50,
+    "provider_capability_hash": "sha256:d09d85b2e6fc24828c2537c25fc6c41ba853e084e34bd88aceecc76eb2aaf7ff",
+    "provider_capability_schema": "openpi.conditioned_rtc.provider_capability.v1",
+    "sampler_constraint": "clamped_v1",
+    "supports_unconditioned_bootstrap": true,
+    "wire_protocol": "openpi.conditioned_rtc.v1"
+  },
+  "result_action_representation": "typed_canonical_v1",
+  "schema": "openpi_inference_only_rtc_artifact_binding_v1",
+  "semantic_content_hash": "d062816d4ca6fe6c3a6ab4150f29f84777428b33b571aecf79567e8fda7cba60",
+  "source_artifact_hash": "7296af228a4475138c22af42674df82bd8b4cf5a5dc6f77ec279ad479382ff4a",
+  "training": null
+}

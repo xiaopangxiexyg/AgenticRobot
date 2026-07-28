@@ -13,7 +13,10 @@
 
 ## 0. 运行前确认
 
-- 从仓库根目录使用 Bash，并已激活 `dexteleop310`。
+- 从仓库根目录使用 Bash 或 zsh，并已激活 `dexteleop310`。
+- 如果使用复制的 checkout，先把 `DEXTELEOP_ROOT` 指向该副本；下面命令默认使用
+  `/home/user/zc/DexTeleop`，不会猜测副本目录名。例如远端当前副本实际是
+  `/home/user/zc/DexTelop_0726`（`DexTelop` 少一个 `e`）。
 - 已完成 [设备只读检查](../hardware/README.md)；左右 side、RM65 IP、tool/TCP、Q6、DMTAC
   和相机配置与现场一致。
 - [`teleop_args.sh`](./teleop_args.sh) 是当前站点参数，不是通用默认值。正式数采前检查其中的 CPU 编号、数据目录
@@ -66,6 +69,24 @@ Tracker 等待与稳定 Home 采样共享 1 秒总时限；超时会取消切换
 警告弹窗的时间不计入，二次确认后重新开始这 1 秒窗口。普通 Home 与 Q6 Home
 不会被双踏板模式误识别为快速 Home。
 
+位控的 `single_step_singularity_aware` 路径还会在 q5 接近腕部共轴区域时禁止等价的
+`±pi` 腕部翻转候选参与逐帧竞争（默认 guard 为 12°），避免候选步长裁剪后在两个
+等价解之间抖动。候选层还会拒绝任何辅助姿态/腕部卸载候选在局部步长裁剪后跨入
+该 guard 的另一侧；q5 已经逃离 3.25° SDK 边界后，在 ±6° release band 内的
+向内候选会保持上一侧的 q5，避免 `singularity_escape` 候选在边界两侧开关。可用
+`--position-wrist-q5-hysteresis-release-deg 0` 仅回退 q5 回滞，或用
+`--position-wrist-branch-switch-guard-deg 0` 回退分支 guard；两者均不影响旧的
+`legacy_iterative` 路径。当前稳定基线为 single-step、guard=12°、q5 回滞 release=6°，
+并保留上述两个参数作为逐项回退开关。
+
+当当前 admitted 位姿到目标的误差达到 0.10 m 或 20° 时，稳定基线会暂时放松
+q5 release-band 的“保持上一侧”条件，并启用 `[1,2,4]` 半径的奇异逃逸候选搜索。
+这只扩大搜索和解除粘滞，不改变单周期关节速度、加速度、位置/碰撞约束；最终 qref
+仍必须通过原有 admission。对于宽搜索且确有奇异度进展的候选，允许最多 0.05 m/18°
+的暂时 Cartesian 误差变差，以免“有逃逸方向但被跟踪评分拒绝”；这个放宽不适用于
+普通 IK 或近目标候选。目标回到近距离后自动恢复 6° 回滞。宽搜索由
+`dual_arm_teleop` safety profile 控制，关闭它即可回退单半径搜索。
+
 双踏板模式下 B 是“双臂遥操 / Hold”状态键，并不始终等同于普通“开始遥操”：
 双臂遥操时按 B 进入 Hold；Hold 时按 B 经过快速 Home 恢复双臂遥操；任一单臂
 Fix 状态按 B 时，当前运动臂和数采保持连续，固定臂继续冻结到后台 Home 就绪后
@@ -84,35 +105,73 @@ python -m hardware.foot_pad --count 2
 ### 1.3 正式 position 数采（M）
 
 ```bash
-cd /home/user/zc/DexTeleop
-source /home/user/miniconda3/etc/profile.d/conda.sh
-conda activate /home/user/miniconda3/envs/dexteleop310
-source docs/real/teleop_args.sh
+: "${DEXTELEOP_ROOT:=/home/user/zc/DexTeleop}"
+(
+  if [[ ! -d "$DEXTELEOP_ROOT" ]]; then
+    printf '[DexTeleop] project root not found: %s\n' "$DEXTELEOP_ROOT" >&2
+    exit 1
+  fi
+  cd -- "$DEXTELEOP_ROOT"
+  export PYTHONPATH="$DEXTELEOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  source /home/user/miniconda3/etc/profile.d/conda.sh
+  conda activate /home/user/miniconda3/envs/dexteleop310
+  set -euo pipefail
+  : "${LEFT_ARM_IP:=192.168.101.21}"
+  : "${RIGHT_ARM_IP:=192.168.1.20}"
+  : "${DATASET_BASE:=datasets}"
+  export LEFT_ARM_IP RIGHT_ARM_IP DATASET_BASE
+  source docs/real/teleop_args.sh
 
-taskset -c 0-7 \
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  "${COMMON_REAL_TELEOP_ARGS[@]}" \
-  "${DMTAC_CAPTURE_COMMON_ARGS[@]}" \
-  "${DMTAC_A_ARGS[@]}" \
-  "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}" \
-  "${DATASET_COMMON_ARGS[@]}" \
-  "${POSITION_FORMAL_V1_ARGS[@]}" \
-  "${POSITION_COLLECTION_PROCESS_ARGS[@]}" \
-  "${POSITION_COLLECTION_PRODUCTION_ARGS[@]}" \
-  --dataset-root "$DATASET_BASE" \
-  --collection-task-name dmtac_rm65_bimanual_position_v1 \
-  --collection-task-description "formal rm65 bimanual position v1: accepted-qref FK action, IK 1.0/0.35 min2/max4, 15/60/60/120" \
-  --q6-config latest --q6-config-required \
-  --dmtac-config latest --require-dmtac-config \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
-  --camera-color-format bgr8 \
-  --write-parquet --write-video
+  taskset -c 0-7 \
+  python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+    "${COMMON_REAL_TELEOP_ARGS[@]}" \
+    "${DMTAC_CAPTURE_COMMON_ARGS[@]}" \
+    "${DMTAC_A_ARGS[@]}" \
+    "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}" \
+    "${DATASET_COMMON_ARGS[@]}" \
+    "${POSITION_FORMAL_V1_ARGS[@]}" \
+    "${POSITION_COLLECTION_PROCESS_ARGS[@]}" \
+    "${POSITION_COLLECTION_PRODUCTION_ARGS[@]}" \
+    --dataset-root "$DATASET_BASE" \
+    --collection-task-name dmtac_rm65_bimanual_position_v1 \
+    --collection-task-description "formal rm65 bimanual position v1: accepted-qref FK action, IK 1.0/0.35 min2/max4, 15/60/60/120" \
+    --q6-config latest --q6-config-required \
+    --dmtac-config latest --require-dmtac-config \
+    --camera-config teleop_runtime/configs/devices/realsense.json \
+    --camera-color-format bgr8 \
+    --write-parquet --write-video
+)
+rc=$?
+printf '[DexTeleop] command exited with status=%s\n' "$rc"
 ```
+
+当前 `POSITION_FORMAL_V1_ARGS` 已内置稳定的 single-step 奇异保护（guard=12°、
+q5 回滞 release=6°），因此上面的正式命令就是稳定版命令，不需要另加实验数组。
+如需逐项回退，显式追加对应参数即可；完整旧链路回退使用
+`--position-ik-step-mode legacy_iterative`。
+
+针对“非奇异区 post-IK EMA 仍然不跟手”的修订以独立、可回退的
+`rm65_bimanual_position_v2_responsive` profile 提供。验证 V2 时，将上面命令中的
+`"${POSITION_FORMAL_V1_ARGS[@]}"` 替换为
+`"${POSITION_FORMAL_V2_RESPONSIVE_ARGS[@]}"`，并将 task name 改为
+`dmtac_rm65_bimanual_position_v2_responsive`。V2 仅在单侧状态为 `tracking`、tracker
+运动窗口有效、q3/q5 均在 4° guard 外且腕部 null projection 未介入时，把该侧
+post-IK alpha 提升到 1；进入 guard、发生 hold/boundary 或 q5 escape latch 仍使用受保护
+路径。恢复 `POSITION_FORMAL_V1_ARGS` 即完整回退，不能把 V1/V2 episode 写入同一个
+task/profile 数据集合。
+
+遥操侧的 admitted-anchor QP 速度/加速度约束保持 default-off。测试时将
+`POSITION_FORMAL_V1_ARGS` 替换为 `POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS`；该数组只在
+稳定 V1 上增加 `--position-ik-admitted-motion-limit`，不会改变 source shaping、碰撞或
+受力急停。恢复 `POSITION_FORMAL_V1_ARGS` 即完整回退。
 
 真机多相机默认使用 `bgr8` 颜色传输；它不改变 640×480 等请求分辨率，只避免多台
 RealSense 同时协商 `yuyv` 时出现首帧迟到和底层 SDK 重启。启动首帧等待（5 秒）与
-运行期新鲜度等待（1 秒）分开，启动期间不会因首帧迟到反复重建 pipeline。只有在
-已验证的单站环境中才应显式改用 `--camera-color-format yuyv`。
+运行期新鲜度等待（1 秒）分开，启动期间不会因首帧迟到反复重建 pipeline。现在每台
+相机成功启动时还会打印 `pipeline_start_sec`、`sensor_configure_sec` 和 `warmup_sec`：
+前者偏大表示 USB/UVC/设备内部协商耗时，后者偏大表示首帧等待；这三段都发生在相机
+源启动阶段，与 parquet/video writer 无关。只有在已验证的单站环境中才应显式改用
+`--camera-color-format yuyv`。
 
 `POSITION_FORMAL_V1_ARGS` 会强制启用独立的双臂位控受力急停：通过左右 RM65
 状态连接以 20 Hz 读取 tool-zero 六维力，默认任一侧 `|F| > 15 N` 或
@@ -122,33 +181,57 @@ RealSense 同时协商 `yuyv` 时出现首帧迟到和底层 SDK 重启。启动
 `stale_watchdog=armed_after_fresh_post_camera_samples motion_admission=ready`。
 相机初始化期间真实超力和连续读取错误仍会 fail-closed；只有数据陈旧 watchdog
 延后启用，且启用前强制要求左右各产生一帧新的有效力样本。运行期力读取连续失败、
-数据陈旧或启动后无法取得双侧新鲜样本都会 fail-closed。触发后不能在当前进程
-重新使能，必须检查设备并重启。这里的保护与 impedance 使用的
-`--force-tare-sec` 无关。
+数据陈旧或启动后无法取得双侧新鲜样本都会 fail-closed。若故障发生在已进入遥操的运行期，
+双臂仍会锁存急停，但当前 episode 会先结束并保留受力碰撞标签，GUI、相机、tracker、手部
+和力监控连接保持在 Hold；人工调整机械臂后点击“开始遥操”会刷新真实 qpos、重启 CANFD
+worker 并重新取得双侧新鲜力样本。只有 Arm_Stop 未确认、后台 worker 无法退出或启动阶段
+故障才要求检查设备并重启进程。这里的保护与 impedance 使用的 `--force-tare-sec` 无关。
 
 ### 1.4 Impedance/力控 15→40 Hz 数采（M）
 
-```bash
-cd /home/user/zc/DexTeleop
-source /home/user/miniconda3/etc/profile.d/conda.sh
-conda activate /home/user/miniconda3/envs/dexteleop310
-source docs/real/teleop_args.sh
+力控控制器的 `hard_stop_force_n`/`hard_stop_torque_nm` 触发时同样按碰撞处理：
+左右臂并行请求 `Arm_Stop`，当前 episode 结束并写入 `detected_collision`，但不会关闭
+GUI、相机、tracker、手部或其他设备连接。Arm_Stop 均确认后，GUI 会进入 Hold；人工调整
+机械臂并再次点击“开始遥操”时，系统会以实时 qpos 重建力控/跟随线程并重新采集 runtime
+Home。若任一 Arm_Stop 未确认或控制线程无法退出，则保持 fail-closed 并要求重启，不能
+通过普通 Hold 清除急停锁存。
 
-taskset -c 0-11 \
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  "${COMMON_REAL_TELEOP_ARGS[@]}" \
-  "${DMTAC_CAPTURE_COMMON_ARGS[@]}" \
-  "${DMTAC_A_ARGS[@]}" \
-  "${DATASET_COMMON_ARGS[@]}" \
-  "${IMPEDANCE_40HZ_ARGS[@]}" \
-  "${CONTROL_DEBUG_SUMMARY_ARGS[@]}" \
-  --dataset-root "$DATASET_BASE" \
-  --collection-task-name dmtac_impedance_15_40hz \
-  --collection-task-description "full-device bimanual impedance 15Hz capture / 40Hz backend" \
-  --q6-config latest --q6-config-required \
-  --dmtac-config latest --require-dmtac-config \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
-  --write-parquet --write-video
+```bash
+: "${DEXTELEOP_ROOT:=/home/user/zc/DexTeleop}"
+(
+  if [[ ! -d "$DEXTELEOP_ROOT" ]]; then
+    printf '[DexTeleop] project root not found: %s\n' "$DEXTELEOP_ROOT" >&2
+    exit 1
+  fi
+  cd -- "$DEXTELEOP_ROOT"
+  export PYTHONPATH="$DEXTELEOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  source /home/user/miniconda3/etc/profile.d/conda.sh
+  conda activate /home/user/miniconda3/envs/dexteleop310
+  set -euo pipefail
+  : "${LEFT_ARM_IP:=192.168.101.21}"
+  : "${RIGHT_ARM_IP:=192.168.1.20}"
+  : "${DATASET_BASE:=datasets}"
+  export LEFT_ARM_IP RIGHT_ARM_IP DATASET_BASE
+  source docs/real/teleop_args.sh
+
+  taskset -c 0-11 \
+  python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+    "${COMMON_REAL_TELEOP_ARGS[@]}" \
+    "${DMTAC_CAPTURE_COMMON_ARGS[@]}" \
+    "${DMTAC_A_ARGS[@]}" \
+    "${DATASET_COMMON_ARGS[@]}" \
+    "${IMPEDANCE_40HZ_ARGS[@]}" \
+    "${CONTROL_DEBUG_SUMMARY_ARGS[@]}" \
+    --dataset-root "$DATASET_BASE" \
+    --collection-task-name dmtac_impedance_15_40hz \
+    --collection-task-description "full-device bimanual impedance 15Hz capture / 40Hz backend" \
+    --q6-config latest --q6-config-required \
+    --dmtac-config latest --require-dmtac-config \
+    --camera-config teleop_runtime/configs/devices/realsense.json \
+    --write-parquet --write-video
+)
+rc=$?
+printf '[DexTeleop] command exited with status=%s\n' "$rc"
 ```
 
 ### 1.5 无 collection、无 debug 写盘的卡顿基线（M）
@@ -160,24 +243,39 @@ writer、不启动腕部 depth stream，也不写 standalone debug 文件。它�
 同步 `flush`。
 
 ```bash
-cd /home/user/zc/DexTeleop
-source /home/user/miniconda3/etc/profile.d/conda.sh
-conda activate /home/user/miniconda3/envs/dexteleop310
-source docs/real/teleop_args.sh
+: "${DEXTELEOP_ROOT:=/home/user/zc/DexTeleop}"
+(
+  if [[ ! -d "$DEXTELEOP_ROOT" ]]; then
+    printf '[DexTeleop] project root not found: %s\n' "$DEXTELEOP_ROOT" >&2
+    exit 1
+  fi
+  cd -- "$DEXTELEOP_ROOT"
+  export PYTHONPATH="$DEXTELEOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  source /home/user/miniconda3/etc/profile.d/conda.sh
+  conda activate /home/user/miniconda3/envs/dexteleop310
+  set -euo pipefail
+  : "${LEFT_ARM_IP:=192.168.101.21}"
+  : "${RIGHT_ARM_IP:=192.168.1.20}"
+  : "${DATASET_BASE:=datasets}"
+  export LEFT_ARM_IP RIGHT_ARM_IP DATASET_BASE
+  source docs/real/teleop_args.sh
 
-taskset -c 0-7 \
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  "${COMMON_REAL_TELEOP_ARGS[@]}" \
-  "${DMTAC_CAPTURE_COMMON_ARGS[@]}" \
-  "${DMTAC_A_ARGS[@]}" \
-  "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}" \
-  "${POSITION_FORMAL_V1_ARGS[@]}" \
-  "${NO_COLLECTION_SENSOR_BASELINE_ARGS[@]}" \
-  --q6-config latest --q6-config-required \
-  --dmtac-config latest --require-dmtac-config \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
-  "${CONSOLE_TIMING_ARGS[@]}" \
-  "${NO_DEBUG_DISK_WRITE_ARGS[@]}"
+  taskset -c 0-7 \
+  python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+    "${COMMON_REAL_TELEOP_ARGS[@]}" \
+    "${DMTAC_CAPTURE_COMMON_ARGS[@]}" \
+    "${DMTAC_A_ARGS[@]}" \
+    "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}" \
+    "${POSITION_FORMAL_V1_ARGS[@]}" \
+    "${NO_COLLECTION_SENSOR_BASELINE_ARGS[@]}" \
+    --q6-config latest --q6-config-required \
+    --dmtac-config latest --require-dmtac-config \
+    --camera-config teleop_runtime/configs/devices/realsense.json \
+    "${CONSOLE_TIMING_ARGS[@]}" \
+    "${NO_DEBUG_DISK_WRITE_ARGS[@]}"
+)
+rc=$?
+printf '[DexTeleop] command exited with status=%s\n' "$rc"
 ```
 
 不要在这个基线命令中加入 `DATASET_COMMON_ARGS`、

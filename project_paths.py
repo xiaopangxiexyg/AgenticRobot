@@ -90,6 +90,22 @@ def calibration_profiles_dir() -> Path:
     return local_path("calibration_profiles_dir", teleop_records_root() / "calibration_profiles")
 
 
+def control_station_vive_coordinate_profiles_dir() -> Path:
+    """Return the Control Station-only VIVE coordinate profile directory.
+
+    This is intentionally separate from ``calibration_profiles_dir``.  The
+    latter is owned by the real-teleop profile workflow and may contain
+    deployment-specific RM65 calibration state.  Control Station coordinate
+    profiles contain only VIVE frame/tracker alignment state and are intended
+    for sim or other non-authoritative consumers.
+    """
+
+    return local_path(
+        "control_station_vive_coordinate_profiles_dir",
+        teleop_records_root() / "control_station_vive_coordinate_profiles",
+    )
+
+
 def hand_zero_pose_calibrations_dir() -> Path:
     return local_path(
         "hand_zero_pose_calibrations_dir",

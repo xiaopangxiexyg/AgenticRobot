@@ -7,6 +7,7 @@ This directory contains only OpenPI-specific client pieces:
 - OpenPI policy factory for the generic `deployments.client` remote policy
 - OpenPI-to-sim adapter bound to the shared `robot_motion.deploy` contract
 - artifact-bound OpenPI raw-RTC final-chunk adapter (`continuation=none` only)
+- default-off OpenPI model-RTC v3 provider binding
 - OpenPI startup command wrappers
 
 The generic remote-policy contract, action chunk, and runtime glue live in
@@ -32,6 +33,12 @@ The command above expands to the generic real deploy loop with:
 
 `teleop_runtime` still owns real hardware IO and dispatch, but it does not
 import or know about OpenPI.
+
+By default `--model` and `--checkpoint-step` are informational hints and are not
+used to reject an upstream model instance. The downstream gate checks the
+declared wire protocol and tensor/camera contract. Add
+`--strict-model-identity` when an exact model/checkpoint audit is explicitly
+required.
 
 ## MuJoCo policy adapter
 
@@ -94,8 +101,8 @@ unchanged, while new clients can opt into strict preflight.
 
 ## RTC-4b-A raw-RTC offline adapter
 
-该 adapter 保持 OpenPI 的既有 final-chunk model/server 接口；它不消费未来动作。需要模型消费
-prefix/mask/conditioning receipt 的 model-RTC 属于独立后续实现。
+该 adapter 保持 OpenPI 的既有 final-chunk model/server 接口；它不消费未来动作。模型消费
+prefix/mask/conditioning receipt 时必须使用下面独立的model-RTC v3路径。
 
 `rtc.py` adapts the existing artifact-validated OpenPI final-chunk response to
 the model-neutral RTC v2 envelope. It binds the full artifact and server
@@ -117,9 +124,60 @@ anchors and are decoded to canonical absolute actions before plan admission.
 The launcher preserves the legacy result path for absolute artifacts and
 selects typed results only for an artifact-declared relative raw-RTC request.
 Neither branch changes the OpenPI server payload.
-Model-RTC prefix-conditioned continuation is a separate RTC-4b-B gate; models with
-discrete outputs additionally require a typed discrete prefix/mask/receipt
-before that capability can be enabled.
+Models with discrete outputs additionally require a typed discrete
+prefix/mask/receipt before model-RTC can be enabled.
+
+## RTC-4b-B model-RTC v3 provider
+
+`rtc_conditioned.py`在既有typed OpenPI raw backend之上增加provider binding，不创建第二个transport、worker、plan或
+decoder。canonical future先按artifact layout编码为external action；relative artifact使用请求cut冻结的同一TCP anchor
+做absolute→relative逆投影。OpenPI server继续拥有normalize/pad，并在真实`sample_actions_rtc`调用后返回external、
+internal和mask receipt。DexTeleop验证receipt后只裁剪一次delay prefix。
+
+OpenPI远端改动是default-off且additive：
+
+```text
+ordinary websocket payload -> Policy.infer()       # unchanged
+versioned RTC operation     -> Policy.infer_rtc()
+```
+
+只有显式`--enable-rtc-continuation`才发布
+`rtc_model_continuation_v1` capability。全零mask必须标记
+`unconditioned_bootstrap_v1`；未知operation、capability/dimension/hash drift或receipt context不一致均fail closed。
+当前实现只支持continuous action prefix；它不修改teleop/replay/HITL、target、安全或dispatch，也不构成真实observation、
+checkpoint效果或真机部署证据。
+provider同时接受冻结v1 source contract和显式v2 source contract；普通full-chunk checkpoint的推理期hard inpainting
+必须绑定`inference_only_projection_v1`且`training=null`，不得伪装成prefix-conditioned训练。
+conditioned backend只接受base artifact内正式绑定的source contract；runtime config不再携带第二份contract，只声明
+selected prefix schedule与sampler constraint。
+server metadata还必须发布由loaded instance生成的provider capability hash、continuation implementation identity和
+sampler constraint，call-site receipt逐项回传。客户端context回显不能替代这些provider assertions。
+implementation identity由模型声明的versioned sampler描述与`Policy`实际sampling参数生成；server再把loaded
+internal horizon/dimension和真实external action dimension纳入provider capability，不绑定checkpoint/config白名单。
+
+artifact binding必须在请求循环外完成。`rtc_artifact_binding.py`接收原artifact、loaded provider capability及显式
+delay/prefix范围，生成新的inference-only artifact和receipt；它不会改写checkpoint sidecar。一个可重放的实例位于
+`deployments/openpi/configs/model_rtc/`，仅作为`0712-wrist-cube@92599`的loaded-instance证据，不是兼容白名单。
+
+`OpenPIConditionedRtcBackendV3`直接满足通用
+`RtcConditionedModelRuntimeAdapterV3`；application可将它交给
+`build_rtc_conditioned_model_shadow_frontend_v3()`。该helper只把artifact/runtime contract与loaded capability投影到
+既有bounded worker/timed-plan coordinator，并返回尚未启动的default-off frontend。它不复用或降格为raw/v2
+request spec，不创建新的worker/plan owner，也不接observation source、target或dispatch。当前production
+`teleop_runtime.deploy`尚未选择此profile；本地fake provider已验证bootstrap result进入plan后，下一次请求能消费同一
+plan的canonical overlap prefix。默认re-request coverage由artifact contract的maximum forecast delay派生，避免慢模型
+沿用raw-RTC的2-step阈值而持续退回bootstrap。
+
+S1b1又在不启动server listener或DexTeleop frontend的前提下，只读加载
+`0712-wrist-cube@92599`并直接调用真实GPU `infer_rtc()`。全零mask bootstrap与三帧hard-prefix两次输出均为finite
+`50x16`，第二次实际消费indices `[0,1,2]`且三帧external输出与输入prefix完全一致。该结果只关闭loaded sampler
+数值gate；OpenPI wire的provider assertion、v3 envelope、真实timed-plan/control-loop仍属于下一独立gate。
+
+S1b2已用同一checkpoint完成localhost wire/frontend no-action shadow。动态delay从2升至16后，第二轮请求从尚未pop的
+旧计划选择generation indices `[0..14]`，server consumption receipt、v3 response和plan admission全部通过。该闭环
+保持`send_actions=false`、lookahead disabled、legacy queue pop为0；30 Hz control step最大13.88 ms。为此只修正
+通用契约/时间语义：v2 continuation wrapper在worker校验前规范化、默认re-request coverage取artifact maximum delay、
+model-RTC generation lattice锚定下一枚未pop keyframe。普通OpenPI infer、raw-RTC和production profile均未改变。
 
 RTC-4b-T1 adds only local transport lifecycle mechanics: an RTC worker executor
 may latch cancellation, detach and asynchronously close the current websocket,

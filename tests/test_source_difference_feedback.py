@@ -18,16 +18,21 @@ from control_composition.composition import (
 )
 from control_composition.retention import TimeWindowRetentionSpec
 from control_composition.observability import (
+    DifferenceReceiptReference,
     GuidanceFeedbackSpec,
     NoIoGuidanceFeedbackAdapter,
+    SourceDifferenceImmediateObserver,
     SourceDifferenceSpec,
+    SourceToComposedDifferenceObserver,
     build_guidance_feedback_command,
     evaluate_composition_source_differences,
 )
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_QPOS_HAND16_V1,
+    HandActionSpec,
     RobotAction,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
 from dataset_interface.composition_control_trace import (
@@ -78,6 +83,18 @@ def _evaluate(
     *,
     spec: CompositionSpec,
 ):
+    canonical_action_by_role = {}
+    action_schema = None
+    for role in spec.input_roles:
+        canonical = project_robot_action_v1_to_component_action(
+            action_by_role[role],
+            action_schema=action_schema,
+        )
+        if action_schema is None:
+            action_schema = canonical.action_schema
+        canonical_action_by_role[role] = canonical
+    assert action_schema is not None
+
     clock = Clock()
     coordinator = ControlAdmissionCoordinator(
         "robot-0",
@@ -103,6 +120,7 @@ def _evaluate(
             max_future_lead_sec=2.0,
             max_effective_duration_sec=2.0,
         ),
+        action_schema=action_schema,
     )
     for sequence, role in enumerate(spec.input_roles):
         producer = f"{role}-producer"
@@ -121,7 +139,7 @@ def _evaluate(
                 producer_epoch=1,
                 sequence=sequence,
                 input_role=role,
-                action=action_by_role[role],
+                action=canonical_action_by_role[role],
                 produced_at=9.0 + 0.1 * sequence,
                 produced_clock_domain_id=f"{producer}.clock",
                 effective_from=10.0 + 0.01 * sequence,
@@ -204,23 +222,101 @@ def test_source_difference_is_bound_to_one_cut_and_has_signed_pose_error() -> No
     assert observation.valid_until == 11.0
 
 
-def test_source_difference_qpos_uses_only_common_finite_slots() -> None:
+def test_immediate_difference_observer_returns_only_source_pair_payload() -> None:
     spec = _pose_spec()
+    snapshot, result = _evaluate(
+        {
+            "human_pose": _pose(0.2, 0.0),
+            "policy_pose": _pose(0.5, 90.0),
+        },
+        spec=spec,
+    )
+    observer = SourceDifferenceImmediateObserver(
+        composition_spec=spec,
+        difference_spec=_difference_spec(spec),
+        capability_id="fixture.immediate.pose",
+    )
+    envelope = observer.observe(
+        snapshot,
+        observed_at=10.5,
+        clock_domain_id="control.monotonic",
+    )
+
+    assert result.composition_evaluation_id not in envelope.payload
+    assert envelope.status == "available"
+    assert envelope.payload["difference_scope"] == "source_to_source"
+    assert len(envelope.payload["pairwise_differences"]) == 1
+    assert envelope.composition_evaluation_id is None
+    assert envelope.valid_until == pytest.approx(11.0)
+
+
+def test_post_mix_observer_returns_result_lineage_and_receipt_references() -> None:
+    spec = _pose_spec()
+    snapshot, result = _evaluate(
+        {
+            "human_pose": _pose(0.2, 0.0),
+            "policy_pose": _pose(0.5, 90.0),
+        },
+        spec=spec,
+    )
+    observer = SourceToComposedDifferenceObserver(
+        composition_spec=spec,
+        difference_spec=_difference_spec(spec),
+        capability_id="fixture.post-mix.pose",
+    )
+    reference = DifferenceReceiptReference(
+        stage="dispatch",
+        receipt_id="dispatch:fixture",
+        receipt_hash="dispatch-hash:fixture",
+        observed_at=10.6,
+        clock_domain_id="control.monotonic",
+    )
+    envelope = observer.observe(
+        snapshot,
+        result,
+        observed_at=10.5,
+        clock_domain_id="control.monotonic",
+        receipt_references=(reference,),
+    )
+
+    assert envelope.status == "available"
+    assert envelope.payload["difference_scope"] == "source_to_composed"
+    assert len(envelope.payload["output_residuals"]) == 2
+    assert envelope.composition_evaluation_id == result.composition_evaluation_id
+    assert envelope.receipt_references == (reference,)
+
+
+def test_source_difference_qpos_uses_declared_active_slots() -> None:
+    spec = _pose_spec()
+    active_indices = (0, 4, 5)
+    hand_spec = HandActionSpec(
+        side="left",
+        hand_model="fixture-hand16",
+        slot_count=16,
+        active_dof=len(active_indices),
+        active_mask=tuple(index in active_indices for index in range(16)),
+        joint_names=("q0", "q4", "q5"),
+    )
     human = np.full(16, np.nan, dtype=np.float32)
     policy = np.full(16, np.nan, dtype=np.float32)
-    human[[0, 2, 4, 5]] = [0.0, 0.2, 0.4, 0.5]
-    policy[[0, 1, 4, 5]] = [0.3, 0.9, 0.1, 0.5]
+    human[list(active_indices)] = [0.0, 0.4, 0.5]
+    policy[list(active_indices)] = [0.3, 0.1, 0.5]
+    metadata = {
+        "hand_action_specs_by_side": {"left": hand_spec.to_metadata()}
+    }
     snapshot, result = _evaluate(
         {
             "human_pose": RobotAction(
                 action_space=BIMANUAL_QPOS_HAND16_V1,
                 hand_qpos_by_side={"left": human},
                 active_effectors=("left_hand",),
+                metadata=metadata,
             ),
             "policy_pose": RobotAction(
                 action_space=BIMANUAL_QPOS_HAND16_V1,
                 hand_qpos_by_side={"left": policy},
                 active_effectors=("left_hand",),
+                metadata=metadata,
             ),
         },
         spec=spec,
@@ -241,23 +337,15 @@ def test_source_difference_qpos_uses_only_common_finite_slots() -> None:
     assert observation.output_residuals == ()
 
 
-def test_source_difference_rejects_implicit_frame_conversion() -> None:
+def test_composition_input_schema_rejects_implicit_frame_conversion() -> None:
     spec = _pose_spec()
-    snapshot, result = _evaluate(
-        {
-            "human_pose": _pose(0.2, 0.0, frame="left_base"),
-            "policy_pose": _pose(0.3, 0.0, frame="canonical_desk"),
-        },
-        spec=spec,
-    )
-    with pytest.raises(ValueError, match="frame_mismatch"):
-        evaluate_composition_source_differences(
-            snapshot,
-            result,
+    with pytest.raises(ValueError, match="does not match the runtime payload schema"):
+        _evaluate(
+            {
+                "human_pose": _pose(0.2, 0.0, frame="left_base"),
+                "policy_pose": _pose(0.3, 0.0, frame="canonical_desk"),
+            },
             spec=spec,
-            difference_spec=_difference_spec(spec),
-            evaluated_at=10.5,
-            clock_domain_id="control.monotonic",
         )
 
 

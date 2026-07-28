@@ -26,6 +26,7 @@ import pytest
 
 OPTIONAL_MODULES = frozenset(
     {
+        "test_control_station_mujoco_sim_hil.py",
         "test_dataset_episode_maintenance.py",
         "test_dmtac_viewer.py",
         "test_mujoco.py",
@@ -57,6 +58,8 @@ INTEGRATION_MODULES = frozenset(
         "test_collection_process_writer.py",
         "test_collection_storage_queue.py",
         "test_control_station_mujoco_human_station.py",
+        "test_control_station_sim_hil_gui.py",
+        "test_control_station_vive_calibration.py",
         "test_control_trace_episode.py",
         "test_dmtac_spawn_import_path.py",
         "test_dataset_interface.py",
@@ -70,6 +73,12 @@ INTEGRATION_MODULES = frozenset(
         "test_rm65_worker_drain_integration.py",
         "test_tactile_external_storage.py",
         "test_umi_next_state_arm_action.py",
+        "test_umi_v25p_episode_identity.py",
+        "test_v25p_dual_write_shadow.py",
+        "test_v25p_episode_maintenance_guard.py",
+        "test_v25p_native_store.py",
+        "test_v25p_producer_dual_write.py",
+        "test_v25p_sidecar_store.py",
         "test_writer_video_stats.py",
         "test_wrist_depth_storage.py",
         "test_wrist_depth_visualize.py",
@@ -81,21 +90,28 @@ INTEGRATION_MODULES = frozenset(
 CONTRACT_MODULES = frozenset(
     {
         "test_camera_registry.py",
+        "test_component_target_capability.py",
         "test_dataset_arm_control_mode_contract.py",
         "test_dataset_dependency_boundaries.py",
         "test_dataset_v22_deploy.py",
         "test_dataset_v22_layout.py",
         "test_embodiment_generalization_firewall.py",
+        "test_model_continuation_data_contract.py",
+        "test_openpi_model_rtc_artifact_binding.py",
         "test_package_migrations.py",
         "test_parquet_schema_migration.py",
         "test_robot_motion_action_contracts.py",
         "test_robot_motion_deploy_contracts.py",
         "test_robot_motion_replay_contracts.py",
         "test_rm65_joint6_limits.py",
+        "test_rtc_causal_conditioning_binding.py",
+        "test_rtc_conditioning_bundle.py",
         "test_sim_real2sim_artifact.py",
         "test_sim_contracts.py",
         "test_teleop_action_contract.py",
         "test_teleop_collection_topology.py",
+        "test_v25p_capture_profiles.py",
+        "test_v25p_contracts.py",
     }
 )
 

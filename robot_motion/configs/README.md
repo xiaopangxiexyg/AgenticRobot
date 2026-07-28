@@ -177,6 +177,12 @@
 | `local_step_singularity_escape_max_candidates` | 个数 | 最多生成多少个奇异逃逸候选。 | 增大覆盖更多方向；增加 FK/奇异检查成本。 |
 | `local_step_singularity_escape_max_position_worsen_m` | 米 | 奇异逃逸允许的位置变差上限。 | 变大更容易脱离奇异；过大会牺牲位置跟随。 |
 | `local_step_singularity_escape_max_orientation_worsen_deg` | 度 | 奇异逃逸允许的姿态变差上限。 | 同上。 |
+| `local_step_singularity_escape_wide_search_enabled` | 布尔 | 目标误差较大时是否扩大奇异逃逸候选的搜索半径。 | 只扩大候选搜索，不绕过最终单周期速度/碰撞 admission；关闭可回退为单半径搜索。 |
+| `local_step_singularity_escape_wide_search_position_m` | 米 | 启用宽搜索的位置误差阈值。 | 变小更早扩大搜索；变大更保守。 |
+| `local_step_singularity_escape_wide_search_orientation_deg` | 度 | 启用宽搜索的姿态误差阈值。 | 同上。 |
+| `local_step_singularity_escape_wide_search_radius_factors` | 数组 | 宽搜索使用的候选半径倍数，例如 `[1,2,4]`。 | 覆盖更广但增加 FK/候选评估成本；最终 qref 仍受正常步长限制。 |
+| `local_step_singularity_escape_wide_search_max_position_worsen_m` | 米 | 宽搜索逃逸临时允许的位置误差变差上限。 | 只对远目标且有奇异度进展的候选生效；过大可能牺牲跟手性。 |
+| `local_step_singularity_escape_wide_search_max_orientation_worsen_deg` | 度 | 宽搜索逃逸临时允许的姿态误差变差上限。 | 同上；仍受关节/碰撞/最终 admission 约束。 |
 
 ## `metadata.joint_posture_preference`
 

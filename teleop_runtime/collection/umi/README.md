@@ -127,6 +127,12 @@ python -m teleop_runtime.collection umi \
   --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json
 ```
 
+The provisional canonical-component v2.5-p shadow is wired but remains off by
+default. Add `--v25p-native-shadow` only for dual-write validation; add
+`--v25p-native-storage-layout parquet_stream_chunks_v1` as well to select the
+chunked backend. The v2.3 episode remains authoritative and UMI's per-side
+effective/availability timestamps are preserved.
+
 AngleTrigger 不再从 UMI 启动流程调用终端 `input()`。若一个已保存侧仍能唯一匹配，且
 恰好只剩一个未分配传感器，GUI 会补全另一侧并显示完整的 left/right 设备标签；操作员可
 点击 **确认 Angle 左右自动判断**，也可拒绝并选择 **重新标定 Angle**。如果两侧都无法

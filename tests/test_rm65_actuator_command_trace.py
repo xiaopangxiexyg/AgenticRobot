@@ -150,6 +150,64 @@ def test_preallocated_trace_persists_sparse_singularity_rows_on_close(
         assert rows["gate_status"][0].decode() == "allow_position_elbow_singular"
 
 
+def test_preallocated_trace_persists_fixed_field_ik_shadow_on_close(
+    tmp_path: Path,
+) -> None:
+    recorder = ActuatorCommandTraceRecorder(
+        ActuatorCommandTraceConfig(
+            output_dir=tmp_path / "ik_shadow",
+            active_sides=("left", "right"),
+            command_hz=120.0,
+            reference_hz=60.0,
+            max_duration_sec=1.0,
+        )
+    )
+    pre_q = np.linspace(0.0, 1.1, 12)
+    raw_q = pre_q + 0.01
+    canonical_q = pre_q + 0.005
+    admitted_q = pre_q + 0.002
+    left_target = np.eye(4)
+    right_target = np.eye(4)
+    right_target[1, 3] = 0.2
+
+    assert recorder.record_ik_shadow(
+        12.5,
+        pre_q,
+        raw_q,
+        canonical_q,
+        admitted_q,
+        left_target,
+        right_target,
+        np.arange(6, dtype=float),
+        np.arange(6, dtype=float) + 1.0,
+        0.0,
+        0.5,
+        "tracking",
+    )
+    assert list(recorder.output_dir.iterdir()) == []
+    recorder.close()
+
+    with np.load(
+        recorder.output_dir / ACTUATOR_COMMAND_TRACE_DATA_NAME,
+        allow_pickle=False,
+    ) as data:
+        rows = data["ik_shadow"]
+        assert rows.shape == (1,)
+        np.testing.assert_allclose(rows["pre_q_rad"][0], pre_q)
+        np.testing.assert_allclose(rows["raw_solver_q_rad"][0], raw_q)
+        np.testing.assert_allclose(rows["canonical_solver_q_rad"][0], canonical_q)
+        np.testing.assert_allclose(rows["admitted_q_rad"][0], admitted_q)
+        np.testing.assert_allclose(
+            rows["target_world_pose"][0, 1],
+            right_target,
+        )
+        np.testing.assert_allclose(
+            rows["wrist_null_scale"][0],
+            [0.0, 0.5],
+        )
+        assert rows["status"][0].decode() == "tracking"
+
+
 def test_backend_singularity_trace_is_sparse_for_normal_and_dense_for_abnormal() -> None:
     backend = RM65ArmBackend(
         RM65ArmBackendConfig(

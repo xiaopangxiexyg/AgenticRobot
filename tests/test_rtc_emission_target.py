@@ -15,6 +15,7 @@ from robot_motion.action import (
     RobotAction,
     build_immediate_qref_activation_spec,
     build_scheduled_reference_segment_activation_spec,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.position_control.capability import ExecutionCapabilityProfile
 from robot_motion.deploy import (
@@ -118,6 +119,12 @@ def _pose_action(*, sides: tuple[str, ...] = ("right",)) -> RobotAction:
         },
         source="rtc-emission-target-unit",
     )
+
+
+def _action_schema():
+    return project_robot_action_v1_to_component_action(
+        _pose_action(),
+    ).action_schema
 
 
 def _typed_emission(*, target_effective_at: float = 10.0):
@@ -466,6 +473,7 @@ def test_target_neutral_preparation_admits_once_through_real_proposal_buffer() -
         emission,
         target_contract=contract,
         component_catalog=catalog,
+        action_schema=_action_schema(),
         reference_activation_spec=activation,
         target_clock_domain_id=CLOCK_DOMAIN,
         runtime_session_id=session_id,
@@ -512,6 +520,7 @@ def test_rejected_target_preparation_cannot_create_a_proposal() -> None:
         emission,
         target_contract=contract,
         component_catalog=catalog,
+        action_schema=_action_schema(),
         reference_activation_spec=activation,
         target_clock_domain_id=CLOCK_DOMAIN,
         runtime_session_id="session:rtc-emission-target-unit",
@@ -542,6 +551,7 @@ def test_legacy_preparation_preserves_legacy_representation_proof() -> None:
         emission,
         target_contract=contract,
         component_catalog=catalog,
+        action_schema=_action_schema(),
         reference_activation_spec=activation,
         target_clock_domain_id=CLOCK_DOMAIN,
         runtime_session_id="session:rtc-emission-target-unit",
@@ -578,6 +588,7 @@ def test_target_neutral_preparation_rejects_invalid_producer_identity(
             _typed_emission(),
             target_contract=contract,
             component_catalog=catalog,
+            action_schema=_action_schema(),
             reference_activation_spec=activation,
             target_clock_domain_id=CLOCK_DOMAIN,
             runtime_session_id="session:rtc-emission-target-unit",

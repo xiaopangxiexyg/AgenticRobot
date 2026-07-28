@@ -377,6 +377,28 @@ class ControlTraceRuntime:
         with self._lock:
             return tuple(self._entries)
 
+    def journal_entries_from_offset(
+        self,
+        accepted_entry_offset: int,
+    ) -> tuple[ControlTraceJournalEntry, ...]:
+        """Return accepted entries not yet scanned by one subordinate sink.
+
+        The offset is an accepted-entry count, not a journal sequence. Rejected
+        facts consume journal sequences but do not occupy ``_entries``.
+        """
+
+        offset = int(accepted_entry_offset)
+        if isinstance(accepted_entry_offset, bool) or offset < 0:
+            raise ValueError(
+                "accepted_entry_offset must be a non-negative integer."
+            )
+        with self._lock:
+            if offset > len(self._entries):
+                raise ValueError(
+                    "accepted_entry_offset exceeds admitted journal entries."
+                )
+            return tuple(self._entries[offset:])
+
     def register_durable_sink(self, sink_id: str) -> None:
         """Register the sole subordinate sink allowed to acknowledge durability."""
 

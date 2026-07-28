@@ -89,6 +89,20 @@ def _attach_singularity_transition_trace_sink(
     return attached
 
 
+def _attach_ik_shadow_trace_sink(
+    components: RealTeleopComponents,
+    sink: Callable[..., object] | None,
+) -> int:
+    """Attach one passive 60 Hz IK trace sink to the shared retargeter."""
+
+    retargeter = components.dual_arm_retargeter
+    setter = getattr(retargeter, "set_ik_shadow_trace_sink", None)
+    if not callable(setter):
+        return 0
+    setter(sink)
+    return 1
+
+
 def _new_actuator_command_trace_recorder(
     args: argparse.Namespace,
     *,
@@ -104,6 +118,7 @@ def _new_actuator_command_trace_recorder(
         "active_sides": list(components.active_sides),
         "logical_arm_ip_mapping": dict(components.logical_arm_ip_mapping),
         **_arm_execution_profile_metadata(args),
+        **_position_ik_iteration_metadata(args),
         "effective_transport": _canfd_follow_runtime_config(args),
         "position_command_planner": str(
             getattr(args, "position_command_planner", "")
@@ -193,6 +208,33 @@ def _new_position_debug_recorder(
             "position_post_ik_qpos_smoothing_fast_alpha": float(
                 getattr(args, "position_post_ik_qpos_smoothing_fast_alpha", 0.45)
             ),
+            "position_post_ik_qpos_normal_fast_path": bool(
+                getattr(args, "position_post_ik_qpos_normal_fast_path", False)
+            ),
+            "position_post_ik_qpos_normal_fast_path_alpha": float(
+                getattr(args, "position_post_ik_qpos_normal_fast_path_alpha", 1.0)
+            ),
+            "position_post_ik_qpos_normal_fast_path_guard_deg": float(
+                getattr(
+                    args,
+                    "position_post_ik_qpos_normal_fast_path_guard_deg",
+                    4.0,
+                )
+            ),
+            "position_post_ik_qpos_normal_fast_path_quality_grace_sec": float(
+                getattr(
+                    args,
+                    "position_post_ik_qpos_normal_fast_path_quality_grace_sec",
+                    0.0,
+                )
+            ),
+            "position_wrist_q5_hysteresis_requires_escape_latch": bool(
+                getattr(
+                    args,
+                    "position_wrist_q5_hysteresis_requires_escape_latch",
+                    False,
+                )
+            ),
             "safe_debug": bool(getattr(args, "safe_debug", False)),
             "disable_hold": bool(getattr(args, "disable_hold", False)),
             "singularity_protection_enabled": bool(
@@ -214,7 +256,7 @@ __all__ = [
     "_attach_position_audit_sink",
     "_attach_actuator_command_trace_sink",
     "_attach_singularity_transition_trace_sink",
+    "_attach_ik_shadow_trace_sink",
     "_new_actuator_command_trace_recorder",
     "_new_position_debug_recorder",
 ]
-

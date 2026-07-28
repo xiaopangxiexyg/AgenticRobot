@@ -28,8 +28,16 @@ def deploy_contract_from_policy_artifact(
     protocol_version: str | None = None,
     active_sides: tuple[str, ...] = ("left", "right"),
     required_camera_slots: tuple[str, ...] | None = None,
+    strict_identity: bool = False,
 ) -> DeployPolicyContract:
-    """Derive a strict v2.2 server handshake from one semantic authority."""
+    """Derive a server protocol contract from one semantic authority.
+
+    Model identity is provenance, not wire compatibility.  By default the
+    returned contract deliberately omits the artifact's model id and
+    checkpoint step so a server can switch to another model instance that
+    preserves the same protocol.  Callers performing an explicit provenance
+    audit may set ``strict_identity=True``.
+    """
 
     artifact_slots = (
         () if artifact.camera_input is None else artifact.camera_input.server_camera_slots
@@ -46,8 +54,8 @@ def deploy_contract_from_policy_artifact(
     return DeployPolicyContract(
         protocol_version=protocol_version,
         deploy_schema_version=artifact.deploy_schema_version,
-        model_id=artifact.model_id,
-        checkpoint_step=artifact.checkpoint_step,
+        model_id=artifact.model_id if strict_identity else None,
+        checkpoint_step=artifact.checkpoint_step if strict_identity else None,
         state_key=artifact.state_key,
         state_dim=artifact.state_input_dim,
         state_input_mode=artifact.state_input_mode,

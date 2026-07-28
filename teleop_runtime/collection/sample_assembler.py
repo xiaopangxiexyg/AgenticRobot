@@ -84,6 +84,7 @@ _COMPACT_COMMAND_METADATA_KEYS = frozenset(
 )
 
 _POSE_QUALITY_SCHEMA = "dexteleop_pose_quality_v1"
+_POSE_QUALITY_SPECIAL_SINGULARITY = "singularity"
 DEFAULT_CAMERA_FRAME_MAX_AGE_SEC = 0.1
 
 
@@ -381,6 +382,209 @@ def _joint_margin_summary(value: Any) -> dict[str, Any]:
     }
 
 
+def _singularity_quality_signal(command: TeleopCommand | None) -> dict[str, Any]:
+    """Extract an explicit singularity signal from the accepted-qref metadata.
+
+    The solver's candidate score is an internal ordering value and must not be
+    reused as a dataset quality score.  Position collection instead consumes
+    the final-qref certificate emitted by the singularity-aware path.  The
+    parser also accepts the older preference payloads so that a transition
+    frame cannot silently lose its label while the runtime metadata is being
+    migrated.
+    """
+
+    by_side: dict[str, dict[str, Any]] = {}
+    reasons: list[str] = []
+    certificate_present = False
+    fallback_claimed = False
+    traversal_claimed = False
+    active = False
+
+    def add_reason(reason: str) -> None:
+        text = str(reason)
+        if text and text not in reasons:
+            reasons.append(text)
+
+    def side_payload(side: str) -> dict[str, Any]:
+        normalized = str(side).strip() or "unknown"
+        return by_side.setdefault(
+            normalized,
+            {
+                "kinds": [],
+                "signals": [],
+                "final_qref_singular": False,
+            },
+        )
+
+    def mark_side(side: str, kind: str, signal: str) -> None:
+        nonlocal active
+        payload = side_payload(side)
+        kind_text = str(kind).strip()
+        signal_text = str(signal).strip()
+        if kind_text and kind_text not in payload["kinds"]:
+            payload["kinds"].append(kind_text)
+        if signal_text and signal_text not in payload["signals"]:
+            payload["signals"].append(signal_text)
+        payload["final_qref_singular"] = bool(
+            payload.get("final_qref_singular", False)
+            or signal_text.startswith("final_qref_")
+        )
+        active = True
+
+    def ingest_final_singularity(value: Any, *, source: str) -> None:
+        if not isinstance(value, Mapping):
+            return
+        sides = value.get("sides", value)
+        if not isinstance(sides, Mapping):
+            return
+        for raw_side, raw_payload in sides.items():
+            if not isinstance(raw_payload, Mapping):
+                continue
+            side = str(raw_side)
+            for kind in ("elbow", "wrist", "shoulder"):
+                if _boolish(raw_payload.get(f"is_{kind}_singular", False)):
+                    mark_side(side, kind, f"{source}_{kind}_singular")
+
+    def ingest_traversal(value: Any, *, kind: str) -> None:
+        nonlocal traversal_claimed
+        if not isinstance(value, Mapping):
+            return
+        sides = value.get("by_side", value)
+        if not isinstance(sides, Mapping):
+            return
+        for raw_side, raw_active in sides.items():
+            if _boolish(raw_active):
+                traversal_claimed = True
+                mark_side(str(raw_side), kind, f"{kind}_traversal")
+
+    def ingest_preference(value: Any, *, kind: str) -> None:
+        nonlocal fallback_claimed
+        if not isinstance(value, Mapping):
+            return
+        if not _boolish(value.get("fallback_to_singular", False)):
+            return
+        fallback_claimed = True
+        selected = value.get("selected", {})
+        selected_sides = selected.get("sides", {}) if isinstance(selected, Mapping) else {}
+        if isinstance(selected_sides, Mapping):
+            for raw_side, raw_payload in selected_sides.items():
+                if not isinstance(raw_payload, Mapping):
+                    continue
+                for kind_name in ("elbow", "wrist", "shoulder"):
+                    if _boolish(raw_payload.get(f"is_{kind_name}_singular", False)):
+                        mark_side(str(raw_side), kind_name, f"{kind}_fallback")
+
+    def ingest_selection(selection: Mapping[str, Any]) -> None:
+        nonlocal certificate_present, fallback_claimed
+        certificate = selection.get("candidate_certificate")
+        if isinstance(certificate, Mapping):
+            certificate_present = True
+            if _boolish(certificate.get("singular_fallback_claimed", False)):
+                fallback_claimed = True
+                add_reason("singularity_fallback_claimed")
+            if _boolish(
+                certificate.get("candidate_selected_singular_fallback_claimed", False)
+            ):
+                fallback_claimed = True
+                add_reason("candidate_selected_singular_fallback_claimed")
+            ingest_traversal(
+                certificate.get("singularity_aware_elbow_traversal_by_side"),
+                kind="elbow",
+            )
+            ingest_traversal(
+                certificate.get("singularity_aware_wrist_traversal_by_side"),
+                kind="wrist",
+            )
+            ingest_final_singularity(
+                certificate.get("final_qref_position_singularity"),
+                source="final_qref_position",
+            )
+            ingest_final_singularity(
+                certificate.get("final_qref_wrist_singularity"),
+                source="final_qref_wrist",
+            )
+
+        # These preference fields are retained for compatibility with command
+        # metadata emitted before the candidate certificate became mandatory.
+        ingest_preference(selection.get("position_singularity_preference"), kind="position")
+        ingest_preference(selection.get("wrist_singularity_preference"), kind="wrist")
+        if _boolish(selection.get("singular_fallback_claimed", False)):
+            fallback_claimed = True
+            add_reason("singularity_fallback_claimed")
+        ingest_final_singularity(
+            selection.get("final_qref_position_singularity"),
+            source="final_qref_position",
+        )
+        ingest_final_singularity(
+            selection.get("final_qref_wrist_singularity"),
+            source="final_qref_wrist",
+        )
+
+    if command is None:
+        return {
+            "active": False,
+            "special_code": None,
+            "reasons": [],
+            "by_side": {},
+            "certificate_present": False,
+            "fallback_claimed": False,
+            "traversal_claimed": False,
+        }
+
+    for raw_event in _command_metadata_values(command, "singularity_event"):
+        if not isinstance(raw_event, Mapping):
+            continue
+        if _boolish(raw_event.get("active", False)):
+            active = True
+            add_reason(str(raw_event.get("code") or "singularity_event_active"))
+        if _boolish(raw_event.get("fallback_claimed", False)):
+            fallback_claimed = True
+        if _boolish(raw_event.get("traversal_claimed", False)):
+            traversal_claimed = True
+        ingest_final_singularity(
+            raw_event.get("final_qref_position_singularity"),
+            source="final_qref_position",
+        )
+        ingest_final_singularity(
+            raw_event.get("final_qref_wrist_singularity"),
+            source="final_qref_wrist",
+        )
+        raw_by_side = raw_event.get("by_side", {})
+        if isinstance(raw_by_side, Mapping):
+            for raw_side, raw_payload in raw_by_side.items():
+                if not isinstance(raw_payload, Mapping):
+                    continue
+                for kind in ("elbow", "wrist", "shoulder"):
+                    if _boolish(raw_payload.get(f"{kind}_singular", False)):
+                        mark_side(str(raw_side), kind, "singularity_event")
+
+    for raw_selection in _command_metadata_values(command, "ik_candidate_selection"):
+        if isinstance(raw_selection, Mapping):
+            ingest_selection(raw_selection)
+
+    if fallback_claimed:
+        active = True
+        if "singularity_fallback_claimed" not in reasons:
+            add_reason("singularity_fallback_claimed")
+    if traversal_claimed:
+        active = True
+        add_reason("singularity_traversal")
+    if by_side:
+        for side, payload in by_side.items():
+            for kind in payload.get("kinds", ()):
+                add_reason(f"{side}_{kind}_singular")
+
+    return {
+        "active": bool(active),
+        "special_code": _POSE_QUALITY_SPECIAL_SINGULARITY if active else None,
+        "reasons": reasons,
+        "by_side": by_side,
+        "certificate_present": bool(certificate_present),
+        "fallback_claimed": bool(fallback_claimed),
+        "traversal_claimed": bool(traversal_claimed),
+    }
+
+
 def _build_pose_quality_metadata(command: TeleopCommand | None) -> dict[str, Any]:
     if command is None:
         return {
@@ -388,12 +592,14 @@ def _build_pose_quality_metadata(command: TeleopCommand | None) -> dict[str, Any
             "available": False,
             "status": "unknown",
             "score": None,
+            "special_code": None,
             "source": "no_command",
             "bad": False,
             "reasons": ["no_command"],
             "metrics": {},
         }
 
+    singularity_signal = _singularity_quality_signal(command)
     collision_status = _first_command_metadata(command, "collision_avoidance_status")
     collision_distance_m = _finite_float(_first_command_metadata(command, "collision_distance_m"))
     collision_min_distance_m = _finite_float(
@@ -425,13 +631,14 @@ def _build_pose_quality_metadata(command: TeleopCommand | None) -> dict[str, Any
             pose_error["max_translation_m"],
             joint_margin["nearest_margin_deg"],
         )
-    )
+    ) or bool(singularity_signal.get("active", False))
     if not has_signal:
         return {
             "schema": _POSE_QUALITY_SCHEMA,
             "available": False,
             "status": "unknown",
             "score": None,
+            "special_code": None,
             "source": "command_without_quality_metadata",
             "bad": False,
             "reasons": ["quality_metadata_unavailable"],
@@ -478,6 +685,52 @@ def _build_pose_quality_metadata(command: TeleopCommand | None) -> dict[str, Any
     if time_budget_exceeded:
         warning_reasons.append("ik_time_budget_exceeded")
 
+    singularity_active = bool(singularity_signal.get("active", False))
+    singularity_reasons = [
+        "singularity",
+        *(
+            str(reason)
+            for reason in singularity_signal.get("reasons", ())
+            if str(reason) != "singularity"
+        ),
+    ]
+    if singularity_active:
+        # A singular accepted-qref is an explicit exclusion marker for
+        # training/curation, not a low-but-valid quality score.  Keep the
+        # ordinary diagnostics as context while making the sentinel stable
+        # across v2.1/v2.2 row adapters.
+        bad_reasons = singularity_reasons + bad_reasons
+        return {
+            "schema": _POSE_QUALITY_SCHEMA,
+            "available": True,
+            "status": "singularity",
+            "score": -1.0,
+            "special_code": _POSE_QUALITY_SPECIAL_SINGULARITY,
+            "bad": True,
+            "source": "accepted_qref_singularity_certificate",
+            "reasons": bad_reasons + warning_reasons,
+            "bad_reasons": bad_reasons,
+            "warning_reasons": warning_reasons,
+            "metrics": {
+                "collision_avoidance_status": collision_status,
+                "collision_distance_m": collision_distance_m,
+                "collision_min_distance_m": collision_min_distance_m,
+                "collision_margin_m": (
+                    None
+                    if collision_distance_m is None or collision_min_distance_m is None
+                    else float(collision_distance_m - collision_min_distance_m)
+                ),
+                "collision_avoidance_fallback_reason": fallback_reason,
+                "ik_branch_candidate": branch_candidate,
+                "ik_jump_gate_status": jump_gate_status,
+                "ik_solve_pose_error": pose_error,
+                "joint_limit_margin": joint_margin,
+                "execution_step_limited": execution_step_limited,
+                "ik_time_budget_exceeded": time_budget_exceeded,
+                "singularity": singularity_signal,
+            },
+        }
+
     score = 1.0
     score -= 0.35 * len(bad_reasons)
     score -= 0.12 * len(warning_reasons)
@@ -493,6 +746,7 @@ def _build_pose_quality_metadata(command: TeleopCommand | None) -> dict[str, Any
         "available": True,
         "status": quality_status,
         "score": score,
+        "special_code": None,
         "bad": bool(bad_reasons),
         "source": "existing_command_metadata",
         "reasons": bad_reasons + warning_reasons,

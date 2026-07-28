@@ -142,8 +142,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--prompt", default=None)
-    parser.add_argument("--model", "--expected-model-id", dest="expected_model_id", default=None)
-    parser.add_argument("--checkpoint-step", "--expected-checkpoint-step", dest="expected_checkpoint_step", default=None)
+    parser.add_argument(
+        "--model",
+        "--expected-model-id",
+        dest="expected_model_id",
+        default=None,
+        help="Optional model identity hint; enforced only with --strict-model-identity.",
+    )
+    parser.add_argument(
+        "--checkpoint-step",
+        "--expected-checkpoint-step",
+        dest="expected_checkpoint_step",
+        default=None,
+        help="Optional checkpoint identity hint; enforced only with --strict-model-identity.",
+    )
+    parser.add_argument(
+        "--strict-model-identity",
+        action="store_true",
+        help=(
+            "Require the server model id and checkpoint step to match the "
+            "provided values or policy artifact. By default deployment checks "
+            "protocol compatibility only."
+        ),
+    )
     parser.add_argument("--action-dim", type=int, default=26)
     parser.add_argument("--action-key", default="actions")
     artifact_group = parser.add_mutually_exclusive_group()
@@ -317,13 +338,31 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    strict_model_id = _optional_text(args.expected_model_id)
+    strict_checkpoint_step = _optional_text(args.expected_checkpoint_step)
+    if args.strict_model_identity and policy_artifact is not None:
+        strict_model_id = strict_model_id or policy_artifact.model_id
+        if strict_checkpoint_step is None and policy_artifact.checkpoint_step is not None:
+            strict_checkpoint_step = str(policy_artifact.checkpoint_step)
+
     policy_kwargs: dict[str, Any] = {
         "host": args.host,
         "port": int(args.port),
         "api_key": _optional_text(args.api_key),
         "prompt": _optional_text(args.prompt),
-        "expected_model_id": _optional_text(args.expected_model_id),
-        "expected_checkpoint_step": _optional_text(args.expected_checkpoint_step),
+        # Model identity is intentionally not part of the default downstream
+        # protocol gate. Keep the old exact check available only when a caller
+        # explicitly opts in.
+        "expected_model_id": (
+            strict_model_id
+            if args.strict_model_identity
+            else None
+        ),
+        "expected_checkpoint_step": (
+            strict_checkpoint_step
+            if args.strict_model_identity
+            else None
+        ),
         "action_dim": int(args.action_dim),
         "action_key": str(args.action_key),
         "required_camera_slots": (

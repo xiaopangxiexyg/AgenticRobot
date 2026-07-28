@@ -585,15 +585,83 @@ absolute request/hash继续按 v1 compatibility 解释。
 
 ### 9.2 model-RTC
 
-model-RTC 才允许模型实际消费 versioned future-action prefix/mask，并返回可验证的
-`RtcConditioningReceiptV2`，证明实际使用的 prefix、mask、delay、implementation parameters 和 execution horizon。
+model-RTC 才允许模型实际消费 versioned future-action prefix/mask，并返回可验证的 v3 consumption receipt，
+证明实际使用的 prefix、mask、delay、implementation parameters 和 execution horizon。
 `continuation != none` 必须走 `async_timed_plan`；当前 typed prefix 不支持离散 token continuation 时必须拒绝。
 model-RTC 的 receipt/identity promotion 不得回写 raw-RTC 的 legacy model/server 调用。
+新的causal request只在`robot_motion`携带`conditioning_binding_hash`，不携带model-space ndarray；旧prefix/v2
+envelope保持兼容且不得解释该binding。exact canonical conditioning bundle归`robot_motion.deploy.rtc`；
+model-space codec、encoded input及v3 envelope/receipt归`deployments.client`。
+conditioning 表示链冻结为：
+
+```text
+canonical bundle -> artifact/external prefix
+                 -> provider-owned normalize/pad
+                 -> internal sampler prefix
+```
+
+capability 必须声明 `conditioning_transform_owner`、`external_action_dim` 和
+`internal_sampler_action_dim`。encoding receipt 绑定 external prefix 与完整 horizon mask；consumption receipt 分别绑定
+`consumed_external_prefix_hash`、`consumed_internal_prefix_hash`、`consumed_mask_hash` 和实际 generation indices。
+若provider在server内部执行normalize、padding或mask projection，transform owner必须是`provider_v1`；client发送值的
+hash回显不能替代internal consumption证据。跨仓数组hash统一使用little-endian contiguous float32或binary uint8、
+shape与bytes；不得使用框架对象repr。
+
+全零mask只允许artifact和provider均声明bootstrap支持，且请求显式标记
+`unconditioned_bootstrap_v1`；不得静默降级到raw-RTC。完整model output必须先验证receipt，再且只做一次
+`full_chunk[forecast_delay_steps:]`裁剪。
+该操作正式称为`generation_prefix_crop`；timed-plan随后按实际cursor丢弃已过时candidate称为
+`admission_obsolete_filter`，两者不得合并或重复执行。相应horizon必须区分为generation horizon `H`、
+conditioning window `forecast_delay_steps`、实际selected prefix step数，以及送入plan admission前的
+executable candidate horizon `H - forecast_delay_steps`；最终admitted keyframe数属于plan merge receipt。
+当capability声明`clamped_v1`时，client必须在crop前独立验证完整输出中所有selected generation row与encoded
+external prefix逐float32完全一致；近似约束必须声明其他sampler语义。sampler clamp及consumption receipt都不推进
+`producer_committed_through`，只有正式pop/emission链路可推进execution commitment。conditioned frontend还必须在
+构造期验证worker executor可调用且实现`execute_work_item()`，不得延迟到首个请求发现。
 prefix使用完整generation lattice，满足
 `generation_start_at + forecast_delay_steps * action_period_sec = first_target_effective_at`；model adapter只返回
 `full_chunk[forecast_delay_steps:]`供timed-plan admission，runtime不得再次crop。首批仅允许producer-local overlap；
-sampler约束强度不证明target/reference acceptance。通用contract位于`robot_motion.deploy.rtc`，model client/provider仍分别
-位于`deployments.client`与`deployments/<model>/client`。
+sampler约束强度不证明target/reference acceptance。在线计划timeline、plan overlap、canonical conditioning bundle与
+epoch/plan identity位于
+`robot_motion.deploy.rtc`；共享continuation训练/artifact schema位于`dataset_contracts`，派生训练view位于
+`dataset_interface`，injected codec编排与protocol receipt位于`deployments.client`，artifact-bound数值codec和具体
+provider位于`deployments/<model>/client`或对应模型工程。任一层都不得取得target、safety或dispatch ownership。
+首批overlap selector只接受generation lattice上typed canonical且内部连续的plan keyframe，prefix horizon不得超过
+`forecast_delay_steps`；前导空位必须由prefix mask显式表达，内部空洞及identity/clock/lattice不匹配均拒绝。
+该拓扑已由selected generation indices与既有schedule语义唯一表达，不新增重复的`prefix_mask_topology`字段。
+当前mask虽然使用float32表示，但数值域严格为`{0.0, 1.0}`；`weighted_v1`只描述sampler约束，不允许fractional mask。
+`robot_motion.deploy.rtc_protocol`中的v2 model-space prefix/receipt与
+`robot_motion.deploy.rtc.continuation.RtcContinuationEncodingReceipt`均为冻结兼容面；raw/final-chunk的canonical v2
+用法仅为`continuation=none`，新的model-RTC接入只使用causal binding和deployments-owned v3协议。
+
+首阶段不修改原始dataset row、episode、media或collection/replay schema。model-RTC训练输入是additive derived view；
+artifact必须绑定其continuation data-contract hash。`trajectory_overlap_teacher_v1`与
+`recorded_policy_output_v1`必须使用不同training prefix provenance；在线`producer_local_overlap_v1`是runtime
+source role，不得与任一训练来源共用identity。缺少真实历史policy output时不得推断或伪造该来源。
+当前已实现的首批derived view仅接受continuous absolute teacher overlap，且显式区分prefix、target-padding与loss
+mask；relative、discrete及无exact lineage的recorded-policy输入保持fail closed。
+
+artifact continuation contract按schema解析并保留原始identity。v1是冻结的
+`legacy_v1_compat`组合契约：加载后可无损归一化为runtime/training视图，但不得改写为v2、改变v1 hash，或由其推断模型
+确实做过prefix-conditioned训练。v2显式区分：
+
+```text
+inference_only_projection_v1: runtime required, training = null
+trained_prefix_conditioning_v1: runtime required, training required
+```
+
+`legacy_v1_compat`只允许由v1规范化适配器产生，不是可写入的新v2 origin。artifact、wire capability和receipt始终绑定
+source contract hash；规范化视图不产生替代identity。`dataset_interface`必须拒绝
+`inference_only_projection_v1`训练投影；runtime/provider只消费规范化runtime部分。
+
+具体provider不得接受脱离loaded artifact的临时continuation contract。OpenPI conditioned backend使用的source contract
+必须来自其base backend所加载`PolicyArtifactContract.model_continuation`；runtime config不得再携带第二份contract，
+只声明selected prefix schedule与sampler constraint。provider capability必须由artifact runtime、loaded codec identity和server实际发布的
+loaded-instance metadata共同形成；客户端声明或server原样回显的context不能单独证明sampler implementation。
+call-site receipt必须回传并校验server生成的provider capability hash、implementation id/parameters hash和sampler
+constraint，之后其external/internal/mask hash才构成完整consumption evidence。
+OpenPI中由模型类声明versioned sampler算法描述，`Policy`再绑定实际sampling参数，server最后绑定loaded
+internal horizon/dimension与external action dimension；任何一层都不得用checkpoint/config/model name代替这些事实。
 
 ### 9.3 通用 adapter boundary
 
@@ -656,14 +724,18 @@ live shadow 下 backend MUST expose measured observation while `observation_only
 模式只产生 `rtc_real_shadow_ready` 类验证证据，不授予 motion authorization；teleop、replay、sync dry-run 和 model-RTC
 均不继承此开关。
 
-若开启 `--debug`，raw-RTC 还会记录 model-neutral 的 `rtc_transport_exchange` 事件，包含 observation cut、输入/输出
-identity hash、chunk horizon 以及 inference/result latency；该事件只用于观测，不能替代 plan admission、safety、dispatch
-或 worker-drain evidence。
+若开启 `--debug`，raw-RTC 与 model-RTC 可记录 model-neutral 的 `rtc_transport_exchange` 事件。raw-RTC包含
+observation cut、输入/输出identity hash、chunk horizon以及inference/result latency；model-RTC额外投影
+conditioning mode、generation/conditioning/executable horizon、selected/encoded/consumed prefix计数、source-plan
+generation/hash、binding/encoding/consumption receipt hash及masked-output最大误差。该事件只用于观测，不能替代plan
+admission、safety、dispatch或worker-drain evidence。
 
 RTC debug默认使用`summary`，只记录binding、request/result transition、transport exchange、emission/publication、
 fault和close；显式`--rtc-debug-level trace`才记录每个control tick。RTC事件必须经bounded observer queue非阻塞提交；
 队列满只丢诊断并计数，不得阻塞control/model worker。debug关闭或level不满足时不得构造payload。JSONL允许小批量
 flush，shutdown必须最终flush。所有RTC debug event均为non-authoritative，不得写入或替代共享ControlTrace/WAL。
+默认/非debug路径必须使用空observer语义，不计算masked-output误差、不累计上述计数、不复制或持久化inference bundle；
+debug projection不得反向进入request、result、plan、admission或emission hash。
 
 `--rtc-request-validity-steps`和`--rtc-worker-stop-timeout-sec`只在显式RTC profile下有效，分别绑定request/plan TTL和
 frontend close的bounded worker wait；默认值`10`/`0`保持既有fail-closed与non-waiting语义。模型包、checkpoint名称或
@@ -684,10 +756,99 @@ topology contract of `control_composition`. At the mixed-source boundary an
 arm is always a Cartesian pose component. A robot's 6DoF, 7DoF, or other joint
 count is a downstream resolver/capability property, not a mixer dimension.
 Current left/right pose14 and per-side end-effector rules remain unchanged for
-compatibility. A future component-keyed carrier may support single arm and
-multiple end-effectors per arm only through a new versioned layout/adapter; it
-must not reinterpret an existing checkpoint or silently change v1/v2 tensor
-order.
+compatibility. The additive canonical `ComponentAction` carrier now binds
+arbitrary component IDs to exact `ActionPayloadSchema` hashes and exact active
+coordinates. It carries no source, time, model, chunk, authority, safety, or
+dispatch fields. The sole explicit `RobotAction v1 <-> ComponentAction` bridge
+provides the legacy materialized view; it must not reinterpret an existing
+checkpoint or silently change v1/v2 tensor order.
+
+Standard payload families are `cartesian_pose`, `joint_position`,
+`spatial_twist`, `joint_velocity`, `spatial_wrench`, `joint_effort`,
+`continuous_native`, and `discrete_mode`. Shape alone never selects a family.
+Each schema binds dtype, shape, ordered coordinates, units, value semantics and
+required frames. A namespaced extension is legal at the carrier boundary but
+cannot enter safety or execution without an exact registered capability and
+handler. Model outputs remain fixed-layout tensors decoded by an
+artifact-bound codec into this carrier; generic control topology does not make
+checkpoint tensor layouts dynamic.
+
+The production receiver/selection path is unique:
+`ActionProposal<ComponentAction>` derives action-schema hash, component
+coverage, and selection groups from the carrier; the receiver stamps
+availability and admission sequence under the existing control-domain
+coordinator. A same-cut snapshot reuses the existing producer epoch,
+authority, execution-gate, and decision-schedule facts. Expired proposals are
+pruned by their control-clock effective interval while sequence high-water
+marks remain monotonic. There is no parallel component proposal buffer,
+Arbiter, authority store, queue, or dispatcher.
+
+The Arbiter selects components without interpreting payload numbers. Shared
+resource claims require a target capability to define the legal combined
+command before that representation can reach an execution handler. An Arbiter
+result is candidate
+selection evidence; it is never itself a HOLD, safety, target-admission, or
+motion receipt.
+A resource claim is only a potential conflict set, not permission to combine
+commands: the lower `robot_motion`/target capability must bind accepted
+schema/frame, an explicit resource-combination matrix, a
+representation-specific canonical safety handler and its
+measured/previous-safe state, plus target/reference/dispatch receipts.
+Pose/position, velocity/twist, wrench/effort and trajectory/discrete modes cannot
+share one untyped safety verdict. Therefore such a candidate result is selection
+evidence only for payload families that have no registered target capability.
+The current legacy pose/qpos target profiles continue through their existing
+canonical safety/reference/dispatch implementation by explicitly materializing
+`RobotAction v1` at that lower compatibility edge. The production proposal and
+Arbiter path itself is component-keyed.
+
+`ControlExecutionManifest` and its ControlTrace projection bind the complete
+activation `action_schema_hash` and the structural
+`component_target_capability_hash`; the retained `component_catalog_hash` is
+only legacy v1 target/reference lineage and is not sufficient to identify a
+generic action contract.
+
+The structural capability declares one exact route per schema component and,
+for every claimed resource, the exact active component sets accepted by the
+lower handler. For example a TCP capability may allow `{pose}`, `{wrench}` and
+optionally `{pose,wrench}`. It has no priority mode: the target must not silently
+drop a component already selected by the Arbiter. Capability assessment is
+pure accepted/rejected evidence, not a safety verdict, HOLD, no-action,
+reference admission, or dispatch receipt.
+
+Production representation adaptation follows the accepted authoritative
+publication and precedes `ExecutionDirective`:
+
+```text
+AuthoritativeArbitrationDecision(ComponentAction)
+  -> ActionAdaptationRequest
+  -> TargetCapabilityAssessment
+  -> AdaptedActionCandidate
+  -> ActionAdaptationReceipt
+  -> ExecutionDirective
+  -> canonical safety / resolver / target owner
+```
+
+The current compatibility adapter emits an exact, explicitly non-safe
+`RobotAction v1` candidate for the existing pose/qpos handlers. The receipt
+records receiver identity, processing start/completion in one clock domain,
+acceptance, and exact request/assessment/candidate lineage. Rejection never
+calls canonical safety, the resolver, or dispatch and does not itself command
+HOLD: the unique execution owner applies its existing persistence policy
+(`no_action` for an ordinary rejected candidate, or the existing conservative
+compound-domain fallback). A pure capability-assessment hash may repeat for
+equal candidates, while its ControlTrace occurrence identity remains bound to
+the unique adaptation request.
+
+`RobotAction v1` is a target-private compatibility carrier, not an upper action
+space restriction. `RobotActionV1RepresentationAdapter` accepts an explicit
+target-owned materializer plus its route contract, so a new component topology
+can define a lossless mapping without changing composition or arbitration.
+Adapters must preserve units and semantics: velocity, wrench, and effort may be
+carried only by a typed RobotAction extension/new carrier or by a target-defined
+physical conversion; they must never be relabeled as pose/qpos or hidden in
+metadata. The default materializer remains the existing lossless pose/qpos
+bridge, so current deployment behavior is unchanged.
 
 | 维度 | legacy v1 | v2 |
 | --- | --- | --- |
@@ -742,5 +903,11 @@ observation、artifact、session、policy output 和 runtime compatibility 的�
 - Dataset `action` 是 training target，deploy output 是 prediction，必须在 runtime 中归一化为 `RobotAction` 或 typed target。
 - v2 dataset 的 `PolicyIOLayout` 必须嵌入 artifact 并核对 hash；v1 26D/38D 只有经过显式、可审计 adapter 才能进入 v2。
 - `observation.arm.qpos` 可以由 replay/qpos-init 读取，但不进入默认 v2 model observation。
+- model-RTC continuation首阶段是`dataset_interface`派生训练view，不是新的raw dataset列；它必须分别携带target-valid/pad、
+  conditioning-prefix和loss mask，不能复用一个含义模糊的`mask`。
+- `dataset_interface`止于artifact action representation，不猜模型normalization或framework tensor；训练与在线部署必须
+  使用同一artifact-bound双向codec实现或通过同一conformance/hash证明等价，禁止各自维护无关联的数值转换。
+- teacher trajectory overlap只证明训练样本构造；真实部署old-plan overlap来自`robot_motion` timed plan。两者只有在同一
+  artifact-bound continuation contract、codec/layout/frame/normalization和mask语义下才可比较，不能共享runtime plan identity。
 - 改变 state/action/token/pose/frame 语义时，必须同步更新 dataset layout、artifact、server metadata、adapter 和本文档；
   runtime availability、fault、session preflight 与 output normalization 只在部署契约层维护。

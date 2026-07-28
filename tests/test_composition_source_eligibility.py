@@ -13,6 +13,7 @@ from control_composition.composition import (
     CompositionSpec,
     DeterministicComposer,
     build_composition_input_snapshot,
+    build_robot_action_v1_composition_input_draft,
     decide_composition_authority_disposition,
     project_composition_inputs,
 )
@@ -34,6 +35,7 @@ from robot_motion.action import (
     ActionComponentCatalog,
     ActionComponentSpec,
     RobotAction,
+    build_robot_action_v1_runtime_schema,
 )
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
@@ -92,8 +94,24 @@ def qpos_action(value: float = 0.1) -> RobotAction:
     )
 
 
+def component_catalog() -> ActionComponentCatalog:
+    return ActionComponentCatalog(
+        catalog_id="source-eligibility-left-arm-v1",
+        action_space=BIMANUAL_QPOS_V1,
+        components=(
+            ActionComponentSpec("left_arm", "left_arm", "left_arm"),
+        ),
+    )
+
+
+def action_schema():
+    return build_robot_action_v1_runtime_schema(
+        component_catalog=component_catalog(),
+    )
+
+
 def input_draft() -> CompositionInputDraft:
-    return CompositionInputDraft(
+    return build_robot_action_v1_composition_input_draft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
         producer_id="human-producer",
@@ -101,6 +119,7 @@ def input_draft() -> CompositionInputDraft:
         sequence=0,
         input_role="base",
         action=qpos_action(),
+        action_schema=action_schema(),
         produced_at=9.9,
         produced_clock_domain_id="human.monotonic",
         effective_from=10.0,
@@ -171,6 +190,7 @@ def stores():
         coordinator=coordinator,
         producer_epochs=epochs,
         retention_spec=retention_spec(),
+        action_schema=action_schema(),
     )
     states = CompositionSourceEligibilityStore(
         runtime_session_id="session-0",
@@ -630,18 +650,15 @@ def test_producer_restart_invalidates_old_source_state() -> None:
 def test_runtime_opt_in_events_are_externally_projectable() -> None:
     clock, coordinator, epochs, _, _ = stores()
     events: list[CompositionDomainEvent] = []
+    catalog = component_catalog()
     runtime = ControlCompositionRuntime(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
         embodiment_instance_id="fixture-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        component_catalog=ActionComponentCatalog(
-            catalog_id="left-arm-v1",
-            action_space=BIMANUAL_QPOS_V1,
-            components=(
-                ActionComponentSpec("left_arm", "left_arm", "left_arm"),
-            ),
+        action_schema=build_robot_action_v1_runtime_schema(
+            component_catalog=catalog,
         ),
         event_emitter=lambda batch: events.extend(batch),
         proposal_admitter=lambda *_args, **_kwargs: None,
@@ -663,7 +680,7 @@ def test_runtime_opt_in_events_are_externally_projectable() -> None:
         source_eligibility_spec=state_spec,
         target_effective_at=10.1,
     )
-    assert evaluation.composition_result.output_status == "no_action"
+    assert evaluation.composition_evaluation.output_status == "no_action"
     assert evaluation.input_snapshot.missing_roles == ("base",)
     assert evaluation.source_eligibility_snapshot is not None
     assert evaluation.evaluation_record is not None
@@ -689,7 +706,7 @@ def test_runtime_opt_in_events_are_externally_projectable() -> None:
     )
 
 
-def test_disabled_runtime_rejects_source_state_without_changing_input_path() -> None:
+def test_runtime_composition_support_is_capped_by_source_lease() -> None:
     clock, coordinator, epochs, _, _ = stores()
     runtime = ControlCompositionRuntime(
         runtime_session_id="session-0",
@@ -697,12 +714,42 @@ def test_disabled_runtime_rejects_source_state_without_changing_input_path() -> 
         embodiment_instance_id="fixture-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        component_catalog=ActionComponentCatalog(
-            catalog_id="left-arm-v1",
-            action_space=BIMANUAL_QPOS_V1,
-            components=(
-                ActionComponentSpec("left_arm", "left_arm", "left_arm"),
-            ),
+        action_schema=action_schema(),
+        event_emitter=lambda _batch: None,
+        proposal_admitter=lambda *_args, **_kwargs: None,
+        context_retention_spec=retention_spec(),
+        composition_input_retention_spec=retention_spec(),
+        source_eligibility_retention_spec=retention_spec(),
+        clock=clock,
+    )
+    assert runtime.admit_composition_input(input_draft()).accepted
+    assert runtime.admit_source_eligibility(
+        source_state(lease_expires_at=10.15)
+    ).accepted
+    evaluation = runtime.evaluate_composition(
+        spec=composition_spec(),
+        source_eligibility_spec=eligibility_spec(),
+        target_effective_at=10.1,
+    )
+
+    assert evaluation.composition_evaluation.output_status == "ready"
+    assert (
+        evaluation.composition_evaluation.composition_supported_until
+        == 10.15
+    )
+
+
+def test_disabled_runtime_rejects_source_state_without_changing_input_path() -> None:
+    clock, coordinator, epochs, _, _ = stores()
+    catalog = component_catalog()
+    runtime = ControlCompositionRuntime(
+        runtime_session_id="session-0",
+        control_domain_id="robot-0",
+        embodiment_instance_id="fixture-0",
+        coordinator=coordinator,
+        producer_epochs=epochs,
+        action_schema=build_robot_action_v1_runtime_schema(
+            component_catalog=catalog,
         ),
         event_emitter=lambda _batch: None,
         proposal_admitter=lambda *_args, **_kwargs: None,
@@ -718,5 +765,5 @@ def test_disabled_runtime_rejects_source_state_without_changing_input_path() -> 
         spec=composition_spec(),
         target_effective_at=10.1,
     )
-    assert evaluation.composition_result.output_status == "ready"
+    assert evaluation.composition_evaluation.output_status == "ready"
     assert evaluation.source_eligibility_snapshot is None

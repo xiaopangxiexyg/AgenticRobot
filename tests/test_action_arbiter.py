@@ -3,7 +3,12 @@ from __future__ import annotations
 import inspect
 import numpy as np
 
-from robot_motion.action import BIMANUAL_EE_POSE_V1, RobotAction
+from robot_motion.action import (
+    BIMANUAL_EE_POSE_V1,
+    RobotAction,
+    build_robot_action_v1_runtime_schema,
+    project_robot_action_v1_to_component_action,
+)
 from robot_motion.action.arbiter import ActionArbiter
 from robot_motion.action.arbitration_input import capture_arbitration_input
 from robot_motion.action.arbitration_runtime import DecisionScheduleSpec, DecisionScheduler
@@ -52,6 +57,9 @@ def setup_runtime(*, coupled: bool = False):
     if coupled:
         components.append(ActionComponentSpec("right_arm", "arms", "right_arm", coupled=True))
     catalog = ActionComponentCatalog("arms-v1", BIMANUAL_EE_POSE_V1, tuple(components))
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog
+    )
     proposals = ProposalBuffer(
         runtime_session_id="session-0",
         coordinator=coordinator,
@@ -68,10 +76,19 @@ def setup_runtime(*, coupled: bool = False):
         runtime_session_id="session-0", coordinator=coordinator, policy=policy
     )
     gate = ExecutionGateStore(runtime_session_id="session-0", coordinator=coordinator)
-    return clock, coordinator, epochs, catalog, proposals, authority, gate
+    return clock, coordinator, epochs, action_schema, proposals, authority, gate
 
 
-def proposal(catalog, *, producer: str, kind: str, sequence: int, coverage=("left_arm",)):
+def proposal(action_schema, *, producer: str, kind: str, sequence: int, coverage=("left_arm",)):
+    action = RobotAction.bimanual_ee_pose(
+        left_arm=np.asarray([0.3, 0.0, 0.4, 0, 0, 0, 1], dtype=np.float32),
+        right_arm=(
+            np.asarray([0.3, 0.0, 0.4, 0, 0, 0, 1], dtype=np.float32)
+            if "right_arm" in coverage
+            else None
+        ),
+        source=kind,
+    )
     return ActionProposalDraft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
@@ -80,14 +97,9 @@ def proposal(catalog, *, producer: str, kind: str, sequence: int, coverage=("lef
         producer_id=producer,
         producer_epoch=1,
         sequence=sequence,
-        action=RobotAction.bimanual_ee_pose(
-            left_arm=np.asarray([0.3, 0.0, 0.4, 0, 0, 0, 1], dtype=np.float32),
-            right_arm=(
-                np.asarray([0.3, 0.0, 0.4, 0, 0, 0, 1], dtype=np.float32)
-                if "right_arm" in coverage
-                else None
-            ),
-            source=kind,
+        action=project_robot_action_v1_to_component_action(
+            action,
+            action_schema=action_schema,
         ),
         produced_at=4.0,
         produced_clock_domain_id=f"{producer}.clock",
@@ -95,14 +107,11 @@ def proposal(catalog, *, producer: str, kind: str, sequence: int, coverage=("lef
         effective_until=11.0,
         target_effective_at=10.5,
         effective_clock_domain_id="control.monotonic",
-        component_schema_hash=catalog.semantic_content_hash,
-        component_coverage=coverage,
-        selection_groups=("arms",),
     )
 
 
 def capture(runtime):
-    clock, coordinator, epochs, catalog, proposals, authority, gate = runtime
+    clock, coordinator, epochs, action_schema, proposals, authority, gate = runtime
     clock.value = 10.5
     return capture_arbitration_input(
         coordinator=coordinator,
@@ -114,7 +123,7 @@ def capture(runtime):
             DecisionScheduleSpec(spec_id="30hz", decision_hz=30), clock=clock
         ),
         embodiment_instance_id="rm65-pair-0",
-        component_catalog=catalog,
+        action_schema=action_schema,
         active_selection_groups=("arms",),
     )
 
@@ -131,7 +140,8 @@ def test_same_complete_snapshot_produces_identical_result_hash() -> None:
     assert first.semantic_content_hash == second.semantic_content_hash
     assert first.output_status == "selected"
     assert first.selected_by_group["arms"].endswith("policy-main:1:0")
-    assert first.composed_action is not None
+    assert first.composed_candidate is not None
+    assert first.supported_until == 11.0
 
 
 def test_pure_arbiter_accepts_only_complete_snapshot_and_reads_no_store_or_clock() -> None:
@@ -206,8 +216,11 @@ def test_coupled_group_rejects_incomplete_proposal() -> None:
 
     result = ActionArbiter().arbitrate(snapshot)
 
-    assert result.output_status == "no_action"
-    assert any(item.reason == "coupled_group_incomplete" for item in result.rejections)
+    assert result.output_status == "hold"
+    assert any(
+        item.reason.startswith("composed_candidate_invariant_failed:")
+        for item in result.rejections
+    )
 
 
 def test_gate_hold_is_not_an_authoritative_selected_action() -> None:
@@ -224,7 +237,7 @@ def test_gate_hold_is_not_an_authoritative_selected_action() -> None:
     result = ActionArbiter().arbitrate(snapshot)
 
     assert result.output_status == "hold"
-    assert result.composed_action is None
+    assert result.composed_candidate is None
     assert not result.selected_by_group
 
 

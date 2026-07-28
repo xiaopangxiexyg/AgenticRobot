@@ -43,6 +43,12 @@ class EpisodeStats:
     pose_quality_mean_score: float | None
     force_collision_detected: bool
     force_collision_label: str
+    # Negative/special pose-quality values are exclusion markers rather than
+    # points on the ordinary [0, 1] quality scale.  Keep their counts
+    # explicit so episode statistics remain numerically meaningful.
+    pose_quality_special_count: int = 0
+    pose_quality_singularity_count: int = 0
+    pose_quality_valid_score_count: int = 0
 
 
 def _finite_float(value: Any) -> float | None:
@@ -140,6 +146,9 @@ class EpisodeStatsAccumulator:
         self._pose_quality_scores: list[float] = []
         self._pose_quality_bad_count = 0
         self._pose_quality_warning_count = 0
+        self._pose_quality_special_count = 0
+        self._pose_quality_singularity_count = 0
+        self._pose_quality_valid_score_count = 0
         self._force_collision_detected = False
 
     def update(self, row: Mapping[str, Any]) -> None:
@@ -168,21 +177,46 @@ class EpisodeStatsAccumulator:
         if isinstance(fault_codes, (list, tuple)):
             self._fault_count += len(fault_codes)
         pose_status = row.get("teleop.pose_quality.status")
+        special_code_value = row.get("teleop.pose_quality.special_code")
+        special_code = (
+            str(special_code_value).strip()
+            if special_code_value is not None
+            else ""
+        )
+        if special_code.lower() in {"", "none", "null", "nan"}:
+            special_code = ""
         if pose_status is not None:
             status_key = str(pose_status)
             self._pose_quality_status_counts[status_key] = (
                 self._pose_quality_status_counts.get(status_key, 0) + 1
             )
-            if status_key == "bad":
+            if status_key in {"bad", "singularity"}:
                 self._pose_quality_bad_count += 1
             elif status_key == "warning":
                 self._pose_quality_warning_count += 1
         pose_bad = row.get("teleop.pose_quality.bad")
         if pose_status is None and _truthy(pose_bad):
             self._pose_quality_bad_count += 1
+        if special_code:
+            self._pose_quality_special_count += 1
+            if special_code == "singularity":
+                self._pose_quality_singularity_count += 1
+        elif str(pose_status or "") == "singularity":
+            # Older rows may have the status but not the newer special-code
+            # column; retain the same explicit exclusion counts.
+            self._pose_quality_special_count += 1
+            self._pose_quality_singularity_count += 1
         pose_score = _finite_float(row.get("teleop.pose_quality.score"))
         if pose_score is not None:
-            self._pose_quality_scores.append(pose_score)
+            if pose_score < 0.0:
+                # Legacy/compatibility rows may carry only score=-1 without
+                # the explicit special_code column.  Count them once and
+                # infer the singularity label only when status confirms it.
+                if not special_code:
+                    self._pose_quality_special_count += 1
+            else:
+                self._pose_quality_scores.append(pose_score)
+                self._pose_quality_valid_score_count += 1
         legacy_force_collision = _truthy(row.get("teleop.force_limit_exceeded")) or _truthy(
             row.get("teleop.force_collision_detected")
         )
@@ -237,6 +271,9 @@ class EpisodeStatsAccumulator:
                 if self._force_collision_detected
                 else FORCE_COLLISION_LABEL_CLEAN
             ),
+            pose_quality_special_count=int(self._pose_quality_special_count),
+            pose_quality_singularity_count=int(self._pose_quality_singularity_count),
+            pose_quality_valid_score_count=int(self._pose_quality_valid_score_count),
         )
 
 

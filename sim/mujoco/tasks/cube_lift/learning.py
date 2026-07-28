@@ -22,6 +22,7 @@ from sim.mujoco.learning import (
 
 from .config import (
     NORMAL_POLICY_CLASS,
+    NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
     NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
     CubeLiftTaskConfig,
 )
@@ -31,7 +32,10 @@ def _uses_episode_clock(config: CubeLiftTaskConfig) -> bool:
     return not (
         config.policy_class == NORMAL_POLICY_CLASS
         and config.normal_proprio_profile
-        == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2
+        in {
+            NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
+            NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
+        }
     )
 
 

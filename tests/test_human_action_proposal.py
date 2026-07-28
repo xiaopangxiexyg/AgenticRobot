@@ -9,11 +9,18 @@ from dataset_contracts.completeness import (
 )
 from robot_motion.action import (
     ActionComponentCatalog,
+    ActionComponentCatalogV2,
     ActionComponentSpec,
     ArmActionSpec,
     BIMANUAL_EE_POSE_V1,
+    ComponentActionSchema,
+    ControlComponentSpecV2,
+    EndEffectorTarget,
     HandActionSpec,
     ProposalBuffer,
+    RobotAction,
+    build_robot_action_v1_runtime_schema,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.runtime import (
     EffectorCommand,
@@ -103,6 +110,7 @@ def _adapter(
     effector_name: str = "left_arm",
     component_id: str = "left_arm_pose",
     action_adapter: TeleopCommandActionAdapterConfig | None = None,
+    action_schema: ComponentActionSchema | None = None,
 ) -> HumanProposalAdapter:
     catalog = ActionComponentCatalog(
         catalog_id="human-test-v1",
@@ -115,6 +123,24 @@ def _adapter(
             ),
         ),
     )
+    resolved_adapter = (
+        action_adapter
+        if action_adapter is not None
+        else TeleopCommandActionAdapterConfig(
+            include_command_metadata=False,
+            source="human:vive",
+        )
+    )
+    hand_specs = dict(resolved_adapter.hand_specs or {})
+    for component in catalog.components:
+        side, kind = component.effector_name.split("_", 1)
+        if kind == "hand" and side not in hand_specs:
+            hand_specs[side] = HandActionSpec.inspire_tac(side)
+    action_schema = action_schema or build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+        arm_action_specs_by_side=dict(resolved_adapter.arm_specs or {}),
+        hand_action_specs_by_side=hand_specs,
+    )
     return HumanProposalAdapter(
         HumanProposalAdapterConfig(
             runtime_session_id="runtime-1",
@@ -125,15 +151,52 @@ def _adapter(
             produced_clock_domain_id="control-monotonic",
             effective_clock_domain_id="control-monotonic",
             component_catalog=catalog,
-            action_adapter=(
-                action_adapter
-                if action_adapter is not None
-                else TeleopCommandActionAdapterConfig(
-                    include_command_metadata=False,
-                    source="human:vive",
-                )
-            ),
+            action_schema=action_schema,
+            action_adapter=resolved_adapter,
         )
+    )
+
+
+def _native_mode_action_schema() -> ComponentActionSchema:
+    template = RobotAction(
+        action_space="dexteleop_policy_io_v2.2",
+        end_effector_targets_by_side={
+            "right": EndEffectorTarget(
+                value_type="discrete",
+                values=np.asarray([0], dtype=np.int64),
+                adapter="two_state_gripper_v1",
+                names=("mode",),
+            )
+        },
+        active_effectors=("right_hand",),
+        source="native-schema-template",
+    )
+    local = project_robot_action_v1_to_component_action(template).action_schema
+    payload_schema = local.payload_schema_by_component["right_hand"]
+    catalog = ActionComponentCatalogV2(
+        catalog_id="native-mode-human-test-v1",
+        catalog_version="1",
+        components=(
+            ControlComponentSpecV2(
+                component_id="right_gripper_mode",
+                controlled_entity_id="right",
+                command_channel_id="right_hand",
+                selection_group_id="right_hand",
+                resource_claims=("right_hand",),
+                accepted_payload_schema_hashes=(
+                    payload_schema.semantic_content_hash,
+                ),
+            ),
+        ),
+    )
+    return ComponentActionSchema(
+        schema_id="native-mode-human-test-v1",
+        schema_version="1",
+        component_catalog=catalog,
+        payload_schema_by_component={
+            "right_gripper_mode": payload_schema,
+        },
+        semantic_parameters=local.semantic_parameters,
     )
 
 
@@ -201,7 +264,9 @@ def test_human_adapter_preserves_pre_merge_winner_and_absolute_pose() -> None:
     assert result.proposal_draft is not None
     assert result.proposal_draft.validity == "valid"
     assert "source_observation_cut_id" not in result.proposal_draft.audit_metadata
-    assert result.proposal_draft.component_coverage == ("left_arm_pose",)
+    assert result.proposal_draft.action.component_coverage == (
+        "left_arm_pose",
+    )
     assert result.proposal_draft.selection_groups == ("left_arm",)
     np.testing.assert_allclose(result.robot_action.arm_pose_by_side["left"][:3], [0.2, 0, 0])
     mapping = result.source_adapter_receipt.component_mappings[0]
@@ -366,7 +431,9 @@ def test_hand_only_emission_uses_bound_pose_hand_catalog_action_space() -> None:
     assert result.robot_action.action_space == BIMANUAL_EE_POSE_V1
     assert result.robot_action.active_effectors == ("right_hand",)
     assert result.proposal_draft is not None
-    assert result.proposal_draft.component_coverage == ("right_hand_qpos",)
+    assert result.proposal_draft.action.component_coverage == (
+        "right_hand_qpos",
+    )
 
 
 def test_pose_and_hand_share_one_catalog_bound_proposal() -> None:
@@ -406,6 +473,18 @@ def test_pose_and_hand_share_one_catalog_bound_proposal() -> None:
             produced_clock_domain_id="control-monotonic",
             effective_clock_domain_id="control-monotonic",
             component_catalog=catalog,
+            action_schema=build_robot_action_v1_runtime_schema(
+                component_catalog=catalog,
+                arm_action_specs_by_side={
+                    "left": ArmActionSpec.tool_tcp(
+                        "left",
+                        reference_frame="left_arm_base",
+                    )
+                },
+                hand_action_specs_by_side={
+                    "left": HandActionSpec.inspire_tac("left")
+                },
+            ),
             action_adapter=TeleopCommandActionAdapterConfig(
                 arm_specs={
                     "left": ArmActionSpec.tool_tcp(
@@ -436,7 +515,7 @@ def test_pose_and_hand_share_one_catalog_bound_proposal() -> None:
     assert result.source_validation.accepted
     assert result.robot_action.action_space == BIMANUAL_EE_POSE_V1
     assert result.proposal_draft is not None
-    assert result.proposal_draft.component_coverage == (
+    assert result.proposal_draft.action.component_coverage == (
         "arms",
         "left_hand_qpos",
     )
@@ -562,6 +641,7 @@ def test_human_adapter_accepts_explicit_native_end_effector_target() -> None:
         action_space="dexteleop_policy_io_v2.2",
         effector_name="right_hand",
         component_id="right_gripper_mode",
+        action_schema=_native_mode_action_schema(),
     ).adapt(
         emission,
         effective_from=10.0,
@@ -598,6 +678,9 @@ def test_human_draft_uses_shared_passive_arbiter_path_without_dispatch() -> None
             produced_clock_domain_id="local_monotonic",
             effective_clock_domain_id="local_monotonic",
             component_catalog=catalog,
+            action_schema=build_robot_action_v1_runtime_schema(
+                component_catalog=catalog,
+            ),
             action_adapter=TeleopCommandActionAdapterConfig(
                 include_command_metadata=False,
                 source="human:vive",
@@ -621,6 +704,9 @@ def test_human_draft_uses_shared_passive_arbiter_path_without_dispatch() -> None
             action_space=BIMANUAL_EE_POSE_V1,
             decision_hz=60.0,
             component_catalog=catalog,
+            action_schema=build_robot_action_v1_runtime_schema(
+                component_catalog=catalog,
+            ),
             producer_epoch=1,
         ),
         clock=lambda: 10.0,
@@ -638,9 +724,11 @@ def test_human_draft_uses_shared_passive_arbiter_path_without_dispatch() -> None
     assert step.admission_receipt is not None and step.admission_receipt.accepted
     assert step.evaluation is not None
     assert step.evaluation.non_authoritative
-    assert step.evaluation.would_select_by_group == {"left_arm": step.admission_receipt.proposal_id}
+    assert step.evaluation.would_select_by_group == {
+        "left_arm": step.admission_receipt.proposal_id
+    }
     np.testing.assert_allclose(
-        step.evaluation.would_select_action.arm_pose_by_side["left"][:3],
+        step.evaluation.would_select_action.value("left_arm").values[:3],
         [0.25, 0.0, 0.0],
     )
     legacy_observation = HumanLegacyCommandObservation.capture(
@@ -1028,6 +1116,9 @@ def test_session_hooks_feed_default_off_human_shadow_runtime_without_dispatch_ow
             produced_clock_domain_id="local_monotonic",
             effective_clock_domain_id="local_monotonic",
             component_catalog=catalog,
+            action_schema=build_robot_action_v1_runtime_schema(
+                component_catalog=catalog,
+            ),
             action_adapter=TeleopCommandActionAdapterConfig(
                 include_command_metadata=False,
                 source="human:vive",
@@ -1044,6 +1135,9 @@ def test_session_hooks_feed_default_off_human_shadow_runtime_without_dispatch_ow
             action_space=BIMANUAL_EE_POSE_V1,
             decision_hz=60.0,
             component_catalog=catalog,
+            action_schema=build_robot_action_v1_runtime_schema(
+                component_catalog=catalog,
+            ),
             producer_epoch=1,
         ),
         clock=lambda: 1.0,

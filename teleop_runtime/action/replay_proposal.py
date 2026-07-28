@@ -16,6 +16,7 @@ from dataset_interface.replay import (
     derive_replay_source_action_contract,
     replay_source_contract_from_metadata,
 )
+from robot_motion.action import ComponentActionSchema
 from robot_motion.deploy.runtime import PolicyActionEmission
 from robot_motion.replay.trajectory import ReplayTrajectoryGroup
 from robot_motion.replay.proposal_source import (
@@ -35,6 +36,7 @@ class DatasetReplayProposalShadowConfig:
     embodiment_instance_id: str
     producer_id: str
     producer_epoch: int
+    action_schema: ComponentActionSchema
     component_schema_hash: str
     component_coverage: tuple[str, ...]
     source_path: str
@@ -58,6 +60,14 @@ class DatasetReplayProposalShadowAdapter:
     def __init__(self, config: DatasetReplayProposalShadowConfig) -> None:
         if not isinstance(config, DatasetReplayProposalShadowConfig):
             raise TypeError("config must be DatasetReplayProposalShadowConfig.")
+        if not isinstance(config.action_schema, ComponentActionSchema):
+            raise TypeError("action_schema must be a ComponentActionSchema.")
+        if not set(config.component_coverage).issubset(
+            config.action_schema.component_ids
+        ):
+            raise ValueError(
+                "Replay shadow component coverage is outside the activation schema."
+            )
         source_contract = replay_source_contract_from_metadata(
             config.dataset_metadata,
             source_path=Path(config.source_path),
@@ -130,9 +140,7 @@ class DatasetReplayProposalShadowAdapter:
                 embodiment_instance_id=config.embodiment_instance_id,
                 producer_id=config.producer_id,
                 producer_epoch=config.producer_epoch,
-                component_schema_hash=config.component_schema_hash,
-                component_coverage=config.component_coverage,
-                selection_groups=config.component_coverage,
+                action_schema=config.action_schema,
                 source_contract=source_contract,
                 source_action_contract=source_action_contract,
                 target_runtime_contract=target_contract,

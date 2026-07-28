@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -12,25 +13,27 @@ from dataset_contracts.canonical_encoding import (
 )
 
 from .arbitration_input import ArbitrationInputSnapshot
-from .proposal import ActionProposal, freeze_robot_action, robot_action_semantic_payload
-from .schema import RobotAction, split_effector_name
+from .component_action import ComponentAction
+from .proposal import ActionProposal
 
 
-ARBITER_CONTRACT_ID_V1 = "dexteleop.action_arbiter.v1"
+ARBITER_CONTRACT_ID_V1 = "dexteleop.action_arbiter.component.v2"
 ARBITER_CONTRACT_HASH_V1 = canonical_content_hash(
     {
         "contract_id": ARBITER_CONTRACT_ID_V1,
         "selection": "authority_priority_then_effective_from_sequence_lexical_id",
-        "composition": "component_union_no_pose_blend",
+        "composition": "component_union_payload_opaque",
         "gate": "input_snapshot_only",
     },
     domain="dexteleop.action_arbiter.contract.v1",
 )
 ARBITER_IMPLEMENTATION_HASH_V1 = canonical_content_hash(
-    {"implementation": "pure_authority_component_selection_v1"},
+    {"implementation": "pure_authority_component_selection_v2"},
     domain="dexteleop.action_arbiter.implementation.v1",
 )
 ARBITRATION_RESULT_HASH_DOMAIN_V1 = "dexteleop.arbitration_result.v1"
+ARBITRATION_RESULT_HASH_DOMAIN_V2 = "dexteleop.arbitration_result.v2"
+ARBITRATION_RESULT_HASH_DOMAIN_V3 = "dexteleop.arbitration_result.v3"
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class ArbitrationResult:
     decision_cutoff_at: float
     decided_at: float
     target_effective_at: float
+    target_clock_domain_id: str | None
     publication_deadline_at: float
     authority_epoch: int
     control_mode: str
@@ -66,8 +70,9 @@ class ArbitrationResult:
     selected_by_component: Mapping[str, str]
     owner_by_component: Mapping[str, str]
     status_by_group: Mapping[str, str]
-    composed_action: RobotAction | None
+    composed_candidate: ComponentAction | None
     selected_action_hash: str | None
+    supported_until: float | None
     output_status: str
     rejections: tuple[ArbitrationRejection, ...]
     attribution: Mapping[str, Mapping[str, Any]]
@@ -83,89 +88,55 @@ class ArbitrationResult:
         ):
             object.__setattr__(self, name, MappingProxyType(dict(getattr(self, name))))
         object.__setattr__(self, "rejections", tuple(self.rejections))
-
-
-def _copy_selected_component(
-    proposal: ActionProposal,
-    *,
-    effector_name: str,
-    arm_pose: dict[str, Any],
-    arm_qpos: dict[str, Any],
-    hand_qpos: dict[str, Any],
-    native_targets: dict[str, Any],
-    frame_by_effector: dict[str, str],
-    controlled_frame_by_effector: dict[str, str],
-    execution_metadata: dict[str, dict[str, Any]],
-) -> None:
-    side, kind = split_effector_name(effector_name)
-    action = proposal.action
-    if kind == "arm":
-        if side in action.arm_pose_by_side:
-            arm_pose[side] = action.arm_pose_by_side[side]
-        elif side in action.arm_qpos_by_side:
-            arm_qpos[side] = action.arm_qpos_by_side[side]
-        else:
-            raise ValueError(f"Proposal {proposal.proposal_id} lacks {effector_name} payload.")
-        metadata_key = "arm_action_specs_by_side"
-    else:
-        if side in action.hand_qpos_by_side:
-            hand_qpos[side] = action.hand_qpos_by_side[side]
-        elif side in action.end_effector_targets_by_side:
-            native_targets[side] = action.end_effector_targets_by_side[side]
-        else:
-            raise ValueError(f"Proposal {proposal.proposal_id} lacks {effector_name} payload.")
-        metadata_key = "hand_action_specs_by_side"
-    if effector_name in action.frame_by_effector:
-        frame_by_effector[effector_name] = action.frame_by_effector[effector_name]
-    if effector_name in action.controlled_frame_by_effector:
-        controlled_frame_by_effector[effector_name] = action.controlled_frame_by_effector[effector_name]
-    specs = action.metadata.get(metadata_key, {})
-    if side in specs:
-        execution_metadata.setdefault(metadata_key, {})[side] = specs[side]
+        supported_until = self.supported_until
+        if self.output_status == "selected":
+            if supported_until is None:
+                raise ValueError(
+                    "A selected arbitration result requires supported_until."
+                )
+            supported_until = float(supported_until)
+            if (
+                not math.isfinite(supported_until)
+                or supported_until <= float(self.target_effective_at)
+            ):
+                raise ValueError(
+                    "Arbitration support must extend beyond its target."
+                )
+        elif supported_until is not None:
+            raise ValueError(
+                "Only a selected arbitration result may carry support."
+            )
+        object.__setattr__(self, "supported_until", supported_until)
 
 
 def _compose_selected_action(
     snapshot: ArbitrationInputSnapshot,
     selected_candidate_by_group: Mapping[str, Any],
-) -> tuple[RobotAction | None, dict[str, str], dict[str, str], dict[str, Mapping[str, Any]]]:
-    arm_pose: dict[str, Any] = {}
-    arm_qpos: dict[str, Any] = {}
-    hand_qpos: dict[str, Any] = {}
-    native_targets: dict[str, Any] = {}
-    frames: dict[str, str] = {}
-    controlled_frames: dict[str, str] = {}
-    metadata: dict[str, dict[str, Any]] = {}
+) -> tuple[
+    ComponentAction | None,
+    dict[str, str],
+    dict[str, str],
+    dict[str, Mapping[str, Any]],
+]:
+    values_by_component: dict[str, Any] = {}
     selected_by_component: dict[str, str] = {}
     owner_by_component: dict[str, str] = {}
     attribution: dict[str, Mapping[str, Any]] = {}
-    active_effectors: list[str] = []
+    catalog = snapshot.action_schema.component_catalog
 
     for group in snapshot.active_selection_groups:
         candidate = selected_candidate_by_group.get(group)
         if candidate is None:
             continue
         proposal = candidate.proposal
-        for component in snapshot.component_catalog.components_for_group(group):
+        for component in catalog.components_for_selection_group(group):
             if component.component_id not in proposal.component_coverage:
-                if component.coupled:
-                    raise ValueError(
-                        f"Coupled proposal {proposal.proposal_id} lacks {component.component_id}."
-                    )
                 continue
             if component.component_id in selected_by_component:
                 raise ValueError("A component was selected by multiple groups.")
-            _copy_selected_component(
-                proposal,
-                effector_name=component.effector_name,
-                arm_pose=arm_pose,
-                arm_qpos=arm_qpos,
-                hand_qpos=hand_qpos,
-                native_targets=native_targets,
-                frame_by_effector=frames,
-                controlled_frame_by_effector=controlled_frames,
-                execution_metadata=metadata,
+            values_by_component[component.component_id] = (
+                proposal.action.values_by_component[component.component_id]
             )
-            active_effectors.append(component.effector_name)
             selected_by_component[component.component_id] = proposal.proposal_id
             owner_by_component[component.component_id] = proposal.producer_id
             attribution[component.component_id] = MappingProxyType(
@@ -178,22 +149,34 @@ def _compose_selected_action(
                 }
             )
 
-    if not active_effectors:
+    if not values_by_component:
         return None, selected_by_component, owner_by_component, attribution
-    composed = RobotAction(
-        action_space=snapshot.component_catalog.action_space,
-        timestamp=snapshot.decision_schedule_tick.target_effective_at,
-        arm_pose_by_side=arm_pose,
-        arm_qpos_by_side=arm_qpos,
-        hand_qpos_by_side=hand_qpos,
-        end_effector_targets_by_side=native_targets,
-        active_effectors=tuple(active_effectors),
-        frame_by_effector=frames,
-        controlled_frame_by_effector=controlled_frames,
-        source="action_arbiter",
-        metadata=metadata,
+    present = set(values_by_component)
+    for component_id in tuple(values_by_component):
+        missing = sorted(
+            set(catalog.component_by_id[component_id].dependencies) - present
+        )
+        if missing:
+            raise ValueError(
+                f"Composed component {component_id!r} is missing dependencies: "
+                f"{missing}."
+            )
+    for atomic_group_id in catalog.atomic_group_ids:
+        members = {
+            item.component_id
+            for item in catalog.components_for_atomic_group(atomic_group_id)
+        }
+        selected = members & present
+        if selected and selected != members:
+            raise ValueError(
+                f"Composed atomic group {atomic_group_id!r} must be "
+                "present all-or-none."
+            )
+    composed = ComponentAction(
+        action_schema=snapshot.action_schema,
+        values_by_component=values_by_component,
     )
-    return freeze_robot_action(composed), selected_by_component, owner_by_component, attribution
+    return composed, selected_by_component, owner_by_component, attribution
 
 
 class ActionArbiter:
@@ -221,29 +204,31 @@ class ActionArbiter:
                 lease = snapshot.authority_state_snapshot.active_leases.get(group)
                 shadow_owner = snapshot.authority_policy.shadow_owner_by_group.get(group)
                 ranked: list[tuple[int, float, int, str, Any]] = []
-                required_components = {
-                    item.component_id
-                    for item in snapshot.component_catalog.components_for_group(group)
-                    if item.coupled
-                }
                 for candidate in candidates_by_group[group]:
                     proposal = candidate.proposal
                     reason = None
-                    group_components = snapshot.component_catalog.components_for_group(group)
+                    catalog = snapshot.action_schema.component_catalog
+                    group_components = (
+                        catalog.components_for_selection_group(group)
+                    )
                     covered_group_components = {
                         item.component_id
                         for item in group_components
                         if item.component_id in proposal.component_coverage
                     }
-                    known_component_ids = set(snapshot.component_catalog.component_by_id)
-                    if proposal.action.action_space != snapshot.component_catalog.action_space:
-                        reason = "action_space_mismatch"
+                    known_component_ids = set(catalog.component_by_id)
+                    if (
+                        proposal.action_schema_hash
+                        != snapshot.action_schema.semantic_content_hash
+                    ):
+                        reason = "action_schema_mismatch"
                     elif not set(proposal.component_coverage).issubset(known_component_ids):
                         reason = "unknown_component_coverage"
                     elif not covered_group_components:
                         reason = "selection_group_has_no_covered_component"
                     elif any(
-                        item.effector_name not in proposal.action.active_effectors
+                        item.component_id
+                        not in proposal.action.values_by_component
                         for item in group_components
                         if item.component_id in proposal.component_coverage
                     ):
@@ -260,8 +245,6 @@ class ActionArbiter:
                         reason = "recovery_producer_not_allowed"
                     elif proposal.authority_request != "none" and proposal.producer_id not in snapshot.authority_policy.takeover_allowed_producers:
                         reason = "takeover_request_not_allowed"
-                    elif required_components and not required_components.issubset(proposal.component_coverage):
-                        reason = "coupled_group_incomplete"
                     priority = snapshot.authority_policy.priority_for(proposal, group)
                     if reason is None and priority is None:
                         reason = "source_not_authorized"
@@ -287,16 +270,40 @@ class ActionArbiter:
                         group, "no_action"
                     )
 
-            composed, selected_by_component, owner_by_component, attribution = _compose_selected_action(
-                snapshot, selected_candidates
-            )
-            output_status = (
-                "selected"
-                if composed is not None
-                else "hold"
-                if any(value == "hold" for value in status_by_group.values())
-                else "no_action"
-            )
+            try:
+                (
+                    composed,
+                    selected_by_component,
+                    owner_by_component,
+                    attribution,
+                ) = _compose_selected_action(snapshot, selected_candidates)
+            except ValueError as exc:
+                for group, candidate in selected_candidates.items():
+                    rejections.append(
+                        ArbitrationRejection(
+                            candidate.proposal.proposal_id,
+                            group,
+                            f"composed_candidate_invariant_failed:{exc}",
+                        )
+                    )
+                composed = None
+                selected_by_component = {}
+                owner_by_component = {}
+                attribution = {}
+                selected_by_group = {}
+                status_by_group = {
+                    group: "hold"
+                    for group in snapshot.active_selection_groups
+                }
+                output_status = "hold"
+            else:
+                output_status = (
+                    "selected"
+                    if composed is not None
+                    else "hold"
+                    if any(value == "hold" for value in status_by_group.values())
+                    else "no_action"
+                )
 
         if gate.status in {"hold", "fault", "transitioning"}:
             composed = None
@@ -307,10 +314,17 @@ class ActionArbiter:
         selected_action_hash = (
             None
             if composed is None
-            else canonical_content_hash(
-                robot_action_semantic_payload(composed),
-                domain="dexteleop.arbitration_selected_action.v1",
+            else composed.semantic_content_hash
+        )
+        selected_proposal_ids = set(selected_by_group.values())
+        supported_until = (
+            min(
+                candidate.proposal.effective_until
+                for candidate in selected_candidates.values()
+                if candidate.proposal.proposal_id in selected_proposal_ids
             )
+            if output_status == "selected"
+            else None
         )
         tick = snapshot.decision_schedule_tick
         payload = {
@@ -321,13 +335,22 @@ class ActionArbiter:
             "arbiter_contract_hash": ARBITER_CONTRACT_HASH_V1,
             "arbiter_implementation_hash": ARBITER_IMPLEMENTATION_HASH_V1,
             "authority_policy_hash": snapshot.authority_policy.semantic_content_hash,
-            "component_selection_policy_hash": snapshot.component_catalog.semantic_content_hash,
+            "component_selection_policy_hash": (
+                snapshot.action_schema.component_catalog.semantic_content_hash
+            ),
             "decision_schedule_spec_hash": tick.schedule_spec_hash,
             "canonical_encoding_version": CANONICAL_ENCODING_SCHEMA_V1,
             "schedule_tick_id": tick.schedule_tick_id,
             "decision_cutoff_at": tick.decision_cutoff_at,
             "decided_at": tick.scheduled_decision_at,
             "target_effective_at": tick.target_effective_at,
+            "target_clock_domain_id": (
+                None
+                if not selected_candidates
+                else next(
+                    iter(selected_candidates.values())
+                ).proposal.effective_clock_domain_id
+            ),
             "publication_deadline_at": tick.publication_deadline_at,
             "authority_epoch": snapshot.authority_state_snapshot.authority_epoch,
             "control_mode": snapshot.authority_state_snapshot.control_mode,
@@ -338,6 +361,7 @@ class ActionArbiter:
             "owner_by_component": owner_by_component,
             "status_by_group": status_by_group,
             "selected_action_hash": selected_action_hash,
+            "supported_until": supported_until,
             "output_status": output_status,
             "rejections": tuple(
                 {
@@ -349,11 +373,14 @@ class ActionArbiter:
             ),
             "attribution": attribution,
         }
-        semantic_hash = canonical_content_hash(payload, domain=ARBITRATION_RESULT_HASH_DOMAIN_V1)
+        semantic_hash = canonical_content_hash(
+            payload,
+            domain=ARBITRATION_RESULT_HASH_DOMAIN_V3,
+        )
         return ArbitrationResult(
             result_id=f"arbitration-result:{semantic_hash}",
             **{key: value for key, value in payload.items() if key not in {"rejections", "attribution"}},
-            composed_action=composed,
+            composed_candidate=composed,
             rejections=tuple(rejections),
             attribution=attribution,
             semantic_content_hash=semantic_hash,
@@ -364,6 +391,7 @@ __all__ = [
     "ARBITER_CONTRACT_ID_V1",
     "ARBITER_CONTRACT_HASH_V1",
     "ARBITER_IMPLEMENTATION_HASH_V1",
+    "ARBITRATION_RESULT_HASH_DOMAIN_V3",
     "ActionArbiter",
     "ArbitrationRejection",
     "ArbitrationResult",

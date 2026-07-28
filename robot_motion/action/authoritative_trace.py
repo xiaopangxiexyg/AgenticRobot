@@ -29,6 +29,7 @@ from robot_motion.runtime.observation_cut import ObservationCutRecord
 from robot_motion.runtime.execution_gate import ExecutionGateEvent
 
 from .arbitration_input import ArbitrationInputSnapshot
+from .adaptation import ActionAdaptationRequest, ActionAdaptationResult
 from .candidate_authorization import (
     CandidateAuthorizationAdmissionReceipt,
     CandidateAuthorizationDraft,
@@ -44,6 +45,14 @@ from .authority import AuthorityEvent
 from .executor import teleop_command_semantic_payload
 from .execution_shadow import SharedExecutionShadowEvaluation
 from .execution_manifest import ControlExecutionManifest
+from .execution_handoff import (
+    ComponentExecutionTarget,
+    ComponentExecutionTargetActivationReceipt,
+    ComponentExecutionTargetAdmissionReceipt,
+    TargetExecutionCompletionReceipt,
+    TargetExecutionRequest,
+    TargetExecutionSubmissionReceipt,
+)
 from .persistence import ExecutionDirective
 from .proposal import (
     ProposalAdmissionReceipt,
@@ -107,6 +116,10 @@ def project_control_execution_manifest(
             "manifest_id": manifest.manifest_id,
             "manifest_version": manifest.manifest_version,
             "action_space": manifest.action_space,
+            "action_schema_hash": manifest.action_schema_hash,
+            "component_target_capability_hash": (
+                manifest.component_target_capability_hash
+            ),
             "component_catalog_hash": manifest.component_catalog_hash,
             "controlled_components": manifest.controlled_components,
             "selection_groups": manifest.selection_groups,
@@ -217,7 +230,7 @@ def _proposal_snapshot_payload(snapshot: Any) -> dict[str, Any]:
         "included_admission_sequence_min": snapshot.included_admission_sequence_min,
         "included_admission_sequence_max": snapshot.included_admission_sequence_max,
         "target_effective_at": snapshot.target_effective_at,
-        "component_schema_hash": snapshot.component_schema_hash,
+        "action_schema_hash": snapshot.action_schema_hash,
         "producer_epoch_snapshot_hash": snapshot.producer_epoch_snapshot_hash,
         "reduction_policy_id": snapshot.reduction_policy_id,
         "candidates": tuple(
@@ -430,6 +443,12 @@ def project_proposal_admission(
                     "composition_input_ids": proposal.composition_input_ids,
                     "composition_input_hashes": proposal.composition_input_hashes,
                     "composition_spec_hash": proposal.composition_spec_hash,
+                    "composition_evaluation_id": (
+                        proposal.composition_evaluation_id
+                    ),
+                    "composition_evaluation_hash": (
+                        proposal.composition_evaluation_hash
+                    ),
                     "proposal_semantic_hash_domain": proposal.semantic_hash_domain,
                     "proposal_semantic_content_hash": proposal.semantic_content_hash,
                 },
@@ -629,7 +648,13 @@ def project_arbitration_input(
         "previous_authoritative_decision_id": snapshot.previous_authoritative_decision_id,
         "previous_selection_by_group": snapshot.previous_selection_by_group,
         "active_selection_groups": snapshot.active_selection_groups,
-        "component_catalog_hash": snapshot.component_catalog.semantic_content_hash,
+        "action_schema_hash": snapshot.action_schema.semantic_content_hash,
+        "component_catalog_hash": (
+            snapshot.action_schema.semantic_parameters.get(
+                "legacy_component_catalog_hash",
+                snapshot.action_schema.component_catalog.semantic_content_hash,
+            )
+        ),
         "decision_schedule_tick_id": snapshot.decision_schedule_tick.schedule_tick_id,
         "decision_schedule_tick_hash": snapshot.decision_schedule_tick.semantic_content_hash,
         "semantic_content_hash": snapshot.semantic_content_hash,
@@ -678,6 +703,7 @@ def project_arbitration_computation(
         "decision_cutoff_at": result.decision_cutoff_at,
         "decided_at": result.decided_at,
         "target_effective_at": result.target_effective_at,
+        "target_clock_domain_id": result.target_clock_domain_id,
         "publication_deadline_at": result.publication_deadline_at,
         "authority_epoch": result.authority_epoch,
         "control_mode": result.control_mode,
@@ -687,12 +713,13 @@ def project_arbitration_computation(
         "selected_by_component": result.selected_by_component,
         "owner_by_component": result.owner_by_component,
         "status_by_group": result.status_by_group,
-        "composed_action": (
+        "composed_candidate": (
             None
-            if result.composed_action is None
-            else robot_action_semantic_payload(result.composed_action)
+            if result.composed_candidate is None
+            else result.composed_candidate.semantic_payload()
         ),
         "selected_action_hash": result.selected_action_hash,
+        "supported_until": result.supported_until,
         "output_status": result.output_status,
         "rejections": tuple(
             {
@@ -781,14 +808,140 @@ def project_publication(
             payload={
                 "decision_id": decision.decision_id,
                 "result_id": decision.result_id,
+                "arbitration_result_hash": decision.arbitration_result_hash,
                 "arbitration_input_snapshot_id": decision.arbitration_input_snapshot_id,
-                "selected_action": robot_action_semantic_payload(decision.selected_action),
-                "selected_action_hash": selected_action_hash,
+                "selected_action": decision.selected_action.semantic_payload(),
+                "selected_action_hash": decision.selected_action_hash,
+                "action_schema_hash": decision.action_schema_hash,
                 "selected_by_group": decision.selected_by_group,
+                "target_effective_at": decision.target_effective_at,
+                "supported_until": decision.supported_until,
+                "target_clock_domain_id": decision.target_clock_domain_id,
                 "published_at": decision.published_at,
                 "authority_epoch": decision.authority_epoch,
                 "gate_epoch": decision.gate_epoch,
                 "semantic_content_hash": decision.semantic_content_hash,
+            },
+        )
+    )
+    return tuple(facts)
+
+
+def project_action_adaptation_request(
+    context: AuthoritativeTraceContext,
+    request: ActionAdaptationRequest,
+) -> ControlTraceFact:
+    """Project one submitted representation-adaptation request."""
+
+    if not isinstance(request, ActionAdaptationRequest):
+        raise TypeError("request must be an ActionAdaptationRequest.")
+    return context.fact(
+        fact_id=request.request_id,
+        event_type="action_adaptation_request",
+        occurred_at=request.requested_at,
+        payload={
+            "request_id": request.request_id,
+            "authoritative_decision_id": (
+                request.authoritative_decision_id
+            ),
+            "authoritative_decision_hash": (
+                request.authoritative_decision_hash
+            ),
+            "arbitration_result_id": request.arbitration_result_id,
+            "candidate_action_hash": request.candidate_action_hash,
+            "action_schema_hash": request.action_schema_hash,
+            "component_target_capability_id": (
+                request.component_target_capability_id
+            ),
+            "component_target_capability_hash": (
+                request.component_target_capability_hash
+            ),
+            "component_coverage": request.component_coverage,
+            "target_effective_at": request.target_effective_at,
+            "supported_until": request.supported_until,
+            "authority_sequence": request.authority_sequence,
+            "execution_gate_sequence": request.execution_gate_sequence,
+            "execution_fence_sequence": request.execution_fence_sequence,
+            "requested_at": request.requested_at,
+            "clock_domain_id": request.clock_domain_id,
+            "semantic_content_hash": request.semantic_content_hash,
+        },
+    )
+
+
+def project_action_adaptation(
+    context: AuthoritativeTraceContext,
+    result: ActionAdaptationResult,
+) -> tuple[ControlTraceFact, ...]:
+    """Project adaptation outcome without duplicating its request fact."""
+
+    if not isinstance(result, ActionAdaptationResult):
+        raise TypeError("result must be an ActionAdaptationResult.")
+    request = result.request
+    assessment = result.capability_assessment
+    receipt = result.receipt
+    facts = [
+        context.fact(
+            fact_id=receipt.capability_assessment_id,
+            event_type="target_capability_assessment",
+            occurred_at=receipt.processing_started_at,
+            payload={
+                **assessment.semantic_payload(),
+                "assessment_id": receipt.capability_assessment_id,
+            },
+        ),
+    ]
+    candidate = result.adapted_candidate
+    if candidate is not None:
+        facts.append(
+            context.fact(
+                fact_id=candidate.adapted_candidate_id,
+                event_type="adapted_action_candidate",
+                occurred_at=candidate.created_at,
+                payload={
+                    "adapted_candidate_id": candidate.adapted_candidate_id,
+                    "request_id": candidate.request_id,
+                    "request_hash": candidate.request_hash,
+                    "source_candidate_action_hash": (
+                        candidate.source_candidate_action_hash
+                    ),
+                    "payload_kind": candidate.payload_kind,
+                    "output_action_contract_hash": (
+                        candidate.output_action_contract_hash
+                    ),
+                    "adapter_contract_id": candidate.adapter_contract_id,
+                    "adapter_contract_hash": candidate.adapter_contract_hash,
+                    "payload_semantic": candidate.payload_semantic,
+                    "created_at": candidate.created_at,
+                    "clock_domain_id": candidate.clock_domain_id,
+                    "semantic_content_hash": candidate.semantic_content_hash,
+                },
+            )
+        )
+    facts.append(
+        context.fact(
+            fact_id=receipt.receipt_id,
+            event_type="action_adaptation_receipt",
+            occurred_at=receipt.processing_completed_at,
+            payload={
+                "receipt_id": receipt.receipt_id,
+                "request_id": receipt.request_id,
+                "request_hash": receipt.request_hash,
+                "capability_assessment_id": (
+                    receipt.capability_assessment_id
+                ),
+                "capability_assessment_hash": (
+                    receipt.capability_assessment_hash
+                ),
+                "receiver_id": receipt.receiver_id,
+                "processing_started_at": receipt.processing_started_at,
+                "processing_completed_at": receipt.processing_completed_at,
+                "clock_domain_id": receipt.clock_domain_id,
+                "accepted": receipt.accepted,
+                "rejection_code": receipt.rejection_code,
+                "adapted_candidate_id": receipt.adapted_candidate_id,
+                "adapted_candidate_hash": receipt.adapted_candidate_hash,
+                "semantic_content_hash": receipt.semantic_content_hash,
             },
         )
     )
@@ -827,6 +980,15 @@ def project_execution_directive(
             },
             "persistence_policy_hash": directive.persistence_policy_hash,
             "publication_fallback": directive.publication_fallback,
+            "action_adaptation_receipt_id": (
+                directive.action_adaptation_receipt_id
+            ),
+            "action_adaptation_receipt_hash": (
+                directive.action_adaptation_receipt_hash
+            ),
+            "action_adaptation_fallback": (
+                directive.action_adaptation_fallback
+            ),
             "requires_execution_epoch_increment": directive.requires_execution_epoch_increment,
             "requires_backend_hold": directive.requires_backend_hold,
             "fault_latched": directive.fault_latched,
@@ -863,6 +1025,13 @@ def project_shared_execution_shadow_evaluation(
         },
         "persistence_policy_hash": directive.persistence_policy_hash,
         "publication_fallback": directive.publication_fallback,
+        "action_adaptation_receipt_id": (
+            directive.action_adaptation_receipt_id
+        ),
+        "action_adaptation_receipt_hash": (
+            directive.action_adaptation_receipt_hash
+        ),
+        "action_adaptation_fallback": directive.action_adaptation_fallback,
         "requires_execution_epoch_increment": (
             directive.requires_execution_epoch_increment
         ),
@@ -1225,6 +1394,256 @@ def project_dispatch_receipts(
     )
 
 
+def project_target_execution_request(
+    context: AuthoritativeTraceContext,
+    request: TargetExecutionRequest,
+) -> ControlTraceFact:
+    adaptation = request.adaptation_result
+    payload = {
+        "request_id": request.request_id,
+        "control_domain_id": request.control_domain_id,
+        "target_handler_id": request.target_handler_id,
+        "authoritative_decision_id": (
+            adaptation.request.authoritative_decision_id
+        ),
+        "authoritative_decision_hash": (
+            adaptation.request.authoritative_decision_hash
+        ),
+        "adaptation_request_id": adaptation.request.request_id,
+        "adaptation_request_hash": adaptation.request.semantic_content_hash,
+        "adaptation_receipt_id": adaptation.receipt.receipt_id,
+        "adaptation_receipt_hash": adaptation.receipt.semantic_content_hash,
+        "adapted_candidate_id": request.adapted_candidate.adapted_candidate_id,
+        "adapted_candidate_hash": (
+            request.adapted_candidate.semantic_content_hash
+        ),
+        "component_target_capability_id": (
+            adaptation.request.component_target_capability_id
+        ),
+        "component_target_capability_hash": (
+            adaptation.request.component_target_capability_hash
+        ),
+        "component_coverage": adaptation.request.component_coverage,
+        "target_effective_at": adaptation.request.target_effective_at,
+        "supported_until": request.supported_until,
+        "authority_sequence": adaptation.request.authority_sequence,
+        "execution_gate_sequence": (
+            adaptation.request.execution_gate_sequence
+        ),
+        "execution_fence_sequence": (
+            adaptation.request.execution_fence_sequence
+        ),
+        "submitted_at": request.submitted_at,
+        "clock_domain_id": request.clock_domain_id,
+        "semantic_content_hash": request.semantic_content_hash,
+    }
+    return context.fact(
+        fact_id=request.request_id,
+        event_type="target_execution_request",
+        occurred_at=request.submitted_at,
+        payload=payload,
+    )
+
+
+def project_target_execution_submission(
+    context: AuthoritativeTraceContext,
+    receipt: TargetExecutionSubmissionReceipt,
+) -> ControlTraceFact:
+    payload = {
+        "receipt_id": receipt.receipt_id,
+        "target_execution_request_id": (
+            receipt.target_execution_request_id
+        ),
+        "target_execution_request_hash": (
+            receipt.target_execution_request_hash
+        ),
+        "control_domain_id": receipt.control_domain_id,
+        "target_handler_id": receipt.target_handler_id,
+        "received_at": receipt.received_at,
+        "clock_domain_id": receipt.clock_domain_id,
+        "accepted_for_processing": receipt.accepted_for_processing,
+        "rejection_code": receipt.rejection_code,
+        "processing_token": receipt.processing_token,
+        "semantic_content_hash": receipt.semantic_content_hash,
+    }
+    return context.fact(
+        fact_id=receipt.receipt_id,
+        event_type="target_execution_submission",
+        occurred_at=receipt.received_at,
+        payload=payload,
+    )
+
+
+def project_target_execution_completion(
+    context: AuthoritativeTraceContext,
+    receipt: TargetExecutionCompletionReceipt,
+) -> ControlTraceFact:
+    payload = {
+        "receipt_id": receipt.receipt_id,
+        "target_execution_request_id": (
+            receipt.target_execution_request_id
+        ),
+        "target_execution_request_hash": (
+            receipt.target_execution_request_hash
+        ),
+        "submission_receipt_id": receipt.submission_receipt_id,
+        "submission_receipt_hash": receipt.submission_receipt_hash,
+        "processing_token": receipt.processing_token,
+        "control_domain_id": receipt.control_domain_id,
+        "target_handler_id": receipt.target_handler_id,
+        "status": receipt.status,
+        "completed_at": receipt.completed_at,
+        "available_at": receipt.available_at,
+        "clock_domain_id": receipt.clock_domain_id,
+        "target_id": receipt.target_id,
+        "target_hash": receipt.target_hash,
+        "outcome_code": receipt.outcome_code,
+        "semantic_content_hash": receipt.semantic_content_hash,
+    }
+    return context.fact(
+        fact_id=receipt.receipt_id,
+        event_type="target_execution_completion",
+        occurred_at=receipt.available_at,
+        payload=payload,
+    )
+
+
+def project_component_execution_target(
+    context: AuthoritativeTraceContext,
+    target: ComponentExecutionTarget,
+) -> ControlTraceFact:
+    payload = {
+        name: getattr(target, name)
+        for name in (
+            "target_id",
+            "target_execution_request_id",
+            "target_execution_request_hash",
+            "submission_receipt_id",
+            "submission_receipt_hash",
+            "authoritative_decision_id",
+            "authoritative_decision_hash",
+            "adaptation_request_id",
+            "adaptation_request_hash",
+            "adaptation_receipt_id",
+            "adaptation_receipt_hash",
+            "adapted_candidate_id",
+            "adapted_candidate_hash",
+            "capability_assessment_id",
+            "capability_assessment_hash",
+            "component_target_capability_id",
+            "component_target_capability_hash",
+            "control_domain_id",
+            "target_handler_id",
+            "component_dependencies",
+            "input_action_schema_hash",
+            "output_target_schema_hash",
+            "target_kind",
+            "target_effective_at",
+            "supported_until",
+            "authority_sequence",
+            "execution_gate_sequence",
+            "execution_fence_sequence",
+            "resolved_at",
+            "temporal_semantics",
+            "scheduled_for",
+            "scheduled_until",
+            "clock_domain_id",
+            "payload",
+            "payload_hash",
+            "semantic_content_hash",
+        )
+    }
+    payload["processing_fact_references"] = tuple(
+        {
+            "stage": item.stage,
+            "fact_id": item.fact_id,
+            "fact_hash": item.fact_hash,
+            "status": item.status,
+            "processing_started_at": item.processing_started_at,
+            "processing_completed_at": item.processing_completed_at,
+            "clock_domain_id": item.clock_domain_id,
+            "semantic_content_hash": item.semantic_content_hash,
+        }
+        for item in target.processing_fact_references
+    )
+    return context.fact(
+        fact_id=target.target_id,
+        event_type="component_execution_target",
+        occurred_at=target.resolved_at,
+        payload=payload,
+    )
+
+
+def project_component_execution_target_admission(
+    context: AuthoritativeTraceContext,
+    receipt: ComponentExecutionTargetAdmissionReceipt,
+) -> ControlTraceFact:
+    payload = {
+        name: getattr(receipt, name)
+        for name in (
+            "receipt_id",
+            "target_id",
+            "target_hash",
+            "target_execution_request_id",
+            "target_execution_request_hash",
+            "control_domain_id",
+            "target_handler_id",
+            "receiver_id",
+            "execution_fence_sequence",
+            "admission_sequence",
+            "admitted_at",
+            "available_at",
+            "clock_domain_id",
+            "accepted",
+            "rejection_code",
+            "admission_token",
+            "semantic_content_hash",
+        )
+    }
+    return context.fact(
+        fact_id=receipt.receipt_id,
+        event_type="component_execution_target_admission",
+        occurred_at=receipt.available_at,
+        payload=payload,
+    )
+
+
+def project_component_execution_target_activation(
+    context: AuthoritativeTraceContext,
+    receipt: ComponentExecutionTargetActivationReceipt,
+) -> ControlTraceFact:
+    payload = {
+        name: getattr(receipt, name)
+        for name in (
+            "activation_id",
+            "target_id",
+            "target_hash",
+            "target_execution_request_id",
+            "target_execution_request_hash",
+            "target_admission_receipt_id",
+            "target_admission_receipt_hash",
+            "control_domain_id",
+            "target_handler_id",
+            "receiver_id",
+            "activation_sequence",
+            "activation_status",
+            "activation_at",
+            "available_at",
+            "clock_domain_id",
+            "effective_from",
+            "effective_until",
+            "rejection_code",
+            "semantic_content_hash",
+        )
+    }
+    return context.fact(
+        fact_id=receipt.activation_id,
+        event_type="component_execution_target_activation",
+        occurred_at=receipt.available_at,
+        payload=payload,
+    )
+
+
 def project_measurement_alignment(
     context: AuthoritativeTraceContext,
     *,
@@ -1263,6 +1682,8 @@ def project_measurement_alignment(
 __all__ = [
     "AuthoritativeTraceContext",
     "project_arbitration_computation",
+    "project_action_adaptation",
+    "project_action_adaptation_request",
     "project_arbitration_input",
     "project_authority_event",
     "project_candidate_authorization_admission",
@@ -1271,6 +1692,12 @@ __all__ = [
     "project_dispatch_owner_validation",
     "project_dispatch_permit_validation",
     "project_dispatch_receipts",
+    "project_target_execution_request",
+    "project_target_execution_submission",
+    "project_target_execution_completion",
+    "project_component_execution_target",
+    "project_component_execution_target_admission",
+    "project_component_execution_target_activation",
     "project_execution_cancellation",
     "project_execution_cancellation_ack",
     "project_execution_directive",

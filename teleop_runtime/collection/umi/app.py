@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from dataset_contracts.v25p_native_storage import V25P_RECORD_CJSON_LAYOUT_V1
 from robot_motion.runtime.lifecycle import run_best_effort_cleanup
 
 from ...configs.dmtac_hardware import prepare_dmtac_hardware_assignment_before_gui
@@ -185,12 +186,50 @@ def _run_collection_session(
         T_tcp_to_tracker_by_side=calibrations.T_tcp_to_tracker_by_side,
     )
     labels = OperatorLabelStateMachine()
+    v25p_native_shadow = None
+    if config.v25p_native_shadow:
+        from ..v25p_capture_profiles import (
+            V25P_UMI_SOURCE,
+            build_policy_io_v25p_capture_profiles,
+        )
+        from ..v25p_dual_write_shadow import V25pDualWriteShadow
+        from ..v25p_native_store import V25pNativeEpisodeStore
+        from .v25p_producer import UmiV25pProducer
+
+        bundle = build_policy_io_v25p_capture_profiles(
+            source=V25P_UMI_SOURCE,
+            layout=layout,
+            pose_frame_contract_hash=calibration.pose_frame_contract().contract_hash,
+        )
+        store = V25pNativeEpisodeStore(
+            dataset_root=config.dataset_root,
+            dataset_id=f"umi:{config.task_id}",
+            embodiment_profile=bundle.embodiment,
+            component_stream_profile=bundle.streams,
+            compatibility_projection_profiles=(bundle.v23_projection,),
+            physical_storage_layout=config.v25p_native_storage_layout,
+            defer_sample_file_writes=(
+                config.v25p_native_storage_layout
+                == V25P_RECORD_CJSON_LAYOUT_V1
+            ),
+        )
+        v25p_native_shadow = V25pDualWriteShadow(
+            store=store,
+            bundle=bundle,
+            producer=UmiV25pProducer(
+                stream_profile=bundle.streams,
+                bindings=bundle.producer_bindings,
+                component_action_schema=bundle.component_action_schema,
+                component_action_projection=bundle.component_action_projection,
+            ),
+        )
     recorder = UmiDatasetRecorder(
         config=config,
         calibration=calibration,
         policy_io_layout=layout,
         T_tcp_to_tracker_by_side=calibrations.T_tcp_to_tracker_by_side,
         calibration_by_side=calibrations.by_side,
+        v25p_native_shadow=v25p_native_shadow,
     )
     components = None
     startup_progress = GuiStartupProgress(

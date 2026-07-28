@@ -10,6 +10,10 @@ from typing import Any, Mapping
 import numpy as np
 
 from dataset_contracts.capture_modalities import CaptureModalityContract
+from dataset_contracts.v25p_native_storage import (
+    V25P_NATIVE_STORAGE_LAYOUTS_V1,
+    V25P_RECORD_CJSON_LAYOUT_V1,
+)
 
 from .pose_adapter import as_rigid_transform
 
@@ -186,6 +190,8 @@ class UmiCollectionConfig:
     open_browser: bool = True
     task_id: str = "umi_collection"
     task_description: str = "Dual-wrist UMI collection"
+    v25p_native_shadow: bool = False
+    v25p_native_storage_layout: str = V25P_RECORD_CJSON_LAYOUT_V1
     plus_episode_curation: bool = False
     plus_annotation_root: Path | None = None
     plus_task_profile: Path | None = None
@@ -237,6 +243,14 @@ class UmiCollectionConfig:
             raise ValueError(f"unknown ignored UMI tactile keys: {unknown_tactile}")
         if self.hardware_admission_mode not in {"capability", "strict"}:
             raise ValueError("hardware_admission_mode must be capability or strict")
+        storage_layout = str(self.v25p_native_storage_layout).strip()
+        if storage_layout not in V25P_NATIVE_STORAGE_LAYOUTS_V1:
+            raise ValueError("unsupported v2.5-p native physical storage layout")
+        if not self.v25p_native_shadow and storage_layout != V25P_RECORD_CJSON_LAYOUT_V1:
+            raise ValueError(
+                "v25p_native_storage_layout requires v25p_native_shadow=true"
+            )
+        object.__setattr__(self, "v25p_native_storage_layout", storage_layout)
         if not self.tactile_required:
             ignored_tactile = tuple(SIDES)
         object.__setattr__(self, "ignored_camera_keys", ignored_cameras)
@@ -419,6 +433,13 @@ class UmiCollectionConfig:
             open_browser=bool(payload.get("open_browser", True)),
             task_id=str(payload.get("task_id", "umi_collection")),
             task_description=str(payload.get("task_description", "Dual-wrist UMI collection")),
+            v25p_native_shadow=bool(payload.get("v25p_native_shadow", False)),
+            v25p_native_storage_layout=str(
+                payload.get(
+                    "v25p_native_storage_layout",
+                    V25P_RECORD_CJSON_LAYOUT_V1,
+                )
+            ),
             plus_episode_curation=bool(payload.get("plus_episode_curation", False)),
             plus_annotation_root=(
                 None

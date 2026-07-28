@@ -525,6 +525,7 @@ from ..real_teleop.runtime_metadata import (
 
 from ..real_teleop.diagnostic_setup import (
     _attach_actuator_command_trace_sink,
+    _attach_ik_shadow_trace_sink,
     _attach_position_audit_sink,
     _attach_singularity_transition_trace_sink,
     _new_actuator_command_trace_recorder,
@@ -1253,6 +1254,7 @@ def _guard_impedance_force_control(
     *,
     context: str,
     now: float,
+    collision_handler: Callable[[str], None] | None = None,
 ) -> bool:
     return guard_impedance_force_control(
         args,
@@ -1262,6 +1264,7 @@ def _guard_impedance_force_control(
         issue_provider=_impedance_force_control_issue,
         hold_handler=_hold_motion_after_impedance_guard_issue,
         log=_log,
+        collision_handler=collision_handler,
     )
 
 
@@ -1726,14 +1729,27 @@ _bind_startup_runtime_support(globals())
 
 from ..real_teleop.runtime import (
     bind_legacy_support as _bind_real_teleop_runtime_support,
+    cleanup_active_startup,
     run_real_teleop,
 )
 
 
 def main() -> None:
-    args = parse_args()
-    _bind_real_teleop_runtime_support(globals())
-    run_real_teleop(args)
+    try:
+        args = parse_args()
+        _bind_real_teleop_runtime_support(globals())
+        run_real_teleop(args)
+    except KeyboardInterrupt:
+        # Keep Ctrl+C a normal operator action.  The runtime's regular
+        # ``finally`` handles the post-startup path; this fallback covers the
+        # short pre-startup window where that ``finally`` is not yet active.
+        cleanup_active_startup()
+        print("\n[RealTeleop] 已收到 Ctrl+C，启动已安全取消。", file=sys.stderr)
+    finally:
+        # Also release the registry for non-interrupt startup exceptions.  It
+        # is disarmed automatically once the normal runtime shutdown owns the
+        # resources, so this is idempotent on the regular path.
+        cleanup_active_startup()
 
 
 if __name__ == "__main__":

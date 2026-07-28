@@ -18,7 +18,6 @@ from control_composition.composition import (
     CompositionInputDraft,
     CompositionSpec,
 )
-from robot_motion.action.proposal import freeze_robot_action
 from robot_motion.runtime.immutable import deep_freeze
 
 from .runtime import MujocoDeployRuntime
@@ -244,7 +243,7 @@ class DeterministicAsyncTopologyHarness:
             raise TypeError("draft must be a CompositionInputDraft.")
         frozen_draft = replace(
             draft,
-            action=freeze_robot_action(draft.action),
+            action=draft.action,
             context_ids=tuple(draft.context_ids),
             audit_metadata=deep_freeze(draft.audit_metadata),
         )
@@ -404,7 +403,7 @@ class DeterministicAsyncTopologyHarness:
                     policy_node_id=operation.policy_node_id,
                     required_context_channels=operation.required_context_channels,
                 )
-                status = result.composition_result.output_status
+                status = result.composition_evaluation.output_status
             elif job.job_kind == "decision":
                 result = self.runtime.step(
                     now=job.completed_at,

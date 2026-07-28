@@ -522,6 +522,27 @@ class InspireGripper:
     def _to_signed_16(v: int) -> int:
         return v - 0x10000 if (v & 0x8000) else v
 
+    @classmethod
+    def _decode_opening_register(cls, opening_register: int) -> int:
+        """Decode REG_OPENLEN_ACT as a signed int16 opening value.
+
+        The Modbus transport intentionally returns every holding register as
+        an unsigned 16-bit container.  The gripper's actual opening register
+        is different from most configuration registers: near the closed end
+        it may report a small negative signed value (for example 0xFFFC,
+        which is -4 in int16 representation).  Decode that register at the
+        device-specific boundary, then apply the existing physical range
+        check and clamp policy.
+        """
+        raw_u16 = int(opening_register)
+        if not 0 <= raw_u16 <= 0xFFFF:
+            raise GripperError(
+                f"Abnormal opening_register={raw_u16}, "
+                "likely communication or device issue"
+            )
+        raw_signed = cls._to_signed_16(raw_u16)
+        return cls._sanitize_opening_raw(raw_signed)
+
     def clear_fault(self):
         self.mb.write_single_register(self.mb.REG_FAULT_ACK, 1)
 
@@ -674,14 +695,17 @@ class InspireGripper:
         self.last_joint_pos_cmd = jp
 
     def read_joint_pos(self):
-        opening_raw = self.mb.read_holding_registers(self.mb.REG_OPENLEN_ACT, 1)[0]
+        opening_register = self.mb.read_holding_registers(
+            self.mb.REG_OPENLEN_ACT, 1
+        )[0]
+        opening_raw = self._decode_opening_register(opening_register)
         pos = self._opening_raw_to_joint_pos(opening_raw)
         return [pos]
 
     def get_state(self) -> GripperState:
         regs = self.mb.read_holding_registers(self.mb.REG_OPENLEN_ACT, 5)
 
-        opening_raw = self._sanitize_opening_raw(regs[0])
+        opening_raw = self._decode_opening_register(regs[0])
         current_raw = int(regs[1])
         current = self._to_signed_16(current_raw)
         temperature_c = int(regs[2])

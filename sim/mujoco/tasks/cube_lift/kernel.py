@@ -13,15 +13,18 @@ from sim.contracts import TimingSpec
 
 from ...adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRig
 from ...collision_safety import project_grippers_then_arms
+from ...grasp_contact import extract_gripper_contact_scores
 from ...scene import MujocoCameraRenderer, MujocoScene
 from .config import (
     CONTACT_LATCH_DEBUG_GRASP_MODE,
+    NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
     NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
     NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1,
     CubeLiftTaskConfig,
     SCRIPTED_CONTACT_LOST_REASON,
 )
 from .env import DEFAULT_CUBE_LIFT_TASK_CONFIG_PATH
+from .contacts import classify_cube_contact_position
 from .grasp_latch import ContactGraspLatch
 from .pose_action import CubeLiftPoseActionController
 
@@ -174,6 +177,10 @@ class CubeLiftKernel:
         self._right_finger_body_id = self.scene.body_id(
             self.config.grasp_latch_right_finger_body_name
         )
+        self._gripper_contact_surface_body_ids = {
+            spec.body_name: self.scene.body_id(spec.body_name)
+            for spec in self.config.gripper_contact_surface_specs
+        }
         self.observation_dim = self.config.observation_dim
         self._grasp_latch = (
             ContactGraspLatch(
@@ -277,8 +284,15 @@ class CubeLiftKernel:
             self._post_settle_geom_friction = tuple(overrides)
         self._pose_target_reanchored = False
         self._scripted_contact_reset_applied = False
+        self._scripted_pregrasp_reset_applied = False
+        self._post_contact_phase_active = False
+        self._post_contact_phase_contact_steps = 0
+        self._post_contact_phase_loss_steps = 0
         self._scripted_contact_loss_steps = 0
         self._scripted_contact_action_modified = False
+        self._scripted_pregrasp_action_modified = False
+        self._post_contact_phase_action_modified = False
+        self._last_accepted_action = np.zeros(7, dtype=np.float32)
         self._actuated_rig: MujocoPositionExecutionRig | None = None
         self._pose_action_controller: CubeLiftPoseActionController | None = None
         if self.config.uses_pose_action:
@@ -317,8 +331,15 @@ class CubeLiftKernel:
         self._last_active_collision_check = None
         self._pose_target_reanchored = False
         self._scripted_contact_reset_applied = False
+        self._scripted_pregrasp_reset_applied = False
+        self._post_contact_phase_active = False
+        self._post_contact_phase_contact_steps = 0
+        self._post_contact_phase_loss_steps = 0
         self._scripted_contact_loss_steps = 0
         self._scripted_contact_action_modified = False
+        self._scripted_pregrasp_action_modified = False
+        self._post_contact_phase_action_modified = False
+        self._last_accepted_action.fill(0.0)
         if self._grasp_latch is not None:
             self._grasp_latch.reset()
         self._close_actuated_rig()
@@ -413,9 +434,75 @@ class CubeLiftKernel:
         ).astype(np.float64, copy=True)
         self._previous_observation_right_close = self._measured_gripper_close(1)
         self._next_policy_time = self.physics_time + 1.0 / self.config.policy_hz
+        if self.config.scripted_pregrasp_reset:
+            self._advance_to_scripted_pregrasp()
         if self.config.scripted_contact_reset:
             self._advance_to_scripted_contact()
         return self._observation(), self._info(reset=True, terminal=True)
+
+    def _advance_to_scripted_pregrasp(self) -> None:
+        """Move to an open-finger pre-grasp without fabricating contact."""
+
+        if self._pose_action_controller is None:
+            raise RuntimeError("Scripted pre-grasp reset requires pose actions.")
+        closed_height = float(
+            self.config.reward_shaping.get("closed_grasp_height_offset_m", 0.0)
+        )
+        if closed_height <= 0.0:
+            raise RuntimeError(
+                "Scripted pre-grasp reset requires a positive closed grasp height."
+            )
+        base_rotation = self.scene.body_pose("right_arm_base_link")[:3, :3]
+        reached = False
+        for _ in range(self.config.max_episode_steps):
+            state = self._training_reward_state()
+            cube_position = state[7:10]
+            grasp_position = cube_position - state[20:23]
+            target = cube_position + np.asarray(
+                (0.0, 0.0, closed_height), dtype=np.float64
+            )
+            error = target - grasp_position
+            if np.linalg.norm(error) <= self.config.scripted_pregrasp_distance_m:
+                reached = True
+                break
+            action = np.zeros(7, dtype=np.float32)
+            action[:3] = np.clip(
+                (base_rotation.T @ error)
+                / np.asarray(self.config.right_tcp_delta_m),
+                -1.0,
+                1.0,
+            )
+            result = self.step(action)
+            if result.terminated or result.truncated:
+                raise RuntimeError(
+                    "Scripted pre-grasp reset failed: "
+                    f"reason={result.info.get('termination_reason')}; "
+                    f"grasp_error_m={np.linalg.norm(error):.6f}."
+                )
+        if not reached:
+            raise RuntimeError(
+                "Scripted pre-grasp reset reached its step limit: "
+                f"distance_m={np.linalg.norm(error):.6f}; "
+                f"target_m={self.config.scripted_pregrasp_distance_m:.6f}."
+            )
+
+        # Preparation is not policy experience. Keep the gripper open and
+        # expose a fresh episode clock/action history at the reached pose.
+        self._episode_steps = 0
+        self._success_hold_ticks = 0
+        self._termination_reason = None
+        self._last_action.fill(0.0)
+        self._last_accepted_action.fill(0.0)
+        self._last_safety_result = None
+        self._last_active_collision_check = None
+        self._pose_target_reanchored = False
+        self._scripted_pregrasp_reset_applied = True
+        self._scripted_contact_loss_steps = 0
+        self._previous_observation_right_qpos = self.scene.get_arm_qpos(
+            self.config.controlled_side
+        ).astype(np.float64, copy=True)
+        self._previous_observation_right_close = self._measured_gripper_close(1)
+        self._next_policy_time = self.physics_time + 1.0 / self.config.policy_hz
 
     def _advance_to_scripted_contact(self) -> None:
         """Establish bilateral physical contact for a lift-first curriculum."""
@@ -508,6 +595,7 @@ class CubeLiftKernel:
         self._success_hold_ticks = 0
         self._termination_reason = None
         self._last_action.fill(0.0)
+        self._last_accepted_action.fill(0.0)
         self._last_safety_result = None
         self._last_active_collision_check = None
         self._pose_target_reanchored = False
@@ -518,6 +606,41 @@ class CubeLiftKernel:
         ).astype(np.float64, copy=True)
         self._previous_observation_right_close = self._measured_gripper_close(1)
 
+    def _update_post_contact_phase(self) -> None:
+        """Advance the real-contact lift phase state machine."""
+
+        if not self.config.post_contact_phase_enabled:
+            return
+        left_contact, right_contact = self._cube_finger_contacts()
+        contact_ready = (
+            left_contact
+            and right_contact
+            and self._measured_gripper_close(1)
+            >= self.config.post_contact_phase_min_measured_close
+        )
+        if contact_ready:
+            self._post_contact_phase_contact_steps += 1
+            self._post_contact_phase_loss_steps = 0
+            if (
+                not self._post_contact_phase_active
+                and self._post_contact_phase_contact_steps
+                >= self.config.post_contact_phase_activation_steps
+            ):
+                self._post_contact_phase_active = True
+        else:
+            self._post_contact_phase_contact_steps = 0
+            if self._post_contact_phase_active:
+                self._post_contact_phase_loss_steps += 1
+                grace = self.config.post_contact_phase_loss_grace_steps
+                # A zero grace period means that the lift-only phase must be
+                # abandoned immediately after contact readiness is lost.  The
+                # previous ``grace > 0`` guard made zero mean "never leave"
+                # instead, which trapped a marginal grasp in lift-only mode
+                # after the cube slipped or one finger lost contact.
+                if grace == 0 or self._post_contact_phase_loss_steps >= grace:
+                    self._post_contact_phase_active = False
+                    self._post_contact_phase_loss_steps = 0
+
     def step(self, action: Any) -> CubeLiftKernelStep:
         if self._next_policy_time is None:
             raise RuntimeError("CubeLiftKernel.reset() must be called before step().")
@@ -527,20 +650,54 @@ class CubeLiftKernel:
         if np.any(values < -1.0) or np.any(values > 1.0):
             raise ValueError("CubeLift action values must lie in [-1, 1].")
         values = values.copy()
+        previous_measured_close = self._measured_gripper_close(1)
+        self._update_post_contact_phase()
         self._scripted_contact_action_modified = False
-        if self._scripted_contact_reset_applied:
+        self._scripted_pregrasp_action_modified = False
+        self._post_contact_phase_action_modified = False
+        if self._scripted_contact_reset_applied or self._scripted_pregrasp_reset_applied:
             requested_values = values.copy()
+            action_scale = (
+                self.config.scripted_contact_action_scale
+                if self._scripted_contact_reset_applied
+                else self.config.scripted_pregrasp_action_scale
+            )
+            action_bias = (
+                self.config.scripted_contact_action_bias
+                if self._scripted_contact_reset_applied
+                else self.config.scripted_pregrasp_action_bias
+            )
             values = values * np.asarray(
-                self.config.scripted_contact_action_scale,
+                action_scale,
                 dtype=np.float32,
             )
             values += np.asarray(
-                self.config.scripted_contact_action_bias,
+                action_bias,
                 dtype=np.float32,
             )
-            if self.config.scripted_contact_nonnegative_lift_action:
+            if (
+                self._scripted_contact_reset_applied
+                and self.config.scripted_contact_nonnegative_lift_action
+            ):
                 values[2] = max(float(values[2]), 0.0)
-            self._scripted_contact_action_modified = not np.array_equal(
+            modified = not np.array_equal(values, requested_values)
+            if self._scripted_contact_reset_applied:
+                self._scripted_contact_action_modified = modified
+            else:
+                self._scripted_pregrasp_action_modified = modified
+        if self._post_contact_phase_active:
+            requested_values = values.copy()
+            values = values * np.asarray(
+                self.config.post_contact_action_scale,
+                dtype=np.float32,
+            )
+            values += np.asarray(
+                self.config.post_contact_action_bias,
+                dtype=np.float32,
+            )
+            if self.config.post_contact_nonnegative_lift_action:
+                values[2] = max(float(values[2]), 0.0)
+            self._post_contact_phase_action_modified = not np.array_equal(
                 values,
                 requested_values,
             )
@@ -575,11 +732,16 @@ class CubeLiftKernel:
             self.config.right_gripper_max_close,
         )
         requested_gripper_close = self._gripper_close.copy()
-        locked_scripted_gripper_target = (
-            self._scripted_contact_reset_applied
-            and self.config.uses_actuated_gripper
-            and self.config.scripted_contact_action_scale[6] == 0.0
-            and self.config.scripted_contact_action_bias[6] == 0.0
+        locked_gripper_target = (
+            self.config.uses_actuated_gripper
+            and (
+                (
+                    self._scripted_contact_reset_applied
+                    and self.config.scripted_contact_action_scale[6] == 0.0
+                    and self.config.scripted_contact_action_bias[6] == 0.0
+                )
+                or self._post_contact_phase_active
+            )
         )
         qpos_by_side = {
             self.config.fixed_side: self._left_home,
@@ -591,14 +753,14 @@ class CubeLiftKernel:
             if self.config.uses_actuated_position
             else self._accepted_controlled_qpos
         )
-        if locked_scripted_gripper_target:
-            # The reset-validated force target intentionally exceeds the
-            # physically blocked measured close. Re-projecting that same
-            # closure on every policy step makes the fixed contact force look
-            # like a new unsafe action and can re-anchor an otherwise accepted
-            # upward arm target. Keep the measured gripper state fixed for the
-            # kinematic arm projection; the force target is restored below and
-            # hard penetration remains checked every physics tick.
+        if locked_gripper_target:
+            # During a validated scripted contact or the dynamic post-contact
+            # lift phase, keep the commanded gripper target separate from the
+            # arm projection. Re-projecting the closure together with an arm
+            # move can overwrite the force target with the lagging measured
+            # state, reducing normal force exactly when the cube is lifted.
+            # The arm still goes through the collision projector and hard
+            # penetration remains checked every physics tick.
             gripper_close_by_name = {
                 name: self.scene.gripper_close_from_kinematic_vector(
                     projection_start, name
@@ -664,7 +826,7 @@ class CubeLiftKernel:
             )
             for name in self._gripper_names
         ]
-        if locked_scripted_gripper_target:
+        if locked_gripper_target:
             # A physically blocked gripper is intentionally commanded beyond
             # its measured close to maintain contact force. When the measured
             # state sits just inside a preventive clearance envelope, projecting
@@ -778,6 +940,39 @@ class CubeLiftKernel:
                 self._termination_reason = "non_finite_simulation_state"
                 terminated = True
                 truncated = False
+        accepted_action = np.zeros(7, dtype=np.float32)
+        if self._pose_action_controller is not None:
+            pose_step = self._last_pose_action_step
+            if (
+                pose_step is not None
+                and pose_step.ik_result.success
+                and not pose_step.ik_result.hold
+            ):
+                projection_alpha = float(
+                    1.0
+                    if self._last_safety_result is None
+                    else self._last_safety_result.projection_alpha
+                )
+                accepted_action[:6] = np.clip(
+                    values[:6] * projection_alpha,
+                    -1.0,
+                    1.0,
+                )
+        else:
+            accepted_action[:6] = np.clip(
+                (self._right_target - previous_right_target) / self._right_delta,
+                -1.0,
+                1.0,
+            ).astype(np.float32)
+        measured_close = self._measured_gripper_close(1)
+        if abs(self.config.right_gripper_delta) > 1e-12:
+            accepted_action[6] = np.clip(
+                (measured_close - previous_measured_close)
+                / self.config.right_gripper_delta,
+                -1.0,
+                1.0,
+            )
+        self._last_accepted_action[:] = accepted_action
         terminal = terminated or truncated
         return CubeLiftKernelStep(
             observation=self._observation(),
@@ -967,6 +1162,54 @@ class CubeLiftKernel:
             right_contact = right_contact or other == self._right_finger_body_id
         return left_contact, right_contact
 
+    def _cube_finger_contact_orientation(self) -> tuple[float, float]:
+        """Return side and top/bottom contact scores for the current cube.
+
+        The score is computed from MuJoCo's contact point in the cube's local
+        frame.  Only the configured left/right gripper finger bodies count;
+        table and arm collisions must not be able to manufacture a grasp
+        shaping reward.
+        """
+
+        cube_qpos = self.data.qpos[self._cube_qpos_addr : self._cube_qpos_addr + 7]
+        cube_position = cube_qpos[:3]
+        half_extents = 0.5 * np.asarray(self.config.object_size_m, dtype=float)
+        side_scores: list[float] = []
+        top_bottom_scores: list[float] = []
+        geom_body_id = self.model.geom_bodyid
+        for contact_index in range(int(self.data.ncon)):
+            contact = self.data.contact[contact_index]
+            body1 = int(geom_body_id[int(contact.geom1)])
+            body2 = int(geom_body_id[int(contact.geom2)])
+            if body1 != self._cube_body_id and body2 != self._cube_body_id:
+                continue
+            other = body2 if body1 == self._cube_body_id else body1
+            if other not in (self._left_finger_body_id, self._right_finger_body_id):
+                continue
+            side_score, top_bottom_score = classify_cube_contact_position(
+                np.asarray(contact.pos, dtype=float),
+                cube_position,
+                cube_qpos[3:7],
+                half_extents,
+            )
+            side_scores.append(side_score)
+            top_bottom_scores.append(top_bottom_score)
+        if not side_scores:
+            return 0.0, 0.0
+        # A top/bottom impact is deliberately not averaged away by a second
+        # contact: the strongest bad-face contact should dominate the penalty.
+        return float(max(side_scores)), float(max(top_bottom_scores))
+
+    def _gripper_contact_scores(self) -> dict[str, Any]:
+        scores = extract_gripper_contact_scores(
+            self.model,
+            self.data,
+            object_body_id=self._cube_body_id,
+            surface_specs=self.config.gripper_contact_surface_specs,
+            surface_body_ids=self._gripper_contact_surface_body_ids,
+        )
+        return scores.to_info()
+
     def _check_termination(self, *, check_success: bool) -> bool:
         if not self._critical_state_is_finite():
             self._termination_reason = "non_finite_simulation_state"
@@ -1007,6 +1250,7 @@ class CubeLiftKernel:
             if self.config.normal_proprio_profile in {
                 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1,
                 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
+                NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
             }:
                 measured_qpos = privileged[0:6].astype(np.float64, copy=False)
                 measured_close = float(privileged[6])
@@ -1032,6 +1276,15 @@ class CubeLiftKernel:
                     out[28] = privileged[30]
                 self._previous_observation_right_qpos = measured_qpos.copy()
                 self._previous_observation_right_close = measured_close
+                if (
+                    self.config.normal_proprio_profile
+                    == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1
+                ):
+                    # Keep the cube pose in the existing privileged-state
+                    # convention: world-frame free-joint position followed by
+                    # MuJoCo's wxyz quaternion.  It is appended after the
+                    # established 28-D proprioceptive contract.
+                    out[28:35] = privileged[7:14]
             else:
                 out[7:14] = privileged[23:30]
                 out[14] = privileged[30]
@@ -1084,10 +1337,43 @@ class CubeLiftKernel:
             raise RuntimeError("CubeLift training reward state became non-finite.")
         return out.copy()
 
+    def _scripted_approach_action(self) -> np.ndarray:
+        """Return a privileged, collision-aware approach direction for reward only."""
+
+        action = np.zeros(7, dtype=np.float32)
+        if self._pose_action_controller is None:
+            return action
+        closed_height = float(
+            self.config.reward_shaping.get("closed_grasp_height_offset_m", 0.0)
+        )
+        if closed_height <= 0.0:
+            return action
+        state = self._training_reward_state()
+        cube_position = state[7:10]
+        grasp_position = cube_position - state[20:23]
+        target = cube_position + np.asarray((0.0, 0.0, closed_height))
+        base_rotation = self.scene.body_pose("right_arm_base_link")[:3, :3]
+        action[:3] = np.clip(
+            (base_rotation.T @ (target - grasp_position))
+            / np.asarray(self.config.right_tcp_delta_m),
+            -1.0,
+            1.0,
+        )
+        return action
+
     def _info(self, *, reset: bool, terminal: bool) -> dict[str, Any]:
         tracking_error = self._right_target - self.data.qpos[self._right_qpos_idx]
         measured_right_close = self._measured_gripper_close(1)
         left_finger_contact, right_finger_contact = self._cube_finger_contacts()
+        if self.config.gripper_contact_surface_specs:
+            # Generic surface shaping supersedes the historical cube-local
+            # face labels. Keep the legacy keys at zero for old log readers.
+            cube_side_contact_score, cube_top_bottom_contact_score = 0.0, 0.0
+        else:
+            cube_side_contact_score, cube_top_bottom_contact_score = (
+                self._cube_finger_contact_orientation()
+            )
+        generic_gripper_contact = self._gripper_contact_scores()
         compact: dict[str, Any] = {
             "reset": bool(reset),
             "episode_step": self._episode_steps,
@@ -1178,12 +1464,37 @@ class CubeLiftKernel:
             ),
             "pose_target_anti_windup": self.config.pose_target_anti_windup,
             "pose_target_reanchored": self._pose_target_reanchored,
+            "scripted_pregrasp_reset": self._scripted_pregrasp_reset_applied,
+            "scripted_pregrasp_action_modified": (
+                self._scripted_pregrasp_action_modified
+            ),
+            "post_contact_phase_enabled": (
+                self.config.post_contact_phase_enabled
+            ),
+            "post_contact_phase_active": self._post_contact_phase_active,
+            "post_contact_phase_contact_steps": (
+                self._post_contact_phase_contact_steps
+            ),
+            "post_contact_phase_loss_steps": self._post_contact_phase_loss_steps,
+            "post_contact_phase_action_modified": (
+                self._post_contact_phase_action_modified
+            ),
+            "requested_action": self._last_action.astype(float).tolist(),
+            "accepted_action": self._last_accepted_action.astype(float).tolist(),
+            # This is intentionally a diagnostic/reward-only teacher signal;
+            # it is never appended to normal or privileged policy input.
+            "scripted_approach_action": self._scripted_approach_action().tolist(),
             "scripted_contact_reset": self._scripted_contact_reset_applied,
             "left_finger_cube_contact": left_finger_contact,
             "right_finger_cube_contact": right_finger_contact,
             "bilateral_finger_cube_contact": (
                 left_finger_contact and right_finger_contact
             ),
+            "cube_side_contact_score": cube_side_contact_score,
+            "cube_top_bottom_contact_score": cube_top_bottom_contact_score,
+            "cube_side_contact": bool(cube_side_contact_score >= 0.5),
+            "cube_top_bottom_contact": bool(cube_top_bottom_contact_score >= 0.5),
+            **generic_gripper_contact,
             "arm_tracking_error_rad_mean": float(np.mean(np.abs(tracking_error))),
             "arm_tracking_error_rad_max": float(np.max(np.abs(tracking_error))),
             "runtime": "cube_lift_fast_kernel_v2",
@@ -1210,6 +1521,35 @@ class CubeLiftKernel:
                 float("inf")
                 if self._last_safety_result is None
                 else self._last_safety_result.check.minimum_distance_m
+            ),
+            "safety_status": (
+                None
+                if self._last_safety_result is None
+                else self._last_safety_result.status
+            ),
+            "safety_blocking_body1": (
+                None
+                if (
+                    self._last_safety_result is None
+                    or self._last_safety_result.blocking_check is None
+                )
+                else self._last_safety_result.blocking_check.body1_name
+            ),
+            "safety_blocking_body2": (
+                None
+                if (
+                    self._last_safety_result is None
+                    or self._last_safety_result.blocking_check is None
+                )
+                else self._last_safety_result.blocking_check.body2_name
+            ),
+            "safety_blocking_distance_m": (
+                None
+                if (
+                    self._last_safety_result is None
+                    or self._last_safety_result.blocking_check is None
+                )
+                else self._last_safety_result.blocking_check.minimum_distance_m
             ),
         }
         if self.config.wrist_rgb_enabled:

@@ -28,6 +28,11 @@ from .normalization import (
     explicit_identity_normalization_contract,
     normalization_contract_hash,
 )
+from .next_step import (
+    PolicyNextStepExecutionSignal,
+    build_policy_next_step_execution_signal,
+    normalized_policy_action_hash,
+)
 from .chunk_plan import TimedPolicyActionKeyframe
 from .canonical_policy_action import CanonicalPolicyAction
 from .observation import DeploymentObservation
@@ -589,10 +594,42 @@ class PolicyActionPreparationResult:
     queue_len_before: int = 0
     queue_len_after: int = 0
     canonical_action: CanonicalPolicyAction | None = None
+    next_step_execution_signal: PolicyNextStepExecutionSignal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "queue_len_before", int(self.queue_len_before))
         object.__setattr__(self, "queue_len_after", int(self.queue_len_after))
+        signal = self.next_step_execution_signal
+        if signal is None:
+            return
+        if not isinstance(signal, PolicyNextStepExecutionSignal):
+            raise TypeError(
+                "next_step_execution_signal must be a "
+                "PolicyNextStepExecutionSignal when supplied."
+            )
+        if self.raw_lookahead_action is None:
+            raise ValueError(
+                "A next-step execution signal requires raw_lookahead_action."
+            )
+        if self.emission is None:
+            raise ValueError(
+                "A next-step execution signal requires the current emission."
+            )
+        if (
+            signal.current_emission_id != self.emission.emission_id
+            or signal.current_emission_hash
+            != self.emission.semantic_content_hash
+        ):
+            raise ValueError(
+                "Next-step execution signal does not bind the current emission."
+            )
+        if (
+            signal.next_action_hash
+            != normalized_policy_action_hash(self.raw_lookahead_action)
+        ):
+            raise ValueError(
+                "Next-step execution signal does not bind raw_lookahead_action."
+            )
 
 
 def resolve_action_queue_policy(
@@ -717,8 +754,17 @@ class PolicyDeployRuntime:
         preparer: ActionPreparer,
         policy_name: str = "",
         allow_output: bool = True,
+        same_chunk_next_step_will_execute: bool = False,
     ) -> PolicyActionPreparationResult:
-        """Pop one decoded action and prepare it through the canonical boundary."""
+        """Pop and prepare one action, optionally reporting existing certainty.
+
+        ``same_chunk_next_step_will_execute`` must describe queue semantics
+        already enforced by the calling frontend.  It does not reserve,
+        commit, pop, prepare, admit, or dispatch the exposed successor.
+        """
+
+        if not isinstance(same_chunk_next_step_will_execute, bool):
+            raise TypeError("same_chunk_next_step_will_execute must be a bool.")
 
         queue_len_before = self.action_queue_length()
         raw_action = self.pop_action(allow_output=allow_output)
@@ -731,6 +777,7 @@ class PolicyDeployRuntime:
         )
         prepared_action = None
         emission = None
+        next_step_execution_signal = None
         emission_error: BaseException | None = None
         if raw_action is not None:
             pre_safety: DeployRobotActionAdapterResult | None = None
@@ -760,9 +807,33 @@ class PolicyDeployRuntime:
                 observation,
                 policy_name=policy_name,
             )
+            if (
+                same_chunk_next_step_will_execute
+                and emission is not None
+                and raw_lookahead_action is not None
+            ):
+                next_step_execution_signal = (
+                    build_policy_next_step_execution_signal(
+                        current_emission_id=emission.emission_id,
+                        current_emission_hash=emission.semantic_content_hash,
+                        policy_node_id=emission.policy_node_id,
+                        inference_id=emission.inference_id,
+                        current_chunk_id=emission.chunk_id,
+                        current_chunk_keyframe_index=(
+                            emission.chunk_keyframe_index
+                        ),
+                        current_chunk_size=emission.chunk_size,
+                        current_effective_until=emission.effective_until,
+                        effective_clock_domain_id=(
+                            emission.effective_clock_domain_id
+                        ),
+                        next_action=raw_lookahead_action,
+                    )
+                )
         return PolicyActionPreparationResult(
             raw_action=raw_action,
             raw_lookahead_action=raw_lookahead_action,
+            next_step_execution_signal=next_step_execution_signal,
             prepared_action=prepared_action,
             emission=emission,
             emission_error=emission_error,

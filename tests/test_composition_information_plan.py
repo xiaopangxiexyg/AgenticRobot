@@ -23,6 +23,8 @@ from robot_motion.action import (
     ActionComponentCatalog,
     ActionComponentSpec,
     RobotAction,
+    build_robot_action_v1_runtime_schema,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
@@ -170,18 +172,21 @@ def test_maximum_age_requires_a_shared_clock_domain(
             ),
         ),
     )
+    component_catalog = ActionComponentCatalog(
+        catalog_id="left-arm-v1",
+        action_space=BIMANUAL_QPOS_V1,
+        components=(
+            ActionComponentSpec("left_arm", "left_arm", "left_arm"),
+        ),
+    )
     runtime = ControlCompositionRuntime(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
         embodiment_instance_id="fixture-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        component_catalog=ActionComponentCatalog(
-            catalog_id="left-arm-v1",
-            action_space=BIMANUAL_QPOS_V1,
-            components=(
-                ActionComponentSpec("left_arm", "left_arm", "left_arm"),
-            ),
+        action_schema=build_robot_action_v1_runtime_schema(
+            component_catalog=component_catalog,
         ),
         event_emitter=lambda _batch: None,
         proposal_admitter=lambda *_args, **_kwargs: None,
@@ -218,12 +223,15 @@ def test_maximum_age_requires_a_shared_clock_domain(
             producer_epoch=1,
             sequence=0,
             input_role="base",
-            action=RobotAction(
-                action_space=BIMANUAL_QPOS_V1,
-                arm_qpos_by_side={
-                    "left": np.zeros(6, dtype=np.float32),
-                },
-                source="context-age-clock-test",
+            action=project_robot_action_v1_to_component_action(
+                RobotAction(
+                    action_space=BIMANUAL_QPOS_V1,
+                    arm_qpos_by_side={
+                        "left": np.zeros(6, dtype=np.float32),
+                    },
+                    source="context-age-clock-test",
+                ),
+                action_schema=runtime.action_schema,
             ),
             produced_at=9.95,
             produced_clock_domain_id="human.monotonic",
@@ -243,5 +251,5 @@ def test_maximum_age_requires_a_shared_clock_domain(
         ),
         target_effective_at=10.1,
     )
-    assert evaluation.composition_result.output_status == expected_status
-    assert evaluation.composition_result.reason == expected_reason
+    assert evaluation.composition_evaluation.output_status == expected_status
+    assert evaluation.composition_evaluation.reason == expected_reason

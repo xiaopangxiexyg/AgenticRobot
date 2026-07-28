@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -10,8 +11,10 @@ pytestmark = pytest.mark.integration
 
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.real_teleop import control_loop
 from teleop_runtime.real_teleop.position_force_guard import (
     PositionForceGuardConfig,
+    PositionForceGuardFault,
     PositionForceGuardMonitor,
     PositionForceGuardTripped,
 )
@@ -342,6 +345,42 @@ def test_force_limit_still_trips_while_stale_watchdog_is_deferred():
         monitor.close()
 
 
+def test_force_guard_rearms_only_after_explicit_manual_home():
+    stops = []
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={
+            "left": lambda: _payload(force_x=0.0),
+            "right": lambda: _payload(force_x=0.0),
+        },
+        emergency_stop=stops.append,
+        config=PositionForceGuardConfig(
+            poll_hz=20.0,
+            stale_timeout_sec=0.2,
+            startup_timeout_sec=0.5,
+        ),
+    )
+    try:
+        monitor.start()
+        monitor._trip(
+            PositionForceGuardFault(
+                reason="force_limit_exceeded",
+                side="left",
+                message="synthetic collision",
+                monotonic_time_sec=time.monotonic(),
+                wall_time_sec=time.time(),
+            )
+        )
+        assert monitor.fault is not None
+        assert monitor.motion_ready is False
+
+        snapshot = monitor.rearm_after_manual_home(timeout_sec=0.5)
+        assert monitor.fault is None
+        assert snapshot["motion_ready"] is True
+        assert len(stops) == 1
+    finally:
+        monitor.close()
+
+
 def test_read_errors_still_trip_while_stale_watchdog_is_deferred():
     stops = []
     calls = 0
@@ -491,3 +530,135 @@ def test_bimanual_emergency_stop_reports_unacknowledged_side():
             now=1.0,
             raise_on_failure=True,
         )
+
+
+def test_emergency_stop_lookup_failure_isolated_to_one_side():
+    class Backend:
+        def __init__(self):
+            self.calls = 0
+
+        def emergency_stop(self):
+            self.calls += 1
+
+    right = Backend()
+    # The left command backend attribute is intentionally absent.  The
+    # bimanual stop must still reach the healthy right side and return a
+    # structured error instead of escaping from the worker future.
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        right_command_backend=right,
+    )
+
+    errors = real_teleop._emergency_stop_real_arms(
+        components,
+        reason="dispatch_safety_race",
+        now=1.0,
+    )
+
+    assert right.calls == 1
+    assert "left" in errors
+    assert "AttributeError" in errors["left"]
+
+
+def test_safety_recording_stop_failure_is_contained():
+    logs = []
+    messages = []
+
+    class UI:
+        def append_message(self, tag, message):
+            messages.append((tag, message))
+
+    failure = control_loop._stop_recording_best_effort(
+        recording_active=lambda: True,
+        stop_recording=lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("writer flush failed")
+        ),
+        now=1.0,
+        end_reason="force_collision",
+        summary={"force_collision_detected": True},
+        log=lambda tag, message, **kwargs: logs.append((tag, message)),
+        control_ui=UI(),
+        ui_tag="ForceControl",
+        ui_failure_message="collision save failed",
+    )
+
+    assert isinstance(failure, RuntimeError)
+    assert any("writer flush failed" in message for _tag, message in logs)
+    assert messages == [("ForceControl", "collision save failed")]
+
+
+def test_safety_hold_request_failure_keeps_a_local_stop_latch():
+    clutch_input = SimpleNamespace(
+        request_hold=lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("UI publish failed")
+        )
+    )
+    logs = []
+
+    control_loop._request_safety_hold_best_effort(
+        clutch_input,
+        reason="impedance_force_collision",
+        log=lambda tag, message, **kwargs: logs.append((tag, message)),
+        now=1.0,
+    )
+
+    assert clutch_input._hold_requested is True
+    assert clutch_input._hold_active is True
+    assert clutch_input._hold_request_reason == "impedance_force_collision"
+    assert clutch_input._gripper_control_enabled is False
+    assert any("UI publish failed" in message for _tag, message in logs)
+
+
+def test_safety_dispatch_classifies_only_stop_races():
+    assert control_loop._is_emergency_stop_latch_error(
+        RuntimeError("left_arm emergency_stop is latched; refusing command dispatch")
+    )
+    assert control_loop._is_emergency_stop_latch_error(
+        RuntimeError("emergency stop was not acknowledged")
+    )
+    assert not control_loop._is_emergency_stop_latch_error(
+        RuntimeError("left arm transport timeout")
+    )
+
+
+def test_impedance_issue_provider_force_error_enters_collision_callback():
+    class Session:
+        def __init__(self):
+            self.state_machine = SimpleNamespace(
+                state=real_teleop.TeleopRunState.RUNNING
+            )
+
+    session = Session()
+    components = SimpleNamespace(session=session)
+    collisions = []
+
+    with patch.object(
+        real_teleop,
+        "_impedance_force_control_issue",
+        side_effect=RuntimeError("left: force 55.0000N > hard_stop_force_n"),
+    ):
+        ok = real_teleop._guard_impedance_force_control(
+            SimpleNamespace(),
+            components,
+            context="main_loop",
+            now=1.0,
+            collision_handler=collisions.append,
+        )
+
+    assert ok is False
+    assert len(collisions) == 1
+    assert "hard_stop_force_n" in collisions[0]
+
+    with patch.object(
+        real_teleop,
+        "_impedance_force_control_issue",
+        side_effect=RuntimeError("left arm transport timeout"),
+    ):
+        with pytest.raises(RuntimeError, match="transport timeout"):
+            real_teleop._guard_impedance_force_control(
+                SimpleNamespace(),
+                components,
+                context="main_loop",
+                now=1.0,
+                collision_handler=collisions.append,
+            )

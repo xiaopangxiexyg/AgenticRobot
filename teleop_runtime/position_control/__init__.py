@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from robot_motion.position_control import (
+    POSITION_60_120_PROFILE,
+    POSITION_60_120_PROFILE_NAME,
     PositionAuditFanout,
     PositionAuditMode,
     PositionAuditMultiplexer,
@@ -39,6 +41,11 @@ from .reference_publisher import (
     PositionReferencePublisher,
     PositionReferencePublisherConfig,
 )
+from .execution_observation_adapter import (
+    POSITION_PRE_RESOLVER_REFERENCE_STAGE,
+    POSITION_PRE_RESOLVER_SOURCE_HASH_DOMAIN,
+    project_position_pre_resolver_reference_frame,
+)
 from .formal_profile import apply_rm65_position_profile_defaults
 from .reference_observation import (
     BoundLegacyReferenceSegmentObservation,
@@ -72,6 +79,8 @@ __all__ = [
     "DEFAULT_CONTROL_DEBUG_QUEUE_SIZE",
     "DEFAULT_CONTROL_DEBUG_ROOT",
     "IMPEDANCE_40HZ_PROFILE_NAME",
+    "POSITION_60_120_PROFILE",
+    "POSITION_60_120_PROFILE_NAME",
     "POSITION_15_60_120HZ_PROFILE_NAME",
     "POSITION_45_150HZ_PROFILE_NAME",
     "POSITION_PROFILE_NAME",
@@ -79,6 +88,8 @@ __all__ = [
     "POSITION_REFERENCE_SIDECAR_NAME",
     "POSITION_SUMMARY_NAME",
     "POSITION_TIMING_SIDECAR_NAME",
+    "POSITION_PRE_RESOLVER_REFERENCE_STAGE",
+    "POSITION_PRE_RESOLVER_SOURCE_HASH_DOMAIN",
     "ControlDebugConfig",
     "PositionDebugRecorder",
     "PositionDebugRecorderConfig",
@@ -110,6 +121,7 @@ __all__ = [
     "apply_rm65_position_profile_defaults",
     "build_legacy_reference_parent_provenance",
     "project_legacy_reference_segment",
+    "project_position_pre_resolver_reference_frame",
     "RealArmExecutionConfig",
     "resolve_control_debug_config",
     "resolve_real_arm_execution_config",

@@ -17,6 +17,8 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.runtime.immutable import deep_freeze
 
 from .arbiter import ArbitrationResult
+from .component_action import ComponentAction
+from .component_action_v1 import materialize_robot_action_v1
 from .executor import RobotActionResolver, teleop_command_semantic_payload
 from .persistence import (
     ActionPersistencePolicy,
@@ -64,6 +66,7 @@ COUNTERFACTUAL_TARGET_COMMIT_HASH_DOMAIN_V1 = (
 )
 
 SharedSafety = Callable[[RobotAction, str], SharedCanonicalSafetyResult]
+ShadowTargetActionAdapter = Callable[[ComponentAction], RobotAction]
 
 
 @dataclass(frozen=True)
@@ -323,6 +326,7 @@ def evaluate_shared_execution_shadow(
     active_execution: ActiveExecutionSnapshot,
     persistence_policy: ActionPersistencePolicy,
     shared_safety: SharedSafety,
+    target_action_adapter: ShadowTargetActionAdapter | None = None,
     resolver: RobotActionResolver | None = None,
     now: float,
     supports_local_group_stop: bool,
@@ -350,11 +354,25 @@ def evaluate_shared_execution_shadow(
         for item in directive.directive_by_selection_group.values()
     )
     if publishes_selected:
-        if result.output_status != "selected" or result.composed_action is None:
+        if result.output_status != "selected" or result.composed_candidate is None:
             raise ValueError(
                 "A publish_selected shadow directive requires a selected action."
             )
-        safety_result = shared_safety(result.composed_action, result.result_id)
+        target_action = (
+            materialize_robot_action_v1(
+                result.composed_candidate,
+                timestamp=result.target_effective_at,
+                source="shared_execution_shadow",
+            )
+            if target_action_adapter is None
+            else target_action_adapter(result.composed_candidate)
+        )
+        if not isinstance(target_action, RobotAction):
+            raise TypeError(
+                "target_action_adapter must return a RobotAction for the "
+                "existing shared safety edge."
+            )
+        safety_result = shared_safety(target_action, result.result_id)
         if not isinstance(safety_result, SharedCanonicalSafetyResult):
             raise TypeError("shared_safety must return SharedCanonicalSafetyResult.")
         if safety_result.input_action_id != result.result_id:

@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from robot_motion.action import ActionComponentCatalog, ActionComponentSpec
+from robot_motion.action import (
+    ActionComponentCatalog,
+    ActionComponentSpec,
+    project_robot_action_v1_to_component_action,
+)
 from robot_motion.replay.proposal_source import ReplaySourceFrameEmission
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,
@@ -217,6 +221,9 @@ class ReplayGuiShadowConsumer:
             action_space=emission.action.action_space,
             components=components,
         )
+        action_schema = project_robot_action_v1_to_component_action(
+            emission.action
+        ).action_schema
         shadow = PassivePolicyArbiterShadow(
             PolicyArbiterShadowConfig(
                 runtime_session_id=runtime_session_id,
@@ -228,6 +235,7 @@ class ReplayGuiShadowConsumer:
                 action_space=emission.action.action_space,
                 decision_hz=self.profile.decision_hz,
                 component_catalog=catalog,
+                action_schema=action_schema,
                 clock_domain_id=REPLAY_GUI_SHADOW_CLOCK_DOMAIN_V1,
                 boot_id=runtime_session_id,
             ),
@@ -240,6 +248,7 @@ class ReplayGuiShadowConsumer:
                 embodiment_instance_id=embodiment_instance_id,
                 producer_id=producer_id,
                 producer_epoch=0,
+                action_schema=action_schema,
                 component_schema_hash=catalog.semantic_content_hash,
                 component_coverage=emission.action.active_effectors,
                 source_path=binding.source_path,

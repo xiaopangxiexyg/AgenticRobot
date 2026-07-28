@@ -168,6 +168,13 @@ ARM_MODE_FLOAT64_COLUMNS = frozenset(
     }
 )
 
+POSE_QUALITY_STRING_COLUMNS = frozenset(
+    {
+        "teleop.pose_quality.status",
+        "teleop.pose_quality.special_code",
+    }
+)
+
 
 def _to_serializable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
@@ -235,6 +242,8 @@ def write_rows_to_parquet(
             arrays.append(pa.array(values, type=pa.int64()))
         elif name in ARM_MODE_STRING_COLUMNS:
             arrays.append(pa.array(values, type=pa.string()))
+        elif name in POSE_QUALITY_STRING_COLUMNS:
+            arrays.append(pa.array(values, type=pa.string()))
         elif name in ARM_MODE_FLOAT64_COLUMNS:
             arrays.append(pa.array(values, type=pa.float64()))
         elif name in FLOAT32_LIST_COLUMNS or name in V22_FLOAT32_LIST_COLUMNS:
@@ -255,6 +264,7 @@ __all__ = [
     "ARM_MODE_INT64_COLUMNS",
     "ARM_MODE_STRING_COLUMNS",
     "ARM_MODE_FLOAT64_COLUMNS",
+    "POSE_QUALITY_STRING_COLUMNS",
     "FLOAT32_LIST_COLUMNS",
     "INT64_LIST_COLUMNS",
     "BOOL_LIST_COLUMNS",

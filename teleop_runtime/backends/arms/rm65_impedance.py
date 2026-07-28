@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import threading
 import time
 
@@ -41,6 +41,8 @@ _IMPEDANCE_CONFIG_DEBUG_KEYS = (
     "tool_name",
     "control_hz",
     "action_hz",
+    "hard_stop_force_n",
+    "hard_stop_torque_nm",
     "force_source",
     "axes",
     "force_sign",
@@ -114,6 +116,19 @@ _IMPEDANCE_CONFIG_DEBUG_KEYS = (
 _RM65_IMPEDANCE_MAX_CONTROL_HZ = 40.0
 _RM65_CANFD_FOLLOW_DEFAULT_STATE_READ_EVERY = 4
 _RM65_PASSTHROUGH_POSITION_MAX_COMMAND_STEP_DEG = 1.0e9
+
+
+def _is_force_hard_stop_exception(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        text = str(current)
+        if (
+            "hard_stop_force_n" in text
+            or "hard_stop_torque_nm" in text
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _debug_config_value(value: object) -> object:
@@ -461,6 +476,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._state_lock = threading.RLock()
         self._send_lock = threading.RLock()
         self._emergency_stopped = False
+        self._force_hard_stop_callback: Callable[[str, str], None] | None = None
         self._loop_stop_event = threading.Event()
         self._loop_thread: threading.Thread | None = None
         self._last_send_time: float | None = None
@@ -550,6 +566,81 @@ class RM65ImpedanceArmBackend(EffectorBackend):
     def is_ready(self) -> bool:
         return (not self.config.connect_hardware) or self.arm is not None
 
+    def set_force_hard_stop_callback(
+        self,
+        callback: Callable[[str, str], None] | None,
+    ) -> None:
+        """Install the deployment-owned callback for controller hard stops."""
+
+        if callback is not None and not callable(callback):
+            raise TypeError("force hard-stop callback must be callable or None")
+        with self._state_lock:
+            self._force_hard_stop_callback = callback
+
+    def read_impedance_force_guard_data(self) -> dict[str, object]:
+        """Return the latest validated force sample without another SDK read."""
+
+        with self._state_lock:
+            controller = self._controller
+            record = (
+                None
+                if self._last_step_record is None
+                else dict(self._last_step_record)
+            )
+            fault = self._last_fault
+            emergency_stopped = bool(self._emergency_stopped)
+        if controller is None:
+            return {
+                "sample": None,
+                "sample_error": f"{self.name} impedance controller is unavailable",
+            }
+        if fault is not None:
+            return {
+                "sample": None,
+                "backend_fault": fault,
+            }
+        if emergency_stopped:
+            return {
+                "sample": None,
+                "backend_fault": f"{self.name} emergency_stop is latched",
+            }
+        if record is None:
+            return {
+                "sample": None,
+                "sample_error": f"{self.name} has no completed impedance step",
+            }
+        sample_monotonic = record.get("backend_controller_step_end_monotonic")
+        sample_wall = record.get("backend_controller_step_end_wall_time")
+        try:
+            force_norm = float(record.get("force_norm_n"))
+            torque_norm = float(record.get("torque_norm_nm"))
+            sample_monotonic = float(sample_monotonic)
+            sample_wall = float(sample_wall)
+            if not all(
+                np.isfinite(value)
+                for value in (force_norm, torque_norm, sample_monotonic, sample_wall)
+            ):
+                raise ValueError("force sample contains non-finite values")
+        except (TypeError, ValueError) as exc:
+            return {
+                "sample": None,
+                "sample_error": f"{self.name} force sample is invalid: {exc}",
+            }
+        config = controller.config
+        return {
+            "sample": {
+                "side": self.config.side,
+                "force_source": str(config.force_source),
+                "force_norm_n": force_norm,
+                "torque_norm_nm": torque_norm,
+                "max_force_n": float(config.hard_stop_force_n),
+                "max_torque_nm": float(config.hard_stop_torque_nm),
+                "monotonic_time_sec": sample_monotonic,
+                "wall_time_sec": sample_wall,
+                "step": record.get("step"),
+            }
+        }
+
     def hold_motion(self, reason: str = "manual hold") -> None:
         del reason
         if self.config.observation_only:
@@ -557,6 +648,17 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._last_send_result_code = 0
                 self._last_send_result_text = "observation_only_hold"
             return
+        # A force/collision stop is an explicit backend latch.  The outer
+        # runtime may still consume the normal GUI Hold transition after it
+        # has already issued Arm_Stop; do not send a second Slow_Stop here or
+        # race the controller's failed worker teardown.  Runtime Home calls
+        # ``manual_rearm_after_emergency_stop`` before enabling impedance
+        # again.
+        with self._state_lock:
+            if self._emergency_stopped:
+                self._last_send_result_code = 0
+                self._last_send_result_text = "hold_skipped_emergency_latched"
+                return
         self._release_exact_qpos_transit_best_effort(reason="hold")
         with self._send_lock:
             self._loop_stop_event.set()
@@ -630,6 +732,99 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             if controller is not None and qpos_array is not None:
                 controller.reset_motion_state(qpos_array)
 
+    def is_emergency_stopped(self) -> bool:
+        """Return whether an emergency stop latch still blocks dispatch."""
+
+        with self._state_lock:
+            return bool(self._emergency_stopped)
+
+    def manual_rearm_after_emergency_stop(
+        self,
+        qpos: object,
+    ) -> dict[str, object]:
+        """Clear a force/collision stop latch after an explicit fresh Home.
+
+        The control loop never calls this method.  ``runtime Home`` is the
+        operator acknowledgement that the arm was manually repositioned and
+        that it is safe to rebuild the impedance controller state.  A failed
+        controller/worker teardown keeps the latch set and therefore forces a
+        process restart rather than silently resuming after an incomplete
+        safety stop.
+        """
+
+        qpos_array = np.asarray(qpos, dtype=float).reshape(-1)
+        if qpos_array.shape != (6,) or not np.all(np.isfinite(qpos_array)):
+            raise ValueError(
+                f"{self.name} manual rearm qpos must be a finite 6-vector."
+            )
+        if self.config.observation_only:
+            with self._state_lock:
+                self._emergency_stopped = False
+                self._last_fault = None
+                self._last_send_result_code = 0
+                self._last_send_result_text = "observation_only_manual_rearm"
+            return {"rearmed": True, "observation_only": True}
+
+        with self._state_lock:
+            if self.arm is None or self._controller is None:
+                raise RuntimeError(
+                    f"{self.name} has no ready RM65 connection for manual re-arm."
+                )
+            if not self._emergency_stopped:
+                return {"rearmed": False, "reason": "not_emergency_stopped"}
+            worker = self._loop_thread
+            self._loop_stop_event.set()
+
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=1.0)
+            if worker.is_alive():
+                raise RuntimeError(
+                    f"{self.name} impedance worker did not stop before manual re-arm."
+                )
+
+        # The worker normally called stop_motion while reporting its fault.
+        # Repeat that local teardown only after the worker is joined; it is
+        # idempotent for the RM65 controller and also stops a follow stream
+        # that may have outlived the failed impedance tick.
+        with self._send_lock:
+            with self._state_lock:
+                if not self._emergency_stopped:
+                    return {"rearmed": False, "reason": "latch_cleared_concurrently"}
+                controller = self._controller
+            if controller is None:
+                raise RuntimeError(
+                    f"{self.name} impedance controller disappeared during manual re-arm."
+                )
+            try:
+                controller.stop_motion()
+                controller.reset_motion_state(qpos_array)
+            except Exception:
+                # Keep ``_emergency_stopped`` and the worker stop event set on
+                # every failure.  The next Home attempt can retry, while no
+                # command can leak through this partially rebuilt state.
+                raise
+            with self._state_lock:
+                self._loop_thread = None
+                self._loop_stop_event.clear()
+                self._enabled = False
+                self._last_fault = None
+                self._last_step_record = None
+                self._recent_step_records = []
+                self._latest_target_pose6 = None
+                self._latest_target_joint_deg = None
+                self._latest_target_sequence = None
+                self._command_sequence = 0
+                self._last_command = None
+                self._last_command_timestamp = None
+                self._last_send_time = None
+                self._smoothed_send_dt = float(self.config.control_dt)
+                self._last_effective_control_dt = float(self.config.control_dt)
+                self._last_effective_step_scale = 1.0
+                self._emergency_stopped = False
+                self._last_send_result_code = 0
+                self._last_send_result_text = "manual_rearm_ready"
+        return {"rearmed": True}
+
     def set_command_action_dt_sec(self, action_dt_sec: float) -> None:
         value = float(action_dt_sec)
         if value <= 0.0:
@@ -662,6 +857,12 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             raise RuntimeError(
                 f"{self.name} is observation-only; force control is disabled."
             )
+        with self._state_lock:
+            if self._emergency_stopped:
+                raise RuntimeError(
+                    f"{self.name} emergency_stop is latched; "
+                    "manual re-arm is required before enabling force control."
+                )
         if self._enabled:
             return
         if self._loop_thread is not None:
@@ -1319,8 +1520,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                             break
                     mark_timing("pre_step_check")
                     controller_step_start_wall_time = time.time()
+                    controller_step_start_monotonic = time.monotonic()
                     record = dict(self._controller.step(step_target, target_joint_deg=step_target_joint_deg))
                     controller_step_end_wall_time = time.time()
+                    controller_step_end_monotonic = time.monotonic()
                     if target_dispatched_this_step:
                         last_dispatched_target_sequence = target_sequence
                     record.update(
@@ -1337,6 +1540,12 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                             ),
                             "backend_controller_step_end_wall_time": float(
                                 controller_step_end_wall_time
+                            ),
+                            "backend_controller_step_start_monotonic": float(
+                                controller_step_start_monotonic
+                            ),
+                            "backend_controller_step_end_monotonic": float(
+                                controller_step_end_monotonic
                             ),
                             "backend_controller_step_wall_duration_sec": float(
                                 controller_step_end_wall_time - controller_step_start_wall_time
@@ -1390,12 +1599,31 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     self._last_send_result_text = fault
                     self._enabled = False
                     self._exact_qpos_transit_operation_id = None
+                    force_hard_stop_callback = self._force_hard_stop_callback
+                hard_stop = _is_force_hard_stop_exception(exc)
+                bimanual_stop_completed = False
                 try:
-                    try:
-                        self._controller.end_exact_qpos_transit()
-                    finally:
-                        self._controller.stop_motion()
+                    if hard_stop and force_hard_stop_callback is not None:
+                        force_hard_stop_callback(self.config.side, fault)
+                        bimanual_stop_completed = self.is_emergency_stopped()
+                        if not bimanual_stop_completed:
+                            self.emergency_stop()
+                            bimanual_stop_completed = True
+                    else:
+                        try:
+                            self._controller.end_exact_qpos_transit()
+                        finally:
+                            self._controller.stop_motion()
                 finally:
+                    if hard_stop and force_hard_stop_callback is not None and not bimanual_stop_completed:
+                        try:
+                            self.emergency_stop()
+                        except Exception as stop_exc:  # noqa: BLE001
+                            with self._state_lock:
+                                self._last_send_result_text = (
+                                    f"{fault}; emergency_stop_failed:"
+                                    f"{type(stop_exc).__name__}: {stop_exc}"
+                                )
                     self._loop_stop_event.set()
                 break
             next_deadline += period

@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.model_continuation import (
+    normalize_model_continuation_contract,
+)
 from .inference import PolicyChunkResult, PolicyInferenceRequest
 from .async_producer import (
     POLICY_WORKER_SESSION_ABANDONED_UNDRAINED,
@@ -29,6 +32,8 @@ from .async_producer import (
     POLICY_WORKER_SESSION_STATES_V1,
 )
 from .observation_view import PolicyObservationView
+from .rtc.conditioning import CanonicalRtcConditioningBundle
+from .rtc.continuation import rtc_continuation_timeline_from_request
 
 
 POLICY_WORK_ITEM_HASH_DOMAIN_V1 = "dexteleop.deploy.policy_work_item.v1"
@@ -41,6 +46,7 @@ POLICY_WORKER_COMPLETION_HASH_DOMAIN_V1 = (
 POLICY_WORKER_STOP_HASH_DOMAIN_V1 = "dexteleop.deploy.policy_worker_stop.v1"
 POLICY_WORK_ITEM_HASH_DOMAIN_V2 = "dexteleop.deploy.policy_work_item.v2"
 POLICY_WORK_ITEM_HASH_DOMAIN_V3 = "dexteleop.deploy.policy_work_item.v3"
+POLICY_WORK_ITEM_HASH_DOMAIN_V4 = "dexteleop.deploy.policy_work_item.v4"
 POLICY_WORKER_SUBMISSION_HASH_DOMAIN_V2 = (
     "dexteleop.deploy.policy_worker_submission.v2"
 )
@@ -107,6 +113,16 @@ class PolicyInferenceExecutor(Protocol):
         ...
 
 
+class PolicyInferenceWorkItemExecutor(PolicyInferenceExecutor, Protocol):
+    """Opt-in executor that consumes the exact immutable queued work item."""
+
+    def execute_work_item(
+        self,
+        work_item: "PolicyInferenceWorkItem",
+    ) -> PolicyChunkResult:
+        ...
+
+
 class PolicyInferenceCancellationHook(Protocol):
     """Optional, non-blocking cancellation hook for a session executor.
 
@@ -128,6 +144,7 @@ class PolicyInferenceWorkItem:
     request: PolicyInferenceRequest
     actor_observation: PolicyObservationView
     submitted_at: float
+    conditioning_bundle: CanonicalRtcConditioningBundle | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "worker_id", _required(self.worker_id, field_name="worker_id"))
@@ -158,6 +175,84 @@ class PolicyInferenceWorkItem:
             raise ValueError("Actor observation/request timestamp mismatch.")
         if int(payload["step_index"]) != self.request.observation_step_index:
             raise ValueError("Actor observation/request step mismatch.")
+        self._validate_conditioning_binding()
+
+    def _validate_conditioning_binding(self) -> None:
+        request = self.request
+        bundle = self.conditioning_bundle
+        if request.conditioning_binding_hash is None:
+            if bundle is not None:
+                raise ValueError(
+                    "A conditioning bundle requires a causal request binding."
+                )
+            return
+        if bundle is None:
+            raise ValueError(
+                "A causal conditioning request requires its immutable bundle "
+                "in the work item."
+            )
+        if not isinstance(bundle, CanonicalRtcConditioningBundle):
+            raise TypeError(
+                "conditioning_bundle must be a "
+                "CanonicalRtcConditioningBundle or None."
+            )
+        if request.conditioning_binding_hash != bundle.conditioning_binding_hash:
+            raise ValueError("Request/conditioning bundle hash mismatch.")
+        if request.session_id != bundle.runtime_session_id:
+            raise ValueError("Request/conditioning runtime session mismatch.")
+        if request.control_domain_id != bundle.control_domain_id:
+            raise ValueError("Request/conditioning control domain mismatch.")
+        if request.artifact_hash != bundle.artifact_hash:
+            raise ValueError("Request/conditioning artifact mismatch.")
+        if request.source_plan_hash != bundle.selection.source_plan_hash:
+            raise ValueError("Request/conditioning source plan hash mismatch.")
+        if (
+            rtc_continuation_timeline_from_request(request)
+            .semantic_content_hash
+            != bundle.timeline.semantic_content_hash
+        ):
+            raise ValueError("Request/conditioning timeline mismatch.")
+        context = request.action_representation_context
+        if context is None:
+            raise ValueError(
+                "A canonical conditioning request requires an action "
+                "representation context."
+            )
+        if (
+            context.semantic_content_hash
+            != bundle.action_representation_context.semantic_content_hash
+        ):
+            raise ValueError(
+                "Request/conditioning action representation context mismatch."
+            )
+        contract = normalize_model_continuation_contract(
+            bundle.continuation_contract
+        ).runtime
+        for name in (
+            "action_codec_hash",
+            "frame_contract_hash",
+            "layout_hash",
+            "normalization_hash",
+        ):
+            if getattr(request, name) != getattr(contract, name):
+                raise ValueError(
+                    f"Request/conditioning continuation {name} mismatch."
+                )
+        continuation_slice = bundle.selection.continuation_slice
+        if continuation_slice is None:
+            return
+        expected = {
+            "source_plan_id": request.source_plan_id,
+            "source_plan_generation": request.source_plan_generation,
+            "producer_id": request.producer_id,
+            "producer_epoch": request.producer_epoch,
+            "policy_node_id": request.policy_node_id,
+        }
+        for name, expected_value in expected.items():
+            if getattr(continuation_slice, name) != expected_value:
+                raise ValueError(
+                    f"Request/conditioning continuation {name} mismatch."
+                )
 
     @property
     def actor_observation_hash(self) -> str:
@@ -184,16 +279,23 @@ class PolicyInferenceWorkItem:
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "worker_id": self.worker_id,
+            "worker_session_id": self.worker_session_id,
+            "submit_sequence": self.submit_sequence,
+            "request_hash": self.request.semantic_content_hash,
+            "actor_observation_hash": self.actor_observation_hash,
+            "submitted_at": self.submitted_at,
+        }
+        domain = POLICY_WORK_ITEM_HASH_DOMAIN_V3
+        if self.conditioning_bundle is not None:
+            payload["conditioning_bundle_hash"] = (
+                self.conditioning_bundle.conditioning_binding_hash
+            )
+            domain = POLICY_WORK_ITEM_HASH_DOMAIN_V4
         return canonical_content_hash(
-            {
-                "worker_id": self.worker_id,
-                "worker_session_id": self.worker_session_id,
-                "submit_sequence": self.submit_sequence,
-                "request_hash": self.request.semantic_content_hash,
-                "actor_observation_hash": self.actor_observation_hash,
-                "submitted_at": self.submitted_at,
-            },
-            domain=POLICY_WORK_ITEM_HASH_DOMAIN_V3,
+            payload,
+            domain=domain,
         )
 
 
@@ -645,10 +747,23 @@ class BoundedPolicyInferenceWorker:
                     self._executing_request_id = work_item.request.request_id
                 started_at = max(self._time(), work_item.request.admitted_at)
                 try:
-                    result = self.executor(
-                        work_item.request,
-                        work_item.actor_observation,
-                    )
+                    if work_item.conditioning_bundle is None:
+                        result = self.executor(
+                            work_item.request,
+                            work_item.actor_observation,
+                        )
+                    else:
+                        execute_work_item = getattr(
+                            self.executor,
+                            "execute_work_item",
+                            None,
+                        )
+                        if not callable(execute_work_item):
+                            raise TypeError(
+                                "A conditioning bundle requires an executor "
+                                "with execute_work_item()."
+                            )
+                        result = execute_work_item(work_item)
                     if not isinstance(result, PolicyChunkResult):
                         raise TypeError("Policy executor must return PolicyChunkResult.")
                 except Exception as error:  # noqa: BLE001 - converted to typed fault.
@@ -880,6 +995,7 @@ __all__ = [
     "POLICY_WORK_ITEM_HASH_DOMAIN_V1",
     "POLICY_WORK_ITEM_HASH_DOMAIN_V2",
     "POLICY_WORK_ITEM_HASH_DOMAIN_V3",
+    "POLICY_WORK_ITEM_HASH_DOMAIN_V4",
     "POLICY_EXECUTOR_CANCELLATION_HASH_DOMAIN_V1",
     "POLICY_EXECUTOR_CANCELLATION_STATUSES_V1",
     "POLICY_EXECUTOR_CANCEL_DECLINED",
@@ -890,6 +1006,7 @@ __all__ = [
     "PolicyExecutorCancellationReceipt",
     "PolicyInferenceCancellationHook",
     "PolicyInferenceExecutor",
+    "PolicyInferenceWorkItemExecutor",
     "PolicyInferenceWorkItem",
     "PolicyWorkerCompletion",
     "PolicyWorkerSessionSnapshot",

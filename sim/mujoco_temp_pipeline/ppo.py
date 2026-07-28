@@ -57,6 +57,11 @@ class RolloutBatch:
     safety_rejection_rate: float
     safety_recovery_rate: float
     safety_projection_alpha_mean: float
+    effective_action_override_rate: float
+    effective_action_delta_mean: float
+    post_contact_phase_active_rate: float
+    post_contact_action_modified_rate: float
+    scripted_pregrasp_action_modified_rate: float
     safety_minimum_distance_m: float | None
     hard_penetration_count: int
     clearance_violation_count: int
@@ -246,6 +251,17 @@ class PPOSmokeTrainer:
             ],
             dtype=np.float32,
         )
+        self._previous_inner_contact_score = np.asarray(
+            [float(info.get("gripper_inner_contact_score", 0.0)) for info in reset_infos],
+            dtype=np.float32,
+        )
+        self._previous_bilateral_inner_contact_score = np.asarray(
+            [
+                float(info.get("gripper_bilateral_inner_contact_score", 0.0))
+                for info in reset_infos
+            ],
+            dtype=np.float32,
+        )
         self._apply_exploration_schedule()
 
     @staticmethod
@@ -299,6 +315,11 @@ class PPOSmokeTrainer:
         safety_recovery_count = 0
         safety_alpha_sum = 0.0
         safety_sample_count = 0
+        effective_action_override_count = 0
+        effective_action_delta_sum = 0.0
+        post_contact_phase_active_count = 0
+        post_contact_action_modified_count = 0
+        scripted_pregrasp_action_modified_count = 0
         safety_minimum_distance = float("inf")
         hard_penetration_count = 0
         clearance_violation_count = 0
@@ -332,9 +353,56 @@ class PPOSmokeTrainer:
                 environment_action
             )
             done = np.logical_or(terminated, truncated)
+            transition_infos = tuple(
+                info.get("final_info", info) if done[env_id] else info
+                for env_id, info in enumerate(infos)
+            )
             safety_alpha = np.asarray(
                 [float(info.get("safety_projection_alpha", 1.0)) for info in infos],
                 dtype=np.float32,
+            )
+            safety_modified = np.asarray(
+                [bool(info.get("safety_modified", False)) for info in transition_infos],
+                dtype=bool,
+            )
+            post_contact_phase_active = np.asarray(
+                [
+                    bool(info.get("post_contact_phase_active", False))
+                    for info in transition_infos
+                ],
+                dtype=bool,
+            )
+            post_contact_action_modified = np.asarray(
+                [
+                    bool(info.get("post_contact_phase_action_modified", False))
+                    for info in transition_infos
+                ],
+                dtype=bool,
+            )
+            scripted_pregrasp_action_modified = np.asarray(
+                [
+                    bool(info.get("scripted_pregrasp_action_modified", False))
+                    for info in transition_infos
+                ],
+                dtype=bool,
+            )
+            effective_action_override = (
+                safety_modified
+                | (safety_alpha < (1.0 - 1e-6))
+                | post_contact_action_modified
+                | scripted_pregrasp_action_modified
+            )
+            effective_action_override_count += int(
+                np.count_nonzero(effective_action_override)
+            )
+            post_contact_phase_active_count += int(
+                np.count_nonzero(post_contact_phase_active)
+            )
+            post_contact_action_modified_count += int(
+                np.count_nonzero(post_contact_action_modified)
+            )
+            scripted_pregrasp_action_modified_count += int(
+                np.count_nonzero(scripted_pregrasp_action_modified)
             )
             safety_modified_count += sum(
                 bool(info.get("safety_modified", False)) for info in infos
@@ -419,6 +487,109 @@ class PPOSmokeTrainer:
                 ],
                 dtype=np.float32,
             )
+            side_contact_score = np.asarray(
+                [
+                    float(
+                        (
+                            info.get("final_info", info)
+                            if done[env_id]
+                            else info
+                        ).get("cube_side_contact_score", 0.0)
+                    )
+                    for env_id, info in enumerate(infos)
+                ],
+                dtype=np.float32,
+            )
+            top_bottom_contact_score = np.asarray(
+                [
+                    float(
+                        (
+                            info.get("final_info", info)
+                            if done[env_id]
+                            else info
+                        ).get("cube_top_bottom_contact_score", 0.0)
+                    )
+                    for env_id, info in enumerate(infos)
+                ],
+                dtype=np.float32,
+            )
+            inner_contact_score = np.asarray(
+                [
+                    float(
+                        (
+                            info.get("final_info", info)
+                            if done[env_id]
+                            else info
+                        ).get("gripper_inner_contact_score", 0.0)
+                    )
+                    for env_id, info in enumerate(infos)
+                ],
+                dtype=np.float32,
+            )
+            bilateral_inner_contact_score = np.asarray(
+                [
+                    float(
+                        (
+                            info.get("final_info", info)
+                            if done[env_id]
+                            else info
+                        ).get("gripper_bilateral_inner_contact_score", 0.0)
+                    )
+                    for env_id, info in enumerate(infos)
+                ],
+                dtype=np.float32,
+            )
+            outer_contact_score = np.asarray(
+                [
+                    float(
+                        (
+                            info.get("final_info", info)
+                            if done[env_id]
+                            else info
+                        ).get("gripper_outer_contact_score", 0.0)
+                    )
+                    for env_id, info in enumerate(infos)
+                ],
+                dtype=np.float32,
+            )
+            accepted_action = np.stack(
+                [
+                    np.asarray(
+                        (
+                            info.get("final_info", info)
+                            if done[env_id]
+                            else info
+                        ).get("accepted_action", np.zeros(7, dtype=np.float32)),
+                        dtype=np.float32,
+                    ).reshape(7)
+                    for env_id, info in enumerate(infos)
+                ]
+            )
+            accepted_compact_action = accepted_action[:, self.active_action_indices]
+            action_for_update = np.where(
+                effective_action_override[:, None],
+                accepted_compact_action,
+                action,
+            )
+            effective_action_delta_sum += float(
+                np.sum(np.abs(action_for_update - action))
+            )
+            approach_action = np.stack(
+                [
+                    np.asarray(
+                        (
+                            info.get("final_info", info)
+                            if done[env_id]
+                            else info
+                        ).get(
+                            "scripted_approach_action",
+                            np.zeros(7, dtype=np.float32),
+                        ),
+                        dtype=np.float32,
+                    ).reshape(7)
+                    for env_id, info in enumerate(infos)
+                ]
+            )
             shaped_reward, terms = shape_rewards(
                 self._reward_observation,
                 transition_reward_next,
@@ -431,6 +602,17 @@ class PPOSmokeTrainer:
                 grasp_latched=grasp_latched,
                 bilateral_contact=bilateral_contact,
                 previous_bilateral_contact=self._previous_bilateral_contact,
+                side_contact_score=side_contact_score,
+                top_bottom_contact_score=top_bottom_contact_score,
+                inner_contact_score=inner_contact_score,
+                bilateral_inner_contact_score=bilateral_inner_contact_score,
+                outer_contact_score=outer_contact_score,
+                previous_inner_contact_score=self._previous_inner_contact_score,
+                previous_bilateral_inner_contact_score=(
+                    self._previous_bilateral_inner_contact_score
+                ),
+                accepted_action=accepted_action,
+                approach_action=approach_action,
                 time_limit=truncated,
                 failure_termination=failure_termination,
                 unsafe_termination=unsafe_termination,
@@ -442,8 +624,18 @@ class PPOSmokeTrainer:
             reward_term_samples += cfg.num_envs
 
             observations[step] = normalized
-            actions[step] = action
-            log_probs[step] = log_prob_tensor.cpu().numpy()
+            actions[step] = action_for_update if cfg.effective_action_for_ppo else action
+            if cfg.effective_action_for_ppo and np.any(effective_action_override):
+                with torch.no_grad():
+                    effective_log_prob_tensor, _entropy, _effective_value = (
+                        self.policy.evaluate_actions(
+                            observation_tensor,
+                            torch.as_tensor(action_for_update, device=self.device),
+                        )
+                    )
+                log_probs[step] = effective_log_prob_tensor.cpu().numpy()
+            else:
+                log_probs[step] = log_prob_tensor.cpu().numpy()
             values[step] = value_tensor.cpu().numpy()
             rewards[step] = shaped_reward
             raw_rewards_buffer[step] = raw_reward
@@ -507,10 +699,22 @@ class PPOSmokeTrainer:
                             )
                         )
                     )
+                    inner_contact_score[env_id] = float(
+                        reset_info.get("gripper_inner_contact_score", 0.0)
+                    )
+                    bilateral_inner_contact_score[env_id] = float(
+                        reset_info.get(
+                            "gripper_bilateral_inner_contact_score", 0.0
+                        )
+                    )
             self._episode_resting_cube_z[done] = CubeLiftRewardState.from_flat(
                 next_reward_observation[done]
             ).cube_z
             self._previous_bilateral_contact = bilateral_contact
+            self._previous_inner_contact_score = inner_contact_score
+            self._previous_bilateral_inner_contact_score = (
+                bilateral_inner_contact_score
+            )
 
             self.observation = next_observation
             self._reward_observation = next_reward_observation
@@ -551,6 +755,23 @@ class PPOSmokeTrainer:
             safety_rejection_rate=safety_rejected_count / max(safety_sample_count, 1),
             safety_recovery_rate=safety_recovery_count / max(safety_sample_count, 1),
             safety_projection_alpha_mean=safety_alpha_sum / max(safety_sample_count, 1),
+            effective_action_override_rate=(
+                effective_action_override_count / max(safety_sample_count, 1)
+            ),
+            effective_action_delta_mean=(
+                effective_action_delta_sum
+                / max(safety_sample_count * self.action_dim, 1)
+            ),
+            post_contact_phase_active_rate=(
+                post_contact_phase_active_count / max(safety_sample_count, 1)
+            ),
+            post_contact_action_modified_rate=(
+                post_contact_action_modified_count / max(safety_sample_count, 1)
+            ),
+            scripted_pregrasp_action_modified_rate=(
+                scripted_pregrasp_action_modified_count
+                / max(safety_sample_count, 1)
+            ),
             safety_minimum_distance_m=(
                 None if not np.isfinite(safety_minimum_distance) else safety_minimum_distance
             ),
@@ -591,6 +812,15 @@ class PPOSmokeTrainer:
         advantages = (batch.advantages - batch.advantages.mean()) / (
             batch.advantages.std(unbiased=False) + 1e-8
         )
+        # A corrupted bootstrap or a rare extreme terminal return must not
+        # poison the actor update.  The clip is only on the normalized GAE;
+        # value targets remain untouched for critic fitting.
+        advantages = torch.nan_to_num(
+            advantages,
+            nan=0.0,
+            posinf=float(cfg.advantage_clip),
+            neginf=-float(cfg.advantage_clip),
+        ).clamp(-float(cfg.advantage_clip), float(cfg.advantage_clip))
         metrics: dict[str, list[float]] = {
             "policy_loss": [],
             "value_loss": [],
@@ -598,16 +828,46 @@ class PPOSmokeTrainer:
             "approx_kl": [],
             "clip_fraction": [],
         }
+        early_stop_count = 0
+        minibatch_count = 0
+        stop_update = False
         self.policy.train()
         for _epoch in range(cfg.update_epochs):
             permutation = torch.randperm(count, device=self.device)
             for start in range(0, count, cfg.minibatch_size):
+                minibatch_count += 1
                 index = permutation[start : start + cfg.minibatch_size]
                 new_log_prob, entropy, new_value = self.policy.evaluate_actions(
                     batch.observations[index], batch.actions[index]
                 )
-                log_ratio = new_log_prob - batch.old_log_probs[index]
+                raw_log_ratio = new_log_prob - batch.old_log_probs[index]
+                if not torch.isfinite(raw_log_ratio).all():
+                    early_stop_count += 1
+                    stop_update = True
+                    break
+                log_ratio = torch.clamp(
+                    raw_log_ratio,
+                    -float(cfg.max_log_ratio),
+                    float(cfg.max_log_ratio),
+                )
                 ratio = log_ratio.exp()
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                # Once this minibatch is already outside the trust region,
+                # do not apply another gradient step.  Without this guard a
+                # single projected-action outlier can make exp(log_ratio)
+                # dominate the remaining epochs and eventually become NaN.
+                if (
+                    not torch.isfinite(approx_kl)
+                    or float(approx_kl) > float(cfg.target_kl)
+                ):
+                    if torch.isfinite(approx_kl):
+                        metrics["approx_kl"].append(
+                            float(approx_kl.detach().cpu())
+                        )
+                    early_stop_count += 1
+                    stop_update = True
+                    break
                 minibatch_advantage = advantages[index]
                 unclipped = ratio * minibatch_advantage
                 clipped = torch.clamp(
@@ -624,14 +884,22 @@ class PPOSmokeTrainer:
                     - cfg.entropy_coef * entropy_mean
                 )
                 if not torch.isfinite(loss):
-                    raise RuntimeError("PPO loss became non-finite.")
+                    early_stop_count += 1
+                    stop_update = True
+                    break
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), cfg.max_grad_norm
+                )
+                if not torch.isfinite(grad_norm):
+                    self.optimizer.zero_grad(set_to_none=True)
+                    early_stop_count += 1
+                    stop_update = True
+                    break
                 self.optimizer.step()
 
                 with torch.no_grad():
-                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
                     clip_fraction = (
                         (torch.abs(ratio - 1.0) > cfg.clip_coef).float().mean()
                     )
@@ -640,8 +908,21 @@ class PPOSmokeTrainer:
                 metrics["entropy"].append(float(entropy_mean.detach().cpu()))
                 metrics["approx_kl"].append(float(approx_kl.detach().cpu()))
                 metrics["clip_fraction"].append(float(clip_fraction.detach().cpu()))
+            if stop_update:
+                break
         self.update_index += 1
-        return {name: float(np.mean(values_)) for name, values_ in metrics.items()}
+        if not metrics["policy_loss"]:
+            # The first minibatch can be rejected when resuming from a policy
+            # that already drifted.  Returning finite diagnostics lets the
+            # outer loop checkpoint and continue instead of destroying the
+            # last valid checkpoint with NaNs.
+            metrics = {
+                name: [0.0] if not values else values
+                for name, values in metrics.items()
+            }
+        result = {name: float(np.mean(values_)) for name, values_ in metrics.items()}
+        result["ppo_early_stop_rate"] = early_stop_count / max(minibatch_count, 1)
+        return result
 
 
 __all__ = [

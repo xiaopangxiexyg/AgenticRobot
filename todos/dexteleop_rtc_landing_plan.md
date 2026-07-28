@@ -64,8 +64,8 @@ raw-RTC -> PolicyActionEmission
 
 RTC-1 已按 deployment-only 边界形成第一版 local-only 实现：
 
-- `robot_motion/deploy/inference.py`：版本化 inference mode、delay estimator spec/state、model-space prefix、
-  request 与 worker result immutable contract；
+- `robot_motion/deploy/inference.py`：版本化 inference mode、delay estimator spec/state、当前兼容性model-space prefix、
+  request 与 worker result immutable contract；其中prefix/模型协议归属将在MRTC-D1/R1中渐进拆分，raw-RTC不改义；
 - `robot_motion/deploy/chunk_plan.py`：target-time keyframe/plan、single in-flight binding、producer committed-through、
   unique due pop、`replace_mutable_future_v1` merge 与 receipt；
 - `robot_motion/deploy/__init__.py`：只增加上述 pure deployment contract 的公开导出；
@@ -1100,10 +1100,11 @@ prefix/mask。hard prefix 应来自 downstream-accepted reference，producer-loc
 #### 4.6.1 model-RTC 代码组织与首批时间契约
 
 RTC是跨层feature，不新增跨`robot_motion`、`deployments`、`teleop_runtime`、`sim`或`control_station`的顶级
-`rtc/` package。新通用语义进入`robot_motion.deploy.rtc`内部子包；model-neutral client仍在
-`deployments.client`，具体模型provider仍在`deployments/<model>/client`，dataset派生view仍在
-`dataset_contracts`/`dataset_interface`。现有`rtc_protocol.py`、`rtc_runtime.py`等flat module保持兼容并渐进迁移，
-不得一次性搬迁或建立新production entrypoint。
+`rtc/` package，也不让`robot_motion`完整承载model-RTC。在线计划因果进入`robot_motion.deploy.rtc`内部子包；
+版本化continuation训练/artifact schema进入`dataset_contracts`，离线派生view进入`dataset_interface`；
+model-neutral encoding/protocol进入`deployments.client`，具体模型provider进入`deployments/<model>/client`；
+learner/sampler/loss最终属于future `model/`。现有`rtc_protocol.py`、`rtc_runtime.py`等flat module保持兼容并渐进迁移，
+不得一次性搬迁、建立新production entrypoint或让下层包反向依赖`deployments`。
 
 `PolicyAsyncExecutionProfile`历史上同时绑定producer cadence与position/send/lookahead application设置，其字段和hash
 保持不变。新producer代码只消费target-neutral `RtcProducerProfile`投影；position sample/reference/IK/command rate、
@@ -1123,6 +1124,214 @@ client returns executable suffix full_chunk[delay:H]
 runtime与model adapter不得各自再次应用delay crop。首批prefix source只允许
 `producer_local_overlap_v1`；sampler的clamped/weighted数值约束强度不构成downstream target acceptance、reference commit或
 motion authority。相关pure contract位于`robot_motion.deploy.rtc.continuation`。
+
+首批pure timed-plan selector已落地：只读取immutable plan snapshot，不修改plan、不插值/重采样、不调用模型；只选择
+generation lattice上typed canonical、同cadence且内部连续的old-plan keyframe。prefix exclusive horizon不得超过
+`forecast_delay_steps`，避免producer-local overlap侵入本轮可执行suffix。已经pop的前导generation index可以缺失，但后续
+encoder必须在versioned prefix mask中显式标为未选中；选中区间内部有洞、identity/clock/lattice/representation不匹配均
+fail closed。empty/no-overlap/不足最小步数只产生显式bootstrap outcome，不伪造prefix。下一批只接
+跨层data/artifact contract与兼容迁移，不直接在`robot_motion`内接canonical-to-model-space encoder；仍不接
+target/reference/safety/dispatch。
+
+#### 4.6.2 model-RTC 跨层契约与迁移计划（2026-07-26 冻结）
+
+model-RTC必须把“同一语义”与“同一owner”分开：训练、在线计划和模型调用共享versioned identity，但各层只实现自己
+拥有的转换或生命周期。首阶段不修改原始v2.3/v2.4 parquet、episode、media、collection、replay、HITL或ControlTrace。
+
+| 契约/行为 | canonical owner | 明确不负责 |
+|---|---|---|
+| producer cadence、generation/execution timeline、old-plan overlap slice、canonical conditioning bundle、bootstrap、epoch/plan identity | `robot_motion.deploy.rtc` | model tensor、dataset sample、sampler、loss、target |
+| continuation mode、training source kind、runtime source role、mask/loss语义、支持的delay/prefix范围、codec/layout/frame/normalization binding | `dataset_contracts` pure schema | projection、runtime state、模型调用、持久化owner |
+| episode/window→artifact-action training prefix/target/mask view、teacher/recorded source provenance | `dataset_interface` | normalization、framework tensor、learner、runtime plan、episode writer |
+| injected codec编排、capability negotiation、model envelope、encoding/consumption receipt validation | `deployments.client` | model-specific数值codec、plan advancement、worker ownership、target/safety/dispatch |
+| OpenPI/其它模型的artifact-bound双向codec、normalization、输入字段、loaded-instance capability、continuation sampler和transport | `deployments/<model>/client`或对应模型工程 | 通用RTC调度、dataset schema、robot execution |
+| optimizer、loss、noise/corruption schedule、训练loop | future `model/`或仓库外模型工程 | deployment runtime、motion authority |
+
+首个pure data contract暂定`ModelContinuationDataContractV1`，至少冻结：
+
+```text
+schema/version
+continuation mode + conditioning representation
+prediction horizon
+supported forecast-delay/prefix range
+prefix-mask semantics
+target-valid/pad mask semantics
+loss-mask semantics
+training prefix source kinds
+runtime prefix source roles
+component/action pose/discrete support
+action codec + layout + frame + normalization hashes
+training projection implementation/parameters hash
+```
+
+该contract不得包含runtime request、producer epoch、plan id、target receipt或motion authority。它通过optional
+artifact field及hash绑定checkpoint/server；旧artifact缺失该字段时只能声明`continuation=none`，解析和raw-RTC hash/
+行为保持兼容。
+
+首个派生训练view至少区分：
+
+```text
+trajectory_overlap_teacher_v1
+  从同一示教轨迹构造理想prefix，只证明训练projection
+
+recorded_policy_output_v1
+  来自有exact model-output/codec lineage的历史policy chunk
+
+synthetic_corruption_v1
+  可选、由明确参数hash约束的训练扰动
+```
+
+普通future action target不得自动标记为`recorded_policy_output_v1`。训练sample分别携带conditioning prefix/mask、
+full target chunk、target-valid/pad mask和loss mask；conditioned位置是否参与loss由contract声明，禁止用一个`mask`
+同时表达padding、conditioning和loss。动态runtime latency不能被单一checkpoint白名单固定；artifact声明支持范围，
+训练projection记录实际采样delay，runtime request选择值必须落在该范围内。上述三项是training provenance；
+在线首批只接受独立的runtime source role `producer_local_overlap_v1`。artifact可分别声明训练覆盖与runtime支持，
+但不得用training source identity伪造plan/epoch lineage。
+
+数值转换只允许一条语义真值链：
+
+```text
+dataset_interface
+  canonical dataset rows -> artifact-action training view
+                         （不做model normalization/framework tensor）
+
+model/provider supplied bidirectional codec
+  artifact-action/canonical action <-> exact model space
+  bound by codec/layout/frame/normalization/implementation hashes
+
+deployments.client
+  只注入调用该codec并验证hash/round-trip/receipt，不猜转换
+```
+
+训练工程与deployment provider应复用同一codec实现；若跨仓无法共享代码，必须通过同一golden fixture、contract hash及
+双向round-trip conformance证明数值等价。不得让`dataset_interface`导入`deployments`，也不得让`deployments`为了
+复用训练pipeline而取得dataset reader/window ownership。
+
+现有实现的渐进归位如下：
+
+| 当前符号 | 目标 |
+|---|---|
+| `RtcProducerProfile`、`RtcContinuationTimeline`、`RtcPlanContinuationSlice/Outcome` | 保留在`robot_motion.deploy.rtc` |
+| `PolicyInferencePrefix`中的model-space ndarray | 旧路径仅保留兼容导出/构造语义；新canonical conditioning bundle由`robot_motion.deploy.rtc`组合已有typed timeline/slice/context/data-contract identity |
+| `RtcContinuationEncodingReceipt` | 旧receipt保持兼容；新的model-space encoding/consumption receipt及校验进入`deployments.client` |
+| `RtcContinuationCapability`、`RtcProtocolRequestSpec`、`RtcInferenceEnvelopeV2`、`RtcConditioningReceiptV2` | 新canonical protocol owner迁入`deployments.client`；旧`robot_motion.deploy.rtc_protocol`按characterization保持兼容，禁止bulk move |
+| `PolicyInferenceRequest` | 保留scheduler/causal request；model payload逐步改为versioned pure binding，不在`robot_motion`实现codec |
+
+依赖方向禁止`robot_motion`导入`deployments`，因此旧v2 protocol不能通过反向import成为新实现shim。MRTC-R1/C1采用：
+
+```text
+robot_motion
+  frozen v1/v2 compatibility request/protocol
+  + additive canonical conditioning bundle
+  + causal binding（request hash domain v3；只含bundle hash，不含model ndarray）
+
+deployments.client
+  model-RTC envelope v3
+  = causal request + encoded model prefix/mask + artifact/capability binding
+
+upper-layer parity adapter
+  只做旧fixture/兼容映射，不成为第二个producer或plan owner
+```
+
+旧class/hash domain保持冻结；新v3使用新type和hash domain，不能让两个同名实现并行演化。raw-RTC继续使用现有
+`PolicyInferenceRequest`/`continuation=none`路径。model-RTC切到v3后，`robot_motion`只验证binding hash与result
+回显，不解析model-space内容。
+
+迁移批次与exit gate：
+
+1. **MRTC-ORG0（本文档，完成）：**冻结上述owner、依赖方向和“不改raw dataset/控制链”范围。
+2. **MRTC-D1 pure data/artifact contract（完成）：**已新增
+   `ModelContinuationDataContract`，冻结continuation mode、delay/prefix range、continuous prefix、training/runtime
+   source role、prefix/padding/loss mask语义及artifact identity；`PolicyArtifactContract`采用optional/default-none
+   binding。旧OpenPI raw-RTC artifact hash有固定golden，当前D1定向兼容回归157项通过；未增加raw dataset字段、
+   runtime/model import或控制权。
+   **MRTC-D1b（完成）：**冻结v1序列化/hash不变，将其只在内存中规范化为`legacy_v1_compat`；新增v2
+   `inference_only_projection_v1`（`training=null`）与`trained_prefix_conditioning_v1`（training required）。
+   artifact/wire始终绑定source contract hash，legacy origin不能写入新v2。D2对inference-only fail closed，generic
+   conditioning和OpenPI同时接受v1/v2 source contract；相关定向回归96项通过。
+   **MRTC-B1/B2（完成）：**OpenPI conditioned backend只从base artifact读取source contract并拒绝missing/mismatch；
+   capability由artifact runtime、loaded codec与server loaded-instance metadata交集形成。模型声明versioned sampler
+   算法描述，`Policy`绑定实际sampling参数，server绑定external/internal dims与horizon并生成provider capability hash；
+   call-site receipt独立回传该hash、implementation identity和sampler constraint。客户端envelope/context回显不再充当
+   provider assertion。missing/tampered/drift负例、跨仓portable golden及default-off legacy旁路均已覆盖。
+3. **MRTC-D2 offline projection（完成）：**已新增确定性
+   `ModelContinuationTrainingSample`及episode-local projection；首批只支持continuous absolute
+   `trajectory_overlap_teacher_v1`，显式接收delay/prefix而不在data layer引入sampler。prefix、target-padding、loss
+   mask独立；episode tail必须保留真实executable suffix；relative、discrete、NaN/Inf、错误binding及无typed lineage的
+   recorded-policy/synthetic source均fail closed。D1+D2定向测试24项、RTC/artifact兼容回归168项、dataset-interface
+   相关回归121项通过；未修改raw dataset、writer、normalization、framework tensor或runtime。
+4. **MRTC-R1 runtime decoupling（R1a完成，R1b随C1）：**现有timeline/selector及旧
+   `PolicyInferencePrefix`/v2 envelope保持冻结；`PolicyInferenceRequest`已增加optional
+   `conditioning_binding_hash`，使新model-RTC causal request无需携带model-space ndarray。新binding与旧prefix互斥，
+   raw-RTC禁止携带，并使用独立v3 request hash domain；raw request、旧prefix、旧flow request三个固定golden未变，
+   runtime/protocol/plan回归78项通过。canonical bundle、encoder及v3 envelope归后续C1；其中bundle由
+   `robot_motion.deploy.rtc`持有，model-space encoder/envelope归`deployments.client`。D1/D2/R1a合并后的RTC相关回归
+   321项通过（loopback测试需绕过环境HTTP代理）。
+5. **MRTC-C1 generic online conditioning（C1a-f本地闭环已实现）：**
+   `robot_motion.deploy.rtc`已组合immutable canonical bundle并随work item传递；只有bound work item走typed executor，
+   raw/legacy executor与hash domain保持原样。`deployments.client`已有injected bidirectional codec、full-horizon
+   prefix/mask、v3 capability/envelope、encoding/consumption receipt、full-output验证后exact-once delay crop，以及
+   `PolicyChunkResult`/plan-merge binding校验。external/internal transform ownership、portable array hash、provider-transform
+   fake、tamper rejection与frontend explicit bootstrap均已覆盖，不启动target。P0 hardening进一步将该crop命名为
+   `generation_prefix_crop`并与plan-owned `admission_obsolete_filter`分离，显式投影generation/conditioning/selected/
+   executable-candidate四种horizon；`clamped_v1`在client crop前逐row精确回验，conditioned executor在frontend构造期
+   检查`execute_work_item()`。sampler receipt/plan admission均不得推进execution commitment，mask仍由selected indices
+   与schedule唯一表达，不增加重复schema字段。P0 protocol cleanup进一步冻结旧v2 model-space prefix与pre-C1
+   `RtcContinuationEncodingReceipt`：raw/final-chunk的canonical v2用法仅为`continuation=none`，新conditioned接入只走
+   causal binding与deployments-owned v3；C1 bundle/runtime在构造期拒绝非`flow_inpaint`contract，work-item executor
+   使用包含legacy callable面的专用typed protocol。结构收敛后，v3 evidence bundle只由envelope持有capability与
+   encoded conditioning，bundle访问器不再保存第二份可漂移对象；OpenPI runtime config也不再复制artifact-bound
+   continuation contract。通用纯校验函数统一artifact/runtime、codec、sampler、bootstrap与selected schedule绑定，
+   provider边界仍保持fail closed。
+6. **MRTC-P1 provider接入（OpenPI additive接线与B1/B2证据闭环完成，真实模型sampler shadow待执行）：**OpenPI provider按loaded instance的metadata
+   声明external/internal dims与bootstrap，DexTeleop `rtc_conditioned.py`复用既有transport、prepared observation和typed
+   decoder；server内继续执行normalize/pad，并在真实sampler调用后产生双prefix receipt。普通payload仍走旧`infer()`，
+   `serve_policy.py`与实际DexTeleop入口`serve_dexteleop_policy.py`均由
+   `--enable-rtc-continuation`显式开启新路径，不使用model/checkpoint/config白名单。远端provider/wire单元测试
+   15项及Pi0纯projection测试2项通过；本地跨层契约123项、扩大RTC/OpenPI/VLA迁移回归290项通过。已只读加载真实
+   checkpoint并导出loaded-instance capability，但尚未调用其conditioned sampler，也未完成真实observation shadow。
+7. **MRTC-S1 shadow（S1a artifact binding、S1b0本地coordinator、S1b1 direct GPU sampler及S1b2 wire/frontend shadow完成）：**
+   `deployments.openpi.client.rtc_artifact_binding`已能将原artifact、真实loaded-instance provider capability与显式
+   delay/prefix范围收敛为v2 `inference_only_projection_v1` artifact及可重放receipt；不修改source artifact，也不使用
+   model/checkpoint/config白名单。`0712-wrist-cube@92599`只读加载得到的capability已形成仓内派生artifact与receipt，
+   source/bound artifact、provider、codec/layout/frame/normalization和continuation hash均可离线重放。
+   `RtcConditionedModelRuntimeAdapterV3`及`build_rtc_conditioned_model_shadow_frontend_v3()`现已将v3 backend直接接入
+   既有bounded worker/timed plan；不经过raw/v2 capability降格。fake provider闭环已验证worker线程不阻塞control
+   loop、首轮bootstrap result进入唯一plan并正式emission、后续request从同一plan取得canonical overlap prefix，
+   同时保持`send_actions=false`、lookahead disabled和production queue pop为0。聚焦兼容矩阵120项通过。
+   `0712-wrist-cube@92599`真实JAX policy又以合成双腕图像/16D state直接完成一次bootstrap和一次三帧hard-prefix
+   `infer_rtc()`：两次输出均为finite `50x16`；第二次receipt确认消费generation indices `[0,1,2]`，最终external
+   output对应三帧与输入prefix最大绝对误差为0。该证据只证明loaded sampler数值路径，不包含server-level provider
+   assertions、DexTeleop envelope、timed-plan admission或control-loop时序。
+   S1b2已通过localhost OpenPI wire把同一loaded provider接入v3 frontend：首轮bootstrap request的forecast delay为2，
+   第二轮动态升至16并从唯一旧计划选择generation indices `[0..14]`；两轮server consumption receipt、v3 response和
+   plan admission均通过，分别接纳27帧。30 Hz control budget为33.33 ms，观测到的最大step为13.88 ms；27次正式
+   emission、legacy queue pop为0、无late rejection，且`send_actions=false`/lookahead disabled。该实跑同时暴露并关闭
+   三个通用缺口：worker校验先normalize v2 continuation wrapper、conditioned re-request coverage默认绑定contract
+   maximum delay、已有plan时generation start锚定下一枚尚未pop的keyframe而非任意control-tick相位。
+   下一步才进入真实observation input-only shadow，仍不接target或讨论motion效果。scoped evidence见
+   `todos/evidence/rtc/mrtc_s1b1_openpi_gpu_conditioned_sampler_synthetic_evidence_v1.json`及
+   `todos/evidence/rtc/mrtc_s1b2_openpi_gpu_wire_frontend_shadow_evidence_v1.json`。
+   **MRTC-H1 debug/lease hardening（完成）：**复用既有`--debug + --rtc-debug-level`和bounded observer，不新增
+   RTC debug状态机。默认不注入observer；已有应用gated callback在debug off时也必须在payload构造前返回，因此不计算
+   masked-output误差、不累计额外计数或保存bundle；
+   显式debug才从已验证的envelope/response/receipt惰性投影bootstrap/conditioned mode、
+   generation/conditioning/selected/encoded/consumed/executable计数、source-plan binding、latency及masked-output误差。
+   raw/model-RTC共用一个debug payload dispatch入口，所有记录均为`debug_only`、`non_authoritative`且无action-send
+   authority。lease测试覆盖in-flight期间cursor推进后的obsolete filter、epoch rotation late-result拒绝，以及debug
+   开关不改变conditioned result hash。
+
+现有OpenPI checkpoint是普通full-chunk flow训练、RTC为推理期hard inpainting，因此其新binding必须使用
+`inference_only_projection_v1`且`training=null`。只有未来有真实prefix-conditioned训练证据的artifact才可使用
+`trained_prefix_conditioning_v1`；v1 `legacy_v1_compat`不自动证明任一来源。
+
+RTC-4b-B provider工作在MRTC-D1/D2/R1/C1通过前暂停扩大。任何批次均不得：
+
+- 修改teleop/replay/collection/HITL/control_composition或创建第二个source/plan/worker owner；
+- 将teacher prefix称为真实old plan，或从decoded action反推缺失的model-output provenance；
+- 让dataset projection、debug observer或model receipt取得target/reference/safety/dispatch authority；
+- 以model-RTC需求反向改变raw-RTC `continuation=none`或`sync_queue_v1`默认行为；
+- 在尚无learner工作时提前创建`model/` runtime entrypoint。
 
 ### 4.7 表示 gate
 
@@ -2509,9 +2718,10 @@ fixture决定 contract：
      end-effector target链；
    - 不修改sim observation实现，不走direct arm qpos shortcut，不让`sim`反向依赖`teleop_runtime`。
 8. **R-M1 optional model-RTC**
-   - absolute model-space prefix与relative new-anchor re-encode分开验收；
-   - 只有typed preview/downstream acceptance、encode/decode round-trip、conditioning receipt和identity promotion
-     齐备后才接；
+   - 先完成MRTC-D1/D2/R1/C1，再分别验收absolute model-space prefix与relative new-anchor re-encode；
+   - producer-local overlap只需要plan lineage、encode/decode round-trip和conditioning receipt，不要求target
+     preview/downstream acceptance；
+   - downstream-accepted hard prefix与position lookahead仍是独立D-LA gate，不进入首个model-RTC producer；
    - 该批失败不回退或降级R-A1/R-R1 raw-RTC。
 
 R-A0/R-A0b/R-A0c/R-A0d的pure/local seam已冻结。进入真实native profile前仍须为具体gripper/hand确认units、bounds、
@@ -2528,7 +2738,7 @@ representation lineage消费与anchor lifecycle evidence。R-S1开始前唯一�
 - sim observation、MuJoCo→Real adapter或sim2real并行目录；
 - teleop、collection或replay链；
 - PolicyGraph/M7C；
-- dataset schema/lockfile（除非后续实际需求另行批准）。
+- raw dataset磁盘schema、collection writer或lockfile（additive derived-view/pure contract按MRTC-D1/D2单独验收）。
 
 ## 16. 参考与证据
 

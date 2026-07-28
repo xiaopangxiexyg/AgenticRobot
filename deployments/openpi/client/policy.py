@@ -169,8 +169,6 @@ class OpenPIClientPolicyConfig:
         object.__setattr__(self, "policy_artifact", artifact)
         if artifact is not None:
             object.__setattr__(self, "deploy_schema_version", artifact.deploy_schema_version)
-            object.__setattr__(self, "expected_model_id", artifact.model_id)
-            object.__setattr__(self, "expected_checkpoint_step", artifact.checkpoint_step)
             object.__setattr__(self, "action_key", artifact.action_key)
             object.__setattr__(self, "action_discrete_key", artifact.action_discrete_key)
         object.__setattr__(self, "action_dim", action_dim)

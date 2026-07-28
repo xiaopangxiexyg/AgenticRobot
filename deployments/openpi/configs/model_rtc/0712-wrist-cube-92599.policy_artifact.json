@@ -1,0 +1,304 @@
+{
+  "camera_input": {
+    "color_space": "rgb",
+    "dtype": "uint8",
+    "inputs": [
+      {
+        "model_input_key": "observation.images.left_wrist",
+        "server_camera_slot": "left_wrist_0_rgb",
+        "source_key": "left_wrist"
+      },
+      {
+        "model_input_key": "observation.images.right_wrist",
+        "server_camera_slot": "right_wrist_0_rgb",
+        "source_key": "right_wrist"
+      }
+    ],
+    "layout": "HWC",
+    "required": true
+  },
+  "checkpoint_step": 92599,
+  "dataset_schema": "dexteleop_dataset_v2.2",
+  "deploy_schema_version": "dexteleop_deploy_v2",
+  "inputs": {
+    "state": {
+      "dim": 16,
+      "dtype": "float32",
+      "key": "state"
+    },
+    "state_discrete": {
+      "dim": 0,
+      "dtype": "int64",
+      "key": "state_discrete"
+    }
+  },
+  "metadata": {
+    "continuous_only": true,
+    "openpi_internal_action_dim": 32
+  },
+  "model_continuation_data_contract": {
+    "conditioning_origin": "inference_only_projection_v1",
+    "runtime": {
+      "action_codec_hash": "f51db1e1889272158c20a89d4e865416d1a106e340d634eac38828e6f878d4b9",
+      "component_scope": [
+        "left.arm.pose",
+        "left.end_effector.target",
+        "right.arm.pose",
+        "right.end_effector.target"
+      ],
+      "conditioning_representation": "continuous_model_action_prefix_v1",
+      "continuation_implementation_id": "openpi.pi0.hard-flow-prefix.v1",
+      "continuation_implementation_parameters_hash": "sha256:1ce2fe7611b0a15fad0f340e21ac7f1bca4a8ed958f96956b9d271485d0fba64",
+      "continuation_mode": "flow_inpaint",
+      "frame_contract_hash": "2806625bbe44739327e5c64b4465ac87bdcf92d79af31a8553a3c54cadf735d7",
+      "layout_hash": "sha256:a94b05fd5e94eaa0d431af726009ba7113ea8e8b774edf45d42f591e80690e89",
+      "maximum_forecast_delay_steps": 16,
+      "maximum_prefix_steps": 16,
+      "minimum_forecast_delay_steps": 1,
+      "minimum_prefix_steps": 0,
+      "model_action_dim": 16,
+      "model_action_discrete_dim": 0,
+      "normalization_hash": "7da40f2c0af1034c06f1dcb6532a55f6946caee523a1d317b3ee1271517b11cc",
+      "prediction_horizon_steps": 50,
+      "prefix_mask_semantics": "float_weight_per_generation_step_v1",
+      "runtime_prefix_source_roles": [
+        "producer_local_overlap_v1"
+      ],
+      "sampler_constraints": [
+        "clamped_v1"
+      ],
+      "schema": "dexteleop_model_continuation_runtime_v2",
+      "supported_action_pose_modes": [
+        "absolute"
+      ],
+      "supports_unconditioned_bootstrap": true,
+      "target_padding_mask_semantics": "true_is_padding_per_generation_step_v1"
+    },
+    "schema": "dexteleop_model_continuation_data_v2",
+    "training": null
+  },
+  "model_continuation_data_contract_hash": "sha256:9b60d7fed3a4fc5e4cd4e5f9e5bbda06b8d4148dfbf0fe7787105f3a3fc988f3",
+  "model_id": "0712-wrist-cube",
+  "outputs": {
+    "actions": {
+      "dim": 16,
+      "dtype": "float32",
+      "key": "actions"
+    },
+    "actions_discrete": {
+      "dim": 0,
+      "dtype": "int64",
+      "key": "actions_discrete"
+    }
+  },
+  "policy_io_layout": {
+    "arm": {
+      "action_dim": 14,
+      "controlled_frame_by_side": {
+        "left": "tool_tcp",
+        "right": "tool_tcp"
+      },
+      "observation_pose_dim": 14,
+      "pose_representation": "xyz_quat_xyzw",
+      "qpos_audit_dim": 12,
+      "reference_frame_by_side": {
+        "left": "left_arm_base",
+        "right": "right_arm_base"
+      }
+    },
+    "end_effectors": {
+      "left": {
+        "adapter": "dmtac_gripper_v1",
+        "metadata": {
+          "legacy_q6_command_space": "normalized_0_1"
+        },
+        "side": "left",
+        "state": {
+          "dim": 1,
+          "legacy_q6_slot_indices": [
+            0
+          ],
+          "names": [
+            "gripper_close"
+          ],
+          "normalization": {},
+          "source_indices": [
+            0
+          ],
+          "tokens": [],
+          "units": "normalized_0_1",
+          "value_type": "continuous"
+        },
+        "state_source_field": "joint_pos",
+        "target": {
+          "dim": 1,
+          "legacy_q6_slot_indices": [
+            0
+          ],
+          "names": [
+            "gripper_close"
+          ],
+          "normalization": {},
+          "source_indices": [
+            0
+          ],
+          "tokens": [],
+          "units": "normalized_0_1",
+          "value_type": "continuous"
+        }
+      },
+      "right": {
+        "adapter": "dmtac_gripper_v1",
+        "metadata": {
+          "legacy_q6_command_space": "normalized_0_1"
+        },
+        "side": "right",
+        "state": {
+          "dim": 1,
+          "legacy_q6_slot_indices": [
+            0
+          ],
+          "names": [
+            "gripper_close"
+          ],
+          "normalization": {},
+          "source_indices": [
+            0
+          ],
+          "tokens": [],
+          "units": "normalized_0_1",
+          "value_type": "continuous"
+        },
+        "state_source_field": "joint_pos",
+        "target": {
+          "dim": 1,
+          "legacy_q6_slot_indices": [
+            0
+          ],
+          "names": [
+            "gripper_close"
+          ],
+          "normalization": {},
+          "source_indices": [
+            0
+          ],
+          "tokens": [],
+          "units": "normalized_0_1",
+          "value_type": "continuous"
+        }
+      }
+    },
+    "metadata": {
+      "conversion_basis": "All sorted 2026-07 datasets use DM-Tac grippers; slot 0 is the only active legacy q6 slot.",
+      "conversion_policy": "Preserve historical scalar values exactly; do not clip or rescale.",
+      "source_value_range": "normalized_0_1"
+    },
+    "model": {
+      "action": {
+        "continuous_components": [
+          {
+            "dim": 7,
+            "name": "left.arm.pose",
+            "offset": 0,
+            "side": "left",
+            "stop": 7,
+            "value_type": "continuous"
+          },
+          {
+            "dim": 7,
+            "name": "right.arm.pose",
+            "offset": 7,
+            "side": "right",
+            "stop": 14,
+            "value_type": "continuous"
+          },
+          {
+            "dim": 1,
+            "name": "left.end_effector.target",
+            "offset": 14,
+            "side": "left",
+            "stop": 15,
+            "value_type": "continuous"
+          },
+          {
+            "dim": 1,
+            "name": "right.end_effector.target",
+            "offset": 15,
+            "side": "right",
+            "stop": 16,
+            "value_type": "continuous"
+          }
+        ],
+        "continuous_dim": 16,
+        "discrete_components": [],
+        "discrete_dim": 0
+      },
+      "observation_state": {
+        "continuous_components": [
+          {
+            "dim": 7,
+            "name": "left.arm.pose",
+            "offset": 0,
+            "side": "left",
+            "stop": 7,
+            "value_type": "continuous"
+          },
+          {
+            "dim": 7,
+            "name": "right.arm.pose",
+            "offset": 7,
+            "side": "right",
+            "stop": 14,
+            "value_type": "continuous"
+          },
+          {
+            "dim": 1,
+            "name": "left.end_effector.state",
+            "offset": 14,
+            "side": "left",
+            "stop": 15,
+            "value_type": "continuous"
+          },
+          {
+            "dim": 1,
+            "name": "right.end_effector.state",
+            "offset": 15,
+            "side": "right",
+            "stop": 16,
+            "value_type": "continuous"
+          }
+        ],
+        "continuous_dim": 16,
+        "discrete_components": [],
+        "discrete_dim": 0
+      }
+    },
+    "name": "dual_arm_bimanual_dmtac_gripper",
+    "schema": "dexteleop_policy_io_layout_v2.2"
+  },
+  "policy_io_layout_hash": "sha256:a94b05fd5e94eaa0d431af726009ba7113ea8e8b774edf45d42f591e80690e89",
+  "schema": "dexteleop_policy_artifact_v1",
+  "source_datasets": [
+    "/home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success"
+  ],
+  "state_augmentation": {
+    "dropout": {
+      "formula": "state_aug=(state_norm+noise)*mask",
+      "granularity": "whole_state",
+      "probability": 0.0
+    },
+    "enabled": true,
+    "excluded": [
+      "action",
+      "observation.state.discrete",
+      "observation.arm.qpos"
+    ],
+    "normalized_noise": {
+      "distribution": "normal",
+      "mean": 0.0,
+      "per_element": true,
+      "std": 0.02
+    }
+  },
+  "state_input_mode": "raw_state_v1"
+}

@@ -10,6 +10,10 @@ from typing import Callable
 
 from dataset_contracts.control_trace import ControlTraceFact
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
+from robot_motion.action.component_action import (
+    ActionPayloadSchema,
+    ComponentActionSchema,
+)
 from robot_motion.action.proposal import robot_action_semantic_payload
 from control_composition.activation import CompositionActivationScope
 from control_composition.events import (
@@ -18,6 +22,7 @@ from control_composition.events import (
     CompositionSourceEligibilityBinding,
 )
 from control_composition.information import CompositionInformationPlan
+from control_composition.temporal import CompositionTemporalSelectionSpec
 from control_composition.eligibility import (
     CompositionSourceEligibilityAdmissionReceipt,
     CompositionSourceEligibilitySnapshot,
@@ -33,12 +38,17 @@ from control_composition.composition import (
     CompositionInputAdmissionReceipt,
     CompositionInputRecord,
     CompositionInputSnapshot,
-    CompositionResult,
+    CompositionEvaluation,
     CompositionSpec,
     FormalCompositionStrategyInput,
     FormalCompositionStrategyResultBinding,
     FormalCompositionStrategySpec,
     FormalComponentCompositionBinding,
+    CompositionDynamicParameterContract,
+    CompositionDynamicParameterRecord,
+    CompositionDynamicParameterSnapshot,
+    CompositionStrategyControlBinding,
+    CompositionStrategyRevision,
     composition_input_semantic_payload,
     CompositionContextAdmissionReceipt,
     CompositionContextRecord,
@@ -465,6 +475,10 @@ def project_composition_spec(
             "algebra": spec.algebra,
             "input_roles": spec.input_roles,
             "required_roles": spec.required_roles,
+            "participation_requirement_by_role": (
+                spec.participation_requirement_by_role
+            ),
+            "depends_on_roles_by_role": spec.depends_on_roles_by_role,
             "missing_required_behavior": spec.missing_required_behavior,
             "missing_residual_behavior": spec.missing_residual_behavior,
             "residual_limit_by_component": spec.residual_limit_by_component,
@@ -476,8 +490,59 @@ def project_composition_spec(
                 spec.max_rotation_disagreement_rad
             ),
             "pose_component_dependencies": spec.pose_component_dependencies,
+            "component_rule_set_hash": spec.component_rule_set_hash,
+            "action_schema_hash": spec.action_schema_hash,
+            "input_action_schema_hash_by_role": (
+                spec.input_action_schema_hash_by_role
+            ),
             "semantic_content_hash": spec.semantic_content_hash,
         },
+    )
+
+
+def project_action_payload_schema(
+    context: AuthoritativeTraceContext,
+    schema: ActionPayloadSchema,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    """Publish one complete immutable payload-schema definition."""
+
+    if not isinstance(schema, ActionPayloadSchema):
+        raise TypeError("schema must be an ActionPayloadSchema.")
+    return context.fact(
+        fact_id=f"action-payload-schema:{schema.semantic_content_hash}",
+        event_type="action_payload_schema",
+        occurred_at=float(occurred_at),
+        payload=schema.semantic_payload(),
+    )
+
+
+def project_component_action_schema(
+    context: AuthoritativeTraceContext,
+    schema: ComponentActionSchema,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    """Publish one action schema plus its complete topology definition."""
+
+    if not isinstance(schema, ComponentActionSchema):
+        raise TypeError("schema must be a ComponentActionSchema.")
+    catalog = schema.component_catalog
+    payload = schema.semantic_payload()
+    payload["component_catalog"] = {
+        "catalog_id": catalog.catalog_id,
+        "catalog_version": catalog.catalog_version,
+        "components": tuple(
+            component.semantic_payload()
+            for component in catalog.components
+        ),
+    }
+    return context.fact(
+        fact_id=f"component-action-schema:{schema.semantic_content_hash}",
+        event_type="component_action_schema",
+        occurred_at=float(occurred_at),
+        payload=payload,
     )
 
 
@@ -580,6 +645,181 @@ def project_formal_composition_strategy_spec(
     )
 
 
+def project_composition_dynamic_parameter_contract(
+    context: AuthoritativeTraceContext,
+    contract: CompositionDynamicParameterContract,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    if not isinstance(contract, CompositionDynamicParameterContract):
+        raise TypeError(
+            "contract must be a CompositionDynamicParameterContract."
+        )
+    return context.fact(
+        fact_id=(
+            "composition-dynamic-parameter-contract:"
+            f"{contract.semantic_content_hash}"
+        ),
+        event_type="composition_dynamic_parameter_contract",
+        occurred_at=float(occurred_at),
+        payload={
+            "parameter_set_id": contract.parameter_set_id,
+            "parameter_semantics": "component_base_overlay_alpha_v1",
+            "base_role": contract.base_role,
+            "overlay_role": contract.overlay_role,
+            "component_ids": contract.component_ids,
+            "default_alpha_by_component": (
+                contract.default_alpha_by_component
+            ),
+            "lifecycle": contract.lifecycle,
+            "semantic_content_hash": contract.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_strategy_revision(
+    context: AuthoritativeTraceContext,
+    revision: CompositionStrategyRevision,
+) -> ControlTraceFact:
+    if not isinstance(revision, CompositionStrategyRevision):
+        raise TypeError("revision must be a CompositionStrategyRevision.")
+    contract = revision.dynamic_parameter_contract
+    return context.fact(
+        fact_id=revision.revision_id,
+        event_type="composition_strategy_revision",
+        occurred_at=revision.available_at,
+        payload={
+            "revision_id": revision.revision_id,
+            "runtime_session_id": revision.runtime_session_id,
+            "control_domain_id": revision.control_domain_id,
+            "strategy_instance_id": revision.strategy_instance_id,
+            "revision_sequence": revision.revision_sequence,
+            "previous_revision_hash": revision.previous_revision_hash,
+            "request_id": revision.request_id,
+            "strategy_mode": revision.strategy_mode,
+            "composition_spec_hash": (
+                revision.composition_spec.semantic_content_hash
+            ),
+            "strategy_spec_hash": revision.strategy_spec.semantic_content_hash,
+            "component_rule_set_hash": (
+                revision.component_rule_set.semantic_content_hash
+            ),
+            "dynamic_parameter_contract_hash": (
+                None if contract is None else contract.semantic_content_hash
+            ),
+            "initial_alpha_by_component": (
+                revision.initial_alpha_by_component
+            ),
+            "available_at": revision.available_at,
+            "available_clock_domain_id": (
+                revision.available_clock_domain_id
+            ),
+            "control_admission_sequence": (
+                revision.control_admission_sequence
+            ),
+            "semantic_content_hash": revision.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_dynamic_parameter(
+    context: AuthoritativeTraceContext,
+    record: CompositionDynamicParameterRecord,
+) -> ControlTraceFact:
+    if not isinstance(record, CompositionDynamicParameterRecord):
+        raise TypeError(
+            "record must be a CompositionDynamicParameterRecord."
+        )
+    return context.fact(
+        fact_id=record.parameter_record_id,
+        event_type="composition_dynamic_parameter",
+        occurred_at=record.available_at,
+        payload={
+            "parameter_record_id": record.parameter_record_id,
+            "runtime_session_id": record.runtime_session_id,
+            "control_domain_id": record.control_domain_id,
+            "producer_id": record.producer_id,
+            "producer_generation": record.producer_generation,
+            "sequence": record.sequence,
+            "strategy_revision_hash": record.strategy_revision_hash,
+            "parameter_contract_hash": record.parameter_contract_hash,
+            "alpha_by_component": record.alpha_by_component,
+            "produced_at": record.produced_at,
+            "produced_clock_domain_id": record.produced_clock_domain_id,
+            "available_at": record.available_at,
+            "available_clock_domain_id": record.available_clock_domain_id,
+            "effective_from": record.effective_from,
+            "effective_until": record.effective_until,
+            "effective_clock_domain_id": record.effective_clock_domain_id,
+            "control_admission_sequence": record.control_admission_sequence,
+            "semantic_content_hash": record.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_dynamic_parameter_snapshot(
+    context: AuthoritativeTraceContext,
+    snapshot: CompositionDynamicParameterSnapshot,
+) -> ControlTraceFact:
+    if not isinstance(snapshot, CompositionDynamicParameterSnapshot):
+        raise TypeError(
+            "snapshot must be a CompositionDynamicParameterSnapshot."
+        )
+    return context.fact(
+        fact_id=snapshot.parameter_snapshot_id,
+        event_type="composition_dynamic_parameter_snapshot",
+        occurred_at=snapshot.cutoff_at,
+        payload={
+            "parameter_snapshot_id": snapshot.parameter_snapshot_id,
+            "strategy_revision_hash": snapshot.strategy_revision_hash,
+            "parameter_contract_hash": snapshot.parameter_contract_hash,
+            "control_domain_id": snapshot.control_domain_id,
+            "cutoff_at": snapshot.cutoff_at,
+            "cutoff_admission_sequence": (
+                snapshot.cutoff_admission_sequence
+            ),
+            "target_effective_at": snapshot.target_effective_at,
+            "selected_parameter_record_id": (
+                snapshot.selected_parameter_record_id
+            ),
+            "selected_parameter_record_hash": (
+                snapshot.selected_parameter_record_hash
+            ),
+            "alpha_by_component": snapshot.alpha_by_component,
+            "semantic_content_hash": snapshot.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_strategy_control_binding(
+    context: AuthoritativeTraceContext,
+    binding: CompositionStrategyControlBinding,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    if not isinstance(binding, CompositionStrategyControlBinding):
+        raise TypeError(
+            "binding must be a CompositionStrategyControlBinding."
+        )
+    return context.fact(
+        fact_id=binding.binding_id,
+        event_type="composition_strategy_control_binding",
+        occurred_at=float(occurred_at),
+        payload={
+            "binding_id": binding.binding_id,
+            "strategy_revision_id": binding.revision.revision_id,
+            "strategy_revision_hash": binding.revision.semantic_content_hash,
+            "parameter_snapshot_id": (
+                binding.parameter_snapshot.parameter_snapshot_id
+            ),
+            "parameter_snapshot_hash": (
+                binding.parameter_snapshot.semantic_content_hash
+            ),
+            "semantic_content_hash": binding.semantic_content_hash,
+        },
+    )
+
+
 def project_formal_composition_strategy_input(
     context: AuthoritativeTraceContext,
     strategy_input: FormalCompositionStrategyInput,
@@ -632,6 +872,64 @@ def project_formal_composition_strategy_input(
     )
 
 
+def project_hot_composition_strategy_input(
+    context: AuthoritativeTraceContext,
+    strategy_input: FormalCompositionStrategyInput,
+) -> ControlTraceFact:
+    if strategy_input.strategy_control_binding_id is None:
+        raise ValueError(
+            "Hot strategy input requires a strategy-control binding."
+        )
+    context_snapshot = strategy_input.context_snapshot
+    information_plan = strategy_input.information_plan
+    return context.fact(
+        fact_id=strategy_input.strategy_input_id,
+        event_type="hot_composition_strategy_input",
+        occurred_at=strategy_input.input_snapshot.cutoff_at,
+        payload={
+            "strategy_input_id": strategy_input.strategy_input_id,
+            "runtime_session_id": strategy_input.runtime_session_id,
+            "control_domain_id": strategy_input.control_domain_id,
+            "clock_domain_id": strategy_input.clock_domain_id,
+            "strategy_id": strategy_input.strategy_spec.strategy_id,
+            "strategy_spec_hash": (
+                strategy_input.strategy_spec.semantic_content_hash
+            ),
+            "composition_spec_hash": (
+                strategy_input.composition_spec.semantic_content_hash
+            ),
+            "composition_input_snapshot_id": (
+                strategy_input.input_snapshot.composition_input_snapshot_id
+            ),
+            "composition_input_snapshot_hash": (
+                strategy_input.input_snapshot.semantic_content_hash
+            ),
+            "context_snapshot_id": (
+                None
+                if context_snapshot is None
+                else context_snapshot.context_snapshot_id
+            ),
+            "context_snapshot_hash": (
+                None
+                if context_snapshot is None
+                else context_snapshot.semantic_content_hash
+            ),
+            "information_plan_hash": (
+                None
+                if information_plan is None
+                else information_plan.semantic_content_hash
+            ),
+            "strategy_control_binding_id": (
+                strategy_input.strategy_control_binding_id
+            ),
+            "strategy_control_binding_hash": (
+                strategy_input.strategy_control_binding_hash
+            ),
+            "semantic_content_hash": strategy_input.semantic_content_hash,
+        },
+    )
+
+
 def project_formal_composition_strategy_result_binding(
     context: AuthoritativeTraceContext,
     binding: FormalCompositionStrategyResultBinding,
@@ -650,8 +948,8 @@ def project_formal_composition_strategy_result_binding(
             "binding_id": binding.binding_id,
             "strategy_input_id": binding.strategy_input_id,
             "strategy_input_hash": binding.strategy_input_hash,
-            "composition_result_id": binding.composition_result_id,
-            "composition_result_hash": binding.composition_result_hash,
+            "composition_evaluation_id": binding.composition_evaluation_id,
+            "composition_evaluation_hash": binding.composition_evaluation_hash,
             "semantic_content_hash": binding.semantic_content_hash,
         },
     )
@@ -668,6 +966,14 @@ def project_composition_input_snapshot(
         "cutoff_admission_sequence": snapshot.cutoff_admission_sequence,
         "target_effective_at": snapshot.target_effective_at,
         "composition_spec_hash": snapshot.composition_spec_hash,
+        "action_schema_hash": snapshot.action_schema_hash,
+        "input_action_schema_hash_by_role": (
+            snapshot.input_action_schema_hash_by_role
+        ),
+        "target_clock_domain_id": snapshot.target_clock_domain_id,
+        "temporal_selection_spec_hash": (
+            snapshot.temporal_selection_spec_hash
+        ),
         "selected_input_ids_by_role": {
             role: record.composition_input_id
             for role, record in snapshot.selected_input_by_role.items()
@@ -676,6 +982,22 @@ def project_composition_input_snapshot(
             role: record.semantic_content_hash
             for role, record in snapshot.selected_input_by_role.items()
         },
+        "selected_input_ids_before_dependency_by_role": {
+            role: record.composition_input_id
+            for role, record in (
+                snapshot.selected_input_before_dependency_by_role.items()
+            )
+        },
+        "selected_input_hashes_before_dependency_by_role": {
+            role: record.semantic_content_hash
+            for role, record in (
+                snapshot.selected_input_before_dependency_by_role.items()
+            )
+        },
+        "dependency_ineligibility_reason_by_role": (
+            snapshot.dependency_ineligibility_reason_by_role
+        ),
+        "required_roles": snapshot.required_roles,
         "missing_roles": snapshot.missing_roles,
         "producer_epoch_snapshot_hash": snapshot.producer_epoch_snapshot_hash,
         "semantic_content_hash": snapshot.semantic_content_hash,
@@ -688,33 +1010,70 @@ def project_composition_input_snapshot(
     )
 
 
-def project_composition_result(
+def project_composition_temporal_selection_spec(
     context: AuthoritativeTraceContext,
-    result: CompositionResult,
+    spec: CompositionTemporalSelectionSpec,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    if not isinstance(spec, CompositionTemporalSelectionSpec):
+        raise TypeError(
+            "spec must be a CompositionTemporalSelectionSpec."
+        )
+    return context.fact(
+        fact_id=(
+            "composition-temporal-selection-spec:"
+            f"{spec.semantic_content_hash}"
+        ),
+        event_type="composition_temporal_selection_spec",
+        occurred_at=float(occurred_at),
+        payload={
+            "spec_id": spec.spec_id,
+            "selection": "same_target_effective_interval_cover",
+            "overlap_behavior": spec.overlap_behavior,
+            "maximum_target_lead_sec": spec.maximum_target_lead_sec,
+            "maximum_target_lag_sec": spec.maximum_target_lag_sec,
+            "action_timestamp_semantics": (
+                spec.action_timestamp_semantics
+            ),
+            "semantic_content_hash": spec.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_evaluation(
+    context: AuthoritativeTraceContext,
+    result: CompositionEvaluation,
     *,
     occurred_at: float,
 ) -> ControlTraceFact:
     payload = {
-        "composition_result_id": result.composition_result_id,
+        "composition_evaluation_id": result.composition_evaluation_id,
         "composition_input_snapshot_id": result.composition_input_snapshot_id,
         "composition_input_snapshot_hash": result.composition_input_snapshot_hash,
         "composition_spec_hash": result.composition_spec_hash,
+        "action_schema_hash": result.action_schema_hash,
+        "target_effective_at": result.target_effective_at,
+        "target_clock_domain_id": result.target_clock_domain_id,
         "output_status": result.output_status,
         "reason": result.reason,
-        "composed_action": (
+        "composed_candidate": (
             None
-            if result.composed_action is None
-            else robot_action_semantic_payload(result.composed_action)
+            if result.composed_candidate is None
+            else result.composed_candidate.semantic_payload()
         ),
-        "composed_action_hash": result.composed_action_hash,
+        "composed_candidate_hash": result.composed_candidate_hash,
         "input_ids": result.input_ids,
         "input_hashes": result.input_hashes,
         "context_ids": result.context_ids,
+        "composition_supported_until": (
+            result.composition_supported_until
+        ),
         "semantic_content_hash": result.semantic_content_hash,
     }
     return context.fact(
-        fact_id=result.composition_result_id,
-        event_type="composition_result",
+        fact_id=result.composition_evaluation_id,
+        event_type="composition_evaluation",
         occurred_at=occurred_at,
         payload=payload,
     )
@@ -800,6 +1159,8 @@ def project_composition_information_plan(
                     ),
                     "payload_access": item.payload_access,
                     "maximum_age_sec": item.maximum_age_sec,
+                    "binding_mode": item.binding_mode,
+                    "bound_input_roles": item.bound_input_roles,
                 }
                 for item in plan.context_requirements
             ),
@@ -847,8 +1208,8 @@ def project_composition_authority_disposition(
         payload={
             "disposition_id": disposition.disposition_id,
             "gate_spec_hash": disposition.gate_spec_hash,
-            "composition_result_id": disposition.composition_result_id,
-            "composition_result_hash": disposition.composition_result_hash,
+            "composition_evaluation_id": disposition.composition_evaluation_id,
+            "composition_evaluation_hash": disposition.composition_evaluation_hash,
             "action": disposition.action,
             "reason": disposition.reason,
             "missing_roles": disposition.missing_roles,
@@ -869,8 +1230,8 @@ def project_source_difference_observation(
             "observation_id": observation.observation_id,
             "composition_input_snapshot_id": observation.composition_input_snapshot_id,
             "composition_input_snapshot_hash": observation.composition_input_snapshot_hash,
-            "composition_result_id": observation.composition_result_id,
-            "composition_result_hash": observation.composition_result_hash,
+            "composition_evaluation_id": observation.composition_evaluation_id,
+            "composition_evaluation_hash": observation.composition_evaluation_hash,
             "composition_spec_hash": observation.composition_spec_hash,
             "source_difference_spec_hash": observation.source_difference_spec_hash,
             "target_effective_at": observation.target_effective_at,
@@ -1048,6 +1409,12 @@ def project_composition_domain_event(
             subject,
             occurred_at=event.occurred_at,
         )
+    if kind == "composition_temporal_selection_spec":
+        return project_composition_temporal_selection_spec(
+            context,
+            subject,
+            occurred_at=event.occurred_at,
+        )
     if kind == "composition_context_admission":
         return project_composition_context_admission(
             context,
@@ -1097,6 +1464,18 @@ def project_composition_domain_event(
             subject,
             occurred_at=event.occurred_at,
         )
+    if kind == "action_payload_schema":
+        return project_action_payload_schema(
+            context,
+            subject,
+            occurred_at=event.occurred_at,
+        )
+    if kind == "component_action_schema":
+        return project_component_action_schema(
+            context,
+            subject,
+            occurred_at=event.occurred_at,
+        )
     if kind == "component_composition_rule_set":
         return project_component_composition_rule_set(
             context,
@@ -1117,13 +1496,36 @@ def project_composition_domain_event(
             subject,
             occurred_at=event.occurred_at,
         )
+    if kind == "composition_dynamic_parameter_contract":
+        return project_composition_dynamic_parameter_contract(
+            context,
+            subject,
+            occurred_at=event.occurred_at,
+        )
+    if kind == "composition_strategy_revision":
+        return project_composition_strategy_revision(context, subject)
+    if kind == "composition_dynamic_parameter":
+        return project_composition_dynamic_parameter(context, subject)
+    if kind == "composition_dynamic_parameter_snapshot":
+        return project_composition_dynamic_parameter_snapshot(
+            context,
+            subject,
+        )
+    if kind == "composition_strategy_control_binding":
+        return project_composition_strategy_control_binding(
+            context,
+            subject,
+            occurred_at=event.occurred_at,
+        )
     if kind == "formal_composition_strategy_input":
         return project_formal_composition_strategy_input(
             context,
             subject,
         )
-    if kind == "composition_result":
-        return project_composition_result(
+    if kind == "hot_composition_strategy_input":
+        return project_hot_composition_strategy_input(context, subject)
+    if kind == "composition_evaluation":
+        return project_composition_evaluation(
             context,
             subject,
             occurred_at=event.occurred_at,
@@ -1187,11 +1589,19 @@ __all__ = [
     "project_composition_context",
     "project_composition_context_admission",
     "project_composition_context_snapshot",
+    "project_action_payload_schema",
+    "project_component_action_schema",
     "project_component_composition_rule_set",
+    "project_composition_dynamic_parameter",
+    "project_composition_dynamic_parameter_contract",
+    "project_composition_dynamic_parameter_snapshot",
+    "project_composition_strategy_control_binding",
+    "project_composition_strategy_revision",
     "project_formal_component_composition_binding",
     "project_composition_domain_event",
     "project_composition_information_plan",
     "project_formal_composition_strategy_input",
+    "project_hot_composition_strategy_input",
     "project_formal_composition_strategy_result_binding",
     "project_formal_composition_strategy_spec",
     "project_composition_source_eligibility_admission",
@@ -1209,7 +1619,8 @@ __all__ = [
     "project_composition_input",
     "project_composition_input_admission",
     "project_composition_input_snapshot",
-    "project_composition_result",
+    "project_composition_temporal_selection_spec",
+    "project_composition_evaluation",
     "project_guidance_feedback_command",
     "project_guidance_feedback_receipt",
     "project_source_difference_observation",

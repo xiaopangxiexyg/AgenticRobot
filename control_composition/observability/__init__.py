@@ -10,6 +10,7 @@ from .difference import (
     SourceDifferenceObservation,
     SourceDifferenceSpec,
     action_difference_semantic_payload,
+    evaluate_composition_input_differences,
     evaluate_composition_source_differences,
 )
 from .feedback import (
@@ -24,6 +25,28 @@ from .feedback import (
     NoIoGuidanceFeedbackAdapter,
     build_guidance_feedback_command,
 )
+from .modules import (
+    DIFFERENCE_MODULE_COMPOSITION_IMMEDIATE,
+    DIFFERENCE_MODULE_POST_COMPOSITION_EXECUTION,
+    DIFFERENCE_OBSERVATION_ENVELOPE_HASH_DOMAIN,
+    DIFFERENCE_OBSERVATION_STATUSES,
+    DIFFERENCE_RECEIPT_REFERENCE_HASH_DOMAIN,
+    CompositionImmediateDifferenceObserver,
+    DifferenceObservationEnvelope,
+    DifferenceReceiptReference,
+    DisabledCompositionImmediateDifferenceObserver,
+    DisabledPostCompositionExecutionDifferenceObserver,
+    PostCompositionExecutionDifferenceObserver,
+    SourceDifferenceImmediateObserver,
+    SourceToComposedDifferenceObserver,
+    validate_difference_observation_lineage,
+)
+from .execution_difference import (
+    MEASUREMENT_REFERENCE_ASSOCIATION_HASH_DOMAIN,
+    MEASUREMENT_REFERENCE_ASSOCIATION_STATUSES,
+    MeasurementReferenceAssociation,
+    associate_measurement_to_reference,
+)
 
 __all__ = [
     "SOURCE_DIFFERENCE_OBSERVATION_HASH_DOMAIN_V1",
@@ -33,6 +56,7 @@ __all__ = [
     "SourceDifferenceObservation",
     "SourceDifferenceSpec",
     "action_difference_semantic_payload",
+    "evaluate_composition_input_differences",
     "evaluate_composition_source_differences",
     "GUIDANCE_FEEDBACK_COMMAND_HASH_DOMAIN_V1",
     "GUIDANCE_FEEDBACK_RECEIPT_HASH_DOMAIN_V1",
@@ -44,4 +68,22 @@ __all__ = [
     "GuidanceFeedbackSpec",
     "NoIoGuidanceFeedbackAdapter",
     "build_guidance_feedback_command",
+    "DIFFERENCE_MODULE_COMPOSITION_IMMEDIATE",
+    "DIFFERENCE_MODULE_POST_COMPOSITION_EXECUTION",
+    "DIFFERENCE_OBSERVATION_ENVELOPE_HASH_DOMAIN",
+    "DIFFERENCE_OBSERVATION_STATUSES",
+    "DIFFERENCE_RECEIPT_REFERENCE_HASH_DOMAIN",
+    "CompositionImmediateDifferenceObserver",
+    "DifferenceObservationEnvelope",
+    "DifferenceReceiptReference",
+    "DisabledCompositionImmediateDifferenceObserver",
+    "DisabledPostCompositionExecutionDifferenceObserver",
+    "PostCompositionExecutionDifferenceObserver",
+    "SourceDifferenceImmediateObserver",
+    "SourceToComposedDifferenceObserver",
+    "validate_difference_observation_lineage",
+    "MEASUREMENT_REFERENCE_ASSOCIATION_HASH_DOMAIN",
+    "MEASUREMENT_REFERENCE_ASSOCIATION_STATUSES",
+    "MeasurementReferenceAssociation",
+    "associate_measurement_to_reference",
 ]

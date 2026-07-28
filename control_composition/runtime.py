@@ -10,6 +10,8 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Mapping
 
 from control_composition.activation import CompositionActivationScope
 from control_composition.events import (
@@ -21,6 +23,7 @@ from control_composition.information import (
     CompositionContextRequirement,
     CompositionInformationPlan,
 )
+from control_composition.temporal import CompositionTemporalSelectionSpec
 from control_composition.eligibility import (
     CompositionSourceEligibilityAdmissionReceipt,
     CompositionSourceEligibilityDraft,
@@ -37,13 +40,13 @@ from control_composition.ports import (
     CompositionEventEmitter,
     CompositionProposalAdmitter,
 )
-from robot_motion.action.components import ActionComponentCatalog
+from robot_motion.action.component_action import ComponentActionSchema
 from control_composition.composition import (
     CompositionInputAdmissionReceipt,
     CompositionInputDraft,
     CompositionInputSnapshot,
     CompositionInputStore,
-    CompositionResult,
+    CompositionEvaluation,
     CompositionSpec,
     CompositionStrategyDecision,
     DeterministicComposer,
@@ -51,14 +54,24 @@ from control_composition.composition import (
     FormalCompositionStrategyInput,
     FormalCompositionStrategyResultBinding,
     FormalCompositionStrategySpec,
-    build_blocked_composition_result,
+    build_blocked_composition_evaluation,
     build_composite_action_proposal_draft,
-    build_formal_strategy_composition_result,
+    build_formal_strategy_composition_evaluation,
     build_formal_strategy_result_binding,
     CompositionContextAdmissionReceipt,
     CompositionContextDraft,
     CompositionContextSnapshot,
     CompositionContextStore,
+    CompositionPreMixPolicy,
+    CompositionPreMixPolicyDecision,
+    CompositionPreMixPolicyInput,
+    CompositionPreMixPolicySpec,
+    CompositionDynamicParameterAdmissionReceipt,
+    CompositionDynamicParameterDraft,
+    CompositionStrategyControl,
+    CompositionStrategyControlBinding,
+    CompositionStrategyRevisionAdmissionReceipt,
+    CompositionStrategyRevisionDraft,
 )
 from robot_motion.action.proposal import ProposalAdmissionReceipt
 from control_composition.composition.component_contract import (
@@ -85,7 +98,7 @@ from control_composition.retention import TimeWindowRetentionSpec
 @dataclass(frozen=True)
 class CompositeProposalSubmission:
     input_snapshot: CompositionInputSnapshot
-    composition_result: CompositionResult
+    composition_evaluation: CompositionEvaluation
     proposal_admission: ProposalAdmissionReceipt | None
     context_snapshot: CompositionContextSnapshot | None = None
     source_difference_observation: SourceDifferenceObservation | None = None
@@ -110,6 +123,51 @@ class CompositeProposalSubmission:
         return self.evaluation_record.domain_events_emitted
 
 
+def _composition_supported_until(
+    *,
+    input_snapshot: CompositionInputSnapshot,
+    context_snapshot: CompositionContextSnapshot | None,
+    source_eligibility_snapshot: (
+        CompositionSourceEligibilitySnapshot | None
+    ),
+    information_plan: CompositionInformationPlan | None,
+) -> float | None:
+    """Return the earliest known end of support for this exact cut."""
+
+    limits = [
+        record.effective_until
+        for record in input_snapshot.selected_input_by_role.values()
+    ]
+    if source_eligibility_snapshot is not None:
+        limits.extend(
+            source_eligibility_snapshot.selected_state_by_role[
+                role
+            ].lease_expires_at
+            for role in input_snapshot.selected_input_by_role
+            if (
+                role
+                in source_eligibility_snapshot.selected_state_by_role
+            )
+        )
+    if context_snapshot is not None:
+        limits.extend(
+            record.effective_until
+            for record in context_snapshot.selected_context_by_channel.values()
+        )
+        if information_plan is not None:
+            for requirement in information_plan.context_requirements:
+                if requirement.maximum_age_sec is None:
+                    continue
+                record = context_snapshot.selected_context_by_channel.get(
+                    requirement.channel
+                )
+                if record is not None:
+                    limits.append(
+                        record.produced_at + requirement.maximum_age_sec
+                    )
+    return None if not limits else min(float(value) for value in limits)
+
+
 class ControlCompositionRuntime:
     """Context/composition owner that can only publish proposal drafts."""
 
@@ -121,14 +179,20 @@ class ControlCompositionRuntime:
         embodiment_instance_id: str,
         coordinator: ControlAdmissionCoordinator,
         producer_epochs: ProducerEpochRegistry,
-        component_catalog: ActionComponentCatalog,
+        action_schema: ComponentActionSchema,
+        input_action_schema_by_role: Mapping[
+            str, ComponentActionSchema
+        ] | None = None,
         event_emitter: CompositionEventEmitter,
         proposal_admitter: CompositionProposalAdmitter,
         context_retention_spec: TimeWindowRetentionSpec,
         composition_input_retention_spec: TimeWindowRetentionSpec,
         source_eligibility_retention_spec: TimeWindowRetentionSpec | None = None,
+        temporal_selection_spec: CompositionTemporalSelectionSpec | None = None,
         information_plan: CompositionInformationPlan | None = None,
         composition_strategy: FormalCompositionStrategy | None = None,
+        strategy_control: CompositionStrategyControl | None = None,
+        pre_mix_policy: CompositionPreMixPolicy | None = None,
         clock: CompositionClock = time.monotonic,
     ) -> None:
         if coordinator.control_domain_id != control_domain_id:
@@ -165,16 +229,100 @@ class ControlCompositionRuntime:
                     "Formal strategy channels must match the runtime "
                     "CompositionInformationPlan."
                 )
+        if strategy_control is not None:
+            if composition_strategy is None:
+                raise ValueError(
+                    "strategy_control requires a formal composition strategy."
+                )
+            if not isinstance(
+                strategy_control,
+                CompositionStrategyControl,
+            ):
+                raise TypeError(
+                    "strategy_control must be a CompositionStrategyControl."
+                )
+            if (
+                strategy_control.runtime_session_id != runtime_session_id
+                or strategy_control.control_domain_id != control_domain_id
+                or strategy_control.coordinator is not coordinator
+                or strategy_control.producer_epochs is not producer_epochs
+            ):
+                raise ValueError(
+                    "strategy_control must share this runtime receiver."
+                )
+            initial_revision = strategy_control.latest_revision
+            if (
+                initial_revision.strategy_spec != composition_strategy.spec
+                or initial_revision.composition_spec.semantic_content_hash
+                != composition_strategy.spec.composition_spec_hash
+            ):
+                raise ValueError(
+                    "strategy_control initial revision must bind the installed "
+                    "formal strategy."
+                )
+        if pre_mix_policy is not None:
+            policy_spec = getattr(pre_mix_policy, "spec", None)
+            if not isinstance(policy_spec, CompositionPreMixPolicySpec):
+                raise TypeError(
+                    "pre_mix_policy must expose a "
+                    "CompositionPreMixPolicySpec."
+                )
+            if policy_spec.maximum_decision_latency_sec is None:
+                raise ValueError(
+                    "A synchronous pre_mix_policy must declare "
+                    "maximum_decision_latency_sec."
+                )
+            if not callable(getattr(pre_mix_policy, "decide", None)):
+                raise TypeError("pre_mix_policy must implement decide().")
+        if temporal_selection_spec is not None and not isinstance(
+            temporal_selection_spec,
+            CompositionTemporalSelectionSpec,
+        ):
+            raise TypeError(
+                "temporal_selection_spec must be a "
+                "CompositionTemporalSelectionSpec or None."
+            )
         self.runtime_session_id = runtime_session_id
         self.control_domain_id = control_domain_id
         self.embodiment_instance_id = embodiment_instance_id
         self.coordinator = coordinator
         self.producer_epochs = producer_epochs
-        self.component_catalog = component_catalog
+        if not isinstance(action_schema, ComponentActionSchema):
+            raise TypeError("action_schema must be a ComponentActionSchema.")
+        self.action_schema = action_schema
+        input_schemas = dict(input_action_schema_by_role or {})
+        if any(
+            not isinstance(schema, ComponentActionSchema)
+            for schema in input_schemas.values()
+        ):
+            raise TypeError(
+                "input_action_schema_by_role values must be "
+                "ComponentActionSchema."
+            )
+        self.input_action_schema_by_role = MappingProxyType(input_schemas)
         self.event_emitter = event_emitter
         self.proposal_admitter = proposal_admitter
         self._information_plan = information_plan
         self.composition_strategy = composition_strategy
+        self.strategy_control = strategy_control
+        self.pre_mix_policy = pre_mix_policy
+        self.temporal_selection_spec = (
+            temporal_selection_spec
+            if temporal_selection_spec is not None
+            else CompositionTemporalSelectionSpec(
+                spec_id=(
+                    "runtime-bounded-same-target:"
+                    f"{composition_input_retention_spec.spec_id}"
+                ),
+                maximum_target_lead_sec=(
+                    composition_input_retention_spec.max_future_lead_sec
+                    + composition_input_retention_spec.max_effective_duration_sec
+                ),
+                maximum_target_lag_sec=(
+                    composition_input_retention_spec.history_window_sec
+                ),
+            )
+        )
         self.clock = clock
         self.contexts = CompositionContextStore(
             runtime_session_id=runtime_session_id,
@@ -187,6 +335,8 @@ class ControlCompositionRuntime:
             coordinator=coordinator,
             producer_epochs=producer_epochs,
             retention_spec=composition_input_retention_spec,
+            action_schema=action_schema,
+            input_action_schema_by_role=self.input_action_schema_by_role,
         )
         self.source_eligibility = (
             None
@@ -203,15 +353,30 @@ class ControlCompositionRuntime:
         self._composition_promotion_lock = threading.RLock()
         self._event_spec_lock = threading.RLock()
         self._emitted_composition_spec_hashes: set[str] = set()
+        self._emitted_action_payload_schema_hashes: set[str] = set()
+        self._emitted_component_action_schema_hashes: set[str] = set()
         self._emitted_source_eligibility_spec_hashes: set[str] = set()
         self._emitted_source_difference_spec_hashes: set[str] = set()
         self._emitted_formal_strategy_spec_hashes: set[str] = set()
         self._emitted_component_rule_set_hashes: set[str] = set()
         self._emitted_formal_component_binding_hashes: set[str] = set()
+        self._emitted_strategy_revision_hashes: set[str] = set()
+        self._emitted_dynamic_parameter_contract_hashes: set[str] = set()
         self._information_plan_emitted = False
-        self._proposal_admission_by_composition_result_id: dict[
+        self._temporal_selection_spec_emitted = False
+        self._proposal_admission_by_composition_evaluation_id: dict[
             str,
-            tuple[str, int, ProposalAdmissionReceipt],
+            tuple[
+                str,
+                int,
+                int,
+                float,
+                str | None,
+                ProposalAdmissionReceipt,
+            ],
+        ] = {}
+        self._accepted_publication_target_by_scope: dict[
+            tuple[str, int, str], float
         ] = {}
 
     def _emit(self, *events: CompositionDomainEvent) -> None:
@@ -222,6 +387,116 @@ class ControlCompositionRuntime:
         """Return the immutable runtime-bound demand plan, if configured."""
 
         return self._information_plan
+
+    def admit_strategy_revision(
+        self,
+        draft: CompositionStrategyRevisionDraft,
+    ) -> CompositionStrategyRevisionAdmissionReceipt:
+        """Admit one complete low-frequency revision without mutating strategy."""
+
+        if self.strategy_control is None:
+            raise RuntimeError("This runtime has no strategy hot-control path.")
+        receipt = self.strategy_control.admit_revision(draft)
+        if receipt.revision is not None:
+            revision = receipt.revision
+            contract = revision.dynamic_parameter_contract
+            with self._event_spec_lock:
+                events: list[CompositionDomainEvent] = []
+                if (
+                    contract is not None
+                    and contract.semantic_content_hash
+                    not in self._emitted_dynamic_parameter_contract_hashes
+                ):
+                    events.append(
+                        CompositionDomainEvent(
+                            event_kind=(
+                                "composition_dynamic_parameter_contract"
+                            ),
+                            subject=contract,
+                            occurred_at=revision.available_at,
+                        )
+                    )
+                if (
+                    revision.semantic_content_hash
+                    not in self._emitted_strategy_revision_hashes
+                ):
+                    events.append(
+                        CompositionDomainEvent(
+                            event_kind="composition_strategy_revision",
+                            subject=revision,
+                            occurred_at=revision.available_at,
+                        )
+                    )
+                if events:
+                    self._emit(*events)
+                if contract is not None:
+                    self._emitted_dynamic_parameter_contract_hashes.add(
+                        contract.semantic_content_hash
+                    )
+                self._emitted_strategy_revision_hashes.add(
+                    revision.semantic_content_hash
+                )
+        return receipt
+
+    def admit_dynamic_parameters(
+        self,
+        draft: CompositionDynamicParameterDraft,
+    ) -> CompositionDynamicParameterAdmissionReceipt:
+        """Admit one high-frequency complete alpha vector."""
+
+        if self.strategy_control is None:
+            raise RuntimeError("This runtime has no strategy hot-control path.")
+        receipt = self.strategy_control.admit_parameter(draft)
+        if receipt.parameter_record is not None:
+            record = receipt.parameter_record
+            revision = self.strategy_control.revision_by_hash(
+                record.strategy_revision_hash
+            )
+            assert revision is not None
+            contract = revision.dynamic_parameter_contract
+            with self._event_spec_lock:
+                events: list[CompositionDomainEvent] = []
+                if (
+                    contract is not None
+                    and contract.semantic_content_hash
+                    not in self._emitted_dynamic_parameter_contract_hashes
+                ):
+                    events.append(
+                        CompositionDomainEvent(
+                            event_kind=(
+                                "composition_dynamic_parameter_contract"
+                            ),
+                            subject=contract,
+                            occurred_at=record.available_at,
+                        )
+                    )
+                if (
+                    revision.semantic_content_hash
+                    not in self._emitted_strategy_revision_hashes
+                ):
+                    events.append(
+                        CompositionDomainEvent(
+                            event_kind="composition_strategy_revision",
+                            subject=revision,
+                            occurred_at=record.available_at,
+                        )
+                    )
+                events.append(
+                    CompositionDomainEvent(
+                        event_kind="composition_dynamic_parameter",
+                        subject=record,
+                        occurred_at=record.available_at,
+                    )
+                )
+                self._emit(*events)
+                if contract is not None:
+                    self._emitted_dynamic_parameter_contract_hashes.add(
+                        contract.semantic_content_hash
+                    )
+                self._emitted_strategy_revision_hashes.add(
+                    revision.semantic_content_hash
+                )
+        return receipt
 
     def _information_plan_event(
         self,
@@ -506,8 +781,6 @@ class ControlCompositionRuntime:
         producer_epoch: int,
         sequence: int,
         effective_until: float,
-        component_coverage: tuple[str, ...],
-        selection_groups: tuple[str, ...],
         policy_node_id: str | None = None,
         required_context_channels: tuple[str, ...] = (),
         cutoff_at: float | None = None,
@@ -525,8 +798,8 @@ class ControlCompositionRuntime:
             source_eligibility_spec=source_eligibility_spec,
         )
         if (
-            evaluation.composition_result.output_status != "ready"
-            or evaluation.composition_result.composed_action is None
+            evaluation.composition_evaluation.output_status != "ready"
+            or evaluation.composition_evaluation.composed_candidate is None
         ):
             return evaluation
         return self.admit_evaluated_composition(
@@ -536,9 +809,7 @@ class ControlCompositionRuntime:
             producer_epoch=producer_epoch,
             sequence=sequence,
             effective_until=float(effective_until),
-            component_coverage=component_coverage,
-            selection_groups=selection_groups,
-            policy_node_id=policy_node_id,
+                policy_node_id=policy_node_id,
         )
 
     def admit_evaluated_composition(
@@ -550,8 +821,6 @@ class ControlCompositionRuntime:
         producer_epoch: int,
         sequence: int,
         effective_until: float,
-        component_coverage: tuple[str, ...],
-        selection_groups: tuple[str, ...],
         policy_node_id: str | None = None,
     ) -> CompositeProposalSubmission:
         """Promote one exact ready result at most once.
@@ -566,9 +835,19 @@ class ControlCompositionRuntime:
             raise ValueError("Composition promotion belongs to another session.")
         if evaluation.proposal_admission is not None:
             raise ValueError("Composition evaluation was already promoted.")
-        result = evaluation.composition_result
-        if result.output_status != "ready" or result.composed_action is None:
+        result = evaluation.composition_evaluation
+        if result.output_status != "ready" or result.composed_candidate is None:
             raise ValueError("Only a ready composition evaluation may be promoted.")
+        missing_required = tuple(
+            role
+            for role in evaluation.input_snapshot.required_roles
+            if role not in evaluation.input_snapshot.selected_input_by_role
+        )
+        if missing_required:
+            raise ValueError(
+                "A composition with missing required roles cannot be promoted: "
+                f"{missing_required!r}."
+            )
         if (
             result.composition_input_snapshot_id
             != evaluation.input_snapshot.composition_input_snapshot_id
@@ -576,18 +855,38 @@ class ControlCompositionRuntime:
             != evaluation.input_snapshot.semantic_content_hash
         ):
             raise ValueError("Composition result does not match its input snapshot.")
+        normalized_epoch = int(producer_epoch)
+        normalized_sequence = int(sequence)
+        normalized_until = float(effective_until)
+        activation_id = result.composition_activation_id or "unscoped"
+        publication_scope = (
+            str(producer_id),
+            normalized_epoch,
+            activation_id,
+        )
         with self._composition_promotion_lock:
-            cached = self._proposal_admission_by_composition_result_id.get(
-                result.composition_result_id
+            cached = self._proposal_admission_by_composition_evaluation_id.get(
+                result.composition_evaluation_id
             )
             if cached is not None:
-                cached_producer, cached_epoch, receipt = cached
+                (
+                    cached_producer,
+                    cached_epoch,
+                    cached_sequence,
+                    cached_until,
+                    cached_policy_node_id,
+                    receipt,
+                ) = cached
                 if (
                     cached_producer != producer_id
-                    or cached_epoch != int(producer_epoch)
+                    or cached_epoch != normalized_epoch
+                    or cached_sequence != normalized_sequence
+                    or cached_until != normalized_until
+                    or cached_policy_node_id != policy_node_id
                 ):
                     raise ValueError(
-                        "Composition result was already promoted by another producer."
+                        "Composition result promotion retry changed its "
+                        "publication envelope."
                     )
                 return CompositeProposalSubmission(
                     evaluation.input_snapshot,
@@ -599,38 +898,64 @@ class ControlCompositionRuntime:
                     evaluation.evaluation_record,
                     evaluation.source_eligibility_snapshot,
                 )
+            last_target = self._accepted_publication_target_by_scope.get(
+                publication_scope
+            )
+            if (
+                last_target is not None
+                and result.target_effective_at <= last_target
+            ):
+                raise ValueError(
+                    "Production composition targets must increase strictly "
+                    "within one producer activation."
+                )
+            produced_at = float(self.clock())
+            if (
+                result.composition_supported_until is None
+                or produced_at >= result.composition_supported_until
+            ):
+                raise ValueError(
+                    "Composition support expired before proposal publication."
+                )
             draft = build_composite_action_proposal_draft(
                 result,
                 runtime_session_id=self.runtime_session_id,
                 control_domain_id=self.control_domain_id,
                 embodiment_instance_id=self.embodiment_instance_id,
                 producer_id=producer_id,
-                producer_epoch=producer_epoch,
-                sequence=sequence,
-                produced_at=float(self.clock()),
+                producer_epoch=normalized_epoch,
+                sequence=normalized_sequence,
+                produced_at=produced_at,
                 produced_clock_domain_id=(
                     self.coordinator.clock_domain.clock_domain_id
                 ),
                 effective_from=float(
                     evaluation.input_snapshot.target_effective_at
                 ),
-                effective_until=float(effective_until),
+                effective_until=normalized_until,
                 effective_clock_domain_id=(
                     self.coordinator.clock_domain.clock_domain_id
                 ),
-                component_schema_hash=self.component_catalog.semantic_content_hash,
-                component_coverage=component_coverage,
-                selection_groups=selection_groups,
                 policy_node_id=policy_node_id,
             )
             receipt = self.proposal_admitter(
                 draft,
-                source_event_id=result.composition_result_id,
+                source_event_id=result.composition_evaluation_id,
             )
             if receipt.accepted:
-                self._proposal_admission_by_composition_result_id[
-                    result.composition_result_id
-                ] = (producer_id, int(producer_epoch), receipt)
+                self._proposal_admission_by_composition_evaluation_id[
+                    result.composition_evaluation_id
+                ] = (
+                    producer_id,
+                    normalized_epoch,
+                    normalized_sequence,
+                    normalized_until,
+                    policy_node_id,
+                    receipt,
+                )
+                self._accepted_publication_target_by_scope[
+                    publication_scope
+                ] = result.target_effective_at
             return CompositeProposalSubmission(
                 evaluation.input_snapshot,
                 result,
@@ -641,6 +966,45 @@ class ControlCompositionRuntime:
                 evaluation.evaluation_record,
                 evaluation.source_eligibility_snapshot,
             )
+
+    def evaluate_hot_composition(
+        self,
+        *,
+        target_effective_at: float,
+        required_context_channels: tuple[str, ...] = (),
+        cutoff_at: float | None = None,
+        control_cut: ControlCut | None = None,
+        source_difference_spec: SourceDifferenceSpec | None = None,
+        activation_scope: CompositionActivationScope | None = None,
+        source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+    ) -> CompositeProposalSubmission:
+        """Evaluate one cut using its exact admitted revision and parameters."""
+
+        if self.strategy_control is None:
+            raise RuntimeError("This runtime has no strategy hot-control path.")
+        if control_cut is not None and cutoff_at is not None:
+            raise ValueError("Provide control_cut or cutoff_at, not both.")
+        if control_cut is None:
+            timestamp = float(self.clock() if cutoff_at is None else cutoff_at)
+            cut = self.coordinator.capture_cut(cutoff_at=timestamp).cut
+        else:
+            cut = control_cut
+        producer_epochs = self.producer_epochs.snapshot(cut)
+        binding = self.strategy_control.capture_binding(
+            cut,
+            producer_epochs=producer_epochs,
+            target_effective_at=target_effective_at,
+        )
+        return self.evaluate_composition(
+            spec=binding.revision.composition_spec,
+            target_effective_at=target_effective_at,
+            required_context_channels=required_context_channels,
+            control_cut=cut,
+            source_difference_spec=source_difference_spec,
+            activation_scope=activation_scope,
+            source_eligibility_spec=source_eligibility_spec,
+            _strategy_control_binding=binding,
+        )
 
     def evaluate_composition(
         self,
@@ -653,9 +1017,41 @@ class ControlCompositionRuntime:
         source_difference_spec: SourceDifferenceSpec | None = None,
         activation_scope: CompositionActivationScope | None = None,
         source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+        _strategy_control_binding: CompositionStrategyControlBinding | None = None,
     ) -> CompositeProposalSubmission:
         """Evaluate and observe one composition cut without publishing a proposal."""
 
+        if spec.action_schema_hash is not None and (
+            spec.action_schema_hash
+            != self.action_schema.semantic_content_hash
+        ):
+            raise ValueError(
+                "CompositionSpec must bind the runtime ComponentActionSchema."
+            )
+        if spec.input_action_schema_hash_by_role:
+            installed_hashes = {
+                role: schema.semantic_content_hash
+                for role, schema in self.input_action_schema_by_role.items()
+            }
+            if (
+                installed_hashes
+                != dict(spec.input_action_schema_hash_by_role)
+            ):
+                raise ValueError(
+                    "CompositionSpec role-specific input schemas do not match "
+                    "the runtime."
+                )
+        if _strategy_control_binding is not None:
+            if self.strategy_control is None:
+                raise ValueError(
+                    "A strategy-control binding requires an enabled controller."
+                )
+            if (
+                _strategy_control_binding.revision.composition_spec != spec
+            ):
+                raise ValueError(
+                    "Strategy-control binding uses another CompositionSpec."
+                )
         if source_difference_spec is not None and not isinstance(
             source_difference_spec,
             SourceDifferenceSpec,
@@ -701,13 +1097,23 @@ class ControlCompositionRuntime:
                 raise ValueError(
                     "source_difference_spec must match CompositionInformationPlan."
                 )
+        debug_diagnostics_enabled = (
+            self.information_plan is None
+            or self.information_plan.diagnostic_level == "debug"
+        )
         strategy = self.composition_strategy
+        active_strategy_spec: FormalCompositionStrategySpec | None = None
         component_rule_set: ComponentCompositionRuleSet | None = None
         formal_component_binding: (
             FormalComponentCompositionBinding | None
         ) = None
         if strategy is not None:
-            strategy_spec = strategy.spec
+            strategy_spec = (
+                strategy.spec
+                if _strategy_control_binding is None
+                else _strategy_control_binding.revision.strategy_spec
+            )
+            active_strategy_spec = strategy_spec
             if strategy_spec.composition_spec_hash != spec.semantic_content_hash:
                 raise ValueError(
                     "Formal strategy is bound to another CompositionSpec."
@@ -746,6 +1152,10 @@ class ControlCompositionRuntime:
                     "component_rule_set",
                     None,
                 )
+                if _strategy_control_binding is not None:
+                    component_rule_set = (
+                        _strategy_control_binding.revision.component_rule_set
+                    )
                 if not isinstance(
                     component_rule_set,
                     ComponentCompositionRuleSet,
@@ -798,6 +1208,26 @@ class ControlCompositionRuntime:
             if self.source_eligibility is not None:
                 self.source_eligibility.validate_target(target_effective_at)
             epoch_snapshot = self.producer_epochs.snapshot(cut)
+            if _strategy_control_binding is not None:
+                if (
+                    _strategy_control_binding.parameter_snapshot.control_domain_id
+                    != cut.control_domain_id
+                    or _strategy_control_binding.parameter_snapshot.cutoff_at
+                    != cut.cutoff_at
+                    or (
+                        _strategy_control_binding.parameter_snapshot
+                        .cutoff_admission_sequence
+                        != cut.cutoff_admission_sequence
+                    )
+                    or (
+                        _strategy_control_binding.parameter_snapshot
+                        .target_effective_at
+                        != float(target_effective_at)
+                    )
+                ):
+                    raise ValueError(
+                        "Strategy-control binding does not match this causal cut."
+                    )
             source_eligibility_snapshot: (
                 CompositionSourceEligibilitySnapshot | None
             ) = None
@@ -818,6 +1248,7 @@ class ControlCompositionRuntime:
                 target_effective_at=target_effective_at,
                 activation_scope=activation_scope,
                 source_eligibility_snapshot=source_eligibility_snapshot,
+                temporal_selection_spec=self.temporal_selection_spec,
             )
             context_snapshot: CompositionContextSnapshot | None = None
             if requested_context_channels:
@@ -830,23 +1261,43 @@ class ControlCompositionRuntime:
             else:
                 self.contexts.advance_closed_target(target_effective_at)
         blocked_reason: str | None = None
+        blocked_result_status = "no_action"
         if context_snapshot is not None:
             if context_snapshot.missing_channels:
                 blocked_reason = "missing_context:" + ",".join(
                     context_snapshot.missing_channels
                 )
             else:
-                required_context_ids = set(
-                    context_snapshot.selected_context_id_by_channel.values()
-                )
-                mismatched_roles = tuple(
-                    role
-                    for role, item in input_snapshot.selected_input_by_role.items()
-                    if not required_context_ids.issubset(item.context_ids)
-                )
-                if mismatched_roles:
-                    blocked_reason = "context_dependency_mismatch:" + ",".join(
-                        sorted(mismatched_roles)
+                mismatches: list[str] = []
+                if self.information_plan is not None:
+                    selected_inputs = input_snapshot.selected_input_by_role
+                    for requirement in (
+                        self.information_plan.context_requirements
+                    ):
+                        if requirement.binding_mode != (
+                            "selected_input_ancestor"
+                        ):
+                            continue
+                        context_id = (
+                            context_snapshot.selected_context_id_by_channel[
+                                requirement.channel
+                            ]
+                        )
+                        roles = (
+                            requirement.bound_input_roles
+                            or tuple(selected_inputs)
+                        )
+                        mismatches.extend(
+                            f"{requirement.channel}@{role}"
+                            for role in roles
+                            if role not in selected_inputs
+                            or context_id
+                            not in selected_inputs[role].context_ids
+                        )
+                if mismatches:
+                    blocked_reason = (
+                        "context_dependency_mismatch:"
+                        + ",".join(sorted(mismatches))
                     )
             if blocked_reason is None and self.information_plan is not None:
                 receiver_clock_domain_id = (
@@ -884,52 +1335,184 @@ class ControlCompositionRuntime:
                                     requirement.channel
                                 ].produced_at
                             )
-                            > requirement.maximum_age_sec
+                            >= requirement.maximum_age_sec
                         )
                     )
                     if stale_channels:
                         blocked_reason = "stale_context:" + ",".join(
                             stale_channels
                         )
+        pre_mix_policy_spec: CompositionPreMixPolicySpec | None = None
+        pre_mix_policy_input: CompositionPreMixPolicyInput | None = None
+        pre_mix_policy_decision: CompositionPreMixPolicyDecision | None = None
+        pre_mix_policy_elapsed_sec: float | None = None
+        pre_mix_policy_diagnostic: CompositionDiagnostic | None = None
+        pre_mix_policy_failed = False
+        if self.pre_mix_policy is not None:
+            pre_mix_policy_spec = self.pre_mix_policy.spec
+        if blocked_reason is None and self.pre_mix_policy is not None:
+            policy_spec = self.pre_mix_policy.spec
+            policy_input = CompositionPreMixPolicyInput(
+                runtime_session_id=self.runtime_session_id,
+                control_domain_id=self.control_domain_id,
+                target_effective_at=target_effective_at,
+                composition_spec=spec,
+                input_snapshot=input_snapshot,
+                context_snapshot=context_snapshot,
+                information_plan=self.information_plan,
+            )
+            pre_mix_policy_input = policy_input
+            started_at = time.perf_counter()
+            try:
+                candidate_decision = self.pre_mix_policy.decide(policy_input)
+                if not isinstance(
+                    candidate_decision,
+                    CompositionPreMixPolicyDecision,
+                ):
+                    raise TypeError(
+                        "Composition pre-mix policy decide() must return "
+                        "CompositionPreMixPolicyDecision."
+                    )
+                if (
+                    candidate_decision.policy_spec_hash
+                    != policy_spec.semantic_content_hash
+                ):
+                    raise ValueError(
+                        "Composition pre-mix policy decision uses another spec."
+                    )
+                if (
+                    candidate_decision.policy_input_hash
+                    != policy_input.semantic_content_hash
+                ):
+                    raise ValueError(
+                        "Composition pre-mix policy decision uses another cut."
+                    )
+                pre_mix_policy_decision = candidate_decision
+            except Exception as error:
+                pre_mix_policy_failed = True
+                pre_mix_policy_decision = CompositionPreMixPolicyDecision(
+                    policy_spec_hash=policy_spec.semantic_content_hash,
+                    policy_input_hash=policy_input.semantic_content_hash,
+                    disposition="invalid",
+                    reason=f"policy_error:{type(error).__name__}",
+                )
+                if debug_diagnostics_enabled:
+                    pre_mix_policy_diagnostic = CompositionDiagnostic(
+                        stage="pre_mix_policy",
+                        code=type(error).__name__,
+                        message=str(error),
+                        recoverable=True,
+                    )
+            finally:
+                pre_mix_policy_elapsed_sec = time.perf_counter() - started_at
+            maximum_latency = policy_spec.maximum_decision_latency_sec
+            if (
+                not pre_mix_policy_failed
+                and maximum_latency is not None
+                and pre_mix_policy_elapsed_sec > maximum_latency
+            ):
+                pre_mix_policy_decision = CompositionPreMixPolicyDecision(
+                    policy_spec_hash=policy_spec.semantic_content_hash,
+                    policy_input_hash=policy_input.semantic_content_hash,
+                    disposition="no_action",
+                    reason="policy_latency_exceeded",
+                )
+                if debug_diagnostics_enabled:
+                    pre_mix_policy_diagnostic = CompositionDiagnostic(
+                        stage="pre_mix_policy",
+                        code="latency_exceeded",
+                        message=(
+                            "Composition pre-mix policy exceeded its declared "
+                            "decision latency."
+                        ),
+                        recoverable=True,
+                    )
+            if pre_mix_policy_decision.disposition != "pass":
+                blocked_result_status = pre_mix_policy_decision.disposition
+                blocked_reason = (
+                    "pre_mix_policy:"
+                    f"{policy_spec.policy_id}:"
+                    f"{pre_mix_policy_decision.disposition}:"
+                    f"{pre_mix_policy_decision.reason}"
+                )
         strategy_input: FormalCompositionStrategyInput | None = None
         strategy_result_binding: (
             FormalCompositionStrategyResultBinding | None
         ) = None
         strategy_diagnostic: CompositionDiagnostic | None = None
+        composition_supported_until = _composition_supported_until(
+            input_snapshot=input_snapshot,
+            context_snapshot=context_snapshot,
+            source_eligibility_snapshot=source_eligibility_snapshot,
+            information_plan=self.information_plan,
+        )
         if strategy is None:
             result = (
-                self.composer.compose(input_snapshot, spec=spec)
-                if blocked_reason is None
-                else build_blocked_composition_result(
+                self.composer.compose(
                     input_snapshot,
                     spec=spec,
-                    status="no_action",
+                    composition_supported_until=(
+                        composition_supported_until
+                    ),
+                )
+                if blocked_reason is None
+                else build_blocked_composition_evaluation(
+                    input_snapshot,
+                    spec=spec,
+                    status=blocked_result_status,
                     reason=blocked_reason,
                 )
             )
         else:
+            assert active_strategy_spec is not None
             strategy_input = FormalCompositionStrategyInput(
                 runtime_session_id=self.runtime_session_id,
                 control_domain_id=self.control_domain_id,
                 clock_domain_id=(
                     self.coordinator.clock_domain.clock_domain_id
                 ),
-                strategy_spec=strategy.spec,
+                strategy_spec=active_strategy_spec,
                 composition_spec=spec,
                 input_snapshot=input_snapshot,
                 context_snapshot=context_snapshot,
                 information_plan=self.information_plan,
+                strategy_control_binding_id=(
+                    None
+                    if _strategy_control_binding is None
+                    else _strategy_control_binding.binding_id
+                ),
+                strategy_control_binding_hash=(
+                    None
+                    if _strategy_control_binding is None
+                    else _strategy_control_binding.semantic_content_hash
+                ),
             )
             if blocked_reason is not None:
                 strategy_decision = CompositionStrategyDecision(
-                    output_status="no_action",
+                    output_status=blocked_result_status,
                     reason=blocked_reason,
-                    composed_action=None,
+                    composed_candidate=None,
                 )
             else:
                 started_at = time.perf_counter()
                 try:
-                    strategy_decision = strategy.decide(strategy_input)
+                    if _strategy_control_binding is None:
+                        strategy_decision = strategy.decide(strategy_input)
+                    else:
+                        decide_with_control = getattr(
+                            strategy,
+                            "decide_with_control",
+                            None,
+                        )
+                        if not callable(decide_with_control):
+                            raise TypeError(
+                                "Hot-controlled strategy must implement "
+                                "decide_with_control()."
+                            )
+                        strategy_decision = decide_with_control(
+                            strategy_input,
+                            _strategy_control_binding,
+                        )
                     if not isinstance(
                         strategy_decision,
                         CompositionStrategyDecision,
@@ -942,18 +1525,19 @@ class ControlCompositionRuntime:
                     strategy_decision = CompositionStrategyDecision(
                         output_status="invalid",
                         reason=f"strategy_error:{type(error).__name__}",
-                        composed_action=None,
+                        composed_candidate=None,
                     )
-                    strategy_diagnostic = CompositionDiagnostic(
-                        stage="formal_strategy",
-                        code=type(error).__name__,
-                        message=str(error),
-                        recoverable=True,
-                    )
+                    if debug_diagnostics_enabled:
+                        strategy_diagnostic = CompositionDiagnostic(
+                            stage="formal_strategy",
+                            code=type(error).__name__,
+                            message=str(error),
+                            recoverable=True,
+                        )
                 else:
                     elapsed = time.perf_counter() - started_at
                     maximum_latency = (
-                        strategy.spec.maximum_decision_latency_sec
+                        active_strategy_spec.maximum_decision_latency_sec
                     )
                     if (
                         maximum_latency is not None
@@ -962,32 +1546,52 @@ class ControlCompositionRuntime:
                         strategy_decision = CompositionStrategyDecision(
                             output_status="no_action",
                             reason="strategy_latency_exceeded",
-                            composed_action=None,
+                            composed_candidate=None,
                         )
-                        strategy_diagnostic = CompositionDiagnostic(
-                            stage="formal_strategy",
-                            code="strategy_latency_exceeded",
-                            message=(
-                                "Formal inline strategy exceeded its declared "
-                                "decision latency."
-                            ),
-                            recoverable=True,
-                        )
-            result = build_formal_strategy_composition_result(
+                        if debug_diagnostics_enabled:
+                            strategy_diagnostic = CompositionDiagnostic(
+                                stage="formal_strategy",
+                                code="strategy_latency_exceeded",
+                                message=(
+                                    "Formal inline strategy exceeded its "
+                                    "declared decision latency."
+                                ),
+                                recoverable=True,
+                            )
+            result = build_formal_strategy_composition_evaluation(
                 strategy_input,
                 strategy_decision,
+                composition_supported_until=composition_supported_until,
             )
             strategy_result_binding = build_formal_strategy_result_binding(
                 strategy_input,
                 result,
             )
-        events = [
+        events = []
+        if _strategy_control_binding is not None:
+            events.extend(
+                (
+                    CompositionDomainEvent(
+                        event_kind="composition_dynamic_parameter_snapshot",
+                        subject=(
+                            _strategy_control_binding.parameter_snapshot
+                        ),
+                        occurred_at=input_snapshot.cutoff_at,
+                    ),
+                    CompositionDomainEvent(
+                        event_kind="composition_strategy_control_binding",
+                        subject=_strategy_control_binding,
+                        occurred_at=input_snapshot.cutoff_at,
+                    ),
+                )
+            )
+        events.append(
             CompositionDomainEvent(
                 event_kind="composition_input_snapshot",
                 subject=input_snapshot,
                 occurred_at=input_snapshot.cutoff_at,
             )
-        ]
+        )
         if input_snapshot.expected_activation_id is not None:
             events.append(
                 CompositionDomainEvent(
@@ -1044,7 +1648,11 @@ class ControlCompositionRuntime:
         if strategy_input is not None:
             events.append(
                 CompositionDomainEvent(
-                    event_kind="formal_composition_strategy_input",
+                    event_kind=(
+                        "formal_composition_strategy_input"
+                        if _strategy_control_binding is None
+                        else "hot_composition_strategy_input"
+                    ),
                     subject=strategy_input,
                     occurred_at=input_snapshot.cutoff_at,
                 )
@@ -1052,7 +1660,7 @@ class ControlCompositionRuntime:
         result_observed_at = float(self.clock())
         events.append(
             CompositionDomainEvent(
-                event_kind="composition_result",
+                event_kind="composition_evaluation",
                 subject=result,
                 occurred_at=result_observed_at,
             )
@@ -1070,8 +1678,8 @@ class ControlCompositionRuntime:
                 CompositionDomainEvent(
                     event_kind="composition_activation_binding",
                     subject=CompositionActivationBinding(
-                        subject_kind="result",
-                        subject_id=result.composition_result_id,
+                        subject_kind="evaluation",
+                        subject_id=result.composition_evaluation_id,
                         subject_hash=result.semantic_content_hash,
                         activation_id=result.composition_activation_id,
                         activation_hash=str(
@@ -1084,6 +1692,8 @@ class ControlCompositionRuntime:
         difference_observation: SourceDifferenceObservation | None = None
         difference_error: str | None = None
         diagnostics: list[CompositionDiagnostic] = []
+        if pre_mix_policy_diagnostic is not None:
+            diagnostics.append(pre_mix_policy_diagnostic)
         if strategy_diagnostic is not None:
             diagnostics.append(strategy_diagnostic)
         difference_observation_event: CompositionDomainEvent | None = None
@@ -1105,15 +1715,20 @@ class ControlCompositionRuntime:
                     )
                 )
             except Exception as error:
-                difference_error = f"{type(error).__name__}:{error}"
-                diagnostics.append(
-                    CompositionDiagnostic(
-                        stage="source_difference",
-                        code=type(error).__name__,
-                        message=str(error),
-                        recoverable=True,
-                    )
+                difference_error = (
+                    f"{type(error).__name__}:{error}"
+                    if debug_diagnostics_enabled
+                    else type(error).__name__
                 )
+                if debug_diagnostics_enabled:
+                    diagnostics.append(
+                        CompositionDiagnostic(
+                            stage="source_difference",
+                            code=type(error).__name__,
+                            message=str(error),
+                            recoverable=True,
+                        )
+                    )
             else:
                 difference_observation_event = CompositionDomainEvent(
                     event_kind="source_difference_observation",
@@ -1121,6 +1736,32 @@ class ControlCompositionRuntime:
                     occurred_at=difference_observation.evaluated_at,
                 )
         with self._event_spec_lock:
+            action_schema_by_hash = {
+                schema.semantic_content_hash: schema
+                for schema in (
+                    self.action_schema,
+                    *self.input_action_schema_by_role.values(),
+                )
+            }
+            payload_schema_by_hash = {
+                payload_schema.semantic_content_hash: payload_schema
+                for action_schema in action_schema_by_hash.values()
+                for payload_schema in (
+                    action_schema.payload_schema_by_component.values()
+                )
+            }
+            action_payload_schemas_to_emit = tuple(
+                payload_schema_by_hash[schema_hash]
+                for schema_hash in sorted(payload_schema_by_hash)
+                if schema_hash
+                not in self._emitted_action_payload_schema_hashes
+            )
+            component_action_schemas_to_emit = tuple(
+                action_schema_by_hash[schema_hash]
+                for schema_hash in sorted(action_schema_by_hash)
+                if schema_hash
+                not in self._emitted_component_action_schema_hashes
+            )
             composition_spec_hash = spec.semantic_content_hash
             emit_composition_spec = (
                 composition_spec_hash
@@ -1137,8 +1778,8 @@ class ControlCompositionRuntime:
                 not in self._emitted_source_difference_spec_hashes
             )
             emit_formal_strategy_spec = (
-                strategy is not None
-                and strategy.spec.semantic_content_hash
+                active_strategy_spec is not None
+                and active_strategy_spec.semantic_content_hash
                 not in self._emitted_formal_strategy_spec_hashes
             )
             emit_component_rule_set = (
@@ -1151,12 +1792,56 @@ class ControlCompositionRuntime:
                 and formal_component_binding.semantic_content_hash
                 not in self._emitted_formal_component_binding_hashes
             )
+            active_revision = (
+                None
+                if _strategy_control_binding is None
+                else _strategy_control_binding.revision
+            )
+            emit_strategy_revision = (
+                active_revision is not None
+                and active_revision.semantic_content_hash
+                not in self._emitted_strategy_revision_hashes
+            )
+            dynamic_parameter_contract = (
+                None
+                if active_revision is None
+                else active_revision.dynamic_parameter_contract
+            )
+            emit_dynamic_parameter_contract = (
+                dynamic_parameter_contract is not None
+                and dynamic_parameter_contract.semantic_content_hash
+                not in self._emitted_dynamic_parameter_contract_hashes
+            )
             evaluation_events: list[CompositionDomainEvent] = []
             plan_event = self._information_plan_event(
                 occurred_at=input_snapshot.cutoff_at
             )
             if plan_event is not None:
                 evaluation_events.append(plan_event)
+            if not self._temporal_selection_spec_emitted:
+                evaluation_events.append(
+                    CompositionDomainEvent(
+                        event_kind="composition_temporal_selection_spec",
+                        subject=self.temporal_selection_spec,
+                        occurred_at=input_snapshot.cutoff_at,
+                    )
+                )
+            evaluation_events.extend(
+                CompositionDomainEvent(
+                    event_kind="action_payload_schema",
+                    subject=payload_schema,
+                    occurred_at=input_snapshot.cutoff_at,
+                )
+                for payload_schema in action_payload_schemas_to_emit
+            )
+            evaluation_events.extend(
+                CompositionDomainEvent(
+                    event_kind="component_action_schema",
+                    subject=action_schema,
+                    occurred_at=input_snapshot.cutoff_at,
+                )
+                for action_schema in component_action_schemas_to_emit
+            )
             if emit_composition_spec:
                 evaluation_events.append(
                     CompositionDomainEvent(
@@ -1177,7 +1862,23 @@ class ControlCompositionRuntime:
                 evaluation_events.append(
                     CompositionDomainEvent(
                         event_kind="formal_composition_strategy_spec",
-                        subject=strategy.spec,
+                        subject=active_strategy_spec,
+                        occurred_at=input_snapshot.cutoff_at,
+                    )
+                )
+            if emit_dynamic_parameter_contract:
+                evaluation_events.append(
+                    CompositionDomainEvent(
+                        event_kind="composition_dynamic_parameter_contract",
+                        subject=dynamic_parameter_contract,
+                        occurred_at=input_snapshot.cutoff_at,
+                    )
+                )
+            if emit_strategy_revision:
+                evaluation_events.append(
+                    CompositionDomainEvent(
+                        event_kind="composition_strategy_revision",
+                        subject=active_revision,
                         occurred_at=input_snapshot.cutoff_at,
                     )
                 )
@@ -1211,6 +1912,15 @@ class ControlCompositionRuntime:
             self._emit(*evaluation_events)
             if plan_event is not None:
                 self._information_plan_emitted = True
+            self._temporal_selection_spec_emitted = True
+            self._emitted_action_payload_schema_hashes.update(
+                schema.semantic_content_hash
+                for schema in action_payload_schemas_to_emit
+            )
+            self._emitted_component_action_schema_hashes.update(
+                schema.semantic_content_hash
+                for schema in component_action_schemas_to_emit
+            )
             if emit_composition_spec:
                 self._emitted_composition_spec_hashes.add(
                     composition_spec_hash
@@ -1225,7 +1935,15 @@ class ControlCompositionRuntime:
                 )
             if emit_formal_strategy_spec:
                 self._emitted_formal_strategy_spec_hashes.add(
-                    strategy.spec.semantic_content_hash
+                    active_strategy_spec.semantic_content_hash
+                )
+            if emit_dynamic_parameter_contract:
+                self._emitted_dynamic_parameter_contract_hashes.add(
+                    dynamic_parameter_contract.semantic_content_hash
+                )
+            if emit_strategy_revision:
+                self._emitted_strategy_revision_hashes.add(
+                    active_revision.semantic_content_hash
                 )
             if emit_component_rule_set:
                 self._emitted_component_rule_set_hashes.add(
@@ -1242,22 +1960,31 @@ class ControlCompositionRuntime:
             control_cut=cut,
             producer_epoch_snapshot=epoch_snapshot,
             input_snapshot=input_snapshot,
-            composition_result=result,
+            composition_evaluation=result,
             required_context_channels=requested_context_channels,
             context_snapshot=context_snapshot,
             source_eligibility_spec=source_eligibility_spec,
             source_eligibility_snapshot=source_eligibility_snapshot,
-            strategy_spec=None if strategy is None else strategy.spec,
+            strategy_spec=active_strategy_spec,
             strategy_input=strategy_input,
             strategy_result_binding=strategy_result_binding,
+            strategy_control_binding=_strategy_control_binding,
             source_difference_spec=source_difference_spec,
             source_difference_observation=difference_observation,
             diagnostics=tuple(diagnostics),
             domain_events_emitted=emitted_events,
+            pre_mix_policy_spec=pre_mix_policy_spec,
+            pre_mix_policy_input=pre_mix_policy_input,
+            pre_mix_policy_decision=pre_mix_policy_decision,
+            pre_mix_policy_elapsed_sec=(
+                pre_mix_policy_elapsed_sec
+                if debug_diagnostics_enabled
+                else None
+            ),
         )
         return CompositeProposalSubmission(
             input_snapshot=input_snapshot,
-            composition_result=result,
+            composition_evaluation=result,
             proposal_admission=None,
             context_snapshot=context_snapshot,
             source_difference_observation=difference_observation,

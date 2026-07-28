@@ -105,7 +105,13 @@ def _hash_receipt(kind: str, payload: dict[str, object]) -> str:
 
 @dataclass(frozen=True)
 class MixedControlBoundaryPolicy:
-    """Versioned pause/capture/takeover semantics; never a motion permit."""
+    """Versioned pause/capture/takeover semantics; never a motion permit.
+
+    ``require_canonical_safety`` is retained for the v1 compatibility path
+    that consumed a pre-admission safety preview.  New source-readiness paths
+    should set it to ``False`` and let the lower authoritative execution path
+    perform canonical safety after formal proposal admission.
+    """
 
     policy_id: str
     policy_suspension_mode: str
@@ -134,10 +140,16 @@ class MixedControlBoundaryPolicy:
             "require_post_takeover_human_emission",
             "require_deadman_rearm",
             "require_retargeter_rebase",
-            "require_canonical_safety",
         )
         if any(not bool(getattr(self, name)) for name in required_flags):
-            raise ValueError("Human takeover v1 fixes every readiness requirement to true.")
+            raise ValueError(
+                "Human takeover fixes source-readiness requirements to true."
+            )
+        object.__setattr__(
+            self,
+            "require_canonical_safety",
+            bool(self.require_canonical_safety),
+        )
 
     @property
     def semantic_content_hash(self) -> str:
@@ -551,6 +563,13 @@ class HumanAuthorityTakeoverReceipt:
 
 @dataclass(frozen=True)
 class HumanReadinessReceipt:
+    """Fresh source/readiness evidence for a human takeover.
+
+    Canonical-safety fields are an optional v1 compatibility attachment.  They
+    are absent on the mainline source-readiness path; lower execution readiness
+    and the later authoritative safety result remain separate receipts.
+    """
+
     request_id: str
     human_emission_id: str
     human_emission_available_at: float
@@ -560,8 +579,8 @@ class HumanReadinessReceipt:
     deadman_rearmed_at: float
     retargeter_rebase_receipt_id: str
     retargeter_rebased_at: float
-    canonical_safety_receipt_id: str
-    canonical_safety_status: str
+    canonical_safety_receipt_id: str | None
+    canonical_safety_status: str | None
     completed_at: float
 
     def __post_init__(self) -> None:
@@ -571,7 +590,6 @@ class HumanReadinessReceipt:
             "measured_state_id",
             "deadman_rearm_event_id",
             "retargeter_rebase_receipt_id",
-            "canonical_safety_receipt_id",
         ):
             object.__setattr__(
                 self,
@@ -590,13 +608,28 @@ class HumanReadinessReceipt:
                 field_name,
                 _finite(getattr(self, field_name), field_name=field_name),
             )
-        if self.canonical_safety_status not in {
-            "safe",
-            "modified",
-            "hold",
-            "fault",
-        }:
-            raise ValueError("Unsupported canonical_safety_status.")
+        if (self.canonical_safety_receipt_id is None) != (
+            self.canonical_safety_status is None
+        ):
+            raise ValueError(
+                "Canonical-safety receipt ID/status must appear together."
+            )
+        if self.canonical_safety_receipt_id is not None:
+            object.__setattr__(
+                self,
+                "canonical_safety_receipt_id",
+                _required(
+                    self.canonical_safety_receipt_id,
+                    field_name="canonical_safety_receipt_id",
+                ),
+            )
+            if self.canonical_safety_status not in {
+                "safe",
+                "modified",
+                "hold",
+                "fault",
+            }:
+                raise ValueError("Unsupported canonical_safety_status.")
 
     @property
     def semantic_content_hash(self) -> str:
@@ -958,12 +991,17 @@ def apply_human_readiness(
         > state.policy.measured_state_max_age_sec
     ):
         raise ValueError("Human takeover measured state is stale.")
-    if receipt.canonical_safety_status not in {"safe", "modified"}:
-        return _failed(
-            state,
-            reason=f"human_readiness_{receipt.canonical_safety_status}",
-            readiness_receipt=receipt,
-        )
+    if state.policy.require_canonical_safety:
+        if receipt.canonical_safety_status is None:
+            raise ValueError(
+                "The legacy takeover policy requires a canonical-safety preview."
+            )
+        if receipt.canonical_safety_status not in {"safe", "modified"}:
+            return _failed(
+                state,
+                reason=f"human_readiness_{receipt.canonical_safety_status}",
+                readiness_receipt=receipt,
+            )
     return replace(
         state,
         phase="awaiting_ready",

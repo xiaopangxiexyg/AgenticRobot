@@ -89,7 +89,43 @@ PYTHONPATH=. python -m pytest -q \
 
 ## 3. 应用侧组装顺序
 
-当前没有通用 CLI；应用代码应复用以下顺序，不要在 GUI 或 source 中另建控制循环：
+除下方这个 default-off 应用 profile 外，当前没有通用 HIL CLI；应用代码应复用
+以下顺序，不要在 GUI 或 source 中另建控制循环。临时 PPO + 真实 VIVE/Q6
+（仅驱动 MuJoCo）的具体 profile 入口是：
+
+```bash
+PYTHONPATH=. python -m control_station sim-hil --help
+PYTHONPATH=. python -m control_station sim-hil --dry-run --device cpu
+```
+
+只有显式传入 `--enable --left-q6-port ... --right-q6-port ...` 才会启动该
+profile；它仍不构造或连接真实 RM65 执行 backend。GUI 只是同一 Station
+生命周期的只读状态页，不另建控制循环。
+
+### 3.1 Compose 频率与下游位置控制 profile
+
+Sim-HIL 的最终 compose/authority 频率不是写死在 Station loop 中，而是由
+`--position-control-profile` 与 `--compose-hz` 共同确定：
+
+```bash
+# 默认：compose/authority 60 Hz，reference/IK 60 Hz，command 120 Hz
+PYTHONPATH=. python -m control_station sim-hil --help
+
+# 例：保留 policy source 15 Hz，compose 45 Hz；下游仍为 60/60/120
+PYTHONPATH=. python -m control_station sim-hil \
+  --position-control-profile position --compose-hz 45 \
+  --enable --left-q6-port ... --right-q6-port ...
+```
+
+`--rate` 是旧参数的兼容别名，表示同一个 compose 频率；同时提供两个参数时
+数值必须一致。`policy_hz` 只表示模型/source 产出频率，不会被误当成最终
+compose 频率。选择的 profile 会校验 compose 频率不低于其输入 cadence、且不高于
+其 reference cadence，并把 reference/IK/command clocks 原样绑定到下游 target。
+
+Station 配置层不再额外施加 60 Hz 上限；当前 MuJoCo authoritative ActionArbiter
+仍保留既有 `(0, 60]` production gate，因此超过该能力的值会在 target 构建时明确
+拒绝，而不是悄悄改变执行语义。这个 gate 与 source、replay、teleop 和 RTC 的
+输入/worker/reference/backend 频率无关；本次修改只作用于 default-off Sim-HIL。
 
 ```text
 build MuJoCo runtime + pose target
@@ -189,7 +225,12 @@ policy source。
 1. 用 `evaluate/play` 验证 checkpoint 的任务成功率、collision projection、rejection 和 tracking error；
 2. 在不取得 authority、不发送动作的 shadow adapter 中加载同一 checkpoint 和 normalizer，记录 observation/action/hash；
 3. 只有完成显式 observation contract、delta→target 解码、right-arm FK→pose、gripper component contract、safety 和 downstream admission receipt 后，才考虑接入 policy source；
-4. policy→human 或 policy→replay 的正式混合另属于后续 independent policy-source gate，不自动并入 CS-6b1f。
+4. 当前新增的 `control_station` `mujoco_sim_hil` profile 是独立的、default-off
+   的双臂 pose + 双手 qpos formal component path。它只接收已经产生的
+   `PolicyActionEmission` 和 passive human emission，不能把 7-D qpos delta
+   直接伪装成 pose，也不会改变 CS-6b1f 的 replay/human 路径。即使是
+   virtual source 也必须提供显式 readiness evidence；HOLD 后需要显式
+   rearm，不能自动清门。
 
 这条路径仍然复用 `PolicyActionEmission` / `PolicyDeployRuntime` 的 lower-owned
 emission seam；模型侧不需要为 RTC 或 Station 增加专用 adapter。需要的只是应用侧

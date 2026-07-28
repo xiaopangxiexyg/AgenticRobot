@@ -86,6 +86,32 @@ class IKSafetyProfile:
     local_step_singularity_escape_max_candidates: int = 6
     local_step_singularity_escape_max_position_worsen_m: float = 0.02
     local_step_singularity_escape_max_orientation_worsen_deg: float = 8.0
+    # Position teleop can opt into a directional escape policy.  The legacy
+    # policy remains the default so callers with hand-built profiles retain an
+    # exact rollback path.  The directional policy emits only the side of a
+    # J3/J5 move that leaves the current singular pocket and latches that side
+    # until the pocket is cleared (or a bounded failure reset occurs).
+    local_step_singularity_escape_directional_enabled: bool = False
+    local_step_singularity_escape_combined_enabled: bool = False
+    local_step_singularity_escape_direction_hysteresis_deg: float = 1.0
+    # A one-step singularity escape is intentionally conservative near the
+    # target.  When the target is genuinely far away, a larger *search
+    # radius* lets the selector discover which J3/J5 direction actually
+    # leaves the singular pocket.  The final admitted qref is still limited
+    # by the normal execution step, so this is a search breadth control, not a
+    # command-speed bypass.  The default keeps the historical one-radius
+    # behavior; position teleop profiles opt in explicitly.
+    local_step_singularity_escape_wide_search_enabled: bool = False
+    local_step_singularity_escape_wide_search_position_m: float = 0.10
+    local_step_singularity_escape_wide_search_orientation_deg: float = 20.0
+    local_step_singularity_escape_wide_search_radius_factors: tuple[float, ...] = (1.0,)
+    # A wide-search candidate is still subject to the normal joint, collision,
+    # and final admission checks.  These two bounds only let a far-target
+    # escape temporarily trade a little Cartesian tracking error for a
+    # measurable singularity-depth improvement; near-target escapes retain the
+    # tighter bounds above.
+    local_step_singularity_escape_wide_search_max_position_worsen_m: float = 0.05
+    local_step_singularity_escape_wide_search_max_orientation_worsen_deg: float = 18.0
     local_step_full_target_step_enabled: bool = True
     local_step_hold_on_failure: bool = True
     stable_recovery_frames: int = 3
@@ -304,6 +330,34 @@ def profile_from_dict(name: str, payload: dict[str, Any]) -> IKSafetyProfile:
         ),
         local_step_singularity_escape_max_orientation_worsen_deg=float(
             payload.get("local_step_singularity_escape_max_orientation_worsen_deg", 8.0)
+        ),
+        local_step_singularity_escape_directional_enabled=bool(
+            payload.get("local_step_singularity_escape_directional_enabled", False)
+        ),
+        local_step_singularity_escape_combined_enabled=bool(
+            payload.get("local_step_singularity_escape_combined_enabled", False)
+        ),
+        local_step_singularity_escape_direction_hysteresis_deg=float(
+            payload.get("local_step_singularity_escape_direction_hysteresis_deg", 1.0)
+        ),
+        local_step_singularity_escape_wide_search_enabled=bool(
+            payload.get("local_step_singularity_escape_wide_search_enabled", False)
+        ),
+        local_step_singularity_escape_wide_search_position_m=float(
+            payload.get("local_step_singularity_escape_wide_search_position_m", 0.10)
+        ),
+        local_step_singularity_escape_wide_search_orientation_deg=float(
+            payload.get("local_step_singularity_escape_wide_search_orientation_deg", 20.0)
+        ),
+        local_step_singularity_escape_wide_search_radius_factors=_tuple_float(
+            payload.get("local_step_singularity_escape_wide_search_radius_factors"),
+            default=(1.0,),
+        ),
+        local_step_singularity_escape_wide_search_max_position_worsen_m=float(
+            payload.get("local_step_singularity_escape_wide_search_max_position_worsen_m", 0.05)
+        ),
+        local_step_singularity_escape_wide_search_max_orientation_worsen_deg=float(
+            payload.get("local_step_singularity_escape_wide_search_max_orientation_worsen_deg", 18.0)
         ),
         local_step_full_target_step_enabled=bool(payload.get("local_step_full_target_step_enabled", True)),
         local_step_hold_on_failure=bool(payload.get("local_step_hold_on_failure", True)),

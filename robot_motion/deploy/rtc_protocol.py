@@ -1,10 +1,11 @@
 """Model-, transport-, and backend-neutral RTC protocol contracts.
 
-The objects in this module describe what an RTC-capable producer promises and
-what one inference exchange actually consumed.  They deliberately do not own
-model invocation, threads, transport, simulation, or hardware.  Existing v1
-``PolicyInferenceRequest`` objects remain the causal request facts; v2 wraps
-them with independently negotiable scheduling and continuation capabilities.
+The objects in this module describe the frozen RTC v2 compatibility surface.
+Raw/final-chunk RTC canonically uses ``continuation=none``.  The legacy
+model-space prefix modes remain hash/import compatible, but new model-RTC
+providers must use the deployments-owned causal-binding/v3 protocol instead.
+This module deliberately owns no model invocation, thread, transport,
+simulation, or hardware.
 """
 
 from __future__ import annotations
@@ -179,7 +180,11 @@ def rtc_v1_mode_from_v2(mode: RtcProtocolMode) -> str:
 
 @dataclass(frozen=True)
 class RtcContinuationCapability:
-    """One continuation implementation with exact representation bindings."""
+    """Frozen v2 compatibility capability.
+
+    New model-RTC integrations must not use this class to choose between the
+    legacy v2 prefix path and the canonical conditioned v3 path.
+    """
 
     continuation_mode: str
     implementation_id: str

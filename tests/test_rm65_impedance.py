@@ -186,6 +186,40 @@ class _FakeRobot:
 
 
 class RM65ImpedanceTest(unittest.TestCase):
+    def test_impedance_backend_manual_rearm_clears_force_stop_latch(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="left",
+                connect_hardware=False,
+            )
+        )
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+                self.reset_qpos = None
+
+            def stop_motion(self) -> None:
+                self.stop_calls += 1
+
+            def reset_motion_state(self, qpos) -> None:
+                self.reset_qpos = np.asarray(qpos, dtype=float).copy()
+
+        controller = FakeController()
+        backend.arm = object()  # type: ignore[assignment]
+        backend._controller = controller  # type: ignore[assignment]
+        backend._emergency_stopped = True
+        backend._last_fault = "RuntimeError: left: force 55.0000N > hard_stop_force_n"
+
+        result = backend.manual_rearm_after_emergency_stop(np.zeros(6))
+
+        self.assertTrue(result["rearmed"])
+        self.assertFalse(backend.is_emergency_stopped())
+        self.assertIsNone(backend.get_state()["fault"])
+        self.assertEqual(controller.stop_calls, 1)
+        np.testing.assert_allclose(controller.reset_qpos, np.zeros(6))
+
     def test_impedance_backend_exposes_profile_tcp_for_replay_preflight(self) -> None:
         backend = RM65ImpedanceArmBackend(
             RM65ImpedanceArmBackendConfig(
@@ -1086,6 +1120,64 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertIsNotNone(backend._last_step_record)
         self.assertFalse(backend._last_step_record["backend_target_dispatched_this_step"])
         self.assertEqual(backend._last_step_record["backend_last_dispatched_target_sequence"], 7)
+
+    def test_impedance_backend_hard_stop_callback_uses_latched_emergency_stop(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0 / 40.0,
+            )
+        )
+
+        class FakeArm:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+                self.slow_stop_calls = 0
+
+            def Arm_Stop(self) -> int:
+                self.stop_calls += 1
+                return 0
+
+            def Arm_Slow_Stop(self) -> int:
+                self.slow_stop_calls += 1
+                return 0
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(control_hz=40.0)
+                self.stop_motion_calls = 0
+
+            def step(self, target, *, target_joint_deg=None):
+                del target, target_joint_deg
+                raise RuntimeError(
+                    "left: force 60.1000N > hard_stop_force_n"
+                )
+
+            def stop_motion(self) -> None:
+                self.stop_motion_calls += 1
+
+        arm = FakeArm()
+        controller = FakeController()
+        backend.arm = arm
+        backend._controller = controller  # type: ignore[assignment]
+        callback_calls = []
+
+        def hard_stop_callback(side: str, message: str) -> None:
+            callback_calls.append((side, message))
+            backend.emergency_stop()
+
+        backend.set_force_hard_stop_callback(hard_stop_callback)
+        backend._impedance_loop()
+
+        self.assertEqual(len(callback_calls), 1)
+        self.assertEqual(callback_calls[0][0], "left")
+        self.assertTrue(backend.is_emergency_stopped())
+        self.assertEqual(arm.stop_calls, 1)
+        self.assertEqual(arm.slow_stop_calls, 0)
+        self.assertEqual(controller.stop_motion_calls, 0)
+        self.assertIn("hard_stop_force_n", backend.get_state()["fault"])
 
     def test_pose_controller_reuses_same_joint_hint_without_resetting_interpolator(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]

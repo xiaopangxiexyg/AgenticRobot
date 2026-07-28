@@ -42,12 +42,17 @@ from dataset_contracts.completeness import (
     trace_requirement_profile,
 )
 from robot_motion.action import (
+    ActionAdaptationResult,
     ActionProposalDraft,
     AuthoritativeControlRuntime,
+    ExecutionObservationPlan,
     IMMEDIATE_QREF_SIM_V1,
     RobotAction,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
     SharedCanonicalSafetyResult,
+    assess_component_target_capability,
+    build_action_adaptation_receipt,
+    project_robot_action_v1_to_component_action,
     resolve_safety_anchor_commit_timeline,
 )
 from robot_motion.runtime import (
@@ -88,6 +93,39 @@ class IncrementingClock:
         current = self.value
         self.value += self.step
         return current
+
+
+class RejectingRepresentationAdapter:
+    def __init__(self, capability, *, clock) -> None:
+        self._capability = capability
+        self._clock = clock
+
+    @property
+    def component_target_capability(self):
+        return self._capability
+
+    def adapt(self, request):
+        started_at = float(self._clock())
+        assessment = assess_component_target_capability(
+            self._capability,
+            request.candidate_action,
+        )
+        receipt = build_action_adaptation_receipt(
+            request=request,
+            assessment=assessment,
+            receiver_id="fixture-rejecting-adapter",
+            processing_started_at=started_at,
+            processing_completed_at=float(self._clock()),
+            accepted=False,
+            rejection_code="fixture_receiver_rejected",
+            adapted_candidate=None,
+        )
+        return ActionAdaptationResult(
+            request=request,
+            capability_assessment=assessment,
+            adapted_candidate=None,
+            receipt=receipt,
+        )
 
 
 class FakeScene:
@@ -380,9 +418,7 @@ def replay_source(runtime: MujocoDeployRuntime) -> ReplayProposalSource:
             embodiment_instance_id=runtime.config.embodiment_instance_id,
             producer_id=runtime.config.replay_producer_id,
             producer_epoch=runtime.config.producer_epoch,
-            component_schema_hash=runtime.catalog.semantic_content_hash,
-            component_coverage=("left_arm", "right_arm"),
-            selection_groups=("arms",),
+            action_schema=runtime.action_schema,
             source_contract=source_contract,
             source_action_contract=source_action_contract,
             target_runtime_contract=runtime.target_runtime_action_contract,
@@ -442,6 +478,10 @@ def test_deployable_sim_runs_one_authoritative_control_and_trace_chain() -> None
         "arbitration_computation",
         "arbitration_publication_attempt",
         "arbitration_decision",
+        "action_adaptation_request",
+        "target_capability_assessment",
+        "adapted_action_candidate",
+        "action_adaptation_receipt",
         "execution_directive",
         "shared_safety_result",
         "command",
@@ -458,6 +498,42 @@ def test_deployable_sim_runs_one_authoritative_control_and_trace_chain() -> None
     assert "would_select_action" not in decision_fact.payload
     runtime.close()
     assert runtime.trace_facts[-1].event_type == "runtime_trace_terminal"
+
+
+def test_adaptation_rejection_never_reaches_safety_or_dispatch() -> None:
+    runtime, scene, clock = build_runtime()
+    runtime.core.action_representation_adapter = (
+        RejectingRepresentationAdapter(
+            runtime.component_target_capability,
+            clock=clock,
+        )
+    )
+    runtime.start()
+    receipt = runtime.submit_policy_action(
+        action(),
+        policy_output_id="policy-output-adaptation-rejected",
+    )
+    assert receipt.accepted
+
+    step = runtime.step(now=10.0, physics_ticks_after_dispatch=12)
+
+    assert step.status in {
+        "execution_cancelled",
+        "execution_hold_active",
+        "action_adaptation_rejected_keep_existing",
+    }
+    assert step.action_adaptation is not None
+    assert step.action_adaptation.receipt.accepted is False
+    assert step.safety_result is None
+    assert step.command is None
+    assert step.dispatch_receipts is None
+    assert scene.physics_commands == []
+    event_types = tuple(fact.event_type for fact in runtime.trace_facts)
+    assert "action_adaptation_receipt" in event_types
+    assert "shared_safety_result" not in event_types
+    assert "command" not in event_types
+    assert "dispatch_receipt" not in event_types
+    runtime.close()
 
 
 def test_sim_policy_chunk_admits_only_prefix_and_schedules_continuous_steps() -> None:
@@ -490,8 +566,12 @@ def test_sim_policy_chunk_admits_only_prefix_and_schedules_continuous_steps() ->
     second = runtime.step(now=clock.value, physics_ticks_after_dispatch=1)
     assert second.status == "dispatched"
     assert first.decision is not None and second.decision is not None
-    assert float(first.decision.selected_action.arm_qpos_by_side["left"][0]) == pytest.approx(0.1)
-    assert float(second.decision.selected_action.arm_qpos_by_side["left"][0]) == pytest.approx(0.2)
+    assert float(
+        first.decision.selected_action.value("left_arm").values[0]
+    ) == pytest.approx(0.1)
+    assert float(
+        second.decision.selected_action.value("left_arm").values[0]
+    ) == pytest.approx(0.2)
     next_submission = runtime.submit_policy_action_chunk(
         [action(0.4, -0.4), action(0.5, -0.5)],
         policy_output_id="policy-chunk-1",
@@ -689,6 +769,42 @@ def test_mujoco_reference_activation_profiles_do_not_redefine_existing_default()
     scheduled.start()
     assert scheduled.reference_receiver is not None
     scheduled.close()
+
+
+def test_non_off_execution_observation_plan_requires_a_sink_at_build_time() -> None:
+    clock = ManualClock()
+    rig = MujocoPositionExecutionRig(
+        FakeScene(),
+        MujocoPositionExecutionConfig(
+            timing=timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+        monotonic_clock=clock,
+    )
+    plan = ExecutionObservationPlan(
+        plan_id="required-observation-without-sink",
+        measurement_mode="full_frames",
+        component_ids=("right_arm",),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires an ExecutionObservationSink",
+    ):
+        MujocoDeployRuntime(
+            rig,
+            MujocoDeployConfig(
+                reference_activation_profile_id=(
+                    SCHEDULED_REFERENCE_SEGMENT_SIM_V1
+                ),
+                enable_component_execution_handoff=True,
+                execution_observation_plan=plan,
+            ),
+            clock=clock,
+        )
 
 
 def test_scheduled_qpos_receiver_admits_future_segment_without_early_activation() -> None:
@@ -1156,6 +1272,47 @@ def test_existing_replay_source_frame_rejects_implicit_cross_clock_binding() -> 
     runtime.close()
 
 
+def test_external_trace_fact_index_preserves_duplicate_semantics() -> None:
+    clock = ManualClock()
+    runtime, _scene, _ = build_runtime(clock=clock)
+    runtime.start()
+    context = runtime.core.trace_context
+    first = context.fact(
+        fact_id="external-source-validation-1",
+        event_type="source_validation",
+        occurred_at=clock.value,
+        payload={
+            "validation_id": "external-source-validation-1",
+            "source_event_id": "external-source-1",
+            "accepted": True,
+            "reasons": (),
+        },
+    )
+    conflicting = context.fact(
+        fact_id=first.fact_id,
+        event_type="source_validation",
+        occurred_at=clock.value,
+        payload={
+            "validation_id": "external-source-validation-1",
+            "source_event_id": "external-source-1",
+            "accepted": False,
+            "reasons": ("changed",),
+        },
+    )
+    before = len(runtime.trace_facts)
+
+    runtime.record_external_facts((first, first))
+
+    assert len(runtime.trace_facts) == before + 1
+    assert runtime.trace_facts[-1].semantic_content_hash == (
+        first.semantic_content_hash
+    )
+    with pytest.raises(ValueError, match="reused with new content"):
+        runtime.record_external_facts((conflicting,))
+    assert len(runtime.trace_facts) == before + 1
+    runtime.close()
+
+
 def test_replay_publication_fails_closed_without_admitted_target_evidence() -> None:
     clock = ManualClock()
     base, _scene, _ = build_runtime(clock=clock)
@@ -1178,16 +1335,16 @@ def test_replay_publication_fails_closed_without_admitted_target_evidence() -> N
         producer_id=runtime.config.replay_producer_id,
         producer_epoch=runtime.config.producer_epoch,
         sequence=0,
-        action=action(),
+        action=project_robot_action_v1_to_component_action(
+            action(),
+            action_schema=runtime.action_schema,
+        ),
         produced_at=clock.value,
         produced_clock_domain_id=runtime.config.clock_domain_id,
         effective_from=clock.value,
         effective_until=clock.value + 0.1,
         target_effective_at=clock.value,
         effective_clock_domain_id=runtime.config.clock_domain_id,
-        component_schema_hash=runtime.catalog.semantic_content_hash,
-        component_coverage=("left_arm", "right_arm"),
-        selection_groups=("arms",),
     )
     receipt = runtime.core.admit_proposal(draft, source_event_id="unbound-replay")
     assert receipt.accepted
@@ -1334,6 +1491,57 @@ def test_typed_gate_transition_returns_exact_cancellation_evidence() -> None:
     assert outcome.cancellation.cancellation_id in outcome.lower_event_ids
 
 
+def test_authority_transition_requires_completed_lower_execution_fence() -> None:
+    runtime, _scene, _clock = build_runtime()
+    runtime.start()
+
+    with pytest.raises(RuntimeError, match="execution fence"):
+        runtime.core.admit_authority_event(
+            event_type="mode",
+            control_mode=runtime.config.initial_control_mode,
+            reason="unfenced_authority_change",
+        )
+
+    hold = runtime.transition_execution_gate(
+        "hold",
+        reason="authority_transition_fence",
+        source_event_ids=("authority-transition-test",),
+    )
+    assert hold.cancellation_receipt is not None
+    assert hold.cancellation_receipt.complete
+    before = runtime.core.dispatch_owners.snapshot()
+
+    event = runtime.core.admit_authority_event(
+        event_type="mode",
+        control_mode=runtime.config.initial_control_mode,
+        reason="fenced_authority_change",
+    )
+
+    after = runtime.core.dispatch_owners.snapshot()
+    assert event.authority_epoch == before.current_authority_epoch + 1
+    assert after.current_authority_epoch == event.authority_epoch
+    assert after.current_execution_epoch == hold.cancellation.execution_epoch
+
+
+def test_ready_gate_does_not_reuse_old_hold_as_authority_fence() -> None:
+    runtime, _scene, _clock = build_runtime()
+    runtime.start()
+    hold = runtime.transition_execution_gate(
+        "hold",
+        reason="establish_old_hold",
+    )
+    assert hold.cancellation_receipt is not None
+    assert hold.cancellation_receipt.complete
+    runtime.transition_execution_gate("ready", reason="leave_execution_fence")
+
+    with pytest.raises(RuntimeError, match="execution fence"):
+        runtime.core.admit_authority_event(
+            event_type="mode",
+            control_mode=runtime.config.initial_control_mode,
+            reason="ready_is_not_a_fence",
+        )
+
+
 def test_forced_gate_cancellation_advances_epoch_while_backend_already_held() -> None:
     runtime, _scene, _clock = build_runtime()
     runtime.start()
@@ -1464,7 +1672,10 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
             producer_epoch=runtime.config.producer_epoch,
             sequence=0,
             input_role="base",
-            action=base,
+            action=project_robot_action_v1_to_component_action(
+                base,
+                action_schema=runtime.action_schema,
+            ),
             produced_at=clock.value,
             produced_clock_domain_id=runtime.config.clock_domain_id,
             effective_from=clock.value,
@@ -1503,7 +1714,10 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
             producer_epoch=runtime.config.producer_epoch,
             sequence=0,
             input_role="residual",
-            action=residual,
+            action=project_robot_action_v1_to_component_action(
+                residual,
+                action_schema=runtime.action_schema,
+            ),
             produced_at=clock.value,
             produced_clock_domain_id=runtime.config.clock_domain_id,
             effective_from=clock.value,
@@ -1529,15 +1743,15 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
         spec=spec,
         target_effective_at=clock.value,
     )
-    assert shadow.composition_result.output_status == "ready"
+    assert shadow.composition_evaluation.output_status == "ready"
     assert shadow.proposal_admission is None
     assert shadow.source_difference_observation is None
     assert shadow.source_difference_error is None
     assert shadow.evaluation_record is not None
     assert shadow.evaluation_record.composition_spec is spec
     assert shadow.evaluation_record.input_snapshot is shadow.input_snapshot
-    assert shadow.evaluation_record.composition_result is (
-        shadow.composition_result
+    assert shadow.evaluation_record.composition_evaluation is (
+        shadow.composition_evaluation
     )
     assert shadow.evaluation_record.selected_inputs_by_role.keys() == {
         "base",
@@ -1545,11 +1759,14 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
     }
     assert {
         event.event_kind for event in shadow.domain_events_emitted
-    } == {
-        "composition_spec",
-        "composition_input_snapshot",
-        "composition_result",
-    }
+        } == {
+            "action_payload_schema",
+            "component_action_schema",
+            "composition_spec",
+            "composition_temporal_selection_spec",
+            "composition_input_snapshot",
+            "composition_evaluation",
+        }
     assert shadow.diagnostics == ()
     assert len(runtime.core.proposals) == 0
 
@@ -1562,7 +1779,7 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
             compared_reference_role_pairs=(("base", "unknown-role"),),
         ),
     )
-    assert invalid_diagnostic.composition_result.output_status == "ready"
+    assert invalid_diagnostic.composition_evaluation.output_status == "ready"
     assert invalid_diagnostic.source_difference_observation is None
     assert invalid_diagnostic.source_difference_error is not None
     assert "unknown composition role" in (
@@ -1597,7 +1814,7 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
     submission = runtime.submit_evaluated_composition(
         shadow,
     )
-    assert submission.composition_result.output_status == "ready"
+    assert submission.composition_evaluation.output_status == "ready"
     assert submission.proposal_admission is not None
     assert submission.proposal_admission.accepted
     assert submission.evaluation_record is shadow.evaluation_record
@@ -1612,11 +1829,11 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
     assert step.status == "dispatched"
     assert step.decision is not None
     np.testing.assert_allclose(
-        step.decision.selected_action.arm_qpos_by_side["left"],
+        step.decision.selected_action.value("left_arm").values,
         np.full(6, 0.12),
     )
     np.testing.assert_allclose(
-        step.decision.selected_action.arm_qpos_by_side["right"],
+        step.decision.selected_action.value("right_arm").values,
         np.full(6, -0.12),
     )
     assert step.computation.attribution["left_arm"]["context_ids"] == (
@@ -1633,7 +1850,7 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
         "composition_context_snapshot",
         "composition_input",
         "composition_input_snapshot",
-        "composition_result",
+        "composition_evaluation",
         "action_proposal",
         "arbitration_decision",
         "dispatch_receipt",
@@ -1751,11 +1968,14 @@ def test_information_plan_rejects_unrequested_context_before_retention() -> None
             producer_epoch=runtime.config.producer_epoch,
             sequence=0,
             input_role="base",
-            action=RobotAction.bimanual_qpos(
-                left_arm=np.zeros(6, dtype=np.float32),
-                right_arm=np.zeros(6, dtype=np.float32),
-                timestamp=clock.value,
-                source="information-plan-fixture",
+            action=project_robot_action_v1_to_component_action(
+                RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6, dtype=np.float32),
+                    right_arm=np.zeros(6, dtype=np.float32),
+                    timestamp=clock.value,
+                    source="information-plan-fixture",
+                ),
+                action_schema=runtime.action_schema,
             ),
             produced_at=clock.value,
             produced_clock_domain_id=runtime.config.clock_domain_id,
@@ -1776,7 +1996,7 @@ def test_information_plan_rejects_unrequested_context_before_retention() -> None
         spec=spec,
         target_effective_at=clock.value,
     )
-    assert fresh.composition_result.output_status == "ready"
+    assert fresh.composition_evaluation.output_status == "ready"
     assert fresh.evaluation_record is not None
     assert fresh.evaluation_record.information_plan is plan
     assert fresh.evaluation_record.required_context_channels == ("motion-plan",)
@@ -1786,8 +2006,8 @@ def test_information_plan_rejects_unrequested_context_before_retention() -> None
         spec=spec,
         target_effective_at=clock.value,
     )
-    assert stale.composition_result.output_status == "no_action"
-    assert stale.composition_result.reason == "stale_context:motion-plan"
+    assert stale.composition_evaluation.output_status == "no_action"
+    assert stale.composition_evaluation.reason == "stale_context:motion-plan"
     composition_event_types = [
         fact.event_type
         for fact in runtime.trace_facts
@@ -1875,11 +2095,14 @@ def test_source_eligibility_is_default_off_and_opt_in_shadow_holds_no_motion() -
             producer_epoch=runtime.config.producer_epoch,
             sequence=0,
             input_role="policy",
-            action=RobotAction.bimanual_qpos(
-                left_arm=np.full(6, 0.1, dtype=np.float32),
-                right_arm=np.full(6, -0.1, dtype=np.float32),
-                timestamp=clock.value,
-                source="virtual-policy",
+            action=project_robot_action_v1_to_component_action(
+                RobotAction.bimanual_qpos(
+                    left_arm=np.full(6, 0.1, dtype=np.float32),
+                    right_arm=np.full(6, -0.1, dtype=np.float32),
+                    timestamp=clock.value,
+                    source="virtual-policy",
+                ),
+                action_schema=runtime.action_schema,
             ),
             produced_at=clock.value,
             produced_clock_domain_id=runtime.config.clock_domain_id,
@@ -1912,7 +2135,7 @@ def test_source_eligibility_is_default_off_and_opt_in_shadow_holds_no_motion() -
         source_eligibility_spec=source_spec,
         target_effective_at=clock.value,
     )
-    assert ready.composition_result.output_status == "ready"
+    assert ready.composition_evaluation.output_status == "ready"
     assert ready.proposal_admission is None
 
     clock.value += 0.01
@@ -1940,7 +2163,7 @@ def test_source_eligibility_is_default_off_and_opt_in_shadow_holds_no_motion() -
         source_eligibility_spec=source_spec,
         target_effective_at=clock.value,
     )
-    assert blocked.composition_result.output_status == "no_action"
+    assert blocked.composition_evaluation.output_status == "no_action"
     assert blocked.input_snapshot.missing_roles == ("policy",)
     assert blocked.input_snapshot.source_ineligibility_reason_by_role[
         "policy"
@@ -2046,11 +2269,14 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
                     producer_epoch=runtime.config.producer_epoch,
                     sequence=index,
                     input_role="base",
-                    action=RobotAction.bimanual_qpos(
-                        left_arm=np.full(6, current_base_value, dtype=np.float32),
-                        right_arm=np.full(6, -current_base_value, dtype=np.float32),
-                        timestamp=clock.value,
-                        source="synthetic_slow_base",
+                    action=project_robot_action_v1_to_component_action(
+                        RobotAction.bimanual_qpos(
+                            left_arm=np.full(6, current_base_value, dtype=np.float32),
+                            right_arm=np.full(6, -current_base_value, dtype=np.float32),
+                            timestamp=clock.value,
+                            source="synthetic_slow_base",
+                        ),
+                        action_schema=runtime.action_schema,
                     ),
                     produced_at=clock.value,
                     produced_clock_domain_id=runtime.config.clock_domain_id,
@@ -2080,15 +2306,18 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
                     producer_epoch=runtime.config.producer_epoch,
                     sequence=index,
                     input_role="residual",
-                    action=RobotAction.bimanual_qpos(
-                        left_arm=np.full(
-                            6, current_residual_value, dtype=np.float32
+                    action=project_robot_action_v1_to_component_action(
+                        RobotAction.bimanual_qpos(
+                            left_arm=np.full(
+                                6, current_residual_value, dtype=np.float32
+                            ),
+                            right_arm=np.full(
+                                6, -current_residual_value, dtype=np.float32
+                            ),
+                            timestamp=clock.value,
+                            source="synthetic_fast_residual",
                         ),
-                        right_arm=np.full(
-                            6, -current_residual_value, dtype=np.float32
-                        ),
-                        timestamp=clock.value,
-                        source="synthetic_fast_residual",
+                        action_schema=runtime.action_schema,
                     ),
                     produced_at=clock.value,
                     produced_clock_domain_id=runtime.config.clock_domain_id,
@@ -2117,7 +2346,7 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
                 spec=spec,
                 target_effective_at=clock.value,
             )
-            assert submission.composition_result.output_status == "ready"
+            assert submission.composition_evaluation.output_status == "ready"
             assert submission.proposal_admission is not None
             assert submission.proposal_admission.accepted
             step = runtime.step(
@@ -2140,7 +2369,7 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
     for step, expected in zip(dispatched_steps, expected_selected_values, strict=True):
         assert step.decision is not None
         np.testing.assert_allclose(
-            step.decision.selected_action.arm_qpos_by_side["left"],
+            step.decision.selected_action.value("left_arm").values,
             np.full(6, expected),
         )
     published_at = [step.decision.published_at for step in dispatched_steps]
@@ -2151,7 +2380,7 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
     event_types = [fact.event_type for fact in runtime.trace_facts]
     assert event_types.count("composition_context") == 3
     assert event_types.count("composition_input") == 12
-    assert event_types.count("composition_result") == 7
+    assert event_types.count("composition_evaluation") == 7
     assert event_types.count("action_proposal") == 7
     assert event_types.count("arbitration_decision") == 7
     runtime.close()

@@ -28,14 +28,18 @@ from robot_motion.action import (
     BIMANUAL_QPOS_HAND16_V1,
     BIMANUAL_QPOS_V1,
     AuthoritativeCommandDispatchContext,
+    AuthoritativeTargetDispatchContext,
     CanonicalDeskToRuntimePoseTransformer,
+    ComponentExecutionTarget,
     CompoundDispatchManifest,
     ResolvedExecutionTarget,
     RobotAction,
     build_resolved_execution_target,
+    build_component_execution_target,
     hand_action_specs_from_metadata,
     project_robot_action_to_components,
     validate_compound_dispatch_manifest,
+    TargetProcessingFactReference,
 )
 from robot_motion.action.executor import RobotActionResolver, xyzquat_to_matrix
 from robot_motion.action.proposal import (
@@ -535,6 +539,85 @@ def build_mujoco_pose_qpos_execution_target(
     )
 
 
+def build_mujoco_component_execution_target(
+    resolution: MujocoPoseToQposResolution,
+    context: AuthoritativeTargetDispatchContext,
+    *,
+    resolved_at: float,
+    output_target_schema_hash: str,
+) -> ComponentExecutionTarget:
+    """Build the component-keyed MuJoCo target without a universal safe claim."""
+
+    if not isinstance(resolution, MujocoPoseToQposResolution):
+        raise TypeError("resolution must be MujocoPoseToQposResolution.")
+    if not isinstance(context, AuthoritativeTargetDispatchContext):
+        raise TypeError(
+            "context must be an AuthoritativeTargetDispatchContext."
+        )
+    output = resolution.output_qpos_action
+    if tuple(output.active_effectors) != context.component_coverage:
+        raise ValueError(
+            "Resolved qpos target must cover the exact authoritative "
+            "component set."
+        )
+    component_values: dict[str, object] = {
+        f"{side}_arm": np.asarray(values, dtype=float).tolist()
+        for side, values in output.arm_qpos_by_side.items()
+    }
+    component_values.update(
+        {
+            f"{side}_hand": np.asarray(values, dtype=float).tolist()
+            for side, values in output.hand_qpos_by_side.items()
+        }
+    )
+    if set(component_values) != set(context.component_coverage):
+        raise ValueError(
+            "Resolved qpos payload does not exactly cover the target context."
+        )
+    resolved = float(resolved_at)
+    processing_fact = TargetProcessingFactReference(
+        stage="mujoco.coupled_pose_to_qpos",
+        fact_id=resolution.resolution_id,
+        fact_hash=resolution.semantic_content_hash,
+        status=resolution.solver_status,
+        processing_started_at=resolved,
+        processing_completed_at=resolved,
+        clock_domain_id=context.target_execution_request.clock_domain_id,
+    )
+    target_at = float(context.target_effective_at)
+    return build_component_execution_target(
+        context.target_execution_request,
+        context.submission_receipt,
+        component_dependencies=context.component_coverage,
+        output_target_schema_hash=str(output_target_schema_hash),
+        target_kind="mujoco.component_qpos_reference",
+        resolved_at=resolved,
+        temporal_semantics="point_target",
+        scheduled_for=target_at,
+        scheduled_until=None,
+        payload={
+            "command_id": context.command_id,
+            "resolution_id": resolution.resolution_id,
+            "resolution_hash": resolution.semantic_content_hash,
+            "resolver_contract_id": resolution.resolver_contract_id,
+            "resolver_contract_hash": resolution.resolver_contract_hash,
+            "transform_receipt_id": resolution.transform_receipt_id,
+            "transform_contract_hash": resolution.transform_contract_hash,
+            "input_processed_action_hash": (
+                resolution.input_safe_action_hash
+            ),
+            "output_qpos_action_hash": (
+                resolution.output_qpos_action_hash
+            ),
+            "component_values": component_values,
+            "group_segment_generation_by_group": dict(
+                context.group_segment_generation_by_group
+            ),
+        },
+        processing_fact_references=(processing_fact,),
+    )
+
+
 __all__ = [
     "MujocoCoupledPoseToQposResolver",
     "MujocoPoseToQposResolution",
@@ -542,4 +625,5 @@ __all__ = [
     "POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1",
     "POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1",
     "build_mujoco_pose_qpos_execution_target",
+    "build_mujoco_component_execution_target",
 ]

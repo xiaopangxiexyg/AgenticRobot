@@ -126,12 +126,26 @@ def build_device_retry_runtime(
             status_keys.add("arm.force_guard")
         if bool(getattr(args, "foot_pad_requested", False)):
             status_keys.add("foot_pad")
+        # The retry path replaces the live adapter and intentionally updates
+        # ``_last_foot_pad_online`` to suppress a second edge event on the
+        # next poll.  Therefore the normal edge publisher cannot be relied on
+        # to refresh the GUI card.  Include the complete foot-pad test state
+        # in every hardware-status projection so a successful reconnect is
+        # immediately visible (and stays visible on later status ticks).
+        foot_pad_ui_state: dict[str, object] = {}
+        foot_pad_state_builder = getattr(clutch_input, "_foot_pad_test_ui_state", None)
+        if callable(foot_pad_state_builder):
+            try:
+                foot_pad_ui_state = dict(foot_pad_state_builder() or {})
+            except Exception as exc:  # noqa: BLE001 - status must not break retry.
+                _log("FootPad", f"状态刷新失败，保留硬件状态：{type(exc).__name__}: {exc}")
         control_ui.publish(
             hardware_status={
                 key: hardware_status_item(key)
                 for key in sorted(status_keys)
             },
             active_controls=clutch_input._current_active_controls(),
+            **foot_pad_ui_state,
         )
 
 
@@ -316,8 +330,35 @@ def build_device_retry_runtime(
                     foot_pad_input = replacement
                     clutch_input.foot_pad_input = replacement
                     clutch_input._last_foot_pad_online = True
+                    # A manual retry bypasses the normal offline->online edge
+                    # in ``RealTeleopControl.poll`` (the edge is intentionally
+                    # suppressed above so the replacement is not opened twice).
+                    # Re-arm the connection-scoped diagnostic and publish its
+                    # complete UI payload explicitly; otherwise the hardware
+                    # card can turn green while the ``脚踏板安全测试`` control
+                    # remains hidden/stale until another unrelated event.
+                    clutch_input._foot_pad_test_active = False
+                    clutch_input._foot_pad_test_completed = False
+                    clutch_input._foot_pad_test_seen_events = set()
+                    clutch_input._foot_pad_test_last_event = ""
+                    count = int(getattr(replacement, "foot_pad_count", 0) or 0)
+                    if count == 2:
+                        clutch_input._foot_pad_test_status = (
+                            "已重连并识别 2 个踏板；可开始“脚踏板安全测试”。"
+                        )
+                    elif count == 4:
+                        clutch_input._foot_pad_test_status = (
+                            "已重连并识别 4 个踏板；可开始“脚踏板安全测试”。"
+                        )
                     args.special_arm_control_mode = SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
                     args.foot_pad_startup_error = ""
+                    publish_foot_pad_test = getattr(
+                        clutch_input, "_publish_foot_pad_test_state", None
+                    )
+                    if callable(publish_foot_pad_test):
+                        publish_foot_pad_test(
+                            message="脚踏板已重连；“脚踏板安全测试”已恢复。"
+                        )
                 elif key in {
                     "dmtac.assignment",
                     "camera.config",

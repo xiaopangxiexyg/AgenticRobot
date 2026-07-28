@@ -34,6 +34,9 @@ from robot_motion.action import (
     HandActionSpec,
     ProposalBuffer,
     RobotAction,
+    build_robot_action_v1_runtime_schema,
+    materialize_robot_action_v1,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.arbitration_input import capture_arbitration_input
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
@@ -105,6 +108,17 @@ def _capture(
         BIMANUAL_EE_POSE_V1,
         tuple(components),
     )
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+        hand_action_specs_by_side=(
+            {
+                "left": HandActionSpec.dmtac_gripper("left"),
+                "right": HandActionSpec.dmtac_gripper("right"),
+            }
+            if include_hands
+            else None
+        ),
+    )
     proposals = ProposalBuffer(
         runtime_session_id="session-0",
         coordinator=coordinator,
@@ -117,6 +131,33 @@ def _capture(
             ("replay-main", "replay", 0.45),
         )
     ):
+        source_action = (
+            _pose(x, source=kind)
+            if action_by_producer is None
+            else action_by_producer[producer]
+        )
+        if include_hands and action_by_producer is None:
+            left_hand_spec = HandActionSpec.dmtac_gripper("left")
+            right_hand_spec = HandActionSpec.dmtac_gripper("right")
+            source_action = RobotAction.bimanual_ee_pose(
+                left_arm=source_action.arm_pose_by_side["left"],
+                right_arm=source_action.arm_pose_by_side["right"],
+                left_hand=np.zeros(6, dtype=np.float32),
+                right_hand=np.zeros(6, dtype=np.float32),
+                active_effectors=(
+                    "left_arm",
+                    "right_arm",
+                    "left_hand",
+                    "right_hand",
+                ),
+                source=kind,
+                metadata={
+                    "hand_action_specs_by_side": {
+                        "left": left_hand_spec.to_metadata(),
+                        "right": right_hand_spec.to_metadata(),
+                    }
+                },
+            )
         receipt = proposals.admit(
             ActionProposalDraft(
                 runtime_session_id="session-0",
@@ -126,10 +167,9 @@ def _capture(
                 producer_id=producer,
                 producer_epoch=1,
                 sequence=sequence,
-                action=(
-                    _pose(x, source=kind)
-                    if action_by_producer is None
-                    else action_by_producer[producer]
+                action=project_robot_action_v1_to_component_action(
+                    source_action,
+                    action_schema=action_schema,
                 ),
                 produced_at=4.0,
                 produced_clock_domain_id=f"{producer}.clock",
@@ -137,13 +177,6 @@ def _capture(
                 effective_until=11.0,
                 target_effective_at=10.5,
                 effective_clock_domain_id="control.monotonic",
-                component_schema_hash=catalog.semantic_content_hash,
-                component_coverage=(
-                    "left_arm",
-                    "right_arm",
-                    *(("left_hand", "right_hand") if include_hands else ()),
-                ),
-                selection_groups=("arms",),
             )
         )
         assert receipt.accepted
@@ -188,7 +221,7 @@ def _capture(
             clock=clock,
         ),
         embodiment_instance_id="rm65-pair-0",
-        component_catalog=catalog,
+        action_schema=action_schema,
         active_selection_groups=("arms",),
     )
     assert snapshot is not None
@@ -220,21 +253,25 @@ def _compound_arbitration_input_with_left_hand():
         (0.2, 0.8),
     ):
         proposal = item.proposal
-        base = proposal.action
+        base = materialize_robot_action_v1(proposal.action)
         hand = np.zeros(6, dtype=np.float32)
         hand[0] = value
         object.__setattr__(
             proposal,
             "action",
-            RobotAction(
-                action_space=BIMANUAL_EE_POSE_V1,
-                arm_pose_by_side=base.arm_pose_by_side,
-                hand_qpos_by_side={"left": hand},
-                active_effectors=("left_arm", "right_arm", "left_hand"),
-                frame_by_effector=base.frame_by_effector,
-                controlled_frame_by_effector=base.controlled_frame_by_effector,
-                source=base.source,
-                metadata=base.metadata,
+            project_robot_action_v1_to_component_action(
+                RobotAction(
+                    action_space=BIMANUAL_EE_POSE_V1,
+                    arm_pose_by_side=base.arm_pose_by_side,
+                    hand_qpos_by_side={"left": hand},
+                    active_effectors=("left_arm", "right_arm", "left_hand"),
+                    frame_by_effector=base.frame_by_effector,
+                    controlled_frame_by_effector=(
+                        base.controlled_frame_by_effector
+                    ),
+                    source=base.source,
+                    metadata=base.metadata,
+                ),
             ),
         )
     return arbitration_input
@@ -252,9 +289,12 @@ def test_discrete_owner_strategy_is_pose_passthrough_equivalent_to_arbiter() -> 
     assert mixed.selected_proposal_ids == (normal.selected_by_group["arms"],)
     assert mixed.output_action is not None
     assert mixed.output_action.action_space == BIMANUAL_EE_POSE_V1
+    authoritative_action = materialize_robot_action_v1(
+        normal.composed_candidate
+    )
     np.testing.assert_array_equal(
         mixed.output_action.arm_pose_by_side["left"],
-        normal.composed_action.arm_pose_by_side["left"],
+        authoritative_action.arm_pose_by_side["left"],
     )
 
 
@@ -581,29 +621,31 @@ def test_weighted_se3_pose_fusion_fails_closed_on_source_conflict() -> None:
 
 
 def test_weighted_se3_pose_fusion_rejects_implicit_frame_conversion() -> None:
-    arbitration_input = _capture(
-        action_by_producer={
-            "human-main": _rotated_pose(0.35, 0.0, source="human"),
-            "replay-main": _rotated_pose(
-                0.45,
-                0.0,
-                source="replay",
-                frame_by_effector={
-                    "left_arm": "canonical_desk",
-                    "right_arm": "canonical_desk",
-                },
-            ),
-        }
+    catalog = ActionComponentCatalog(
+        "pose-arms-v1",
+        BIMANUAL_EE_POSE_V1,
+        (
+            ActionComponentSpec("left_arm", "arms", "left_arm", coupled=True),
+            ActionComponentSpec("right_arm", "arms", "right_arm", coupled=True),
+        ),
     )
-    decision = WeightedSE3PoseFusionStrategy(
-        weights_by_source_slot={
-            "human-slot": 0.5,
-            "replay-slot": 0.5,
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
+    source = _rotated_pose(
+        0.45,
+        0.0,
+        source="replay",
+        frame_by_effector={
+            "left_arm": "canonical_desk",
+            "right_arm": "canonical_desk",
         },
-    ).decide(_mixing_snapshot(arbitration_input))
-
-    assert decision.status == "invalid"
-    assert decision.reason == "pose_fusion_frame_or_action_space_mismatch"
+    )
+    with pytest.raises(ValueError, match="does not match the runtime payload schema"):
+        project_robot_action_v1_to_component_action(
+            source,
+            action_schema=action_schema,
+        )
 
 
 def test_weighted_se3_pose_fusion_missing_source_policy_is_explicit() -> None:
@@ -641,9 +683,11 @@ def test_pose_mixing_rejects_qpos_candidate_at_the_boundary() -> None:
     object.__setattr__(
         candidate,
         "action",
-        RobotAction.bimanual_qpos(
-            left_arm=np.zeros(6, dtype=np.float32),
-            right_arm=np.zeros(6, dtype=np.float32),
+        project_robot_action_v1_to_component_action(
+            RobotAction.bimanual_qpos(
+                left_arm=np.zeros(6, dtype=np.float32),
+                right_arm=np.zeros(6, dtype=np.float32),
+            )
         ),
     )
     with pytest.raises(ValueError, match="requires bimanual_ee_pose_v1"):
@@ -653,26 +697,28 @@ def test_pose_mixing_rejects_qpos_candidate_at_the_boundary() -> None:
 def test_arm_pose_mixing_rejects_silently_carried_hand_qpos() -> None:
     arbitration_input = _capture()
     candidate = arbitration_input.proposal_snapshot.candidates[0].proposal
-    pose_action = candidate.action
+    pose_action = materialize_robot_action_v1(candidate.action)
     object.__setattr__(
         candidate,
         "action",
-        RobotAction(
-            action_space=BIMANUAL_EE_POSE_V1,
-            arm_pose_by_side=pose_action.arm_pose_by_side,
-            hand_qpos_by_side={
-                "left": np.zeros(6, dtype=np.float32),
-                "right": np.zeros(6, dtype=np.float32),
-            },
-            active_effectors=(
-                "left_arm",
-                "right_arm",
-                "left_hand",
-                "right_hand",
-            ),
-            frame_by_effector=pose_action.frame_by_effector,
-            controlled_frame_by_effector=(
-                pose_action.controlled_frame_by_effector
+        project_robot_action_v1_to_component_action(
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                arm_pose_by_side=pose_action.arm_pose_by_side,
+                hand_qpos_by_side={
+                    "left": np.zeros(6, dtype=np.float32),
+                    "right": np.zeros(6, dtype=np.float32),
+                },
+                active_effectors=(
+                    "left_arm",
+                    "right_arm",
+                    "left_hand",
+                    "right_hand",
+                ),
+                frame_by_effector=pose_action.frame_by_effector,
+                controlled_frame_by_effector=(
+                    pose_action.controlled_frame_by_effector
+                ),
             ),
         ),
     )
@@ -690,8 +736,9 @@ def _hand_input_snapshot(
     values = (0.2, 0.8)
     for item, value in zip(arbitration_input.proposal_snapshot.candidates, values):
         proposal = item.proposal
-        left_arm = proposal.action.arm_pose_by_side["left"]
-        right_arm = proposal.action.arm_pose_by_side["right"]
+        base_action = materialize_robot_action_v1(proposal.action)
+        left_arm = base_action.arm_pose_by_side["left"]
+        right_arm = base_action.arm_pose_by_side["right"]
         if action_space == BIMANUAL_EE_POSE_HAND16_V1:
             left_hand = np.full(16, np.nan, dtype=np.float32)
             left_hand[: hand_spec.active_dof] = np.linspace(
@@ -705,7 +752,12 @@ def _hand_input_snapshot(
                 right_arm=right_arm,
                 left_hand=left_hand,
                 active_effectors=("left_arm", "right_arm", "left_hand"),
-                source=proposal.action.source,
+                source=base_action.source,
+                metadata={
+                    "hand_action_specs_by_side": {
+                        "left": hand_spec.to_metadata(),
+                    }
+                },
             )
         else:
             left_hand = np.zeros(6, dtype=np.float32)
@@ -715,9 +767,18 @@ def _hand_input_snapshot(
                 right_arm=right_arm,
                 left_hand=left_hand,
                 active_effectors=("left_arm", "right_arm", "left_hand"),
-                source=proposal.action.source,
+                source=base_action.source,
+                metadata={
+                    "hand_action_specs_by_side": {
+                        "left": hand_spec.to_metadata(),
+                    }
+                },
             )
-        object.__setattr__(proposal, "action", action)
+        object.__setattr__(
+            proposal,
+            "action",
+            project_robot_action_v1_to_component_action(action),
+        )
     return build_hand_qpos_mixing_input_snapshot(
         arbitration_input,
         source_slot_by_producer={

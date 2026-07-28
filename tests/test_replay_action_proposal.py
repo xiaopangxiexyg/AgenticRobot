@@ -20,7 +20,11 @@ from dataset_contracts.replay import (
 )
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from dataset_interface.replay import replay_action_stage_from_contract
-from robot_motion.action import ArmActionSpec, RobotAction
+from robot_motion.action import (
+    ArmActionSpec,
+    RobotAction,
+    project_robot_action_v1_to_component_action,
+)
 from robot_motion.replay.proposal_source import (
     ReplayProposalSource,
     ReplayProposalSourceConfig,
@@ -122,6 +126,27 @@ def _action() -> RobotAction:
     )
 
 
+def _action_schema():
+    action = _action()
+    cleaned = RobotAction(
+        action_space=action.action_space,
+        timestamp=action.timestamp,
+        arm_pose_by_side=action.arm_pose_by_side,
+        active_effectors=action.active_effectors,
+        frame_by_effector=action.frame_by_effector,
+        controlled_frame_by_effector=action.controlled_frame_by_effector,
+        source="runtime-schema-template",
+        metadata={
+            "arm_action_specs_by_side": action.metadata[
+                "arm_action_specs_by_side"
+            ]
+        },
+    )
+    return project_robot_action_v1_to_component_action(
+        cleaned
+    ).action_schema
+
+
 def _adapter(
     *,
     stage: str = REPLAY_ACTION_STAGE_SELECTED,
@@ -138,9 +163,7 @@ def _adapter(
             embodiment_instance_id="rm65-pair-0",
             producer_id="replay-main",
             producer_epoch=1,
-            component_schema_hash="target-components",
-            component_coverage=("right_arm",),
-            selection_groups=("right_arm",),
+            action_schema=_action_schema(),
             source_contract=_source_contract(stage=stage),
             source_action_contract=source_action,
             target_runtime_contract=target,
@@ -187,7 +210,11 @@ def test_replay_adapter_moves_debug_metadata_to_typed_lineage() -> None:
     assert result.replay_action_record is not None
     assert result.proposal_draft is not None
     assert result.proposal_draft.producer_kind == "replay"
-    assert set(result.proposal_draft.action.metadata) == {"arm_action_specs_by_side"}
+    assert set(
+        result.proposal_draft.action.action_schema.semantic_parameters[
+            "v1_execution_metadata"
+        ]
+    ) == {"arm_action_specs_by_side"}
     assert result.proposal_draft.representation_trace_id == (
         result.source_adapter_receipt.representation_trace_id
     )

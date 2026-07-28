@@ -54,8 +54,9 @@ GUI-selectable application assemblies should become declarative
 not recreate their queues, workers, cursors, epochs, safety, or dispatch.
 
 The boundary tests keep current migration debt explicit: dataset projection is
-confined to `control_trace.py` and the existing
-`composition/mujoco_pose_composer.py` profile, OpenPI knowledge to
+confined to `control_trace.py`, the existing
+`composition/mujoco_pose_composer.py` profile, and the default-off
+`composition/mujoco_sim_hil.py` profile, OpenPI knowledge to
 `preflight/openpi_rtc.py`, MuJoCo imports to concrete profiles, and numerical
 source code to the two source modules scheduled for extraction. New debt may
 not spread while those files are migrated.
@@ -156,6 +157,20 @@ MuJoCo target single-arm: that concrete profile remains bimanual and must fail
 closed until a target binding advertises a matching resolver/safety capability.
 Arbitrary named arms require a later component-schema version.
 
+The default-off `mujoco_sim_hil` application profile adds the first formal
+human+policy compound binding for the existing MuJoCo pose execution target.
+It accepts a lower-owned `PolicyActionEmission` and a passive
+`PassiveTeleopComponentSessionSource`, converts both to non-authoritative
+composition inputs, and promotes only one all-required composer proposal.
+Policy inference/chunk ownership, teleop calibration/Home/rebase/deadman,
+formal fusion, shared safety, RM65 IK, reference scheduling, and dispatch stay
+with their existing lower owners. The profile does not alter the direct
+`run_vive_mujoco_teleop.py` debug path or `policy_rollout.py`; it has no default
+CLI activation and is not a real-arm motion permission.
+An explicit readiness provider is required even for a virtual source; recovery
+from HOLD uses an explicit `rearm()` activation and never auto-clears the
+lower execution gate.
+
 `control_composition.observability` owns the non-authoritative observation over
 one exact composition snapshot/result. An explicit `SourceDifferenceSpec`
 binds the composition spec hash and declares comparable `(compared, reference)`
@@ -170,7 +185,7 @@ returns the observation on `CompositeProposalSubmission`, and emits exact
 protocol-neutral source-difference domain events. The injected dataset adapter
 may project them into hash-linked v2.4 ControlTrace facts. Diagnostic
 failure is returned separately and cannot rewrite the
-composition result. CS-6b1h/1i only forward the opt-in spec and expose the same
+composition evaluation. CS-6b1h/1i only forward the opt-in spec and expose the same
 observation on their step result. With the default `None`, no observation,
 extra trace fact, clock read, or legacy binding-hash field is added.
 `guidance_feedback.py` can map one configured pose pair to bounded dimensionless
@@ -326,6 +341,23 @@ sim only: no GUI, device start, replay cursor, policy/RTC source, real binding,
 or production entrypoint is added, and no physical deadman/retarget evidence is
 claimed.
 
+The current default-off `python -m control_station sim-hil --enable` application
+profile is the operational Station leaf for the temporary PPO + passive VIVE/Q6
+MuJoCo path. Its local GUI is intentionally a status surface only: it shows
+readiness checks, source freshness, composition input/proposal receipts,
+activation hashes, and execution receipts, but exposes no raw-action or direct
+re-arm endpoint. The status API binds to loopback and uses the versioned
+`dexteleop.control_station.sim_hil_status.v1` projection; a failed status
+provider is rendered as an explicit GUI error rather than as a false HOLD.
+
+The optional `--vive-coordinate-profile` selects a profile from the independent
+`control_station_vive_coordinate_profiles` directory. Station combines its
+VIVE frame and tracker offsets with the explicitly selected
+`--calibration-profile`, which supplies target transforms and session Home
+anchors. The two source JSON files are never modified or conflated. A
+coordinate-only profile cannot be used as the Home profile by itself, and a
+bimanual Sim-HIL run rejects a single-side coordinate profile.
+
 The reusable boundary is intentional: a new tracker only supplies the public
 passive-session profile, a new target supplies the shared authoritative target
 adapter plus capability/manifest evidence, and a new model/replay source
@@ -378,3 +410,26 @@ backend-neutral executable seam, not merely to create per-device files.
 
 Compatibility re-exports are kept during migrations so existing entrypoints
 and tests do not need synchronized rewrites.
+
+## VIVE coordinate calibration
+
+`python -m control_station vive-calibration` opens a local browser GUI for the
+VIVE coordinate/tracker calibration workflow. It reuses the existing VIVE
+receiver, virtual-desk sweep fitting, tracker-offset calculation, and
+`TeleopCalibration` serialization through
+`teleop_runtime.real_teleop.vive_calibration_runtime`; Control Station only
+binds the source, lifecycle, GUI events, and independent profile store. It
+creates no robot/sim target and owns no dispatch or motion authority.
+
+The GUI supports `--sides left`, `--sides right`, and `--sides both`. It fits
+the VIVE virtual desk from X/Y/Z sweeps, captures wrist tracker offsets for the
+selected side(s), and displays live channels, fit quality, transforms, and
+saved profiles. Use `--view-only` to inspect profiles without opening the VIVE
+receiver and `--dry-run` for configuration validation.
+
+These profiles use the independent
+`control_station_vive_coordinate_profiles_dir` path, defaulting to
+`teleop_records/control_station_vive_coordinate_profiles`. They are not
+discovered by the real-teleop `calibration_profiles_dir` workflow and carry a
+distinct `profile_kind=control_station_vive_coordinate` marker. Robot/sim
+desk-to-base transforms and session Home anchors remain target/runtime-owned.

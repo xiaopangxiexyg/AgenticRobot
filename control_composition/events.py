@@ -37,7 +37,7 @@ class CompositionActivationBinding:
 
     def __post_init__(self) -> None:
         kind = _required(self.subject_kind, name="subject_kind")
-        if kind not in {"input", "snapshot", "result"}:
+        if kind not in {"input", "snapshot", "evaluation"}:
             raise ValueError("Unsupported composition activation subject kind.")
         payload = {
             "subject_kind": kind,

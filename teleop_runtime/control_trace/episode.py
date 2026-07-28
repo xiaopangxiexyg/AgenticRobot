@@ -18,6 +18,7 @@ from dataset_contracts.control_trace_episode import (
     EpisodeTraceSealAssessment,
     V24EpisodeCaptureCommit,
 )
+from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.stream_catalog import (
     NativeStreamEpisodeManifest,
     NativeStreamExternalArtifactReceipt,
@@ -351,6 +352,7 @@ class EpisodeTraceRecorderSink:
         *,
         legacy_episode_index: int,
         prepared_at: float,
+        episode_identity: EpisodeCaptureIdentity | None = None,
     ) -> PreparedEpisodeTraceCapture:
         with self._lock:
             if self._prepared is not None or self.lifecycle.active_episode_uuid is not None:
@@ -358,7 +360,15 @@ class EpisodeTraceRecorderSink:
             index = int(legacy_episode_index)
             if index < 0:
                 raise ValueError("legacy_episode_index must be non-negative.")
-            episode_uuid = str(self.uuid_factory()).strip()
+            if episode_identity is not None:
+                if episode_identity.legacy_episode_index != index:
+                    raise ValueError(
+                        "Episode capture identity legacy index does not match "
+                        "the ControlTrace preparation."
+                    )
+                episode_uuid = str(episode_identity.episode_uuid).strip()
+            else:
+                episode_uuid = str(self.uuid_factory()).strip()
             if not episode_uuid:
                 raise ValueError("uuid_factory returned an empty episode UUID.")
             prepared = PreparedEpisodeTraceCapture(

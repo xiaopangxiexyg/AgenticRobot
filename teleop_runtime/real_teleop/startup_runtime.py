@@ -524,6 +524,18 @@ def _wait_for_real_teleop_start_request(
         "Pre-Home exact-qpos maintenance is available from the GUI.",
     )
     status_gate = ChangeGate()
+    # The startup wait loop is not a control loop.  Before runtime Home is
+    # captured, the state backends are still live because the GUI needs a
+    # fresh qpos for an explicit Init/hold operation, but polling them every
+    # 20 ms needlessly competes with PositionForceGuard's 20 Hz
+    # ``Get_Force_Data`` calls on the same RM65 SDK connection.  The vendor
+    # request/response API is serialized by the backend read lock; an
+    # occasional delayed state response can therefore make the force sample
+    # appear stale and trip the fail-closed watchdog.  Five Hz is sufficient
+    # for the startup preview, while the explicit Init action still performs
+    # its own fresh qpos read when requested.
+    startup_state_sync_period_sec = 0.2
+    last_startup_state_sync_monotonic: float | None = None
     clutch_input.set_startup_qpos_maintenance_enabled(True)
     try:
         initial_force_sides = _impedance_force_control_not_ready_sides(args, components)
@@ -617,7 +629,14 @@ def _wait_for_real_teleop_start_request(
                     return None
                 clutch_input.publish_calibration_waiting("Home 标定已取消，回到等待状态。")
 
-            _sync_preview_from_real_state_real(components, required=False)
+            now_monotonic = time.monotonic()
+            if (
+                last_startup_state_sync_monotonic is None
+                or now_monotonic - last_startup_state_sync_monotonic
+                >= startup_state_sync_period_sec
+            ):
+                _sync_preview_from_real_state_real(components, required=False)
+                last_startup_state_sync_monotonic = time.monotonic()
 
             channels, _ = components.session.poll_sources(loop_start)
             clutch_input.publish_raw_tracker_pose_state(channels=channels, now=loop_start)
@@ -689,14 +708,57 @@ def _arm_after_start_calibration(
     clutch_input: RealTeleopControlInput,
     *,
     home_captured: bool,
+    position_force_guard_monitor: object | None = None,
 ) -> None:
     arm_after_start = time.perf_counter()
     reset_elapsed_ms = 0.0
     if home_captured:
         reset_start = time.perf_counter()
-        synced = _reset_runtime_motion_state_from_real_qpos(components, required=True)
+        try:
+            synced = _reset_runtime_motion_state_from_real_qpos(components, required=True)
+        except Exception as exc:  # noqa: BLE001 - collision recovery remains in GUI Hold.
+            guard_fault = (
+                None
+                if position_force_guard_monitor is None
+                else getattr(position_force_guard_monitor, "fault", None)
+            )
+            if guard_fault is None:
+                raise
+            message = (
+                "位控受力急停后的 runtime Home 复位失败，保持停臂："
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("PositionForceGuard", message)
+            clutch_input.publish_calibration_waiting(
+                message + " 请检查机械臂状态后重试。"
+            )
+            return
         reset_elapsed_ms = (time.perf_counter() - reset_start) * 1000.0
         _log("Calibration", f"runtime restart motion state reset from live real qpos synced={synced}")
+        if position_force_guard_monitor is not None:
+            guard_fault = getattr(position_force_guard_monitor, "fault", None)
+            rearm = getattr(
+                position_force_guard_monitor,
+                "rearm_after_manual_home",
+                None,
+            )
+            if guard_fault is not None and callable(rearm):
+                try:
+                    rearm()
+                except Exception as exc:  # noqa: BLE001 - remain in safe Hold.
+                    message = (
+                        "位控受力急停仍保持锁存，不能恢复遥操："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    _log("PositionForceGuard", message)
+                    try:
+                        components.session.hold_hardware(message)
+                    except Exception as hold_exc:  # noqa: BLE001 - preserve first cause.
+                        message += f"；Hold 下发失败: {type(hold_exc).__name__}: {hold_exc}"
+                    clutch_input.publish_calibration_waiting(
+                        message + " 请检查急停确认/机械臂状态后再重试。"
+                    )
+                    return
     state_machine_start = time.perf_counter()
     if home_captured:
         components.session.mark_home_recalibrated("RM65 runtime home captured")

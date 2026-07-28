@@ -27,6 +27,7 @@ from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_QPOS_V1,
     HandActionSpec,
+    build_robot_action_v1_runtime_schema,
 )
 
 from teleop_runtime.control_trace import (
@@ -668,6 +669,11 @@ def build_real_teleop_human_shadow_frontend(
         include_command_metadata=False,
         source="human:vive:canonical_gui",
     )
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+        arm_action_specs_by_side=dict(action_adapter.arm_specs or {}),
+        hand_action_specs_by_side=dict(action_adapter.hand_specs or {}),
+    )
     adapter = HumanProposalAdapter(
         HumanProposalAdapterConfig(
             runtime_session_id=runtime_session_id,
@@ -678,6 +684,7 @@ def build_real_teleop_human_shadow_frontend(
             produced_clock_domain_id=HUMAN_SHADOW_CLOCK_DOMAIN_V1,
             effective_clock_domain_id=HUMAN_SHADOW_CLOCK_DOMAIN_V1,
             component_catalog=catalog,
+            action_schema=action_schema,
             action_adapter=action_adapter,
         )
     )
@@ -692,6 +699,7 @@ def build_real_teleop_human_shadow_frontend(
             action_space=profile.action_space,
             decision_hz=profile.decision_hz,
             component_catalog=catalog,
+            action_schema=action_schema,
         ),
         clock=clock,
     )

@@ -6009,6 +6009,38 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             any("hold_motion failed" in str(call.args[1]) for call in log.call_args_list)
         )
 
+    def test_impedance_force_collision_uses_runtime_collision_callback(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.state_machine = SimpleNamespace(state=real_teleop.TeleopRunState.RUNNING)
+                self.faults: list[str] = []
+
+            def fault(self, reason: str) -> None:
+                self.faults.append(reason)
+
+        session = FakeSession()
+        components = SimpleNamespace(session=session)
+        issue = "left_arm pose impedance fault before command dispatch: RuntimeError: left: force 55.0000N > hard_stop_force_n"
+        collisions: list[str] = []
+
+        with patch.object(real_teleop, "_impedance_force_control_issue", return_value=issue), patch.object(
+            real_teleop,
+            "_log",
+        ) as log, patch.object(real_teleop, "_hold_motion_after_impedance_guard_issue") as hold:
+            ok = real_teleop._guard_impedance_force_control(
+                SimpleNamespace(),
+                components,
+                context="main_loop",
+                now=1.0,
+                collision_handler=collisions.append,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(collisions, [f"main_loop: {issue}"])
+        self.assertEqual(session.faults, [])
+        hold.assert_not_called()
+        log.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

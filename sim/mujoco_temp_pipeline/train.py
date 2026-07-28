@@ -16,10 +16,13 @@ import torch
 from .checkpoint import (
     build_policy_from_checkpoint,
     check_task_config_compatibility,
+    expand_cube_pose_policy_state,
     file_sha256,
     save_checkpoint,
+    scale_pose_action_head_for_doubled_step,
 )
 from .config import PPOConfig, RewardShapingConfig
+from .normalization import RunningMeanStd
 from .ppo import PPOSmokeTrainer
 from .records import RunRecorder
 from sim.mujoco.tasks.cube_lift.config import (
@@ -54,6 +57,7 @@ def initialize_policy_weights(
         payload,
         task_config_path,
         allow_mismatch=True,
+        allow_cube_pose_observation_expansion=True,
     )
     if (
         restored.environment_action_dim != trainer.policy.environment_action_dim
@@ -67,8 +71,35 @@ def initialize_policy_weights(
             f"runtime={trainer.policy.active_action_indices}/"
             f"{trainer.policy.environment_action_dim}. Start a fresh checkpoint."
         )
-    trainer.policy.load_state_dict(restored.state_dict())
-    trainer.observation_normalizer = normalizer
+    if bool(compatibility.get("cube_pose_observation_expansion", False)):
+        # Preserve the learned 28-D actor while adding the seven new cube-pose
+        # inputs.  The new first-layer columns are zeroed, and the arm output
+        # head is made conservative because v5 doubles the physical pose step.
+        expand_cube_pose_policy_state(restored, trainer.policy)
+        scale_pose_action_head_for_doubled_step(trainer.policy)
+        if normalizer.mean.shape != (28,) or trainer.observation_dim != 35:
+            raise ValueError(
+                "Cube-pose migration expects a 28-D source and 35-D runtime "
+                f"observation, got source={normalizer.mean.shape}, "
+                f"runtime={trainer.observation_dim}."
+            )
+        expanded_normalizer = RunningMeanStd.create((35,), epsilon=normalizer.count)
+        expanded_normalizer.mean[:28] = normalizer.mean
+        expanded_normalizer.var[:28] = normalizer.var
+        # Keep the new channels numerically quiet until the running statistics
+        # have observed them in the target environment.  Their initial policy
+        # weights are zero, so this does not alter the old actor's behavior.
+        expanded_normalizer.mean[28:] = np.mean(trainer.observation[:, 28:35], axis=0)
+        expanded_normalizer.var[28:] = 1.0
+        expanded_normalizer.clip = normalizer.clip
+        trainer.observation_normalizer = expanded_normalizer
+    else:
+        trainer.policy.load_state_dict(restored.state_dict())
+        trainer.observation_normalizer = normalizer
+    if bool(compatibility.get("task_config_mismatch", False)):
+        # Keep the actor as a warm start, but do not reuse value estimates
+        # from a different transition/reward contract.
+        trainer.policy.reset_critic()
     return {
         "path": str(Path(checkpoint).resolve()),
         "source_global_step": int(payload.get("global_step", 0)),
@@ -170,6 +201,7 @@ def format_training_progress(
         f"loss={_format_metric(record.get('policy_loss'), decimals=3)} "
         f"v={_format_metric(record.get('value_loss'), decimals=3)} "
         f"kl={_format_metric(record.get('approx_kl'), decimals=2, scientific=True)} "
+        f"stop={_format_metric(100.0 * float(record.get('ppo_early_stop_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"ckpt={checkpoint}"
     )
 
@@ -239,9 +271,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--target-kl",
+        type=float,
+        default=0.03,
+        help="Stop PPO minibatch updates when approximate KL exceeds this value.",
+    )
+    parser.add_argument(
+        "--max-log-ratio",
+        type=float,
+        default=10.0,
+        help="Clamp PPO log importance ratios before exponentiation.",
+    )
+    parser.add_argument(
+        "--advantage-clip",
+        type=float,
+        default=10.0,
+        help="Bound normalized advantages for numerical robustness.",
+    )
     parser.add_argument("--initial-log-std", type=float, default=-0.5)
     parser.add_argument("--final-log-std", type=float, default=-2.5)
     parser.add_argument("--std-anneal-fraction", type=float, default=0.75)
+    parser.add_argument(
+        "--effective-action-for-ppo",
+        action="store_true",
+        help=(
+            "For safety/post-contact-modified transitions, recompute PPO's "
+            "old log-probability on the compact action that was actually "
+            "accepted by the simulator."
+        ),
+    )
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
@@ -288,9 +347,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         update_epochs=args.update_epochs,
         minibatch_size=args.minibatch_size,
         learning_rate=args.learning_rate,
+        target_kl=args.target_kl,
+        max_log_ratio=args.max_log_ratio,
+        advantage_clip=args.advantage_clip,
         initial_log_std=args.initial_log_std,
         final_log_std=args.final_log_std,
         std_anneal_fraction=args.std_anneal_fraction,
+        effective_action_for_ppo=args.effective_action_for_ppo,
         hidden_dim=args.hidden_dim,
         seed=args.seed,
         checkpoint_interval=args.checkpoint_interval,
@@ -448,6 +511,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "safety_rejection_rate": rollout.safety_rejection_rate,
                 "safety_recovery_rate": rollout.safety_recovery_rate,
                 "safety_projection_alpha_mean": rollout.safety_projection_alpha_mean,
+                "effective_action_override_rate": (
+                    rollout.effective_action_override_rate
+                ),
+                "effective_action_delta_mean": rollout.effective_action_delta_mean,
+                "post_contact_phase_active_rate": (
+                    rollout.post_contact_phase_active_rate
+                ),
+                "post_contact_action_modified_rate": (
+                    rollout.post_contact_action_modified_rate
+                ),
+                "scripted_pregrasp_action_modified_rate": (
+                    rollout.scripted_pregrasp_action_modified_rate
+                ),
                 "safety_minimum_distance_m": rollout.safety_minimum_distance_m,
                 "hard_penetration_count": rollout.hard_penetration_count,
                 "clearance_violation_count": rollout.clearance_violation_count,

@@ -25,6 +25,7 @@ from robot_motion.action import (
     HandActionSpec,
     RobotAction,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
+    project_robot_action_v1_to_component_action,
 )
 from sim.contracts import TimingSpec
 from sim.mujoco.adapters import (
@@ -164,26 +165,29 @@ def _input(
         producer_epoch=runtime.config.producer_epoch,
         sequence=0,
         input_role=role,
-        action=RobotAction(
-            action_space=BIMANUAL_EE_POSE_V1,
-            arm_pose_by_side={
-                "left": np.asarray(
-                    [arm_x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                    dtype=np.float32,
-                )
-            },
-            hand_qpos_by_side={
-                "left": np.full(6, hand_value, dtype=np.float32)
-            },
-            active_effectors=("left_arm", "left_hand"),
-            frame_by_effector={"left_arm": "left_arm_base"},
-            controlled_frame_by_effector={"left_arm": "tool_tcp"},
-            source=f"mujoco-shadow-{role}",
-            metadata={
-                "hand_action_specs_by_side": {
-                    "left": hand_spec.to_metadata()
-                }
-            },
+        action=project_robot_action_v1_to_component_action(
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                arm_pose_by_side={
+                    "left": np.asarray(
+                        [arm_x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                        dtype=np.float32,
+                    )
+                },
+                hand_qpos_by_side={
+                    "left": np.full(6, hand_value, dtype=np.float32)
+                },
+                active_effectors=("left_arm", "left_hand"),
+                frame_by_effector={"left_arm": "left_arm_base"},
+                controlled_frame_by_effector={"left_arm": "tool_tcp"},
+                source=f"mujoco-shadow-{role}",
+                metadata={
+                    "hand_action_specs_by_side": {
+                        "left": hand_spec.to_metadata()
+                    }
+                },
+            ),
+            action_schema=runtime.action_schema,
         ),
         produced_at=10.0,
         produced_clock_domain_id=runtime.config.clock_domain_id,
@@ -193,7 +197,7 @@ def _input(
     )
 
 
-def test_mujoco_formal_component_profile_is_shadow_only_and_default_off() -> None:
+def test_shadow_composition_rejects_components_outside_runtime_schema() -> None:
     hand_spec, composition_spec, strategy = _strategy()
     clock = ManualClock()
     scene = ShadowScene()
@@ -235,40 +239,16 @@ def test_mujoco_formal_component_profile_is_shadow_only_and_default_off() -> Non
         clock=clock,
     )
     runtime.start()
-    for producer_id, role, arm_x, hand_value in (
-        ("human-shadow", "human", 0.0, 0.2),
-        ("policy-shadow", "policy", 0.04, 0.6),
-    ):
-        runtime.activate_policy_node_producer(producer_id)
-        assert runtime.submit_composition_input(
-            _input(
-                runtime,
-                producer_id=producer_id,
-                role=role,
-                arm_x=arm_x,
-                hand_value=hand_value,
-                hand_spec=hand_spec,
-            )
-        ).accepted
-
-    evaluation = runtime.evaluate_composition_shadow(
-        spec=composition_spec,
-        target_effective_at=10.0,
-    )
-    assert evaluation.composition_result.output_status == "ready"
-    assert evaluation.proposal_admission is None
+    runtime.activate_policy_node_producer("human-shadow")
+    with pytest.raises(ValueError, match="outside the runtime action schema"):
+        _input(
+            runtime,
+            producer_id="human-shadow",
+            role="human",
+            arm_x=0.0,
+            hand_value=0.2,
+            hand_spec=hand_spec,
+        )
     assert scene.physics_command_count == 0
     assert len(runtime.core.proposals) == 0
-    trace_types = tuple(fact.event_type for fact in runtime.trace_facts)
-    assert trace_types.count("component_composition_rule_set") == 1
-    assert trace_types.count("formal_component_composition_binding") == 1
-    issues = evaluate_control_trace_lineage(
-        runtime.trace_facts,
-        profile=trace_requirement_profile("deployable_sim_v1"),
-    )
-    assert not {
-        issue.code
-        for issue in issues
-        if issue.code.startswith("formal_component_")
-    }
     runtime.close()

@@ -50,8 +50,10 @@ INFERENCE_DELAY_ESTIMATOR_STATE_HASH_DOMAIN_V1 = (
 POLICY_INFERENCE_PREFIX_HASH_DOMAIN_V1 = "dexteleop.policy_inference_prefix.v1"
 POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V1 = "dexteleop.policy_inference_request.v1"
 POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V2 = "dexteleop.policy_inference_request.v2"
+POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V3 = "dexteleop.policy_inference_request.v3"
 POLICY_CHUNK_RESULT_HASH_DOMAIN_V1 = "dexteleop.policy_chunk_result.v1"
 POLICY_CHUNK_RESULT_HASH_DOMAIN_V2 = "dexteleop.policy_chunk_result.v2"
+POLICY_CHUNK_RESULT_HASH_DOMAIN_V3 = "dexteleop.policy_chunk_result.v3"
 
 POLICY_ACTION_PAYLOAD_LEGACY_NORMALIZED_V1 = "legacy_normalized_absolute_v1"
 POLICY_ACTION_PAYLOAD_TYPED_CANONICAL_V1 = "typed_canonical_policy_action_v1"
@@ -285,7 +287,7 @@ class InferenceDelayEstimatorState:
 
 @dataclass(frozen=True)
 class PolicyInferencePrefix:
-    """Model-space suffix supplied as explicit RTC conditioning context."""
+    """Legacy v2 model-space prefix retained for protocol compatibility."""
 
     model_space_actions: np.ndarray
     valid_steps: int
@@ -363,6 +365,7 @@ class PolicyInferenceRequest:
     valid_until: float
     conditioning_prefix: PolicyInferencePrefix | None = None
     action_representation_context: PolicyActionRepresentationContext | None = None
+    conditioning_binding_hash: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -440,6 +443,22 @@ class PolicyInferenceRequest:
         object.__setattr__(self, "prediction_horizon_steps", prediction)
         object.__setattr__(self, "minimum_execution_horizon_steps", minimum)
         prefix = self.conditioning_prefix
+        binding_hash = self.conditioning_binding_hash
+        if binding_hash is not None:
+            binding_hash = _nonempty(
+                binding_hash,
+                name="conditioning_binding_hash",
+            )
+            object.__setattr__(
+                self,
+                "conditioning_binding_hash",
+                binding_hash,
+            )
+        if prefix is not None and binding_hash is not None:
+            raise ValueError(
+                "A request cannot carry both a legacy model-space prefix and "
+                "a causal conditioning binding."
+            )
         if prefix is not None:
             if prefix.source_plan_id != self.source_plan_id:
                 raise ValueError("Conditioning prefix source plan id mismatch.")
@@ -447,8 +466,17 @@ class PolicyInferenceRequest:
                 raise ValueError("Conditioning prefix source plan generation mismatch.")
             if prefix.source_plan_hash != self.source_plan_hash:
                 raise ValueError("Conditioning prefix source plan hash mismatch.")
-        if mode == RTC_FLOW_INPAINT_MODE_V1 and prefix is None:
-            raise ValueError("rtc_flow_inpaint_v1 requires a conditioning prefix.")
+        if mode == RTC_FLOW_INPAINT_MODE_V1 and (
+            prefix is None and binding_hash is None
+        ):
+            raise ValueError(
+                "rtc_flow_inpaint_v1 requires a legacy prefix or causal "
+                "conditioning binding."
+            )
+        if mode != RTC_FLOW_INPAINT_MODE_V1 and binding_hash is not None:
+            raise ValueError(
+                "A causal conditioning binding requires rtc_flow_inpaint_v1."
+            )
         context = self.action_representation_context
         if context is not None:
             if not isinstance(context, PolicyActionRepresentationContext):
@@ -517,6 +545,11 @@ class PolicyInferenceRequest:
                 self.action_representation_context.semantic_content_hash
             )
             domain = POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V2
+        if self.conditioning_binding_hash is not None:
+            payload["conditioning_binding_hash"] = (
+                self.conditioning_binding_hash
+            )
+            domain = POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V3
         return canonical_content_hash(payload, domain=domain)
 
 
@@ -558,6 +591,9 @@ class PolicyChunkResult:
     fault_code: str | None = None
     fault_detail: str | None = None
     canonical_actions: tuple[CanonicalPolicyAction, ...] = ()
+    conditioning_binding_hash: str | None = None
+    conditioning_encoding_receipt_hash: str | None = None
+    conditioning_consumption_receipt_hash: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -720,10 +756,44 @@ class PolicyChunkResult:
                     "model_output_hash",
                     _nonempty(self.model_output_hash, name="model_output_hash"),
                 )
-        for name in ("protocol_version", "conditioning_prefix_hash", "fault_detail"):
+        for name in (
+            "protocol_version",
+            "conditioning_prefix_hash",
+            "conditioning_binding_hash",
+            "conditioning_encoding_receipt_hash",
+            "conditioning_consumption_receipt_hash",
+            "fault_detail",
+        ):
             value = getattr(self, name)
             if value is not None:
-                object.__setattr__(self, name, str(value))
+                if name == "fault_detail":
+                    object.__setattr__(self, name, str(value))
+                else:
+                    object.__setattr__(
+                        self,
+                        name,
+                        _nonempty(value, name=name),
+                    )
+        conditioning_hashes = (
+            self.conditioning_binding_hash,
+            self.conditioning_encoding_receipt_hash,
+            self.conditioning_consumption_receipt_hash,
+        )
+        if any(value is not None for value in conditioning_hashes):
+            if not all(value is not None for value in conditioning_hashes):
+                raise ValueError(
+                    "A conditioned result requires binding, encoding, and "
+                    "consumption receipt hashes together."
+                )
+            if self.rtc_mode != RTC_FLOW_INPAINT_MODE_V1:
+                raise ValueError(
+                    "Conditioning receipt hashes require rtc_flow_inpaint_v1."
+                )
+            if self.conditioning_prefix_hash is not None:
+                raise ValueError(
+                    "Legacy conditioning prefix and v3 binding receipts are "
+                    "mutually exclusive."
+                )
         for name in ("effective_delay_steps", "execution_horizon_steps"):
             value = getattr(self, name)
             if value is not None:
@@ -790,6 +860,21 @@ class PolicyChunkResult:
             domain = POLICY_CHUNK_RESULT_HASH_DOMAIN_V2
         else:
             domain = POLICY_CHUNK_RESULT_HASH_DOMAIN_V1
+        if self.conditioning_binding_hash is not None:
+            payload.update(
+                {
+                    "conditioning_binding_hash": (
+                        self.conditioning_binding_hash
+                    ),
+                    "conditioning_encoding_receipt_hash": (
+                        self.conditioning_encoding_receipt_hash
+                    ),
+                    "conditioning_consumption_receipt_hash": (
+                        self.conditioning_consumption_receipt_hash
+                    ),
+                }
+            )
+            domain = POLICY_CHUNK_RESULT_HASH_DOMAIN_V3
         return canonical_content_hash(
             payload,
             domain=domain,
@@ -805,9 +890,13 @@ __all__ = [
     "InferenceDelayEstimatorState",
     "NEAREST_RANK_QUANTILE_ESTIMATOR_V1",
     "POLICY_CHUNK_RESULT_HASH_DOMAIN_V1",
+    "POLICY_CHUNK_RESULT_HASH_DOMAIN_V2",
+    "POLICY_CHUNK_RESULT_HASH_DOMAIN_V3",
     "POLICY_INFERENCE_MODES_V1",
     "POLICY_INFERENCE_PREFIX_HASH_DOMAIN_V1",
     "POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V1",
+    "POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V2",
+    "POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V3",
     "PolicyChunkResult",
     "PolicyInferencePrefix",
     "PolicyInferenceRequest",

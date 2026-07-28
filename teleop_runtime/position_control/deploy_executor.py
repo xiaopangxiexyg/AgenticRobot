@@ -34,6 +34,7 @@ from robot_motion.position_control import (
     DEFAULT_POSITION_COMMAND_HZ,
     DEFAULT_POSITION_REFERENCE_HZ,
     DEFAULT_POSITION_SAMPLE_HZ,
+    PositionControlProfile,
     ResampledMotionReference,
     TimestampedMotionTarget,
 )
@@ -108,6 +109,56 @@ class PositionDeployExecutorConfig:
     # current sample-rate action is consumed, so references query the current logical
     # time instead of adding the legacy one-sample causal delay.
     chunk_lookahead_enabled: bool = False
+
+    @classmethod
+    def from_position_profile(
+        cls,
+        profile: PositionControlProfile,
+        *,
+        compose_target_hz: float | None = None,
+        stale_after_sec: float | None = None,
+        **overrides: Any,
+    ) -> "PositionDeployExecutorConfig":
+        """Build executor rates from a shared position-control profile.
+
+        ``compose_target_hz`` is the already-composed upstream target cadence;
+        it is intentionally separate from a policy/model source rate.  The
+        profile supplies the downstream reference and command clocks, while
+        all existing executor safety, queue, lookahead, and dispatch defaults
+        remain unchanged.
+        """
+
+        if not isinstance(profile, PositionControlProfile):
+            raise TypeError("profile must be a PositionControlProfile.")
+        forbidden_overrides = {
+            "sample_hz",
+            "reference_hz",
+            "command_hz",
+        }.intersection(overrides)
+        if forbidden_overrides:
+            raise TypeError(
+                "profile-owned rate fields cannot be overridden: "
+                + ", ".join(sorted(forbidden_overrides))
+            )
+        target_hz = (
+            profile.rates.sample_hz
+            if compose_target_hz is None
+            else float(compose_target_hz)
+        )
+        target_hz = profile.validate_compose_target_hz(target_hz)
+        config_values = dict(overrides)
+        config_values.setdefault(
+            "stale_after_sec",
+            max(0.25, 3.0 / float(target_hz)),
+        )
+        if stale_after_sec is not None:
+            config_values["stale_after_sec"] = float(stale_after_sec)
+        return cls(
+            sample_hz=target_hz,
+            reference_hz=profile.rates.reference_hz,
+            command_hz=profile.rates.command_hz,
+            **config_values,
+        )
 
     def __post_init__(self) -> None:
         for name in (

@@ -25,6 +25,7 @@ _QUALITY_COLUMNS = (
     "teleop.pose_quality.status",
     "teleop.pose_quality.bad",
     "teleop.pose_quality.score",
+    "teleop.pose_quality.special_code",
     "teleop.force_limit_exceeded",
     "teleop.force_collision_detected",
     "faults_json",
@@ -53,6 +54,9 @@ class ForceCollisionEpisodeLabel:
     pose_quality_warning_count: int
     pose_quality_min_score: float | None
     pose_quality_mean_score: float | None
+    pose_quality_special_count: int = 0
+    pose_quality_singularity_count: int = 0
+    pose_quality_valid_score_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -133,6 +137,9 @@ def _compute_label(
         pose_quality_status_counts=dict(stats.pose_quality_status_counts),
         pose_quality_bad_count=int(stats.pose_quality_bad_count),
         pose_quality_warning_count=int(stats.pose_quality_warning_count),
+        pose_quality_special_count=int(stats.pose_quality_special_count),
+        pose_quality_singularity_count=int(stats.pose_quality_singularity_count),
+        pose_quality_valid_score_count=int(stats.pose_quality_valid_score_count),
         pose_quality_min_score=stats.pose_quality_min_score,
         pose_quality_mean_score=stats.pose_quality_mean_score,
     )
@@ -168,6 +175,9 @@ def _quality_payload(label: ForceCollisionEpisodeLabel) -> dict[str, Any]:
         "pose_quality_status_counts": dict(label.pose_quality_status_counts),
         "pose_quality_bad_count": int(label.pose_quality_bad_count),
         "pose_quality_warning_count": int(label.pose_quality_warning_count),
+        "pose_quality_special_count": int(label.pose_quality_special_count),
+        "pose_quality_singularity_count": int(label.pose_quality_singularity_count),
+        "pose_quality_valid_score_count": int(label.pose_quality_valid_score_count),
         "pose_quality_min_score": label.pose_quality_min_score,
         "pose_quality_mean_score": label.pose_quality_mean_score,
         "force_collision_detected": bool(label.force_collision_detected),

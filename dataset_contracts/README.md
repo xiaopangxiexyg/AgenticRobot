@@ -99,6 +99,15 @@ validation requires every v2 formal-component spec to resolve exactly one such
 binding and requires that binding to resolve its three typed facts. Historical
 spec/strategy v1 record schemas are unchanged.
 
+Role-specific composition additionally publishes low-frequency
+`action_payload_schema` and `component_action_schema` definition facts.
+Per-frame action records retain compact schema hashes; the definition facts
+resolve those hashes to value semantics, frames, coordinates, units, semantic
+parameters, topology, and component-to-payload bindings. Completeness checks
+require relative/absolute role schemas and the absolute output schema to
+resolve, and require every action schema payload reference to resolve exactly
+once.
+
 Formal compound execution adds two records without widening those composition
 facts. `conservative_compound_authority_profile` binds the exact spec,
 rule-set, strategy, producer, components, groups, TTL/fallback class, and
@@ -124,6 +133,24 @@ Storage envelope materialization happens outside the control admission lock.
 The canonical human fixture uses a dataset-local session WAL plus immutable
 per-episode seal/commit sidecars. This is not production activation, Parquet
 materialization, or target-machine power-loss acceptance.
+The spool sink keeps an accepted-entry offset and scans only newly admitted
+journal entries on each worker flush; this removes repeated full-journal scans
+but does not release in-memory history. Releasing durable entries remains a
+separate protocol change because completeness, episode seal, and record
+materialization still read the in-memory journal.
+
+ControlTrace completeness and recorder routing are separate contracts.
+`TraceRequirementProfile` declares which facts must exist for one trace mode;
+`ControlTraceCaptureRoutingPolicy` classifies already-produced facts as
+`causal_core`, `declared_observation`, `diagnostic_debug`, or
+`live_telemetry`. A routing policy must classify every registered event exactly
+once, but classification never changes the fact payload or hash. The optional
+`ControlTraceCaptureRouter` is not installed by any production frontend: it
+provides a default-off recorder seam where core facts must remain durable,
+declared observations/debug may be selected explicitly, and live telemetry may
+use a transient sink. The preserve-all compatibility policy retains every fact
+and exists only to model old behavior; it is not a claim that every fact is
+required for every replay capability.
 
 The opt-in `native_streams` capability is subordinate to that same episode
 lifecycle. Its writer must use the prepared episode UUID/index and seal before
@@ -135,6 +162,83 @@ supports bounded, non-blocking inline submission for small pose/qpos samples
 and records queue/size rejections as native manifest drops. RGBD/tactile arrays
 must instead reuse the existing shared-memory snapshot transport; their native
 identity binding and real producer activation remain separate gates.
+
+## Provisional v2.5-p capability contracts
+
+v2.5-p now has two deliberately separate branches:
+
+- `v25p_native` is the authoritative provisional design. It records typed
+  component streams and causal sample cuts below `meta/v25p/native/` and has no
+  dependency on a v2.3 row, `PolicyIOLayout`, or `meta/episodes.jsonl`.
+- `v25p` and the v1 `CaptureProjectionProfile` are frozen compatibility
+  contracts for already-created, v2.3-based sidecars. Their hashes and readers
+  remain valid, but they are not the native storage model.
+
+The frozen `EmbodimentCaptureProfile` v1 still carries target-capability
+bindings for old artifacts. `EmbodimentCaptureProfileV2` is the corrected
+native topology contract and deliberately omits execution target, authority,
+route, reference, and dispatch semantics. Both versions remain explicitly
+readable by schema ID; a v1 artifact is never reinterpreted as v2.
+
+`action_schema` is the shared pure contract for `ActionPayloadSchema` and
+`ComponentActionSpaceSchema`. Runtime `ComponentAction` and native action
+streams therefore use the same semantic definitions and hash domains. The v2
+stream profile embeds resolvable action-space, payload-schema, and component-
+catalog definitions; its redundant stream fields are retained for simple
+readers but must exactly equal those definitions. `cartesian_pose`, rather
+than the coordinate spelling `xyz_quat_xyzw`, is the representation family;
+the quaternion spelling lives in coordinates and semantic parameters.
+
+A separate native stream profile owns each concrete pose, qpos,
+velocity, end-effector, or other captured representation and chooses its
+action, state, observation, and audit streams, their semantic stage,
+representation, dtype, shape, frames, and storage kind. Small payloads use
+`inline_tensor`; media and
+other large payloads use a content-hash-bound `external_artifact` reference.
+`V25pCausalSample` joins only records available at its cut. This is the common
+recording protocol; no robot-specific concatenated action vector is canonical.
+
+Compatibility output is explicit and subordinate. A v2.3 adapter must resolve
+each target field by an exact component/role/stage/schema match. It fails on
+missing, ambiguous, invalid, or externally stored selected values, and reports
+every native stream omitted by v2.3. Only after the old writer finalizes may a
+`V25pCompatibilityProjectionReceipt` bind that output. Native capture remains
+valid when a compatibility projection is skipped or fails.
+
+`v25p_native_storage` defines an optional physical binding for the same logical
+records. `parquet_stream_chunks_v1` binds immutable per-stream Parquet shards,
+causal-sample shards, file hashes, logical bundle hashes, schema hashes, and
+contiguous sample ranges. These manifests never redefine component semantics or
+make Parquet bytes part of logical record identity. Writers and lifecycle
+remain outside `dataset_contracts`.
+
+`episode_identity` is still minted once by the authoritative episode owner and
+passed unchanged to native storage, task semantics, compatibility writers, and
+eventually the v2.4 branch. The current identity retains the field name
+`legacy_episode_index` as a transitional owner-assigned ordinal; native storage
+does not use it to locate or validate a legacy row. `task_semantics` remains an
+append-only attempt timeline, so failure/recovery/success sequences are
+preserved and frame-local stages are derived views.
+
+Both stores are default-off and subordinate: neither may start, stop, discard,
+or finalize another writer's episode. A native episode seals its sample and
+record bundles before optional compatibility receipts are attached. It still
+does not claim final `native_v25_eligible`; that requires the later formal v2.5
+commit and the planned v2.4 capability merge.
+
+Current built-in adapters expose only values their source sample actually
+provides. RealTeleop declares arm pose, measured qpos, and configured
+end-effector target/state for its active side set; UMI declares tracker pose and
+configured end-effector target/state. Neither invents a velocity stream.
+RM65's six-joint qpos shape belongs to the RealTeleop producer profile, not to
+the native protocol, which supports arbitrary component counts and declared
+stream shapes. These built-in V2 profiles are selected only by the explicit
+default-off native-shadow path; frozen V1 profiles and readers remain available
+for already-created provisional artifacts.
+
+Any immutable v2.5-p identity, whether under the compatibility or native root,
+blocks legacy in-place delete/reindex compaction. A copy-on-write derived
+dataset must issue new identities instead of rewriting captured identity facts.
 
 ## Learning observability contracts
 
@@ -151,6 +255,29 @@ cannot be satisfied by a seed/RNG receipt. Current generic policy clients do
 not expose these facts, so no runtime event schema is registered until one
 concrete model adapter supplies typed evidence. Runtime object references,
 CUDA pointers, and shared-memory handles are never persistent evidence.
+
+## Model continuation data contract
+
+`dataset_contracts.model_continuation` owns the pure, optional artifact
+binding. Frozen v1 combines runtime and training declarations and normalizes
+only in memory as `legacy_v1_compat`; its serialization and hash never change.
+V2 separates a required runtime contract from optional training provenance:
+`inference_only_projection_v1` requires `training=null`, while
+`trained_prefix_conditioning_v1` requires an exact training contract.
+`legacy_v1_compat` cannot be persisted as a new v2 origin.
+
+Both versions bind continuation implementation, delay/prefix ranges,
+continuous action and mask semantics, plus codec/layout/frame/normalization
+identity. Training prefix provenance (`trajectory_overlap_teacher_v1`,
+`recorded_policy_output_v1`, or `synthetic_corruption_v1`) remains distinct
+from runtime `producer_local_overlap_v1`.
+
+The contract owns no dataset reader, ndarray/tensor payload, model call,
+sampler implementation, runtime request/plan, target, safety, or dispatch.
+`PolicyArtifactContract` preserves the source schema and source contract hash;
+the normalized view never creates a replacement identity. Its binding remains
+default-none, so legacy artifact serialization and raw-RTC hashes are
+unchanged.
 
 ## Optional v2.3/v2.4 Plus episode curation overlay
 

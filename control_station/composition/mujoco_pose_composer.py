@@ -1,7 +1,7 @@
 """Default-off formal pose composition profile for deterministic MuJoCo.
 
 Human and replay are immutable contributors, never parallel proposal owners.
-One composer producer may promote an exact ready composition result; missing
+One composer producer may promote an exact ready composition evaluation; missing
 required contributors, numerical conflicts, or promotion errors transition the
 shared execution gate to HOLD.  This module owns no device, replay cursor,
 policy worker, canonical safety implementation, IK, dispatcher, or episode.
@@ -39,6 +39,9 @@ from robot_motion.action import (
     ExecutionGateTransitionOutcome,
     ExecutionProfileExclusion,
     build_control_execution_manifest,
+)
+from robot_motion.action.component_action_v1 import (
+    project_robot_action_v1_to_component_action,
 )
 from dataset_interface.composition_control_trace import (
     project_composition_activation_scope,
@@ -461,7 +464,10 @@ class MujocoPoseComposerAuthorityComposition:
                 producer_epoch=producer_epoch,
                 sequence=sequence,
                 input_role=role,
-                action=action,
+                action=project_robot_action_v1_to_component_action(
+                    action,
+                    action_schema=self.runtime.action_schema,
+                ),
                 produced_at=float(produced_at),
                 produced_clock_domain_id=produced_clock_domain_id,
                 effective_from=float(effective_from),
@@ -643,7 +649,11 @@ class MujocoPoseComposerAuthorityComposition:
                 producer_id=self.replay_source.config.producer_id,
                 producer_epoch=self.replay_source.config.producer_epoch,
                 sequence=emission.source_action_index,
-                action=draft.action,
+                # Formal composition v1 still consumes RobotAction pose
+                # values.  The replay proposal itself is ComponentAction-
+                # native; retain the immutable source-frame action at this
+                # explicitly legacy composition-input edge.
+                action=emission.action,
                 produced_at=draft.produced_at,
                 produced_clock_domain_id=draft.produced_clock_domain_id,
                 effective_from=draft.effective_from,
@@ -712,7 +722,7 @@ class MujocoPoseComposerAuthorityComposition:
                     )
                     disposition = decide_composition_authority_disposition(
                         evaluation.input_snapshot,
-                        evaluation.composition_result,
+                        evaluation.composition_evaluation,
                         spec=self.composition_spec,
                         gate_spec=self.authority_gate_spec,
                     )
@@ -725,7 +735,7 @@ class MujocoPoseComposerAuthorityComposition:
                             ),
                         )
                     )
-                    if disposition.action == "publish_proposal":
+                    if disposition.downstream_request == "submit_candidate":
                         proposal = self.runtime.submit_evaluated_composition(
                             evaluation,
                             policy_node_id="cs6b1h-formal-pose-composer",
@@ -755,15 +765,15 @@ class MujocoPoseComposerAuthorityComposition:
             payload = {
                 "decision_key": key,
                 "target_effective_at": target,
-                "composition_result_id": (
+                "composition_evaluation_id": (
                     None
                     if evaluation is None
-                    else evaluation.composition_result.composition_result_id
+                    else evaluation.composition_evaluation.composition_evaluation_id
                 ),
-                "composition_result_hash": (
+                "composition_evaluation_hash": (
                     None
                     if evaluation is None
-                    else evaluation.composition_result.semantic_content_hash
+                    else evaluation.composition_evaluation.semantic_content_hash
                 ),
                 "disposition_id": (
                     None if disposition is None else disposition.disposition_id
@@ -905,7 +915,7 @@ def build_cs6b1i_pose_composition_session_manifest(
         "composition_input_admission",
         "composition_contributor_input",
         "composition_input_snapshot",
-        "composition_result",
+        "composition_evaluation",
         "composition_authority_disposition",
     )
     return ControlStationRunManifest(
@@ -1000,7 +1010,7 @@ def build_cs6b1i_pose_composition_session_manifest(
                 ),
                 supported_uses=("candidate", "authority"),
                 expected_emission_seam=(
-                    "control_composition.composition.CompositionResult"
+                    "control_composition.composition.CompositionEvaluation"
                 ),
                 required_binding_refs=(
                     composition.composition_spec.semantic_content_hash,
@@ -1084,6 +1094,8 @@ def build_cs6b1i_pose_composition_session_execution_manifest(
         manifest_id=CS6B1I_COMPOSITION_SESSION_EXECUTION_MANIFEST_ID_V1,
         manifest_version="v1",
         action_space=runtime.catalog.action_space,
+        action_schema=runtime.action_schema,
+        component_target_capability=runtime.component_target_capability,
         catalog=runtime.catalog,
         motion_authority_sources=(
             f"composer:{runtime.config.composer_producer_id}",

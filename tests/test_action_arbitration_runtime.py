@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
+from robot_motion.action import (
+    BIMANUAL_QPOS_V1,
+    RobotAction,
+    project_robot_action_v1_to_component_action,
+)
 from robot_motion.action.arbitration_runtime import (
     MAX_PRODUCTION_ARBITER_HZ,
     ArbitrationRuntime,
@@ -28,18 +34,28 @@ def computation(
     gate_epoch=0,
     schedule_hash=None,
 ):
+    action = project_robot_action_v1_to_component_action(
+        RobotAction(
+            action_space=BIMANUAL_QPOS_V1,
+            arm_qpos_by_side={"left": np.zeros(6, dtype=np.float32)},
+            source="test",
+        )
+    )
     return SimpleNamespace(
         result_id=result_id,
         output_status="selected",
         gate_epoch=gate_epoch,
         publication_deadline_at=deadline,
         target_effective_at=target,
+        supported_until=deadline,
         arbitration_input_snapshot_id="input-0",
-        selected_action_hash="action-hash",
+        selected_action_hash=action.semantic_content_hash,
         selected_by_group={"arms": "proposal-0"},
-        composed_action=object(),
+        composed_candidate=action,
         authority_epoch=0,
         decision_schedule_spec_hash=schedule_hash,
+        target_clock_domain_id="control.monotonic",
+        semantic_content_hash=f"{result_id}-hash",
     )
 
 

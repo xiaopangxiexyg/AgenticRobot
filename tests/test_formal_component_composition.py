@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import numpy as np
@@ -9,13 +10,20 @@ import pytest
 from control_composition.composition import (
     FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V2,
     FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2,
+    FORMAL_COMPONENT_STRATEGY_MODE_DISCRETE_OWNER_V1,
+    FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
     ComponentCompositionRuleSet,
     CompositionInputDraft,
+    CompositionDynamicParameterContract,
+    CompositionDynamicParameterDraft,
     CompositionSpec,
+    CompositionStrategyControl,
+    CompositionStrategyRevisionDraft,
     FormalComponentCompositionStrategyV2,
     FormalCompositionStrategySpec,
     PoseComponentCompositionRule,
     QposComponentCompositionRule,
+    build_initial_strategy_revision,
     hand_action_spec_semantic_hash,
 )
 from control_composition.composition.core import (
@@ -36,6 +44,8 @@ from robot_motion.action import (
     HandActionSpec,
     ProposalBuffer,
     RobotAction,
+    build_robot_action_v1_runtime_schema,
+    project_robot_action_v1_to_component_action,
 )
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
@@ -120,6 +130,8 @@ def build_runtime(
     strategy,
     *,
     action_space: str = BIMANUAL_EE_POSE_V1,
+    enable_hot_control: bool = False,
+    hot_parameter_lifecycle: str = "latched",
 ):
     clock = Clock()
     coordinator = ControlAdmissionCoordinator(
@@ -151,29 +163,92 @@ def build_runtime(
         capacity=16,
     )
     events = []
+    component_catalog = ActionComponentCatalog(
+        catalog_id="virtual-left-arm-hand-v1",
+        action_space=action_space,
+        components=(
+            ActionComponentSpec("left_arm", "left_arm", "left_arm"),
+            ActionComponentSpec(
+                "left_hand",
+                "left_hand",
+                "left_hand",
+            ),
+        ),
+    )
+    hand_spec = (
+        None
+        if strategy is None
+        else getattr(
+            strategy,
+            "qpos_value_spec_by_component",
+            {},
+        ).get("left_hand")
+    )
+    if hand_spec is None:
+        hand_spec = (
+            HandActionSpec.q16("left")
+            if action_space == BIMANUAL_EE_POSE_HAND16_V1
+            else HandActionSpec.inspire_tac("left")
+        )
+    strategy_control = None
+    if enable_hot_control:
+        if strategy is None:
+            raise ValueError("Hot control requires a formal strategy.")
+        component_ids = tuple(
+            rule.component_id for rule in strategy.component_rule_set.rules
+        )
+        parameter_contract = CompositionDynamicParameterContract(
+            parameter_set_id="human-policy-alpha-v1",
+            base_role="policy",
+            overlay_role="human",
+            component_ids=component_ids,
+            default_alpha_by_component={
+                component_id: 0.0 for component_id in component_ids
+            },
+            lifecycle=hot_parameter_lifecycle,
+        )
+        initial_revision = build_initial_strategy_revision(
+            runtime_session_id="session-0",
+            control_domain_id="robot-0",
+            strategy_instance_id="component-strategy-instance-0",
+            request_id="initial",
+            strategy_mode=FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
+            composition_spec=strategy.composition_spec,
+            strategy_spec=strategy.spec,
+            component_rule_set=strategy.component_rule_set,
+            dynamic_parameter_contract=parameter_contract,
+            initial_alpha_by_component={
+                component_id: 0.0 for component_id in component_ids
+            },
+            available_at=9.8,
+            available_clock_domain_id="control.monotonic",
+        )
+        strategy_control = CompositionStrategyControl(
+            runtime_session_id="session-0",
+            control_domain_id="robot-0",
+            strategy_instance_id="component-strategy-instance-0",
+            coordinator=coordinator,
+            producer_epochs=epochs,
+            retention_spec=retention_spec(),
+            supported_strategy_modes=strategy.supported_strategy_modes,
+            initial_revision=initial_revision,
+        )
     runtime = ControlCompositionRuntime(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
         embodiment_instance_id="virtual-robot-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        component_catalog=ActionComponentCatalog(
-            catalog_id="virtual-left-arm-hand-v1",
-            action_space=action_space,
-            components=(
-                ActionComponentSpec("left_arm", "left_arm", "left_arm"),
-                ActionComponentSpec(
-                    "left_hand",
-                    "left_hand",
-                    "left_hand",
-                ),
-            ),
+        action_schema=build_robot_action_v1_runtime_schema(
+            component_catalog=component_catalog,
+            hand_action_specs_by_side={"left": hand_spec},
         ),
         event_emitter=lambda batch: events.extend(batch),
         proposal_admitter=lambda draft, **_kwargs: proposals.admit(draft),
         context_retention_spec=retention_spec(),
         composition_input_retention_spec=retention_spec(),
         composition_strategy=strategy,
+        strategy_control=strategy_control,
         clock=clock,
     )
     return runtime, proposals, events
@@ -194,6 +269,40 @@ def input_draft(
         if hand_spec is None
         else {"hand_action_specs_by_side": {"left": hand_spec.to_metadata()}}
     )
+    robot_action = RobotAction(
+        action_space=action_space,
+        arm_pose_by_side={
+            "left": np.asarray(
+                [arm_x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                dtype=np.float32,
+            )
+        },
+        hand_qpos_by_side={"left": hand_values},
+        active_effectors=("left_arm", "left_hand"),
+        frame_by_effector={"left_arm": "left_arm_base"},
+        controlled_frame_by_effector={"left_arm": "tool_tcp"},
+        source=f"virtual-{role}",
+        metadata=metadata,
+    )
+    component_catalog = ActionComponentCatalog(
+        catalog_id="virtual-left-arm-hand-v1",
+        action_space=action_space,
+        components=(
+            ActionComponentSpec("left_arm", "left_arm", "left_arm"),
+            ActionComponentSpec("left_hand", "left_hand", "left_hand"),
+        ),
+    )
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=component_catalog,
+        hand_action_specs_by_side={
+            "left": hand_spec
+            or (
+                HandActionSpec.q16("left")
+                if action_space == BIMANUAL_EE_POSE_HAND16_V1
+                else HandActionSpec.inspire_tac("left")
+            )
+        },
+    )
     return CompositionInputDraft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
@@ -201,20 +310,9 @@ def input_draft(
         producer_epoch=1,
         sequence=sequence,
         input_role=role,
-        action=RobotAction(
-            action_space=action_space,
-            arm_pose_by_side={
-                "left": np.asarray(
-                    [arm_x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                    dtype=np.float32,
-                )
-            },
-            hand_qpos_by_side={"left": hand_values},
-            active_effectors=("left_arm", "left_hand"),
-            frame_by_effector={"left_arm": "left_arm_base"},
-            controlled_frame_by_effector={"left_arm": "tool_tcp"},
-            source=f"virtual-{role}",
-            metadata=metadata,
+        action=project_robot_action_v1_to_component_action(
+            robot_action,
+            action_schema=action_schema,
         ),
         produced_at=9.9,
         produced_clock_domain_id=f"{producer_id}.monotonic",
@@ -337,20 +435,20 @@ def test_virtual_human_policy_pose_and_q6_form_one_result() -> None:
         spec=composition_spec,
         target_effective_at=10.1,
     )
-    result = evaluation.composition_result
+    result = evaluation.composition_evaluation
     assert result.output_status == "ready"
     assert result.reason == "formal_component_composition"
-    assert result.composed_action is not None
-    assert result.composed_action.active_effectors == (
+    assert result.composed_candidate is not None
+    assert result.composed_candidate.component_coverage == (
         "left_arm",
         "left_hand",
     )
     np.testing.assert_allclose(
-        result.composed_action.arm_pose_by_side["left"][:3],
+        result.composed_candidate.value("left_arm").values[:3],
         np.asarray([0.01, 0.0, 0.0], dtype=np.float32),
     )
     np.testing.assert_allclose(
-        result.composed_action.hand_qpos_by_side["left"],
+        result.composed_candidate.value("left_hand").values,
         np.full(6, 0.75, dtype=np.float32),
     )
     assert result.strategy_spec_hash == strategy.spec.semantic_content_hash
@@ -409,13 +507,11 @@ def test_virtual_human_policy_pose_and_q6_form_one_result() -> None:
         evaluation,
         runtime_session_id="session-0",
         producer_id="composer-0",
-        producer_epoch=1,
-        sequence=0,
-        effective_until=10.2,
-        component_coverage=("left_arm", "left_hand"),
-        selection_groups=("left_arm", "left_hand"),
-        policy_node_id="virtual-component-policy",
-    )
+            producer_epoch=1,
+            sequence=0,
+            effective_until=10.2,
+            policy_node_id="virtual-component-policy",
+        )
     assert promoted.proposal_admission is not None
     assert promoted.proposal_admission.accepted
     assert len(proposals) == 1
@@ -437,10 +533,10 @@ def test_v2_without_formal_strategy_fails_closed() -> None:
     result = runtime.evaluate_composition(
         spec=composition_spec,
         target_effective_at=10.1,
-    ).composition_result
+    ).composition_evaluation
     assert result.output_status == "invalid"
     assert result.reason == "formal_component_strategy_required"
-    assert result.composed_action is None
+    assert result.composed_candidate is None
     assert len(proposals) == 0
 
 
@@ -488,17 +584,17 @@ def test_missing_policy_can_only_renormalize_when_rule_contract_allows_it() -> N
     result = runtime.evaluate_composition(
         spec=composition_spec,
         target_effective_at=10.1,
-    ).composition_result
+    ).composition_evaluation
     assert result.output_status == "ready"
     assert result.reason == (
         "formal_component_composition_renormalized:left_arm,left_hand"
     )
     np.testing.assert_allclose(
-        result.composed_action.arm_pose_by_side["left"][0],
+        result.composed_candidate.value("left_arm").values[0],
         0.02,
     )
     np.testing.assert_allclose(
-        result.composed_action.hand_qpos_by_side["left"],
+        result.composed_candidate.value("left_hand").values,
         human_hand,
     )
 
@@ -526,23 +622,16 @@ def test_component_missing_from_present_role_obeys_rule_fallback() -> None:
     )
     policy_pose_only = replace(
         policy_pose_only,
-        action=RobotAction(
-            action_space=BIMANUAL_EE_POSE_V1,
-            arm_pose_by_side=policy_pose_only.action.arm_pose_by_side,
-            active_effectors=("left_arm",),
-            frame_by_effector={"left_arm": "left_arm_base"},
-            controlled_frame_by_effector={"left_arm": "tool_tcp"},
-            source="virtual-policy-pose-only",
-        ),
+        action=policy_pose_only.action.project(("left_arm",)),
     )
     assert runtime.admit_composition_input(policy_pose_only).accepted
     result = runtime.evaluate_composition(
         spec=composition_spec,
         target_effective_at=10.1,
-    ).composition_result
+    ).composition_evaluation
     assert result.output_status == "no_action"
     assert result.reason == "component_missing:left_hand:policy"
-    assert result.composed_action is None
+    assert result.composed_candidate is None
 
 
 def test_pose_disagreement_and_frame_mismatch_fail_closed() -> None:
@@ -571,10 +660,10 @@ def test_pose_disagreement_and_frame_mismatch_fail_closed() -> None:
     disagreement = runtime.evaluate_composition(
         spec=composition_spec,
         target_effective_at=10.1,
-    ).composition_result
+    ).composition_evaluation
     assert disagreement.output_status == "invalid"
-    assert disagreement.reason.startswith(
-        "component_invalid:left_arm:translation_disagreement:"
+    assert disagreement.reason == (
+        "component_invalid:left_arm:translation_disagreement"
     )
 
     hand_spec2, _, composition_spec2, strategy2 = build_contract()
@@ -595,29 +684,26 @@ def test_pose_disagreement_and_frame_mismatch_fail_closed() -> None:
         hand_values=np.ones(6, dtype=np.float32),
         hand_spec=hand_spec2,
     )
-    policy = replace(
-        policy,
-        action=RobotAction(
+    wrong_frame = RobotAction(
             action_space=BIMANUAL_EE_POSE_V1,
-            arm_pose_by_side=policy.action.arm_pose_by_side,
-            hand_qpos_by_side=policy.action.hand_qpos_by_side,
+            arm_pose_by_side={"left": policy.action.value("left_arm").values},
+            hand_qpos_by_side={"left": policy.action.value("left_hand").values},
             active_effectors=("left_arm", "left_hand"),
             frame_by_effector={"left_arm": "different_arm_base"},
             controlled_frame_by_effector={"left_arm": "tool_tcp"},
             source="virtual-policy-wrong-frame",
-            metadata=policy.action.metadata,
-        ),
-    )
+            metadata={
+                "hand_action_specs_by_side": {
+                    "left": hand_spec2.to_metadata()
+                }
+            },
+        )
     assert runtime2.admit_composition_input(human).accepted
-    assert runtime2.admit_composition_input(policy).accepted
-    mismatch = runtime2.evaluate_composition(
-        spec=composition_spec2,
-        target_effective_at=10.1,
-    ).composition_result
-    assert mismatch.output_status == "invalid"
-    assert mismatch.reason == (
-        "component_invalid:left_arm:frame_or_action_space_mismatch"
-    )
+    with pytest.raises(ValueError, match="does not match"):
+        project_robot_action_v1_to_component_action(
+            wrong_frame,
+            action_schema=policy.action.action_schema,
+        )
 
 
 def test_q16_active_mask_preserves_inactive_padding() -> None:
@@ -656,7 +742,429 @@ def test_q16_active_mask_preserves_inactive_padding() -> None:
     result = runtime.evaluate_composition(
         spec=composition_spec,
         target_effective_at=10.1,
-    ).composition_result
-    output = result.composed_action.hand_qpos_by_side["left"]
+    ).composition_evaluation
+    output = result.composed_candidate.value("left_hand").values
     np.testing.assert_allclose(output[:6], np.full(6, 0.5))
     assert np.all(np.isnan(output[6:]))
+
+
+def _admit_hot_control_inputs(
+    runtime: ControlCompositionRuntime,
+    *,
+    hand_spec: HandActionSpec,
+) -> None:
+    for producer_id, role, arm_x, hand_value in (
+        ("human-0", "human", 0.08, 1.0),
+        ("policy-0", "policy", 0.00, 0.0),
+    ):
+        assert runtime.admit_composition_input(
+            input_draft(
+                producer_id=producer_id,
+                role=role,
+                sequence=0,
+                arm_x=arm_x,
+                hand_values=np.full(6, hand_value, dtype=np.float32),
+                hand_spec=hand_spec,
+            )
+        ).accepted
+
+
+def _parameter_draft(
+    runtime: ControlCompositionRuntime,
+    *,
+    sequence: int,
+    alpha: float,
+    effective_until: float | None = None,
+) -> CompositionDynamicParameterDraft:
+    control = runtime.strategy_control
+    assert control is not None
+    revision = control.latest_revision
+    contract = revision.dynamic_parameter_contract
+    assert contract is not None
+    return CompositionDynamicParameterDraft(
+        runtime_session_id="session-0",
+        control_domain_id="robot-0",
+        producer_id="human-0",
+        producer_generation=1,
+        sequence=sequence,
+        strategy_revision_hash=revision.semantic_content_hash,
+        parameter_contract_hash=contract.semantic_content_hash,
+        alpha_by_component={
+            component_id: alpha for component_id in contract.component_ids
+        },
+        produced_at=10.0,
+        produced_clock_domain_id="human-0.monotonic",
+        effective_from=10.0,
+        effective_until=effective_until,
+        effective_clock_domain_id="control.monotonic",
+    )
+
+
+def test_hot_alpha_uses_latest_record_from_the_same_control_cut() -> None:
+    hand_spec, _, _, strategy = build_contract()
+    runtime, _, events = build_runtime(
+        strategy,
+        enable_hot_control=True,
+    )
+    _admit_hot_control_inputs(runtime, hand_spec=hand_spec)
+
+    before_update = runtime.coordinator.capture_cut(cutoff_at=10.0).cut
+    receipt = runtime.admit_dynamic_parameters(
+        _parameter_draft(runtime, sequence=0, alpha=0.75)
+    )
+    assert receipt.accepted
+
+    old_cut = runtime.evaluate_hot_composition(
+        target_effective_at=10.1,
+        control_cut=before_update,
+    )
+    new_cut = runtime.evaluate_hot_composition(
+        target_effective_at=10.1,
+        cutoff_at=10.0,
+    )
+    old_action = old_cut.composition_evaluation.composed_candidate
+    new_action = new_cut.composition_evaluation.composed_candidate
+    np.testing.assert_allclose(
+        old_action.value("left_arm").values[0],
+        0.0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        new_action.value("left_arm").values[0],
+        0.06,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        new_action.value("left_hand").values,
+        np.full(6, 0.75),
+        atol=1e-6,
+    )
+    assert (
+        old_cut.evaluation_record.strategy_control_binding
+        .parameter_snapshot.selected_parameter_record_id
+        is None
+    )
+    assert (
+        new_cut.evaluation_record.strategy_control_binding
+        .parameter_snapshot.selected_parameter_record_id
+        == receipt.parameter_record.parameter_record_id
+    )
+    assert new_cut.composition_evaluation.strategy_control_binding_hash == (
+        new_cut.evaluation_record.strategy_control_binding.semantic_content_hash
+    )
+    kinds = tuple(event.event_kind for event in events)
+    assert "composition_dynamic_parameter" in kinds
+    assert "composition_dynamic_parameter_snapshot" in kinds
+    assert "composition_strategy_control_binding" in kinds
+    trace_context = AuthoritativeTraceContext(
+        runtime_session_id="session-0",
+        control_domain_id="robot-0",
+        embodiment_instance_id="virtual-robot-0",
+        clock_domain_id="control.monotonic",
+    )
+    hot_event_kinds = {
+        "composition_dynamic_parameter_contract",
+        "composition_strategy_revision",
+        "composition_dynamic_parameter",
+        "composition_dynamic_parameter_snapshot",
+        "composition_strategy_control_binding",
+        "hot_composition_strategy_input",
+    }
+    projected = {
+        event.event_kind: project_composition_domain_event(
+            trace_context,
+            event,
+        )
+        for event in events
+        if event.event_kind in hot_event_kinds
+    }
+    assert set(projected) == hot_event_kinds
+    assert (
+        projected["hot_composition_strategy_input"].payload[
+            "strategy_control_binding_hash"
+        ]
+        == new_cut.composition_evaluation.strategy_control_binding_hash
+    )
+
+
+def test_invalid_hot_parameter_keeps_the_previous_applied_value() -> None:
+    hand_spec, _, _, strategy = build_contract()
+    runtime, _, _ = build_runtime(strategy, enable_hot_control=True)
+    _admit_hot_control_inputs(runtime, hand_spec=hand_spec)
+    accepted = runtime.admit_dynamic_parameters(
+        _parameter_draft(runtime, sequence=0, alpha=0.4)
+    )
+    assert accepted.accepted
+    rejected = runtime.admit_dynamic_parameters(
+        _parameter_draft(runtime, sequence=1, alpha=1.2)
+    )
+    assert not rejected.accepted
+
+    result = runtime.evaluate_hot_composition(
+        target_effective_at=10.1,
+        cutoff_at=10.0,
+    )
+    np.testing.assert_allclose(
+        result.composition_evaluation.composed_candidate
+        .value("left_arm")
+        .values[0],
+        0.032,
+        atol=1e-6,
+    )
+    snapshot = result.evaluation_record.strategy_control_binding.parameter_snapshot
+    assert snapshot.selected_parameter_record_id == (
+        accepted.parameter_record.parameter_record_id
+    )
+
+
+def test_low_frequency_revision_switch_is_atomic_with_initial_parameters() -> None:
+    hand_spec, _, _, strategy = build_contract()
+    runtime, _, _ = build_runtime(strategy, enable_hot_control=True)
+    _admit_hot_control_inputs(runtime, hand_spec=hand_spec)
+    old_parameter = runtime.admit_dynamic_parameters(
+        _parameter_draft(runtime, sequence=0, alpha=0.25)
+    )
+    assert old_parameter.accepted
+    control = runtime.strategy_control
+    assert control is not None
+    previous = control.latest_revision
+    revised_rules = replace(
+        previous.component_rule_set,
+        rule_set_id="virtual-human-policy-pose-qpos-revision-1",
+    )
+    revised_spec = replace(
+        previous.composition_spec,
+        spec_id="virtual-human-policy-pose-qpos-revision-1",
+        component_rule_set_hash=revised_rules.semantic_content_hash,
+    )
+    revised_strategy_spec = replace(
+        previous.strategy_spec,
+        composition_spec_hash=revised_spec.semantic_content_hash,
+        implementation_contract_hashes=(
+            revised_rules.semantic_content_hash,
+        ),
+    )
+    revision_receipt = runtime.admit_strategy_revision(
+        CompositionStrategyRevisionDraft(
+            request_id="switch-to-human-default",
+            expected_previous_revision_hash=previous.semantic_content_hash,
+            strategy_mode=(
+                FORMAL_COMPONENT_STRATEGY_MODE_DISCRETE_OWNER_V1
+            ),
+            composition_spec=revised_spec,
+            strategy_spec=revised_strategy_spec,
+            component_rule_set=revised_rules,
+            dynamic_parameter_contract=(
+                previous.dynamic_parameter_contract
+            ),
+            initial_alpha_by_component={
+                "left_arm": 0.6,
+                "left_hand": 0.6,
+            },
+        )
+    )
+    assert revision_receipt.accepted
+
+    result = runtime.evaluate_hot_composition(
+        target_effective_at=10.1,
+        cutoff_at=10.0,
+    )
+    binding = result.evaluation_record.strategy_control_binding
+    assert binding.revision.semantic_content_hash == (
+        revision_receipt.revision.semantic_content_hash
+    )
+    assert binding.parameter_snapshot.selected_parameter_record_id is None
+    np.testing.assert_allclose(
+        result.composition_evaluation.composed_candidate
+        .value("left_arm")
+        .values[0],
+        0.08,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        binding.parameter_snapshot.alpha_by_component["left_hand"],
+        0.6,
+    )
+    assert result.composition_evaluation.reason.endswith(
+        FORMAL_COMPONENT_STRATEGY_MODE_DISCRETE_OWNER_V1
+    )
+
+
+def test_revision_rejects_stale_cas_and_runtime_boundary_change() -> None:
+    _, _, _, strategy = build_contract()
+    runtime, _, _ = build_runtime(strategy, enable_hot_control=True)
+    control = runtime.strategy_control
+    assert control is not None
+    previous = control.latest_revision
+
+    stale = runtime.admit_strategy_revision(
+        CompositionStrategyRevisionDraft(
+            request_id="stale",
+            expected_previous_revision_hash="not-current",
+            strategy_mode=previous.strategy_mode,
+            composition_spec=previous.composition_spec,
+            strategy_spec=previous.strategy_spec,
+            component_rule_set=previous.component_rule_set,
+            dynamic_parameter_contract=(
+                previous.dynamic_parameter_contract
+            ),
+            initial_alpha_by_component=(
+                previous.initial_alpha_by_component
+            ),
+        )
+    )
+    assert not stale.accepted
+    assert stale.rejection_code == "stale_previous_revision"
+
+    topology_change = replace(
+        previous.component_rule_set,
+        rule_set_id="invalid-topology-change",
+        rules=(previous.component_rule_set.rules[0],),
+    )
+    incompatible_spec = replace(
+        previous.composition_spec,
+        component_rule_set_hash=topology_change.semantic_content_hash,
+    )
+    incompatible_strategy = replace(
+        previous.strategy_spec,
+        composition_spec_hash=incompatible_spec.semantic_content_hash,
+        implementation_contract_hashes=(
+            topology_change.semantic_content_hash,
+        ),
+    )
+    incompatible = runtime.admit_strategy_revision(
+        CompositionStrategyRevisionDraft(
+            request_id="topology-change",
+            expected_previous_revision_hash=previous.semantic_content_hash,
+            strategy_mode=previous.strategy_mode,
+            composition_spec=incompatible_spec,
+            strategy_spec=incompatible_strategy,
+            component_rule_set=topology_change,
+            dynamic_parameter_contract=None,
+        )
+    )
+    assert not incompatible.accepted
+    assert "fixed runtime compatibility boundary" in incompatible.message
+
+    pending = runtime.admit_strategy_revision(
+        CompositionStrategyRevisionDraft(
+            request_id="one-pending",
+            expected_previous_revision_hash=previous.semantic_content_hash,
+            strategy_mode=previous.strategy_mode,
+            composition_spec=previous.composition_spec,
+            strategy_spec=previous.strategy_spec,
+            component_rule_set=previous.component_rule_set,
+            dynamic_parameter_contract=(
+                previous.dynamic_parameter_contract
+            ),
+            initial_alpha_by_component=(
+                previous.initial_alpha_by_component
+            ),
+        )
+    )
+    assert pending.accepted
+    second_pending = runtime.admit_strategy_revision(
+        CompositionStrategyRevisionDraft(
+            request_id="second-pending",
+            expected_previous_revision_hash=(
+                pending.revision.semantic_content_hash
+            ),
+            strategy_mode=previous.strategy_mode,
+            composition_spec=previous.composition_spec,
+            strategy_spec=previous.strategy_spec,
+            component_rule_set=previous.component_rule_set,
+            dynamic_parameter_contract=(
+                previous.dynamic_parameter_contract
+            ),
+            initial_alpha_by_component=(
+                previous.initial_alpha_by_component
+            ),
+        )
+    )
+    assert not second_pending.accepted
+    assert second_pending.rejection_code == "pending_revision_exists"
+
+
+def test_ttl_hot_parameter_expires_to_revision_default() -> None:
+    hand_spec, _, _, strategy = build_contract()
+    runtime, _, _ = build_runtime(
+        strategy,
+        enable_hot_control=True,
+        hot_parameter_lifecycle="ttl",
+    )
+    _admit_hot_control_inputs(runtime, hand_spec=hand_spec)
+    receipt = runtime.admit_dynamic_parameters(
+        _parameter_draft(
+            runtime,
+            sequence=0,
+            alpha=1.0,
+            effective_until=10.15,
+        )
+    )
+    assert receipt.accepted
+    before_expiry = runtime.evaluate_hot_composition(
+        target_effective_at=10.1,
+        cutoff_at=10.0,
+    )
+    after_expiry = runtime.evaluate_hot_composition(
+        target_effective_at=10.2,
+        cutoff_at=10.0,
+    )
+    assert before_expiry.composition_evaluation.composed_candidate.value(
+        "left_arm"
+    ).values[0] == pytest.approx(0.08)
+    assert after_expiry.composition_evaluation.composed_candidate.value(
+        "left_arm"
+    ).values[0] == pytest.approx(0.0)
+    assert (
+        after_expiry.evaluation_record.strategy_control_binding
+        .parameter_snapshot.selected_parameter_record_id
+        is None
+    )
+
+
+def test_concurrent_hot_updates_never_expose_a_torn_component_vector() -> None:
+    hand_spec, _, _, strategy = build_contract()
+    runtime, _, _ = build_runtime(strategy, enable_hot_control=True)
+    _admit_hot_control_inputs(runtime, hand_spec=hand_spec)
+    observations: list[tuple[float, float, str]] = []
+
+    def publish() -> None:
+        for sequence in range(100):
+            alpha = float(sequence % 11) / 10.0
+            receipt = runtime.admit_dynamic_parameters(
+                _parameter_draft(
+                    runtime,
+                    sequence=sequence,
+                    alpha=alpha,
+                )
+            )
+            assert receipt.accepted
+
+    def evaluate() -> None:
+        for _ in range(100):
+            result = runtime.evaluate_hot_composition(
+                target_effective_at=10.1,
+                cutoff_at=10.0,
+            )
+            action = result.composition_evaluation.composed_candidate
+            arm_alpha = float(action.value("left_arm").values[0]) / 0.08
+            hand_alpha = float(action.value("left_hand").values[0])
+            observations.append(
+                (
+                    arm_alpha,
+                    hand_alpha,
+                    result.composition_evaluation
+                    .strategy_control_binding_hash,
+                )
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = (pool.submit(publish), pool.submit(evaluate))
+        for future in futures:
+            future.result()
+
+    assert len(observations) == 100
+    for arm_alpha, hand_alpha, binding_hash in observations:
+        assert arm_alpha == pytest.approx(hand_alpha, abs=2e-6)
+        assert binding_hash

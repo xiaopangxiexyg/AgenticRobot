@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.v25p_native_storage import V25P_PARQUET_CHUNK_LAYOUT_V1
+from dataset_contracts.v25p_native import V25pComponentStreamProfileV2
+from dataset_contracts.v22 import PolicyIOLayout
 from dataset_contracts.stream_catalog import NativeStreamContract
+from dataset_interface.v25p_native import load_v25p_native_episode
 from dataset_interface.streams import (
     NativeStreamExternalPayloadReference,
     load_native_stream_episode,
@@ -17,7 +24,9 @@ from teleop_runtime.collection.process_writer import (
     ProcessCollectionConfig,
     ProcessCollectionWorker,
     ProcessExternalNativeStreamBinding,
+    ProcessV25pShadowConfig,
 )
+from teleop_runtime.collection.policy_io import load_policy_io_layout
 from teleop_runtime.collection.sample_assembler import (
     CollectorSampleBuilderConfig,
     CollectorSampleSnapshot,
@@ -26,6 +35,7 @@ from teleop_runtime.collection.video_frame import NearestFrameBuffer, VideoFrame
 from teleop_runtime.collection.writer_v21 import LeRobotV21WriterConfig
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.session import SessionStepResult
+from teleop_runtime.schemas import EffectorCommand, TeleopCommand
 
 
 def _snapshot() -> CollectorSampleSnapshot:
@@ -64,6 +74,67 @@ def _snapshot() -> CollectorSampleSnapshot:
         position_reference=None,
         active_sides=("left", "right"),
         component_metadata={"test": True},
+        snapshot_timings_s={
+            "arm_snapshot_s": 0.0,
+            "hand_snapshot_s": 0.0,
+            "camera_snapshot_s": 0.0,
+        },
+    )
+
+
+def _strict_snapshot(
+    *, timestamp: float, joint_timestamp: float
+) -> CollectorSampleSnapshot:
+    def pose(x: float) -> np.ndarray:
+        value = np.eye(4, dtype=np.float32)
+        value[0, 3] = x
+        return value
+
+    command = TeleopCommand(timestamp=timestamp)
+    for side, x in (("left", 0.1), ("right", 0.2)):
+        command.add_command(
+            EffectorCommand(
+                effector_name=f"{side}_arm",
+                side=side,
+                command_type="cartesian_pose",
+                value=pose(x),
+            )
+        )
+        command.add_command(
+            EffectorCommand(
+                effector_name=f"{side}_hand",
+                side=side,
+                command_type="joint_vector",
+                value=np.zeros(6, dtype=np.float32),
+            )
+        )
+    return CollectorSampleSnapshot(
+        step_result=SessionStepResult(
+            timestamp=timestamp,
+            state=TeleopRunState.RUNNING,
+            control_hz=60.0,
+            command=command,
+            command_dispatched=False,
+        ),
+        arm_states={
+            side: {
+                "current_qpos": np.zeros(6, dtype=np.float32),
+                "current_tcp_pose": pose(x),
+                "runtime_arm_state_source": "causal_measured_hardware",
+            }
+            for side, x in (("left", 0.1), ("right", 0.2))
+        },
+        hand_states={
+            side: {
+                "gripper_measured_scalar": 0.2 if side == "left" else 0.8,
+                "joint_timestamp": joint_timestamp,
+            }
+            for side in ("left", "right")
+        },
+        camera_frames={},
+        position_reference=None,
+        active_sides=("left", "right"),
+        component_metadata={"test": "strict_v22"},
         snapshot_timings_s={
             "arm_snapshot_s": 0.0,
             "hand_snapshot_s": 0.0,
@@ -171,6 +242,329 @@ def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_pat
         / "episode_000000"
         / "sensor_a.uint8.bin"
     ).is_file()
+
+
+def test_process_worker_rejects_stale_v22_sample_without_poisoning_worker(tmp_path) -> None:
+    layout = load_policy_io_layout(
+        Path(__file__).parents[1]
+        / (
+            "teleop_runtime/configs/policy_io_layouts/"
+            "dual_arm_bimanual_dmtac_gripper_v22.json"
+        )
+    )
+    assert layout is not None
+    timestamp = time.time()
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            nominal_fps=15.0,
+            task_id="process-strict-v22-test",
+            write_parquet=False,
+            write_video=False,
+            policy_io_layout=layout,
+            strict_v22_policy_io=True,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=2,
+            shared_slot_count=2,
+            shared_slot_bytes=65536,
+            worker_nice=0,
+        ),
+    )
+    try:
+        worker.start()
+        episode_index = worker.start_episode({"formal_dataset": True})
+        assert worker.submit_snapshot(
+            _strict_snapshot(timestamp=timestamp, joint_timestamp=timestamp - 0.503)
+        )
+        worker.flush()
+        stale_stats = worker.stats()
+        assert stale_stats.worker_error is None
+        assert stale_stats.sample_rejections == 1
+        assert stale_stats.completed_samples == 0
+
+        assert worker.submit_snapshot(
+            _strict_snapshot(timestamp=timestamp + 0.1, joint_timestamp=timestamp + 0.0)
+        )
+        worker.flush()
+        valid_stats = worker.stats()
+        assert valid_stats.worker_error is None
+        assert valid_stats.sample_rejections == 1
+        assert valid_stats.completed_samples == 1
+        assert valid_stats.active_episode_frame_count == 1
+        worker.finalize_episode(episode_index, summary={"test": True})
+    finally:
+        worker.close()
+
+
+def test_process_worker_v25p_shadow_uses_owner_identity_and_same_legacy_row(
+    tmp_path,
+) -> None:
+    layout = PolicyIOLayout(name="process_v25p_no_end_effector")
+    pose_hash = canonical_content_hash(
+        {"name": "process_v25p_pose_frames"},
+        domain="test.process_writer.v25p_pose_frames.v1",
+    )
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            nominal_fps=15.0,
+            task_id="process-v25p-shadow-test",
+            write_parquet=False,
+            write_video=False,
+            policy_io_layout=layout,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=2,
+            shared_slot_count=2,
+            shared_slot_bytes=65536,
+            worker_nice=0,
+        ),
+        v25p_shadow_config=ProcessV25pShadowConfig(
+            dataset_id="process-v25p-shadow-dataset",
+            pose_frame_contract_hash=pose_hash,
+            physical_storage_layout=V25P_PARQUET_CHUNK_LAYOUT_V1,
+        ),
+    )
+    identity = EpisodeCaptureIdentity(
+        episode_uuid="process-v25p-owner-episode",
+        legacy_episode_index=0,
+        lifecycle_owner_id="test.process_writer.owner",
+        prepared_at=1.0,
+        prepared_clock_domain_id="test_clock",
+    )
+    timestamp = time.time()
+    sample_count = 48
+    try:
+        worker.start()
+        episode_index = worker.start_episode(
+            {"formal_dataset": True},
+            episode_identity=identity,
+        )
+        assert episode_index == identity.legacy_episode_index
+        for frame_index in range(sample_count):
+            sample_timestamp = timestamp + frame_index / 15.0
+            deadline = time.monotonic() + 5.0
+            while not worker.submit_snapshot(
+                _strict_snapshot(
+                    timestamp=sample_timestamp,
+                    joint_timestamp=sample_timestamp,
+                )
+            ):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("process shadow queue did not accept sample")
+                time.sleep(0.001)
+        worker.flush()
+        active_stats = worker.stats()
+        shadow_timing = active_stats.timing_ms["worker.v25p_native_shadow_append"]
+        assert shadow_timing["count"] == sample_count
+        assert shadow_timing["p95"] is not None
+        assert float(shadow_timing["p95"]) < 10.0
+        result = worker.finalize_episode(episode_index, summary={"test": True})
+    finally:
+        worker.close()
+
+    assert result.legacy_finalized
+    assert result.v25p_native_shadow_error == ""
+    assert result.v25p_native_shadow_report is not None
+    assert result.v25p_native_shadow_report.receipt.status == "complete"
+    loaded = load_v25p_native_episode(tmp_path, identity.episode_uuid)
+    assert loaded.identity == identity
+    assert loaded.native_capture_manifest.sample_count == sample_count
+    assert isinstance(loaded.component_stream_profile, V25pComponentStreamProfileV2)
+    assert {
+        stream.representation_family
+        for stream in loaded.component_stream_profile.streams
+        if stream.dataset_role == "action"
+    } == {"cartesian_pose"}
+    episode_dir = tmp_path / "meta/v25p/native/episodes" / identity.episode_uuid
+    assert (episode_dir / "native_storage_manifest.cjson").is_file()
+
+
+def test_process_worker_v25p_parquet_long_episode_soak(tmp_path) -> None:
+    layout = PolicyIOLayout(name="process_v25p_parquet_soak_no_end_effector")
+    pose_hash = canonical_content_hash(
+        {"name": "process_v25p_parquet_soak_pose_frames"},
+        domain="test.process_writer.v25p_parquet_soak_pose_frames.v1",
+    )
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            nominal_fps=15.0,
+            task_id="process-v25p-parquet-soak",
+            write_parquet=False,
+            write_video=False,
+            policy_io_layout=layout,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=8,
+            shared_slot_count=4,
+            shared_slot_bytes=65536,
+            worker_nice=0,
+        ),
+        v25p_shadow_config=ProcessV25pShadowConfig(
+            dataset_id="process-v25p-parquet-soak-dataset",
+            pose_frame_contract_hash=pose_hash,
+            physical_storage_layout=V25P_PARQUET_CHUNK_LAYOUT_V1,
+        ),
+    )
+    identity = EpisodeCaptureIdentity(
+        episode_uuid="process-v25p-parquet-soak-episode",
+        legacy_episode_index=0,
+        lifecycle_owner_id="test.process_writer.owner",
+        prepared_at=1.0,
+        prepared_clock_domain_id="test_clock",
+    )
+    sample_count = 1024
+    timestamp = time.time()
+    try:
+        worker.start()
+        episode_index = worker.start_episode(
+            {"formal_dataset": True},
+            episode_identity=identity,
+        )
+        for frame_index in range(sample_count):
+            sample_timestamp = timestamp + frame_index / 15.0
+            deadline = time.monotonic() + 5.0
+            while not worker.submit_snapshot(
+                _strict_snapshot(
+                    timestamp=sample_timestamp,
+                    joint_timestamp=sample_timestamp,
+                )
+            ):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("process Parquet soak queue did not accept sample")
+                time.sleep(0.001)
+        worker.flush()
+        timing = worker.stats().timing_ms["worker.v25p_native_shadow_append"]
+        assert timing["count"] == sample_count
+        assert timing["p95"] is not None
+        assert float(timing["p95"]) < 10.0
+        result = worker.finalize_episode(episode_index, summary={"soak": True})
+    finally:
+        worker.close()
+
+    assert result.legacy_finalized
+    assert result.v25p_native_shadow_error == ""
+    assert result.v25p_native_shadow_report.receipt.status == "complete"
+    loaded = load_v25p_native_episode(tmp_path, identity.episode_uuid)
+    assert loaded.native_capture_manifest.sample_count == sample_count
+    episode_dir = tmp_path / "meta/v25p/native/episodes" / identity.episode_uuid
+    assert len(tuple((episode_dir / "chunks").glob("*.cjson"))) == 8
+
+
+def test_process_v25p_shadow_interruption_cannot_publish_commit_and_can_restart(
+    tmp_path,
+) -> None:
+    layout = PolicyIOLayout(name="process_v25p_restart_no_end_effector")
+    pose_hash = canonical_content_hash(
+        {"name": "process_v25p_restart_pose_frames"},
+        domain="test.process_writer.v25p_restart_pose_frames.v1",
+    )
+
+    def new_worker() -> ProcessCollectionWorker:
+        return ProcessCollectionWorker(
+            writer_config=LeRobotV21WriterConfig(
+                root_dir=tmp_path,
+                nominal_fps=15.0,
+                task_id="process-v25p-restart-test",
+                write_parquet=False,
+                write_video=False,
+                policy_io_layout=layout,
+            ),
+            sample_builder_config=CollectorSampleBuilderConfig(
+                active_sides=("left", "right"),
+                camera_buffers={},
+                require_camera_frames=False,
+            ),
+            config=ProcessCollectionConfig(
+                queue_size=2,
+                shared_slot_count=2,
+                shared_slot_bytes=65536,
+                worker_nice=0,
+            ),
+            v25p_shadow_config=ProcessV25pShadowConfig(
+                dataset_id="process-v25p-restart-dataset",
+                pose_frame_contract_hash=pose_hash,
+            ),
+        )
+
+    interrupted_identity = EpisodeCaptureIdentity(
+        episode_uuid="process-v25p-interrupted",
+        legacy_episode_index=0,
+        lifecycle_owner_id="test.process_writer.owner",
+        prepared_at=1.0,
+        prepared_clock_domain_id="test_clock",
+    )
+    timestamp = time.time()
+    interrupted_worker = new_worker()
+    interrupted_worker.start()
+    assert interrupted_worker.start_episode(
+        {"formal_dataset": True},
+        episode_identity=interrupted_identity,
+    ) == 0
+    assert interrupted_worker.submit_snapshot(
+        _strict_snapshot(timestamp=timestamp, joint_timestamp=timestamp)
+    )
+    interrupted_worker.flush()
+    interrupted_worker.close()
+
+    interrupted_root = (
+        tmp_path
+        / "meta/v25p/native/episodes"
+        / interrupted_identity.episode_uuid
+    )
+    assert (interrupted_root / "identity.cjson").is_file()
+    assert not (interrupted_root / "native_capture_manifest.cjson").exists()
+    assert not (interrupted_root / "episode_manifest.cjson").exists()
+
+    recovered_identity = EpisodeCaptureIdentity(
+        episode_uuid="process-v25p-recovered",
+        legacy_episode_index=0,
+        lifecycle_owner_id="test.process_writer.owner",
+        prepared_at=2.0,
+        prepared_clock_domain_id="test_clock",
+    )
+    recovered_worker = new_worker()
+    try:
+        recovered_worker.start()
+        episode_index = recovered_worker.start_episode(
+            {"formal_dataset": True},
+            episode_identity=recovered_identity,
+        )
+        assert recovered_worker.submit_snapshot(
+            _strict_snapshot(
+                timestamp=timestamp + 1.0,
+                joint_timestamp=timestamp + 1.0,
+            )
+        )
+        recovered_worker.flush()
+        result = recovered_worker.finalize_episode(
+            episode_index,
+            summary={"test": "restart"},
+        )
+    finally:
+        recovered_worker.close()
+
+    assert result.v25p_native_shadow_error == ""
+    assert result.v25p_native_shadow_report.receipt.status == "complete"
+    loaded = load_v25p_native_episode(tmp_path, recovered_identity.episode_uuid)
+    assert loaded.identity == recovered_identity
 
 
 def test_process_worker_native_stream_capture_is_bounded_and_episode_bound(

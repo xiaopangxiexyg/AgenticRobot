@@ -21,6 +21,15 @@ def shape_rewards(
     grasp_latched: np.ndarray | None = None,
     bilateral_contact: np.ndarray | None = None,
     previous_bilateral_contact: np.ndarray | None = None,
+    side_contact_score: np.ndarray | None = None,
+    top_bottom_contact_score: np.ndarray | None = None,
+    inner_contact_score: np.ndarray | None = None,
+    bilateral_inner_contact_score: np.ndarray | None = None,
+    outer_contact_score: np.ndarray | None = None,
+    previous_inner_contact_score: np.ndarray | None = None,
+    previous_bilateral_inner_contact_score: np.ndarray | None = None,
+    accepted_action: np.ndarray | None = None,
+    approach_action: np.ndarray | None = None,
     time_limit: np.ndarray | None = None,
     failure_termination: np.ndarray | None = None,
     unsafe_termination: np.ndarray | None = None,
@@ -38,6 +47,23 @@ def shape_rewards(
     current_state = CubeLiftRewardState.from_flat(current)
     previous_state.validate_batch(raw.shape[0])
     current_state.validate_batch(raw.shape[0])
+    if accepted_action is None:
+        accepted = current_state.last_action
+    else:
+        accepted = np.asarray(accepted_action, dtype=np.float32)
+        if accepted.shape != (raw.shape[0], 7):
+            raise ValueError("accepted_action must have shape (N, 7).")
+        if not np.all(np.isfinite(accepted)):
+            raise ValueError("accepted_action must be finite.")
+    if approach_action is None:
+        scripted_approach = np.zeros((raw.shape[0], 7), dtype=np.float32)
+    else:
+        scripted_approach = np.asarray(approach_action, dtype=np.float32)
+        if scripted_approach.shape != (raw.shape[0], 7):
+            raise ValueError("approach_action must have shape (N, 7).")
+        if not np.all(np.isfinite(scripted_approach)):
+            raise ValueError("approach_action must be finite.")
+        scripted_approach = np.clip(scripted_approach, -1.0, 1.0)
 
     if lift_delta_m <= 0.0:
         raise ValueError("lift_delta_m must be positive.")
@@ -79,6 +105,97 @@ def shape_rewards(
                 "previous_bilateral_contact must match the reward batch."
             )
         previous_bilateral = np.clip(previous_bilateral, 0.0, 1.0)
+    if side_contact_score is None:
+        side_contact = np.zeros_like(raw, dtype=np.float32)
+    else:
+        side_contact = np.asarray(side_contact_score, dtype=np.float32).reshape(-1)
+        if side_contact.shape != raw.shape:
+            raise ValueError("side_contact_score must match the reward batch.")
+        if not np.all(np.isfinite(side_contact)):
+            raise ValueError("side_contact_score must be finite.")
+        side_contact = np.clip(side_contact, 0.0, 1.0)
+    if top_bottom_contact_score is None:
+        top_bottom_contact = np.zeros_like(raw, dtype=np.float32)
+    else:
+        top_bottom_contact = np.asarray(
+            top_bottom_contact_score, dtype=np.float32
+        ).reshape(-1)
+        if top_bottom_contact.shape != raw.shape:
+            raise ValueError(
+                "top_bottom_contact_score must match the reward batch."
+            )
+        if not np.all(np.isfinite(top_bottom_contact)):
+            raise ValueError("top_bottom_contact_score must be finite.")
+        top_bottom_contact = np.clip(top_bottom_contact, 0.0, 1.0)
+    if inner_contact_score is None:
+        inner_contact = np.zeros_like(raw, dtype=np.float32)
+    else:
+        inner_contact = np.asarray(inner_contact_score, dtype=np.float32).reshape(-1)
+        if inner_contact.shape != raw.shape:
+            raise ValueError("inner_contact_score must match the reward batch.")
+        if not np.all(np.isfinite(inner_contact)):
+            raise ValueError("inner_contact_score must be finite.")
+        inner_contact = np.clip(inner_contact, 0.0, 1.0)
+    if bilateral_inner_contact_score is None:
+        bilateral_inner_contact = np.zeros_like(raw, dtype=np.float32)
+    else:
+        bilateral_inner_contact = np.asarray(
+            bilateral_inner_contact_score, dtype=np.float32
+        ).reshape(-1)
+        if bilateral_inner_contact.shape != raw.shape:
+            raise ValueError(
+                "bilateral_inner_contact_score must match the reward batch."
+            )
+        if not np.all(np.isfinite(bilateral_inner_contact)):
+            raise ValueError("bilateral_inner_contact_score must be finite.")
+        bilateral_inner_contact = np.clip(bilateral_inner_contact, 0.0, 1.0)
+    if outer_contact_score is None:
+        outer_contact = np.zeros_like(raw, dtype=np.float32)
+    else:
+        outer_contact = np.asarray(outer_contact_score, dtype=np.float32).reshape(-1)
+        if outer_contact.shape != raw.shape:
+            raise ValueError("outer_contact_score must match the reward batch.")
+        if not np.all(np.isfinite(outer_contact)):
+            raise ValueError("outer_contact_score must be finite.")
+        outer_contact = np.clip(outer_contact, 0.0, 1.0)
+    generic_contact_enabled = any(
+        value is not None
+        for value in (
+            inner_contact_score,
+            bilateral_inner_contact_score,
+            outer_contact_score,
+        )
+    )
+    if previous_inner_contact_score is None:
+        previous_inner_contact = np.zeros_like(raw, dtype=np.float32)
+    else:
+        previous_inner_contact = np.asarray(
+            previous_inner_contact_score, dtype=np.float32
+        ).reshape(-1)
+        if previous_inner_contact.shape != raw.shape:
+            raise ValueError(
+                "previous_inner_contact_score must match the reward batch."
+            )
+        if not np.all(np.isfinite(previous_inner_contact)):
+            raise ValueError("previous_inner_contact_score must be finite.")
+        previous_inner_contact = np.clip(previous_inner_contact, 0.0, 1.0)
+    if previous_bilateral_inner_contact_score is None:
+        previous_bilateral_inner_contact = np.zeros_like(raw, dtype=np.float32)
+    else:
+        previous_bilateral_inner_contact = np.asarray(
+            previous_bilateral_inner_contact_score, dtype=np.float32
+        ).reshape(-1)
+        if previous_bilateral_inner_contact.shape != raw.shape:
+            raise ValueError(
+                "previous_bilateral_inner_contact_score must match the reward batch."
+            )
+        if not np.all(np.isfinite(previous_bilateral_inner_contact)):
+            raise ValueError(
+                "previous_bilateral_inner_contact_score must be finite."
+            )
+        previous_bilateral_inner_contact = np.clip(
+            previous_bilateral_inner_contact, 0.0, 1.0
+        )
     if time_limit is None:
         timed_out = np.zeros_like(raw, dtype=np.float32)
     else:
@@ -128,11 +245,25 @@ def shape_rewards(
     grasp_error = current_state.cube_to_grasp.copy()
     grasp_error[:, 2] += config.closed_grasp_height_offset_m
     grasp_distance = np.linalg.norm(grasp_error, axis=1)
+    previous_grasp_error = previous_state.cube_to_grasp.copy()
+    previous_grasp_error[:, 2] += config.closed_grasp_height_offset_m
+    previous_grasp_distance = np.linalg.norm(previous_grasp_error, axis=1)
     grasp_gate = 1.0 / (
         1.0
         + np.exp(
             np.clip(
                 (grasp_distance - config.grasp_distance_m)
+                / config.grasp_gate_width_m,
+                -60.0,
+                60.0,
+            )
+        )
+    )
+    previous_grasp_gate = 1.0 / (
+        1.0
+        + np.exp(
+            np.clip(
+                (previous_grasp_distance - config.grasp_distance_m)
                 / config.grasp_gate_width_m,
                 -60.0,
                 60.0,
@@ -164,6 +295,64 @@ def shape_rewards(
     )
     lift_progress = current_lift - previous_lift
 
+    # The generic contact score is a geometric signal.  For the contact-aware
+    # profile, only its positive onset is rewarded; otherwise a stationary
+    # finger/object contact would pay on every policy tick.
+    inner_contact_gain = np.maximum(inner_contact - previous_inner_contact, 0.0)
+    bilateral_inner_contact_gain = np.maximum(
+        bilateral_inner_contact - previous_bilateral_inner_contact,
+        0.0,
+    )
+    if generic_contact_enabled:
+        contact_gate = bilateral_inner_contact
+    else:
+        contact_gate = bilateral
+    contact_gate = np.clip(contact_gate, 0.0, 1.0)
+    contact_ready = (
+        contact_gate >= float(config.contact_gate_threshold)
+    ).astype(np.float32)
+    closure_gate = (
+        contact_gate if config.gripper_reward_requires_contact else close_gate
+    )
+
+    # The grasp-center distance is useful for long-range approach shaping, but
+    # it must not become a target for driving a closed gripper through the
+    # object.  Once the center frame enters the configured exclusion radius,
+    # charge a strong penalty only while the gripper is meaningfully closed and
+    # a bilateral inner-surface grasp has not yet been established.  Valid
+    # bilateral contact therefore remains reachable; unilateral/deep impacts
+    # do not receive a free pass from the proximity term.
+    center_distance = np.linalg.norm(current_state.cube_to_grasp, axis=1)
+    if (
+        config.center_proximity_limit_m > 0.0
+        and config.center_proximity_penalty > 0.0
+    ):
+        center_proximity_violation = np.clip(
+            (
+                config.center_proximity_limit_m - center_distance
+            )
+            / config.center_proximity_limit_m,
+            0.0,
+            1.0,
+        )
+        close_threshold = float(config.center_proximity_close_threshold)
+        if close_threshold >= 1.0:
+            close_fraction = np.zeros_like(gripper_close)
+        else:
+            close_fraction = np.clip(
+                (gripper_close - close_threshold) / max(1.0 - close_threshold, 1e-6),
+                0.0,
+                1.0,
+            )
+        center_proximity_violation *= close_fraction * (1.0 - contact_ready)
+    else:
+        center_proximity_violation = np.zeros_like(raw)
+    center_proximity_term = (
+        -config.center_proximity_penalty
+        * center_proximity_violation
+        * pre_latch
+    )
+
     reach_term = (
         config.reach_reward_scale
         * reach_score
@@ -177,16 +366,62 @@ def shape_rewards(
         * pre_latch
     )
     grasp_region_term = config.grasp_region_reward_scale * grasp_gate * pre_latch
+    grasp_region_progress_term = (
+        config.grasp_region_progress_scale
+        * (grasp_gate - previous_grasp_gate)
+        * pre_latch
+    )
+    approach_alignment = np.mean(
+        accepted[:, :3] * scripted_approach[:, :3], axis=1
+    )
+    approach_alignment = np.clip(approach_alignment, 0.0, 1.0)
+    approach_alignment_term = (
+        config.approach_alignment_reward_scale
+        * approach_alignment
+        * (1.0 - contact_ready)
+        * pre_latch
+    )
     gripper_term = (
-        config.gripper_reward_scale * close_gate * gripper_close * pre_latch
+        config.gripper_reward_scale * closure_gate * gripper_close * pre_latch
+    )
+    gripper_progress_for_reward = (
+        np.maximum(gripper_progress, 0.0)
+        if config.gripper_reward_requires_contact
+        else gripper_progress
     )
     gripper_progress_term = (
-        config.gripper_progress_scale * close_gate * gripper_progress * pre_latch
+        config.gripper_progress_scale
+        * closure_gate
+        * gripper_progress_for_reward
+        * pre_latch
     )
-    premature_close_term = (
-        -config.premature_close_penalty
-        * (1.0 - close_gate)
+    gripper_command_term = (
+        config.gripper_command_reward_scale
+        * closure_gate
+        * accepted[:, 6]
+        * pre_latch
+    )
+    if config.gripper_reward_requires_contact:
+        # Penalize the positive closing movement itself before inner contact;
+        # penalizing the absolute open/closed state would make exploration
+        # unable to discover the contact event.
+        premature_close_term = (
+            -config.premature_close_penalty
+            * np.maximum(gripper_progress, 0.0)
+            * (1.0 - contact_gate)
+            * pre_latch
+        )
+    else:
+        premature_close_term = (
+            -config.premature_close_penalty
+            * (1.0 - close_gate)
+            * gripper_close
+            * pre_latch
+        )
+    premature_close_state_term = (
+        -config.premature_close_state_penalty
         * gripper_close
+        * (1.0 - contact_gate)
         * pre_latch
     )
     close_confidence = (
@@ -210,24 +445,74 @@ def shape_rewards(
             (previous_gripper_close < config.grasp_acquire_close)
             & (gripper_close >= config.grasp_acquire_close)
             & (grasp_gate >= config.grasp_acquire_gate)
+            & (
+                (not config.grasp_acquire_requires_contact)
+                | (contact_ready >= 0.5)
+            )
         ).astype(np.float32)
         if config.staged_grasp
         else np.zeros_like(raw)
     )
     grasp_acquire_term = config.grasp_acquire_bonus * grasp_acquire * pre_latch
     bilateral_contact_term = config.bilateral_contact_reward_scale * bilateral
-    bilateral_contact_acquire = bilateral * (previous_bilateral < 0.5)
+    bilateral_contact_acquire = (
+        bilateral
+        * (previous_bilateral < 0.5)
+        * (
+            (not config.grasp_acquire_requires_contact)
+            | (contact_ready >= 0.5)
+        )
+    )
     bilateral_contact_acquire_term = (
         config.bilateral_contact_acquire_bonus * bilateral_contact_acquire
     )
+    missing_reference = (
+        previous_bilateral
+        if config.contact_missing_requires_previous
+        else np.ones_like(previous_bilateral)
+    )
     bilateral_contact_missing_term = (
-        -config.bilateral_contact_missing_penalty * (1.0 - bilateral)
+        -config.bilateral_contact_missing_penalty
+        * (1.0 - bilateral)
+        * missing_reference
+    )
+    side_contact_term = (
+        config.side_contact_reward_scale * side_contact * pre_latch
+    )
+    top_bottom_contact_penalty_term = (
+        -config.top_bottom_contact_penalty * top_bottom_contact * pre_latch
+    )
+    inner_contact_signal = (
+        inner_contact_gain
+        if config.contact_reward_onset_only
+        else inner_contact
+    )
+    bilateral_inner_contact_signal = (
+        bilateral_inner_contact_gain
+        if config.contact_reward_onset_only
+        else bilateral_inner_contact
+    )
+    inner_contact_term = (
+        config.inner_contact_reward_scale * inner_contact_signal * pre_latch
+    )
+    bilateral_inner_contact_term = (
+        config.bilateral_inner_contact_reward_scale
+        * bilateral_inner_contact_signal
+        * pre_latch
+    )
+    outer_contact_penalty_term = (
+        -config.outer_contact_penalty * outer_contact * pre_latch
     )
     # A lifted cube is the reliable grasp signal available in the current
     # observation. Gate the sustained lift reward by proximity and closure so
     # table jitter alone cannot be harvested as task progress.
     latch_term = config.latch_reward_scale * latched
     grasp_confidence = np.maximum(grasp_gate * close_confidence, latched)
+    if config.require_generic_contact_for_lift and generic_contact_enabled:
+        grasp_confidence = np.maximum(
+            latched,
+            grasp_confidence * bilateral_inner_contact,
+        )
     if config.require_bilateral_contact_for_lift_reward:
         grasp_confidence = np.maximum(latched, grasp_confidence * bilateral)
     lift_term = config.lift_reward_scale * current_lift * grasp_confidence
@@ -266,13 +551,23 @@ def shape_rewards(
         reach_term
         + reach_progress_term
         + grasp_region_term
+        + grasp_region_progress_term
+        + approach_alignment_term
         + gripper_term
         + gripper_progress_term
+        + gripper_command_term
         + premature_close_term
+        + premature_close_state_term
         + grasp_acquire_term
         + bilateral_contact_term
         + bilateral_contact_acquire_term
         + bilateral_contact_missing_term
+        + side_contact_term
+        + top_bottom_contact_penalty_term
+        + inner_contact_term
+        + bilateral_inner_contact_term
+        + outer_contact_penalty_term
+        + center_proximity_term
         + latch_term
         + lift_term
         + lift_progress_term
@@ -287,6 +582,9 @@ def shape_rewards(
     )
     return shaped.astype(np.float32), {
         "distance_m": current_distance.astype(np.float32),
+        "center_distance_m": center_distance.astype(np.float32),
+        "center_proximity_violation": center_proximity_violation.astype(np.float32),
+        "center_proximity_term": center_proximity_term.astype(np.float32),
         "grasp_distance_m": grasp_distance.astype(np.float32),
         "horizontal_distance_m": np.linalg.norm(
             current_error[:, :2], axis=1
@@ -303,9 +601,17 @@ def shape_rewards(
         "reach_term": reach_term.astype(np.float32),
         "reach_progress_term": reach_progress_term.astype(np.float32),
         "grasp_region_term": grasp_region_term.astype(np.float32),
+        "grasp_region_progress_term": grasp_region_progress_term.astype(
+            np.float32
+        ),
+        "approach_alignment_term": approach_alignment_term.astype(np.float32),
         "gripper_term": gripper_term.astype(np.float32),
         "gripper_progress_term": gripper_progress_term.astype(np.float32),
+        "gripper_command_term": gripper_command_term.astype(np.float32),
         "premature_close_term": premature_close_term.astype(np.float32),
+        "premature_close_state_term": premature_close_state_term.astype(
+            np.float32
+        ),
         "grasp_close_confidence": close_confidence.astype(np.float32),
         "grasp_acquire_term": grasp_acquire_term.astype(np.float32),
         "bilateral_contact_term": bilateral_contact_term.astype(np.float32),
@@ -314,6 +620,26 @@ def shape_rewards(
         ),
         "bilateral_contact_missing_term": (
             bilateral_contact_missing_term.astype(np.float32)
+        ),
+        "side_contact_score": side_contact.astype(np.float32),
+        "top_bottom_contact_score": top_bottom_contact.astype(np.float32),
+        "side_contact_term": side_contact_term.astype(np.float32),
+        "top_bottom_contact_penalty_term": (
+            top_bottom_contact_penalty_term.astype(np.float32)
+        ),
+        "inner_contact_score": inner_contact.astype(np.float32),
+        "bilateral_inner_contact_score": bilateral_inner_contact.astype(np.float32),
+        "outer_contact_score": outer_contact.astype(np.float32),
+        "inner_contact_gain": inner_contact_gain.astype(np.float32),
+        "bilateral_inner_contact_gain": bilateral_inner_contact_gain.astype(
+            np.float32
+        ),
+        "inner_contact_term": inner_contact_term.astype(np.float32),
+        "bilateral_inner_contact_term": bilateral_inner_contact_term.astype(
+            np.float32
+        ),
+        "outer_contact_penalty_term": outer_contact_penalty_term.astype(
+            np.float32
         ),
         "latch_term": latch_term.astype(np.float32),
         "lift_term": lift_term.astype(np.float32),

@@ -143,6 +143,73 @@ class DMTacGripperDriverTest(unittest.TestCase):
         gripper_driver.time.sleep = old_sleep
         gripper_driver.time.monotonic = old_monotonic
 
+    def test_opening_register_decodes_signed_int16_before_range_check(self) -> None:
+        self.assertEqual(InspireGripper._decode_opening_register(0xFFFC), 0)
+        self.assertEqual(InspireGripper._decode_opening_register(0xFFFE), 0)
+        self.assertEqual(InspireGripper._decode_opening_register(0), 0)
+        self.assertEqual(InspireGripper._decode_opening_register(1000), 1000)
+
+    def test_opening_register_still_rejects_values_outside_signed_physical_range(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(GripperError, "Abnormal opening_raw=-4096"):
+            InspireGripper._decode_opening_register(0xF000)
+
+        with self.assertRaisesRegex(GripperError, "Abnormal opening_raw=5000"):
+            InspireGripper._decode_opening_register(5000)
+
+    def test_get_state_decodes_negative_signed_opening_register(self) -> None:
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        _ScriptedSerial.scripts = [
+            _read_register_response(1, 0xFFFC, 0xFFFF, 25, 0, 1)
+        ]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            gripper = InspireGripper(
+                port="/dev/fake0",
+                gripper_id=1,
+                timeout=0.01,
+                reconnect_on_error=False,
+            )
+            state = gripper.get_state()
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            self._restore_clock(patched_clock)
+            _ScriptedSerial.clock = None
+
+        self.assertEqual(state.opening_raw, 0)
+        self.assertEqual(state.current_raw, 0xFFFF)
+        self.assertEqual(state.current, -1)
+        self.assertEqual(state.joint_pos, 1.0)
+        self.assertEqual(state.opening_mm, 0.0)
+
+    def test_read_joint_pos_decodes_negative_signed_opening_register(self) -> None:
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        _ScriptedSerial.scripts = [_read_register_response(1, 0xFFFC)]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            gripper = InspireGripper(
+                port="/dev/fake0",
+                gripper_id=1,
+                timeout=0.01,
+                reconnect_on_error=False,
+            )
+            joint_pos = gripper.read_joint_pos()
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            self._restore_clock(patched_clock)
+            _ScriptedSerial.clock = None
+
+        self.assertEqual(joint_pos, [1.0])
+
     def test_wait_until_idle_allows_device_to_enter_moving(self) -> None:
         clock = _FakeClock()
         patched_clock = self._patch_clock(clock)

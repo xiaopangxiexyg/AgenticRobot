@@ -47,15 +47,16 @@ from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
     DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
     DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
-    IKObjectiveWeights,
     LEGACY_POSITION_CONTROL_PROFILE_NAME,
     RM65_BIMANUAL_POSITION_V1,
     RM65_BIMANUAL_POSITION_V1_NAME,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
-    load_ik_tuning_config,
+    build_rm65_pose_lift_ik_tuning,
+    resolve_rm65_pose_lift_profile,
 )
 from robot_motion.joint_limits import load_joint_velocity_limit_profiles
 from robot_motion.runtime.lifecycle import (
@@ -135,22 +136,13 @@ REPLAY_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S = (
 )
 
 
-def _replay_position_ik_tuning():
+def _replay_position_ik_tuning(pose_lift_profile_name: str):
     """Build the formal replay objective without mutating shared IK defaults."""
 
-    tuning = load_ik_tuning_config()
-    mode_name = RM65_BIMANUAL_POSITION_V1_NAME
-    objective_modes = dict(tuning.objective_modes)
-    objective_modes[mode_name] = IKObjectiveWeights(
-        single_arm_position_weight=1.0,
-        single_arm_orientation_weight=REPLAY_POSITION_IK_ORIENTATION_WEIGHT,
-        dual_arm_position_cost=1.0,
-        dual_arm_orientation_cost=REPLAY_POSITION_IK_ORIENTATION_WEIGHT,
-    )
-    return replace(
-        tuning,
-        ik_objective_mode=mode_name,
-        objective_modes=objective_modes,
+    return build_rm65_pose_lift_ik_tuning(
+        position_control_profile=RM65_BIMANUAL_POSITION_V1_NAME,
+        pose_lift_profile=pose_lift_profile_name,
+        orientation_weight=REPLAY_POSITION_IK_ORIENTATION_WEIGHT,
     )
 
 
@@ -356,57 +348,6 @@ def _send_pose_reference(
         sender(pose_by_side, source=str(source), metadata=dict(metadata))
     else:
         sender(pose_by_side, source=str(source))
-
-
-def _prepare_replay_singularity_targets(
-    rig: Any,
-    qpos_by_side: Mapping[str, Any],
-    *,
-    source: str,
-) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
-    """Return replay slow targets prepared by hardware, without dispatching.
-
-    The optional hook lives on `ReplayHardwareRig`; keeping the fallback here
-    preserves dry-run and focused-test rigs that do not own real arm backends.
-    """
-
-    original = {
-        str(side): np.asarray(qpos, dtype=float).reshape(ARM_JOINT_DOF).copy()
-        for side, qpos in qpos_by_side.items()
-    }
-    prepare = getattr(rig, "prepare_replay_singularity_targets", None)
-    if not callable(prepare):
-        return original, {}
-    result = prepare(original, source=str(source))
-    if not isinstance(result, tuple) or len(result) != 2:
-        raise RuntimeError("replay singularity preparation returned an invalid result.")
-    targets, metadata = result
-    if not isinstance(targets, Mapping) or not isinstance(metadata, Mapping):
-        raise RuntimeError("replay singularity preparation returned invalid mappings.")
-    prepared = {
-        str(side): np.asarray(qpos, dtype=float).reshape(ARM_JOINT_DOF).copy()
-        for side, qpos in targets.items()
-    }
-    if set(prepared) != set(original):
-        raise RuntimeError(
-            "replay singularity preparation changed the active arm-side set."
-        )
-    if not all(np.all(np.isfinite(qpos)) for qpos in prepared.values()):
-        raise RuntimeError("replay singularity preparation returned non-finite qpos.")
-    normalized_metadata: dict[str, dict[str, Any]] = {}
-    for side, value in metadata.items():
-        if not isinstance(value, Mapping):
-            raise RuntimeError(
-                f"replay singularity preparation metadata for {side!r} is invalid."
-            )
-        normalized_metadata[str(side)] = dict(value)
-    unexpected_metadata_sides = set(normalized_metadata).difference(original)
-    if unexpected_metadata_sides:
-        raise RuntimeError(
-            "replay singularity preparation returned metadata for inactive sides: "
-            f"{sorted(unexpected_metadata_sides)}."
-        )
-    return prepared, normalized_metadata
 
 
 def _position_keyframe_safety_metadata(result: Any) -> dict[str, Any]:
@@ -635,6 +576,7 @@ class ReplayExecutionSettings:
     position_max_rot_step_deg: float = 15.0
     position_max_joint_step_rad: float = float(np.deg2rad(6.0))
     position_control_profile_name: str = RM65_BIMANUAL_POSITION_V1_NAME
+    pose_lift_profile_name: str = RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME
     position_collision_required: bool = True
     position_collision_scene_profile: str = DEFAULT_COLLISION_SCENE
     position_collision_min_distance_m: float = DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M
@@ -648,6 +590,10 @@ class ReplayExecutionSettings:
     position_collision_debug: bool = False
 
     def __post_init__(self) -> None:
+        trajectory_source = normalize_replay_trajectory_source(
+            self.trajectory_source
+        )
+        object.__setattr__(self, "trajectory_source", trajectory_source)
         profile_name = str(self.position_control_profile_name).strip()
         if profile_name not in {
             RM65_BIMANUAL_POSITION_V1_NAME,
@@ -657,6 +603,19 @@ class ReplayExecutionSettings:
                 f"unsupported position_control_profile_name: {profile_name!r}"
             )
         object.__setattr__(self, "position_control_profile_name", profile_name)
+        pose_lift_profile = resolve_rm65_pose_lift_profile(
+            self.pose_lift_profile_name
+        )
+        object.__setattr__(self, "pose_lift_profile_name", pose_lift_profile.name)
+        if (
+            bool(self.send_actions_enabled)
+            and trajectory_source == REPLAY_TRAJECTORY_ACTION_POSE
+            and not pose_lift_profile.hardware_dispatch_allowed
+        ):
+            raise ValueError(
+                f"pose-lift profile {pose_lift_profile.name!r} forbids replay "
+                "arm output."
+            )
         workspace_min = np.asarray(self.position_workspace_min, dtype=float).reshape(3)
         workspace_max = np.asarray(self.position_workspace_max, dtype=float).reshape(3)
         if not np.all(np.isfinite(workspace_min)) or not np.all(np.isfinite(workspace_max)):
@@ -901,6 +860,13 @@ class ReplayExecutionSettings:
                     current.position_control_profile_name,
                 )
             ),
+            pose_lift_profile_name=str(
+                _payload_value(
+                    payload,
+                    ("pose_lift_profile_name", "poseLiftProfileName"),
+                    current.pose_lift_profile_name,
+                )
+            ),
             position_collision_required=_bool_value(
                 _payload_value(
                     payload,
@@ -1008,6 +974,7 @@ class ReplayExecutionSettings:
             "position_max_rot_step_deg": float(self.position_max_rot_step_deg),
             "position_max_joint_step_rad": float(self.position_max_joint_step_rad),
             "position_control_profile_name": self.position_control_profile_name,
+            "pose_lift_profile_name": self.pose_lift_profile_name,
             "position_collision_required": bool(self.position_collision_required),
             "position_collision_scene_profile": str(self.position_collision_scene_profile),
             "position_collision_min_distance_m": float(
@@ -2050,8 +2017,11 @@ class ReplayExecutionController:
             solve_min_iterations=REPLAY_POSITION_IK_SOLVE_MIN_ITERATIONS,
             solve_adaptive_iterations_enabled=True,
             solve_iteration_reserve_ms=REPLAY_POSITION_IK_ITERATION_RESERVE_MS,
+            pose_lift_profile=self._settings.pose_lift_profile_name,
             debug_profile=bool(self._settings.position_collision_debug),
-            ik_tuning=_replay_position_ik_tuning(),
+            ik_tuning=_replay_position_ik_tuning(
+                self._settings.pose_lift_profile_name
+            ),
         )
         factory = (
             self._position_collision_planner_factory
@@ -2072,6 +2042,7 @@ class ReplayExecutionController:
             {
                 "replay_position_ik_profile": {
                     "profile": self._settings.position_control_profile_name,
+                    "pose_lift_profile": self._settings.pose_lift_profile_name,
                     "main_action_contract": "accepted_qref_fk_pose",
                     "source_shaping_reapplied": False,
                     "solve_min_iterations": REPLAY_POSITION_IK_SOLVE_MIN_ITERATIONS,
@@ -2216,8 +2187,8 @@ class ReplayExecutionController:
         The first stage applies only explicit keyframe limits.  It does not run
         a temporal filter.  Offline timestamp resampling then linearly
         interpolates translation/qpos and uses shortest-path quaternion SLERP.
-        When collision checking is required (the production default), every
-        Each high-rate tool pose is converted by one coupled dual-arm collision IK
+        When collision checking is required (the production default), each
+        high-rate tool pose is converted by one coupled dual-arm collision IK
         planner into an explicitly limited qpos endpoint.  Only that qpos is
         passed to the sim/real-neutral reference->command stage; per-arm backend
         Cartesian IK is not used.  Segment collision certification between
@@ -2264,13 +2235,6 @@ class ReplayExecutionController:
                     f"got reference_hz={reference_hz:g}, keyframe_hz={keyframe_hz:g}"
                 )
             if collision_required:
-                if trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET:
-                    raise RuntimeError(
-                        "collision-required position replay accepts target poses only; "
-                        "trajectory_source=qpos_target is a low-level legacy path. "
-                        "Set position_collision_required=false explicitly only for "
-                        "compatibility/debug use."
-                    )
                 collision_planner, reset_metadata = self._build_position_collision_planner(
                     rig,
                     reference_hz=reference_hz,
@@ -2381,7 +2345,69 @@ class ReplayExecutionController:
                     ),
                     "temporal_smoothing_applied": False,
                 }
-                if collision_required:
+                if (
+                    collision_required
+                    and trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET
+                ):
+                    assert collision_planner is not None
+                    admission = collision_planner.admit_qpos_reference(
+                        reference.qpos_by_side,
+                        source=(
+                            f"replay_qpos_reference_{_rate_label(reference_hz)}hz"
+                        ),
+                    )
+                    admission_metadata = dict(
+                        getattr(admission, "metadata", {}) or {}
+                    )
+                    endpoint_checked = bool(
+                        admission_metadata.get("endpoint_collision_checked", False)
+                    )
+                    endpoint_passed = bool(
+                        admission_metadata.get("endpoint_collision_passed", False)
+                    )
+                    reference_metadata.update(
+                        {
+                            "position_collision": admission_metadata,
+                            "position_endpoint_collision_checked": endpoint_checked,
+                            "position_endpoint_collision_passed": endpoint_passed,
+                            "position_collision_certification_status": (
+                                "qpos_endpoint_only_segment_not_certified"
+                            ),
+                            "replay_qpos_strict": {
+                                "enabled": True,
+                                "ik_applied": False,
+                                "target_modified": False,
+                            },
+                        }
+                    )
+                    if (
+                        not bool(getattr(admission, "safe", False))
+                        or not endpoint_checked
+                        or not endpoint_passed
+                    ):
+                        raise RuntimeError(
+                            "strict QPOS replay failed coupled endpoint admission: "
+                            f"reason={getattr(admission, 'reason', None)}, "
+                            f"endpoint_checked={endpoint_checked}, "
+                            f"endpoint_passed={endpoint_passed}."
+                        )
+                    qpos_reference = {
+                        str(side): np.asarray(
+                            admission.qpos_by_side[str(side)], dtype=float
+                        ).reshape(ARM_JOINT_DOF)
+                        for side in self._hardware_config.active_sides
+                    }
+                    dispatched = self._dispatch_unless_stopped(
+                        lambda: _send_joint_reference(
+                            rig,
+                            qpos_reference,
+                            source=(
+                                f"replay_qpos_reference_{_rate_label(reference_hz)}hz"
+                            ),
+                            metadata=reference_metadata,
+                        )
+                    )
+                elif collision_required:
                     assert collision_planner is not None
                     plan_result = collision_planner.plan_pose_reference(
                         reference.pose_by_side,
@@ -2452,72 +2478,6 @@ class ReplayExecutionController:
                     replay_source = (
                         f"replay_collision_qpos_reference_{_rate_label(reference_hz)}hz"
                     )
-                    qpos_reference, singularity_preparation = (
-                        _prepare_replay_singularity_targets(
-                            rig,
-                            qpos_reference,
-                            source=replay_source,
-                        )
-                    )
-                    slow_sides = tuple(
-                        side
-                        for side, preparation in singularity_preparation.items()
-                        if bool(preparation.get("applied", False))
-                    )
-                    if slow_sides:
-                        slow_validation = collision_planner.validate_qpos(
-                            qpos_reference,
-                            source=f"{replay_source}_singularity_slow_recheck",
-                        )
-                        slow_validation_metadata = dict(
-                            getattr(slow_validation, "metadata", {}) or {}
-                        )
-                        slow_endpoint_checked = bool(
-                            slow_validation_metadata.get(
-                                "endpoint_collision_checked",
-                                False,
-                            )
-                        )
-                        slow_endpoint_passed = bool(
-                            slow_validation_metadata.get(
-                                "endpoint_collision_passed",
-                                False,
-                            )
-                        )
-                        if (
-                            not bool(getattr(slow_validation, "safe", False))
-                            or not slow_endpoint_checked
-                            or not slow_endpoint_passed
-                        ):
-                            raise RuntimeError(
-                                "Replay singularity slow target failed the required coupled "
-                                "collision recheck: "
-                                f"sides={list(slow_sides)}, "
-                                f"reason={getattr(slow_validation, 'reason', None)}, "
-                                f"endpoint_checked={slow_endpoint_checked}, "
-                                f"endpoint_passed={slow_endpoint_passed}."
-                            )
-                        reference_metadata.update(
-                            {
-                                "singularity_replay_preparation_by_side": singularity_preparation,
-                                "position_singularity_replay_slowdown": {
-                                    "applied": True,
-                                    "sides": list(slow_sides),
-                                    "collision_rechecked": True,
-                                    "collision_recheck": slow_validation_metadata,
-                                },
-                                "position_collision": {
-                                    **dict(collision_metadata),
-                                    "singularity_slow_target_recheck": slow_validation_metadata,
-                                },
-                                "position_endpoint_collision_checked": bool(
-                                    slow_endpoint_checked
-                                ),
-                                "position_endpoint_collision_passed": bool(
-                                    slow_endpoint_passed
-                                ),
-                            }
-                        )
                     def dispatch_collision_joint_reference() -> None:
                         self._capture_position_transport_health(
                             rig,
@@ -2692,19 +2652,9 @@ class ReplayExecutionController:
         active_sides = tuple(self._hardware_config.active_sides)
         if set(active_sides) != {"left", "right"} or len(active_sides) != 2:
             raise RuntimeError(
-                "collision-required position pose replay requires active_sides=both "
+                "collision-required position replay requires active_sides=both "
                 "before preflight or motion; "
                 f"got active_sides={active_sides}."
-            )
-        trajectory_source = normalize_replay_trajectory_source(
-            self._settings.trajectory_source
-        )
-        if trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET:
-            raise RuntimeError(
-                "collision-required position replay accepts target poses only; "
-                "trajectory_source=qpos_target is a low-level legacy path. "
-                "Set position_collision_required=false explicitly only for "
-                "compatibility/debug use."
             )
 
     def _clear_qpos_init_status_locked(self) -> None:

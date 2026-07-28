@@ -776,7 +776,14 @@ class UmiCollectionController:
             note_attempt()
         self.last_rejection = ()
         self._event_message = ""
-        self.recorder.submit(result)
+        accepted = self.recorder.submit(result)
+        if accepted is False:
+            rejection_message = str(
+                getattr(self.recorder, "last_message", "sample rejected")
+                or "sample rejected"
+            )
+            self.last_rejection = (rejection_message,)
+            self._event_message = rejection_message
 
     def _publish(self, now: float, *, gripper_ready: bool, gripper_reason: str) -> None:
         remaining = (

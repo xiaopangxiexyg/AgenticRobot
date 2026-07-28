@@ -31,6 +31,104 @@ from .shutdown_runtime import shutdown_real_teleop_runtime
 from .visualization_runtime import build_visualization_runtime
 
 
+_ACTIVE_STARTUP_CLEANUP: "_StartupCleanupRegistry | None" = None
+
+
+class _StartupCleanupRegistry:
+    """Best-effort cleanup for the portion before the main startup ``try``.
+
+    The historical runtime enters its full shutdown ``finally`` only after the
+    initial diagnostics/input objects have been created.  Ctrl+C can arrive in
+    that short preamble, so keep a small LIFO registry until ownership is
+    transferred to the normal runtime shutdown path.
+    """
+
+    def __init__(self) -> None:
+        self._steps: list[tuple[str, Any]] = []
+        self._active = True
+
+    def add(self, label: str, callback: Any) -> None:
+        if self._active and callable(callback):
+            self._steps.append((str(label), callback))
+
+    def disarm(self) -> None:
+        global _ACTIVE_STARTUP_CLEANUP
+        self._active = False
+        if _ACTIVE_STARTUP_CLEANUP is self:
+            _ACTIVE_STARTUP_CLEANUP = None
+        self._steps.clear()
+
+    def close(self) -> None:
+        global _ACTIVE_STARTUP_CLEANUP
+        if not self._active:
+            return
+        self._active = False
+        if _ACTIVE_STARTUP_CLEANUP is self:
+            _ACTIVE_STARTUP_CLEANUP = None
+        failures: list[str] = []
+        for label, callback in reversed(self._steps):
+            try:
+                callback()
+            except BaseException as exc:  # noqa: BLE001 - never mask Ctrl+C.
+                failures.append(f"{label}: {type(exc).__name__}: {exc}")
+        self._steps.clear()
+        if failures:
+            logger = globals().get("_log")
+            if callable(logger):
+                logger(
+                    "Shutdown",
+                    "startup Ctrl+C cleanup completed with recoverable failures: "
+                    + "; ".join(failures),
+                )
+
+
+def _activate_startup_cleanup() -> _StartupCleanupRegistry:
+    global _ACTIVE_STARTUP_CLEANUP
+    if _ACTIVE_STARTUP_CLEANUP is not None:
+        _ACTIVE_STARTUP_CLEANUP.close()
+    registry = _StartupCleanupRegistry()
+    _ACTIVE_STARTUP_CLEANUP = registry
+    return registry
+
+
+def _deactivate_startup_cleanup() -> None:
+    registry = _ACTIVE_STARTUP_CLEANUP
+    if registry is not None:
+        registry.disarm()
+
+
+def cleanup_active_startup() -> None:
+    """Close resources created before normal runtime shutdown takes ownership."""
+
+    registry = _ACTIVE_STARTUP_CLEANUP
+    if registry is not None:
+        registry.close()
+
+
+def _register_component_startup_cleanup(
+    registry: _StartupCleanupRegistry,
+    components: Any,
+) -> None:
+    """Register only idempotent component close hooks for early cancellation."""
+
+    for side in ("right", "left"):
+        state_backend = getattr(components, f"{side}_state_backend", None)
+        if state_backend is not None:
+            registry.add(f"{side}_state_backend", state_backend.close)
+        hand_backend = getattr(components, f"{side}_hand_backend", None)
+        if hand_backend is not None:
+            registry.add(f"{side}_hand_backend", hand_backend.close)
+    executor = getattr(components, "arm_state_read_executor", None)
+    if executor is not None:
+        registry.add(
+            "arm_state_read_executor",
+            lambda executor=executor: executor.shutdown(wait=True),
+        )
+    session = getattr(components, "session", None)
+    if session is not None:
+        registry.add("teleop_session", session.close)
+
+
 _REQUIRED_SUPPORT_NAMES = (
     "ActionDebugLogRecorder",
     "AsyncDMTacDistributedForceVisualizer",
@@ -87,6 +185,7 @@ _REQUIRED_SUPPORT_NAMES = (
     "_arm_control_mode_arg",
     "_arm_execution_profile_metadata",
     "_attach_actuator_command_trace_sink",
+    "_attach_ik_shadow_trace_sink",
     "_attach_position_audit_sink",
     "_attach_singularity_transition_trace_sink",
     "_build_action_debug_metadata",
@@ -258,6 +357,7 @@ def bind_legacy_support(namespace: Mapping[str, Any]) -> None:
 
 
 def run_real_teleop(args: argparse.Namespace) -> None:
+    startup_cleanup = _activate_startup_cleanup()
     capability_admission = (
         str(getattr(args, "hardware_admission_mode", "strict")) == "capability"
     )
@@ -266,6 +366,8 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         if bool(getattr(args, "gui_requested", False))
         else None
     )
+    if control_ui is not None:
+        startup_cleanup.add("web_ui", control_ui.close)
     startup_progress: GuiStartupProgress | None = None
     if control_ui is not None:
         control_ui.publish(
@@ -275,6 +377,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         )
         control_ui.start()
         startup_progress = GuiStartupProgress(control_ui)
+        startup_cleanup.add("startup_progress", startup_progress.close)
         startup_progress.start()
     foot_pad_input = None
     foot_pad_requested = (
@@ -296,6 +399,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         except (FootPadUnavailableError, OSError, RuntimeError, ValueError) as exc:
             args.foot_pad_startup_error = f"{type(exc).__name__}: {exc}"
             foot_pad_input = FootPadSpecialArmInput.waiting_for_service()
+            startup_cleanup.add("foot_pad", foot_pad_input.close)
             if startup_progress is not None:
                 startup_progress.fail(
                     "foot_pad",
@@ -310,6 +414,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 f"{exc}",
             )
         else:
+            startup_cleanup.add("foot_pad", foot_pad_input.close)
             if startup_progress is not None:
                 startup_progress.succeed("foot_pad", message="脚踏输入已连接")
     init_restored, init_restore_message = _restore_init_arm_after_foot_pad_fallback(
@@ -335,6 +440,8 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         )
     if bool(args.visualize_tactile) and not bool(args.skip_renderer):
         tactile_visualizer = _build_tactile_visualizer(args, _active_sides_from_args(args))
+        if tactile_visualizer is not None:
+            startup_cleanup.add("tactile_visualizer", tactile_visualizer.close)
     try:
         components = _build_components(args)
     except Exception as exc:
@@ -354,6 +461,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 "runtime.components",
                 message="运行时组件已构建，尚未启动设备",
             )
+        _register_component_startup_cleanup(startup_cleanup, components)
     init_controller_available = (
         getattr(components, "init_arm_controller", None) is not None
     )
@@ -385,6 +493,8 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         )
     try:
         camera_sources = _build_camera_sources(args)
+        for camera_key, source in camera_sources.items():
+            startup_cleanup.add(f"camera[{camera_key}]", source.close)
         try:
             preview_camera_sources = _select_preview_camera_sources(
                 camera_sources,
@@ -474,11 +584,13 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         pose_snapshot_recorder=pose_snapshot_recorder,
         foot_pad_input=foot_pad_input,
     )
+    startup_cleanup.add("clutch_input", clutch_input.close)
     debug_episode_recording_enabled = _debug_episode_recording_enabled(args)
     episode_recorder = EpisodeRecorder(
         root_dir=_episode_root_dir(args, components) if debug_episode_recording_enabled else None,
         config=EpisodeRecorderConfig(enabled=debug_episode_recording_enabled),
     )
+    startup_cleanup.add("episode_recorder", episode_recorder.close)
     control_debug_requested = bool(args.control_debug_config.enabled)
     _merge_control_debug_runtime_metadata(
         args,
@@ -517,6 +629,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 components=components,
                 camera_sources=camera_sources,
             )
+            startup_cleanup.add("dataset_recorder", dataset_recorder.close)
         except (OSError, RuntimeError, ValueError) as exc:
             if startup_progress is not None:
                 startup_progress.fail(
@@ -613,6 +726,12 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 components=components,
                 recorder_scope="session",
             )
+            startup_cleanup.add(
+                "position_debug_session_recorder",
+                lambda recorder=position_debug_session_recorder: recorder.close(
+                    timeout_sec=1.0
+                ),
+            )
             position_audit_fanout = PositionAuditFanout((position_debug_session_recorder,))
             _attach_position_audit_sink(components, position_audit_fanout)
             attached_wall_time = time.time()
@@ -680,6 +799,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 components=components,
                 output_dir=actuator_trace_session_dir,
             )
+            startup_cleanup.add("actuator_trace_recorder", actuator_trace_recorder.close)
             attached_count = _attach_actuator_command_trace_sink(
                 components,
                 actuator_trace_recorder.record_command,
@@ -702,12 +822,17 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                         f"attached={singularity_attached_count} "
                         f"active={len(components.active_sides)}"
                     )
+            ik_shadow_attached_count = _attach_ik_shadow_trace_sink(
+                components,
+                actuator_trace_recorder.record_ik_shadow,
+            )
             _log(
                 "ActuatorTrace",
                 "preallocated fixed-field capture attached "
                 f"output={actuator_trace_session_dir} "
                 f"capacity_per_side={actuator_trace_recorder.config.capacity_per_side} "
                 f"singularity_trace={bool(singularity_attached_count)} "
+                f"ik_shadow_trace={bool(ik_shadow_attached_count)} "
                 "hot_path_disk_write=false",
             )
         except Exception as exc:  # noqa: BLE001 - diagnostics must not alter control behavior.
@@ -723,6 +848,13 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             except Exception as cleanup_exc:  # noqa: BLE001
                 cleanup_errors.append(
                     "singularity_sink_detach:"
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            try:
+                _attach_ik_shadow_trace_sink(components, None)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors.append(
+                    "ik_shadow_sink_detach:"
                     f"{type(cleanup_exc).__name__}: {cleanup_exc}"
                 )
             if actuator_trace_recorder is not None:
@@ -807,6 +939,11 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             return False
 
     try:
+        # From this point on the complete runtime shutdown ``finally`` owns
+        # every resource registered above.  Keeping the pre-start registry
+        # active until this exact boundary covers Ctrl+C after terminal cbreak
+        # has been enabled but before device startup enters the main try body.
+        _deactivate_startup_cleanup()
         start_device("arm.left.qpos", components.left_state_backend)
         start_device("arm.right.qpos", components.right_state_backend)
         for side, backend, via_rig in (
@@ -905,10 +1042,19 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 def position_force_guard_stop(
                     fault: PositionForceGuardFault,
                 ) -> None:
-                    # Latch process exit before entering the blocking vendor
-                    # stop calls.  If an SDK acknowledgement stalls, no later
-                    # control frame may still be admitted by the main loop.
-                    clutch_input.should_quit = True
+                    # During startup a force-guard fault remains fail-closed
+                    # and terminates the not-yet-admitted runtime, preserving
+                    # the historical safety contract.  Once teleop has been
+                    # admitted, the stop is an episode/runtime transition:
+                    # keep the GUI and device sessions alive so the operator
+                    # can manually reposition the arms and capture a fresh
+                    # Home.  The control loop consumes the latched fault and
+                    # enters Hold before any further command dispatch.
+                    teleop_active = bool(
+                        getattr(clutch_input, "_teleop_started", False)
+                    )
+                    if not teleop_active:
+                        clutch_input.should_quit = True
                     stop_error: Exception | None = None
                     try:
                         _emergency_stop_real_arms(
@@ -929,12 +1075,34 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                         now=fault.wall_time_sec,
                     )
                     if control_ui is not None:
-                        control_ui.append_message(
-                            "PositionForceGuard",
-                            "位控受力急停已触发，左右臂均已锁存停机；"
-                            "当前启动/遥操进程将退出，必须检查设备后重启。"
-                            f"\n{fault.message}",
-                        )
+                        try:
+                            if teleop_active and stop_error is None:
+                                message = (
+                                    "位控受力急停已触发，左右臂均已锁存停机；"
+                                    "当前 episode 将结束，GUI 与设备连接保持；"
+                                    "请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。"
+                                )
+                            elif teleop_active:
+                                message = (
+                                    "位控受力急停已触发，但至少一侧 Arm_Stop 未确认；"
+                                    "GUI 保持显示，禁止继续运动，必须检查设备并重启进程。"
+                                )
+                            else:
+                                message = (
+                                    "位控受力急停已触发，左右臂均已锁存停机；"
+                                    "当前启动/遥操进程将退出，必须检查设备后重启。"
+                                )
+                            control_ui.append_message(
+                                "PositionForceGuard",
+                                message + f"\n{fault.message}",
+                            )
+                        except Exception as ui_exc:  # noqa: BLE001 - UI is not stop ownership.
+                            _log(
+                                "PositionForceGuard",
+                                "force-trip UI notification failed; preserving the backend stop result: "
+                                f"{type(ui_exc).__name__}: {ui_exc}",
+                                now=fault.wall_time_sec,
+                            )
                     if stop_error is not None:
                         _log(
                             "PositionForceGuard",
@@ -1876,6 +2044,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             components,
             clutch_input,
             home_captured=startup_home_captured,
+            position_force_guard_monitor=position_force_guard_monitor,
         )
         clutch_input.consume_episode_start_request()
         clutch_input.consume_episode_stop_request()
@@ -2150,5 +2319,6 @@ def run_real_teleop(args: argparse.Namespace) -> None:
 
 __all__ = [
     "bind_legacy_support",
+    "cleanup_active_startup",
     "run_real_teleop",
 ]

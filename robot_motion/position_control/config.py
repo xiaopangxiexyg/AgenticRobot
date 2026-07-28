@@ -14,6 +14,10 @@ DEFAULT_POSITION_SAMPLE_HZ = 15.0
 POSITION_PROFILE_NAME = "position"
 POSITION_45_150_PROFILE_NAME = "position_45_150hz"
 POSITION_15_60_120_PROFILE_NAME = "position_15_60_120hz"
+# HIL/deploy profile: the final composed target is already available at the
+# downstream reference/IK cadence.  Keep this separate from the historical
+# 15->60->120 profile so its rate identity and metadata remain stable.
+POSITION_60_120_PROFILE_NAME = "position_60_120hz"
 
 
 def _finite_positive(value: float, *, name: str) -> float:
@@ -30,6 +34,10 @@ class PositionControlRates:
     The clocks are independent.  Consumers must advance them from timestamps;
     they must not assume that ``reference_hz / sample_hz`` or
     ``command_hz / reference_hz`` is an integer.
+
+    In a downstream position controller, ``sample_hz`` is the accepted
+    target/keyframe cadence.  It is not required to equal a policy/model
+    source rate; an upper compose schedule may publish at that cadence.
     """
 
     sample_hz: float = DEFAULT_POSITION_SAMPLE_HZ
@@ -135,6 +143,29 @@ class PositionControlProfile:
             "rates": self.rates.to_metadata(),
         }
 
+    def validate_compose_target_hz(self, compose_target_hz: float) -> float:
+        """Validate one upper compose rate against this controller profile.
+
+        ``sample_hz`` is the minimum target/keyframe cadence the downstream
+        controller is configured to consume.  ``reference_hz`` is the rate at
+        which the controller can materialize continuous references.  Keeping
+        this check at the profile boundary prevents an integration from
+        accidentally using a model/source rate as the final compose rate.
+        """
+
+        resolved = _finite_positive(compose_target_hz, name="compose_target_hz")
+        if resolved < self.rates.sample_hz:
+            raise ValueError(
+                "compose_target_hz cannot be below the controller input rate: "
+                f"{resolved:g} < {self.rates.sample_hz:g}."
+            )
+        if resolved > self.rates.reference_hz:
+            raise ValueError(
+                "compose_target_hz cannot exceed the controller reference rate: "
+                f"{resolved:g} > {self.rates.reference_hz:g}."
+            )
+        return resolved
+
 
 POSITION_PROFILE = PositionControlProfile(
     name=POSITION_PROFILE_NAME,
@@ -148,6 +179,19 @@ POSITION_15_60_120_PROFILE = PositionControlProfile(
     name=POSITION_15_60_120_PROFILE_NAME,
     rates=PositionControlRates(
         sample_hz=15.0,
+        reference_hz=60.0,
+        ik_hz=60.0,
+        command_hz=120.0,
+    ),
+)
+
+# Explicit HIL/deploy input-rate profile.  This changes only the accepted
+# keyframe/target cadence; interpolation, IK and command settings remain the
+# same 60 Hz reference / 120 Hz command contract used by the canonical profile.
+POSITION_60_120_PROFILE = PositionControlProfile(
+    name=POSITION_60_120_PROFILE_NAME,
+    rates=PositionControlRates(
+        sample_hz=60.0,
         reference_hz=60.0,
         ik_hz=60.0,
         command_hz=120.0,
@@ -177,6 +221,8 @@ __all__ = [
     "POSITION_45_150_PROFILE_NAME",
     "POSITION_15_60_120_PROFILE",
     "POSITION_15_60_120_PROFILE_NAME",
+    "POSITION_60_120_PROFILE",
+    "POSITION_60_120_PROFILE_NAME",
     "POSITION_PROFILE",
     "POSITION_PROFILE_NAME",
     "PositionControlProfile",

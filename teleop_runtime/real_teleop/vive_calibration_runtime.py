@@ -11,12 +11,13 @@ from __future__ import annotations
 import argparse
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from ..calibration import VIRTUAL_DESK_SWEEP_CONVENTION_VERSION
+from ..calibration import TeleopCalibration, VIRTUAL_DESK_SWEEP_CONVENTION_VERSION
 from ..calibration_flow import (
     average_pose,
     euler_xyz_deg_to_matrix,
@@ -44,6 +45,39 @@ from .gui_vive_calibration import (
 )
 
 
+@dataclass
+class ViveCoordinateCalibrationContext:
+    """Minimal context consumed by the shared VIVE coordinate workflow.
+
+    Real teleop still passes its existing ``RealTeleopComponents`` object to
+    the compatibility helpers below.  Simulation and Control Station callers
+    can pass this small context instead, without constructing a real-teleop
+    component graph or acquiring any execution authority.
+    """
+
+    source: object
+    calibration: TeleopCalibration
+    active_sides: tuple[str, ...]
+
+
+def _context_calibration(context: object) -> TeleopCalibration | None:
+    calibration = getattr(context, "calibration", None)
+    if calibration is not None:
+        return calibration
+    session = getattr(context, "session", None)
+    return getattr(session, "calibration", None)
+
+
+def _context_active_sides(context: object) -> tuple[str, ...]:
+    return tuple(getattr(context, "active_sides", ()) or ())
+
+
+def _context_profile_ui_state(args: argparse.Namespace, context: object) -> dict[str, object]:
+    if isinstance(context, ViveCoordinateCalibrationContext):
+        return {}
+    return _vive_calibration_profile_ui_state(args, context)
+
+
 def _vive_pose_source_from_components(
     components: RealTeleopComponents,
 ) -> VivePoseSource | None:
@@ -68,12 +102,15 @@ def _raw_tracker_pose_state_from_channels(
     )
 
 
-def _clear_runtime_home_state(components: RealTeleopComponents) -> None:
-    calibration = components.session.calibration
+def _clear_runtime_home_state(components: object) -> None:
+    calibration = _context_calibration(components)
     if calibration is not None:
         calibration.clear_home_state()
-    components.left_retargeter.clear_home_anchors()
-    components.right_retargeter.clear_home_anchors()
+    for retargeter_name in ("left_retargeter", "right_retargeter"):
+        retargeter = getattr(components, retargeter_name, None)
+        clear_home_anchors = getattr(retargeter, "clear_home_anchors", None)
+        if callable(clear_home_anchors):
+            clear_home_anchors()
 
 
 def _channel_sample_key(channel: object) -> tuple[object, object, object]:
@@ -177,17 +214,28 @@ def _resolve_virtual_desk_channel_name(args: argparse.Namespace, channels: Mappi
     return "right_wrist_pose"
 
 
-def _default_gui_vive_calibration_side(args: argparse.Namespace) -> str:
+def _default_gui_vive_calibration_side(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...] = ("left", "right"),
+) -> str:
     requested = str(getattr(args, "virtual_desk_tracker_role", "auto") or "auto")
-    return "left" if requested == "left_wrist" else "right"
+    if requested in {"left_wrist", "right_wrist"}:
+        requested_side = requested.removesuffix("_wrist")
+        if requested_side in active_sides:
+            return requested_side
+    if "right" in active_sides:
+        return "right"
+    if "left" in active_sides:
+        return "left"
+    return "right"
 
 
 def _select_gui_vive_coordinate_sweep_hand(
     *,
     ui: CalibrationWebUi,
     args: argparse.Namespace,
-    components: RealTeleopComponents,
-    source: VivePoseSource,
+    components: object,
+    source: object,
 ) -> tuple[str, str]:
     requested = str(getattr(args, "virtual_desk_tracker_role", "auto") or "auto")
     if requested == "auxiliary":
@@ -201,7 +249,10 @@ def _select_gui_vive_coordinate_sweep_hand(
 
     stage_name = "VIVE 标定手选择"
     stage_id = "ViveCalibrationHand"
-    selected_side = _default_gui_vive_calibration_side(args)
+    selected_side = _default_gui_vive_calibration_side(
+        args,
+        _context_active_sides(components) or ("left", "right"),
+    )
     last_status_hint = ""
     ui.append_message(
         "ViveCalibration",
@@ -264,10 +315,10 @@ def _select_gui_vive_coordinate_sweep_hand(
             gripper_control_enabled=False,
             raw_tracker_poses=_raw_tracker_pose_state_from_channels(
                 dict(channels),
-                active_sides=components.active_sides,
+                active_sides=_context_active_sides(components),
                 now=loop_start,
             ),
-            **_vive_calibration_profile_ui_state(args, components),
+            **_context_profile_ui_state(args, components),
         )
         if "n" in events:
             if channel_valid:
@@ -293,7 +344,7 @@ def _select_gui_vive_coordinate_sweep_hand(
 def _publish_vive_capture_state(
     ui: CalibrationWebUi,
     args: argparse.Namespace,
-    components: RealTeleopComponents,
+    components: object,
     channels: Mapping[str, object],
     *,
     now: float,
@@ -342,10 +393,10 @@ def _publish_vive_capture_state(
         gripper_control_enabled=False,
         raw_tracker_poses=_raw_tracker_pose_state_from_channels(
             dict(channels),
-            active_sides=components.active_sides,
+            active_sides=_context_active_sides(components),
             now=now,
         ),
-        **_vive_calibration_profile_ui_state(args, components),
+        **_context_profile_ui_state(args, components),
     )
 
 
@@ -357,8 +408,8 @@ def _capture_single_vive_channel_from_gui(
     *,
     ui: CalibrationWebUi,
     args: argparse.Namespace,
-    components: RealTeleopComponents,
-    source: VivePoseSource,
+    components: object,
+    source: object,
     stage_name: str,
     instructions: str,
     timed_flow_hint: str,
@@ -367,6 +418,7 @@ def _capture_single_vive_channel_from_gui(
     min_samples: int,
     capture_duration_sec: float,
     validator,
+    pose_transform: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> list[np.ndarray]:
     ui.append_message(stage_name, instructions)
     ui.append_message(stage_name, timed_flow_hint)
@@ -434,7 +486,8 @@ def _capture_single_vive_channel_from_gui(
             source_stats_at_start = _source_debug_stats(source)
             if channel_valid:
                 last_sample_key = _channel_sample_key(channel)
-                poses.append(as_pose_matrix(getattr(channel, "value")))
+                pose = as_pose_matrix(getattr(channel, "value"))
+                poses.append(pose if pose_transform is None else pose_transform(pose))
             ui.append_message(
                 stage_name,
                 f"采集开始，窗口 {float(capture_duration_sec):.1f}s，"
@@ -495,7 +548,8 @@ def _capture_single_vive_channel_from_gui(
             sample_key = _channel_sample_key(channel)
             if sample_key != last_sample_key:
                 last_sample_key = sample_key
-                poses.append(as_pose_matrix(getattr(channel, "value")))
+                pose = as_pose_matrix(getattr(channel, "value"))
+                poses.append(pose if pose_transform is None else pose_transform(pose))
             if len(poses) >= int(min_samples) and not min_samples_reported:
                 min_samples_reported = True
                 ui.append_message(stage_name, f"已达到最小样本数 {len(poses)}/{int(min_samples)}。")
@@ -625,8 +679,8 @@ def _capture_dual_wrist_offsets_from_gui(
     *,
     ui: CalibrationWebUi,
     args: argparse.Namespace,
-    components: RealTeleopComponents,
-    source: VivePoseSource,
+    components: object,
+    source: object,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     stage_id = "WristOffset"
     stage_name = "Wrist Offset Capture"
@@ -701,12 +755,12 @@ def _capture_dual_wrist_offsets_from_gui(
             if left_valid:
                 left_last_sample_key = _channel_sample_key(left_channel)
                 left_poses.append(
-                    components.session.calibration.world_to_desk(as_pose_matrix(getattr(left_channel, "value")))
+                    _context_calibration(components).world_to_desk(as_pose_matrix(getattr(left_channel, "value")))
                 )
             if right_valid:
                 right_last_sample_key = _channel_sample_key(right_channel)
                 right_poses.append(
-                    components.session.calibration.world_to_desk(as_pose_matrix(getattr(right_channel, "value")))
+                    _context_calibration(components).world_to_desk(as_pose_matrix(getattr(right_channel, "value")))
                 )
             ui.append_message(stage_id, f"采集开始，窗口 {float(getattr(args, 'hold_capture_sec', 4.0)):.1f}s。")
         elapsed = max(0.0, loop_start - capture_start_time) if capturing else 0.0
@@ -763,7 +817,7 @@ def _capture_dual_wrist_offsets_from_gui(
             left_sample_key = _channel_sample_key(left_channel)
             if left_sample_key != left_last_sample_key:
                 left_last_sample_key = left_sample_key
-                left_poses.append(components.session.calibration.world_to_desk(as_pose_matrix(getattr(left_channel, "value"))))
+                left_poses.append(_context_calibration(components).world_to_desk(as_pose_matrix(getattr(left_channel, "value"))))
             if len(left_poses) >= min_samples and not left_min_reported:
                 left_min_reported = True
                 ui.append_message(stage_id, f"左手已达到最小样本数 {len(left_poses)}/{min_samples}。")
@@ -771,7 +825,7 @@ def _capture_dual_wrist_offsets_from_gui(
             right_sample_key = _channel_sample_key(right_channel)
             if right_sample_key != right_last_sample_key:
                 right_last_sample_key = right_sample_key
-                right_poses.append(components.session.calibration.world_to_desk(as_pose_matrix(getattr(right_channel, "value"))))
+                right_poses.append(_context_calibration(components).world_to_desk(as_pose_matrix(getattr(right_channel, "value"))))
             if len(right_poses) >= min_samples and not right_min_reported:
                 right_min_reported = True
                 ui.append_message(stage_id, f"右手已达到最小样本数 {len(right_poses)}/{min_samples}。")
@@ -817,19 +871,23 @@ def _capture_dual_wrist_offsets_from_gui(
         time.sleep(max(0.0, min(0.02, (1.0 / float(args.hz)) - (time.time() - loop_start))))
 
 
-def calibrate_gui_vive_coordinate_profile(
+def calibrate_vive_coordinate_profile(
     args: argparse.Namespace,
-    components: RealTeleopComponents,
+    context: ViveCoordinateCalibrationContext | object,
     ui: CalibrationWebUi,
     *,
-    save_profile: Callable[[argparse.Namespace, RealTeleopComponents], Path],
-) -> Path:
-    if not {"left", "right"}.issubset(set(components.active_sides)):
-        raise RuntimeError("VIVE coordinate calibration requires active-sides both.")
-    source = _vive_pose_source_from_components(components)
+    save_profile: Callable[[argparse.Namespace, object], Path] | None = None,
+    save_on_complete: bool = True,
+) -> Path | None:
+    active_sides = _context_active_sides(context)
+    if not active_sides:
+        raise RuntimeError("VIVE coordinate calibration requires at least one active side.")
+    source = getattr(context, "source", None)
+    if source is None and isinstance(context, RealTeleopComponents):
+        source = _vive_pose_source_from_components(context)
     if source is None:
         raise RuntimeError("No VIVE pose source is attached to the teleop session.")
-    calibration = components.session.calibration
+    calibration = _context_calibration(context)
     if calibration is None:
         raise RuntimeError("No active calibration is attached to the teleop session.")
 
@@ -853,7 +911,7 @@ def calibrate_gui_vive_coordinate_profile(
     _, desk_channel_name = _select_gui_vive_coordinate_sweep_hand(
         ui=ui,
         args=args,
-        components=components,
+        components=context,
         source=source,
     )
     desk_tracker_role = _tracker_role_for_channel(desk_channel_name)
@@ -862,7 +920,7 @@ def calibrate_gui_vive_coordinate_profile(
     x_sweep = _capture_single_vive_channel_from_gui(
         ui=ui,
         args=args,
-        components=components,
+        components=context,
         source=source,
         stage_name="VirtualDeskX",
         instructions=(
@@ -879,7 +937,7 @@ def calibrate_gui_vive_coordinate_profile(
     y_sweep = _capture_single_vive_channel_from_gui(
         ui=ui,
         args=args,
-        components=components,
+        components=context,
         source=source,
         stage_name="VirtualDeskY",
         instructions="做 Y 轴扫动，让拟合后的 +Y 指向你的左侧：从身体右侧开始，向身体左侧移动并结束。",
@@ -893,7 +951,7 @@ def calibrate_gui_vive_coordinate_profile(
     z_sweep = _capture_single_vive_channel_from_gui(
         ui=ui,
         args=args,
-        components=components,
+        components=context,
         source=source,
         stage_name="VirtualDeskZ",
         instructions="做 Z 轴扫动，让拟合后的 +Z 指向上方：从低处开始，向上移动并结束。",
@@ -964,17 +1022,39 @@ def calibrate_gui_vive_coordinate_profile(
         f"VIVE desk 坐标系拟合完成，post_yaw={yaw_deg:.0f}deg；接下来采左右 wrist tracker offset。",
     )
 
-    left_poses, right_poses = _capture_dual_wrist_offsets_from_gui(
-        ui=ui,
-        args=args,
-        components=components,
-        source=source,
-    )
+    if set(active_sides) == {"left", "right"}:
+        left_poses, right_poses = _capture_dual_wrist_offsets_from_gui(
+            ui=ui,
+            args=args,
+            components=context,
+            source=source,
+        )
+        per_side_poses = {"left": left_poses, "right": right_poses}
+    else:
+        per_side_poses = {}
+        for side in active_sides:
+            per_side_poses[side] = _capture_single_vive_channel_from_gui(
+                ui=ui,
+                args=args,
+                components=context,
+                source=source,
+                stage_name="WristOffset",
+                instructions=(
+                    f"把 {side} wrist tracker 放到标准中立姿态：前臂朝前、手背朝上、"
+                    "手指大致沿 desk +X。"
+                ),
+                timed_flow_hint="保持中立姿态，采集自动结束后写入 tracker offset。",
+                direction_hint="保持中立姿态",
+                channel_name=f"{side}_wrist_pose",
+                min_samples=int(getattr(args, "min_hold_samples", 3)),
+                capture_duration_sec=float(getattr(args, "hold_capture_sec", 4.0)),
+                validator=None,
+                pose_transform=lambda pose, calibration=calibration: calibration.world_to_desk(pose),
+            )
     tracker_metadata = calibration.metadata.setdefault("tracker_offset_calibration", {})
     if not isinstance(tracker_metadata, dict):
         tracker_metadata = {}
         calibration.metadata["tracker_offset_calibration"] = tracker_metadata
-    per_side_poses = {"left": left_poses, "right": right_poses}
     for side, poses in per_side_poses.items():
         tracker_role = f"{side}_wrist"
         canonical_rpy_deg = canonical_hand_rpy_default()
@@ -996,10 +1076,42 @@ def calibrate_gui_vive_coordinate_profile(
             "final_offset": offset.tolist(),
             "captured_tracker_pose_virtual": tracker_pose_virtual.tolist(),
         }
-    _clear_runtime_home_state(components)
-    path = save_profile(args, components)
+    _clear_runtime_home_state(context)
+    if save_profile is None or not save_on_complete:
+        return None
+    path = save_profile(args, context)
     setattr(args, "load_profile", str(path))
     return path
+
+
+def calibrate_gui_vive_coordinate_profile(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    ui: CalibrationWebUi,
+    *,
+    save_profile: Callable[[argparse.Namespace, RealTeleopComponents], Path],
+) -> Path:
+    """Compatibility wrapper for the existing real-teleop GUI entrypoint."""
+
+    source = _vive_pose_source_from_components(components)
+    if source is None:
+        raise RuntimeError("No VIVE pose source is attached to the teleop session.")
+    calibration = components.session.calibration
+    if calibration is None:
+        raise RuntimeError("No active calibration is attached to the teleop session.")
+    result = calibrate_vive_coordinate_profile(
+        args,
+        ViveCoordinateCalibrationContext(
+            source=source,
+            calibration=calibration,
+            active_sides=tuple(components.active_sides),
+        ),
+        ui,
+        save_profile=lambda workflow_args, _context: save_profile(workflow_args, components),
+    )
+    if result is None:
+        raise RuntimeError("VIVE coordinate calibration did not produce a profile path.")
+    return result
 
 __all__ = [
     "_capture_dual_wrist_offsets_from_gui",
@@ -1018,6 +1130,7 @@ __all__ = [
     "_source_debug_stats",
     "_tracker_role_for_channel",
     "_virtual_desk_post_rotation_pose",
+    "ViveCoordinateCalibrationContext",
+    "calibrate_vive_coordinate_profile",
     "calibrate_gui_vive_coordinate_profile",
 ]
-

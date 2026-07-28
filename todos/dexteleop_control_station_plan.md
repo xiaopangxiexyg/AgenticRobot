@@ -100,13 +100,14 @@
 - `control_composition.lifecycle.handoff`现唯一持有上述模型、本体和backend无关的纯事务；旧
   `control_station.handoff`转发层已在调用审计后删除。typed request依次消费
   `ExecutionHoldReceipt`、`SourceInvalidationReceipt`、release/takeover、post-takeover readiness与READY receipt；任一乱序、
-  request/epoch错配、stale input、unsafe verdict或failed ack都fail closed，且相同receipt幂等。`capture_only`不能被偷偷解释为
+  request/epoch错配、stale input、invalid source-readiness receipt或failed ack都fail closed，且相同receipt幂等。`capture_only`不能被偷偷解释为
   motion stop，`suspend_policy_keep_reference`也不能进入handoff；
 - `composition/mujoco_human_replay.py`新增独立、单向、显式调用的CS-6b0 sim gate，同时完整保留原CS-6a `handoff_to()`数值和
   顺序。新路径先关闭human/replay publication，使用真实MuJoCo cancellation/`software_queue` ack推进execution epoch，再将旧
   replay producer推进到新epoch，使其已接纳proposal在Arbiter active-epoch cut中整体失效；replay fixture没有worker，drain明确
-  为`not_applicable`而非伪造完成。authority在HOLD下release/takeover，READY前只做non-publishing human adapter/canonical-safety
-  preview与真实MuJoCo qpos采样；deadman/rebase仍是测试注入的虚拟typed evidence；
+  为`not_applicable`而非伪造完成。authority只在lower HOLD/cancellation ack完成后release/takeover；READY前只做
+  non-publishing human adapter/source-readiness与真实MuJoCo qpos采样，不做pre-admission canonical-safety preview；
+  deadman/rebase仍是测试注入的虚拟typed evidence；
 - CS-6b0把preview过的human emission identity、content hash与effective interval保留为一次性promotion约束。READY后第一条正式
   `HumanCommandEmission`必须exact匹配，随后仍只经原`submit_human_emission()`产生一次source fact和一次proposal admission；不同
   emission、不同timing、旧replay late submission均在影响reference前拒绝。该历史direct-qpos fixture的25项pure+MuJoCo聚焦测试
@@ -935,11 +936,16 @@ inference/pop/merge。
   production入口；
 - **CS-6b1h（composer-only formal pose fusion，deterministic sim第一段complete）**：
   独立profile关闭primary-policy与replay proposal authority，human/replay仅作为同一receiver prefix中的non-authoritative
-  contributor；唯一arms proposal producer是pose composer。`CompositionAuthorityGateSpec/Disposition`冻结required-role
-  missing、TTL、epoch invalidation、conflict和composer error均HOLD，禁止parallel source proposal及绕过canonical safety。
-  formal gate先检查exact `CompositionResult`，再以同一result一次性promotion，不能重新capture更晚cut；同decision key/result
+  contributor；唯一arms proposal producer是pose composer。兼容命名的
+  `CompositionAuthorityGateSpec/Disposition`只生成绑定exact result的
+  `submit_candidate/request_hold`下游请求；它不执行HOLD、不签发authority或safety receipt。
+  required-role missing、TTL、epoch invalidation、conflict和composer error在该profile中请求lower HOLD，
+  实际cancellation由既有execution owner接纳并回receipt；parallel source proposal仍由authority profile禁止，
+  canonical safety仍由下游强制执行。formal disposition先检查exact `CompositionEvaluation`，再以同一result一次性promotion，不能重新capture更晚cut；同decision key/result
   幂等。ready proposal仍走原Arbiter→canonical safety→pose transform→coupled IK→scheduled MuJoCo dispatch；HOLD后fresh
-  input不会自动READY或预发恢复proposal。ControlTrace新增`composition_authority_disposition`闭合publish/HOLD原因。
+  input不会自动READY或预发恢复proposal。兼容
+  `composition_authority_disposition`只记录submit/request原因；实际HOLD由独立lower
+  execution/cancellation事实证明。
   human/replay contributor另记录`composition_contributor_input`，其source fact ID/hash必须精确解析到既有source/
   representation事实；无source lineage的旧`composition_input`事件和hash不变。
   formal strategy v2现可通过`MujocoDeployRuntime`构造参数显式注入，不进入sim config或默认profile hash。
@@ -958,10 +964,10 @@ inference/pop/merge。
   | formal composer 条件 | disposition |
   |---|---|
   | human + replay同cut有效，融合ready | 发布唯一composer proposal |
-  | required contributor TTL过期或producer epoch失效 | HOLD + cancellation |
-  | 所有contributor缺失 | HOLD + cancellation |
-  | frame/quaternion/pose disagreement冲突 | HOLD + cancellation |
-  | evaluation/promotion异常 | HOLD + cancellation |
+  | required contributor TTL过期或producer epoch失效 | request-HOLD → lower cancellation receipt |
+  | 所有contributor缺失 | request-HOLD → lower cancellation receipt |
+  | frame/quaternion/pose disagreement冲突 | request-HOLD → lower cancellation receipt |
+  | evaluation/promotion异常 | request-HOLD → lower cancellation receipt |
   | gate已经HOLD，随后出现fresh input | 保持HOLD；等待外部typed re-arm，不预发proposal |
 - **CS-6b1i（generic composition session + formal sim capture，complete/default-off）**：
   新增单次使用的`CompositionSessionOperationSpec`及独立`start_composition_session`/`stop_composition_session`

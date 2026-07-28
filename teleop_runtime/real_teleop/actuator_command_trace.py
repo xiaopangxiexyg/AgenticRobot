@@ -71,6 +71,21 @@ _SINGULARITY_DTYPE = np.dtype(
     ],
     align=False,
 )
+_IK_SHADOW_DTYPE = np.dtype(
+    [
+        ("sequence", "<i8"),
+        ("monotonic_time_ns", "<i8"),
+        ("pre_q_rad", "<f8", (12,)),
+        ("raw_solver_q_rad", "<f8", (12,)),
+        ("canonical_solver_q_rad", "<f8", (12,)),
+        ("admitted_q_rad", "<f8", (12,)),
+        ("target_world_pose", "<f8", (2, 4, 4)),
+        ("jacobian_singular_values", "<f8", (2, 6)),
+        ("wrist_null_scale", "<f8", (2,)),
+        ("status", "S32"),
+    ],
+    align=False,
+)
 
 
 def _normalize_side(side: object) -> str:
@@ -193,22 +208,31 @@ class ActuatorCommandTraceRecorder:
             )
             singularity_buffer.view(np.uint8).fill(0)
             self._singularity_buffers[side] = singularity_buffer
+        self._ik_shadow_buffer = np.empty(
+            int(config.singularity_capacity_per_side),
+            dtype=_IK_SHADOW_DTYPE,
+        )
+        self._ik_shadow_buffer.view(np.uint8).fill(0)
         self._next_index = {side: 0 for side in config.active_sides}
         self._singularity_next_index = {
             side: 0 for side in config.active_sides
         }
+        self._ik_shadow_next_index = 0
         self._drop_count = {side: 0 for side in config.active_sides}
         self._singularity_drop_count = {
             side: 0 for side in config.active_sides
         }
+        self._ik_shadow_drop_count = 0
         self._error_count = {side: 0 for side in config.active_sides}
         self._singularity_error_count = {
             side: 0 for side in config.active_sides
         }
+        self._ik_shadow_error_count = 0
         self._last_error = {side: None for side in config.active_sides}
         self._last_singularity_error = {
             side: None for side in config.active_sides
         }
+        self._last_ik_shadow_error: str | None = None
         self._accepting = True
         self._closed = False
         self._started_wall_time_ns = time.time_ns()
@@ -409,6 +433,91 @@ class ActuatorCommandTraceRecorder:
                 )
             return False
 
+    def record_ik_shadow(
+        self,
+        monotonic_time: float,
+        pre_q: Sequence[float] | np.ndarray,
+        raw_solver_q: Sequence[float] | np.ndarray | None,
+        canonical_solver_q: Sequence[float] | np.ndarray | None,
+        admitted_q: Sequence[float] | np.ndarray,
+        left_target_world_pose: np.ndarray,
+        right_target_world_pose: np.ndarray,
+        left_jacobian_singular_values: Sequence[float] | np.ndarray | None,
+        right_jacobian_singular_values: Sequence[float] | np.ndarray | None,
+        left_wrist_null_scale: float | None,
+        right_wrist_null_scale: float | None,
+        status: str,
+    ) -> bool:
+        """Record one 60 Hz IK shadow row into preallocated memory."""
+
+        if not self._accepting:
+            return False
+        try:
+            index = self._ik_shadow_next_index
+            buffer = self._ik_shadow_buffer
+            if index >= buffer.shape[0]:
+                self._ik_shadow_drop_count += 1
+                return False
+
+            def q12(value: object, *, allow_missing: bool = False) -> np.ndarray:
+                if value is None and allow_missing:
+                    return np.full(12, np.nan, dtype=float)
+                array = np.asarray(value, dtype=float)
+                if array.shape != (12,):
+                    raise ValueError("IK shadow q fields must be 12-vectors")
+                return array
+
+            def sigma6(value: object) -> np.ndarray:
+                if value is None:
+                    return np.full(6, np.nan, dtype=float)
+                array = np.asarray(value, dtype=float)
+                if array.shape != (6,):
+                    raise ValueError(
+                        "IK shadow singular-value fields must be 6-vectors"
+                    )
+                return array
+
+            left_pose = np.asarray(left_target_world_pose, dtype=float)
+            right_pose = np.asarray(right_target_world_pose, dtype=float)
+            if left_pose.shape != (4, 4) or right_pose.shape != (4, 4):
+                raise ValueError("IK shadow target poses must be 4x4 matrices")
+
+            buffer["sequence"][index] = int(index)
+            buffer["monotonic_time_ns"][index] = _seconds_to_ns(monotonic_time)
+            buffer["pre_q_rad"][index] = q12(pre_q)
+            buffer["raw_solver_q_rad"][index] = q12(
+                raw_solver_q,
+                allow_missing=True,
+            )
+            buffer["canonical_solver_q_rad"][index] = q12(
+                canonical_solver_q,
+                allow_missing=True,
+            )
+            buffer["admitted_q_rad"][index] = q12(admitted_q)
+            buffer["target_world_pose"][index, 0] = left_pose
+            buffer["target_world_pose"][index, 1] = right_pose
+            buffer["jacobian_singular_values"][index, 0] = sigma6(
+                left_jacobian_singular_values
+            )
+            buffer["jacobian_singular_values"][index, 1] = sigma6(
+                right_jacobian_singular_values
+            )
+            buffer["wrist_null_scale"][index] = (
+                np.nan
+                if left_wrist_null_scale is None
+                else float(left_wrist_null_scale),
+                np.nan
+                if right_wrist_null_scale is None
+                else float(right_wrist_null_scale),
+            )
+            buffer["status"][index] = str(status).encode("utf-8")
+            self._ik_shadow_next_index = index + 1
+            return True
+        except Exception as exc:  # noqa: BLE001 - tracing must never stop control.
+            self._ik_shadow_error_count += 1
+            self._last_ik_shadow_error = f"{type(exc).__name__}: {exc}"
+            return False
+
     def stop_accepting(self) -> None:
         self._accepting = False
 
@@ -422,6 +531,7 @@ class ActuatorCommandTraceRecorder:
                     buffer.nbytes
                     for buffer in self._singularity_buffers.values()
                 )
+                + self._ik_shadow_buffer.nbytes
             ),
             "rows_by_side": {
                 side: int(self._next_index[side]) for side in self.config.active_sides
@@ -441,6 +551,10 @@ class ActuatorCommandTraceRecorder:
                 side: int(self._singularity_error_count[side])
                 for side in self.config.active_sides
             },
+            "ik_shadow_rows": int(self._ik_shadow_next_index),
+            "ik_shadow_drop_count": int(self._ik_shadow_drop_count),
+            "ik_shadow_error_count": int(self._ik_shadow_error_count),
+            "last_ik_shadow_error": self._last_ik_shadow_error,
             "last_singularity_error_by_side": dict(
                 self._last_singularity_error
             ),
@@ -473,6 +587,9 @@ class ActuatorCommandTraceRecorder:
                 for side in self.config.active_sides
             }
         )
+        arrays["ik_shadow"] = self._ik_shadow_buffer[
+            : self._ik_shadow_next_index
+        ]
         with temporary_data_path.open("wb") as stream:
             np.savez(stream, **arrays)
             stream.flush()
@@ -509,6 +626,7 @@ class ActuatorCommandTraceRecorder:
             },
             "dtype": _COMMAND_DTYPE.descr,
             "singularity_dtype": _SINGULARITY_DTYPE.descr,
+            "ik_shadow_dtype": _IK_SHADOW_DTYPE.descr,
             "started_wall_time_ns": int(self._started_wall_time_ns),
             "started_monotonic_time_ns": int(self._started_monotonic_time_ns),
             "stopped_wall_time_ns": int(stopped_wall_time_ns),

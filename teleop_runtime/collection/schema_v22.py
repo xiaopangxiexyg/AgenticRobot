@@ -49,6 +49,119 @@ STRICT_LAST_ACTION_INITIALIZATION_METADATA = {
 }
 
 
+class StrictV22SampleRejection(ValueError):
+    """A sample-level v2.2 contract rejection, not a writer failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        side: str,
+        reason: str,
+        age_sec: float | None = None,
+    ) -> None:
+        super().__init__(str(message))
+        self.side = str(side)
+        self.reason = str(reason)
+        self.age_sec = None if age_sec is None else float(age_sec)
+
+
+def validate_strict_v22_measured_state(
+    hand_states: Mapping[str, Mapping[str, Any]],
+    *,
+    layout: PolicyIOLayout,
+    sample_timestamp: float,
+    future_tolerance_sec: float = 0.05,
+) -> None:
+    """Validate measured end-effector feedback before writer admission.
+
+    This is intentionally the same check used by the strict row adapter.  The
+    real-teleop parent can reject a stale snapshot before it enters a process
+    worker, while direct writer callers retain the same fail-closed contract.
+    """
+
+    sample_time = float(sample_timestamp)
+    future_tolerance = max(0.0, float(future_tolerance_sec))
+    for side in SIDES:
+        channel = layout.channel("state", side)
+        if channel.value_type == "none":
+            continue
+        raw_state = hand_states.get(side)
+        state = raw_state if isinstance(raw_state, Mapping) else {}
+        end_effector = layout.end_effector(side)
+        state_source_field = end_effector.state_source_field
+        raw = state.get(state_source_field)
+        if raw is None:
+            raise StrictV22SampleRejection(
+                f"v2.2 {side} end-effector state is missing required measured field "
+                f"{state_source_field!r}.",
+                side=side,
+                reason="missing_measured_field",
+            )
+        if channel.value_type == "continuous":
+            selected = _select_numeric_channel(channel, raw)
+            if selected is None:
+                raise StrictV22SampleRejection(
+                    f"v2.2 {side} end-effector measured field "
+                    f"{state_source_field!r} is invalid.",
+                    side=side,
+                    reason="invalid_measured_field",
+                )
+            if not np.all(np.isfinite(selected)):
+                raise StrictV22SampleRejection(
+                    f"v2.2 {side} end-effector measured field "
+                    f"{state_source_field!r} is non-finite.",
+                    side=side,
+                    reason="nonfinite_measured_field",
+                )
+        elif channel.value_type == "discrete":
+            try:
+                selected_discrete = _select_discrete_channel(
+                    channel,
+                    raw=raw,
+                    metadata=state,
+                )
+                if selected_discrete is None:
+                    raise ValueError("no discrete state value")
+                for token, value in zip(channel.tokens, selected_discrete):
+                    token.resolve(value)
+            except (DatasetLayoutError, TypeError, ValueError) as exc:
+                raise StrictV22SampleRejection(
+                    f"v2.2 {side} end-effector measured field "
+                    f"{state_source_field!r} is invalid: {exc}",
+                    side=side,
+                    reason="invalid_measured_field",
+                ) from exc
+        state_metadata = end_effector.metadata
+        timestamp_field = str(
+            state_metadata.get("collection_state_timestamp_field", "joint_timestamp")
+        )
+        timestamp = state.get(timestamp_field)
+        try:
+            timestamp_value = float(timestamp)
+        except (TypeError, ValueError) as exc:
+            raise StrictV22SampleRejection(
+                f"v2.2 {side} end-effector state is missing timestamp "
+                f"{timestamp_field!r}.",
+                side=side,
+                reason="missing_measured_timestamp",
+            ) from exc
+        max_age_sec = float(state_metadata.get("collection_state_max_age_sec", 0.5))
+        age_sec = sample_time - timestamp_value
+        if (
+            not np.isfinite(timestamp_value)
+            or age_sec < -future_tolerance
+            or age_sec > max_age_sec
+        ):
+            raise StrictV22SampleRejection(
+                f"v2.2 {side} end-effector measured state is stale "
+                f"(age_sec={age_sec:.3f}, max_age_sec={max_age_sec:.3f}).",
+                side=side,
+                reason="stale_measured_state",
+                age_sec=age_sec,
+            )
+
+
 def _vector_or_none(value: Any, *, length: int | None = None) -> np.ndarray | None:
     if value is None:
         return None
@@ -161,6 +274,12 @@ def _eef_values_from_sample(
 ) -> dict[str, Any]:
     values: dict[str, Any] = {}
     action = _legacy_action(sample, last=last_action)
+    if role == "state" and strict:
+        validate_strict_v22_measured_state(
+            sample.hand_states,
+            layout=layout,
+            sample_timestamp=float(sample.timestamp),
+        )
     for side in SIDES:
         channel = layout.channel("action" if role == "action" else "state", side)
         if channel.value_type == "none":
@@ -173,31 +292,6 @@ def _eef_values_from_sample(
             end_effector = layout.end_effector(side)
             state_source_field = end_effector.state_source_field
             raw = state.get(state_source_field)
-            if strict:
-                if raw is None:
-                    raise ValueError(
-                        f"v2.2 {side} end-effector state is missing required measured field "
-                        f"{state_source_field!r}."
-                    )
-                state_metadata = end_effector.metadata
-                timestamp_field = str(
-                    state_metadata.get("collection_state_timestamp_field", "joint_timestamp")
-                )
-                timestamp = state.get(timestamp_field)
-                try:
-                    timestamp_value = float(timestamp)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"v2.2 {side} end-effector state is missing timestamp "
-                        f"{timestamp_field!r}."
-                    ) from exc
-                max_age_sec = float(state_metadata.get("collection_state_max_age_sec", 0.5))
-                age_sec = float(sample.timestamp) - timestamp_value
-                if not np.isfinite(timestamp_value) or age_sec < -0.05 or age_sec > max_age_sec:
-                    raise ValueError(
-                        f"v2.2 {side} end-effector measured state is stale "
-                        f"(age_sec={age_sec:.3f}, max_age_sec={max_age_sec:.3f})."
-                    )
             if raw is None:
                 legacy_state = _legacy_state(sample)
                 # v2.1 state always contains six raw hand slots.  It is only a
@@ -259,6 +353,53 @@ def _arm_qpos_from_state(sample: CollectorSample) -> dict[str, np.ndarray]:
         for side in SIDES
         if np.all(np.isfinite(state[STATE_ARM_QPOS_SLICES[side]]))
     }
+
+
+def extract_collector_policy_io_component_values(
+    sample: CollectorSample,
+    *,
+    layout: PolicyIOLayout,
+    strict: bool = False,
+) -> dict[str, np.ndarray]:
+    """Extract typed current action/state components from one source sample.
+
+    This is the shared source-production boundary for row and native shadow
+    encoders.  It does not create a dataset row and therefore does not assign
+    compatibility field names or own persistence.
+    """
+
+    action_poses = _arm_poses_from_action(sample)
+    state_poses = _arm_poses_from_state(sample)
+    state_qpos = _arm_qpos_from_state(sample)
+    action_eef = _eef_values_from_sample(
+        sample,
+        layout,
+        role="action",
+        strict=bool(strict),
+    )
+    state_eef = _eef_values_from_sample(
+        sample,
+        layout,
+        role="state",
+        strict=bool(strict),
+    )
+    values: dict[str, np.ndarray] = {}
+    for side in SIDES:
+        if side in action_poses:
+            values[f"action.pose.{side}"] = action_poses[side]
+        if side in state_poses:
+            values[f"state.pose.{side}"] = state_poses[side]
+        if side in state_qpos:
+            values[f"state.qpos.{side}"] = state_qpos[side]
+        for role, source in (("action", action_eef), ("state", state_eef)):
+            if side not in source:
+                continue
+            channel = layout.channel(role, side)
+            dtype = np.int64 if channel.value_type == "discrete" else np.float32
+            values[f"{role}.end_effector.{side}"] = np.asarray(
+                source[side], dtype=dtype
+            )
+    return values
 
 
 def _write_end_effector_component_columns(
@@ -410,4 +551,9 @@ def collector_sample_to_v22_row(
     return row, camera_expectations
 
 
-__all__ = ["collector_sample_to_v22_row"]
+__all__ = [
+    "StrictV22SampleRejection",
+    "collector_sample_to_v22_row",
+    "extract_collector_policy_io_component_values",
+    "validate_strict_v22_measured_state",
+]
