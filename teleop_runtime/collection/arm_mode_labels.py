@@ -6,11 +6,15 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from dataset_contracts.arm_mode import (
+    ARM_MODE_IDS,
+    ARM_MODE_ID_TO_LABEL,
+    ARM_MODE_SCHEMA,
+)
 from robot_motion.pose import pose_delta_metrics
 
 from ..schemas import TeleopCommand
 
-ARM_MODE_SCHEMA = "dexteleop_arm_mode_v2"
 INIT_AUDIT_SCHEMA = "dexteleop_init_audit_v1"
 
 # Match the existing hand-eye auto-record stillness detector.  The velocity
@@ -23,17 +27,6 @@ INIT_STILL_TRANSLATION_SPEED_M_S = 0.015
 INIT_STILL_ROTATION_SPEED_DEG_S = 2.5
 INIT_STILL_DWELL_SEC = 3.0
 INIT_AUDIT_MAX_SAMPLE_GAP_SEC = 0.5
-
-ARM_MODE_IDS: dict[str, int] = {
-    "unknown": 0,
-    "teleop": 1,
-    "fixed_hold": 2,
-    "init_pose": 3,
-    "stopped": 4,
-}
-
-ARM_MODE_ID_TO_LABEL = {mode_id: label for label, mode_id in ARM_MODE_IDS.items()}
-
 
 def _normalize_side(side: Any) -> str:
     normalized = str(side or "").strip().lower()

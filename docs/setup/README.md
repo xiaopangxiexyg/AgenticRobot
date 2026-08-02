@@ -5,6 +5,20 @@
 
 ## 1. 创建或修复环境
 
+只进行封存数据的后期阶段标注时，不要安装完整真机环境：
+
+```bash
+cd /path/to/DexTeleop
+bash scripts/install_annotation_env.sh
+source .venv-annotation/bin/activate
+python -m control_station refinement-annotation
+```
+
+该轻量环境不安装硬件 SDK、机器人控制、仿真、训练或部署依赖。详细边界与自定义安装路径见
+[`README_ENV.md` 的标注环境章节](../../README_ENV.md#2-只安装后期标注环境)。
+
+完整项目或真机机器才使用：
+
 ```bash
 cd /path/to/DexTeleop
 bash scripts/install_conda_env.sh

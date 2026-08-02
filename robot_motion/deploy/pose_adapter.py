@@ -243,6 +243,7 @@ def convert_normalized_action_chunk_to_absolute(
                 NormalizedAction(
                     vector=vector,
                     arm_joint_targets=dict(action.arm_joint_targets),
+                    arm_hold_prediction=action.arm_hold_prediction,
                     metadata={
                         **dict(action.metadata),
                         "pose_action_source_mode": source,
@@ -280,6 +281,7 @@ def convert_normalized_action_chunk_to_absolute(
             NormalizedAction(
                 vector=converted[index].copy(),
                 arm_joint_targets=dict(action.arm_joint_targets),
+                arm_hold_prediction=action.arm_hold_prediction,
                 metadata={
                     **dict(action.metadata),
                     "pose_action_source_mode": source,
@@ -338,6 +340,7 @@ def convert_normalized_action_chunk_to_relative(
         NormalizedAction(
             vector=converted[index].copy(),
             arm_joint_targets=dict(action.arm_joint_targets),
+            arm_hold_prediction=action.arm_hold_prediction,
             metadata={
                 **dict(action.metadata),
                 "pose_action_source_mode": ACTION_POSE_MODE_ABSOLUTE,

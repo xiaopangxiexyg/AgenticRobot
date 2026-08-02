@@ -1,0 +1,73 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_rm65_bimanual_position_writing_four_stage_stages",
+  "profile_version": "2",
+  "task_progress_profile_hash": "76e5ebf9befeaa7f28061092e2c5ebac9d2bc24993606c9fef9fae195c20fd77",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.approach",
+      "display_name": "靠近毛笔",
+      "description": "右手移动并靠近待抓取的毛笔。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.grasp",
+      "display_name": "正确抓住毛笔",
+      "description": "右手建立正确且稳定的毛笔抓取。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.lift_and_present",
+      "display_name": "提起毛笔并送至左手",
+      "description": "右手提起毛笔并送到左手能够取下笔盖的位置。",
+      "ordinal": 3
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "left_remove_brush_cap",
+      "stage_id": "left_remove_brush_cap.remove",
+      "display_name": "取下笔盖",
+      "description": "左手从毛笔上取下笔盖。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "left_remove_brush_cap",
+      "stage_id": "left_remove_brush_cap.return",
+      "display_name": "放回笔盖",
+      "description": "左手将取下的笔盖放回指定位置。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.write",
+      "display_name": "右手书写",
+      "description": "右手持毛笔完成规定的书写内容。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_return_brush",
+      "stage_id": "right_return_brush.align",
+      "display_name": "调整放回位置",
+      "description": "右手调整毛笔到正确的放回位置和姿态。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_return_brush",
+      "stage_id": "right_return_brush.release",
+      "display_name": "放下归位",
+      "description": "右手放下毛笔并完成归位。",
+      "ordinal": 2
+    }
+  ],
+  "semantic_content_hash": "54a627b747eae869ad172c802f4ec41333760c3dd2d17b79a4cc444e844a5839"
+}

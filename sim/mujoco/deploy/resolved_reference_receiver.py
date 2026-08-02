@@ -1011,6 +1011,38 @@ class MujocoScheduledResolvedQposReferenceReceiver(
             group_segment_generation_by_group=generations
         )
 
+    def _require_successor_predecessor_evidence(
+        self,
+        predecessor: ReferenceSegment,
+        *,
+        activated_at: float,
+    ) -> None:
+        """Component targets use activation receipts, not legacy safety candidates."""
+
+        component_result = self._component_result_by_segment_id.get(
+            predecessor.reference_segment_id
+        )
+        if component_result is None:
+            super()._require_successor_predecessor_evidence(
+                predecessor,
+                activated_at=activated_at,
+            )
+            return
+        predecessor_activation = next(
+            (
+                item
+                for item in reversed(self._component_target_activations)
+                if item.target_id == component_result.target.target_id
+                and item.activation_status == "activated"
+            ),
+            None,
+        )
+        if predecessor_activation is None:
+            raise RuntimeError(
+                "Component successor activation requires the predecessor "
+                "target activation receipt."
+            )
+
     def cancel_all(self, *, reason: str, effective_at: float) -> None:
         with self._lock:
             activated_target_ids = {

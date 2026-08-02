@@ -10,12 +10,17 @@ import numpy as np
 from .background import BackgroundMode, TemporalRandomBackground, apply_random_background, temporal_background_from_episode
 from .mask_io import BitpackMaskReader, MaskRole, normalize_keep_mask
 from .photometric import PhotometricAugmentConfig, PhotometricImageAugmenter
-from .real_image_provider import LocalImageBackgroundProvider, RealImageTemporalBackground
+from .real_image_provider import (
+    LocalImageBackgroundProvider,
+    RealImageTemporalBackground,
+    default_real_image_root,
+)
 from .view_occlusion import ViewOcclusionAugmenter, ViewOcclusionConfig, validate_occlusion_ratio
 
 
 ProviderKind = Literal["procedural", "real_image", "original", "black", "mixed"]
 FixedMaskProviderKind = Literal["inherit", "procedural", "real_image"]
+WristPairMode = Literal["shared_scene_family", "independent"]
 
 _FIXED_BORDER_SIDES = ("top", "bottom", "left", "right")
 
@@ -52,17 +57,86 @@ class FixedBorderMaskConfig:
 @dataclass(frozen=True)
 class RandomBackgroundAugmentConfig:
     global_seed: int = 20260709
-    provider: ProviderKind = "procedural"
+    # C profile: retain a small original-background slice while pairing the
+    # two wrist views through a shared scene family.  ``independent`` is the
+    # explicit compatibility fallback for the previous per-camera behavior.
+    provider: ProviderKind = "mixed"
     mode: BackgroundMode = "embodied_mix"
     real_image_prob: float = 0.4
     mask_role: MaskRole = "keep"
     edge_blur_px: int = 1
     enable_epoch_variation: bool = True
     mixed_original_prob: float = 0.1
-    mixed_black_prob: float = 0.1
+    mixed_black_prob: float = 0.0
+    wrist_pair_mode: WristPairMode = "shared_scene_family"
+    wrist_pair_camera_keys: tuple[str, ...] = ("left_wrist", "right_wrist")
     fixed_mask: FixedBorderMaskConfig = field(default_factory=FixedBorderMaskConfig)
     photometric: PhotometricAugmentConfig = field(default_factory=PhotometricAugmentConfig)
     view_occlusion: ViewOcclusionConfig = field(default_factory=ViewOcclusionConfig)
+
+    def __post_init__(self) -> None:
+        if self.provider not in ("procedural", "real_image", "original", "black", "mixed"):
+            raise ValueError(f"unsupported random background provider: {self.provider!r}")
+        for name in ("real_image_prob", "mixed_original_prob", "mixed_black_prob"):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be within [0, 1]")
+        if (
+            float(self.mixed_original_prob)
+            + float(self.mixed_black_prob)
+            + float(self.real_image_prob)
+            > 1.0
+        ):
+            raise ValueError(
+                "mixed_original_prob + mixed_black_prob + real_image_prob must be within [0, 1]"
+            )
+        if self.wrist_pair_mode not in ("shared_scene_family", "independent"):
+            raise ValueError(f"unsupported wrist_pair_mode: {self.wrist_pair_mode!r}")
+        camera_keys = tuple(dict.fromkeys(str(key) for key in self.wrist_pair_camera_keys))
+        if any(not key for key in camera_keys):
+            raise ValueError("wrist_pair_camera_keys must contain non-empty camera keys")
+        object.__setattr__(self, "wrist_pair_camera_keys", camera_keys)
+
+    @property
+    def requires_real_image_provider(self) -> bool:
+        """Whether this configuration can select a real-image background.
+
+        The previous implementation silently converted this branch to
+        procedural when the provider was omitted.  That made a nominal 10/40/50
+        profile run as 10/90.  Callers that construct the augmenter can now
+        fail closed or inject the repository default provider.
+        """
+
+        if self.provider == "real_image":
+            return True
+        if self.provider == "mixed" and float(self.real_image_prob) > 0.0:
+            return True
+        if self.fixed_mask.enabled:
+            if self.fixed_mask.provider == "real_image":
+                return True
+            if self.fixed_mask.provider == "inherit" and self.provider in ("real_image", "mixed"):
+                return True
+        return False
+
+    def mixed_probabilities(self, *, real_image_available: bool = True) -> dict[str, float]:
+        """Return the effective provider probabilities for audit/tests."""
+
+        if self.provider != "mixed":
+            return {
+                "original": 1.0 if self.provider == "original" else 0.0,
+                "black": 1.0 if self.provider == "black" else 0.0,
+                "real_image": 1.0 if self.provider == "real_image" else 0.0,
+                "procedural": 1.0 if self.provider == "procedural" else 0.0,
+            }
+        original = float(self.mixed_original_prob)
+        black = float(self.mixed_black_prob)
+        real_image = float(self.real_image_prob) if real_image_available else 0.0
+        return {
+            "original": original,
+            "black": black,
+            "real_image": real_image,
+            "procedural": max(0.0, 1.0 - original - black - real_image),
+        }
 
 
 @dataclass(frozen=True)
@@ -172,7 +246,10 @@ class _LruStaticBackgroundFrames:
 class _LruStreams:
     def __init__(self, max_size: int = 128):
         self.max_size = max(1, int(max_size))
-        self.items: OrderedDict[tuple[int, str, int, int, int, str], TemporalRandomBackground] = OrderedDict()
+        self.items: OrderedDict[
+            tuple[int, str, int, int, int, str, int | None, int | None],
+            TemporalRandomBackground,
+        ] = OrderedDict()
 
     def get(
         self,
@@ -184,8 +261,19 @@ class _LruStreams:
         epoch: int,
         seed: int,
         mode: BackgroundMode,
+        canvas_seed: int | None = None,
+        view_seed: int | None = None,
     ) -> TemporalRandomBackground:
-        key = (int(width), int(height), int(episode_index), _camera_hash(camera_key), int(epoch), str(mode))
+        key = (
+            int(width),
+            int(height),
+            int(episode_index),
+            _camera_hash(camera_key),
+            int(epoch),
+            str(mode),
+            None if canvas_seed is None else int(canvas_seed),
+            None if view_seed is None else int(view_seed),
+        )
         stream = self.items.get(key)
         if stream is not None:
             self.items.move_to_end(key)
@@ -197,6 +285,8 @@ class _LruStreams:
             camera_key=str(camera_key),
             seed=int(seed),
             mode=mode,
+            canvas_seed=None if canvas_seed is None else int(canvas_seed),
+            view_seed=None if view_seed is None else int(view_seed),
         )
         self.items[key] = stream
         if len(self.items) > self.max_size:
@@ -207,7 +297,10 @@ class _LruStreams:
 class _LruRealStreams:
     def __init__(self, max_size: int = 128):
         self.max_size = max(1, int(max_size))
-        self.items: OrderedDict[tuple[int, int, int, str], RealImageTemporalBackground] = OrderedDict()
+        self.items: OrderedDict[
+            tuple[int, int, int, str, int | None, int | None],
+            RealImageTemporalBackground,
+        ] = OrderedDict()
 
     def get(
         self,
@@ -218,8 +311,17 @@ class _LruRealStreams:
         episode_index: int,
         camera_key: str,
         epoch: int,
+        scene_seed: int | None = None,
+        view_seed: int | None = None,
     ) -> RealImageTemporalBackground:
-        key = (int(width), int(height), int(episode_index), f"{camera_key}:{int(epoch)}")
+        key = (
+            int(width),
+            int(height),
+            int(episode_index),
+            f"{camera_key}:{int(epoch)}",
+            None if scene_seed is None else int(scene_seed),
+            None if view_seed is None else int(view_seed),
+        )
         stream = self.items.get(key)
         if stream is not None:
             self.items.move_to_end(key)
@@ -230,6 +332,8 @@ class _LruRealStreams:
             episode_index=int(episode_index),
             camera_key=str(camera_key),
             epoch=int(epoch),
+            scene_seed=scene_seed,
+            view_seed=view_seed,
         )
         self.items[key] = stream
         if len(self.items) > self.max_size:
@@ -266,32 +370,169 @@ class RandomBackgroundVideoAugmenter:
             cache_size=stream_cache_size,
         )
         self.real_image_provider = real_image_provider
+        if self.config.requires_real_image_provider and self.real_image_provider is None:
+            try:
+                self.real_image_provider = LocalImageBackgroundProvider(
+                    image_root=default_real_image_root()
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                raise RuntimeError(
+                    "the configured background profile can select real_image, but no "
+                    "usable provider was supplied; pass real_image_provider or set "
+                    "DEXTELEOP_REAL_IMAGE_ROOT"
+                ) from exc
+
+    def _uses_wrist_pair(self, camera_key: str) -> bool:
+        return bool(
+            self.config.wrist_pair_mode == "shared_scene_family"
+            and str(camera_key) in self.config.wrist_pair_camera_keys
+        )
+
+    def _effective_background_epoch(self, epoch: int) -> int:
+        return int(epoch) if self.config.enable_epoch_variation else 0
+
+    def _wrist_pair_scene_seed(self, *, episode_index: int, epoch: int) -> int:
+        effective_epoch = self._effective_background_epoch(epoch)
+        return (
+            int(self.config.global_seed)
+            + int(episode_index) * 100003
+            + int(effective_epoch) * 10000019
+            + _camera_hash("wrist_pair:scene") * 1009
+        )
+
+    def _wrist_pair_provider_seed(self, *, episode_index: int, epoch: int) -> int:
+        return self._wrist_pair_scene_seed(
+            episode_index=int(episode_index),
+            epoch=int(epoch),
+        ) + _camera_hash("wrist_pair:provider") * 1009
+
+    def _wrist_pair_view_seed(self, *, episode_index: int, camera_key: str, epoch: int) -> int:
+        return self._wrist_pair_scene_seed(
+            episode_index=int(episode_index),
+            epoch=int(epoch),
+        ) + _camera_hash(f"wrist_pair:view:{camera_key}") * 1009
+
+    def _background_stream_seeds(
+        self,
+        *,
+        episode_index: int,
+        camera_key: str,
+        epoch: int,
+    ) -> tuple[int | None, int | None]:
+        if not self._uses_wrist_pair(camera_key):
+            return None, None
+        return (
+            self._wrist_pair_scene_seed(episode_index=int(episode_index), epoch=int(epoch)),
+            self._wrist_pair_view_seed(
+                episode_index=int(episode_index),
+                camera_key=str(camera_key),
+                epoch=int(epoch),
+            ),
+        )
 
     def _provider_for_sample(self, *, episode_index: int, camera_key: str, frame_index: int, epoch: int) -> ProviderKind:
         provider = self.config.provider
         if provider != "mixed":
             return provider
-        seed = (
-            int(self.config.global_seed)
-            + int(episode_index) * 100003
-            + _camera_hash(camera_key)
-            + int(frame_index) * 9176
-            + int(epoch) * 10000019
-        )
+        if self._uses_wrist_pair(camera_key):
+            # Provider selection is shared by the wrist pair for one
+            # episode+epoch.  Sampling it per camera or per frame can create
+            # a left-original/right-procedural mismatch and temporal flicker.
+            seed = self._wrist_pair_provider_seed(
+                episode_index=int(episode_index),
+                epoch=int(epoch),
+            )
+        else:
+            seed = (
+                int(self.config.global_seed)
+                + int(episode_index) * 100003
+                + _camera_hash(camera_key)
+                + int(frame_index) * 9176
+                + int(epoch) * 10000019
+            )
         value = float(np.random.default_rng(seed).random())
-        if value < float(self.config.mixed_original_prob):
+        probabilities = self.config.mixed_probabilities(
+            real_image_available=self.real_image_provider is not None
+        )
+        if value < probabilities["original"]:
             return "original"
-        if value < float(self.config.mixed_original_prob) + float(self.config.mixed_black_prob):
+        if value < probabilities["original"] + probabilities["black"]:
             return "black"
-        if (
-            self.real_image_provider is not None
-            and value
-            < float(self.config.mixed_original_prob)
-            + float(self.config.mixed_black_prob)
-            + float(self.config.real_image_prob)
-        ):
+        if value < probabilities["original"] + probabilities["black"] + probabilities["real_image"]:
             return "real_image"
         return "procedural"
+
+    def background_metadata(
+        self,
+        *,
+        episode_index: int,
+        camera_key: str,
+        frame_index: int,
+        epoch: int,
+    ) -> dict[str, Any]:
+        """Return deterministic background-family metadata for audit/replay.
+
+        This is diagnostic metadata only; it is not part of the model input.
+        Paired wrist views share the scene/canvas seed but receive different
+        view seeds, so a consumer can verify both coupling and independence.
+        """
+
+        effective_epoch = self._effective_background_epoch(epoch)
+        paired = self._uses_wrist_pair(camera_key)
+        payload: dict[str, Any] = {
+            "type": "masked_background_augmentation_v2",
+            "configured_provider": str(self.config.provider),
+            "provider": self._provider_for_sample(
+                episode_index=int(episode_index),
+                camera_key=str(camera_key),
+                frame_index=int(frame_index),
+                epoch=effective_epoch,
+            ),
+            "mode": str(self.config.mode),
+            "camera_key": str(camera_key),
+            "wrist_pair_mode": str(self.config.wrist_pair_mode),
+            "static_scope": "episode_epoch" if self.config.enable_epoch_variation else "episode",
+            "effective_epoch": int(effective_epoch),
+            "effective_probabilities": self.config.mixed_probabilities(
+                real_image_available=self.real_image_provider is not None
+            ),
+        }
+        if paired:
+            scene_seed, view_seed = self._background_stream_seeds(
+                episode_index=int(episode_index),
+                camera_key=str(camera_key),
+                epoch=effective_epoch,
+            )
+            assert scene_seed is not None and view_seed is not None
+            provider = str(payload["provider"])
+            payload.update(
+                {
+                    "background_family": "wrist_pair_scene",
+                    "background_family_id": f"wrist_pair:{int(scene_seed)}",
+                    "paired_camera_keys": list(self.config.wrist_pair_camera_keys),
+                    "scene_seed": int(scene_seed),
+                    "view_seed": int(view_seed),
+                    "scene_canvas_shared": provider == "procedural",
+                    "scene_source_shared": provider in ("procedural", "real_image"),
+                    "scene_canvas_source": (
+                        "shared_procedural_canvas"
+                        if provider == "procedural"
+                        else "shared_real_image_independent_views"
+                        if provider == "real_image"
+                        else "not_generated"
+                    ),
+                    "camera_view_seed_independent": True,
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "background_family": "camera_independent",
+                    "scene_canvas_shared": False,
+                    "camera_view_seed_independent": True,
+                }
+            )
+        return payload
 
     def uses_fixed_border_mask(self, camera_key: str) -> bool:
         """Whether the configured fixed replacement mask applies to this camera."""
@@ -602,6 +843,11 @@ class RandomBackgroundVideoAugmenter:
                 if provider == "real_image":
                     if self.real_image_provider is None:
                         raise ValueError("provider='real_image' requires real_image_provider")
+                    scene_seed, view_seed = self._background_stream_seeds(
+                        episode_index=int(episode_index),
+                        camera_key=str(camera_key),
+                        epoch=effective_epoch,
+                    )
                     stream = self.real_streams.get(
                         self.real_image_provider,
                         width=width,
@@ -609,6 +855,8 @@ class RandomBackgroundVideoAugmenter:
                         episode_index=int(episode_index),
                         camera_key=str(camera_key),
                         epoch=effective_epoch,
+                        scene_seed=scene_seed,
+                        view_seed=view_seed,
                     )
                     augmented = apply_random_background(
                         image,
@@ -617,6 +865,11 @@ class RandomBackgroundVideoAugmenter:
                         edge_blur_px=int(self.config.edge_blur_px),
                     )
                 elif provider == "procedural":
+                    canvas_seed, view_seed = self._background_stream_seeds(
+                        episode_index=int(episode_index),
+                        camera_key=str(camera_key),
+                        epoch=effective_epoch,
+                    )
                     stream = self.streams.get(
                         width=width,
                         height=height,
@@ -625,6 +878,8 @@ class RandomBackgroundVideoAugmenter:
                         epoch=effective_epoch,
                         seed=int(self.config.global_seed),
                         mode=self.config.mode,
+                        canvas_seed=canvas_seed,
+                        view_seed=view_seed,
                     )
                     augmented = stream.apply(
                         image,

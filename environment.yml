@@ -4,7 +4,7 @@ channels:
   - nodefaults
 
 # This is the conda base for the complete project environment.  The installer
-# uses uv.lock for the seven PyPI dependency groups (including the CUDA-capable
+# uses uv.lock for all PyPI dependency groups (including the CUDA-capable
 # model group), then adds pin-pink with
 # --no-deps and installs the local DM-Tac SDK. Those special steps are kept
 # out of this pip section because their package metadata is not suitable for

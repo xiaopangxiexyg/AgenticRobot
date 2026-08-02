@@ -29,19 +29,19 @@ from dataset_interface.v25p_projection_plan import (
 from dataset_interface.v25p_v23_adapter import V25pV23ProjectedRow
 
 from .v25p_capture_profiles import V25pCaptureProfileBundle
-from .v25p_native_store import (
-    V25pNativeCommitReport,
-    V25pNativeEpisodeStore,
-    V25pNativeSealReport,
+from collection_runtime.component_capture import (
+    ComponentCaptureCommitReport,
+    ComponentCaptureEpisodeStore,
+    ComponentCaptureSealReport,
+    ProducedComponentSample,
 )
-from .v25p_producer import V25pProducedSample
 
 
 _LEGACY_ROW_JOB_KIND = "lerobot_v21.row"
 
 
 class V25pSampleProducer(Protocol):
-    def produce(self, sample: Any) -> V25pProducedSample: ...
+    def produce(self, sample: Any) -> ProducedComponentSample: ...
 
 
 @dataclass(frozen=True)
@@ -53,9 +53,9 @@ class V25pShadowAppendReport:
 
 @dataclass(frozen=True)
 class V25pShadowFinalizeReport:
-    seal: V25pNativeSealReport
+    seal: ComponentCaptureSealReport
     receipt: V25pCompatibilityProjectionReceipt
-    commit: V25pNativeCommitReport
+    commit: ComponentCaptureCommitReport
     equivalent_sample_count: int
     mismatched_sample_count: int
 
@@ -108,7 +108,7 @@ def load_finalized_legacy_episode_record(
 
 def _project_produced_sample(
     *,
-    produced: V25pProducedSample,
+    produced: ProducedComponentSample,
     bundle: V25pCaptureProfileBundle,
     plan: V25pV23ProjectionPlan,
 ) -> V25pV23ProjectedRow:
@@ -146,7 +146,7 @@ class V25pDualWriteShadow:
     def __init__(
         self,
         *,
-        store: V25pNativeEpisodeStore,
+        store: ComponentCaptureEpisodeStore,
         bundle: V25pCaptureProfileBundle,
         producer: V25pSampleProducer,
     ) -> None:

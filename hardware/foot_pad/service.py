@@ -16,16 +16,23 @@ from typing import Any, Iterable, Mapping, Sequence
 
 SCHEMA_VERSION = "foot_pad_assignment.v1"
 LATEST_CONFIG_NAME = "latest.json"
-MAX_PEDALS = 4
 DEFAULT_PEDAL_COUNT = 4
-# Linux input-event key codes for F13 through F16.  They remain available for
-# configuration validation without importing the optional evdev dependency.
+# Linux input-event key codes for F13 through F22.  Keep this table explicit so
+# configuration validation does not need to import the optional evdev
+# dependency.  The first four entries are the long-standing F13--F16 mapping.
 SPECIAL_KEYS: tuple[tuple[str, int], ...] = (
     ("F13", 183),
     ("F14", 184),
     ("F15", 185),
     ("F16", 186),
+    ("F17", 187),
+    ("F18", 188),
+    ("F19", 189),
+    ("F20", 190),
+    ("F21", 191),
+    ("F22", 192),
 )
+MAX_PEDALS = len(SPECIAL_KEYS)
 IDENTITY_FIELDS = ("id_path", "vendor_id", "model_id", "name")
 
 
@@ -440,8 +447,9 @@ def run_daemon(config: Mapping[str, Any]) -> None:
         devices = _open_devices(_configured_candidates(config, candidates), evdev)
         # Advertise exactly the configured topology.  Teleop uses the live
         # virtual keyboard capabilities to distinguish two-pad (F13/F14 fix)
-        # from four-pad (F13--F16 fix/init) operation, so exposing all four
-        # keys for a two-pad config would incorrectly re-enable Init-arm.
+        # from four-pad (F13--F16 fix/init) operation, so exposing extra keys
+        # would incorrectly re-enable controls.  For generic layouts, the
+        # first N keys are the corresponding F13--F(12+N) outputs.
         count = int(config["count"])
         ui = evdev.UInput(
             {evdev.ecodes.EV_KEY: [key_code for _, key_code in SPECIAL_KEYS[:count]]},
@@ -491,7 +499,7 @@ def _prompt_count() -> int:
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Calibrate USB foot pads and forward them as virtual F13-F16 keys."
+        description="Calibrate USB foot pads and forward them as virtual F13-F22 keys."
     )
     parser.add_argument(
         "--count",

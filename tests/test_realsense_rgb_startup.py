@@ -8,7 +8,11 @@ import pytest
 import numpy as np
 
 from teleop_runtime.sources.camera import realsense_rgb
-from teleop_runtime.sources.camera.realsense_rgb import RealSenseRGBCameraConfig, RealSenseRGBSource
+from teleop_runtime.sources.camera.realsense_rgb import (
+    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+    RealSenseRGBCameraConfig,
+    RealSenseRGBSource,
+)
 
 
 class _FakeStreamConfig:
@@ -295,6 +299,87 @@ def test_realsense_startup_aborts_warmup_after_timeout_threshold() -> None:
     assert fake_rs.pipelines[0].wait_timeouts == [5000, 5000, 5000]
 
 
+def test_realsense_bounded_warmup_returns_after_first_valid_frame() -> None:
+    fake_rs = _FakeRealSense()
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=10,
+            startup_warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+        )
+    )
+
+    pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert len(pipeline.wait_timeouts) == 1
+    assert 1 <= pipeline.wait_timeouts[0] <= 5000
+
+
+def test_realsense_bounded_warmup_failure_skips_hardware_reset_retry() -> None:
+    fake_rs = _FakeRealSense()
+    target_device = _FakeHardwareDevice("FRONT123")
+    fake_rs.devices = [target_device]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 10
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=10,
+            startup_warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="policy=bounded_first_frame"):
+        source._start_pipeline(fake_rs)
+
+    assert len(fake_rs.pipelines) == 1
+    assert target_device.hardware_reset_calls == 0
+
+
+def test_realsense_bounded_warmup_uses_full_grace_not_legacy_frame_count() -> None:
+    fake_rs = _FakeRealSense()
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=2,
+            startup_wait_timeout_ms=1000,
+            startup_frame_grace_sec=5.0,
+            startup_warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="attempts=5"):
+        source._start_pipeline(fake_rs)
+
+    assert fake_rs.pipelines[0].wait_timeouts == [1000] * 5
+
+
+def test_realsense_bounded_policy_keeps_explicit_connection_error_reset_retry() -> None:
+    fake_rs = _FakeRealSense()
+    target_device = _FakeHardwareDevice("LEFT123")
+    fake_rs.devices = [target_device]
+    fake_rs.start_errors = [RuntimeError("Device or resource busy")]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            startup_reset=False,
+            startup_warmup_frames=1,
+            startup_warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+            startup_hardware_reset_sleep_sec=0.0,
+        )
+    )
+
+    pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline is fake_rs.pipelines[1]
+    assert len(fake_rs.pipelines) == 2
+    assert target_device.hardware_reset_calls == 1
+
+
 def test_realsense_warmup_honours_shutdown_request() -> None:
     fake_rs = _FakeRealSense()
     source = RealSenseRGBSource(
@@ -324,6 +409,7 @@ def test_realsense_startup_reset_defaults_are_serialized() -> None:
     assert payload["restart_on_runtime_error"] is True
     assert payload["startup_reset_sleep_sec"] == 0.2
     assert payload["startup_warmup_frames"] == 10
+    assert payload["startup_warmup_policy"] == "legacy"
     assert payload["startup_hardware_reset"] is False
     assert payload["startup_hardware_reset_on_failure"] is True
     assert payload["startup_hardware_reset_retry_attempts"] == 1
@@ -332,6 +418,14 @@ def test_realsense_startup_reset_defaults_are_serialized() -> None:
     assert payload["startup_hardware_reset_reconnect_poll_sec"] == 0.25
     assert payload["restart_on_black_frames"] is True
     assert payload["restart_after_black_frames"] == 5
+
+
+def test_realsense_startup_warmup_policy_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="startup_warmup_policy must be one of"):
+        RealSenseRGBCameraConfig(
+            serial="ABC",
+            startup_warmup_policy="not_a_policy",
+        )
 
 
 def test_realsense_near_zero_frames_are_dropped_and_restart_pipeline() -> None:

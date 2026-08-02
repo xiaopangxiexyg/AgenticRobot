@@ -34,6 +34,18 @@ RTC, simulator, hardware, numerical-composition, or dataset-writer behavior.
 Those owners expose typed emissions, receipts, status, and lifecycle ports;
 Station selects a profile and coordinates operations over those ports.
 
+The concrete `refinement_annotation/` application follows the same rule for
+post-capture data. Station owns the loopback HTTP/UI lifecycle and operator
+interaction. Finalized-Episode discovery and stage/training-index resolution
+remain in `dataset_interface`; draft and immutable annotation-set persistence
+remain in `collection_runtime.progress`. The application never starts a
+device, owns an Episode, rewrites raw data, or becomes a second schema source.
+It starts without dataset arguments via
+`python -m control_station refinement-annotation`; dataset absolute path and
+annotator identity are selected in the loopback GUI before the lower-owned
+annotation workspace and writer lock are opened. CLI values remain optional
+GUI prefill only.
+
 Current concrete-profile and migration debt is frozen as follows:
 
 | Current Station area | Long-term owner |
@@ -169,7 +181,14 @@ with their existing lower owners. The profile does not alter the direct
 CLI activation and is not a real-arm motion permission.
 An explicit readiness provider is required even for a virtual source; recovery
 from HOLD uses an explicit `rearm()` activation and never auto-clears the
-lower execution gate.
+lower execution gate. Human/policy availability and policy-chunk TTL are
+published through the generic source-eligibility store and consumed with the
+actions on the same causal cut. A missing active contributor yields the formal
+`no_action` disposition; Station neither substitutes another source nor
+mutates the gate. The lower execution profile alone decides target persistence
+or HOLD after no-action. Calibration, Home/rebase/deadman, and non-finite
+measured-state failures request latched HOLD because they require operator or
+lower-runtime repair.
 
 `control_composition.observability` owns the non-authoritative observation over
 one exact composition snapshot/result. An explicit `SourceDifferenceSpec`
@@ -342,21 +361,222 @@ or production entrypoint is added, and no physical deadman/retarget evidence is
 claimed.
 
 The current default-off `python -m control_station sim-hil --enable` application
-profile is the operational Station leaf for the temporary PPO + passive VIVE/Q6
-MuJoCo path. Its local GUI is intentionally a status surface only: it shows
-readiness checks, source freshness, composition input/proposal receipts,
-activation hashes, and execution receipts, but exposes no raw-action or direct
-re-arm endpoint. The status API binds to loopback and uses the versioned
-`dexteleop.control_station.sim_hil_status.v1` projection; a failed status
+profile is the operational Station leaf for the temporary PPO plus one passive
+VIVE tracker and one selected right gripper input (Q6 first, calibrated angle
+trigger fallback). Its native composition schema is
+`right_arm: cartesian_pose` plus `right_gripper: physical_joint_qpos`; the old
+`RobotAction` is materialized only inside the current coupled MuJoCo execution
+edge. The selected topology is an application profile, while the lower source,
+component schema, and target binding remain cardinality-driven. The ordinary
+`--gui` remains a read-only status surface showing readiness, source freshness,
+composition input/proposal receipts, activation hashes, and execution
+receipts. The explicit `--control-gui --enable` profile additionally exposes
+a loopback-only typed control endpoint. Browser requests enter a bounded
+intent queue; only the Station control thread starts passive devices, changes
+blend parameters, steps MuJoCo, or finalizes ControlTrace. Neither GUI mode
+accepts raw actions or owns authority/dispatch. The status API uses the
+versioned `dexteleop.control_station.sim_hil_status.v1` projection; a failed
 provider is rendered as an explicit GUI error rather than as a false HOLD.
+When `--gui` or `--control-gui` starts the local page, the default behavior is
+to open `http://127.0.0.1:8787/` (or the configured host/port) in the default
+browser. Use `--no-open-browser` on a headless or remote machine.
 
-The optional `--vive-coordinate-profile` selects a profile from the independent
-`control_station_vive_coordinate_profiles` directory. Station combines its
-VIVE frame and tracker offsets with the explicitly selected
-`--calibration-profile`, which supplies target transforms and session Home
-anchors. The two source JSON files are never modified or conflated. A
-coordinate-only profile cannot be used as the Home profile by itself, and a
-bimanual Sim-HIL run rejects a single-side coordinate profile.
+The ordinary `--gui` intentionally has no mutation buttons. Use
+`--control-gui --enable` for formal operator controls. In that page,
+`保持输出` requests the lower HOLD, `恢复运行` is an explicit re-arm, and
+`采集当前 Runtime Home` re-anchors the live VIVE pose to the current MuJoCo
+TCP while held, without closing the viewer or publishing an action.
+`结束当前仿真并返回准备页` is the separate destructive rebuild operation:
+it closes the current MuJoCo episode and restores the VIVE setup owner. Neither
+operation commands a physical robot to home. A composition failure is shown
+separately from later input diagnostics, so the operator can diagnose the
+first fault before choosing Home capture, re-arm, or a whole-runtime rebuild.
+
+The control page starts before a MuJoCo target or policy runtime is
+constructed. One setup controller owns the VIVE receiver and projects live
+input plus the selected saved coordinate profile into the same page. The
+operator may start/cancel/retry coordinate calibration there; an unsaved
+calibration is never used for execution. Human-only and proportional launch
+require a finite/fresh selected VIVE channel plus a valid coordinate profile.
+PPO-only launch does not consume or wait for either fact: Station reserves the
+typed human component port without constructing a device source, starts the
+policy/target/viewer path, and keeps the setup receiver available only for an
+optional later Human attachment. A setup-receiver bind/start failure remains
+visible and disables Human modes, but does not prevent PPO-only construction.
+Switching from PPO-only to a Human-using mode
+first requires live Human readiness, enters HOLD, constructs and attaches the
+exact reserved source, validates one passive emission, captures Runtime Home,
+then publishes the new blend parameter and re-arms. A failed Human preparation
+leaves the effective PPO blend unchanged.
+
+Mode changes activate contributors transactionally. Crossing from zero Human
+weight to a Human-using mode always captures a new Runtime Home against the
+current MuJoCo pose; returning to PPO from Human-only similarly refreshes the
+previously inactive policy source under HOLD. Changes that only adjust weights
+between already-active contributors do not add a HOLD/re-arm cycle.
+
+For a Human-using initial mode, Station constructs the application while the
+setup receiver remains live, then hands the exact source-role mapping and
+profile path to it. The setup receiver is closed only after construction
+succeeds, immediately before the new application starts its receiver. Station
+checks the passive human emission and samples the current VIVE pose as Runtime
+Home before composition starts, then opens the native passive MuJoCo viewer.
+The viewer is opened before the realtime physics worker is started,
+avoiding a native `MjData` race; missing/stale inputs and failed source
+activation remain on the Station page without opening a misleading simulator
+window. Because native window construction may take longer than a contributor
+TTL, Station acquires and validates a new human/policy emission after the viewer
+opens and before composition preflight; it never relabels the pre-viewer frame
+as fresh or widens the TTL. The ControlTrace episode is prepared only
+after viewer, composition, and blend activation all succeed, so a native startup
+crash cannot leave an active episode preparation behind.
+
+The formal ControlTrace WAL grows in bounded filesystem extents rather than
+stopping at the initial 64 MiB allocation. Its in-memory admission journal
+remains explicitly bounded and its utilization is visible in status. Any
+durable-writer or journal-admission failure makes the formal capture
+uncommittable, is displayed by the GUI, and causes the Station control thread
+to establish lower HOLD; re-arm and mode activation remain blocked until the
+runtime is rebuilt.
+
+The viewer handle, synchronization, and teardown are owned by `sim.mujoco`;
+Station only coordinates that lower resource. Formal interactive control
+requires this viewer because the operator must be able to observe the simulator.
+Ordinary non-control runs remain
+headless unless `--mujoco-viewer` is supplied.
+Closing the native window is observational and does not introduce a new motion
+gate. If full PPO/runtime startup fails after resources have been torn down,
+the same closed application instance is never reused. The unified control
+controller restores a fresh setup receiver and permits an explicit retry that
+builds a new application; the first failure remains visible. While a passive
+input wait or startup operation is active, `cancel_operation` requests
+cancellation without giving the HTTP thread device, simulator, or authority
+ownership.
+
+The right-side angle-trigger fallback is side-keyed and lazy: application/GUI
+construction performs no angle-sensor discovery or serial open, while the
+formal runtime startup loads the configured right-only reader. Failures remain
+visible and retryable before full startup unless lower resources were already
+closed by a terminal startup failure. Interactive assignment and endpoint
+calibration are lower-owned hardware setup operations and never block the
+Station HTTP or control thread.
+
+The control GUI also exposes one typed `swap_vive_sources` intent until Human
+input is attached, including while a pure PPO runtime is active. The lower
+VIVE source swaps only upstream
+`left_wrist`/`right_wrist` roles and clears buffered history; when a sender
+snapshot for the new role exists, that snapshot is re-seeded into causal
+history so the display cache and cutoff query cannot disagree for one control
+cycle. Logical output channels remain stable. The same operation toggles one
+single-side binding or exchanges both bindings in a bilateral profile. It does
+not inspect source identity, validity, or freshness. A mapping generation is
+carried on channel metadata so the passive session resets pose baseline and
+retargeter smoothing at the boundary. Therefore a single sender can be
+switched in either direction and immediately switched back; an unavailable
+role remains explicitly invalid. Station rejects swapping after Human
+attachment, so it cannot become an untracked live target jump.
+
+The same GUI now projects both upstream sender roles before that mapping,
+including packet count/age, valid/stale state, pose summary, sender error, and
+the logical output currently selecting each role. This is a passive diagnostic
+cache shared with the real-teleop display semantics; it never becomes a second
+observation source or composition input. The device-input wait runs outside the
+Station status lock, so these facts continue to refresh while acceptance is
+pending. A JSON packet with an explicit `tracker_role` is routed strictly by
+that role; tracker-name fallback is retained only for legacy JSON without a
+role and cannot silently undo a role swap.
+
+The page uses two refresh budgets: the complete `/api/status` projection is
+polled at a low rate, while `/api/vive-status` only reads the VIVE receiver's
+small lock-protected diagnostic snapshot and refreshes at 4 Hz. This keeps live
+pose/role display responsive without repeatedly rebuilding policy,
+composition, or execution receipts.
+
+The VIVE status distinguishes transport freshness from source acceptance. In
+addition to packet count/age and upstream role validity, it exposes
+`worker_alive`, `process_error_count`, `last_process_error`, and the latest
+batch/parse diagnostics. Sim-HIL human status separately exposes the latest
+observed emission sequence and `last_rejection_reason`; an accepted emission
+is required for human readiness, so a fresh UDP packet with a rejected action
+contract is not reported as a healthy human command.
+
+An intent POST returns a submission/queue receipt, not completion. After a
+source swap the page briefly reads `/api/status` until the same `intent_id`
+appears in `acceptance.last_result`, then repaints the current mapping from the
+Station-owned status snapshot.
+
+The primary readiness label follows the sources required by the currently
+effective blend: PPO-only does not falsely fail because human evidence is
+stale, and human-only does not falsely fail because policy evidence is stale.
+The same payload retains `all_evidence_ready` and
+`all_evidence_failed_checks` for diagnosis, while the GUI marks inactive checks
+as “not required for current mix” rather than claiming that their evidence is
+healthy. This is a status projection of the existing admission rule, not a
+readiness bypass.
+
+The runtime exposes three peer control modes:
+
+- `human_teleop` publishes human alpha one.
+- `ppo_only` publishes human alpha zero.
+- `proportional_blend` publishes a typed dynamic parameter record with alpha
+  strictly between zero and one for proportional pose/qpos composition.
+
+The runtime can start in any mode, and the operator may switch modes in any
+order and any number of times. Mode selection occurs before the first Station
+control cycle and before composition contract construction/preflight, so no
+different mode is silently exercised during startup. HOLD, re-arm, Runtime
+Home, rebuild, and trace finalization are
+independent lifecycle operations, not mode-unlock gates. Finalization requires
+an active recording episode but does not require all three modes to have been
+visited. `SimHILAcceptanceTraceCapture` remains the internal capture adapter:
+it binds the lower-owned `EpisodeTraceRecorderSink`, records both immediate
+source/composed differences and lower reference/measurement differences,
+establishes HOLD/cancellation at episode end, then seal/commits the trace.
+Runtime termination stays outside episode membership. This is ControlTrace-core
+capture, not a replacement for collection-runtime camera/tactile/native-stream
+writers. `--acceptance-gui` remains only a CLI compatibility alias for
+`--control-gui`.
+
+The Station loop follows the authoritative scheduler's exposed next deadline.
+If synchronous contributor work misses one or more upstream compose cuts,
+Station records and skips those cuts without burst catch-up; it does not add a
+second HOLD policy. The lower target admission/execution gate remains the
+authority for late target acceptance and HOLD. The status page preserves the
+first lower control fault separately from any later source-staleness symptom.
+Scheduled reference profiles also declare an upstream admission margin
+(`--target-admission-margin-sec`, default 50 ms); source validity covers the
+next inference interval plus the target lead. These are timing/support
+contracts, not extra safety filters. The receiver still rejects late segment
+admission and remains the sole reference/activation owner.
+
+`--vive-coordinate-profile` selects a coordinate-only profile from the
+independent `control_station_vive_coordinate_profiles` directory. Its default
+is `latest`, resolved as the newest valid independent record. The checked
+legacy seed in that directory is a non-mutating extraction of the former
+combined profile.
+It owns only the VIVE frame, tracker offsets, canonical station-frame contract,
+and source artifact identity. `--calibration-profile` is currently retained
+only as the compatibility source of the stored human Home. Its robot Home and
+base transforms are not trusted for Sim-HIL.
+
+The MuJoCo target derives a `TargetFrameProfile` from the exact loaded URDF and
+scene body poses, and a `ToolFrameProfile` from the exact selected-arm tool
+file. For a task that declares scripted reset semantics, the simulator target
+reuses `CubeLiftKernel.reset` and publishes the resulting initialization facts;
+Station and the PPO adapter do not reproduce that trajectory. After task reset
+it measures each selected `tool_tcp`, converts it through that target
+profile, replaces the compatibility robot Home in an in-memory calibration
+copy, and emits a `SessionAnchorReceipt` binding all profile hashes and selected
+Home poses. Neither source JSON is modified. Coordinate/Home provenance
+mismatch, canonical-frame mismatch, missing side, wrong tool frame, or a
+non-closing target transform fails before the passive source is built.
+
+The present receipt deliberately labels human Home as
+`stored_human_home_from_selected_profile`; live VIVE recenter is a later
+device-lifecycle gate. Real targets must supply their own measured
+`TargetFrameProfile`, `ToolFrameProfile`, and activation-local target Home.
+They must not reuse the simulated robot Home or treat an URDF-derived frame as
+hardware measurement.
 
 The reusable boundary is intentional: a new tracker only supplies the public
 passive-session profile, a new target supplies the shared authoritative target
@@ -426,6 +646,38 @@ the VIVE virtual desk from X/Y/Z sweeps, captures wrist tracker offsets for the
 selected side(s), and displays live channels, fit quality, transforms, and
 saved profiles. Use `--view-only` to inspect profiles without opening the VIVE
 receiver and `--dry-run` for configuration validation.
+
+Before a workflow starts, Station checks every channel needed by the selected
+sweep tracker and wrist side(s) for a finite, valid, fresh pose. A missing,
+stale, or wrong-side channel keeps the workflow idle so the operator can change
+the side, select another sweep tracker, or swap the left/right VIVE source
+roles. During any capture stage, **Cancel calibration** stops only the current
+workflow and returns to that configurable idle state; the receiver and page
+remain open. In the standalone calibration command, **Exit calibration** also
+closes the receiver and terminates that standalone session.
+
+The signed sweep directions are explicit: desk `+X` is captured back to front,
+desk `+Y` right to left, and desk `+Z` low to high. Move once in the displayed
+direction after the preparation countdown and do not reverse before the
+capture window ends. Reset restarts only the current stage; it is not an exit.
+
+For right-arm Sim-HIL control, the same `--control-gui` contains VIVE
+readiness and calibration controls. It first selects `--vive-coordinate-profile`
+(`latest` by default). If that profile and the live selected tracker are ready,
+the operator may start a Human-using mode immediately; if not, the operator can
+still start pure PPO without a coordinate artifact. Calibration may continue
+on the same page while PPO runs. Before a later Human attachment, Station
+requires the saved artifact and fresh input, holds policy execution, closes
+the setup receiver, and starts the bound runtime source on the same port. A
+live Human target never hot-swaps coordinate frames. The compatibility flag
+`--vive-calibration-gui` no longer opens a second page; its port/browser
+options are retained only so older commands fail neither parsing nor startup.
+
+Sim-HIL 的网络容忍使用独立的
+`--human-emission-timeout`（默认 5 秒），不改真机 TeleopSession 的丢帧 HOLD。
+`--human-timeout-fallback hold` 默认保持下游输出；显式选择 `policy` 时，运行中
+人类输出超过窗口未更新会用新 PPO 输出锁存切换，恢复后需人工重新选择人类或混合。
+GUI 中该选项与“融合目标不可执行回退”分开显示。
 
 These profiles use the independent
 `control_station_vive_coordinate_profiles_dir` path, defaulting to

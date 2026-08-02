@@ -25,6 +25,57 @@ Existing imports through `teleop_runtime.collection.schema_v21`,
 `utils.dataset_postprocess.wrist_cam_adjust.depth` remain compatibility exports;
 new format-level code should import this package directly.
 
+## Arm hold-intent training contract
+
+`dataset_contracts.arm_mode` freezes the existing
+`dexteleop_arm_mode_v2` IDs and defines an additive
+`arm_hold_intent_v1` training projection. It does not change the v2.3 row
+layout: `fixed_hold` is the positive per-side target, `teleop` is negative,
+and `unknown`, `init_pose`, and `stopped` are ignored. A positive label is
+valid only when its recorded scope is `arm_and_end_effector`; this means the
+current hold intent covers both the arm and its end effector.
+
+Datasets with the known v2 label spec but no `training_projections` entry use
+the frozen v1 projection in compatibility mode. Datasets with no arm-mode
+label spec remain valid action-training datasets and expose no arm-hold
+contract. Missing row columns are never guessed into negative targets.
+
+## Collection progress contracts
+
+`dataset_contracts.progress_profile` and `dataset_contracts.progress_facts`
+define the first p2 capture-truth slice without importing a runtime or GUI:
+
+- unique coarse progress-step identity with LINEAR or finite ROOTED_TREE
+  topology;
+- explicit Episode entry/scope/history and sample-clock binding;
+- a minimal causal fact envelope and strict tagged payload registry;
+- composite Advance, appended Undo, operator-report-time Failure,
+  application Hold/Resume and formal-capture Pause/Resume receipts, Retry, and
+  scope-aware termination;
+- a sealed manifest over the exact ordered fact hashes.
+
+The initial Attempt has an explicit `EpisodeProgressStartedV1` fact because
+binding alone cannot reconstruct its Attempt identity.
+`dataset_contracts.progress_refinement` now defines only the reusable minimum
+needed to validate a salvage anchor: boundary identity and ordering, coarse
+progress-profile binding, prefix-certification eligibility, and explicit
+predecessor coverage. `dataset_contracts.progress_annotations` adds the
+smallest immutable persistence contract that proved necessary after that
+resolver prototype: one boundary annotation, one sealed-progress/profile
+binding, append-ordered chunks, and a seal manifest over exact ordered hashes.
+Episode/profile/set identity is carried once by the binding rather than copied
+into every boundary. Annotator provenance, supersession/correction graphs,
+coverage receipts, and training-exclusion payloads remain deliberately
+unfrozen until their resolver prototypes stabilize.
+
+`dataset_contracts.progress_stages` adds the self-contained ordered execution
+stages inside each coarse progress step and an exact capture-time entry binding
+for `NOMINAL` or `RECOVERY_FROM_FAILURE`. `progress_stage_annotations` defines
+immutable stage occurrences, fixed capture-Failure lineage, abnormal intervals,
+privileged coarse-boundary overrides, whole-Episode abnormal exclusion, and one
+sealed annotation-set binding/bundle/manifest. These are pure facts: they do
+not select an annotation set, operate a GUI, or persist a training index.
+
 `PoseTrainingDataContract` distinguishes three pose-training origins: native
 v2.3 canonical desk, legacy v2.2 raw-identity compatibility, and v2.2 rows
 physically migrated to canonical desk. The migrated origin uses an explicit
@@ -152,6 +203,15 @@ use a transient sink. The preserve-all compatibility policy retains every fact
 and exists only to model old behavior; it is not a claim that every fact is
 required for every replay capability.
 
+The policy + human component Sim-HIL topology uses
+`deployable_sim_scheduled_component_policy_human_composer_v1`. It is distinct
+from the legacy human + replay Station composer profile: replay and legacy
+Station/session-reducer facts are not applicable, while direct composition
+activation, both typed source families, component composition, scheduled
+execution, and difference observations are required. The profile remains
+`planned` until the application-level episode recorder lifecycle and a
+complete seal/rebuild fixture are wired.
+
 The opt-in `native_streams` capability is subordinate to that same episode
 lifecycle. Its writer must use the prepared episode UUID/index and seal before
 the capture commit; the commit binds the native episode-manifest hash, which is
@@ -265,6 +325,11 @@ V2 separates a required runtime contract from optional training provenance:
 `inference_only_projection_v1` requires `training=null`, while
 `trained_prefix_conditioning_v1` requires an exact training contract.
 `legacy_v1_compat` cannot be persisted as a new v2 origin.
+The first trained model-RTC validator requires explicit trained-v2 provenance,
+continuous absolute teacher-overlap data, and the existing `flow_inpaint`
+runtime. Training provenance therefore does not create a second RTC runtime;
+the reserved `trained_prefix_conditioning` runtime mode needs a separate
+future sampler gate.
 
 Both versions bind continuation implementation, delay/prefix ranges,
 continuous action and mask semantics, plus codec/layout/frame/normalization
@@ -278,6 +343,20 @@ sampler implementation, runtime request/plan, target, safety, or dispatch.
 the normalized view never creates a replacement identity. Its binding remains
 default-none, so legacy artifact serialization and raw-RTC hashes are
 unchanged.
+
+## Optional policy arm-hold output contract
+
+`dataset_contracts.policy_action_semantics.PolicyArmHoldOutputContract` binds
+an additive deployment output to the existing arm-mode training projection.
+It fixes left/right order, probability semantics, same-keyframe alignment,
+`arm_and_end_effector` positive scope, all four bimanual combinations, and
+explicit calibrated enter/exit thresholds plus debounce counts.
+
+`PolicyArtifactContract.arm_hold_output` is omitted from legacy serialization
+when absent. When present it is stored beside—not inside—the existing
+continuous/discrete `outputs`, so action dimensions and old artifact readers
+remain unchanged. The contract owns no tensor, model adapter, runtime state,
+safety, or dispatch behavior.
 
 ## Optional v2.3/v2.4 Plus episode curation overlay
 

@@ -69,7 +69,13 @@ from robot_motion.position_control.trajectory import (
     JointTrajectoryProposal,
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     normalize_position_command_planner,
+)
+from robot_motion.position_control.horizon_governor import JointHorizonLimits
+from robot_motion.position_control.sample_aligned_trajectory import (
+    SampleAlignedJerkLimitedJointTrajectoryPlanner,
+    SampleAlignedTargetAdmission,
 )
 from robot_motion.runtime.dispatch import BackendDispatchError, CommandDispatchReceipt
 from robot_motion.runtime import (
@@ -121,10 +127,13 @@ _SINGULARITY_LABELS = {
 # reach Movej_CANFD.
 _RM65_ABSOLUTE_Q_MIN_RAD = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
 _RM65_ABSOLUTE_Q_MAX_RAD = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
-# The final 150 Hz transport boundary is a hard qpos envelope.  Upstream
-# interpolation may approach an endpoint, but it may never use a tolerance to
-# emit a value beyond it.
-_RM65_ABSOLUTE_LIMIT_TOLERANCE_RAD = 0.0
+# The final transport boundary remains a hard qpos envelope.  Upstream solver
+# and canonicalization checks admit 1e-8 rad of floating-point endpoint noise.
+# Keep a 2x transport comparison guard band, then always project every accepted
+# value to a slightly *smaller* envelope before it can reach a planner or SDK.
+# The comparison tolerance therefore never widens the physical joint range.
+_RM65_ABSOLUTE_LIMIT_TOLERANCE_RAD = 2.0e-8
+_RM65_ABSOLUTE_LIMIT_DISPATCH_MARGIN_RAD = 1.0e-8
 # RM65 SDK joint feedback is reported in degrees and converted back to radians
 # here. A local preview/home anchor may therefore exceed an endpoint by a few
 # encoder/float quanta even though no command was sent beyond the envelope.
@@ -428,6 +437,16 @@ class RM65ArmBackendConfig:
     # guard does not reduce sustained tracking velocity.
     position_max_command_step_deg: float | None = None
     position_degraded_speed_scale: float = DEFAULT_POSITION_DEGRADED_SPEED_SCALE
+    # Experimental, default-off execution profile. Incoming 60 Hz qrefs keep
+    # running for IK/safety, while the transport admits one reachable endpoint
+    # per dataset-rate bucket and caches its 120 Hz jerk-limited control cut.
+    position_sample_aligned_source_hz: float = 15.0
+    position_sample_aligned_horizon_source_steps: int = 2
+    position_sample_aligned_scale_degraded_target: bool = True
+    position_sample_aligned_jerk_regularization: float = 1e-9
+    position_sample_aligned_jerk_delta_regularization: float = 0.0
+    position_sample_aligned_terminal_velocity_regularization: float = 0.0
+    position_sample_aligned_terminal_acceleration_regularization: float = 0.0
     arm_follow_qpos_alpha: float = 1.0
     canfd_follow: bool = True
     canfd_trajectory_mode: int = 0
@@ -587,9 +606,12 @@ class RM65ArmBackendConfig:
                 raise ValueError(
                     "position_max_command_step_deg must be finite and positive when set."
                 )
-            if self.position_command_planner != POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED:
+            if self.position_command_planner not in {
+                POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+                POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+            }:
                 raise ValueError(
-                    "position_max_command_step_deg requires the acceleration_limited "
+                    "position_max_command_step_deg requires an acceleration/jerk-limited "
                     "position command planner."
                 )
             self.position_max_command_step_deg = max_command_step_deg
@@ -601,6 +623,55 @@ class RM65ArmBackendConfig:
             self.arm_follow_qpos_alpha
         ) <= 1.0:
             raise ValueError("arm_follow_qpos_alpha must be finite and in (0, 1].")
+        if (
+            self.position_command_planner
+            == POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+        ):
+            source_hz = float(self.position_sample_aligned_source_hz)
+            ratio = float(self.background_streaming_hz) / source_hz
+            if (
+                not math.isfinite(source_hz)
+                or source_hz <= 0.0
+                or not math.isclose(ratio, round(ratio), rel_tol=0.0, abs_tol=1e-9)
+            ):
+                raise ValueError(
+                    "sample-aligned jerk execution requires background_streaming_hz / "
+                    "position_sample_aligned_source_hz to be a positive integer."
+                )
+            self.position_sample_aligned_scale_degraded_target = bool(
+                self.position_sample_aligned_scale_degraded_target
+            )
+            for name in (
+                "position_sample_aligned_jerk_regularization",
+                "position_sample_aligned_jerk_delta_regularization",
+                "position_sample_aligned_terminal_velocity_regularization",
+                "position_sample_aligned_terminal_acceleration_regularization",
+            ):
+                value = float(getattr(self, name))
+                if not math.isfinite(value) or value < 0.0:
+                    raise ValueError(f"{name} must be finite and non-negative.")
+                setattr(self, name, value)
+            horizon_steps = self.position_sample_aligned_horizon_source_steps
+            if (
+                isinstance(horizon_steps, bool)
+                or int(horizon_steps) != horizon_steps
+                or int(horizon_steps) < 2
+            ):
+                raise ValueError(
+                    "position_sample_aligned_horizon_source_steps must be an integer >= 2."
+                )
+            if not math.isclose(
+                float(self.arm_follow_qpos_alpha),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "sample-aligned jerk execution requires arm_follow_qpos_alpha=1; "
+                    "post-planner EMA would invalidate the jerk certificate."
+                )
+            self.position_sample_aligned_source_hz = source_hz
+            self.position_sample_aligned_horizon_source_steps = int(horizon_steps)
         if int(self.canfd_trajectory_mode) not in (0, 1, 2):
             raise ValueError("canfd_trajectory_mode must be one of 0, 1, or 2.")
         if not 0 <= int(self.canfd_radio) <= 100:
@@ -871,7 +942,10 @@ class RM65ArmBackend(EffectorBackend):
             if self._current_qpos is None
             else self._current_qpos.copy()
         )
-        if self._stream_planner_mode == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED:
+        if self._stream_planner_mode in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }:
             max_velocity = np.asarray(config.max_angvel, dtype=float).reshape(6)
             max_acceleration = (
                 max_velocity / float(config.position_velocity_ramp_sec)
@@ -881,22 +955,66 @@ class RM65ArmBackend(EffectorBackend):
                     dtype=float,
                 ).reshape(6)
             )
-            self._stream_planner: (
-                JointCommandInterpolator | AccelerationLimitedJointTrajectoryPlanner
-            ) = AccelerationLimitedJointTrajectoryPlanner(
-                JointTrajectoryLimits(
-                    max_velocity_rad_s=max_velocity,
-                    max_acceleration_rad_s2=max_acceleration,
-                    # One 150 Hz SDK tick may never jump farther than one
-                    # outer safe-reference step, even after scheduler delay.
-                    max_command_step_rad=self._base_max_joint_step,
-                ),
-                velocity_ramp_sec=float(config.position_velocity_ramp_sec),
-                target_velocity_filter_tau_sec=float(
-                    config.position_target_velocity_filter_tau_sec
-                ),
-                reference_period_sec=self._base_control_dt,
-            )
+            if (
+                self._stream_planner_mode
+                == POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+            ):
+                # The position step remains a hard bound even when its implied
+                # velocity is below the nominal joint velocity profile.
+                step_velocity = (
+                    np.asarray(self._base_max_joint_step, dtype=float)
+                    * float(config.background_streaming_hz)
+                )
+                effective_velocity = np.minimum(max_velocity, step_velocity)
+                self._stream_planner = (
+                    SampleAlignedJerkLimitedJointTrajectoryPlanner(
+                        JointHorizonLimits(
+                            min_position_rad=_RM65_ABSOLUTE_Q_MIN_RAD,
+                            max_position_rad=_RM65_ABSOLUTE_Q_MAX_RAD,
+                            max_velocity_rad_s=effective_velocity,
+                            max_acceleration_rad_s2=max_acceleration,
+                            max_jerk_rad_s3=(
+                                max_acceleration
+                                / float(config.position_velocity_ramp_sec)
+                            ),
+                        ),
+                        source_hz=float(config.position_sample_aligned_source_hz),
+                        command_hz=float(config.background_streaming_hz),
+                        horizon_source_steps=int(
+                            config.position_sample_aligned_horizon_source_steps
+                        ),
+                        scale_degraded_target=bool(
+                            config.position_sample_aligned_scale_degraded_target
+                        ),
+                        jerk_regularization=float(
+                            config.position_sample_aligned_jerk_regularization
+                        ),
+                        jerk_delta_regularization=float(
+                            config.position_sample_aligned_jerk_delta_regularization
+                        ),
+                        terminal_velocity_regularization=float(
+                            config.position_sample_aligned_terminal_velocity_regularization
+                        ),
+                        terminal_acceleration_regularization=float(
+                            config.position_sample_aligned_terminal_acceleration_regularization
+                        ),
+                    )
+                )
+            else:
+                self._stream_planner = AccelerationLimitedJointTrajectoryPlanner(
+                    JointTrajectoryLimits(
+                        max_velocity_rad_s=max_velocity,
+                        max_acceleration_rad_s2=max_acceleration,
+                        # One 150 Hz SDK tick may never jump farther than one
+                        # outer safe-reference step, even after scheduler delay.
+                        max_command_step_rad=self._base_max_joint_step,
+                    ),
+                    velocity_ramp_sec=float(config.position_velocity_ramp_sec),
+                    target_velocity_filter_tau_sec=float(
+                        config.position_target_velocity_filter_tau_sec
+                    ),
+                    reference_period_sec=self._base_control_dt,
+                )
             self._stream_planner.reset(
                 planner_initial_qpos,
                 monotonic_time=time.monotonic(),
@@ -1025,6 +1143,13 @@ class RM65ArmBackend(EffectorBackend):
                 self._stream_segment_duration_sec = value
                 if isinstance(self._stream_planner, JointCommandInterpolator):
                     self._stream_planner.set_segment_duration_sec(value)
+                elif isinstance(
+                    self._stream_planner,
+                    SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                ):
+                    # The sample-aligned planner has an explicit immutable
+                    # source period and a fixed 120 Hz command grid.
+                    pass
                 else:
                     self._stream_planner.set_max_command_step(
                         self._base_max_joint_step
@@ -1344,9 +1469,14 @@ class RM65ArmBackend(EffectorBackend):
     ) -> int:
         if not isinstance(
             self._stream_planner,
-            AccelerationLimitedJointTrajectoryPlanner,
+            (
+                AccelerationLimitedJointTrajectoryPlanner,
+                SampleAlignedJerkLimitedJointTrajectoryPlanner,
+            ),
         ):
-            raise RuntimeError("software quick stop requires acceleration_limited planner mode")
+            raise RuntimeError(
+                "software quick stop requires an acceleration/jerk-limited planner mode"
+            )
         anchor = self._command_anchor_qpos_locked()
         if anchor is None:
             anchor = np.zeros(6, dtype=float)
@@ -1519,7 +1649,15 @@ class RM65ArmBackend(EffectorBackend):
                 f"{self.name} {label} joint {index + 1}={target[index]:.6f}rad exceeds "
                 f"absolute limits [{lower[index]:.6f}, {upper[index]:.6f}]rad."
             )
-        return target.copy()
+        dispatch_margin = _RM65_ABSOLUTE_LIMIT_DISPATCH_MARGIN_RAD
+        safe_lower = lower + dispatch_margin
+        safe_upper = upper - dispatch_margin
+        if np.any(safe_upper <= safe_lower):
+            raise RuntimeError(
+                f"{self.name} absolute joint envelope is narrower than the "
+                "configured dispatch margin."
+            )
+        return np.clip(target, safe_lower, safe_upper)
 
     def _normalize_local_qpos_observation(
         self,
@@ -3102,14 +3240,16 @@ class RM65ArmBackend(EffectorBackend):
             ),
         )
         qpos_target = self._validate_final_joint_target(qpos_target, label="final target")
-        self._stamp_final_action_target(command, qpos_target, source=command_source)
 
         trajectory_policy: _PositionTrajectoryPolicy | None = None
         if (
             self.config.background_streaming_enabled
             and isinstance(
                 self._stream_planner,
-                AccelerationLimitedJointTrajectoryPlanner,
+                (
+                    AccelerationLimitedJointTrajectoryPlanner,
+                    SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                ),
             )
         ):
             command_metadata = (
@@ -3136,6 +3276,64 @@ class RM65ArmBackend(EffectorBackend):
                     "epoch-mediated RM65 quick-stop cannot inherit ordinary motion "
                     "work; admit a new-epoch SafetyControlOperation tick instead"
                 )
+
+        sample_aligned_admission: SampleAlignedTargetAdmission | None = None
+        if (
+            isinstance(
+                self._stream_planner,
+                SampleAlignedJerkLimitedJointTrajectoryPlanner,
+            )
+            and trajectory_policy is not None
+            and not trajectory_policy.quick_stop
+            and self.arm is None
+        ):
+            # EffectorCommand deliberately has no independent clock.  Use the
+            # backend admission wall time unless a deterministic replay/test
+            # binds an explicit source-cut timestamp in metadata.
+            source_timestamp = float(
+                command_metadata.get(
+                    "sample_aligned_source_timestamp",
+                    command_metadata.get(
+                        "_parent_command_timestamp",
+                        command_start_time,
+                    ),
+                )
+            )
+            sample_aligned_admission = self._stream_planner.prepare_target(
+                qpos_target,
+                source_timestamp=source_timestamp,
+                speed_scale=trajectory_policy.speed_scale,
+                mode=trajectory_policy.mode,
+                reason=trajectory_policy.reason,
+            )
+            requested_qpos_target = qpos_target.copy()
+            qpos_target = np.asarray(
+                sample_aligned_admission.admitted_qpos,
+                dtype=float,
+            ).copy()
+            qpos_target = self._validate_final_joint_target(
+                qpos_target,
+                label="sample-aligned admitted target",
+            )
+            if not isinstance(command.metadata, dict):
+                command.metadata = dict(command.metadata or {})
+            command.metadata.update(
+                {
+                    "sample_aligned_execution": True,
+                    "sample_aligned_requested_qpos": requested_qpos_target.tolist(),
+                    "sample_aligned_admitted_qpos": qpos_target.tolist(),
+                    "sample_aligned_new_source_bucket": bool(
+                        sample_aligned_admission.new_source_bucket
+                    ),
+                    "sample_aligned_admission": dict(
+                        sample_aligned_admission.metadata
+                    ),
+                }
+            )
+
+        # The dataset action is the exact endpoint admitted by the selected
+        # transport profile, never an unreachable pre-governor request.
+        self._stamp_final_action_target(command, qpos_target, source=command_source)
 
         if self.arm is not None and self.config.background_streaming_enabled:
             with self._send_lock:
@@ -3164,6 +3362,68 @@ class RM65ArmBackend(EffectorBackend):
                         side=str(self.config.side),
                         target_sequence=transport_target_sequence,
                     )
+                    if (
+                        isinstance(
+                            self._stream_planner,
+                            SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                        )
+                        and trajectory_policy is not None
+                        and not trajectory_policy.quick_stop
+                    ):
+                        # Planning, action admission and plan activation share
+                        # the same send/state lock domain as the 120 Hz commit.
+                        # Otherwise a worker can commit one old tick after the
+                        # QP snapshots state but before this target is active.
+                        source_timestamp = float(
+                            command_metadata.get(
+                                "sample_aligned_source_timestamp",
+                                command_metadata.get(
+                                    "_parent_command_timestamp",
+                                    command_start_time,
+                                ),
+                            )
+                        )
+                        sample_aligned_admission = (
+                            self._stream_planner.prepare_target(
+                                qpos_target,
+                                source_timestamp=source_timestamp,
+                                speed_scale=trajectory_policy.speed_scale,
+                                mode=trajectory_policy.mode,
+                                reason=trajectory_policy.reason,
+                            )
+                        )
+                        requested_qpos_target = qpos_target.copy()
+                        qpos_target = np.asarray(
+                            sample_aligned_admission.admitted_qpos,
+                            dtype=float,
+                        ).copy()
+                        qpos_target = self._validate_final_joint_target(
+                            qpos_target,
+                            label="sample-aligned admitted target",
+                        )
+                        if not isinstance(command.metadata, dict):
+                            command.metadata = dict(command.metadata or {})
+                        command.metadata.update(
+                            {
+                                "sample_aligned_execution": True,
+                                "sample_aligned_requested_qpos": (
+                                    requested_qpos_target.tolist()
+                                ),
+                                "sample_aligned_admitted_qpos": qpos_target.tolist(),
+                                "sample_aligned_new_source_bucket": bool(
+                                    sample_aligned_admission.new_source_bucket
+                                ),
+                                "sample_aligned_admission": dict(
+                                    sample_aligned_admission.metadata
+                                ),
+                            }
+                        )
+                        self._stamp_final_action_target(
+                            command,
+                            qpos_target,
+                            source=command_source,
+                        )
+                    sample_aligned_bucket_held = False
                     if trajectory_policy is not None and trajectory_policy.quick_stop:
                         transport_target_sequence = self._activate_stream_quick_stop_locked(
                             reason=trajectory_policy.reason,
@@ -3174,6 +3434,49 @@ class RM65ArmBackend(EffectorBackend):
                         qpos_target = self._command_anchor_qpos_locked()
                         if qpos_target is None:
                             qpos_target = segment_start_qpos.copy()
+                    elif isinstance(
+                        self._stream_planner,
+                        SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                    ):
+                        if sample_aligned_admission is None:
+                            raise RuntimeError(
+                                "sample-aligned target admission is missing."
+                            )
+                        if sample_aligned_admission.new_source_bucket:
+                            self._stream_planner.activate_target(
+                                sample_aligned_admission,
+                                sequence=transport_target_sequence,
+                            )
+                            self._stream_target_sequence = transport_target_sequence
+                            self._stream_target_qpos = qpos_target.copy()
+                            self._stream_target_source = command_source
+                            self._stream_target_timestamp = transport_target_wall_time
+                            self._stream_target_monotonic = transport_target_monotonic
+                            self._stream_segment_start_qpos = segment_start_qpos
+                            self._stream_segment_start_time = transport_target_monotonic
+                            self._stream_segment_duration_sec = (
+                                1.0
+                                / float(
+                                    self.config.position_sample_aligned_source_hz
+                                )
+                            )
+                            self._stream_quick_stop_active = False
+                            self._stream_quick_stop_reason = ""
+                            self._stream_planner_policy_mode = trajectory_policy.mode
+                            self._stream_planner_policy_speed_scale = (
+                                trajectory_policy.speed_scale
+                            )
+                            self._stream_planner_policy_reason = trajectory_policy.reason
+                        else:
+                            # Intermediate 60 Hz IK frames are still evaluated
+                            # upstream for input freshness and safety, but must
+                            # not supersede the active 15 Hz execution cut or
+                            # create a 120 Hz skipped tick.
+                            sample_aligned_bucket_held = True
+                            transport_target_sequence = int(
+                                self._stream_target_sequence
+                            )
+                            backend_execution_work = self._stream_execution_work_item
                     elif isinstance(self._stream_planner, JointCommandInterpolator):
                         self._stream_planner.accept_qpos_target(
                             {str(self.config.side): qpos_target},
@@ -3226,15 +3529,16 @@ class RM65ArmBackend(EffectorBackend):
                         self._stream_planner_policy_mode = trajectory_policy.mode
                         self._stream_planner_policy_speed_scale = trajectory_policy.speed_scale
                         self._stream_planner_policy_reason = trajectory_policy.reason
-                    self._stream_reference_epoch = _metadata_non_negative_int(
-                        command.metadata,
-                        "position_reference_epoch",
-                    )
-                    self._stream_reference_sequence = _metadata_non_negative_int(
-                        command.metadata,
-                        "position_reference_sequence",
-                    )
-                    self._stream_execution_work_item = backend_execution_work
+                    if not sample_aligned_bucket_held:
+                        self._stream_reference_epoch = _metadata_non_negative_int(
+                            command.metadata,
+                            "position_reference_epoch",
+                        )
+                        self._stream_reference_sequence = _metadata_non_negative_int(
+                            command.metadata,
+                            "position_reference_sequence",
+                        )
+                        self._stream_execution_work_item = backend_execution_work
                     command.metadata.update(
                         {
                             POSITION_TRANSPORT_TARGET_SEQUENCE_KEY: transport_target_sequence,
@@ -3242,6 +3546,9 @@ class RM65ArmBackend(EffectorBackend):
                             "position_transport_target_monotonic_time": transport_target_monotonic,
                             "position_transport_target_source": command_source,
                             "position_transport_planner": self._stream_planner_mode,
+                            "position_transport_sample_aligned_bucket_held": bool(
+                                sample_aligned_bucket_held
+                            ),
                         }
                     )
                     self._last_target_qpos = qpos_target.copy()
@@ -4460,9 +4767,16 @@ class RM65ArmBackend(EffectorBackend):
                             "segment_planner": (
                                 "robot_motion.position_control."
                                 + (
-                                    "AccelerationLimitedJointTrajectoryPlanner"
-                                    if trajectory_proposal is not None
-                                    else "JointCommandInterpolator"
+                                    "SampleAlignedJerkLimitedJointTrajectoryPlanner"
+                                    if isinstance(
+                                        self._stream_planner,
+                                        SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                                    )
+                                    else (
+                                        "AccelerationLimitedJointTrajectoryPlanner"
+                                        if trajectory_proposal is not None
+                                        else "JointCommandInterpolator"
+                                    )
                                 )
                             ),
                             "position_command_planner": self._stream_planner_mode,

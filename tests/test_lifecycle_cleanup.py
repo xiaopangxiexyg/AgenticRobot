@@ -10,7 +10,7 @@ from robot_motion.runtime.lifecycle import (
     run_best_effort_cleanup,
 )
 from robot_motion.runtime.rig import BimanualRig
-from teleop_runtime.collection.async_writer import (
+from collection_runtime.async_writer import (
     AsyncWriterConfig,
     AsyncWriterPool,
     WriteJob,

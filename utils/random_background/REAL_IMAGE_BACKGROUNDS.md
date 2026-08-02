@@ -52,7 +52,7 @@ augmenter = RandomBackgroundVideoAugmenter(
         provider="mixed",
         real_image_prob=0.4,
         mixed_original_prob=0.1,
-        mixed_black_prob=0.1,
+        mixed_black_prob=0.0,
     ),
     real_image_provider=provider,
 )
@@ -143,10 +143,10 @@ COCO 官方站点提供下载入口。COCO 图片物体语义很强，不建议�
 训练配比起点：
 
 ```text
-40% procedural temporal backgrounds
-40% real-image temporal backgrounds
 10% original background
-10% black/neutral masked background
+40% real-image temporal backgrounds
+50% procedural temporal backgrounds
+0% black/neutral masked background
 ```
 
 如果真实部署场景变化很大，提高 real-image 比例；如果模型开始依赖真实背景里的语义物体，降低 COCO/OpenImages 比例，提高 Places365/自采纹理比例。

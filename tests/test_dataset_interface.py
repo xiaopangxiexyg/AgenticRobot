@@ -18,6 +18,7 @@ from dataset_interface import (
     VideoConfig,
 )
 from dataset_interface.adapters.torch import TorchMaskedAugmentDataset
+from dataset_interface.mask_source import FinalMaskSource
 from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.core import WRIST_DEPTH_MASK_FORMAT, pack_binary_mask
 from utils.random_background import (
     FixedBorderMaskConfig,
@@ -88,6 +89,32 @@ def _write_episode_metadata(
             json.dumps(modality_validity, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+def test_final_mask_source_does_not_fall_back_to_wrist_depth_mask(tmp_path) -> None:
+    dataset = tmp_path / "dataset"
+    depth_manifest = dataset / "wrist_depth/mask/left_wrist/manifest.json"
+    depth_manifest.parent.mkdir(parents=True)
+    depth_manifest.write_text("{}", encoding="utf-8")
+    _write_episode_metadata(
+        dataset,
+        [
+            {
+                "episode_index": 0,
+                "frame_count": 1,
+                "wrist_depth_mask_paths": {
+                    "left_wrist": str(depth_manifest.relative_to(dataset)),
+                },
+            }
+        ],
+    )
+    source = FinalMaskSource(
+        dataset_index=DexTeleopDatasetIndex(dataset),
+        final_mask_root=tmp_path / "missing_final_masks",
+    )
+
+    with pytest.raises(FileNotFoundError, match="not an implicit training fallback"):
+        source.manifest_path(0, "left_wrist")
 
 
 def test_masked_frame_pipeline_reads_video_mask_and_applies_black_background(tmp_path) -> None:
@@ -223,6 +250,12 @@ def test_masked_frame_pipeline_records_photometric_plan_as_audit_metadata_only(t
     audit = sample.metadata["photometric_augmentation"]
     assert audit["type"] == "full_image_photometric_v1"
     assert audit["white_balance_bgr"] == [0.85, 1.0, 1.15]
+    background = sample.metadata["background_augmentation"]
+    assert background["type"] == "masked_background_augmentation_v2"
+    assert background["background_family"] == "wrist_pair_scene"
+    assert background["provider"] == "original"
+    assert background["scene_canvas_shared"] is False
+    assert background["scene_canvas_source"] == "not_generated"
     assert "observation.images.left_wrist.augmented" not in sample.metadata
 
 

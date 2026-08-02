@@ -12,6 +12,8 @@ from robot_motion.rm65.position_collision import (
     RM65PositionPlannerProtocol,
 )
 
+from .official_all_ik_governor import RM65OfficialAllIKGovernorPlanner
+
 
 def _six_positive(values: Sequence[float], *, name: str) -> tuple[float, ...]:
     array = np.asarray(values, dtype=float).reshape(-1)
@@ -140,7 +142,63 @@ def build_position_collision_planner_from_started_backends(
     return planner
 
 
+def build_official_all_ik_governor_from_started_backends(
+    arm_backends: Mapping[str, Any],
+    *,
+    source_hz: float,
+    command_hz: float,
+    lookahead_source_steps: int,
+    jerk_ramp_sec: float,
+    scene_profile: str,
+    collision_min_distance_m: float,
+    collision_distance_epsilon_m: float,
+    max_joint_velocity_rad_s: Sequence[float],
+    max_joint_acceleration_rad_s2: Sequence[float],
+    debug_profile: bool = False,
+) -> RM65OfficialAllIKGovernorPlanner:
+    """Build the promoted source all-IK + causal qref governor backend."""
+
+    endpoint_to_tool = endpoint_to_tool_transforms_from_started_backends(
+        arm_backends
+    )
+    collision_planner = RM65PositionCollisionPlanner(
+        RM65PositionCollisionPlannerConfig(
+            reference_hz=float(command_hz),
+            scene_profile=str(scene_profile),
+            collision_min_distance_m=float(collision_min_distance_m),
+            collision_distance_epsilon_m=float(collision_distance_epsilon_m),
+            max_joint_velocity_rad_s=_six_positive(
+                max_joint_velocity_rad_s,
+                name="max_joint_velocity_rad_s",
+            ),
+            max_joint_acceleration_rad_s2=_six_positive(
+                max_joint_acceleration_rad_s2,
+                name="max_joint_acceleration_rad_s2",
+            ),
+            solve_max_iterations=1,
+            solve_min_iterations=1,
+            debug_profile=bool(debug_profile),
+        ),
+        endpoint_to_tool_by_side=endpoint_to_tool,
+    )
+    if int(collision_planner.collision_pair_count) <= 0:
+        raise RuntimeError(
+            "required official all-IK governor refuses a scene with no collision pairs."
+        )
+    return RM65OfficialAllIKGovernorPlanner(
+        collision_planner,
+        endpoint_to_tool_by_side=endpoint_to_tool,
+        source_hz=float(source_hz),
+        command_hz=float(command_hz),
+        lookahead_source_steps=int(lookahead_source_steps),
+        jerk_ramp_sec=float(jerk_ramp_sec),
+        max_velocity_rad_s=max_joint_velocity_rad_s,
+        max_acceleration_rad_s2=max_joint_acceleration_rad_s2,
+    )
+
+
 __all__ = [
+    "build_official_all_ik_governor_from_started_backends",
     "build_position_collision_planner_from_started_backends",
     "endpoint_to_tool_transforms_from_started_backends",
 ]

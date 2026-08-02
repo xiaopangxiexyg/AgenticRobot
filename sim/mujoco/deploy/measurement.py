@@ -110,8 +110,12 @@ def _measured_qpos_from_snapshot(
         measured_raw,
         field_name="measured_qpos_by_side",
     )
-    if set(measured) != set(sides):
-        raise ValueError("Measured qpos must cover exactly the requested arm sides.")
+    if not set(sides).issubset(measured):
+        raise ValueError("Measured qpos does not cover every requested arm side.")
+    # A backend snapshot may expose private/support arms that are outside the
+    # application action topology.  Export only the explicitly requested
+    # public observation scope.
+    measured = {side: measured[side] for side in sides}
     physics_tick_raw = execution.get("physics_tick", snapshot.get("physics_ticks"))
     physics_tick = None if physics_tick_raw is None else int(physics_tick_raw)
     if physics_tick is not None and physics_tick < 0:

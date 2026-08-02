@@ -41,7 +41,10 @@ from teleop_runtime.deploy import cli as deploy_cli
 from teleop_runtime.deploy.observation import DeploymentObservation
 from teleop_runtime.deploy import run_policy
 from teleop_runtime.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
-from robot_motion.deploy import RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
+from robot_motion.deploy import (
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+    RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+)
 
 
 def _server_metadata() -> dict:
@@ -675,9 +678,15 @@ class OpenPICommonDeployTest(unittest.TestCase):
         raw_rtc_period = run_policy._runtime_action_keyframe_period_sec(
             SimpleNamespace(rtc_profile=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1)
         )
+        model_rtc_period = run_policy._runtime_action_keyframe_period_sec(
+            SimpleNamespace(
+                rtc_profile=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+            )
+        )
 
         self.assertEqual(legacy_period, 1.0 / 15.0)
         self.assertEqual(raw_rtc_period, 1.0 / 30.0)
+        self.assertEqual(model_rtc_period, 1.0 / 30.0)
 
     def test_openpi_real_launcher_passes_explicit_wrist_image_map(self) -> None:
         with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:

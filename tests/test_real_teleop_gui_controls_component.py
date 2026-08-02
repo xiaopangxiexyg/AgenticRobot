@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from teleop_runtime.debug import run_vive_sapien_virtual as virtual_entrypoint
-from teleop_runtime.real_teleop.gui_controls import (
+from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,
     current_active_controls,

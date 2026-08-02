@@ -113,17 +113,19 @@ def _relative_missing_behavior(value: object) -> str:
 class PoseComponentCompositionRule:
     """One pose-valued component fusion rule.
 
-    Pose values use the canonical ``xyz + quat_xyzw`` representation carried
-    by ``RobotAction``. Frame and controlled-frame equality are checked by the
-    numerical strategy before fusion.
+    Pose values use the canonical ``xyz + quat_xyzw`` component payload.
+    Frame and controlled-frame equality are checked by the numerical strategy
+    before fusion.  Either disagreement limit may be ``None`` to keep the
+    difference observable without turning it into a pre-composition rejection
+    gate.  Canonical motion safety remains downstream.
     """
 
     component_id: str
     contributing_roles: tuple[str, ...]
     weight_by_role: Mapping[str, float]
     missing_behavior: str = "no_action"
-    max_translation_disagreement_m: float = 0.20
-    max_rotation_disagreement_rad: float = math.radians(60.0)
+    max_translation_disagreement_m: float | None = 0.20
+    max_rotation_disagreement_rad: float | None = math.radians(60.0)
 
     def __post_init__(self) -> None:
         component_id = _required(self.component_id, field_name="component_id")
@@ -131,20 +133,31 @@ class PoseComponentCompositionRule:
             self.contributing_roles,
             self.weight_by_role,
         )
-        translation_limit = float(self.max_translation_disagreement_m)
-        rotation_limit = float(self.max_rotation_disagreement_rad)
-        if not math.isfinite(translation_limit) or translation_limit < 0.0:
+        translation_limit = (
+            None
+            if self.max_translation_disagreement_m is None
+            else float(self.max_translation_disagreement_m)
+        )
+        rotation_limit = (
+            None
+            if self.max_rotation_disagreement_rad is None
+            else float(self.max_rotation_disagreement_rad)
+        )
+        if translation_limit is not None and (
+            not math.isfinite(translation_limit) or translation_limit < 0.0
+        ):
             raise ValueError(
                 "Pose translation disagreement limit must be finite and "
-                "non-negative."
+                "non-negative when enabled."
             )
-        if (
+        if rotation_limit is not None and (
             not math.isfinite(rotation_limit)
             or rotation_limit < 0.0
             or rotation_limit >= math.pi
         ):
             raise ValueError(
-                "Pose rotation disagreement limit must be in [0, pi)."
+                "Pose rotation disagreement limit must be in [0, pi) when "
+                "enabled."
             )
         object.__setattr__(self, "component_id", component_id)
         object.__setattr__(self, "contributing_roles", roles)

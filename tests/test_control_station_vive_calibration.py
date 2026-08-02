@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,15 +16,17 @@ from control_station.vive_calibration import (
 )
 from control_station.vive_calibration_gui import ViveCoordinateCalibrationGui
 from control_station.vive_calibration_profiles import (
+    LATEST_VIVE_COORDINATE_PROFILE,
     VIVE_COORDINATE_PROFILE_KIND,
     coordinate_profile_view,
+    derive_coordinate_calibration,
     load_coordinate_profile,
     new_coordinate_calibration,
     save_coordinate_profile,
     validate_coordinate_profile,
 )
 from project_paths import calibration_profiles_dir, control_station_vive_coordinate_profiles_dir
-from teleop_runtime.calibration import TeleopCalibration
+from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
 from teleop_runtime.real_teleop.vive_calibration_runtime import (
     ViveCoordinateCalibrationContext,
     calibrate_vive_coordinate_profile,
@@ -38,15 +41,54 @@ def _pose(x: float, y: float, z: float) -> np.ndarray:
 
 
 def _channel(name: str, pose: np.ndarray, sequence: int) -> SimpleNamespace:
+    received_at = time.time()
     return SimpleNamespace(
         channel_name=name,
         frame_name="vive_world",
         value=pose,
         valid=True,
         critical=True,
-        timestamp=1000.0 + sequence,
-        metadata={"seq": sequence, "receiver_timestamp": 1000.0 + sequence},
+        timestamp=received_at,
+        metadata={"seq": sequence, "receiver_timestamp": received_at},
     )
+
+
+def _vive_role_packet(
+    *,
+    sequence: int = 1,
+    right_valid: bool,
+) -> bytes:
+    return json.dumps(
+        {
+            "protocol": "teleop_runtime.vive/v1",
+            "seq": sequence,
+            "sender_timestamp": time.time(),
+            "trackers": [
+                {
+                    "tracker_name": "physical-single",
+                    "tracker_role": "left_wrist",
+                    "valid": True,
+                    "pose_matrix_4x4": np.eye(4).tolist(),
+                    "error": None,
+                },
+                {
+                    "tracker_name": (
+                        "physical-right"
+                        if right_valid
+                        else "<right_wrist_unavailable>"
+                    ),
+                    "tracker_role": "right_wrist",
+                    "valid": right_valid,
+                    "pose_matrix_4x4": np.eye(4).tolist(),
+                    "error": (
+                        None
+                        if right_valid
+                        else "single_tracker_mode:not_connected"
+                    ),
+                },
+            ],
+        }
+    ).encode("utf-8")
 
 
 class _WorkflowUi:
@@ -93,6 +135,55 @@ class _ScriptedSource:
         return {}
 
 
+class _LiveControllerSource:
+    def __init__(self, available_channels: tuple[str, ...]) -> None:
+        self.available_channels = available_channels
+        self.sequence = 0
+
+    def get_latest_channels(self) -> dict[str, object]:
+        self.sequence += 1
+        return {
+            name: _channel(name, _pose(0.1, 0.2, 0.3), self.sequence)
+            for name in self.available_channels
+        }
+
+    def debug_stats(self) -> dict[str, object]:
+        return {"packet_count": self.sequence}
+
+    @property
+    def source_role_by_output_channel(self) -> dict[str, str]:
+        return {
+            name: name.removesuffix("_pose")
+            for name in self.available_channels
+        }
+
+
+class _FixedControllerSource:
+    def __init__(self, channels: dict[str, object]) -> None:
+        self.channels = channels
+
+    def get_latest_channels(self) -> dict[str, object]:
+        return dict(self.channels)
+
+    def debug_stats(self) -> dict[str, object]:
+        return {}
+
+
+class _RecoveringControllerSource(_LiveControllerSource):
+    def __init__(self) -> None:
+        super().__init__(("right_wrist_pose",))
+        self.start_calls = 0
+        self.closed = False
+
+    def start(self) -> None:
+        self.start_calls += 1
+        if self.start_calls == 1:
+            raise RuntimeError("synthetic receiver start failure")
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_single_side_reuses_shared_workflow_and_saves_independent_profile(tmp_path: Path) -> None:
     ui = _WorkflowUi()
     source = _ScriptedSource(ui)
@@ -131,6 +222,36 @@ def test_single_side_reuses_shared_workflow_and_saves_independent_profile(tmp_pa
     assert sorted(loaded.tracker_offsets) == ["right_wrist"]
 
 
+def test_latest_profile_selects_newest_valid_independent_record(
+    tmp_path: Path,
+) -> None:
+    calibration = new_coordinate_calibration(active_sides=("right",))
+    calibration.set_world_to_desk(np.eye(4))
+    calibration.set_tracker_offset("right_wrist", np.eye(4))
+    first = save_coordinate_profile(
+        calibration,
+        root=tmp_path,
+        profile_name="first",
+    )
+    time.sleep(0.002)
+    second = save_coordinate_profile(
+        calibration,
+        root=tmp_path,
+        profile_name="second",
+    )
+    corrupt = tmp_path / "99999999_999999_corrupt.json"
+    corrupt.write_text("{invalid", encoding="utf-8")
+
+    loaded, resolved = load_coordinate_profile(
+        LATEST_VIVE_COORDINATE_PROFILE,
+        root=tmp_path,
+    )
+
+    assert first != second
+    assert resolved == second
+    assert loaded.metadata["profile_name"] == "second"
+
+
 def test_real_teleop_profile_marker_is_rejected(tmp_path: Path) -> None:
     real_like = TeleopCalibration()
     real_like.set_world_to_desk(np.eye(4))
@@ -150,6 +271,52 @@ def test_coordinate_profile_view_has_no_target_or_home_state() -> None:
     assert view["target_binding_policy"] == "target_profile_supplies_desk_to_base"
     assert view["home_policy"] == "session_home_is_not_part_of_coordinate_profile"
     assert not calibration.captured_home_qpos
+
+
+def test_legacy_profile_migration_strips_target_and_home_state(tmp_path: Path) -> None:
+    source_path = tmp_path / "legacy.json"
+    source = TeleopCalibration(
+        arms={
+            side: ArmCalibration(
+                name=f"{side}_arm",
+                side=side,
+                T_D_B=np.eye(4),
+                home_qpos=np.ones(6),
+                workspace_min=np.full(3, -1.0),
+                workspace_max=np.full(3, 1.0),
+            )
+            for side in ("left", "right")
+        },
+        captured_home_qpos={
+            f"{side}_arm": np.ones(6) for side in ("left", "right")
+        },
+        metadata={
+            "home_ready": True,
+            "home_capture": {"must_not_survive": True},
+        },
+    )
+    source.set_world_to_vive_retarget(np.eye(4))
+    source.set_tracker_offset("left_wrist", np.eye(4))
+    source.set_tracker_offset("right_wrist", np.eye(4))
+    source.save_json(source_path)
+
+    derived = derive_coordinate_calibration(
+        source,
+        active_sides=("left", "right"),
+        source_profile_path=source_path,
+        profile_name="derived",
+    )
+
+    validate_coordinate_profile(derived)
+    assert derived.metadata["home_policy"] == "session_home_is_not_part_of_coordinate_profile"
+    assert "home_capture" not in derived.metadata
+    assert derived.captured_home_qpos == {}
+    for side in ("left", "right"):
+        arm = derived.get_arm_for_side(side)
+        assert arm.T_D_B is None
+        assert arm.home_qpos is None
+        assert arm.workspace_min is None
+        assert arm.workspace_max is None
 
 
 def test_default_profile_directory_is_not_real_teleop_directory() -> None:
@@ -193,6 +360,11 @@ def test_gui_is_read_only_with_respect_to_motion_and_exposes_state(tmp_path: Pat
         assert 'class="live-grid"' in page
         assert 'id="worldMatrix"' in page
         assert 'data-step="virtual_desk_x"' in page
+        assert 'id="cancel"' in page
+        assert 'id="exit"' in page
+        assert "X 后→前" in page
+        assert "Y 右→左" in page
+        assert "Z 下→上" in page
         assert 'nonce="' in page
         assert "script-src 'self' 'nonce-" in content_security_policy
         assert "style-src 'self' 'nonce-" in content_security_policy
@@ -202,6 +374,8 @@ def test_gui_is_read_only_with_respect_to_motion_and_exposes_state(tmp_path: Pat
         assert state["motion_authorized"] is False
         assert state["real_arm_motion"] is False
         assert state["no_dispatch_owner"] is True
+        assert state["input_preflight"]["ready"] is False
+        assert state["workflow_active"] is False
 
         request = urllib.request.Request(
             gui.url + "api/event",
@@ -209,16 +383,434 @@ def test_gui_is_read_only_with_respect_to_motion_and_exposes_state(tmp_path: Pat
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with opener.open(request, timeout=2.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        assert payload["accepted"] is True
-        for _ in range(20):
-            if controller.snapshot()["stage"] == "virtual_desk_x":
-                break
-            time.sleep(0.01)
-        assert controller.snapshot()["stage"] == "virtual_desk_x"
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            opener.open(request, timeout=2.0)
+        payload = json.loads(exc_info.value.read().decode("utf-8"))
+        assert payload["accepted"] is False
+        assert "开始前检查未通过" in payload["error"]
+        state = controller.snapshot()
+        assert state["stage"] == "idle"
+        assert state["phase"] == "blocked"
+        assert state["workflow_active"] is False
     finally:
         gui.close()
+        controller.close()
+
+
+def test_begin_requires_every_selected_channel_before_starting(tmp_path: Path) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=_LiveControllerSource(("left_wrist_pose",)),
+    )
+    controller.start(start_source=False)
+    try:
+        state = controller.snapshot()
+        assert state["input_preflight"]["required_channels"] == ["right_wrist_pose"]
+        assert state["input_preflight"]["ready"] is False
+        with pytest.raises(RuntimeError, match="right_wrist_pose"):
+            controller.dispatch("begin_calibration")
+        assert controller.snapshot()["workflow_active"] is False
+    finally:
+        controller.close()
+
+
+def test_station_auto_sweep_uses_active_wrist_even_when_aux_is_configured(
+    tmp_path: Path,
+) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            desk_tracker="auto",
+            auxiliary_tracker_name="tracker_aux",
+            profile_dir=tmp_path,
+        ),
+        source=_LiveControllerSource(("right_wrist_pose",)),
+    )
+    try:
+        state = controller.snapshot()
+        assert state["input_preflight"]["required_channels"] == [
+            "right_wrist_pose"
+        ]
+        assert state["input_preflight"]["ready"] is True
+    finally:
+        controller.close()
+
+
+@pytest.mark.parametrize(
+    ("channel", "reason"),
+    [
+        (
+            SimpleNamespace(
+                channel_name="right_wrist_pose",
+                frame_name="vive_world",
+                value=_pose(0.0, 0.0, 0.0),
+                valid=True,
+                critical=True,
+                timestamp=1.0,
+                metadata={"seq": 1, "receiver_timestamp": 1.0},
+            ),
+            "stale",
+        ),
+        (
+            SimpleNamespace(
+                channel_name="right_wrist_pose",
+                frame_name="vive_world",
+                value=np.full((4, 4), np.nan),
+                valid=True,
+                critical=True,
+                timestamp=time.time(),
+                metadata={"seq": 1, "receiver_timestamp": time.time()},
+            ),
+            "invalid",
+        ),
+        (
+            SimpleNamespace(
+                channel_name="right_wrist_pose",
+                frame_name="vive_world",
+                value=_pose(0.0, 0.0, 0.0),
+                valid=True,
+                critical=True,
+                timestamp="malformed",
+                metadata={"seq": 1, "receiver_timestamp": "malformed"},
+            ),
+            "timestamp_missing",
+        ),
+    ],
+)
+def test_preflight_rejects_stale_nonfinite_or_unclocked_pose(
+    tmp_path: Path,
+    channel: object,
+    reason: str,
+) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=_FixedControllerSource({"right_wrist_pose": channel}),
+    )
+    try:
+        state = controller.snapshot()
+        assert state["input_preflight"]["ready"] is False
+        assert state["input_preflight"]["failures"] == [
+            {"channel": "right_wrist_pose", "reason": reason}
+        ]
+        with pytest.raises(RuntimeError, match="开始前检查未通过"):
+            controller.dispatch("begin_calibration")
+    finally:
+        controller.close()
+
+
+def test_active_calibration_can_be_cancelled_and_reconfigured(tmp_path: Path) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            capture_prep_sec=0.0,
+            profile_dir=tmp_path,
+        ),
+        source=_LiveControllerSource(("right_wrist_pose",)),
+    )
+    controller.start(start_source=False)
+    try:
+        controller.dispatch("begin_calibration")
+        for _ in range(100):
+            state = controller.snapshot()
+            if state["workflow_active"] and state["stage"] == "virtual_desk_x":
+                break
+            time.sleep(0.01)
+        assert state["workflow_active"] is True
+
+        controller.dispatch("capture")
+        for _ in range(100):
+            state = controller.snapshot()
+            if state["phase"] == "capturing":
+                break
+            time.sleep(0.01)
+        assert state["phase"] == "capturing"
+
+        controller.dispatch("cancel_calibration")
+        for _ in range(100):
+            state = controller.snapshot()
+            if not state["workflow_active"]:
+                break
+            time.sleep(0.01)
+        assert state["workflow_active"] is False
+        assert state["stage"] == "idle"
+        assert state["phase"] == "idle"
+        assert state["error"] == ""
+
+        controller.dispatch("set_active_sides", {"active_sides": "left"})
+        assert controller.snapshot()["active_sides"] == ["left"]
+    finally:
+        controller.close()
+
+
+def test_idle_capture_and_reset_cannot_pollute_next_workflow(tmp_path: Path) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=_LiveControllerSource(("right_wrist_pose",)),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="No active"):
+            controller.dispatch("capture")
+        with pytest.raises(RuntimeError, match="No active"):
+            controller.dispatch("reset_stage")
+    finally:
+        controller.close()
+
+
+def test_receiver_start_failure_does_not_leave_controller_unretryable(
+    tmp_path: Path,
+) -> None:
+    source = _RecoveringControllerSource()
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=source,
+    )
+    with pytest.raises(RuntimeError, match="synthetic receiver"):
+        controller.start(start_source=True)
+    failed = controller.snapshot()
+    assert failed["lifecycle"] == "stopped"
+    assert failed["phase"] == "error"
+    assert "synthetic receiver start failure" in failed["error"]
+
+    controller.start(start_source=True)
+    assert source.start_calls == 2
+    recovered = controller.snapshot()
+    assert recovered["source_started"] is True
+    assert recovered["phase"] == "idle"
+    assert recovered["error"] == ""
+    controller.close()
+    assert source.closed is True
+
+
+def test_close_event_requests_outer_calibration_loop_shutdown(tmp_path: Path) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(profile_dir=tmp_path),
+        source=_LiveControllerSource(()),
+    )
+    controller.start(start_source=False)
+    controller.dispatch("close")
+
+    state = controller.snapshot()
+    assert controller.shutdown_requested is True
+    assert state["shutdown_requested"] is True
+    assert state["phase"] == "shutting_down"
+    controller.close()
+
+
+def test_close_event_interrupts_an_active_capture(tmp_path: Path) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            capture_prep_sec=0.0,
+            profile_dir=tmp_path,
+        ),
+        source=_LiveControllerSource(("right_wrist_pose",)),
+    )
+    controller.start(start_source=False)
+    controller.dispatch("begin_calibration")
+    controller.dispatch("capture")
+    controller.dispatch("close")
+    for _ in range(100):
+        state = controller.snapshot()
+        if not state["workflow_active"]:
+            break
+        time.sleep(0.01)
+
+    assert controller.shutdown_requested is True
+    assert state["workflow_active"] is False
+    controller.close()
+
+
+def test_calibration_gui_can_swap_valid_bilateral_sources_before_capture(
+    tmp_path: Path,
+) -> None:
+    source = VivePoseSource(
+        [
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+            ),
+            ViveTrackerConfig(
+                name="tracker_2",
+                side="right",
+                role="right_wrist",
+                channel_name="right_wrist_pose",
+            ),
+        ],
+        port=0,
+        clock_sync_port=0,
+    )
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=source,
+    )
+    source._process_received_batch(
+        [
+            (
+                _vive_role_packet(right_valid=True),
+                time.time(),
+                time.monotonic(),
+                ("192.0.2.10", 4000),
+            )
+        ]
+    )
+
+    controller.dispatch("swap_vive_sources")
+    state = controller.snapshot()
+
+    assert state["source_role_by_output_channel"] == {
+        "left_wrist_pose": "right_wrist",
+        "right_wrist_pose": "left_wrist",
+    }
+    assert state["source_swap_count"] == 1
+    assert state["stage"] == "idle"
+
+
+def test_calibration_gui_swaps_single_tracker_without_source_admission(
+    tmp_path: Path,
+) -> None:
+    source = VivePoseSource(
+        [
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="right",
+                role="left_wrist",
+                channel_name="right_wrist_pose",
+            )
+        ],
+        port=0,
+        clock_sync_port=0,
+    )
+    source._process_received_batch(
+        [
+            (
+                _vive_role_packet(right_valid=False),
+                time.time(),
+                time.monotonic(),
+                ("192.0.2.10", 4000),
+            )
+        ]
+    )
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=source,
+    )
+
+    controller.dispatch("swap_vive_sources")
+
+    assert source.source_role_by_output_channel == {
+        "right_wrist_pose": "right_wrist",
+    }
+    assert controller.snapshot()["source_swap_count"] == 1
+
+
+def test_calibration_gui_can_swap_single_tracker_back_without_source_admission(
+    tmp_path: Path,
+) -> None:
+    source = VivePoseSource(
+        [
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="right",
+                role="right_wrist",
+                channel_name="right_wrist_pose",
+            )
+        ],
+        port=0,
+        clock_sync_port=0,
+    )
+    source._process_received_batch(
+        [
+            (
+                _vive_role_packet(right_valid=False),
+                time.time(),
+                time.monotonic(),
+                ("192.0.2.10", 4000),
+            )
+        ]
+    )
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=source,
+    )
+
+    controller.dispatch("swap_vive_sources")
+
+    assert source.source_role_by_output_channel == {
+        "right_wrist_pose": "left_wrist",
+    }
+    assert controller.snapshot()["source_swap_count"] == 1
+
+
+def test_single_tracker_swap_back_restores_selected_channel_immediately(
+    tmp_path: Path,
+) -> None:
+    source = VivePoseSource(
+        [
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+            ),
+            ViveTrackerConfig(
+                name="tracker_2",
+                side="right",
+                role="right_wrist",
+                channel_name="right_wrist_pose",
+            ),
+        ],
+        port=0,
+        clock_sync_port=0,
+    )
+    source._process_received_batch(
+        [
+            (
+                _vive_role_packet(right_valid=False),
+                time.time(),
+                time.monotonic(),
+                ("192.0.2.10", 4000),
+            )
+        ]
+    )
+    source.swap_left_right_source_roles()
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+        ),
+        source=source,
+    )
+
+    assert controller.snapshot()["input_preflight"]["ready"] is True
+    controller.dispatch("swap_vive_sources")
+    assert controller.snapshot()["input_preflight"]["ready"] is False
+    controller.dispatch("swap_vive_sources")
+    state = controller.snapshot()
+    assert state["input_preflight"]["ready"] is True
+    assert state["source_role_by_output_channel"]["right_wrist_pose"] == "left_wrist"
 
 
 def test_vive_calibration_gui_is_loopback_only(tmp_path: Path) -> None:

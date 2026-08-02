@@ -6,7 +6,10 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from robot_motion.position_control import POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+from robot_motion.position_control import (
+    POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+)
 
 def _short_status_text(value: object, *, max_len: int = 160) -> str:
     text = str(value)
@@ -41,7 +44,10 @@ def _command_backend_status_text(state: dict[str, object]) -> str:
     stream = state.get("background_streaming")
     if isinstance(stream, Mapping):
         planner = str(stream.get("position_command_planner") or "")
-        if planner == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED:
+        if planner in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }:
             mode = str(stream.get("trajectory_policy_mode") or "unknown")
             scale = float(stream.get("trajectory_policy_speed_scale", 1.0) or 0.0)
             bits.append(f"traj={mode}/{scale:.2f}")

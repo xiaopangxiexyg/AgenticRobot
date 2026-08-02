@@ -282,6 +282,17 @@ class TeleopCalibration:
     def desk_to_base(self, pose_desk: Any, side: str) -> np.ndarray:
         return self.vive_retarget_to_base(pose_desk, side=side)
 
+    def base_to_desk(self, pose_base: Any, side: str) -> np.ndarray:
+        """Transform an arm-base pose into the canonical retarget frame."""
+
+        arm = self.get_arm_for_side(side)
+        if arm.T_D_B is None:
+            raise RuntimeError(
+                f"Arm calibration for side '{side}' is missing T_VR_B "
+                "(legacy T_D_B)."
+            )
+        return np.asarray(arm.T_D_B, dtype=float) @ as_pose_matrix(pose_base)
+
     def vive_retarget_to_base(self, pose_vive_retarget: Any, side: str) -> np.ndarray:
         arm = self.get_arm_for_side(side)
         if arm.T_D_B is None:

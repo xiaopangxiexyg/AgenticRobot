@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from control_station.sources import (
+    AttachablePassiveTeleopComponentSource,
     HumanPoseSourceContract,
+    PassiveTeleopComponentClockBridge,
     PassiveTeleopComponentSessionSource,
     PassiveTeleopComponentSourceSpec,
     PassiveTeleopComponentSpec,
@@ -330,6 +332,44 @@ def test_wrapper_rejects_any_session_with_dispatch_rig_or_existing_observer() ->
         )
 
 
+def test_source_mapping_generation_resets_pose_baseline_before_safety_check() -> None:
+    session = TeleopSession(
+        TeleopSessionConfig(
+            mode="mapping-transition-test",
+            record_enabled=False,
+            allow_hardware_after_debug_pass=False,
+        ),
+        sources=(),
+        retargeters=(),
+    )
+    channel = ObservationChannel(
+        channel_name="right_wrist_pose",
+        capability="pose6d",
+        side="right",
+        value=_pose(0.1),
+        frame_name="right_arm_base",
+        timestamp=1.0,
+        source_name="vive_pose",
+        metadata={"source_mapping_generation": 0},
+    )
+
+    session._observe_source_mapping_transitions({channel.channel_name: channel})
+    session.safety_monitor.evaluate_channels(
+        {channel.channel_name: channel},
+        now=1.0,
+    )
+    assert channel.channel_name not in session.safety_monitor._pose_reset_pending_by_channel
+
+    remapped = channel.copy()
+    remapped.metadata["source_mapping_generation"] = 1
+    remapped.value = _pose(0.8)
+    session._observe_source_mapping_transitions(
+        {remapped.channel_name: remapped}
+    )
+
+    assert channel.channel_name in session.safety_monitor._pose_reset_pending_by_channel
+
+
 def test_external_arm_transition_is_detected_before_another_source_poll() -> None:
     session, _ = _session()
     source = PassiveTeleopPoseSessionSource(
@@ -472,6 +512,74 @@ def test_component_source_accepts_pose_and_hand_qpos_without_dispatch() -> None:
     finally:
         source.close()
     assert lower_source.started and lower_source.closed
+
+
+def test_attachable_component_source_stays_passive_until_exact_delegate_attaches() -> None:
+    lower_source = _BimanualPoseSource(sides=("left",))
+    spec = PassiveTeleopComponentSourceSpec(
+        components=(_left_pose_component(),),
+        source_profile_id="deferred-human-source-v1",
+    )
+    delegate = build_passive_teleop_component_session_source(
+        spec,
+        sources=(lower_source,),
+        retargeters=(_PoseRetargeter("left"),),
+    )
+    source = AttachablePassiveTeleopComponentSource(spec)
+    try:
+        receipt = source.start()
+        source.set_calibration_ready()
+        waiting = source.step(now=1.0)
+
+        assert receipt.rig_absent and not receipt.authoritative
+        assert source.attached is False
+        assert waiting.emission is None
+        assert waiting.rejection_reason == "human_source_not_attached"
+        assert lower_source.started is False
+
+        attached = source.attach(delegate)
+        assert attached["status"] == "attached"
+        assert attached["command_dispatched"] is False
+        assert attached["authoritative"] is False
+        assert source.attached is True
+        assert lower_source.started is True
+
+        emitted = source.step(now=1.1)
+        assert emitted.emission_valid is True
+        assert emitted.command_dispatched is False
+    finally:
+        source.close()
+    assert lower_source.closed is True
+
+
+def test_component_clock_bridge_keeps_session_freshness_on_wall_clock() -> None:
+    lower_source = _BimanualPoseSource(sides=("left",))
+    spec = PassiveTeleopComponentSourceSpec(
+        components=(_left_pose_component(),),
+        source_profile_id="clock-bridge-test-v1",
+    )
+    source = build_passive_teleop_component_session_source(
+        spec,
+        sources=(lower_source,),
+        retargeters=(_PoseRetargeter("left"),),
+    )
+    bridge = PassiveTeleopComponentClockBridge(
+        source,
+        wall_clock=lambda: 1.01,
+    )
+    try:
+        bridge.start()
+        bridge.set_calibration_ready()
+
+        # The outer tick is deliberately from an unrelated monotonic domain.
+        # TeleopSession must receive the source-compatible wall time.
+        step = bridge.step(now=9_000.0)
+
+        assert step.session_step.timestamp == pytest.approx(1.01)
+        assert step.emission_valid is True
+        assert step.session_step.tracker_loss_channels == ()
+    finally:
+        bridge.close()
 
 
 def test_component_source_accepts_hand_only_qpos_from_virtual_device() -> None:

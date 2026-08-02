@@ -20,6 +20,7 @@ from sim.mujoco.adapters.reference_lineage import (
     build_mujoco_reference_target_activation_observation,
 )
 from sim.mujoco.deploy.execution_difference import (
+    MujocoExecutionDifferenceObserver,
     build_mujoco_qpos_execution_difference_observation,
     project_mujoco_execution_measurement_observation,
     project_mujoco_execution_reference_frame,
@@ -270,6 +271,75 @@ def test_mujoco_owner_can_return_measurement_coupled_reference_point_sample() ->
     assert reference.temporal_semantics == "point_sample"
     assert association.status == "available"
     assert association.reason == "downstream_actual_reference_at_measurement"
+
+
+def test_bounded_observer_pairs_only_exact_target_owned_sample() -> None:
+    segment, admission, activation, _ = _reference_facts()
+    observer = MujocoExecutionDifferenceObserver(
+        selection_group_id="arms",
+        component_ids=("right_arm",),
+        max_pending_references=1,
+    )
+    reference = project_mujoco_execution_reference_sample(
+        segment=segment,
+        admission=admission,
+        activation=activation,
+        sampled_at=10.2,
+        available_at=10.21,
+        side_to_component_id={"right": "right_arm"},
+        component_schema_hash="right-arm-qpos-schema",
+        observation_binding_id="observation-binding:1",
+        observation_plan_hash="observation-plan-hash:1",
+    )
+    measurement = project_mujoco_execution_measurement_observation(
+        _measurement(measured_at=10.2),
+        control_domain_id="robot-0",
+        side_to_component_id={"right": "right_arm"},
+        component_schema_hash="right-arm-qpos-schema",
+        available_at=10.22,
+        observation_binding_id="observation-binding:1",
+        observation_plan_hash="observation-plan-hash:1",
+    )
+
+    assert observer.publish_execution_observation(reference)
+    assert observer.publish_execution_observation(measurement)
+    snapshot = observer.snapshot()
+    assert snapshot.latest_association is not None
+    assert snapshot.latest_association.status == "available"
+    assert snapshot.pending_reference_count == 0
+
+    unmatched = project_mujoco_execution_measurement_observation(
+        _measurement(measured_at=10.3),
+        control_domain_id="robot-0",
+        side_to_component_id={"right": "right_arm"},
+        component_schema_hash="right-arm-qpos-schema",
+        available_at=10.31,
+        observation_binding_id="observation-binding:1",
+        observation_plan_hash="observation-plan-hash:1",
+    )
+    assert observer.publish_execution_observation(unmatched)
+    snapshot = observer.snapshot()
+    assert snapshot.latest_association is not None
+    assert snapshot.latest_association.status == "unavailable"
+    assert snapshot.latest_association.reason == (
+        "reference_observation_not_provided"
+    )
+    assert snapshot.unmatched_measurement_count == 1
+
+
+def test_bounded_observer_reports_invalid_unbound_input_without_throwing() -> None:
+    observer = MujocoExecutionDifferenceObserver(
+        selection_group_id="arms",
+        component_ids=("right_arm",),
+    )
+    measurement = project_mujoco_execution_measurement_observation(
+        _measurement(),
+        control_domain_id="robot-0",
+        side_to_component_id={"right": "right_arm"},
+        component_schema_hash="right-arm-qpos-schema",
+    )
+    assert observer.publish_execution_observation(measurement) is False
+    assert observer.snapshot().measurement_count == 0
 
 
 def test_mujoco_adapter_rejects_rejected_or_quick_stop_reference_as_actual_qref() -> None:

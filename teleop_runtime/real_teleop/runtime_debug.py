@@ -21,7 +21,7 @@ from ..collection.status_snapshot import (
     hand_debug_text as _collection_hand_debug_text,
     writer_debug_text as _collection_writer_debug_text,
 )
-from ..gui.status_payloads import (
+from .status_payloads import (
     _debug_timing_arm_text,
     _debug_timing_fault_text,
     _debug_timing_ik_text,
@@ -138,7 +138,12 @@ def _dataset_recording_debug_text(
     camera_previewer: CameraPreviewer | None,
     now: float,
 ) -> str:
-    writer_text = _collection_writer_debug_text(dataset_recorder.writer_pool)
+    writer_owner = (
+        dataset_recorder.process_worker
+        if getattr(dataset_recorder, "process_worker", None) is not None
+        else dataset_recorder.writer_pool
+    )
+    writer_text = _collection_writer_debug_text(writer_owner)
     storage_text = _dataset_storage_debug_text(dataset_recorder)
     camera_text = _collection_camera_debug_text(
         camera_sources,

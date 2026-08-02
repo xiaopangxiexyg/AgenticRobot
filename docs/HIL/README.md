@@ -7,6 +7,39 @@
 当前 profile 是 **sim-only、default-off、library/test composition**，不是新的
 production entrypoint，也不会改变既有 teleop、replay、deploy 或 RTC 路径。
 
+本文同时保留历史 replay→human takeover profile 的说明。当前面向
+`PPO + 单 VIVE + Q6/angle trigger` 的应用主线是：
+
+```bash
+PYTHONPATH=. python -m control_station sim-hil --dry-run --device cpu
+PYTHONPATH=. python -m control_station sim-hil \
+  --enable --human-alpha 0.5
+```
+
+该主线不依赖 replay，也不伪造 replay cursor 或旧 Station session。它使用
+component-keyed `right_arm: cartesian_pose` 与
+`right_gripper: physical_joint_qpos`，只在 MuJoCo target 私有边界物化当前兼容
+执行表示。当前自动验收分为：
+
+1. 同一 HITL 主线分别运行 PPO-only（alpha=0）和 passive human-only（alpha=1）；
+2. 运行 0/1 切换与中间 alpha 的 pose/qpos 比例混合；
+3. episode end 先 HOLD/cancel，再完成 ControlTrace WAL、seal、commit 与回读，
+   核对 source、composition、target/reference/measurement、两层 difference 和
+   cancellation 事实。
+
+最小无设备验收：
+
+```bash
+PYTHONPATH=. python -m pytest -q \
+  tests/test_control_station_mujoco_sim_hil.py::test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences
+```
+
+它加载选定 PPO checkpoint，但用虚拟 passive VIVE/gripper source，不打开硬件。
+真实 VIVE、Q6/angle trigger 的连接、recenter/deadman 与操作者行为仍需独立手工
+验收；通过上述测试不代表真机设备已验证。交互式 Sim-HIL 使用 immediate-qref，
+`--target-admission-margin-sec` 仅保留给显式 scheduled 诊断 profile；它不改变
+当前交互路径，也不增加混合前数值安全或运动限制。
+
 ## 1. 当前能力与边界
 
 | 项目 | 当前语义 |
@@ -90,7 +123,7 @@ PYTHONPATH=. python -m pytest -q \
 ## 3. 应用侧组装顺序
 
 除下方这个 default-off 应用 profile 外，当前没有通用 HIL CLI；应用代码应复用
-以下顺序，不要在 GUI 或 source 中另建控制循环。临时 PPO + 真实 VIVE/Q6
+以下顺序，不要在 GUI 或 source 中另建控制循环。临时 PPO + 真实 VIVE/gripper
 （仅驱动 MuJoCo）的具体 profile 入口是：
 
 ```bash
@@ -98,23 +131,216 @@ PYTHONPATH=. python -m control_station sim-hil --help
 PYTHONPATH=. python -m control_station sim-hil --dry-run --device cpu
 ```
 
-只有显式传入 `--enable --left-q6-port ... --right-q6-port ...` 才会启动该
-profile；它仍不构造或连接真实 RM65 执行 backend。GUI 只是同一 Station
-生命周期的只读状态页，不另建控制循环。
+只有显式传入 `--enable` 才会启动当前右侧 profile；`--left-q6-port` 会明确拒绝，
+而不是被静默忽略。默认 `--gripper-input-source auto`：先探测显式
+`--right-q6-port` 或 `--q6-config` 中的 right assignment；Q6 确实不可达时再扫描
+可达设备，仍无 Q6 才回退到 calibrated angle trigger。多个 Q6 可达但没有明确
+right assignment 属于配置歧义，会停止而不是猜测。可使用
+`--gripper-input-source q6` 禁止回退，或用 `angle_trigger` 明确跳过 Q6 探测；
+angle trigger 的配置和采样率由 `--angle-trigger-config-root`、
+`--angle-trigger-rate-hz` 指定。当前右侧单臂 profile 只要求一个物理 angle
+trigger；旧双侧 reader 的“两设备”要求不再泄漏到该 profile。
 
-### 3.1 Compose 频率与下游位置控制 profile
+该 profile 使用一个 VIVE tracker（legacy packet slot 0 映射到逻辑 right）和一个
+选定的 gripper input；它仍不构造或连接真实 RM65 执行 backend。Q6 与 angle
+trigger 复用真机遥操的 observation source 和 `ScalarToGripperRetargeter`，Station
+只选择 profile、显示 requested/resolved source 及 fallback reason。普通 `--gui`
+仍是只读状态页；正式交互控制使用 `--control-gui`。
+
+### 3.1 正式 Sim-HIL 控制 GUI
+
+推荐从仓库根目录启动：
+
+```bash
+# VIVE/OpenVR 主机；当前单 tracker compatibility 会发送 packet slot 0
+python hardware/VIVE/mocap/vive_data_sender.py \
+  --single --host <sim-hil-receiver-ip> --port 9999 --hz 300
+
+# DexTeleop / MuJoCo 主机
+PYTHONPATH=. python -m control_station sim-hil \
+  --enable --control-gui \
+  --gripper-input-source auto \
+  --acceptance-root teleop_records/sim_hil_acceptance
+```
+
+该命令只把真实 VIVE 与 Q6/angle trigger 用作 passive input，执行目标仍是
+MuJoCo，`real_arm_motion=false`。命令启动后会自动在默认浏览器打开
+`http://127.0.0.1:8787/`（可用 `--no-open-browser` 关闭），先只打开一个 Station 网页和一个
+VIVE setup receiver；此时不会构造 MuJoCo target、PPO runtime 或 gripper reader。
+网页同时显示实时左右 VIVE 来源、当前选中的坐标 profile 和按需标定控件。只有
+所选来源新鲜有效、且已有保存成功的 profile 时，才允许启动正式 runtime。
+
+从任一控制模式启动时，Station 先关闭 setup receiver，再把其精确来源映射和
+profile 路径交给新 application；随后解析 Q6/angle trigger 并验证 passive human
+emission。原生 MuJoCo passive viewer 在首次来源检查通过后、realtime physics
+worker 启动前构造；构造完成后会重新采集并验证一帧当前 human/policy emission，
+再进入 composition preflight。这样既不会因窗口构造耗时把健康来源误判为 stale，
+也不会放宽 TTL 或把旧帧改写为新帧。无 VIVE 等首次来源错误只留在网页中，不会
+先弹出一个无信号且无法操作的 MuJoCo 窗口。viewer 只读取并同步 lower-owned
+scene，不推进 physics，也不成为新的 authority 或 safety gate。
+
+等待输入或启动期间可点“中断启动 / 等待”。HTTP 线程只设置取消请求，实际资源
+清理由 Station control thread 完成。失败或取消会关闭本次未启动成功的 application，
+恢复新的 setup receiver，并允许重新标定或重试；不会复用已关闭 source，也不需要
+为了可恢复的启动失败重启整个 Station 进程。
+
+`--single` sender 将唯一物理 tracker 标记为上游 `left_wrist`。当前单右臂 profile
+默认把该来源映射到逻辑输出 `right_wrist_pose`，因此无需第二个 tracker。GUI 中的
+“交换左右 VIVE 来源”按钮只交换上游 role，保持下游逻辑 channel 不变：
+
+```text
+单侧：left_wrist ↔ right_wrist -> right_wrist_pose
+双侧：left_wrist/right_wrist 交换 -> left/right_wrist_pose 保持不变
+```
+
+按钮只允许在 runtime 尚未启动、composition 尚未运行时使用。交换只修改
+上游 role 映射，不检查来源身份、有效性或新鲜度；交换会清空旧 VIVE history，
+并在对应 upstream role 已有 snapshot 时用该 snapshot 重新种入 causal history。
+因此控制线程不会因为显示缓存与 causal query 不一致而制造一个额外的
+`missing_channel` 周期。source mapping generation 变化也会通知下游 session
+重置 pose baseline 和 retargeter smoothing；无效来源仍保持无效，不会被伪造为有效动作。
+控制已经运行后不会允许直接交换，避免旧 pose 穿过映射边界或产生瞬时目标跳变。
+
+Sim-HIL GUI 的“VIVE 接收诊断”与 real-teleop 一样显示左右 sender role 的
+valid、age、seq、xyz/rpy 和 sender error，并额外标出当前哪个 role 被选入
+`right_wrist_pose`。这些字段来自 mapping 之前的只读接收缓存，不参与 retarget、
+composition 或执行。设备验收等待期间 status 页面仍会持续刷新：
+
+- `waiting_for_packet`、`packet_count=0`：接收器已启动但没有 UDP 数据；检查 sender
+  的 `--host/--port`、网络和端口占用，交换 role 不会解决；
+- `left=有效`、`right=无效`：这是 `--single` 的预期结果，应保持
+  `left_wrist -> right_wrist_pose`；按钮仍可用于显式切换来源；
+- 切换到 `device '<right_wrist_unavailable>' not found` 后，输入 readiness 会
+  变为无效，但可以再次点击交换恢复 `left_wrist -> right_wrist_pose`；
+- `receiving` 但物理 role 无效：根据对应卡片的 sender error 排查 OpenVR/tracker，
+  而不是修改逻辑映射。
+- `running=true` 但 `worker_alive=false`：接收线程已经退出，检查
+  `last_process_error`；这不是 sender stale，应重建 receiver。
+- `packet_count` 持续增长但 `channel_update_counts` 不增长：检查显式
+  `tracker_role`、logical source mapping 和 `last_process_parse_error_count`。
+- GUI 的 `packet_age_sec` 使用 socket 到达端记录的 monotonic age；同时保留
+  `packet_age_wall_sec` 供日志对照，系统 NTP/手工改时不会把正常包误判为 stale。
+- `processed_packet_count` 与 `process_error_count` 只表示解析/发布进度；即使解析暂时
+  延迟，`datagram_count` 和 packet age 仍反映真实 UDP 到达情况。
+- `dropped_stale_packet_count` 是 receiver 在一次读取中清空的旧 datagram 数；这些样本
+  仍进入有限历史，实时输出只发布最新样本，不等于 UDP 丢包。
+- `packet_age` 新鲜但 `human_device_ready=emission_stale`：继续查看
+  `last_rejection_reason`、session state、hold/fault；packet freshness 不等于
+  accepted human emission freshness。
+
+timeout 异常也会附带 `vive_receiver`、packet count/age 以及左右 role facts，便于
+在无 GUI 环境中做同样判断。
+
+网络抖动容忍与回退是 Sim-HIL 独立配置，不改变真机遥操的 tracker-loss HOLD：
+
+```bash
+PYTHONPATH=. python -m control_station sim-hil \
+  --enable --control-gui \
+  --human-emission-timeout 5 \
+  --human-timeout-fallback policy
+```
+
+`--human-emission-timeout` 默认 `5 s`，表示 accepted human emission 的最大允许
+年龄；它不会把旧位姿重新标成新位姿，也不会修改 `TeleopSession` 的自动 HOLD
+门槛。`--human-timeout-fallback hold`（默认）在窗口耗尽后交给下游保持输出；
+选择 `policy` 时，运行中的人类输入超时会用一帧新 PPO 输出切换到 PPO，并锁存该
+选择，VIVE 恢复后不会自动夺回控制权，必须在 GUI 中重新选择人类/混合模式。
+GUI 的“人类输入超时回退”与“融合目标不可执行时回退”是两个独立选项，前者只
+处理网络/人类输入新鲜度。
+
+排查 GUI 服务本身时，先不要把空响应直接送入 JSON parser：
+
+```bash
+curl -i --max-time 3 http://127.0.0.1:8787/api/vive-status
+```
+
+只有确认返回 `HTTP 200` 和 JSON 后，再使用 `python -c` 或 `jq` 提取
+`vive_receiver`；连接拒绝或空响应表示 Station/GUI 没有提供状态，不能归因于 VIVE
+数据包内容。
+
+GUI 的 intent POST 只表示请求已进入 Station 队列；交换按钮会在回执后等待同一
+`intent_id` 出现在 `acceptance.last_result`，再从新的 setup snapshot 刷新当前映射。
+
+页面的完整状态和 VIVE 状态分开轮询：完整 `/api/status` 低频刷新，轻量
+`/api/vive-status` 约每 250 ms 只读取 receiver snapshot，用于实时更新左右卡片，
+不会重复触发 policy/composition 状态计算。
+
+如果单个右侧 angle trigger 尚未标定，先在终端完成一次显式硬件设置：
+
+```bash
+PYTHONPATH=. python -m hardware.angle_trigger --side right
+```
+
+单侧配置保存为 `assignment/right.json` 和 `angles/right.json`，不会覆盖 UMI/双侧
+遥操使用的 `latest.json`。若原有双侧配置中的 right identity 与当前唯一设备匹配，
+单侧 Sim-HIL 可以直接复用其中的 right assignment/calibration。GUI 的输入设置只
+加载已标定配置，不会在 Station 控制线程中阻塞等待终端 `input()`。
+
+同一只传感器更换 USB 口后，基于 USB location 的旧 identity 可能不再匹配。此时只
+更新右侧 assignment，保留原来的角度端点：
+
+```bash
+PYTHONPATH=. python -m hardware.angle_trigger --side right --reassign
+```
+
+如果换成了另一只物理传感器，或者将原 left 传感器改作 right，必须同时重新标定：
+
+```bash
+PYTHONPATH=. python -m hardware.angle_trigger \
+  --side right --reassign --recalibrate-angles
+```
+
+出现 `Could not uniquely resolve the configured right sensor` 时，系统不会在 GUI 中
+自动改写 identity；完成上述对应操作后，直接重新启动 runtime 即可。
+
+页面将设备设置、正式控制和数据封存分开：
+
+- **VIVE setup / 按需标定**：使用已有有效 profile 时无需进入标定；需要时在同一
+  GUI 依次完成 `+X 后→前`、`+Y 右→左`、`+Z 下→上` 和 wrist 中立姿态，并保存后
+  选用。进入标定前要求所选通道有效，过程中可以取消并返回 setup。
+- **正式控制**：`human_teleop`、`ppo_only`、`proportional_blend` 是三个并列模式。
+  runtime 可以直接以任一模式启动，启动后也可任意顺序、任意次数切换。前两者的
+  human alpha 分别为 1 和 0；比例混合要求 alpha 严格位于 `(0,1)`。
+- **运行控制**：HOLD、恢复运行、Runtime Home 和整体 runtime 重建不承担模式解锁
+  职责；它们只处理对应的 lifecycle 操作。
+- **数据封存**：操作者可在正式 runtime 已启动且 trace 正在记录时结束 episode 并
+  封存，不要求访问或“确认通过”全部三种模式。该操作先结束运动 episode，再执行
+  ControlTrace WAL flush、seal 与 commit。
+
+模式切换仍发布 typed parameter record，并由后续 control cycle 反映到
+composition/dispatch/difference 状态；这些是运行事实和诊断信息，不是进入另一模式
+的解锁条件。
+
+浏览器只向有界队列提交版本化 typed control intent；唯一 Station 主循环执行
+设备启动、alpha 更新、`app.step()` 和 capture finalize。HTTP 线程没有 action
+payload、authority、dispatch 或 dataset writer 所有权。普通 `--gui` 不带 POST
+能力，`--control-gui` 也必须同时显式提供 `--enable`。旧
+`--acceptance-gui` 仅作为命令行兼容别名。
+
+取消当前操作与退出属于 out-of-band lifecycle intent，不依赖可能已过期的状态
+revision；启动、Home 或恢复运行正在等待时，状态页继续提供缓存的只读 runtime
+投影和实时 VIVE 状态。关闭 MuJoCo 原生窗口会先建立下游 HOLD，再退出 Station
+循环并确认 viewer 原生资源已结束，避免把已关闭窗口留成后台运行的仿真。
+
+当前封存内容是 **ControlTrace core**，覆盖 source、composition、target/reference、
+measurement、difference、HOLD 与 commit 事实；它不是包含相机/触觉/native stream
+的正式 v2.5 数据集。完整传感器数据接入仍需由 collection runtime/writer 绑定，不能
+由 Station 页面自行拼装。
+
+### 3.2 Compose 频率与下游位置控制 profile
 
 Sim-HIL 的最终 compose/authority 频率不是写死在 Station loop 中，而是由
 `--position-control-profile` 与 `--compose-hz` 共同确定：
 
 ```bash
-# 默认：compose/authority 60 Hz，reference/IK 60 Hz，command 120 Hz
+# 默认：compose/authority 30 Hz，policy source 仍按模型配置运行，
+# reference/IK 60 Hz，command 120 Hz
 PYTHONPATH=. python -m control_station sim-hil --help
 
 # 例：保留 policy source 15 Hz，compose 45 Hz；下游仍为 60/60/120
 PYTHONPATH=. python -m control_station sim-hil \
   --position-control-profile position --compose-hz 45 \
-  --enable --left-q6-port ... --right-q6-port ...
+  --enable
 ```
 
 `--rate` 是旧参数的兼容别名，表示同一个 compose 频率；同时提供两个参数时
@@ -126,6 +352,45 @@ Station 配置层不再额外施加 60 Hz 上限；当前 MuJoCo authoritative A
 仍保留既有 `(0, 60]` production gate，因此超过该能力的值会在 target 构建时明确
 拒绝，而不是悄悄改变执行语义。这个 gate 与 source、replay、teleop 和 RTC 的
 输入/worker/reference/backend 频率无关；本次修改只作用于 default-off Sim-HIL。
+
+Sim-HIL 的物理 VIVE jump 门限与正式遥操一致，为 `0.45 m / 160 deg`，不再误用
+通用 fixture 的 `0.10 m / 45 deg` 默认值。若 latest-value consumer 超过
+`0.25 s` 未轮询，下一个有效样本只重建相邻比较基线，不把跨停顿位移误报为
+`translation_jump`；无效、过期和后续相邻 teleport 仍按原 safety monitor 处理。
+
+### 3.3 坐标 profile 与启动 Home
+
+Sim-HIL 不再把一个真机 calibration 文件同时解释成 VIVE 坐标、目标基座和
+robot Home。启动绑定分成：
+
+```text
+ViveCoordinateProfile
+    VIVE world/operator -> station retarget；tracker offsets
+
+TargetFrameProfile
+    exact MuJoCo URDF/scene -> profile-selected arm_base
+
+ToolFrameProfile
+    exact tool artifact -> tool_tcp semantics
+
+SessionAnchorReceipt
+    stored human Home + measured reset-state sim TCP
+```
+
+默认 coordinate profile 位于
+`teleop_records/control_station_vive_coordinate_profiles/`，不包含 `T_D_B`、
+workspace、qpos 或 Home。MuJoCo target 对声明 scripted reset 的任务复用
+task-owned `CubeLiftKernel.reset`；dry-run 会执行这个纯 sim 初始化，但不会启动
+设备、authority、runtime worker 或控制循环。随后从当前 scene 测量选中侧的
+`T_arm_base_tool_tcp`，因此 human 零偏移对应当前 sim TCP，而不是历史真机 Home。
+四层 ID/hash 与选中侧 pose 都进入 receipt，并通过同一个
+`station_retarget_x_forward_y_left_z_up_v1` frame contract 绑定。任一来源、侧别、
+tool frame 或刚体变换不一致都会在 passive source 构造前拒绝。
+
+当前 human Home 仍来自兼容 calibration，receipt 会明确记录为 stored source；
+这不是实时 VIVE recenter。未来真机接入必须用实测 base/tool/当前 TCP 生成新的
+target/tool/session evidence，不能复用 sim receipt，也不能把 URDF 派生结果声明为
+真机测量。
 
 ```text
 build MuJoCo runtime + pose target
@@ -236,6 +501,21 @@ policy source。
 emission seam；模型侧不需要为 RTC 或 Station 增加专用 adapter。需要的只是应用侧
 observation/action representation adapter，并且 adapter 必须保留 checkpoint schema、
 task-config hash、normalizer 和 source lineage。
+
+### 4.3 Policy + human component ControlTrace profile
+
+`deployable_sim_immediate_component_policy_human_composer_v1` 描述当前直接
+policy + human component composition 的正式 trace 拓扑。它要求真实的 policy/human
+emission、component input admission、activation、composition evaluation/disposition、
+component target request/completion/admission、混合前 source difference 和执行 measurement
+alignment；旧 replay emission、旧 Station
+intent/operation/publication barrier 以及旧 composition-session reducer facts 明确为
+not applicable，不能为了 seal 而合成。
+
+该 profile 当前标记为 `planned`：事实投影和外部 `trace_sink` seam 已存在，但本
+Sim-HIL 应用尚未完成 `EpisodeTraceRecorderSink` 的 prepare/bind/release/seal/commit
+联动与完整 fixture，因此不能据此声称已经具备正式 capture eligibility。完成该联动
+并验证完整 lineage 后，才可将状态提升为 `runtime_integrated`。
 
 ## 5. 进入下一阶段前的验收
 

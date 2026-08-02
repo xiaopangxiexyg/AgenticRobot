@@ -1,0 +1,33 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_rm65_bimanual_position_v1_stages",
+  "profile_version": "1",
+  "task_progress_profile_hash": "9af03398ac96f1c0f2a5627ac9d68683c4f0c6192442dedfebe4b0c0f779f361",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "execute_task",
+      "stage_id": "execute_task.approach",
+      "display_name": "接近与对准",
+      "description": "接近目标并建立可执行的末端对准。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "execute_task",
+      "stage_id": "execute_task.manipulate",
+      "display_name": "执行操作",
+      "description": "完成接触、抓取或主要操作过程。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "execute_task",
+      "stage_id": "execute_task.finish",
+      "display_name": "完成与确认",
+      "description": "完成释放、退出并确认任务结果。",
+      "ordinal": 3
+    }
+  ],
+  "semantic_content_hash": "54c75abb1a7deb220e3cc4ae134521dcfe70de7d4090570d470c2908e17bc8ce"
+}

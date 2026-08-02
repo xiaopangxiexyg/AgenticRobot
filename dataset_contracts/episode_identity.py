@@ -22,10 +22,9 @@ EPISODE_CAPTURE_IDENTITY_HASH_DOMAIN_V1 = (
 
 
 def _required(value: object, *, name: str) -> str:
-    text = str(value).strip()
-    if not text:
-        raise ValueError(f"{name} must be non-empty.")
-    return text
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string.")
+    return value.strip()
 
 
 def _safe_episode_uuid(value: object) -> str:
@@ -36,6 +35,8 @@ def _safe_episode_uuid(value: object) -> str:
 
 
 def _finite_time(value: object, *, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric.")
     result = float(value)
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite.")
@@ -59,8 +60,8 @@ class EpisodeCaptureIdentity:
 
     def __post_init__(self) -> None:
         episode_uuid = _safe_episode_uuid(self.episode_uuid)
-        index = int(self.legacy_episode_index)
-        if isinstance(self.legacy_episode_index, bool) or index < 0:
+        index = self.legacy_episode_index
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
             raise ValueError("legacy_episode_index must be a non-negative integer.")
         owner = _required(self.lifecycle_owner_id, name="lifecycle_owner_id")
         prepared_at = _finite_time(self.prepared_at, name="prepared_at")

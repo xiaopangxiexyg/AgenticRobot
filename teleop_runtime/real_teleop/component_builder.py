@@ -24,6 +24,7 @@ from robot_motion.position_control import (
     DEFAULT_POSITION_VELOCITY_RAMP_SEC,
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     normalize_position_command_planner,
 )
 from robot_motion.rm65 import (
@@ -120,6 +121,7 @@ from .control_profile import (
     effective_dual_arm_temporary_safety as _effective_dual_arm_temporary_safety,
     effective_outer_control_hz as _effective_outer_control_hz,
     effective_position_post_ik_qpos_smoothing_alpha as _effective_position_post_ik_qpos_smoothing_alpha,
+    output_qpos_smoothing_singularity_alpha as _output_qpos_smoothing_singularity_alpha,
     position_retargeter_stability_switches as _position_retargeter_stability_switches,
 )
 from .debug_timing import (
@@ -311,11 +313,15 @@ def build_real_teleop_components(
         getattr(args, "position_command_planner", POSITION_COMMAND_PLANNER_LINEAR)
     )
     if (
-        position_command_planner == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        position_command_planner
+        in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }
         and arm_control_mode != "position"
     ):
         raise ValueError(
-            "--position-command-planner acceleration_limited requires position arm control mode."
+            "the selected limited position-command planner requires position arm control mode."
         )
     position_max_command_step_deg = getattr(
         args,
@@ -329,22 +335,34 @@ def build_real_teleop_components(
         )
     if (
         position_max_command_step_deg is not None
-        and position_command_planner != POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        and position_command_planner
+        not in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }
     ):
         raise ValueError(
-            "--position-max-command-step-deg requires "
-            "--position-command-planner acceleration_limited."
+            "--position-max-command-step-deg requires an acceleration/jerk-limited "
+            "position command planner."
         )
     if (
-        position_command_planner == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        position_command_planner
+        in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }
         and not position_background_streaming_enabled
     ):
         raise ValueError(
-            "--position-command-planner acceleration_limited requires the high-rate position "
+            "the selected limited position-command planner requires the high-rate position "
             "background stream; enable the normal position CANFD follow path."
         )
     if (
-        position_command_planner == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        position_command_planner
+        in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }
         and position_background_streaming_hz < outer_control_hz
     ):
         raise ValueError(
@@ -649,6 +667,43 @@ def build_real_teleop_components(
                     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
                 )
             ),
+            "position_sample_aligned_scale_degraded_target": bool(
+                getattr(
+                    args,
+                    "position_sample_aligned_scale_degraded_target",
+                    True,
+                )
+            ),
+            "position_sample_aligned_governor_regularization": {
+                "jerk": float(
+                    getattr(
+                        args,
+                        "position_sample_aligned_jerk_regularization",
+                        1e-9,
+                    )
+                ),
+                "jerk_delta": float(
+                    getattr(
+                        args,
+                        "position_sample_aligned_jerk_delta_regularization",
+                        0.0,
+                    )
+                ),
+                "terminal_velocity": float(
+                    getattr(
+                        args,
+                        "position_sample_aligned_terminal_velocity_regularization",
+                        0.0,
+                    )
+                ),
+                "terminal_acceleration": float(
+                    getattr(
+                        args,
+                        "position_sample_aligned_terminal_acceleration_regularization",
+                        0.0,
+                    )
+                ),
+            },
             "canfd_follow_warning_ratio_effective": float(canfd_follow_warning_ratio),
             "arm_canfd_trajectory_mode": getattr(args, "arm_canfd_trajectory_mode", None),
             "canfd_trajectory_mode_effective": int(canfd_trajectory_mode),
@@ -731,6 +786,45 @@ def build_real_teleop_components(
             "ik_tuning_source": ik_tuning.source_path,
             "ik_objective_mode": ik_tuning.ik_objective_mode,
             "ik_objective_weights": asdict(ik_tuning.objective_weights()),
+            "position_ik_branch_continuity_anchor": {
+                "enabled": bool(
+                    arm_control_mode == "position"
+                    and bool(
+                        getattr(
+                            args,
+                            "position_ik_branch_continuity_anchor",
+                            False,
+                        )
+                    )
+                    and str(
+                        getattr(
+                            args,
+                            "position_ik_step_mode",
+                            "legacy_iterative",
+                        )
+                    )
+                    == "single_step_singularity_aware"
+                ),
+                "cost": 0.5,
+                "joint_weights_per_arm": [0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                "anchor": "previous_admitted_qref",
+            },
+            "position_joint_limit_guard": {
+                "mode": str(
+                    getattr(
+                        args,
+                        "position_joint_limit_guard_mode",
+                        "legacy",
+                    )
+                ),
+                "boundary_margin_deg": float(
+                    getattr(
+                        args,
+                        "position_joint_limit_boundary_margin_deg",
+                        1.5,
+                    )
+                ),
+            },
             "position_ik_orientation_weight_override": getattr(
                 args,
                 "position_ik_orientation_weight",
@@ -890,6 +984,48 @@ def build_real_teleop_components(
                             if arm_control_mode == "position"
                             else "legacy_iterative"
                         ),
+                        # The single-step position path must keep the raw QP
+                        # on the last admitted RM65 structural branch.  This
+                        # is a soft q3/q5 objective only; candidate safety,
+                        # collision checks, execution limits, and dispatch
+                        # ownership remain unchanged.
+                        branch_continuity_anchor_enabled=bool(
+                            arm_control_mode == "position"
+                            and bool(
+                                getattr(
+                                    args,
+                                    "position_ik_branch_continuity_anchor",
+                                    False,
+                                )
+                            )
+                            and str(
+                                getattr(
+                                    args,
+                                    "position_ik_step_mode",
+                                    "legacy_iterative",
+                                )
+                            )
+                            == "single_step_singularity_aware"
+                        ),
+                        branch_continuity_anchor_cost=0.5,
+                        joint_limit_guard_mode=(
+                            str(
+                                getattr(
+                                    args,
+                                    "position_joint_limit_guard_mode",
+                                    "legacy",
+                                )
+                            )
+                            if arm_control_mode == "position"
+                            else "legacy"
+                        ),
+                        joint_limit_boundary_guard_margin_deg=float(
+                            getattr(
+                                args,
+                                "position_joint_limit_boundary_margin_deg",
+                                1.5,
+                            )
+                        ),
                         joint_acceleration_limit_rad_s2=(
                             np.asarray(
                                 getattr(
@@ -1011,16 +1147,17 @@ def build_real_teleop_components(
                         # the normal 0.14 alpha making the guarded wrist feel
                         # latched, while the existing per-cycle joint step and
                         # acceleration limits remain authoritative.
-                        output_qpos_smoothing_singularity_alpha=float(
-                            max(
-                                float(
+                        output_qpos_smoothing_singularity_alpha=(
+                            _output_qpos_smoothing_singularity_alpha(
+                                arm_control_mode,
+                                slow_alpha=position_post_ik_qpos_smoothing_alpha,
+                                fast_alpha=float(
                                     getattr(
                                         args,
                                         "position_post_ik_qpos_smoothing_fast_alpha",
                                         0.45,
                                     )
                                 ),
-                                0.65,
                             )
                         ),
                         # Force control keeps an interior envelope so an
@@ -1109,6 +1246,34 @@ def build_real_teleop_components(
                         inactive_side_hold_execution_release_enabled=(
                             arm_control_mode == "position"
                         ),
+                        inactive_side_hold_execution_release_translation_static_m=float(
+                            getattr(
+                                args,
+                                "position_inactive_execution_release_translation_static_m",
+                                0.03,
+                            )
+                        ),
+                        inactive_side_hold_execution_release_translation_full_m=float(
+                            getattr(
+                                args,
+                                "position_inactive_execution_release_translation_full_m",
+                                0.10,
+                            )
+                        ),
+                        inactive_side_hold_execution_release_rotation_static_deg=float(
+                            getattr(
+                                args,
+                                "position_inactive_execution_release_rotation_static_deg",
+                                5.0,
+                            )
+                        ),
+                        inactive_side_hold_execution_release_rotation_full_deg=float(
+                            getattr(
+                                args,
+                                "position_inactive_execution_release_rotation_full_deg",
+                                30.0,
+                            )
+                        ),
                     ),
                     left_pose_retargeter=left_retargeter,
                     right_pose_retargeter=right_retargeter,
@@ -1179,11 +1344,13 @@ def build_real_teleop_components(
             reader = prepare_reader(
                 config_root=config_root,
                 sample_hz=float(getattr(args, "gripper_angle_trigger_rate_hz", 30.0)),
+                active_sides=tuple(dmtac_active_sides),
             )
             angle_trigger_source = AngleTriggerSource(
                 reader,
                 rate_hz=float(getattr(args, "gripper_angle_trigger_rate_hz", 30.0)),
                 config_root=config_root,
+                active_sides=tuple(dmtac_active_sides),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             if str(getattr(args, "hardware_admission_mode", "strict")) == "strict":
@@ -1447,6 +1614,42 @@ def build_real_teleop_components(
                             args,
                             "position_degraded_speed_scale",
                             DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
+                        )
+                    ),
+                    position_sample_aligned_source_hz=float(args.hz),
+                    position_sample_aligned_scale_degraded_target=bool(
+                        getattr(
+                            args,
+                            "position_sample_aligned_scale_degraded_target",
+                            True,
+                        )
+                    ),
+                    position_sample_aligned_jerk_regularization=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_jerk_regularization",
+                            1e-9,
+                        )
+                    ),
+                    position_sample_aligned_jerk_delta_regularization=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_jerk_delta_regularization",
+                            0.0,
+                        )
+                    ),
+                    position_sample_aligned_terminal_velocity_regularization=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_terminal_velocity_regularization",
+                            0.0,
+                        )
+                    ),
+                    position_sample_aligned_terminal_acceleration_regularization=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_terminal_acceleration_regularization",
+                            0.0,
                         )
                     ),
                     arm_follow_qpos_alpha=float(arm_follow_qpos_alpha),

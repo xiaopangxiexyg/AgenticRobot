@@ -216,7 +216,10 @@ Pose Lift 与 live-human source profile 是两个独立合同。默认
 只读调试入口 `teleop_runtime.debug.view_rm65_pose_lift_sim_replay` 会读取正式数据集中的
 pose action，以所选片段第一帧保存的 accepted `q_ref` 初始化，再通过与 pose replay/deploy
 相同的 `RM65PositionCollisionPlanner` 生成后续 60 Hz qpos。MuJoCo 只显示已经过 planner
-准入的 qpos，不会再次解 IK、修改轨迹或连接设备。
+准入的 qpos，不会再次解 IK、修改轨迹或连接设备。显式的
+`official_source_all_ik_causal_governor_ramp_0p05` 对比项除外：它在打开 MuJoCo 前离线
+生成 source-rate 官方全解、collision-safe causal branch selector、linear joint qref 和
+120 Hz/两 source-step/0.05 s jerk ramp 的 third-order governor 结果；MuJoCo 仍只负责显示。
 
 先查看可用 episode：
 
@@ -248,6 +251,24 @@ python -m teleop_runtime.debug.view_rm65_pose_lift_sim_replay \
   --pause-between-profiles-sec 1 \
   --hold-viewer-at-end
 ```
+
+查看固定的 0727 代表集。每个连续片段都先播放 V4，再播放当前离线整体最优候选；不会跨
+`collection.continuity_segment_index` 插值：
+
+```bash
+conda run -n dexteleop310 python -m \
+  teleop_runtime.debug.view_rm65_pose_lift_sim_replay \
+  --dataset-root remote_data/pose_lift_0727_full_v2 \
+  --representative-suite 0727-v4-vs-official-governor \
+  --fixed-solve-iterations 2 \
+  --speed 0.5 \
+  --pause-between-profiles-sec 2
+```
+
+固定片段为 ep96 `[40,115)`（V4 错误 branch drift）、ep37 `[157,219)`（source action
+本身接近奇异）和 ep68 `[0,163)`（正常响应及动态压力）。终端在每段开始时打印
+`A_V4_BASELINE` 或 `B_CURRENT_BETTER_OFFICIAL_ALL_IK_GOVERNOR`。该对比链路是只读、
+无设备、无 dispatch 的 default-off 研究结果，不会改变 V4 deploy 默认值。
 
 可用 `--start-frame`/`--max-frames` 选择轨迹片段；可调参数包括
 `--posture-cost`、`--damping`、`--orientation-weight`、IK min/max/fixed iterations、

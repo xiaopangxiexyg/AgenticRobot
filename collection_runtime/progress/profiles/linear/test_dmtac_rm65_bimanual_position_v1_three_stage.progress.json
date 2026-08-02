@@ -1,0 +1,43 @@
+{
+  "schema": "dexteleop.task_progress_profile.v1",
+  "profile_id": "test_dmtac_rm65_bimanual_position_v1_three_stage_progress",
+  "profile_version": "1",
+  "task_id": "dmtac_rm65_bimanual_position_v1",
+  "steps": [
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "test_prepare",
+      "semantic_type": "TEST_PREPARE",
+      "display_name": "【测试】阶段 1/3：准备与接近",
+      "ordinal": 1,
+      "allowed_next_step_ids": [
+        "test_manipulate"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "test_manipulate",
+      "semantic_type": "TEST_MANIPULATE",
+      "display_name": "【测试】阶段 2/3：操作与调整",
+      "ordinal": 2,
+      "allowed_next_step_ids": [
+        "test_finish"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "test_finish",
+      "semantic_type": "TEST_FINISH",
+      "display_name": "【测试】阶段 3/3：完成与确认",
+      "ordinal": 3,
+      "allowed_next_step_ids": []
+    }
+  ],
+  "initial_step_id": "test_prepare",
+  "terminal_step_ids": [
+    "test_finish"
+  ],
+  "topology_kind": "LINEAR",
+  "allow_retry_after_failure": true,
+  "semantic_content_hash": "de494ad9c5ab14ec2c4e097c443371b1b8e5aba3af7b5fbcac1aeaf7cb8069f6"
+}

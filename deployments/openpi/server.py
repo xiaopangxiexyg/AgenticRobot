@@ -148,6 +148,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8078)
     parser.add_argument("--record", action="store_true")
     parser.add_argument(
+        "--enable-rtc-continuation",
+        action="store_true",
+        help=(
+            "Explicitly enable the upstream OpenPI conditioned inference "
+            "operation. Disabled by default."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Write the temporary registry and print the server command without starting it.",
@@ -199,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         command.extend(("--default-prompt", args.default_prompt))
     if args.record:
         command.append("--record")
+    if args.enable_rtc_continuation:
+        command.append("--enable-rtc-continuation")
     project_root = Path(__file__).resolve().parents[2]
     runtime_pythonpath = _pythonpath_with_project(
         project_root,

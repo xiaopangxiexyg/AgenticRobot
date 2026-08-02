@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,14 @@ from ...recording import _to_serializable
 from ...registry import register_source
 from ...schemas import ObservationChannel
 from ...collection.video_frame import NearestFrameBuffer, VideoFrame
+
+
+REALSENSE_STARTUP_WARMUP_LEGACY = "legacy"
+REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME = "bounded_first_frame"
+REALSENSE_STARTUP_WARMUP_POLICIES = (
+    REALSENSE_STARTUP_WARMUP_LEGACY,
+    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+)
 
 
 def _load_pyrealsense2():
@@ -64,6 +73,11 @@ class RealSenseRGBCameraConfig:
     startup_reset: bool = True
     startup_reset_sleep_sec: float = 0.2
     startup_warmup_frames: int = 10
+    # ``legacy`` preserves the historical N-frame synchronous warmup and its
+    # hardware-reset retry. ``bounded_first_frame`` waits only for the first
+    # valid frameset within startup_frame_grace_sec; the existing global camera
+    # self-check remains responsible for proving multi-frame freshness.
+    startup_warmup_policy: str = REALSENSE_STARTUP_WARMUP_LEGACY
     startup_hardware_reset: bool = False
     startup_hardware_reset_on_failure: bool = True
     startup_hardware_reset_retry_attempts: int = 1
@@ -111,6 +125,13 @@ class RealSenseRGBCameraConfig:
             raise ValueError("startup_reset_sleep_sec must be >= 0.")
         if int(self.startup_warmup_frames) < 0:
             raise ValueError("startup_warmup_frames must be >= 0.")
+        self.startup_warmup_policy = str(self.startup_warmup_policy).strip().lower()
+        if self.startup_warmup_policy not in REALSENSE_STARTUP_WARMUP_POLICIES:
+            raise ValueError(
+                "startup_warmup_policy must be one of "
+                f"{REALSENSE_STARTUP_WARMUP_POLICIES}; got "
+                f"{self.startup_warmup_policy!r}."
+            )
         if int(self.startup_hardware_reset_retry_attempts) < 0:
             raise ValueError("startup_hardware_reset_retry_attempts must be >= 0.")
         if float(self.startup_hardware_reset_sleep_sec) < 0.0:
@@ -157,6 +178,7 @@ class RealSenseRGBCameraConfig:
                 "startup_reset": bool(self.startup_reset),
                 "startup_reset_sleep_sec": float(self.startup_reset_sleep_sec),
                 "startup_warmup_frames": int(self.startup_warmup_frames),
+                "startup_warmup_policy": self.startup_warmup_policy,
                 "startup_hardware_reset": bool(self.startup_hardware_reset),
                 "startup_hardware_reset_on_failure": bool(self.startup_hardware_reset_on_failure),
                 "startup_hardware_reset_retry_attempts": int(self.startup_hardware_reset_retry_attempts),
@@ -310,7 +332,7 @@ class RealSenseRGBSource(ObservationSource):
                 last_error = exc
                 if (
                     attempt_index + 1 >= attempts
-                    or not self._is_startup_connection_error(str(exc))
+                    or not self._should_hardware_reset_retry_startup_error(str(exc))
                 ):
                     raise
                 with self._lock:
@@ -415,6 +437,12 @@ class RealSenseRGBSource(ObservationSource):
         warmup_frames = int(self.config.startup_warmup_frames)
         if warmup_frames <= 0:
             return
+        if (
+            self.config.startup_warmup_policy
+            == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+        ):
+            self._warmup_pipeline_bounded_first_frame(pipeline, warmup_frames=warmup_frames)
+            return
         timeout_ms = int(self.config.startup_wait_timeout_ms)
         success_count = 0
         failure_count = 0
@@ -440,6 +468,65 @@ class RealSenseRGBSource(ObservationSource):
                 f"no_frames_after={warmup_frames}:startup_timeout_ms={timeout_ms}:"
                 f"last_error={last_error}"
             )
+
+    def _warmup_pipeline_bounded_first_frame(
+        self,
+        pipeline: Any,
+        *,
+        warmup_frames: int,
+    ) -> None:
+        """Wait for one native frame under a single bounded startup budget.
+
+        This is intentionally not the final camera admission check. Real
+        teleop runs its existing cross-camera, consecutive-new-frame self-check
+        after every pipeline has been started. Keeping this wait local and
+        bounded avoids multiplying a 5-second SDK timeout by ten warmup frames.
+        """
+
+        grace_sec = float(self.config.startup_frame_grace_sec)
+        deadline = time.monotonic() + grace_sec
+        configured_timeout_ms = int(self.config.startup_wait_timeout_ms)
+        failure_count = 0
+        last_error: str | None = None
+        # ``warmup_frames`` belongs to the legacy N-frame policy.  It must not
+        # truncate this policy's time budget: stations commonly configure only
+        # two legacy warmup frames while using a 1 s SDK wait and a 5 s bounded
+        # first-frame grace period.  The previous implementation therefore
+        # reported a 5 s budget after actually making only two 1 s attempts.
+        # Bound the number of calls from the grace/timeout pair so mocked or
+        # immediately failing SDK calls cannot spin, while a real blocking SDK
+        # receives the complete configured deadline.
+        del warmup_frames
+        attempt_budget = max(
+            1,
+            int(
+                math.ceil(
+                    (grace_sec * 1000.0) / max(1, configured_timeout_ms)
+                )
+            ),
+        )
+        for _ in range(attempt_budget):
+            if self._shutdown_event.is_set():
+                raise RuntimeError("startup_cancelled:shutdown_requested")
+            remaining_sec = deadline - time.monotonic()
+            if remaining_sec <= 0.0:
+                break
+            timeout_ms = max(
+                1,
+                min(configured_timeout_ms, int(remaining_sec * 1000.0)),
+            )
+            try:
+                pipeline.wait_for_frames(timeout_ms=timeout_ms)
+                return
+            except Exception as exc:  # noqa: BLE001
+                failure_count += 1
+                last_error = f"{type(exc).__name__}: {exc}"
+        raise RuntimeError(
+            "startup_warmup_failed:"
+            "policy=bounded_first_frame:"
+            f"no_frames_within_sec={grace_sec:.3f}:"
+            f"attempts={failure_count}:last_error={last_error}"
+        )
 
     def _hardware_reset_device_if_requested(self, rs: Any, *, reason: str) -> None:
         if not bool(self.config.startup_hardware_reset):
@@ -524,6 +611,19 @@ class RealSenseRGBSource(ObservationSource):
             )
         )
 
+    def _should_hardware_reset_retry_startup_error(self, message: str) -> bool:
+        # A missing first frame is deliberately fail-fast in the opt-in
+        # bounded policy. Hardware reset adds reset/re-enumeration latency and
+        # has historically destabilized sibling cameras. Explicit device,
+        # USB, UVC, or exclusive-access failures still use the legacy retry.
+        if (
+            self.config.startup_warmup_policy
+            == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+            and "startup_warmup_failed" in str(message).lower()
+        ):
+            return False
+        return self._is_startup_connection_error(message)
+
     def _configure_depth_state(self, rs: Any, profile: Any) -> None:
         if not bool(self.config.enable_depth):
             self._depth_align = None
@@ -579,6 +679,7 @@ class RealSenseRGBSource(ObservationSource):
             "startup_reset": bool(self.config.startup_reset),
             "startup_reset_sleep_sec": float(self.config.startup_reset_sleep_sec),
             "startup_warmup_frames": int(self.config.startup_warmup_frames),
+            "startup_warmup_policy": self.config.startup_warmup_policy,
             "startup_hardware_reset": bool(self.config.startup_hardware_reset),
             "startup_hardware_reset_on_failure": bool(self.config.startup_hardware_reset_on_failure),
             "startup_hardware_reset_retry_attempts": int(self.config.startup_hardware_reset_retry_attempts),

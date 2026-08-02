@@ -205,6 +205,7 @@ class RtcContinuationCapability:
     prefix_requirement: str = RTC_PREFIX_FORBIDDEN
     supports_prefix_mask: bool = False
     supports_conditioning_receipt: bool = False
+    arm_hold_output_contract_hash: str | None = None
 
     def __post_init__(self) -> None:
         continuation = _nonempty(self.continuation_mode, name="continuation_mode")
@@ -289,31 +290,50 @@ class RtcContinuationCapability:
             "supports_conditioning_receipt",
             bool(self.supports_conditioning_receipt),
         )
+        if self.arm_hold_output_contract_hash is not None:
+            if continuation != RTC_CONTINUATION_NONE:
+                raise ValueError(
+                    "Arm-hold output is supported only by raw RTC "
+                    "continuation 'none'."
+                )
+            object.__setattr__(
+                self,
+                "arm_hold_output_contract_hash",
+                _nonempty(
+                    self.arm_hold_output_contract_hash,
+                    name="arm_hold_output_contract_hash",
+                ),
+            )
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "continuation_mode": self.continuation_mode,
+            "implementation_id": self.implementation_id,
+            "implementation_parameters_hash": self.implementation_parameters_hash,
+            "model_action_space": self.model_action_space,
+            "model_action_dim": self.model_action_dim,
+            "model_action_discrete_dim": self.model_action_discrete_dim,
+            "supported_action_pose_modes": self.supported_action_pose_modes,
+            "component_scope": self.component_scope,
+            "action_codec_hash": self.action_codec_hash,
+            "frame_contract_hash": self.frame_contract_hash,
+            "layout_hash": self.layout_hash,
+            "normalization_hash": self.normalization_hash,
+            "minimum_prediction_horizon_steps": self.minimum_prediction_horizon_steps,
+            "maximum_prediction_horizon_steps": self.maximum_prediction_horizon_steps,
+            "minimum_execution_horizon_steps": self.minimum_execution_horizon_steps,
+            "maximum_execution_horizon_steps": self.maximum_execution_horizon_steps,
+            "prefix_requirement": self.prefix_requirement,
+            "supports_prefix_mask": self.supports_prefix_mask,
+            "supports_conditioning_receipt": self.supports_conditioning_receipt,
+        }
+        if self.arm_hold_output_contract_hash is not None:
+            payload["arm_hold_output_contract_hash"] = (
+                self.arm_hold_output_contract_hash
+            )
         return canonical_content_hash(
-            {
-                "continuation_mode": self.continuation_mode,
-                "implementation_id": self.implementation_id,
-                "implementation_parameters_hash": self.implementation_parameters_hash,
-                "model_action_space": self.model_action_space,
-                "model_action_dim": self.model_action_dim,
-                "model_action_discrete_dim": self.model_action_discrete_dim,
-                "supported_action_pose_modes": self.supported_action_pose_modes,
-                "component_scope": self.component_scope,
-                "action_codec_hash": self.action_codec_hash,
-                "frame_contract_hash": self.frame_contract_hash,
-                "layout_hash": self.layout_hash,
-                "normalization_hash": self.normalization_hash,
-                "minimum_prediction_horizon_steps": self.minimum_prediction_horizon_steps,
-                "maximum_prediction_horizon_steps": self.maximum_prediction_horizon_steps,
-                "minimum_execution_horizon_steps": self.minimum_execution_horizon_steps,
-                "maximum_execution_horizon_steps": self.maximum_execution_horizon_steps,
-                "prefix_requirement": self.prefix_requirement,
-                "supports_prefix_mask": self.supports_prefix_mask,
-                "supports_conditioning_receipt": self.supports_conditioning_receipt,
-            },
+            payload,
             domain=RTC_CONTINUATION_CAPABILITY_HASH_DOMAIN_V2,
         )
 
@@ -398,6 +418,7 @@ class RtcProtocolRequestSpec:
     require_prefix_mask: bool = False
     require_conditioning_receipt: bool = False
     protocol_version: str = RTC_PROTOCOL_V2
+    arm_hold_output_contract_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, RtcProtocolMode):
@@ -454,28 +475,47 @@ class RtcProtocolRequestSpec:
                 raise ValueError("Continuation 'none' cannot require prefix semantics.")
         elif not self.require_conditioning_receipt:
             raise ValueError("Every continuation request must require a conditioning receipt.")
+        if self.arm_hold_output_contract_hash is not None:
+            if self.mode.continuation_mode != RTC_CONTINUATION_NONE:
+                raise ValueError(
+                    "Arm-hold output is supported only by raw RTC "
+                    "continuation 'none'."
+                )
+            object.__setattr__(
+                self,
+                "arm_hold_output_contract_hash",
+                _nonempty(
+                    self.arm_hold_output_contract_hash,
+                    name="arm_hold_output_contract_hash",
+                ),
+            )
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "mode_hash": self.mode.semantic_content_hash,
+            "artifact_hash": self.artifact_hash,
+            "model_action_space": self.model_action_space,
+            "model_action_dim": self.model_action_dim,
+            "model_action_discrete_dim": self.model_action_discrete_dim,
+            "action_pose_mode": self.action_pose_mode,
+            "component_scope": self.component_scope,
+            "action_codec_hash": self.action_codec_hash,
+            "frame_contract_hash": self.frame_contract_hash,
+            "layout_hash": self.layout_hash,
+            "normalization_hash": self.normalization_hash,
+            "prediction_horizon_steps": self.prediction_horizon_steps,
+            "minimum_execution_horizon_steps": self.minimum_execution_horizon_steps,
+            "require_prefix_mask": self.require_prefix_mask,
+            "require_conditioning_receipt": self.require_conditioning_receipt,
+            "protocol_version": self.protocol_version,
+        }
+        if self.arm_hold_output_contract_hash is not None:
+            payload["arm_hold_output_contract_hash"] = (
+                self.arm_hold_output_contract_hash
+            )
         return canonical_content_hash(
-            {
-                "mode_hash": self.mode.semantic_content_hash,
-                "artifact_hash": self.artifact_hash,
-                "model_action_space": self.model_action_space,
-                "model_action_dim": self.model_action_dim,
-                "model_action_discrete_dim": self.model_action_discrete_dim,
-                "action_pose_mode": self.action_pose_mode,
-                "component_scope": self.component_scope,
-                "action_codec_hash": self.action_codec_hash,
-                "frame_contract_hash": self.frame_contract_hash,
-                "layout_hash": self.layout_hash,
-                "normalization_hash": self.normalization_hash,
-                "prediction_horizon_steps": self.prediction_horizon_steps,
-                "minimum_execution_horizon_steps": self.minimum_execution_horizon_steps,
-                "require_prefix_mask": self.require_prefix_mask,
-                "require_conditioning_receipt": self.require_conditioning_receipt,
-                "protocol_version": self.protocol_version,
-            },
+            payload,
             domain=RTC_PROTOCOL_REQUEST_SPEC_HASH_DOMAIN_V2,
         )
 
@@ -558,6 +598,11 @@ def negotiate_rtc_capability(
         ):
             if getattr(selected, name) != getattr(request, name):
                 reasons.append(f"{name}_mismatch")
+        if (
+            selected.arm_hold_output_contract_hash
+            != request.arm_hold_output_contract_hash
+        ):
+            reasons.append("arm_hold_output_contract_hash_mismatch")
         if not (
             selected.minimum_prediction_horizon_steps
             <= request.prediction_horizon_steps
@@ -877,6 +922,8 @@ class RtcModelResponseEnvelopeV2:
     result_received_at: float
     model_space_discrete_actions: np.ndarray | None = None
     conditioning_receipt: RtcConditioningReceiptV2 | None = None
+    arm_hold_probabilities: np.ndarray | None = None
+    arm_hold_output_contract_hash: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -911,6 +958,45 @@ class RtcModelResponseEnvelopeV2:
                 horizon=actions.shape[0],
             ),
         )
+        if (self.arm_hold_probabilities is None) != (
+            self.arm_hold_output_contract_hash is None
+        ):
+            raise ValueError(
+                "arm_hold_probabilities and "
+                "arm_hold_output_contract_hash must be supplied together."
+            )
+        if self.arm_hold_probabilities is not None:
+            probabilities = np.asarray(
+                self.arm_hold_probabilities,
+                dtype=np.float32,
+            ).copy()
+            expected_shape = (actions.shape[0], 2)
+            if probabilities.shape != expected_shape:
+                raise ValueError(
+                    "arm_hold_probabilities must have shape "
+                    f"{expected_shape}, got {probabilities.shape}."
+                )
+            if (
+                np.any(~np.isfinite(probabilities))
+                or np.any(probabilities < 0.0)
+                or np.any(probabilities > 1.0)
+            ):
+                raise ValueError(
+                    "arm_hold_probabilities must contain probabilities in [0, 1]."
+                )
+            object.__setattr__(
+                self,
+                "arm_hold_probabilities",
+                deep_freeze(probabilities),
+            )
+            object.__setattr__(
+                self,
+                "arm_hold_output_contract_hash",
+                _nonempty(
+                    self.arm_hold_output_contract_hash or "",
+                    name="arm_hold_output_contract_hash",
+                ),
+            )
         object.__setattr__(
             self,
             "effective_delay_steps",
@@ -942,32 +1028,38 @@ class RtcModelResponseEnvelopeV2:
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "envelope_hash": self.envelope_hash,
+            "request_id": self.request_id,
+            "request_hash": self.request_hash,
+            "model_input_hash": self.model_input_hash,
+            "capability_hash": self.capability_hash,
+            "selected_continuation_hash": self.selected_continuation_hash,
+            "protocol_version": self.protocol_version,
+            "scheduler_mode": self.scheduler_mode,
+            "continuation_mode": self.continuation_mode,
+            "artifact_hash": self.artifact_hash,
+            "action_codec_hash": self.action_codec_hash,
+            "frame_contract_hash": self.frame_contract_hash,
+            "layout_hash": self.layout_hash,
+            "normalization_hash": self.normalization_hash,
+            "model_output_id": self.model_output_id,
+            "model_space_actions": self.model_space_actions,
+            "model_space_discrete_actions": self.model_space_discrete_actions,
+            "effective_delay_steps": self.effective_delay_steps,
+            "execution_horizon_steps": self.execution_horizon_steps,
+            "inference_started_at": self.inference_started_at,
+            "inference_completed_at": self.inference_completed_at,
+            "result_received_at": self.result_received_at,
+            "conditioning_receipt_hash": self.conditioning_receipt_hash,
+        }
+        if self.arm_hold_probabilities is not None:
+            payload["arm_hold_probabilities"] = self.arm_hold_probabilities
+            payload["arm_hold_output_contract_hash"] = (
+                self.arm_hold_output_contract_hash
+            )
         return canonical_content_hash(
-            {
-                "envelope_hash": self.envelope_hash,
-                "request_id": self.request_id,
-                "request_hash": self.request_hash,
-                "model_input_hash": self.model_input_hash,
-                "capability_hash": self.capability_hash,
-                "selected_continuation_hash": self.selected_continuation_hash,
-                "protocol_version": self.protocol_version,
-                "scheduler_mode": self.scheduler_mode,
-                "continuation_mode": self.continuation_mode,
-                "artifact_hash": self.artifact_hash,
-                "action_codec_hash": self.action_codec_hash,
-                "frame_contract_hash": self.frame_contract_hash,
-                "layout_hash": self.layout_hash,
-                "normalization_hash": self.normalization_hash,
-                "model_output_id": self.model_output_id,
-                "model_space_actions": self.model_space_actions,
-                "model_space_discrete_actions": self.model_space_discrete_actions,
-                "effective_delay_steps": self.effective_delay_steps,
-                "execution_horizon_steps": self.execution_horizon_steps,
-                "inference_started_at": self.inference_started_at,
-                "inference_completed_at": self.inference_completed_at,
-                "result_received_at": self.result_received_at,
-                "conditioning_receipt_hash": self.conditioning_receipt_hash,
-            },
+            payload,
             domain=RTC_MODEL_RESPONSE_HASH_DOMAIN_V2,
         )
 
@@ -1048,6 +1140,14 @@ def validate_rtc_model_response(
         reasons.append("execution_horizon_exceeded")
     if response.effective_delay_steps != request.forecast_delay_steps:
         reasons.append("effective_delay_mismatch")
+    if response.arm_hold_output_contract_hash != (
+        spec.arm_hold_output_contract_hash
+    ):
+        reasons.append("arm_hold_output_contract_hash_mismatch")
+    if (response.arm_hold_probabilities is None) != (
+        spec.arm_hold_output_contract_hash is None
+    ):
+        reasons.append("arm_hold_output_presence_mismatch")
     receipt = response.conditioning_receipt
     if spec.mode.continuation_mode == RTC_CONTINUATION_NONE:
         if receipt is not None:
@@ -1056,7 +1156,7 @@ def validate_rtc_model_response(
         reasons.append("missing_conditioning_receipt")
     else:
         prefix = request.conditioning_prefix
-        receipt_expected = {
+        receipt_expected: dict[str, object] = {
             "envelope_hash": envelope.semantic_content_hash,
             "request_hash": request.semantic_content_hash,
             "capability_hash": capability.semantic_content_hash,
@@ -1072,8 +1172,8 @@ def validate_rtc_model_response(
             receipt_expected["implementation_parameters_hash"] = (
                 selected.implementation_parameters_hash
             )
-        for name, value in receipt_expected.items():
-            if getattr(receipt, name) != value:
+        for name, receipt_value in receipt_expected.items():
+            if getattr(receipt, name) != receipt_value:
                 reasons.append(f"conditioning_{name}_mismatch")
         if prefix is not None and receipt.effective_prefix_steps > prefix.valid_steps:
             reasons.append("conditioning_prefix_steps_exceeded")

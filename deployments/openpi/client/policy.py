@@ -247,6 +247,16 @@ class OpenPIClientPolicy:
             required_camera_slots=self.config.required_camera_slots,
             hand_layout=self.config.hand_layout,
             normalization_hash=normalization_hash,
+            arm_hold_output_key=(
+                None
+                if artifact is None or artifact.arm_hold_output is None
+                else artifact.arm_hold_output.output_key
+            ),
+            arm_hold_output_contract_hash=(
+                None
+                if artifact is None or artifact.arm_hold_output is None
+                else artifact.arm_hold_output.contract_hash
+            ),
         )
         if remote_policy is None:
             observation_config = OpenPIObservationAdapterConfig(
@@ -279,6 +289,9 @@ class OpenPIClientPolicy:
                     action_discrete_dim=self.config.action_discrete_dim,
                     contract=contract,
                     source="openpi_remote_policy",
+                    arm_hold_output=(
+                        None if artifact is None else artifact.arm_hold_output
+                    ),
                 ),
             )
         else:
@@ -346,6 +359,56 @@ class OpenPIClientPolicy:
                 minimum_execution_horizon_steps=minimum_execution_horizon_steps,
                 prompt=self.config.prompt,
                 result_action_representation=result_action_representation,
+            ),
+        )
+
+    def create_model_rtc_adapter(
+        self,
+        *,
+        frame_contract_hash: str,
+        normalization_hash: str,
+        active_sides: tuple[str, ...] | list[str] | None = None,
+        action_pose_mode: str = "absolute",
+        minimum_execution_horizon_steps: int = 1,
+    ):
+        """Wrap this loaded OpenPI client in the conditioned RTC v3 seam.
+
+        This is an additive wrapper around ``create_raw_rtc_adapter``.  It
+        creates no second transport, worker, plan, safety or dispatch owner.
+        """
+
+        from robot_motion.deploy.rtc import (
+            RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1,
+        )
+
+        from .rtc_conditioned import (
+            OpenPIConditionedRtcBackendV3,
+            OpenPIConditionedRtcConfig,
+        )
+
+        artifact = self.config.policy_artifact
+        if artifact is None or artifact.model_continuation is None:
+            raise ValueError(
+                "OpenPI model-RTC requires an artifact-bound continuation "
+                "contract."
+            )
+        base_backend = self.create_raw_rtc_adapter(
+            frame_contract_hash=frame_contract_hash,
+            normalization_hash=normalization_hash,
+            active_sides=active_sides,
+            action_pose_mode=action_pose_mode,
+            minimum_execution_horizon_steps=(
+                minimum_execution_horizon_steps
+            ),
+            result_action_representation="typed_canonical_v1",
+        )
+        return OpenPIConditionedRtcBackendV3(
+            base_backend=base_backend,
+            config=OpenPIConditionedRtcConfig.from_artifact(
+                artifact,
+                selected_prefix_schedule=(
+                    RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
+                ),
             ),
         )
 

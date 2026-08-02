@@ -15,11 +15,11 @@ from robot_motion.action import ComponentAction, ComponentActionSchema
 
 from .sample_assembler import CollectorSample
 from .schema_v22 import extract_collector_policy_io_component_values
-from .v25p_component_action import attach_projected_component_action_timing
-from .v25p_native_store import V25pComponentInput
-from .v25p_producer import (
-    V25pProducedSample,
-    V25pProducerBindings,
+from collection_runtime.component_capture import (
+    ComponentStreamBindings,
+    ComponentStreamInput,
+    ProducedComponentSample,
+    attach_projected_component_action_timing,
     validate_produced_values,
     validate_producer_bindings,
 )
@@ -33,7 +33,7 @@ class RealTeleopV25pProducer:
         *,
         layout: PolicyIOLayout,
         stream_profile: V25pComponentStreamProfileLike,
-        bindings: V25pProducerBindings,
+        bindings: ComponentStreamBindings,
         component_action_schema: ComponentActionSchema | None = None,
         component_action_projection: ComponentActionProjectionSpec | None = None,
         clock_domain_id: str = "local_wall_time",
@@ -77,14 +77,14 @@ class RealTeleopV25pProducer:
         ):
             raise ValueError("RealTeleop ComponentAction/profile binding mismatch.")
 
-    def produce(self, sample: CollectorSample) -> V25pProducedSample:
+    def produce(self, sample: CollectorSample) -> ProducedComponentSample:
         timestamp = float(sample.timestamp)
         source = extract_collector_policy_io_component_values(
             sample,
             layout=self.layout,
             strict=self.strict,
         )
-        inputs: dict[str, V25pComponentInput] = {}
+        inputs: dict[str, ComponentStreamInput] = {}
         if isinstance(self.stream_profile, V25pComponentStreamProfileV2):
             assert self.component_action_schema is not None
             assert self.component_action_projection is not None
@@ -123,7 +123,7 @@ class RealTeleopV25pProducer:
                 )
             if stream_id in inputs:
                 continue
-            inputs[stream_id] = V25pComponentInput(
+            inputs[stream_id] = ComponentStreamInput(
                 values=source[value_key],
                 effective_at=timestamp,
                 available_at=timestamp,
@@ -134,7 +134,7 @@ class RealTeleopV25pProducer:
                     f"{int(sample.frame_index)}:{value_key}"
                 ),
             )
-        produced = V25pProducedSample(
+        produced = ProducedComponentSample(
             sample_index=int(sample.frame_index),
             cut_at=timestamp,
             cut_clock_domain_id=self.clock_domain_id,

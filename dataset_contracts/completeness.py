@@ -223,6 +223,89 @@ _AUTHORITATIVE_POLICY_SOURCE_REQUIRED = frozenset(
         "source_validation",
     }
 )
+_DIRECT_COMPONENT_COMPOSITION_REQUIRED = frozenset(
+    {
+        "composition_activation_scope",
+        "composition_activation_binding",
+        "composition_input_admission",
+        "action_payload_schema",
+        "component_action_schema",
+        "composition_spec",
+        "composition_temporal_selection_spec",
+        "component_composition_rule_set",
+        "formal_component_composition_binding",
+        "composition_contributor_input",
+        "composition_input_snapshot",
+        "formal_composition_strategy_spec",
+        "formal_composition_strategy_input",
+        "composition_evaluation",
+        "formal_composition_strategy_result_binding",
+        "composition_authority_disposition",
+        "conservative_compound_authority_profile",
+        "source_difference_spec",
+        "source_difference_observation",
+    }
+)
+_DIRECT_COMPONENT_HOT_COMPOSITION_REQUIRED = frozenset(
+    (
+        _DIRECT_COMPONENT_COMPOSITION_REQUIRED
+        - {"formal_composition_strategy_input"}
+    )
+    | {
+        "composition_dynamic_parameter_contract",
+        "composition_strategy_revision",
+        "composition_dynamic_parameter_snapshot",
+        "composition_strategy_control_binding",
+        "hot_composition_strategy_input",
+    }
+)
+_IMMEDIATE_COMPONENT_EXECUTION_EVENT_TYPES = frozenset(
+    {
+        "target_execution_request",
+        "target_execution_submission",
+        "target_execution_completion",
+        "component_execution_target",
+        "component_execution_target_admission",
+    }
+)
+_SCHEDULED_COMPONENT_EXECUTION_EVENT_TYPES = (
+    _IMMEDIATE_COMPONENT_EXECUTION_EVENT_TYPES
+    | {
+        "component_execution_target_activation",
+        "reference_receiver_validation",
+        "reference_segment",
+        "reference_segment_admission",
+        "group_generation_reservation",
+        "reference_segment_terminal",
+    }
+)
+_DIRECT_COMPONENT_COMPOSITION_LEGACY_NOT_APPLICABLE = frozenset(
+    {
+        "station_run_manifest",
+        "station_intent_transition",
+        "station_operation_transition",
+        "station_publication_barrier_transition",
+        "composition_session_spec",
+        "composition_session_rearm_spec",
+        "composition_session_rearm_receipt",
+        "composition_session_transition",
+        "replay_action_record",
+        "replay_source_frame_emission",
+        "legacy_replay_contract_derivation",
+        "replay_source_action_contract",
+        "replay_binding_assessment",
+        "replay_source_adapter_receipt",
+        "replay_execution_authorization",
+    }
+)
+_DIRECT_COMPONENT_COMPOSITION_LINEAGE_POLICIES = frozenset(
+    {
+        "authoritative_immediate_component_policy_human_"
+        "composition_lineage_v1",
+        "authoritative_scheduled_component_policy_human_"
+        "composition_lineage_v1",
+    }
+)
 _SCHEDULED_REFERENCE_EVENT_TYPES = frozenset(
     {
         "reference_receiver_validation",
@@ -648,6 +731,66 @@ TRACE_REQUIREMENT_PROFILES_V1: Mapping[str, TraceRequirementProfile] = MappingPr
                 profile_scope="formal_capture",
                 implementation_status="runtime_integrated",
             ),
+            _profile(
+                "deployable_sim_immediate_component_policy_human_composer_v1",
+                "deployable_sim_immediate_component_policy_human_composer",
+                required=(
+                    _AUTHORITATIVE_SIM_CORE_REQUIRED
+                    | _IMMEDIATE_COMPONENT_EXECUTION_EVENT_TYPES
+                    | _DIRECT_COMPONENT_HOT_COMPOSITION_REQUIRED
+                    | _AUTHORITATIVE_POLICY_SOURCE_REQUIRED
+                    | _AUTHORITATIVE_HUMAN_SOURCE_REQUIRED
+                    | {
+                        "execution_gate_event",
+                        "execution_cancellation",
+                        "execution_cancellation_ack",
+                    }
+                ),
+                not_applicable=(
+                    _AUTHORITATIVE_NOT_APPLICABLE
+                    | _DIRECT_COMPONENT_COMPOSITION_LEGACY_NOT_APPLICABLE
+                    | _SCHEDULED_REFERENCE_EVENT_TYPES
+                    | {"component_execution_target_activation"}
+                ),
+                receipt_policy="required",
+                measurement_policy="required",
+                writer_failure_behavior="mark_uncommitted_continue",
+                lineage_policy_id=(
+                    "authoritative_immediate_component_policy_human_"
+                    "composition_lineage_v1"
+                ),
+                profile_scope="formal_capture",
+                implementation_status="runtime_integrated",
+            ),
+            _profile(
+                "deployable_sim_scheduled_component_policy_human_composer_v1",
+                "deployable_sim_scheduled_component_policy_human_composer",
+                required=(
+                    _AUTHORITATIVE_SIM_CORE_REQUIRED
+                    | _SCHEDULED_COMPONENT_EXECUTION_EVENT_TYPES
+                    | _DIRECT_COMPONENT_HOT_COMPOSITION_REQUIRED
+                    | _AUTHORITATIVE_POLICY_SOURCE_REQUIRED
+                    | _AUTHORITATIVE_HUMAN_SOURCE_REQUIRED
+                    | {
+                        "execution_gate_event",
+                        "execution_cancellation",
+                        "execution_cancellation_ack",
+                    }
+                ),
+                not_applicable=(
+                    _AUTHORITATIVE_NOT_APPLICABLE
+                    | _DIRECT_COMPONENT_COMPOSITION_LEGACY_NOT_APPLICABLE
+                ),
+                receipt_policy="required",
+                measurement_policy="required",
+                writer_failure_behavior="mark_uncommitted_continue",
+                lineage_policy_id=(
+                    "authoritative_scheduled_component_policy_human_"
+                    "composition_lineage_v1"
+                ),
+                profile_scope="formal_capture",
+                implementation_status="runtime_integrated",
+            ),
         )
     }
 )
@@ -1035,6 +1178,36 @@ def evaluate_control_trace_lineage(
         event_type="action_adaptation_receipt",
         payload_key="receipt_id",
     )
+    target_execution_request_by_id = _payload_index(
+        ordered,
+        event_type="target_execution_request",
+        payload_key="request_id",
+    )
+    target_execution_submission_by_request_id = _payload_index(
+        ordered,
+        event_type="target_execution_submission",
+        payload_key="target_execution_request_id",
+    )
+    target_execution_completion_by_request_id = _payload_index(
+        ordered,
+        event_type="target_execution_completion",
+        payload_key="target_execution_request_id",
+    )
+    component_execution_target_by_request_id = _payload_index(
+        ordered,
+        event_type="component_execution_target",
+        payload_key="target_execution_request_id",
+    )
+    component_execution_target_admission_by_target_id = _payload_index(
+        ordered,
+        event_type="component_execution_target_admission",
+        payload_key="target_id",
+    )
+    component_execution_target_activation_by_target_id = _payload_index(
+        ordered,
+        event_type="component_execution_target_activation",
+        payload_key="target_id",
+    )
     adaptation_protocol_active = bool(
         action_adaptation_request_by_id
         or action_adaptation_receipt_by_id
@@ -1075,6 +1248,15 @@ def evaluate_control_trace_lineage(
         event_type="composition_input",
         payload_key="composition_input_id",
     )
+    composition_input_admission_by_input_id = _payload_index(
+        ordered,
+        event_type="composition_input_admission",
+        payload_key="composition_input_id",
+    )
+    composition_contributor_input_by_source_fact_id: dict[
+        str,
+        list[ControlTraceFact],
+    ] = {}
     composition_spec_by_hash = _payload_index(
         ordered,
         event_type="composition_spec",
@@ -1119,6 +1301,12 @@ def evaluate_control_trace_lineage(
             *composition_input_by_id.get(input_id, ()),
             *facts,
         )
+        for contributor in facts:
+            for source_fact_id in contributor.payload["source_fact_ids"]:
+                composition_contributor_input_by_source_fact_id.setdefault(
+                    str(source_fact_id),
+                    [],
+                ).append(contributor)
     composition_snapshot_by_id = _payload_index(
         ordered,
         event_type="composition_input_snapshot",
@@ -1861,7 +2049,11 @@ def evaluate_control_trace_lineage(
         elif fact.event_type == "composition_activation_scope":
             operation_spec_id = str(payload["operation_spec_id"])
             specs = composition_session_spec_by_id.get(operation_spec_id, ())
-            if (
+            direct_component_activation = (
+                profile.lineage_policy_id
+                in _DIRECT_COMPONENT_COMPOSITION_LINEAGE_POLICIES
+            )
+            if not direct_component_activation and (
                 len(specs) != 1
                 or specs[0].payload["semantic_content_hash"]
                 != payload["operation_spec_hash"]
@@ -3081,6 +3273,54 @@ def evaluate_control_trace_lineage(
                     "An emission needs an admission receipt or typed shadow status.",
                 )
 
+    if profile.lineage_policy_id == (
+        "authoritative_scheduled_component_policy_human_"
+        "composition_lineage_v1"
+    ):
+        for fact in ordered:
+            if fact.event_type != "policy_action_emission":
+                continue
+            emission_id = str(fact.payload["emission_id"])
+            validations = validation_by_emission.get(emission_id, ())
+            if len(validations) != 1:
+                issue(
+                    "policy_component_emission_missing_source_validation",
+                    fact.fact_id,
+                    "Each policy contributor emission must have exactly one "
+                    "source-validation fact.",
+                )
+            contributor_inputs = tuple(
+                composition_contributor_input_by_source_fact_id.get(
+                    emission_id,
+                    (),
+                )
+            )
+            if len(contributor_inputs) != 1:
+                issue(
+                    "policy_component_emission_missing_input",
+                    fact.fact_id,
+                    "Each accepted policy contributor emission must resolve "
+                    "to exactly one composition contributor input.",
+                    *(item.fact_id for item in contributor_inputs),
+                )
+                continue
+            input_id = str(
+                contributor_inputs[0].payload["composition_input_id"]
+            )
+            admissions = tuple(
+                composition_input_admission_by_input_id.get(input_id, ())
+            )
+            if len(admissions) != 1 or not bool(
+                admissions[0].payload["accepted"]
+            ):
+                issue(
+                    "policy_component_input_missing_admission",
+                    contributor_inputs[0].fact_id,
+                    "A policy contributor input needs one accepted "
+                    "composition admission receipt.",
+                    *(item.fact_id for item in admissions),
+                )
+
     if profile.lineage_policy_id in {
         "human_shadow_lineage_v1",
         "authoritative_scheduled_qpos_human_replay_handoff_lineage_v1",
@@ -3121,6 +3361,77 @@ def evaluate_control_trace_lineage(
                     "human_emission_missing_outcome",
                     fact.fact_id,
                     "A human emission needs an admission receipt or typed shadow status.",
+                )
+
+    if profile.lineage_policy_id == (
+        "authoritative_scheduled_component_policy_human_"
+        "composition_lineage_v1"
+    ):
+        receipt_by_emission = _payload_index(
+            ordered,
+            event_type="source_adapter_receipt",
+            payload_key="source_emission_id",
+        )
+        for fact in ordered:
+            if fact.event_type != "human_command_emission":
+                continue
+            emission_id = str(fact.payload["source_emission_id"])
+            receipts = tuple(receipt_by_emission.get(emission_id, ()))
+            if len(receipts) != 1:
+                issue(
+                    "human_component_emission_missing_source_receipt",
+                    fact.fact_id,
+                    "Each human contributor emission must resolve exactly one "
+                    "source-adapter receipt.",
+                    *(item.fact_id for item in receipts),
+                )
+            validations = tuple(validation_by_emission.get(emission_id, ()))
+            if len(validations) != 1:
+                issue(
+                    "human_component_emission_missing_source_validation",
+                    fact.fact_id,
+                    "Each human contributor emission must have exactly one "
+                    "source-validation fact.",
+                    *(item.fact_id for item in validations),
+                )
+            output_action_present = bool(
+                len(receipts) == 1
+                and receipts[0].payload["output_action_semantic_hash"]
+                is not None
+            )
+            contributor_inputs = tuple(
+                composition_contributor_input_by_source_fact_id.get(
+                    emission_id,
+                    (),
+                )
+            )
+            expected_input_count = 1 if output_action_present else 0
+            if len(contributor_inputs) != expected_input_count:
+                issue(
+                    "human_component_emission_input_count_mismatch",
+                    fact.fact_id,
+                    "A human emission contributes exactly when its adapter "
+                    "receipt contains an output action.",
+                    *(item.fact_id for item in contributor_inputs),
+                )
+                continue
+            if not contributor_inputs:
+                continue
+            input_id = str(
+                contributor_inputs[0].payload["composition_input_id"]
+            )
+            admissions = tuple(
+                composition_input_admission_by_input_id.get(input_id, ())
+            )
+            if len(admissions) != 1 or not bool(
+                admissions[0].payload["accepted"]
+            ):
+                issue(
+                    "human_component_input_missing_admission",
+                    contributor_inputs[0].fact_id,
+                    "A human contributor input needs one accepted "
+                    "composition admission receipt.",
+                    *(item.fact_id for item in admissions),
                 )
 
     if profile.lineage_policy_id in {
@@ -3212,6 +3523,209 @@ def evaluate_control_trace_lineage(
                     computations[0].fact_id,
                     "Each shadow computation needs exactly one evaluation.",
                 )
+
+    if (
+        profile.lineage_policy_id
+        in _DIRECT_COMPONENT_COMPOSITION_LINEAGE_POLICIES
+    ):
+        activation_required = profile.lineage_policy_id.startswith(
+            "authoritative_scheduled_"
+        )
+        for request_id, requests in target_execution_request_by_id.items():
+            if len(requests) != 1:
+                continue
+            request = requests[0]
+            request_hash = request.payload["semantic_content_hash"]
+            submissions = tuple(
+                target_execution_submission_by_request_id.get(
+                    request_id,
+                    (),
+                )
+            )
+            if len(submissions) != 1:
+                issue(
+                    "component_execution_request_missing_submission",
+                    request.fact_id,
+                    "Each component execution request needs exactly one "
+                    "target submission receipt.",
+                    *(item.fact_id for item in submissions),
+                )
+                continue
+            submission = submissions[0]
+            if submission.payload["target_execution_request_hash"] != request_hash:
+                issue(
+                    "component_execution_submission_request_hash_mismatch",
+                    submission.fact_id,
+                    "Target submission receipt must bind the exact execution "
+                    "request hash.",
+                    request.fact_id,
+                )
+            if not bool(submission.payload["accepted_for_processing"]):
+                continue
+            completions = tuple(
+                target_execution_completion_by_request_id.get(
+                    request_id,
+                    (),
+                )
+            )
+            if len(completions) != 1:
+                issue(
+                    "component_execution_request_missing_completion",
+                    request.fact_id,
+                    "Each accepted component execution request needs exactly "
+                    "one completion receipt.",
+                    *(item.fact_id for item in completions),
+                )
+            elif completions[0].payload["status"] != "resolved":
+                # An accepted request may terminate with an explicit failed
+                # or cancelled completion.  In that case, the absence of a
+                # resolved target is the correct terminal evidence.
+                unexpected_targets = tuple(
+                    component_execution_target_by_request_id.get(
+                        request_id,
+                        (),
+                    )
+                )
+                if unexpected_targets:
+                    issue(
+                        "component_execution_failed_request_has_target",
+                        completions[0].fact_id,
+                        "A non-resolved completion must not publish a "
+                        "component execution target.",
+                        *(item.fact_id for item in unexpected_targets),
+                    )
+                continue
+            targets = tuple(
+                component_execution_target_by_request_id.get(
+                    request_id,
+                    (),
+                )
+            )
+            if len(targets) != 1:
+                issue(
+                    "component_execution_request_missing_target",
+                    request.fact_id,
+                    "Each accepted component execution request needs exactly "
+                    "one resolved component target.",
+                    *(item.fact_id for item in targets),
+                )
+                continue
+            target = targets[0]
+            if (
+                target.payload["target_execution_request_hash"] != request_hash
+                or target.payload["submission_receipt_id"]
+                != submission.fact_id
+                or target.payload["submission_receipt_hash"]
+                != submission.payload["semantic_content_hash"]
+            ):
+                issue(
+                    "component_execution_target_request_binding_mismatch",
+                    target.fact_id,
+                    "Component target must bind the exact request and "
+                    "submission receipt.",
+                    request.fact_id,
+                    submission.fact_id,
+                )
+            target_id = str(target.payload["target_id"])
+            target_hash = target.payload["semantic_content_hash"]
+            admissions = tuple(
+                component_execution_target_admission_by_target_id.get(
+                    target_id,
+                    (),
+                )
+            )
+            if len(admissions) != 1 or not bool(
+                admissions[0].payload["accepted"]
+            ):
+                issue(
+                    "component_execution_target_missing_admission",
+                    target.fact_id,
+                    "Each resolved component target needs one accepted target "
+                    "admission receipt.",
+                    *(item.fact_id for item in admissions),
+                )
+                continue
+            admission = admissions[0]
+            if (
+                admission.payload["target_hash"] != target_hash
+                or admission.payload["target_execution_request_id"]
+                != request_id
+                or admission.payload["target_execution_request_hash"]
+                != request_hash
+            ):
+                issue(
+                    "component_execution_target_admission_binding_mismatch",
+                    admission.fact_id,
+                    "Target admission must bind the exact component target "
+                    "and execution request.",
+                    target.fact_id,
+                    request.fact_id,
+                )
+            activations = tuple(
+                component_execution_target_activation_by_target_id.get(
+                    target_id,
+                    (),
+                )
+            )
+            if activation_required and len(activations) != 1:
+                issue(
+                    "component_execution_target_missing_activation",
+                    target.fact_id,
+                    "Each admitted component target needs exactly one "
+                    "activation receipt.",
+                    *(item.fact_id for item in activations),
+                )
+            elif activation_required:
+                activation = activations[0]
+                if (
+                    activation.payload["target_hash"] != target_hash
+                    or activation.payload["target_execution_request_id"]
+                    != request_id
+                    or activation.payload["target_execution_request_hash"]
+                    != request_hash
+                    or activation.payload["target_admission_receipt_id"]
+                    != admission.fact_id
+                    or activation.payload["target_admission_receipt_hash"]
+                    != admission.payload["semantic_content_hash"]
+                ):
+                    issue(
+                        "component_execution_target_activation_binding_mismatch",
+                        activation.fact_id,
+                        "Target activation must bind the exact request, "
+                        "target, and admission receipt.",
+                        request.fact_id,
+                        target.fact_id,
+                        admission.fact_id,
+                    )
+            elif activations:
+                issue(
+                    "component_execution_target_unexpected_activation",
+                    target.fact_id,
+                    "Immediate component targets must omit a separate "
+                    "activation receipt.",
+                    *(item.fact_id for item in activations),
+                )
+            if len(completions) == 1:
+                completion = completions[0]
+                if (
+                    completion.payload["target_execution_request_hash"]
+                    != request_hash
+                    or completion.payload["submission_receipt_id"]
+                    != submission.fact_id
+                    or completion.payload["submission_receipt_hash"]
+                    != submission.payload["semantic_content_hash"]
+                    or completion.payload["target_id"] != target_id
+                    or completion.payload["target_hash"] != target_hash
+                ):
+                    issue(
+                        "component_execution_completion_binding_mismatch",
+                        completion.fact_id,
+                        "Execution completion must bind the exact request, "
+                        "submission, and component target.",
+                        request.fact_id,
+                        submission.fact_id,
+                        target.fact_id,
+                    )
 
     if profile.lineage_policy_id in {
         "authoritative_scheduled_qpos_lineage_v1",

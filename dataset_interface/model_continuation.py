@@ -19,6 +19,7 @@ from dataset_contracts.model_continuation import (
     MODEL_CONTINUATION_LOSS_UNCONDITIONED_VALID_V1,
     TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
     normalize_model_continuation_contract,
+    require_trained_model_rtc_v1_contract,
 )
 from dataset_contracts.policy_artifact import PolicyArtifactContract
 from dataset_contracts.pose_frames import PoseFrameContract
@@ -39,6 +40,24 @@ MODEL_CONTINUATION_TRAINING_VIEW_HASH_DOMAIN_V1 = (
 )
 MODEL_CONTINUATION_ARTIFACT_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.model_continuation_artifact_binding.v1"
+)
+MODEL_CONTINUATION_TRAINING_SAMPLING_SCHEMA_V1 = (
+    "dexteleop_model_continuation_training_sampling_v1"
+)
+MODEL_CONTINUATION_TRAINING_SAMPLING_HASH_DOMAIN_V1 = (
+    "dexteleop.model_continuation_training_sampling.v1"
+)
+MODEL_CONTINUATION_TRAINING_WINDOW_SCHEMA_V1 = (
+    "dexteleop_model_continuation_training_window_v1"
+)
+MODEL_CONTINUATION_TRAINING_WINDOW_HASH_DOMAIN_V1 = (
+    "dexteleop.model_continuation_training_window.v1"
+)
+MODEL_CONTINUATION_TRAINING_CAUSAL_BINDING_HASH_DOMAIN_V1 = (
+    "dexteleop.model_continuation_training_causal_binding.v1"
+)
+MODEL_CONTINUATION_SAMPLING_HASH_INDEXED_EXPLICIT_PAIRS_V1 = (
+    "hash_indexed_uniform_explicit_pairs_v1"
 )
 TEACHER_OVERLAP_PROJECTION_IMPLEMENTATION_ID_V1 = (
     "dataset_interface.trajectory_overlap_teacher_v1"
@@ -96,6 +115,278 @@ def _artifact_binding_hash(artifact: PolicyArtifactContract) -> str:
             "model_continuation": artifact.model_continuation.to_dict(),
         },
         domain=MODEL_CONTINUATION_ARTIFACT_BINDING_HASH_DOMAIN_V1,
+    )
+
+
+@dataclass(frozen=True)
+class ModelContinuationTrainingSamplingSpec:
+    """Replayable selection over explicitly approved delay/prefix pairs."""
+
+    delay_prefix_pairs: tuple[tuple[int, int], ...]
+    selection_salt: str
+    strategy: str = (
+        MODEL_CONTINUATION_SAMPLING_HASH_INDEXED_EXPLICIT_PAIRS_V1
+    )
+    schema: str = MODEL_CONTINUATION_TRAINING_SAMPLING_SCHEMA_V1
+
+    def __post_init__(self) -> None:
+        if self.schema != MODEL_CONTINUATION_TRAINING_SAMPLING_SCHEMA_V1:
+            raise ModelContinuationViewError(
+                f"Unsupported continuation sampling schema {self.schema!r}."
+            )
+        if (
+            self.strategy
+            != MODEL_CONTINUATION_SAMPLING_HASH_INDEXED_EXPLICIT_PAIRS_V1
+        ):
+            raise ModelContinuationViewError(
+                f"Unsupported continuation sampling strategy {self.strategy!r}."
+            )
+        salt = _nonempty(self.selection_salt, name="selection_salt")
+        normalized: list[tuple[int, int]] = []
+        for index, pair in enumerate(self.delay_prefix_pairs):
+            if (
+                not isinstance(pair, Sequence)
+                or isinstance(pair, (str, bytes))
+                or len(pair) != 2
+            ):
+                raise ModelContinuationViewError(
+                    "Each delay_prefix_pairs entry must contain delay and "
+                    f"prefix integers; entry {index} is invalid."
+                )
+            delay = _exact_int(pair[0], name=f"delay_prefix_pairs[{index}].delay")
+            prefix = _exact_int(
+                pair[1],
+                name=f"delay_prefix_pairs[{index}].prefix",
+            )
+            if delay < 0 or prefix < 0 or prefix > delay:
+                raise ModelContinuationViewError(
+                    "Each delay/prefix pair must satisfy "
+                    "0 <= prefix_steps <= forecast_delay_steps."
+                )
+            normalized.append((delay, prefix))
+        if not normalized:
+            raise ModelContinuationViewError(
+                "delay_prefix_pairs must contain at least one pair."
+            )
+        if len(set(normalized)) != len(normalized):
+            raise ModelContinuationViewError(
+                "delay_prefix_pairs must not contain duplicates."
+            )
+        object.__setattr__(self, "delay_prefix_pairs", tuple(sorted(normalized)))
+        object.__setattr__(self, "selection_salt", salt)
+
+    def semantic_payload(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "strategy": self.strategy,
+            "delay_prefix_pairs": [
+                [delay, prefix]
+                for delay, prefix in self.delay_prefix_pairs
+            ],
+            "selection_salt": self.selection_salt,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.semantic_payload()
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "ModelContinuationTrainingSamplingSpec":
+        expected = {
+            "schema",
+            "strategy",
+            "delay_prefix_pairs",
+            "selection_salt",
+        }
+        unknown = sorted(set(payload).difference(expected))
+        if unknown:
+            raise ModelContinuationViewError(
+                f"Continuation sampling spec has unknown entries: {unknown}."
+            )
+        pairs = payload.get("delay_prefix_pairs")
+        if not isinstance(pairs, Sequence) or isinstance(pairs, (str, bytes)):
+            raise ModelContinuationViewError(
+                "delay_prefix_pairs must be a sequence."
+            )
+        return cls(
+            delay_prefix_pairs=tuple(pairs),
+            selection_salt=str(payload.get("selection_salt", "")),
+            strategy=str(payload.get("strategy", "")),
+            schema=str(payload.get("schema", "")),
+        )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return "sha256:" + canonical_content_hash(
+            self.semantic_payload(),
+            domain=MODEL_CONTINUATION_TRAINING_SAMPLING_HASH_DOMAIN_V1,
+        )
+
+
+def select_model_continuation_training_delay_prefix(
+    spec: ModelContinuationTrainingSamplingSpec,
+    artifact: PolicyArtifactContract,
+    *,
+    source_episode_id: str,
+    source_start_index: int,
+    draw_index: int,
+    valid_action_count: int,
+) -> tuple[int, int]:
+    """Select one legal pair without mutable RNG or worker-order dependence."""
+
+    if not isinstance(spec, ModelContinuationTrainingSamplingSpec):
+        raise TypeError(
+            "spec must be a ModelContinuationTrainingSamplingSpec."
+        )
+    if not isinstance(artifact, PolicyArtifactContract):
+        raise TypeError("artifact must be a PolicyArtifactContract.")
+    if artifact.model_continuation is None:
+        raise ModelContinuationViewError(
+            "Trained model-RTC sampling requires an artifact continuation "
+            "contract."
+        )
+    try:
+        normalized = require_trained_model_rtc_v1_contract(
+            artifact.model_continuation
+        )
+    except DatasetLayoutBindingError as exc:
+        raise ModelContinuationViewError(str(exc)) from exc
+    runtime = normalized.runtime
+    valid_count = _exact_int(valid_action_count, name="valid_action_count")
+    if valid_count < 1 or valid_count > runtime.prediction_horizon_steps:
+        raise ModelContinuationViewError(
+            "valid_action_count must be within the prediction horizon."
+        )
+    for delay, prefix in spec.delay_prefix_pairs:
+        if not (
+            runtime.minimum_forecast_delay_steps
+            <= delay
+            <= runtime.maximum_forecast_delay_steps
+        ):
+            raise ModelContinuationViewError(
+                "Sampling spec delay is outside the artifact-supported range."
+            )
+        if not (
+            runtime.minimum_prefix_steps
+            <= prefix
+            <= runtime.maximum_prefix_steps
+        ):
+            raise ModelContinuationViewError(
+                "Sampling spec prefix is outside the artifact-supported range."
+            )
+        if prefix > delay:
+            raise ModelContinuationViewError(
+                "Sampling spec prefix cannot exceed its delay."
+            )
+    eligible = tuple(
+        pair
+        for pair in spec.delay_prefix_pairs
+        if pair[0] < valid_count
+    )
+    if not eligible:
+        raise ModelContinuationViewError(
+            "Sampling spec has no pair with a real executable suffix."
+        )
+    episode = _nonempty(source_episode_id, name="source_episode_id")
+    start = _exact_int(source_start_index, name="source_start_index")
+    draw = _exact_int(draw_index, name="draw_index")
+    if start < 0 or draw < 0:
+        raise ModelContinuationViewError(
+            "source_start_index and draw_index must be non-negative."
+        )
+    selection_digest = canonical_content_hash(
+        {
+            "sampling_spec_hash": spec.semantic_content_hash,
+            "continuation_contract_hash": normalized.source_contract_hash,
+            "source_episode_id": episode,
+            "source_start_index": start,
+            "draw_index": draw,
+        },
+        domain="dexteleop.model_continuation_training_pair_choice.v1",
+    )
+    return eligible[int(selection_digest[:16], 16) % len(eligible)]
+
+
+def model_continuation_training_masks(
+    artifact: PolicyArtifactContract,
+    *,
+    forecast_delay_steps: int,
+    prefix_steps: int,
+    valid_action_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return canonical prefix, padding and loss masks for one trained window."""
+
+    if not isinstance(artifact, PolicyArtifactContract):
+        raise TypeError("artifact must be a PolicyArtifactContract.")
+    continuation = artifact.model_continuation
+    if continuation is None:
+        raise ModelContinuationViewError(
+            "Trained model-RTC masks require a continuation contract."
+        )
+    normalized = normalize_model_continuation_contract(continuation)
+    runtime = normalized.runtime
+    training = normalized.training
+    if training is None:
+        raise ModelContinuationViewError(
+            "Inference-only continuation has no training masks."
+        )
+    delay = _exact_int(
+        forecast_delay_steps,
+        name="forecast_delay_steps",
+    )
+    prefix = _exact_int(prefix_steps, name="prefix_steps")
+    valid_count = _exact_int(
+        valid_action_count,
+        name="valid_action_count",
+    )
+    horizon = runtime.prediction_horizon_steps
+    if not (
+        runtime.minimum_forecast_delay_steps
+        <= delay
+        <= runtime.maximum_forecast_delay_steps
+    ):
+        raise ModelContinuationViewError(
+            "forecast_delay_steps is outside the artifact-supported range."
+        )
+    if not (
+        runtime.minimum_prefix_steps
+        <= prefix
+        <= runtime.maximum_prefix_steps
+    ):
+        raise ModelContinuationViewError(
+            "prefix_steps is outside the artifact-supported range."
+        )
+    if prefix > delay:
+        raise ModelContinuationViewError(
+            "prefix_steps cannot exceed forecast_delay_steps."
+        )
+    if not 1 <= valid_count <= horizon:
+        raise ModelContinuationViewError(
+            "valid_action_count must be within the prediction horizon."
+        )
+    if delay >= valid_count:
+        raise ModelContinuationViewError(
+            "forecast_delay_steps leaves no real executable target."
+        )
+    prefix_mask = np.arange(horizon) < prefix
+    target_is_pad = np.arange(horizon) >= valid_count
+    if (
+        training.loss_mask_semantics
+        == MODEL_CONTINUATION_LOSS_UNCONDITIONED_VALID_V1
+    ):
+        loss_mask = ~target_is_pad & ~prefix_mask
+    elif training.loss_mask_semantics == MODEL_CONTINUATION_LOSS_ALL_VALID_V1:
+        loss_mask = ~target_is_pad
+    else:
+        raise ModelContinuationViewError(
+            "Unsupported loss_mask_semantics."
+        )
+    return (
+        prefix_mask.astype(np.float32),
+        target_is_pad.astype(bool),
+        loss_mask.astype(bool),
     )
 
 
@@ -301,6 +592,44 @@ class ModelContinuationTrainingSample:
             domain=MODEL_CONTINUATION_TRAINING_VIEW_HASH_DOMAIN_V1,
         )
 
+    @property
+    def valid_action_count(self) -> int:
+        return int(np.count_nonzero(~self.target_is_pad))
+
+    def causal_window_binding_payload(self) -> dict[str, Any]:
+        """Name the observation/generation/executable indices explicitly."""
+
+        start = self.source_start_index
+        return {
+            "schema": "dexteleop_model_continuation_causal_binding_v1",
+            "source_episode_id": self.source_episode_id,
+            "observation_source_index": start,
+            "generation_start_source_index": start,
+            "first_executable_source_index": (
+                start + self.forecast_delay_steps
+            ),
+            "valid_action_stop_source_index_exclusive": (
+                start + self.valid_action_count
+            ),
+            "forecast_delay_steps": self.forecast_delay_steps,
+            "prefix_steps": self.prefix_steps,
+            "training_sample_hash": self.sample_hash,
+            "artifact_binding_hash": self.artifact_binding_hash,
+            "continuation_contract_hash": self.continuation_contract_hash,
+            "layout_hash": self.layout_hash,
+            "chunk_contract_hash": self.chunk_contract_hash,
+            "pose_frame_contract_hash": self.pose_frame_contract_hash,
+        }
+
+    @property
+    def causal_window_binding_hash(self) -> str:
+        return "sha256:" + canonical_content_hash(
+            self.causal_window_binding_payload(),
+            domain=(
+                MODEL_CONTINUATION_TRAINING_CAUSAL_BINDING_HASH_DOMAIN_V1
+            ),
+        )
+
     def artifact_action_dict(self) -> dict[str, Any]:
         """Return copies without normalization or framework conversion."""
 
@@ -319,6 +648,164 @@ class ModelContinuationTrainingSample:
             ),
             "model_continuation_training_sample_hash": self.sample_hash,
         }
+
+
+@dataclass(frozen=True)
+class ModelContinuationTrainingWindow:
+    """One causally bound observation/action view for framework adapters."""
+
+    pose_chunk: PoseActionChunkSample
+    continuation: ModelContinuationTrainingSample
+    sampling_spec_hash: str
+    sampling_draw_index: int
+    schema: str = MODEL_CONTINUATION_TRAINING_WINDOW_SCHEMA_V1
+
+    def __post_init__(self) -> None:
+        if self.schema != MODEL_CONTINUATION_TRAINING_WINDOW_SCHEMA_V1:
+            raise ModelContinuationViewError(
+                f"Unsupported continuation training window {self.schema!r}."
+            )
+        if not isinstance(self.pose_chunk, PoseActionChunkSample):
+            raise TypeError("pose_chunk must be a PoseActionChunkSample.")
+        if not isinstance(
+            self.continuation,
+            ModelContinuationTrainingSample,
+        ):
+            raise TypeError(
+                "continuation must be a ModelContinuationTrainingSample."
+            )
+        sample = self.continuation
+        sampling_spec_hash = _nonempty(
+            self.sampling_spec_hash,
+            name="sampling_spec_hash",
+        )
+        sampling_draw_index = _exact_int(
+            self.sampling_draw_index,
+            name="sampling_draw_index",
+        )
+        if sampling_draw_index < 0:
+            raise ModelContinuationViewError(
+                "sampling_draw_index must be non-negative."
+            )
+        metadata_start = _exact_int(
+            self.pose_chunk.metadata.get("start_index"),
+            name="pose_chunk.metadata.start_index",
+        )
+        if metadata_start != sample.source_start_index:
+            raise ModelContinuationViewError(
+                "Observation chunk and continuation source_start_index differ."
+            )
+        if (
+            self.pose_chunk.valid_action_count
+            != sample.valid_action_count
+            or not np.array_equal(
+                self.pose_chunk.action,
+                sample.target_action,
+            )
+            or not np.array_equal(
+                self.pose_chunk.action_is_pad,
+                sample.target_is_pad,
+            )
+        ):
+            raise ModelContinuationViewError(
+                "Observation chunk action target differs from continuation."
+            )
+        expected_identities = {
+            "layout_hash": self.pose_chunk.layout_hash,
+            "chunk_contract_hash": self.pose_chunk.chunk_contract_hash,
+            "pose_frame_contract_hash": (
+                self.pose_chunk.pose_frame_contract_hash
+            ),
+        }
+        for name, expected in expected_identities.items():
+            if getattr(sample, name) != expected:
+                raise ModelContinuationViewError(
+                    f"Observation chunk {name} differs from continuation."
+                )
+        object.__setattr__(
+            self,
+            "sampling_spec_hash",
+            sampling_spec_hash,
+        )
+        object.__setattr__(
+            self,
+            "sampling_draw_index",
+            sampling_draw_index,
+        )
+
+    def semantic_payload(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "causal_window_binding_hash": (
+                self.continuation.causal_window_binding_hash
+            ),
+            "training_sample_hash": self.continuation.sample_hash,
+            "sampling_spec_hash": self.sampling_spec_hash,
+            "sampling_draw_index": self.sampling_draw_index,
+            "observation_state": self.pose_chunk.observation_state,
+            "observation_state_discrete": (
+                self.pose_chunk.observation_state_discrete
+            ),
+            "last_action": self.pose_chunk.last_action,
+            "last_action_discrete": (
+                self.pose_chunk.last_action_discrete
+            ),
+            "actual_tcp_pose_by_side": dict(
+                self.pose_chunk.actual_tcp_pose_by_side
+            ),
+        }
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return "sha256:" + canonical_content_hash(
+            self.semantic_payload(),
+            domain=MODEL_CONTINUATION_TRAINING_WINDOW_HASH_DOMAIN_V1,
+        )
+
+    def training_dict(self) -> dict[str, Any]:
+        """Return one framework-neutral observation/action training mapping."""
+
+        payload = self.pose_chunk.model_dict()
+        continuation = self.continuation.artifact_action_dict()
+        if not np.array_equal(payload["action"], continuation["action"]):
+            raise ModelContinuationViewError(
+                "Training window action merge is inconsistent."
+            )
+        if not np.array_equal(
+            payload["action_is_pad"],
+            continuation["action_is_pad"],
+        ):
+            raise ModelContinuationViewError(
+                "Training window padding merge is inconsistent."
+            )
+        payload.update(continuation)
+        payload.update(
+            {
+                "model_continuation_sampling_spec_hash": (
+                    self.sampling_spec_hash
+                ),
+                "model_continuation_sampling_draw_index": (
+                    self.sampling_draw_index
+                ),
+                "model_continuation_training_window_hash": (
+                    self.semantic_content_hash
+                ),
+                "model_continuation_causal_window_binding_hash": (
+                    self.continuation.causal_window_binding_hash
+                ),
+                "observation_source_index": (
+                    self.continuation.source_start_index
+                ),
+                "generation_start_source_index": (
+                    self.continuation.source_start_index
+                ),
+                "first_executable_source_index": (
+                    self.continuation.source_start_index
+                    + self.continuation.forecast_delay_steps
+                ),
+            }
+        )
+        return payload
 
 
 def model_continuation_training_sample_from_pose_chunk(
@@ -446,21 +933,22 @@ def model_continuation_training_sample_from_pose_chunk(
             "forecast_delay_steps leaves no real executable target."
         )
 
-    horizon = runtime_contract.prediction_horizon_steps
-    prefix_mask = np.zeros((horizon,), dtype=np.float32)
-    prefix_mask[:selected_prefix_steps] = 1.0
+    prefix_mask, target_is_pad, loss_mask = (
+        model_continuation_training_masks(
+            artifact,
+            forecast_delay_steps=delay,
+            prefix_steps=selected_prefix_steps,
+            valid_action_count=chunk.valid_action_count,
+        )
+    )
     conditioning_prefix = np.zeros_like(chunk.action, dtype=np.float32)
     conditioning_prefix[:selected_prefix_steps] = chunk.action[
         :selected_prefix_steps
     ]
-    target_is_pad = chunk.action_is_pad.astype(bool, copy=True)
-    if (
-        training_contract.loss_mask_semantics
-        == MODEL_CONTINUATION_LOSS_UNCONDITIONED_VALID_V1
-    ):
-        loss_mask = ~target_is_pad & ~(prefix_mask > 0)
-    else:
-        loss_mask = ~target_is_pad
+    if not np.array_equal(target_is_pad, chunk.action_is_pad):
+        raise ModelContinuationViewError(
+            "Derived target padding differs from the pose chunk."
+        )
 
     return ModelContinuationTrainingSample(
         conditioning_prefix=conditioning_prefix,
@@ -529,14 +1017,88 @@ def model_continuation_training_sample_from_episode_rows(
     )
 
 
+def model_continuation_training_window_from_episode_rows(
+    episode_rows: Sequence[Mapping[str, Any]],
+    artifact: PolicyArtifactContract,
+    *,
+    pose_frame_contract: PoseFrameContract,
+    source_episode_id: str,
+    start_index: int,
+    sampling_spec: ModelContinuationTrainingSamplingSpec,
+    draw_index: int,
+    active_sides: Sequence[str] = ("left", "right"),
+) -> ModelContinuationTrainingWindow:
+    """Build the first trained model-RTC observation/action window."""
+
+    if not isinstance(artifact, PolicyArtifactContract):
+        raise TypeError("artifact must be a PolicyArtifactContract.")
+    continuation_contract = artifact.model_continuation
+    if continuation_contract is None:
+        raise ModelContinuationViewError(
+            "Trained model-RTC requires an artifact continuation contract."
+        )
+    try:
+        require_trained_model_rtc_v1_contract(continuation_contract)
+    except DatasetLayoutBindingError as exc:
+        raise ModelContinuationViewError(str(exc)) from exc
+    if artifact.pose_action_chunk is None:
+        raise ModelContinuationViewError(
+            "Trained model-RTC requires an artifact-bound pose action chunk."
+        )
+    chunk = pose_action_chunk_from_episode_rows(
+        episode_rows,
+        artifact.policy_io_layout,
+        pose_frame_contract=pose_frame_contract,
+        chunk_contract=artifact.pose_action_chunk,
+        start_index=start_index,
+        active_sides=active_sides,
+    )
+    delay, prefix = select_model_continuation_training_delay_prefix(
+        sampling_spec,
+        artifact,
+        source_episode_id=source_episode_id,
+        source_start_index=start_index,
+        draw_index=draw_index,
+        valid_action_count=chunk.valid_action_count,
+    )
+    sample = model_continuation_training_sample_from_pose_chunk(
+        chunk,
+        artifact,
+        source_episode_id=source_episode_id,
+        source_start_index=start_index,
+        forecast_delay_steps=delay,
+        prefix_steps=prefix,
+        training_prefix_source_kind=(
+            TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1
+        ),
+    )
+    return ModelContinuationTrainingWindow(
+        pose_chunk=chunk,
+        continuation=sample,
+        sampling_spec_hash=sampling_spec.semantic_content_hash,
+        sampling_draw_index=draw_index,
+    )
+
+
 __all__ = [
     "MODEL_CONTINUATION_ARTIFACT_BINDING_HASH_DOMAIN_V1",
+    "MODEL_CONTINUATION_SAMPLING_HASH_INDEXED_EXPLICIT_PAIRS_V1",
+    "MODEL_CONTINUATION_TRAINING_CAUSAL_BINDING_HASH_DOMAIN_V1",
+    "MODEL_CONTINUATION_TRAINING_SAMPLING_HASH_DOMAIN_V1",
+    "MODEL_CONTINUATION_TRAINING_SAMPLING_SCHEMA_V1",
     "MODEL_CONTINUATION_TRAINING_VIEW_HASH_DOMAIN_V1",
     "MODEL_CONTINUATION_TRAINING_VIEW_SCHEMA_V1",
+    "MODEL_CONTINUATION_TRAINING_WINDOW_HASH_DOMAIN_V1",
+    "MODEL_CONTINUATION_TRAINING_WINDOW_SCHEMA_V1",
     "TEACHER_OVERLAP_PROJECTION_IMPLEMENTATION_ID_V1",
     "TEACHER_OVERLAP_PROJECTION_PARAMETERS_HASH_V1",
+    "ModelContinuationTrainingSamplingSpec",
     "ModelContinuationTrainingSample",
+    "ModelContinuationTrainingWindow",
     "ModelContinuationViewError",
+    "model_continuation_training_masks",
+    "model_continuation_training_window_from_episode_rows",
     "model_continuation_training_sample_from_episode_rows",
     "model_continuation_training_sample_from_pose_chunk",
+    "select_model_continuation_training_delay_prefix",
 ]

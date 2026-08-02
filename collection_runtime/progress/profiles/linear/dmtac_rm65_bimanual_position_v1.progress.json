@@ -1,0 +1,23 @@
+{
+  "schema": "dexteleop.task_progress_profile.v1",
+  "profile_id": "dmtac_rm65_bimanual_position_v1_progress",
+  "profile_version": "1",
+  "task_id": "dmtac_rm65_bimanual_position_v1",
+  "steps": [
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "execute_task",
+      "semantic_type": "EXECUTE_TASK",
+      "display_name": "完成整项任务",
+      "ordinal": 1,
+      "allowed_next_step_ids": []
+    }
+  ],
+  "initial_step_id": "execute_task",
+  "terminal_step_ids": [
+    "execute_task"
+  ],
+  "topology_kind": "LINEAR",
+  "allow_retry_after_failure": true,
+  "semantic_content_hash": "9af03398ac96f1c0f2a5627ac9d68683c4f0c6192442dedfebe4b0c0f779f361"
+}

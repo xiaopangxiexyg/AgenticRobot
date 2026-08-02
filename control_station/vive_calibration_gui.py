@@ -78,8 +78,12 @@ button:hover:not(:disabled) { border-color:var(--accent); background:#153441; tr
 button.primary { color:#05231c; border-color:var(--accent); background:var(--accent); }
 button.primary:hover:not(:disabled) { background:#76efd2; border-color:#76efd2; }
 button.warn { color:var(--warn); border-color:#795f32; background:rgba(109,77,24,.22); }
+button.danger { color:var(--bad); border-color:#7d4050; background:rgba(145,47,69,.15); }
 .button-row { margin-top:17px; gap:9px; }
 .button-row button { min-width:140px; }
+.input-readiness { margin-top:13px; padding:10px 12px; border:1px solid #755d35; border-radius:9px; color:var(--warn); background:rgba(117,93,53,.12); font-size:.76rem; line-height:1.5; }
+.input-readiness.ready { color:var(--accent); border-color:#2e806d; background:rgba(42,128,105,.13); }
+.input-readiness.bad { color:var(--bad); border-color:#7d4050; background:rgba(145,47,69,.13); }
 .step-rail { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin:10px 0 15px; }
 .step-rail span { padding:8px 7px; border:1px solid var(--line-soft); border-radius:8px; color:#64808d; background:rgba(7,19,27,.42); font-size:.7rem; font-weight:800; text-align:center; }
 .step-rail span.active { color:var(--text); border-color:#348d79; background:rgba(40,136,111,.22); }
@@ -100,6 +104,11 @@ button.warn { color:var(--warn); border-color:#795f32; background:rgba(109,77,24
 .stage { margin:8px 0 4px; font-size:1.45rem; letter-spacing:-.03em; }
 kbd { display:inline-block; min-width:20px; margin-left:3px; padding:2px 5px; border:1px solid #386071; border-bottom-width:2px; border-radius:5px; color:var(--text); background:#0a1821; font:700 .68rem ui-monospace,SFMono-Regular,Consolas,monospace; text-align:center; }
 .message { min-height:46px; margin-bottom:15px; padding:11px 12px; border:1px solid var(--line-soft); border-radius:9px; color:var(--muted); background:rgba(7,19,27,.42); }
+.stage-guide { margin-top:12px; padding:13px 14px; border:1px solid #315b86; border-radius:10px; background:rgba(42,83,126,.12); }
+.stage-guide-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+.stage-guide strong { color:var(--text); font-size:.86rem; }
+.stage-direction { flex:0 0 auto; border:1px solid #315b86; border-radius:999px; padding:4px 8px; color:#82b9ff; font-size:.7rem; font-weight:800; }
+.stage-guide ol { margin:10px 0 0; padding-left:20px; color:var(--muted); font-size:.75rem; line-height:1.65; }
 .metric-grid { grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
 .metric-grid.live-metrics { margin-top:11px; }
 .metric { border-color:var(--line-soft); border-radius:10px; background:rgba(7,19,27,.42); }
@@ -158,10 +167,11 @@ th,td { border-color:var(--line-soft); padding:10px 8px; }
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <main>
 <section class="panel"><h2>标定配置</h2><div class="notice">只打开 VIVE 接收器。结果写入独立 Control Station profile 目录，不会读取或覆盖真机遥操 profiles。</div>
-<div class="controls top-gap"><label>标定侧别<select id="sides"><option value="left">左手</option><option value="right">右手</option><option value="both">双手</option></select><span class="hint">单侧标定不会要求另一侧的 wrist offset。</span></label><label>坐标系 sweep tracker<select id="deskTracker"><option value="auto">自动：active wrist</option><option value="left">左 wrist</option><option value="right">右 wrist</option><option value="auxiliary">Auxiliary tracker</option></select><span class="hint">建议与本次标定侧别一致。</span></label></div>
-<div class="button-row"><button id="begin" class="primary">开始 / 重新标定</button><button id="capture">采集当前阶段 <kbd>N</kbd></button><button id="reset" class="warn">重置当前阶段 <kbd>R</kbd></button></div>
-<p class="hint">流程：X 后→前、Y 右→左、Z 低→高，最后保持 wrist tracker 中立姿态。快捷键仅在未聚焦输入框时生效。</p></section>
-<section class="panel"><h2>当前阶段</h2><div id="stepRail" class="step-rail"><span data-step="virtual_desk_x">1 · X</span><span data-step="virtual_desk_y">2 · Y</span><span data-step="virtual_desk_z">3 · Z</span><span data-step="wrist_offsets">4 · Offset</span></div><div class="stage-card"><div id="stageIcon" class="stage-icon">1</div><div><div id="stageKicker" class="eyebrow">CURRENT STEP</div><div id="stage" class="stage">—</div><div id="message" class="message">—</div></div><div class="stage-meta"><span id="phase" class="phase-pill">—</span><span id="captureValidity" class="hint">等待 tracker</span></div></div><div class="stage-progress"><span id="stageProgress"></span></div><div class="capture-row"><span id="samples">尚未开始采集</span><span id="captureElapsed">—</span></div><div class="stage-progress thin"><span id="captureProgress"></span></div><div id="error" class="error" hidden></div></section>
+<div class="controls top-gap"><label>标定侧别<select id="sides"><option value="left">左手</option><option value="right">右手</option><option value="both">双手</option></select><span class="hint">单侧标定不会要求另一侧的 wrist offset。</span></label><label>坐标系 sweep tracker<select id="deskTracker"><option value="auto">自动：单侧用该侧，双侧优先右侧</option><option value="left">左 wrist</option><option value="right">右 wrist</option><option value="auxiliary">Auxiliary tracker</option></select><span class="hint">建议与本次标定侧别一致；Auxiliary 必须显式选择。</span></label></div>
+<div id="inputReadiness" class="input-readiness">正在检查本轮所需 VIVE 通道…</div>
+<div class="button-row"><button id="begin" class="primary">开始 / 重新标定</button><button id="capture">采集当前阶段 <kbd>N</kbd></button><button id="reset" class="warn">重置当前阶段 <kbd>R</kbd></button><button id="cancel" class="warn">取消本轮标定 <kbd>Esc</kbd></button><button id="swapVive">交换左右 VIVE 来源</button><button id="exit" class="danger">退出标定 / 取消启动</button></div>
+<p class="hint">“取消本轮标定”会回到可换手/切源状态并保留 VIVE 接收；“退出标定”会关闭接收器，并取消等待本次 profile 的 Sim-HIL 启动。</p></section>
+<section class="panel"><h2>当前阶段</h2><div id="stepRail" class="step-rail"><span data-step="virtual_desk_x">1 · X 后→前</span><span data-step="virtual_desk_y">2 · Y 右→左</span><span data-step="virtual_desk_z">3 · Z 下→上</span><span data-step="wrist_offsets">4 · Offset</span></div><div class="stage-card"><div id="stageIcon" class="stage-icon">1</div><div><div id="stageKicker" class="eyebrow">CURRENT STEP</div><div id="stage" class="stage">—</div><div id="message" class="message">—</div></div><div class="stage-meta"><span id="phase" class="phase-pill">—</span><span id="captureValidity" class="hint">等待 tracker</span></div></div><div id="stageGuide" class="stage-guide"><div class="stage-guide-head"><strong id="guideTitle">—</strong><span id="guideDirection" class="stage-direction">—</span></div><ol id="guideSteps"></ol></div><div class="stage-progress"><span id="stageProgress"></span></div><div class="capture-row"><span id="samples">尚未开始采集</span><span id="captureElapsed">—</span></div><div class="stage-progress thin"><span id="captureProgress"></span></div><div id="error" class="error" hidden></div></section>
 <section class="panel"><h2>Live VIVE channels</h2><div id="channels" class="live-grid"><article id="channel-left" class="channel-card"><div class="channel-head"><span class="channel-dot"></span><div class="channel-title"><strong>左 wrist</strong><span>left_wrist_pose</span></div><span class="channel-state">等待</span></div><div class="channel-values"><div class="channel-value"><span>X</span><strong>—</strong></div><div class="channel-value"><span>Y</span><strong>—</strong></div><div class="channel-value"><span>Z</span><strong>—</strong></div></div><div class="channel-footer"><span>tracker: —</span><span>age: —</span></div></article><article id="channel-right" class="channel-card"><div class="channel-head"><span class="channel-dot"></span><div class="channel-title"><strong>右 wrist</strong><span>right_wrist_pose</span></div><span class="channel-state">等待</span></div><div class="channel-values"><div class="channel-value"><span>X</span><strong>—</strong></div><div class="channel-value"><span>Y</span><strong>—</strong></div><div class="channel-value"><span>Z</span><strong>—</strong></div></div><div class="channel-footer"><span>tracker: —</span><span>age: —</span></div></article><article id="channel-auxiliary" class="channel-card"><div class="channel-head"><span class="channel-dot"></span><div class="channel-title"><strong>Auxiliary</strong><span>auxiliary_tracker_pose</span></div><span class="channel-state">等待</span></div><div class="channel-values"><div class="channel-value"><span>X</span><strong>—</strong></div><div class="channel-value"><span>Y</span><strong>—</strong></div><div class="channel-value"><span>Z</span><strong>—</strong></div></div><div class="channel-footer"><span>tracker: —</span><span>age: —</span></div></article></div><div class="metric-grid live-metrics"><div class="metric"><div class="label">Receiver</div><div id="receiverMetric" class="value">—</div></div><div class="metric"><div class="label">Packets received</div><div id="packetMetric" class="value">—</div></div></div><details class="raw-toggle"><summary>查看 source diagnostics</summary><pre id="sourceDiagnostics">—</pre></details></section>
 <section class="panel"><h2>标定结果查看</h2><div id="profile" class="profile-view"><div class="profile-block"><h3>World → VIVE retarget frame</h3><div id="worldMatrix" class="empty-state">完成三轴 sweep 后显示 4×4 transform。</div></div><div class="profile-block"><h3>Tracker offsets</h3><div id="offsetList" class="offset-grid"><div class="empty-state">完成 wrist offset capture 后显示。</div></div></div></div><details class="raw-toggle"><summary>查看完整 profile payload</summary><pre id="profileRaw">—</pre></details><div class="controls top-gap"><label>保存名称<input id="profileName" placeholder="例如 sim_right_vive_20260726"></label><label>加载已有 profile<select id="profileSelect"><option value="">选择 profile</option></select></label></div><div class="button-row"><button id="save" class="primary">保存独立 profile</button><button id="load">加载查看</button></div></section>
 <section class="panel wide"><h2>独立 profile 目录</h2><p id="profileDir" class="hint">—</p><table><thead><tr><th>文件</th><th>侧别</th><th>保存时间</th><th>状态</th><th>错误</th><th>操作</th></tr></thead><tbody id="profileRows"></tbody></table></section>
@@ -171,7 +181,7 @@ th,td { border-color:var(--line-soft); padding:10px 8px; }
 const byId = (id) => document.getElementById(id);
 const stageOrder = ["virtual_desk_x", "virtual_desk_y", "virtual_desk_z", "wrist_offsets"];
 const stageAliases = {VirtualDeskX:"virtual_desk_x", VirtualDeskY:"virtual_desk_y", VirtualDeskZ:"virtual_desk_z", WristOffset:"wrist_offsets"};
-const phaseLabels = {idle:"未开始", ready:"等待采集", preparing:"准备中", capturing:"采集中", waiting:"等待 fresh sample", completed:"已完成", error:"需要处理"};
+const phaseLabels = {idle:"未开始", blocked:"输入未就绪", ready:"等待采集", preparing:"准备中", capturing:"采集中", waiting:"等待 fresh sample", cancelling:"正在取消", shutting_down:"正在退出", completed:"已完成", error:"需要处理"};
 const channelSpecs = [["left_wrist_pose", "channel-left"], ["right_wrist_pose", "channel-right"], ["auxiliary_tracker_pose", "channel-auxiliary"]];
 let latest = null;
 let busy = false;
@@ -220,6 +230,24 @@ function renderSteps(state) {
   });
   byId("stageIcon").textContent = completed ? "✓" : stage === "error" ? "!" : String(Math.max(1, index + 1));
   byId("stageKicker").textContent = completed ? "PROFILE READY" : index >= 0 ? "STEP " + (index + 1) + " OF 4" : "CALIBRATION";
+}
+function renderReadiness(state) {
+  const readiness = state.input_preflight || {};
+  const root = byId("inputReadiness");
+  root.textContent = display(readiness.message, "正在检查本轮所需 VIVE 通道…");
+  root.className = "input-readiness " + (readiness.ready ? "ready" : "bad");
+}
+function renderGuide(state) {
+  const guide = state.stage_guide || {};
+  byId("guideTitle").textContent = display(guide.title);
+  byId("guideDirection").textContent = display(guide.direction);
+  const root = byId("guideSteps");
+  root.replaceChildren();
+  (guide.steps || []).forEach((step) => {
+    const item = document.createElement("li");
+    item.textContent = String(step);
+    root.append(item);
+  });
 }
 function captureEntries(state) {
   const entries = [];
@@ -392,17 +420,26 @@ function render(state) {
   byId("error").textContent = state.error || "";
   byId("error").hidden = !state.error;
   renderSteps(state);
+  renderReadiness(state);
+  renderGuide(state);
   renderCapture(state);
   renderLive(state);
   renderProfile(state);
   renderLibrary(state);
   const stage = normalizedStage(state);
-  const canCapture = ["ready", "waiting", "error"].includes(state.phase) && stageOrder.includes(stage);
+  const workflowActive = Boolean(state.workflow_active);
+  const canCapture = workflowActive && ["ready", "waiting", "error"].includes(state.phase) && stageOrder.includes(stage);
   byId("capture").disabled = busy || !canCapture;
-  byId("reset").disabled = busy || !stageOrder.includes(stage);
+  byId("reset").disabled = busy || !workflowActive || !stageOrder.includes(stage);
+  byId("cancel").disabled = busy || !workflowActive;
   byId("save").disabled = busy || state.stage !== "completed";
-  byId("load").disabled = busy || !byId("profileSelect").value;
-  byId("begin").disabled = busy;
+  byId("load").disabled = busy || workflowActive || !byId("profileSelect").value;
+  byId("begin").disabled = busy || workflowActive || !Boolean((state.input_preflight || {}).ready) || Boolean(state.shutdown_requested);
+  byId("exit").disabled = busy || Boolean(state.shutdown_requested);
+  byId("sides").disabled = busy || workflowActive;
+  byId("deskTracker").disabled = busy || workflowActive;
+  byId("swapVive").disabled = busy || workflowActive
+    || !["idle", "view", "completed", "error"].includes(state.stage);
 }
 async function send(event, payload = {}) {
   if (busy) return;
@@ -443,6 +480,11 @@ byId("deskTracker").addEventListener("change", () => submit("set_desk_tracker", 
 byId("begin").addEventListener("click", () => submit("begin_calibration"));
 byId("capture").addEventListener("click", () => submit("capture"));
 byId("reset").addEventListener("click", () => submit("reset_stage"));
+byId("cancel").addEventListener("click", () => submit("cancel_calibration"));
+byId("swapVive").addEventListener("click", () => submit("swap_vive_sources"));
+byId("exit").addEventListener("click", () => {
+  if (window.confirm("退出会关闭 VIVE 标定接收器，并取消等待本次标定结果的启动。确定退出吗？")) submit("close");
+});
 byId("save").addEventListener("click", () => submit("save_profile", {profile_name:byId("profileName").value}));
 byId("load").addEventListener("click", () => {
   const name = byId("profileSelect").value;
@@ -460,6 +502,7 @@ document.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
   if (key === "n" && !byId("capture").disabled) { event.preventDefault(); submit("capture"); }
   if (key === "r" && !byId("reset").disabled) { event.preventDefault(); submit("reset_stage"); }
+  if (key === "escape" && !byId("cancel").disabled) { event.preventDefault(); submit("cancel_calibration"); }
 });
 refresh();
 window.setInterval(refresh, 800);

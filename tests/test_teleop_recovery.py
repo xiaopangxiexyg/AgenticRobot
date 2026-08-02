@@ -29,6 +29,8 @@ from teleop_runtime.collection.run_collect import _drive_recovery_step, build_co
 from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.debug.run_vive_sapien_virtual import (
     _build_optional_hand_command,
+    _capture_atomic_real_qpos_snapshot,
+    _mean_pose,
     _preview_tcp_pose_desk,
     _resolve_robot_home_for_side,
     _send_optional_hand_command,
@@ -142,6 +144,20 @@ def _pose(tx: float = 0.0, yaw_deg: float = 0.0) -> np.ndarray:
     )
     pose[0, 3] = float(tx)
     return pose
+
+
+def test_runtime_home_late_weighted_pose_favors_newer_samples() -> None:
+    poses = [_pose(tx=value) for value in (0.0, 1.0, 2.0)]
+
+    uniform = _mean_pose(poses)
+    late_weighted = _mean_pose(
+        poses,
+        weights=np.asarray([1.0, 2.0, 3.0], dtype=float),
+    )
+
+    assert uniform[0, 3] == pytest.approx(1.0)
+    assert late_weighted[0, 3] == pytest.approx(4.0 / 3.0)
+    assert late_weighted[0, 3] > uniform[0, 3]
 
 
 class StubPoseSource:
@@ -2365,6 +2381,65 @@ class TeleopRecoveryTests(unittest.TestCase):
         self.assertAlmostEqual(command.reset_qpos[2], 2.355, places=9)
         self.assertEqual(preview.get_state()["local_qpos_normalization"]["status"], "clipped")
 
+    def test_runtime_home_atomic_snapshot_is_reused_without_hardware_reread(self) -> None:
+        class FakeStateBackend:
+            def __init__(self, qpos):
+                self.qpos = np.asarray(qpos, dtype=float)
+                self.read_count = 0
+
+            def refresh_state_from_hardware(self):
+                self.read_count += 1
+                return {"current_qpos": self.qpos.copy()}
+
+        class FakePreviewBackend:
+            def __init__(self):
+                self.qpos = None
+
+            def set_local_qpos(self, qpos):
+                self.qpos = np.asarray(qpos, dtype=float).copy()
+
+            def get_state(self):
+                return {"current_qpos": self.qpos}
+
+        class FakeCommandBackend:
+            def __init__(self):
+                self.reset_qpos = None
+
+            def reset_motion_state(self, qpos):
+                self.reset_qpos = np.asarray(qpos, dtype=float).copy()
+
+        left_qpos = np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+        right_qpos = -left_qpos
+        left_state = FakeStateBackend(left_qpos)
+        right_state = FakeStateBackend(right_qpos)
+        left_preview = FakePreviewBackend()
+        right_preview = FakePreviewBackend()
+        left_command = FakeCommandBackend()
+        right_command = FakeCommandBackend()
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            left_state_backend=left_state,
+            right_state_backend=right_state,
+            left_preview_backend=left_preview,
+            right_preview_backend=right_preview,
+            left_command_backend=left_command,
+            right_command_backend=right_command,
+            dual_arm_retargeter=None,
+        )
+
+        snapshot = _capture_atomic_real_qpos_snapshot(components, required=True)
+        synced = _reset_runtime_motion_state_from_real_qpos(
+            components,
+            required=True,
+            qpos_snapshot=snapshot,
+        )
+
+        self.assertEqual(synced, {"left": True, "right": True})
+        self.assertEqual(left_state.read_count, 1)
+        self.assertEqual(right_state.read_count, 1)
+        np.testing.assert_allclose(left_command.reset_qpos, left_qpos)
+        np.testing.assert_allclose(right_command.reset_qpos, right_qpos)
+
     def test_safety_monitor_resets_pose_baseline_after_invalid_channel(self) -> None:
         monitor = SafetyMonitor(
             TeleopSafetyConfig(
@@ -2496,6 +2571,44 @@ class TeleopRecoveryTests(unittest.TestCase):
         self.assertEqual(
             [violation.code for violation in violations],
             ["translation_jump", "rotation_jump"],
+        )
+
+    def test_pose_jump_baseline_can_reset_after_consumer_polling_gap(self) -> None:
+        monitor = SafetyMonitor(
+            TeleopSafetyConfig(
+                max_translation_jump_m=0.10,
+                max_rotation_jump_deg=45.0,
+                pose_jump_baseline_max_gap_sec=0.25,
+                required_channels=("right_wrist_pose",),
+            )
+        )
+
+        def sample(*, now: float, tx: float) -> dict[str, ObservationChannel]:
+            return {
+                "right_wrist_pose": ObservationChannel(
+                    channel_name="right_wrist_pose",
+                    capability="pose6d",
+                    side="right",
+                    value=_pose(tx=tx),
+                    frame_name="desk",
+                    timestamp=now,
+                    source_name="latest-value-stub",
+                    valid=True,
+                    critical=True,
+                )
+            }
+
+        self.assertEqual(monitor.evaluate_channels(sample(now=0.0, tx=0.0), 0.0), [])
+        self.assertEqual(
+            [item.code for item in monitor.evaluate_channels(sample(now=0.1, tx=0.2), 0.1)],
+            ["translation_jump"],
+        )
+        # The same absolute difference after a long consumer-side gap seeds a
+        # new adjacency baseline.  Downstream execution safety is unaffected.
+        self.assertEqual(monitor.evaluate_channels(sample(now=0.5, tx=0.5), 0.5), [])
+        self.assertEqual(
+            [item.code for item in monitor.evaluate_channels(sample(now=0.6, tx=0.7), 0.6)],
+            ["translation_jump"],
         )
 
 

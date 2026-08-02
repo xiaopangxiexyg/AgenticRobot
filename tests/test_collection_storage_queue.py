@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import unittest
 
-from teleop_runtime.collection.async_writer import WriteJob
+from collection_runtime.async_writer import WriteJob
 from teleop_runtime.collection.build_collect_components import CollectorComponents
 from teleop_runtime.collection.observers import (
     CollectionWriterObserver,

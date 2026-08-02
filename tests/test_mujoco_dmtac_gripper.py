@@ -49,7 +49,7 @@ from sim.mujoco.deploy.pose_resolution import MujocoCoupledPoseToQposResolver
 from sim.mujoco.ik import RM65CanonicalIK
 from sim.mujoco.scene import MujocoScene
 from teleop_runtime.action.human_proposal import HumanCommandEmission
-from teleop_runtime.collection.stream_sink import NativeStreamEpisodeWriter
+from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"

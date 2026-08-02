@@ -654,6 +654,47 @@ trained_prefix_conditioning_v1: runtime required, training required
 source contract hash；规范化视图不产生替代identity。`dataset_interface`必须拒绝
 `inference_only_projection_v1`训练投影；runtime/provider只消费规范化runtime部分。
 
+首个trained model-RTC profile冻结为：
+
+```text
+conditioning_origin = trained_prefix_conditioning_v1
+runtime.continuation_mode = flow_inpaint
+training = required
+action = continuous absolute
+prefix provenance = trajectory_overlap_teacher_v1
+```
+
+这里training provenance与runtime sampler mode正交：首版trained checkpoint复用既有v3
+flow-inpaint envelope/receipt/crop，不新增第二套RTC runtime。只有未来sampler语义确实无法由v3表达时，才允许以独立gate
+启用`continuation_mode=trained_prefix_conditioning`。`require_trained_model_rtc_v1_contract()`是该首版profile的pure
+validator；它不得把inference-only或legacy artifact提升为trained。
+
+训练window必须由同一episode、同一`source_start_index`一次构造observation与action chunk，并冻结：
+
+```text
+observation_source_index = generation_start_source_index = source_start_index
+first_executable_source_index = source_start_index + forecast_delay_steps
+valid_action_stop_source_index_exclusive = source_start_index + valid_action_count
+```
+
+delay/prefix不由worker顺序或隐式RNG决定。首版使用versioned sampling spec显式列出允许的
+`(forecast_delay_steps, prefix_steps)`，逐项验证artifact范围及`prefix_steps <= forecast_delay_steps`，再以
+`spec hash + source contract hash + episode/id/index + draw_index`做stateless hash-indexed uniform selection；episode
+tail只保留仍有真实executable suffix的pair。sampling spec、causal binding与最终training window各自有可重放hash；
+chosen pair已由既有training sample hash绑定，不新增重复selection receipt。
+训练run evidence不倒塞进既有v2 continuation schema，而使用独立
+`dexteleop_model_continuation_training_run_v1`绑定artifact template、base checkpoint、exact sampling spec、
+trainer implementation/parameters、train config及source bindings。每个source binding至少覆盖dataset identity、
+完整episode manifest和所选logical camera media index。每个保存的checkpoint必须同时写
+`model_continuation_training_run.json`与`model_continuation_checkpoint_receipt.json`；receipt绑定实际
+`policy_artifact.json` hash、model id和checkpoint step。部署trained profile时必须重算并核对三者，且actual artifact除
+`checkpoint_step`外必须与冻结template相同。该run/receipt只证明训练来源与实现，不证明任务性能或motion readiness。
+
+OpenPI首版training adapter只添加可选`model_rtc.action_loss_mask`。字段缺失时DataLoader仍返回原二元batch且loss保持原
+`mean`；字段存在时才返回显式mask并按`sum(loss * mask) / sum(mask)`聚合。mask由dataset identity、episode/index、
+epoch和sampling spec无状态生成，normal mode不产生额外debug tensor。adapter通过外部launcher包装任意兼容base config，
+不写OpenPI默认config registry；原checkpoint只读，输出model/config/experiment/checkpoint目录必须独立。
+
 具体provider不得接受脱离loaded artifact的临时continuation contract。OpenPI conditioned backend使用的source contract
 必须来自其base backend所加载`PolicyArtifactContract.model_continuation`；runtime config不得再携带第二份contract，
 只声明selected prefix schedule与sampler constraint。provider capability必须由artifact runtime、loaded codec identity和server实际发布的
@@ -701,12 +742,12 @@ horizon 范围、`prefix_requirement`，以及 prefix-mask/conditioning-receipt 
 capability drift、hash drift 或 horizon 不满足时不得降级成另一种 model/RTC 语义。
 
 RTC profile MUST remain default-off；`--rtc-profile off` 时 server metadata、legacy `Policy.infer()`、sampler、websocket
-payload、sync queue 顺序和 existing action-chunk behavior 不得改变。OpenPI raw-RTC 的 launcher/profile 细节见
+payload、sync queue 顺序和 existing action-chunk behavior 不得改变。OpenPI raw/model-RTC 的 launcher/profile 细节见
 [`deployments/openpi/client/README.md`](deployments/openpi/client/README.md)。
 
 ### 9.3.1 Live observation/transport no-action shadow
 
-`--rtc-real-shadow` 是 raw-RTC 的显式部署开关，语义是：
+`--rtc-real-shadow` 是model-backed raw/model-RTC的显式部署开关，语义是：
 
 ```text
 real arm/hand/camera observation
@@ -716,13 +757,14 @@ real arm/hand/camera observation
 ```
 
 它不是数据集 replay；数据集/合成 observation 只能验证离线 codec、adapter 和 plan，不覆盖真实设备采样、相机时序或
-网络延迟。该开关必须与 `raw_rtc_final_chunk_15_30_60_120_v1`、`send_actions=false` 一起使用；没有显式开关时，raw-RTC
-不接受 live arm/hand endpoints。
+网络延迟。该开关必须与`raw_rtc_final_chunk_15_30_60_120_v1`或
+`model_rtc_flow_inpaint_shadow_15_30_60_120_v1`及`send_actions=false`一起使用；没有显式开关时，model-backed RTC
+不接受live arm/hand endpoints。
 
 live shadow 下 backend MUST expose measured observation while `observation_only=true`：RM65 不得配置奇异点阈值、同步工具
 帧、启动 force/CANFD 输出或发送/停止 motion；DMTAC/hand 不得清 fault、写 speed/torque、open/reset 或发送 command。该
-模式只产生 `rtc_real_shadow_ready` 类验证证据，不授予 motion authorization；teleop、replay、sync dry-run 和 model-RTC
-均不继承此开关。
+模式只产生`rtc_real_shadow_ready`类验证证据，不授予motion authorization；teleop、replay和sync deployment均不继承
+此开关。
 
 若开启 `--debug`，raw-RTC 与 model-RTC 可记录 model-neutral 的 `rtc_transport_exchange` 事件。raw-RTC包含
 observation cut、输入/输出identity hash、chunk horizon以及inference/result latency；model-RTC额外投影

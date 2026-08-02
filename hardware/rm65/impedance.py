@@ -379,7 +379,10 @@ class RM65ImpedanceConfig:
     deployment_full_ik_hz: float = 15.0
     deployment_full_ik_deadline_ms: float = 66.66666666666667
     deployment_local_ik_deadline_ms: float = 6.0
-    deployment_full_ik_preempts_local: bool = True
+    # A full solve is advisory when the bounded local path is available.  The
+    # deployment CLI can still opt into the historical fail-closed preemption
+    # behavior explicitly for rollback/debugging.
+    deployment_full_ik_preempts_local: bool = False
     ik_seed_expansion_enabled: bool = True
     ik_seed_expansion_profile: str = "rm65"
     ik_seed_expansion_json: str | None = None
@@ -736,6 +739,7 @@ class RM65BaseImpedanceController:
         self._joint_rate_limiter: JointRateLimiter | None = None
         self._joint_velocity_limit_profile: JointVelocityLimitProfile | None = None
         self._last_joint_rate_limit_warning_time = 0.0
+        self._soft_hold_active = False
         self._joint_position_limits_deg: tuple[list[float], list[float]] | None = None
         self._joint_position_limits_checked = False
         self._joint_position_limits_error = ""
@@ -2974,6 +2978,7 @@ class RM65BaseImpedanceController:
         self._previous_measured_joint = list(self._state["joint_deg"])
         self._previous_measured_sample_time = initial_sample_time
         self._last_step_time = initial_sample_time
+        self._soft_hold_active = False
         self._started = True
         self._reset_follow_stream_state(self._previous_command_joint)
         self._start_follow_stream_if_needed()
@@ -3039,6 +3044,7 @@ class RM65BaseImpedanceController:
         self._last_step_time = reset_sample_time
         self._current_step_dt = None
         self._step_index = 0
+        self._soft_hold_active = False
         self._reset_follow_stream_state(self._previous_command_joint)
         self._start_follow_stream_if_needed()
 
@@ -3200,6 +3206,8 @@ class RM65BaseImpedanceController:
         target: Iterable[float] | None = None,
         *,
         target_joint_deg: Iterable[float] | None = None,
+        soft_hold_joint_deg: Iterable[float] | None = None,
+        soft_hold_reason: str = "",
     ) -> dict[str, object]:
         self.start()
         assert self.robot is not None
@@ -3252,17 +3260,67 @@ class RM65BaseImpedanceController:
         admittance_dt_details = self._admittance_dt_details()
         admittance_dt = float(admittance_dt_details["effective_dt_sec"])
         self._last_joint_hint_invalidation = None
-        if target is not None:
-            self._reference.set_target(target)
-            if self._deployment_dual_rate_ik_enabled():
-                with self._deployment_dual_rate_lock:
-                    self._deployment_target_generation += 1
-            if target_joint_deg is None:
-                self._invalidate_preferred_joint_hint(
-                    reason="fresh_cartesian_target_without_solver_qpos",
+        soft_hold_joint = (
+            None
+            if soft_hold_joint_deg is None
+            else finite_list(
+                soft_hold_joint_deg,
+                expected_len=6,
+                label="soft_hold_joint_deg",
+            )
+        )
+        soft_hold_pose = None
+        if soft_hold_joint is not None:
+            if target is not None or target_joint_deg is not None:
+                raise ValueError(
+                    "soft hold cannot be combined with a fresh impedance target."
                 )
-        reference = self._reference.advance(dt)
-        preferred_joint = self._advance_preferred_joint(target_joint_deg, dt)
+            soft_hold_pose = normalize_pose(self._forward_pose(soft_hold_joint))
+            if not self._soft_hold_active:
+                self._admittance.reset()
+                # The old command may still be ahead of the measured arm
+                # state.  Rebase the final-step/rate-limit anchors before the
+                # first hold tick so the backend does not take one more step
+                # toward that stale target while entering the lease.
+                self._previous_command_joint = list(soft_hold_joint)
+                self._previous_command_pose = list(soft_hold_pose)
+                if self._joint_rate_limiter is not None:
+                    self._joint_rate_limiter.reset(
+                        _joint_deg_to_rad(
+                            soft_hold_joint,
+                            label="policy_inference_soft_hold_joint",
+                        )
+                    )
+            self._soft_hold_active = True
+            self._reference.current = list(soft_hold_pose)
+            self._reference.start = list(soft_hold_pose)
+            self._reference.target = list(soft_hold_pose)
+            self._reference.elapsed = 0.0
+            self._reference.duration = 0.0
+            if self._joint_hint_reference is not None:
+                self._joint_hint_reference.current = list(soft_hold_joint)
+                self._joint_hint_reference.start = list(soft_hold_joint)
+                self._joint_hint_reference.target = list(soft_hold_joint)
+                self._joint_hint_reference.elapsed = 0.0
+                self._joint_hint_reference.duration = 0.0
+            self._joint_hint_target = list(soft_hold_joint)
+            reference = list(soft_hold_pose)
+            preferred_joint = list(soft_hold_joint)
+        else:
+            if self._soft_hold_active:
+                self._admittance.reset()
+            self._soft_hold_active = False
+            if target is not None:
+                self._reference.set_target(target)
+                if self._deployment_dual_rate_ik_enabled():
+                    with self._deployment_dual_rate_lock:
+                        self._deployment_target_generation += 1
+                if target_joint_deg is None:
+                    self._invalidate_preferred_joint_hint(
+                        reason="fresh_cartesian_target_without_solver_qpos",
+                    )
+            reference = self._reference.advance(dt)
+            preferred_joint = self._advance_preferred_joint(target_joint_deg, dt)
         mark_timing("reference")
 
         passthrough_position_control = self._passthrough_position_control_enabled()
@@ -3371,11 +3429,39 @@ class RM65BaseImpedanceController:
                 else dict(self._last_joint_hint_invalidation)
             ),
         }
-        command_pose, command_joint = self._command_from_reference(
-            reference,
-            update["offset"],
-            preferred_joint=preferred_joint,
-        )
+        if soft_hold_joint is not None:
+            # Inference hold is a measured-pose freeze, not a replay of the
+            # previous Cartesian target.  Keep the force guard and sensing
+            # alive, but do not let admittance or IK move the frozen pose.
+            zero_offset = [0.0] * 6
+            update["offset"] = list(zero_offset)
+            self._admittance.reset()
+            self._latest_wrench_context.update(
+                {
+                    "offset": list(zero_offset),
+                    "applied_offset": list(zero_offset),
+                    "applied_offset_source": "policy_inference_soft_hold",
+                    "admittance_offset_state_update_enabled": False,
+                    "policy_inference_soft_hold": True,
+                    "policy_inference_soft_hold_reason": str(soft_hold_reason),
+                    "ik_method": ["policy_inference_soft_hold"],
+                    "ik_metadata": {
+                        "status": "hold",
+                        "method": "policy_inference_soft_hold",
+                        "source": "policy_inference_soft_hold",
+                        "hold_reason": str(soft_hold_reason),
+                    },
+                }
+            )
+            command_pose = list(soft_hold_pose or reference)
+            command_joint = list(soft_hold_joint)
+            self._ik_seed = list(command_joint)
+        else:
+            command_pose, command_joint = self._command_from_reference(
+                reference,
+                update["offset"],
+                preferred_joint=preferred_joint,
+            )
         pre_follow_smoothing_command_pose = list(command_pose)
         pre_follow_smoothing_command_joint = list(command_joint)
         follow_qpos_smoothing = dict(
@@ -3408,7 +3494,11 @@ class RM65BaseImpedanceController:
         if self._latest_wrench_context is not None:
             self._latest_wrench_context["follow_qpos_smoothing"] = dict(follow_qpos_smoothing)
         sync_realized_offset = getattr(self, "_sync_admittance_to_realized_pose_offset", None)
-        if callable(sync_realized_offset) and final_command_pose_realized_from_joint:
+        if (
+            callable(sync_realized_offset)
+            and final_command_pose_realized_from_joint
+            and soft_hold_joint is None
+        ):
             sync_realized_offset(
                 reference_pose=reference,
                 command_pose=command_pose,
@@ -3614,6 +3704,10 @@ class RM65BaseImpedanceController:
             "step": self._step_index,
             "exact_qpos_transit_active": self.exact_qpos_transit_active,
             "exact_qpos_transit_operation_id": self.exact_qpos_transit_operation_id,
+            "policy_inference_soft_hold": soft_hold_joint is not None,
+            "policy_inference_soft_hold_reason": (
+                None if soft_hold_joint is None else str(soft_hold_reason)
+            ),
             "measurement_timestamp": state_sample_wall_time,
             "measurement_timestamp_monotonic": state_sample_time,
             "measurement_valid": bool(
@@ -4320,6 +4414,7 @@ class RM65BaseImpedanceController:
         raise NotImplementedError
 
     def stop_motion(self) -> None:
+        self._soft_hold_active = False
         self.end_exact_qpos_transit()
         self._stop_deployment_dual_rate_ik()
         self._stop_follow_stream()
@@ -4702,9 +4797,10 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         """Combine a periodic full solve with bounded, local 40 Hz IK.
 
         A full request is merely published here; the 15 Hz worker owns the
-        expensive solve.  If that worker is busy, the force thread still reads
-        force, updates admittance, and sends a previous safe joint command at
-        40 Hz.  It deliberately does not start competing candidate searches.
+        expensive solve.  By default, if that worker is busy, the force thread
+        still reads force, updates admittance, and runs the bounded local IK at
+        40 Hz.  The historical previous-safe-command hold remains available
+        through ``deployment_full_ik_preempts_local``.
         """
 
         if self._deployment_local_ik_resolver is None:

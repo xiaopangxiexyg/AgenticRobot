@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -75,6 +77,7 @@ def process_video(
     codec: str = "mp4v",
     size_policy: SizePolicy = "strict",
     max_frames: int = 0,
+    expected_frame_count: int | None = None,
     overwrite: bool = False,
     progress: Callable[[int], None] | None = None,
 ) -> VideoProcessResult:
@@ -87,6 +90,13 @@ def process_video(
         raise FileNotFoundError(f"input video does not exist: {input_path}")
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"output video already exists: {output_path}")
+    if expected_frame_count is not None and int(expected_frame_count) <= 0:
+        raise ValueError(
+            f"expected_frame_count must be positive when provided, got {expected_frame_count}"
+        )
+    temporary_output_path = output_path.with_name(
+        f".{output_path.stem}.partial-{os.getpid()}-{uuid.uuid4().hex}{output_path.suffix}"
+    )
 
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
@@ -94,6 +104,7 @@ def process_video(
     writer = None
     started = time.perf_counter()
     frame_count = 0
+    processing_succeeded = False
     try:
         width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
         height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -117,7 +128,13 @@ def process_video(
                 )
 
         maps = build_undistort_maps(effective_intrinsics, alpha=alpha)
-        writer = _open_writer(output_path, codec=codec, fps=fps, width=width, height=height)
+        writer = _open_writer(
+            temporary_output_path,
+            codec=codec,
+            fps=fps,
+            width=width,
+            height=height,
+        )
 
         while True:
             if max_frames > 0 and frame_count >= int(max_frames):
@@ -129,10 +146,23 @@ def process_video(
             frame_count += 1
             if progress is not None:
                 progress(frame_count)
+        processing_succeeded = True
     finally:
         capture.release()
         if writer is not None:
             writer.release()
+        if not processing_succeeded:
+            temporary_output_path.unlink(missing_ok=True)
+    try:
+        if expected_frame_count is not None and frame_count != int(expected_frame_count):
+            raise RuntimeError(
+                "decoded frame count does not satisfy the dataset contract: "
+                f"input={input_path}, expected={int(expected_frame_count)}, decoded={frame_count}"
+            )
+        os.replace(temporary_output_path, output_path)
+    except BaseException:
+        temporary_output_path.unlink(missing_ok=True)
+        raise
     elapsed = time.perf_counter() - started
     return VideoProcessResult(
         input_path=input_path,

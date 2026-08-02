@@ -10,6 +10,7 @@ import pytest
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
 )
 from teleop_runtime.backends.arms.rm65 import (
     RM65ArmBackend,
@@ -218,6 +219,58 @@ def test_acceleration_mode_uses_independent_uniform_command_step_envelope() -> N
     )
 
 
+def test_sample_aligned_backend_stamps_admitted_endpoint_and_holds_inner_frames() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            control_dt=1.0 / 60.0,
+            background_streaming_enabled=True,
+            background_streaming_hz=120.0,
+            position_command_planner=(
+                POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+            ),
+            position_sample_aligned_source_hz=15.0,
+            position_velocity_ramp_sec=0.075,
+            position_max_acceleration_rad_s2=(
+                56.0,
+                56.0,
+                72.0,
+                120.0,
+                120.0,
+                160.0,
+            ),
+            position_max_command_step_deg=0.675,
+            arm_follow_qpos_alpha=1.0,
+            singularity_protection_enabled=False,
+        )
+    )
+    backend.arm = _FakeArm()
+
+    first = _command(1.0)
+    first.metadata["sample_aligned_source_timestamp"] = 100.0
+    backend.send_command(first)
+    admitted = np.asarray(first.metadata["backend_final_target_qpos"], dtype=float)
+    assert np.max(admitted) < 0.1
+    assert first.metadata["sample_aligned_admission"]["admission_limited"] is True
+    assert first.metadata["position_transport_sample_aligned_bucket_held"] is False
+
+    intermediate = _command(-1.0)
+    intermediate.metadata["sample_aligned_source_timestamp"] = 100.0 + 1.0 / 60.0
+    backend.send_command(intermediate)
+    np.testing.assert_allclose(
+        intermediate.metadata["backend_final_target_qpos"],
+        admitted,
+    )
+    assert intermediate.metadata["position_transport_sample_aligned_bucket_held"] is True
+
+    next_cut = _command(0.5)
+    next_cut.metadata["sample_aligned_source_timestamp"] = 100.0 + 4.0 / 60.0
+    backend.send_command(next_cut)
+    assert next_cut.metadata["position_transport_sample_aligned_bucket_held"] is False
+
 def test_command_step_envelope_default_remains_velocity_times_control_dt() -> None:
     max_angvel = np.asarray((0.7, 0.7, 0.9, 1.5, 1.5, 2.0), dtype=float)
     control_dt = 1.0 / 75.0
@@ -251,7 +304,7 @@ def test_command_step_envelope_rejects_non_positive_or_non_finite(value: float) 
 
 
 def test_command_step_envelope_rejects_linear_planner() -> None:
-    with pytest.raises(ValueError, match="acceleration_limited"):
+    with pytest.raises(ValueError, match="acceleration/jerk-limited"):
         RM65ArmBackendConfig(
             arm_ip="0.0.0.0",
             side="left",

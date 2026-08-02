@@ -170,7 +170,6 @@ def test_batch_one_payload_modules_preserve_legacy_names_and_do_not_reverse_impo
         assert getattr(legacy_entrypoint, name) is getattr(runtime_debug, name)
     assert legacy_entrypoint._DEBUG_TIMING_RED == gripper_status._DEBUG_TIMING_RED
     assert legacy_entrypoint._DEBUG_TIMING_RESET == gripper_status._DEBUG_TIMING_RESET
-
     for path in (
         ROOT / "teleop_runtime/gui/status_payloads.py",
         ROOT / "teleop_runtime/real_teleop/action_debug_payload.py",
@@ -185,6 +184,41 @@ def test_batch_one_payload_modules_preserve_legacy_names_and_do_not_reverse_impo
         source = path.read_text(encoding="utf-8")
         assert "run_vive_rm65_real_teleop" not in source
         assert "teleop_runtime.debug" not in source
+
+
+def test_dataset_recording_debug_uses_process_writer_stats() -> None:
+    process_worker = SimpleNamespace(
+        stats=lambda: SimpleNamespace(
+            submitted_samples=12,
+            completed_samples=11,
+            rejected_busy=1,
+            sample_rejections=0,
+            queue_capacity=4,
+            queue_high_water=2,
+            slots_available=3,
+            slot_count=4,
+            worker_alive=True,
+            worker_error=None,
+            sample_process_ms_p50=10.0,
+            sample_process_ms_p95=20.0,
+        )
+    )
+    recorder = SimpleNamespace(
+        process_worker=process_worker,
+        writer_pool=None,
+        _storage_queue_stats_payload=lambda: {"enabled": False},
+    )
+
+    text = runtime_debug._dataset_recording_debug_text(
+        dataset_recorder=recorder,
+        components=SimpleNamespace(active_sides=()),
+        camera_sources={},
+        camera_previewer=None,
+        now=1.0,
+    )
+
+    assert "writer=mode:process submitted:12 completed:11" in text
+    assert "writer=status_error" not in text
 
 
 def test_extracted_debug_timing_report_keeps_legacy_ansi_frame() -> None:
@@ -376,12 +410,24 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 389
-    assert sum(len(action.option_strings) for action in parser._actions) == 433
+    assert len(parser._actions) == 404
+    assert sum(len(action.option_strings) for action in parser._actions) == 454
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).v25p_native_shadow is False
     assert parser.parse_args([]).v25p_native_storage_layout == "record_cjson_v1"
+    assert parser.parse_args([]).position_ik_branch_continuity_anchor is False
+    assert parser.parse_args([]).position_joint_limit_guard_mode == "legacy"
+    assert parser.parse_args([]).runtime_home_atomic_arm_snapshot is True
+    assert parser.parse_args([]).runtime_home_late_weighted_vive is True
+    rollback_args = parser.parse_args(
+        [
+            "--no-runtime-home-atomic-arm-snapshot",
+            "--no-runtime-home-late-weighted-vive",
+        ]
+    )
+    assert rollback_args.runtime_home_atomic_arm_snapshot is False
+    assert rollback_args.runtime_home_late_weighted_vive is False
     assert parser.parse_args(["--v25p-native-shadow"]).v25p_native_shadow is True
     assert (
         parser.parse_args(
@@ -857,6 +903,71 @@ def test_device_retry_runtime_keeps_optional_foot_pad_status_dynamic() -> None:
         and update.get("foot_pad_status") == "online"
         for update in published
     )
+
+
+def test_device_retry_runtime_immediately_refreshes_camera_projection() -> None:
+    errors = {"camera.front": "initial startup failure"}
+    camera_calls: list[str] = []
+    camera_status_refreshes: list[str] = []
+
+    class Camera:
+        def close(self) -> None:
+            camera_calls.append("close")
+
+        def start(self) -> None:
+            camera_calls.append("start")
+
+    published: list[dict[str, object]] = []
+    ui = SimpleNamespace(
+        publish=lambda **kwargs: published.append(kwargs),
+        append_message=lambda *_args: None,
+    )
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: ("device_retry",),
+        device_retry_admission=lambda: (True, ""),
+        _episode_busy=lambda: False,
+        _teleop_started=False,
+        hold_active=lambda: True,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    runtime = device_retry_runtime.build_device_retry_runtime(
+        args=SimpleNamespace(foot_pad_requested=False, ignore_camera=()),
+        components=components,
+        control_ui=ui,
+        clutch_input=clutch,
+        camera_sources={"front": Camera()},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: None,
+        set_dataset_recorder=lambda value: None,
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda value: None,
+        dataset_recorder_type=object,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *args, **kwargs: (
+            False,
+            "",
+        ),
+        log=lambda *args, **kwargs: None,
+        publish_camera_status=lambda: camera_status_refreshes.append("refresh"),
+    )
+
+    runtime.retry_failed_devices()
+
+    assert camera_calls == ["close", "start"]
+    assert camera_status_refreshes == ["refresh"]
+    assert "camera.front" not in errors
+    assert published[-1]["hardware_status"]["camera.front"]["status_level"] == "ok"
 
 
 def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 import select
 import sys
 import termios
@@ -1063,6 +1065,7 @@ def _resolve_robot_home_for_side(
     components: VirtualRunComponents,
     *,
     side: str,
+    qpos_snapshot: Mapping[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, str]:
     calibration = components.session.calibration
     assert calibration is not None
@@ -1095,6 +1098,16 @@ def _resolve_robot_home_for_side(
                 )
             if qpos is not None:
                 return _preview_tcp_pose_desk(components, side=side), qpos, "initial_alignment_qpos"
+
+    if qpos_snapshot is not None and side in qpos_snapshot:
+        anchor_qpos = np.asarray(qpos_snapshot[side], dtype=float).reshape(6).copy()
+        preview_backend.set_local_qpos(anchor_qpos)
+        _sync_dual_arm_retargeter_from_preview(components)
+        return (
+            _preview_tcp_pose_desk(components, side=side),
+            anchor_qpos,
+            "real_atomic_home_snapshot",
+        )
 
     if state_backend is not None:
         state = state_backend.refresh_state_from_hardware()
@@ -1470,18 +1483,141 @@ def _sync_preview_from_real_state(
     return synced
 
 
-def _mean_pose(poses: list[np.ndarray]) -> np.ndarray:
+def _mean_pose(
+    poses: list[np.ndarray],
+    *,
+    weights: np.ndarray | None = None,
+) -> np.ndarray:
     if not poses:
         raise ValueError("Cannot average an empty pose list.")
+    if weights is None:
+        normalized_weights = np.full(len(poses), 1.0 / len(poses), dtype=float)
+    else:
+        weight_values = np.asarray(weights, dtype=float).reshape(-1)
+        if weight_values.size != len(poses):
+            raise ValueError("Pose-average weights must match the pose count.")
+        if not np.all(np.isfinite(weight_values)) or np.any(weight_values <= 0.0):
+            raise ValueError("Pose-average weights must be finite and positive.")
+        normalized_weights = weight_values / float(np.sum(weight_values))
     mean_pose = np.eye(4, dtype=float)
-    mean_pose[:3, 3] = np.mean([pose[:3, 3] for pose in poses], axis=0)
-    rot_sum = np.sum([pose[:3, :3] for pose in poses], axis=0)
+    mean_pose[:3, 3] = np.sum(
+        [weight * pose[:3, 3] for weight, pose in zip(normalized_weights, poses)],
+        axis=0,
+    )
+    rot_sum = np.sum(
+        [weight * pose[:3, :3] for weight, pose in zip(normalized_weights, poses)],
+        axis=0,
+    )
     u, _, vt = np.linalg.svd(rot_sum)
     mean_pose[:3, :3] = u @ vt
     if np.linalg.det(mean_pose[:3, :3]) < 0.0:
         u[:, -1] *= -1.0
         mean_pose[:3, :3] = u @ vt
     return mean_pose
+
+
+def _capture_atomic_real_qpos_snapshot(
+    components: VirtualRunComponents,
+    *,
+    required: bool,
+) -> dict[str, np.ndarray]:
+    """Read one dual-arm Home snapshot and normalize it through preview state.
+
+    The returned qpos values are the sole real-arm anchors for this Home
+    transaction. Callers must reuse them for robot Home, IK synchronization,
+    and command-backend reset instead of reading hardware again.
+    """
+
+    active: list[tuple[str, object, object]] = []
+    for side, state_backend, preview_backend in (
+        ("left", components.left_state_backend, components.left_preview_backend),
+        ("right", components.right_state_backend, components.right_preview_backend),
+    ):
+        if side in _active_side_set(components) and state_backend is not None:
+            active.append((side, state_backend, preview_backend))
+
+    if required and len(active) != len(_active_side_set(components)):
+        available = {side for side, _, _ in active}
+        missing = sorted(_active_side_set(components) - available)
+        raise RuntimeError(
+            "runtime Home atomic arm snapshot is missing real state backend(s): "
+            f"{missing}"
+        )
+
+    states: dict[str, Mapping[str, object]] = {}
+
+    def read_one(item: tuple[str, object, object]) -> tuple[str, Mapping[str, object]]:
+        side, state_backend, _ = item
+        state = state_backend.refresh_state_from_hardware()
+        if not isinstance(state, Mapping):
+            raise RuntimeError(f"{side}_arm returned a non-mapping hardware state.")
+        return side, state
+
+    configured_executor = getattr(components, "arm_state_read_executor", None)
+    parallel_reads_enabled = bool(
+        configured_executor is not None
+        and int(getattr(configured_executor, "_max_workers", 1)) > 1
+    )
+    if len(active) > 1 and parallel_reads_enabled:
+        # Runtime Home is a rare control boundary. Use a fresh executor rather
+        # than the startup executor, which is deliberately shut down after the
+        # first Home and cannot serve later Hold -> Home transitions. Preserve
+        # an explicit --arm-io-threads=1 request by keeping this read sequential.
+        with ThreadPoolExecutor(
+            max_workers=len(active),
+            thread_name_prefix="rm65_home_snapshot",
+        ) as executor:
+            futures = [executor.submit(read_one, item) for item in active]
+            for future in futures:
+                side, state = future.result()
+                states[side] = state
+    else:
+        for item in active:
+            side, state = read_one(item)
+            states[side] = state
+
+    snapshot: dict[str, np.ndarray] = {}
+    for side, _, preview_backend in active:
+        state = states.get(side)
+        qpos = None if state is None else state.get("current_qpos")
+        if qpos is None:
+            if required:
+                raise RuntimeError(
+                    f"{side}_arm atomic runtime Home snapshot has no current_qpos."
+                )
+            continue
+        qpos_array = np.asarray(qpos, dtype=float).reshape(6)
+        if not np.all(np.isfinite(qpos_array)):
+            raise RuntimeError(
+                f"{side}_arm atomic runtime Home snapshot contains non-finite qpos."
+            )
+        preview_backend.set_local_qpos(qpos_array)
+        preview_state = preview_backend.get_state()
+        anchor_qpos = preview_state.get("current_qpos")
+        if anchor_qpos is None:
+            raise RuntimeError(
+                f"{side}_arm preview did not retain the atomic Home qpos anchor."
+            )
+        anchor_qpos = np.asarray(anchor_qpos, dtype=float).reshape(6).copy()
+        normalization = preview_state.get("local_qpos_normalization")
+        if isinstance(normalization, dict) and normalization.get("status") == "clipped":
+            _log(
+                "Calibration",
+                f"{side}_arm atomic Home qpos had a tiny endpoint quantization "
+                "overshoot; the shared preview/IK/command anchor was clipped at "
+                f"joint(s) {normalization.get('clipped_joint_indices', [])}.",
+            )
+        snapshot[side] = anchor_qpos
+
+    if components.dual_arm_retargeter is not None:
+        left_qpos = components.left_preview_backend.get_state().get("current_qpos")
+        right_qpos = components.right_preview_backend.get_state().get("current_qpos")
+        if left_qpos is not None and right_qpos is not None:
+            components.dual_arm_retargeter.set_current_qpos_pair(
+                left_qpos=left_qpos,
+                right_qpos=right_qpos,
+            )
+    return snapshot
 
 
 def _channel_pose_in_desk(channel, calibration) -> np.ndarray:
@@ -1512,7 +1648,9 @@ def _runtime_home_calibration(
     require_stable: bool = False,
     capture_sides: tuple[str, ...] | None = None,
     stability_profile: str = "strict",
-) -> None:
+    atomic_robot_home_snapshot: bool = True,
+    late_weighted_human_home: bool = True,
+) -> dict[str, np.ndarray]:
     calibration = components.session.calibration
     assert calibration is not None
     active_sides = components.active_sides
@@ -1565,11 +1703,20 @@ def _runtime_home_calibration(
         f"home_capture_mode={_robot_home_mode_label(components)}",
     )
     if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
-        synced = _sync_preview_from_real_state(components, required=False)
-        _log(
-            "Calibration",
-            f"start-pose source=real synced={synced}; pressing 'p' will capture tracker home and current real-arm home",
-        )
+        if atomic_robot_home_snapshot:
+            _log(
+                "Calibration",
+                "start-pose source=real; one final dual-arm snapshot will be "
+                "captured after the last fresh VIVE Home sample and reused by "
+                "robot Home, preview/IK, and command reset",
+            )
+        else:
+            synced = _sync_preview_from_real_state(components, required=False)
+            _log(
+                "Calibration",
+                f"start-pose source=real synced={synced}; pressing 'p' will "
+                "capture tracker home and current real-arm home",
+            )
     elif _has_live_real_state(components):
         _log(
             "Calibration",
@@ -1588,6 +1735,11 @@ def _runtime_home_calibration(
     calibration_timing_start = time.perf_counter()
     start_time = time.time()
     samples: dict[str, list[np.ndarray]] = {side: [] for side in home_sides}
+    last_sample_timestamp: dict[str, float | None] = {
+        side: None for side in home_sides
+    }
+    late_weighted_active = bool(late_weighted_human_home and num_samples > 1)
+    sample_target = int(num_samples) + (1 if late_weighted_active else 0)
     profile_name = str(stability_profile or "strict").strip().lower()
     if profile_name not in {"strict", "transition"}:
         raise ValueError(
@@ -1596,7 +1748,11 @@ def _runtime_home_calibration(
         )
     _log(
         "Calibration",
-        f"stability_profile={profile_name} capture_sides={','.join(home_sides)}",
+        f"stability_profile={profile_name} capture_sides={','.join(home_sides)} "
+        f"human_home_estimator="
+        f"{'late_linear_fresh_final' if late_weighted_active else 'legacy_uniform'} "
+        f"robot_home_snapshot="
+        f"{'atomic_shared' if atomic_robot_home_snapshot else 'legacy_reread'}",
     )
     stability_factory = (
         HomeCaptureStabilityState.transition_profile
@@ -1605,7 +1761,9 @@ def _runtime_home_calibration(
     )
     stability_by_side = {side: stability_factory() for side in home_sides}
     observed_channels: set[str] = set()
-    sample_markers = sorted({1, max(1, num_samples // 2), num_samples})
+    sample_markers = sorted(
+        {1, max(1, num_samples // 2), num_samples, sample_target}
+    )
     reported: dict[str, set[int]] = {side: set() for side in home_sides}
 
     def publish_progress(*, now: float, channels=None, waiting: bool = False) -> None:
@@ -1623,7 +1781,7 @@ def _runtime_home_calibration(
         progress_callback(
             sample_counts={side: len(samples[side]) for side in home_sides},
             valid_by_side=valid,
-            min_samples=int(num_samples),
+            min_samples=int(sample_target),
             elapsed_sec=max(0.0, now - start_time),
             timeout_sec=float(timeout_sec),
             waiting_for_samples=bool(waiting),
@@ -1632,7 +1790,7 @@ def _runtime_home_calibration(
 
     publish_progress(now=start_time, waiting=False)
 
-    while any(len(samples[side]) < num_samples for side in home_sides):
+    while any(len(samples[side]) < sample_target for side in home_sides):
         now = time.time()
         if now - start_time > timeout_sec:
             counts = {side: len(samples[side]) for side in home_sides}
@@ -1685,30 +1843,44 @@ def _runtime_home_calibration(
                     now=now,
                 )
                 observed_channels.add(channel.channel_name)
-            if channel.valid and len(samples[side]) < num_samples:
+            if channel.valid and len(samples[side]) < sample_target:
+                channel_timestamp = float(channel.timestamp)
+                previous_timestamp = last_sample_timestamp[side]
+                if (
+                    late_weighted_active
+                    and previous_timestamp is not None
+                    and channel_timestamp <= previous_timestamp
+                ):
+                    # The legacy path counted repeated polls of one latest-value
+                    # packet as independent samples. The new estimator admits
+                    # only fresh VIVE packets and reserves the final packet as
+                    # the highest-weight Home observation.
+                    continue
                 pose_desk = _channel_pose_in_desk(channel, calibration)
                 if require_stable:
                     decision = stability_by_side[side].observe(
                         pose_desk,
-                        source_timestamp=float(channel.timestamp),
+                        source_timestamp=channel_timestamp,
                         first_accepted_pose=(
                             samples[side][0] if samples[side] else None
                         ),
                     )
                     if decision.reset_samples:
                         samples[side].clear()
+                        last_sample_timestamp[side] = None
                     if not decision.accepted:
                         continue
                 samples[side].append(pose_desk)
+                last_sample_timestamp[side] = channel_timestamp
                 for marker in sample_markers:
                     if len(samples[side]) >= marker and marker not in reported[side]:
                         reported[side].add(marker)
                         _log(
                             "Calibration",
-                            f"{side} progress {len(samples[side])}/{num_samples}",
+                            f"{side} progress {len(samples[side])}/{sample_target}",
                             now=now,
                         )
-        if any(len(samples[side]) < num_samples for side in home_sides):
+        if any(len(samples[side]) < sample_target for side in home_sides):
             publish_progress(
                 now=now,
                 channels=channels,
@@ -1721,7 +1893,25 @@ def _runtime_home_calibration(
     publish_progress(now=time.time(), waiting=False)
 
     sync_elapsed_ms = 0.0
-    if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
+    robot_qpos_snapshot: dict[str, np.ndarray] = {}
+    follows_live_real_state = _preview_should_follow_live_real_state(
+        arm_mode=arm_mode,
+        components=components,
+    )
+    if follows_live_real_state and atomic_robot_home_snapshot:
+        sync_start = time.perf_counter()
+        robot_qpos_snapshot = _capture_atomic_real_qpos_snapshot(
+            components,
+            required=True,
+        )
+        sync_elapsed_ms = (time.perf_counter() - sync_start) * 1000.0
+        _log(
+            "Calibration",
+            "locked one atomic real-arm Home snapshot for robot Home, preview, "
+            "IK, and command reset "
+            f"sides={sorted(robot_qpos_snapshot)} elapsed={sync_elapsed_ms:.1f}ms",
+        )
+    elif follows_live_real_state:
         sync_start = time.perf_counter()
         synced = _sync_preview_from_real_state(components, required=False)
         sync_elapsed_ms = (time.perf_counter() - sync_start) * 1000.0
@@ -1737,12 +1927,20 @@ def _runtime_home_calibration(
     for side in home_sides:
         side_start = time.perf_counter()
         mean_start = time.perf_counter()
-        human_home = _mean_pose(samples[side])
+        weights = (
+            np.arange(1, len(samples[side]) + 1, dtype=float)
+            if late_weighted_active
+            else None
+        )
+        human_home = _mean_pose(samples[side], weights=weights)
         mean_elapsed_ms = (time.perf_counter() - mean_start) * 1000.0
         robot_home_start = time.perf_counter()
         robot_home_desk, qpos, robot_source = _resolve_robot_home_for_side(
             components,
             side=side,
+            qpos_snapshot=(
+                robot_qpos_snapshot if atomic_robot_home_snapshot else None
+            ),
         )
         robot_home_elapsed_ms = (time.perf_counter() - robot_home_start) * 1000.0
         anchor_start = time.perf_counter()
@@ -1784,6 +1982,10 @@ def _runtime_home_calibration(
         f"runtime home captured sample_counts={sample_counts} "
         + " ".join(qpos_summaries),
     )
+    return {
+        side: np.asarray(qpos, dtype=float).reshape(6).copy()
+        for side, qpos in robot_qpos_snapshot.items()
+    }
 
 
 def _wait_for_calibration_start(

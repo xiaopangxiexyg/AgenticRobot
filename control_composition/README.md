@@ -418,9 +418,11 @@ translation and the meaning of the referenced readiness evidence.
 Eligibility is default-off. Without a configured store and an evaluation-time
 eligibility spec, existing input selection and v1/v2 hashes are unchanged.
 Eligibility only converts contributors to missing roles; it does not grant
-authority or execute HOLD. A result-bound disposition may request lower HOLD,
-but only the downstream execution owner can accept that request, advance the
-execution epoch, cancel work, and return the authoritative receipt.
+authority or execute HOLD. A result-bound disposition can submit the exact
+ready candidate, emit `no_action` (submit no candidate), or request lower
+HOLD. Only the downstream execution owner defines persistence after
+`no_action`, or accepts HOLD, advances the execution generation, cancels work,
+and returns the authoritative receipt.
 
 ## Input, optional action-space checks, and fallback
 
@@ -442,8 +444,8 @@ or grant authority. A failed check remains a candidate rejection reason, not a
 canonical safety verdict.
 
 The evaluation outcome is only `ready`, `no_action`, or `invalid`. A
-result-bound disposition may submit an exact ready candidate or request
-lower-runtime HOLD.
+result-bound disposition may submit an exact ready candidate, submit no
+candidate for this cycle, or request lower-runtime HOLD.
 The request itself is non-authoritative and is not a HOLD/cancellation receipt.
 Workspace, joint, velocity, force, IK, smoothing, limit, cancellation and
 backend safety remain private responsibilities of the selected downstream

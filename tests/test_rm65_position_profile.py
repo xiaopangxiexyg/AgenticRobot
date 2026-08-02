@@ -11,6 +11,10 @@ from robot_motion.rm65 import (
     RM65_BIMANUAL_POSITION_V1_QREF_PROFILE,
     RM65_BIMANUAL_POSITION_V2_RESPONSIVE,
     RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME,
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1,
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME,
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2,
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME,
 )
 
 
@@ -83,6 +87,65 @@ def test_responsive_v2_is_opt_in_and_v1_remains_rollback_profile() -> None:
     assert v2.to_metadata()["sha256"] != RM65_BIMANUAL_POSITION_V1.to_metadata()[
         "sha256"
     ]
+
+
+def test_sample_aligned_jerk_profile_is_execution_only_and_reversible() -> None:
+    profile = RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1
+
+    assert profile.name == RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME
+    assert profile.source_shaping == RM65_BIMANUAL_POSITION_V1.source_shaping
+    assert profile.ik_execution == RM65_BIMANUAL_POSITION_V1.ik_execution
+    assert profile.rates == RM65_BIMANUAL_POSITION_V1.rates
+    assert profile.command_execution.planner == "sample_aligned_jerk_limited"
+    assert profile.command_execution.velocity_ramp_sec == pytest.approx(0.05)
+    assert profile.command_execution.target_velocity_filter_tau_sec == pytest.approx(
+        0.0
+    )
+    assert profile.command_execution.follow_qpos_alpha == pytest.approx(1.0)
+    assert profile.to_metadata()["sha256"] != RM65_BIMANUAL_POSITION_V1.to_metadata()[
+        "sha256"
+    ]
+
+
+def test_sample_aligned_jerk_v2_is_atomic_and_v1_remains_exact_rollback() -> None:
+    v1 = RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1
+    v2 = RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2
+
+    assert v2.name == RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME
+    assert v2.rates == v1.rates
+    assert v2.ik_execution == v1.ik_execution
+    assert v1.command_execution.sample_aligned_scale_degraded_target is True
+    assert v1.command_execution.sample_aligned_jerk_regularization == pytest.approx(
+        1e-9
+    )
+    assert v1.command_execution.sample_aligned_jerk_delta_regularization == 0.0
+    assert v1.source_shaping.inactive_execution_release_translation_static_m == (
+        pytest.approx(0.03)
+    )
+
+    source = v2.source_shaping
+    command = v2.command_execution
+    assert source.post_ik_qpos_normal_fast_path is True
+    assert source.post_ik_qpos_normal_fast_path_alpha == pytest.approx(0.70)
+    assert source.inactive_execution_release_translation_static_m == pytest.approx(
+        0.0015
+    )
+    assert source.inactive_execution_release_translation_full_m == pytest.approx(
+        0.012
+    )
+    assert source.inactive_execution_release_rotation_static_deg == pytest.approx(
+        0.25
+    )
+    assert source.inactive_execution_release_rotation_full_deg == pytest.approx(2.0)
+    assert command.sample_aligned_scale_degraded_target is False
+    assert command.sample_aligned_jerk_regularization == pytest.approx(1e-6)
+    assert command.sample_aligned_jerk_delta_regularization == pytest.approx(1e-5)
+    assert command.sample_aligned_terminal_velocity_regularization == 0.0
+    assert command.sample_aligned_terminal_acceleration_regularization == 0.0
+    assert v2.to_metadata()["sha256"] not in {
+        v1.to_metadata()["sha256"],
+        RM65_BIMANUAL_POSITION_V1.to_metadata()["sha256"],
+    }
 
 
 def test_production_qref_profile_preserves_validated_numeric_envelope() -> None:

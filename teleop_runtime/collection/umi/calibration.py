@@ -15,6 +15,7 @@ from dataset_contracts.pose_frames import PoseFrameContract
 
 from .config import UmiCollectionConfig
 from .pose_adapter import as_rigid_transform
+from .topology import SIDES
 
 
 RESULT_SCHEMA = "dexteleop.umi_hand_eye.result.v1"
@@ -121,7 +122,7 @@ class UmiCalibrationBinding:
                 "UMI calibration validity exceeds the configured maximum lifetime"
             )
         calibration_side = self.side
-        if calibration_side not in {"left", "right"}:
+        if calibration_side not in set(SIDES):
             raise RuntimeError("UMI calibration side binding is invalid")
         side = config.side(calibration_side)
         if self.camera_serial != side.camera_serial:
@@ -160,7 +161,7 @@ class UmiCalibrationBinding:
                     "source_family": "vive_umi",
                     "source_description": "Dual wrist UMI poses in Vive world calibrated to board-defined desk.",
                     "topology": "dual_wrist",
-                    "active_sides": ["left", "right"],
+                    "active_sides": list(SIDES),
                     "raw_absolute_frame_by_side": {
                         "left": "vive_world",
                         "right": "vive_world",
@@ -232,7 +233,7 @@ class UmiCalibrationSet:
     def load(cls, config: UmiCollectionConfig) -> "UmiCalibrationSet":
         bindings: dict[str, UmiCalibrationBinding] = {}
         transforms: dict[str, np.ndarray] = {}
-        for side in ("left", "right"):
+        for side in SIDES:
             result_path = config.side(side).hand_eye_result
             if result_path is None:
                 if not config.allow_identity_tcp_placeholder:

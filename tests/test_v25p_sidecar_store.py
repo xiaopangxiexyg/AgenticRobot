@@ -23,7 +23,7 @@ from dataset_contracts.v25p import (
     V25P_EPISODE_RELATIVE_ROOT_V1,
 )
 from dataset_interface.v25p import V25pReadError, load_v25p_episode
-from teleop_runtime.collection.v25p_sidecar import V25pEpisodeSidecarStore
+from collection_runtime.v25p_sidecar import V25pEpisodeSidecarStore
 
 
 HASH_A = "a" * 64

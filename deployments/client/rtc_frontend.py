@@ -18,6 +18,9 @@ from dataset_contracts.model_continuation import (
     ModelContinuationContract,
     normalize_model_continuation_contract,
 )
+from dataset_contracts.policy_action_semantics import (
+    PolicyArmHoldOutputContract,
+)
 from robot_motion.deploy.async_producer import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
@@ -286,6 +289,29 @@ def build_rtc_model_shadow_frontend(
         raise TypeError("clock must be callable.")
     if observe_bundle is not None and not callable(observe_bundle):
         raise TypeError("observe_bundle must be callable or None.")
+    request_spec = adapter.request_spec
+    if not isinstance(request_spec, RtcProtocolRequestSpec):
+        raise TypeError("adapter.request_spec must be RtcProtocolRequestSpec.")
+    runtime_arm_hold = deploy_runtime.config.arm_hold_output
+    if runtime_arm_hold is not None and not isinstance(
+        runtime_arm_hold,
+        PolicyArmHoldOutputContract,
+    ):
+        raise RuntimeError(
+            "PolicyDeployRuntimeConfig did not normalize arm_hold_output."
+        )
+    runtime_arm_hold_hash = (
+        None
+        if runtime_arm_hold is None
+        else runtime_arm_hold.contract_hash
+    )
+    if (
+        request_spec.arm_hold_output_contract_hash
+        != runtime_arm_hold_hash
+    ):
+        raise ValueError(
+            "RTC adapter/deploy runtime arm-hold output contract mismatch."
+        )
     expected_period = 1.0 / profile.action_hz
     runtime_period = deploy_runtime.config.action_keyframe_period_sec
     if not math.isclose(

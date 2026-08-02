@@ -17,6 +17,7 @@ from ..schema_v21 import (
     bind_hand_state_snapshot_fields,
 )
 from ..schema_v22 import validate_strict_v22_measured_state
+from .topology import SIDES
 from .types import UmiSample
 
 
@@ -110,21 +111,21 @@ class UmiV23RowEncoder:
             )
         raw_poses = {
             side: np.asarray(sample.poses[side].raw_tcp_pose7, dtype=np.float32)
-            for side in ("left", "right")
+            for side in SIDES
         }
         action_poses = {
             side: np.asarray(
                 sample.arm_action_poses[side].raw_tcp_pose7,
                 dtype=np.float32,
             )
-            for side in ("left", "right")
+            for side in SIDES
         }
         command_values = {
             side: [float(sample.gripper_commands[side])]
-            for side in ("left", "right")
+            for side in SIDES
         }
         measured_values: dict[str, list[float]] = {}
-        for side in ("left", "right"):
+        for side in SIDES:
             measured = sample.hand_states[side].get("gripper_measured_scalar")
             measured_values[side] = [float(measured)]
 
@@ -189,13 +190,13 @@ class UmiV23RowEncoder:
                 _jsonable(sample.metadata), ensure_ascii=True, sort_keys=True
             ),
             "faults_json": json.dumps(_jsonable(sample.faults), ensure_ascii=True, sort_keys=True),
-            "active_sides": ["left", "right"],
+            "active_sides": list(SIDES),
             "camera_keys": sorted(str(key) for key in sample.camera_frames),
             "fault_codes": [],
         }
         row.update(flatten_arm_mode_columns(label_payload))
 
-        for side in ("left", "right"):
+        for side in SIDES:
             pose = sample.poses[side]
             prefix = f"observation.arm.{side}."
             row.update(

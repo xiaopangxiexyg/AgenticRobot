@@ -112,17 +112,18 @@ class ChunkedTactileStream:
         encoding = str(self.spec.get("encoding") or "").strip().lower().replace("-", "_")
         if encoding == "chunked_delta_zstd":
             predictor = str(chunk.get("predictor") or self.spec.get("predictor") or "")
-            if predictor != "delta_mod_uint8_bias_128":
+            if predictor not in {"delta_mod_uint8", "delta_mod_uint8_bias_128"}:
                 raise ValueError(f"Unsupported tactile delta predictor '{predictor}'.")
             if self.storage_dtype != np.dtype(np.uint8):
-                raise ValueError("delta_mod_uint8_bias_128 requires uint8 storage.")
+                raise ValueError(f"{predictor} requires uint8 storage.")
             restored = np.empty_like(array)
             restored[0] = array[0]
             for index in range(1, frame_count):
+                delta = array[index].astype(np.int16)
+                if predictor == "delta_mod_uint8_bias_128":
+                    delta = delta - 128
                 restored[index] = (
-                    restored[index - 1].astype(np.int16)
-                    + array[index].astype(np.int16)
-                    - 128
+                    restored[index - 1].astype(np.int16) + delta
                 ).astype(np.uint8)
             array = restored
         quantization = chunk.get("quantization")

@@ -13,6 +13,7 @@ from .dataset_augment import (
     MaskReaderCache,
     RandomBackgroundAugmentConfig,
     RandomBackgroundVideoAugmenter,
+    WristPairMode,
     augment_sample_from_paths,
 )
 from .photometric import PhotometricAugmentConfig, PhotometricImageAugmenter
@@ -20,6 +21,7 @@ from .real_image_provider import (
     LocalImageBackgroundProvider,
     RealImageBackgroundConfig,
     RealImageTemporalBackground,
+    default_real_image_root,
     discover_image_paths,
     write_image_manifest,
 )
@@ -44,12 +46,14 @@ __all__ = [
     "MaskReaderCache",
     "RandomBackgroundAugmentConfig",
     "RandomBackgroundVideoAugmenter",
+    "WristPairMode",
     "augment_sample_from_paths",
     "PhotometricAugmentConfig",
     "PhotometricImageAugmenter",
     "LocalImageBackgroundProvider",
     "RealImageBackgroundConfig",
     "RealImageTemporalBackground",
+    "default_real_image_root",
     "discover_image_paths",
     "write_image_manifest",
     "BlobOcclusionConfig",

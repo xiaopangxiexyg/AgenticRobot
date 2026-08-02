@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from dataset_contracts.v22 import (
     PolicyIOLayout,
@@ -16,11 +16,10 @@ from dataset_contracts.pose_chunk import PoseActionChunkContract
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from dataset_contracts.episode_curation import EpisodeCurationRecord
 
-from .pose_chunk import (
-    PoseActionChunkLocation,
-    pose_action_chunk_start_indices,
-)
 from .episode_curation import EpisodeCurationReader
+
+if TYPE_CHECKING:
+    from .pose_chunk import PoseActionChunkLocation
 
 
 MODALITY_VALIDITY_SCHEMA_VERSION = "dexteleop.modality_validity.v1"
@@ -292,6 +291,11 @@ class DexTeleopDatasetIndex:
         A missing/zero ``frame_count`` is rejected rather than guessed because
         guessing could construct a chunk that crosses the real episode tail.
         """
+
+        from .pose_chunk import (
+            PoseActionChunkLocation,
+            pose_action_chunk_start_indices,
+        )
 
         selected = self.episode_indices if episode_indices is None else tuple(
             int(value) for value in episode_indices

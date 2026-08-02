@@ -220,6 +220,34 @@ def apply_rm65_position_profile_defaults(
         command.degraded_speed_scale,
         "--position-degraded-speed-scale",
     )
+    # Versioned sample-aligned internals intentionally stay out of the public
+    # free-form CLI.  Selecting the profile changes them atomically and
+    # selecting V1 restores the complete predecessor behavior.
+    setattr(
+        args,
+        "position_sample_aligned_scale_degraded_target",
+        command.sample_aligned_scale_degraded_target,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_jerk_regularization",
+        command.sample_aligned_jerk_regularization,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_jerk_delta_regularization",
+        command.sample_aligned_jerk_delta_regularization,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_terminal_velocity_regularization",
+        command.sample_aligned_terminal_velocity_regularization,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_terminal_acceleration_regularization",
+        command.sample_aligned_terminal_acceleration_regularization,
+    )
 
     if include_source_shaping:
         default(
@@ -270,6 +298,26 @@ def apply_rm65_position_profile_defaults(
             args,
             "position_wrist_q5_hysteresis_requires_escape_latch",
             source.wrist_q5_hysteresis_requires_escape_latch,
+        )
+        setattr(
+            args,
+            "position_inactive_execution_release_translation_static_m",
+            source.inactive_execution_release_translation_static_m,
+        )
+        setattr(
+            args,
+            "position_inactive_execution_release_translation_full_m",
+            source.inactive_execution_release_translation_full_m,
+        )
+        setattr(
+            args,
+            "position_inactive_execution_release_rotation_static_deg",
+            source.inactive_execution_release_rotation_static_deg,
+        )
+        setattr(
+            args,
+            "position_inactive_execution_release_rotation_full_deg",
+            source.inactive_execution_release_rotation_full_deg,
         )
 
     metadata = profile.to_metadata()

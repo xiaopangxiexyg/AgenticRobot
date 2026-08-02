@@ -10,6 +10,11 @@ from robot_motion.rm65 import (
     RM65_POSE_LIFT_V2_CONTINUOUS_NAME,
     RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME,
     RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+    RM65_POSE_LIFT_V5_SIGMA_ESCAPE_NAME,
+    RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH_NAME,
+    RM65_POSE_LIFT_V8_NONLINEAR_BEST_CANDIDATE_NAME,
+    RM65_POSE_LIFT_V9_PREDICTIVE_BRANCH_BARRIER_NAME,
+    RM65_POSE_LIFT_V10_DIRECTIONAL_FEASIBILITY_GUARD_NAME,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
     build_rm65_dual_arm_scene_profile,
@@ -54,6 +59,7 @@ class _FakeDualSolver:
     ) -> None:
         self.q = np.zeros(12, dtype=float)
         self.solve_output = np.zeros(12, dtype=float)
+        self.solve_outputs: list[np.ndarray] = []
         self.solve_error: BaseException | None = None
         self.distance: float | None | object = distance
         self.solve_targets: list[list[np.ndarray]] = []
@@ -66,6 +72,10 @@ class _FakeDualSolver:
         self.admitted_motion_references: list[
             tuple[np.ndarray, np.ndarray, float]
         ] = []
+        self.task_conditioning_calls: list[dict[str, object]] = []
+        self.sigma_escape_configuration: dict[str, float] | None = None
+        self.structural_branch_configuration: dict[str, object] | None = None
+        self.motion_state_reset_count = 0
         self.robot = _FakeRobot(
             np.full(12, -1.0) if lower is None else lower,
             np.full(12, 1.0) if upper is None else upper,
@@ -82,7 +92,12 @@ class _FakeDualSolver:
         self.solve_targets.append([np.asarray(target, dtype=float).copy() for target in targets])
         if self.solve_error is not None:
             raise self.solve_error
-        self.q = np.asarray(self.solve_output, dtype=float).reshape(12).copy()
+        output = (
+            self.solve_outputs[len(self.solve_targets) - 1]
+            if len(self.solve_outputs) >= len(self.solve_targets)
+            else self.solve_output
+        )
+        self.q = np.asarray(output, dtype=float).reshape(12).copy()
         return self.q.copy()
 
     def configure_velocity_limit(self, values: np.ndarray) -> None:
@@ -123,6 +138,43 @@ class _FakeDualSolver:
             )
         )
 
+    def configure_normalized_sigma_escape_task(
+        self,
+        *,
+        cost: float,
+        guard_sigma: float,
+        rate_per_sec: float,
+    ) -> None:
+        self.sigma_escape_configuration = {
+            "cost": float(cost),
+            "guard_sigma": float(guard_sigma),
+            "rate_per_sec": float(rate_per_sec),
+        }
+
+    def configure_structural_branch_guard(
+        self,
+        *,
+        guard_sigma: float,
+        margin_deg: float,
+        release_sigma: float,
+        constraint_mode: str = "hard_margin",
+        barrier_gain: float = 0.0,
+        barrier_activation_sigma: float = 0.0,
+        prediction_horizon_sec: float = 0.0,
+    ) -> None:
+        self.structural_branch_configuration = {
+            "guard_sigma": float(guard_sigma),
+            "margin_deg": float(margin_deg),
+            "release_sigma": float(release_sigma),
+            "constraint_mode": str(constraint_mode),
+            "barrier_gain": float(barrier_gain),
+            "barrier_activation_sigma": float(barrier_activation_sigma),
+            "prediction_horizon_sec": float(prediction_horizon_sec),
+        }
+
+    def reset_admitted_reference_motion_state(self) -> None:
+        self.motion_state_reset_count += 1
+
     def compute_min_collision_distance(self, q: np.ndarray) -> float | None:
         qpos = np.asarray(q, dtype=float).reshape(12).copy()
         self.distance_q.append(qpos)
@@ -156,6 +208,41 @@ class _FakeDualSolver:
             [0.5, 0.5, 0.5, 1.0, 1.0, 1.0]
         )
         return jacobian
+
+    def compute_frame_task_conditioning(
+        self,
+        targets: list[np.ndarray],
+        *,
+        q: np.ndarray,
+        joint_indices_by_target: list[np.ndarray],
+        joint_velocity_limit_rad_s: np.ndarray,
+        dt_sec: float,
+    ) -> list[dict[str, object]]:
+        self.task_conditioning_calls.append(
+            {
+                "targets": [
+                    np.asarray(target, dtype=float).copy() for target in targets
+                ],
+                "q": np.asarray(q, dtype=float).copy(),
+                "joint_indices_by_target": [
+                    np.asarray(indices, dtype=int).copy()
+                    for indices in joint_indices_by_target
+                ],
+                "joint_velocity_limit_rad_s": np.asarray(
+                    joint_velocity_limit_rad_s,
+                    dtype=float,
+                ).copy(),
+                "dt_sec": float(dt_sec),
+            }
+        )
+        return [
+            {
+                "sigma_task_velocity_min": 0.1 + side_index,
+                "condition_number_task_velocity": 10.0 + side_index,
+                "max_required_velocity_utilization": 0.5 + side_index,
+            }
+            for side_index in range(2)
+        ]
 
 
 def _identity_pair() -> dict[str, np.ndarray]:
@@ -195,6 +282,82 @@ def _target(x: float = 0.0, y: float = 0.0, z: float = 0.0) -> np.ndarray:
     pose = np.eye(4, dtype=float)
     pose[:3, 3] = (x, y, z)
     return pose
+
+
+def test_task_conditioning_is_observational_and_uses_formal_velocity_limits() -> None:
+    solver = _FakeDualSolver()
+    solver.q = np.linspace(0.0, 0.11, 12)
+    planner = _planner(solver)
+    original_solver_q = solver.q.copy()
+    qpos = {
+        "left": np.linspace(0.1, 0.6, 6),
+        "right": np.linspace(-0.1, -0.6, 6),
+    }
+
+    diagnostics = planner.analyze_task_conditioning(
+        qpos,
+        {"left": _target(0.1), "right": _target(-0.1)},
+        dt_sec=0.02,
+    )
+
+    assert diagnostics["schema"] == "robot_motion.rm65.task_conditioning/v1"
+    assert diagnostics["observational_only"] is True
+    assert diagnostics["control_authority"] == "none"
+    assert diagnostics["sides"]["left"]["sigma_task_velocity_min"] == pytest.approx(
+        0.1
+    )
+    assert diagnostics["sides"]["right"]["sigma_task_velocity_min"] == pytest.approx(
+        1.1
+    )
+    np.testing.assert_allclose(solver.q, original_solver_q)
+    call = solver.task_conditioning_calls[-1]
+    np.testing.assert_allclose(call["q"][:6], qpos["left"])
+    np.testing.assert_allclose(call["q"][6:], qpos["right"])
+    np.testing.assert_allclose(
+        call["joint_velocity_limit_rad_s"],
+        np.full(12, 0.45),
+    )
+    np.testing.assert_array_equal(call["joint_indices_by_target"][0], np.arange(6))
+    np.testing.assert_array_equal(
+        call["joint_indices_by_target"][1], np.arange(6, 12)
+    )
+
+
+def test_endpoint_fk_observer_uses_requested_qpos_without_advancing_solver() -> None:
+    solver = _FakeDualSolver()
+    solver.q = np.linspace(-0.2, 0.2, 12)
+    planner = _planner(solver)
+    original_solver_q = solver.q.copy()
+    qpos = {
+        "left": np.array([0.12, 0.0, 0.0, 0.2, 0.0, -0.1]),
+        "right": np.array([-0.34, 0.0, 0.0, -0.3, 0.0, 0.15]),
+    }
+
+    poses = planner.observe_endpoint_poses_world(qpos)
+
+    assert poses["left"][0, 3] == pytest.approx(0.12)
+    assert poses["right"][0, 3] == pytest.approx(-0.34)
+    np.testing.assert_allclose(solver.q, original_solver_q)
+    with pytest.raises(ValueError, match="both arms"):
+        planner.observe_endpoint_poses_world({"left": qpos["left"]})
+
+
+def test_resolve_target_endpoint_pose_world_matches_plan_input_without_state_change() -> None:
+    solver = _FakeDualSolver()
+    solver.q = np.linspace(-0.2, 0.2, 12)
+    planner = _planner(solver)
+    original_solver_q = solver.q.copy()
+    targets = {"left": _target(0.12), "right": _target(-0.34)}
+
+    resolved = planner.resolve_target_endpoint_pose_world(
+        targets,
+        target_reference_frame="arm_base",
+        target_controlled_frame="tool_tcp",
+    )
+
+    np.testing.assert_allclose(resolved["left"], targets["left"])
+    np.testing.assert_allclose(resolved["right"], targets["right"])
+    np.testing.assert_allclose(solver.q, original_solver_q)
 
 
 def test_scene_urdf_base_transforms_include_mount_translation_and_rotation() -> None:
@@ -301,6 +464,212 @@ def test_v4_configures_qp_velocity_limit_and_commits_only_admitted_velocity() ->
     assert result.metadata["ik_solve_iteration_max"] == 4
     assert result.metadata["qp_motion_constraints"]["velocity_limit_enabled"] is True
     assert result.metadata["qp_motion_constraints"]["acceleration_limit_enabled"] is True
+
+
+def test_v5_sigma_escape_is_explicit_soft_metadata_and_v4_stays_disabled() -> None:
+    v4_solver = _FakeDualSolver()
+    v4_planner = _planner(
+        v4_solver,
+        config=RM65PositionCollisionPlannerConfig(
+            pose_lift_profile=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        ),
+    )
+    v4_planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    v4_result = v4_planner.plan_pose_reference(
+        {"left": _target(0.0), "right": _target(0.0)}
+    )
+
+    assert v4_solver.sigma_escape_configuration is None
+    assert v4_result.metadata["qp_motion_constraints"]["sigma_escape_enabled"] is False
+
+    v5_solver = _FakeDualSolver()
+    v5_planner = _planner(
+        v5_solver,
+        config=RM65PositionCollisionPlannerConfig(
+            pose_lift_profile=RM65_POSE_LIFT_V5_SIGMA_ESCAPE_NAME,
+        ),
+    )
+    v5_planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    v5_result = v5_planner.plan_pose_reference(
+        {"left": _target(0.0), "right": _target(0.0)}
+    )
+
+    assert v5_solver.sigma_escape_configuration == pytest.approx(
+        {"cost": 0.15, "guard_sigma": 0.04, "rate_per_sec": 0.03}
+    )
+    constraints = v5_result.metadata["qp_motion_constraints"]
+    assert constraints["sigma_escape_enabled"] is True
+    assert constraints["sigma_escape_authority"].startswith("soft_objective_only")
+
+
+def test_v6_structural_branch_guard_is_explicit_offline_metadata() -> None:
+    solver = _FakeDualSolver()
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            pose_lift_profile=RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH_NAME,
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    result = planner.plan_pose_reference(
+        {"left": _target(0.0), "right": _target(0.0)}
+    )
+
+    assert solver.structural_branch_configuration == {
+        "guard_sigma": pytest.approx(0.04),
+        "margin_deg": pytest.approx(0.75),
+        "release_sigma": pytest.approx(0.05),
+        "constraint_mode": "hard_margin",
+        "barrier_gain": pytest.approx(0.0),
+        "barrier_activation_sigma": pytest.approx(0.0),
+        "prediction_horizon_sec": pytest.approx(0.0),
+    }
+    constraints = result.metadata["qp_motion_constraints"]
+    assert constraints["structural_branch_guard_enabled"] is True
+    assert constraints["structural_branch_guard_margin_deg"] == pytest.approx(0.75)
+    assert solver.motion_state_reset_count == 1
+
+
+def test_v9_configures_predictive_smooth_branch_barrier_without_enabling_hardware() -> None:
+    solver = _FakeDualSolver()
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            pose_lift_profile=RM65_POSE_LIFT_V9_PREDICTIVE_BRANCH_BARRIER_NAME,
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    result = planner.plan_pose_reference(
+        {"left": _target(0.0), "right": _target(0.0)}
+    )
+
+    assert solver.structural_branch_configuration == {
+        "guard_sigma": pytest.approx(0.04),
+        "margin_deg": pytest.approx(0.75),
+        "release_sigma": pytest.approx(0.05),
+        "constraint_mode": "hybrid_deep_barrier",
+        "barrier_gain": pytest.approx(6.0),
+        "barrier_activation_sigma": pytest.approx(0.01),
+        "prediction_horizon_sec": pytest.approx(0.15),
+    }
+    constraints = result.metadata["qp_motion_constraints"]
+    assert (
+        constraints["structural_branch_constraint_mode"]
+        == "hybrid_deep_barrier"
+    )
+    assert constraints["structural_branch_barrier_gain"] == pytest.approx(6.0)
+    assert constraints[
+        "structural_branch_barrier_activation_sigma"
+    ] == pytest.approx(0.01)
+    assert constraints["structural_branch_prediction_horizon_sec"] == pytest.approx(
+        0.15
+    )
+
+
+def test_v10_shapes_only_overdemanded_pink_direction_before_offline_qp() -> None:
+    solver = _FakeDualSolver()
+
+    def directional_metrics(
+        targets: list[np.ndarray],
+        *,
+        q: np.ndarray,
+        joint_indices_by_target: list[np.ndarray],
+        joint_velocity_limit_rad_s: np.ndarray,
+        dt_sec: float,
+    ) -> list[dict[str, object]]:
+        del targets, q, joint_indices_by_target, joint_velocity_limit_rad_s, dt_sec
+        metrics = {
+            "task_error_local": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "task_cost": [1.0] * 6,
+            "task_direction_rows": np.eye(6).tolist(),
+            "joint_utilization_direction_rows": np.eye(6).tolist(),
+            "singular_values_task_velocity": [1.0] * 6,
+            "directional_demand": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "directional_required_velocity_utilization": [
+                2.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            "joint_velocity_limit_rad_s": [1.0] * 6,
+            "max_required_velocity_utilization": 2.0,
+            "sigma_task_velocity_min": 0.02,
+        }
+        return [dict(metrics), dict(metrics)]
+
+    solver.compute_frame_task_conditioning = directional_metrics
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            solve_min_iterations=1,
+            solve_max_iterations=1,
+            pose_lift_profile=(
+                RM65_POSE_LIFT_V10_DIRECTIONAL_FEASIBILITY_GUARD_NAME
+            ),
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+
+    result = planner.plan_pose_reference(
+        {"left": _target(0.1), "right": _target(0.1)}
+    )
+
+    assert solver.solve_targets[0][0][0] == pytest.approx(0.0425)
+    assert solver.solve_targets[0][1][0] == pytest.approx(0.0425)
+    guard = result.metadata["qp_motion_constraints"]["directional_task_guard"]
+    assert guard["enabled"] is True
+    assert guard["reason"] == "directionally_shaped"
+    assert guard["sides"]["left"]["transition"] == "entered"
+    assert guard["sides"]["left"]["minimum_direction_scale"] == pytest.approx(
+        0.425
+    )
+    assert (
+        result.metadata["qp_motion_constraints"]["structural_branch_constraint_mode"]
+        == "barrier"
+    )
+
+
+def test_v8_selects_exact_nonlinear_best_candidate_instead_of_last_iteration() -> None:
+    solver = _FakeDualSolver()
+    solver.solve_outputs = [
+        np.array([0.01, 0, 0, 0, 0, 0] * 2, dtype=float),
+        np.array([0.03, 0, 0, 0, 0, 0] * 2, dtype=float),
+        np.array([0.02, 0, 0, 0, 0, 0] * 2, dtype=float),
+        np.array([0.015, 0, 0, 0, 0, 0] * 2, dtype=float),
+    ]
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            reference_hz=60.0,
+            max_joint_velocity_rad_s=(6.0,) * 6,
+            solve_min_iterations=4,
+            solve_max_iterations=4,
+            pose_lift_profile=(
+                RM65_POSE_LIFT_V8_NONLINEAR_BEST_CANDIDATE_NAME
+            ),
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+
+    result = planner.plan_pose_reference(
+        {"left": _target(0.04), "right": _target(0.04)}
+    )
+
+    np.testing.assert_allclose(
+        result.q_ref_by_side["left"],
+        np.array([0.03, 0, 0, 0, 0, 0], dtype=float),
+    )
+    selection = result.metadata["qp_motion_constraints"][
+        "nonlinear_best_so_far"
+    ]
+    assert selection["selected_iteration"] == 2
+    assert len(selection["candidates"]) == 3
+    assert (
+        result.metadata["ik_solve_iteration_stop_reason"]
+        == "max_iterations:best_so_far_iteration_2"
+    )
 
 
 def test_reset_requires_complete_dual_qpos_and_fail_closes_unavailable_distance() -> None:

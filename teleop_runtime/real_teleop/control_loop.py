@@ -11,17 +11,41 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import inspect
+from pathlib import Path
+import re
 import time
 from typing import Any
 
 import numpy as np
 from dataclasses import replace
 
+from control_station.real_teleop.progress import (
+    PROGRESS_ARM_CONTROL_MODE_IGNORE,
+    ProgressControlAvailability,
+    ProgressProfileOption,
+    build_real_teleop_progress_ui_payload,
+)
+from control_station.real_teleop.progress_workflow import (
+    PromotableHoldPause,
+    RealTeleopProgressWorkflow,
+)
 from dataset_contracts.stats import (
     FORCE_COLLISION_LABEL_DETECTED,
     has_force_limit_collision_text,
 )
-
+from collection_runtime.progress.profiles import (
+    inspect_dataset_progress_profile,
+)
+from .progress_adapter import (
+    list_real_teleop_managed_progress_profile_options,
+    select_real_teleop_managed_progress_profile,
+)
+from .progress_arm_control import (
+    PendingProgressArmTransition,
+    ProgressArmTransitionPlan,
+    build_progress_arm_transition_plan,
+    progress_step_arm_requirements_differ,
+)
 
 _REQUIRED_SUPPORT_NAMES = (
     "AsyncDMTacDistributedForceVisualizer",
@@ -118,6 +142,46 @@ _REQUIRED_SUPPORT_NAMES = (
     "tactile_by_side_from_backends",
 )
 
+_PROGRESS_FAILURE_PROMOTABLE_HOLD_REASONS = frozenset(
+    {"manual", "two_pedal_b", "two_pedal_c"}
+)
+
+
+def _build_promotable_progress_hold_pause(
+    *,
+    hold_reason: object,
+    application_hold_was_active: bool,
+    formal_capture_was_paused: bool,
+    hold_requested_at: float,
+    application_hold_effective_at: float | None,
+    formal_capture_pause_effective_at: float | None,
+    episode_capture_identity_hash: object,
+    progress_phase: object,
+) -> PromotableHoldPause | None:
+    """Admit only an operator Hold that created this exact formal pause."""
+
+    normalized_reason = str(hold_reason or "").strip()
+    identity_hash = str(episode_capture_identity_hash or "").strip()
+    if (
+        normalized_reason not in _PROGRESS_FAILURE_PROMOTABLE_HOLD_REASONS
+        or bool(application_hold_was_active)
+        or bool(formal_capture_was_paused)
+        or application_hold_effective_at is None
+        or formal_capture_pause_effective_at is None
+        or not identity_hash
+        or str(progress_phase) != "ACTIVE_ATTEMPT"
+    ):
+        return None
+    return PromotableHoldPause(
+        episode_capture_identity_hash=identity_hash,
+        hold_requested_at=hold_requested_at,
+        application_hold_effective_at=application_hold_effective_at,
+        formal_capture_pause_effective_at=(
+            formal_capture_pause_effective_at
+        ),
+        hold_reason=normalized_reason,
+    )
+
 
 class _LegacyFunctionProxy:
     __slots__ = ("_namespace", "_name")
@@ -165,6 +229,157 @@ def _is_emergency_stop_latch_error(error: BaseException) -> bool:
         for text in texts
         for marker in markers
     )
+
+
+_EXCEPTION_FLOAT_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_JOINT_HARD_LIMIT_PATTERN = re.compile(
+    rf"(?P<effector>left_arm|right_arm)\s+"
+    rf"(?P<label>.+?)\s+joint\s+(?P<joint>\d+)="
+    rf"(?P<target>{_EXCEPTION_FLOAT_PATTERN})rad\s+exceeds\s+absolute\s+limits\s+"
+    rf"\[(?P<lower>{_EXCEPTION_FLOAT_PATTERN}),\s*"
+    rf"(?P<upper>{_EXCEPTION_FLOAT_PATTERN})\]rad\."
+)
+
+
+def _joint_hard_limit_dispatch_context(
+    error: BaseException,
+) -> dict[str, object] | None:
+    """Parse only the RM65 transport hard-limit rejection contract.
+
+    The active control loop may consume this exact fail-closed rejection as a
+    safety transition.  Other ``ValueError`` and ``RigDispatchError`` failures
+    remain programming/transport errors and must still escape visibly.
+    """
+
+    exception_chain = _exception_chain_text(error)
+    for text in exception_chain:
+        match = _JOINT_HARD_LIMIT_PATTERN.search(text)
+        if match is None:
+            continue
+        target_rad = float(match.group("target"))
+        lower_rad = float(match.group("lower"))
+        upper_rad = float(match.group("upper"))
+        limit_side = "lower" if target_rad <= lower_rad else "upper"
+        return {
+            "effector_name": match.group("effector"),
+            "target_label": match.group("label").strip(),
+            "joint_index": int(match.group("joint")),
+            "target_rad": target_rad,
+            "lower_rad": lower_rad,
+            "upper_rad": upper_rad,
+            "limit_side": limit_side,
+            "exception_chain": exception_chain,
+        }
+    return None
+
+
+def _consume_joint_hard_limit_dispatch(
+    error: BaseException,
+    *,
+    components: Any,
+    clutch_input: Any,
+    recording_active: Callable[[], bool],
+    stop_recording: Callable[..., Any],
+    cancel_recording_countdown: Callable[..., Any],
+    emergency_stop_real_arms: Callable[..., Mapping[str, str]],
+    now: float,
+    step_index: int,
+    last_state: object,
+    log: Callable[..., Any],
+    control_ui: Any,
+) -> bool:
+    """Turn one active RM65 hard-limit rejection into a retained safety Hold."""
+
+    context = _joint_hard_limit_dispatch_context(error)
+    if context is None:
+        return False
+    exception_chain = tuple(context.pop("exception_chain"))
+    event = {
+        "detected": True,
+        "source": "rm65_transport_hard_limit_gate",
+        **context,
+        "message": " <- ".join(exception_chain),
+    }
+    summary: dict[str, object] = {
+        "last_step_index": int(step_index),
+        "last_state": last_state,
+        "reason": "joint_hard_limit",
+        "joint_hard_limit_detected": True,
+        "joint_hard_limit_event": event,
+    }
+    _cancel_safety_recording_countdown_best_effort(
+        cancel_recording_countdown,
+        now=now,
+        reason="joint_hard_limit",
+        log=log,
+    )
+    stop_errors: dict[str, str] = {}
+    try:
+        stop_errors = dict(
+            emergency_stop_real_arms(
+                components,
+                reason=(
+                    "joint_hard_limit_dispatch:"
+                    f"{event['effector_name']}:joint_{event['joint_index']}"
+                ),
+                now=now,
+                raise_on_failure=False,
+            )
+            or {}
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the fail-closed transition.
+        stop_errors = {"__all__": f"{type(exc).__name__}: {exc}"}
+    if stop_errors:
+        summary["emergency_stop_errors"] = dict(stop_errors)
+    _stop_recording_best_effort(
+        recording_active=recording_active,
+        stop_recording=stop_recording,
+        now=now,
+        end_reason="joint_hard_limit",
+        summary=summary,
+        log=log,
+        control_ui=control_ui,
+        ui_tag="JointHardLimit",
+        ui_failure_message=(
+            "关节硬限位触发后的数采收尾失败；机械臂保持急停，"
+            "请检查数据目录和设备状态。"
+        ),
+    )
+    _request_safety_hold_best_effort(
+        clutch_input,
+        reason="joint_hard_limit",
+        log=log,
+        now=now,
+    )
+    log(
+        "JointHardLimit",
+        "active RM65 joint hard-limit rejection consumed; bimanual Arm_Stop "
+        "requested, episode closed, and GUI/devices retained in Hold: "
+        + " <- ".join(exception_chain),
+        now=now,
+    )
+    if control_ui is not None:
+        try:
+            if stop_errors:
+                control_ui.append_message(
+                    "JointHardLimit",
+                    "关节硬限位已触发，但至少一侧 Arm_Stop 未确认；当前数采已停止，"
+                    "GUI/设备连接保持在 Hold。必须检查双臂状态后再决定是否恢复。",
+                )
+            else:
+                control_ui.append_message(
+                    "JointHardLimit",
+                    "检测到机械臂关节硬限位门禁：双臂已急停并结束当前数采；"
+                    "GUI/设备连接保持。请人工调整位置后点击“开始遥操”重新采集 runtime Home。",
+                )
+        except Exception as exc:  # noqa: BLE001 - UI cannot change safety state.
+            log(
+                "JointHardLimit",
+                "hard-limit Hold message could not be published: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
+    return True
 
 
 def _stop_recording_best_effort(
@@ -224,6 +439,40 @@ def _stop_recording_best_effort(
                 )
         return exc
     return None
+
+
+def _consume_manual_episode_stop_request(
+    *,
+    clutch_input: Any,
+    recording_active: Callable[[], bool],
+    stop_recording: Callable[..., Any],
+    cancel_recording_countdown: Callable[..., Any],
+    now: float,
+    step_index: int,
+    episode_last_state: object,
+) -> bool:
+    """Consume one operator stop even while progress is fail-closed.
+
+    A durable Failure can keep the control loop in
+    ``AWAITING_HOLD_RECEIPT``.  Stopping/sealing the Episode is still a valid
+    operator action in that state and must not be starved by the normal
+    fail-closed ``continue``.
+    """
+
+    if not clutch_input.consume_episode_stop_request():
+        return False
+    if recording_active():
+        stop_recording(
+            now,
+            end_reason="manual_key_stop",
+            summary={
+                "last_step_index": step_index,
+                "last_state": episode_last_state,
+            },
+        )
+    else:
+        cancel_recording_countdown(now, reason="manual_key_stop")
+    return True
 
 
 def _request_safety_hold_best_effort(
@@ -305,6 +554,7 @@ def bind_legacy_support(namespace: Mapping[str, object]) -> None:
 @dataclass(frozen=True)
 class RealTeleopControlLoopContext:
     action_debug_log_recorder: Any
+    actuator_trace_recorder: Any
     advance_recording_countdown: Callable[..., None]
     args: Any
     camera_preview_rate: Any
@@ -366,6 +616,7 @@ class RealTeleopControlLoopContext:
 
 def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     action_debug_log_recorder = context.action_debug_log_recorder
+    actuator_trace_recorder = context.actuator_trace_recorder
     advance_recording_countdown = context.advance_recording_countdown
     args = context.args
     camera_preview_rate = context.camera_preview_rate
@@ -425,10 +676,260 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     step_index = context.step_index()
     recovery_plan = None
     last_dispatched_main_command = None
+    progress_workflow: RealTeleopProgressWorkflow | None = None
+    progress_workflow_recorder: object | None = None
+    promotable_hold_pause: PromotableHoldPause | None = None
+    progress_profile_options_task_id = ""
+    progress_profile_options: tuple[ProgressProfileOption, ...] = ()
+    pending_progress_arm_transition: PendingProgressArmTransition | None = None
+    progress_arm_entry_episode_hash = ""
+
+    def managed_progress_profile_options() -> tuple[
+        ProgressProfileOption,
+        ...,
+    ]:
+        nonlocal progress_profile_options_task_id, progress_profile_options
+        task_id = str(getattr(args, "collection_task_id", "") or "").strip()
+        if task_id == progress_profile_options_task_id:
+            return progress_profile_options
+        progress_profile_options = (
+            list_real_teleop_managed_progress_profile_options(
+                collection_task_id=task_id,
+            )
+        )
+        progress_profile_options_task_id = task_id
+        return progress_profile_options
+
+    def apply_progress_arm_plan_direct(
+        plan: ProgressArmTransitionPlan,
+        *,
+        now: float,
+    ) -> bool:
+        """Apply one exact target; return False only when fresh Home is absent."""
+
+        controller = getattr(components, "fix_arm_controller", None)
+        if controller is None:
+            raise RuntimeError(
+                "A progress arm_control declaration requires the FixArm controller."
+            )
+        current_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
+        target_fixed = plan.target_fixed_sides
+        if current_fixed == target_fixed:
+            return True
+        for side in target_fixed:
+            scope = str(getattr(controller, "scope_for_side")(side))
+            if scope != plan.requirement.fixed_scope:
+                raise RuntimeError(
+                    "Profile fixed_hold requires arm_and_end_effector but the "
+                    f"runtime FixArm scope is {scope!r} for {side}."
+                )
+        newly_teleop = tuple(
+            side for side in current_fixed if side not in set(target_fixed)
+        )
+        if newly_teleop:
+            cache_ready = all(
+                bool(
+                    controller.passive_home_cache_status(side, now=now).get(
+                        "ready",
+                        False,
+                    )
+                )
+                for side in newly_teleop
+            )
+            if not cache_ready:
+                return False
+            if len(current_fixed) != 1 or len(target_fixed) > 1:
+                raise RuntimeError(
+                    "Cached profile arm switching only supports the existing "
+                    "bimanual/single-arm Fix states."
+                )
+            target_side = target_fixed[0] if target_fixed else None
+            transition = controller.start_two_pedal_transition(
+                fixed_side=target_side,
+                now=now,
+                timeout_sec=1.0,
+                min_samples=1,
+            )
+            if not transition.ok:
+                raise RuntimeError(transition.message)
+            home_progress = advance_fix_arm_home_capture(
+                controller=controller,
+                channels={},
+                calibration=components.session.calibration,
+                now=now,
+                pose_from_channel=_channel_pose_in_desk,
+                mean_pose=_mean_pose,
+                resolve_robot_home=lambda side: _resolve_robot_home_for_side(
+                    components,
+                    side=side,
+                ),
+                side_retargeter=lambda side: _side_retargeter(components, side),
+                tcp_mode=args.tcp_mode,
+                log=lambda tag, message: _log(tag, message, now=now),
+            )
+            if not home_progress.completed:
+                if home_progress.failed:
+                    raise RuntimeError(home_progress.message)
+                return False
+            components.session.safety_monitor.request_pose_baseline_reset_many(
+                tuple(f"{side}_wrist_pose" for side in newly_teleop)
+            )
+        elif target_fixed:
+            target_side = target_fixed[0]
+            transition = controller.select_side(target_side)
+            if transition.ok:
+                transition = controller.freeze_selected(now=now)
+            if not transition.ok:
+                raise RuntimeError(transition.message)
+        else:
+            raise RuntimeError(
+                "Unexpected profile arm transition without a newly live arm."
+            )
+        actual_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
+        if actual_fixed != target_fixed:
+            raise RuntimeError(
+                "Profile arm transition did not reach its exact target: "
+                f"expected={target_fixed!r} actual={actual_fixed!r}."
+            )
+        return True
 
     main_loop_watchdog.start()
     emergency_stop_sent = False
     force_guard_fault_handled = False
+
+    def current_promotable_hold_pause() -> PromotableHoldPause | None:
+        """Return only the still-current, same-Episode ordinary Hold cut."""
+
+        candidate = promotable_hold_pause
+        episode = (
+            None
+            if dataset_recorder is None
+            else getattr(
+                dataset_recorder,
+                "active_progress_episode",
+                None,
+            )
+        )
+        identity_hash = str(
+            getattr(
+                None if episode is None else episode.identity,
+                "semantic_content_hash",
+                "",
+            )
+        )
+        pause_started_at = (
+            None
+            if dataset_recorder is None
+            else dataset_recorder.pause_started_at
+        )
+        if (
+            candidate is None
+            or progress_workflow_recorder is not dataset_recorder
+            or episode is None
+            or episode.state.phase
+            not in {"ACTIVE_ATTEMPT", "AWAITING_HOLD_RECEIPT"}
+            or identity_hash != candidate.episode_capture_identity_hash
+            or dataset_recorder is None
+            or not dataset_recorder.is_recording
+            or not dataset_recorder.is_paused
+            or pause_started_at is None
+            or pause_started_at
+            != candidate.formal_capture_pause_effective_at
+            or not clutch_input.hold_active()
+        ):
+            return None
+        return candidate
+
+    def publish_progress_ui_state(*, now: float) -> None:
+        """Publish display-only progress state without affecting control."""
+
+        publisher = getattr(clutch_input, "publish_progress_ui_state", None)
+        if not callable(publisher):
+            return
+        recorder_matches_current_dataset = bool(
+            dataset_recorder is not None
+            and Path(dataset_recorder.dataset_root).expanduser().resolve()
+            == Path(args.dataset_root).expanduser().resolve()
+            and str(dataset_recorder.writer_storage_config.task_id)
+            == str(args.collection_task_id)
+        )
+        if recorder_matches_current_dataset:
+            profile = getattr(dataset_recorder, "progress_profile", None)
+            profile_selection_locked = bool(
+                getattr(
+                    dataset_recorder,
+                    "progress_profile_selection_locked",
+                    False,
+                )
+            )
+            profile_binding_source = str(
+                getattr(
+                    dataset_recorder,
+                    "progress_profile_binding_source",
+                    "",
+                )
+            )
+        else:
+            requested_profile = getattr(
+                args,
+                "collection_progress_profile",
+                None,
+            )
+            selection_admission = inspect_dataset_progress_profile(
+                Path(args.dataset_root),
+                requested_profile=requested_profile,
+            )
+            profile = selection_admission.profile
+            profile_selection_locked = selection_admission.locked
+            profile_binding_source = selection_admission.source
+        episode = (
+            None
+            if dataset_recorder is None
+            else getattr(dataset_recorder, "active_progress_episode", None)
+        )
+        availability = (
+            progress_workflow.availability(
+                application_held=clutch_input.hold_active(),
+                promotable_hold_pause=current_promotable_hold_pause(),
+            )
+            if progress_workflow is not None
+            else None
+        )
+        try:
+            if availability is None:
+                availability = ProgressControlAvailability()
+            payload = build_real_teleop_progress_ui_payload(
+                profile=profile,
+                episode=episode,
+                availability=availability,
+                gui_enabled=bool(
+                    getattr(args, "collection_progress_gui", False)
+                ),
+                available_profiles=managed_progress_profile_options(),
+                profile_selection_enabled=not bool(
+                    getattr(clutch_input, "_episode_busy", lambda: True)()
+                ),
+                profile_selection_locked=profile_selection_locked,
+                profile_binding_source=profile_binding_source,
+                arm_control_mode=str(
+                    getattr(
+                        args,
+                        "collection_progress_arm_control_mode",
+                        "profile",
+                    )
+                ),
+                arm_control_mode_selection_enabled=not bool(
+                    getattr(clutch_input, "_episode_busy", lambda: True)()
+                ),
+            )
+            publisher(payload)
+        except Exception as exc:  # noqa: BLE001 - UI is observational only.
+            _log(
+                "Progress",
+                "长程进度 GUI 状态发布失败；控制与数采语义不受影响："
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
 
     def consume_position_force_guard_fault(
         fault: Any,
@@ -547,6 +1048,337 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
 
         clutch_input.poll()
         mark_loop_phase("loop.control_input_poll")
+        consume_profile_selections = getattr(
+            clutch_input,
+            "consume_progress_profile_selection_intents",
+            None,
+        )
+        profile_selection_intents = (
+            ()
+            if not callable(consume_profile_selections)
+            else consume_profile_selections()
+        )
+        consume_arm_mode_selections = getattr(
+            clutch_input,
+            "consume_progress_arm_control_mode_selection_intents",
+            None,
+        )
+        arm_mode_selection_intents = (
+            ()
+            if not callable(consume_arm_mode_selections)
+            else consume_arm_mode_selections()
+        )
+        for selection_intent in arm_mode_selection_intents:
+            try:
+                if bool(
+                    getattr(clutch_input, "_episode_busy", lambda: True)()
+                ):
+                    raise RuntimeError(
+                        "Episode countdown, recording, pause, or finalization "
+                        "is active"
+                    )
+                args.collection_progress_arm_control_mode = (
+                    selection_intent.mode
+                )
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "Progress",
+                        "已选择长程进度臂控制模式："
+                        f"{selection_intent.mode}。",
+                    )
+            except Exception as exc:  # noqa: BLE001 - no control effect.
+                message = (
+                    "长程进度臂控制模式选择失败，原配置保持不变："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("Progress", message, now=loop_start)
+                if control_ui is not None:
+                    control_ui.append_message("Progress", message)
+        for selection_intent in profile_selection_intents:
+            try:
+                if not bool(
+                    getattr(args, "collection_progress_gui", False)
+                ):
+                    raise RuntimeError(
+                        "collection progress GUI selection is disabled"
+                    )
+                if bool(
+                    getattr(clutch_input, "_episode_busy", lambda: True)()
+                ):
+                    raise RuntimeError(
+                        "Episode countdown, recording, pause, or finalization "
+                        "is active"
+                    )
+                current_recorder = context.dataset_recorder()
+                selected_profile = select_real_teleop_managed_progress_profile(
+                    args=args,
+                    dataset_recorder=current_recorder,
+                    profile_id=selection_intent.profile_id,
+                )
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "Progress",
+                        "已选择长程进度 profile："
+                        f"{selected_profile.profile_id}@"
+                        f"{selected_profile.profile_version}；"
+                        "首个 Episode 启动时将按完整 hash 锁定到数据集。",
+                    )
+            except Exception as exc:  # noqa: BLE001 - selection has no control effect.
+                message = (
+                    "长程进度 profile 选择失败，原配置保持不变："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("Progress", message, now=loop_start)
+                if control_ui is not None:
+                    control_ui.append_message("Progress", message)
+        progress_enabled = bool(
+            dataset_recorder is not None
+            and getattr(dataset_recorder, "progress_profile", None) is not None
+        )
+        if not progress_enabled:
+            progress_workflow = None
+            progress_workflow_recorder = None
+            promotable_hold_pause = None
+            pending_progress_arm_transition = None
+            progress_arm_entry_episode_hash = ""
+        elif progress_workflow_recorder is not dataset_recorder:
+            progress_workflow = RealTeleopProgressWorkflow(
+                recorder=dataset_recorder
+            )
+            progress_workflow_recorder = dataset_recorder
+            promotable_hold_pause = None
+            pending_progress_arm_transition = None
+            progress_arm_entry_episode_hash = ""
+        progress_failure_pending = False
+        if progress_workflow is not None:
+            progress_callbacks = {
+                "request_application_hold": (
+                    lambda reason: clutch_input.request_hold(reason=reason)
+                ),
+                "pause_formal_capture": (
+                    lambda at, reason: pause_recording(at, reason=reason)
+                ),
+            }
+            consume_progress_intents = getattr(
+                clutch_input,
+                "consume_progress_operator_intents",
+                None,
+            )
+            progress_intents = (
+                ()
+                if not callable(consume_progress_intents)
+                else consume_progress_intents()
+            )
+            try:
+                active_progress_episode = getattr(
+                    dataset_recorder,
+                    "active_progress_episode",
+                    None,
+                )
+                active_identity_hash = str(
+                    getattr(
+                        None
+                        if active_progress_episode is None
+                        else active_progress_episode.identity,
+                        "semantic_content_hash",
+                        "",
+                    )
+                )
+                if (
+                    active_progress_episode is not None
+                    and active_progress_episode.state.phase == "ACTIVE_ATTEMPT"
+                    and active_identity_hash
+                    and active_identity_hash != progress_arm_entry_episode_hash
+                    and pending_progress_arm_transition is None
+                ):
+                    entry_step_id = (
+                        active_progress_episode.state.current_progress_step_id
+                    )
+                    assert entry_step_id is not None
+                    fix_controller = getattr(
+                        components,
+                        "fix_arm_controller",
+                        None,
+                    )
+                    entry_plan = build_progress_arm_transition_plan(
+                        profile=active_progress_episode.profile,
+                        target_progress_step_id=entry_step_id,
+                        current_fixed_sides=tuple(
+                            getattr(fix_controller, "fixed_sides", ()) or ()
+                        ),
+                        enforcement_mode=str(
+                            getattr(
+                                args,
+                                "collection_progress_arm_control_mode",
+                                "profile",
+                            )
+                        ),
+                    )
+                    if entry_plan is None or not entry_plan.changes_arm_control:
+                        progress_arm_entry_episode_hash = active_identity_hash
+                    elif apply_progress_arm_plan_direct(
+                        entry_plan,
+                        now=loop_start,
+                    ):
+                        progress_arm_entry_episode_hash = active_identity_hash
+                    else:
+                        pending_progress_arm_transition = (
+                            PendingProgressArmTransition(
+                                intent=None,
+                                plan=entry_plan,
+                                capture_sides=entry_plan.newly_teleop_sides,
+                            )
+                        )
+                        pause_recording(
+                            loop_start,
+                            reason="progress_arm_profile_entry_home_required",
+                        )
+                        clutch_input.request_hold(
+                            reason="progress_arm_profile_transition"
+                        )
+                for progress_intent in progress_intents:
+                    if pending_progress_arm_transition is not None:
+                        raise RuntimeError(
+                            "A profile arm transition is already waiting for "
+                            "runtime Home."
+                        )
+                    episode = getattr(
+                        dataset_recorder,
+                        "active_progress_episode",
+                        None,
+                    )
+                    mode = str(
+                        getattr(
+                            args,
+                            "collection_progress_arm_control_mode",
+                            "profile",
+                        )
+                    )
+                    plan = None
+                    undo_profile_arm_change = False
+                    if (
+                        episode is not None
+                        and mode != PROGRESS_ARM_CONTROL_MODE_IGNORE
+                        and progress_intent.kind
+                        in {"ADVANCE_PROGRESS", "UNDO_LAST_ADVANCE"}
+                    ):
+                        target_step_id = (
+                            episode.preview_advance_target(
+                                progress_intent.target_progress_step_id
+                            )
+                            if progress_intent.kind == "ADVANCE_PROGRESS"
+                            else episode.preview_undo_target()
+                        )
+                        fix_controller = getattr(
+                            components,
+                            "fix_arm_controller",
+                            None,
+                        )
+                        plan = build_progress_arm_transition_plan(
+                            profile=episode.profile,
+                            target_progress_step_id=target_step_id,
+                            current_fixed_sides=tuple(
+                                getattr(fix_controller, "fixed_sides", ()) or ()
+                            ),
+                            enforcement_mode=mode,
+                        )
+                        if (
+                            progress_intent.kind == "UNDO_LAST_ADVANCE"
+                            and plan is not None
+                        ):
+                            source_step_id = (
+                                episode.state.current_progress_step_id
+                            )
+                            undo_profile_arm_change = bool(
+                                source_step_id is not None
+                                and progress_step_arm_requirements_differ(
+                                    episode.profile,
+                                    source_step_id,
+                                    target_step_id,
+                                )
+                            )
+                    force_hold_for_undo = bool(
+                        plan is not None
+                        and progress_intent.kind == "UNDO_LAST_ADVANCE"
+                        and undo_profile_arm_change
+                    )
+                    direct_applied = bool(
+                        plan is None
+                        or (
+                            not force_hold_for_undo
+                            and (
+                                not plan.changes_arm_control
+                                or apply_progress_arm_plan_direct(
+                                    plan,
+                                    now=loop_start,
+                                )
+                            )
+                        )
+                    )
+                    if not direct_applied:
+                        assert plan is not None
+                        capture_sides = (
+                            plan.newly_teleop_sides
+                            if plan.newly_teleop_sides
+                            else plan.requirement.teleop_sides
+                        )
+                        pending_progress_arm_transition = (
+                            PendingProgressArmTransition(
+                                intent=progress_intent,
+                                plan=plan,
+                                capture_sides=capture_sides,
+                            )
+                        )
+                        pause_recording(
+                            loop_start,
+                            reason="progress_arm_profile_transition_home_required",
+                        )
+                        clutch_input.request_hold(
+                            reason="progress_arm_profile_transition"
+                        )
+                        if control_ui is not None:
+                            control_ui.append_message(
+                                "Progress",
+                                "目标子任务需要切换活动臂；已把 Hold/Pause "
+                                "保留在当前子任务。请摆好目标活动臂 VIVE 后"
+                                "点击“开始遥操”。",
+                            )
+                        continue
+                    progress_result = progress_workflow.handle_operator_intent(
+                        progress_intent,
+                        now=loop_start,
+                        application_held=clutch_input.hold_active(),
+                        promotable_hold_pause=(
+                            current_promotable_hold_pause()
+                        ),
+                        **progress_callbacks,
+                    )
+                    if control_ui is not None and progress_result.handled:
+                        control_ui.append_message(
+                            "Progress",
+                            "采集进度请求已生效："
+                            f"{progress_intent.kind} → {progress_result.phase}",
+                        )
+                pending_result = progress_workflow.request_pending_failure_effect(
+                    now=loop_start,
+                    promotable_hold_pause=current_promotable_hold_pause(),
+                    **progress_callbacks,
+                )
+                progress_failure_pending = pending_result.phase == (
+                    "AWAITING_HOLD_RECEIPT"
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve collection fail-close.
+                message = (
+                    "collection progress 请求处理失败，数采保持暂停并进入 Hold："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("Progress", message, now=loop_start)
+                if control_ui is not None:
+                    control_ui.append_message("Progress", message)
+                clutch_input.request_hold(reason="progress_workflow_error")
+                pause_recording(loop_start, reason="progress_workflow_error")
+                progress_failure_pending = True
+        publish_progress_ui_state(now=loop_start)
         if bool(
             getattr(
                 clutch_input,
@@ -736,8 +1568,32 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 ),
             )
             break
+        if _consume_manual_episode_stop_request(
+            clutch_input=clutch_input,
+            recording_active=recording_active,
+            stop_recording=stop_recording,
+            cancel_recording_countdown=cancel_recording_countdown,
+            now=loop_start,
+            step_index=step_index,
+            episode_last_state=episode_last_state,
+        ):
+            # A pending Failure outbox may re-issue Hold on every frame.  The
+            # Episode stop must win this frame so it cannot be starved by the
+            # Hold branch's fail-closed continue.  No control command is
+            # dispatched; an unconsumed Hold remains latched for the next
+            # frame.
+            continue
         if clutch_input.consume_hold_request():
             hold_reason = clutch_input.hold_request_reason()
+            promotable_hold_pause = None
+            application_hold_effective_at: float | None = None
+            application_hold_was_active = bool(
+                components.session.home_recalibration_required
+            )
+            formal_capture_was_paused = bool(
+                dataset_recorder is not None
+                and dataset_recorder.is_paused
+            )
             safety_hold = hold_reason in {
                 "position_force_guard_collision",
                 "position_force_guard_fault",
@@ -809,6 +1665,16 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     "emergency stop latch observed during command dispatch; "
                     "runtime home recalibration required"
                 )
+            elif hold_reason == "progress_failure":
+                hold_hardware_reason = (
+                    "collection progress failure reported; "
+                    "waiting for operator adjustment and runtime home recalibration"
+                )
+            elif hold_reason == "progress_arm_profile_transition":
+                hold_hardware_reason = (
+                    "collection progress arm profile requires a newly active arm; "
+                    "waiting for target-side runtime home calibration"
+                )
             elif hold_reason.startswith("init_qpos_"):
                 hold_hardware_reason = (
                     "Init qpos operation completed; runtime home recalibration required"
@@ -853,6 +1719,14 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     components,
                     now=loop_start,
                     reason="hold_requested",
+                    # A profile transition freezes the currently-live peer
+                    # side at this exact Hold cut after Home. Preserve that
+                    # last accepted arm+end-effector snapshot so no ordinary
+                    # command is needed before the new Fix is established.
+                    clear_fix_snapshots=not (
+                        hold_reason == "progress_arm_profile_transition"
+                        and pending_progress_arm_transition is not None
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - safety Hold remains fail-closed.
                 if not safety_hold:
@@ -879,10 +1753,12 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             if not components.session.home_recalibration_required:
                 if safety_hold:
                     try:
-                        components.session.hold_hardware(
+                        hold_applied = components.session.hold_hardware(
                             hold_hardware_reason,
                             require_home_recalibration=True,
                         )
+                        if hold_applied:
+                            application_hold_effective_at = time.time()
                     except Exception as exc:  # noqa: BLE001 - stay fail-closed in GUI.
                         _log(
                             "Hold",
@@ -904,7 +1780,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                                     now=loop_start,
                                 )
                 else:
-                    components.session.hold_hardware(hold_hardware_reason)
+                    hold_applied = components.session.hold_hardware(
+                        hold_hardware_reason
+                    )
+                    if hold_applied:
+                        application_hold_effective_at = time.time()
+            else:
+                # A prior authoritative Hold has already moved the Session out
+                # of RUNNING and required a new Home calibration.
+                application_hold_effective_at = time.time()
             try:
                 _disengage_position_backends_for_manual_interaction(
                     components,
@@ -963,6 +1847,18 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         "检测到急停与控制帧竞态，当前数采已结束并进入 Hold；"
                         "请检查机械臂后重新采集 runtime Home。"
                     )
+                elif hold_reason == "progress_failure":
+                    message = (
+                        "当前阶段失败已记录，正式数采已暂停且机械臂进入 Hold。"
+                        "人工调整后点击“开始遥操”重新采集 runtime Home；"
+                        "writer 接纳恢复后的首帧时会创建同阶段 Retry Attempt。"
+                    )
+                elif hold_reason == "progress_arm_profile_transition":
+                    message = (
+                        "当前子任务的正式数采边界已暂停，目标子任务尚未提交。"
+                        "请摆好目标活动臂 VIVE 后点击“开始遥操”；Home 与目标 Fix "
+                        "状态建立成功后才会切换子任务并继续写入。"
+                    )
                 elif hold_reason.startswith("init_qpos_"):
                     message = (
                         "Init qpos 已完成并进入 Hold；请摆好 VIVE/Q6 后点击“开始遥操”重新采集 runtime Home。"
@@ -991,6 +1887,91 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         f"{type(exc).__name__}: {exc}",
                         now=loop_start,
                     )
+            if (
+                progress_workflow is not None
+                and progress_failure_pending
+                and hold_reason == "progress_failure"
+                and application_hold_effective_at is not None
+                and dataset_recorder is not None
+                and dataset_recorder.is_paused
+                and dataset_recorder.pause_started_at is not None
+            ):
+                try:
+                    receipt_result = (
+                        progress_workflow.record_pending_failure_effect_receipt(
+                            application_hold_effective_at=(
+                                application_hold_effective_at
+                            ),
+                            formal_capture_pause_effective_at=(
+                                dataset_recorder.pause_started_at
+                            ),
+                            available_at=time.time(),
+                        )
+                    )
+                    progress_failure_pending = receipt_result.phase == (
+                        "AWAITING_HOLD_RECEIPT"
+                    )
+                    publish_progress_ui_state(now=time.time())
+                except Exception as exc:  # noqa: BLE001 - remain held and paused.
+                    _log(
+                        "Progress",
+                        "Hold/Pause 已执行但 progress receipt 写入失败；"
+                        "保持 Hold/Pause 并等待 durable outbox 重放："
+                        f"{type(exc).__name__}: {exc}",
+                        now=time.time(),
+                    )
+            active_progress_episode = (
+                None
+                if dataset_recorder is None
+                else getattr(
+                    dataset_recorder,
+                    "active_progress_episode",
+                    None,
+                )
+            )
+            candidate = _build_promotable_progress_hold_pause(
+                hold_reason=hold_reason,
+                application_hold_was_active=application_hold_was_active,
+                formal_capture_was_paused=formal_capture_was_paused,
+                hold_requested_at=loop_start,
+                application_hold_effective_at=(
+                    application_hold_effective_at
+                ),
+                formal_capture_pause_effective_at=(
+                    None
+                    if dataset_recorder is None
+                    or not dataset_recorder.is_recording
+                    or not dataset_recorder.is_paused
+                    else dataset_recorder.pause_started_at
+                ),
+                episode_capture_identity_hash=(
+                    ""
+                    if active_progress_episode is None
+                    else getattr(
+                        active_progress_episode.identity,
+                        "semantic_content_hash",
+                        "",
+                    )
+                ),
+                progress_phase=(
+                    ""
+                    if active_progress_episode is None
+                    else active_progress_episode.state.phase
+                ),
+            )
+            if candidate is not None:
+                promotable_hold_pause = candidate
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "Progress",
+                        "本次普通 Hold 可直接提升为“当前阶段失败并 Hold”；"
+                        "失败边界将沿用原暂停时刻，不包含后续人工调整。",
+                    )
+            publish_progress_ui_state(now=time.time())
+            continue
+        if progress_failure_pending:
+            # The Failure fact is durable, but no authoritative application
+            # Hold receipt exists yet. Never dispatch a normal control frame.
             continue
         fast_two_pedal_home, fast_two_pedal_fixed_side = (
             clutch_input.consume_two_pedal_fast_home_target(now=time.time())
@@ -1008,7 +1989,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             )
             recovery_plan = None
             try:
-                _runtime_home_calibration(
+                fast_home_qpos_snapshot = _runtime_home_calibration(
                     components,
                     arm_mode="real",
                     timeout_sec=clutch_input.two_pedal_fast_home_timeout_sec(),
@@ -1026,6 +2007,12 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         else None
                     ),
                     stability_profile="transition",
+                    atomic_robot_home_snapshot=bool(
+                        getattr(args, "runtime_home_atomic_arm_snapshot", True)
+                    ),
+                    late_weighted_human_home=bool(
+                        getattr(args, "runtime_home_late_weighted_vive", True)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 message = (
@@ -1056,6 +2043,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 clutch_input,
                 home_captured=True,
                 position_force_guard_monitor=position_force_guard_monitor,
+                runtime_home_qpos_snapshot=(
+                    fast_home_qpos_snapshot
+                    if bool(getattr(args, "runtime_home_atomic_arm_snapshot", True))
+                    else None
+                ),
             )
             clutch_input.finish_two_pedal_fast_home(
                 success=True,
@@ -1064,8 +2056,16 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             )
             continue
         if clutch_input.consume_calibration_request():
+            profile_home_pending = pending_progress_arm_transition
             if recording_active():
-                pause_recording(loop_start, reason="runtime_recalibration_requested")
+                pause_recording(
+                    loop_start,
+                    reason=(
+                        "progress_arm_profile_transition_home"
+                        if profile_home_pending is not None
+                        else "runtime_recalibration_requested"
+                    ),
+                )
             special_cancel_messages = _cancel_special_arm_modes_for_hold(
                 components,
                 now=loop_start,
@@ -1085,7 +2085,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 control_ui.append_message(
                     "Calibration",
                     "；".join(special_cancel_messages)
-                    + "；本次 runtime home 后特殊状态保持关闭。",
+                    + (
+                        "；本次 runtime Home 后将按目标子任务建立精确 Fix 状态。"
+                        if profile_home_pending is not None
+                        else "；本次 runtime home 后特殊状态保持关闭。"
+                    ),
                 )
             if not clutch_input.before_calibration_start_delay(
                 DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
@@ -1093,12 +2097,29 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             ):
                 continue
             try:
-                _runtime_home_calibration(
+                runtime_home_qpos_snapshot = _runtime_home_calibration(
                     components,
                     arm_mode="real",
                     timeout_sec=args.calibration_timeout,
                     num_samples=args.calibration_samples,
                     progress_callback=clutch_input.publish_runtime_home_progress,
+                    capture_sides=(
+                        profile_home_pending.capture_sides
+                        if profile_home_pending is not None
+                        else None
+                    ),
+                    require_stable=(profile_home_pending is not None),
+                    stability_profile=(
+                        "transition"
+                        if profile_home_pending is not None
+                        else "strict"
+                    ),
+                    atomic_robot_home_snapshot=bool(
+                        getattr(args, "runtime_home_atomic_arm_snapshot", True)
+                    ),
+                    late_weighted_human_home=bool(
+                        getattr(args, "runtime_home_late_weighted_vive", True)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 message = _runtime_home_failure_message(exc)
@@ -1106,7 +2127,54 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 clutch_input.publish_calibration_waiting(
                     f"{message}\n请检查 VIVE sender/tracker_role 后重新选择操作。"
                 )
+                if profile_home_pending is not None:
+                    clutch_input.request_hold(
+                        reason="progress_arm_profile_transition"
+                    )
                 continue
+            if profile_home_pending is not None:
+                if profile_home_pending.plan.target_fixed_sides:
+                    target_fixed = (
+                        profile_home_pending.plan.target_fixed_sides
+                    )
+                    fix_controller = getattr(
+                        components,
+                        "fix_arm_controller",
+                        None,
+                    )
+                    transition = None
+                    if fix_controller is not None and len(target_fixed) == 1:
+                        transition = fix_controller.select_side(
+                            target_fixed[0]
+                        )
+                        if transition.ok:
+                            transition = fix_controller.freeze_selected(
+                                now=loop_start
+                            )
+                    if (
+                        transition is None
+                        or not transition.ok
+                        or tuple(
+                            getattr(fix_controller, "fixed_sides", ()) or ()
+                        )
+                        != target_fixed
+                    ):
+                        message = (
+                            "目标子任务 Home 完成后无法从 Hold 边界快照建立精确 "
+                            "arm+end-effector Fix；保持旧子任务与 Hold/Pause："
+                            + (
+                                str(getattr(transition, "message", ""))
+                                if transition is not None
+                                else "FixArm controller unavailable"
+                            )
+                        )
+                        _log("Progress", message, now=loop_start)
+                        if control_ui is not None:
+                            control_ui.append_message("Progress", message)
+                        clutch_input.request_hold(
+                            reason="progress_arm_profile_transition"
+                        )
+                        continue
             _emit_home_alignment_logs(components)
             _arm_after_start_calibration(
                 args,
@@ -1114,20 +2182,51 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 clutch_input,
                 home_captured=True,
                 position_force_guard_monitor=position_force_guard_monitor,
+                runtime_home_qpos_snapshot=(
+                    runtime_home_qpos_snapshot
+                    if bool(getattr(args, "runtime_home_atomic_arm_snapshot", True))
+                    else None
+                ),
             )
-            continue
-        if clutch_input.consume_episode_stop_request():
-            if recording_active():
-                stop_recording(
-                    loop_start,
-                    end_reason="manual_key_stop",
-                    summary={
-                        "last_step_index": step_index,
-                        "last_state": episode_last_state,
-                    },
+            if profile_home_pending is not None:
+                if (
+                    profile_home_pending.intent is not None
+                    and progress_workflow is not None
+                ):
+                    progress_result = progress_workflow.handle_operator_intent(
+                        profile_home_pending.intent,
+                        now=time.time(),
+                        application_held=False,
+                        promotable_hold_pause=None,
+                        **progress_callbacks,
+                    )
+                    if control_ui is not None:
+                        target_label = (
+                            "目标 arm+end-effector Fix 与活动臂 Home"
+                            if profile_home_pending.plan.target_fixed_sides
+                            else "目标活动臂 Home"
+                        )
+                        control_ui.append_message(
+                            "Progress",
+                            f"{target_label}已建立，子任务切换已提交："
+                            f"{progress_result.phase}。",
+                        )
+                active_episode = getattr(
+                    dataset_recorder,
+                    "active_progress_episode",
+                    None,
                 )
-            else:
-                cancel_recording_countdown(loop_start, reason="manual_key_stop")
+                progress_arm_entry_episode_hash = str(
+                    getattr(
+                        None
+                        if active_episode is None
+                        else active_episode.identity,
+                        "semantic_content_hash",
+                        "",
+                    )
+                )
+                pending_progress_arm_transition = None
+            continue
         episode_delete_index = clutch_input.consume_episode_delete_request()
         if episode_delete_index is not None:
             if clutch_input.plus_curation_save_in_flight():
@@ -1418,7 +2517,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     )
 
         def handle_safety_dispatch_exception(error: BaseException) -> bool:
-            """Route only collision/stop races; leave unrelated failures visible."""
+            """Route classified safety rejections; leave other failures visible."""
 
             force_guard_fault_now = (
                 None
@@ -1438,6 +2537,21 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     "dispatch rejected after controller force collision: "
                     + " <- ".join(exception_text)
                 )
+                return True
+            if teleop_active and _consume_joint_hard_limit_dispatch(
+                error,
+                components=components,
+                clutch_input=clutch_input,
+                recording_active=recording_active,
+                stop_recording=stop_recording,
+                cancel_recording_countdown=cancel_recording_countdown,
+                emergency_stop_real_arms=_emergency_stop_real_arms,
+                now=loop_start,
+                step_index=step_index,
+                last_state=episode_last_state,
+                log=_log,
+                control_ui=control_ui,
+            ):
                 return True
             if _is_emergency_stop_latch_error(error):
                 consume_latched_safety_dispatch(error)
@@ -1509,6 +2623,14 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             if step_result.raw_channels
             else step_result.channels
         )
+        if actuator_trace_recorder is not None:
+            actuator_trace_recorder.record_vive_source(
+                control_wall_time=loop_start,
+                control_monotonic_time_ns=time.monotonic_ns(),
+                raw_channels=raw_step_channels,
+                teleop_state=step_result.state.value,
+                motion_hold_mode=step_result.motion_hold_mode,
+            )
         clutch_input.publish_raw_tracker_pose_state(
             channels=raw_step_channels,
             now=loop_start,
@@ -1631,7 +2753,20 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
         fix_controller = getattr(components, "fix_arm_controller", None)
         if (
             fix_controller is not None
-            and clutch_input._two_pedal_mode_active()
+            and (
+                clutch_input._two_pedal_mode_active()
+                or (
+                    progress_workflow is not None
+                    and str(
+                        getattr(
+                            args,
+                            "collection_progress_arm_control_mode",
+                            "profile",
+                        )
+                    )
+                    != PROGRESS_ARM_CONTROL_MODE_IGNORE
+                )
+            )
             and not bool(getattr(fix_controller, "recapturing", False))
             and components.session.calibration is not None
             and bool(getattr(fix_controller, "fixed_sides", ()) or ())
@@ -2155,6 +3290,54 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 )
         if recording_active() and recording_paused():
             resume_recording_if_ready(loop_start, step_result=step_result)
+        if progress_workflow is not None:
+            try:
+                resume_result = progress_workflow.observe_applied_resume(
+                    now=loop_start,
+                    application_running=bool(
+                        step_result.state == TeleopRunState.RUNNING
+                        and not clutch_input.hold_active()
+                    ),
+                    formal_capture_paused=bool(
+                        dataset_recorder is not None
+                        and dataset_recorder.is_paused
+                    ),
+                    formal_capture_resume_effective_at=(
+                        None
+                        if dataset_recorder is None
+                        else dataset_recorder.last_resume_at
+                    ),
+                )
+                acceptance_result = progress_workflow.consume_sample_acceptance(
+                    available_at=loop_start,
+                )
+                if control_ui is not None and resume_result.handled:
+                    control_ui.append_message(
+                        "Progress",
+                        "失败后的 Hold 已解除，正式采集已恢复；"
+                        "等待第一帧 writer 接纳后创建 Retry Attempt。",
+                    )
+                if control_ui is not None and acceptance_result.handled:
+                    control_ui.append_message(
+                        "Progress",
+                        "首帧已由正式 writer 接纳；Retry Attempt 已开始。",
+                    )
+                publish_progress_ui_state(now=loop_start)
+            except Exception as exc:  # noqa: BLE001 - semantics fail closed.
+                message = (
+                    "collection progress Resume/Retry 对齐失败，"
+                    "数采保持暂停并进入 Hold："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("Progress", message, now=loop_start)
+                if control_ui is not None:
+                    control_ui.append_message("Progress", message)
+                clutch_input.request_hold(reason="progress_retry_alignment_error")
+                pause_recording(
+                    loop_start,
+                    reason="progress_retry_alignment_error",
+                )
+                continue
         if recording_active():
             episode_last_state = context.episode_last_state()
             if episode_last_state != step_result.state.value:

@@ -17,7 +17,6 @@ from utils.dataset_postprocess.real_undistort.intrinsics import (
 )
 
 from ..geometry import (
-    SceneGeometry,
     load_scene_geometry,
     resolve_repo_relative_path,
     tool_transform_from_profile,
@@ -251,6 +250,32 @@ def _resolve_pose_frame(
     return "tool_tcp" if str(frame or "").strip() == "tool_tcp" else "arm_end"
 
 
+def _base_from_stored_pose_by_side(
+    info: Mapping[str, Any],
+) -> tuple[dict[str, np.ndarray], str]:
+    contract = info.get("pose_frame_contract")
+    if not isinstance(contract, Mapping):
+        return {}, "native_arm_base"
+    storage_frame = str(contract.get("pose_storage_frame") or "").strip()
+    if storage_frame != "desk_absolute":
+        return {}, storage_frame or "native_arm_base"
+    source = contract.get("source")
+    if not isinstance(source, Mapping):
+        raise ValueError("desk_absolute pose_frame_contract has no source mapping")
+    transforms = source.get("raw_to_canonical_desk_transform_by_side")
+    if not isinstance(transforms, Mapping):
+        raise ValueError(
+            "desk_absolute pose_frame_contract has no per-side raw-to-desk transforms"
+        )
+    result: dict[str, np.ndarray] = {}
+    for side in ("left", "right"):
+        value = np.asarray(transforms.get(side), dtype=np.float64)
+        if value.shape != (4, 4) or not np.all(np.isfinite(value)):
+            raise ValueError(f"invalid raw-to-desk transform for {side}")
+        result[side] = np.linalg.inv(value)
+    return result, storage_frame
+
+
 def _expected_video_frames(record: Mapping[str, Any], *, max_frames: int) -> int:
     raw_count = record.get("frame_count")
     try:
@@ -270,12 +295,14 @@ class DatasetVideoJob:
     relative_path: str
     source_path: Path
     output_path: Path
+    expected_frame_count: int
     parquet_path: Path
     record: Mapping[str, Any]
     intrinsics: CameraIntrinsics
     body_mask_path: Path | None
     tool_profile_path: Path | None
     T_end_tool: np.ndarray | None
+    T_base_from_stored_pose: np.ndarray | None
     pose_frame: str
 
 
@@ -343,6 +370,10 @@ def adjust_dataset(
     output_root.mkdir(parents=True, exist_ok=True)
 
     scene = load_scene_geometry(urdf_path)
+    dataset_info = _read_json(source_root / "meta" / "info.json")
+    base_from_stored_pose, pose_storage_frame = _base_from_stored_pose_by_side(
+        dataset_info
+    )
     intrinsics = _intrinsics_by_camera(
         source_root,
         None if devices_json is None else Path(devices_json).expanduser().resolve(),
@@ -416,19 +447,34 @@ def adjust_dataset(
                     relative_path=str(relative_path),
                     source_path=source_path,
                     output_path=output_root / str(relative_path),
+                    expected_frame_count=_expected_video_frames(
+                        record,
+                        max_frames=max_frames,
+                    ),
                     parquet_path=parquet_path,
                     record=record,
                     intrinsics=intrinsics[str(camera_key)],
                     body_mask_path=body_masks[side],
                     tool_profile_path=profile_path,
                     T_end_tool=T_end_tool,
+                    T_base_from_stored_pose=base_from_stored_pose.get(side),
                     pose_frame=effective_pose_frame,
                 )
             )
     if not jobs_to_run:
         raise ValueError(f"no videos found for selected cameras: {', '.join(selected_cameras)}")
+    missing_frame_contract = [
+        f"episode={job.episode_index},camera={job.camera_key}"
+        for job in jobs_to_run
+        if job.expected_frame_count <= 0
+    ]
+    if missing_frame_contract:
+        raise ValueError(
+            "selected videos have no positive frame_count contract: "
+            + ", ".join(missing_frame_contract[:8])
+        )
 
-    expected_total_frames = sum(_expected_video_frames(job.record, max_frames=max_frames) for job in jobs_to_run)
+    expected_total_frames = sum(job.expected_frame_count for job in jobs_to_run)
     progress = ProgressPrinter(
         label="wrist_cam_adjust dataset",
         total_items=len(jobs_to_run),
@@ -461,6 +507,7 @@ def adjust_dataset(
                 pose_column=pose_column,
                 qpos_column=qpos_column,
                 T_end_tool=job.T_end_tool,
+                T_base_from_stored_pose=job.T_base_from_stored_pose,
                 table_margin_m=table_margin_m,
                 table_height_offset_m=table_height_offset_m,
                 table_mask_mode=table_mask_mode,
@@ -482,6 +529,7 @@ def adjust_dataset(
             output_kind=output_kind,
             codec=codec,
             max_frames=max_frames,
+            expected_frame_count=job.expected_frame_count,
             overwrite=True,
             mask_blur_px=mask_blur_px,
             mask_blur_sigma=mask_blur_sigma,
@@ -521,6 +569,11 @@ def adjust_dataset(
         "episodes": list(selected_episode_indices),
         "pose_frame": str(pose_frame),
         "pose_source": str(pose_source),
+        "pose_storage_frame": pose_storage_frame,
+        "stored_pose_to_arm_base": {
+            side: transform.tolist()
+            for side, transform in sorted(base_from_stored_pose.items())
+        },
         "pose_column": pose_column,
         "qpos_column": qpos_column,
         "output_kind": str(output_kind),
@@ -564,7 +617,11 @@ def adjust_dataset(
                 "camera_key": job.camera_key,
                 "side": job.side,
                 "relative_path": job.relative_path,
+                "expected_frame_count": job.expected_frame_count,
                 "pose_frame": job.pose_frame,
+                "stored_pose_transform_applied": (
+                    job.T_base_from_stored_pose is not None
+                ),
                 "body_mask_path": None if job.body_mask_path is None else str(job.body_mask_path),
                 "tool_profile_path": None if job.tool_profile_path is None else str(job.tool_profile_path),
             }

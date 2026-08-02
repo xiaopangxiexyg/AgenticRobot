@@ -21,6 +21,8 @@ from dataset_contracts.completeness import (
     trace_requirement_profile,
 )
 from robot_motion.action import (
+    ActionResolutionError,
+    ActionResolutionFailure,
     BIMANUAL_EE_POSE_V1,
     CanonicalActionSafetyAnchor,
     CanonicalKeyframeSafetyProfile,
@@ -910,4 +912,60 @@ def test_compound_pre_dispatch_failures_hold_without_partial_pending(
     ]
     assert len(failures) == 1
     assert failures[0].payload["stage"] == expected_stage
+    runtime.close()
+
+
+def test_typed_resolution_failure_is_traced_and_existing_hold_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        _clock,
+        _scene,
+        runtime,
+        hand_specs,
+        composition_spec,
+        _authority_profile,
+    ) = _runtime(component_execution_handoff=True)
+    _admit_ready_composition(
+        runtime,
+        composition_spec=composition_spec,
+        hand_specs=hand_specs,
+    )
+    runtime.core._backend_hold_active = True
+
+    failure = ActionResolutionFailure(
+        reason_code="collision_margin_low",
+        resolver_status="hold_last_safe",
+        message="blended target is below the collision margin",
+        diagnostics={"best_candidate_distance_m": 0.029},
+    )
+
+    def fail_resolution(_action):
+        raise ActionResolutionError(failure)
+
+    monkeypatch.setattr(runtime.core.resolver, "resolve", fail_resolution)
+    cancellations_before = len(
+        [
+            fact
+            for fact in runtime.trace_facts
+            if fact.event_type == "execution_cancellation"
+        ]
+    )
+
+    step = runtime.step(now=10.0)
+
+    assert step.status == "compound_resolution_failure_hold"
+    assert step.resolution_failure is failure
+    assert step.target_completion_receipt is not None
+    assert step.target_completion_receipt.outcome_code == (
+        "target_private_resolution_failure.collision_margin_low"
+    )
+    assert step.cancellation is None
+    assert len(
+        [
+            fact
+            for fact in runtime.trace_facts
+            if fact.event_type == "execution_cancellation"
+        ]
+    ) == cancellations_before
     runtime.close()

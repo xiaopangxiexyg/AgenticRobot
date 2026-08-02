@@ -15,6 +15,18 @@ from .actions import (
     FilteredNormalizedAction,
     NormalizedAction,
     normalize_policy_output,
+    normalize_policy_output_with_semantics,
+)
+from .action_semantics import ArmHoldKeyframePrediction
+from .arm_hold import (
+    ARM_HOLD_RESOLUTION_HASH_DOMAIN_V1,
+    ARM_HOLD_RESOLUTION_RECEIPT_SCHEMA_V1,
+    ARM_HOLD_STATE_HOLD,
+    ARM_HOLD_STATE_MOVING,
+    ArmHoldResolutionReceipt,
+    ArmHoldSemanticResolver,
+    ArmHoldSideResolution,
+    ArmHoldStagedResolution,
 )
 from .chunk import (
     ActionChunkExecutionPolicy,
@@ -340,6 +352,15 @@ __all__ = [
     "POLICY_NORMALIZATION_HASH_DOMAIN_V1",
     "ActionSafetyFilter",
     "ActionSafetyFilterConfig",
+    "ArmHoldKeyframePrediction",
+    "ArmHoldResolutionReceipt",
+    "ArmHoldSemanticResolver",
+    "ArmHoldSideResolution",
+    "ArmHoldStagedResolution",
+    "ARM_HOLD_RESOLUTION_HASH_DOMAIN_V1",
+    "ARM_HOLD_RESOLUTION_RECEIPT_SCHEMA_V1",
+    "ARM_HOLD_STATE_HOLD",
+    "ARM_HOLD_STATE_MOVING",
     "BoundedPolicyInferenceWorker",
     "CanonicalDeployActionPipeline",
     "CanonicalDeployActionResult",
@@ -419,6 +440,7 @@ __all__ = [
     "HAND_DOF",
     "HAND_VECTOR_ORDER",
     "NormalizedAction",
+    "normalize_policy_output_with_semantics",
     "OBSERVATION_STATE_DIM",
     "POLICY_CONTRACT_LEGACY_V1",
     "POLICY_CONTRACT_MODES",

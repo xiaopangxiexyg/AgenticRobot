@@ -1320,6 +1320,26 @@ upper-layer parity adapter
    raw/model-RTC共用一个debug payload dispatch入口，所有记录均为`debug_only`、`non_authoritative`且无action-send
    authority。lease测试覆盖in-flight期间cursor推进后的obsolete filter、epoch rotation late-result拒绝，以及debug
    开关不改变conditioned result hash。
+   **MRTC-T0 trained preflight semantics（完成）：**首个trained profile明确使用v2
+   `trained_prefix_conditioning_v1` provenance，但runtime继续声明`flow_inpaint`并复用现有v3
+   envelope/receipt/crop；`trained_prefix_conditioning` runtime mode继续保留为未来不同sampler语义的独立gate。
+   pure validator同时冻结continuous absolute、teacher-overlap和显式training contract，拒绝legacy/inference-only提升。
+   `dataset_interface`新增framework-neutral training window：observation与generation start绑定同一episode/index，
+   first executable index严格为`start + delay`；delay/prefix从artifact范围内的显式pair集合，以
+   spec/contract/episode/start/draw identity做stateless hash selection，tail只保留存在真实executable suffix的pair。
+   sampling spec、causal binding及合并后的training window均有独立hash，chosen pair继续由既有sample hash绑定，
+   不新增重复selection receipt；既有D2 sample/hash与v2 artifact
+   serialization不变。本批不实现normalization、framework tensor、model/loss、trained artifact writer、provider改动或
+   真实训练。
+   **MRTC-T1 OpenPI additive training/deploy adapter（已接线，GPU smoke待空闲）：**新增独立training source/run/
+   checkpoint evidence、v2.2 absolute compatibility artifact template、stateless sampling transform和可选
+   `model_rtc.action_loss_mask`。OpenPI普通二元batch/mean loss不变；只有显式mask才走suffix reduction。外部launcher
+   包装任意通过artifact/horizon/layout/camera/dataset-root gate的base config，base checkpoint只读，输出目录独立，
+   不注册第二个默认config。远端真实`0712-wrist-cube + 92599 + 503 episodes + wrist pair` no-train dry-run已通过并形成
+   stable training-run manifest；OpenPI mask seam 4项CPU测试通过。部署CLI新增显式
+   `model_rtc_flow_inpaint_shadow_15_30_60_120_v1`，复用现有conditioned v3 backend与同一个producer，仍强制
+   `send_actions=false`、lookahead off；trained checkpoint在连接前验证artifact/run/receipt。当前远端另一个训练进程
+   占用GPU，未启动第二进程，首个10-step GPU smoke及其sidecar验证仍待资源空闲。
 
 现有OpenPI checkpoint是普通full-chunk flow训练、RTC为推理期hard inpainting，因此其新binding必须使用
 `inference_only_projection_v1`且`training=null`。只有未来有真实prefix-conditioned训练证据的artifact才可使用

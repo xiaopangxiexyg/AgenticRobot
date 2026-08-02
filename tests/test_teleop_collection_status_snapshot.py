@@ -36,6 +36,24 @@ class _WriterPool:
         )
 
 
+class _ProcessWriter:
+    def stats(self):
+        return SimpleNamespace(
+            submitted_samples=45,
+            completed_samples=44,
+            rejected_busy=1,
+            sample_rejections=2,
+            queue_capacity=4,
+            queue_high_water=3,
+            slots_available=2,
+            slot_count=4,
+            worker_alive=True,
+            worker_error=None,
+            sample_process_ms_p50=12.3,
+            sample_process_ms_p95=24.6,
+        )
+
+
 class TeleopCollectionStatusSnapshotTest(unittest.TestCase):
     def test_compact_log_value_truncates_long_text(self) -> None:
         self.assertEqual(compact_log_value("abcdef", max_chars=4), "a...")
@@ -47,6 +65,16 @@ class TeleopCollectionStatusSnapshotTest(unittest.TestCase):
         self.assertEqual(
             text,
             "writer=queued:1 submitted:2 completed:3 dropped:4 failures:5 workers:6",
+        )
+
+    def test_writer_debug_text_formats_process_worker_stats(self) -> None:
+        text = writer_debug_text(_ProcessWriter())
+
+        self.assertEqual(
+            text,
+            "writer=mode:process submitted:45 completed:44 rejected_busy:1 "
+            "sample_rejections:2 queue_high:3/4 slots:2/4 alive:True "
+            "p50:12.3ms p95:24.6ms error:ok",
         )
 
     def test_camera_status_and_signature_cover_streaming_error_and_preview(self) -> None:

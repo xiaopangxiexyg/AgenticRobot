@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from utils.dataset_postprocess.real_undistort.dataset import inspect_intrinsics, undistort_dataset
 from utils.dataset_postprocess.real_undistort.intrinsics import CameraIntrinsics, build_undistort_maps, require_cv2
@@ -75,6 +76,49 @@ def test_process_video_writes_undistorted_video(tmp_path: Path) -> None:
     assert result.output_intrinsics.coeffs == (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+def test_process_video_does_not_write_through_hardlinked_target(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "output.mp4"
+    _write_video(source, frame_count=4)
+    output.hardlink_to(source)
+    source_before = source.read_bytes()
+    source_inode = source.stat().st_ino
+    intrinsics = CameraIntrinsics(
+        width=64,
+        height=48,
+        fx=40.0,
+        fy=39.0,
+        ppx=31.5,
+        ppy=23.5,
+    )
+
+    with pytest.raises(RuntimeError, match="expected=5, decoded=4"):
+        process_video(
+            source,
+            output,
+            intrinsics,
+            expected_frame_count=5,
+            overwrite=True,
+        )
+
+    assert source.stat().st_ino == source_inode
+    assert output.stat().st_ino == source_inode
+    assert source.read_bytes() == source_before
+    assert not tuple(tmp_path.glob(".*.partial-*"))
+
+    result = process_video(
+        source,
+        output,
+        intrinsics,
+        expected_frame_count=4,
+        overwrite=True,
+    )
+    assert result.frame_count == 4
+    assert source.stat().st_ino == source_inode
+    assert output.stat().st_ino != source_inode
+    assert source.read_bytes() == source_before
+
+
 def test_undistort_dataset_updates_devices_and_manifest(tmp_path: Path) -> None:
     source_root = tmp_path / "dataset"
     output_root = tmp_path / "dataset_undistorted"
@@ -102,6 +146,7 @@ def test_undistort_dataset_updates_devices_and_manifest(tmp_path: Path) -> None:
             {
                 "episode_index": 0,
                 "episode_id": "episode_000000",
+                "frame_count": 4,
                 "video_paths": {"left_wrist": video_rel},
             }
         ],

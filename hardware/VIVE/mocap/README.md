@@ -8,6 +8,9 @@
   较大者分配为 `right_wrist`；少于或多于两个都会直接报错。需要发送更多 tracker
   时必须显式传入 `--tracker-count N`（`N >= 3`）；第 3 个角色为 `auxiliary`，后续按
   顺序为 `auxiliary_2`、`auxiliary_3` 等，UDP v1 根字段和单 tracker 字段均不改变。
+  显式 `--single` 时，唯一物理 tracker 保持兼容角色 `left_wrist`，并附带一个
+  invalid `right_wrist` 记录。接收端应用负责将这个 source role 映射到实际逻辑臂；
+  不应仅根据逻辑右臂就假定 sender 会把单 tracker 改名为 `right_wrist`。
 - `vive_data_sender_legacy.py`：稳定 v1 sender。强制关闭校时控制面，并冻结
   发布版的字段形状/60 Hz 默认值，用于 `DexTeleop_StableCollect_0705` 等稳定
   receiver。
@@ -25,6 +28,22 @@ SteamVR 电脑即可；发送端不需要同时复制 `clock_sync.py`、`teleop_
 python -c "import openvr; print(openvr.__file__)"
 python .\vive_data_sender.py --host <receiver-ip> --port 9999 --hz 200
 ```
+
+排查 `stale` 时先看 sender 每秒的 `[Status]` 行：`rate`/`loop` 反映实际采样
+循环，`valid` 反映 OpenVR 当前 tracker 是否有效，`send_errors` 反映 UDP 是否真正
+发送失败；`get_pose`、`registry` 和 `trackers_max` 会在慢循环时打印。`rate` 持续接近
+目标且 `send_errors=0` 时，发送端通常仍在发送，即使某个 tracker 的 `valid=false`
+也只是一个带错误原因的有效 UDP 帧，不等于链路断开。
+
+接收端再按层判断：`packet_count`/`datagram_count`/`packet_age_monotonic_sec` 是 UDP
+到达证据；`processed_packet_count`、`process_error_count` 和
+`last_process_duration_sec` 是解析/发布证据，
+`upstream_role_update_counts` 是 sender role 解析证据，`channel_update_counts` 是
+当前逻辑映射证据，最后才看 Sim-HIL 的 `last_accepted_emission` 和
+`last_rejection_reason`。因此“包新鲜但 human emission stale”应先查 role/valid、
+session hold/fault 或 action contract，而不是盲目重启 sender。接收端
+`worker_alive=false` 且 `process_error_count` 增长则是 receiver worker 异常，应重建
+receiver；不要同时启动诊断 receiver 和遥操作 receiver 竞争 9999 端口。
 
 若完整 `triad_openvr.py` 与 sender 一起复制，启动时仍会按确定顺序搜索 sender
 同目录、其子目录以及父目录下的子目录，并优先使用找到的完整驱动。没有找到，或完整
@@ -55,8 +74,10 @@ python -m hardware.VIVE.mocap.vive_data_sender \
 - `summary.json`：接收频率、缺包率、无效帧、重复 pose 比例及各指标分位数；
 - `metadata.json`：运行参数、主机和输出文件说明。
 
-测试 receiver 与遥操作 receiver 默认都监听 UDP 9999，因此不能同时运行；否则
-同一数据流会被竞争消费，统计结果无效。
+测试 receiver 与遥操作 receiver 默认都监听 UDP 9999，因此不能同时运行；实时
+`VivePoseSource` 默认不启用 `SO_REUSEADDR`，第二个 receiver 会直接 bind 失败，
+避免两个进程竞争同一数据流。只有明确的 legacy/诊断场景才应通过
+`allow_socket_reuse=True` 选择复用；这不是 Sim-HIL 的默认配置。
 
 ## 两组建议录制
 

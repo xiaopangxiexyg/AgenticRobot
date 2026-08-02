@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from robot_motion.runtime import EffectorCommand, TeleopCommand
 from teleop_runtime.rigs.bimanual import BimanualRig
 
 
@@ -18,13 +19,14 @@ class _FakeBackend:
         self.fail_send = fail_send
         self.holds: list[str] = []
         self.send_count = 0
+        self.commands = []
 
     @property
     def name(self) -> str:
         return self._name
 
     def send_command(self, command) -> None:
-        del command
+        self.commands.append(command)
         self.send_count += 1
         if self.fail_send:
             raise RuntimeError(f"{self.name} send failed")
@@ -36,6 +38,29 @@ class _FakeBackend:
 
 
 class BimanualRigHoldMotionTest(unittest.TestCase):
+    def test_dispatch_binds_one_atomic_parent_timestamp_to_both_effectors(self) -> None:
+        left = _FakeBackend("left")
+        right = _FakeBackend("right")
+        rig = BimanualRig({"left_arm": left, "right_arm": right})
+        command = TeleopCommand(timestamp=123.5)
+        command.add_command(
+            EffectorCommand("left_arm", "left", "joint_vector", [0.0] * 6)
+        )
+        command.add_command(
+            EffectorCommand("right_arm", "right", "joint_vector", [0.0] * 6)
+        )
+
+        rig.send_commands(command)
+
+        self.assertEqual(
+            left.commands[0].metadata["_parent_command_timestamp"],
+            123.5,
+        )
+        self.assertEqual(
+            right.commands[0].metadata["_parent_command_timestamp"],
+            123.5,
+        )
+
     def test_hold_motion_attempts_all_backends(self) -> None:
         left = _FakeBackend("left", fail_hold=True)
         right = _FakeBackend("right")

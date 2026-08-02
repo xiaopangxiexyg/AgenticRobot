@@ -41,7 +41,7 @@ from sim.mujoco.adapters import (
     MujocoPositionExecutionRig,
 )
 from sim.mujoco.deploy import MujocoDeployConfig, MujocoDeployRuntime
-from teleop_runtime.collection.stream_sink import NativeStreamEpisodeWriter
+from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,
     ControlTraceSpool,

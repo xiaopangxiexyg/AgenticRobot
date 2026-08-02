@@ -8,13 +8,16 @@ the shared safety callback needs a current measured anchor.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from project_paths import resolve_path
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     CanonicalActionSafetyAnchor,
@@ -22,6 +25,17 @@ from robot_motion.action import (
     ExecutionObservationPlan,
     ExecutionObservationSink,
     HandActionSpec,
+)
+from robot_motion.coordinate_frames import (
+    CoordinateFrameGraph,
+    CoordinateFrameSpec,
+    RigidFrameTransformSpec,
+)
+from robot_motion.coordinate_profiles import (
+    STATION_RETARGET_FRAME_CONTRACT_V1,
+    TargetFrameProfile,
+    ToolFrameBinding,
+    ToolFrameProfile,
 )
 from robot_motion.deploy.schema import pose_matrix_to_xyzquat
 from robot_motion.position_control import (
@@ -58,14 +72,16 @@ class MujocoSimHILTargetConfig:
     composer_producer_id: str = "control-station-sim-hil-composer"
     policy_node_id: str = "sim-hil-temp-ppo"
     clock_domain_id: str = "mujoco.sim_hil.monotonic"
-    # Sim-HIL receives already-composed targets at the downstream reference
-    # cadence by default.  The old 15->60->120 contract remains selectable by
-    # name and is not changed for replay or ordinary policy deployment.
-    position_control_profile_name: str = POSITION_60_120_PROFILE.name
+    # Synchronous pose resolution is admitted at 15 Hz; the lower planner and
+    # command clocks remain 60/120 Hz.  A 60 Hz compose profile remains an
+    # explicit option for integrations with a sufficiently fast resolver.
+    position_control_profile_name: str = POSITION_15_60_120_PROFILE.name
     # Optional explicit final compose/authority cadence.  When omitted, the
     # selected profile's accepted input cadence is used.
     compose_target_hz: float | None = None
+    target_admission_margin_sec: float = 0.05
     execution_observation_plan: ExecutionObservationPlan | None = None
+    exposed_pose_sides: tuple[str, ...] = ("left", "right")
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_config_path", Path(self.task_config_path).expanduser())
@@ -86,6 +102,16 @@ class MujocoSimHILTargetConfig:
             if not np.isfinite(compose_target_hz) or compose_target_hz <= 0.0:
                 raise ValueError("compose_target_hz must be finite and positive.")
             object.__setattr__(self, "compose_target_hz", compose_target_hz)
+        target_margin = float(self.target_admission_margin_sec)
+        if not np.isfinite(target_margin) or target_margin <= 0.0:
+            raise ValueError(
+                "target_admission_margin_sec must be finite and positive."
+            )
+        object.__setattr__(
+            self,
+            "target_admission_margin_sec",
+            target_margin,
+        )
         if self.execution_observation_plan is not None and not isinstance(
             self.execution_observation_plan,
             ExecutionObservationPlan,
@@ -94,6 +120,14 @@ class MujocoSimHILTargetConfig:
                 "execution_observation_plan must be an "
                 "ExecutionObservationPlan or None."
             )
+        sides = tuple(str(side).strip().lower() for side in self.exposed_pose_sides)
+        if (
+            not sides
+            or any(side not in {"left", "right"} for side in sides)
+            or len(sides) != len(set(sides))
+        ):
+            raise ValueError("exposed_pose_sides must contain unique known sides.")
+        object.__setattr__(self, "exposed_pose_sides", sides)
 
 
 @dataclass(frozen=True)
@@ -104,62 +138,48 @@ class MujocoSimHILTarget:
     scene: Any
     runtime: Any
     hand_specs_by_side: Mapping[str, HandActionSpec]
+    target_frame_profile: TargetFrameProfile
+    tool_frame_profile: ToolFrameProfile
+    task_initialization_info: Mapping[str, object]
 
 
-def build_mujoco_sim_hil_target(
-    *,
-    config: MujocoSimHILTargetConfig,
-    contracts: Any,
-    hand_specs_by_side: Mapping[str, HandActionSpec],
-    composition_input_action_schema_by_role: Mapping[
-        str, ComponentActionSchema
-    ]
-    | None = None,
-    execution_observation_sink: ExecutionObservationSink | None = None,
-) -> MujocoSimHILTarget:
-    """Build scene, shared safety, coupled IK and one deploy runtime.
+@dataclass(frozen=True)
+class MujocoSimHILPreparedTarget:
+    """Prepared lower-owned resources before application contract binding.
 
-    The composition contract is supplied by the application leaf as an
-    opaque binding.  This target factory only uses its already-built strategy
-    and compound authority profile; it does not define composition semantics.
+    This phase exists so the application leaf can inspect the exact target
+    component schema derived from the loaded scene, then build composition
+    contracts, without constructing MuJoCo twice or moving composition
+    semantics into the simulator package.
     """
+
+    config: MujocoSimHILTargetConfig
+    task_config: Any
+    scene: Any
+    position_profile: PositionControlProfile
+    compose_target_hz: float
+    timing: Any
+    arm_profile: Any
+    gripper_profile: Any
+    target_frame_profile: TargetFrameProfile
+    tool_frame_profile: ToolFrameProfile
+    task_initialization_info: Mapping[str, object]
+
+
+def prepare_mujoco_sim_hil_target(
+    config: MujocoSimHILTargetConfig,
+) -> MujocoSimHILPreparedTarget:
+    """Load and initialize one MuJoCo target without authority or execution."""
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
-    if not hasattr(contracts, "authority_profile") or not hasattr(contracts, "strategy"):
-        raise TypeError("contracts must expose authority_profile and strategy.")
-    hand_specs = {
-        str(side): (
-            spec
-            if isinstance(spec, HandActionSpec)
-            else HandActionSpec.from_metadata(spec)
-        )
-        for side, spec in dict(hand_specs_by_side).items()
-    }
-    if set(hand_specs) != {"left", "right"}:
-        raise ValueError("MuJoCo Sim-HIL target requires left and right hand specs.")
-
-    from robot_motion.action import (
-        CanonicalKeyframeSafetyProfile,
-        HandQposSafetyLimits,
-        SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
-        apply_canonical_keyframe_safety,
-    )
-    from robot_motion.position_control import PositionKeyframeSafetyConfig
     from sim.contracts import TimingSpec
     from sim.mujoco.actuation import (
         identified_bimanual_dmtac_gripper_profile,
         rm65_bimanual_udp_feedback_profile,
     )
-    from sim.mujoco.adapters import (
-        MujocoPositionExecutionConfig,
-        MujocoPositionExecutionRig,
-    )
-    from sim.mujoco.ik import RM65CanonicalIK
     from sim.mujoco.scene import MujocoScene
     from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
-    from .pose_resolution import MujocoCoupledPoseToQposResolver
-    from .runtime import MujocoDeployConfig, MujocoDeployRuntime
 
     task_config = CubeLiftTaskConfig.load(config.task_config_path)
     contract = task_config.base_contract()
@@ -172,10 +192,6 @@ def build_mujoco_sim_hil_target(
             "Unsupported Sim-HIL position control profile: "
             f"{config.position_control_profile_name!r}."
         ) from exc
-    # The task contract owns the simulation physics budget, while the selected
-    # position profile owns the target/reference/IK/command clocks.  Refuse a
-    # silent mixed profile instead of allowing task metadata and the execution
-    # capability manifest to disagree.
     if not np.isclose(
         float(task_config.reference_hz),
         float(position_profile.rates.reference_hz),
@@ -202,8 +218,6 @@ def build_mujoco_sim_hil_target(
         else config.compose_target_hz
     )
     timing = TimingSpec(
-        # ``policy_hz`` remains the model/source clock.  ``sample_hz`` is the
-        # final compose target cadence consumed by the downstream controller.
         sample_hz=compose_target_hz,
         policy_hz=task_config.policy_hz,
         reference_hz=position_profile.rates.reference_hz,
@@ -228,18 +242,162 @@ def build_mujoco_sim_hil_target(
         position_actuation_profile=arm_profile,
         gripper_actuation_profile=gripper_profile,
     )
-    scene.reset_data()
-    scene.set_qpos_by_side(
-        {"left": task_config.left_home_qpos, "right": task_config.right_home_qpos}
+    if task_config.scripted_pregrasp_reset or task_config.scripted_contact_reset:
+        # The task kernel is the single owner of its simulator-only episode
+        # preparation.  Reuse it instead of copying the scripted trajectory
+        # into Station, composition, or the policy source.
+        from sim.mujoco.tasks.cube_lift.kernel import CubeLiftKernel
+
+        reset_kernel = CubeLiftKernel(
+            task_config,
+            scene=scene,
+            info_mode="terminal",
+            use_settled_snapshot=False,
+        )
+        try:
+            _observation, reset_info = reset_kernel.reset(seed=0)
+        finally:
+            reset_kernel.close()
+        if (
+            bool(reset_info.get("scripted_pregrasp_reset", False))
+            != bool(task_config.scripted_pregrasp_reset)
+            or bool(reset_info.get("scripted_contact_reset", False))
+            != bool(task_config.scripted_contact_reset)
+        ):
+            raise RuntimeError(
+                "CubeLift task initialization did not apply its declared "
+                "scripted reset semantics."
+            )
+        task_initialization_info = {
+            "owner": "sim.mujoco.tasks.cube_lift.CubeLiftKernel.reset",
+            "seed": 0,
+            "scripted_pregrasp_reset": bool(
+                reset_info.get("scripted_pregrasp_reset", False)
+            ),
+            "scripted_contact_reset": bool(
+                reset_info.get("scripted_contact_reset", False)
+            ),
+        }
+    else:
+        scene.reset_data()
+        scene.set_qpos_by_side(
+            {"left": task_config.left_home_qpos, "right": task_config.right_home_qpos}
+        )
+        for name, close in task_config.initial_gripper_close_by_name.items():
+            scene.set_gripper_close(name, float(close))
+        scene.set_freejoint_state(
+            task_config.object_freejoint_name,
+            qpos=task_config.cube_spawn_qpos,
+            qvel=(0.0,) * 6,
+        )
+        scene.forward()
+        task_initialization_info = {
+            "owner": "sim.mujoco.deploy.prepare_mujoco_sim_hil_target",
+            "seed": None,
+            "scripted_pregrasp_reset": False,
+            "scripted_contact_reset": False,
+        }
+    target_frame_profile, tool_frame_profile = (
+        build_mujoco_sim_hil_coordinate_profiles(
+            scene,
+            task_config,
+            active_sides=config.exposed_pose_sides,
+        )
     )
-    for name, close in task_config.initial_gripper_close_by_name.items():
-        scene.set_gripper_close(name, float(close))
-    scene.set_freejoint_state(
-        task_config.object_freejoint_name,
-        qpos=task_config.cube_spawn_qpos,
-        qvel=(0.0,) * 6,
+    return MujocoSimHILPreparedTarget(
+        config=config,
+        task_config=task_config,
+        scene=scene,
+        position_profile=position_profile,
+        compose_target_hz=compose_target_hz,
+        timing=timing,
+        arm_profile=arm_profile,
+        gripper_profile=gripper_profile,
+        target_frame_profile=target_frame_profile,
+        tool_frame_profile=tool_frame_profile,
+        task_initialization_info=MappingProxyType(task_initialization_info),
     )
-    scene.forward()
+
+
+def build_mujoco_sim_hil_target(
+    *,
+    config: MujocoSimHILTargetConfig,
+    contracts: Any,
+    hand_specs_by_side: Mapping[str, HandActionSpec],
+    composition_input_action_schema_by_role: Mapping[
+        str, ComponentActionSchema
+    ]
+    | None = None,
+    prepared_target: MujocoSimHILPreparedTarget | None = None,
+    component_execution_binding: Any | None = None,
+    execution_observation_sink: ExecutionObservationSink | None = None,
+    trace_sink: Callable[[Any], None] | None = None,
+) -> MujocoSimHILTarget:
+    """Build scene, shared safety, coupled IK and one deploy runtime.
+
+    The composition contract is supplied by the application leaf as an
+    opaque binding.  This target factory only uses its already-built strategy
+    and compound authority profile; it does not define composition semantics.
+    """
+
+    if not isinstance(config, MujocoSimHILTargetConfig):
+        raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    if not hasattr(contracts, "authority_profile") or not hasattr(contracts, "strategy"):
+        raise TypeError("contracts must expose authority_profile and strategy.")
+    hand_specs = {
+        str(side): (
+            spec
+            if isinstance(spec, HandActionSpec)
+            else HandActionSpec.from_metadata(spec)
+        )
+        for side, spec in dict(hand_specs_by_side).items()
+    }
+    if not hand_specs or not set(hand_specs).issubset({"left", "right"}):
+        raise ValueError(
+            "MuJoCo Sim-HIL target requires at least one known-side hand spec."
+        )
+
+    from robot_motion.action import (
+        CanonicalKeyframeSafetyProfile,
+        HandQposSafetyLimits,
+        IMMEDIATE_QREF_SIM_V1,
+        apply_canonical_keyframe_safety,
+    )
+    from robot_motion.position_control import PositionKeyframeSafetyConfig
+    from control_composition.composition import (
+        FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
+        CompositionStrategyControl,
+        build_initial_strategy_revision,
+    )
+    from control_composition.retention import TimeWindowRetentionSpec
+    from sim.mujoco.adapters import (
+        MujocoPositionExecutionConfig,
+        MujocoPositionExecutionRig,
+    )
+    from robot_motion.rm65 import RM65PositionCollisionPlannerConfig
+    from sim.mujoco.ik import RM65CanonicalIK
+    from .pose_resolution import MujocoCoupledPoseToQposResolver
+    from .runtime import MujocoDeployConfig, MujocoDeployRuntime
+
+    prepared = (
+        prepare_mujoco_sim_hil_target(config)
+        if prepared_target is None
+        else prepared_target
+    )
+    if (
+        not isinstance(prepared, MujocoSimHILPreparedTarget)
+        or prepared.config != config
+    ):
+        raise ValueError("prepared_target belongs to another target config.")
+    task_config = prepared.task_config
+    scene = prepared.scene
+    position_profile = prepared.position_profile
+    compose_target_hz = prepared.compose_target_hz
+    timing = prepared.timing
+    arm_profile = prepared.arm_profile
+    gripper_profile = prepared.gripper_profile
+    target_frame_profile = prepared.target_frame_profile
+    tool_frame_profile = prepared.tool_frame_profile
     rig = MujocoPositionExecutionRig(
         scene,
         MujocoPositionExecutionConfig(
@@ -261,11 +419,13 @@ def build_mujoco_sim_hil_target(
     )
 
     def shared_safety(action: Any, input_id: str) -> Any:
-        anchor = capture_mujoco_sim_hil_safety_anchor(
-            scene,
-            task_config,
-            hand_specs,
-            now=time.monotonic(),
+        anchor = rig.capture_scene(
+            lambda captured_scene: capture_mujoco_sim_hil_safety_anchor(
+                captured_scene,
+                task_config,
+                hand_specs,
+                now=time.monotonic(),
+            )
         )
         return apply_canonical_keyframe_safety(
             action,
@@ -280,6 +440,74 @@ def build_mujoco_sim_hil_target(
             "left": task_config.left_tool_profile_path,
             "right": task_config.right_tool_profile_path,
         },
+        planner_config=RM65PositionCollisionPlannerConfig(
+            # This synchronous resolver advances once per composed target,
+            # not at the downstream reference interpolation rate.  Computing
+            # the per-call joint step at 60 Hz while invoking it at 15/30 Hz
+            # silently reduced Cartesian tracking amplitude and speed.
+            reference_hz=compose_target_hz,
+            # Preserve the selected lower IK stage's computation budget.
+            solve_time_budget_ms=1000.0 / float(position_profile.rates.ik_hz),
+        ),
+    )
+    strategy_control_factory = None
+    dynamic_contract = getattr(
+        contracts,
+        "dynamic_parameter_contract",
+        None,
+    )
+    if dynamic_contract is not None:
+        initial_alpha = dict(contracts.initial_alpha_by_component)
+
+        def strategy_control_factory(
+            coordinator,
+            producer_epochs,
+            available_at,
+        ):
+            initial_revision = build_initial_strategy_revision(
+                runtime_session_id=config.runtime_session_id,
+                control_domain_id=config.control_domain_id,
+                strategy_instance_id=(
+                    f"{contracts.strategy_spec.strategy_id}:control"
+                ),
+                request_id=(
+                    f"{contracts.strategy_spec.strategy_id}:initial"
+                ),
+                strategy_mode=(
+                    FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1
+                ),
+                composition_spec=contracts.composition_spec,
+                strategy_spec=contracts.strategy_spec,
+                component_rule_set=contracts.component_rule_set,
+                dynamic_parameter_contract=dynamic_contract,
+                initial_alpha_by_component=initial_alpha,
+                available_at=float(available_at),
+                available_clock_domain_id=config.clock_domain_id,
+            )
+            return CompositionStrategyControl(
+                runtime_session_id=config.runtime_session_id,
+                control_domain_id=config.control_domain_id,
+                strategy_instance_id=initial_revision.strategy_instance_id,
+                coordinator=coordinator,
+                producer_epochs=producer_epochs,
+                retention_spec=TimeWindowRetentionSpec(
+                    spec_id=(
+                        "mujoco-sim-hil-strategy-control-window-v1"
+                    ),
+                    history_window_sec=2.0,
+                    max_future_lead_sec=1.0,
+                    max_effective_duration_sec=1.0,
+                    max_late_arrival_sec=0.0,
+                ),
+                supported_strategy_modes=(
+                    FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
+                ),
+                initial_revision=initial_revision,
+            )
+
+    source_support_horizon_sec = max(
+        0.25,
+        1.0 / compose_target_hz,
     )
     runtime = MujocoDeployRuntime(
         rig,
@@ -297,30 +525,186 @@ def build_mujoco_sim_hil_target(
             # The authoritative compose schedule is independent from the
             # lower policy source/inference schedule.
             decision_hz=compose_target_hz,
-            reference_activation_profile_id=SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
-            proposal_horizon_sec=0.1,
+            # Interactive Sim-HIL publishes the latest qref immediately.
+            # The scheduled-segment profile remains available to deterministic
+            # tests, but its single future reservation is not a live stream.
+            reference_activation_profile_id=IMMEDIATE_QREF_SIM_V1,
+            selected_segment_max_lifetime_sec=(
+                source_support_horizon_sec
+            ),
+            proposal_horizon_sec=source_support_horizon_sec,
             clock_domain_id=config.clock_domain_id,
             pose_frame_contract_hash="mujoco-sim-hil-rm65-arm-base-v1",
             compound_hand_action_specs_by_side=hand_specs,
             compound_composer_authority_profile=contracts.authority_profile,
             initial_control_mode="policy",
             enable_component_execution_handoff=True,
+            enable_composition_source_eligibility=True,
             execution_observation_plan=config.execution_observation_plan,
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(ik),
         shared_safety=shared_safety,
         composition_strategy=contracts.strategy,
+        composition_strategy_control_factory=strategy_control_factory,
         composition_input_action_schema_by_role=(
             composition_input_action_schema_by_role
         ),
+        component_execution_binding=component_execution_binding,
         execution_observation_sink=execution_observation_sink,
+        trace_sink=trace_sink,
     )
     return MujocoSimHILTarget(
         task_config=task_config,
         scene=scene,
         runtime=runtime,
         hand_specs_by_side=hand_specs,
+        target_frame_profile=target_frame_profile,
+        tool_frame_profile=tool_frame_profile,
+        task_initialization_info=prepared.task_initialization_info,
     )
+
+
+def _file_sha256(path: str | Path) -> str:
+    candidate = resolve_path(path)
+    digest = hashlib.sha256()
+    with candidate.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _arm_base_body_name(scene: Any, side: str) -> str:
+    candidates = (f"{side}_arm_base_link", "arm_base_link", "base_link")
+    base_name = next((name for name in candidates if scene.has_body(name)), None)
+    if base_name is None:
+        raise KeyError(f"Could not resolve {side} arm base body.")
+    return base_name
+
+
+def build_mujoco_sim_hil_coordinate_profiles(
+    scene: Any,
+    task_config: Any,
+    *,
+    active_sides: tuple[str, ...] = ("left", "right"),
+) -> tuple[TargetFrameProfile, ToolFrameProfile]:
+    """Derive immutable target/tool identities from the loaded MuJoCo scene."""
+
+    canonical_frame_id = "mujoco_sim_hil/station"
+    frames = [
+        CoordinateFrameSpec(
+            canonical_frame_id,
+            semantic_parameters={
+                "frame_family": "target_station",
+                "source": "loaded_mujoco_scene_world",
+            },
+        )
+    ]
+    transforms = []
+    reference_by_component: dict[str, str] = {}
+    sides = tuple(str(side).strip().lower() for side in active_sides)
+    if (
+        not sides
+        or any(side not in {"left", "right"} for side in sides)
+        or len(sides) != len(set(sides))
+    ):
+        raise ValueError("active_sides must contain unique known sides.")
+    for side in sides:
+        component_id = f"{side}_arm"
+        reference_frame_id = f"{side}_arm_base"
+        body_name = _arm_base_body_name(scene, side)
+        frames.append(
+            CoordinateFrameSpec(
+                reference_frame_id,
+                semantic_parameters={
+                    "frame_family": "arm_base",
+                    "side": side,
+                    "scene_body_name": body_name,
+                },
+            )
+        )
+        transforms.append(
+            RigidFrameTransformSpec(
+                transform_id=f"mujoco-scene:{reference_frame_id}-to-station",
+                source_frame_id=reference_frame_id,
+                target_frame_id=canonical_frame_id,
+                matrix_target_source=scene.body_pose(body_name),
+                semantic_parameters={
+                    "source": "loaded_scene_body_pose",
+                    "scene_body_name": body_name,
+                },
+            )
+        )
+        reference_by_component[component_id] = reference_frame_id
+
+    urdf_path = Path(scene.conversion.urdf_path).expanduser().resolve()
+    target_profile = TargetFrameProfile(
+        profile_id=f"mujoco-target-frame:{scene.conversion.scene_profile_name}",
+        target_kind="simulation",
+        artifact_id=str(urdf_path),
+        artifact_hash=_file_sha256(urdf_path),
+        frame_graph=CoordinateFrameGraph(
+            graph_id=f"mujoco-target-frame:{scene.conversion.scene_profile_name}",
+            frames=tuple(frames),
+            transforms=tuple(transforms),
+        ),
+        canonical_reference_frame_id=canonical_frame_id,
+        reference_frame_by_component=reference_by_component,
+        semantic_parameters={
+            "backend": "mujoco",
+            "derivation": "loaded_scene_body_pose",
+            "canonical_target_frame_contract_id": (
+                STATION_RETARGET_FRAME_CONTRACT_V1
+            ),
+        },
+    )
+
+    tool_bindings = []
+    profile_path_by_side = {
+        "left": task_config.left_tool_profile_path,
+        "right": task_config.right_tool_profile_path,
+    }
+    for side in sides:
+        profile_path = profile_path_by_side[side]
+        resolved = resolve_path(profile_path)
+        tool_bindings.append(
+            ToolFrameBinding(
+                component_id=f"{side}_arm",
+                controlled_frame_id="tool_tcp",
+                artifact_id=str(resolved),
+                artifact_hash=_file_sha256(resolved),
+            )
+        )
+    tool_profile = ToolFrameProfile(
+        profile_id=f"mujoco-tool-frame:{task_config.name}",
+        target_frame_profile_hash=target_profile.semantic_content_hash,
+        bindings=tuple(tool_bindings),
+    )
+    return target_profile, tool_profile
+
+
+def capture_mujoco_sim_hil_tool_tcp_pose_by_side(
+    scene: Any,
+    task_config: Any,
+) -> dict[str, np.ndarray]:
+    """Capture current ``T_arm_base_tool_tcp`` for each active arm."""
+
+    result: dict[str, np.ndarray] = {}
+    tool_profiles = {
+        "left": load_rm65_tool_profile(
+            task_config.left_tool_profile_path,
+            side="left",
+        ),
+        "right": load_rm65_tool_profile(
+            task_config.right_tool_profile_path,
+            side="right",
+        ),
+    }
+    for side in ("left", "right"):
+        base_name = _arm_base_body_name(scene, side)
+        endpoint = scene.body_pose(scene.arm_specs[side].controlled_body)
+        pose = np.linalg.inv(scene.body_pose(base_name)) @ endpoint
+        result[side] = pose @ endpoint_to_tool_transform(tool_profiles[side])
+    return result
 
 
 def capture_mujoco_sim_hil_safety_anchor(
@@ -333,28 +717,23 @@ def capture_mujoco_sim_hil_safety_anchor(
     """Capture one measured bimanual pose/hand anchor for shared safety."""
 
     arm_pose_by_side: dict[str, np.ndarray] = {}
-    tool_profiles = {
-        "left": load_rm65_tool_profile(task_config.left_tool_profile_path, side="left"),
-        "right": load_rm65_tool_profile(task_config.right_tool_profile_path, side="right"),
-    }
-    for side in ("left", "right"):
-        candidates = (f"{side}_arm_base_link", "arm_base_link", "base_link")
-        base_name = next((name for name in candidates if scene.has_body(name)), None)
-        if base_name is None:
-            raise KeyError(f"Could not resolve {side} arm base body.")
-        endpoint = scene.body_pose(scene.arm_specs[side].controlled_body)
-        pose = np.linalg.inv(scene.body_pose(base_name)) @ endpoint
-        pose = pose @ endpoint_to_tool_transform(tool_profiles[side])
+    tool_tcp_pose_by_side = capture_mujoco_sim_hil_tool_tcp_pose_by_side(
+        scene,
+        task_config,
+    )
+    for side, pose in tool_tcp_pose_by_side.items():
         vector = pose_matrix_to_xyzquat(pose)
         if vector is None:
             raise ValueError(f"Current {side} TCP pose cannot be represented as xyzquat.")
         arm_pose_by_side[side] = np.asarray(vector, dtype=np.float32)
 
     hand_qpos_by_side: dict[str, np.ndarray] = {}
-    for side, name in (
-        ("left", task_config.left_gripper_name),
-        ("right", task_config.right_gripper_name),
-    ):
+    gripper_name_by_side = {
+        "left": task_config.left_gripper_name,
+        "right": task_config.right_gripper_name,
+    }
+    for side in hand_specs:
+        name = gripper_name_by_side[side]
         values = np.zeros(6, dtype=np.float32)
         values[0] = float(scene.get_gripper_close(name))
         hand_qpos_by_side[side] = values
@@ -373,6 +752,10 @@ def capture_mujoco_sim_hil_safety_anchor(
 __all__ = [
     "MujocoSimHILTarget",
     "MujocoSimHILTargetConfig",
+    "MujocoSimHILPreparedTarget",
+    "build_mujoco_sim_hil_coordinate_profiles",
     "build_mujoco_sim_hil_target",
     "capture_mujoco_sim_hil_safety_anchor",
+    "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
+    "prepare_mujoco_sim_hil_target",
 ]

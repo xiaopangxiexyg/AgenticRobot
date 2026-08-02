@@ -94,6 +94,25 @@ def effective_position_post_ik_qpos_smoothing_alpha(args: argparse.Namespace) ->
     return 0.9 if value is None else float(value)
 
 
+def output_qpos_smoothing_singularity_alpha(
+    arm_control_mode: str,
+    *,
+    slow_alpha: float,
+    fast_alpha: float,
+) -> float | None:
+    """Resolve the position-only singularity smoothing endpoint.
+
+    Impedance mode emits Cartesian poses and does not use the position-mode
+    post-IK qpos smoothing path.  Keep the optional solver field unset there;
+    otherwise its cross-field validation would compare an irrelevant 0.65
+    endpoint against the impedance identity slow alpha of 1.0.
+    """
+
+    if str(arm_control_mode) != "position":
+        return None
+    return max(float(slow_alpha), float(fast_alpha), 0.65)
+
+
 def effective_arm_follow_qpos_alpha(args: argparse.Namespace) -> float:
     """Return final high-rate transport EMA alpha, or 1 outside position streaming."""
 
@@ -250,6 +269,7 @@ __all__ = [
     "effective_dual_arm_temporary_safety",
     "effective_outer_control_hz",
     "effective_position_post_ik_qpos_smoothing_alpha",
+    "output_qpos_smoothing_singularity_alpha",
     "effective_arm_follow_qpos_alpha",
     "effective_position_reference_hz",
     "position_retargeter_stability_switches",

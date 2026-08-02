@@ -15,11 +15,11 @@ from teleop_runtime.collection.v25p_capture_profiles import (
     build_policy_io_v25p_capture_profiles,
 )
 from teleop_runtime.collection.v25p_dual_write_shadow import V25pDualWriteShadow
-from teleop_runtime.collection.v25p_native_store import (
+from collection_runtime.v25p_native_store import (
     V25pComponentInput,
     V25pNativeEpisodeStore,
 )
-from teleop_runtime.collection.v25p_producer import V25pProducedSample
+from collection_runtime.v25p_producer import V25pProducedSample
 
 
 POSE_HASH = canonical_content_hash(

@@ -10,7 +10,61 @@ from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.core import (
     pack_binary_mask,
 )
 from utils.dataset_postprocess.wrist_cam_adjust.final_mask import compose_final_masks
+from utils.dataset_postprocess.wrist_cam_adjust.geometry_mask.dataset import (
+    _base_from_stored_pose_by_side,
+)
 from utils.random_background.mask_io import BitpackMaskReader
+
+
+def test_desk_absolute_pose_contract_is_mapped_back_to_each_arm_base() -> None:
+    left_raw_to_desk = np.asarray(
+        [
+            [0.0, -1.0, 0.0, -0.472],
+            [1.0, 0.0, 0.0, 0.2625],
+            [0.0, 0.0, 1.0, -0.01],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    right_raw_to_desk = np.asarray(
+        [
+            [0.0, 1.0, 0.0, -0.472],
+            [-1.0, 0.0, 0.0, -0.2625],
+            [0.0, 0.0, 1.0, -0.01],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    transforms, storage_frame = _base_from_stored_pose_by_side(
+        {
+            "pose_frame_contract": {
+                "pose_storage_frame": "desk_absolute",
+                "source": {
+                    "raw_to_canonical_desk_transform_by_side": {
+                        "left": left_raw_to_desk.tolist(),
+                        "right": right_raw_to_desk.tolist(),
+                    }
+                },
+            }
+        }
+    )
+
+    assert storage_frame == "desk_absolute"
+    np.testing.assert_allclose(transforms["left"] @ left_raw_to_desk, np.eye(4))
+    np.testing.assert_allclose(transforms["right"] @ right_raw_to_desk, np.eye(4))
+
+
+def test_native_arm_base_pose_contract_does_not_add_a_transform() -> None:
+    transforms, storage_frame = _base_from_stored_pose_by_side(
+        {
+            "pose_frame_contract": {
+                "pose_storage_frame": "native_arm_base",
+            }
+        }
+    )
+
+    assert storage_frame == "native_arm_base"
+    assert transforms == {}
 
 
 def test_compose_final_mask_ors_postprocessed_depth_and_table_without_proxy(tmp_path) -> None:

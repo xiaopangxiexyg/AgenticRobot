@@ -19,6 +19,13 @@ from robot_motion.safety_constraints import (
 )
 
 from .observation import DeploymentObservation
+from .action_semantics import (
+    ArmHoldKeyframePrediction,
+    bind_arm_hold_predictions,
+)
+from dataset_contracts.policy_action_semantics import (
+    PolicyArmHoldOutputContract,
+)
 from .schema import (
     ACTION_ARM_POSE_SLICES,
     ACTION_DIM,
@@ -44,6 +51,7 @@ class NormalizedAction:
     vector: np.ndarray
     arm_joint_targets: dict[str, np.ndarray] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    arm_hold_prediction: ArmHoldKeyframePrediction | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +121,7 @@ def _with_extra_metadata(
                 vector=action.vector,
                 arm_joint_targets=dict(action.arm_joint_targets),
                 metadata=metadata,
+                arm_hold_prediction=action.arm_hold_prediction,
             )
         )
     return output
@@ -469,6 +478,40 @@ def normalize_policy_output(
     )
 
 
+def normalize_policy_output_with_semantics(
+    output: Any,
+    observation: DeploymentObservation,
+    *,
+    arm_hold_output_contract: PolicyArmHoldOutputContract | None,
+    active_sides: tuple[str, ...] | None = None,
+    arms_enabled: bool | None = None,
+    hands_enabled: bool | None = None,
+) -> list[NormalizedAction]:
+    """Normalize actions and strictly bind an optional declared sidecar."""
+
+    actions = normalize_policy_output(
+        output,
+        observation,
+        active_sides=active_sides,
+        arms_enabled=arms_enabled,
+        hands_enabled=hands_enabled,
+    )
+    if arm_hold_output_contract is None:
+        return [
+            NormalizedAction(
+                vector=action.vector,
+                arm_joint_targets=dict(action.arm_joint_targets),
+                metadata=dict(action.metadata),
+            )
+            for action in actions
+        ]
+    return bind_arm_hold_predictions(
+        output,
+        actions,
+        contract=arm_hold_output_contract,
+    )
+
+
 class ActionChunkBuffer:
     def __init__(self):
         self._queue: deque[NormalizedAction] = deque()
@@ -500,6 +543,20 @@ class ActionChunkBuffer:
 
         if self._queue:
             return self._queue[0]
+        return default
+
+    def peek_at(
+        self,
+        offset: int,
+        default: NormalizedAction | None = None,
+    ) -> NormalizedAction | None:
+        """Return a bounded future action without advancing queue ownership."""
+
+        index = int(offset)
+        if isinstance(offset, bool) or index != offset or index < 0:
+            raise ValueError("offset must be a non-negative integer.")
+        if index < len(self._queue):
+            return self._queue[index]
         return default
 
 

@@ -642,6 +642,33 @@ class MujocoPositionExecutionRig(Rig):
         with self._lock:
             sync()
 
+    def capture_scene(self, capture: Callable[[MujocoScene], object]) -> object:
+        """Run one read-only scene capture without racing the physics owner."""
+
+        if not callable(capture):
+            raise TypeError("capture must be callable.")
+        with self._lock:
+            return capture(self.scene)
+
+    def capture_active_reference(self) -> dict[str, object] | None:
+        """Return a read-only copy of the qref currently owned by execution."""
+
+        with self._lock:
+            reference = self._last_reference
+            if reference is None:
+                return None
+            return {
+                "sequence": reference.sequence,
+                "published_monotonic_time": (
+                    reference.published_monotonic_time
+                ),
+                "activate_at": reference.activate_at,
+                "qref_by_side": {
+                    side: values.copy()
+                    for side, values in reference.qref_by_side.items()
+                },
+            }
+
     def step_physics(self) -> None:
         """Advance one deterministic physics tick; used by tests and offline replay."""
 
@@ -910,8 +937,13 @@ class MujocoPositionExecutionRig(Rig):
                     self._sleep(min(remaining, period))
                     continue
                 if now - scheduled > period:
+                    missed = int((now - scheduled) // period)
                     with self._lock:
-                        self._worker_deadline_misses += 1
+                        self._worker_deadline_misses += missed
+                        # Rebase the wall-clock schedule instead of running a
+                        # catch-up burst that can starve target publication,
+                        # observation capture, and viewer synchronization.
+                        self._clock_origin += missed * period
                 self.step_physics()
         except Exception as exc:  # noqa: BLE001 - worker fault must latch visibly.
             with self._lock:
@@ -921,9 +953,18 @@ class MujocoPositionExecutionRig(Rig):
     def close(self) -> None:
         self._stop_event.set()
         worker = self._worker
-        self._worker = None
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=self.config.worker_join_timeout_sec)
+            if worker.is_alive():
+                # Do not follow a bounded join with an unbounded acquisition
+                # of the lock the same worker may still own.  Retain the
+                # worker identity so a later idempotent close can retry after
+                # the native physics call unwinds.
+                raise TimeoutError(
+                    "MuJoCo position execution worker did not stop before "
+                    f"{self.config.worker_join_timeout_sec:.3f}s."
+                )
+        self._worker = None
         with self._lock:
             self._started = False
 

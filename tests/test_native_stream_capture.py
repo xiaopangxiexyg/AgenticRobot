@@ -16,7 +16,7 @@ from dataset_interface.streams import (
     load_native_stream_episode,
 )
 from robot_motion.runtime.observation_cut import ObservationSampleRef
-from teleop_runtime.collection.stream_sink import NativeStreamEpisodeWriter
+from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 
 
 def _contract(stream_id: str) -> NativeStreamContract:

@@ -7,6 +7,7 @@ from unittest import mock
 
 import numpy as np
 
+from robot_motion.action import ArmActionSpec
 from robot_motion.runtime import BackendDispatchError
 from robot_motion.position_control import (
     POSITION_QREF_FINGERPRINT_SCHEMA,
@@ -1142,6 +1143,13 @@ class ArmEndpointActionTest(unittest.TestCase):
 
         left = command.commands["left_arm"]
         self.assertEqual(left.metadata["arm_controlled_frame"], TOOL_TCP_FRAME)
+        self.assertEqual(
+            left.metadata["arm_action_spec"],
+            ArmActionSpec.tool_tcp(
+                "left",
+                reference_frame=retargeter.config.output_frame_name,
+            ).to_metadata(),
+        )
         self.assertAlmostEqual(float(left.value[2, 3]), 0.0, places=6)
         self.assertAlmostEqual(float(left.metadata["target_pose_desk"][2, 3]), 0.0, places=6)
         self.assertAlmostEqual(

@@ -101,8 +101,20 @@ python -m utils.dataset_postprocess tactile-compact datasets/umi_dual_wrist \
 wrist-depth 或触觉频率。批量前后必须用 `dataset_contracts.ChunkedTactileStream` 回读每个
 stream 的首/中/末帧，并核对 manifest frame_count 与索引不变。
 
-旧的 `tactile-recompress-zstd` 只提供 full-resolution 无损兼容迁移，不属于默认 pipeline，
-不得与 compact v1 混合作为正式数据发布格式。
+`tactile-recompress-zstd` 是 full-resolution raw 的无损重打包路径。当前稳定 profile 为
+`dmtac_raw_temporal_delta_zstd_v1`：每 8 帧独立做 modular temporal delta，再使用 zstd
+level 1；logical dtype、shape、帧数和帧索引不变。命令默认只读：
+
+```bash
+python -m utils.dataset_postprocess tactile-recompress-zstd DATASET_ROOT \
+  --level 1 --chunk-frames 8 --min-free-gb 20
+```
+
+先用 `--max-manifests 1` 灰度；确认计划后才显式增加 `--apply --delete-originals`。工具拒绝
+活动 collection、v2.4 committed capture、hardlink source、文件尺寸不符或运行中变化；每路
+先写新 inode，逐 chunk round-trip 并全流 SHA-256 校验，再原子提交 manifest，最后删除 raw，
+并在 `meta/tactile_recompression/` 写事务收据。它与会改变 raw 空间/量化精度的 compact v1
+是不同 profile，不能在同一 stream 上叠加解释。
 
 ## Stable/source 与 sorted 数据的 hardlink 去重
 

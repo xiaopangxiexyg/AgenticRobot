@@ -8,7 +8,7 @@ import pytest
 from dataset_contracts.canonical_encoding import canonical_bytes
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v25p import V25P_EPISODE_IDENTITY_FILE_DOMAIN_V1
-from teleop_runtime.collection.dataset_episode_maintenance import (
+from collection_runtime.dataset_episode_maintenance import (
     delete_episode_and_compact,
 )
 

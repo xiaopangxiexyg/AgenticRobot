@@ -1,10 +1,14 @@
-"""Compatibility wrapper for the runtime browser GUI.
+"""Compatibility wrapper for the Control Station browser GUI.
 
-The implementation lives in :mod:`teleop_runtime.gui.calibration_web_ui`.
+The implementation lives in :mod:`control_station.web.calibration_web_ui`.
 This module keeps older debug entrypoints and tests import-compatible.
 """
 
-from ..gui.calibration_web_ui import CalibrationWebUi, CalibrationWebUiState, WebUiKeyInput
+from control_station.web.calibration_web_ui import (
+    CalibrationWebUi,
+    CalibrationWebUiState,
+    WebUiKeyInput,
+)
 
 __all__ = [
     "CalibrationWebUi",

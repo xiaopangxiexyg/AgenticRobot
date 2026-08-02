@@ -25,6 +25,11 @@ from .pose_training import (
     POSE_TRAINING_DATA_METADATA_KEY,
     PoseTrainingDataContract,
 )
+from .policy_action_semantics import (
+    POLICY_ARM_HOLD_OUTPUT_HASH_KEY,
+    POLICY_ARM_HOLD_OUTPUT_METADATA_KEY,
+    PolicyArmHoldOutputContract,
+)
 from .v22 import (
     DEXTELEOP_DATASET_SCHEMA_V22,
     DatasetLayoutBindingError,
@@ -261,6 +266,7 @@ class PolicyArtifactContract:
     pose_training_data: PoseTrainingDataContract | Mapping[str, Any] | None = None
     pose_frame_contract_hashes: tuple[str, ...] = ()
     model_continuation: ModelContinuationContract | Mapping[str, Any] | None = None
+    arm_hold_output: PolicyArmHoldOutputContract | Mapping[str, Any] | None = None
     state_augmentation: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -322,6 +328,19 @@ class PolicyArtifactContract:
             raise TypeError(
                 "model_continuation must be a v1/v2 model continuation "
                 "contract, mapping, or None."
+            )
+        arm_hold_output = self.arm_hold_output
+        if isinstance(arm_hold_output, Mapping):
+            arm_hold_output = PolicyArmHoldOutputContract.from_dict(
+                arm_hold_output
+            )
+        elif arm_hold_output is not None and not isinstance(
+            arm_hold_output,
+            PolicyArmHoldOutputContract,
+        ):
+            raise TypeError(
+                "arm_hold_output must be a PolicyArmHoldOutputContract, "
+                "mapping, or None."
             )
         if pose_action_chunk is not None and dataset_schema != DEXTELEOP_DATASET_SCHEMA_V23:
             raise DatasetLayoutBindingError(
@@ -411,6 +430,15 @@ class PolicyArtifactContract:
             if not value:
                 raise DatasetLayoutBindingError(f"{name} must be non-empty.")
             object.__setattr__(self, name, value)
+        if arm_hold_output is not None and arm_hold_output.output_key in {
+            self.action_key,
+            self.action_discrete_key,
+            POLICY_ARM_HOLD_OUTPUT_HASH_KEY,
+        }:
+            raise DatasetLayoutBindingError(
+                "arm-hold output key must not collide with action outputs or "
+                "its contract-hash field."
+            )
         object.__setattr__(self, "state_input_mode", normalize_state_input_mode(self.state_input_mode))
         object.__setattr__(self, "model_id", _optional_text(self.model_id))
         object.__setattr__(
@@ -426,6 +454,7 @@ class PolicyArtifactContract:
         object.__setattr__(self, "pose_training_data", pose_training_data)
         object.__setattr__(self, "pose_frame_contract_hashes", pose_frame_hashes)
         object.__setattr__(self, "model_continuation", model_continuation)
+        object.__setattr__(self, "arm_hold_output", arm_hold_output)
         object.__setattr__(self, "state_augmentation", dict(self.state_augmentation))
         object.__setattr__(self, "metadata", dict(self.metadata))
 
@@ -490,6 +519,13 @@ class PolicyArtifactContract:
             )
             payload[MODEL_CONTINUATION_DATA_HASH_KEY] = (
                 self.model_continuation.contract_hash
+            )
+        if self.arm_hold_output is not None:
+            payload[POLICY_ARM_HOLD_OUTPUT_METADATA_KEY] = (
+                self.arm_hold_output.to_dict()
+            )
+            payload[POLICY_ARM_HOLD_OUTPUT_HASH_KEY] = (
+                self.arm_hold_output.contract_hash
             )
         return payload
 
@@ -614,6 +650,29 @@ class PolicyArtifactContract:
                 "Policy artifact model continuation hash does not match its "
                 "contract."
             )
+        raw_arm_hold_output = payload.get(POLICY_ARM_HOLD_OUTPUT_METADATA_KEY)
+        arm_hold_output = (
+            None
+            if raw_arm_hold_output is None
+            else PolicyArmHoldOutputContract.from_dict(
+                _mapping(
+                    raw_arm_hold_output,
+                    name=POLICY_ARM_HOLD_OUTPUT_METADATA_KEY,
+                )
+            )
+        )
+        declared_arm_hold_hash = payload.get(POLICY_ARM_HOLD_OUTPUT_HASH_KEY)
+        if arm_hold_output is None:
+            if declared_arm_hold_hash is not None:
+                raise DatasetLayoutBindingError(
+                    "Policy artifact declares an arm-hold output hash without "
+                    "its contract."
+                )
+        elif str(declared_arm_hold_hash or "") != arm_hold_output.contract_hash:
+            raise DatasetLayoutBindingError(
+                "Policy artifact arm-hold output hash does not match its "
+                "contract."
+            )
         return cls(
             policy_io_layout=layout,
             model_id=payload.get("model_id"),
@@ -640,6 +699,7 @@ class PolicyArtifactContract:
                 str(value) for value in raw_pose_frame_hashes
             ),
             model_continuation=model_continuation,
+            arm_hold_output=arm_hold_output,
             state_augmentation=dict(_mapping(payload.get("state_augmentation", {}), name="state_augmentation")),
             metadata=dict(_mapping(payload.get("metadata", {}), name="policy artifact metadata")),
         )
@@ -668,6 +728,7 @@ __all__ = [
     "POLICY_ARTIFACT_METADATA_KEY",
     "POLICY_ARTIFACT_SCHEMA_V1",
     "PolicyArtifactContract",
+    "PolicyArmHoldOutputContract",
     "PolicyCameraInput",
     "PolicyCameraInputContract",
     "PolicyTensorField",

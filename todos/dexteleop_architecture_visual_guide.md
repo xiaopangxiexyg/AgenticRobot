@@ -30,7 +30,7 @@ flowchart TD
     A["control_station / sim / teleop / deployment adapters"] --> B["control_composition<br/>cut / strategy / session / lineage / difference"]
     B --> C["robot_motion<br/>proposal admission / authority / safety / execution"]
     B --> D["dataset_interface adapter<br/>optional v2.4 projection"]
-    D --> E["dataset_contracts / teleop_runtime<br/>schema + WAL + episode + writer"]
+    D --> E["dataset_contracts / collection_runtime<br/>schema + WAL + episode + writer"]
 ```
 
 `control_composition`不拥有最终动作许可，也不导入MuJoCo、硬件、遥操设备或模型实现。当前package/ports/

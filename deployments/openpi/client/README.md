@@ -13,6 +13,31 @@ This directory contains only OpenPI-specific client pieces:
 The generic remote-policy contract, action chunk, and runtime glue live in
 `deployments.client`.
 
+## Optional arm-hold output
+
+For a checkpoint whose `policy_artifact.json` declares
+`arm_hold_output_contract`, the OpenPI server handshake must advertise:
+
+```json
+{
+  "action_semantics": {
+    "arm_hold_output_key": "arm_hold_probability",
+    "arm_hold_output_contract_hash": "<exact artifact contract hash>"
+  }
+}
+```
+
+Every non-RTC response must then include the declared key as a float
+`[action_horizon, 2]` probability matrix in `["left", "right"]` order, plus
+the same top-level `arm_hold_output_contract_hash`. The OpenPI adapter does not
+apply a second sigmoid: provider logits must be converted to probabilities
+before this boundary. The generic client rejects missing, non-finite,
+out-of-range, misaligned, or hash-mismatched output before queue admission.
+The existing continuous action tensor and its dimension do not change.
+This first landing is limited to the synchronous `PolicyDeployRuntime` path;
+RTC and `OpenPISimAdapter` reject an arm-hold artifact until their own
+emission-time semantic resolution seam is implemented.
+
 Example real dry-run:
 
 ```bash
@@ -117,6 +142,13 @@ default-off raw profile; that profile forces `send_actions=false` and does not
 change `sync_queue_v1` or the RTC-3c builtin-hold frontend. Offline fake
 transport plus shared-frontend coverage lives in
 `tests/test_openpi_rtc_final_chunk_adapter.py`.
+An artifact-declared arm-hold sidecar is supported only on the absolute
+`legacy_normalized_v1` branch. The adapter binds its exact output-contract hash
+through capability/request/response, preserves the `[H, 2]` rows beside decoded
+actions, and leaves emission-time stage/commit/rollback to `robot_motion`.
+Missing, malformed, or mismatched sidecars reject the whole inference. The
+frontend also rejects any adapter/runtime contract mismatch before starting a
+worker. Artifacts without the sidecar preserve the previous protocol hashes.
 When `typed_canonical_v1` is selected, the client frontend records a versioned
 representation context. Absolute actions use an explicit no-anchor context;
 relative actions require the original request cut's fixed measured-TCP

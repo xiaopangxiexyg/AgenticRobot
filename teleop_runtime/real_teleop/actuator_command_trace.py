@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-ACTUATOR_COMMAND_TRACE_SCHEMA = "dexteleop.rm65_actuator_command_trace.v2"
+ACTUATOR_COMMAND_TRACE_SCHEMA = "dexteleop.rm65_actuator_command_trace.v3"
 ACTUATOR_COMMAND_TRACE_DATA_NAME = "command_trace.npz"
 ACTUATOR_COMMAND_TRACE_MANIFEST_NAME = "manifest.json"
 DEFAULT_ACTUATOR_TRACE_ROOT = Path("teleop_records/actuator_identification")
@@ -83,6 +83,32 @@ _IK_SHADOW_DTYPE = np.dtype(
         ("jacobian_singular_values", "<f8", (2, 6)),
         ("wrist_null_scale", "<f8", (2,)),
         ("status", "S32"),
+    ],
+    align=False,
+)
+_VIVE_SOURCE_DTYPE = np.dtype(
+    [
+        ("sequence", "<i8"),
+        ("control_wall_time_ns", "<i8"),
+        ("control_monotonic_time_ns", "<i8"),
+        ("present_mask", "u1"),
+        ("valid_mask", "u1"),
+        ("channel_seq", "<i8", (2,)),
+        ("channel_timestamp_ns", "<i8", (2,)),
+        ("receiver_timestamp_ns", "<i8", (2,)),
+        ("receiver_monotonic_time_ns", "<i8", (2,)),
+        ("availability_monotonic_time_ns", "<i8", (2,)),
+        ("pose_sample_monotonic_time_ns", "<i8", (2,)),
+        ("capture_receiver_monotonic_estimate_ns", "<i8", (2,)),
+        ("sender_timestamp_sec", "<f8", (2,)),
+        ("pose_sample_timestamp_sec", "<f8", (2,)),
+        ("capture_estimate_uncertainty_sec", "<f8", (2,)),
+        ("clock_sync_offset_sec", "<f8", (2,)),
+        ("pose_vive_world", "<f8", (2, 4, 4)),
+        ("tracker_name", "S64", (2,)),
+        ("tracker_role", "S32", (2,)),
+        ("teleop_state", "S24"),
+        ("motion_hold_mode", "S32"),
     ],
     align=False,
 )
@@ -213,26 +239,35 @@ class ActuatorCommandTraceRecorder:
             dtype=_IK_SHADOW_DTYPE,
         )
         self._ik_shadow_buffer.view(np.uint8).fill(0)
+        self._vive_source_buffer = np.empty(
+            int(config.singularity_capacity_per_side),
+            dtype=_VIVE_SOURCE_DTYPE,
+        )
+        self._vive_source_buffer.view(np.uint8).fill(0)
         self._next_index = {side: 0 for side in config.active_sides}
         self._singularity_next_index = {
             side: 0 for side in config.active_sides
         }
         self._ik_shadow_next_index = 0
+        self._vive_source_next_index = 0
         self._drop_count = {side: 0 for side in config.active_sides}
         self._singularity_drop_count = {
             side: 0 for side in config.active_sides
         }
         self._ik_shadow_drop_count = 0
+        self._vive_source_drop_count = 0
         self._error_count = {side: 0 for side in config.active_sides}
         self._singularity_error_count = {
             side: 0 for side in config.active_sides
         }
         self._ik_shadow_error_count = 0
+        self._vive_source_error_count = 0
         self._last_error = {side: None for side in config.active_sides}
         self._last_singularity_error = {
             side: None for side in config.active_sides
         }
         self._last_ik_shadow_error: str | None = None
+        self._last_vive_source_error: str | None = None
         self._accepting = True
         self._closed = False
         self._started_wall_time_ns = time.time_ns()
@@ -518,6 +553,118 @@ class ActuatorCommandTraceRecorder:
             self._last_ik_shadow_error = f"{type(exc).__name__}: {exc}"
             return False
 
+    def record_vive_source(
+        self,
+        *,
+        control_wall_time: float,
+        control_monotonic_time_ns: int,
+        raw_channels: Mapping[str, object],
+        teleop_state: str,
+        motion_hold_mode: str,
+    ) -> bool:
+        """Copy one pre-filter logical wrist-pose cut into fixed memory."""
+
+        if not self._accepting:
+            return False
+        try:
+            index = self._vive_source_next_index
+            buffer = self._vive_source_buffer
+            if index >= buffer.shape[0]:
+                self._vive_source_drop_count += 1
+                return False
+            row = buffer[index]
+            row["sequence"] = index
+            row["control_wall_time_ns"] = _seconds_to_ns(control_wall_time)
+            row["control_monotonic_time_ns"] = int(control_monotonic_time_ns)
+            row["present_mask"] = 0
+            row["valid_mask"] = 0
+            for field_name in (
+                "channel_seq",
+                "channel_timestamp_ns",
+                "receiver_timestamp_ns",
+                "receiver_monotonic_time_ns",
+                "availability_monotonic_time_ns",
+                "pose_sample_monotonic_time_ns",
+                "capture_receiver_monotonic_estimate_ns",
+            ):
+                row[field_name].fill(_INT64_MISSING)
+            for field_name in (
+                "sender_timestamp_sec",
+                "pose_sample_timestamp_sec",
+                "capture_estimate_uncertainty_sec",
+                "clock_sync_offset_sec",
+                "pose_vive_world",
+            ):
+                row[field_name].fill(np.nan)
+            row["tracker_name"].fill(b"")
+            row["tracker_role"].fill(b"")
+            for side_index, channel_name in enumerate(
+                ("left_wrist_pose", "right_wrist_pose")
+            ):
+                channel = raw_channels.get(channel_name)
+                if channel is None:
+                    continue
+                pose = np.asarray(getattr(channel, "value"), dtype=float)
+                if pose.shape != (4, 4):
+                    raise ValueError(
+                        f"{channel_name} source pose must be a 4x4 matrix"
+                    )
+                metadata = getattr(channel, "metadata", {}) or {}
+                row["present_mask"] |= 1 << side_index
+                if bool(getattr(channel, "valid", False)):
+                    row["valid_mask"] |= 1 << side_index
+                row["channel_seq"][side_index] = _optional_i64(metadata.get("seq"))
+                row["channel_timestamp_ns"][side_index] = _seconds_to_ns(
+                    getattr(channel, "timestamp", None)
+                )
+                for field_name, metadata_name in (
+                    ("receiver_timestamp_ns", "receiver_timestamp"),
+                    ("receiver_monotonic_time_ns", "receiver_monotonic_time"),
+                    (
+                        "availability_monotonic_time_ns",
+                        "availability_monotonic_time",
+                    ),
+                    (
+                        "pose_sample_monotonic_time_ns",
+                        "pose_sample_monotonic_time",
+                    ),
+                    (
+                        "capture_receiver_monotonic_estimate_ns",
+                        "capture_receiver_monotonic_estimate",
+                    ),
+                ):
+                    row[field_name][side_index] = _seconds_to_ns(
+                        metadata.get(metadata_name)
+                    )
+                for field_name, metadata_name in (
+                    ("sender_timestamp_sec", "sender_timestamp"),
+                    ("pose_sample_timestamp_sec", "pose_sample_timestamp"),
+                    (
+                        "capture_estimate_uncertainty_sec",
+                        "capture_estimate_uncertainty_sec",
+                    ),
+                    ("clock_sync_offset_sec", "clock_sync_offset_sec"),
+                ):
+                    value = metadata.get(metadata_name)
+                    row[field_name][side_index] = (
+                        np.nan if value is None else float(value)
+                    )
+                row["pose_vive_world"][side_index] = pose
+                row["tracker_name"][side_index] = str(
+                    metadata.get("tracker_name") or ""
+                ).encode("utf-8")
+                row["tracker_role"][side_index] = str(
+                    metadata.get("tracker_role") or ""
+                ).encode("utf-8")
+            row["teleop_state"] = str(teleop_state).encode("utf-8")
+            row["motion_hold_mode"] = str(motion_hold_mode).encode("utf-8")
+            self._vive_source_next_index = index + 1
+            return True
+        except Exception as exc:  # noqa: BLE001 - tracing cannot stop control.
+            self._vive_source_error_count += 1
+            self._last_vive_source_error = f"{type(exc).__name__}: {exc}"
+            return False
+
     def stop_accepting(self) -> None:
         self._accepting = False
 
@@ -532,6 +679,7 @@ class ActuatorCommandTraceRecorder:
                     for buffer in self._singularity_buffers.values()
                 )
                 + self._ik_shadow_buffer.nbytes
+                + self._vive_source_buffer.nbytes
             ),
             "rows_by_side": {
                 side: int(self._next_index[side]) for side in self.config.active_sides
@@ -555,6 +703,10 @@ class ActuatorCommandTraceRecorder:
             "ik_shadow_drop_count": int(self._ik_shadow_drop_count),
             "ik_shadow_error_count": int(self._ik_shadow_error_count),
             "last_ik_shadow_error": self._last_ik_shadow_error,
+            "vive_source_rows": int(self._vive_source_next_index),
+            "vive_source_drop_count": int(self._vive_source_drop_count),
+            "vive_source_error_count": int(self._vive_source_error_count),
+            "last_vive_source_error": self._last_vive_source_error,
             "last_singularity_error_by_side": dict(
                 self._last_singularity_error
             ),
@@ -589,6 +741,9 @@ class ActuatorCommandTraceRecorder:
         )
         arrays["ik_shadow"] = self._ik_shadow_buffer[
             : self._ik_shadow_next_index
+        ]
+        arrays["vive_source"] = self._vive_source_buffer[
+            : self._vive_source_next_index
         ]
         with temporary_data_path.open("wb") as stream:
             np.savez(stream, **arrays)
@@ -627,6 +782,7 @@ class ActuatorCommandTraceRecorder:
             "dtype": _COMMAND_DTYPE.descr,
             "singularity_dtype": _SINGULARITY_DTYPE.descr,
             "ik_shadow_dtype": _IK_SHADOW_DTYPE.descr,
+            "vive_source_dtype": _VIVE_SOURCE_DTYPE.descr,
             "started_wall_time_ns": int(self._started_wall_time_ns),
             "started_monotonic_time_ns": int(self._started_monotonic_time_ns),
             "stopped_wall_time_ns": int(stopped_wall_time_ns),

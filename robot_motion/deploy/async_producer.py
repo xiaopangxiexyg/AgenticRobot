@@ -177,6 +177,7 @@ class PolicyAsyncExecutionProfile:
         if profile_id in {
             RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
             RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+            MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
         }:
             expected_rates = (15.0, 30.0, 30.0, 15.0, 60.0, 60.0, 120.0)
             actual_rates = (
@@ -192,9 +193,15 @@ class PolicyAsyncExecutionProfile:
                 raise ValueError(
                     "RTC final-chunk shadow cadence is fixed at 15/30/60/120 Hz."
                 )
-            if rtc_mode != ASYNC_ALIGNED_CHUNK_MODE_V1:
+            expected_rtc_mode = (
+                RTC_FLOW_INPAINT_MODE_V1
+                if profile_id
+                == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+                else ASYNC_ALIGNED_CHUNK_MODE_V1
+            )
+            if rtc_mode != expected_rtc_mode:
                 raise ValueError(
-                    "RTC final-chunk shadow requires async_aligned_chunk_v1."
+                    "RTC shadow mode does not match its execution profile."
                 )
             if self.position_lookahead_enabled:
                 raise ValueError(

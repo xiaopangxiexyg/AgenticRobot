@@ -22,11 +22,16 @@ from robot_motion.rm65 import (
     DEFAULT_RM65_JACOBIAN_CHARACTERISTIC_LENGTH_M,
     RM65_POSE_LIFT_PROFILE_CHOICES,
     RM65_POSE_LIFT_V1_BASELINE_NAME,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
     build_rm65_pose_lift_ik_tuning,
     endpoint_to_tool_transform,
     load_rm65_tool_profile,
+    resolve_rm65_pose_lift_profile,
+)
+from robot_motion.rm65.defaults import (
+    RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
 )
 from robot_motion.replay import ReplayGroupSpec
 from robot_motion.transforms import parse_pose_matrix
@@ -64,6 +69,22 @@ def _rotation_deg(left: np.ndarray, right: np.ndarray) -> float:
     return float(math.degrees(math.acos(cosine)))
 
 
+def _plain_observation(value: Any) -> Any:
+    """Copy immutable observer payloads into JSON-native containers."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_observation(item) for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_plain_observation(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _summary(values: Sequence[float]) -> dict[str, float | int | None]:
     array = np.asarray(tuple(values), dtype=float)
     array = array[np.isfinite(array)]
@@ -95,6 +116,55 @@ def _summary_with_nonfinite(
     result = _summary(values)
     result["nonfinite_count"] = int(np.count_nonzero(~np.isfinite(raw)))
     return result
+
+
+def _sigma_exposure_summary(
+    values: Sequence[float],
+    *,
+    guard_sigma: float = 0.04,
+) -> dict[str, Any]:
+    """Summarize guarded-band exposure without over-weighting one sampled min."""
+
+    raw = np.asarray(tuple(values), dtype=float)
+    array = raw[np.isfinite(raw)]
+    guard = float(guard_sigma)
+    if not math.isfinite(guard) or guard <= 0.0:
+        raise ValueError("sigma exposure guard must be finite and positive.")
+    if array.size == 0:
+        return {
+            "guard_sigma": guard,
+            "sample_count": 0,
+            "below_guard_count": 0,
+            "below_guard_ratio": None,
+            "below_0p01_count": 0,
+            "below_0p01_ratio": None,
+            "below_0p001_count": 0,
+            "below_0p001_ratio": None,
+            "mean_guard_deficit": None,
+            "max_guard_deficit": None,
+            "guarded_sigma": _summary(()),
+        }
+    below_guard = array < guard
+    below_0p01 = array < 0.01
+    below_0p001 = array < 0.001
+    deficit = np.maximum(0.0, guard - array)
+    return {
+        "guard_sigma": guard,
+        "sample_count": int(array.size),
+        "below_guard_count": int(np.count_nonzero(below_guard)),
+        "below_guard_ratio": float(np.mean(below_guard)),
+        "below_0p01_count": int(np.count_nonzero(below_0p01)),
+        "below_0p01_ratio": float(np.mean(below_0p01)),
+        "below_0p001_count": int(np.count_nonzero(below_0p001)),
+        "below_0p001_ratio": float(np.mean(below_0p001)),
+        "mean_guard_deficit": float(np.mean(deficit)),
+        "max_guard_deficit": float(np.max(deficit)),
+        "guarded_sigma": _summary(array[below_guard]),
+        "sampling_note": (
+            "counts_and_min_are_reference-clock samples; a sign-changing "
+            "structural singularity can pass between adjacent samples"
+        ),
+    }
 
 
 def _direction_label(delta: float) -> str:
@@ -164,6 +234,46 @@ def _configuration_diagnostics(
     return result if isinstance(result, Mapping) else None
 
 
+def _task_conditioning_diagnostics(
+    planner: Any,
+    qpos_by_side: Mapping[str, np.ndarray],
+    target_endpoint_pose_world_by_side: Mapping[str, np.ndarray],
+    *,
+    dt_sec: float,
+) -> Mapping[str, Any] | None:
+    analyze = getattr(planner, "analyze_task_conditioning", None)
+    if not callable(analyze):
+        return None
+    result = analyze(
+        qpos_by_side,
+        target_endpoint_pose_world_by_side,
+        dt_sec=float(dt_sec),
+    )
+    if not isinstance(result, Mapping) or not bool(result.get("available", True)):
+        return None
+    return result
+
+
+def _constrained_feasibility_diagnostics(
+    planner: Any,
+    qpos_by_side: Mapping[str, np.ndarray],
+    target_endpoint_pose_world_by_side: Mapping[str, np.ndarray],
+    *,
+    dt_sec: float,
+) -> Mapping[str, Any] | None:
+    analyze = getattr(planner, "analyze_constrained_task_feasibility", None)
+    if not callable(analyze):
+        return None
+    result = analyze(
+        qpos_by_side,
+        target_endpoint_pose_world_by_side,
+        dt_sec=float(dt_sec),
+    )
+    if not isinstance(result, Mapping) or not bool(result.get("available", False)):
+        return None
+    return result
+
+
 class _AdaptivePostureCandidatePlanner:
     """Offline-only Pareto selector over two fully certified planners.
 
@@ -186,12 +296,16 @@ class _AdaptivePostureCandidatePlanner:
         pose_score_improvement: float = 0.05,
         max_step_slack_deg: float,
         characteristic_length_m: float,
+        dynamic_relative_slack: float = 0.0,
         rollout_baseline: RM65PositionCollisionPlanner | None = None,
         rollout_alternate: RM65PositionCollisionPlanner | None = None,
         rollout_shadow_baseline: RM65PositionCollisionPlanner | None = None,
         horizon_steps: int = 1,
         lock_steps: int = 1,
         terminal_shadow_delta_deg: float = 0.5,
+        terminal_mode: str = "joint_shadow",
+        terminal_translation_m: float = 0.002,
+        terminal_rotation_deg: float = 0.5,
     ) -> None:
         self.baseline = baseline
         self.alternate = alternate
@@ -202,6 +316,12 @@ class _AdaptivePostureCandidatePlanner:
         self.pose_score_slack = float(pose_score_slack)
         self.pose_score_improvement = float(pose_score_improvement)
         self.max_step_slack_deg = float(max_step_slack_deg)
+        self.dynamic_relative_slack = float(dynamic_relative_slack)
+        if (
+            not math.isfinite(self.dynamic_relative_slack)
+            or self.dynamic_relative_slack < 0.0
+        ):
+            raise ValueError("dynamic_relative_slack must be non-negative.")
         self.characteristic_length_m = float(characteristic_length_m)
         self.rollout_baseline = rollout_baseline
         self.rollout_alternate = rollout_alternate
@@ -209,6 +329,20 @@ class _AdaptivePostureCandidatePlanner:
         self.horizon_steps = max(1, int(horizon_steps))
         self.lock_steps = max(1, int(lock_steps))
         self.terminal_shadow_delta_deg = float(terminal_shadow_delta_deg)
+        self.terminal_mode = str(terminal_mode).strip().lower()
+        self.terminal_translation_m = float(terminal_translation_m)
+        self.terminal_rotation_deg = float(terminal_rotation_deg)
+        if self.terminal_mode not in {"joint_shadow", "task_space_tube"}:
+            raise ValueError(
+                "terminal_mode must be 'joint_shadow' or 'task_space_tube'."
+            )
+        if (
+            not math.isfinite(self.terminal_translation_m)
+            or self.terminal_translation_m < 0.0
+            or not math.isfinite(self.terminal_rotation_deg)
+            or self.terminal_rotation_deg < 0.0
+        ):
+            raise ValueError("task-space terminal tolerances must be non-negative.")
         rollout_planners = (
             self.rollout_baseline,
             self.rollout_alternate,
@@ -476,6 +610,8 @@ class _AdaptivePostureCandidatePlanner:
             "max_velocity_deg_s_mean": 0.0,
             "max_acceleration_deg_s2_mean": 0.0,
             "max_jerk_deg_s3_mean": 0.0,
+            "terminal_translation_m": float("inf"),
+            "terminal_rotation_deg": float("inf"),
             "_results": [],
         }
         pose_score_sum = 0.0
@@ -524,6 +660,12 @@ class _AdaptivePostureCandidatePlanner:
             aggregate["max_step_deg"] = max(
                 float(aggregate["max_step_deg"]),
                 float(metrics["max_step_deg"]),
+            )
+            aggregate["terminal_translation_m"] = float(
+                metrics["translation_m"]
+            )
+            aggregate["terminal_rotation_deg"] = float(
+                metrics["rotation_deg"]
             )
             for metric_name in (
                 "max_velocity_deg_s",
@@ -637,11 +779,25 @@ class _AdaptivePostureCandidatePlanner:
         shadow_metrics: Mapping[str, Any],
         anchor_sigma: float,
         horizon: bool,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, dict[str, bool]]:
         if not baseline_metrics["valid"] and alternate_metrics["valid"]:
-            return "alternate", "baseline_invalid_alternate_certified"
+            return (
+                "alternate",
+                "baseline_invalid_alternate_certified",
+                {
+                    "baseline_valid": False,
+                    "alternate_valid": True,
+                },
+            )
         if not (baseline_metrics["valid"] and alternate_metrics["valid"]):
-            return "baseline", "baseline_default"
+            return (
+                "baseline",
+                "baseline_default",
+                {
+                    "baseline_valid": bool(baseline_metrics["valid"]),
+                    "alternate_valid": bool(alternate_metrics["valid"]),
+                },
+            )
         guarded = min(
             anchor_sigma,
             float(baseline_metrics["sigma_min"]),
@@ -670,13 +826,31 @@ class _AdaptivePostureCandidatePlanner:
             + self.pose_score_slack
         )
         terminal_delta = alternate_metrics.get("terminal_shadow_joint_delta_deg")
-        terminal_ok = bool(
-            not horizon
-            or (
+        if not horizon:
+            terminal_ok = True
+        elif self.terminal_mode == "joint_shadow":
+            terminal_ok = bool(
                 terminal_delta is not None
-                and float(terminal_delta) <= self.terminal_shadow_delta_deg
+                and float(terminal_delta)
+                <= self.terminal_shadow_delta_deg
             )
-        )
+        else:
+            terminal_ok = bool(
+                float(
+                    alternate_metrics.get(
+                        "terminal_translation_m",
+                        float("inf"),
+                    )
+                )
+                <= self.terminal_translation_m
+                and float(
+                    alternate_metrics.get(
+                        "terminal_rotation_deg",
+                        float("inf"),
+                    )
+                )
+                <= self.terminal_rotation_deg
+            )
         dynamic_ok = True
         for metric_name in (
             "max_velocity_deg_s",
@@ -692,7 +866,9 @@ class _AdaptivePostureCandidatePlanner:
                 float(shadow_metrics.get(metric_name) or 0.0),
             )
             dynamic_ok = bool(
-                dynamic_ok and float(alternate_value) <= ceiling + 1e-9
+                dynamic_ok
+                and float(alternate_value)
+                <= ceiling * (1.0 + self.dynamic_relative_slack) + 1e-9
             )
             if horizon:
                 alternate_mean = alternate_metrics.get(f"{metric_name}_mean")
@@ -700,9 +876,24 @@ class _AdaptivePostureCandidatePlanner:
                 if alternate_mean is not None and shadow_mean is not None:
                     dynamic_ok = bool(
                         dynamic_ok
-                        and float(alternate_mean) <= float(shadow_mean) + 1e-9
+                        and float(alternate_mean)
+                        <= float(shadow_mean)
+                        * (1.0 + self.dynamic_relative_slack)
+                        + 1e-9
                     )
         suffix = "horizon" if horizon else "step"
+        decision_checks = {
+            "baseline_valid": bool(baseline_metrics["valid"]),
+            "alternate_valid": bool(alternate_metrics["valid"]),
+            "guarded": bool(guarded),
+            "step_ok": bool(step_ok),
+            "dynamic_ok": bool(dynamic_ok),
+            "terminal_ok": bool(terminal_ok),
+            "sigma_not_worse": bool(sigma_not_worse),
+            "pose_better": bool(pose_better),
+            "sigma_better": bool(sigma_better),
+            "pose_not_worse": bool(pose_not_worse),
+        }
         if (
             guarded
             and step_ok
@@ -714,6 +905,7 @@ class _AdaptivePostureCandidatePlanner:
             return (
                 "alternate",
                 f"guarded_{suffix}_pose_improvement_sigma_dynamic_nonregression",
+                decision_checks,
             )
         if (
             guarded
@@ -726,8 +918,9 @@ class _AdaptivePostureCandidatePlanner:
             return (
                 "alternate",
                 f"guarded_{suffix}_sigma_improvement_pose_dynamic_bounded",
+                decision_checks,
             )
-        return "baseline", f"{suffix}_baseline_default"
+        return "baseline", f"{suffix}_baseline_default", decision_checks
 
     def plan_pose_reference(self, *args: Any, **kwargs: Any) -> Any:
         if self._anchor is None:
@@ -777,6 +970,7 @@ class _AdaptivePostureCandidatePlanner:
         chosen_metrics = None
         selected = "baseline"
         reason = "baseline_default"
+        decision_checks: dict[str, bool] | None = None
         if (
             self._baseline_lock_remaining > 0
             and self._committed_selection == "baseline"
@@ -833,7 +1027,7 @@ class _AdaptivePostureCandidatePlanner:
                     "alternate": alternate_metrics,
                     "shadow_baseline": shadow_metrics,
                 }
-                selected, reason = self._select_from_metrics(
+                selected, reason, decision_checks = self._select_from_metrics(
                     baseline_metrics=decision_metrics["baseline"],
                     alternate_metrics=decision_metrics["alternate"],
                     shadow_metrics=decision_metrics["shadow_baseline"],
@@ -964,7 +1158,11 @@ class _AdaptivePostureCandidatePlanner:
             "shadow_dynamic_max": dict(self._shadow_dynamic_max),
             "horizon_steps": self.horizon_steps,
             "terminal_shadow_delta_deg": self.terminal_shadow_delta_deg,
+            "terminal_mode": self.terminal_mode,
+            "terminal_translation_m": self.terminal_translation_m,
+            "terminal_rotation_deg": self.terminal_rotation_deg,
             "pose_score_improvement": self.pose_score_improvement,
+            "dynamic_relative_slack": self.dynamic_relative_slack,
             "horizon": (
                 None
                 if horizon_metrics is None
@@ -976,6 +1174,7 @@ class _AdaptivePostureCandidatePlanner:
             "plan_id": self._plan_id,
             "plan_lock_remaining": self._lock_remaining,
             "plan_lock_cancelled": lock_cancelled,
+            "decision_checks": decision_checks,
         }
         return replace(chosen, metadata=metadata)
 
@@ -1029,6 +1228,7 @@ def evaluate_group(
     modes: Sequence[str] = MODES,
     reference_hz: float = 60.0,
     include_frames: bool = False,
+    include_constrained_feasibility: bool = False,
     jacobian_characteristic_length_m: float = (
         DEFAULT_RM65_JACOBIAN_CHARACTERISTIC_LENGTH_M
     ),
@@ -1095,6 +1295,16 @@ def evaluate_group(
         pose_lift_selected_scales: dict[str, dict[str, int]] = {}
         adaptive_posture_selections: dict[str, int] = {}
         adaptive_posture_reasons: dict[str, int] = {}
+        adaptive_posture_failed_checks: dict[str, int] = {}
+        adaptive_posture_guarded_failed_checks: dict[str, int] = {}
+        adaptive_posture_guarded_decisions = 0
+        adaptive_posture_guarded_route_counts = {
+            "pose_quality_eligible": 0,
+            "sigma_quality_eligible": 0,
+            "sigma_quality_terminal_eligible": 0,
+            "pose_route_eligible": 0,
+            "sigma_route_eligible": 0,
+        }
         previous_output = _truth_at(group, 0)
         previous_truth = _truth_at(group, 0)
         previous_timestamp = 0.0
@@ -1104,6 +1314,25 @@ def evaluate_group(
         max_velocity_deg_s: list[float] = []
         max_acceleration_deg_s2: list[float] = []
         max_jerk_deg_s3: list[float] = []
+        post_qp_admission_delta_deg: list[float] = []
+        raw_velocity_utilization: list[float] = []
+        admitted_velocity_utilization: list[float] = []
+        raw_acceleration_utilization: list[float] = []
+        admitted_acceleration_utilization: list[float] = []
+        motion_limit_violation_counts = {
+            "raw_velocity_side_frames": 0,
+            "admitted_velocity_side_frames": 0,
+            "raw_acceleration_side_frames": 0,
+            "admitted_acceleration_side_frames": 0,
+        }
+        velocity_limit = np.asarray(
+            REPLAY_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S,
+            dtype=float,
+        )
+        acceleration_limit = np.asarray(
+            RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
+            dtype=float,
+        )
         kinematic_dt_skipped_count = 0
         wrist_motion: dict[str, dict[str, dict[str, Any]]] = {
             stream: {
@@ -1144,6 +1373,37 @@ def evaluate_group(
                 "raw_candidate_vs_previous_admitted",
             )
         }
+        task_conditioning_available = False
+        task_conditioning_values: dict[
+            str, dict[str, dict[str, list[float]]]
+        ] = {
+            stream: {
+                side: {
+                    "sigma_task_velocity_min": [],
+                    "condition_number_task_velocity": [],
+                    "max_required_velocity_utilization": [],
+                    "weakest_direction_abs_demand": [],
+                    "weakest_direction_required_velocity_utilization": [],
+                }
+                for side in ("left", "right")
+            }
+            for stream in ("pre_solve", "truth", "raw_ik", "admitted")
+        }
+        constrained_feasibility_available = False
+        constrained_global_alpha: list[float] = []
+        constrained_side_alpha: dict[str, list[float]] = {
+            "left": [],
+            "right": [],
+        }
+        constrained_side_tracking_residual: dict[str, list[float]] = {
+            "left": [],
+            "right": [],
+        }
+        constrained_active_source_frame_counts: dict[str, dict[str, int]] = {
+            "global": {},
+            "left": {},
+            "right": {},
+        }
         previous_admitted_diagnostics = _configuration_diagnostics(
             planner,
             previous_output,
@@ -1177,6 +1437,7 @@ def evaluate_group(
             truth,
         ) in enumerate(work):
             sequence = work_offset + 1
+            dt = 1.0 / float(reference_hz)
             if mode == "teacher_forced":
                 planner.reset(previous_truth)
             prepare_reference_window = getattr(
@@ -1203,6 +1464,43 @@ def evaluate_group(
                         ) in work[work_offset : work_offset + window_steps]
                     ]
                 )
+            pre_solve_target_endpoint_world: Mapping[str, np.ndarray] | None = None
+            resolve_targets = getattr(
+                planner,
+                "resolve_target_endpoint_pose_world",
+                None,
+            )
+            if callable(resolve_targets):
+                resolved_targets = resolve_targets(
+                    pose_by_side,
+                    target_reference_frame="arm_base",
+                    target_controlled_frame="tool_tcp",
+                )
+                if isinstance(resolved_targets, Mapping):
+                    pre_solve_target_endpoint_world = resolved_targets
+            pre_solve_task_conditioning = (
+                _task_conditioning_diagnostics(
+                    planner,
+                    previous_output,
+                    pre_solve_target_endpoint_world,
+                    dt_sec=dt,
+                )
+                if pre_solve_target_endpoint_world is not None
+                else None
+            )
+            pre_solve_constrained_feasibility = (
+                _constrained_feasibility_diagnostics(
+                    planner,
+                    previous_output,
+                    pre_solve_target_endpoint_world,
+                    dt_sec=dt,
+                )
+                if (
+                    include_constrained_feasibility
+                    and pre_solve_target_endpoint_world is not None
+                )
+                else None
+            )
             result = planner.plan_pose_reference(
                 pose_by_side,
                 target_reference_frame="arm_base",
@@ -1249,6 +1547,79 @@ def evaluate_group(
                 adaptive_posture_reasons[selection_reason] = (
                     adaptive_posture_reasons.get(selection_reason, 0) + 1
                 )
+                decision_checks = adaptive_posture.get("decision_checks")
+                if isinstance(decision_checks, Mapping):
+                    for check_name, passed in decision_checks.items():
+                        if bool(passed):
+                            continue
+                        key = str(check_name)
+                        adaptive_posture_failed_checks[key] = (
+                            adaptive_posture_failed_checks.get(key, 0) + 1
+                        )
+                    if bool(decision_checks.get("guarded", False)):
+                        adaptive_posture_guarded_decisions += 1
+                        for check_name, passed in decision_checks.items():
+                            if bool(passed):
+                                continue
+                            key = str(check_name)
+                            adaptive_posture_guarded_failed_checks[key] = (
+                                adaptive_posture_guarded_failed_checks.get(key, 0)
+                                + 1
+                            )
+                        common_ready = all(
+                            bool(decision_checks.get(name, False))
+                            for name in (
+                                "baseline_valid",
+                                "alternate_valid",
+                                "step_ok",
+                                "dynamic_ok",
+                                "terminal_ok",
+                            )
+                        )
+                        if (
+                            bool(
+                                decision_checks.get("sigma_not_worse", False)
+                            )
+                            and bool(decision_checks.get("pose_better", False))
+                        ):
+                            adaptive_posture_guarded_route_counts[
+                                "pose_quality_eligible"
+                            ] += 1
+                        sigma_quality_eligible = bool(
+                            decision_checks.get("sigma_better", False)
+                        ) and bool(
+                            decision_checks.get("pose_not_worse", False)
+                        )
+                        if sigma_quality_eligible:
+                            adaptive_posture_guarded_route_counts[
+                                "sigma_quality_eligible"
+                            ] += 1
+                        if sigma_quality_eligible and bool(
+                            decision_checks.get("terminal_ok", False)
+                        ):
+                            adaptive_posture_guarded_route_counts[
+                                "sigma_quality_terminal_eligible"
+                            ] += 1
+                        if (
+                            common_ready
+                            and bool(
+                                decision_checks.get("sigma_not_worse", False)
+                            )
+                            and bool(decision_checks.get("pose_better", False))
+                        ):
+                            adaptive_posture_guarded_route_counts[
+                                "pose_route_eligible"
+                            ] += 1
+                        if (
+                            common_ready
+                            and bool(decision_checks.get("sigma_better", False))
+                            and bool(
+                                decision_checks.get("pose_not_worse", False)
+                            )
+                        ):
+                            adaptive_posture_guarded_route_counts[
+                                "sigma_route_eligible"
+                            ] += 1
             holds += int(hold)
             hold_run = hold_run + 1 if hold else 0
             longest_hold = max(longest_hold, hold_run)
@@ -1260,12 +1631,18 @@ def evaluate_group(
                 side: np.asarray(previous_truth[side], dtype=float).copy()
                 for side in ("left", "right")
             }
-            dt = float(timestamp) - float(previous_timestamp)
-            if not math.isfinite(dt) or dt <= 0.0:
+            source_dt = float(timestamp) - float(previous_timestamp)
+            if not math.isfinite(source_dt) or source_dt <= 0.0:
                 raise ValueError(
                     f"parity references must have increasing timestamps; "
                     f"previous={previous_timestamp}, current={timestamp}."
                 )
+            # The planner integrates every emitted reference with its fixed
+            # deploy control period.  ``resample_motion_targets`` may append a
+            # non-grid-aligned final source timestamp, but that final target is
+            # still one physical control tick, not a fractional servo cycle.
+            # Dynamic certificates must therefore use the same fixed period as
+            # the planner instead of the source-time interpolation interval.
             frame_max_joint_error = 0.0
             frame_max_step = 0.0
             frame_sides: dict[str, Any] = {}
@@ -1359,23 +1736,70 @@ def evaluate_group(
             frame_velocity = 0.0
             frame_acceleration = 0.0
             frame_jerk = 0.0
+            frame_motion_certificate: dict[str, Any] = {}
             acceleration_computed = False
             jerk_computed = False
-            kinematic_dt_valid = bool(
-                mode != "runtime_causal"
-                or dt >= 0.5 / float(reference_hz)
-            )
-            if not kinematic_dt_valid:
-                kinematic_dt_skipped_count += 1
+            kinematic_dt_valid = True
             for side in ("left", "right"):
                 velocity = _unwrap_error(
                     actual_by_side[side], prior_output[side]
                 ) / dt
+                raw_velocity = (
+                    None
+                    if side not in raw_by_side
+                    else _unwrap_error(
+                        raw_by_side[side], prior_output[side]
+                    )
+                    / dt
+                )
+                post_qp_delta = (
+                    None
+                    if side not in raw_by_side
+                    else float(
+                        np.max(
+                            np.abs(
+                                np.rad2deg(
+                                    _unwrap_error(
+                                        actual_by_side[side], raw_by_side[side]
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+                if post_qp_delta is not None:
+                    post_qp_admission_delta_deg.append(post_qp_delta)
+                side_certificate: dict[str, Any] = {
+                    "post_qp_admission_delta_deg": post_qp_delta,
+                }
                 if kinematic_dt_valid:
                     frame_velocity = max(
                         frame_velocity,
                         float(np.max(np.abs(np.rad2deg(velocity)))),
                     )
+                    admitted_velocity_ratio = float(
+                        np.max(np.abs(velocity) / velocity_limit)
+                    )
+                    admitted_velocity_utilization.append(
+                        admitted_velocity_ratio
+                    )
+                    motion_limit_violation_counts[
+                        "admitted_velocity_side_frames"
+                    ] += int(admitted_velocity_ratio > 1.0 + 1e-5)
+                    side_certificate["admitted_velocity_utilization"] = (
+                        admitted_velocity_ratio
+                    )
+                    if raw_velocity is not None:
+                        raw_velocity_ratio = float(
+                            np.max(np.abs(raw_velocity) / velocity_limit)
+                        )
+                        raw_velocity_utilization.append(raw_velocity_ratio)
+                        motion_limit_violation_counts[
+                            "raw_velocity_side_frames"
+                        ] += int(raw_velocity_ratio > 1.0 + 1e-5)
+                        side_certificate["raw_velocity_utilization"] = (
+                            raw_velocity_ratio
+                        )
                 if kinematic_dt_valid and side in previous_velocity:
                     acceleration_computed = True
                     acceleration = (velocity - previous_velocity[side]) / dt
@@ -1383,6 +1807,36 @@ def evaluate_group(
                         frame_acceleration,
                         float(np.max(np.abs(np.rad2deg(acceleration)))),
                     )
+                    admitted_acceleration_ratio = float(
+                        np.max(np.abs(acceleration) / acceleration_limit)
+                    )
+                    admitted_acceleration_utilization.append(
+                        admitted_acceleration_ratio
+                    )
+                    motion_limit_violation_counts[
+                        "admitted_acceleration_side_frames"
+                    ] += int(admitted_acceleration_ratio > 1.0 + 1e-5)
+                    side_certificate["admitted_acceleration_utilization"] = (
+                        admitted_acceleration_ratio
+                    )
+                    if raw_velocity is not None:
+                        raw_acceleration = (
+                            raw_velocity - previous_velocity[side]
+                        ) / dt
+                        raw_acceleration_ratio = float(
+                            np.max(
+                                np.abs(raw_acceleration) / acceleration_limit
+                            )
+                        )
+                        raw_acceleration_utilization.append(
+                            raw_acceleration_ratio
+                        )
+                        motion_limit_violation_counts[
+                            "raw_acceleration_side_frames"
+                        ] += int(raw_acceleration_ratio > 1.0 + 1e-5)
+                        side_certificate["raw_acceleration_utilization"] = (
+                            raw_acceleration_ratio
+                        )
                     if side in previous_acceleration:
                         jerk_computed = True
                         jerk = (acceleration - previous_acceleration[side]) / dt
@@ -1393,6 +1847,7 @@ def evaluate_group(
                     previous_acceleration[side] = acceleration.copy()
                 if kinematic_dt_valid:
                     previous_velocity[side] = velocity.copy()
+                frame_motion_certificate[side] = side_certificate
 
                 stream_pairs = {
                     "truth": (prior_truth[side], truth[side]),
@@ -1447,6 +1902,160 @@ def evaluate_group(
                     else None
                 ),
             }
+            target_endpoint_world = dict(
+                getattr(
+                    result,
+                    "target_endpoint_pose_world_by_side",
+                    {},
+                )
+                or {}
+            )
+            task_conditioning_by_stream: dict[
+                str, Mapping[str, Any] | None
+            ] = {
+                "pre_solve": pre_solve_task_conditioning,
+                "truth": (
+                    _task_conditioning_diagnostics(
+                        planner,
+                        truth,
+                        target_endpoint_world,
+                        dt_sec=dt,
+                    )
+                    if set(target_endpoint_world) == {"left", "right"}
+                    else None
+                ),
+                "admitted": (
+                    _task_conditioning_diagnostics(
+                        planner,
+                        actual_by_side,
+                        target_endpoint_world,
+                        dt_sec=dt,
+                    )
+                    if set(target_endpoint_world) == {"left", "right"}
+                    else None
+                ),
+                "raw_ik": (
+                    _task_conditioning_diagnostics(
+                        planner,
+                        raw_by_side,
+                        target_endpoint_world,
+                        dt_sec=dt,
+                    )
+                    if (
+                        set(raw_by_side) == {"left", "right"}
+                        and set(target_endpoint_world) == {"left", "right"}
+                    )
+                    else None
+                ),
+            }
+            task_conditioning_available = bool(
+                task_conditioning_available
+                or any(
+                    diagnostics is not None
+                    for diagnostics in task_conditioning_by_stream.values()
+                )
+            )
+            for stream, diagnostics in task_conditioning_by_stream.items():
+                if diagnostics is None:
+                    continue
+                sides = diagnostics.get("sides")
+                if not isinstance(sides, Mapping):
+                    continue
+                for side in ("left", "right"):
+                    side_metrics = sides.get(side)
+                    if not isinstance(side_metrics, Mapping):
+                        continue
+                    for name in (
+                        "sigma_task_velocity_min",
+                        "condition_number_task_velocity",
+                        "max_required_velocity_utilization",
+                        "weakest_direction_abs_demand",
+                        "weakest_direction_required_velocity_utilization",
+                    ):
+                        value = side_metrics.get(name)
+                        if value is not None:
+                            task_conditioning_values[stream][side][name].append(
+                                float(value)
+                            )
+            frame_constrained_feasibility = pre_solve_constrained_feasibility
+            if frame_constrained_feasibility is not None:
+                constrained_feasibility_available = True
+                strict = frame_constrained_feasibility.get(
+                    "strict_directional_alpha"
+                )
+                if isinstance(strict, Mapping):
+                    global_metrics = strict.get("global")
+                    if isinstance(global_metrics, Mapping) and bool(
+                        global_metrics.get("available", False)
+                    ):
+                        constrained_global_alpha.append(
+                            float(global_metrics["alpha"])
+                        )
+                        for source_metrics in (
+                            global_metrics.get("active_inequality_sources") or ()
+                        ):
+                            if not isinstance(source_metrics, Mapping):
+                                continue
+                            source = str(source_metrics.get("source") or "")
+                            if source and int(
+                                source_metrics.get("active_count") or 0
+                            ) > 0:
+                                counts = constrained_active_source_frame_counts[
+                                    "global"
+                                ]
+                                counts[source] = counts.get(source, 0) + 1
+                    frame_metrics = strict.get("frames")
+                    if isinstance(frame_metrics, Sequence):
+                        for side, side_metrics in zip(
+                            ("left", "right"),
+                            frame_metrics,
+                        ):
+                            if isinstance(side_metrics, Mapping) and bool(
+                                side_metrics.get("available", False)
+                            ):
+                                constrained_side_alpha[side].append(
+                                    float(side_metrics["alpha"])
+                                )
+                                for source_metrics in (
+                                    side_metrics.get(
+                                        "active_inequality_sources"
+                                    )
+                                    or ()
+                                ):
+                                    if not isinstance(source_metrics, Mapping):
+                                        continue
+                                    source = str(
+                                        source_metrics.get("source") or ""
+                                    )
+                                    if source and int(
+                                        source_metrics.get("active_count") or 0
+                                    ) > 0:
+                                        counts = (
+                                            constrained_active_source_frame_counts[
+                                                side
+                                            ]
+                                        )
+                                        counts[source] = (
+                                            counts.get(source, 0) + 1
+                                        )
+                tracking = frame_constrained_feasibility.get(
+                    "best_constrained_tracking"
+                )
+                if isinstance(tracking, Mapping):
+                    frame_metrics = tracking.get("frames")
+                    if isinstance(frame_metrics, Sequence):
+                        for side, side_metrics in zip(
+                            ("left", "right"),
+                            frame_metrics,
+                        ):
+                            if isinstance(side_metrics, Mapping):
+                                constrained_side_tracking_residual[side].append(
+                                    float(
+                                        side_metrics[
+                                            "weighted_residual_norm"
+                                        ]
+                                    )
+                                )
             jacobian_available = bool(
                 jacobian_available
                 or diagnostics_by_stream["truth"] is not None
@@ -1578,6 +2187,55 @@ def evaluate_group(
                             side_metrics := diagnostic_sides.get(side), Mapping
                         )
                     }
+                frame_task_conditioning: dict[str, Any] = {}
+                for stream, diagnostics in task_conditioning_by_stream.items():
+                    if not isinstance(diagnostics, Mapping):
+                        continue
+                    diagnostic_sides = diagnostics.get("sides")
+                    if not isinstance(diagnostic_sides, Mapping):
+                        continue
+                    frame_task_conditioning[stream] = {
+                        side: {
+                            name: (
+                                int(side_metrics[name])
+                                if name == "weakest_direction_index"
+                                else float(side_metrics[name])
+                            )
+                            for name in (
+                                "sigma_task_velocity_min",
+                                "condition_number_task_velocity",
+                                "max_required_velocity_utilization",
+                                "weakest_direction_index",
+                                "weakest_direction_abs_demand",
+                                "weakest_direction_required_velocity_utilization",
+                            )
+                            if side_metrics.get(name) is not None
+                        }
+                        for side in ("left", "right")
+                        if isinstance(
+                            side_metrics := diagnostic_sides.get(side), Mapping
+                        )
+                    }
+                frame_feasibility = {}
+                if isinstance(frame_constrained_feasibility, Mapping):
+                    strict = frame_constrained_feasibility.get(
+                        "strict_directional_alpha"
+                    )
+                    tracking = frame_constrained_feasibility.get(
+                        "best_constrained_tracking"
+                    )
+                    frame_feasibility = {
+                        "strict_directional_alpha": (
+                            {}
+                            if not isinstance(strict, Mapping)
+                            else _plain_observation(strict)
+                        ),
+                        "best_constrained_tracking": (
+                            {}
+                            if not isinstance(tracking, Mapping)
+                            else _plain_observation(tracking)
+                        ),
+                    }
                 frames.append(
                     {
                         "sequence": sequence,
@@ -1592,7 +2250,7 @@ def evaluate_group(
                         "adaptive_posture_candidate_selection": (
                             None
                             if not isinstance(adaptive_posture, Mapping)
-                            else dict(adaptive_posture)
+                            else _plain_observation(adaptive_posture)
                         ),
                         "max_joint_error_deg": frame_max_joint_error,
                         "max_step_deg": frame_max_step,
@@ -1603,6 +2261,9 @@ def evaluate_group(
                         "max_jerk_deg_s3": frame_jerk if jerk_computed else None,
                         "sides": frame_sides,
                         "singularity": frame_singularity,
+                        "task_conditioning": frame_task_conditioning,
+                        "constrained_task_feasibility": frame_feasibility,
+                        "motion_constraint_certificate": frame_motion_certificate,
                     }
                 )
         wrist_motion_report = {
@@ -1635,6 +2296,9 @@ def evaluate_group(
                 stream: {
                     side: {
                         "sigma_min": _summary(values["sigma_min"]),
+                        "guarded_exposure": _sigma_exposure_summary(
+                            values["sigma_min"]
+                        ),
                         "condition_number": _summary_with_nonfinite(
                             values["condition_number"]
                         ),
@@ -1648,6 +2312,79 @@ def evaluate_group(
             },
             "direction_counts": jacobian_direction_counts,
         }
+        task_conditioning_report = {
+            "available": bool(task_conditioning_available),
+            "observational_only": True,
+            "control_authority": "none",
+            "jacobian_contract": "pink_frame_task_se3_log_local",
+            "task_weighting": "pink_cost_left_multiply",
+            "joint_scaling": (
+                "columns_multiplied_by_formal_joint_velocity_limit_rad_s"
+            ),
+            "demand_contract": (
+                "pink_deadbeat_minus_gain_error_divided_by_reference_dt"
+            ),
+            "threshold_contract": (
+                "no trigger threshold assigned; retain geometric sigma and "
+                "q3/q5 structural margin as separate diagnostics"
+            ),
+            "streams": {
+                stream: {
+                    side: {
+                        "sigma_task_velocity_min": _summary(
+                            values["sigma_task_velocity_min"]
+                        ),
+                        "condition_number_task_velocity": _summary_with_nonfinite(
+                            values["condition_number_task_velocity"]
+                        ),
+                        "max_required_velocity_utilization": (
+                            _summary_with_nonfinite(
+                                values["max_required_velocity_utilization"]
+                            )
+                        ),
+                        "weakest_direction_abs_demand": _summary(
+                            values["weakest_direction_abs_demand"]
+                        ),
+                        "weakest_direction_required_velocity_utilization": (
+                            _summary_with_nonfinite(
+                                values[
+                                    "weakest_direction_required_velocity_utilization"
+                                ]
+                            )
+                        ),
+                    }
+                    for side, values in sides.items()
+                }
+                for stream, sides in task_conditioning_values.items()
+            },
+        }
+        constrained_feasibility_report = {
+            "enabled": bool(include_constrained_feasibility),
+            "available": bool(constrained_feasibility_available),
+            "observational_only": True,
+            "control_authority": "none",
+            "strict_directional_alpha_contract": (
+                "max_exact_requested_direction_scale_under_current_qp_inequalities"
+            ),
+            "global_alpha": _summary(constrained_global_alpha),
+            "active_inequality_source_frame_counts": {
+                scope: dict(sorted(counts.items()))
+                for scope, counts in (
+                    constrained_active_source_frame_counts.items()
+                )
+            },
+            "sides": {
+                side: {
+                    "strict_directional_alpha": _summary(
+                        constrained_side_alpha[side]
+                    ),
+                    "best_tracking_weighted_residual_norm": _summary(
+                        constrained_side_tracking_residual[side]
+                    ),
+                }
+                for side in ("left", "right")
+            },
+        }
         mode_report = {
             "evaluated_references": len(work),
             "hold_count": holds,
@@ -1659,6 +2396,18 @@ def evaluate_group(
             "pose_lift_selected_scale_counts": pose_lift_selected_scales,
             "adaptive_posture_selection_counts": adaptive_posture_selections,
             "adaptive_posture_reason_counts": adaptive_posture_reasons,
+            "adaptive_posture_failed_check_counts": (
+                adaptive_posture_failed_checks
+            ),
+            "adaptive_posture_guarded_decision_count": (
+                adaptive_posture_guarded_decisions
+            ),
+            "adaptive_posture_guarded_failed_check_counts": (
+                adaptive_posture_guarded_failed_checks
+            ),
+            "adaptive_posture_guarded_route_counts": (
+                adaptive_posture_guarded_route_counts
+            ),
             "q5_branch_mismatch_side_frames": q5_branch_mismatch,
             "max_joint_error_deg": _summary(joint_error_deg),
             "requested_to_admitted_translation_m": _summary(translation_error_m),
@@ -1673,8 +2422,36 @@ def evaluate_group(
             ),
             "admitted_max_jerk_deg_s3": _summary(max_jerk_deg_s3),
             "kinematic_dt_skipped_count": int(kinematic_dt_skipped_count),
+            "motion_constraint_certificate": {
+                "observational_only": True,
+                "reference_clock_hz": float(reference_hz),
+                "velocity_limit_rad_s": velocity_limit.tolist(),
+                "acceleration_limit_rad_s2": acceleration_limit.tolist(),
+                "violation_ratio_epsilon": 1e-5,
+                "violation_counts": dict(motion_limit_violation_counts),
+                "raw_ik_velocity_utilization": _summary(
+                    raw_velocity_utilization
+                ),
+                "admitted_velocity_utilization": _summary(
+                    admitted_velocity_utilization
+                ),
+                "raw_ik_acceleration_utilization": _summary(
+                    raw_acceleration_utilization
+                ),
+                "admitted_acceleration_utilization": _summary(
+                    admitted_acceleration_utilization
+                ),
+                "post_qp_admission_delta_deg": _summary(
+                    post_qp_admission_delta_deg
+                ),
+                "post_qp_scope": (
+                    "pose_lift_canonicalization_joint_certificate_collision_backoff"
+                ),
+            },
             "wrist_branch_continuity": wrist_motion_report,
             "singularity_diagnostics": jacobian_report,
+            "task_conditioning_diagnostics": task_conditioning_report,
+            "constrained_task_feasibility": constrained_feasibility_report,
             "joint_error_deg_by_side_joint": {
                 side: {
                     f"q{joint_index + 1}": _summary(values)
@@ -1749,6 +2526,65 @@ def rank_singular_groups(groups: Sequence[Any], *, limit: int) -> list[dict[str,
     return rows[: max(1, int(limit))]
 
 
+def rank_jacobian_singular_groups(
+    groups: Sequence[Any],
+    *,
+    planner: Any,
+    limit: int,
+    characteristic_length_m: float,
+) -> list[dict[str, Any]]:
+    """Rank saved accepted qref using the same normalized Jacobian as Pose Lift."""
+
+    rows: list[dict[str, Any]] = []
+    for group in groups:
+        sigma_by_side = {"left": [], "right": []}
+        frame_count = int(group.frame_count)
+        for frame_index in range(frame_count):
+            diagnostics = planner.analyze_configuration(
+                {
+                    side: np.asarray(
+                        group.arm_joint_targets[side][frame_index],
+                        dtype=float,
+                    )
+                    for side in ("left", "right")
+                },
+                characteristic_length_m=float(characteristic_length_m),
+            )
+            for side in ("left", "right"):
+                sigma_by_side[side].append(
+                    float(diagnostics["sides"][side]["sigma_min"])
+                )
+        side_metrics = {
+            side: {
+                "sigma_min": _summary(values),
+                "guarded_exposure": _sigma_exposure_summary(values),
+            }
+            for side, values in sigma_by_side.items()
+        }
+        rows.append(
+            {
+                "episode_index": int(group.source_episode_index),
+                "frame_count": frame_count,
+                "min_sigma": min(
+                    float(side_metrics[side]["sigma_min"]["min"])
+                    for side in ("left", "right")
+                ),
+                "sides": side_metrics,
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            float(row["min_sigma"]),
+            -sum(
+                int(metrics["guarded_exposure"]["below_guard_count"])
+                for metrics in row["sides"].values()
+            ),
+            int(row["episode_index"]),
+        )
+    )
+    return rows[: max(1, int(limit))]
+
+
 def compact_report(report: Mapping[str, Any]) -> dict[str, Any]:
     """Keep sweep output bounded while retaining parity decision metrics."""
 
@@ -1765,6 +2601,10 @@ def compact_report(report: Mapping[str, Any]) -> dict[str, Any]:
                 "pose_lift_selected_scale_counts",
                 "adaptive_posture_selection_counts",
                 "adaptive_posture_reason_counts",
+                "adaptive_posture_failed_check_counts",
+                "adaptive_posture_guarded_decision_count",
+                "adaptive_posture_guarded_failed_check_counts",
+                "adaptive_posture_guarded_route_counts",
                 "max_joint_error_deg",
                 "requested_to_admitted_translation_m",
                 "requested_to_admitted_rotation_deg",
@@ -1774,6 +2614,7 @@ def compact_report(report: Mapping[str, Any]) -> dict[str, Any]:
                 "admitted_max_acceleration_deg_s2",
                 "admitted_max_jerk_deg_s3",
                 "kinematic_dt_skipped_count",
+                "motion_constraint_certificate",
             )
         }
         singularity = dict(values.get("singularity_diagnostics") or {})
@@ -1788,6 +2629,12 @@ def compact_report(report: Mapping[str, Any]) -> dict[str, Any]:
                 side: {
                     "sigma_min": dict(
                         dict(admitted_singularity.get(side) or {}).get("sigma_min")
+                        or {}
+                    ),
+                    "guarded_exposure": dict(
+                        dict(admitted_singularity.get(side) or {}).get(
+                            "guarded_exposure"
+                        )
                         or {}
                     ),
                     "condition_number": dict(
@@ -1808,6 +2655,23 @@ def compact_report(report: Mapping[str, Any]) -> dict[str, Any]:
             "direction_counts": direction_counts,
             "admitted_wrist": dict(wrist.get("admitted") or {}),
         }
+        task_conditioning = dict(
+            values.get("task_conditioning_diagnostics") or {}
+        )
+        compact_modes[str(mode)]["task_conditioning"] = {
+            "available": bool(task_conditioning.get("available", False)),
+            "pre_solve_by_side": dict(
+                dict(task_conditioning.get("streams") or {}).get("pre_solve")
+                or {}
+            ),
+            "admitted_by_side": dict(
+                dict(task_conditioning.get("streams") or {}).get("admitted")
+                or {}
+            ),
+        }
+        compact_modes[str(mode)]["constrained_task_feasibility"] = dict(
+            values.get("constrained_task_feasibility") or {}
+        )
         compact_modes[str(mode)]["right_q4_error_deg"] = (
             dict(joint_summaries.get("right") or {}).get("q4")
         )
@@ -1922,6 +2786,30 @@ def compare_profile_reports(
                 baseline_value=dict(base.get(metric) or {}).get("max"),
                 candidate_value=dict(cand.get(metric) or {}).get("max"),
             )
+        base_violations = dict(
+            dict(base.get("motion_constraint_certificate") or {}).get(
+                "violation_counts"
+            )
+            or {}
+        )
+        cand_violations = dict(
+            dict(cand.get("motion_constraint_certificate") or {}).get(
+                "violation_counts"
+            )
+            or {}
+        )
+        for metric in (
+            "raw_velocity_side_frames",
+            "admitted_velocity_side_frames",
+            "raw_acceleration_side_frames",
+            "admitted_acceleration_side_frames",
+        ):
+            lower_or_equal(
+                mode=mode,
+                metric=f"motion_constraint_certificate.{metric}",
+                baseline_value=int(base_violations.get(metric) or 0),
+                candidate_value=int(cand_violations.get(metric) or 0),
+            )
 
         base_singularity = dict(base.get("singularity_diagnostics") or {})
         cand_singularity = dict(cand.get("singularity_diagnostics") or {})
@@ -2006,13 +2894,352 @@ def compare_profile_reports(
         "episode_index": int(candidate["episode_index"]),
         "accepted": not failed,
         "contract": (
-            "parity_mean_p95_nonworse_and_singularity_dynamics_branch_nonregression"
+            "parity_mean_p95_nonworse_singularity_dynamics_motion_certificate_"
+            "and_branch_nonregression"
         ),
         "absolute_tolerance": tolerance,
         "sigma_min_tolerance": sigma_tolerance,
         "singularity_guard_sigma": guard_sigma,
         "translation_p95_slack_m": float(translation_p95_slack_m),
         "rotation_p95_slack_deg": float(rotation_p95_slack_deg),
+        "check_count": len(checks),
+        "failed_check_count": len(failed),
+        "failed_checks": failed,
+    }
+
+
+def assess_sigma_escape_research_candidate(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    singularity_guard_sigma: float = 0.04,
+    minimum_sigma_improvement_ratio: float = 1e-3,
+    minimum_sigma_improvement_absolute: float = 1e-5,
+    max_joint_error_mean_regression_deg: float = 0.15,
+    max_joint_error_p95_regression_deg: float = 0.15,
+    max_translation_mean_regression_m: float = 2e-5,
+    max_translation_p95_regression_m: float = 2e-5,
+    max_rotation_mean_regression_deg: float = 0.005,
+    max_rotation_p95_regression_deg: float = 0.005,
+    max_jerk_regression_ratio: float = 1e-3,
+    max_guarded_sample_count_regression: int = 0,
+    max_deep_sample_count_regression: int = 0,
+    max_mean_guard_deficit_regression: float = 0.0,
+) -> dict[str, Any]:
+    """Assess an offline singularity tradeoff without weakening production gates.
+
+    This contract is intentionally separate from :func:`compare_profile_reports`.
+    It accepts a bounded loss of teacher-qpos/pose parity only when every
+    guarded admitted arm gains a material normalized Jacobian margin, no hard
+    motion certificate is violated, and hold/branch behavior is non-regressive.
+    It is research evidence, never hardware admission authority.
+    """
+
+    if int(baseline.get("episode_index", -1)) != int(
+        candidate.get("episode_index", -2)
+    ):
+        raise ValueError("research comparison requires the same episode.")
+    thresholds = {
+        "singularity_guard_sigma": float(singularity_guard_sigma),
+        "minimum_sigma_improvement_ratio": float(minimum_sigma_improvement_ratio),
+        "minimum_sigma_improvement_absolute": float(
+            minimum_sigma_improvement_absolute
+        ),
+        "max_joint_error_mean_regression_deg": float(
+            max_joint_error_mean_regression_deg
+        ),
+        "max_joint_error_p95_regression_deg": float(
+            max_joint_error_p95_regression_deg
+        ),
+        "max_translation_mean_regression_m": float(
+            max_translation_mean_regression_m
+        ),
+        "max_translation_p95_regression_m": float(
+            max_translation_p95_regression_m
+        ),
+        "max_rotation_mean_regression_deg": float(
+            max_rotation_mean_regression_deg
+        ),
+        "max_rotation_p95_regression_deg": float(
+            max_rotation_p95_regression_deg
+        ),
+        "max_jerk_regression_ratio": float(max_jerk_regression_ratio),
+        "max_guarded_sample_count_regression": float(
+            max_guarded_sample_count_regression
+        ),
+        "max_deep_sample_count_regression": float(
+            max_deep_sample_count_regression
+        ),
+        "max_mean_guard_deficit_regression": float(
+            max_mean_guard_deficit_regression
+        ),
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in thresholds.values()):
+        raise ValueError("research comparison thresholds must be finite and non-negative.")
+    if thresholds["singularity_guard_sigma"] <= 0.0:
+        raise ValueError("singularity_guard_sigma must be positive.")
+
+    baseline_modes = dict(baseline.get("modes") or {})
+    candidate_modes = dict(candidate.get("modes") or {})
+    if set(baseline_modes) != set(candidate_modes):
+        raise ValueError("research comparison requires identical evaluator modes.")
+
+    checks: list[dict[str, Any]] = []
+
+    def append_bounded_regression(
+        *,
+        mode: str,
+        metric: str,
+        baseline_value: Any,
+        candidate_value: Any,
+        allowance: float,
+    ) -> None:
+        passed = bool(
+            baseline_value is not None
+            and candidate_value is not None
+            and math.isfinite(float(baseline_value))
+            and math.isfinite(float(candidate_value))
+            and float(candidate_value) <= float(baseline_value) + float(allowance)
+        )
+        checks.append(
+            {
+                "mode": mode,
+                "metric": metric,
+                "requirement": "candidate<=baseline+research_allowance",
+                "baseline": baseline_value,
+                "candidate": candidate_value,
+                "allowed_regression": float(allowance),
+                "passed": passed,
+            }
+        )
+
+    guarded_side_count = 0
+    for mode in sorted(baseline_modes):
+        base = dict(baseline_modes[mode])
+        cand = dict(candidate_modes[mode])
+        append_bounded_regression(
+            mode=mode,
+            metric="hold_count",
+            baseline_value=base.get("hold_count"),
+            candidate_value=cand.get("hold_count"),
+            allowance=0.0,
+        )
+        parity_limits = (
+            (
+                "max_joint_error_deg",
+                "mean",
+                thresholds["max_joint_error_mean_regression_deg"],
+            ),
+            (
+                "max_joint_error_deg",
+                "p95",
+                thresholds["max_joint_error_p95_regression_deg"],
+            ),
+            (
+                "requested_to_admitted_translation_m",
+                "mean",
+                thresholds["max_translation_mean_regression_m"],
+            ),
+            (
+                "requested_to_admitted_translation_m",
+                "p95",
+                thresholds["max_translation_p95_regression_m"],
+            ),
+            (
+                "requested_to_admitted_rotation_deg",
+                "mean",
+                thresholds["max_rotation_mean_regression_deg"],
+            ),
+            (
+                "requested_to_admitted_rotation_deg",
+                "p95",
+                thresholds["max_rotation_p95_regression_deg"],
+            ),
+        )
+        for metric, statistic, allowance in parity_limits:
+            append_bounded_regression(
+                mode=mode,
+                metric=f"{metric}.{statistic}",
+                baseline_value=dict(base.get(metric) or {}).get(statistic),
+                candidate_value=dict(cand.get(metric) or {}).get(statistic),
+                allowance=allowance,
+            )
+
+        base_jerk = dict(base.get("admitted_max_jerk_deg_s3") or {}).get("max")
+        jerk_allowance = (
+            0.0
+            if base_jerk is None
+            else abs(float(base_jerk)) * thresholds["max_jerk_regression_ratio"]
+        )
+        append_bounded_regression(
+            mode=mode,
+            metric="admitted_max_jerk_deg_s3.max",
+            baseline_value=base_jerk,
+            candidate_value=dict(cand.get("admitted_max_jerk_deg_s3") or {}).get(
+                "max"
+            ),
+            allowance=jerk_allowance,
+        )
+
+        cand_violations = dict(
+            dict(cand.get("motion_constraint_certificate") or {}).get(
+                "violation_counts"
+            )
+            or {}
+        )
+        for metric in (
+            "raw_velocity_side_frames",
+            "admitted_velocity_side_frames",
+            "raw_acceleration_side_frames",
+            "admitted_acceleration_side_frames",
+        ):
+            value = int(cand_violations.get(metric) or 0)
+            checks.append(
+                {
+                    "mode": mode,
+                    "metric": f"motion_constraint_certificate.{metric}",
+                    "requirement": "candidate==0",
+                    "baseline": None,
+                    "candidate": value,
+                    "passed": value == 0,
+                }
+            )
+
+        base_admitted = dict(
+            dict(base.get("singularity_diagnostics") or {})
+            .get("streams", {})
+            .get("admitted", {})
+        )
+        cand_admitted = dict(
+            dict(cand.get("singularity_diagnostics") or {})
+            .get("streams", {})
+            .get("admitted", {})
+        )
+        for side in ("left", "right"):
+            base_side = dict(base_admitted.get(side) or {})
+            cand_side = dict(cand_admitted.get(side) or {})
+            base_sigma = dict(base_side.get("sigma_min") or {}).get("min")
+            cand_sigma = dict(cand_side.get("sigma_min") or {}).get("min")
+            guarded = bool(
+                base_sigma is not None
+                and math.isfinite(float(base_sigma))
+                and float(base_sigma) < thresholds["singularity_guard_sigma"]
+            )
+            if guarded:
+                guarded_side_count += 1
+                required_gain = max(
+                    thresholds["minimum_sigma_improvement_absolute"],
+                    abs(float(base_sigma))
+                    * thresholds["minimum_sigma_improvement_ratio"],
+                )
+                sigma_passed = bool(
+                    cand_sigma is not None
+                    and math.isfinite(float(cand_sigma))
+                    and float(cand_sigma) >= float(base_sigma) + required_gain
+                )
+                checks.append(
+                    {
+                        "mode": mode,
+                        "metric": f"admitted.{side}.sigma_min.min",
+                        "requirement": "material_improvement_in_guarded_band",
+                        "baseline": base_sigma,
+                        "candidate": cand_sigma,
+                        "required_gain": required_gain,
+                        "passed": sigma_passed,
+                    }
+                )
+                base_exposure = dict(base_side.get("guarded_exposure") or {})
+                cand_exposure = dict(cand_side.get("guarded_exposure") or {})
+                base_sample_count = base_exposure.get("sample_count")
+                cand_sample_count = cand_exposure.get("sample_count")
+                checks.append(
+                    {
+                        "mode": mode,
+                        "metric": f"admitted.{side}.guarded_exposure.sample_count",
+                        "requirement": "candidate==baseline",
+                        "baseline": base_sample_count,
+                        "candidate": cand_sample_count,
+                        "passed": bool(
+                            base_sample_count is not None
+                            and cand_sample_count is not None
+                            and int(cand_sample_count) == int(base_sample_count)
+                        ),
+                    }
+                )
+                for metric, allowance in (
+                    (
+                        "below_guard_count",
+                        thresholds["max_guarded_sample_count_regression"],
+                    ),
+                    (
+                        "below_0p01_count",
+                        thresholds["max_deep_sample_count_regression"],
+                    ),
+                    (
+                        "below_0p001_count",
+                        thresholds["max_deep_sample_count_regression"],
+                    ),
+                    (
+                        "mean_guard_deficit",
+                        thresholds["max_mean_guard_deficit_regression"],
+                    ),
+                ):
+                    append_bounded_regression(
+                        mode=mode,
+                        metric=f"admitted.{side}.guarded_exposure.{metric}",
+                        baseline_value=base_exposure.get(metric),
+                        candidate_value=cand_exposure.get(metric),
+                        allowance=allowance,
+                    )
+            cand_condition = dict(cand_side.get("condition_number") or {})
+            nonfinite = int(cand_condition.get("nonfinite_count") or 0)
+            checks.append(
+                {
+                    "mode": mode,
+                    "metric": f"admitted.{side}.condition_number.nonfinite_count",
+                    "requirement": "candidate==0",
+                    "baseline": None,
+                    "candidate": nonfinite,
+                    "passed": nonfinite == 0,
+                }
+            )
+            base_wrist = dict(
+                dict(base.get("wrist_branch_continuity") or {})
+                .get("admitted", {})
+                .get(side, {})
+            )
+            cand_wrist = dict(
+                dict(cand.get("wrist_branch_continuity") or {})
+                .get("admitted", {})
+                .get(side, {})
+            )
+            append_bounded_regression(
+                mode=mode,
+                metric=f"admitted.{side}.branch_jump_count",
+                baseline_value=base_wrist.get("branch_jump_count", 0),
+                candidate_value=cand_wrist.get("branch_jump_count", 0),
+                allowance=0.0,
+            )
+
+    checks.append(
+        {
+            "mode": "all",
+            "metric": "guarded_side_count",
+            "requirement": "candidate_evaluation_contains_guarded_evidence",
+            "baseline": None,
+            "candidate": guarded_side_count,
+            "passed": guarded_side_count > 0,
+        }
+    )
+    failed = [check for check in checks if not bool(check["passed"])]
+    return {
+        "schema": "teleop_runtime.rm65_pose_lift_sigma_escape_research/v1",
+        "episode_index": int(candidate["episode_index"]),
+        "accepted": not failed,
+        "authority": "offline_research_only_not_hardware_admission",
+        "production_comparison_unchanged": True,
+        "guarded_side_count": guarded_side_count,
+        "thresholds": thresholds,
         "check_count": len(checks),
         "failed_check_count": len(failed),
         "failed_checks": failed,
@@ -2029,6 +3256,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--episode", type=int, action="append")
+    parser.add_argument(
+        "--all-episodes",
+        action="store_true",
+        help=(
+            "Evaluate every committed episode in --dataset-root. Offline-only; "
+            "mutually exclusive with --episode and ranking modes."
+        ),
+    )
     parser.add_argument("--left-tool-profile", required=True)
     parser.add_argument("--right-tool-profile", required=True)
     parser.add_argument("--scene-profile", default=DEFAULT_COLLISION_SCENE)
@@ -2045,6 +3280,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Evaluate a second rollback profile on the same inputs and emit a "
             "non-regression verdict covering parity, Jacobian margin, dynamics, "
             "holds, and branch jumps."
+        ),
+    )
+    parser.add_argument(
+        "--comparison-contract",
+        choices=("production", "sigma_escape_research"),
+        default="production",
+        help=(
+            "Keep the production non-regression gate by default. The separate "
+            "sigma_escape_research contract permits tightly bounded parity "
+            "tradeoffs but remains offline-only and has no hardware authority."
         ),
     )
     parser.add_argument(
@@ -2075,12 +3320,86 @@ def build_parser() -> argparse.ArgumentParser:
         help="Offline-only override for the IK continuity/posture cost sweep.",
     )
     parser.add_argument(
+        "--offline-sigma-escape-cost",
+        type=float,
+        default=None,
+        help=(
+            "Offline research only: override the selected profile's normalized "
+            "sigma escape soft-objective cost without changing its registry/default."
+        ),
+    )
+    parser.add_argument(
+        "--offline-sigma-escape-rate-per-sec",
+        type=float,
+        default=None,
+        help=(
+            "Offline research only: override the selected profile's bounded "
+            "sigma target rate without changing its registry/default."
+        ),
+    )
+    parser.add_argument(
+        "--offline-structural-branch-margin-deg",
+        type=float,
+        default=None,
+        help=(
+            "Offline research only: override the V6 one-sided q3/q5 zero "
+            "margin in degrees without changing its registry/default."
+        ),
+    )
+    parser.add_argument(
+        "--offline-structural-branch-guard-sigma",
+        type=float,
+        default=None,
+        help=(
+            "Offline research only: override the V6 structural branch guard "
+            "sigma threshold without changing its registry/default."
+        ),
+    )
+    parser.add_argument(
+        "--offline-structural-branch-release-sigma",
+        type=float,
+        default=None,
+        help=(
+            "Offline research only: override the V6 structural branch release "
+            "threshold without changing its registry/default."
+        ),
+    )
+    parser.add_argument(
+        "--offline-structural-branch-barrier-gain",
+        type=float,
+        default=None,
+        help=(
+            "Offline research only: override a barrier-mode structural "
+            "profile's CBF gain without changing its registry/default."
+        ),
+    )
+    parser.add_argument(
+        "--offline-structural-branch-prediction-horizon-sec",
+        type=float,
+        default=None,
+        help=(
+            "Offline research only: override a predictive structural "
+            "profile's previous-velocity horizon without changing its "
+            "registry/default."
+        ),
+    )
+    parser.add_argument(
         "--alternate-posture-cost",
         type=float,
         default=None,
         help=(
             "Offline-only: solve a second fully constrained candidate from the "
             "same admitted anchor and apply guarded Pareto selection."
+        ),
+    )
+    parser.add_argument(
+        "--alternate-pose-lift-profile",
+        choices=RM65_POSE_LIFT_PROFILE_CHOICES,
+        default=None,
+        help=(
+            "Offline-only horizon research: use a second registered Pose Lift "
+            "as the alternate certified rollout. This does not change deploy "
+            "or register a production selector."
         ),
     )
     parser.add_argument(
@@ -2109,6 +3428,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--adaptive-posture-max-step-slack-deg", type=float, default=0.25)
     parser.add_argument(
+        "--adaptive-posture-dynamic-relative-slack",
+        type=float,
+        default=0.0,
+        help=(
+            "Offline horizon research only: bounded relative allowance for "
+            "candidate velocity/acceleration/jerk maxima and means. Default "
+            "zero preserves strict dynamic non-regression."
+        ),
+    )
+    parser.add_argument(
         "--adaptive-posture-horizon-steps",
         type=int,
         default=1,
@@ -2136,6 +3465,26 @@ def build_parser() -> argparse.ArgumentParser:
             "horizon endpoint and the independent V1 shadow endpoint."
         ),
     )
+    parser.add_argument(
+        "--adaptive-posture-terminal-mode",
+        choices=("joint_shadow", "task_space_tube"),
+        default="joint_shadow",
+        help=(
+            "Offline horizon terminal contract. task_space_tube permits a "
+            "different legal joint lift when its terminal FK rejoins the "
+            "requested task-space tube."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-posture-terminal-translation-m",
+        type=float,
+        default=0.002,
+    )
+    parser.add_argument(
+        "--adaptive-posture-terminal-rotation-deg",
+        type=float,
+        default=0.5,
+    )
     parser.add_argument("--output-json", default="")
     parser.add_argument(
         "--rank-singular-episodes",
@@ -2145,9 +3494,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only rank all episodes by saved q3/q5 singular proximity and print top N.",
     )
     parser.add_argument(
+        "--rank-jacobian-episodes",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Only rank saved accepted qref by the normalized RM65 Jacobian used "
+            "by Pose Lift. This is observational and performs no IK or dispatch."
+        ),
+    )
+    parser.add_argument(
         "--include-frames",
         action="store_true",
         help="Include per-reference rows; default output is bounded aggregate metrics.",
+    )
+    parser.add_argument(
+        "--include-constrained-feasibility",
+        action="store_true",
+        help=(
+            "Run additional detached QPs for strict directional alpha and "
+            "best constrained residual. Offline-only and intentionally "
+            "disabled by default because it adds four observer QPs/reference."
+        ),
     )
     parser.add_argument(
         "--compact",
@@ -2162,13 +3530,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     for name in (
         "posture_cost",
         "alternate_posture_cost",
+        "offline_sigma_escape_cost",
+        "offline_sigma_escape_rate_per_sec",
+        "offline_structural_branch_margin_deg",
+        "offline_structural_branch_guard_sigma",
+        "offline_structural_branch_release_sigma",
+        "offline_structural_branch_barrier_gain",
+        "offline_structural_branch_prediction_horizon_sec",
         "adaptive_posture_guard_sigma",
         "adaptive_posture_sigma_tolerance",
         "adaptive_posture_sigma_improvement",
         "adaptive_posture_pose_score_slack",
         "adaptive_posture_pose_score_improvement",
         "adaptive_posture_max_step_slack_deg",
+        "adaptive_posture_dynamic_relative_slack",
         "adaptive_posture_terminal_shadow_delta_deg",
+        "adaptive_posture_terminal_translation_m",
+        "adaptive_posture_terminal_rotation_deg",
     ):
         value = getattr(args, name)
         if value is not None and (
@@ -2183,6 +3561,45 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(f"--{name.replace('_', '-')} must be at least 1")
     if int(args.offline_fixed_solve_iterations) < 0:
         raise SystemExit("--offline-fixed-solve-iterations must be non-negative")
+    if (
+        args.offline_sigma_escape_cost is not None
+        or args.offline_sigma_escape_rate_per_sec is not None
+    ) and resolve_rm65_pose_lift_profile(
+        str(args.pose_lift_profile)
+    ).qp_sigma_escape_cost <= 0.0:
+        raise SystemExit(
+            "offline sigma escape overrides require a selected profile that "
+            "already owns the sigma escape algorithm"
+        )
+    if (
+        args.offline_structural_branch_margin_deg is not None
+        or args.offline_structural_branch_guard_sigma is not None
+        or args.offline_structural_branch_release_sigma is not None
+        or args.offline_structural_branch_barrier_gain is not None
+        or args.offline_structural_branch_prediction_horizon_sec is not None
+    ) and resolve_rm65_pose_lift_profile(
+        str(args.pose_lift_profile)
+    ).qp_structural_branch_margin_deg <= 0.0:
+        raise SystemExit(
+            "offline structural branch overrides require a selected profile "
+            "that already owns the structural branch algorithm"
+        )
+    if (
+        args.offline_structural_branch_barrier_gain is not None
+        or args.offline_structural_branch_prediction_horizon_sec is not None
+    ) and resolve_rm65_pose_lift_profile(
+        str(args.pose_lift_profile)
+    ).qp_structural_branch_constraint_mode != "barrier":
+        raise SystemExit(
+            "offline structural barrier overrides require a selected "
+            "barrier-mode profile"
+        )
+    if args.offline_structural_branch_barrier_gain is not None and float(
+        args.offline_structural_branch_barrier_gain
+    ) <= 0.0:
+        raise SystemExit(
+            "--offline-structural-branch-barrier-gain must be positive"
+        )
     if (
         int(args.adaptive_posture_horizon_steps) > 1
         and int(args.offline_fixed_solve_iterations) < 1
@@ -2209,13 +3626,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         replay_all_episodes=False,
         active_sides=("left", "right"),
     )
+    ranking_requested = bool(
+        int(args.rank_singular_episodes) > 0
+        or int(args.rank_jacobian_episodes) > 0
+    )
+    if bool(args.all_episodes) and (args.episode or ranking_requested):
+        raise SystemExit(
+            "--all-episodes is mutually exclusive with --episode and ranking modes"
+        )
     episode_indices = (
         read_replay_dataset_episode_indices(args.dataset_root)
-        if int(args.rank_singular_episodes) > 0
+        if (bool(args.all_episodes) or ranking_requested)
         else list(args.episode or [])
     )
     if not episode_indices:
-        raise SystemExit("provide --episode or --rank-singular-episodes N")
+        raise SystemExit(
+            "provide --episode, --all-episodes, or a ranking mode"
+        )
     groups = [
         build_replay_group_for_episode(
             group_args,
@@ -2263,6 +3690,63 @@ def main(argv: Sequence[str] | None = None) -> None:
         posture_cost: float | None,
     ) -> RM65PositionCollisionPlanner:
         fixed_iterations = int(args.offline_fixed_solve_iterations)
+        resolved_profile = resolve_rm65_pose_lift_profile(profile_name)
+        profile_overrides: dict[str, float] = {}
+        apply_sigma_overrides = str(profile_name) == str(args.pose_lift_profile)
+        if apply_sigma_overrides and args.offline_sigma_escape_cost is not None:
+            profile_overrides["qp_sigma_escape_cost"] = float(
+                args.offline_sigma_escape_cost
+            )
+        if (
+            apply_sigma_overrides
+            and args.offline_sigma_escape_rate_per_sec is not None
+        ):
+            profile_overrides["qp_sigma_escape_rate_per_sec"] = float(
+                args.offline_sigma_escape_rate_per_sec
+            )
+        if (
+            apply_sigma_overrides
+            and args.offline_structural_branch_margin_deg is not None
+        ):
+            profile_overrides["qp_structural_branch_margin_deg"] = float(
+                args.offline_structural_branch_margin_deg
+            )
+        if (
+            apply_sigma_overrides
+            and args.offline_structural_branch_guard_sigma is not None
+        ):
+            profile_overrides["qp_structural_branch_guard_sigma"] = float(
+                args.offline_structural_branch_guard_sigma
+            )
+        if (
+            apply_sigma_overrides
+            and args.offline_structural_branch_release_sigma is not None
+        ):
+            profile_overrides["qp_structural_branch_release_sigma"] = float(
+                args.offline_structural_branch_release_sigma
+            )
+        if (
+            apply_sigma_overrides
+            and args.offline_structural_branch_barrier_gain is not None
+        ):
+            profile_overrides["qp_structural_branch_barrier_gain"] = float(
+                args.offline_structural_branch_barrier_gain
+            )
+        if (
+            apply_sigma_overrides
+            and args.offline_structural_branch_prediction_horizon_sec
+            is not None
+        ):
+            profile_overrides[
+                "qp_structural_branch_prediction_horizon_sec"
+            ] = float(
+                args.offline_structural_branch_prediction_horizon_sec
+            )
+        effective_profile = (
+            resolved_profile
+            if not profile_overrides
+            else replace(resolved_profile, **profile_overrides)
+        )
         return RM65PositionCollisionPlanner(
             RM65PositionCollisionPlannerConfig(
                 reference_hz=float(args.reference_hz),
@@ -2286,10 +3770,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 solve_adaptive_iterations_enabled=fixed_iterations <= 0,
                 solve_iteration_reserve_ms=REPLAY_POSITION_IK_ITERATION_RESERVE_MS,
-                pose_lift_profile=str(profile_name),
+                pose_lift_profile=effective_profile,
                 ik_tuning=build_rm65_pose_lift_ik_tuning(
                     position_control_profile="rm65_bimanual_position_v1",
-                    pose_lift_profile=str(profile_name),
+                    pose_lift_profile=effective_profile,
                     orientation_weight=REPLAY_POSITION_IK_ORIENTATION_WEIGHT,
                 ),
             ),
@@ -2303,11 +3787,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     ) -> Callable[[], Any]:
         def factory() -> Any:
             baseline = build_planner(profile_name, args.posture_cost)
-            if not adaptive or args.alternate_posture_cost is None:
+            if not adaptive:
                 return baseline
+            alternate_profile_name = str(
+                args.alternate_pose_lift_profile or profile_name
+            )
+            alternate_posture_cost = (
+                args.posture_cost
+                if args.alternate_posture_cost is None
+                else float(args.alternate_posture_cost)
+            )
             alternate = build_planner(
-                profile_name,
-                float(args.alternate_posture_cost),
+                alternate_profile_name,
+                alternate_posture_cost,
             )
             shadow_baseline = build_planner(profile_name, args.posture_cost)
             finite_horizon = int(args.adaptive_posture_horizon_steps) > 1
@@ -2323,6 +3815,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.adaptive_posture_pose_score_improvement
                 ),
                 max_step_slack_deg=float(args.adaptive_posture_max_step_slack_deg),
+                dynamic_relative_slack=float(
+                    args.adaptive_posture_dynamic_relative_slack
+                ),
                 characteristic_length_m=float(
                     args.jacobian_characteristic_length_m
                 ),
@@ -2333,8 +3828,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 rollout_alternate=(
                     build_planner(
-                        profile_name,
-                        float(args.alternate_posture_cost),
+                        alternate_profile_name,
+                        alternate_posture_cost,
                     )
                     if finite_horizon
                     else None
@@ -2349,14 +3844,61 @@ def main(argv: Sequence[str] | None = None) -> None:
                 terminal_shadow_delta_deg=float(
                     args.adaptive_posture_terminal_shadow_delta_deg
                 ),
+                terminal_mode=str(
+                    args.adaptive_posture_terminal_mode
+                ),
+                terminal_translation_m=float(
+                    args.adaptive_posture_terminal_translation_m
+                ),
+                terminal_rotation_deg=float(
+                    args.adaptive_posture_terminal_rotation_deg
+                ),
             )
 
         return factory
 
+    if int(args.rank_jacobian_episodes) > 0:
+        ranking_planner = build_planner(
+            RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+            args.posture_cost,
+        )
+        print(
+            json.dumps(
+                {
+                    "schema": (
+                        "teleop_runtime.rm65_pose_lift_jacobian_singular_rank/v1"
+                    ),
+                    "device_access": False,
+                    "dispatch": False,
+                    "episodes_scanned": len(groups),
+                    "profile": RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+                    "characteristic_length_m": float(
+                        args.jacobian_characteristic_length_m
+                    ),
+                    "ranking": rank_jacobian_singular_groups(
+                        groups,
+                        planner=ranking_planner,
+                        limit=int(args.rank_jacobian_episodes),
+                        characteristic_length_m=float(
+                            args.jacobian_characteristic_length_m
+                        ),
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
     reports = []
+    adaptive_candidate_enabled = bool(
+        args.alternate_posture_cost is not None
+        or args.alternate_pose_lift_profile is not None
+    )
     planner_factory = planner_factory_for(
         str(args.pose_lift_profile),
-        adaptive=args.alternate_posture_cost is not None,
+        adaptive=adaptive_candidate_enabled,
     )
     for group in groups:
         reports.append(
@@ -2366,6 +3908,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 modes=tuple(args.mode or MODES),
                 reference_hz=float(args.reference_hz),
                 include_frames=bool(args.include_frames),
+                include_constrained_feasibility=bool(
+                    args.include_constrained_feasibility
+                ),
                 jacobian_characteristic_length_m=float(
                     args.jacobian_characteristic_length_m
                 ),
@@ -2385,23 +3930,37 @@ def main(argv: Sequence[str] | None = None) -> None:
                 modes=tuple(args.mode or MODES),
                 reference_hz=float(args.reference_hz),
                 include_frames=False,
+                include_constrained_feasibility=bool(
+                    args.include_constrained_feasibility
+                ),
                 jacobian_characteristic_length_m=float(
                     args.jacobian_characteristic_length_m
                 ),
             )
             baseline_reports.append(baseline_report)
-            comparisons.append(
-                compare_profile_reports(
-                    baseline_report,
-                    candidate_report,
-                    sigma_min_tolerance=float(
-                        args.comparison_sigma_min_tolerance
-                    ),
-                    singularity_guard_sigma=float(
-                        args.comparison_singularity_guard_sigma
-                    ),
+            if str(args.comparison_contract) == "sigma_escape_research":
+                comparisons.append(
+                    assess_sigma_escape_research_candidate(
+                        baseline_report,
+                        candidate_report,
+                        singularity_guard_sigma=float(
+                            args.comparison_singularity_guard_sigma
+                        ),
+                    )
                 )
-            )
+            else:
+                comparisons.append(
+                    compare_profile_reports(
+                        baseline_report,
+                        candidate_report,
+                        sigma_min_tolerance=float(
+                            args.comparison_sigma_min_tolerance
+                        ),
+                        singularity_guard_sigma=float(
+                            args.comparison_singularity_guard_sigma
+                        ),
+                    )
+                )
     payload = {
         "schema": "teleop_runtime.rm65_pose_lift_parity/v2",
         "device_access": False,
@@ -2409,8 +3968,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         "no_motion_acknowledged": bool(args.no_motion),
         "pose_lift_profile": str(args.pose_lift_profile),
         "compare_baseline_profile": args.compare_baseline_profile,
+        "comparison_contract": str(args.comparison_contract),
         "posture_cost_override": args.posture_cost,
+        "offline_sigma_escape_overrides": {
+            "cost": args.offline_sigma_escape_cost,
+            "rate_per_sec": args.offline_sigma_escape_rate_per_sec,
+            "registry_profile_unchanged": True,
+        },
+        "offline_structural_branch_overrides": {
+            "margin_deg": args.offline_structural_branch_margin_deg,
+            "guard_sigma": args.offline_structural_branch_guard_sigma,
+            "release_sigma": args.offline_structural_branch_release_sigma,
+            "barrier_gain": args.offline_structural_branch_barrier_gain,
+            "prediction_horizon_sec": (
+                args.offline_structural_branch_prediction_horizon_sec
+            ),
+            "registry_profile_unchanged": True,
+        },
         "alternate_posture_cost": args.alternate_posture_cost,
+        "alternate_pose_lift_profile": args.alternate_pose_lift_profile,
         "offline_fixed_solve_iterations": (
             None
             if int(args.offline_fixed_solve_iterations) <= 0
@@ -2422,9 +3998,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "adaptive_posture_candidate_selection": (
             None
-            if args.alternate_posture_cost is None
+            if not adaptive_candidate_enabled
             else {
                 "offline_only": True,
+                "alternate_pose_lift_profile": (
+                    args.alternate_pose_lift_profile
+                ),
                 "guard_sigma": float(args.adaptive_posture_guard_sigma),
                 "sigma_tolerance": float(args.adaptive_posture_sigma_tolerance),
                 "sigma_improvement": float(args.adaptive_posture_sigma_improvement),
@@ -2435,10 +4014,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "max_step_slack_deg": float(
                     args.adaptive_posture_max_step_slack_deg
                 ),
+                "dynamic_relative_slack": float(
+                    args.adaptive_posture_dynamic_relative_slack
+                ),
                 "horizon_steps": int(args.adaptive_posture_horizon_steps),
                 "lock_steps": int(args.adaptive_posture_lock_steps),
                 "terminal_shadow_delta_deg": float(
                     args.adaptive_posture_terminal_shadow_delta_deg
+                ),
+                "terminal_mode": str(
+                    args.adaptive_posture_terminal_mode
+                ),
+                "terminal_translation_m": float(
+                    args.adaptive_posture_terminal_translation_m
+                ),
+                "terminal_rotation_deg": float(
+                    args.adaptive_posture_terminal_rotation_deg
                 ),
             }
         ),

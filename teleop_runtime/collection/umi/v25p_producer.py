@@ -16,17 +16,16 @@ from dataset_interface.component_action_projection import (
 )
 from robot_motion.action import ComponentAction, ComponentActionSchema
 
-from ..v25p_component_action import (
-    V25pActionComponentTiming,
+from collection_runtime.component_capture import (
+    ComponentActionTiming,
+    ComponentStreamBindings,
+    ComponentStreamInput,
+    ProducedComponentSample,
     attach_projected_component_action_timings,
-)
-from ..v25p_native_store import V25pComponentInput
-from ..v25p_producer import (
-    V25pProducedSample,
-    V25pProducerBindings,
     validate_produced_values,
     validate_producer_bindings,
 )
+from .topology import SIDES
 from .types import UmiPoseMeasurement, UmiSample
 
 
@@ -45,7 +44,7 @@ class UmiV25pProducer:
         self,
         *,
         stream_profile: V25pComponentStreamProfileLike,
-        bindings: V25pProducerBindings,
+        bindings: ComponentStreamBindings,
         component_action_schema: ComponentActionSchema | None = None,
         component_action_projection: ComponentActionProjectionSpec | None = None,
         cut_clock_domain_id: str = "local_wall_time",
@@ -93,8 +92,8 @@ class UmiV25pProducer:
         pose: UmiPoseMeasurement,
         *,
         source_record_id: str,
-    ) -> V25pComponentInput:
-        return V25pComponentInput(
+    ) -> ComponentStreamInput:
+        return ComponentStreamInput(
             values=np.asarray(pose.raw_tcp_pose7, dtype=np.float32),
             effective_at=float(pose.source_timestamp),
             available_at=float(pose.available_timestamp),
@@ -103,7 +102,7 @@ class UmiV25pProducer:
             source_record_id=source_record_id,
         )
 
-    def produce(self, sample: UmiSample) -> V25pProducedSample:
+    def produce(self, sample: UmiSample) -> ProducedComponentSample:
         if sample.arm_action_poses is None:
             raise ValueError(
                 "UMI native action requires the next accepted observation alignment."
@@ -114,9 +113,9 @@ class UmiV25pProducer:
             action_source_timestamp,
             *(float(pose.available_timestamp) for pose in sample.arm_action_poses.values()),
         )
-        values: dict[str, V25pComponentInput] = {}
-        source_by_key: dict[str, V25pComponentInput] = {}
-        for side in ("left", "right"):
+        values: dict[str, ComponentStreamInput] = {}
+        source_by_key: dict[str, ComponentStreamInput] = {}
+        for side in SIDES:
             source_by_key[f"action.pose.{side}"] = self._pose_input(
                 sample.arm_action_poses[side],
                 source_record_id=(
@@ -131,7 +130,7 @@ class UmiV25pProducer:
                     f"{int(sample.frame_index)}:{side}"
                 ),
             )
-            source_by_key[f"action.end_effector.{side}"] = V25pComponentInput(
+            source_by_key[f"action.end_effector.{side}"] = ComponentStreamInput(
                 values=np.asarray([sample.gripper_commands[side]], dtype=np.float32),
                 effective_at=float(sample.timestamp),
                 available_at=float(sample.timestamp),
@@ -151,7 +150,7 @@ class UmiV25pProducer:
                 hand.get("telemetry_snapshot_available_timestamp"),
                 fallback=float(sample.timestamp),
             )
-            source_by_key[f"state.end_effector.{side}"] = V25pComponentInput(
+            source_by_key[f"state.end_effector.{side}"] = ComponentStreamInput(
                 values=np.asarray(
                     [float(hand["gripper_measured_scalar"])], dtype=np.float32
                 ),
@@ -194,7 +193,7 @@ class UmiV25pProducer:
                     projected=projected,
                     profile=self.stream_profile,
                     timing_by_stream={
-                        stream_id: V25pActionComponentTiming(
+                        stream_id: ComponentActionTiming(
                             effective_at=source_by_key[
                                 source_key_by_stream[stream_id]
                             ].effective_at,
@@ -215,7 +214,7 @@ class UmiV25pProducer:
         for value_key, stream_id in self.bindings.stream_id_by_value_key.items():
             if stream_id not in values:
                 values[stream_id] = source_by_key[value_key]
-        produced = V25pProducedSample(
+        produced = ProducedComponentSample(
             sample_index=int(sample.frame_index),
             cut_at=cut_at,
             cut_clock_domain_id=self.cut_clock_domain_id,

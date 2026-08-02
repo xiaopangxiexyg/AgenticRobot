@@ -108,7 +108,7 @@ def _normalized_action_semantic_payload(action: NormalizedAction) -> dict[str, A
     joint targets; diagnostic metadata is detached but deliberately excluded.
     """
 
-    return {
+    payload = {
         "vector": np.asarray(action.vector, dtype=np.float32),
         "arm_joint_targets": {
             str(side): np.asarray(value, dtype=np.float32)
@@ -120,6 +120,11 @@ def _normalized_action_semantic_payload(action: NormalizedAction) -> dict[str, A
             if key in action.metadata
         },
     }
+    if action.arm_hold_prediction is not None:
+        payload["arm_hold_prediction"] = (
+            action.arm_hold_prediction.to_dict()
+        )
+    return payload
 
 
 def _freeze_normalized_action(action: NormalizedAction) -> NormalizedAction:
@@ -139,6 +144,7 @@ def _freeze_normalized_action(action: NormalizedAction) -> NormalizedAction:
         vector=deep_freeze(vector),
         arm_joint_targets=joints,
         metadata=deep_freeze(dict(action.metadata)),
+        arm_hold_prediction=action.arm_hold_prediction,
     )
     object.__setattr__(frozen, "arm_joint_targets", deep_freeze(joints))
     return frozen

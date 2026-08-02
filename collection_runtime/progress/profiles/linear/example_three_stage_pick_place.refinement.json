@@ -1,0 +1,81 @@
+{
+  "schema": "dexteleop.task_refinement_profile.v1",
+  "profile_id": "example_three_stage_pick_place_refinement",
+  "profile_version": "1",
+  "task_progress_profile_hash": "01fc5eef1c512df34279f939cd0b5e56bb44a0238396f2d839c35adf0817b9b9",
+  "boundaries": [
+    {
+      "schema": "dexteleop.refinement_boundary_definition.v1",
+      "progress_step_id": "approach_target",
+      "refinement_boundary_id": "approach_target.alignment_started",
+      "ordinal": 1,
+      "semantics": "ENTER_STAGE",
+      "parent_refinement_boundary_id": null,
+      "eligible_as_exclusion_anchor": false,
+      "certifies_valid_prefix": false,
+      "required_predecessor_boundary_ids": []
+    },
+    {
+      "schema": "dexteleop.refinement_boundary_definition.v1",
+      "progress_step_id": "approach_target",
+      "refinement_boundary_id": "approach_target.pregrasp_reached",
+      "ordinal": 2,
+      "semantics": "COMPLETE_STAGE",
+      "parent_refinement_boundary_id": "approach_target.alignment_started",
+      "eligible_as_exclusion_anchor": false,
+      "certifies_valid_prefix": false,
+      "required_predecessor_boundary_ids": [
+        "approach_target.alignment_started"
+      ]
+    },
+    {
+      "schema": "dexteleop.refinement_boundary_definition.v1",
+      "progress_step_id": "acquire_object",
+      "refinement_boundary_id": "acquire_object.contact_established",
+      "ordinal": 1,
+      "semantics": "ENTER_STAGE",
+      "parent_refinement_boundary_id": null,
+      "eligible_as_exclusion_anchor": false,
+      "certifies_valid_prefix": false,
+      "required_predecessor_boundary_ids": []
+    },
+    {
+      "schema": "dexteleop.refinement_boundary_definition.v1",
+      "progress_step_id": "acquire_object",
+      "refinement_boundary_id": "acquire_object.lift_verified",
+      "ordinal": 2,
+      "semantics": "COMPLETE_STAGE",
+      "parent_refinement_boundary_id": "acquire_object.contact_established",
+      "eligible_as_exclusion_anchor": false,
+      "certifies_valid_prefix": false,
+      "required_predecessor_boundary_ids": [
+        "acquire_object.contact_established"
+      ]
+    },
+    {
+      "schema": "dexteleop.refinement_boundary_definition.v1",
+      "progress_step_id": "place_object",
+      "refinement_boundary_id": "place_object.target_region_reached",
+      "ordinal": 1,
+      "semantics": "ENTER_STAGE",
+      "parent_refinement_boundary_id": null,
+      "eligible_as_exclusion_anchor": false,
+      "certifies_valid_prefix": false,
+      "required_predecessor_boundary_ids": []
+    },
+    {
+      "schema": "dexteleop.refinement_boundary_definition.v1",
+      "progress_step_id": "place_object",
+      "refinement_boundary_id": "place_object.release_verified",
+      "ordinal": 2,
+      "semantics": "COMPLETE_STAGE",
+      "parent_refinement_boundary_id": "place_object.target_region_reached",
+      "eligible_as_exclusion_anchor": false,
+      "certifies_valid_prefix": false,
+      "required_predecessor_boundary_ids": [
+        "place_object.target_region_reached"
+      ]
+    }
+  ],
+  "semantic_content_hash": "a397f44cfc02299111c6b544e970b5bed8651e600931c6b4e0512584738e6b60"
+}

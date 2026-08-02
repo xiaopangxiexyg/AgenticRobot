@@ -27,6 +27,8 @@ from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_QPOS_HAND16_V1,
     BIMANUAL_QPOS_V1,
+    ActionResolutionError,
+    ActionResolutionFailure,
     AuthoritativeCommandDispatchContext,
     AuthoritativeTargetDispatchContext,
     CanonicalDeskToRuntimePoseTransformer,
@@ -247,9 +249,54 @@ class MujocoCoupledPoseToQposResolver:
         }
         result = self.ik.solve(targets)
         if not result.success or result.hold:
-            raise RuntimeError(
-                "Coupled pose IK did not produce an executable qpos target: "
-                f"status={result.status!r} hold={result.hold} message={result.message!r}."
+            metadata = dict(result.metadata or {})
+            failure = dict(metadata.get("failure") or {})
+            reason_code = str(
+                failure.get("code")
+                or (
+                    "resolver_hold"
+                    if result.hold
+                    else "resolver_failed"
+                )
+            ).strip()
+            attempts = tuple(
+                dict(value)
+                for value in metadata.get("collision_check_attempts", ())
+                if isinstance(value, Mapping)
+            )
+            finite_distances = tuple(
+                float(value["distance_m"])
+                for value in attempts
+                if value.get("distance_m") is not None
+                and np.isfinite(float(value["distance_m"]))
+            )
+            diagnostics = {
+                "solver": str(result.solver),
+                "hold": bool(result.hold),
+                "collision_min_distance_m": metadata.get(
+                    "collision_min_distance_m"
+                ),
+                "collision_distance_epsilon_m": metadata.get(
+                    "collision_distance_epsilon_m"
+                ),
+                "hold_reference_distance_m": metadata.get(
+                    "collision_distance_m"
+                ),
+                "best_candidate_distance_m": (
+                    None if not finite_distances else max(finite_distances)
+                ),
+                "collision_attempt_count": len(attempts),
+            }
+            raise ActionResolutionError(
+                ActionResolutionFailure(
+                    reason_code=reason_code,
+                    resolver_status=str(result.status or "unknown"),
+                    message=(
+                        str(result.message).strip()
+                        or "Coupled pose IK produced no executable qpos target."
+                    ),
+                    diagnostics=diagnostics,
+                )
             )
         resolution = self._build_resolution(
             safe_action,
@@ -545,6 +592,8 @@ def build_mujoco_component_execution_target(
     *,
     resolved_at: float,
     output_target_schema_hash: str,
+    component_id_by_output_effector: Mapping[str, str] | None = None,
+    support_only_output_effectors: tuple[str, ...] = (),
 ) -> ComponentExecutionTarget:
     """Build the component-keyed MuJoCo target without a universal safe claim."""
 
@@ -555,22 +604,66 @@ def build_mujoco_component_execution_target(
             "context must be an AuthoritativeTargetDispatchContext."
         )
     output = resolution.output_qpos_action
-    if tuple(output.active_effectors) != context.component_coverage:
-        raise ValueError(
-            "Resolved qpos target must cover the exact authoritative "
-            "component set."
-        )
-    component_values: dict[str, object] = {
+    raw_component_values: dict[str, object] = {
         f"{side}_arm": np.asarray(values, dtype=float).tolist()
         for side, values in output.arm_qpos_by_side.items()
     }
-    component_values.update(
+    raw_component_values.update(
         {
             f"{side}_hand": np.asarray(values, dtype=float).tolist()
             for side, values in output.hand_qpos_by_side.items()
         }
     )
-    if set(component_values) != set(context.component_coverage):
+    output_effectors = tuple(output.active_effectors)
+    if set(raw_component_values) != set(output_effectors):
+        raise ValueError(
+            "Resolved qpos payload and output active-effectors disagree."
+        )
+    support_only = tuple(str(value).strip() for value in support_only_output_effectors)
+    if (
+        any(not value for value in support_only)
+        or len(support_only) != len(set(support_only))
+    ):
+        raise ValueError("support_only_output_effectors must be unique identifiers.")
+    if component_id_by_output_effector is None:
+        output_to_component = {
+            effector: effector for effector in output_effectors
+        }
+    else:
+        output_to_component = {
+            str(effector).strip(): str(component_id).strip()
+            for effector, component_id in dict(
+                component_id_by_output_effector
+            ).items()
+        }
+        if any(
+            not effector or not component_id
+            for effector, component_id in output_to_component.items()
+        ):
+            raise ValueError(
+                "component_id_by_output_effector must contain identifiers."
+            )
+    if set(output_to_component) & set(support_only):
+        raise ValueError(
+            "An output effector cannot be authoritative and support-only."
+        )
+    if set(output_effectors) != set(output_to_component) | set(support_only):
+        raise ValueError(
+            "Every resolved output effector must be explicitly authoritative "
+            "or support-only."
+        )
+    if (
+        len(output_to_component.values())
+        != len(set(output_to_component.values()))
+    ):
+        raise ValueError("Output effectors must map to unique component ids.")
+    authoritative_component_to_output_effector = {
+        component_id: effector
+        for effector, component_id in output_to_component.items()
+    }
+    if set(authoritative_component_to_output_effector) != set(
+        context.component_coverage
+    ):
         raise ValueError(
             "Resolved qpos payload does not exactly cover the target context."
         )
@@ -609,7 +702,15 @@ def build_mujoco_component_execution_target(
             "output_qpos_action_hash": (
                 resolution.output_qpos_action_hash
             ),
-            "component_values": component_values,
+            # These are downstream resolver outputs, not the native source or
+            # composition component values.  Keep the representation edge
+            # explicit so a target-private six-slot hand vector cannot be
+            # mistaken for a physical gripper-qpos component.
+            "output_values_by_effector": raw_component_values,
+            "authoritative_component_to_output_effector": (
+                authoritative_component_to_output_effector
+            ),
+            "support_only_output_effectors": support_only,
             "group_segment_generation_by_group": dict(
                 context.group_segment_generation_by_group
             ),

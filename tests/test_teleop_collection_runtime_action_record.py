@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from teleop_runtime.collection.build_collect_components import CollectorComponents
-from teleop_runtime.collection.async_writer import WriteJob
+from collection_runtime.async_writer import WriteJob
 from teleop_runtime.collection.runtime import CollectionRuntime
 from teleop_runtime.collection.writer_runtime import CollectionWriterRuntime
 from teleop_runtime.diagnostics import TeleopRunState

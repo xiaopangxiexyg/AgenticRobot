@@ -44,6 +44,7 @@ from dataset_contracts.model_continuation import (
     MODEL_CONTINUATION_FLOW_INPAINT_V1,
     MODEL_CONTINUATION_NATIVE_V1,
     MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
+    MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
     MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,
     MODEL_CONTINUATION_SAMPLER_WEIGHTED_V1,
     RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
@@ -52,6 +53,7 @@ from dataset_contracts.model_continuation import (
     ModelContinuationDataContract,
     ModelContinuationDataContractV2,
     ModelContinuationRuntimeContractV2,
+    ModelContinuationTrainingContractV2,
     normalize_model_continuation_contract,
 )
 from robot_motion.action import RobotAction
@@ -461,6 +463,27 @@ def test_inference_only_v2_uses_existing_generic_conditioning_path() -> None:
     assert _request(bundle).conditioning_binding_hash == (
         bundle.conditioning_binding_hash
     )
+
+
+def test_trained_v2_reuses_existing_flow_inpaint_v3_conditioning_path() -> None:
+    legacy = _continuation_contract()
+    contract = ModelContinuationDataContractV2(
+        conditioning_origin=MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
+        runtime=ModelContinuationRuntimeContractV2.from_v1(legacy),
+        training=ModelContinuationTrainingContractV2.from_v1(legacy),
+    )
+    bundle = _bundle(continuation_contract=contract)
+    encoded = encode_rtc_conditioning_bundle(
+        _FakeConditioningCodec(),
+        bundle,
+    )
+
+    assert bundle.continuation_contract is contract
+    assert encoded.receipt.conditioning_binding_hash == (
+        bundle.conditioning_binding_hash
+    )
+    assert encoded.external_prefix.shape == (6, 7)
+    assert encoded.prefix_mask.tolist() == list(bundle.prefix_mask)
 
 
 def test_bundle_rejects_mask_tampering_and_identity_mismatches() -> None:

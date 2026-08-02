@@ -9,6 +9,8 @@ if a caller accidentally copies one into this directory.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import math
 import re
@@ -21,12 +23,14 @@ from project_paths import (
     calibration_profiles_dir,
     control_station_vive_coordinate_profiles_dir,
 )
+from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
 from teleop_runtime.transforms import as_pose_matrix
 
 
 VIVE_COORDINATE_PROFILE_KIND = "control_station_vive_coordinate"
 VIVE_COORDINATE_PROFILE_SCHEMA = "control_station_vive_coordinate_v1"
+LATEST_VIVE_COORDINATE_PROFILE = "latest"
 _PROFILE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _VALID_SIDES = frozenset({"left", "right"})
 
@@ -90,9 +94,90 @@ def new_coordinate_calibration(
             "desk_tracker": str(desk_tracker),
             "home_policy": "session_home_is_not_part_of_coordinate_profile",
             "target_binding_policy": "target_profile_supplies_desk_to_base",
+            "canonical_target_frame_contract_id": (
+                STATION_RETARGET_FRAME_CONTRACT_V1
+            ),
         },
     )
     return calibration
+
+
+def derive_coordinate_calibration(
+    source: TeleopCalibration,
+    *,
+    active_sides: Iterable[str],
+    source_profile_path: str | Path,
+    source_profile_sha256: str | None = None,
+    profile_name: str = "derived_vive_coordinate",
+) -> TeleopCalibration:
+    """Extract only VIVE coordinates from a legacy combined calibration.
+
+    This is a non-mutating migration helper.  Robot/base transforms, workspace
+    limits, qpos, target Home, and captured session Home are intentionally not
+    copied.
+    """
+
+    if not isinstance(source, TeleopCalibration):
+        raise TypeError("source must be TeleopCalibration.")
+    sides = normalize_active_sides(tuple(active_sides))
+    source_path = Path(source_profile_path).expanduser()
+    digest = None if source_profile_sha256 is None else str(source_profile_sha256).strip()
+    if not digest:
+        if not source_path.is_file():
+            raise ValueError(
+                "source_profile_sha256 is required when source_profile_path "
+                "is not a readable file."
+            )
+        hasher = hashlib.sha256()
+        with source_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+    world_to_retarget = source.world_to_vive_retarget_pose()
+    if world_to_retarget is None:
+        raise ValueError("Legacy calibration has no fitted VIVE retarget frame.")
+
+    metadata = dict(source.metadata)
+    result = new_coordinate_calibration(
+        active_sides=sides,
+        left_tracker_name=str(metadata.get("left_tracker_name", "tracker_1")),
+        right_tracker_name=str(metadata.get("right_tracker_name", "tracker_2")),
+        auxiliary_tracker_name=str(
+            metadata.get("auxiliary_tracker_name", metadata.get("aux_tracker_name", ""))
+        ),
+        desk_tracker=str(
+            metadata.get("desk_tracker", metadata.get("virtual_desk_tracker_role", "auto"))
+        ),
+    )
+    result.set_world_to_vive_retarget(world_to_retarget)
+    for side in sides:
+        role = f"{side}_wrist"
+        if role not in source.tracker_offsets:
+            raise ValueError(
+                f"Legacy calibration is missing tracker offset {role}."
+            )
+        result.set_tracker_offset(role, source.tracker_offsets[role])
+    result.metadata.update(
+        {
+            "profile_name": safe_profile_stem(profile_name),
+            "profile_ready": True,
+            "derivation": "coordinate_only_from_legacy_combined_profile",
+            "source_profile_path": str(source_path),
+            "source_profile_sha256": digest,
+            "virtual_desk": copy.deepcopy(metadata.get("virtual_desk", {})),
+            "tracker_offset_calibration": copy.deepcopy(
+                metadata.get("tracker_offset_calibration", {})
+            ),
+            "virtual_desk_post_yaw_deg": metadata.get(
+                "virtual_desk_post_yaw_deg"
+            ),
+            "virtual_desk_sweep_convention_version": metadata.get(
+                "virtual_desk_sweep_convention_version"
+            ),
+        }
+    )
+    validate_coordinate_profile(result)
+    return result
 
 
 def _finite_pose(value: Any, *, field_name: str) -> None:
@@ -120,6 +205,13 @@ def validate_coordinate_profile(
         )
     if metadata.get("profile_schema") != VIVE_COORDINATE_PROFILE_SCHEMA:
         raise ValueError("Unsupported Control Station VIVE coordinate profile schema.")
+    if (
+        metadata.get("canonical_target_frame_contract_id")
+        != STATION_RETARGET_FRAME_CONTRACT_V1
+    ):
+        raise ValueError(
+            "Coordinate profile canonical target-frame contract is unsupported."
+        )
     sides = normalize_active_sides(metadata.get("active_sides", ()))
     if calibration.world_to_desk_pose() is None:
         raise ValueError("Coordinate profile is missing the fitted VIVE frame.")
@@ -185,7 +277,12 @@ def list_coordinate_profiles(root: Path | None = None) -> list[CoordinateProfile
     if not directory.exists():
         return []
     summaries: list[CoordinateProfileSummary] = []
-    for path in sorted(directory.glob("*.json"), key=lambda item: item.name, reverse=True):
+    paths = sorted(
+        directory.glob("*.json"),
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )
+    for path in paths:
         try:
             calibration = TeleopCalibration.load_json(path)
             sides = validate_coordinate_profile(calibration, path=path)
@@ -255,7 +352,21 @@ def load_coordinate_profile(
     root: Path | None = None,
 ) -> tuple[TeleopCalibration, Path]:
     directory = _profile_root(root)
-    path = _profile_path(directory, name_or_path)
+    requested = str(name_or_path).strip()
+    if requested.lower() == LATEST_VIVE_COORDINATE_PROFILE:
+        valid_profiles = [
+            summary
+            for summary in list_coordinate_profiles(directory)
+            if summary.valid
+        ]
+        if not valid_profiles:
+            raise FileNotFoundError(
+                "No valid Control Station VIVE coordinate profile is "
+                f"available in {directory}."
+            )
+        path = Path(valid_profiles[0].path)
+    else:
+        path = _profile_path(directory, name_or_path)
     if not path.exists() and not Path(name_or_path).is_absolute():
         stem = safe_profile_stem(str(name_or_path))
         candidates = sorted(
@@ -292,15 +403,22 @@ def coordinate_profile_view(calibration: TeleopCalibration) -> dict[str, Any]:
         "virtual_desk": metadata.get("virtual_desk", {}),
         "tracker_offset_calibration": metadata.get("tracker_offset_calibration", {}),
         "target_binding_policy": metadata.get("target_binding_policy", ""),
+        "canonical_target_frame_contract_id": metadata.get(
+            "canonical_target_frame_contract_id",
+            "",
+        ),
         "home_policy": metadata.get("home_policy", ""),
     }
 
 
 __all__ = [
     "CoordinateProfileSummary",
+    "LATEST_VIVE_COORDINATE_PROFILE",
+    "STATION_RETARGET_FRAME_CONTRACT_V1",
     "VIVE_COORDINATE_PROFILE_KIND",
     "VIVE_COORDINATE_PROFILE_SCHEMA",
     "coordinate_profile_view",
+    "derive_coordinate_calibration",
     "list_coordinate_profiles",
     "load_coordinate_profile",
     "new_coordinate_calibration",

@@ -996,6 +996,14 @@ def build_episode_recording_runtime(
                     _log("Dataset", native_message, now=now)
                     if control_ui is not None:
                         control_ui.append_message("Dataset", native_message)
+                if task.progress_error:
+                    progress_message = (
+                        f"episode {task.episode_index} 的正式数据已保存，但 "
+                        f"collection progress 未完整封存：{task.progress_error}"
+                    )
+                    _log("Dataset", progress_message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", progress_message)
             else:
                 message = f"正式数据集 episode {task.episode_index} 保存失败: {task.error}"
                 _log("Dataset", message, now=now)

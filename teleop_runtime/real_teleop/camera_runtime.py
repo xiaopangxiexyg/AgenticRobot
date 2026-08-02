@@ -6,11 +6,11 @@ import argparse
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Protocol
 
 from hardware.realsense.color import normalize_color_format
 from robot_motion.runtime import run_best_effort_cleanup
 
-from ..gui.startup_progress import GuiStartupProgress
 from ..log_utils import log_event as _log
 from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_map
 from .wrist_depth_freshness import (
@@ -21,6 +21,30 @@ from .wrist_depth_freshness import (
 
 
 CAMERA_START_STAGGER_SEC = 0.5
+
+
+class CameraStartupProgress(Protocol):
+    """Narrow presentation port accepted by camera lifecycle helpers."""
+
+    def begin(
+        self,
+        key: str,
+        *,
+        label: str,
+        message: str,
+        requirement: str = "feature_dependent",
+    ) -> None: ...
+
+    def update(self, key: str, *, message: str) -> None: ...
+
+    def succeed(self, key: str, *, message: str = "连接完成") -> None: ...
+
+    def fail(self, key: str, error: str, *, message: str = "连接失败") -> None: ...
+
+
+def _camera_warmup_policy(source: object) -> str:
+    config = getattr(source, "config", None)
+    return str(getattr(config, "startup_warmup_policy", "unknown"))
 
 
 def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSource]:
@@ -54,7 +78,15 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
     requested_color_format = normalize_color_format(
         str(getattr(args, "camera_color_format", "bgr8") or "bgr8").strip().lower()
     )
+    requested_warmup_policy = str(
+        getattr(args, "camera_startup_warmup_policy", "legacy") or "legacy"
+    ).strip().lower()
     for camera_key, config in camera_configs.items():
+        configured_warmup_policy = str(config.startup_warmup_policy)
+        config.startup_warmup_policy = requested_warmup_policy
+        config.metadata = dict(config.metadata)
+        config.metadata["configured_startup_warmup_policy"] = configured_warmup_policy
+        config.metadata["real_teleop_startup_warmup_policy"] = requested_warmup_policy
         configured_color_format = str(config.color_format)
         if configured_color_format != requested_color_format:
             config.metadata = dict(config.metadata)
@@ -161,8 +193,11 @@ def _start_camera_sources(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
     stagger_sec: float = CAMERA_START_STAGGER_SEC,
-    startup_progress: GuiStartupProgress | None = None,
+    startup_progress: CameraStartupProgress | None = None,
 ) -> None:
+    batch_started = time.perf_counter()
+    source_elapsed_sec: dict[str, float] = {}
+    stagger_elapsed_sec = 0.0
     for index, (camera_key, source) in enumerate(camera_sources.items()):
         progress_key = f"camera.{camera_key}"
         if startup_progress is not None:
@@ -178,7 +213,9 @@ def _start_camera_sources(
             )
         if index > 0 and float(stagger_sec) > 0.0:
             _log("Camera", f"waiting {float(stagger_sec):.2f}s before starting camera {camera_key}")
+            stagger_started = time.perf_counter()
             time.sleep(float(stagger_sec))
+            stagger_elapsed_sec += time.perf_counter() - stagger_started
             if startup_progress is not None:
                 startup_progress.update(progress_key, message="正在启动视频流")
         _log("Camera", f"starting camera {camera_key}")
@@ -186,31 +223,48 @@ def _start_camera_sources(
         try:
             source.start()
         except Exception as exc:
+            source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             if startup_progress is not None:
                 startup_progress.fail(
                     progress_key,
                     f"{type(exc).__name__}: {exc}",
                 )
+            _log_camera_startup_batch_timing(
+                batch_started=batch_started,
+                source_elapsed_sec=source_elapsed_sec,
+                stagger_elapsed_sec=stagger_elapsed_sec,
+                failed_camera=str(camera_key),
+            )
             raise
         else:
+            source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             _log(
                 "Camera",
                 f"camera {camera_key} video stream ready; "
-                f"source_start_elapsed={(time.perf_counter() - start_started):.3f}s "
+                f"source_start_elapsed={source_elapsed_sec[str(camera_key)]:.3f}s "
+                f"warmup_policy={_camera_warmup_policy(source)} "
                 f"stages={getattr(source, 'startup_timing', {})}",
             )
             if startup_progress is not None:
                 startup_progress.succeed(progress_key, message="视频流已启动")
+    _log_camera_startup_batch_timing(
+        batch_started=batch_started,
+        source_elapsed_sec=source_elapsed_sec,
+        stagger_elapsed_sec=stagger_elapsed_sec,
+    )
 
 
 def _start_camera_sources_best_effort(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
     stagger_sec: float = CAMERA_START_STAGGER_SEC,
-    startup_progress: GuiStartupProgress | None = None,
+    startup_progress: CameraStartupProgress | None = None,
 ) -> dict[str, str]:
     """Attempt every configured camera without making cameras a GUI gate."""
     errors: dict[str, str] = {}
+    batch_started = time.perf_counter()
+    source_elapsed_sec: dict[str, float] = {}
+    stagger_elapsed_sec = 0.0
     for index, (camera_key, source) in enumerate(camera_sources.items()):
         progress_key = f"camera.{camera_key}"
         if startup_progress is not None:
@@ -226,7 +280,9 @@ def _start_camera_sources_best_effort(
             )
         if index > 0 and float(stagger_sec) > 0.0:
             _log("Camera", f"waiting {float(stagger_sec):.2f}s before starting camera {camera_key}")
+            stagger_started = time.perf_counter()
             time.sleep(float(stagger_sec))
+            stagger_elapsed_sec += time.perf_counter() - stagger_started
             if startup_progress is not None:
                 startup_progress.update(progress_key, message="正在启动视频流")
         _log("Camera", f"starting camera {camera_key}")
@@ -234,21 +290,53 @@ def _start_camera_sources_best_effort(
         try:
             source.start()
         except Exception as exc:  # noqa: BLE001 - optional-device admission records failure.
+            source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             detail = f"{type(exc).__name__}: {exc}"
             errors[str(camera_key)] = detail
             _log("Camera", f"WARNING: camera {camera_key} unavailable: {detail}")
             if startup_progress is not None:
                 startup_progress.fail(progress_key, detail)
         else:
+            source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             _log(
                 "Camera",
                 f"camera {camera_key} video stream ready; "
-                f"source_start_elapsed={(time.perf_counter() - start_started):.3f}s "
+                f"source_start_elapsed={source_elapsed_sec[str(camera_key)]:.3f}s "
+                f"warmup_policy={_camera_warmup_policy(source)} "
                 f"stages={getattr(source, 'startup_timing', {})}",
             )
             if startup_progress is not None:
                 startup_progress.succeed(progress_key, message="视频流已启动")
+    _log_camera_startup_batch_timing(
+        batch_started=batch_started,
+        source_elapsed_sec=source_elapsed_sec,
+        stagger_elapsed_sec=stagger_elapsed_sec,
+        failed_camera=",".join(sorted(errors)) if errors else None,
+    )
     return errors
+
+
+def _log_camera_startup_batch_timing(
+    *,
+    batch_started: float,
+    source_elapsed_sec: Mapping[str, float],
+    stagger_elapsed_sec: float,
+    failed_camera: str | None = None,
+) -> None:
+    """Emit one compact receipt for the deliberately serial startup policy."""
+    total_sec = max(0.0, time.perf_counter() - float(batch_started))
+    source_total_sec = sum(max(0.0, float(value)) for value in source_elapsed_sec.values())
+    per_camera = ",".join(
+        f"{key}:{float(value):.3f}s" for key, value in source_elapsed_sec.items()
+    ) or "none"
+    failure_text = f" failed={failed_camera}" if failed_camera else ""
+    _log(
+        "CameraTiming",
+        "serial_start "
+        f"total={total_sec:.3f}s source_start_sum={source_total_sec:.3f}s "
+        f"stagger_wait={max(0.0, float(stagger_elapsed_sec)):.3f}s "
+        f"per_camera={{{per_camera}}}{failure_text}",
+    )
 
 
 def _close_camera_sources(camera_sources: Mapping[str, RealSenseRGBSource]) -> None:

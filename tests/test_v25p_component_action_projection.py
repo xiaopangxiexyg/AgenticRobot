@@ -40,10 +40,10 @@ from robot_motion.action import (
     ComponentActionSchema,
     ControlComponentSpecV2,
 )
-from teleop_runtime.collection.v25p_component_action import (
+from collection_runtime.v25p_component_action import (
     attach_projected_component_action_timing,
 )
-from teleop_runtime.collection.v25p_native_store import (
+from collection_runtime.v25p_native_store import (
     V25pComponentInput,
     V25pNativeEpisodeStore,
 )

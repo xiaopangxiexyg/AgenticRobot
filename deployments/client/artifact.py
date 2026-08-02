@@ -68,6 +68,16 @@ def deploy_contract_from_policy_artifact(
         active_sides=active_sides,
         required_camera_slots=camera_slots,
         hand_layout=None,
+        arm_hold_output_key=(
+            None
+            if artifact.arm_hold_output is None
+            else artifact.arm_hold_output.output_key
+        ),
+        arm_hold_output_contract_hash=(
+            None
+            if artifact.arm_hold_output is None
+            else artifact.arm_hold_output.contract_hash
+        ),
     )
 
 

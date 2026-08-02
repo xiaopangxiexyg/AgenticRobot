@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
+import pytest
 
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from sim.contracts import TimingSpec
@@ -158,3 +162,37 @@ def test_mujoco_position_rig_rejects_partial_bimanual_reference() -> None:
         assert "atomic qref" in str(exc)
     else:
         raise AssertionError("partial bimanual reference must be rejected")
+
+
+def test_mujoco_position_rig_close_does_not_wait_on_live_worker_lock() -> None:
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            worker_join_timeout_sec=0.01,
+        ),
+    )
+    rig.start()
+    release = threading.Event()
+    worker = threading.Thread(
+        target=release.wait,
+        daemon=True,
+        name="synthetic-stuck-mujoco-worker",
+    )
+    worker.start()
+    rig._worker = worker
+
+    started_at = time.monotonic()
+    with pytest.raises(TimeoutError, match="did not stop"):
+        rig.close()
+    assert time.monotonic() - started_at < 0.5
+    assert rig._worker is worker
+
+    release.set()
+    worker.join(timeout=1.0)
+    rig.close()
+    assert rig._worker is None

@@ -43,9 +43,14 @@ from sim.mujoco.deploy.deployment_observation import (
     MujocoDeploymentObservationConfig,
 )
 from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+from sim.mujoco.tasks.cube_lift.action_conditioning import (
+    CubeLiftActionConditioner,
+    CubeLiftFingerContactObserver,
+)
 from sim.mujoco.tasks.cube_lift.spec import (
     CubeLiftActionSpec,
     CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION,
+    CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION,
     CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION,
 )
 
@@ -77,14 +82,60 @@ def _arm_base_body_name(scene: Any, side: str) -> str:
     raise KeyError(f"Could not resolve {side} arm base body; tried={candidates}.")
 
 
+def validate_temp_ppo_hil_profile(
+    task_config: CubeLiftTaskConfig,
+    policy: Any,
+) -> None:
+    """Validate the task/checkpoint pair without constructing devices or motion."""
+
+    if not task_config.uses_pose_action:
+        raise ValueError("Temporary PPO Sim-HIL requires a pose-action task.")
+    if task_config.action_layout != CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION:
+        raise ValueError("Temporary PPO task action layout is not the pose layout.")
+    supported_layout_dims = {
+        CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION: 28,
+        CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION: 35,
+    }
+    expected_observation_dim = supported_layout_dims.get(
+        task_config.observation_layout
+    )
+    if expected_observation_dim is None:
+        raise ValueError(
+            "Temporary PPO Sim-HIL requires a supported no-episode-clock "
+            "motion-tracking observation."
+        )
+    if (
+        task_config.observation_dim != expected_observation_dim
+        or task_config.action_dim != 7
+    ):
+        raise ValueError(
+            "Temporary PPO task dimensions do not match its declared "
+            "observation layout."
+        )
+    if (
+        int(policy.observation_dim) != expected_observation_dim
+        or int(policy.action_dim) != 7
+    ):
+        raise ValueError(
+            "Selected PPO checkpoint dimensions do not match the task "
+            "observation layout."
+        )
+    if int(policy.environment_action_dim) != 7:
+        raise ValueError(
+            "Temporary PPO checkpoint environment action dim must be 7."
+        )
+
+
 class TempPPOHILObservationAdapter:
-    """Project the shared MuJoCo observation into the checkpoint's 28-D state.
+    """Project the shared MuJoCo observation into a supported task-local state.
 
     The shared deployment observation remains 38-D so it can pass the common
-    observation firewall.  The task-local 28-D PPO state is stored in its
-    prefix and the predictor explicitly consumes that prefix.  Target-error
+    observation firewall.  The task-local 28-D or 35-D PPO state is stored in
+    its prefix and the predictor explicitly consumes that prefix.  Target-error
     fields are zeroed because reconstructing the old CubeLift internal qpos
     target before composition would introduce the forbidden second IK owner.
+    Motion deltas advance only on policy-cadence samples, not on every faster
+    Control Station composition tick.
     """
 
     def __init__(
@@ -116,7 +167,12 @@ class TempPPOHILObservationAdapter:
             raise ValueError("Temporary PPO last action must be finite 7-D.")
         self._last_compact_action = values.copy()
 
-    def capture(self, *, step_index: int | None = None) -> DeploymentObservation:
+    def capture(
+        self,
+        *,
+        step_index: int | None = None,
+        commit_policy_history: bool = True,
+    ) -> DeploymentObservation:
         base_observation = self.base.capture(step_index=step_index)
         measured_qpos = np.asarray(
             self.scene.get_arm_qpos("right"), dtype=np.float32
@@ -139,19 +195,34 @@ class TempPPOHILObservationAdapter:
             if self._previous_close is None
             else self._previous_close
         )
-        state28 = np.zeros(28, dtype=np.float32)
-        state28[:6] = measured_qpos
-        state28[6] = measured_close
-        state28[7:13] = measured_qpos - previous_qpos
-        state28[13] = measured_close - previous_close
+        compact_dim = int(self.task_config.observation_dim)
+        compact_state = np.zeros(compact_dim, dtype=np.float32)
+        compact_state[:6] = measured_qpos
+        compact_state[6] = measured_close
+        compact_state[7:13] = measured_qpos - previous_qpos
+        compact_state[13] = measured_close - previous_close
         # 14:20 and 20 are the historical target-error fields.  They remain
         # explicit zero fallbacks until a post-composition target is available.
-        state28[21:28] = self._last_compact_action
-        self._previous_qpos = measured_qpos.copy()
-        self._previous_close = measured_close
+        compact_state[21:28] = self._last_compact_action
+        if (
+            self.task_config.observation_layout
+            == CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION
+        ):
+            cube_pose = np.asarray(
+                self.scene.freejoint_qpos(
+                    self.task_config.object_freejoint_name
+                ),
+                dtype=np.float32,
+            ).reshape(-1)
+            if cube_pose.shape != (7,) or not np.all(np.isfinite(cube_pose)):
+                raise ValueError("MuJoCo cube freejoint pose is not finite 7-D.")
+            compact_state[28:35] = cube_pose
+        if commit_policy_history:
+            self._previous_qpos = measured_qpos.copy()
+            self._previous_close = measured_close
 
         state = np.zeros(38, dtype=np.float32)
-        state[:28] = state28
+        state[:compact_dim] = compact_state
         state_valid = np.ones(38, dtype=bool)
         metadata = dict(base_observation.metadata)
         metadata.update(
@@ -164,9 +235,12 @@ class TempPPOHILObservationAdapter:
                     "target_error_not_reconstructed_without_precomposition_ik"
                 ),
                 "policy_observation_layout": (
-                    CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION
+                    self.task_config.observation_layout
                 ),
-                "policy_observation_dim": 28,
+                "policy_observation_dim": compact_dim,
+                "policy_observation_history_committed": bool(
+                    commit_policy_history
+                ),
                 "policy_observation_compact_last_action": (
                     self._last_compact_action.copy()
                 ),
@@ -175,9 +249,16 @@ class TempPPOHILObservationAdapter:
         state_dict = dict(base_observation.state_dict)
         state_dict.update(
             {
-                "temp_ppo_state": state28.copy(),
+                "temp_ppo_state": compact_state.copy(),
                 "right_target_error": np.zeros(6, dtype=np.float32),
                 "right_gripper_target_error": 0.0,
+                **(
+                    {
+                        "cube_pose": compact_state[28:35].copy(),
+                    }
+                    if compact_dim == 35
+                    else {}
+                ),
             }
         )
         return replace(
@@ -224,10 +305,20 @@ class _TempPPOAbsolutePoseDecoder:
         scene: Any,
         task_config: CubeLiftTaskConfig,
         observation_adapter: TempPPOHILObservationAdapter,
+        *,
+        task_initialization_info: Mapping[str, object],
+        scene_capture: Callable[[Callable[[Any], object]], object] | None = None,
     ) -> None:
         self.scene = scene
         self.task_config = task_config
         self.observation_adapter = observation_adapter
+        if scene_capture is not None and not callable(scene_capture):
+            raise TypeError("scene_capture must be callable or None.")
+        self._scene_capture = (
+            (lambda capture: capture(self.scene))
+            if scene_capture is None
+            else scene_capture
+        )
         from robot_motion.rm65 import endpoint_to_tool_transform, load_rm65_tool_profile
 
         self._endpoint_to_tool = endpoint_to_tool_transform(
@@ -237,10 +328,34 @@ class _TempPPOAbsolutePoseDecoder:
             layout_version=task_config.action_layout
         )
         self._right_hand_spec = HandActionSpec.dmtac_gripper("right")
+        initialization = dict(task_initialization_info)
+        self._scripted_pregrasp_reset_applied = bool(
+            initialization.get("scripted_pregrasp_reset", False)
+        )
+        self._scripted_contact_reset_applied = bool(
+            initialization.get("scripted_contact_reset", False)
+        )
+        if (
+            self._scripted_pregrasp_reset_applied
+            != bool(task_config.scripted_pregrasp_reset)
+            or self._scripted_contact_reset_applied
+            != bool(task_config.scripted_contact_reset)
+        ):
+            raise ValueError(
+                "Temporary PPO source initialization does not match the "
+                "task-declared scripted reset semantics."
+            )
+        self._action_conditioner = CubeLiftActionConditioner(task_config)
+        self._contact_observer = (
+            CubeLiftFingerContactObserver(scene, task_config)
+            if task_config.post_contact_phase_enabled
+            else None
+        )
         self._target_pose_arm_base: np.ndarray | None = None
         self._target_gripper_close: float | None = None
 
     def reset(self) -> None:
+        self._action_conditioner.reset()
         self._target_pose_arm_base = None
         self._target_gripper_close = None
 
@@ -258,8 +373,43 @@ class _TempPPOAbsolutePoseDecoder:
         action: Sequence[float] | np.ndarray,
         observation: DeploymentObservation,
     ) -> NormalizedAction:
+        # The model inference has already completed.  Capture only the short
+        # read/conditioning/decode section under the downstream scene owner;
+        # never hold the MuJoCo lock while running the policy network.
+        return self._scene_capture(
+            lambda _scene: self._decode_from_captured_scene(
+                action,
+                observation,
+            )
+        )
+
+    def _decode_from_captured_scene(
+        self,
+        action: Sequence[float] | np.ndarray,
+        observation: DeploymentObservation,
+    ) -> NormalizedAction:
         del observation
-        values = self._action_spec.coerce(action)
+        requested_values = self._action_spec.coerce(action)
+        left_contact, right_contact = (
+            (False, False)
+            if self._contact_observer is None
+            else self._contact_observer.observe()
+        )
+        conditioning = self._action_conditioner.condition(
+            requested_values,
+            left_finger_contact=left_contact,
+            right_finger_contact=right_contact,
+            measured_gripper_close=self.scene.get_gripper_close(
+                self.task_config.right_gripper_name
+            ),
+            scripted_pregrasp_reset_applied=(
+                self._scripted_pregrasp_reset_applied
+            ),
+            scripted_contact_reset_applied=(
+                self._scripted_contact_reset_applied
+            ),
+        )
+        values = conditioning.values
         if self._target_pose_arm_base is None:
             self._target_pose_arm_base = self._current_tool_pose_arm_base()
         if self._target_gripper_close is None:
@@ -325,6 +475,26 @@ class _TempPPOAbsolutePoseDecoder:
             "action_protocol": "robot_action_v1",
             "policy_action_layout": CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION,
             "observation_target_error_source": "measured_qpos_zero_fallback_v1",
+            "policy_requested_action": requested_values.copy(),
+            "policy_conditioned_action": values.copy(),
+            "scripted_pregrasp_action_modified": (
+                conditioning.scripted_pregrasp_modified
+            ),
+            "scripted_contact_action_modified": (
+                conditioning.scripted_contact_modified
+            ),
+            "post_contact_phase_active": (
+                conditioning.post_contact_phase_active
+            ),
+            "post_contact_phase_action_modified": (
+                conditioning.post_contact_modified
+            ),
+            "post_contact_phase_contact_steps": (
+                conditioning.post_contact_phase_contact_steps
+            ),
+            "post_contact_phase_loss_steps": (
+                conditioning.post_contact_phase_loss_steps
+            ),
         }
         self.observation_adapter.set_last_compact_action(values)
         self.observation_adapter.base.set_last_action(vector)
@@ -389,10 +559,20 @@ class TempPPOHILPolicySource:
         device: str = "auto",
         monotonic_clock: Callable[[], float] = time.monotonic,
         allow_task_config_mismatch: bool = False,
+        task_initialization_info: Mapping[str, object] | None = None,
+        downstream_target_lead_sec: float | None = None,
+        scene_capture: Callable[[Callable[[Any], object]], object] | None = None,
     ) -> None:
         if not callable(monotonic_clock):
             raise TypeError("monotonic_clock must be callable.")
+        if scene_capture is not None and not callable(scene_capture):
+            raise TypeError("scene_capture must be callable or None.")
         self.scene = scene
+        self._scene_capture = (
+            (lambda capture: capture(self.scene))
+            if scene_capture is None
+            else scene_capture
+        )
         self.checkpoint_path = Path(checkpoint_path)
         self.task_config_path = Path(task_config_path)
         self.clock = monotonic_clock
@@ -407,6 +587,22 @@ class TempPPOHILPolicySource:
             allow_mismatch=allow_task_config_mismatch,
         )
         self._validate_profile()
+        initialization = (
+            {
+                "scripted_pregrasp_reset": False,
+                "scripted_contact_reset": False,
+            }
+            if task_initialization_info is None
+            else dict(task_initialization_info)
+        )
+        if (
+            self.task_config.scripted_pregrasp_reset
+            or self.task_config.scripted_contact_reset
+        ) and task_initialization_info is None:
+            raise ValueError(
+                "A task with scripted reset semantics requires explicit "
+                "task_initialization_info from the simulator target."
+            )
         hand_spec = HandActionSpec.dmtac_gripper("right")
         arm_spec = ArmActionSpec.tool_tcp(
             "right", reference_frame="right_arm_base"
@@ -440,9 +636,32 @@ class TempPPOHILPolicySource:
             scene, self.task_config, base_observation
         )
         self.decoder = _TempPPOAbsolutePoseDecoder(
-            scene, self.task_config, self.observation_adapter
+            scene,
+            self.task_config,
+            self.observation_adapter,
+            task_initialization_info=initialization,
+            scene_capture=self._scene_capture,
         )
         period = float(self.task_config.policy_period_sec)
+        downstream_lead = (
+            0.0
+            if downstream_target_lead_sec is None
+            else _finite_time(
+                downstream_target_lead_sec,
+                name="downstream_target_lead_sec",
+            )
+        )
+        if downstream_lead < 0.0:
+            raise ValueError(
+                "downstream_target_lead_sec must be non-negative."
+            )
+        # This single-step source has no guaranteed successor.  Keep the last
+        # admitted action through one bounded CPU inference/IK tail; longer
+        # stalls still expire and enter the existing HOLD path.
+        self._maximum_hold_sec = max(
+            0.25,
+            2.0 * period + downstream_lead,
+        )
         runtime_config = PolicyDeployRuntimeConfig(
             active_sides=("right",),
             arms_enabled=True,
@@ -452,7 +671,12 @@ class TempPPOHILPolicySource:
             policy_node_id=str(policy_node_id),
             policy_clock_domain_id=str(policy_clock_domain_id),
             action_keyframe_period_sec=period,
-            action_maximum_hold_sec=period,
+            # A one-step policy has no guaranteed successor to interpolate.
+            # Keep the current step valid across the next inference period
+            # plus one downstream scheduling horizon; this is hold-last
+            # fallback, not future-action prediction.
+            action_maximum_hold_sec=self._maximum_hold_sec,
+            extend_final_keyframe_to_maximum_hold=True,
             action_chunk_execution_steps=1,
             policy_observation_binding_id="temp_ppo_hil_v1",
         )
@@ -479,25 +703,7 @@ class TempPPOHILPolicySource:
         self._last_error: str | None = None
 
     def _validate_profile(self) -> None:
-        if not self.task_config.uses_pose_action:
-            raise ValueError("Temporary PPO Sim-HIL requires a pose-action task.")
-        if self.task_config.action_layout != CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION:
-            raise ValueError("Temporary PPO task action layout is not the pose layout.")
-        if (
-            self.task_config.observation_layout
-            != CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION
-        ):
-            raise ValueError(
-                "Temporary PPO Sim-HIL requires the 28-D no-episode-clock observation."
-            )
-        if self.task_config.observation_dim != 28 or self.task_config.action_dim != 7:
-            raise ValueError("Temporary PPO Sim-HIL requires task dimensions 28 -> 7.")
-        if self.policy.observation_dim != 28 or self.policy.action_dim != 7:
-            raise ValueError(
-                "Selected PPO checkpoint must have policy dimensions 28 -> 7."
-            )
-        if self.policy.environment_action_dim != 7:
-            raise ValueError("Temporary PPO checkpoint environment action dim must be 7.")
+        validate_temp_ppo_hil_profile(self.task_config, self.policy)
 
     @property
     def started(self) -> bool:
@@ -518,6 +724,10 @@ class TempPPOHILPolicySource:
     @property
     def policy_period_sec(self) -> float:
         return float(self.task_config.policy_period_sec)
+
+    @property
+    def maximum_hold_sec(self) -> float:
+        return self._maximum_hold_sec
 
     def start(self) -> None:
         if self._started:
@@ -555,13 +765,23 @@ class TempPPOHILPolicySource:
     ) -> PolicyActionEmission | None:
         if not self._started:
             raise RuntimeError("TempPPOHILPolicySource.start() is required.")
-        observation = self.observation_adapter.capture(step_index=step_index)
-        timestamp = observation.timestamp if now is None else _finite_time(now, name="now")
-        if self.runtime.should_predict(
+        timestamp = (
+            _finite_time(self.clock(), name="clock")
+            if now is None
+            else _finite_time(now, name="now")
+        )
+        prediction_due = self.runtime.should_predict(
             now=timestamp,
             policy_interval_s=self.policy_period_sec,
             min_action_queue=0,
-        ):
+        )
+        observation = self._scene_capture(
+            lambda _scene: self.observation_adapter.capture(
+                step_index=step_index,
+                commit_policy_history=prediction_due,
+            )
+        )
+        if prediction_due:
             result = self.runtime.predict_and_queue(
                 self._model,
                 observation,
@@ -601,6 +821,13 @@ class TempPPOHILPolicySource:
         age = None
         if self._last_emission is not None:
             age = float(timestamp) - float(self._last_emission.emitted_at)
+        lineage = getattr(self._last_prediction_result, "chunk_lineage", None)
+        inference_duration = (
+            None
+            if lineage is None
+            else float(lineage.inference_completed_at)
+            - float(lineage.inference_started_at)
+        )
         return {
             "source_id": TEMP_PPO_HIL_POLICY_ID_V1,
             "started": self._started,
@@ -612,6 +839,7 @@ class TempPPOHILPolicySource:
             "policy_period_sec": self.policy_period_sec,
             "queue_length": self.runtime.action_queue_length(),
             "last_emission_age_sec": age,
+            "last_inference_duration_sec": inference_duration,
             "last_error": self._last_error,
             "unused_action_components": [],
             "policy_hand_control": "right_gripper_delta_to_absolute_qpos_v1",
@@ -624,4 +852,5 @@ __all__ = [
     "TEMP_PPO_HIL_POLICY_ID_V1",
     "TempPPOHILObservationAdapter",
     "TempPPOHILPolicySource",
+    "validate_temp_ppo_hil_profile",
 ]

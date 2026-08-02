@@ -126,6 +126,7 @@ class DatasetVideoJob:
     relative_path: str
     source_path: Path
     output_path: Path
+    expected_frame_count: int
     intrinsics: CameraIntrinsics
 
 
@@ -227,6 +228,16 @@ def _parse_episode_filter(episodes: Sequence[int] | None) -> set[int] | None:
     return {int(value) for value in episodes}
 
 
+def _expected_video_frames(record: Mapping[str, Any], *, max_frames: int) -> int:
+    try:
+        frame_count = int(record.get("frame_count"))
+    except (TypeError, ValueError):
+        frame_count = 0
+    if int(max_frames) > 0:
+        return int(max_frames) if frame_count <= 0 else min(frame_count, int(max_frames))
+    return max(0, frame_count)
+
+
 def undistort_dataset(
     source_root: str | Path,
     output_root: str | Path,
@@ -260,6 +271,10 @@ def undistort_dataset(
     if not selected_records:
         raise ValueError("no episodes selected from meta/episodes.jsonl")
     video_paths = _video_paths_from_records(selected_records)
+    records_by_episode = {
+        int(record["episode_index"]): record
+        for record in selected_records
+    }
 
     jobs_to_run: list[DatasetVideoJob] = []
     for (episode_index, camera_key), relative_path in sorted(video_paths.items()):
@@ -275,11 +290,25 @@ def undistort_dataset(
                 relative_path=relative_path,
                 source_path=source_path,
                 output_path=output_root / relative_path,
+                expected_frame_count=_expected_video_frames(
+                    records_by_episode[episode_index],
+                    max_frames=max_frames,
+                ),
                 intrinsics=intrinsics_by_camera[camera_key],
             )
         )
     if not jobs_to_run:
         raise ValueError(f"no videos found for selected cameras: {', '.join(selected_cameras)}")
+    missing_frame_contract = [
+        f"episode={job.episode_index},camera={job.camera_key}"
+        for job in jobs_to_run
+        if job.expected_frame_count <= 0
+    ]
+    if missing_frame_contract:
+        raise ValueError(
+            "selected videos have no positive frame_count contract: "
+            + ", ".join(missing_frame_contract[:8])
+        )
 
     processed_relative_paths = {job.relative_path for job in jobs_to_run}
     _clone_non_video_files(source_root, output_root, copy_mode=copy_mode, overwrite=overwrite)
@@ -300,6 +329,7 @@ def undistort_dataset(
             codec=codec,
             size_policy=size_policy,  # type: ignore[arg-type]
             max_frames=max_frames,
+            expected_frame_count=job.expected_frame_count,
             overwrite=True,
         )
 

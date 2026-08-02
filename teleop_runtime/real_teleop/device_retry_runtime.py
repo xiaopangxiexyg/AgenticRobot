@@ -6,6 +6,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .foot_pad_controls import (
+    apply_live_foot_pad_topology,
+    foot_pad_progress_topology_guidance,
+)
+
 
 @dataclass(frozen=True)
 class DeviceRetryRuntime:
@@ -38,6 +43,7 @@ def build_device_retry_runtime(
     has_dmtac_gripper_backend: Callable[[Any], bool],
     promote_angle_trigger_gripper_input_to_q6: Callable[..., tuple[bool, str]],
     log: Callable[..., None],
+    publish_camera_status: Callable[[], None] | None = None,
 ) -> DeviceRetryRuntime:
     RealTeleopDatasetRecorder = dataset_recorder_type
     DMTacGripperBackend = dmtac_gripper_backend_type
@@ -214,6 +220,7 @@ def build_device_retry_runtime(
             publish_runtime_hardware_status()
             return
         q6_retry_handled = False
+        camera_retry_attempted = False
         if (
             str(getattr(components, "gripper_input_source", "") or "")
             == "angle_trigger"
@@ -279,6 +286,7 @@ def build_device_retry_runtime(
                         if state.get("current_qpos") is None:
                             raise RuntimeError("hardware returned no current_qpos")
                 elif key.startswith("camera.") and key.split(".", 1)[1] in camera_sources:
+                    camera_retry_attempted = True
                     camera = camera_sources[key.split(".", 1)[1]]
                     camera.close()
                     camera.start()
@@ -317,6 +325,17 @@ def build_device_retry_runtime(
                         raise RuntimeError("required VIVE clock sync is still not ready")
                 elif key == "foot_pad":
                     replacement = FootPadSpecialArmInput.open_online()
+                    try:
+                        live_count = int(
+                            getattr(replacement, "foot_pad_count", 0) or 0
+                        )
+                        live_mode = apply_live_foot_pad_topology(
+                            args,
+                            live_count,
+                        )
+                    except Exception:
+                        replacement.close()
+                        raise
                     if foot_pad_input is not None:
                         foot_pad_input.close()
                     # Keep the runtime provider and the control-input object
@@ -342,6 +361,15 @@ def build_device_retry_runtime(
                     clutch_input._foot_pad_test_seen_events = set()
                     clutch_input._foot_pad_test_last_event = ""
                     count = int(getattr(replacement, "foot_pad_count", 0) or 0)
+                    restored_persisted_test = False
+                    if count == 5:
+                        restore_test = getattr(
+                            clutch_input,
+                            "_restore_persisted_five_pedal_test_state",
+                            None,
+                        )
+                        if callable(restore_test):
+                            restored_persisted_test = bool(restore_test())
                     if count == 2:
                         clutch_input._foot_pad_test_status = (
                             "已重连并识别 2 个踏板；可开始“脚踏板安全测试”。"
@@ -350,14 +378,42 @@ def build_device_retry_runtime(
                         clutch_input._foot_pad_test_status = (
                             "已重连并识别 4 个踏板；可开始“脚踏板安全测试”。"
                         )
-                    args.special_arm_control_mode = SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
+                    elif count == 5:
+                        if not restored_persisted_test:
+                            clutch_input._foot_pad_test_status = (
+                                "已重连并识别 5 个踏板；1/2 为 Fix，"
+                                "3/4/5 在 progress profile 就绪后执行 progress；"
+                                "可开始“脚踏板安全测试”。"
+                            )
+                    _log(
+                        "FootPad",
+                        "manual retry resolved live virtual keyboard topology: "
+                        f"count={live_count} mode={live_mode}",
+                    )
+                    topology_guidance = foot_pad_progress_topology_guidance(
+                        live_count,
+                        progress_enabled=bool(
+                            getattr(args, "collection_progress_profile", None)
+                            is not None
+                            or getattr(args, "collection_progress_gui", False)
+                        ),
+                    )
+                    if topology_guidance:
+                        _log("FootPad", topology_guidance)
+                        if control_ui is not None:
+                            control_ui.append_message("FootPad", topology_guidance)
                     args.foot_pad_startup_error = ""
                     publish_foot_pad_test = getattr(
                         clutch_input, "_publish_foot_pad_test_state", None
                     )
                     if callable(publish_foot_pad_test):
                         publish_foot_pad_test(
-                            message="脚踏板已重连；“脚踏板安全测试”已恢复。"
+                            message=(
+                                "脚踏板已重连；当前五踏板映射已有持久化测试结果，"
+                                "无需重测。"
+                                if restored_persisted_test
+                                else "脚踏板已重连；“脚踏板安全测试”已恢复。"
+                            )
                         )
                 elif key in {
                     "dmtac.assignment",
@@ -379,6 +435,19 @@ def build_device_retry_runtime(
             startup_device_errors.pop(key, None)
             if control_ui is not None:
                 control_ui.append_message("Device", f"{key} 重连成功。")
+        if camera_retry_attempted and publish_camera_status is not None:
+            try:
+                # ``hardware_status`` and the left-column RealSense cards are
+                # independent rebuildable projections.  During startup/Home
+                # wait there may be no control-loop tick to refresh the latter,
+                # so explicitly replace its stale startup-error snapshot after
+                # this manual retry attempt.
+                publish_camera_status()
+            except Exception as exc:  # noqa: BLE001 - display refresh is non-authoritative.
+                message = f"相机重连状态刷新失败：{type(exc).__name__}: {exc}"
+                _log("Camera", message)
+                if control_ui is not None:
+                    control_ui.append_message("Camera", message)
         publish_runtime_hardware_status()
 
     return DeviceRetryRuntime(

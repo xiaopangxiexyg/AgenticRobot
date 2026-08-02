@@ -48,7 +48,7 @@ from .calibration_flow import (
     pose_from_rotation_translation,
     tracker_offset_from_neutral_pose,
 )
-from ..gui.calibration_web_ui import CalibrationWebUi, WebUiKeyInput
+from control_station.web.calibration_web_ui import CalibrationWebUi, WebUiKeyInput
 from .log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event, log_stage
 from robot_motion.rm65.assets import require_asset_path
 from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from dataset_contracts.capture_modalities import CaptureModalityContract
-from teleop_runtime.collection.async_writer import AsyncWriterStats
+from collection_runtime.async_writer import AsyncWriterStats
 from teleop_runtime.collection.schema_v22 import StrictV22SampleRejection
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,

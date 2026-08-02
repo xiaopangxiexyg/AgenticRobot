@@ -93,6 +93,54 @@ def test_angle_trigger_source_publishes_per_side_scalar_channels() -> None:
     assert channels["right_angle_trigger"].value == 0.75
 
 
+def test_angle_trigger_source_publishes_only_declared_single_side() -> None:
+    source = AngleTriggerSource(
+        _FakeReader(),
+        rate_hz=100.0,
+        active_sides=("right",),
+    )
+    source.start()
+    try:
+        deadline = time.monotonic() + 0.5
+        channels = source.get_latest_channels()
+        while not channels and time.monotonic() < deadline:
+            time.sleep(0.01)
+            channels = source.get_latest_channels()
+    finally:
+        source.close()
+
+    assert source.active_sides == ("right",)
+    assert set(channels) == {"right_angle_trigger"}
+    assert channels["right_angle_trigger"].value == 0.75
+
+
+def test_single_side_missing_reader_value_publishes_invalid_without_deadlock() -> None:
+    class MissingRightReader(_FakeReader):
+        def read(self) -> dict[str, float]:
+            assert self.opened
+            return {"left": 0.25}
+
+    source = AngleTriggerSource(
+        MissingRightReader(),
+        rate_hz=100.0,
+        active_sides=("right",),
+    )
+    source.start()
+    try:
+        deadline = time.monotonic() + 0.5
+        channel = None
+        while channel is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            channel = source.get_latest_channels().get(
+                "right_angle_trigger"
+            )
+        assert channel is not None
+        assert channel.valid is False
+        assert "missing right" in channel.metadata["read_error"]
+    finally:
+        source.close()
+
+
 def test_scalar_retargeter_accepts_angle_trigger_scalar() -> None:
     retargeter = ScalarToGripperRetargeter(
         ScalarToGripperRetargeterConfig(

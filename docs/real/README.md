@@ -6,6 +6,8 @@
 | 专题 | 用途 |
 |---|---|
 | [TELEOP_COLLECTION](./TELEOP_COLLECTION.md) | 启动顺序、正式 profile 参数、数采验收和回退 |
+| [长程 Progress Profile](./TELEOP_COLLECTION.md#38-可选长程进度语义与独立-gui) | GUI 选择、数据集唯一绑定、Failure/Retry 和回退方式 |
+| [长程细粒度阶段标注](./LONG_HORIZON_STAGE_ANNOTATION.md) | 已封存 Episode 的视频时间轴、Failure/stage 标注和训练排除 |
 | [REPLAY](./REPLAY.md) | 离线/真机 replay 参数和安全门 |
 | [DEPLOY](./DEPLOY.md) | 通用 deploy 合约和验收 |
 | [OPENPI](./OPENPI.md) | OpenPI 两进程部署 |
@@ -55,9 +57,9 @@ Q6、真手或任何持久配置。
 结果，并在准备倒计时结束、真正采集 Home 前再复核一次。运行中双臂映射已锁定时，
 弹窗不会提供不可用的“交换”建议，而是要求恢复左右手位置，或安全退出后重新启动。
 左右关系检查只在当前 GUI 进程第一次开始遥操时执行一次：首次通过或经人工二次
-确认后，本进程后续的普通 Home、Q6 重采和双踏板切换不再重复计算左右关系，避免
+确认后，本进程后续的普通 Home、Q6 重采和 2/5 踏板切换不再重复计算左右关系，避免
 把它变成持续运行监控。后续 Home 仍会独立检查 Tracker 新鲜度和稳定性。首次操作
-若来自双踏板 Hold 恢复，则左右检查通过后仍走原有快速 Home。双踏板切换的稳定判定为
+若来自 2/5 踏板 Hold 恢复，则左右检查通过后仍走原有快速 Home。2/5 踏板切换的稳定判定为
 平移速度 ≤90 mm/s、旋转速度 ≤15°/s、连续稳定 120 ms，窗口漂移 ≤6 mm/1.5°；普通
 runtime Home 仍使用更严格的 15 mm/s、2.5°/s、250 ms、3 mm/0.75°。Init 单臂
 到位判定另采用平移速度 ≤30 mm/s、旋转速度 ≤5°/s、连续稳定 2 s；这些阈值不改变
@@ -67,7 +69,7 @@ Tracker 仍在运动而阻塞切换；从单臂恢复双臂时只采集需要释
 双臂时仍采集双侧。
 Tracker 等待与稳定 Home 采样共享 1 秒总时限；超时会取消切换并显示 3 秒红色提醒。人工处理首次左右
 警告弹窗的时间不计入，二次确认后重新开始这 1 秒窗口。普通 Home 与 Q6 Home
-不会被双踏板模式误识别为快速 Home。
+不会被 2/5 踏板模式误识别为快速 Home。
 
 位控的 `single_step_singularity_aware` 路径还会在 q5 接近腕部共轴区域时禁止等价的
 `±pi` 腕部翻转候选参与逐帧竞争（默认 guard 为 12°），避免候选步长裁剪后在两个
@@ -87,12 +89,13 @@ q5 release-band 的“保持上一侧”条件，并启用 `[1,2,4]` 半径的�
 普通 IK 或近目标候选。目标回到近距离后自动恢复 6° 回滞。宽搜索由
 `dual_arm_teleop` safety profile 控制，关闭它即可回退单半径搜索。
 
-双踏板模式下 B 是“双臂遥操 / Hold”状态键，并不始终等同于普通“开始遥操”：
-双臂遥操时按 B 进入 Hold；Hold 时按 B 经过快速 Home 恢复双臂遥操；任一单臂
-Fix 状态按 B 时，当前运动臂和数采保持连续，固定臂继续冻结到后台 Home 就绪后
-再原子释放为双臂遥操，不触发全局 Hold，也不暂停数采。Init 移动、精确 qpos
-或 Init Home 重采期间不会接受 B/踏板 1/2 的模式切换；此时 C 仍始终可用，用于
-先进入常规 Hold，再重新选择单臂/双臂遥操。
+双踏板模式以及五踏板模式下的 B 都是“双臂遥操 / Hold”状态键，并不始终等同于普通
+“开始遥操”：双臂遥操时按 B 进入 Hold；Hold 时按 B 经过快速 Home 恢复双臂遥操；
+任一单臂 Fix 状态按 B 时，当前运动臂和数采保持连续，固定臂继续冻结到后台 Home
+就绪后再原子释放为双臂遥操，不触发全局 Hold，也不暂停数采。Init 移动、精确 qpos
+或 Init Home 重采期间不会接受 B/踏板 1/2 的模式切换；此时 C 仍始终可用，用于先进入
+常规 Hold，再重新选择单臂/双臂遥操。五踏板的 A 仍为开始/停止数采，B/C 的派发和
+双踏板专用 B/C 完全一致；F15/F16/F17 仅承担进度推进/失败/Hold/撤销。
 
 ### 踏板:
 
@@ -160,6 +163,24 @@ post-IK alpha 提升到 1；进入 guard、发生 hold/boundary 或 q5 escape la
 路径。恢复 `POSITION_FORMAL_V1_ARGS` 即完整回退，不能把 V1/V2 episode 写入同一个
 task/profile 数据集合。
 
+J3/J5 物理限位附近的 `joint_limit_escape` 仍保留在 `legacy` 回退链路中。验证不制造
+固定向外步的边界保护时，在 V1 或 V2 数组之后显式追加
+`--position-joint-limit-guard-mode boundary_hold` 和
+`--position-joint-limit-boundary-margin-deg 1.5`，并使用独立 task name。
+`boundary_hold` 会从候选池移除旧的人工 limit-escape 分支；只有普通候选进入 1.5°
+硬限位带且继续向内时，才把对应关节分量投影为零步，向外运动立即放行。投影后仍会
+复检普通误差界、关节动态和碰撞；在正常误差界内保留其他关节/另一侧运动，超界才
+退回整对 reference hold。删除这两个命令行覆盖即可原子回退到数组内显式声明的
+`legacy`，不要通过把 boundary margin 扩大到旧 8° escape 激活带来模拟该模式。
+
+若活动遥操帧最终仍被 RM65 发送前的绝对关节限位门禁拒绝，运行时把它作为独立的
+`joint_hard_limit` 安全事件处理：请求双臂 `Arm_Stop`、结束当前 episode 并进入 Hold，
+但保留 GUI 和设备连接，供人工调整后重新采集 runtime Home。该事件不会伪装成碰撞，
+也不会写入 `force_collision_detected`；启动/归位阶段及不符合该精确错误格式的异常仍会
+正常抛出，避免隐藏配置或程序错误。上游允许 `1e-8 rad` 纯数值端点误差，发送门禁以
+`2e-8 rad` 提供两倍比较余量；所有通过的目标都会投影到物理限位内侧 `1e-8 rad` 后
+再交给轨迹器/SDK。这只吸收浮点换算误差，不会向外放宽 RM65 的物理关节范围。
+
 遥操侧的 admitted-anchor QP 速度/加速度约束保持 default-off。测试时将
 `POSITION_FORMAL_V1_ARGS` 替换为 `POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS`；该数组只在
 稳定 V1 上增加 `--position-ik-admitted-motion-limit`，不会改变 source shaping、碰撞或
@@ -172,6 +193,17 @@ RealSense 同时协商 `yuyv` 时出现首帧迟到和底层 SDK 重启。启动
 前者偏大表示 USB/UVC/设备内部协商耗时，后者偏大表示首帧等待；这三段都发生在相机
 源启动阶段，与 parquet/video writer 无关。只有在已验证的单站环境中才应显式改用
 `--camera-color-format yuyv`。
+
+相机协商仍必须串行。若 `warmup_sec` 明显偏大，可在原完整命令末尾追加
+`--camera-startup-warmup-policy bounded_first_frame`：每台相机在 `pipeline.start()` 后
+只等待第一帧，且总等待受 `startup_frame_grace_sec`（当前默认 5 秒）约束；随后仍由
+原有的三相机连续新帧自检完成正式 admission。这个开关不会更改视频内容、分辨率、
+颜色格式或全局自检，也不会并行启动 native pipeline。首帧等待会完整使用这 5 秒预算，
+不再被 legacy 的 `startup_warmup_frames` 截短；例如 1 秒 SDK wait 会最多连续尝试 5 次，
+而不是仅因 legacy 配置为 2 帧就只等约 2 秒。删除该参数或显式使用
+`--camera-startup-warmup-policy legacy` 即原子回退到旧的 10 帧同步 warmup 与 reset
+retry。若日志中偏大的是 `pipeline_start_sec` 而非 `warmup_sec`，该开关不会缩短 SDK
+自身的 USB/UVC 协商时间，应继续检查 USB 拓扑、独占占用和设备状态。
 
 `POSITION_FORMAL_V1_ARGS` 会强制启用独立的双臂位控受力急停：通过左右 RM65
 状态连接以 20 Hz 读取 tool-zero 六维力，默认任一侧 `|F| > 15 N` 或

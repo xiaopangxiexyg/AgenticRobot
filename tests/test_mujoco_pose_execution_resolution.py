@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from robot_motion.action import (
+    ActionResolutionError,
     CanonicalDeskToRuntimePoseTransformer,
     DecisionScheduleSpec,
     HandActionSpec,
@@ -93,7 +94,28 @@ class _Planner:
                 side: identity.copy() for side in pose_by_side
             },
             modification_reasons=("hold_last_safe",) if self.hold else (),
-            metadata={"planner": "fixture-coupled-rm65"},
+            metadata={
+                "planner": "fixture-coupled-rm65",
+                "failure": (
+                    {
+                        "code": "collision_margin_low",
+                        "error_type": "_PlanningFailure",
+                    }
+                    if self.hold
+                    else None
+                ),
+                "collision_min_distance_m": 0.03,
+                "collision_distance_epsilon_m": 0.0001,
+                "collision_distance_m": 0.031,
+                "collision_check_attempts": (
+                    [
+                        {"scale": 1.0, "distance_m": 0.022},
+                        {"scale": 0.25, "distance_m": 0.029},
+                    ]
+                    if self.hold
+                    else []
+                ),
+            },
         )
 
 
@@ -303,8 +325,18 @@ def test_pose_resolution_hold_never_creates_executable_command() -> None:
     resolver = MujocoCoupledPoseToQposResolver(
         RM65CanonicalIK(_Scene(), _Planner(hold=True))
     )
-    with pytest.raises(RuntimeError, match="did not produce an executable"):
+    with pytest.raises(ActionResolutionError) as captured:
         resolver.resolve(_pose_action())
+    failure = captured.value.failure
+    assert failure.reason_code == "collision_margin_low"
+    assert failure.resolver_status == "hold_last_safe"
+    assert failure.outcome_code == (
+        "target_private_resolution_failure.collision_margin_low"
+    )
+    assert failure.diagnostics["best_candidate_distance_m"] == pytest.approx(
+        0.029
+    )
+    assert failure.diagnostics["collision_attempt_count"] == 2
 
 
 def test_resolution_lookup_rejects_untyped_command() -> None:

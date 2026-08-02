@@ -40,8 +40,16 @@ is experimental.
 - `hardware/`: vendor SDKs and device backends; no dataset schema or learner.
 - `sim/`: simulation-only backends, tasks, and adapters; may use `robot_motion`,
   but must not depend on `teleop_runtime` or real hardware.
-- `teleop_runtime/`: real-robot teleop, GUI/headless orchestration, collection,
-  and policy deployment frontends.
+- `collection_runtime/`: device-, control-, and UI-neutral live collection
+  lifecycle and persistence mechanics. It may depend on `dataset_contracts`,
+  `dataset_interface`, and pure domain contracts, but must not import
+  `teleop_runtime`, `control_station`, concrete hardware, simulation, or GUI
+  modules. It owns no device production, robot control, operator intent, or
+  dataset schema definition.
+- `teleop_runtime/`: real-robot teleop, GUI/headless orchestration, source-bound
+  collection adapters, compatibility collection paths, and policy deployment
+  frontends. Compatibility shims may re-export migrated collection runtime
+  APIs but must not duplicate their implementations.
 - `deployments/`: model client, protocol, and artifact integration.
 - `dataset_contracts/`: pure schemas, identities, hash domains, and validation
   contracts; no runtime, device, GUI, or control ownership.
@@ -78,6 +86,13 @@ owned state.
 - Remote hardware work must use the wrappers and rules in `codex_remote/`.
 - Inspect status/diff first, preserve concurrent work, keep edits scoped, and
   do not reset or overwrite unrelated changes.
+- Before any dataset transform that combines hardlinks, partial selection, or
+  overwrite, verify source/target device, inode, link count, and independent
+  backup receipts. A differently named path is not an independent backup.
+- Dataset video transforms must write a fresh temporary inode, validate the
+  declared/decoded frame count and tail decode, then atomically replace the
+  target. Stop at the first decoder warning or count mismatch; never accept
+  process exit status alone as data-integrity evidence.
 - Ask for clarification when an unresolved choice affects safety, public
   control/data semantics, ownership, or destructive behavior; otherwise state
   assumptions and proceed.

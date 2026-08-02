@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol
 
 import numpy as np
 
@@ -17,6 +18,85 @@ from .schema import (
     RobotAction,
     effector_name,
 )
+
+
+@dataclass(frozen=True)
+class ActionResolutionFailure:
+    """Expected reason why an action could not become an executable command.
+
+    This is target-resolution evidence, not a canonical safety verdict.  The
+    resolver may expose a small, backend-neutral diagnostic summary without
+    leaking its private planner state into the action contract.
+    """
+
+    reason_code: str
+    resolver_status: str
+    message: str
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        reason_code = str(self.reason_code).strip()
+        resolver_status = str(self.resolver_status).strip()
+        message = str(self.message).strip()
+        if not reason_code or any(
+            not (character.islower() or character.isdigit() or character == "_")
+            for character in reason_code
+        ):
+            raise ValueError(
+                "reason_code must use non-empty lower_snake_case tokens."
+            )
+        if not resolver_status:
+            raise ValueError("resolver_status must be non-empty.")
+        if not message:
+            raise ValueError("message must be non-empty.")
+        diagnostics = {
+            str(name): value
+            for name, value in dict(self.diagnostics).items()
+            if str(name).strip()
+        }
+        unsupported = {
+            name: type(value).__name__
+            for name, value in diagnostics.items()
+            if value is not None
+            and not isinstance(value, (bool, int, float, str))
+        }
+        if unsupported:
+            raise TypeError(
+                "Action resolution diagnostics must be bounded scalar "
+                f"values; unsupported={unsupported}."
+            )
+        if any(
+            isinstance(value, float) and not np.isfinite(value)
+            for value in diagnostics.values()
+        ):
+            raise ValueError(
+                "Action resolution diagnostics must contain finite floats."
+            )
+        object.__setattr__(self, "reason_code", reason_code)
+        object.__setattr__(self, "resolver_status", resolver_status)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(
+            self,
+            "diagnostics",
+            MappingProxyType(diagnostics),
+        )
+
+    @property
+    def outcome_code(self) -> str:
+        return f"target_private_resolution_failure.{self.reason_code}"
+
+
+class ActionResolutionError(RuntimeError):
+    """Typed expected failure raised by a concrete action resolver."""
+
+    def __init__(self, failure: ActionResolutionFailure) -> None:
+        if not isinstance(failure, ActionResolutionFailure):
+            raise TypeError("failure must be an ActionResolutionFailure.")
+        self.failure = failure
+        super().__init__(
+            f"{failure.reason_code}: {failure.message} "
+            f"(resolver_status={failure.resolver_status})"
+        )
 
 
 def xyzquat_to_matrix(value: Any) -> np.ndarray:
@@ -332,6 +412,8 @@ class ActionExecutor:
 __all__ = [
     "ActionExecutor",
     "ActionExecutorConfig",
+    "ActionResolutionError",
+    "ActionResolutionFailure",
     "ActionResolver",
     "CommandDispatcher",
     "NullCommandDispatcher",

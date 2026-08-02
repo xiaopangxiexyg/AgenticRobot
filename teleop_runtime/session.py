@@ -187,6 +187,7 @@ class TeleopSession:
         self._current_human_command_emission: HumanCommandEmission | None = None
         self._input_sample_tracker = ObservationSampleTracker()
         self._current_input_sample_refs: dict[str, ObservationSampleRef] = {}
+        self._source_mapping_generation_by_channel: dict[str, int] = {}
 
     @property
     def motion_hold_mode(self) -> str:
@@ -287,6 +288,42 @@ class TeleopSession:
         self._tracker_last_healthy_at.clear()
         self._tracker_loss_duration_sec = 0.0
         self._tracker_loss_channels = ()
+
+    def _observe_source_mapping_transitions(
+        self,
+        channels: Mapping[str, ObservationChannel],
+    ) -> None:
+        """Reset pose baselines when a source changes its logical binding.
+
+        A source may keep a live display snapshot while rebuilding its causal
+        history (for example, after swapping VIVE left/right roles).  The
+        generation is deliberately a generic channel metadata seam rather than
+        a VIVE-specific dependency.  The first sample in a new generation is
+        accepted as the new baseline; it is not compared to the old physical
+        source pose.
+        """
+
+        transitioned: list[str] = []
+        for channel_name, channel in channels.items():
+            raw_generation = (channel.metadata or {}).get(
+                "source_mapping_generation"
+            )
+            if raw_generation is None:
+                continue
+            try:
+                generation = int(raw_generation)
+            except (TypeError, ValueError):
+                continue
+            previous = self._source_mapping_generation_by_channel.get(channel_name)
+            if previous is not None and previous != generation:
+                self.safety_monitor.request_pose_baseline_reset(channel_name)
+                transitioned.append(channel_name)
+            self._source_mapping_generation_by_channel[channel_name] = generation
+        if transitioned:
+            # Retargeter smoothing has the same physical-source continuity
+            # assumption as the pose safety baseline.  Reset it once per
+            # mapping transition, without changing authority or hold state.
+            self._reset_retargeter_tracking()
 
     def mark_home_recalibrated(self, reason: str = "runtime home recalibrated") -> None:
         """Explicitly release the manual tracker-loss hold after a new home capture."""
@@ -551,7 +588,7 @@ class TeleopSession:
         reason: str = "manual hold",
         *,
         require_home_recalibration: bool = False,
-    ) -> None:
+    ) -> bool:
         self._clear_recovery_context()
         self.safety_monitor.request_pose_baseline_reset_many(self.safety_monitor.config.required_channels)
         self._reset_retargeter_tracking()
@@ -564,6 +601,7 @@ class TeleopSession:
         self._transition(TeleopRunState.DEBUG_ONLY, reason)
         if require_home_recalibration and not hold_succeeded:
             self.fault("manual tracker-loss hold failed; manual intervention required")
+        return bool(hold_succeeded)
 
     def freeze(self, reason: str) -> None:
         already_frozen = self.state_machine.state == TeleopRunState.FROZEN
@@ -812,6 +850,7 @@ class TeleopSession:
 
         channels, faults = self.poll_sources(current_time)
         raw_channels = {name: channel.copy() for name, channel in channels.items()}
+        self._observe_source_mapping_transitions(channels)
         self._current_input_sample_refs = dict(
             self._input_sample_tracker.observe(
                 raw_channels,

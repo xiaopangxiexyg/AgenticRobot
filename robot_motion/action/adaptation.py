@@ -432,6 +432,12 @@ class ActionRepresentationAdapter(Protocol):
     def component_target_capability(self) -> ComponentTargetCapabilitySpec:
         ...
 
+    @property
+    def expected_output_effectors(self) -> tuple[str, ...]:
+        """Target-private complete scope after representation adaptation."""
+
+        ...
+
     def adapt(
         self,
         request: ActionAdaptationRequest,
@@ -544,6 +550,7 @@ class RobotActionV1RepresentationAdapter:
         adapter_contract_id: str = ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID,
         adapter_contract_hash: str = ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH,
         materializer: Callable[..., RobotAction] = materialize_robot_action_v1,
+        expected_output_effectors: tuple[str, ...] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(
@@ -569,6 +576,24 @@ class RobotActionV1RepresentationAdapter:
         )
         self.materializer = materializer
         self.clock = clock
+        expected = (
+            tuple(
+                component.component_id
+                for component in (
+                    component_target_capability.action_schema.component_catalog.components
+                )
+            )
+            if expected_output_effectors is None
+            else tuple(
+                _required(value, name="expected output effector")
+                for value in expected_output_effectors
+            )
+        )
+        if not expected or len(expected) != len(set(expected)):
+            raise ValueError(
+                "expected_output_effectors must be non-empty and unique."
+            )
+        self.expected_output_effectors = expected
         routes = component_target_capability.component_routes
         if any(
             route.handler_contract_id
@@ -624,6 +649,13 @@ class RobotActionV1RepresentationAdapter:
             if not isinstance(materialized, RobotAction):
                 raise TypeError(
                     "RobotAction materializer must return a RobotAction."
+                )
+            if set(materialized.active_effectors) != set(
+                self.expected_output_effectors
+            ):
+                raise ValueError(
+                    "RobotAction materializer output scope does not match its "
+                    "declared target-private execution scope."
                 )
             action = freeze_robot_action(materialized)
             payload_semantic = robot_action_semantic_payload(action)

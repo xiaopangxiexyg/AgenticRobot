@@ -96,9 +96,16 @@ def _warm_start_impedance_force_control_before_home(
             if clutch_input.terminal.should_quit:
                 clutch_input.should_quit = True
             if clutch_input.ui is not None:
-                for event in clutch_input.ui.consume_events():
+                ui_events = clutch_input.ui.consume_events()
+                deferred_ui_events = []
+                for event in ui_events:
                     if event == "q":
                         clutch_input.should_quit = True
+                    else:
+                        deferred_ui_events.append(event)
+                defer_ui_events = getattr(clutch_input, "defer_ui_events", None)
+                if callable(defer_ui_events):
+                    defer_ui_events(deferred_ui_events)
             time.sleep(0.05)
         try:
             results = future.result()

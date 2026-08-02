@@ -28,10 +28,29 @@ def _backend_state(
 
 
 def writer_debug_text(writer_pool: Any) -> str:
+    if writer_pool is None:
+        return "writer=off"
     try:
         stats = writer_pool.stats()
     except Exception as exc:  # noqa: BLE001
         return f"writer=status_error:{type(exc).__name__}:{compact_log_value(exc, max_chars=80)}"
+    if hasattr(stats, "submitted_samples"):
+        error = getattr(stats, "worker_error", None)
+        p50 = getattr(stats, "sample_process_ms_p50", None)
+        p95 = getattr(stats, "sample_process_ms_p95", None)
+        return (
+            "writer=mode:process "
+            f"submitted:{int(stats.submitted_samples)} "
+            f"completed:{int(stats.completed_samples)} "
+            f"rejected_busy:{int(stats.rejected_busy)} "
+            f"sample_rejections:{int(stats.sample_rejections)} "
+            f"queue_high:{int(stats.queue_high_water)}/{int(stats.queue_capacity)} "
+            f"slots:{int(stats.slots_available)}/{int(stats.slot_count)} "
+            f"alive:{bool(stats.worker_alive)} "
+            f"p50:{'none' if p50 is None else f'{float(p50):.1f}ms'} "
+            f"p95:{'none' if p95 is None else f'{float(p95):.1f}ms'} "
+            f"error:{'ok' if not error else compact_log_value(error, max_chars=60)}"
+        )
     text = (
         "writer="
         f"queued:{stats.queued} submitted:{stats.submitted} completed:{stats.completed} "

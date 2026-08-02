@@ -73,6 +73,27 @@ def policy_action_emission_payload(
         payload["canonicalization_receipt_hash"] = (
             emission.canonical_action.canonicalization_receipt.semantic_content_hash
         )
+    if emission.arm_hold_resolution is not None:
+        payload["arm_hold_resolution"] = (
+            emission.arm_hold_resolution.to_dict(include_hash=True)
+        )
+        model_action = emission.model_decoded_absolute_action
+        payload["model_decoded_action_hash"] = (
+            None
+            if model_action is None
+            else canonical_content_hash(
+                {
+                    "vector": model_action.vector,
+                    "arm_joint_targets": model_action.arm_joint_targets,
+                    "arm_hold_prediction": (
+                        None
+                        if model_action.arm_hold_prediction is None
+                        else model_action.arm_hold_prediction.to_dict()
+                    ),
+                },
+                domain="dexteleop.model_decoded_action.v1",
+            )
+        )
     return payload
 
 

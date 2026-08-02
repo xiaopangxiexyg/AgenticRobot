@@ -365,6 +365,7 @@
       "local_step_component_progress_max_after_position_error_m": 0.25,
       "local_step_limit_escape_enabled": true,
       "local_step_limit_escape_activation_margin_deg": 8.0,
+      "local_step_limit_escape_direction_hysteresis_deg": 2.0,
       "local_step_limit_escape_step_fraction": 1.0,
       "local_step_limit_escape_max_candidates": 8,
       "local_step_limit_escape_accept_worse_within_tolerance": true,

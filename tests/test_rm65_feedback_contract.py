@@ -161,6 +161,49 @@ def test_rm65_local_observation_clips_tiny_endpoint_quantization_without_relaxin
         backend._validate_final_joint_target(observed, label="transport target")
 
 
+def test_rm65_transport_absorbs_endpoint_roundoff_into_an_inward_margin() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="192.0.2.1",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            singularity_protection_enabled=False,
+        )
+    )
+    lower, upper = backend._joint_position_limits_rad()
+    tolerance = rm65_module._RM65_ABSOLUTE_LIMIT_TOLERANCE_RAD
+    margin = rm65_module._RM65_ABSOLUTE_LIMIT_DISPATCH_MARGIN_RAD
+    assert tolerance == pytest.approx(2.0e-8)
+    assert margin == pytest.approx(1.0e-8)
+
+    upper_roundoff = np.zeros(6, dtype=float)
+    upper_roundoff[5] = upper[5] + 0.5 * tolerance
+    normalized_upper = backend._validate_final_joint_target(
+        upper_roundoff,
+        label="transport target",
+    )
+    assert normalized_upper[5] == pytest.approx(upper[5] - margin, abs=1e-15)
+    assert normalized_upper[5] < upper[5]
+
+    lower_roundoff = np.zeros(6, dtype=float)
+    lower_roundoff[5] = lower[5] - 0.5 * tolerance
+    normalized_lower = backend._validate_final_joint_target(
+        lower_roundoff,
+        label="transport target",
+    )
+    assert normalized_lower[5] == pytest.approx(lower[5] + margin, abs=1e-15)
+    assert normalized_lower[5] > lower[5]
+
+    real_violation = upper_roundoff.copy()
+    real_violation[5] = upper[5] + 2.0 * tolerance
+    with pytest.raises(ValueError, match="absolute limits"):
+        backend._validate_final_joint_target(
+            real_violation,
+            label="transport target",
+        )
+
+
 class _LifecycleBackend:
     def __init__(self, *, fail_start: bool = False):
         self.fail_start = fail_start

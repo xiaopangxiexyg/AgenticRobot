@@ -1,0 +1,100 @@
+{
+  "vive_retarget_frame": {
+    "name": "vive_retarget_frame",
+    "axes": {
+      "x": "forward",
+      "y": "left",
+      "z": "up"
+    }
+  },
+  "desk_frame": {
+    "name": "vive_retarget_frame",
+    "axes": {
+      "x": "forward",
+      "y": "left",
+      "z": "up"
+    }
+  },
+  "arms": {
+    "left_arm": {
+      "name": "left_arm",
+      "side": "left",
+      "T_VR_B": null,
+      "T_D_B": null,
+      "workspace_min": null,
+      "workspace_max": null,
+      "home_qpos": null,
+      "home_pose": null,
+      "tcp_frame": "tool_tcp",
+      "metadata": {}
+    },
+    "right_arm": {
+      "name": "right_arm",
+      "side": "right",
+      "T_VR_B": null,
+      "T_D_B": null,
+      "workspace_min": null,
+      "workspace_max": null,
+      "home_qpos": null,
+      "home_pose": null,
+      "tcp_frame": "tool_tcp",
+      "metadata": {}
+    }
+  },
+  "hands": {},
+  "T_W_O": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "T_O_VR": [
+    [0.8978347474954391, -0.4299437461706392, -0.09508491635668588, 0.16672781331050726],
+    [0.0996738690656224, -0.011894545494396537, 0.9949490638283807, 0.1778727920850118],
+    [-0.42890311961477984, -0.9027773229962296, 0.03217482041086095, -0.9012173683113522],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "T_O_D": [
+    [0.8978347474954391, -0.4299437461706392, -0.09508491635668588, 0.16672781331050726],
+    [0.0996738690656224, -0.011894545494396537, 0.9949490638283807, 0.1778727920850118],
+    [-0.42890311961477984, -0.9027773229962296, 0.03217482041086095, -0.9012173683113522],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "tracker_offsets": {
+    "left_wrist": [
+      [0.07445793041431742, 0.9970125570649956, -0.020542094662805047, 0.0],
+      [0.9934249796063334, -0.07595491778338243, -0.0856601445170131, 0.0],
+      [-0.08696451283467593, -0.014028952891740026, -0.996112625152492, 0.0],
+      [0.0, 0.0, 0.0, 1.0]
+    ],
+    "right_wrist": [
+      [-0.0987663750594299, 0.9951099363531769, -0.001190684171305393, 0.0],
+      [0.9918159702939569, 0.09834201611479847, -0.08142437556613394, 0.0],
+      [-0.08090911090525038, -0.009222929992821705, -0.9966788115209779, 0.0],
+      [0.0, 0.0, 0.0, 1.0]
+    ]
+  },
+  "captured_home_qpos": {},
+  "metadata": {
+    "profile_kind": "control_station_vive_coordinate",
+    "profile_schema": "control_station_vive_coordinate_v1",
+    "profile_scope": "control_station_vive_coordinate_only",
+    "profile_name": "vive_rm65_virtual_desk_coordinate",
+    "profile_ready": true,
+    "active_sides": ["left", "right"],
+    "left_tracker_name": "tracker_1",
+    "right_tracker_name": "tracker_2",
+    "auxiliary_tracker_name": "",
+    "desk_tracker": "left_wrist",
+    "home_policy": "session_home_is_not_part_of_coordinate_profile",
+    "target_binding_policy": "target_profile_supplies_desk_to_base",
+    "canonical_target_frame_contract_id": "station_retarget_x_forward_y_left_z_up_v1",
+    "world_to_vive_retarget_mode": "direct",
+    "world_to_desk_mode": "direct",
+    "derivation": "coordinate_only_from_legacy_combined_profile",
+    "source_profile_path": "teleop_records/calibration_profiles/20260627_112114_vive_rm65_virtual_desk.json",
+    "source_profile_sha256": "d538d7f92d58d3e4d549f17ccab1d3835039b5adf729d56c30c988d95fa86b1c",
+    "virtual_desk_post_yaw_deg": 180.0,
+    "virtual_desk_sweep_convention_version": 2
+  }
+}

@@ -7,12 +7,13 @@ transport, or know about OpenPI, simulation, teleoperation, or hardware.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
 from robot_motion.deploy.actions import NormalizedAction
+from robot_motion.deploy.action_semantics import ArmHoldKeyframePrediction
 from robot_motion.deploy.canonical_policy_action import CanonicalPolicyAction
 from robot_motion.deploy.inference import PolicyChunkResult, PolicyInferenceRequest
 from robot_motion.deploy.rtc_protocol import (
@@ -239,6 +240,31 @@ class ModelAgnosticRtcClient:
                         "model-space decoding",
                         ("decoded_anchor_identity_mismatch",),
                     )
+        if response.arm_hold_probabilities is not None:
+            if canonical_decoded:
+                raise RtcClientProtocolError(
+                    "model-space decoding",
+                    ("arm_hold_typed_canonical_unsupported",),
+                )
+            contract_hash = response.arm_hold_output_contract_hash
+            assert contract_hash is not None
+            probabilities = np.asarray(
+                response.arm_hold_probabilities,
+                dtype=np.float32,
+            )
+            legacy_decoded = tuple(
+                replace(
+                    action,
+                    arm_hold_prediction=ArmHoldKeyframePrediction(
+                        probabilities=(
+                            float(probabilities[index, 0]),
+                            float(probabilities[index, 1]),
+                        ),
+                        contract_hash=contract_hash,
+                    ),
+                )
+                for index, action in enumerate(legacy_decoded)
+            )
         response_hash = response.semantic_content_hash
         result = PolicyChunkResult(
             request_id=request.request_id,

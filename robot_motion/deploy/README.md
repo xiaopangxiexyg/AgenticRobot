@@ -8,12 +8,16 @@ under `sim`.
 Current boundary:
 
 ```text
-ObservationSource -> Policy -> CanonicalActionPipeline -> Dispatcher
+ObservationSource -> Policy -> optional action semantics
+                  -> CanonicalActionPipeline -> Dispatcher
 ```
 
 - `source.py`: common observation-source protocol.
 - `dispatcher.py`: common command-dispatch protocol and dry-run recorder.
 - `runtime.py`: small common single-step runtime skeleton.
+- `action_semantics.py`: typed action-aligned prediction sidecars.
+- `arm_hold.py`: target-neutral, per-side hold state machine and immutable
+  resolution receipts. It owns no device or dispatch authority.
 - `policy_worker.py`: bounded model-neutral RTC inference carrier; no plan,
   safety, target or dispatch ownership. Stop dispatches an optional executor
   cancellation hook in isolation and reports cancellation separately from
@@ -104,3 +108,43 @@ Migration notes:
 - Cross-domain launchers such as real-observation-to-sim-dispatch should live
   under `deployments/dexteleop` or another composition layer, not in
   `robot_motion`.
+
+## Arm-hold action semantics
+
+An artifact may add `arm_hold_output_contract` without changing its existing
+continuous/discrete `outputs`. When present, every model response must carry a
+finite `[H, 2]` probability matrix in the declared output key and the exact
+contract hash. Missing fields, logits, horizon mismatch, side-order mismatch,
+or hash mismatch reject the whole chunk. Artifacts without the optional
+contract use the historical path exactly.
+
+The synchronous runtime pairs each probability row with its decoded action
+before chunk-prefix selection. It advances the left/right state machine only
+when that keyframe is actually popped for execution. `00`, `01`, `10`, and
+`11` are all supported. Entering hold latches the measured arm target and the
+last accepted end-effector target once; remaining in hold reuses that snapshot
+instead of following measurement drift. Resolution occurs after pose decoding
+and before canonical safety. A missing hold reference fails closed and emits
+no new command.
+
+Thresholds and consecutive-step counts are artifact fields, not runtime
+defaults. `reset_prediction_schedule()` also releases latched semantic state at
+the existing init/re-arm lifecycle boundary.
+
+The default-off raw-RTC final-chunk path supports the same sidecar without
+changing the continuous action dimension. Capability, request, and response
+bind the exact arm-hold contract hash, and the response carries a finite
+`[H, 2]` matrix. Each row remains attached to its action through timed-plan
+admission. At the actual due-pop observation the resolver stages the semantic
+transition; the state/latch is committed only after the producer accepts the
+formal emission. Adapter failure, missing reference, rejected commit, HOLD,
+FAULT, and close discard/reset pending state. The RTC frontend additionally
+requires the model adapter and `PolicyDeployRuntime` to declare the same
+contract, preventing silent label omission.
+
+This first landing is deliberately limited to
+`async_timed_plan + continuation=none + legacy_normalized_v1` absolute actions.
+Typed-canonical, relative, virtual RTC, and model-continuation/flow-inpaint
+paths reject arm-hold artifacts until they gain an explicit semantic adapter.
+Artifacts without the optional contract keep their historical hash and
+execution path.

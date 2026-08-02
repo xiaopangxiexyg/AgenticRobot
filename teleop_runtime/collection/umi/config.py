@@ -16,11 +16,11 @@ from dataset_contracts.v25p_native_storage import (
 )
 
 from .pose_adapter import as_rigid_transform
+from .topology import CAMERA_KEYS, SIDES
 
 
 DEFAULT_LEFT_WRIST_CAMERA_SERIAL = "261122273924"
 DEFAULT_RIGHT_WRIST_CAMERA_SERIAL = "260522278055"
-SIDES = ("left", "right")
 
 
 def _mapping(value: Any, *, name: str) -> Mapping[str, Any]:
@@ -146,6 +146,12 @@ class UmiTimingConfig:
         if self.sample_hz > self.control_hz:
             raise ValueError("timing.sample_hz cannot exceed control_hz")
 
+    @property
+    def command_input_max_age_sec(self) -> float:
+        """Backend-neutral alias for the frozen AngleTrigger config field."""
+
+        return float(self.angle_trigger_max_age_sec)
+
 
 @dataclass(frozen=True)
 class UmiCollectionConfig:
@@ -188,6 +194,8 @@ class UmiCollectionConfig:
     gui_host: str = "127.0.0.1"
     gui_port: int = 0
     open_browser: bool = True
+    gui_resizable_sidebars: bool = True
+    gui_input_activity_indicators: bool = True
     task_id: str = "umi_collection"
     task_description: str = "Dual-wrist UMI collection"
     v25p_native_shadow: bool = False
@@ -234,7 +242,7 @@ class UmiCollectionConfig:
         if any(not value for value in (*ignored_cameras, *ignored_tactile)):
             raise ValueError("ignored modality keys must be non-empty")
         unknown_cameras = sorted(
-            set(ignored_cameras) - {"left_wrist", "right_wrist"}
+            set(ignored_cameras) - set(CAMERA_KEYS)
         )
         unknown_tactile = sorted(set(ignored_tactile) - set(SIDES))
         if unknown_cameras:
@@ -329,6 +337,12 @@ class UmiCollectionConfig:
         if side == "right":
             return self.right
         raise ValueError(f"unsupported side {side!r}")
+
+    @property
+    def tactile_read_hz(self) -> float:
+        """Backend-neutral alias for the default DMTac capture setting."""
+
+        return float(self.dmtac_tactile_read_hz)
 
     @property
     def capture_modality_contract(self) -> CaptureModalityContract:
@@ -431,6 +445,12 @@ class UmiCollectionConfig:
             gui_host=str(payload.get("gui_host", "127.0.0.1")),
             gui_port=int(payload.get("gui_port", 0)),
             open_browser=bool(payload.get("open_browser", True)),
+            gui_resizable_sidebars=bool(
+                payload.get("gui_resizable_sidebars", True)
+            ),
+            gui_input_activity_indicators=bool(
+                payload.get("gui_input_activity_indicators", True)
+            ),
             task_id=str(payload.get("task_id", "umi_collection")),
             task_description=str(payload.get("task_description", "Dual-wrist UMI collection")),
             v25p_native_shadow=bool(payload.get("v25p_native_shadow", False)),

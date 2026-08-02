@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import sim.mujoco.deploy.runtime as mujoco_deploy_runtime_module
 from control_composition.composition import (
     CompositionContextDraft,
     CompositionInputDraft,
@@ -1062,6 +1063,94 @@ def test_immediate_qref_does_not_invent_scheduled_segment_lineage() -> None:
         "planner_command_frame",
         "reference_segment_terminal",
     }.intersection(fact.event_type for fact in runtime.trace_facts)
+
+
+def test_reference_trace_sync_projects_only_new_append_only_suffix(
+    monkeypatch,
+) -> None:
+    runtime, _scene, _clock = build_runtime()
+    projected: list[tuple[str, str]] = []
+    recorded: list[object] = []
+
+    def project_target(_context, item):
+        projected.append(("target", str(item)))
+        return SimpleNamespace(fact_id=f"target:{item}")
+
+    def project_admission(_context, item):
+        projected.append(("admission", str(item)))
+        return SimpleNamespace(fact_id=f"admission:{item}")
+
+    monkeypatch.setattr(
+        mujoco_deploy_runtime_module,
+        "project_component_execution_target",
+        project_target,
+    )
+    monkeypatch.setattr(
+        mujoco_deploy_runtime_module,
+        "project_component_execution_target_admission",
+        project_admission,
+    )
+    monkeypatch.setattr(
+        runtime.core,
+        "record_external_facts",
+        lambda facts: recorded.extend(facts),
+    )
+
+    history_size = 256
+    runtime._immediate_component_targets.extend(
+        f"t{index}" for index in range(history_size)
+    )
+    runtime._immediate_component_target_admissions.extend(
+        f"a{index}" for index in range(history_size)
+    )
+    runtime._sync_reference_trace()
+
+    assert projected[:2] == [("target", "t0"), ("target", "t1")]
+    assert projected[history_size - 1] == ("target", "t255")
+    assert projected[history_size] == ("admission", "a0")
+    assert projected[-1] == ("admission", "a255")
+    assert len(projected) == 2 * history_size
+    assert len(recorded) == 2 * history_size
+
+    # An idle sync must perform no projection work: it does not reconstruct
+    # old facts merely to discover that their IDs were already published.
+    runtime._sync_reference_trace()
+    assert len(projected) == 2 * history_size
+    assert len(recorded) == 2 * history_size
+
+    runtime._immediate_component_targets.append("t256")
+    runtime._immediate_component_target_admissions.append("a256")
+    runtime._sync_reference_trace()
+    assert projected[-2:] == [("target", "t256"), ("admission", "a256")]
+    assert len(projected) == 2 * history_size + 2
+    assert len(recorded) == 2 * history_size + 2
+
+
+def test_reference_trace_sync_rejects_history_rewind(monkeypatch) -> None:
+    runtime, _scene, _clock = build_runtime()
+    monkeypatch.setattr(
+        mujoco_deploy_runtime_module,
+        "project_component_execution_target",
+        lambda _context, item: SimpleNamespace(fact_id=f"target:{item}"),
+    )
+    monkeypatch.setattr(
+        mujoco_deploy_runtime_module,
+        "project_component_execution_target_admission",
+        lambda _context, item: SimpleNamespace(fact_id=f"admission:{item}"),
+    )
+    monkeypatch.setattr(
+        runtime.core,
+        "record_external_facts",
+        lambda _facts: None,
+    )
+
+    runtime._immediate_component_targets.append("t0")
+    runtime._immediate_component_target_admissions.append("a0")
+    runtime._sync_reference_trace()
+    runtime._immediate_component_targets.clear()
+
+    with pytest.raises(RuntimeError, match="history rewound"):
+        runtime._sync_reference_trace()
 
 
 def test_sim_deploy_module_does_not_import_teleop_runtime() -> None:

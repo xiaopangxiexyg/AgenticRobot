@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
+from pathlib import Path
 import threading
 import time
 from typing import Any
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -23,6 +27,10 @@ from dataset_contracts.model_continuation import (
 from dataset_contracts.policy_artifact import (
     PolicyArtifactContract,
     PolicyCameraInputContract,
+)
+from dataset_contracts import (
+    DEFAULT_ARM_HOLD_TRAINING_CONTRACT_V1,
+    PolicyArmHoldOutputContract,
 )
 from dataset_contracts.v22 import (
     DiscreteCategory,
@@ -51,6 +59,7 @@ from deployments.openpi.client.policy import (
     OpenPIClientPolicy,
     OpenPIClientPolicyConfig,
 )
+from deployments.openpi.client import real as openpi_real_launcher
 from deployments.openpi.client.rtc import (
     OPENPI_FINAL_CHUNK_RTC_ADAPTER_V1,
     OPENPI_RTC_RESULT_TYPED_CANONICAL_V1,
@@ -75,6 +84,8 @@ from robot_motion.deploy import (
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
     CanonicalDeployActionPipeline,
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+    POLICY_ASYNC_PRODUCER_FAULT,
     PolicyDeployRuntime,
     PolicyDeployRuntimeConfig,
     RAW_RTC_FINAL_CHUNK_PROFILE_V1,
@@ -152,6 +163,8 @@ class _FakeTransport:
         metadata: dict[str, Any],
         actions: np.ndarray,
         discrete_actions: np.ndarray | None = None,
+        arm_hold_probabilities: np.ndarray | None = None,
+        arm_hold_contract_hash: str | None = None,
         error: Exception | None = None,
     ) -> None:
         self._metadata = dict(metadata)
@@ -159,6 +172,12 @@ class _FakeTransport:
         self.discrete_actions = (
             None if discrete_actions is None else np.asarray(discrete_actions)
         )
+        self.arm_hold_probabilities = (
+            None
+            if arm_hold_probabilities is None
+            else np.asarray(arm_hold_probabilities)
+        )
+        self.arm_hold_contract_hash = arm_hold_contract_hash
         self.error = error
         self.requests: list[dict[str, Any]] = []
         self.reset_count = 0
@@ -177,6 +196,11 @@ class _FakeTransport:
         }
         if self.discrete_actions is not None:
             response["robot_action_tokens"] = self.discrete_actions
+        if self.arm_hold_probabilities is not None:
+            response["arm_hold_probability"] = self.arm_hold_probabilities
+            response["arm_hold_output_contract_hash"] = (
+                self.arm_hold_contract_hash
+            )
         return response
 
     def reset(self) -> None:
@@ -225,6 +249,27 @@ def _continuous_artifact() -> PolicyArtifactContract:
         action_discrete_key="robot_action_tokens",
         camera_input=_state_only_camera_contract(),
         metadata={"fixture": "continuous"},
+    )
+
+
+def _arm_hold_contract() -> PolicyArmHoldOutputContract:
+    return PolicyArmHoldOutputContract(
+        output_key="arm_hold_probability",
+        training_contract_hash=(
+            DEFAULT_ARM_HOLD_TRAINING_CONTRACT_V1.semantic_content_hash
+        ),
+        enter_threshold=0.8,
+        exit_threshold=0.2,
+        enter_consecutive_steps=1,
+        exit_consecutive_steps=1,
+    )
+
+
+def _arm_hold_artifact() -> PolicyArtifactContract:
+    return replace(
+        _continuous_artifact(),
+        model_id="openpi-final-chunk-arm-hold-unit",
+        arm_hold_output=_arm_hold_contract(),
     )
 
 
@@ -318,6 +363,13 @@ def _server_metadata(
     }
     if horizon is not None:
         metadata["model"]["action_horizon"] = int(horizon)
+    if artifact.arm_hold_output is not None:
+        metadata["action_semantics"] = {
+            "arm_hold_output_key": artifact.arm_hold_output.output_key,
+            "arm_hold_output_contract_hash": (
+                artifact.arm_hold_output.contract_hash
+            ),
+        }
     return metadata
 
 
@@ -388,6 +440,7 @@ def _backend(
     *,
     actions: np.ndarray | None = None,
     discrete_actions: np.ndarray | None = None,
+    arm_hold_probabilities: np.ndarray | None = None,
     metadata: dict[str, Any] | None = None,
     error: Exception | None = None,
     clock: Any | None = None,
@@ -404,6 +457,12 @@ def _backend(
             else actions
         ),
         discrete_actions=discrete_actions,
+        arm_hold_probabilities=arm_hold_probabilities,
+        arm_hold_contract_hash=(
+            None
+            if artifact.arm_hold_output is None
+            else artifact.arm_hold_output.contract_hash
+        ),
         error=error,
     )
     return (
@@ -604,6 +663,166 @@ def test_openpi_raw_rtc_adapter_runs_through_shared_frontend_without_dispatch() 
     assert emitting_step is not None
     assert transport.requests
     assert emitting_step.to_debug_payload()["send_actions"] is False
+
+
+def test_openpi_raw_rtc_arm_hold_sidecar_resolves_and_commits_at_emission() -> None:
+    artifact = _arm_hold_artifact()
+    actions = _absolute_actions(artifact.policy_io_layout.action_dim)
+    actions[:, 0] = 0.5
+    actions[:, 7] = -0.5
+    probabilities = np.tile(
+        np.asarray(((1.0, 0.0),), dtype=np.float32),
+        (HORIZON, 1),
+    )
+    backend, transport = _backend(
+        artifact,
+        actions=actions,
+        arm_hold_probabilities=probabilities,
+    )
+    runtime = PolicyDeployRuntime(
+        PolicyDeployRuntimeConfig(
+            active_sides=("left", "right"),
+            arms_enabled=True,
+            hands_enabled=True,
+            action_keyframe_period_sec=1.0 / 30.0,
+            action_maximum_hold_sec=1.0 / 30.0,
+            arm_hold_output=artifact.arm_hold_output,
+        )
+    )
+    pipeline = CanonicalDeployActionPipeline(
+        safety_filter=ActionSafetyFilter(
+            ActionSafetyFilterConfig(
+                active_sides=("left", "right"),
+                arms_enabled=True,
+                hands_enabled=True,
+                end_effector_sides=("left", "right"),
+                max_arm_xyz_step_m=1.0,
+                max_arm_rot_step_deg=180.0,
+                max_arm_joint_step_rad=1.0,
+                max_hand_step=1.0,
+            )
+        ),
+        active_sides=("left", "right"),
+        arms_enabled=True,
+        hands_enabled=True,
+    )
+    base = time.monotonic()
+    frontend = build_rtc_model_shadow_frontend(
+        backend,
+        runtime_session_id="session:openpi-raw-rtc-arm-hold",
+        control_domain_id="domain:openpi-raw-rtc-arm-hold",
+        producer_id="producer:openpi-raw-rtc-arm-hold",
+        policy_node_id="single_policy",
+        deploy_runtime=runtime,
+        preparer=pipeline,
+        created_at=base,
+        profile=RAW_RTC_FINAL_CHUNK_PROFILE_V1,
+    )
+    frontend.start()
+    emitting_step = None
+    try:
+        for index in range(160):
+            step = frontend.step(
+                _observation(),
+                now=base + index / 30.0,
+            )
+            if step.emission_result.emission is not None:
+                emitting_step = step
+                break
+            time.sleep(0.001)
+    finally:
+        frontend.close(now=base + 6.0)
+
+    assert emitting_step is not None
+    assert transport.requests
+    emission = emitting_step.emission_result.emission
+    assert emission is not None
+    assert emission.arm_hold_resolution is not None
+    assert emission.arm_hold_resolution.resolved_combination == "10"
+    assert emission.model_decoded_absolute_action is not None
+    assert emission.decoded_absolute_action is not None
+    assert emission.model_decoded_absolute_action.vector[0] == pytest.approx(0.5)
+    assert emission.decoded_absolute_action.vector[0] == pytest.approx(0.0)
+    assert emitting_step.emission_commit_transition is not None
+    assert emitting_step.emission_commit_transition.receipt.accepted
+    assert emitting_step.action_preparation.arm_hold_resolution is (
+        emission.arm_hold_resolution
+    )
+    assert emitting_step.to_debug_payload()["send_actions"] is False
+
+
+def test_openpi_raw_rtc_arm_hold_missing_reference_faults_without_partial_commit() -> None:
+    artifact = _arm_hold_artifact()
+    probabilities = np.tile(
+        np.asarray(((1.0, 1.0),), dtype=np.float32),
+        (HORIZON, 1),
+    )
+    backend, _transport = _backend(
+        artifact,
+        arm_hold_probabilities=probabilities,
+    )
+    runtime = PolicyDeployRuntime(
+        PolicyDeployRuntimeConfig(
+            active_sides=("left", "right"),
+            arms_enabled=True,
+            hands_enabled=True,
+            action_keyframe_period_sec=1.0 / 30.0,
+            action_maximum_hold_sec=1.0 / 30.0,
+            arm_hold_output=artifact.arm_hold_output,
+        )
+    )
+    observation = _observation()
+    state = observation.state.copy()
+    state[STATE_ARM_POSE_SLICES["right"]] = np.nan
+    observation = replace(observation, state=state)
+    pipeline = CanonicalDeployActionPipeline(
+        safety_filter=ActionSafetyFilter(
+            ActionSafetyFilterConfig(
+                active_sides=("left", "right"),
+                arms_enabled=True,
+                hands_enabled=True,
+                end_effector_sides=("left", "right"),
+                max_arm_xyz_step_m=1.0,
+                max_arm_rot_step_deg=180.0,
+                max_arm_joint_step_rad=1.0,
+                max_hand_step=1.0,
+            )
+        ),
+        active_sides=("left", "right"),
+        arms_enabled=True,
+        hands_enabled=True,
+    )
+    base = time.monotonic()
+    frontend = build_rtc_model_shadow_frontend(
+        backend,
+        runtime_session_id="session:openpi-raw-rtc-arm-hold-fault",
+        control_domain_id="domain:openpi-raw-rtc-arm-hold-fault",
+        producer_id="producer:openpi-raw-rtc-arm-hold-fault",
+        policy_node_id="single_policy",
+        deploy_runtime=runtime,
+        preparer=pipeline,
+        created_at=base,
+        profile=RAW_RTC_FINAL_CHUNK_PROFILE_V1,
+    )
+    frontend.start()
+    fault_step = None
+    try:
+        for index in range(160):
+            step = frontend.step(
+                observation,
+                now=base + index / 30.0,
+            )
+            if step.state.lifecycle_state == POLICY_ASYNC_PRODUCER_FAULT:
+                fault_step = step
+                break
+            time.sleep(0.001)
+    finally:
+        frontend.close(now=base + 6.0)
+
+    assert fault_step is not None
+    assert fault_step.emission_result.emission is None
+    assert fault_step.emission_commit_transition is None
+    assert runtime._arm_hold_resolver.resolved_combination == "00"
 
 
 def test_openpi_relative_raw_rtc_runs_through_shared_frontend_without_dispatch() -> None:
@@ -1356,6 +1575,55 @@ def test_openpi_model_rtc_v3_binds_provider_transform_without_raw_regression(
     )
 
 
+def test_openpi_real_launcher_wires_conditioned_adapter_only_when_selected(
+    tmp_path: Path,
+) -> None:
+    artifact, _ = _conditioned_artifact_and_metadata(
+        inference_only_v2=True,
+    )
+    continuation = artifact.model_continuation
+    assert isinstance(continuation, ModelContinuationDataContractV2)
+    artifact_path = tmp_path / "policy_artifact.json"
+    artifact_path.write_text(
+        json.dumps(artifact.to_dict()),
+        encoding="utf-8",
+    )
+    with mock.patch(
+        "teleop_runtime.deploy.run_policy.main",
+        return_value=0,
+    ) as run_main:
+        result = openpi_real_launcher.main(
+            [
+                "--policy-artifact-json",
+                str(artifact_path),
+                "--rtc-profile",
+                MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+                "--rtc-frame-contract-hash",
+                continuation.runtime.frame_contract_hash,
+            ]
+        )
+
+    assert result == 0
+    delegated = run_main.call_args.args[0]
+    assert MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1 in delegated
+    factory = run_main.call_args.kwargs["rtc_model_adapter_factory"]
+    creator = mock.Mock(return_value="conditioned-adapter")
+    adapter = factory(
+        policy=SimpleNamespace(create_model_rtc_adapter=creator),
+        deploy_session_contract=SimpleNamespace(
+            runtime_pose_frame_contract=None,
+        ),
+        policy_artifact=artifact,
+        args=SimpleNamespace(policy_action_pose_mode="absolute"),
+        active_sides=("left", "right"),
+    )
+    assert adapter == "conditioned-adapter"
+    assert creator.call_args.kwargs["normalization_hash"] == (
+        continuation.runtime.normalization_hash
+    )
+    assert "result_action_representation" not in creator.call_args.kwargs
+
+
 def test_openpi_model_rtc_requires_exact_artifact_bound_contract() -> None:
     artifact, metadata = _conditioned_artifact_and_metadata(
         inference_only_v2=True,
@@ -1682,6 +1950,14 @@ def test_relative_pose_artifact_requires_structured_typed_adapter() -> None:
             artifact,
             action_pose_mode="relative",
             frame_contract_hash="sha256:" + "2" * 64,
+            result_action_representation=OPENPI_RTC_RESULT_TYPED_CANONICAL_V1,
+        )
+
+
+def test_arm_hold_artifact_rejects_typed_canonical_raw_rtc() -> None:
+    with pytest.raises(ValueError, match="legacy_normalized_v1 absolute"):
+        _config(
+            _arm_hold_artifact(),
             result_action_representation=OPENPI_RTC_RESULT_TYPED_CANONICAL_V1,
         )
 

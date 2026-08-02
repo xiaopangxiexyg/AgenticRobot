@@ -49,6 +49,8 @@ class DeployPolicyContract:
     # deliberately opt-in so legacy servers keep their historical metadata
     # compatibility until they publish a contract hash.
     normalization_hash: str | None = None
+    arm_hold_output_key: str | None = None
+    arm_hold_output_contract_hash: str | None = None
     metadata_required: bool = True
     extra: Mapping[str, Any] = field(default_factory=dict)
 
@@ -85,6 +87,19 @@ class DeployPolicyContract:
         object.__setattr__(self, "required_camera_slots", tuple(str(v) for v in self.required_camera_slots))
         object.__setattr__(self, "hand_layout", _optional_str(self.hand_layout))
         object.__setattr__(self, "normalization_hash", _optional_str(self.normalization_hash))
+        arm_hold_key = _optional_str(self.arm_hold_output_key)
+        arm_hold_hash = _optional_str(self.arm_hold_output_contract_hash)
+        if (arm_hold_key is None) != (arm_hold_hash is None):
+            raise ValueError(
+                "arm_hold_output_key and arm_hold_output_contract_hash must "
+                "be supplied together."
+            )
+        object.__setattr__(self, "arm_hold_output_key", arm_hold_key)
+        object.__setattr__(
+            self,
+            "arm_hold_output_contract_hash",
+            arm_hold_hash,
+        )
         object.__setattr__(self, "extra", dict(self.extra))
 
 
@@ -306,6 +321,40 @@ def validate_server_metadata(
     if contract.hand_layout is not None and not _metadata_supports_hand_layout(payload, contract.hand_layout):
         errors.append(f"hand_layout_mismatch:expected={contract.hand_layout!r}")
 
+    server_arm_hold_key = _optional_str(
+        _first_present(
+            payload,
+            (
+                "action_semantics.arm_hold_output_key",
+                "model.arm_hold_output_key",
+                "arm_hold_output_key",
+            ),
+        )
+    )
+    server_arm_hold_hash = _optional_str(
+        _first_present(
+            payload,
+            (
+                "action_semantics.arm_hold_output_contract_hash",
+                "model.arm_hold_output_contract_hash",
+                "arm_hold_output_contract_hash",
+            ),
+        )
+    )
+    if contract.arm_hold_output_key is not None:
+        if server_arm_hold_key != contract.arm_hold_output_key:
+            errors.append(
+                "arm_hold_output_key_mismatch:"
+                f"expected={contract.arm_hold_output_key!r}, "
+                f"actual={server_arm_hold_key!r}"
+            )
+        if server_arm_hold_hash != contract.arm_hold_output_contract_hash:
+            errors.append(
+                "arm_hold_output_contract_hash_mismatch:"
+                f"expected={contract.arm_hold_output_contract_hash!r}, "
+                f"actual={server_arm_hold_hash!r}"
+            )
+
     summary = {
         "protocol_version": protocol,
         "deploy_schema_version": _first_present(payload, ("deploy_schema_version", "schema_version")),
@@ -323,6 +372,8 @@ def validate_server_metadata(
         "action_horizon": horizon,
         "active_sides": list(server_sides),
         "camera_slots": _server_camera_slots(payload),
+        "arm_hold_output_key": server_arm_hold_key,
+        "arm_hold_output_contract_hash": server_arm_hold_hash,
     }
     result = MetadataValidationResult(
         ok=not errors,

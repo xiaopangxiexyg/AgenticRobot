@@ -499,6 +499,41 @@ def test_policy_deploy_runtime_exposes_only_same_chunk_successor_as_lookahead() 
     assert second_step.raw_lookahead_action is None
 
 
+def test_policy_deploy_runtime_exposes_two_same_chunk_successors_without_pop() -> None:
+    observation = _right_arm_policy_observation()
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+        )
+    )
+    first = _right_arm_policy_action()
+    second = np.asarray(first, dtype=np.float32).copy()
+    third = np.asarray(first, dtype=np.float32).copy()
+    second[7] += 0.01
+    third[7] += 0.02
+    policy = _TransactionalPolicy(np.stack((first, second, third), axis=0))
+    prediction = runtime.predict_and_queue(policy, observation, now=10.0)
+    assert prediction.accepted is True
+
+    step = runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    )
+
+    assert step.raw_action is not None
+    assert step.raw_lookahead_action is not None
+    assert step.raw_second_lookahead_action is not None
+    assert step.raw_lookahead_action.metadata["deploy_action_chunk_index"] == 1
+    assert (
+        step.raw_second_lookahead_action.metadata["deploy_action_chunk_index"]
+        == 2
+    )
+    assert runtime.action_queue_length() == 2
+
+
 def test_policy_deploy_runtime_executes_only_configured_chunk_prefix() -> None:
     observation = _right_arm_policy_observation()
     runtime = robot_runtime.PolicyDeployRuntime(

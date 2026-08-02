@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import inspect
 import json
 from pathlib import Path
 import shutil
@@ -11,6 +12,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from collection_runtime.progress.profiles import (
+    bind_dataset_progress_profile,
+    load_task_progress_profile_file,
+)
 from dataset_contracts.v23_validation import validate_v23_row_causal_snapshots
 from teleop_runtime.collection.operator_labels import (
     LABEL_FIX_ARM,
@@ -30,7 +35,17 @@ from teleop_runtime.collection.umi.config import load_umi_collection_config
 from teleop_runtime.collection.umi.controller import UmiCollectionController
 from teleop_runtime.collection.umi.components import (
     UmiComponents,
+    UmiStartupResource,
     _configure_dmtac_backend_configs,
+)
+from teleop_runtime.collection.umi.app import run_umi_collection
+from teleop_runtime.collection.umi.angle_trigger_calibration import (
+    ensure_default_command_input_from_gui,
+)
+from teleop_runtime.collection.umi.default_components import (
+    DEFAULT_UMI_HARDWARE_PRESENTATION,
+    build_default_umi_components,
+    prepare_default_umi_hardware,
 )
 from teleop_runtime.collection.umi.pose_adapter import (
     UmiPoseAdapter,
@@ -38,7 +53,10 @@ from teleop_runtime.collection.umi.pose_adapter import (
     normalize_vive_tracker_transform,
 )
 from teleop_runtime.collection.umi.row_encoder import UmiV23RowEncoder
-from teleop_runtime.collection.umi.recorder import UmiDatasetRecorder
+from teleop_runtime.collection.umi.recorder import (
+    UmiDatasetRecorder,
+    _validate_umi_dataset_admission,
+)
 from teleop_runtime.collection.umi.snapshot import _gripper_measurement_timing
 from teleop_runtime.collection.umi.recalibration import (
     config_for_calibration_dataset,
@@ -53,6 +71,181 @@ from teleop_runtime.gui.calibration_web_ui import _render_initial_html
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_umi_runtime_factories_are_injectable_without_changing_cli_defaults():
+    signature = inspect.signature(run_umi_collection)
+    assert (
+        signature.parameters["hardware_preparer"].default
+        is prepare_default_umi_hardware
+    )
+    assert (
+        signature.parameters["component_builder"].default
+        is build_default_umi_components
+    )
+    assert (
+        signature.parameters["hardware_presentation"].default
+        is DEFAULT_UMI_HARDWARE_PRESENTATION
+    )
+    assert signature.parameters["pose_adapter_builder"].default is UmiPoseAdapter
+    assert (
+        signature.parameters["command_input_initializer"].default
+        is ensure_default_command_input_from_gui
+    )
+
+
+def test_umi_component_bundle_exposes_backend_neutral_ports():
+    pose = object()
+    cameras = {"wrist": object()}
+    command_input = object()
+    end_effectors = {"tool": object()}
+    rig = object()
+    retargeters = {"tool": object()}
+    state_history = object()
+    components = UmiComponents(
+        vive=pose,
+        cameras=cameras,
+        angle_trigger=command_input,
+        grippers=end_effectors,
+        rig=rig,
+        retargeters=retargeters,
+        hand_state_poller=state_history,
+    )
+
+    assert components.pose_source is pose
+    assert components.camera_sources is cameras
+    assert components.command_input is command_input
+    assert components.end_effectors is end_effectors
+    assert components.command_rig is rig
+    assert components.command_retargeters is retargeters
+    assert components.state_history is state_history
+    assert components.command_input_name == "command_input"
+
+
+def test_umi_component_bundle_uses_injected_diagnostics_without_backend_config():
+    backend = object()
+    components = UmiComponents(
+        vive=object(),
+        cameras={},
+        angle_trigger=object(),
+        grippers={"tool": backend},
+        rig=object(),
+        retargeters={},
+        hand_state_poller=object(),
+        end_effector_diagnostics_provider=lambda side, candidate, _config: {
+            "component_id": side,
+            "same_backend": candidate is backend,
+            "is_connected": True,
+        },
+    )
+
+    assert components.end_effector_diagnostics(
+        "tool",
+        SimpleNamespace(),
+    ) == {
+        "component_id": "tool",
+        "same_backend": True,
+        "is_connected": True,
+    }
+
+
+def test_umi_strict_start_rolls_back_resource_when_readiness_check_fails():
+    events: list[str] = []
+
+    class Resource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def start(self) -> None:
+            events.append(f"start:{self.name}")
+
+        def close(self) -> None:
+            events.append(f"close:{self.name}")
+
+    pose = Resource("pose")
+    tool = Resource("tool")
+    components = UmiComponents(
+        vive=pose,
+        cameras={},
+        angle_trigger=Resource("input"),
+        grippers={"tool": object()},
+        rig=tool,
+        retargeters={},
+        hand_state_poller=Resource("history"),
+        strict_startup=True,
+        startup_resources=(
+            UmiStartupResource(
+                key="pose",
+                component=pose,
+                label="pose",
+                requirement="collection_core",
+                strict_start_message="start pose",
+            ),
+            UmiStartupResource(
+                key="tool",
+                component=tool,
+                label="tool",
+                requirement="collection_core",
+                strict_start_message="start tool",
+                require_end_effector_readiness=True,
+            ),
+        ),
+        end_effector_readiness_check=lambda: (_ for _ in ()).throw(
+            RuntimeError("not ready")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        components.start()
+
+    assert events == [
+        "start:pose",
+        "start:tool",
+        "close:tool",
+        "close:pose",
+    ]
+    assert components._started is False
+
+
+def test_umi_custom_startup_resource_keys_drive_status_without_device_names():
+    class Resource:
+        def start(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    source = Resource()
+    components = UmiComponents(
+        vive=source,
+        cameras={},
+        angle_trigger=source,
+        grippers={},
+        rig=source,
+        retargeters={},
+        hand_state_poller=source,
+        startup_resources=(
+            UmiStartupResource(
+                key="custom.pose",
+                component=source,
+                label="custom pose",
+                requirement="collection_core",
+                strict_start_message="start custom pose",
+            ),
+        ),
+        startup_errors={"custom.pose": "offline"},
+    )
+
+    assert components.hardware_status() == {
+        "custom.pose": {
+            "online": False,
+            "health": "error",
+            "status_level": "error",
+            "status_label": "连接失败",
+            "requirement": "collection_core",
+            "error": "offline",
+        }
+    }
 
 
 def test_umi_components_reject_dmtac_start_that_swallowed_connection_failure():
@@ -1217,6 +1410,121 @@ def test_umi_episode_start_payload_switches_idle_dataset_root(tmp_path):
     assert assembler.config.dataset_root == selected
 
 
+def test_umi_task_select_switches_idle_dataset_root_without_starting(tmp_path):
+    config = replace(
+        load_umi_collection_config(
+            ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
+        ),
+        dataset_root=tmp_path / "before",
+    )
+    selected = tmp_path / "selected"
+    switched = []
+    recorder = SimpleNamespace(
+        recording=False,
+        reconfigure_config=lambda next_config: switched.append(next_config),
+    )
+    assembler = SimpleNamespace(config=config)
+    ui_messages = []
+    controller = _controller_for_logic_tests(
+        ui=SimpleNamespace(
+            append_message=lambda tag, message: ui_messages.append((tag, message))
+        ),
+        recorder=recorder,
+        assembler=assembler,
+    )
+    controller.config = config
+
+    controller._handle_events(
+        [(
+            "task_select:"
+            + json.dumps(
+                {
+                    "dataset_base_root": str(selected),
+                    # UMI task semantics are runtime-owned and these GUI
+                    # fields must not be able to replace them.
+                    "task_key": "another_task",
+                    "task_english_name": "Another Task",
+                }
+            ),
+            "web_gui",
+            1.0,
+        )],
+        gripper_ready=True,
+        gripper_reason="",
+    )
+
+    assert len(switched) == 1
+    assert switched[0].dataset_root == selected
+    assert switched[0].task_id == config.task_id
+    assert controller.config.dataset_root == selected
+    assert assembler.config.dataset_root == selected
+    assert controller._event_status == "ready"
+    assert ui_messages[-1][0] == "Dataset"
+
+
+def test_umi_task_select_fails_closed_while_recording(tmp_path):
+    config = replace(
+        load_umi_collection_config(
+            ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
+        ),
+        dataset_root=tmp_path / "before",
+    )
+    recorder = SimpleNamespace(recording=True)
+    assembler = SimpleNamespace(config=config)
+    controller = _controller_for_logic_tests(
+        ui=SimpleNamespace(),
+        recorder=recorder,
+        assembler=assembler,
+    )
+    controller.config = config
+
+    controller._handle_events(
+        [(
+            "task_select:"
+            + json.dumps({"dataset_base_root": str(tmp_path / "selected")}),
+            "web_gui",
+            1.0,
+        )],
+        gripper_ready=True,
+        gripper_reason="",
+    )
+
+    assert controller.config.dataset_root == tmp_path / "before"
+    assert assembler.config.dataset_root == tmp_path / "before"
+    assert controller._event_status == "error"
+    assert "while an episode is recording" in controller._event_message
+
+
+def test_umi_dataset_switch_rejects_progress_profiled_target(tmp_path):
+    profile = load_task_progress_profile_file(
+        ROOT
+        / "collection_runtime/progress/profiles/linear/"
+        "example_three_stage_pick_place.progress.json"
+    )
+    bind_dataset_progress_profile(tmp_path, profile)
+
+    with pytest.raises(ValueError, match="collection progress profile"):
+        _validate_umi_dataset_admission(tmp_path, task_id="umi_collection")
+
+
+def test_umi_dataset_switch_rejects_populated_different_task(tmp_path):
+    meta = tmp_path / "meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps(
+            {
+                "episode_count": 1,
+                "frame_count": 10,
+                "task_id": "another_task",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="task binding differs"):
+        _validate_umi_dataset_admission(tmp_path, task_id="umi_collection")
+
+
 def test_umi_recalibration_event_exits_session_without_open_episode():
     recorder = SimpleNamespace(recording=False)
     controller = _controller_for_logic_tests(
@@ -1317,13 +1625,28 @@ def test_umi_gui_reports_selected_label_side_and_no_send_truthfully():
         effective_sample_hz=lambda now: None,
         stats=lambda: {},
     )
-    components = SimpleNamespace(
+    resource = SimpleNamespace(start=lambda: None, close=lambda: None)
+    components = UmiComponents(
         foot_pad=None,
-        vive=SimpleNamespace(get_latest_channels_at_or_before=lambda _now: {}),
-        hand_state_poller=SimpleNamespace(latest_at_or_before=lambda _now: {}),
-        angle_trigger=SimpleNamespace(get_latest_channels=lambda: {}),
+        vive=SimpleNamespace(
+            start=lambda: None,
+            close=lambda: None,
+            get_latest_channels_at_or_before=lambda _now: {},
+        ),
+        hand_state_poller=SimpleNamespace(
+            start=lambda: None,
+            close=lambda: None,
+            latest_at_or_before=lambda _now: {},
+        ),
+        angle_trigger=SimpleNamespace(
+            start=lambda: None,
+            close=lambda: None,
+            get_latest_channels=lambda: {},
+        ),
         cameras={},
         grippers={"left": gripper, "right": gripper},
+        rig=resource,
+        retargeters={},
     )
     labels = OperatorLabelStateMachine()
     labels.set("left", "fixed_hold", source="test", timestamp=1.0)
@@ -1375,7 +1698,7 @@ def test_existing_formal_gui_renders_umi_title_without_second_web_server():
         ROOT / "teleop_runtime/collection/umi/controller.py"
     ).read_text()
     assert 'state.ui_mode || "") === "umi_collection"' in (
-        ROOT / "teleop_runtime/gui/calibration_web_ui.py"
+        ROOT / "control_station/web/calibration_web_ui.py"
     ).read_text()
     assert 'id="episodeWarningTitle"' in html
     assert "calibration_validity_warning" in html
@@ -1387,7 +1710,7 @@ def test_existing_formal_gui_renders_umi_title_without_second_web_server():
     assert "等待有效快照" in html
     assert "采样尝试/接受/拒绝" in html
     assert "episode_attempted_sample_count" in (
-        ROOT / "teleop_runtime/gui/calibration_web_ui.py"
+        ROOT / "control_station/web/calibration_web_ui.py"
     ).read_text()
 
 

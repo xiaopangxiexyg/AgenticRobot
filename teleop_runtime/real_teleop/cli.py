@@ -25,6 +25,8 @@ from robot_motion.position_control import (
 from robot_motion.rm65 import (
     IK_STEP_MODE_CHOICES,
     IK_STEP_MODE_LEGACY_ITERATIVE,
+    JOINT_LIMIT_GUARD_LEGACY,
+    JOINT_LIMIT_GUARD_MODE_CHOICES,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_POSITION_CONTROL_PROFILE_CHOICES,
 )
@@ -55,6 +57,7 @@ from ..position_control import (
     DEFAULT_CONTROL_DEBUG_QUEUE_SIZE,
     DEFAULT_CONTROL_DEBUG_ROOT,
 )
+from ..sources.camera import REALSENSE_STARTUP_WARMUP_POLICIES
 from ..sources.pose import DEFAULT_VIVE_CLOCK_SYNC_PORT
 from .actuator_command_trace import (
     DEFAULT_ACTUATOR_TRACE_MAX_DURATION_SEC,
@@ -92,6 +95,7 @@ from .hand_cli import (
 )
 from .movement import MOVEMENT_MULTIPLE_DEFAULT
 from .position_force_guard import POSITION_FORCE_SOURCES
+from .progress_adapter import load_real_teleop_progress_profile
 from .wrist_depth_freshness import (
     DEFAULT_WRIST_DEPTH_MAX_M,
     DEFAULT_WRIST_DEPTH_MIN_M,
@@ -279,9 +283,11 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Optional pedal mapping for special-arm actions. Four pedals map "
             "F13/F14/F15/F16 to Fix-left/Fix-right/Init-left/Init-right; two "
-            "pedals map F13/F14 to Fix-left/Fix-right. Pedal topology or "
-            "availability never disables the configured Fix/Init controllers, "
-            "keyboard shortcuts, or GUI buttons."
+            "pedals map F13/F14 to Fix-left/Fix-right. A five-pedal topology "
+            "uses the same two-pedal side-switch semantics for F13/F14 and "
+            "B/C, while F15/F16/F17 map to Advance/Failure/Undo only after a "
+            "progress profile is ready. Pedal topology or "
+            "availability never disables configured GUI/keyboard controls."
         ),
     )
     add_hand_backend_arguments(parser)
@@ -302,6 +308,19 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
             "RealSense color transport format for real-teleop cameras. "
             "Default bgr8 avoids unstable multi-camera YUYV negotiation; "
             "use yuyv only for an explicitly validated station."
+        ),
+    )
+    parser.add_argument(
+        "--camera-startup-warmup-policy",
+        choices=REALSENSE_STARTUP_WARMUP_POLICIES,
+        default="legacy",
+        help=(
+            "RealSense post-pipeline startup warmup. legacy preserves the "
+            "historical synchronous N-frame wait and reset retry; "
+            "bounded_first_frame waits for one valid frame within the configured "
+            "startup_frame_grace_sec, then relies on the unchanged global "
+            "multi-frame camera self-check. Pipeline negotiation remains serial. "
+            "Default: legacy (atomic rollback)."
         ),
     )
     parser.add_argument(
@@ -920,7 +939,9 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Final position-command planner. 'linear' preserves the existing pure-position "
             "reference interpolation; 'acceleration_limited' adds velocity-continuous, "
-            "acceleration-limited online 60->120 Hz planning."
+            "acceleration-limited online 60->120 Hz planning; "
+            "'sample_aligned_jerk_limited' is the opt-in 15 Hz admitted-action / "
+            "120 Hz jerk-limited cached-control-cut experiment."
         ),
     )
     parser.add_argument(
@@ -928,9 +949,9 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         type=_positive_float,
         default=DEFAULT_POSITION_VELOCITY_RAMP_SEC,
         help=(
-            "Position-error feedback horizon used to form desired velocity in the optional "
-            "planner. Defaults to 0.10 s; acceleration is limited independently by "
-            "--position-max-acceleration-rad-s2."
+            "Position-error feedback horizon for acceleration_limited, or the acceleration-"
+            "to-jerk ramp used by sample_aligned_jerk_limited. Defaults to 0.10 s; "
+            "acceleration is limited independently by --position-max-acceleration-rad-s2."
         ),
     )
     parser.add_argument(
@@ -941,7 +962,8 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
             "Time constant in seconds for the bounded causal low-pass applied to "
             "target velocity inferred from accepted position qrefs. Defaults to 0.03 s; "
             "set 0 to reproduce the unfiltered planner behavior. The option is consumed "
-            "only by the acceleration-limited position planner."
+            "only by the acceleration-limited position planner; the sample-aligned jerk "
+            "planner requires zero and does not apply a second target filter."
         ),
     )
     parser.add_argument(
@@ -1304,6 +1326,37 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--position-ik-branch-continuity-anchor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Position single-step IK only: add the experimental q3/q5 soft "
+            "branch-continuity task. Disabled by default because it changes "
+            "the stable raw IK solution; --no-position-ik-branch-continuity-anchor "
+            "is the atomic rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-joint-limit-guard-mode",
+        choices=JOINT_LIMIT_GUARD_MODE_CHOICES,
+        default=JOINT_LIMIT_GUARD_LEGACY,
+        help=(
+            "Position-mode physical joint-limit behavior. legacy preserves "
+            "the stable selector; boundary_hold removes only inward motion "
+            "inside the narrow guard band; forced_escape_latched retains the "
+            "2026-08-02 outward-step experiment for offline comparison."
+        ),
+    )
+    parser.add_argument(
+        "--position-joint-limit-boundary-margin-deg",
+        type=_non_negative_float,
+        default=1.5,
+        help=(
+            "Guard width used only by --position-joint-limit-guard-mode "
+            "boundary_hold (default 1.5 degrees)."
+        ),
+    )
+    parser.add_argument(
         "--position-ik-solve-min-iterations",
         type=_positive_int,
         default=2,
@@ -1539,6 +1592,26 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gui-resizable-sidebars",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Allow the shared RealTeleop/UMI browser GUI columns to be resized "
+            "with a draggable divider. Enabled by default; pass "
+            "--no-gui-resizable-sidebars for the fixed legacy layout."
+        ),
+    )
+    parser.add_argument(
+        "--gui-input-activity-indicators",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Show passive A/B/C/G and P1--P5 activity blocks above the left "
+            "status column. Enabled by default; pass "
+            "--no-gui-input-activity-indicators for exact display rollback."
+        ),
+    )
+    parser.add_argument(
         "--hardware-admission-mode",
         choices=("capability", "strict"),
         default="capability",
@@ -1579,6 +1652,27 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="Number of valid wrist frames to average per side during runtime home calibration.",
+    )
+    parser.add_argument(
+        "--runtime-home-atomic-arm-snapshot",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use one dual-arm hardware snapshot for runtime robot Home, preview/IK "
+            "anchors, and command-backend reset. Enabled by default; "
+            "--no-runtime-home-atomic-arm-snapshot restores the legacy reread path."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-home-late-weighted-vive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Build runtime human Home from fresh VIVE packets with linearly "
+            "increasing recency weights and one final fresh packet. Enabled by "
+            "default; --no-runtime-home-late-weighted-vive restores the legacy "
+            "uniform latest-value polling average."
+        ),
     )
     parser.add_argument(
         "--auto-calibrate",
@@ -1691,6 +1785,85 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Optional formal dataset task description.",
+    )
+    parser.add_argument(
+        "--collection-progress-profile",
+        type=load_real_teleop_progress_profile,
+        default=None,
+        metavar="JSON_OR_CATALOG",
+        help=(
+            "Opt in to the default-off RealTeleop collection-progress sidecar "
+            "using a one-or-more-step LINEAR FULL_TASK profile from an "
+            "explicit JSON path or catalog:<profile_id>. The "
+            "formal dataset remains authoritative; typed Advance/Undo/Failure "
+            "and Failure/Retry wiring are enabled. The independent rendered "
+            "panel requires --collection-progress-gui; Tree profiles and UMI "
+            "remain disabled."
+        ),
+    )
+    parser.add_argument(
+        "--collection-progress-gui",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Render the optional Control Station long-horizon progress panel. "
+            "A managed LINEAR profile can be selected in the GUI before the "
+            "first Episode; --collection-progress-profile remains an optional "
+            "initial/CLI selection. Default off; disabling it preserves the "
+            "existing RealTeleop collection GUI and A/B/C semantics exactly."
+        ),
+    )
+    parser.add_argument(
+        "--collection-progress-arm-control-mode",
+        choices=("strict_profile", "profile", "ignore_profile"),
+        default="profile",
+        help=(
+            "How a selected coarse progress profile controls left/right arms. "
+            "strict_profile enforces declared arm modes and disables manual "
+            "Fix/single-arm pedals; profile (default) applies declarations on "
+            "progress transitions but keeps manual controls; ignore_profile "
+            "preserves pedal/button-only behavior."
+        ),
+    )
+    parser.add_argument(
+        "--collection-stage-profile",
+        type=str,
+        default="",
+        metavar="JSON_OR_CATALOG",
+        help=(
+            "Optional ordered fine-stage profile for post-capture annotation. "
+            "Managed collection progress profiles automatically use their "
+            "same-name .stages.json asset; use this option only for an "
+            "explicit external profile."
+        ),
+    )
+    parser.add_argument(
+        "--collection-progress-entry-step",
+        type=str,
+        default="",
+        help=(
+            "Advanced partial/recovery capture entry progress_step_id. Empty "
+            "uses the profile initial step."
+        ),
+    )
+    parser.add_argument(
+        "--collection-progress-entry-stage",
+        type=str,
+        default="",
+        help=(
+            "Advanced partial/recovery capture entry stage_id. Empty uses the "
+            "first stage of the selected progress step."
+        ),
+    )
+    parser.add_argument(
+        "--collection-progress-entry-condition",
+        choices=("nominal", "recovery_from_failure"),
+        default="nominal",
+        help=(
+            "Capture entry condition. Non-initial fine-stage entries require "
+            "recovery_from_failure; this records setup semantics but does not "
+            "rewrite a prior Episode's Failure fact."
+        ),
     )
     parser.add_argument(
         "--dataset-name",

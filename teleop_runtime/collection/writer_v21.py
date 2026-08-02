@@ -12,8 +12,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from collection_runtime.async_writer import WriteJob
+from dataset_contracts.arm_mode import (
+    ARM_HOLD_TRAINING_PROJECTION_ID_V1,
+    arm_hold_training_projection_metadata,
+)
 from dataset_contracts.causal_snapshot import DEFAULT_CAUSAL_SNAPSHOT_CONTRACT
-from dataset_contracts.v23_validation import validate_v23_row_causal_snapshots
 from dataset_contracts.pose_frames import (
     POSE_FRAME_CONTRACT_METADATA_KEY,
     POSE_STORAGE_FRAME_DESK,
@@ -40,6 +44,7 @@ from dataset_contracts.v22 import (
     bind_policy_io_layout,
     policy_io_layout_from_metadata,
 )
+from dataset_contracts.v23_validation import validate_v23_row_causal_snapshots
 from dataset_contracts.wrist_depth import (
     DepthRangeMaskConfig,
     depth_range_mask,
@@ -57,7 +62,6 @@ from ..action import (
 )
 from ..recording import _to_serializable
 from .arm_mode_labels import ARM_MODE_IDS, ARM_MODE_SCHEMA
-from .async_writer import WriteJob
 from .hand_state_polling import hand_state_tactile_arrays
 from .pose_storage import (
     bind_collection_row_pose_storage,
@@ -849,6 +853,11 @@ class LeRobotV21Writer:
                             "teleop.arm_mode.<side>.init_rotation_speed_deg_s",
                             "teleop.arm_mode.<side>.init_dwell_sec",
                         ],
+                        "training_projections": {
+                            ARM_HOLD_TRAINING_PROJECTION_ID_V1: (
+                                arm_hold_training_projection_metadata()
+                            )
+                        },
                     }
                 },
                 "features": features,

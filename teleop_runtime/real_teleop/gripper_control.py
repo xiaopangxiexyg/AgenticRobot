@@ -10,7 +10,7 @@ import numpy as np
 from robot_motion.runtime import TeleopCommand, merge_teleop_commands
 
 from ..backends.grippers import DMTacGripperBackend
-from ..gui.status_payloads import (
+from .status_payloads import (
     _json_safe_value,
     _safe_float_value,
     _safe_int_value,
@@ -289,4 +289,3 @@ __all__ = [
     "_probe_gripper_backend_motion",
     "_run_gripper_warmup_probe_for_side",
 ]
-

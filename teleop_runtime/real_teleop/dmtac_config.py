@@ -16,7 +16,7 @@ from ..backends.grippers import (
     DMTacGripperBackendConfig,
     normalize_dmtac_tactile_fields,
 )
-from .dataset_layout import expand_cli_path
+from collection_runtime.dataset_layout import expand_cli_path
 
 
 def dmtac_tactile_enabled(args: argparse.Namespace) -> bool:

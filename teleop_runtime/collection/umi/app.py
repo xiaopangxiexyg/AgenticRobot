@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 import time
+from typing import Callable
 
 from dataset_contracts.v25p_native_storage import V25P_RECORD_CJSON_LAYOUT_V1
 from robot_motion.runtime.lifecycle import run_best_effort_cleanup
 
-from ...configs.dmtac_hardware import prepare_dmtac_hardware_assignment_before_gui
-from ...gui.calibration_web_ui import CalibrationWebUi
-from ...gui.startup_progress import GuiStartupProgress
+from control_station.web.calibration_web_ui import CalibrationWebUi
+from control_station.web.startup_progress import GuiStartupProgress
 from ..operator_labels import OperatorLabelStateMachine
 from ..policy_io import load_policy_io_layout
 from .calibration import UmiCalibrationSet
-from .angle_trigger_calibration import ensure_angle_trigger_ready
-from .components import build_umi_components
+from .angle_trigger_calibration import ensure_default_command_input_from_gui
+from .components import (
+    UmiComponentBuilder,
+    UmiHardwarePreparer,
+    UmiHardwarePresentation,
+)
 from .config import UmiCollectionConfig
 from .controller import UmiCollectionController
-from .pose_adapter import UmiPoseAdapter
+from .default_components import (
+    DEFAULT_UMI_HARDWARE_PRESENTATION,
+    build_default_umi_components,
+    prepare_default_umi_hardware,
+)
+from .pose_adapter import UmiPoseAdapter, UmiPoseAdapterPort
 from .recorder import UmiDatasetRecorder
 from .recalibration import (
     config_for_calibration_dataset,
@@ -27,7 +36,24 @@ from .recalibration import (
 from .snapshot import UmiSnapshotAssembler
 
 
-def run_umi_collection(config: UmiCollectionConfig) -> int:
+UmiPoseAdapterBuilder = Callable[..., UmiPoseAdapterPort]
+UmiCommandInputInitializer = Callable[..., bool]
+
+
+def run_umi_collection(
+    config: UmiCollectionConfig,
+    *,
+    hardware_preparer: UmiHardwarePreparer = prepare_default_umi_hardware,
+    hardware_presentation: UmiHardwarePresentation = (
+        DEFAULT_UMI_HARDWARE_PRESENTATION
+    ),
+    component_builder: UmiComponentBuilder = build_default_umi_components,
+    pose_adapter_builder: UmiPoseAdapterBuilder = UmiPoseAdapter,
+    command_input_initializer: UmiCommandInputInitializer = (
+        ensure_default_command_input_from_gui
+    ),
+) -> int:
+    initialize_command_input = command_input_initializer
     layout = load_policy_io_layout(config.policy_io_layout)
     if layout is None:
         raise RuntimeError("UMI collection requires a policy I/O layout")
@@ -35,6 +61,8 @@ def run_umi_collection(config: UmiCollectionConfig) -> int:
         host=config.gui_host,
         port=config.gui_port,
         open_browser=config.open_browser,
+        resizable_sidebars=config.gui_resizable_sidebars,
+        input_activity_indicators=config.gui_input_activity_indicators,
     )
     try:
         ui.publish(
@@ -49,26 +77,24 @@ def run_umi_collection(config: UmiCollectionConfig) -> int:
         )
         assignment_progress.start()
         assignment_progress.begin(
-            "dmtac.assignment",
-            label="DMTac USB 左右绑定",
-            message="正在扫描并校验触觉夹爪设备",
+            hardware_presentation.preflight_key,
+            label=hardware_presentation.preflight_label,
+            message=hardware_presentation.preflight_message,
             requirement="collection_core",
         )
-        dmtac_assignment = None
-        dmtac_startup_error: Exception | None = None
+        prepared_hardware = None
+        hardware_startup_error: Exception | None = None
         try:
-            dmtac_assignment = prepare_dmtac_hardware_assignment_before_gui(
-                config.dmtac_assignment
-            )
+            prepared_hardware = hardware_preparer(config)
         except (OSError, ValueError, RuntimeError) as exc:
-            dmtac_startup_error = exc
+            hardware_startup_error = exc
             assignment_progress.fail(
-                "dmtac.assignment",
+                hardware_presentation.preflight_key,
                 f"{type(exc).__name__}: {exc}",
             )
             ui.publish(
                 hardware_status={
-                    "dmtac.assignment": {
+                    hardware_presentation.preflight_key: {
                         "online": False,
                         "health": "error",
                         "status_level": "error",
@@ -80,12 +106,12 @@ def run_umi_collection(config: UmiCollectionConfig) -> int:
             )
         else:
             assignment_progress.succeed(
-                "dmtac.assignment",
-                message="DMTac USB 左右绑定已确认",
+                hardware_presentation.preflight_key,
+                message=hardware_presentation.preflight_success_message,
             )
         finally:
             assignment_progress.close()
-        if not _ensure_angle_trigger_from_gui(ui, config):
+        if not initialize_command_input(ui, config):
             return 0
         validate_hand_eye_config_binding(config)
         calibration_required_reason: str | None = None
@@ -105,39 +131,42 @@ def run_umi_collection(config: UmiCollectionConfig) -> int:
                 continue
 
             runtime_config = config_for_calibration_dataset(config, calibrations)
-            if dmtac_assignment is None:
+            if prepared_hardware is None:
                 try:
-                    dmtac_assignment = prepare_dmtac_hardware_assignment_before_gui(
-                        runtime_config.dmtac_assignment
-                    )
-                    dmtac_startup_error = None
+                    prepared_hardware = hardware_preparer(runtime_config)
+                    hardware_startup_error = None
                 except (OSError, ValueError, RuntimeError) as exc:
-                    dmtac_startup_error = exc
-                if dmtac_startup_error is not None:
+                    hardware_startup_error = exc
+                if hardware_startup_error is not None:
                     outcome = _wait_for_device_initialization_recovery(
-                        ui, dmtac_startup_error
+                        ui,
+                        hardware_startup_error,
+                        hardware_presentation=hardware_presentation,
                     )
                     if outcome == "retry_devices":
                         continue
                     if outcome == "recalibrate_angle":
-                        if not _ensure_angle_trigger_from_gui(ui, config, force=True):
+                        if not initialize_command_input(ui, config, force=True):
                             return 0
                         continue
                     return 0
-            assert dmtac_assignment is not None
+            assert prepared_hardware is not None
             outcome = _run_collection_session(
                 config=runtime_config,
                 calibrations=calibrations,
                 layout=layout,
                 ui=ui,
-                dmtac_assignment=dmtac_assignment,
+                prepared_hardware=prepared_hardware,
+                component_builder=component_builder,
+                pose_adapter_builder=pose_adapter_builder,
+                hardware_presentation=hardware_presentation,
             )
             if outcome == "recalibrate_angle":
-                if not _ensure_angle_trigger_from_gui(ui, config, force=True):
+                if not initialize_command_input(ui, config, force=True):
                     return 0
                 continue
             if outcome == "retry_devices":
-                dmtac_assignment = None
+                prepared_hardware = None
                 continue
             if outcome != "recalibrate":
                 return 0
@@ -146,42 +175,21 @@ def run_umi_collection(config: UmiCollectionConfig) -> int:
         ui.close()
 
 
-def _ensure_angle_trigger_from_gui(ui, config, *, force: bool = False) -> bool:
-    retry_force = bool(force)
-    while True:
-        try:
-            return ensure_angle_trigger_ready(
-                ui,
-                config_root=config.angle_trigger_config_root,
-                rate_hz=config.angle_trigger_rate_hz,
-                force=retry_force,
-            )
-        except (OSError, ValueError, RuntimeError) as exc:
-            ui.publish(
-                ui_mode="umi_collection",
-                stage="AngleTrigger 标定未完成",
-                teleop_running=False,
-                episode_recording_available=False,
-                episode_event_status="error",
-                episode_event_message=str(exc),
-                active_controls=["angle_recalibrate", "q"],
-                control_hint="检查两个 Angle 传感器连接后点击“重新标定 Angle”。",
-            )
-            while True:
-                events = set(ui.consume_events())
-                if "q" in events:
-                    return False
-                if "angle_recalibrate" in events:
-                    retry_force = True
-                    break
-                time.sleep(0.1)
-
-
 def _run_collection_session(
-    *, config, calibrations, layout, ui, dmtac_assignment
+    *,
+    config,
+    calibrations,
+    layout,
+    ui,
+    prepared_hardware,
+    component_builder: UmiComponentBuilder = build_default_umi_components,
+    pose_adapter_builder: UmiPoseAdapterBuilder = UmiPoseAdapter,
+    hardware_presentation: UmiHardwarePresentation = (
+        DEFAULT_UMI_HARDWARE_PRESENTATION
+    ),
 ) -> str:
     calibration = calibrations.desk
-    pose_adapter = UmiPoseAdapter(
+    pose_adapter = pose_adapter_builder(
         T_vive_world_to_desk=calibration.T_vive_world_to_desk,
         T_tcp_to_tracker_by_side=calibrations.T_tcp_to_tracker_by_side,
     )
@@ -193,7 +201,7 @@ def _run_collection_session(
             build_policy_io_v25p_capture_profiles,
         )
         from ..v25p_dual_write_shadow import V25pDualWriteShadow
-        from ..v25p_native_store import V25pNativeEpisodeStore
+        from collection_runtime.component_capture import ComponentCaptureEpisodeStore
         from .v25p_producer import UmiV25pProducer
 
         bundle = build_policy_io_v25p_capture_profiles(
@@ -201,7 +209,7 @@ def _run_collection_session(
             layout=layout,
             pose_frame_contract_hash=calibration.pose_frame_contract().contract_hash,
         )
-        store = V25pNativeEpisodeStore(
+        store = ComponentCaptureEpisodeStore(
             dataset_root=config.dataset_root,
             dataset_id=f"umi:{config.task_id}",
             embodiment_profile=bundle.embodiment,
@@ -240,19 +248,19 @@ def _run_collection_session(
     try:
         ui.publish(
             stage="UMI 设备初始化中",
-            control_hint="正在初始化 Vive、双腕相机、AngleTrigger 与 DMTac。",
+            control_hint=hardware_presentation.component_control_hint,
             active_controls=[],
         )
         startup_progress.begin(
             "umi.components",
             label="UMI 运行时组件",
-            message="正在构建 VIVE、双腕相机、AngleTrigger 与 DMTac 组件",
+            message=hardware_presentation.component_build_message,
             requirement="collection_core",
         )
         try:
-            components = build_umi_components(
+            components = component_builder(
                 config,
-                dmtac_assignment=dmtac_assignment,
+                prepared_hardware=prepared_hardware,
             )
         except (OSError, ValueError, RuntimeError) as exc:
             startup_progress.fail(
@@ -261,7 +269,11 @@ def _run_collection_session(
                 message="UMI 运行时组件构建失败",
             )
             startup_progress.close()
-            return _wait_for_device_initialization_recovery(ui, exc)
+            return _wait_for_device_initialization_recovery(
+                ui,
+                exc,
+                hardware_presentation=hardware_presentation,
+            )
         startup_progress.succeed(
             "umi.components",
             message="UMI 运行时组件已构建，尚未启动设备",
@@ -270,9 +282,9 @@ def _run_collection_session(
         assembler = UmiSnapshotAssembler(
             config=config,
             pose_adapter=pose_adapter,
-            vive_source=components.vive,
+            vive_source=components.pose_source,
             camera_selectors=components.camera_selectors(),
-            hand_state_poller=components.hand_state_poller,
+            hand_state_poller=components.state_history,
             gripper_command_provider=lambda: dict(last_commands),
             labels=labels,
         )
@@ -299,14 +311,15 @@ def _run_collection_session(
         run_best_effort_cleanup("umi_collection_session.close", steps)
 
 
-def _wait_for_device_initialization_recovery(ui, error: Exception) -> str:
-    message = str(error)
-    if "DMTac" in message or "DMTAC" in message or "Configured DMTac" in message:
-        message = (
-            "AngleTrigger 配置已通过；当前失败来自 DMTac USB 左右绑定。"
-            "旧配置设备路径与当前扫描结果不一致，程序无法安全猜测左右侧。 "
-            + message
-        )
+def _wait_for_device_initialization_recovery(
+    ui,
+    error: Exception,
+    *,
+    hardware_presentation: UmiHardwarePresentation = (
+        DEFAULT_UMI_HARDWARE_PRESENTATION
+    ),
+) -> str:
+    message = hardware_presentation.recovery_message(error)
     ui.publish(
         ui_mode="umi_collection",
         stage="UMI 设备加载失败",

@@ -1,0 +1,57 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_rm65_bimanual_position_writing_three_stage_stages",
+  "profile_version": "2",
+  "task_progress_profile_hash": "ef3efba566b50db0e43cb72b752b1440f6ae26d3e5978dfb27fd97dc08d60044",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.approach",
+      "display_name": "靠近毛笔",
+      "description": "右手移动并靠近待抓取的毛笔。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.grasp",
+      "display_name": "正确抓住毛笔",
+      "description": "右手建立正确且稳定的毛笔抓取。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.lift_ready",
+      "display_name": "提起毛笔并进入书写准备",
+      "description": "右手提起毛笔并移动到书写准备位置。",
+      "ordinal": 3
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.write",
+      "display_name": "右手书写",
+      "description": "右手持毛笔完成规定的书写内容。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_return_brush",
+      "stage_id": "right_return_brush.align",
+      "display_name": "调整放回位置",
+      "description": "右手调整毛笔到正确的放回位置和姿态。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_return_brush",
+      "stage_id": "right_return_brush.release",
+      "display_name": "放下归位",
+      "description": "右手放下毛笔并完成归位。",
+      "ordinal": 2
+    }
+  ],
+  "semantic_content_hash": "5796d352a2e4298cddcebe13c7223dd5d7ea55cf0762e4a7a56f53d69034f99f"
+}

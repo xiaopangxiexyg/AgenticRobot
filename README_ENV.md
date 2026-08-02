@@ -2,11 +2,12 @@
 
 本文是环境依赖、安装细节和复现约束的权威说明；可直接复制的最短安装/检查命令见
 [`docs/setup/README.md`](./docs/setup/README.md)。项目主环境统一使用 Python 3.10 conda 环境
-`dexteleop310`；`core`、`test`、`dataset`、`sim`、`model`、`openpi`、`vla_scratch`、`hardware` 是同一个环境内的
-依赖分组，不是八个 conda 环境。
+`dexteleop310`；`core`、`test`、`dataset`、`annotation`、`sim`、`model`、`openpi`、
+`vla_scratch`、`hardware` 是依赖分组，不是九个 conda 环境。其中 `annotation` 还支持
+单独安装到 `.venv-annotation`，供不连接真机的异机标注使用。
 
-快速路径：首次安装看第 1–2 节；验证主环境看第 4 节；Isaac Gym 单独看第 5 节；
-MuJoCo/SAPIEN 看第 6 节；只有设备权限问题才进入第 7 节。项目运行命令不在本文维护，完成
+快速路径：只做后期标注看第 2 节；完整环境首次安装看第 1、3 节；验证主环境看第 5 节；
+Isaac Gym 单独看第 6 节；MuJoCo/SAPIEN 看第 7 节；只有设备权限问题才进入第 8 节。项目运行命令不在本文维护，完成
 环境后回到 [运行文档索引](./docs/README.md)。
 
 ## 1. 环境边界与唯一来源
@@ -14,20 +15,71 @@ MuJoCo/SAPIEN 看第 6 节；只有设备权限问题才进入第 7 节。项目
 | 环境 | 用途 | 是否属于主环境 |
 | --- | --- | --- |
 | `dexteleop310` / Python 3.10 | 项目代码、测试、数据集、MuJoCo/SAPIEN、OpenPI client、真机硬件 | 是 |
+| `.venv-annotation` / Python 3.10 | 封存 Episode 的细粒度阶段标注；无设备、控制、仿真和训练能力 | 否，独立轻量环境 |
 | `isaacgym38` / Python 3.8 | Isaac Gym Preview 4 real2sim 检查 | 否，因上游 Python 限制独立 |
 | OpenPI server / GPU | 模型加载和 JAX/CUDA 推理服务 | 否，使用 OpenPI 自己的 `uv` 环境 |
 
 项目环境的机器可读来源如下：
 
-- [`pyproject.toml`](./pyproject.toml)：项目元数据、Python 版本和八个 PyPI extras；
+- [`pyproject.toml`](./pyproject.toml)：项目元数据、Python 版本和九个 PyPI extras；
 - [`environment.yml`](./environment.yml)：conda 基础层，包括 Python、NumPy、SciPy 和 Pinocchio；
-- [`uv.lock`](./uv.lock)：八个 extras 的 PyPI 版本、来源与 hash 锁定结果；
+- [`uv.lock`](./uv.lock)：九个 extras 的 PyPI 版本、来源与 hash 锁定结果；
 - [`scripts/install_conda_env.sh`](./scripts/install_conda_env.sh)：创建、更新和验收完整环境的入口。
+- [`scripts/install_annotation_env.sh`](./scripts/install_annotation_env.sh)：创建或同步独立标注环境的入口。
 
 Isaac Gym、OpenPI server 和真实设备的系统驱动不属于 `uv.lock` 的可移植范围；它们的边界和安装方式
 在本文后面或对应模块文档中单独说明。
 
-## 2. 创建、更新与重建主环境
+## 2. 只安装后期标注环境
+
+标注机器不需要安装完整 conda 环境，也不需要 Pinocchio、Pink、机器人厂商 SDK、
+RealSense、OpenCV、MuJoCo/SAPIEN、PyTorch 或模型部署依赖。前置条件只有：
+
+- Linux；
+- 仓库 checkout；
+- `uv` 可执行；
+- Python 3.10。若本机没有 Python 3.10，`uv` 默认可以下载受管理的解释器。
+- 系统 `ffmpeg`/`ffprobe` 可执行文件。当前采集默认的 `mp4v` 视频不是 Chromium 的
+  原生可播编码；标注服务首次打开时会在临时目录生成 H.264 兼容缓存。
+
+从仓库根执行：
+
+```bash
+cd /path/to/DexTeleop
+bash scripts/install_annotation_env.sh
+source .venv-annotation/bin/activate
+python -m control_station refinement-annotation
+```
+
+GUI 打开后可在数据集路径旁点击“浏览目录”通过页面内目录浏览器选目录，再填写标注员 ID。
+进入标注后也可以点击顶部“更换数据集”切换到其他目录。数据集可以位于本地磁盘或已经
+挂载的共享文件系统，但必须能被标注进程按原路径读写。服务只绑定 loopback；H.264 MP4 会由浏览器
+直接解码，旧的 `mp4v`/其他不兼容编码会由系统 ffmpeg 转为临时 H.264 MP4。转码缓存不在
+数据集目录内，原始 Parquet 和视频不会被改写；当前视频会自动预读，下一个多阶段 Episode
+会后台预热，单阶段 Episode 则默认按需加载；因此 Python 环境仍不需要 OpenCV。
+
+默认环境目录是仓库内被 git 忽略的 `.venv-annotation`。可以显式指定其他位置或 Python：
+
+```bash
+bash scripts/install_annotation_env.sh \
+  --venv-path /opt/dexteleop-annotation \
+  --python /usr/bin/python3.10
+source /opt/dexteleop-annotation/bin/activate
+```
+
+重复运行安装脚本会按照冻结的 `uv.lock` 同步环境，不会安装其他 extras。该环境当前仅包含
+项目代码、NumPy、SciPy、OSQP、PyArrow 及其传递依赖；SciPy/OSQP 是现有公共包级兼容
+导出的暂时依赖，并不授予标注程序控制或执行机器人能力。
+
+只读检查某个数据集能否形成标注工作项：
+
+```bash
+python -m control_station refinement-annotation \
+  /absolute/path/to/dataset \
+  --dry-run
+```
+
+## 3. 创建、更新与重建主环境
 
 前置条件：
 
@@ -84,19 +136,20 @@ bash scripts/install_conda_env.sh
 安装脚本会依次完成：
 
 1. 创建 Python 3.10、NumPy、SciPy、conda-forge Pinocchio 基础环境；
-2. 使用 `uv.lock` 的 hash 锁定结果安装全部八个 PyPI 依赖分组；
+2. 使用 `uv.lock` 的 hash 锁定结果安装全部九个 PyPI 依赖分组；
 3. 以 editable 方式安装本仓库；
 4. 以 `--no-deps` 安装 `pin-pink==4.2.0`，避免错误拉取 pip 包 `pin`；
 5. 以 editable 方式安装本地 `dmrobotics==1.2.10` SDK（除非使用 `--skip-vendor-sdk`）；
 6. 执行核心、仿真、数据集和硬件模块导入检查。
 
-## 3. 依赖分组与特殊包
+## 4. 依赖分组与特殊包
 
 | 分组 | 内容 | 主环境中是否安装 |
 | --- | --- | --- |
 | `core` | NumPy、SciPy、Pink/QP 求解和控制循环工具（`pin-pink` 由脚本特殊安装） | 是 |
 | `test` | pytest | 是 |
 | `dataset` | Pandas、PyArrow、Pillow | 是 |
+| `annotation` | 独立标注所需的 NumPy、SciPy、OSQP、PyArrow | 是；也可单独安装 |
 | `sim` | MuJoCo、Gymnasium、SAPIEN | 是 |
 | `model` | PyTorch 2.10、临时 PPO 训练与 checkpoint 推理 | 是 |
 | `openpi` | DexTeleop OpenPI websocket/msgpack client | 是 |
@@ -106,6 +159,7 @@ bash scripts/install_conda_env.sh
 extras 也可以在已有 Python 3.10 环境中按需安装，例如：
 
 ```bash
+python -m pip install -e '.[annotation]'
 python -m pip install -e '.[core,test]'
 python -m pip install -e '.[core,dataset]'
 python -m pip install -e '.[core,vla_scratch]'
@@ -125,7 +179,7 @@ python -m pip install -e '.[core,vla_scratch]'
 server、模型权重和训练依赖仍留在其自己的环境；采用 HTTP、websocket 或外部 relay 时不需要在
 DexTeleop 侧安装 `pyzmq`。
 
-## 4. 主环境验证
+## 5. 主环境验证
 
 激活环境后，从仓库根目录执行基本 smoke test：
 
@@ -214,6 +268,7 @@ PY
 
 ```bash
 PYTHONNOUSERSITE=1 python - <<'PY'
+import collection_runtime
 import control_station
 from hardware.rm65.robotic_arm_package.robotic_arm import RM65, dllPath
 from teleop_runtime.backends.arms import RM65ArmBackend, RM65ImpedanceArmBackend
@@ -221,6 +276,7 @@ from teleop_runtime.backends.grippers import DMTacGripperBackend
 from teleop_runtime.backends.hands import InspireTacHandBackend
 
 print("RM65 SDK", RM65, dllPath)
+print("collection_runtime import ok", collection_runtime.__name__)
 print("control_station import ok", control_station.__name__)
 print("teleop_runtime imports ok")
 PY
@@ -238,7 +294,7 @@ cd "${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}/hardware/DMTAC_gripper"
 python run_gripper.py --help
 ```
 
-## 5. 安装 Isaac Gym 环境
+## 6. 安装 Isaac Gym 环境
 
 Isaac Gym Preview 4 用于后续 real2sim 和相机位姿检查。不要安装到 `dexteleop310`：包内
 `setup.py` 声明只支持 Python `>=3.6,<3.9`，而 `dexteleop310` 是 Python 3.10。建议单独创建
@@ -349,7 +405,7 @@ export DEXTELEOP_REAL2SIM_URDF="${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}/assets/rm6
 - 左右 `arm_link6` 末端挂载的法兰、D405、`left_camera_rgb` / `right_camera_rgb`
 - 左右 gripper 几何
 
-## 6. MuJoCo / SAPIEN 验证
+## 7. MuJoCo / SAPIEN 验证
 
 MuJoCo 和 SAPIEN 已由完整主环境安装。官方 Python binding 包内已经包含 MuJoCo library，不需要另行
 下载 MuJoCo 二进制，也不要在主环境中再执行一套不受项目元数据约束的 `pip install`。
@@ -373,7 +429,7 @@ PY
 python -m mujoco.viewer
 ```
 
-### 6.1 MuJoCo Gymnasium API
+### 7.1 MuJoCo Gymnasium API
 
 `sim.mujoco.tasks.cube_lift.CubeLiftEnv` 使用 MuJoCo 作为物理后端、使用
 Gymnasium 的标准 `reset/step` API 和 `Box` spaces。环境实现本身不导入训练框架；为运行
@@ -434,7 +490,7 @@ MJCF 用于 MuJoCo 检查，避免为了仿真破坏原始坐标定义。
 参考：[MuJoCo 官方 Python 文档](https://mujoco.readthedocs.io/en/stable/python.html)。本项目已在
 `pyproject.toml` 的 `sim` 分组中固定 MuJoCo 版本。
 
-## 7. 设备权限
+## 8. 设备权限
 
 运行 GUI 遥操作前，先按 [硬件入口](./docs/hardware/README.md)检查 USB、相机、串口和配置。
 
@@ -458,7 +514,7 @@ sudo -E "$CONDA_PREFIX/bin/python" \
 
 长期建议安装 udev rules，或把当前用户加入 `dialout`、`video` 后重新登录并重新插拔设备。
 
-## 8. 运行文档索引
+## 9. 运行文档索引
 
 环境准备完成后，按用途阅读：
 
@@ -470,7 +526,7 @@ sudo -E "$CONDA_PREFIX/bin/python" \
 - [`sim/mujoco/README.md`](./sim/mujoco/README.md)：MuJoCo real2sim、任务和数据回放；
 - [`deployments/openpi/README.md`](./deployments/openpi/README.md)：OpenPI server/client、预检和部署。
 
-## 9. 故障速查
+## 10. 故障速查
 
 - `ModuleNotFoundError: pinocchio`：确认已用 conda 安装 `pinocchio=3.7.0`。
 - `cmeel-boost requires numpy>=2`：环境被 pip `pin` 污染，建议重建环境。

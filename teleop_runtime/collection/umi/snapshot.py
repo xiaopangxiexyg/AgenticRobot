@@ -10,7 +10,8 @@ import numpy as np
 from ..operator_labels import OperatorLabelStateMachine
 from ..hand_state_polling import hand_state_tactile_arrays
 from .config import UmiCollectionConfig
-from .pose_adapter import UmiPoseAdapter
+from .pose_adapter import UmiPoseAdapterPort
+from .topology import CAMERA_KEYS, SIDES
 from .types import SnapshotRejection, UmiPoseMeasurement, UmiSample
 
 
@@ -61,7 +62,7 @@ class UmiSnapshotAssembler:
         self,
         *,
         config: UmiCollectionConfig,
-        pose_adapter: UmiPoseAdapter,
+        pose_adapter: UmiPoseAdapterPort,
         vive_source: Any,
         camera_selectors: Mapping[str, CameraSelector],
         hand_state_poller: Any,
@@ -88,7 +89,7 @@ class UmiSnapshotAssembler:
         channels = self.vive_source.get_latest_channels_at_or_before(t0)
         poses: dict[str, UmiPoseMeasurement] = {}
         vive_rotation_diagnostics: dict[str, dict[str, float | bool]] = {}
-        for side in ("left", "right"):
+        for side in SIDES:
             side_config = self.config.side(side)
             channel = channels.get(side_config.tracker_channel)
             if channel is None:
@@ -136,7 +137,7 @@ class UmiSnapshotAssembler:
                 reasons.append(f"{side}:invalid_vive_pose:{exc}")
 
         camera_frames: dict[str, Any] = {}
-        for camera_key in ("left_wrist", "right_wrist"):
+        for camera_key in CAMERA_KEYS:
             if camera_key in self.config.ignored_camera_keys:
                 continue
             selector = self.camera_selectors.get(camera_key)
@@ -159,7 +160,7 @@ class UmiSnapshotAssembler:
             for side, state in self.hand_state_poller.latest_at_or_before(t0).items()
             if isinstance(state, Mapping)
         }
-        for side in ("left", "right"):
+        for side in SIDES:
             state = hand_states.get(side)
             if not isinstance(state, Mapping):
                 reasons.append(f"{side}:missing_gripper_state")
@@ -192,7 +193,7 @@ class UmiSnapshotAssembler:
                 state["tactile_ignored_by_dataset_contract"] = True
 
         commands = {side: float(value) for side, value in self.gripper_command_provider().items()}
-        if set(commands) != {"left", "right"} or any(
+        if set(commands) != set(SIDES) or any(
             not np.isfinite(value) or not 0.0 <= value <= 1.0
             for value in commands.values()
         ):

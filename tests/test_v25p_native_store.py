@@ -37,11 +37,11 @@ from dataset_interface.v25p_v23_adapter import (
     plan_v23_compatibility_projection,
     project_native_episode_to_v23_rows,
 )
-from teleop_runtime.collection.v25p_native_store import (
+from collection_runtime.v25p_native_store import (
     V25pComponentInput,
     V25pNativeEpisodeStore,
 )
-from teleop_runtime.collection.v25p_parquet_store import (
+from collection_runtime.v25p_parquet_store import (
     V25pParquetChunkEpisodeWriter,
 )
 

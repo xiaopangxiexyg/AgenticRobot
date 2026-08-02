@@ -491,7 +491,12 @@ class MujocoScheduledQposReferenceReceiver:
                     frame_schema_hash="joint-space-frame-not-applicable-v1",
                     target_effective_at=scheduled_from,
                 )
-            raise ValueError("Scheduled reference segment is not contiguous or replacing.")
+            raise ValueError(
+                "Scheduled reference segment is not contiguous or replacing: "
+                f"previous=[{previous.scheduled_from:.12f},"
+                f"{previous.scheduled_until:.12f}], "
+                f"requested_from={scheduled_from:.12f}."
+            )
 
         measured = RobotAction.bimanual_qpos(
             left_arm=self.rig.accepted_qcmd_by_side()["left"],
@@ -545,22 +550,10 @@ class MujocoScheduledQposReferenceReceiver:
                 predecessor = self._active_segment_by_group.get(group)
                 if predecessor is None:
                     raise RuntimeError("Successor activation has no active predecessor.")
-                predecessor_candidate = next(
-                    (
-                        item
-                        for item in self._anchor_candidates
-                        if item.reference_segment_id
-                        == predecessor.reference_segment_id
-                    ),
-                    None,
+                self._require_successor_predecessor_evidence(
+                    predecessor,
+                    activated_at=float(activated_at),
                 )
-                if (
-                    predecessor_candidate is None
-                    or predecessor_candidate.effective_from > float(activated_at) + 1e-12
-                ):
-                    raise RuntimeError(
-                        "Successor activation requires an effective predecessor END candidate."
-                    )
                 predecessor_terminal = build_reference_segment_terminal(
                     predecessor,
                     status="retired_by_successor_activation",
@@ -594,6 +587,35 @@ class MujocoScheduledQposReferenceReceiver:
             if predecessor_terminal is not None:
                 self._terminals.append(predecessor_terminal)
             return activation.activation_id
+
+    def _require_successor_predecessor_evidence(
+        self,
+        predecessor: ReferenceSegment,
+        *,
+        activated_at: float,
+    ) -> None:
+        """Require the legacy safe-endpoint evidence before successor activation."""
+
+        predecessor_candidate = next(
+            (
+                item
+                for item in self._anchor_candidates
+                if item.reference_segment_id
+                == predecessor.reference_segment_id
+            ),
+            None,
+        )
+        if (
+            predecessor_candidate is None
+            or predecessor_candidate.effective_from > float(activated_at) + 1e-12
+        ):
+            raise RuntimeError(
+                "Successor activation requires an effective "
+                "predecessor END candidate: "
+                f"candidate_effective_from="
+                f"{None if predecessor_candidate is None else predecessor_candidate.effective_from}, "
+                f"activated_at={float(activated_at):.12f}."
+            )
 
     def _activate_runtime_groups(
         self,

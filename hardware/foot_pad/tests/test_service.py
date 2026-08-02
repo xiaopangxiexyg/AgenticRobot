@@ -8,6 +8,7 @@ from hardware.foot_pad.service import (
     CalibrationHit,
     CandidateDevice,
     FootPadError,
+    MAX_PEDALS,
     SPECIAL_KEYS,
     build_config,
     normalize_config,
@@ -27,6 +28,50 @@ def candidate(id_path: str, key_codes: set[int] | None = None) -> CandidateDevic
 
 
 class FootPadConfigTests(unittest.TestCase):
+    def test_supports_ten_pads_with_stable_legacy_prefix(self) -> None:
+        self.assertEqual(MAX_PEDALS, 10)
+        self.assertEqual(
+            SPECIAL_KEYS[:4],
+            (("F13", 183), ("F14", 184), ("F15", 185), ("F16", 186)),
+        )
+        self.assertEqual(
+            SPECIAL_KEYS[4:],
+            (
+                ("F17", 187),
+                ("F18", 188),
+                ("F19", 189),
+                ("F20", 190),
+                ("F21", 191),
+                ("F22", 192),
+            ),
+        )
+
+        candidates = [
+            candidate(f"pci-usb-0:6.{index}:1.1", {index + 30})
+            for index in range(10)
+        ]
+        config = build_config(
+            [
+                CalibrationHit(item, index + 30, f"KEY_{index}")
+                for index, item in enumerate(candidates)
+            ]
+        )
+
+        self.assertEqual(config["count"], 10)
+        self.assertEqual(
+            [pedal["output"]["key_name"] for pedal in config["pedals"]],
+            [name for name, _ in SPECIAL_KEYS],
+        )
+        self.assertEqual(validate_config(config, candidates), [])
+
+    def test_normalize_rejects_more_than_ten_pads(self) -> None:
+        first = candidate("pci-usb-0:6.1:1.1", {30})
+        config = build_config([CalibrationHit(first, 30, "KEY_A")])
+        config["count"] = MAX_PEDALS + 1
+
+        with self.assertRaisesRegex(FootPadError, "between 1 and 10"):
+            normalize_config(config)
+
     def test_build_and_validate_two_pads(self) -> None:
         first = candidate("pci-usb-0:6.1:1.1", {30})
         second = candidate("pci-usb-0:6.2:1.1", {48})

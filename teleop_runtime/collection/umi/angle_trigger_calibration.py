@@ -24,6 +24,7 @@ from hardware.angle_trigger.angle_trigger import (
     save_angle_calibration_config,
     save_assignment_config,
 )
+from .topology import SIDES
 
 
 ANGLE_NEXT_EVENT = "angle_calibration_next"
@@ -32,6 +33,44 @@ ANGLE_CONFIRM_ASSIGNMENT_EVENT = "angle_assignment_confirm"
 
 class AngleTriggerCalibrationCancelled(RuntimeError):
     pass
+
+
+def ensure_default_command_input_from_gui(
+    ui: Any,
+    config: Any,
+    *,
+    force: bool = False,
+) -> bool:
+    """Run the default AngleTrigger bootstrap behind the generic app port."""
+
+    retry_force = bool(force)
+    while True:
+        try:
+            return ensure_angle_trigger_ready(
+                ui,
+                config_root=config.angle_trigger_config_root,
+                rate_hz=config.angle_trigger_rate_hz,
+                force=retry_force,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            ui.publish(
+                ui_mode="umi_collection",
+                stage="AngleTrigger 标定未完成",
+                teleop_running=False,
+                episode_recording_available=False,
+                episode_event_status="error",
+                episode_event_message=str(exc),
+                active_controls=["angle_recalibrate", "q"],
+                control_hint="检查两个 Angle 传感器连接后点击“重新标定 Angle”。",
+            )
+            while True:
+                events = set(ui.consume_events())
+                if "q" in events:
+                    return False
+                if "angle_recalibrate" in events:
+                    retry_force = True
+                    break
+                time.sleep(0.1)
 
 
 def ensure_angle_trigger_ready(
@@ -207,7 +246,7 @@ def run_angle_trigger_gui_calibration(
                         if sensor == mapping[side]
                     )
                 ]
-                for side in ("left", "right")
+                for side in SIDES
             },
             sample_hz=sample_hz,
             capture_seconds=capture_seconds,
@@ -238,7 +277,7 @@ def _run_endpoint_only_gui_calibration(
 ) -> None:
     connections = {
         side: SensorConnection(mapping[side], baudrate=baudrate)
-        for side in ("left", "right")
+        for side in SIDES
     }
     try:
         for connection in connections.values():
@@ -426,6 +465,7 @@ def _capture_endpoint(
 __all__ = [
     "ANGLE_NEXT_EVENT",
     "ANGLE_CONFIRM_ASSIGNMENT_EVENT",
+    "ensure_default_command_input_from_gui",
     "ensure_angle_trigger_ready",
     "run_angle_trigger_gui_calibration",
 ]

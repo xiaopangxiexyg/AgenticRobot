@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -161,10 +162,19 @@ def _warm_conditioned_wire(
 def run(args: argparse.Namespace) -> dict[str, object]:
     dexteleop_root = Path(args.dexteleop_root).resolve()
     openpi_root = Path(args.openpi_root).resolve()
+    checkpoint_dir = (
+        None
+        if args.checkpoint_dir is None
+        else Path(args.checkpoint_dir).resolve()
+    )
     artifact_path = (
-        dexteleop_root
-        / "deployments/openpi/configs/model_rtc"
-        / "0712-wrist-cube-92599.policy_artifact.json"
+        checkpoint_dir / "policy_artifact.json"
+        if checkpoint_dir is not None
+        else (
+            dexteleop_root
+            / "deployments/openpi/configs/model_rtc"
+            / "0712-wrist-cube-92599.policy_artifact.json"
+        )
     )
     artifact = load_policy_artifact(artifact_path)
     continuation = artifact.model_continuation
@@ -174,8 +184,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     port = _free_local_port()
     log_path = Path(f"/tmp/mrtc_s1b2_openpi_server_{port}.log")
     server_log = log_path.open("w", encoding="utf-8")
-    server = subprocess.Popen(
-        [
+    if checkpoint_dir is None:
+        server_command = [
             sys.executable,
             str(openpi_root / "scripts/serve_dexteleop_policy.py"),
             "--model",
@@ -185,8 +195,35 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "--port",
             str(port),
             "--enable-rtc-continuation",
-        ],
+        ]
+    else:
+        server_command = [
+            sys.executable,
+            "-m",
+            "deployments.openpi.server",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--openpi-root",
+            str(openpi_root),
+            "--config",
+            str(args.config),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--enable-rtc-continuation",
+        ]
+    server_env = dict(os.environ)
+    existing_pythonpath = server_env.get("PYTHONPATH", "")
+    server_env["PYTHONPATH"] = os.pathsep.join(
+        value
+        for value in (str(dexteleop_root), existing_pythonpath)
+        if value
+    )
+    server = subprocess.Popen(
+        server_command,
         cwd=openpi_root,
+        env=server_env,
         stdout=server_log,
         stderr=subprocess.STDOUT,
         text=True,
@@ -363,6 +400,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if last_step is None:
             raise RuntimeError("Frontend loop did not execute.")
         return {
+            "artifact_path": str(artifact_path),
+            "checkpoint_dir": (
+                None if checkpoint_dir is None else str(checkpoint_dir)
+            ),
             "port": port,
             "server_pid": server.pid,
             "server_log": str(log_path),
@@ -413,6 +454,19 @@ def main() -> int:
     parser.add_argument(
         "--openpi-root",
         default="/home/user/zc/openpi",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help=(
+            "Optional checkpoint to test through deployments.openpi.server. "
+            "When omitted, retain the historical 0712-wrist-cube probe."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default="0712-wrist-cube",
+        help="Existing OpenPI base config used to restore a partial checkpoint.",
     )
     args = parser.parse_args()
     result = run(args)

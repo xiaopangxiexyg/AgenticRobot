@@ -7,7 +7,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from collection_runtime.source_cut import SnapshotRejection
+
 from ..operator_labels import OperatorLabelSnapshot
+from .topology import SIDES
 
 
 @dataclass(frozen=True)
@@ -32,7 +35,7 @@ class UmiPoseMeasurement:
             if not np.isclose(np.linalg.norm(value[3:]), 1.0, atol=1e-5):
                 raise ValueError(f"{name} quaternion must have unit norm")
             object.__setattr__(self, name, value.copy())
-        if self.side not in {"left", "right"}:
+        if self.side not in set(SIDES):
             raise ValueError("side must be left or right")
         if int(self.sequence) <= 0:
             raise ValueError("Vive sequence must be positive")
@@ -56,9 +59,9 @@ class UmiSample:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if set(self.poses) != {"left", "right"}:
+        if set(self.poses) != set(SIDES):
             raise ValueError("UMI samples require left and right poses")
-        if set(self.gripper_commands) != {"left", "right"}:
+        if set(self.gripper_commands) != set(SIDES):
             raise ValueError("UMI samples require left and right gripper commands")
         if self.arm_action_poses is None and (
             self.arm_action_source_frame_index is not None
@@ -66,7 +69,7 @@ class UmiSample:
         ):
             raise ValueError("UMI arm action alignment fields must be provided together")
         if self.arm_action_poses is not None:
-            if set(self.arm_action_poses) != {"left", "right"}:
+            if set(self.arm_action_poses) != set(SIDES):
                 raise ValueError("UMI arm action poses require left and right poses")
             if self.arm_action_source_frame_index is None:
                 raise ValueError("UMI aligned arm actions require a source frame index")
@@ -84,12 +87,5 @@ class UmiSample:
             scalar = float(value)
             if not np.isfinite(scalar) or not 0.0 <= scalar <= 1.0:
                 raise ValueError(f"{side} gripper command must be in [0, 1]")
-
-
-@dataclass(frozen=True)
-class SnapshotRejection:
-    timestamp: float
-    reasons: tuple[str, ...]
-
 
 __all__ = ["SnapshotRejection", "UmiPoseMeasurement", "UmiSample"]

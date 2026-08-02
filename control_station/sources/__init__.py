@@ -27,6 +27,7 @@ from .human import (
     admit_human_observation_cut,
 )
 from .teleop_pose import (
+    AttachablePassiveTeleopComponentSource,
     PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1,
     PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
     PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1,
@@ -78,6 +79,7 @@ __all__ = [
     "PassiveHumanCommandObserverFanout",
     "admit_human_command_emission",
     "admit_human_observation_cut",
+    "AttachablePassiveTeleopComponentSource",
     "PassiveTeleopComponentBindingReceipt",
     "PassiveTeleopComponentClockBridge",
     "PassiveTeleopComponentSessionSource",

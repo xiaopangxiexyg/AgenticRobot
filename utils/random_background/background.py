@@ -44,6 +44,10 @@ class TemporalBackgroundSpec:
     zoom_per_frame: float = 0.0008
     jitter_px: float = 0.25
     velocity_noise_px_per_frame: float = 0.035
+    # Optional scene/canvas seed.  Keeping it separate from ``seed`` lets a
+    # paired set of cameras share the same coarse background family while
+    # retaining independent camera motion and crop trajectories.
+    canvas_seed: int | None = None
 
 
 def _require_cv2():
@@ -393,10 +397,11 @@ class TemporalRandomBackground:
         scale = max(1.2, float(spec.canvas_scale))
         self.canvas_width = max(self.width + 8, int(round(self.width * scale)))
         self.canvas_height = max(self.height + 8, int(round(self.height * scale)))
+        canvas_seed = int(spec.seed) if spec.canvas_seed is None else int(spec.canvas_seed)
         self.canvas = generate_background(
             self.canvas_width,
             self.canvas_height,
-            seed=int(spec.seed) + 104729,
+            seed=canvas_seed + 104729,
             mode=spec.mode,
             blur_px=2,
             noise_std=3.0,
@@ -491,12 +496,20 @@ def temporal_background_from_episode(
     camera_key: str = "",
     seed: int = 20260709,
     mode: BackgroundMode = "embodied_mix",
+    canvas_seed: int | None = None,
+    view_seed: int | None = None,
 ) -> TemporalRandomBackground:
     camera_hash = sum((index + 1) * ord(ch) for index, ch in enumerate(str(camera_key)))
+    derived_view_seed = (
+        int(view_seed)
+        if view_seed is not None
+        else int(seed) + int(episode_index) * 100003 + int(camera_hash)
+    )
     spec = TemporalBackgroundSpec(
         width=int(width),
         height=int(height),
-        seed=int(seed) + int(episode_index) * 100003 + int(camera_hash),
+        seed=derived_view_seed,
+        canvas_seed=None if canvas_seed is None else int(canvas_seed),
         mode=mode,
     )
     return TemporalRandomBackground(spec)

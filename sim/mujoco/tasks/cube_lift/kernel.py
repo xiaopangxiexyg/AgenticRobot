@@ -25,6 +25,7 @@ from .config import (
 )
 from .env import DEFAULT_CUBE_LIFT_TASK_CONFIG_PATH
 from .contacts import classify_cube_contact_position
+from .action_conditioning import CubeLiftActionConditioner
 from .grasp_latch import ContactGraspLatch
 from .pose_action import CubeLiftPoseActionController
 
@@ -292,6 +293,7 @@ class CubeLiftKernel:
         self._scripted_contact_action_modified = False
         self._scripted_pregrasp_action_modified = False
         self._post_contact_phase_action_modified = False
+        self._action_conditioner = CubeLiftActionConditioner(self.config)
         self._last_accepted_action = np.zeros(7, dtype=np.float32)
         self._actuated_rig: MujocoPositionExecutionRig | None = None
         self._pose_action_controller: CubeLiftPoseActionController | None = None
@@ -339,6 +341,7 @@ class CubeLiftKernel:
         self._scripted_contact_action_modified = False
         self._scripted_pregrasp_action_modified = False
         self._post_contact_phase_action_modified = False
+        self._action_conditioner.reset()
         self._last_accepted_action.fill(0.0)
         if self._grasp_latch is not None:
             self._grasp_latch.reset()
@@ -607,39 +610,31 @@ class CubeLiftKernel:
         self._previous_observation_right_close = self._measured_gripper_close(1)
 
     def _update_post_contact_phase(self) -> None:
-        """Advance the real-contact lift phase state machine."""
+        """Compatibility seam over the shared task action conditioner."""
 
-        if not self.config.post_contact_phase_enabled:
-            return
-        left_contact, right_contact = self._cube_finger_contacts()
-        contact_ready = (
-            left_contact
-            and right_contact
-            and self._measured_gripper_close(1)
-            >= self.config.post_contact_phase_min_measured_close
+        self._action_conditioner.restore_post_contact_phase(
+            active=self._post_contact_phase_active,
+            contact_steps=self._post_contact_phase_contact_steps,
+            loss_steps=self._post_contact_phase_loss_steps,
         )
-        if contact_ready:
-            self._post_contact_phase_contact_steps += 1
-            self._post_contact_phase_loss_steps = 0
-            if (
-                not self._post_contact_phase_active
-                and self._post_contact_phase_contact_steps
-                >= self.config.post_contact_phase_activation_steps
-            ):
-                self._post_contact_phase_active = True
-        else:
-            self._post_contact_phase_contact_steps = 0
-            if self._post_contact_phase_active:
-                self._post_contact_phase_loss_steps += 1
-                grace = self.config.post_contact_phase_loss_grace_steps
-                # A zero grace period means that the lift-only phase must be
-                # abandoned immediately after contact readiness is lost.  The
-                # previous ``grace > 0`` guard made zero mean "never leave"
-                # instead, which trapped a marginal grasp in lift-only mode
-                # after the cube slipped or one finger lost contact.
-                if grace == 0 or self._post_contact_phase_loss_steps >= grace:
-                    self._post_contact_phase_active = False
-                    self._post_contact_phase_loss_steps = 0
+        left_contact, right_contact = self._cube_finger_contacts()
+        conditioning = self._action_conditioner.condition(
+            np.zeros(7, dtype=np.float32),
+            left_finger_contact=left_contact,
+            right_finger_contact=right_contact,
+            measured_gripper_close=self._measured_gripper_close(1),
+            scripted_pregrasp_reset_applied=False,
+            scripted_contact_reset_applied=False,
+        )
+        self._post_contact_phase_active = (
+            conditioning.post_contact_phase_active
+        )
+        self._post_contact_phase_contact_steps = (
+            conditioning.post_contact_phase_contact_steps
+        )
+        self._post_contact_phase_loss_steps = (
+            conditioning.post_contact_phase_loss_steps
+        )
 
     def step(self, action: Any) -> CubeLiftKernelStep:
         if self._next_policy_time is None:
@@ -649,58 +644,39 @@ class CubeLiftKernel:
             raise ValueError("CubeLift action must be a finite 7-D vector.")
         if np.any(values < -1.0) or np.any(values > 1.0):
             raise ValueError("CubeLift action values must lie in [-1, 1].")
-        values = values.copy()
         previous_measured_close = self._measured_gripper_close(1)
-        self._update_post_contact_phase()
-        self._scripted_contact_action_modified = False
-        self._scripted_pregrasp_action_modified = False
-        self._post_contact_phase_action_modified = False
-        if self._scripted_contact_reset_applied or self._scripted_pregrasp_reset_applied:
-            requested_values = values.copy()
-            action_scale = (
-                self.config.scripted_contact_action_scale
-                if self._scripted_contact_reset_applied
-                else self.config.scripted_pregrasp_action_scale
-            )
-            action_bias = (
-                self.config.scripted_contact_action_bias
-                if self._scripted_contact_reset_applied
-                else self.config.scripted_pregrasp_action_bias
-            )
-            values = values * np.asarray(
-                action_scale,
-                dtype=np.float32,
-            )
-            values += np.asarray(
-                action_bias,
-                dtype=np.float32,
-            )
-            if (
+        left_contact, right_contact = self._cube_finger_contacts()
+        conditioning = self._action_conditioner.condition(
+            values,
+            left_finger_contact=left_contact,
+            right_finger_contact=right_contact,
+            measured_gripper_close=previous_measured_close,
+            scripted_pregrasp_reset_applied=(
+                self._scripted_pregrasp_reset_applied
+            ),
+            scripted_contact_reset_applied=(
                 self._scripted_contact_reset_applied
-                and self.config.scripted_contact_nonnegative_lift_action
-            ):
-                values[2] = max(float(values[2]), 0.0)
-            modified = not np.array_equal(values, requested_values)
-            if self._scripted_contact_reset_applied:
-                self._scripted_contact_action_modified = modified
-            else:
-                self._scripted_pregrasp_action_modified = modified
-        if self._post_contact_phase_active:
-            requested_values = values.copy()
-            values = values * np.asarray(
-                self.config.post_contact_action_scale,
-                dtype=np.float32,
-            )
-            values += np.asarray(
-                self.config.post_contact_action_bias,
-                dtype=np.float32,
-            )
-            if self.config.post_contact_nonnegative_lift_action:
-                values[2] = max(float(values[2]), 0.0)
-            self._post_contact_phase_action_modified = not np.array_equal(
-                values,
-                requested_values,
-            )
+            ),
+        )
+        values = conditioning.values
+        self._scripted_contact_action_modified = (
+            conditioning.scripted_contact_modified
+        )
+        self._scripted_pregrasp_action_modified = (
+            conditioning.scripted_pregrasp_modified
+        )
+        self._post_contact_phase_action_modified = (
+            conditioning.post_contact_modified
+        )
+        self._post_contact_phase_active = (
+            conditioning.post_contact_phase_active
+        )
+        self._post_contact_phase_contact_steps = (
+            conditioning.post_contact_phase_contact_steps
+        )
+        self._post_contact_phase_loss_steps = (
+            conditioning.post_contact_phase_loss_steps
+        )
         previous_right_target = self._right_target.copy()
         previous_right_close = float(self._gripper_close[1])
         pose_target_needs_reanchor = False

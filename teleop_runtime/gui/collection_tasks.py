@@ -1,14 +1,13 @@
 """Compatibility exports for the real-teleop task layout implementation.
 
-The implementation moved to
-``teleop_runtime.real_teleop.dataset_layout`` so the GUI coordinator does not
-own a second copy of dataset/task policy.  This module intentionally keeps the
-historic GUI import path and symbols available to older callers.
+The implementation lives in ``collection_runtime.dataset_layout`` so the GUI
+coordinator does not own a second copy of dataset/task policy. This module
+intentionally keeps the historic GUI import path and symbols available.
 """
 
 from __future__ import annotations
 
-from ..real_teleop.dataset_layout import (
+from collection_runtime.dataset_layout import (
     GENERAL_TASK_TYPE,
     ROUND_TRIP_IN,
     ROUND_TRIP_OUT,

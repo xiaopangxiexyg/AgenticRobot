@@ -23,8 +23,8 @@ from ..log_utils import ChangeGate
 from ..sources.camera import RealSenseRGBSource
 
 if TYPE_CHECKING:
-    from ..gui.calibration_web_ui import CalibrationWebUi
-    from ..gui.real_teleop_control import RealTeleopControlInput
+    from ..operator_ui_ports import OperatorUiPort
+    from .operator_control_runtime import RealTeleopControlInput
     from ..special_tasks.init_arm import InitArmCommandController
     from .components import RealTeleopComponents
 
@@ -210,8 +210,15 @@ def _run_camera_startup_self_check(
         if sleep_sec > 0.0:
             time.sleep(sleep_sec)
 
+    finished_at = time.time()
     message = str(final_payload.get("message") or "")
-    _log("CameraSelfCheck", message or str(final_payload), now=time.time())
+    _log(
+        "CameraSelfCheck",
+        f"{message or str(final_payload)} "
+        f"elapsed={max(0.0, finished_at - started_at):.3f}s "
+        f"completion_reason={final_payload.get('completion_reason')}",
+        now=finished_at,
+    )
     if clutch_input.ui is not None and message:
         clutch_input.ui.append_message("CameraSelfCheck", message)
     return final_payload
@@ -504,7 +511,7 @@ def _wait_for_real_teleop_start_request(
     *,
     arm_mode: str,
     args: argparse.Namespace,
-    control_ui: CalibrationWebUi | None,
+    control_ui: OperatorUiPort | None,
     ik_debug_log_recorder: IkDebugLogRecorder,
     ik_debug_profile_base_enabled: bool,
     visualization_request_handler: Callable[[float], None] | None = None,
@@ -709,13 +716,18 @@ def _arm_after_start_calibration(
     *,
     home_captured: bool,
     position_force_guard_monitor: object | None = None,
+    runtime_home_qpos_snapshot: Mapping[str, np.ndarray] | None = None,
 ) -> None:
     arm_after_start = time.perf_counter()
     reset_elapsed_ms = 0.0
     if home_captured:
         reset_start = time.perf_counter()
         try:
-            synced = _reset_runtime_motion_state_from_real_qpos(components, required=True)
+            synced = _reset_runtime_motion_state_from_real_qpos(
+                components,
+                required=True,
+                qpos_snapshot=runtime_home_qpos_snapshot,
+            )
         except Exception as exc:  # noqa: BLE001 - collision recovery remains in GUI Hold.
             guard_fault = (
                 None

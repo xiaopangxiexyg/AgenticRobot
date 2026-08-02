@@ -23,9 +23,10 @@ python -m utils.random_background.generate_assets \
 `procedural` 均包含任意大小、重叠、可部分出界的 `color_blocks`，以及由色块、圆/椭圆、三角形和线条组成的
 `shape_collage`；它们是无语义几何扰动，不局限于模拟普通背景纹理。
 
-默认训练不读取这个静态 PNG 池：`provider="procedural"` 直接由 episode/camera/epoch seed 在线生成，避免额外
-图片 I/O，同时每次训练仍可得到不同的色块与几何排列。静态池用于目视检查，或在显式构造
-`LocalImageBackgroundProvider(manifest_path=...)` 时作为可选图片源。
+默认训练使用 `provider="mixed"`：10% 保留原始背景、40% 使用真实图片时间流、50% 使用在线程序化背景，
+黑背景为 0%。如果没有显式传入 provider，增强器会自动读取仓库默认图片池；图片池不可用时直接报错，
+不会静默退化成 10% original / 90% procedural。可通过 `DEXTELEOP_REAL_IMAGE_ROOT` 或显式
+`LocalImageBackgroundProvider(...)` 回退到另一套图片池。
 
 真实图片池默认放在 `assets/random_real_image/openimages_v7_validation/images/`。真实图片流会对每个
 episode/camera/epoch 以确定性 seed 采样独立的缩放、横向拉伸和纵向拉伸，再进行 crop、时间连续平移、旋转、缩放、
@@ -50,7 +51,12 @@ real_images = LocalImageBackgroundProvider(
     image_root="assets/random_real_image/openimages_v7_validation/images"
 )
 augmenter = RandomBackgroundVideoAugmenter(
-    RandomBackgroundAugmentConfig(provider="mixed", real_image_prob=0.45),
+    RandomBackgroundAugmentConfig(
+        provider="mixed",
+        mixed_original_prob=0.1,
+        real_image_prob=0.4,
+        mixed_black_prob=0.0,
+    ),
     real_image_provider=real_images,
 )
 ```
@@ -143,6 +149,10 @@ augmenter = RandomBackgroundVideoAugmenter(
     RandomBackgroundAugmentConfig(
         global_seed=20260709,
         provider="mixed",          # procedural | original | black | mixed
+        mixed_original_prob=0.1,
+        real_image_prob=0.4,
+        mixed_black_prob=0.0,
+        wrist_pair_mode="shared_scene_family",  # or "independent" for rollback
         mask_role="keep",          # keep: mask>0 保留; replace: mask>0 替换
         edge_blur_px=1,
         enable_epoch_variation=True,
@@ -183,10 +193,15 @@ augmented_bgr = augment_sample_from_paths(
 
 - RGB 视频 reader 应在训练 Dataset/DataLoader worker 里缓存，不要每帧重新打开。
 - bitpack mask 用 `MaskReaderCache` 缓存文件句柄。
-- 背景流在 `RandomBackgroundVideoAugmenter` 内按 episode/camera/epoch LRU 缓存。
+- 背景流在 `RandomBackgroundVideoAugmenter` 内按 episode/camera/epoch LRU 缓存；默认左右腕共享
+  `wrist_pair_scene` 的 provider/family 和 epoch，程序背景共享 coarse canvas，真实图片背景则使用
+  独立 donor/crop/运动流；两者都使用独立 view seed，避免左右腕看到完全相同的画面。
 - mask 的 dilation、hole filling、时序去闪烁应提前离线完成；训练时只读最终 mask。
-- 多相机用不同 `camera_key`，seed 会自动区分左右腕。
-- `provider="mixed"` 默认混入少量 original/black，可避免模型只见一种增强分布。
+- 多相机用不同 `camera_key`，左右腕默认共享 provider/family；传入
+  `wrist_pair_mode="independent"` 可回退到旧的逐相机独立 seed 行为。
+- `provider="mixed"` 默认严格使用 10% original / 40% real_image / 50% procedural；默认
+  `mixed_black_prob=0`，避免把黑背景作为额外变量。real-image provider 缺失时直接失败，防止训练
+  输入悄悄变成 10% / 90%。
 
 ## 全图非几何图像增强
 
@@ -336,9 +351,10 @@ python -m utils.random_background.generate_wrist_sample_video \
   --overwrite
 ```
 
-如果还没有生成 final keep-mask，也可以传 `--table-mask-root` 和 postprocessed
-`--depth-mask-root`，脚本会在预览时临时执行 `postprocessed_depth_keep_mask OR table_geometry_keep_mask`。
-正式训练仍建议提前生成 final keep-mask，减少 DataLoader 内的 I/O 和合成逻辑。
+预览脚本默认读取 canonical `final_keep_mask` 根目录；没有 final mask 时直接失败。仅用于诊断
+component 合成时，可以显式传 `--use-component-masks --table-mask-root ...`
+和 postprocessed `--depth-mask-root ...`，脚本才会临时执行
+`postprocessed_depth_keep_mask OR table_geometry_keep_mask`。正式训练不使用这个回退。
 
 真实图片背景池的下载、索引和过滤建议见：
 
@@ -348,7 +364,7 @@ utils/random_background/REAL_IMAGE_BACKGROUNDS.md
 
 ## 是否需要海量真实图片
 
-建议作为第二阶段加入，但不要完全替代程序生成背景。
+默认配置已经纳入真实图片，但不完全替代程序生成背景。
 
 - 程序生成背景适合快速、无版权依赖、可复现地去除固定背景捷径。
 - 大规模真实图片更接近自然图像统计，适合提升 sim/real 和跨场景泛化。
@@ -358,9 +374,9 @@ utils/random_background/REAL_IMAGE_BACKGROUNDS.md
 推荐训练配比起点：
 
 ```text
-40% generated block/patch shuffled backgrounds
+10% original background
 40% real texture/photo backgrounds
-20% original or black masked backgrounds
+50% generated block/patch shuffled backgrounds
 ```
 
 如果验证集在真实不同场地表现仍差，再提高真实图片背景占比；如果前景边界出现伪影依赖，则增大 mask dilation/edge blur。

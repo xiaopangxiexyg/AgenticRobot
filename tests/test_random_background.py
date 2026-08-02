@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections import Counter
+import shutil
+
 import numpy as np
+import pytest
 
 from utils.dataset_postprocess.wrist_cam_adjust.depth import DepthRangeMaskConfig, mask_manifest_payload, pack_binary_mask
 from utils.random_background import (
@@ -19,9 +23,23 @@ from utils.random_background import (
     temporal_background_from_episode,
     write_image_manifest,
 )
+from utils.random_background.generate_wrist_sample_video import (
+    DEFAULT_FINAL_MASK_ROOT,
+    build_arg_parser as build_wrist_sample_video_arg_parser,
+)
 
 
 _DISABLED_PHOTOMETRIC = PhotometricAugmentConfig(enabled=False)
+
+
+def test_wrist_sample_video_defaults_to_final_keep_mask() -> None:
+    args = build_wrist_sample_video_arg_parser().parse_args(
+        ["--session", "dataset", "--output-dir", "preview"]
+    )
+
+    assert args.final_mask_root == DEFAULT_FINAL_MASK_ROOT
+    assert args.use_component_masks is False
+    assert args.table_mask_root is None
 
 
 def test_generate_background_is_deterministic() -> None:
@@ -118,6 +136,174 @@ def test_default_temporal_speed_range_is_doubled_with_zero_lower_bound() -> None
 
     assert (procedural.min_drift_px_per_frame, procedural.max_drift_px_per_frame) == (0.0, 6.0)
     assert (real.min_drift_px_per_frame, real.max_drift_px_per_frame) == (0.0, 7.0)
+
+
+def test_default_profile_is_paired_mixed_with_original_background_slice() -> None:
+    config = RandomBackgroundAugmentConfig()
+
+    assert config.provider == "mixed"
+    assert config.mixed_original_prob == 0.1
+    assert config.real_image_prob == 0.4
+    assert config.mixed_black_prob == 0.0
+    assert config.wrist_pair_mode == "shared_scene_family"
+    assert config.wrist_pair_camera_keys == ("left_wrist", "right_wrist")
+    assert config.mixed_probabilities(real_image_available=True) == {
+        "original": 0.1,
+        "black": 0.0,
+        "real_image": 0.4,
+        "procedural": 0.5,
+    }
+    assert config.mixed_probabilities(real_image_available=False) == {
+        "original": 0.1,
+        "black": 0.0,
+        "real_image": 0.0,
+        "procedural": 0.9,
+    }
+
+
+def test_default_augmenter_materializes_the_real_image_provider() -> None:
+    augmenter = RandomBackgroundVideoAugmenter(
+        RandomBackgroundAugmentConfig(photometric=_DISABLED_PHOTOMETRIC)
+    )
+
+    assert isinstance(augmenter.real_image_provider, LocalImageBackgroundProvider)
+
+
+def test_mixed_provider_selection_matches_the_default_10_40_50_profile() -> None:
+    augmenter = RandomBackgroundVideoAugmenter(
+        RandomBackgroundAugmentConfig(
+            global_seed=20260730,
+            photometric=_DISABLED_PHOTOMETRIC,
+        ),
+        # Selection is tested here without decoding a donor image.
+        real_image_provider=object(),  # type: ignore[arg-type]
+    )
+
+    selected = Counter(
+        augmenter._provider_for_sample(
+            episode_index=episode,
+            camera_key="left_wrist",
+            frame_index=0,
+            epoch=0,
+        )
+        for episode in range(10000)
+    )
+
+    assert 0.08 <= selected["original"] / 10000.0 <= 0.12
+    assert 0.37 <= selected["real_image"] / 10000.0 <= 0.43
+    assert 0.47 <= selected["procedural"] / 10000.0 <= 0.53
+    assert selected["black"] == 0
+
+
+def test_mixed_real_image_branch_fails_closed_when_default_pool_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEXTELEOP_REAL_IMAGE_ROOT", "/tmp/does-not-exist-dexteleop-backgrounds")
+
+    with pytest.raises(RuntimeError, match="can select real_image"):
+        RandomBackgroundVideoAugmenter(
+            RandomBackgroundAugmentConfig(photometric=_DISABLED_PHOTOMETRIC)
+        )
+
+
+def test_paired_temporal_background_shares_canvas_but_not_view_motion() -> None:
+    left = temporal_background_from_episode(
+        width=64,
+        height=48,
+        episode_index=3,
+        mode="lowfreq_noise",
+        canvas_seed=701,
+        view_seed=801,
+    )
+    right = temporal_background_from_episode(
+        width=64,
+        height=48,
+        episode_index=3,
+        mode="lowfreq_noise",
+        canvas_seed=701,
+        view_seed=802,
+    )
+
+    np.testing.assert_array_equal(left.canvas, right.canvas)
+    assert not np.array_equal(left.frame(0), right.frame(0))
+
+
+def test_wrist_pair_provider_and_background_family_are_shared() -> None:
+    rgb = np.full((48, 64, 3), 80, dtype=np.uint8)
+    empty_keep = np.zeros((48, 64), dtype=np.uint8)
+    augmenter = RandomBackgroundVideoAugmenter(
+        RandomBackgroundAugmentConfig(
+            global_seed=101,
+            provider="mixed",
+            mixed_original_prob=0.0,
+            mixed_black_prob=0.0,
+            edge_blur_px=0,
+            photometric=_DISABLED_PHOTOMETRIC,
+        )
+    )
+
+    left = augmenter.apply(
+        rgb,
+        empty_keep,
+        episode_index=7,
+        camera_key="left_wrist",
+        frame_index=0,
+        epoch=2,
+    )
+    right = augmenter.apply(
+        rgb,
+        empty_keep,
+        episode_index=7,
+        camera_key="right_wrist",
+        frame_index=19,
+        epoch=2,
+    )
+    left_metadata = augmenter.background_metadata(
+        episode_index=7,
+        camera_key="left_wrist",
+        frame_index=0,
+        epoch=2,
+    )
+    right_metadata = augmenter.background_metadata(
+        episode_index=7,
+        camera_key="right_wrist",
+        frame_index=19,
+        epoch=2,
+    )
+
+    assert left_metadata["provider"] == right_metadata["provider"]
+    assert left_metadata["background_family_id"] == right_metadata["background_family_id"]
+    assert left_metadata["scene_seed"] == right_metadata["scene_seed"]
+    assert left_metadata["view_seed"] != right_metadata["view_seed"]
+    assert not np.array_equal(left, right)
+
+
+def test_wrist_pair_mode_can_fall_back_to_camera_independent_streams() -> None:
+    augmenter = RandomBackgroundVideoAugmenter(
+        RandomBackgroundAugmentConfig(
+            provider="procedural",
+            wrist_pair_mode="independent",
+            photometric=_DISABLED_PHOTOMETRIC,
+        )
+    )
+
+    left = augmenter.background_metadata(
+        episode_index=1,
+        camera_key="left_wrist",
+        frame_index=0,
+        epoch=0,
+    )
+    right = augmenter.background_metadata(
+        episode_index=1,
+        camera_key="right_wrist",
+        frame_index=0,
+        epoch=0,
+    )
+
+    assert left["background_family"] == "camera_independent"
+    assert right["background_family"] == "camera_independent"
+    assert "scene_seed" not in left
+    assert "scene_seed" not in right
 
 
 def test_video_augmenter_mask_roles_and_epoch_variation() -> None:
@@ -490,6 +676,7 @@ def test_fixed_front_border_mask_mixed_provider_never_falls_back_to_original_or_
             provider="mixed",
             mixed_original_prob=1.0,
             mixed_black_prob=0.0,
+            real_image_prob=0.0,
             edge_blur_px=0,
             fixed_mask=FixedBorderMaskConfig(enabled=True, side_probability=1.0),
             photometric=_DISABLED_PHOTOMETRIC,
@@ -617,6 +804,117 @@ def test_real_image_background_provider(tmp_path) -> None:
     assert fixed_metadata is not None
     assert {item["provider"] for item in fixed_metadata["backgrounds"].values()} == {"real_image"}
     assert not np.array_equal(fixed_first[0, 10], rgb[0, 10])
+
+
+def test_real_image_manifest_is_portable_with_its_image_directory(tmp_path) -> None:
+    cv2 = __import__("cv2")
+    source_root = tmp_path / "source_pool"
+    image_root = source_root / "images"
+    image_root.mkdir(parents=True)
+    image = np.full((32, 48, 3), 127, dtype=np.uint8)
+    assert cv2.imwrite(str(image_root / "background.png"), image)
+    manifest_path = source_root / "real_background_manifest.json"
+
+    payload = write_image_manifest(image_root, manifest_path, source="unit")
+    assert payload["image_root"] == "images"
+    assert payload["image_root_kind"] == "manifest_relative"
+
+    copied_root = tmp_path / "copied_pool"
+    shutil.copytree(source_root, copied_root)
+    provider = LocalImageBackgroundProvider(
+        manifest_path=copied_root / "real_background_manifest.json"
+    )
+    assert provider.image_root == (copied_root / "images").resolve()
+    assert provider.paths == [(copied_root / "images/background.png").resolve()]
+
+
+def test_manifest_image_root_can_be_overridden_for_legacy_absolute_manifest(
+    tmp_path,
+) -> None:
+    cv2 = __import__("cv2")
+    image_root = tmp_path / "remote_pool" / "images"
+    image_root.mkdir(parents=True)
+    image = np.full((24, 24, 3), 64, dtype=np.uint8)
+    assert cv2.imwrite(str(image_root / "background.png"), image)
+    manifest_path = tmp_path / "legacy_manifest.json"
+    manifest_path.write_text(
+        __import__("json").dumps(
+            {
+                "format": "dexteleop_real_background_manifest_v1",
+                "source": "unit",
+                "image_root": "/stale/local/path/images",
+                "count": 1,
+                "images": ["background.png"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    provider = LocalImageBackgroundProvider(
+        manifest_path=manifest_path,
+        image_root=image_root,
+    )
+    assert provider.image_root == image_root.resolve()
+    assert provider.paths == [(image_root / "background.png").resolve()]
+
+
+def test_paired_real_image_background_shares_source_but_not_view(tmp_path) -> None:
+    cv2 = __import__("cv2")
+    image_root = tmp_path / "real_pool"
+    image_root.mkdir()
+    for index in range(3):
+        image = np.zeros((48, 64, 3), dtype=np.uint8)
+        image[:, :] = (20 + index * 60, 80, 180 - index * 40)
+        image[:, 8 + index * 5 : 24 + index * 5] = (220, 180, 40)
+        assert cv2.imwrite(str(image_root / f"background_{index}.png"), image)
+    provider = LocalImageBackgroundProvider(image_root=image_root)
+    augmenter = RandomBackgroundVideoAugmenter(
+        RandomBackgroundAugmentConfig(
+            provider="real_image",
+            edge_blur_px=0,
+            photometric=_DISABLED_PHOTOMETRIC,
+        ),
+        real_image_provider=provider,
+    )
+    rgb = np.zeros((48, 64, 3), dtype=np.uint8)
+    keep = np.zeros((48, 64), dtype=np.uint8)
+
+    left = augmenter.apply(
+        rgb,
+        keep,
+        episode_index=4,
+        camera_key="left_wrist",
+        frame_index=0,
+        epoch=3,
+    )
+    right = augmenter.apply(
+        rgb,
+        keep,
+        episode_index=4,
+        camera_key="right_wrist",
+        frame_index=0,
+        epoch=3,
+    )
+    streams = list(augmenter.real_streams.items.values())
+    left_metadata = augmenter.background_metadata(
+        episode_index=4,
+        camera_key="left_wrist",
+        frame_index=0,
+        epoch=3,
+    )
+    right_metadata = augmenter.background_metadata(
+        episode_index=4,
+        camera_key="right_wrist",
+        frame_index=0,
+        epoch=3,
+    )
+
+    assert len(streams) == 2
+    assert streams[0].path == streams[1].path
+    assert not np.array_equal(left, right)
+    assert left_metadata["background_family_id"] == right_metadata["background_family_id"]
+    assert left_metadata["scene_source_shared"] is True
+    assert left_metadata["scene_canvas_source"] == "shared_real_image_independent_views"
 
 
 def test_real_image_provider_applies_seeded_scale_and_aspect_stretch(tmp_path) -> None:

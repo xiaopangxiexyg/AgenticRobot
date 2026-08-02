@@ -14,6 +14,7 @@ from dataset_contracts.v25p_native_storage import V25P_NATIVE_STORAGE_LAYOUTS_V1
 from ..policy_io import load_policy_io_layout
 from .calibration import UmiCalibrationSet
 from .config import load_umi_collection_config
+from .topology import CAMERA_KEYS, SIDES
 
 
 DEFAULT_CONFIG = (
@@ -32,6 +33,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate configuration, layout and calibration without initializing devices.",
     )
     parser.add_argument("--no-open-browser", action="store_true")
+    parser.add_argument(
+        "--gui-resizable-sidebars",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Allow the shared RealTeleop/UMI browser GUI columns to be resized "
+            "with a draggable divider. Enabled by the default config."
+        ),
+    )
+    parser.add_argument(
+        "--gui-input-activity-indicators",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Show passive A/B/C/G and P1--P5 input activity blocks. Enabled "
+            "by the default config; --no-gui-input-activity-indicators rolls back the display."
+        ),
+    )
     parser.add_argument(
         "--calibration-validity-hours",
         type=float,
@@ -62,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ignore-camera",
         action="append",
-        choices=("left_wrist", "right_wrist"),
+        choices=CAMERA_KEYS,
         default=None,
         help=(
             "Explicitly omit one camera view for the complete target dataset. "
@@ -72,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ignore-tactile",
         action="append",
-        choices=("left", "right"),
+        choices=SIDES,
         default=None,
         help=(
             "Explicitly omit one tactile side for the complete target dataset; "
@@ -138,6 +157,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = replace(
         config,
         open_browser=False if args.no_open_browser else config.open_browser,
+        gui_resizable_sidebars=(
+            config.gui_resizable_sidebars
+            if args.gui_resizable_sidebars is None
+            else bool(args.gui_resizable_sidebars)
+        ),
+        gui_input_activity_indicators=(
+            config.gui_input_activity_indicators
+            if args.gui_input_activity_indicators is None
+            else bool(args.gui_input_activity_indicators)
+        ),
         send_gripper_commands=False if args.no_send_gripper else config.send_gripper_commands,
         foot_pad_enabled=(
             config.foot_pad_enabled
@@ -217,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "sha256": calibrations.by_side[side].sha256,
                             "tcp_profile": calibrations.by_side[side].tcp_profile,
                         }
-                        for side in ("left", "right")
+                        for side in SIDES
                         if side in calibrations.by_side
                     },
                     "policy_io_layout": str(config.policy_io_layout.resolve()),

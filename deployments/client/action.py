@@ -17,6 +17,8 @@ class UnifiedActionChunk:
 
     actions: np.ndarray
     discrete_actions: np.ndarray | None = None
+    arm_hold_probabilities: np.ndarray | None = None
+    arm_hold_contract_hash: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -56,11 +58,57 @@ class UnifiedActionChunk:
                     ) from exc
                 tokens[index] = token
             discrete_actions = tokens
+        arm_hold_probabilities = self.arm_hold_probabilities
+        arm_hold_contract_hash = self.arm_hold_contract_hash
+        if (arm_hold_probabilities is None) != (arm_hold_contract_hash is None):
+            raise ValueError(
+                "arm_hold_probabilities and arm_hold_contract_hash must be "
+                "supplied together."
+            )
+        if arm_hold_probabilities is not None:
+            probabilities = np.asarray(
+                arm_hold_probabilities,
+                dtype=np.float32,
+            )
+            if probabilities.ndim == 1:
+                probabilities = probabilities.reshape(1, -1)
+            if probabilities.shape != (actions.shape[0], 2):
+                raise ValueError(
+                    "arm_hold_probabilities must have shape "
+                    f"{(actions.shape[0], 2)}, got {probabilities.shape}."
+                )
+            if (
+                not np.all(np.isfinite(probabilities))
+                or np.any(probabilities < 0.0)
+                or np.any(probabilities > 1.0)
+            ):
+                raise ValueError(
+                    "arm_hold_probabilities must contain probabilities in [0, 1]."
+                )
+            arm_hold_probabilities = probabilities.astype(
+                np.float32,
+                copy=True,
+            )
+            arm_hold_contract_hash = str(arm_hold_contract_hash).strip()
+            if not arm_hold_contract_hash:
+                raise ValueError(
+                    "arm_hold_contract_hash must be non-empty when supplied."
+                )
         object.__setattr__(self, "actions", actions.astype(np.float32, copy=True))
         object.__setattr__(
             self,
             "discrete_actions",
             None if discrete_actions is None else discrete_actions.astype(np.int64, copy=True),
+        )
+        object.__setattr__(
+            self,
+            "arm_hold_probabilities",
+            arm_hold_probabilities,
+        )
+        object.__setattr__(
+            self,
+            "arm_hold_contract_hash",
+            arm_hold_contract_hash,
         )
         object.__setattr__(self, "metadata", dict(self.metadata))
 

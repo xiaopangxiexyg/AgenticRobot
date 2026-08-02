@@ -37,6 +37,10 @@ from dataset_contracts.stream_catalog import (
 )
 from robot_motion.runtime.observation_cut import ObservationSampleRef
 
+from collection_runtime.sample_acceptance import (
+    AcceptedSampleReceipt,
+    SampleAcceptanceReceiptBuffer,
+)
 from .sample_assembler import (
     CollectorSampleBuilder,
     CollectorSampleBuilderConfig,
@@ -46,7 +50,7 @@ from .schema_v22 import (
     StrictV22SampleRejection,
     validate_strict_v22_measured_state,
 )
-from .stream_sink import NativeStreamEpisodeWriter
+from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 from .video_frame import VideoFrame
 from .writer_v21 import (
     LegacyEpisodeArtifactReport,
@@ -78,6 +82,7 @@ class ProcessCollectionConfig:
     worker_cpus: tuple[int, ...] = ()
     worker_nice: int = 5
     native_inline_message_max_bytes: int = 256 * 1024
+    sample_acceptance_receipt_capacity: int = 0
 
     def __post_init__(self) -> None:
         if int(self.queue_size) <= 0:
@@ -92,6 +97,10 @@ class ProcessCollectionConfig:
             raise ValueError("request_timeout_sec must be positive.")
         if int(self.native_inline_message_max_bytes) <= 0:
             raise ValueError("native_inline_message_max_bytes must be positive.")
+        if int(self.sample_acceptance_receipt_capacity) < 0:
+            raise ValueError(
+                "sample_acceptance_receipt_capacity must be non-negative."
+            )
 
 
 @dataclass(frozen=True)
@@ -810,7 +819,9 @@ def _worker_main(
                 build_policy_io_v25p_capture_profiles,
             )
             from .v25p_dual_write_shadow import V25pDualWriteShadow
-            from .v25p_native_store import V25pNativeEpisodeStore
+            from collection_runtime.component_capture import (
+                ComponentCaptureEpisodeStore,
+            )
             from .v25p_real_teleop_producer import RealTeleopV25pProducer
 
             bundle = build_policy_io_v25p_capture_profiles(
@@ -820,7 +831,7 @@ def _worker_main(
                 component_sides=tuple(sample_builder_config.active_sides),
             )
             v25p_native_shadow = V25pDualWriteShadow(
-                store=V25pNativeEpisodeStore(
+                store=ComponentCaptureEpisodeStore(
                     dataset_root=writer_config.root_dir,
                     dataset_id=v25p_shadow_config.dataset_id,
                     embodiment_profile=bundle.embodiment,
@@ -984,6 +995,9 @@ def _worker_main(
                         {
                             "kind": "sample_done",
                             "episode_index": int(sample.episode_index),
+                            "sample_index": int(sample.index),
+                            "episode_frame_index": int(sample.frame_index),
+                            "sample_timestamp": float(sample.timestamp),
                             "frame_count": int(builder.frame_index),
                             "elapsed_ms": float(
                                 (time.perf_counter() - started) * 1000.0
@@ -1671,6 +1685,9 @@ class ProcessCollectionWorker:
         self._worker_traceback: str | None = None
         self._sample_rejection_count = 0
         self._pending_sample_rejections: deque[str] = deque()
+        self._sample_acceptance_receipt_buffer = SampleAcceptanceReceiptBuffer(
+            capacity=int(config.sample_acceptance_receipt_capacity)
+        )
         self._sample_process_ms: deque[float] = deque(maxlen=2048)
         self._parent_pack_ms: deque[float] = deque(maxlen=2048)
         self._parent_queue_put_ms: deque[float] = deque(maxlen=2048)
@@ -1745,6 +1762,17 @@ class ProcessCollectionWorker:
             elif kind == "sample_done":
                 self._completed_samples += 1
                 self._active_episode_frame_count = int(message.get("frame_count", 0))
+                if self._sample_acceptance_receipt_buffer.capacity > 0:
+                    self._sample_acceptance_receipt_buffer.append(
+                        AcceptedSampleReceipt(
+                            episode_index=int(message["episode_index"]),
+                            sample_index=int(message["sample_index"]),
+                            episode_frame_index=int(
+                                message["episode_frame_index"]
+                            ),
+                            sample_timestamp=float(message["sample_timestamp"]),
+                        )
+                    )
                 elapsed_ms = message.get("elapsed_ms")
                 if elapsed_ms is not None:
                     self._sample_process_ms.append(float(elapsed_ms))
@@ -1791,6 +1819,20 @@ class ProcessCollectionWorker:
         if not self._pending_sample_rejections:
             return None
         return self._pending_sample_rejections.popleft()
+
+    def drain_sample_acceptance_receipts(
+        self,
+    ) -> tuple[AcceptedSampleReceipt, ...]:
+        """Drain writer-terminal sample receipts in acceptance order.
+
+        Receipt retention is explicitly enabled with
+        ``sample_acceptance_receipt_capacity``.  Overflow makes the exact
+        first-sample boundary unknowable, so callers fail closed rather than
+        silently using a later sample.
+        """
+
+        self._drain_acks()
+        return self._sample_acceptance_receipt_buffer.drain()
 
     def _raise_if_failed(self) -> None:
         self._drain_acks()

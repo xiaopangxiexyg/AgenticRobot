@@ -1,0 +1,16 @@
+{
+  "active_sides": [
+    "right"
+  ],
+  "schema_version": "angle_trigger_assignment.v2",
+  "sides": {
+    "right": {
+      "location": "5-1",
+      "pid": "7523",
+      "serial_number": "",
+      "servo_id": 1,
+      "vid": "1a86"
+    }
+  },
+  "updated_at": "2026-07-30T13:44:42+08:00"
+}

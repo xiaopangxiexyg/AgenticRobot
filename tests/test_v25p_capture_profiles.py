@@ -13,7 +13,7 @@ from teleop_runtime.collection.v25p_capture_profiles import (
     V25P_UMI_SOURCE,
     build_policy_io_v25p_capture_profiles,
 )
-from teleop_runtime.collection.v25p_native_store import validate_native_stream_profile
+from collection_runtime.v25p_native_store import validate_native_stream_profile
 from teleop_runtime.collection.v25p_real_teleop_producer import RealTeleopV25pProducer
 from teleop_runtime.collection.umi.v25p_producer import UmiV25pProducer
 

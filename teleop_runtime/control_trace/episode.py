@@ -347,6 +347,18 @@ class EpisodeTraceRecorderSink:
     def commit_now(self) -> float:
         return float(self.commit_clock())
 
+    @property
+    def prepared_episode(self) -> PreparedEpisodeTraceCapture | None:
+        """Return the current preparation for transactional abort handling.
+
+        Episode owners use this read-only view to recover a preparation whose
+        bind step failed before their own receipt was published.  It does not
+        expose mutable lifecycle state or create a second owner.
+        """
+
+        with self._lock:
+            return self._prepared
+
     def prepare_episode(
         self,
         *,

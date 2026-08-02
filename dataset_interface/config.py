@@ -65,3 +65,7 @@ class DatasetInterfaceConfig:
     video: VideoConfig = field(default_factory=VideoConfig)
     augmentation: RandomBackgroundAugmentConfig = field(default_factory=RandomBackgroundAugmentConfig)
     missing_views: MissingViewConfig = field(default_factory=MissingViewConfig)
+    # Optional override for the default mixed 10/40/50 real-image pool.
+    real_image_root: Path | None = None
+    # Prefer a sealed manifest when reproducible image-pool identity matters.
+    real_image_manifest: Path | None = None

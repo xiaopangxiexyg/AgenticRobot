@@ -10,18 +10,31 @@ from typing import Any, Callable, Mapping, Protocol
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.policy_action_semantics import (
+    PolicyArmHoldOutputContract,
+)
 from robot_motion.action import RobotAction, SourceValidationResult
 from robot_motion.action.proposal import robot_action_semantic_payload
 from robot_motion.action.snapshot import ActionEmissionScheduleSpec
 from robot_motion.runtime.immutable import deep_freeze
 
-from .actions import ActionChunkBuffer, NormalizedAction, normalize_policy_output
+from .actions import (
+    ActionChunkBuffer,
+    NormalizedAction,
+    normalize_policy_output,
+    normalize_policy_output_with_semantics,
+)
 from .action_adapter import (
     DeployActionRepresentationReceipt,
     DeployRobotActionAdapter,
     DeployRobotActionAdapterResult,
 )
 from .chunk import ActionChunkExecutionPolicy
+from .arm_hold import (
+    ArmHoldResolutionReceipt,
+    ArmHoldSemanticResolver,
+    ArmHoldStagedResolution,
+)
 from .normalization import (
     NormalizationContractError,
     NormalizationContract,
@@ -109,10 +122,14 @@ class PolicyDeployRuntimeConfig:
     policy_clock_domain_id: str = "local_monotonic"
     action_keyframe_period_sec: float = 1.0 / 15.0
     action_maximum_hold_sec: float = 1.0 / 15.0
+    # Default false preserves the historical chunk horizon.  When true, only
+    # the final emitted keyframe may remain valid for maximum_hold_sec.
+    extend_final_keyframe_to_maximum_hold: bool = False
     action_emission_admission_mode: str = POLICY_ACTION_EMISSION_ADMISSION_MODE_V1
     # ``None`` preserves the historical full-chunk behavior.  An explicit
     # positive value selects only the prefix before the next prediction.
     action_chunk_execution_steps: int | None = None
+    arm_hold_output: PolicyArmHoldOutputContract | Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         sides = tuple(str(side).strip().lower() for side in self.active_sides)
@@ -193,6 +210,10 @@ class PolicyDeployRuntimeConfig:
             raise ValueError("action_keyframe_period_sec must be finite and positive.")
         if not math.isfinite(maximum_hold) or maximum_hold <= 0:
             raise ValueError("action_maximum_hold_sec must be finite and positive.")
+        if not isinstance(self.extend_final_keyframe_to_maximum_hold, bool):
+            raise TypeError(
+                "extend_final_keyframe_to_maximum_hold must be a bool."
+            )
         if self.action_emission_admission_mode != POLICY_ACTION_EMISSION_ADMISSION_MODE_V1:
             raise ValueError("M2/M3 require on_emission_pop_v1 admission mode.")
         chunk_execution_policy = ActionChunkExecutionPolicy(
@@ -207,6 +228,20 @@ class PolicyDeployRuntimeConfig:
             "action_chunk_execution_steps",
             chunk_execution_policy.execution_steps,
         )
+        arm_hold_output = self.arm_hold_output
+        if isinstance(arm_hold_output, Mapping):
+            arm_hold_output = PolicyArmHoldOutputContract.from_dict(
+                arm_hold_output
+            )
+        elif arm_hold_output is not None and not isinstance(
+            arm_hold_output,
+            PolicyArmHoldOutputContract,
+        ):
+            raise TypeError(
+                "arm_hold_output must be a PolicyArmHoldOutputContract, "
+                "mapping, or None."
+            )
+        object.__setattr__(self, "arm_hold_output", arm_hold_output)
         contract = self.policy_observation_contract
         if contract is None:
             contract = default_deploy_policy_observation_contract(
@@ -269,6 +304,8 @@ class PolicyActionEmission:
     semantic_content_hash: str
     canonical_action: CanonicalPolicyAction | None = None
     source_binding_hash: str | None = None
+    model_decoded_absolute_action: NormalizedAction | None = None
+    arm_hold_resolution: ArmHoldResolutionReceipt | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "pre_safety_faults", tuple(self.pre_safety_faults))
@@ -282,7 +319,19 @@ class PolicyActionEmission:
             raise ValueError(
                 "A policy action emission must carry exactly one action payload."
             )
+        if (self.model_decoded_absolute_action is None) != (
+            self.arm_hold_resolution is None
+        ):
+            raise ValueError(
+                "model_decoded_absolute_action and arm_hold_resolution must "
+                "be supplied together."
+            )
         if self.canonical_action is not None:
+            if self.arm_hold_resolution is not None:
+                raise ValueError(
+                    "Typed canonical emission does not yet support arm-hold "
+                    "semantic resolution."
+                )
             if self.representation_receipt is not None:
                 raise ValueError(
                     "A typed policy action emission cannot carry a legacy "
@@ -323,6 +372,7 @@ def _freeze_normalized_action(action: NormalizedAction) -> NormalizedAction:
         vector=vector,
         arm_joint_targets=joints,
         metadata=deep_freeze(dict(action.metadata)),
+        arm_hold_prediction=action.arm_hold_prediction,
     )
     object.__setattr__(frozen, "arm_joint_targets", deep_freeze(joints))
     return frozen
@@ -336,8 +386,8 @@ class _ImmutableList(list[Any]):
         raise TypeError("Immutable prediction candidate metadata cannot be mutated.")
 
     __delitem__ = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
+    __iadd__ = _immutable  # type: ignore[assignment]
+    __imul__ = _immutable  # type: ignore[assignment]
     __setitem__ = _immutable
     append = _immutable
     clear = _immutable
@@ -378,6 +428,7 @@ def _freeze_prediction_candidate_action(action: NormalizedAction) -> NormalizedA
         vector=vector,
         arm_joint_targets=joints,
         metadata=_freeze_candidate_metadata(dict(action.metadata)),
+        arm_hold_prediction=action.arm_hold_prediction,
     )
     object.__setattr__(frozen, "arm_joint_targets", deep_freeze(joints))
     return frozen
@@ -400,6 +451,7 @@ def _detach_normalized_action(
             for side, value in action.arm_joint_targets.items()
         },
         metadata=action_metadata,
+        arm_hold_prediction=action.arm_hold_prediction,
     )
 
 
@@ -426,7 +478,7 @@ def _emission_semantic_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _decoded_action_payload(action: NormalizedAction) -> dict[str, Any]:
-    return {
+    payload = {
         "vector": np.asarray(action.vector, dtype=np.float32),
         "arm_joint_targets": {
             str(side): np.asarray(value, dtype=np.float32)
@@ -434,6 +486,11 @@ def _decoded_action_payload(action: NormalizedAction) -> dict[str, Any]:
         },
         "semantic_metadata": _emission_semantic_metadata(action.metadata),
     }
+    if action.arm_hold_prediction is not None:
+        payload["arm_hold_prediction"] = (
+            action.arm_hold_prediction.to_dict()
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -576,6 +633,7 @@ class PolicyActionEmissionResult:
     queue_len_before: int = 0
     queue_len_after: int = 0
     canonical_action: CanonicalPolicyAction | None = None
+    arm_hold_staged_resolution: ArmHoldStagedResolution | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "queue_len_before", int(self.queue_len_before))
@@ -588,6 +646,7 @@ class PolicyActionPreparationResult:
 
     raw_action: NormalizedAction | None = None
     raw_lookahead_action: NormalizedAction | None = None
+    raw_second_lookahead_action: NormalizedAction | None = None
     prepared_action: Any = None
     emission: PolicyActionEmission | None = None
     emission_error: BaseException | None = None
@@ -595,10 +654,19 @@ class PolicyActionPreparationResult:
     queue_len_after: int = 0
     canonical_action: CanonicalPolicyAction | None = None
     next_step_execution_signal: PolicyNextStepExecutionSignal | None = None
+    model_raw_action: NormalizedAction | None = None
+    arm_hold_resolution: ArmHoldResolutionReceipt | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "queue_len_before", int(self.queue_len_before))
         object.__setattr__(self, "queue_len_after", int(self.queue_len_after))
+        if (
+            self.raw_second_lookahead_action is not None
+            and self.raw_lookahead_action is None
+        ):
+            raise ValueError(
+                "raw_second_lookahead_action requires raw_lookahead_action."
+            )
         signal = self.next_step_execution_signal
         if signal is None:
             return
@@ -686,6 +754,22 @@ class PolicyDeployRuntime:
         self._next_inference_sequence = 0
         self._chunk_lineage_by_id: dict[int, PolicyChunkLineage] = {}
         self._next_scheduled_effective_at: float | None = None
+        arm_hold_contract = config.arm_hold_output
+        if arm_hold_contract is not None and not isinstance(
+            arm_hold_contract,
+            PolicyArmHoldOutputContract,
+        ):
+            raise RuntimeError(
+                "PolicyDeployRuntimeConfig did not normalize arm_hold_output."
+            )
+        self._arm_hold_resolver = (
+            None
+            if arm_hold_contract is None
+            else ArmHoldSemanticResolver(
+                arm_hold_contract,
+                active_sides=config.active_sides,
+            )
+        )
 
     def action_queue_length(self) -> int:
         """Return the number of decoded actions waiting for execution."""
@@ -693,11 +777,12 @@ class PolicyDeployRuntime:
         return len(self._action_queue)
 
     def clear_action_queue(self) -> None:
-        """Discard all queued policy actions."""
+        """Discard the stream and release any latched semantic reference."""
 
         self._action_queue.clear()
         self._chunk_lineage_by_id.clear()
         self._next_scheduled_effective_at = None
+        self.reset_arm_hold_semantics()
 
     def action_queue_pop_count(self) -> int:
         return int(self._action_queue.popped_count)
@@ -730,9 +815,11 @@ class PolicyDeployRuntime:
         return self._action_queue.peek()
 
     @staticmethod
-    def _same_chunk_successor(
+    def _same_chunk_offset(
         current: NormalizedAction | None,
         candidate: NormalizedAction | None,
+        *,
+        offset: int,
     ) -> bool:
         if current is None or candidate is None:
             return False
@@ -745,7 +832,18 @@ class PolicyDeployRuntime:
             candidate_index = int(candidate_metadata[_CHUNK_INDEX_METADATA_KEY])
         except (KeyError, TypeError, ValueError):
             return False
-        return current_chunk == candidate_chunk and candidate_index == current_index + 1
+        return (
+            current_chunk == candidate_chunk
+            and candidate_index == current_index + int(offset)
+        )
+
+    @classmethod
+    def _same_chunk_successor(
+        cls,
+        current: NormalizedAction | None,
+        candidate: NormalizedAction | None,
+    ) -> bool:
+        return cls._same_chunk_offset(current, candidate, offset=1)
 
     def prepare_next_action(
         self,
@@ -767,18 +865,49 @@ class PolicyDeployRuntime:
             raise TypeError("same_chunk_next_step_will_execute must be a bool.")
 
         queue_len_before = self.action_queue_length()
-        raw_action = self.pop_action(allow_output=allow_output)
+        model_raw_action = self.pop_action(allow_output=allow_output)
         queue_len_after = self.action_queue_length()
         queued_candidate = self.peek_action(allow_output=allow_output)
-        raw_lookahead_action = (
-            queued_candidate
-            if self._same_chunk_successor(raw_action, queued_candidate)
+        second_queued_candidate = (
+            self._action_queue.peek_at(1)
+            if allow_output
             else None
         )
+        raw_lookahead_action = (
+            queued_candidate
+            if self._same_chunk_successor(model_raw_action, queued_candidate)
+            else None
+        )
+        raw_second_lookahead_action = (
+            second_queued_candidate
+            if self._same_chunk_offset(
+                model_raw_action,
+                second_queued_candidate,
+                offset=2,
+            )
+            else None
+        )
+        if self._arm_hold_resolver is not None:
+            # The successor's semantic transition is intentionally unknown
+            # until that keyframe is popped. Exposing its unresolved action to
+            # position lookahead would bypass arm-hold resolution.
+            raw_lookahead_action = None
+            raw_second_lookahead_action = None
+        raw_action = model_raw_action
+        arm_hold_resolution = None
         prepared_action = None
-        emission = None
+        emission: PolicyActionEmission | None = None
         next_step_execution_signal = None
         emission_error: BaseException | None = None
+        if raw_action is not None and self._arm_hold_resolver is not None:
+            try:
+                raw_action, arm_hold_resolution = self._arm_hold_resolver.resolve(
+                    raw_action,
+                    observation,
+                )
+            except Exception as exc:  # noqa: BLE001 - semantic path fails closed.
+                emission_error = exc
+                raw_action = None
         if raw_action is not None:
             pre_safety: DeployRobotActionAdapterResult | None = None
             adapt_pre_safety = getattr(preparer, "adapt_pre_safety", None)
@@ -795,6 +924,8 @@ class PolicyDeployRuntime:
             try:
                 emission = self._build_action_emission(
                     raw_action,
+                    model_action=model_raw_action,
+                    arm_hold_resolution=arm_hold_resolution,
                     pre_safety=pre_safety,
                     queue_len_before=queue_len_before,
                     queue_len_after=queue_len_after,
@@ -809,6 +940,7 @@ class PolicyDeployRuntime:
             )
             if (
                 same_chunk_next_step_will_execute
+                and self._arm_hold_resolver is None
                 and emission is not None
                 and raw_lookahead_action is not None
             ):
@@ -832,7 +964,10 @@ class PolicyDeployRuntime:
                 )
         return PolicyActionPreparationResult(
             raw_action=raw_action,
+            model_raw_action=model_raw_action,
+            arm_hold_resolution=arm_hold_resolution,
             raw_lookahead_action=raw_lookahead_action,
+            raw_second_lookahead_action=raw_second_lookahead_action,
             next_step_execution_signal=next_step_execution_signal,
             prepared_action=prepared_action,
             emission=emission,
@@ -877,6 +1012,15 @@ class PolicyDeployRuntime:
             plan_keyframe_count_after=plan_keyframe_count_after,
             plan_pop_count=plan_pop_count,
         )
+        staged = emission_result.arm_hold_staged_resolution
+        if staged is not None:
+            if (
+                emission_result.emission is None
+                or emission_result.emission_error is not None
+            ):
+                self.discard_staged_arm_hold(staged)
+            else:
+                self.commit_staged_arm_hold(staged)
         return self.prepare_emission_result(
             emission_result,
             observation,
@@ -919,7 +1063,19 @@ class PolicyDeployRuntime:
         if (raw_action is None) == (typed_action is None):
             raise RuntimeError("Timed keyframe action payload is ambiguous.")
         if typed_action is not None:
-            emission = self._build_timed_action_emission(
+            if self._arm_hold_resolver is not None:
+                return PolicyActionEmissionResult(
+                    raw_action=None,
+                    emission=None,
+                    emission_error=RuntimeError(
+                        "Raw-RTC arm-hold semantics do not support typed "
+                        "canonical timed actions."
+                    ),
+                    queue_len_before=before,
+                    queue_len_after=after,
+                    canonical_action=typed_action,
+                )
+            typed_emission = self._build_timed_action_emission(
                 keyframe,
                 pre_safety=None,
                 plan_keyframe_count_before=before,
@@ -929,13 +1085,30 @@ class PolicyDeployRuntime:
             )
             return PolicyActionEmissionResult(
                 raw_action=None,
-                emission=emission,
+                emission=typed_emission,
                 emission_error=None,
                 queue_len_before=before,
                 queue_len_after=after,
                 canonical_action=typed_action,
             )
         assert raw_action is not None
+        model_raw_action = raw_action
+        staged_arm_hold = None
+        if self._arm_hold_resolver is not None:
+            try:
+                staged_arm_hold = self._arm_hold_resolver.stage(
+                    raw_action,
+                    observation,
+                )
+                raw_action = staged_arm_hold.resolved_action
+            except Exception as exc:  # noqa: BLE001 - semantic path fails closed.
+                return PolicyActionEmissionResult(
+                    raw_action=None,
+                    emission=None,
+                    emission_error=exc,
+                    queue_len_before=before,
+                    queue_len_after=after,
+                )
         pre_safety: DeployRobotActionAdapterResult | None = None
         emission_error: BaseException | None = None
         if emission_adapter is None:
@@ -948,6 +1121,7 @@ class PolicyDeployRuntime:
                 ),
                 queue_len_before=before,
                 queue_len_after=after,
+                arm_hold_staged_resolution=staged_arm_hold,
             )
         else:
             try:
@@ -960,10 +1134,21 @@ class PolicyDeployRuntime:
             except Exception as exc:  # noqa: BLE001 - formal emission fails closed.
                 emission_error = exc
                 pre_safety = None
-        emission = None
+        emission: PolicyActionEmission | None = None
         try:
             emission = self._build_timed_action_emission(
                 keyframe,
+                resolved_action=raw_action,
+                model_action=(
+                    model_raw_action
+                    if staged_arm_hold is not None
+                    else None
+                ),
+                arm_hold_resolution=(
+                    None
+                    if staged_arm_hold is None
+                    else staged_arm_hold.receipt
+                ),
                 pre_safety=pre_safety,
                 plan_keyframe_count_before=before,
                 plan_keyframe_count_after=after,
@@ -979,6 +1164,7 @@ class PolicyDeployRuntime:
             emission_error=emission_error,
             queue_len_before=before,
             queue_len_after=after,
+            arm_hold_staged_resolution=staged_arm_hold,
         )
 
     def prepare_emission_result(
@@ -1000,6 +1186,15 @@ class PolicyDeployRuntime:
         emission = emission_result.emission
         typed_action = emission_result.canonical_action
         raw_action = emission_result.raw_action
+        if self._arm_hold_resolver is not None and (
+            raw_action is not None or typed_action is not None
+        ) and (
+            emission_result.arm_hold_staged_resolution is None
+        ):
+            preparation_error = RuntimeError(
+                "Arm-hold timed/RTC action preparation requires an "
+                "emission-time staged resolution."
+            )
         if typed_action is not None:
             if emission is not None and preparation_error is None:
                 prepare_canonical = getattr(preparer, "prepare_canonical", None)
@@ -1019,7 +1214,7 @@ class PolicyDeployRuntime:
                         "Typed canonical preparation is unavailable; "
                         "the formal emission remains no-action."
                     )
-        elif raw_action is not None:
+        elif raw_action is not None and self._arm_hold_resolver is None:
             prepared_action = preparer.prepare(
                 raw_action,
                 observation,
@@ -1034,12 +1229,23 @@ class PolicyDeployRuntime:
             queue_len_before=emission_result.queue_len_before,
             queue_len_after=emission_result.queue_len_after,
             canonical_action=typed_action,
+            model_raw_action=(
+                None
+                if emission is None
+                else emission.model_decoded_absolute_action
+            ),
+            arm_hold_resolution=(
+                None if emission is None else emission.arm_hold_resolution
+            ),
         )
 
     def _build_timed_action_emission(
         self,
         keyframe: TimedPolicyActionKeyframe,
         *,
+        resolved_action: NormalizedAction | None = None,
+        model_action: NormalizedAction | None = None,
+        arm_hold_resolution: ArmHoldResolutionReceipt | None = None,
         pre_safety: DeployRobotActionAdapterResult | None,
         plan_keyframe_count_before: int,
         plan_keyframe_count_after: int,
@@ -1055,6 +1261,13 @@ class PolicyDeployRuntime:
             assert keyframe.decoded_absolute_action is not None
             frozen_action = _freeze_normalized_action(
                 keyframe.decoded_absolute_action
+                if resolved_action is None
+                else resolved_action
+            )
+            frozen_model_action = (
+                frozen_action
+                if model_action is None
+                else _freeze_normalized_action(model_action)
             )
             robot_action = None if pre_safety is None else pre_safety.robot_action
             representation = (
@@ -1064,6 +1277,7 @@ class PolicyDeployRuntime:
             faults = () if pre_safety is None else pre_safety.faults
         else:
             frozen_action = None
+            frozen_model_action = None
             robot_action = typed_action.action
             representation = None
             validation = SourceValidationResult(accepted=True, reasons=())
@@ -1121,6 +1335,14 @@ class PolicyDeployRuntime:
                     frozen_action.metadata
                 ),
             }
+            if arm_hold_resolution is not None:
+                assert frozen_model_action is not None
+                payload["model_decoded_absolute_action"] = (
+                    _decoded_action_payload(frozen_model_action)
+                )
+                payload["arm_hold_resolution"] = (
+                    arm_hold_resolution.to_dict(include_hash=True)
+                )
             hash_domain = POLICY_ACTION_EMISSION_HASH_DOMAIN_V1
         else:
             payload["action_payload_kind"] = "typed_canonical_policy_action_v1"
@@ -1162,12 +1384,20 @@ class PolicyDeployRuntime:
             semantic_content_hash=semantic_hash,
             canonical_action=typed_action,
             source_binding_hash=source_binding_hash,
+            model_decoded_absolute_action=(
+                frozen_model_action
+                if arm_hold_resolution is not None
+                else None
+            ),
+            arm_hold_resolution=arm_hold_resolution,
         )
 
     def _build_action_emission(
         self,
         action: NormalizedAction,
         *,
+        model_action: NormalizedAction | None = None,
+        arm_hold_resolution: ArmHoldResolutionReceipt | None = None,
         pre_safety: DeployRobotActionAdapterResult | None,
         queue_len_before: int,
         queue_len_after: int,
@@ -1187,6 +1417,11 @@ class PolicyDeployRuntime:
         if not math.isfinite(emitted_at):
             raise ValueError("monotonic_clock returned a non-finite emission time.")
         frozen_action = _freeze_normalized_action(action)
+        frozen_model_action = (
+            frozen_action
+            if model_action is None
+            else _freeze_normalized_action(model_action)
+        )
         robot_action = None if pre_safety is None else pre_safety.robot_action
         representation = None if pre_safety is None else pre_safety.representation_receipt
         validation = None if pre_safety is None else pre_safety.source_validation
@@ -1231,6 +1466,13 @@ class PolicyDeployRuntime:
             "queue_len_after": int(queue_len_after),
             "queue_pop_count": self.action_queue_pop_count(),
         }
+        if arm_hold_resolution is not None:
+            payload["model_decoded_absolute_action"] = (
+                _decoded_action_payload(frozen_model_action)
+            )
+            payload["arm_hold_resolution"] = (
+                arm_hold_resolution.to_dict(include_hash=True)
+            )
         semantic_hash = canonical_content_hash(
             payload,
             domain=POLICY_ACTION_EMISSION_HASH_DOMAIN_V1,
@@ -1262,6 +1504,12 @@ class PolicyDeployRuntime:
             queue_len_after=int(queue_len_after),
             queue_pop_count=self.action_queue_pop_count(),
             semantic_content_hash=semantic_hash,
+            model_decoded_absolute_action=(
+                frozen_model_action
+                if arm_hold_resolution is not None
+                else None
+            ),
+            arm_hold_resolution=arm_hold_resolution,
         )
         if keyframe_index + 1 >= chunk_size:
             self._chunk_lineage_by_id.pop(chunk_id, None)
@@ -1271,6 +1519,33 @@ class PolicyDeployRuntime:
         """Reset the policy-rate clock after hold/init/re-arm boundaries."""
 
         self._last_prediction_at = None
+        self.reset_arm_hold_semantics()
+
+    def reset_arm_hold_semantics(self) -> None:
+        """Release all latched semantic references at a lifecycle boundary."""
+
+        if self._arm_hold_resolver is not None:
+            self._arm_hold_resolver.reset()
+
+    def commit_staged_arm_hold(
+        self,
+        staged: ArmHoldStagedResolution,
+    ) -> ArmHoldResolutionReceipt:
+        """Commit one emission-bound semantic transition exactly once."""
+
+        if self._arm_hold_resolver is None:
+            raise RuntimeError("Arm-hold semantics are not configured.")
+        return self._arm_hold_resolver.commit(staged)
+
+    def discard_staged_arm_hold(
+        self,
+        staged: ArmHoldStagedResolution,
+    ) -> None:
+        """Discard an uncommitted semantic transition after emission failure."""
+
+        if self._arm_hold_resolver is None:
+            raise RuntimeError("Arm-hold semantics are not configured.")
+        self._arm_hold_resolver.discard(staged)
 
     def should_predict(
         self,
@@ -1352,9 +1627,18 @@ class PolicyDeployRuntime:
 
         if not isinstance(observation, DeploymentObservation):
             raise TypeError("observation must be a DeploymentObservation.")
-        actions = normalize_policy_output(
+        arm_hold_contract = self.config.arm_hold_output
+        if arm_hold_contract is not None and not isinstance(
+            arm_hold_contract,
+            PolicyArmHoldOutputContract,
+        ):
+            raise RuntimeError(
+                "PolicyDeployRuntimeConfig did not normalize arm_hold_output."
+            )
+        actions = normalize_policy_output_with_semantics(
             policy_output,
             observation,
+            arm_hold_output_contract=arm_hold_contract,
             active_sides=self.config.active_sides,
             arms_enabled=bool(self.config.arms_enabled),
             hands_enabled=bool(self.config.hands_enabled),
@@ -1436,6 +1720,15 @@ class PolicyDeployRuntime:
         else:
             schedule_start = float(schedule_start_hint)
         chunk_size = len(actions)
+        maximum_hold_sec = max(
+            period,
+            self.config.action_maximum_hold_sec,
+        )
+        horizon_sec = period * chunk_size
+        if self.config.extend_final_keyframe_to_maximum_hold:
+            horizon_sec = (
+                period * max(0, chunk_size - 1) + maximum_hold_sec
+            )
         schedule = ActionEmissionScheduleSpec(
             spec_id=(
                 f"{self.config.policy_node_id}:chunk:{chunk_id}:"
@@ -1444,11 +1737,8 @@ class PolicyDeployRuntime:
             start_at=schedule_start,
             keyframe_period_sec=period,
             keyframe_count=chunk_size,
-            horizon_sec=period * chunk_size,
-            maximum_hold_sec=max(
-                period,
-                self.config.action_maximum_hold_sec,
-            ),
+            horizon_sec=horizon_sec,
+            maximum_hold_sec=maximum_hold_sec,
         )
         output_hash = canonical_content_hash(
             {
@@ -1903,7 +2193,7 @@ class PolicyDeployRuntime:
                 except Exception as rollback_exc:  # noqa: BLE001 - report both failures.
                     rollback_error = rollback_exc
             self.clear_action_queue()
-            faults = ()
+            faults: tuple[str, ...] = ()
             if rollback_error is not None:
                 faults = (
                     "policy_prediction_rollback_error:"

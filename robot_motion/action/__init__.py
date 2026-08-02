@@ -20,6 +20,8 @@ from .codec import (
 from .executor import (
     ActionExecutor,
     ActionExecutorConfig,
+    ActionResolutionError,
+    ActionResolutionFailure,
     NullCommandDispatcher,
     RigCommandDispatcher,
     RobotActionResolver,
@@ -419,6 +421,8 @@ __all__ = [
     "ActionEmissionScheduleSpec",
     "ActionExecutor",
     "ActionExecutorConfig",
+    "ActionResolutionError",
+    "ActionResolutionFailure",
     "ActionProposal",
     "ActionProposalDraft",
     "ActionPersistencePolicy",

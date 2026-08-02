@@ -294,6 +294,7 @@ def _cancel_special_arm_modes_for_hold(
     *,
     now: float,
     reason: str,
+    clear_fix_snapshots: bool = True,
 ) -> list[str]:
     messages: list[str] = []
     fix_controller = getattr(components, "fix_arm_controller", None)
@@ -301,7 +302,7 @@ def _cancel_special_arm_modes_for_hold(
         transition = fix_controller.cancel_active(
             now=now,
             reason=reason,
-            clear_snapshots=True,
+            clear_snapshots=bool(clear_fix_snapshots),
         )
         if transition.ok:
             side_label = "左臂" if transition.side == "left" else "右臂"

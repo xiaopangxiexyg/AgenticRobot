@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Mapping
 
 from ..session import SessionStepResult
-from .async_writer import AsyncWriterPool, WriteJob
+from collection_runtime.async_writer import AsyncWriterPool, WriteJob
 from .build_collect_components import CollectorComponents
 from .observers import CollectionWriterObserver, CollectionWriterObserverConfig
 

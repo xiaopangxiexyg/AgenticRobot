@@ -7,7 +7,7 @@ import struct
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -56,6 +56,7 @@ class VivePoseSource(ObservationSource):
         clock_sync_min_samples: int = 4,
         clock_sync_expected_sender_host: str | None = None,
         name: str = "vive_pose",
+        allow_socket_reuse: bool = False,
     ):
         self._name = name
         self.host = host
@@ -85,6 +86,11 @@ class VivePoseSource(ObservationSource):
             if not clock_sync_expected_sender_host
             else str(clock_sync_expected_sender_host)
         )
+        # A live control receiver is a singleton for its UDP port.  Reusing
+        # the address by default lets a crashed/duplicate GUI silently split
+        # datagrams between two consumers, which looks exactly like a sender
+        # stale condition.  Legacy diagnostics may opt in explicitly.
+        self.allow_socket_reuse = bool(allow_socket_reuse)
         if self.clock_sync_port < 0 or self.clock_sync_port > 65535:
             raise ValueError("clock_sync_port must be in [0, 65535]")
         if self.clock_sync_port and self.clock_sync_port == self.port:
@@ -94,14 +100,37 @@ class VivePoseSource(ObservationSource):
         self._tracker_configs = list(tracker_configs)
         self.tracker_configs = {config.name: config for config in tracker_configs}
         self._configs_by_role = {config.role: config for config in tracker_configs}
+        # Incremented whenever the logical source-role mapping changes.  This
+        # is carried on observation metadata so a downstream session can reset
+        # its pose baseline without coupling itself to VIVE.
+        self._source_mapping_generation = 0
         self.sock: socket.socket | None = None
         self._running = False
         self._thread: threading.Thread | None = None
+        self._worker_started_once = False
         self._lock = threading.Lock()
         self._socket_lock = threading.Lock()
         self._latest_by_channel: dict[str, dict[str, Any]] = {}
+        # Passive diagnostics retain the sender's upstream tracker roles even
+        # when a role is not selected by the current logical-channel mapping.
+        # This cache never participates in retargeting or control admission.
+        self._latest_upstream_by_role: dict[str, dict[str, Any]] = {}
+        self._upstream_role_update_counts: dict[str, int] = {}
+        self._last_upstream_role_update_at: dict[str, float] = {}
         self._packet_count = 0
         self._last_packet_received_at: float | None = None
+        # Wall time is retained for human-readable provenance, while this
+        # monotonic receive cut is the only clock used to classify transport
+        # freshness.  A wall-clock adjustment must not turn a live sender into
+        # ``packet_stale`` (or make an old packet appear current).
+        self._last_packet_received_monotonic_time: float | None = None
+        # Transport heartbeat is captured at the socket boundary, before any
+        # JSON/legacy parsing or history publication.  It is intentionally
+        # separate from ``last_packet_received_*`` which is retained for the
+        # processed-batch compatibility counters.
+        self._datagram_count = 0
+        self._last_datagram_received_at: float | None = None
+        self._last_datagram_received_monotonic_time: float | None = None
         self._dropped_stale_packet_count = 0
         self._last_drain_count = 0
         self._channel_update_counts: dict[str, int] = {}
@@ -121,6 +150,15 @@ class VivePoseSource(ObservationSource):
         self._last_recv_error: str | None = None
         self._socket_restart_count = 0
         self._last_socket_restart_at: float | None = None
+        self._process_error_count = 0
+        self._last_process_error: str | None = None
+        self._last_process_error_at: float | None = None
+        self._last_process_started_at: float | None = None
+        self._last_process_finished_at: float | None = None
+        self._last_process_finished_monotonic_time: float | None = None
+        self._last_process_duration_sec: float | None = None
+        self._last_process_batch_size = 0
+        self._last_process_parse_error_count = 0
         self._legacy_format = f"<{self.legacy_tracker_count * 12}f"
         self._legacy_packet_size = struct.calcsize(self._legacy_format)
         self._clock_sync_server = ViveClockSyncServer(
@@ -135,14 +173,145 @@ class VivePoseSource(ObservationSource):
         )
 
     def set_tracker_configs(self, tracker_configs: list[ViveTrackerConfig]) -> None:
+        configs = list(tracker_configs)
+        names = [config.name for config in configs]
+        roles = [config.role for config in configs]
+        channels = [config.channel_name for config in configs]
+        if len(names) != len(set(names)):
+            raise ValueError("VIVE tracker config names must be unique.")
+        if len(roles) != len(set(roles)):
+            raise ValueError("VIVE tracker source roles must be unique.")
+        if len(channels) != len(set(channels)):
+            raise ValueError("VIVE tracker output channels must be unique.")
         with self._lock:
-            self._tracker_configs = list(tracker_configs)
-            self.tracker_configs = {config.name: config for config in tracker_configs}
-            self._configs_by_role = {config.role: config for config in tracker_configs}
+            self._tracker_configs = configs
+            self.tracker_configs = {config.name: config for config in configs}
+            self._configs_by_role = {config.role: config for config in configs}
+            self._source_mapping_generation += 1
             self._latest_by_channel = {}
             self._channel_update_counts = {}
             self._last_channel_update_at = {}
             self._clear_history_locked(reason="tracker_configs_changed")
+
+    @property
+    def source_role_by_output_channel(self) -> dict[str, str]:
+        """Return the current physical/source-role to logical-channel binding."""
+
+        with self._lock:
+            return {
+                config.channel_name: config.role
+                for config in self._tracker_configs
+            }
+
+    def swap_left_right_source_roles(self) -> dict[str, object]:
+        """Swap left/right upstream roles without renaming logical channels.
+
+        This works for both cardinalities: a single config toggles which
+        upstream wrist role feeds its logical channel, while a bilateral
+        config exchanges both upstream sources. Auxiliary roles are unchanged.
+        Buffered history is cleared; the latest sender snapshot is exposed
+        under the new mapping so setup status updates immediately.
+        """
+
+        role_swap = {
+            "left_wrist": "right_wrist",
+            "right_wrist": "left_wrist",
+        }
+        with self._lock:
+            before = {
+                config.channel_name: config.role
+                for config in self._tracker_configs
+            }
+            if not any(role in role_swap for role in before.values()):
+                raise RuntimeError(
+                    "VIVE source has no left_wrist/right_wrist role to swap."
+                )
+            configs = [
+                replace(
+                    config,
+                    role=role_swap.get(config.role, config.role),
+                )
+                for config in self._tracker_configs
+            ]
+            roles = [config.role for config in configs]
+            if len(roles) != len(set(roles)):
+                raise RuntimeError(
+                    "VIVE source-role swap would create duplicate roles."
+                )
+            self._tracker_configs = configs
+            self.tracker_configs = {
+                config.name: config for config in configs
+            }
+            self._configs_by_role = {
+                config.role: config for config in configs
+            }
+            self._source_mapping_generation += 1
+            self._latest_by_channel = {}
+            self._channel_update_counts = {}
+            self._last_channel_update_at = {}
+            self._clear_history_locked(
+                reason="left_right_source_roles_swapped"
+            )
+            # Keep the latest sender snapshot visible under the new mapping.
+            # Also seed the causal history with that same snapshot.  The
+            # session queries history (not the display cache) when it applies a
+            # cutoff, so exposing only ``_latest_by_channel`` created a
+            # one-cycle missing_channel after every swap.
+            mapped_latest: dict[str, dict[str, Any]] = {}
+            for config in configs:
+                upstream = self._latest_upstream_by_role.get(config.role)
+                if upstream is None:
+                    continue
+                payload = self._copy_tracker_payload(upstream)
+                payload["role"] = config.role
+                payload["tracker_name"] = payload.get("tracker_name") or config.name
+                payload["config"] = config
+                payload["source_mapping_generation"] = (
+                    self._source_mapping_generation
+                )
+                mapped_latest[config.channel_name] = payload
+
+            if mapped_latest:
+                first_payload = next(iter(mapped_latest.values()))
+                received_at = self._finite_timestamp(
+                    first_payload.get("receiver_timestamp"),
+                    fallback=time.time(),
+                )
+                receiver_monotonic_time = self._finite_timestamp(
+                    first_payload.get("receiver_monotonic_time"),
+                    fallback=time.perf_counter(),
+                )
+                self._append_history_packet_locked(
+                    mapped_latest,
+                    received_at=received_at,
+                    receiver_monotonic_time=receiver_monotonic_time,
+                )
+            self._latest_by_channel = {}
+            for channel_name, payload in mapped_latest.items():
+                live_payload = self._copy_tracker_payload(payload)
+                history = self._history_by_channel.get(channel_name)
+                if history:
+                    live_payload["history_time"] = history[-1]["history_time"]
+                    live_payload["history_clock_source"] = history[-1][
+                        "history_clock_source"
+                    ]
+                    for key in (
+                        "source_timestamp",
+                        "source_clock",
+                        "available_timestamp",
+                        "available_clock",
+                    ):
+                        live_payload[key] = history[-1].get(key)
+                self._latest_by_channel[channel_name] = live_payload
+            after = {
+                config.channel_name: config.role
+                for config in configs
+            }
+        return {
+            "status": "swapped",
+            "before_source_role_by_output_channel": before,
+            "after_source_role_by_output_channel": after,
+        }
 
     @property
     def name(self) -> str:
@@ -199,6 +368,7 @@ class VivePoseSource(ObservationSource):
             daemon=True,
             name=f"{self.name}_recv",
         )
+        self._worker_started_once = True
         self._thread.start()
 
     def close(self) -> None:
@@ -214,7 +384,8 @@ class VivePoseSource(ObservationSource):
         if self.sock is not None:
             self._close_socket_locked()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if self.allow_socket_reuse:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self.host, self.port))
         sock.settimeout(self.socket_timeout_sec)
         self.sock = sock
@@ -233,6 +404,20 @@ class VivePoseSource(ObservationSource):
         with self._lock:
             self._recv_error_count += 1
             self._last_recv_error = f"{type(exc).__name__}: {exc}"
+
+    def _record_process_error(
+        self,
+        exc: BaseException,
+        *,
+        packet_index: int | None = None,
+    ) -> None:
+        detail = f"{type(exc).__name__}: {exc}"
+        if packet_index is not None:
+            detail = f"packet_index={int(packet_index)};{detail}"
+        with self._lock:
+            self._process_error_count += 1
+            self._last_process_error = detail
+            self._last_process_error_at = time.time()
 
     def _restart_socket_after_error(self, exc: BaseException) -> bool:
         self._record_recv_error(exc)
@@ -268,22 +453,40 @@ class VivePoseSource(ObservationSource):
         return True
 
     def _recv_loop(self) -> None:
-        while self._running:
-            try:
-                received_batch = self._recv_packet_batch()
-            except socket.timeout:
-                continue
-            except (OSError, ValueError) as exc:
-                if not self._restart_socket_after_error(exc) and not self._running:
-                    break
-                time.sleep(min(0.25, max(0.01, self.socket_timeout_sec)))
-                continue
-            if not received_batch:
-                self._ensure_socket_open()
-                time.sleep(min(0.05, max(0.0, self.socket_timeout_sec)))
-                continue
+        try:
+            while self._running:
+                try:
+                    received_batch = self._recv_packet_batch()
+                except socket.timeout:
+                    continue
+                except (OSError, ValueError) as exc:
+                    if not self._restart_socket_after_error(exc) and not self._running:
+                        break
+                    time.sleep(min(0.25, max(0.01, self.socket_timeout_sec)))
+                    continue
+                if not received_batch:
+                    self._ensure_socket_open()
+                    time.sleep(min(0.05, max(0.0, self.socket_timeout_sec)))
+                    continue
 
-            self._process_received_batch(received_batch)
+                # Parsing/retaining a malformed or unexpected datagram must
+                # never terminate the receive worker.  The batch method also
+                # isolates individual packets, while this outer guard protects
+                # the worker from a future regression in history publication.
+                try:
+                    self._process_received_batch(received_batch)
+                except Exception as exc:  # noqa: BLE001 - worker must survive bad UDP input.
+                    self._record_process_error(exc)
+        except Exception as exc:  # noqa: BLE001 - expose an unhealthy worker explicitly.
+            self._record_process_error(exc)
+        finally:
+            # An unexpected worker exit must not leave a live socket behind or
+            # report ``running=True`` indefinitely.  ``close()`` remains the
+            # normal lifecycle path; this is only the crash containment path.
+            if self._running:
+                self._running = False
+                with self._socket_lock:
+                    self._close_socket_locked()
 
     def _recv_packet_batch(
         self,
@@ -301,11 +504,17 @@ class VivePoseSource(ObservationSource):
             return []
 
         packet, sender_address = sock.recvfrom(self.max_datagram_size)
+        received_at = time.time()
+        receiver_monotonic_time = time.perf_counter()
+        self._record_datagram_received(
+            received_at=received_at,
+            receiver_monotonic_time=receiver_monotonic_time,
+        )
         batch = [
             (
                 packet,
-                time.time(),
-                time.perf_counter(),
+                received_at,
+                receiver_monotonic_time,
                 (str(sender_address[0]), int(sender_address[1])),
             )
         ]
@@ -325,17 +534,38 @@ class VivePoseSource(ObservationSource):
                 packet, sender_address = sock.recvfrom(self.max_datagram_size)
             except (BlockingIOError, socket.timeout):
                 break
+            received_at = time.time()
+            receiver_monotonic_time = time.perf_counter()
+            self._record_datagram_received(
+                received_at=received_at,
+                receiver_monotonic_time=receiver_monotonic_time,
+            )
             batch.append(
                 (
                     packet,
-                    time.time(),
-                    time.perf_counter(),
+                    received_at,
+                    receiver_monotonic_time,
                     (str(sender_address[0]), int(sender_address[1])),
                 )
             )
             stale_count += 1
 
         return batch
+
+    def _record_datagram_received(
+        self,
+        *,
+        received_at: float,
+        receiver_monotonic_time: float,
+    ) -> None:
+        """Record transport arrival before parsing can delay or fail."""
+
+        with self._lock:
+            self._datagram_count += 1
+            self._last_datagram_received_at = float(received_at)
+            self._last_datagram_received_monotonic_time = float(
+                receiver_monotonic_time
+            )
 
     def _recv_latest_packet(self) -> tuple[bytes, float, int] | None:
         """Compatibility helper returning only the last packet in a batch."""
@@ -352,80 +582,184 @@ class VivePoseSource(ObservationSource):
     ) -> None:
         if not batch:
             return
+        process_started_at = time.perf_counter()
+        process_started_wall = time.time()
+        parse_error_count = 0
+        with self._lock:
+            self._last_process_started_at = process_started_wall
+            self._last_process_batch_size = len(batch)
 
         parsed_batch: list[
             tuple[dict[str, dict[str, Any]], float, float, str | None]
         ] = []
-        for received in batch:
-            if len(received) == 3:
-                packet, received_at, receiver_monotonic_time = received
-                sender_host = None
-            elif len(received) == 4:
-                packet, received_at, receiver_monotonic_time, sender_address = received
-                sender_host = str(sender_address[0]) if sender_address else None
-            else:
-                raise ValueError("VIVE receive batch entries must contain 3 or 4 values")
-            parsed = self._parse_packet(
-                packet,
-                float(received_at),
-                sender_host=sender_host,
-            )
-            parsed_batch.append(
-                (parsed, float(received_at), float(receiver_monotonic_time), sender_host)
-            )
-
-        stale_count = max(0, len(batch) - 1)
-        (
-            latest_parsed,
-            latest_received_at,
-            latest_receiver_monotonic_time,
-            latest_sender_host,
-        ) = parsed_batch[-1]
-        with self._lock:
-            self._packet_count += len(batch)
-            self._last_packet_received_at = batch[-1][1]
-            self._dropped_stale_packet_count += stale_count
-            self._last_drain_count = stale_count
-
-            for parsed, received_at, receiver_monotonic_time, _sender_host in parsed_batch:
-                if parsed:
-                    self._append_history_packet_locked(
+        upstream_batch: list[
+            tuple[dict[str, dict[str, Any]] | None, float, float]
+        ] = []
+        try:
+            for packet_index, received in enumerate(batch):
+                # UDP receive entries are created internally, but retaining the
+                # fallback values here makes direct diagnostics and malformed
+                # test inputs unable to kill the worker.
+                received_at = time.time()
+                receiver_monotonic_time = time.perf_counter()
+                sender_host: str | None = None
+                try:
+                    if len(received) == 3:
+                        packet, received_at, receiver_monotonic_time = received
+                    elif len(received) == 4:
+                        packet, received_at, receiver_monotonic_time, sender_address = received
+                        sender_host = str(sender_address[0]) if sender_address else None
+                    else:
+                        raise ValueError(
+                            "VIVE receive batch entries must contain 3 or 4 values"
+                        )
+                    received_at = float(received_at)
+                    receiver_monotonic_time = float(receiver_monotonic_time)
+                    decoded = self._decode_json_packet(packet)
+                    if decoded is None:
+                        parsed = (
+                            self._parse_legacy_packet(
+                                packet,
+                                received_at,
+                                sender_host=sender_host,
+                            )
+                            or {}
+                        )
+                        upstream = None
+                    else:
+                        parsed = self._parse_decoded_json_packet(
+                            decoded,
+                            received_at,
+                            sender_host=sender_host,
+                        )
+                        upstream = self._parse_decoded_upstream_role_diagnostics(
+                            decoded,
+                            received_at,
+                            sender_host=sender_host,
+                        )
+                except Exception as exc:  # noqa: BLE001 - one bad datagram is not a worker failure.
+                    parse_error_count += 1
+                    self._record_process_error(exc, packet_index=packet_index)
+                    parsed = {}
+                    upstream = None
+                parsed_batch.append(
+                    (
                         parsed,
-                        received_at=received_at,
-                        receiver_monotonic_time=receiver_monotonic_time,
+                        float(received_at),
+                        float(receiver_monotonic_time),
+                        sender_host,
                     )
+                )
+                upstream_batch.append(
+                    (
+                        upstream,
+                        float(received_at),
+                        float(receiver_monotonic_time),
+                    )
+                )
 
-            # Preserve the existing low-latency contract: only the last UDP
-            # datagram in the drained batch becomes the live observation.
-            for channel_name, tracker_payload in latest_parsed.items():
-                live_payload = self._copy_tracker_payload(tracker_payload)
-                live_payload["receiver_monotonic_time"] = latest_receiver_monotonic_time
-                live_payload["availability_monotonic_time"] = latest_receiver_monotonic_time
-                live_payload.update(
-                    self._clock_sync_metadata_for_payload(
-                        live_payload,
-                        sender_host=latest_sender_host,
-                        availability_monotonic_time=latest_receiver_monotonic_time,
+            stale_count = max(0, len(batch) - 1)
+            # A malformed trailing datagram must not erase the last valid live
+            # sample.  Select the newest successfully parsed datagram instead.
+            latest_valid = next(
+                (entry for entry in reversed(parsed_batch) if entry[0]),
+                None,
+            )
+            if latest_valid is None:
+                latest_parsed = {}
+                latest_received_at = float(batch[-1][1])
+                latest_receiver_monotonic_time = float(batch[-1][2])
+                latest_sender_host = None
+            else:
+                (
+                    latest_parsed,
+                    latest_received_at,
+                    latest_receiver_monotonic_time,
+                    latest_sender_host,
+                ) = latest_valid
+            with self._lock:
+                self._packet_count += len(batch)
+                self._last_packet_received_at = float(batch[-1][1])
+                self._last_packet_received_monotonic_time = float(batch[-1][2])
+                self._dropped_stale_packet_count += stale_count
+                self._last_drain_count = stale_count
+                self._last_process_parse_error_count = parse_error_count
+
+                for upstream, received_at, _receiver_monotonic_time in upstream_batch:
+                    if upstream is None:
+                        continue
+                    for tracker_role in upstream:
+                        self._upstream_role_update_counts[tracker_role] = (
+                            self._upstream_role_update_counts.get(tracker_role, 0) + 1
+                        )
+                        self._last_upstream_role_update_at[tracker_role] = received_at
+
+                latest_upstream = next(
+                    (entry[0] for entry in reversed(upstream_batch) if entry[0] is not None),
+                    None,
+                )
+                if latest_upstream is not None:
+                    self._latest_upstream_by_role = {
+                        role: self._copy_tracker_payload(payload)
+                        for role, payload in latest_upstream.items()
+                    }
+                    for payload in self._latest_upstream_by_role.values():
+                        payload["receiver_monotonic_time"] = (
+                            latest_receiver_monotonic_time
+                        )
+                        payload["availability_monotonic_time"] = (
+                            latest_receiver_monotonic_time
+                        )
+
+                for parsed, received_at, receiver_monotonic_time, _sender_host in parsed_batch:
+                    if parsed:
+                        self._append_history_packet_locked(
+                            parsed,
+                            received_at=received_at,
+                            receiver_monotonic_time=receiver_monotonic_time,
+                        )
+
+                # Preserve the existing low-latency contract: only the newest
+                # successfully parsed UDP datagram becomes the live observation.
+                for channel_name, tracker_payload in latest_parsed.items():
+                    live_payload = self._copy_tracker_payload(tracker_payload)
+                    live_payload["receiver_monotonic_time"] = latest_receiver_monotonic_time
+                    live_payload["availability_monotonic_time"] = latest_receiver_monotonic_time
+                    live_payload["source_mapping_generation"] = (
+                        self._source_mapping_generation
                     )
-                )
-                history = self._history_by_channel.get(channel_name)
-                if history:
-                    live_payload["history_time"] = history[-1]["history_time"]
-                    live_payload["history_clock_source"] = history[-1][
-                        "history_clock_source"
-                    ]
-                    for key in (
-                        "source_timestamp",
-                        "source_clock",
-                        "available_timestamp",
-                        "available_clock",
-                    ):
-                        live_payload[key] = history[-1].get(key)
-                self._latest_by_channel[channel_name] = live_payload
-                self._channel_update_counts[channel_name] = (
-                    self._channel_update_counts.get(channel_name, 0) + 1
-                )
-                self._last_channel_update_at[channel_name] = latest_received_at
+                    live_payload.update(
+                        self._clock_sync_metadata_for_payload(
+                            live_payload,
+                            sender_host=latest_sender_host,
+                            availability_monotonic_time=latest_receiver_monotonic_time,
+                        )
+                    )
+                    history = self._history_by_channel.get(channel_name)
+                    if history:
+                        live_payload["history_time"] = history[-1]["history_time"]
+                        live_payload["history_clock_source"] = history[-1][
+                            "history_clock_source"
+                        ]
+                        for key in (
+                            "source_timestamp",
+                            "source_clock",
+                            "available_timestamp",
+                            "available_clock",
+                        ):
+                            live_payload[key] = history[-1].get(key)
+                    self._latest_by_channel[channel_name] = live_payload
+                    self._channel_update_counts[channel_name] = (
+                        self._channel_update_counts.get(channel_name, 0) + 1
+                    )
+                    self._last_channel_update_at[channel_name] = latest_received_at
+        finally:
+            finished_wall = time.time()
+            with self._lock:
+                self._last_process_finished_at = finished_wall
+                self._last_process_finished_monotonic_time = time.perf_counter()
+                self._last_process_duration_sec = time.perf_counter() - process_started_at
+                self._last_process_parse_error_count = parse_error_count
 
     @staticmethod
     def _packet_seq(parsed: dict[str, dict[str, Any]]) -> int | None:
@@ -446,6 +780,14 @@ class VivePoseSource(ObservationSource):
             if value is not None:
                 copied[field_name] = list(value)
         return copied
+
+    @staticmethod
+    def _finite_timestamp(value: Any, *, fallback: float) -> float:
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+        return candidate if np.isfinite(candidate) else float(fallback)
 
     def _clock_sync_metadata_for_payload(
         self,
@@ -583,6 +925,7 @@ class VivePoseSource(ObservationSource):
                     "availability_monotonic_time": receiver_monotonic_time,
                     "history_time": history_time,
                     "history_clock_source": clock_source,
+                    "source_mapping_generation": self._source_mapping_generation,
                 }
             )
             history_sample.update(
@@ -614,7 +957,11 @@ class VivePoseSource(ObservationSource):
                 {
                     "source_timestamp": source_timestamp,
                     "source_clock": source_clock,
-                    "available_timestamp": float(time.time()),
+                    # ``received_at`` is captured at the socket boundary and
+                    # is the causal availability instant.  Calling time.time()
+                    # again here can move the sample a few microseconds into
+                    # the future relative to a same-cycle cutoff.
+                    "available_timestamp": float(received_at),
                     "available_clock": "local_wall_time",
                 }
             )
@@ -660,12 +1007,31 @@ class VivePoseSource(ObservationSource):
         *,
         sender_host: str | None = None,
     ) -> dict[str, dict[str, Any]] | None:
+        decoded = self._decode_json_packet(packet)
+        if decoded is None:
+            return None
+        return self._parse_decoded_json_packet(
+            decoded,
+            received_at,
+            sender_host=sender_host,
+        )
+
+    @staticmethod
+    def _decode_json_packet(packet: bytes) -> dict[str, Any] | None:
         try:
             decoded = json.loads(packet.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
+        return decoded if isinstance(decoded, dict) else None
 
-        if isinstance(decoded, dict) and "trackers" in decoded:
+    def _parse_decoded_json_packet(
+        self,
+        decoded: dict[str, Any],
+        received_at: float,
+        *,
+        sender_host: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if "trackers" in decoded:
             seq = decoded.get("seq")
             sender_timestamp = decoded.get("sender_timestamp", received_at)
             pose_sample_timestamp = decoded.get(
@@ -676,7 +1042,7 @@ class VivePoseSource(ObservationSource):
                 "pose_sample_monotonic_time"
             )
             trackers = decoded.get("trackers", [])
-        elif isinstance(decoded, dict):
+        else:
             seq = decoded.get("seq")
             sender_timestamp = decoded.get("sender_timestamp", received_at)
             pose_sample_timestamp = decoded.get(
@@ -687,8 +1053,6 @@ class VivePoseSource(ObservationSource):
                 "pose_sample_monotonic_time"
             )
             trackers = [decoded]
-        else:
-            return None
 
         parsed: dict[str, dict[str, Any]] = {}
         for tracker in trackers:
@@ -771,6 +1135,83 @@ class VivePoseSource(ObservationSource):
             }
         return parsed
 
+    def _parse_upstream_role_diagnostics(
+        self,
+        packet: bytes,
+        received_at: float,
+        *,
+        sender_host: str | None = None,
+    ) -> dict[str, dict[str, Any]] | None:
+        """Parse sender-role facts without applying the active role mapping.
+
+        ``None`` means that the datagram was not a JSON VIVE packet.  An empty
+        mapping means that it was JSON but contained no named tracker role.
+        The result is diagnostic-only and cannot feed observation channels.
+        """
+
+        decoded = self._decode_json_packet(packet)
+        if decoded is None:
+            return None
+        return self._parse_decoded_upstream_role_diagnostics(
+            decoded,
+            received_at,
+            sender_host=sender_host,
+        )
+
+    def _parse_decoded_upstream_role_diagnostics(
+        self,
+        decoded: dict[str, Any],
+        received_at: float,
+        *,
+        sender_host: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        seq = decoded.get("seq")
+        sender_timestamp = decoded.get("sender_timestamp", received_at)
+        trackers = (
+            decoded.get("trackers", [])
+            if "trackers" in decoded
+            else [decoded]
+        )
+        if not isinstance(trackers, list):
+            return {}
+
+        parsed: dict[str, dict[str, Any]] = {}
+        for tracker in trackers:
+            if not isinstance(tracker, dict):
+                continue
+            tracker_role = str(
+                tracker.get("tracker_role") or tracker.get("role") or ""
+            ).strip()
+            if not tracker_role:
+                continue
+            tracker_name = str(
+                tracker.get("tracker_name") or tracker.get("name") or ""
+            )
+            pose = tracker.get("pose_matrix_4x4") or tracker.get("pose")
+            sender_error = tracker.get("error")
+            try:
+                pose_matrix = self._coerce_pose_matrix(pose)
+            except ValueError as exc:
+                pose_matrix = identity_pose()
+                valid = False
+                if not sender_error:
+                    sender_error = f"receiver_validation: {exc}"
+            else:
+                valid = bool(tracker.get("valid", True))
+            parsed[tracker_role] = {
+                "pose": pose_matrix,
+                "timestamp": float(sender_timestamp),
+                "receiver_timestamp": float(received_at),
+                "sender_host": sender_host,
+                "seq": seq,
+                "tracker_name": tracker_name,
+                "role": tracker_role,
+                "valid": valid,
+                "error": sender_error,
+                "sender_read_elapsed_ms": tracker.get("read_elapsed_ms"),
+            }
+        return parsed
+
     def _parse_legacy_packet(
         self,
         packet: bytes,
@@ -815,8 +1256,12 @@ class VivePoseSource(ObservationSource):
     def _resolve_tracker_config(
         self, *, tracker_name: str, tracker_role: str
     ) -> ViveTrackerConfig | None:
-        if tracker_role and tracker_role in self._configs_by_role:
-            return self._configs_by_role[tracker_role]
+        # A declared v1 role is authoritative.  Falling back to tracker name
+        # after a role mismatch would silently defeat an explicit role swap
+        # (or any other role-based routing profile).  Name matching remains a
+        # compatibility path only for older JSON records that omit the role.
+        if tracker_role:
+            return self._configs_by_role.get(tracker_role)
         if tracker_name and tracker_name in self.tracker_configs:
             return self.tracker_configs[tracker_name]
         return None
@@ -947,6 +1392,10 @@ class VivePoseSource(ObservationSource):
                     "availability_monotonic_time": tracker_payload.get(
                         "availability_monotonic_time"
                     ),
+                    "source_mapping_generation": tracker_payload.get(
+                        "source_mapping_generation",
+                        self._source_mapping_generation,
+                    ),
                     "source_timestamp": tracker_payload.get("source_timestamp"),
                     "source_clock": tracker_payload.get("source_clock"),
                     "available_timestamp": tracker_payload.get("available_timestamp"),
@@ -1015,6 +1464,66 @@ class VivePoseSource(ObservationSource):
 
         return self.get_latest_channels(cutoff_timestamp=float(cutoff_timestamp))
 
+    def get_latest_upstream_role_channels(self) -> dict[str, ObservationChannel]:
+        """Return diagnostic-only channels keyed by sender tracker role.
+
+        Unlike :meth:`get_latest_channels`, this snapshot is taken before the
+        source-role to logical-channel mapping.  Callers may use it for status
+        display and fault diagnosis only; it is not an observation-source
+        output and must not feed retargeting, composition, or execution.
+        """
+
+        with self._lock:
+            latest = {
+                role: self._copy_tracker_payload(payload)
+                for role, payload in self._latest_upstream_by_role.items()
+            }
+
+        channels: dict[str, ObservationChannel] = {}
+        for tracker_role, payload in latest.items():
+            receiver_timestamp = payload.get("receiver_timestamp")
+            sender_timestamp = payload.get("timestamp")
+            timestamp = (
+                float(receiver_timestamp)
+                if receiver_timestamp is not None
+                else float(sender_timestamp)
+            )
+            side = (
+                "left"
+                if tracker_role == "left_wrist"
+                else "right"
+                if tracker_role == "right_wrist"
+                else None
+            )
+            channels[tracker_role] = ObservationChannel(
+                channel_name=f"vive_upstream_role:{tracker_role}",
+                capability="pose6d",
+                side=side,
+                value=np.asarray(payload["pose"], dtype=float).copy(),
+                frame_name="vive_world",
+                timestamp=timestamp,
+                source_name=self.name,
+                valid=bool(payload.get("valid", False)),
+                critical=False,
+                metadata={
+                    "diagnostic_only": True,
+                    "tracker_name": payload.get("tracker_name", ""),
+                    "tracker_role": tracker_role,
+                    "seq": payload.get("seq"),
+                    "receiver_timestamp": receiver_timestamp,
+                    "receiver_monotonic_time": payload.get(
+                        "receiver_monotonic_time"
+                    ),
+                    "sender_timestamp": sender_timestamp,
+                    "sender_host": payload.get("sender_host"),
+                    "sender_error": payload.get("error"),
+                    "sender_read_elapsed_ms": payload.get(
+                        "sender_read_elapsed_ms"
+                    ),
+                },
+            )
+        return channels
+
     def get_pose_history(
         self,
         channel_name: str,
@@ -1073,14 +1582,39 @@ class VivePoseSource(ObservationSource):
 
     def debug_stats(self) -> dict[str, Any]:
         clock_sync_stats = self._clock_sync_server.debug_stats()
+        thread = self._thread
         with self._lock:
             return {
+                "running": self._running,
+                "worker_alive": bool(thread is not None and thread.is_alive()),
+                "worker_started_once": self._worker_started_once,
+                "bind_host": self.host,
+                "port": self.port,
+                "allow_socket_reuse": self.allow_socket_reuse,
+                "source_mapping_generation": self._source_mapping_generation,
                 "packet_count": self._packet_count,
+                "datagram_count": self._datagram_count,
                 "last_packet_received_at": self._last_packet_received_at,
+                "last_packet_received_monotonic_time": (
+                    self._last_packet_received_monotonic_time
+                ),
+                "last_datagram_received_at": self._last_datagram_received_at,
+                "last_datagram_received_monotonic_time": (
+                    self._last_datagram_received_monotonic_time
+                ),
                 "dropped_stale_packet_count": self._dropped_stale_packet_count,
                 "last_drain_count": self._last_drain_count,
                 "channel_update_counts": dict(self._channel_update_counts),
                 "last_channel_update_at": dict(self._last_channel_update_at),
+                "upstream_role_update_counts": dict(
+                    self._upstream_role_update_counts
+                ),
+                "last_upstream_role_update_at": dict(
+                    self._last_upstream_role_update_at
+                ),
+                "latest_upstream_roles": sorted(
+                    self._latest_upstream_by_role
+                ),
                 "history_window_sec": self.history_window_sec,
                 "motion_window_sec": self.motion_window_sec,
                 "history_clock_source": self._history_clock_source,
@@ -1100,5 +1634,18 @@ class VivePoseSource(ObservationSource):
                 "last_recv_error": self._last_recv_error,
                 "socket_restart_count": self._socket_restart_count,
                 "last_socket_restart_at": self._last_socket_restart_at,
+                "process_error_count": self._process_error_count,
+                "last_process_error": self._last_process_error,
+                "last_process_error_at": self._last_process_error_at,
+                "last_process_started_at": self._last_process_started_at,
+                "last_process_finished_at": self._last_process_finished_at,
+                "last_process_finished_monotonic_time": (
+                    self._last_process_finished_monotonic_time
+                ),
+                "last_process_duration_sec": self._last_process_duration_sec,
+                "last_process_batch_size": self._last_process_batch_size,
+                "last_process_parse_error_count": (
+                    self._last_process_parse_error_count
+                ),
                 "clock_sync": clock_sync_stats,
             }

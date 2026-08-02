@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+import json
 from pathlib import Path
 import time
 from typing import Any, Callable, Mapping
@@ -12,10 +13,17 @@ import uuid
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from robot_motion.action.arm_spec import ArmActionSpec
 from robot_motion.action.hand_spec import HandActionSpec
-from dataset_interface.capture_modalities import bind_capture_modality_contract
+from dataset_interface.capture_modalities import (
+    bind_capture_modality_contract,
+    dataset_is_blank,
+)
 
-from ..async_writer import AsyncWriterConfig, AsyncWriterPool
-from ..dataset_episode_maintenance import EpisodeDeleteResult, delete_episode_and_compact
+from collection_runtime.async_writer import AsyncWriterConfig, AsyncWriterPool
+from collection_runtime.dataset_episode_maintenance import (
+    EpisodeDeleteResult,
+    delete_episode_and_compact,
+)
+from collection_runtime.progress.profiles import inspect_dataset_progress_profile
 from ..schema_v22 import (
     StrictV22SampleRejection,
     validate_strict_v22_measured_state,
@@ -26,11 +34,47 @@ from ..v25p_dual_write_shadow import (
     legacy_row_from_planned_jobs,
     load_finalized_legacy_episode_record,
 )
-from ..v25p_sidecar import V25pEpisodeSidecarStore
+from collection_runtime.compatibility import CompatibilityEpisodeSidecarStore
 from .calibration import UmiCalibrationBinding
 from .config import UmiCollectionConfig
 from .row_encoder import UmiV23RowEncoder
+from .topology import SIDES
 from .types import UmiSample
+
+
+def _validate_umi_dataset_admission(
+    dataset_root: str | Path,
+    *,
+    task_id: str,
+) -> None:
+    """Reject targets whose dataset-wide semantics do not match UMI capture."""
+
+    root = Path(dataset_root).expanduser()
+    progress = inspect_dataset_progress_profile(root, requested_profile=None)
+    if progress.profile is not None:
+        raise ValueError(
+            "Target dataset is already bound to a collection progress profile; "
+            "the UMI collector cannot append unprofiled Episodes to it."
+        )
+    if dataset_is_blank(root):
+        return
+    info_path = root / "meta" / "info.json"
+    if not info_path.exists():
+        return
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot validate target dataset metadata {info_path}: {exc}"
+        ) from exc
+    if not isinstance(info, Mapping):
+        raise ValueError(f"Target dataset metadata is not an object: {info_path}")
+    existing_task_id = str(info.get("task_id", "") or "").strip()
+    if existing_task_id and existing_task_id != str(task_id).strip():
+        raise ValueError(
+            "Target dataset task binding differs from the UMI runtime config: "
+            f"existing={existing_task_id!r}, requested={str(task_id).strip()!r}."
+        )
 
 
 class UmiDatasetRecorder:
@@ -42,13 +86,17 @@ class UmiDatasetRecorder:
         policy_io_layout: Any,
         T_tcp_to_tracker_by_side: Mapping[str, Any] | None = None,
         calibration_by_side: Mapping[str, UmiCalibrationBinding] | None = None,
-        v25p_sidecar_store: V25pEpisodeSidecarStore | None = None,
+        v25p_sidecar_store: CompatibilityEpisodeSidecarStore | None = None,
         v25p_native_shadow: V25pDualWriteShadow | None = None,
         episode_uuid_factory: Callable[[], object] = uuid.uuid4,
     ) -> None:
         self.config = config
         self.policy_io_layout = policy_io_layout
         self.capture_modality_contract = config.capture_modality_contract
+        _validate_umi_dataset_admission(
+            config.dataset_root,
+            task_id=config.task_id,
+        )
         bind_capture_modality_contract(
             config.dataset_root,
             self.capture_modality_contract,
@@ -59,7 +107,7 @@ class UmiDatasetRecorder:
                 if T_tcp_to_tracker_by_side is None
                 else T_tcp_to_tracker_by_side[side]
             )
-            for side in ("left", "right")
+            for side in SIDES
         }
         self.encoder = UmiV23RowEncoder()
         self.writer = LeRobotV21Writer(
@@ -106,7 +154,7 @@ class UmiDatasetRecorder:
                                 else calibration_by_side[side].sha256
                             ),
                         }
-                        for side in ("left", "right")
+                        for side in SIDES
                     },
                     "operator_label_semantics": "annotation_only_no_arm_control",
                     "dmtac_gripper_timing": {
@@ -128,11 +176,11 @@ class UmiDatasetRecorder:
                 },
                 arm_action_specs={
                     side: ArmActionSpec.tool_tcp(side, reference_frame="desk")
-                    for side in ("left", "right")
+                    for side in SIDES
                 },
                 hand_action_specs={
                     side: HandActionSpec.dmtac_gripper(side)
-                    for side in ("left", "right")
+                    for side in SIDES
                 },
             )
         )
@@ -396,6 +444,10 @@ class UmiDatasetRecorder:
                 "A UMI recorder with a v2.5-p native shadow cannot change "
                 "dataset_root; construct a new recorder/shadow pair."
             )
+        _validate_umi_dataset_admission(
+            resolved_root,
+            task_id=next_config.task_id,
+        )
         next_contract = next_config.capture_modality_contract
         if (
             resolved_root == self.writer.root_dir

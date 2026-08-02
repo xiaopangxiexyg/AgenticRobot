@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -9,6 +10,26 @@ import numpy as np
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def default_real_image_root() -> Path:
+    """Return the repository/provider root used by the default mixed profile.
+
+    The environment override keeps the profile portable to the remote OpenPI
+    checkout and to machines that keep the image pool outside the repository.
+    The caller still validates the returned root when it constructs a provider.
+    """
+
+    configured = os.environ.get("DEXTELEOP_REAL_IMAGE_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (
+        Path(__file__).resolve().parents[2]
+        / "assets"
+        / "random_real_image"
+        / "openimages_v7_validation"
+        / "images"
+    ).resolve()
 
 
 def _require_cv2():
@@ -37,27 +58,41 @@ def write_image_manifest(
     paths = discover_image_paths(root)
     if int(max_images) > 0:
         paths = paths[: int(max_images)]
+    out = Path(manifest_path).expanduser().resolve()
+    try:
+        serialized_root = str(root.relative_to(out.parent))
+        root_kind = "manifest_relative"
+    except ValueError:
+        serialized_root = str(root)
+        root_kind = "absolute"
     payload = {
         "format": "dexteleop_real_background_manifest_v1",
         "source": str(source),
-        "image_root": str(root),
+        "image_root": serialized_root,
+        "image_root_kind": root_kind,
         "count": len(paths),
         "images": [str(path.relative_to(root)) for path in paths],
     }
-    out = Path(manifest_path).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
     return payload
 
 
-def _load_manifest(path: str | Path) -> tuple[Path, list[Path]]:
+def _load_manifest(
+    path: str | Path,
+    *,
+    image_root_override: str | Path | None = None,
+) -> tuple[Path, list[Path]]:
     manifest_path = Path(path).expanduser().resolve()
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"real background manifest must contain an object: {manifest_path}")
-    root = Path(str(payload.get("image_root") or manifest_path.parent)).expanduser()
-    if not root.is_absolute():
-        root = (manifest_path.parent / root).resolve()
+    if image_root_override is not None:
+        root = Path(image_root_override).expanduser().resolve()
+    else:
+        root = Path(str(payload.get("image_root") or manifest_path.parent)).expanduser()
+        if not root.is_absolute():
+            root = (manifest_path.parent / root).resolve()
     images = payload.get("images")
     if not isinstance(images, list):
         raise ValueError(f"real background manifest has no images list: {manifest_path}")
@@ -102,7 +137,10 @@ class LocalImageBackgroundProvider:
             raise ValueError("image_root or manifest_path is required")
         self.config = config if config is not None else RealImageBackgroundConfig()
         if manifest_path is not None:
-            self.image_root, self.paths = _load_manifest(manifest_path)
+            self.image_root, self.paths = _load_manifest(
+                manifest_path,
+                image_root_override=image_root,
+            )
         else:
             self.image_root = Path(image_root).expanduser().resolve()  # type: ignore[arg-type]
             self.paths = discover_image_paths(self.image_root)
@@ -117,11 +155,34 @@ class LocalImageBackgroundProvider:
         episode_index: int,
         camera_key: str,
         epoch: int = 0,
+        scene_seed: int | None = None,
+        view_seed: int | None = None,
     ) -> "RealImageTemporalBackground":
-        seed = _sample_seed(self.config.seed, episode_index=episode_index, camera_key=camera_key, epoch=epoch)
-        random = np.random.default_rng(seed)
+        default_seed = _sample_seed(
+            self.config.seed,
+            episode_index=episode_index,
+            camera_key=camera_key,
+            epoch=epoch,
+        )
+        path_seed = (
+            default_seed
+            if scene_seed is None
+            else int(self.config.seed) + int(scene_seed)
+        )
+        stream_seed = (
+            default_seed
+            if view_seed is None
+            else int(self.config.seed) + int(view_seed)
+        )
+        random = np.random.default_rng(path_seed)
         path = self.paths[int(random.integers(0, len(self.paths)))]
-        return RealImageTemporalBackground(path=path, width=width, height=height, seed=seed, config=self.config)
+        return RealImageTemporalBackground(
+            path=path,
+            width=width,
+            height=height,
+            seed=stream_seed,
+            config=self.config,
+        )
 
 
 class RealImageTemporalBackground:

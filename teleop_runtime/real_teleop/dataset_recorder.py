@@ -66,7 +66,17 @@ from ..collection.schema_v22 import (
 )
 from ..collection.writer_runtime import CollectionWriterRuntime
 from ..collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
-from ..collection.v25p_sidecar import V25pEpisodeSidecarStore
+from collection_runtime.compatibility import CompatibilityEpisodeSidecarStore
+from collection_runtime.progress.profiles import (
+    bind_dataset_progress_profile,
+    bind_dataset_task_stage_profile,
+    inspect_dataset_progress_profile,
+    inspect_dataset_task_stage_profile,
+)
+from collection_runtime.sample_acceptance import (
+    AcceptedSampleReceipt,
+    SampleAcceptanceReceiptBuffer,
+)
 from ..collection.v25p_capture_profiles import (
     V25P_REAL_TELEOP_SOURCE,
     build_policy_io_v25p_capture_profiles,
@@ -76,7 +86,7 @@ from ..collection.v25p_dual_write_shadow import (
     legacy_row_from_planned_jobs,
     load_finalized_legacy_episode_record,
 )
-from ..collection.v25p_native_store import V25pNativeEpisodeStore
+from collection_runtime.component_capture import ComponentCaptureEpisodeStore
 from ..collection.v25p_real_teleop_producer import RealTeleopV25pProducer
 from ..control_trace.episode import EpisodeTraceRecorderSink
 from ..sources.camera import RealSenseRGBSource
@@ -101,6 +111,16 @@ from .gripper_policy import (
 )
 from .hand_config import dmtac_sides as _dmtac_sides
 from .movement import movement_multiple_value as _movement_multiple_value
+from .progress_adapter import (
+    RealTeleopProgressEpisode,
+    resolve_real_teleop_progress_profile,
+    resolve_real_teleop_task_stage_profile,
+)
+from .progress_arm_control import strict_progress_arm_sample_rejection
+from control_station.real_teleop.progress import (
+    PROGRESS_ARM_CONTROL_MODE_STRICT,
+    normalize_progress_arm_control_mode,
+)
 from .runtime_metadata import (
     arm_execution_profile_metadata as _arm_execution_profile_metadata,
     position_ik_iteration_metadata as _position_ik_iteration_metadata,
@@ -229,6 +249,48 @@ class RealTeleopDatasetRecorder:
             ),
         )
         self.writer_storage_config = writer_config
+        requested_progress_profile = resolve_real_teleop_progress_profile(
+            getattr(args, "collection_progress_profile", None),
+            collection_task_id=str(args.collection_task_id),
+        )
+        progress_admission = inspect_dataset_progress_profile(
+            self.dataset_root,
+            requested_profile=requested_progress_profile,
+        )
+        self.progress_profile = progress_admission.profile
+        self._progress_profile_dataset_locked = bool(
+            progress_admission.locked
+        )
+        self._progress_profile_binding_source = progress_admission.source
+        # A bound dataset is authoritative on restart. Keep args aligned so
+        # later recorder reconfiguration cannot silently drop its progress
+        # sidecar merely because the CLI option was omitted.
+        if self.progress_profile is not None:
+            self.args.collection_progress_profile = self.progress_profile
+            requested_stage_profile = resolve_real_teleop_task_stage_profile(
+                self.progress_profile,
+                getattr(args, "collection_stage_profile", ""),
+            )
+            stage_admission = inspect_dataset_task_stage_profile(
+                self.dataset_root,
+                progress_profile=self.progress_profile,
+                requested_profile=requested_stage_profile,
+            )
+            self.stage_profile = stage_admission.profile
+            if self.stage_profile is not None:
+                self.args.collection_stage_profile = self.stage_profile
+        else:
+            self.stage_profile = None
+        self._sample_acceptance_receipt_buffer = SampleAcceptanceReceiptBuffer(
+            capacity=(
+                256
+                if (
+                    self.progress_profile is not None
+                    or bool(getattr(args, "collection_progress_gui", False))
+                )
+                else 0
+            )
+        )
         self.v25p_native_shadow: V25pDualWriteShadow | None = None
         self._v25p_native_shadow_active = False
         self._v25p_native_shadow_error = ""
@@ -424,6 +486,9 @@ class RealTeleopDatasetRecorder:
                         )
                     ),
                     worker_nice=int(getattr(args, "collection_worker_nice", 5)),
+                    sample_acceptance_receipt_capacity=(
+                        self._sample_acceptance_receipt_buffer.capacity
+                    ),
                 ),
             )
             self.writer = self.process_worker
@@ -440,7 +505,7 @@ class RealTeleopDatasetRecorder:
                     component_sides=tuple(components.active_sides),
                 )
                 self.v25p_native_shadow = V25pDualWriteShadow(
-                    store=V25pNativeEpisodeStore(
+                    store=ComponentCaptureEpisodeStore(
                         dataset_root=self.dataset_root,
                         dataset_id=v25p_shadow_config.dataset_id,
                         embodiment_profile=bundle.embodiment,
@@ -492,9 +557,10 @@ class RealTeleopDatasetRecorder:
         self.active_episode_index: int | None = None
         self.active_started_at: float | None = None
         self.control_trace_episode_sink: EpisodeTraceRecorderSink | None = None
-        self.v25p_sidecar_store: V25pEpisodeSidecarStore | None = None
+        self.v25p_sidecar_store: CompatibilityEpisodeSidecarStore | None = None
         self._active_control_trace_preparation: Any | None = None
         self._active_episode_identity: EpisodeCaptureIdentity | None = None
+        self._active_progress_episode: RealTeleopProgressEpisode | None = None
         self._episode_uuid_factory = uuid.uuid4
         self.finalize_tasks: list[RealDatasetFinalizeTask] = []
         self.saved_episodes = 0
@@ -505,6 +571,7 @@ class RealTeleopDatasetRecorder:
         self._record_timestamps: deque[float] = deque()
         self._episode_start_monotonic: float | None = None
         self._pause_started_at: float | None = None
+        self._last_resume_at: float | None = None
         self._pause_started_monotonic: float | None = None
         self._pause_reason: str | None = None
         self._pause_reasons: list[str] = []
@@ -716,6 +783,48 @@ class RealTeleopDatasetRecorder:
         if desired_force_contract is None and desired_root == self.dataset_root:
             desired_force_contract = getattr(self, "gripper_force_contract", None)
         existing_force_contract = getattr(self, "gripper_force_contract", None)
+        requested_progress_profile = resolve_real_teleop_progress_profile(
+            getattr(self.args, "collection_progress_profile", None),
+            collection_task_id=str(self.args.collection_task_id),
+        )
+        desired_progress_profile = inspect_dataset_progress_profile(
+            desired_root,
+            requested_profile=requested_progress_profile,
+        ).profile
+        existing_progress_profile = getattr(self, "progress_profile", None)
+        desired_stage_profile = (
+            None
+            if desired_progress_profile is None
+            else inspect_dataset_task_stage_profile(
+                desired_root,
+                progress_profile=desired_progress_profile,
+                requested_profile=resolve_real_teleop_task_stage_profile(
+                    desired_progress_profile,
+                    getattr(self.args, "collection_stage_profile", ""),
+                ),
+            ).profile
+        )
+        existing_stage_profile = getattr(self, "stage_profile", None)
+        desired_progress_hash = (
+            None
+            if desired_progress_profile is None
+            else desired_progress_profile.semantic_content_hash
+        )
+        existing_progress_hash = (
+            None
+            if existing_progress_profile is None
+            else existing_progress_profile.semantic_content_hash
+        )
+        desired_stage_hash = (
+            None
+            if desired_stage_profile is None
+            else desired_stage_profile.semantic_content_hash
+        )
+        existing_stage_hash = (
+            None
+            if existing_stage_profile is None
+            else existing_stage_profile.semantic_content_hash
+        )
         if existing_force_contract is not None:
             current_force_contract = _current_gripper_force_dataset_contract(
                 self.args, self.components.active_sides
@@ -726,6 +835,8 @@ class RealTeleopDatasetRecorder:
             desired_root == self.dataset_root
             and desired_contract == self.capture_modality_contract
             and desired_force_contract == existing_force_contract
+            and desired_progress_hash == existing_progress_hash
+            and desired_stage_hash == existing_stage_hash
             and str(self.writer_storage_config.task_id) == str(self.args.collection_task_id)
             and str(self.writer_storage_config.task_description) == str(self.args.collection_task_description)
             and str(self.writer_storage_config.dataset_name) == str(self.args.dataset_name)
@@ -738,6 +849,60 @@ class RealTeleopDatasetRecorder:
             "dataset task/root/modality configuration changed after warmup started; "
             "cancel and start collection again"
         )
+
+    @property
+    def progress_profile_selection_locked(self) -> bool:
+        """Whether this dataset has permanently fixed its profile capability."""
+
+        return bool(self._progress_profile_dataset_locked)
+
+    @property
+    def progress_profile_binding_source(self) -> str:
+        return str(self._progress_profile_binding_source)
+
+    def select_progress_profile(
+        self,
+        profile: object,
+    ) -> None:
+        """Apply one idle, validated selection without binding it yet."""
+
+        if self.is_recording or self.finalizing:
+            raise RuntimeError(
+                "Cannot select a collection progress profile while an "
+                "Episode is recording or finalizing."
+            )
+        selected = resolve_real_teleop_progress_profile(
+            profile,
+            collection_task_id=str(self.args.collection_task_id),
+        )
+        if selected is None:
+            raise ValueError("A selected progress profile must not be empty.")
+        admission = inspect_dataset_progress_profile(
+            self.dataset_root,
+            requested_profile=selected,
+        )
+        buffer = self._sample_acceptance_receipt_buffer
+        if buffer.capacity <= 0:
+            raise RuntimeError(
+                "This recorder was not prepared for runtime profile "
+                "selection; restart with --collection-progress-gui."
+            )
+        buffer.reset()
+        self.progress_profile = selected
+        self.args.collection_progress_profile = selected
+        requested_stage_profile = resolve_real_teleop_task_stage_profile(
+            selected,
+            None,
+        )
+        stage_admission = inspect_dataset_task_stage_profile(
+            self.dataset_root,
+            progress_profile=selected,
+            requested_profile=requested_stage_profile,
+        )
+        self.stage_profile = stage_admission.profile
+        self.args.collection_stage_profile = self.stage_profile
+        self._progress_profile_dataset_locked = bool(admission.locked)
+        self._progress_profile_binding_source = admission.source
 
     def reload_finalized_dataset_state(self) -> None:
         """Rescan idle dataset counters before opening the next episode."""
@@ -760,6 +925,18 @@ class RealTeleopDatasetRecorder:
         """Stop the writer lifecycle, compact one finalized episode, then resume."""
         if self.is_recording or self.finalizing:
             raise RuntimeError("Cannot delete an episode while recording or finalizing.")
+        progress_root = (
+            self.dataset_root
+            / "meta"
+            / "progress"
+            / "episodes"
+        )
+        if progress_root.exists() and any(progress_root.iterdir()):
+            raise RuntimeError(
+                "Episode deletion/compaction is disabled for datasets containing "
+                "collection-progress artifacts until identity-preserving progress "
+                "maintenance is implemented."
+            )
         trace_sink = getattr(self, "control_trace_episode_sink", None)
         v25p_store = getattr(self, "v25p_sidecar_store", None)
         self.close()
@@ -804,11 +981,14 @@ class RealTeleopDatasetRecorder:
             raise RuntimeError("A different ControlTrace episode sink is already attached.")
         self.control_trace_episode_sink = sink
 
-    def attach_v25p_sidecar_store(self, store: V25pEpisodeSidecarStore) -> None:
+    def attach_v25p_sidecar_store(
+        self,
+        store: CompatibilityEpisodeSidecarStore,
+    ) -> None:
         """Attach one subordinate v2.5-p store before an episode is active."""
 
-        if not isinstance(store, V25pEpisodeSidecarStore):
-            raise TypeError("store must be V25pEpisodeSidecarStore.")
+        if not isinstance(store, CompatibilityEpisodeSidecarStore):
+            raise TypeError("store must be CompatibilityEpisodeSidecarStore.")
         if self.is_recording or self.finalizing:
             raise RuntimeError("Cannot replace the v2.5-p store during an episode lifecycle.")
         if store.dataset_root != self.dataset_root.expanduser().resolve():
@@ -821,6 +1001,12 @@ class RealTeleopDatasetRecorder:
     @property
     def active_episode_identity(self) -> EpisodeCaptureIdentity | None:
         return getattr(self, "_active_episode_identity", None)
+
+    @property
+    def active_progress_episode(self) -> RealTeleopProgressEpisode | None:
+        """Expose the subordinate progress port without transferring ownership."""
+
+        return getattr(self, "_active_progress_episode", None)
 
     def begin_subtask_attempt(
         self,
@@ -885,6 +1071,16 @@ class RealTeleopDatasetRecorder:
     @property
     def is_paused(self) -> bool:
         return bool(self.is_recording and getattr(self, "_pause_started_at", None) is not None)
+
+    @property
+    def pause_started_at(self) -> float | None:
+        value = getattr(self, "_pause_started_at", None)
+        return None if value is None else float(value)
+
+    @property
+    def last_resume_at(self) -> float | None:
+        value = getattr(self, "_last_resume_at", None)
+        return None if value is None else float(value)
 
     @property
     def can_record_samples(self) -> bool:
@@ -974,6 +1170,7 @@ class RealTeleopDatasetRecorder:
         trace_preparation = None
         v25p_prepared = False
         v25p_native_prepared = False
+        progress_episode: RealTeleopProgressEpisode | None = None
         planned_episode_index = int(self.writer.next_episode_index)
         episode_uuid_factory = getattr(self, "_episode_uuid_factory", None)
         if episode_uuid_factory is None:
@@ -994,6 +1191,54 @@ class RealTeleopDatasetRecorder:
         if force_contract is not None:
             metadata_payload["gripper_force_profile"] = force_contract.to_dict()
         try:
+            progress_profile = getattr(self, "progress_profile", None)
+            if progress_profile is not None:
+                bind_dataset_progress_profile(
+                    self.dataset_root,
+                    progress_profile,
+                )
+                self._progress_profile_dataset_locked = True
+                self._progress_profile_binding_source = "dataset_binding"
+                stage_profile = getattr(self, "stage_profile", None)
+                if stage_profile is not None:
+                    bind_dataset_task_stage_profile(
+                        self.dataset_root,
+                        progress_profile=progress_profile,
+                        stage_profile=stage_profile,
+                    )
+                progress_episode = RealTeleopProgressEpisode(
+                    dataset_root=self.dataset_root,
+                    identity=episode_identity,
+                    profile=progress_profile,
+                    stage_profile=stage_profile,
+                    entry_step_id=str(
+                        getattr(
+                            self.args,
+                            "collection_progress_entry_step",
+                            "",
+                        )
+                        or ""
+                    ),
+                    entry_stage_id=str(
+                        getattr(
+                            self.args,
+                            "collection_progress_entry_stage",
+                            "",
+                        )
+                        or ""
+                    ),
+                    entry_condition=str(
+                        getattr(
+                            self.args,
+                            "collection_progress_entry_condition",
+                            "nominal",
+                        )
+                        or "nominal"
+                    ),
+                )
+                metadata_payload["progress_episode"] = (
+                    progress_episode.metadata_reference
+                )
             if v25p_store is not None:
                 v25p_store.prepare_episode(episode_identity)
                 v25p_prepared = True
@@ -1008,6 +1253,10 @@ class RealTeleopDatasetRecorder:
                 )
         except BaseException as start_error:
             rollback_steps = []
+            if progress_episode is not None:
+                rollback_steps.append(
+                    ("progress_preparation", progress_episode.discard)
+                )
             if v25p_store is not None and v25p_prepared:
                 rollback_steps.append(
                     (
@@ -1090,6 +1339,10 @@ class RealTeleopDatasetRecorder:
             episode_index = self.writer.start_episode(**writer_start_kwargs)
         except BaseException as start_error:
             rollback_steps = []
+            if progress_episode is not None:
+                rollback_steps.append(
+                    ("progress_preparation", progress_episode.discard)
+                )
             if trace_sink is not None and trace_preparation is not None:
                 rollback_steps.append(
                     (
@@ -1123,6 +1376,8 @@ class RealTeleopDatasetRecorder:
             raise
         if int(episode_index) != episode_identity.legacy_episode_index:
             self.writer.discard_episode(int(episode_index))
+            if progress_episode is not None:
+                progress_episode.discard()
             if trace_sink is not None and trace_preparation is not None:
                 trace_sink.cancel_prepared_episode(trace_preparation)
             if v25p_store is not None and v25p_prepared:
@@ -1135,6 +1390,8 @@ class RealTeleopDatasetRecorder:
                 f"actual={int(episode_index)}"
             )
         try:
+            if progress_episode is not None:
+                progress_episode.bind(started_at=float(now))
             if v25p_store is not None:
                 v25p_store.bind_prepared_episode(
                     episode_identity,
@@ -1156,6 +1413,10 @@ class RealTeleopDatasetRecorder:
                 )
         except BaseException as start_error:
             rollback_steps = [("legacy_episode", lambda: self.writer.discard_episode(int(episode_index)))]
+            if progress_episode is not None:
+                rollback_steps.append(
+                    ("progress_episode", progress_episode.discard)
+                )
             if v25p_store is not None and v25p_prepared:
                 rollback_steps.append(
                     (
@@ -1197,9 +1458,11 @@ class RealTeleopDatasetRecorder:
         self.active_started_at = float(now)
         self._active_control_trace_preparation = trace_preparation
         self._active_episode_identity = episode_identity
+        self._active_progress_episode = progress_episode
         self._record_timestamps.clear()
         self._episode_start_monotonic = time.monotonic()
         self._pause_started_at = None
+        self._last_resume_at = None
         self._pause_started_monotonic = None
         self._pause_reason = None
         self._pause_reasons = []
@@ -1209,7 +1472,66 @@ class RealTeleopDatasetRecorder:
         self._pause_segments = []
         self._paused_accumulated_sec = 0.0
         self._continuity_segment_index = 0
+        if progress_episode is None:
+            # The optional GUI no longer requires a profile before an
+            # ordinary Episode can start.  Once that Episode is actually
+            # admitted, the target dataset is permanently profile-less under
+            # the dataset binding contract; reflect that fact immediately so
+            # the UI cannot offer a selection that the next backend request
+            # would reject.
+            self._progress_profile_dataset_locked = True
+            self._progress_profile_binding_source = (
+                "populated_profileless_dataset"
+            )
+        self._reset_sample_acceptance_receipts()
         return int(episode_index)
+
+    def _reset_sample_acceptance_receipts(self) -> None:
+        process_worker = getattr(self, "process_worker", None)
+        drain_process = getattr(
+            process_worker,
+            "drain_sample_acceptance_receipts",
+            None,
+        )
+        if callable(drain_process):
+            # A new Episode must never inherit a receipt from the preceding
+            # writer cursor.  Any overflow here belongs to the old Episode and
+            # is irrelevant after its lifecycle has already closed.
+            try:
+                drain_process()
+            except RuntimeError:
+                pass
+        buffer = getattr(self, "_sample_acceptance_receipt_buffer", None)
+        if buffer is not None:
+            buffer.reset()
+
+    def _record_thread_sample_acceptance(self, sample: Any) -> None:
+        buffer = getattr(self, "_sample_acceptance_receipt_buffer", None)
+        if buffer is None or buffer.capacity <= 0:
+            return
+        receipt = AcceptedSampleReceipt(
+            episode_index=int(sample.episode_index),
+            sample_index=int(sample.index),
+            episode_frame_index=int(sample.frame_index),
+            sample_timestamp=float(sample.timestamp),
+        )
+        buffer.append(receipt)
+
+    def drain_accepted_sample_receipts(
+        self,
+    ) -> tuple[AcceptedSampleReceipt, ...]:
+        """Return exact writer-accepted samples since the previous drain."""
+
+        if getattr(self, "collection_worker_mode", "thread") == "process":
+            process_worker = getattr(self, "process_worker", None)
+            drain = getattr(
+                process_worker,
+                "drain_sample_acceptance_receipts",
+                None,
+            )
+            return () if not callable(drain) else tuple(drain())
+        buffer = getattr(self, "_sample_acceptance_receipt_buffer", None)
+        return () if buffer is None else buffer.drain()
 
     def actual_feedback_warmup_status(self, now: float) -> tuple[bool, str]:
         """Return the feedback-start gate without issuing a synchronous hardware read."""
@@ -1377,6 +1699,7 @@ class RealTeleopDatasetRecorder:
             step_index=step_index,
         ) is not None
         if resumed:
+            self._last_resume_at = float(now)
             # A modality rejection is a one-shot result from the previous
             # sample attempt.  Do not carry it across a successful resume:
             # otherwise the control loop can immediately pause the reopened
@@ -1420,10 +1743,24 @@ class RealTeleopDatasetRecorder:
             and sample_hz is not None
         )
         threshold_hz = float(self.frequency_warning_hz)
-        warning_active = bool(enough_data and float(sample_hz) < threshold_hz)
+        # The operator-facing value is rendered to 0.1 Hz. Do not emit a
+        # logically contradictory "15.0 < 15.0" warning for ordinary
+        # scheduler jitter hidden by that display precision. A real missed
+        # 15 Hz deadline remains much larger than this half-bin tolerance.
+        comparison_tolerance_hz = 0.05
+        comparison_threshold_hz = max(
+            0.0,
+            threshold_hz - comparison_tolerance_hz,
+        )
+        warning_active = bool(
+            enough_data
+            and float(sample_hz) < comparison_threshold_hz
+        )
         warning = {
             "active": warning_active,
             "threshold_hz": threshold_hz,
+            "comparison_threshold_hz": comparison_threshold_hz,
+            "comparison_tolerance_hz": comparison_tolerance_hz,
             "message": "",
         }
         if warning_active:
@@ -1536,9 +1873,19 @@ class RealTeleopDatasetRecorder:
         include_action_debug_metadata: bool = False,
         phase_recorder: Any | None = None,
         metadata_extra: Mapping[str, Any] | None = None,
+        strict_progress_step_id: str | None = None,
     ) -> Any | None:
         if not self.can_record_samples:
             return None
+        progress_arm_rejection = self._progress_arm_sample_rejection(
+            step_result,
+            progress_step_id=strict_progress_step_id,
+        )
+        if progress_arm_rejection is not None:
+            self._sample_overload_reason = progress_arm_rejection
+            return None
+        if str(self._sample_overload_reason or "").startswith("progress_step_"):
+            self._sample_overload_reason = None
         if include_action_debug_metadata:
             metadata_with_action_debug = dict(metadata_extra or {})
             record_wall_time = time.time()
@@ -1606,6 +1953,8 @@ class RealTeleopDatasetRecorder:
                     self._sample_overload_reason = sample_rejection
                     self._mark_collection_integrity_issue(sample_rejection)
                     result = None
+                if result is not None:
+                    self._record_thread_sample_acceptance(result)
         finally:
             self.sample_builder.include_debug_metadata = previous_include_debug_metadata
             self.sample_builder.include_action_debug_metadata = previous_include_action_debug_metadata
@@ -1616,6 +1965,48 @@ class RealTeleopDatasetRecorder:
             self._sample_modality_reason = None
             self._note_recorded_sample()
         return result
+
+    def _progress_arm_sample_rejection(
+        self,
+        step_result: SessionStepResult,
+        *,
+        progress_step_id: str | None = None,
+    ) -> str | None:
+        """Apply the strict profile-vs-arm-mode gate before writer admission.
+
+        Async collection captures ``progress_step_id`` at the sample's causal
+        cut.  Do not reread a later reducer state in the worker: a direct
+        Advance can otherwise make an old, already-queued sample appear to
+        belong to the new subtask.
+        """
+
+        mode = normalize_progress_arm_control_mode(
+            getattr(
+                getattr(self, "args", None),
+                "collection_progress_arm_control_mode",
+                "profile",
+            )
+        )
+        if mode != PROGRESS_ARM_CONTROL_MODE_STRICT:
+            return None
+        episode = self.active_progress_episode
+        if episode is None:
+            return None
+        state = episode.state
+        if progress_step_id is None:
+            step_id = state.current_progress_step_id
+            phase = state.phase
+        else:
+            step_id = str(progress_step_id).strip() or None
+            phase = "ACTIVE_ATTEMPT" if step_id is not None else "NOT_ACTIVE"
+        if phase != "ACTIVE_ATTEMPT" or step_id is None:
+            return f"progress_step_not_active:phase={phase}"
+        return strict_progress_arm_sample_rejection(
+            profile=episode.profile,
+            progress_step_id=step_id,
+            step_result=step_result,
+            active_sides=tuple(self.collector_components.active_sides),
+        )
 
     def _drain_async_sample(self) -> Any | None:
         future = getattr(self, "_sample_future", None)
@@ -1653,6 +2044,23 @@ class RealTeleopDatasetRecorder:
             return result is not None
         if not self.can_record_samples:
             return False
+        strict_progress_step_id: str | None = None
+        if normalize_progress_arm_control_mode(
+            getattr(
+                getattr(self, "args", None),
+                "collection_progress_arm_control_mode",
+                "profile",
+            )
+        ) == PROGRESS_ARM_CONTROL_MODE_STRICT:
+            episode = self.active_progress_episode
+            if episode is not None and episode.state.phase == "ACTIVE_ATTEMPT":
+                strict_progress_step_id = str(
+                    episode.state.current_progress_step_id or ""
+                )
+            else:
+                # Empty string is an explicit captured non-active state; None
+                # remains the backward-compatible synchronous "read now" path.
+                strict_progress_step_id = ""
         previous = getattr(self, "_sample_future", None)
         if previous is not None:
             if not previous.done():
@@ -1700,6 +2108,7 @@ class RealTeleopDatasetRecorder:
             include_action_debug_metadata=include_action_debug_metadata,
             phase_recorder=None,
             metadata_extra=None if metadata_extra is None else dict(metadata_extra),
+            strict_progress_step_id=strict_progress_step_id,
         )
         return True
 
@@ -1937,6 +2346,14 @@ class RealTeleopDatasetRecorder:
                         "legacy_finalize_failure_close:"
                         f"{type(shadow_exc).__name__}: {shadow_exc}"
                     )
+            if task.progress_episode is not None and not task.progress_error:
+                try:
+                    task.progress_episode.close_unsealed()
+                except BaseException as progress_exc:
+                    task.progress_error = (
+                        "legacy_finalize_failure_close:"
+                        f"{type(progress_exc).__name__}: {progress_exc}"
+                    )
             task.mark_done(success=False, error=f"{type(exc).__name__}: {exc}")
             return
         process_shadow_report = getattr(
@@ -2079,6 +2496,25 @@ class RealTeleopDatasetRecorder:
                         )
         elif getattr(self, "_v25p_native_shadow_error", ""):
             task.v25p_native_error = str(self._v25p_native_shadow_error)
+        if task.progress_episode is not None and not task.progress_error:
+            try:
+                task.progress_finalize_report = run_stage(
+                    "progress_post_finalize",
+                    lambda: task.progress_episode.seal(
+                        sealed_at=time.time(),
+                    ),
+                )
+            except BaseException as progress_exc:
+                task.progress_error = (
+                    f"post_finalize:{type(progress_exc).__name__}: {progress_exc}"
+                )
+                try:
+                    task.progress_episode.close_unsealed()
+                except BaseException as close_exc:
+                    task.progress_error += (
+                        ";close_unsealed:"
+                        f"{type(close_exc).__name__}: {close_exc}"
+                    )
         task.mark_done(success=True)
 
     def _start_finalize_task(self, task: RealDatasetFinalizeTask) -> bool:
@@ -2146,8 +2582,10 @@ class RealTeleopDatasetRecorder:
         v25p_native_shadow = getattr(self, "v25p_native_shadow", None)
         trace_preparation = getattr(self, "_active_control_trace_preparation", None)
         episode_identity = getattr(self, "_active_episode_identity", None)
+        progress_episode = getattr(self, "_active_progress_episode", None)
         trace_release = None
         trace_release_error = ""
+        progress_error = ""
         if trace_sink is not None and trace_preparation is not None:
             try:
                 trace_release = trace_sink.release_episode(
@@ -2164,6 +2602,7 @@ class RealTeleopDatasetRecorder:
                 )
         self._active_control_trace_preparation = None
         self._active_episode_identity = None
+        self._active_progress_episode = None
         self.active_episode_index = None
         self.active_started_at = None
         self._episode_start_monotonic = None
@@ -2208,12 +2647,40 @@ class RealTeleopDatasetRecorder:
                         "v25p_native_episode_discard:"
                         f"{type(shadow_exc).__name__}:{shadow_exc}"
                     )
+            if progress_episode is not None:
+                try:
+                    progress_episode.discard()
+                except BaseException as progress_exc:
+                    self._mark_collection_integrity_issue(
+                        "progress_episode_discard:"
+                        f"{type(progress_exc).__name__}:{progress_exc}"
+                    )
             self._v25p_native_shadow_active = False
             self.discarded_episodes += 1
             self._record_timestamps.clear()
             self._pause_segments = []
             self._paused_accumulated_sec = 0.0
             return None
+        if progress_episode is not None:
+            try:
+                progress_episode.terminate(
+                    reason=reason,
+                    effective_at=time.time(),
+                )
+            except BaseException as progress_exc:
+                progress_error = (
+                    f"terminate:{type(progress_exc).__name__}: {progress_exc}"
+                )
+                self._mark_collection_integrity_issue(
+                    f"progress_episode_{progress_error}"
+                )
+                try:
+                    progress_episode.close_unsealed()
+                except BaseException as close_exc:
+                    progress_error += (
+                        ";close_unsealed:"
+                        f"{type(close_exc).__name__}: {close_exc}"
+                    )
         task = RealDatasetFinalizeTask(
             episode_index=episode_index,
             frame_count=frame_count,
@@ -2223,6 +2690,8 @@ class RealTeleopDatasetRecorder:
             control_trace_release=trace_release,
             control_trace_error=trace_release_error,
             episode_identity=episode_identity,
+            progress_episode=progress_episode,
+            progress_error=progress_error,
         )
         task.summary = self._finalize_summary(
             reason=reason,
@@ -2289,6 +2758,12 @@ class RealTeleopDatasetRecorder:
                     lambda: shadow.close_unsealed(identity),
                 )
             )
+        progress_episode = getattr(self, "_active_progress_episode", None)
+        if progress_episode is not None:
+            steps.append(
+                ("progress_episode", progress_episode.close_unsealed)
+            )
+            self._active_progress_episode = None
         steps.append(
             ("writer_runtime", lambda: self._writer_lifecycle().close(flush=True))
         )

@@ -15,6 +15,27 @@
 
 `92599` 是当前保存的训练 checkpoint，并不表示 150k 训练已完成或已通过任务成功率评估。部署前应先完成无硬件预检和 dry-run。
 
+远端 OpenPI 的历史配置名现已冻结，继续保留其训练时的 mask、worker 和 epoch 行为，供已有
+checkpoint 解释、复现和回退。不要用同名配置续训成另一种输入语义。
+
+修正后的配置使用一对一的 `-corrected-v1` 后缀。它们统一启用：
+
+- `final_keep_mask` only，缺失时 fail closed；
+- 10% original、40% real-image、50% procedural、0% black；
+- 左右腕共享背景源/canvas，但使用独立 crop、漂移和 view seed；
+- `num_workers=4` 与 `shared_worker_v1` epoch 同步；
+- 在 policy metadata 中写入训练输入 contract、配置来源和 real-image manifest SHA256。
+
+真实图片池使用远端
+`assets/random_real_image/openimages_v7_validation/real_background_manifest_corrected_v1.json`。
+该 manifest 使用相对 `image_root`，可随图片目录迁移；历史
+`real_background_manifest.json` 保持不变。图片池或 final mask 不完整时，修正版训练会在首个
+样本前停止，不会静默退化比例。
+
+完整旧/新名称映射和回退说明见远端 OpenPI
+`docs/dexteleop_corrected_training_configs.md`。本目录中早期的三个实验 patch 已被版本化配置方案
+取代，不应再直接应用到包含历史 checkpoint 的 OpenPI checkout。
+
 ## 1. 不可变契约
 
 `policy_artifact.json` 是 checkpoint 的唯一 I/O 权威。客户端传入 `--policy-artifact-json` 后会强制校验：
@@ -83,7 +104,7 @@ pose hash 不匹配或误用 native-v2.3 语义都会直接失败；DexTeleop �
 
 这里的 raw-RTC 指 OpenPI 仍执行既有 `observation -> final action chunk` 推理，模型和 server 不接收未来动作；
 RTC 只负责客户端 worker、timed plan、admission、TTL、epoch 和 emission。model-RTC（模型消费未来
-prefix/mask 并返回 conditioning receipt）是独立的后续分支，本节不实现也不暗示该能力。
+prefix/mask 并返回 conditioning receipt）是独立分支，见下一节；raw-RTC本身不暗示该能力。
 
 `deployments.openpi.client.rtc`已经可以把现有artifact约束的OpenPI final chunk接到通用RTC v2
 capability/envelope/decoder seam，但当前只声明：
@@ -109,6 +130,50 @@ profile 强制 `send_actions=false`。其作用是先用
 可替换的model adapter证明artifact→payload→final output→absolute/relative canonical decode的离线完整性；换用其他本地模型或
 模型服务时，通用RTC request/response/plan/emission语义保持不变，只替换具体backend与codec。鲁棒fixture见
 `tests/test_openpi_rtc_final_chunk_adapter.py`。
+
+### OpenPI trained model-RTC（default-off）
+
+首版训练适配不改模型结构：外部DexTeleop launcher包装任意兼容OpenPI base config，在training transform中产生可选
+`model_rtc.action_loss_mask`。普通OpenPI batch缺少该key时仍走原二元batch和全量mean loss；只有显式trained run才使用
+prefix-conditioned suffix loss。base checkpoint只读，输出config/experiment/checkpoint目录独立，回退时直接使用原
+config/checkpoint。
+
+准备与启动顺序：
+
+```bash
+python -m deployments.openpi.training.prepare \
+  --source-artifact-json deployments/openpi/configs/model_rtc/0712-wrist-cube-92599.policy_artifact.json \
+  --output-artifact-json deployments/openpi/configs/model_rtc/0712-wrist-cube-model-rtc-v1.template.policy_artifact.json \
+  --output-model-id 0712-wrist-cube-model-rtc-v1 \
+  --source-dataset-root /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success
+
+python -m deployments.openpi.training.launch \
+  --base-config 0712-wrist-cube \
+  --base-checkpoint-dir /home/user/zc/openpi/checkpoints/0712-wrist-cube/0712-wrist-cube-wrist-only/92599 \
+  --artifact-template-json deployments/openpi/configs/model_rtc/0712-wrist-cube-model-rtc-v1.template.policy_artifact.json \
+  --sampling-spec-json deployments/openpi/configs/model_rtc/0712-wrist-cube-model-rtc-v1.sampling.json \
+  --source-dataset-root /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success \
+  --camera-key left_wrist --camera-key right_wrist \
+  --output-config-name 0712-wrist-cube-model-rtc-v1 \
+  --exp-name EXPERIMENT --dry-run
+```
+
+去掉`--dry-run`才会加载权重和训练。每个checkpoint同时写artifact、training-run manifest和checkpoint receipt；trained
+deployment会在连接server/设备前验证三者。部署仅开放显式
+`--rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1`的`send_actions=false`conditioned shadow；target、
+safety和dispatch仍由既有部署链路拥有，RTC adapter不接管。
+
+trained checkpoint使用既有base config恢复模型；conditioned wire也必须显式启用：
+
+```bash
+python -m deployments.openpi.server \
+  --checkpoint-dir /path/to/model-rtc/EXPERIMENT/STEP \
+  --config BASE_CONFIG \
+  --enable-rtc-continuation
+```
+
+不传`--enable-rtc-continuation`时，checkpoint server保持原有普通推理行为。该开关只开放模型侧conditioning
+operation，不启动DexTeleop target、设备或动作下发。
 
 服务端 registry 位于 `~/zc/openpi/configs/dexteleop_policy_registry.json`，必须包含：
 

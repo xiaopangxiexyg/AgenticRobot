@@ -1,0 +1,117 @@
+--- a/src/openpi/policies/dexteleop_v22_policy.py
++++ b/src/openpi/policies/dexteleop_v22_policy.py
+@@ -758,6 +758,9 @@
+     return None if value is None else str(value)
+ 
+ 
++# Final keep-masks are the training contract.  A caller may still name a
++# depth-derived mask explicitly for a rollback experiment, but it is never an
++# implicit/default fallback.
+ _DEFAULT_EXPLICIT_MASK_KEYS = (
+     "final_mask_paths",
+     "wrist_final_mask_paths",
+--- a/src/openpi/policies/dexteleop_v23_policy.py
++++ b/src/openpi/policies/dexteleop_v23_policy.py
+@@ -56,11 +56,13 @@
+ QUALITY_FILTER = v22.QUALITY_FILTER
+ STATE_AUGMENTATION_KEY = v22.STATE_AUGMENTATION_KEY
+ STATE_AUGMENTATION_MASK_KEY = v22.STATE_AUGMENTATION_MASK_KEY
++# Match v2.2's final-only training contract.  In particular, do not silently
++# fall back to the capture-time wrist depth mask when a final keep-mask is
++# missing.
+ _DEFAULT_EXPLICIT_MASK_KEYS = (
+     "final_mask_paths",
+     "wrist_final_mask_paths",
+     "wrist_keep_mask_paths",
+-    "wrist_depth_mask_paths",
+ )
+ 
+ ACTION_POSE_MODE_ABSOLUTE = "absolute"
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -1337,7 +1337,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+                 dexteleop_v22_policy.DexTeleopV22DatasetSourceConfig(
+                     name="bimanual-cube-new-success",
+@@ -1428,7 +1427,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+                 dexteleop_v23_policy.DexTeleopV23DatasetSourceConfig(
+                     name="bimanual-cube-new-success",
+@@ -1501,7 +1499,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+                 dexteleop_v22_policy.DexTeleopV22DatasetSourceConfig(
+                     name="bimanual-cube-new-success",
+@@ -1590,7 +1587,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+                 dexteleop_v23_policy.DexTeleopV23DatasetSourceConfig(
+                     name="bimanual-cube-new-success",
+@@ -1666,7 +1662,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+                 dexteleop_v23_policy.DexTeleopV23DatasetSourceConfig(
+                     name="bimanual-cube-new-success",
+@@ -1742,7 +1737,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+             ),
+         ),
+@@ -1812,7 +1806,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+             ),
+         ),
+@@ -1883,7 +1876,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+             ),
+         ),
+@@ -1955,7 +1947,6 @@
+                         (0.3, 0.10),
+                         (0.0, 0.70),
+                     ),
+-                    explicit_mask_keys=("wrist_depth_mask_paths",),
+                 ),
+             ),
+         ),
+--- a/src/openpi/policies/dexteleop_v23_policy_test.py
++++ b/src/openpi/policies/dexteleop_v23_policy_test.py
+@@ -10,6 +10,11 @@
+ from openpi.policies import dexteleop_v23_policy as v23
+ 
+ 
++def test_v23_default_mask_keys_require_final_keep_masks() -> None:
++    assert v23._DEFAULT_EXPLICIT_MASK_KEYS == v22._DEFAULT_EXPLICIT_MASK_KEYS  # noqa: SLF001
++    assert "wrist_depth_mask_paths" not in v23._DEFAULT_EXPLICIT_MASK_KEYS  # noqa: SLF001
++
++
+ def _pose_rows(frame_count: int, *, offset: float = 0.0) -> np.ndarray:
+     values = np.zeros((frame_count, 7), dtype=np.float32)
+     values[:, 0] = np.arange(frame_count, dtype=np.float32) * 0.01 + offset

@@ -34,6 +34,7 @@ from robot_motion.deploy import (
     POLICY_ASYNC_PRODUCER_HOLD,
     POLICY_WORKER_SESSION_ABANDONED_UNDRAINED,
     POLICY_WORKER_SESSION_DRAINED,
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
@@ -278,6 +279,44 @@ def test_raw_rtc_profile_is_explicit_model_adapter_shadow_only() -> None:
                 profile_id,
                 "--policy-artifact-json",
                 "/tmp/raw-rtc-policy-artifact.json",
+                "--send-actions",
+            )
+        )
+
+
+def test_conditioned_model_rtc_profile_reuses_shadow_guards() -> None:
+    profile_id = MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+    args = _parse_deploy_args(
+        "--rtc-profile",
+        profile_id,
+        "--policy",
+        "some.module:Policy",
+        "--policy-artifact-json",
+        "/tmp/model-rtc-policy-artifact.json",
+        "--rtc-real-shadow",
+    )
+    run_policy.validate_args(
+        args,
+        raw_argv=(
+            "--rtc-profile",
+            profile_id,
+            "--policy-artifact-json",
+            "/tmp/model-rtc-policy-artifact.json",
+            "--rtc-real-shadow",
+        ),
+    )
+    assert args.action_hz == 30.0
+    assert args.policy_hz == 30.0
+    assert args.position_chunk_lookahead is False
+    assert not args.send_actions
+
+    with pytest.raises(ValueError, match="forbids --send-actions"):
+        run_policy.validate_args(
+            _parse_deploy_args(
+                "--rtc-profile",
+                profile_id,
+                "--policy-artifact-json",
+                "/tmp/model-rtc-policy-artifact.json",
                 "--send-actions",
             )
         )

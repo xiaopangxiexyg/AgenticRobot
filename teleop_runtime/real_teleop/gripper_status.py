@@ -19,7 +19,7 @@ from ..retargeters import (
     ScalarToGripperRetargeter,
     map_scalar_to_gripper_target,
 )
-from ..gui.status_payloads import (
+from .status_payloads import (
     _compact_runtime_bool,
     _compact_runtime_float,
     _json_safe_value,

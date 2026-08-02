@@ -17,6 +17,11 @@ from utils.random_background import (
 from utils.random_background.mask_io import BitpackMaskReader
 
 
+DEFAULT_FINAL_MASK_ROOT = Path(
+    "utils/dataset_postprocess/wrist_cam_adjust/outputs/final_keep_mask"
+)
+
+
 def _load_episode(session: Path, episode: int) -> dict[str, Any]:
     episodes_path = session / "meta" / "episodes.jsonl"
     with episodes_path.open("r", encoding="utf-8") as file:
@@ -100,14 +105,14 @@ def _open_writer(path: Path, fps: float, width: int, height: int, codec: str) ->
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create wrist-camera random-background sample videos from table and depth keep masks."
+        description="Create wrist-camera random-background sample videos from final keep-masks."
     )
     parser.add_argument("--session", required=True, type=Path, help="Dataset root containing meta/episodes.jsonl.")
     parser.add_argument(
         "--table-mask-root",
         default=None,
         type=Path,
-        help="Output root from wrist_cam_adjust dataset --output-kind keep-mask.",
+        help="Component table-mask root; only valid with --use-component-masks.",
     )
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--camera", action="append", default=None, help="Camera key. Repeatable.")
@@ -122,8 +127,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--final-mask-root",
         type=Path,
-        default=None,
-        help="Root containing compose-final-mask outputs. When set, this is used directly.",
+        default=DEFAULT_FINAL_MASK_ROOT,
+        help="Root containing compose-final-mask outputs (default: canonical final_keep_mask root).",
+    )
+    parser.add_argument(
+        "--use-component-masks",
+        action="store_true",
+        help=(
+            "Explicit diagnostic rollback: compose postprocessed depth and table masks "
+            "during preview instead of reading final_keep_mask."
+        ),
     )
     parser.add_argument(
         "--allow-raw-depth-mask",
@@ -144,11 +157,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     session = args.session.resolve()
-    table_root = None if args.table_mask_root is None else args.table_mask_root.resolve()
     depth_mask_root = args.depth_mask_root.resolve()
-    final_mask_root = None if args.final_mask_root is None else args.final_mask_root.resolve()
-    if final_mask_root is None and table_root is None:
-        raise ValueError("--table-mask-root is required unless --final-mask-root is set.")
+    if args.use_component_masks:
+        if args.table_mask_root is None:
+            raise ValueError("--table-mask-root is required with --use-component-masks.")
+        table_root = args.table_mask_root.resolve()
+        final_mask_root = None
+    else:
+        if args.table_mask_root is not None:
+            raise ValueError(
+                "--table-mask-root requires --use-component-masks; previews use "
+                "final_keep_mask by default."
+            )
+        table_root = None
+        final_mask_root = args.final_mask_root.resolve()
     output_dir = args.output_dir.resolve()
     episode = _load_episode(session, args.episode)
     cameras = args.camera or ["left_wrist", "right_wrist"]

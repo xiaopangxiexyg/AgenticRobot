@@ -99,6 +99,7 @@ from robot_motion.position_control import (
     DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
     DEFAULT_POSITION_VELOCITY_RAMP_SEC,
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     POSITION_COMMAND_PLANNER_CHOICES,
     POSITION_COMMAND_PLANNER_LINEAR,
     PositionAuditFanout,
@@ -282,8 +283,8 @@ from ..calibration_flow import (
     tracker_offset_from_neutral_pose,
 )
 from ..gui import collection_tasks as gui_collection_tasks
-from ..gui.calibration_web_ui import CalibrationWebUi
-from ..gui.startup_progress import GuiStartupProgress
+from control_station.web.calibration_web_ui import CalibrationWebUi
+from control_station.web.startup_progress import GuiStartupProgress
 from ..real_teleop.foot_pad_controls import (
     FootPadSpecialArmInput,
     FootPadUnavailableError,
@@ -1306,7 +1307,7 @@ from ..real_teleop.gripper_status import (
 )
 
 
-from ..gui.status_payloads import _build_pose_quality_display_payload
+from ..real_teleop.status_payloads import _build_pose_quality_display_payload
 
 
 
@@ -1432,7 +1433,7 @@ from ..real_teleop.main_loop_watchdog import MainLoopStallWatchdog
 
 # GUI batch 1 compatibility bridge: the imported policy is pure and the
 # coordinator below continues to own all state transitions and event effects.
-from ..real_teleop.gui_controls import (
+from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,
     collection_task_controls as _gui_collection_task_controls,
@@ -1523,7 +1524,7 @@ from ..real_teleop.debug_ik_payload import (
 # GUI batch 2: the coordinator body lives in ``teleop_runtime.gui``.  The
 # explicit support binding below keeps legacy imports and monkeypatch points
 # stable while this entrypoint retains runtime assembly and control-loop code.
-from ..gui.status_payloads import (
+from ..real_teleop.status_payloads import (
     _IK_RED_WARNING_LABELS,
     _IK_RED_WARNING_SINGULARITY_GATE_CODES,
     _IK_RED_WARNING_STATUS_CODES,
@@ -1602,7 +1603,7 @@ from ..real_teleop.action_debug_payload import (
 
 _bind_action_debug_payload_support(globals())
 
-from ..gui.real_teleop_control import (
+from ..real_teleop.operator_control_runtime import (
     RealTeleopControlInput,
     bind_legacy_support as _bind_real_teleop_gui_support,
 )

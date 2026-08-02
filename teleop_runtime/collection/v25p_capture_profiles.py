@@ -37,7 +37,7 @@ from robot_motion.action import (
     ControlComponentSpecV2,
 )
 
-from .v25p_producer import V25pProducerBindings
+from collection_runtime.component_capture import ComponentStreamBindings
 
 
 V25P_REAL_TELEOP_SOURCE = "real_teleop"
@@ -55,7 +55,7 @@ class V25pCaptureProfileBundle:
     embodiment: EmbodimentCaptureProfileV2
     streams: V25pComponentStreamProfileV2
     v23_projection: CaptureProjectionProfileV2
-    producer_bindings: V25pProducerBindings
+    producer_bindings: ComponentStreamBindings
     component_action_schema: ComponentActionSchema
     component_action_projection: ComponentActionProjectionSpec
 
@@ -533,7 +533,7 @@ def build_policy_io_v25p_capture_profiles(
         embodiment=embodiment,
         streams=stream_profile,
         v23_projection=v23_projection,
-        producer_bindings=V25pProducerBindings(bindings),
+        producer_bindings=ComponentStreamBindings(bindings),
         component_action_schema=component_action_schema,
         component_action_projection=component_action_projection,
     )

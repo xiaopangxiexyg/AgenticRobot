@@ -25,10 +25,16 @@ from control_composition.activation import (
     build_composition_activation_scope,
 )
 from control_composition.observability import SourceDifferenceSpec
+from control_composition.eligibility import (
+    CompositionSourceEligibilityDraft,
+    CompositionSourceEligibilitySpec,
+)
 from control_composition.composition import (
     FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2,
     CompositionAuthorityDisposition,
     CompositionAuthorityGateSpec,
+    CompositionDynamicParameterContract,
+    CompositionDynamicParameterDraft,
     CompositionInputAdmissionReceipt,
     CompositionSpec,
     ComponentCompositionRuleSet,
@@ -54,7 +60,7 @@ from robot_motion.action import (
     ConservativeCompoundAuthorityProfile,
     ExecutionGateTransitionOutcome,
     HandActionSpec,
-    SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
+    IMMEDIATE_QREF_SIM_V1,
 )
 from robot_motion.action.authoritative_control import AuthoritativeControlStep
 from robot_motion.deploy import (
@@ -149,6 +155,8 @@ class MujocoSimHILContracts:
     strategy: FormalComponentCompositionStrategyV2
     authority_profile: ConservativeCompoundAuthorityProfile
     authority_gate_spec: CompositionAuthorityGateSpec
+    dynamic_parameter_contract: CompositionDynamicParameterContract | None = None
+    initial_alpha_by_component: Mapping[str, float] = field(default_factory=dict)
     semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -222,12 +230,61 @@ class MujocoSimHILContracts:
             self.authority_profile.producer_id
         ):
             raise ValueError("Authority gate and compound profile producer disagree.")
+        dynamic_contract = self.dynamic_parameter_contract
+        initial_alpha = {
+            _required(component_id, name="initial alpha component"): _finite(
+                value,
+                name=f"initial_alpha_by_component[{component_id!r}]",
+            )
+            for component_id, value in dict(
+                self.initial_alpha_by_component
+            ).items()
+        }
+        if dynamic_contract is None:
+            if initial_alpha:
+                raise ValueError(
+                    "Initial alpha values require a dynamic parameter contract."
+                )
+        else:
+            if not isinstance(
+                dynamic_contract,
+                CompositionDynamicParameterContract,
+            ):
+                raise TypeError(
+                    "dynamic_parameter_contract must be a "
+                    "CompositionDynamicParameterContract or None."
+                )
+            if set(initial_alpha) != set(dynamic_contract.component_ids):
+                raise ValueError(
+                    "Initial alpha values must exactly cover the dynamic "
+                    "parameter components."
+                )
+            if (
+                dynamic_contract.base_role
+                not in self.composition_spec.input_roles
+                or dynamic_contract.overlay_role
+                not in self.composition_spec.input_roles
+            ):
+                raise ValueError(
+                    "Dynamic parameter roles must belong to the composition."
+                )
+        object.__setattr__(
+            self,
+            "initial_alpha_by_component",
+            MappingProxyType(initial_alpha),
+        )
         payload = {
             "composition_spec_hash": self.composition_spec.semantic_content_hash,
             "component_rule_set_hash": self.component_rule_set.semantic_content_hash,
             "strategy_spec_hash": self.strategy_spec.semantic_content_hash,
             "authority_profile_hash": self.authority_profile.semantic_content_hash,
             "authority_gate_spec_hash": self.authority_gate_spec.semantic_content_hash,
+            "dynamic_parameter_contract_hash": (
+                None
+                if dynamic_contract is None
+                else dynamic_contract.semantic_content_hash
+            ),
+            "initial_alpha_by_component": initial_alpha,
         }
         object.__setattr__(
             self,
@@ -237,6 +294,196 @@ class MujocoSimHILContracts:
                 domain=MUJOCO_SIM_HIL_CONTRACT_HASH_DOMAIN_V1,
             ),
         )
+
+
+def build_component_keyed_mujoco_sim_hil_contracts(
+    action_schema: ComponentActionSchema,
+    *,
+    composer_producer_id: str,
+    proposal_ttl_sec: float,
+    profile_id: str = "control-station-mujoco-component-sim-hil-v1",
+    human_role: str = MUJOCO_SIM_HIL_HUMAN_ROLE_V1,
+    policy_role: str = MUJOCO_SIM_HIL_POLICY_ROLE_V1,
+    policy_active_components: Sequence[str] | None = None,
+    human_weight: float = 0.5,
+    policy_weight: float = 0.5,
+    max_pose_translation_disagreement_m: float | None = None,
+    max_pose_rotation_disagreement_rad: float | None = None,
+) -> MujocoSimHILContracts:
+    """Build a Sim-HIL contract from a native component action schema.
+
+    This is an application profile selection helper, not a second action
+    carrier.  Component cardinality, names, topology, representation, frames,
+    units, and qpos layout come only from ``action_schema``.  ``None`` pose
+    disagreement limits keep the difference observable without rejecting the
+    pre-composition input; downstream target safety remains authoritative.
+    """
+
+    if not isinstance(action_schema, ComponentActionSchema):
+        raise TypeError("action_schema must be a ComponentActionSchema.")
+    profile_name = _required(profile_id, name="profile_id")
+    human = _required(human_role, name="human_role")
+    policy = _required(policy_role, name="policy_role")
+    if human == policy:
+        raise ValueError("human_role and policy_role must differ.")
+    weights = {
+        human: float(human_weight),
+        policy: float(policy_weight),
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in weights.values()):
+        raise ValueError("Sim-HIL role weights must be finite and non-negative.")
+    if not any(value > 0.0 for value in weights.values()):
+        raise ValueError("At least one Sim-HIL role weight must be positive.")
+    component_ids = action_schema.component_ids
+    if policy_active_components is None:
+        policy_components = component_ids
+    else:
+        policy_components = tuple(
+            _required(value, name="policy component id")
+            for value in policy_active_components
+        )
+        if not policy_components or len(policy_components) != len(
+            set(policy_components)
+        ):
+            raise ValueError(
+                "policy_active_components must be non-empty and unique."
+            )
+        unknown = sorted(set(policy_components) - set(component_ids))
+        if unknown:
+            raise ValueError(
+                f"policy_active_components contains unknown components: {unknown}."
+            )
+    policy_component_set = set(policy_components)
+    dynamic_alpha_enabled = policy_component_set == set(component_ids)
+    human_alpha = weights[human] / (weights[human] + weights[policy])
+
+    rules: list[PoseComponentCompositionRule | QposComponentCompositionRule] = []
+    for component_id in component_ids:
+        payload_schema = action_schema.payload_schema_by_component[component_id]
+        has_policy = component_id in policy_component_set
+        roles = (human, policy) if has_policy else (human,)
+        component_weights = (
+            weights if has_policy else {human: 1.0}
+        )
+        # Positive-weight contributors are required for this cycle.  A role
+        # whose hot-control weight is exactly zero is ignored by the formal
+        # strategy, while temporary loss of an active role yields no_action
+        # rather than silently changing the requested blend ratio.
+        missing_behavior = "no_action"
+        if payload_schema.representation_family == "cartesian_pose":
+            rules.append(
+                PoseComponentCompositionRule(
+                    component_id=component_id,
+                    contributing_roles=roles,
+                    weight_by_role=component_weights,
+                    missing_behavior=missing_behavior,
+                    max_translation_disagreement_m=(
+                        max_pose_translation_disagreement_m
+                    ),
+                    max_rotation_disagreement_rad=(
+                        max_pose_rotation_disagreement_rad
+                    ),
+                )
+            )
+        elif payload_schema.representation_family == "joint_position":
+            rules.append(
+                QposComponentCompositionRule(
+                    component_id=component_id,
+                    contributing_roles=roles,
+                    weight_by_role=component_weights,
+                    value_contract_hash=payload_schema.semantic_content_hash,
+                    missing_behavior=missing_behavior,
+                )
+            )
+        else:
+            raise ValueError(
+                "The current minimal Sim-HIL strategy supports only "
+                "cartesian_pose and joint_position components; "
+                f"{component_id!r} uses "
+                f"{payload_schema.representation_family!r}."
+            )
+
+    rule_set = ComponentCompositionRuleSet(
+        rule_set_id=f"{profile_name}:rules",
+        action_space=f"component_action:{action_schema.semantic_content_hash}",
+        rules=tuple(rules),
+    )
+    composition_spec = CompositionSpec(
+        spec_id=f"{profile_name}:composition",
+        algebra=FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2,
+        input_roles=(human, policy),
+        required_roles=(),
+        missing_required_behavior="no_action",
+        component_rule_set_hash=rule_set.semantic_content_hash,
+        action_schema_hash=action_schema.semantic_content_hash,
+    )
+    strategy_spec = FormalCompositionStrategySpec(
+        strategy_id=f"{profile_name}:strategy",
+        strategy_version="development",
+        composition_spec_hash=composition_spec.semantic_content_hash,
+        implementation_contract_hashes=(rule_set.semantic_content_hash,),
+    )
+    strategy = FormalComponentCompositionStrategyV2(
+        strategy_spec=strategy_spec,
+        composition_spec=composition_spec,
+        component_rule_set=rule_set,
+    )
+    catalog = action_schema.component_catalog
+    authority_profile = ConservativeCompoundAuthorityProfile(
+        profile_id=f"{profile_name}:compound-authority",
+        producer_id=_required(
+            composer_producer_id,
+            name="composer_producer_id",
+        ),
+        component_coverage=component_ids,
+        selection_groups=catalog.selection_group_ids,
+        composition_spec_hash=composition_spec.semantic_content_hash,
+        component_rule_set_hash=rule_set.semantic_content_hash,
+        formal_strategy_spec_hash=strategy_spec.semantic_content_hash,
+    )
+    authority_gate_spec = CompositionAuthorityGateSpec(
+        gate_spec_id=f"{profile_name}:authority-gate",
+        composition_spec_hash=composition_spec.semantic_content_hash,
+        composer_producer_id=authority_profile.producer_id,
+        missing_behavior_by_role={
+            human: "no_action",
+            policy: "no_action",
+        },
+        proposal_ttl_sec=_finite(proposal_ttl_sec, name="proposal_ttl_sec"),
+        invalid_result_behavior="hold",
+        composer_error_behavior="hold",
+        all_inputs_missing_behavior="no_action",
+        allow_parallel_source_proposals=False,
+        canonical_safety_required=True,
+    )
+    dynamic_contract = (
+        CompositionDynamicParameterContract(
+            parameter_set_id=f"{profile_name}:human-alpha",
+            base_role=policy,
+            overlay_role=human,
+            component_ids=component_ids,
+            default_alpha_by_component={
+                component_id: human_alpha for component_id in component_ids
+            },
+            lifecycle="latched",
+        )
+        if dynamic_alpha_enabled
+        else None
+    )
+    return MujocoSimHILContracts(
+        composition_spec=composition_spec,
+        component_rule_set=rule_set,
+        strategy_spec=strategy_spec,
+        strategy=strategy,
+        authority_profile=authority_profile,
+        authority_gate_spec=authority_gate_spec,
+        dynamic_parameter_contract=dynamic_contract,
+        initial_alpha_by_component=(
+            {}
+            if dynamic_contract is None
+            else dynamic_contract.default_alpha_by_component
+        ),
+    )
 
 
 def build_default_mujoco_sim_hil_contracts(
@@ -426,6 +673,17 @@ _READINESS_FIELDS = (
     "measured_state_ready",
 )
 
+# These fields are projected into the same-cut composition input/eligibility
+# stores.  They are not execution-gate readiness and must not be interpreted
+# by Station as permission to mutate the lower gate.
+_COMPOSITION_INPUT_AVAILABILITY_FIELDS = frozenset(
+    {
+        "policy_source_ready",
+        "human_device_ready",
+        "policy_chunk_ttl_ready",
+    }
+)
+
 
 @dataclass(frozen=True)
 class MujocoSimHILReadinessEvidence:
@@ -513,7 +771,13 @@ class MujocoSimHILPreflightReport:
         reasons = tuple(str(value).strip() for value in self.reasons)
         if any(not value for value in reasons):
             raise ValueError("Preflight reasons must be non-empty.")
-        passed = bool(all(checks.values()) and self.readiness.ready)
+        # ``checks["required_readiness"]`` is computed from the active source
+        # mix.  A human-only stage intentionally does not require policy
+        # freshness, so the full evidence envelope may still contain false
+        # policy fields without making this preflight fail.  The selected
+        # readiness contract is represented by the checks map and must be the
+        # sole admission criterion here.
+        passed = bool(all(checks.values()))
         object.__setattr__(self, "checks", MappingProxyType(checks))
         object.__setattr__(self, "reasons", reasons)
         object.__setattr__(self, "passed", passed)
@@ -542,6 +806,9 @@ class MujocoSimHILProfileConfig:
     policy_role: str = MUJOCO_SIM_HIL_POLICY_ROLE_V1
     human_producer_id: str = "human-passive"
     human_producer_epoch: int = 1
+    blend_control_producer_id: str = "control-station-sim-hil-blend-control"
+    blend_control_producer_epoch: int = 1
+    initial_human_alpha: float = 0.5
     max_human_emission_age_sec: float = 0.20
     max_policy_emission_age_sec: float = 0.20
     physics_ticks_after_dispatch: int = 0
@@ -552,6 +819,7 @@ class MujocoSimHILProfileConfig:
             "human_role",
             "policy_role",
             "human_producer_id",
+            "blend_control_producer_id",
         ):
             object.__setattr__(
                 self,
@@ -570,6 +838,27 @@ class MujocoSimHILProfileConfig:
         ):
             raise ValueError("human_producer_epoch must be a non-negative integer.")
         object.__setattr__(self, "human_producer_epoch", epoch)
+        blend_epoch = int(self.blend_control_producer_epoch)
+        if (
+            isinstance(self.blend_control_producer_epoch, bool)
+            or blend_epoch != self.blend_control_producer_epoch
+            or blend_epoch < 0
+        ):
+            raise ValueError(
+                "blend_control_producer_epoch must be a non-negative integer."
+            )
+        object.__setattr__(
+            self,
+            "blend_control_producer_epoch",
+            blend_epoch,
+        )
+        alpha = _finite(
+            self.initial_human_alpha,
+            name="initial_human_alpha",
+        )
+        if alpha < 0.0 or alpha > 1.0:
+            raise ValueError("initial_human_alpha must be in [0, 1].")
+        object.__setattr__(self, "initial_human_alpha", alpha)
         for name in (
             "max_human_emission_age_sec",
             "max_policy_emission_age_sec",
@@ -922,6 +1211,13 @@ class MujocoSimHILComposition:
         self._activation_scope: CompositionActivationScope | None = None
         self._activation_epoch = 0
         self._cycle_index = 0
+        self._next_blend_sequence = 0
+        self._human_alpha_by_component = dict(
+            contracts.initial_alpha_by_component
+        )
+        self._blend_alpha_schedule: list[
+            tuple[float, int, dict[str, float]]
+        ] = []
         self._submission_by_key: dict[
             tuple[str, str],
             MujocoSimHILInputSubmission,
@@ -929,6 +1225,34 @@ class MujocoSimHILComposition:
         self._human_anchor_only_source_ids: set[str] = set()
         self._step_by_decision_key: dict[str, MujocoSimHILCompositionStep] = {}
         self._fact_hash_by_id: dict[str, str] = {}
+        policy_binding = self.policy_input_adapter.binding
+        if self.human_source_spec.source_id == policy_binding.source_slot_id:
+            raise ValueError(
+                "Human and policy contributors require distinct source slots."
+            )
+        self._source_eligibility_spec = CompositionSourceEligibilitySpec(
+            spec_id=f"{self.config.profile_id}:source-eligibility",
+            composition_spec_hash=(
+                self.contracts.composition_spec.semantic_content_hash
+            ),
+            source_slot_by_role={
+                self.config.human_role: self.human_source_spec.source_id,
+                self.config.policy_role: policy_binding.source_slot_id,
+            },
+            producer_id_by_source_slot={
+                self.human_source_spec.source_id: (
+                    self.config.human_producer_id
+                ),
+                policy_binding.source_slot_id: policy_binding.producer_id,
+            },
+        )
+        self._source_status_by_role: dict[str, str] = {}
+        self._source_status_epoch_by_role: dict[str, int] = {}
+        self._source_lease_expires_at_by_role: dict[str, float] = {}
+        self._next_source_status_sequence_by_role = {
+            self.config.human_role: 0,
+            self.config.policy_role: 0,
+        }
         self._validate_bindings()
 
     @property
@@ -950,6 +1274,13 @@ class MujocoSimHILComposition:
             raise ValueError("MuJoCo Sim-HIL requires shared pose execution.")
         if not runtime.explicit_shared_safety:
             raise ValueError("MuJoCo Sim-HIL requires explicit shared safety.")
+        if runtime.policy_topology.source_eligibility is None:
+            raise ValueError(
+                "MuJoCo Sim-HIL requires source-eligibility admission."
+            )
+        self._source_eligibility_spec.validate_composition_spec(
+            self.contracts.composition_spec
+        )
         runtime_config = runtime.config
         if not runtime_config.enable_composer_authority:
             raise ValueError("MuJoCo Sim-HIL requires composer authority.")
@@ -968,9 +1299,10 @@ class MujocoSimHILComposition:
             raise ValueError(
                 "MuJoCo Sim-HIL requires a target execution submission port."
             )
-        if getattr(target_port, "activation_mode", None) != "required":
+        if getattr(target_port, "activation_mode", None) != "omitted":
             raise ValueError(
-                "MuJoCo Sim-HIL requires required target activation semantics."
+                "MuJoCo Sim-HIL requires immediate target semantics without "
+                "a separate activation receipt."
             )
         if runtime_config.composer_producer_id != profile.producer_id:
             raise ValueError("Composer producer does not match the formal profile.")
@@ -979,13 +1311,19 @@ class MujocoSimHILComposition:
                 "Runtime compound authority profile does not match Sim-HIL contract."
             )
         if runtime_config.reference_activation_profile_id != (
-            SCHEDULED_REFERENCE_SEGMENT_SIM_V1
+            IMMEDIATE_QREF_SIM_V1
         ):
             raise ValueError(
-                "MuJoCo Sim-HIL requires scheduled reference-segment activation."
+                "MuJoCo Sim-HIL requires immediate qref activation."
             )
-        if runtime.catalog.action_space != BIMANUAL_EE_POSE_V1:
-            raise ValueError("MuJoCo Sim-HIL requires a bimanual pose catalog.")
+        if not any(
+            payload.representation_family == "cartesian_pose"
+            for payload in runtime.action_schema.payload_schema_by_component.values()
+        ):
+            raise ValueError(
+                "MuJoCo pose-execution Sim-HIL requires at least one "
+                "cartesian_pose component."
+            )
         runtime_action_schema_hash = runtime.action_schema.semantic_content_hash
         runtime_capability = getattr(runtime, "component_target_capability", None)
         port_capability = getattr(target_port, "component_target_capability", None)
@@ -1070,10 +1408,16 @@ class MujocoSimHILComposition:
             ("policy_node_id", runtime_config.policy_node_id),
             ("policy_clock_domain_id", runtime_config.clock_domain_id),
             ("component_catalog_hash", runtime.catalog.semantic_content_hash),
-            ("action_space", runtime.catalog.action_space),
         ):
             if getattr(binding, name) != expected:
                 raise ValueError(f"Policy binding field {name} does not match runtime.")
+        if (
+            binding.component_projection_contract_hash is None
+            and binding.action_space != runtime.catalog.action_space
+        ):
+            raise ValueError(
+                "Identity policy binding action_space does not match runtime."
+            )
         declared_policy_effectors = tuple(binding.required_active_effectors)
         if not declared_policy_effectors:
             raise ValueError("Policy binding must declare at least one contributor component.")
@@ -1196,6 +1540,34 @@ class MujocoSimHILComposition:
             runtime_config.composer_producer_id,
         }:
             raise ValueError("Human contributor producer must be distinct from policy/composer.")
+        if config.blend_control_producer_id in {
+            binding.producer_id,
+            config.human_producer_id,
+            runtime_config.composer_producer_id,
+        }:
+            raise ValueError(
+                "Blend-control producer must be distinct from source and "
+                "composer producers."
+            )
+        dynamic_contract = self.contracts.dynamic_parameter_contract
+        strategy_control = runtime.composition_strategy_control
+        if (dynamic_contract is None) != (strategy_control is None):
+            raise ValueError(
+                "Sim-HIL dynamic blend contract/runtime control mismatch."
+            )
+        if dynamic_contract is not None:
+            if any(
+                not math.isclose(
+                    value,
+                    config.initial_human_alpha,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                for value in self.contracts.initial_alpha_by_component.values()
+            ):
+                raise ValueError(
+                    "Profile initial_human_alpha does not match its contracts."
+                )
 
     def _require_started(self) -> None:
         if not self._started:
@@ -1243,6 +1615,10 @@ class MujocoSimHILComposition:
             name="now",
         )
         readiness = self._readiness_snapshot(now=timestamp)
+        readiness_failures = self._mix_readiness_failures(
+            readiness,
+            target_effective_at=timestamp,
+        )
         runtime = self.runtime
         profile = self.contracts.authority_profile
         checks = {
@@ -1279,15 +1655,15 @@ class MujocoSimHILComposition:
                 )
             ),
             "policy_contributor_only": not runtime.config.enable_primary_policy_authority,
-            "required_readiness": readiness.ready,
+            "required_readiness": not readiness_failures,
         }
         reasons = [
             f"check_failed:{name}"
             for name, passed in checks.items()
             if not passed
         ]
-        reasons.extend(f"readiness_failed:{name}" for name in readiness.failed_checks)
-        for name in readiness.failed_checks:
+        reasons.extend(f"readiness_failed:{name}" for name in readiness_failures)
+        for name in readiness_failures:
             detail = readiness.detail_by_check.get(name)
             if detail:
                 reasons.append(f"readiness_detail:{name}:{detail}")
@@ -1296,6 +1672,314 @@ class MujocoSimHILComposition:
             checks=checks,
             reasons=tuple(dict.fromkeys(reasons)),
         )
+
+    @property
+    def human_alpha_by_component(self) -> Mapping[str, float]:
+        with self._lock:
+            return MappingProxyType(
+                self._human_alpha_at(float(self.runtime.clock()))
+            )
+
+    def _human_alpha_at(self, effective_at: float) -> dict[str, float]:
+        target = _finite(effective_at, name="blend effective_at")
+        values = dict(self._human_alpha_by_component)
+        for scheduled_at, _sequence, scheduled_values in sorted(
+            self._blend_alpha_schedule,
+            key=lambda item: (item[0], item[1]),
+        ):
+            if scheduled_at > target + 1e-12:
+                break
+            values = dict(scheduled_values)
+        return values
+
+    def _required_readiness_checks(
+        self,
+        *,
+        target_effective_at: float | None = None,
+    ) -> tuple[str, ...]:
+        alpha_by_component = self._human_alpha_at(
+            float(self.runtime.clock())
+            if target_effective_at is None
+            else target_effective_at
+        )
+        if not alpha_by_component:
+            return _READINESS_FIELDS
+        human_active = any(
+            value > 1e-12
+            for value in alpha_by_component.values()
+        )
+        policy_active = any(
+            value < 1.0 - 1e-12
+            for value in alpha_by_component.values()
+        )
+        required = {"measured_state_ready"}
+        if human_active:
+            required.update(
+                {
+                    "human_device_ready",
+                    "calibration_ready",
+                    "home_ready",
+                    "rebase_ready",
+                    "deadman_ready",
+                }
+            )
+        if policy_active:
+            required.update(
+                {
+                    "policy_source_ready",
+                    "policy_chunk_ttl_ready",
+                }
+            )
+        return tuple(
+            name
+            for name in _READINESS_FIELDS
+            if name in required
+        )
+
+    def _mix_readiness_failures(
+        self,
+        readiness: MujocoSimHILReadinessEvidence,
+        *,
+        target_effective_at: float | None = None,
+    ) -> tuple[str, ...]:
+        required = self._required_readiness_checks(
+            target_effective_at=target_effective_at,
+        )
+        return tuple(
+            name
+            for name in required
+            if not bool(getattr(readiness, name))
+        )
+
+    def _runtime_gate_readiness_failures(
+        self,
+        readiness: MujocoSimHILReadinessEvidence,
+        *,
+        target_effective_at: float,
+    ) -> tuple[str, ...]:
+        """Return only failures that require a lower gate transition."""
+
+        return tuple(
+            name
+            for name in self._mix_readiness_failures(
+                readiness,
+                target_effective_at=target_effective_at,
+            )
+            if name not in _COMPOSITION_INPUT_AVAILABILITY_FIELDS
+        )
+
+    def _publish_source_eligibility(
+        self,
+        *,
+        readiness: MujocoSimHILReadinessEvidence,
+        observed_at: float,
+        target_effective_at: float,
+    ) -> None:
+        """Publish source liveness without granting authority or HOLD."""
+
+        role_status = {
+            self.config.human_role: (
+                "available" if readiness.human_device_ready else "paused"
+            ),
+            self.config.policy_role: (
+                "available"
+                if (
+                    readiness.policy_source_ready
+                    and readiness.policy_chunk_ttl_ready
+                )
+                else "paused"
+            ),
+        }
+        binding = self.policy_input_adapter.binding
+        producer_by_role = {
+            self.config.human_role: (
+                self.config.human_producer_id,
+                self.config.human_producer_epoch,
+            ),
+            self.config.policy_role: (
+                binding.producer_id,
+                binding.producer_epoch,
+            ),
+        }
+        clock_domain_id = self.runtime.config.clock_domain_id
+        effective_from = min(observed_at, target_effective_at)
+        lease_expires_at = max(observed_at, target_effective_at) + (
+            self.runtime.config.proposal_horizon_sec
+        )
+        for role in self.contracts.composition_spec.input_roles:
+            status = role_status[role]
+            previous_status = self._source_status_by_role.get(role)
+            previous_lease = self._source_lease_expires_at_by_role.get(role)
+            if (
+                status == previous_status
+                and previous_lease is not None
+                and previous_lease
+                >= target_effective_at
+                + 0.5 * self.runtime.config.proposal_horizon_sec
+            ):
+                continue
+            status_epoch = self._source_status_epoch_by_role.get(role, 0)
+            if previous_status is not None and status != previous_status:
+                status_epoch += 1
+            sequence = self._next_source_status_sequence_by_role[role]
+            producer_id, producer_epoch = producer_by_role[role]
+            source_slot_id = (
+                self._source_eligibility_spec.source_slot_by_role[role]
+            )
+            receipt = self.runtime.submit_composition_source_eligibility(
+                CompositionSourceEligibilityDraft(
+                    runtime_session_id=self.runtime.config.runtime_session_id,
+                    control_domain_id=self.runtime.config.control_domain_id,
+                    source_slot_id=source_slot_id,
+                    producer_id=producer_id,
+                    producer_epoch=producer_epoch,
+                    status_epoch=status_epoch,
+                    sequence=sequence,
+                    status=status,
+                    observed_at=observed_at,
+                    observed_clock_domain_id=clock_domain_id,
+                    effective_from=effective_from,
+                    lease_expires_at=lease_expires_at,
+                    effective_clock_domain_id=clock_domain_id,
+                    rearm_required=False,
+                    audit_metadata={
+                        "composition_profile_id": self.config.profile_id,
+                        "input_role": role,
+                        "readiness_detail": (
+                            {
+                                name: readiness.detail_by_check.get(name)
+                                for name in (
+                                    ("human_device_ready",)
+                                    if role == self.config.human_role
+                                    else (
+                                        "policy_source_ready",
+                                        "policy_chunk_ttl_ready",
+                                    )
+                                )
+                            }
+                        ),
+                    },
+                )
+            )
+            if not receipt.accepted:
+                raise RuntimeError(
+                    "Source eligibility admission failed for "
+                    f"{role!r}: {receipt.rejection_code or receipt.message}"
+                )
+            self._source_status_by_role[role] = status
+            self._source_status_epoch_by_role[role] = status_epoch
+            self._source_lease_expires_at_by_role[role] = lease_expires_at
+            self._next_source_status_sequence_by_role[role] = sequence + 1
+
+    def required_readiness_checks(
+        self,
+        *,
+        target_effective_at: float | None = None,
+    ) -> tuple[str, ...]:
+        """Return evidence fields relevant to the selected source mix."""
+
+        with self._lock:
+            return self._required_readiness_checks(
+                target_effective_at=target_effective_at,
+            )
+
+    def readiness_failures(
+        self,
+        readiness: MujocoSimHILReadinessEvidence,
+        *,
+        target_effective_at: float | None = None,
+    ) -> tuple[str, ...]:
+        """Return only the checks required by the currently selected mix."""
+
+        if not isinstance(readiness, MujocoSimHILReadinessEvidence):
+            raise TypeError("readiness must be MujocoSimHILReadinessEvidence.")
+        with self._lock:
+            return self._mix_readiness_failures(
+                readiness,
+                target_effective_at=target_effective_at,
+            )
+
+    def set_human_blend_alpha(
+        self,
+        alpha: float | Mapping[str, float],
+        *,
+        effective_from: float | None = None,
+    ):
+        """Admit one receiver-linearized human-overlay alpha vector.
+
+        Alpha zero selects policy values, alpha one selects human values, and
+        intermediate values use the installed pose/qpos component rules.  This
+        changes no source, authority, safety, target, or dispatch owner.
+        """
+
+        with self._lock:
+            self._require_started()
+            contract = self.contracts.dynamic_parameter_contract
+            strategy_control = self.runtime.composition_strategy_control
+            if contract is None or strategy_control is None:
+                raise RuntimeError(
+                    "This Sim-HIL profile has no dynamic blend control."
+                )
+            if isinstance(alpha, Mapping):
+                values = {
+                    _required(key, name="blend component"): _finite(
+                        value,
+                        name=f"human alpha[{key!r}]",
+                    )
+                    for key, value in dict(alpha).items()
+                }
+            else:
+                scalar = _finite(alpha, name="human alpha")
+                values = {
+                    component_id: scalar
+                    for component_id in contract.component_ids
+                }
+            if set(values) != set(contract.component_ids):
+                raise ValueError(
+                    "Human alpha must exactly cover the dynamic components."
+                )
+            if any(value < 0.0 or value > 1.0 for value in values.values()):
+                raise ValueError("Human alpha values must be in [0, 1].")
+            now = float(self.runtime.clock())
+            effective = (
+                now
+                if effective_from is None
+                else _finite(effective_from, name="effective_from")
+            )
+            revision = strategy_control.latest_revision
+            receipt = self.runtime.policy_topology.admit_dynamic_parameters(
+                CompositionDynamicParameterDraft(
+                    runtime_session_id=self.runtime.config.runtime_session_id,
+                    control_domain_id=self.runtime.config.control_domain_id,
+                    producer_id=self.config.blend_control_producer_id,
+                    producer_generation=(
+                        self.config.blend_control_producer_epoch
+                    ),
+                    sequence=self._next_blend_sequence,
+                    strategy_revision_hash=revision.semantic_content_hash,
+                    parameter_contract_hash=contract.semantic_content_hash,
+                    alpha_by_component=values,
+                    produced_at=now,
+                    produced_clock_domain_id=(
+                        self.runtime.config.clock_domain_id
+                    ),
+                    effective_from=effective,
+                    effective_until=None,
+                    effective_clock_domain_id=(
+                        self.runtime.config.clock_domain_id
+                    ),
+                )
+            )
+            if receipt.accepted:
+                self._next_blend_sequence += 1
+                self._blend_alpha_schedule.append(
+                    (
+                        effective,
+                        self._next_blend_sequence - 1,
+                        dict(values),
+                    )
+                )
+            return receipt
 
     def _record_facts(self, facts: tuple[ControlTraceFact, ...]) -> None:
         pending: list[ControlTraceFact] = []
@@ -1367,6 +2051,16 @@ class MujocoSimHILComposition:
                     producer_epoch=self.config.human_producer_epoch,
                     reason="control-station sim-hil passive human contributor startup",
                 )
+                if self.contracts.dynamic_parameter_contract is not None:
+                    self.runtime.activate_policy_node_producer(
+                        self.config.blend_control_producer_id,
+                        producer_epoch=(
+                            self.config.blend_control_producer_epoch
+                        ),
+                        reason=(
+                            "control-station sim-hil blend-control startup"
+                        ),
+                    )
                 # The Station application may have started the passive source
                 # during its readiness warm-up.  Keep this composition usable
                 # on its own, but do not invoke the lower lifecycle twice when
@@ -1405,17 +2099,24 @@ class MujocoSimHILComposition:
                 self._submission_by_key.clear()
                 self._human_anchor_only_source_ids.clear()
                 self._step_by_decision_key.clear()
-                self._cycle_index = 0
+            self._cycle_index = 0
+            self._next_blend_sequence = 0
+            self._human_alpha_by_component = dict(
+                self.contracts.initial_alpha_by_component
+            )
+            self._blend_alpha_schedule.clear()
             if source_error is not None:
                 raise source_error
 
     def rearm(self, *, now: float | None = None) -> MujocoSimHILPreflightReport:
         """Create a new input activation only after an explicit HOLD.
 
-        Readiness recovery is intentionally not automatic.  The existing
-        authoritative runtime remains the owner of gate/epoch/cancellation
-        evidence; this method only supplies the Station lifecycle boundary and
-        a new composition activation scope.
+        Recovery from a latched gate is intentionally not automatic.  A
+        temporary contributor underrun does not make Station request HOLD;
+        the lower persistence profile may still choose HOLD after its active
+        target expires. The existing authoritative runtime remains the owner
+        of gate/generation/cancellation evidence; this method only supplies
+        the Station lifecycle boundary and a new composition activation scope.
         """
 
         with self._lock:
@@ -1454,6 +2155,36 @@ class MujocoSimHILComposition:
             )
             return report
 
+    def request_hold(
+        self,
+        *,
+        reason: str,
+        source_event_ids: tuple[str, ...] = (),
+        force_cancellation: bool = False,
+    ) -> ExecutionGateTransitionOutcome | None:
+        """Establish the lower-owned HOLD boundary without closing sources.
+
+        Station lifecycle code calls this before pause, episode release, or
+        shutdown.  An existing HOLD is idempotent unless the caller explicitly
+        requests another cancellation fence; FAULT is never downgraded.
+        """
+
+        with self._lock:
+            self._require_started()
+            normalized_reason = _required(reason, name="reason")
+            now = float(self.runtime.clock())
+            gate = self.runtime.capture_execution_gate_snapshot(now=now)
+            if gate.status == "fault":
+                return None
+            if gate.status == "hold" and not force_cancellation:
+                return None
+            return self.runtime.transition_execution_gate(
+                "hold",
+                reason=normalized_reason,
+                source_event_ids=tuple(source_event_ids),
+                force_cancellation=bool(force_cancellation),
+            )
+
     def _submission_error(
         self,
         *,
@@ -1466,26 +2197,6 @@ class MujocoSimHILComposition:
             source_emission_id=source_emission_id,
             error=error,
         )
-
-    @staticmethod
-    def _fresh_enough(
-        *,
-        emitted_at: float,
-        effective_until: float,
-        now: float,
-        max_age_sec: float,
-    ) -> str | None:
-        emitted = _finite(emitted_at, name="emitted_at")
-        until = _finite(effective_until, name="effective_until")
-        timestamp = _finite(now, name="now")
-        age = timestamp - emitted
-        if age < -1e-9:
-            return "emission_clock_is_in_the_future"
-        if age > max_age_sec:
-            return f"emission_stale:{age:.9f}>{max_age_sec:.9f}"
-        if until <= timestamp:
-            return "emission_ttl_expired"
-        return None
 
     def submit_policy_emission(
         self,
@@ -1515,43 +2226,30 @@ class MujocoSimHILComposition:
                 )
                 self._record_facts(facts)
                 self.policy_input_adapter.binding.validate_emission(emission)
-                freshness_error = self._fresh_enough(
-                    emitted_at=emission.emitted_at,
-                    effective_until=emission.effective_until,
-                    now=now,
-                    max_age_sec=self.config.max_policy_emission_age_sec,
+                draft = self.policy_input_adapter.adapt(
+                    emission,
+                    activation_scope=self._activation_scope,
+                    source_fact_ids=tuple(fact.fact_id for fact in facts),
+                    source_fact_hashes=tuple(
+                        fact.semantic_content_hash for fact in facts
+                    ),
                 )
-                if freshness_error is not None:
-                    submission = self._submission_error(
-                        role=self.config.policy_role,
-                        source_emission_id=emission.emission_id,
-                        error=freshness_error,
-                    )
-                else:
-                    draft = self.policy_input_adapter.adapt(
-                        emission,
-                        activation_scope=self._activation_scope,
-                        source_fact_ids=tuple(fact.fact_id for fact in facts),
-                        source_fact_hashes=tuple(
-                            fact.semantic_content_hash for fact in facts
-                        ),
-                    )
-                    receipt = self.runtime.submit_composition_input(
-                        draft,
-                        activation_scope=self._activation_scope,
-                    )
-                    submission = MujocoSimHILInputSubmission(
-                        role=self.config.policy_role,
-                        source_emission_id=emission.emission_id,
-                        input_receipt=receipt,
-                        error=(
-                            None
-                            if receipt.accepted
-                            else receipt.message
-                            or receipt.rejection_code
-                            or "composition_input_rejected"
-                        ),
-                    )
+                receipt = self.runtime.submit_composition_input(
+                    draft,
+                    activation_scope=self._activation_scope,
+                )
+                submission = MujocoSimHILInputSubmission(
+                    role=self.config.policy_role,
+                    source_emission_id=emission.emission_id,
+                    input_receipt=receipt,
+                    error=(
+                        None
+                        if receipt.accepted
+                        else receipt.message
+                        or receipt.rejection_code
+                        or "composition_input_rejected"
+                    ),
+                )
             except Exception as error:  # noqa: BLE001 - contributor failure holds later.
                 submission = self._submission_error(
                     role=self.config.policy_role,
@@ -1603,21 +2301,7 @@ class MujocoSimHILComposition:
                 self._record_facts(facts)
                 source_id = result.source_adapter_receipt.source_emission_id
                 key = (self.config.human_role, source_id)
-                freshness_error = self._fresh_enough(
-                    emitted_at=emission.emitted_at,
-                    effective_until=(
-                        now + self.runtime.config.proposal_horizon_sec
-                    ),
-                    now=now,
-                    max_age_sec=self.config.max_human_emission_age_sec,
-                )
-                if freshness_error is not None:
-                    submission = self._submission_error(
-                        role=self.config.human_role,
-                        source_emission_id=source_id,
-                        error=freshness_error,
-                    )
-                elif (
+                if (
                     not result.source_validation.accepted
                     or result.proposal_draft is None
                 ):
@@ -1768,7 +2452,18 @@ class MujocoSimHILComposition:
             emission = getattr(step, "emission", None)
             if emission is None:
                 return step, None
-            return step, self.submit_human_emission(emission, observed_at=timestamp)
+            # ``HumanCommandEmission.emitted_at`` is captured inside the
+            # source step.  Use a post-step observation cut for admission;
+            # using the requested cut can make a valid synchronous emission
+            # appear to come from the future by a few milliseconds.
+            observed_at = max(
+                timestamp,
+                _finite(self.runtime.clock(), name="human.observed_at"),
+            )
+            return step, self.submit_human_emission(
+                emission,
+                observed_at=observed_at,
+            )
 
     def _hold(
         self,
@@ -1818,26 +2513,53 @@ class MujocoSimHILComposition:
             hold = None
             blocked_reason = None
             error_text = None
+            readiness_failures: tuple[str, ...] = ()
+            runtime_gate_failures: tuple[str, ...] = ()
             try:
                 gate = self.runtime.capture_execution_gate_snapshot(now=now)
                 if gate.status != "ready":
                     blocked_reason = f"execution_gate_not_ready:{gate.status}"
-                elif not readiness.ready:
-                    blocked_reason = "readiness_not_ready"
+                else:
+                    readiness_failures = self._mix_readiness_failures(
+                        readiness,
+                        target_effective_at=target,
+                    )
+                    runtime_gate_failures = (
+                        self._runtime_gate_readiness_failures(
+                            readiness,
+                            target_effective_at=target,
+                        )
+                    )
+                if gate.status == "ready" and runtime_gate_failures:
+                    blocked_reason = "manual_recovery_required"
                     hold = self._hold(
                         reason=(
                             "sim_hil:readiness_not_ready:"
-                            + ",".join(readiness.failed_checks)
+                            + ",".join(runtime_gate_failures)
                         )
                     )
-                else:
-                    control_cut = self.runtime.capture_control_cut(cutoff_at=now)
+                elif gate.status == "ready":
+                    self._publish_source_eligibility(
+                        readiness=readiness,
+                        observed_at=now,
+                        target_effective_at=target,
+                    )
+                    # Eligibility admission obtains its receiver timestamp
+                    # inside the lower runtime.  Capture the cut afterwards
+                    # so the input records and their source state are visible
+                    # on one causally closed cut.
+                    control_cut = self.runtime.capture_control_cut(
+                        cutoff_at=float(self.runtime.clock())
+                    )
                     evaluation = self.runtime.evaluate_composition_shadow(
                         spec=self.contracts.composition_spec,
                         target_effective_at=target,
                         control_cut=control_cut,
                         source_difference_spec=self.source_difference_spec,
                         activation_scope=self._activation_scope,
+                        source_eligibility_spec=(
+                            self._source_eligibility_spec
+                        ),
                     )
                     disposition = decide_composition_authority_disposition(
                         evaluation.input_snapshot,
@@ -1870,6 +2592,10 @@ class MujocoSimHILComposition:
                             raise RuntimeError(
                                 "Sim-HIL compound proposal admission was rejected."
                             )
+                    elif disposition.downstream_request == "no_action":
+                        blocked_reason = (
+                            f"composition_no_action:{disposition.reason}"
+                        )
                     else:
                         hold = self._hold(
                             reason=f"sim_hil:{disposition.reason}",
@@ -1921,10 +2647,33 @@ class MujocoSimHILComposition:
                     policy_emission,
                     observed_at=timestamp,
                 )
-            target = (
-                timestamp + self.runtime.reference_activation_spec.target_lead_time_sec
+            requested_target = (
+                timestamp
+                + self.runtime.reference_activation_spec.target_lead_time_sec
                 if target_effective_at is None
-                else _finite(target_effective_at, name="target_effective_at")
+                else _finite(
+                    target_effective_at,
+                    name="target_effective_at",
+                )
+            )
+            # A synchronous human source timestamps its new input at the
+            # post-poll observation cut.  Immediate targets must use that same
+            # cut; otherwise every fresh VIVE/hand sample is ineligible for
+            # the current composition and the runtime silently reuses the
+            # preceding sample.  Scheduled targets retain their explicitly
+            # requested future activation and remain subject to lower late
+            # admission.
+            target = (
+                max(
+                    requested_target,
+                    _finite(
+                        self.runtime.clock(),
+                        name="post_input_observed_at",
+                    ),
+                )
+                if self.runtime.reference_activation_spec.activation_mode
+                == "immediate_target"
+                else requested_target
             )
             decision_key = f"{self.config.profile_id}:cycle:{self._cycle_index}"
             composition_step = self.compose_at(
@@ -1938,8 +2687,9 @@ class MujocoSimHILComposition:
             )
             if physics_ticks < 0:
                 raise ValueError("physics_ticks_after_dispatch must be non-negative.")
+            execution_now = max(timestamp, float(self.runtime.clock()))
             execution = self.runtime.step(
-                now=timestamp,
+                now=execution_now,
                 physics_ticks_after_dispatch=physics_ticks,
             )
             result = MujocoSimHILCycleResult(
@@ -1960,12 +2710,18 @@ def build_mujoco_sim_hil_policy_binding(
     source_slot_id: str | None = None,
     role: str = MUJOCO_SIM_HIL_POLICY_ROLE_V1,
     policy_active_effectors: Sequence[str] | None = None,
+    source_action_space: str | None = None,
+    component_id_by_effector: Mapping[str, str] | None = None,
+    component_projection_contract_hash: str | None = None,
 ) -> PolicyCompositionInputBinding:
     """Bind the lower policy emission seam to this exact MuJoCo catalog."""
 
     if not isinstance(runtime, MujocoDeployRuntime):
         raise TypeError("runtime must be a MujocoDeployRuntime.")
-    if runtime.catalog.action_space != BIMANUAL_EE_POSE_V1:
+    if (
+        component_projection_contract_hash is None
+        and runtime.catalog.action_space != BIMANUAL_EE_POSE_V1
+    ):
         raise ValueError("Sim-HIL policy binding requires a pose target catalog.")
     expected_effectors = tuple(
         component.effector_name for component in runtime.catalog.components
@@ -1981,6 +2737,21 @@ def build_mujoco_sim_hil_policy_binding(
         raise ValueError(
             "policy_active_effectors must be a subset of the runtime catalog."
         )
+    mapping = (
+        {effector: effector for effector in selected_effectors}
+        if component_id_by_effector is None
+        else {
+            str(effector).strip(): str(component_id).strip()
+            for effector, component_id in dict(
+                component_id_by_effector
+            ).items()
+        }
+    )
+    if set(mapping) != set(selected_effectors):
+        raise ValueError(
+            "component_id_by_effector must exactly cover policy effectors."
+        )
+    required_components = tuple(mapping[effector] for effector in selected_effectors)
     return PolicyCompositionInputBinding(
         source_slot_id=(
             runtime.config.producer_id
@@ -1995,9 +2766,17 @@ def build_mujoco_sim_hil_policy_binding(
         policy_node_id=runtime.config.policy_node_id,
         policy_clock_domain_id=runtime.config.clock_domain_id,
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        action_space=runtime.catalog.action_space,
+        action_space=(
+            runtime.catalog.action_space
+            if source_action_space is None
+            else str(source_action_space)
+        ),
         required_active_effectors=selected_effectors,
         action_schema=runtime.action_schema,
+        required_component_ids=required_components,
+        component_projection_contract_hash=(
+            component_projection_contract_hash
+        ),
     )
 
 
@@ -2015,6 +2794,9 @@ def build_scoped_mujoco_sim_hil_composition(
     contracts: MujocoSimHILContracts | None = None,
     config: MujocoSimHILProfileConfig | None = None,
     policy_active_effectors: Sequence[str] | None = None,
+    policy_component_action_projector: Any | None = None,
+    human_component_action_projector: Any | None = None,
+    human_component_id_by_effector: Mapping[str, str] | None = None,
 ) -> MujocoSimHILComposition:
     """Assemble the default-off profile without constructing lower runtimes."""
 
@@ -2042,12 +2824,17 @@ def build_scoped_mujoco_sim_hil_composition(
             policy_active_effectors=policy_active_effectors,
             action_schema_hash=runtime.action_schema.semantic_content_hash,
         )
-    policy_adapter = PolicyCompositionInputAdapter(binding)
+    policy_adapter = PolicyCompositionInputAdapter(
+        binding,
+        component_action_projector=policy_component_action_projector,
+    )
     human_adapter = build_mujoco_component_human_proposal_adapter(
         runtime,
         human_source_spec,
         producer_id=profile_config.human_producer_id,
         producer_epoch=profile_config.human_producer_epoch,
+        component_id_by_effector=human_component_id_by_effector,
+        component_action_projector=human_component_action_projector,
     )
     return MujocoSimHILComposition(
         runtime=runtime,

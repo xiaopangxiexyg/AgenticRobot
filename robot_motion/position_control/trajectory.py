@@ -14,9 +14,13 @@ from .timeline import OutOfOrderReferenceError
 
 POSITION_COMMAND_PLANNER_LINEAR = "linear"
 POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED = "acceleration_limited"
+POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED = (
+    "sample_aligned_jerk_limited"
+)
 POSITION_COMMAND_PLANNER_CHOICES = (
     POSITION_COMMAND_PLANNER_LINEAR,
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
 )
 DEFAULT_POSITION_VELOCITY_RAMP_SEC = 0.10
 DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC = 0.03
@@ -31,6 +35,8 @@ def normalize_position_command_planner(value: object) -> str:
         "velocity": POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
         "velocity_planned": POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
         "accel_limited": POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        "sample_aligned": POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        "jerk_limited": POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     }
     normalized = aliases.get(text, text)
     if normalized not in POSITION_COMMAND_PLANNER_CHOICES:
@@ -641,7 +647,19 @@ class AccelerationLimitedJointTrajectoryPlanner:
             self._target_velocity_filter_applied = False
             self._target_velocity_filter_dt_sec = None
             self._target_sequence = normalized_sequence
-            self._target_published_monotonic = now
+            # Quick-stop is a local execution event, not a newly published
+            # upstream reference. Preserve the last reference-publication
+            # watermark so a simulation planner clock that has advanced ahead
+            # of the receiver clock cannot make the first post-HOLD reference
+            # appear to move backwards. With no prior target, ``now`` remains
+            # the only valid initialization boundary.
+            if self._target_published_monotonic is None:
+                self._target_published_monotonic = now
+            # A post-HOLD target starts a new finite-difference history. It
+            # must not infer target velocity across the stopped interval.
+            self._last_safe_target_q = None
+            self._last_safe_target_published_monotonic = None
+            self._last_observed_reference_dt_sec = None
             self._qd = np.zeros_like(self._q)
             self._qdd = np.zeros_like(self._q)
             self._last_commit_monotonic = now
@@ -1103,5 +1121,6 @@ __all__ = [
     "POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED",
     "POSITION_COMMAND_PLANNER_CHOICES",
     "POSITION_COMMAND_PLANNER_LINEAR",
+    "POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED",
     "normalize_position_command_planner",
 ]

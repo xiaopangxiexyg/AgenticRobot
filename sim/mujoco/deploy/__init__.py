@@ -19,10 +19,21 @@ from .execution_difference import (
     MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID,
     MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH,
     MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID,
+    MujocoExecutionDifferenceObserver,
+    MujocoExecutionDifferenceSnapshot,
     build_mujoco_qpos_execution_difference_observation,
     project_mujoco_execution_measurement_observation,
+    project_mujoco_immediate_execution_reference_sample,
     project_mujoco_execution_reference_frame,
     project_mujoco_execution_reference_sample,
+)
+from .component_action_profile import (
+    MujocoComponentActionRobotActionV1Materializer,
+    MujocoComponentTargetProfile,
+    MujocoRobotActionV1ComponentIngressAdapter,
+    build_mujoco_component_execution_binding,
+    build_mujoco_pose_qpos_component_target_profile,
+    build_rm65_right_cube_lift_component_target_profile,
 )
 from .pose_resolution import (
     MujocoCoupledPoseToQposResolver,
@@ -32,10 +43,14 @@ from .pose_resolution import (
     build_mujoco_pose_qpos_execution_target,
 )
 from .sim_hil_target import (
+    MujocoSimHILPreparedTarget,
     MujocoSimHILTarget,
     MujocoSimHILTargetConfig,
+    build_mujoco_sim_hil_coordinate_profiles,
     build_mujoco_sim_hil_target,
     capture_mujoco_sim_hil_safety_anchor,
+    capture_mujoco_sim_hil_tool_tcp_pose_by_side,
+    prepare_mujoco_sim_hil_target,
 )
 from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
@@ -52,6 +67,7 @@ from .rtc_policy import (
 )
 from .runtime import (
     build_mujoco_pose_action_schema,
+    MujocoComponentExecutionBinding,
     MujocoDeployConfig,
     MujocoDeployRuntime,
     MujocoPolicyActionChunkSubmission,
@@ -71,6 +87,7 @@ from .policy_rollout import (
 __all__ = [
     "build_mujoco_pose_action_schema",
     "MujocoDeployConfig",
+    "MujocoComponentExecutionBinding",
     "MujocoDeployRuntime",
     "MujocoPolicyActionChunkSubmission",
     "MujocoPolicyEmissionSubmission",
@@ -84,8 +101,11 @@ __all__ = [
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID",
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH",
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID",
+    "MujocoExecutionDifferenceObserver",
+    "MujocoExecutionDifferenceSnapshot",
     "build_mujoco_qpos_execution_difference_observation",
     "project_mujoco_execution_measurement_observation",
+    "project_mujoco_immediate_execution_reference_sample",
     "project_mujoco_execution_reference_frame",
     "project_mujoco_execution_reference_sample",
     "MujocoCoupledPoseToQposResolver",
@@ -97,8 +117,12 @@ __all__ = [
     "build_mujoco_pose_qpos_execution_target",
     "MujocoSimHILTarget",
     "MujocoSimHILTargetConfig",
+    "MujocoSimHILPreparedTarget",
+    "build_mujoco_sim_hil_coordinate_profiles",
     "build_mujoco_sim_hil_target",
     "capture_mujoco_sim_hil_safety_anchor",
+    "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
+    "prepare_mujoco_sim_hil_target",
     "DeterministicVirtualPolicyRtcRunner",
     "VirtualBimanualQposPolicy",
     "VirtualBimanualQposPolicySpec",
@@ -116,4 +140,10 @@ __all__ = [
     "MujocoPolicyRollout",
     "MujocoPolicyRolloutConfig",
     "MujocoPolicyRolloutError",
+    "MujocoComponentTargetProfile",
+    "MujocoComponentActionRobotActionV1Materializer",
+    "MujocoRobotActionV1ComponentIngressAdapter",
+    "build_mujoco_component_execution_binding",
+    "build_mujoco_pose_qpos_component_target_profile",
+    "build_rm65_right_cube_lift_component_target_profile",
 ]

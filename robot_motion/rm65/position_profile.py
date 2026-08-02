@@ -18,6 +18,7 @@ from typing import Any, Mapping, Sequence
 from robot_motion.position_control.config import PositionControlRates
 from robot_motion.position_control.trajectory import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
 )
 
 
@@ -25,6 +26,12 @@ RM65_BIMANUAL_POSITION_PROFILE_SCHEMA = "robot_motion.rm65_bimanual_position_pro
 RM65_BIMANUAL_POSITION_V1_NAME = "rm65_bimanual_position_v1"
 RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME = (
     "rm65_bimanual_position_v2_responsive"
+)
+RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME = (
+    "rm65_bimanual_position_sample_aligned_jerk_v1"
+)
+RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME = (
+    "rm65_bimanual_position_sample_aligned_jerk_v2"
 )
 RM65_BIMANUAL_POSITION_V1_QREF_PROFILE = "rm65_bimanual_position_v1_qref"
 LEGACY_POSITION_CONTROL_PROFILE_NAME = "legacy"
@@ -66,6 +73,16 @@ class RM65PositionSourceShapingProfile:
     # require evidence that an escape correction reached admitted qref before
     # the release-band hysteresis is allowed to hold an inward q5 candidate.
     wrist_q5_hysteresis_requires_escape_latch: bool = False
+    # A stationary tracker freezes the Cartesian target, not the robot.  These
+    # thresholds decide when the robot-side execution reference is close
+    # enough to that frozen target to re-enter the inactive jitter hold.  The
+    # broad historical defaults are preserved for V1; successor profiles may
+    # use task-scale tolerances so an inactive hand does not leave centimetres
+    # of permanent tracking error.
+    inactive_execution_release_translation_static_m: float = 0.03
+    inactive_execution_release_translation_full_m: float = 0.10
+    inactive_execution_release_rotation_static_deg: float = 5.0
+    inactive_execution_release_rotation_full_deg: float = 30.0
 
     def __post_init__(self) -> None:
         scale = _finite(
@@ -98,12 +115,42 @@ class RM65PositionSourceShapingProfile:
             name="post_ik_qpos_normal_fast_path_quality_grace_sec",
             minimum=0.0,
         )
+        inactive_translation_static = _finite(
+            self.inactive_execution_release_translation_static_m,
+            name="inactive_execution_release_translation_static_m",
+            minimum=0.0,
+        )
+        inactive_translation_full = _finite(
+            self.inactive_execution_release_translation_full_m,
+            name="inactive_execution_release_translation_full_m",
+            minimum=0.0,
+        )
+        inactive_rotation_static = _finite(
+            self.inactive_execution_release_rotation_static_deg,
+            name="inactive_execution_release_rotation_static_deg",
+            minimum=0.0,
+        )
+        inactive_rotation_full = _finite(
+            self.inactive_execution_release_rotation_full_deg,
+            name="inactive_execution_release_rotation_full_deg",
+            minimum=0.0,
+        )
         if scale > 1.0:
             raise ValueError("inactive_enter_threshold_scale must be <= 1.")
         if slow > 1.0 or fast > 1.0 or normal_fast > 1.0:
             raise ValueError("post-IK smoothing alphas must be <= 1.")
         if fast < slow:
             raise ValueError("fast post-IK smoothing alpha must be >= slow alpha.")
+        if inactive_translation_full <= inactive_translation_static:
+            raise ValueError(
+                "inactive execution translation full threshold must exceed the "
+                "static threshold."
+            )
+        if inactive_rotation_full <= inactive_rotation_static:
+            raise ValueError(
+                "inactive execution rotation full threshold must exceed the "
+                "static threshold."
+            )
         object.__setattr__(self, "inactive_enter_threshold_scale", scale)
         object.__setattr__(self, "post_ik_qpos_smoothing_alpha", slow)
         object.__setattr__(self, "post_ik_qpos_smoothing_fast_alpha", fast)
@@ -137,6 +184,26 @@ class RM65PositionSourceShapingProfile:
             "wrist_q5_hysteresis_requires_escape_latch",
             bool(self.wrist_q5_hysteresis_requires_escape_latch),
         )
+        object.__setattr__(
+            self,
+            "inactive_execution_release_translation_static_m",
+            inactive_translation_static,
+        )
+        object.__setattr__(
+            self,
+            "inactive_execution_release_translation_full_m",
+            inactive_translation_full,
+        )
+        object.__setattr__(
+            self,
+            "inactive_execution_release_rotation_static_deg",
+            inactive_rotation_static,
+        )
+        object.__setattr__(
+            self,
+            "inactive_execution_release_rotation_full_deg",
+            inactive_rotation_full,
+        )
 
     def to_metadata(self) -> dict[str, Any]:
         payload = {
@@ -167,6 +234,20 @@ class RM65PositionSourceShapingProfile:
             )
         if self.wrist_q5_hysteresis_requires_escape_latch:
             payload["wrist_q5_hysteresis_requires_escape_latch"] = True
+        inactive_release = (
+            self.inactive_execution_release_translation_static_m,
+            self.inactive_execution_release_translation_full_m,
+            self.inactive_execution_release_rotation_static_deg,
+            self.inactive_execution_release_rotation_full_deg,
+        )
+        if inactive_release != (0.03, 0.10, 5.0, 30.0):
+            payload["inactive_execution_release"] = {
+                "translation_static_m": inactive_release[0],
+                "translation_full_m": inactive_release[1],
+                "rotation_static_deg": inactive_release[2],
+                "rotation_full_deg": inactive_release[3],
+                "semantics": "freeze_target_then_converge_to_task_tolerance",
+            }
         return payload
 
 
@@ -293,11 +374,28 @@ class RM65PositionCommandExecutionProfile:
     max_command_step_deg: float = 0.675
     follow_qpos_alpha: float = 0.9
     degraded_speed_scale: float = 0.5
+    # V1 scales the absolute target itself in degraded mode.  A successor may
+    # retain the full already-admitted qref and let the hard q/qd/qdd/jerk
+    # envelope determine how much is safely reachable in the current cut.
+    sample_aligned_scale_degraded_target: bool = True
+    # Dimensionless regularizers for the normalized-jerk horizon QP.  They are
+    # zero/near-zero in V1 for exact rollback.  V2 uses small positive values
+    # to discourage bang-bang jerk without weakening any hard bound.
+    sample_aligned_jerk_regularization: float = 1e-9
+    sample_aligned_jerk_delta_regularization: float = 0.0
+    sample_aligned_terminal_velocity_regularization: float = 0.0
+    sample_aligned_terminal_acceleration_regularization: float = 0.0
 
     def __post_init__(self) -> None:
         planner = str(self.planner).strip()
-        if planner != POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED:
-            raise ValueError("formal RM65 position execution requires acceleration_limited.")
+        if planner not in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }:
+            raise ValueError(
+                "formal RM65 position execution requires a registered "
+                "acceleration/jerk-limited planner."
+            )
         reference_max_age = _finite(
             self.reference_max_age_sec,
             name="reference_max_age_sec",
@@ -327,6 +425,26 @@ class RM65PositionCommandExecutionProfile:
             name="degraded_speed_scale",
             minimum=0.0,
         )
+        jerk_regularization = _finite(
+            self.sample_aligned_jerk_regularization,
+            name="sample_aligned_jerk_regularization",
+            minimum=0.0,
+        )
+        jerk_delta_regularization = _finite(
+            self.sample_aligned_jerk_delta_regularization,
+            name="sample_aligned_jerk_delta_regularization",
+            minimum=0.0,
+        )
+        terminal_velocity_regularization = _finite(
+            self.sample_aligned_terminal_velocity_regularization,
+            name="sample_aligned_terminal_velocity_regularization",
+            minimum=0.0,
+        )
+        terminal_acceleration_regularization = _finite(
+            self.sample_aligned_terminal_acceleration_regularization,
+            name="sample_aligned_terminal_acceleration_regularization",
+            minimum=0.0,
+        )
         if ramp <= 0.0 or step <= 0.0:
             raise ValueError("velocity_ramp_sec and max_command_step_deg must be positive.")
         if follow > 1.0 or degraded > 1.0:
@@ -343,9 +461,34 @@ class RM65PositionCommandExecutionProfile:
         object.__setattr__(self, "max_command_step_deg", step)
         object.__setattr__(self, "follow_qpos_alpha", follow)
         object.__setattr__(self, "degraded_speed_scale", degraded)
+        object.__setattr__(
+            self,
+            "sample_aligned_scale_degraded_target",
+            bool(self.sample_aligned_scale_degraded_target),
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_jerk_regularization",
+            jerk_regularization,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_jerk_delta_regularization",
+            jerk_delta_regularization,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_terminal_velocity_regularization",
+            terminal_velocity_regularization,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_terminal_acceleration_regularization",
+            terminal_acceleration_regularization,
+        )
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        payload = {
             "planner": self.planner,
             "reference_max_age_sec": self.reference_max_age_sec,
             "canfd_follow": self.canfd_follow,
@@ -359,6 +502,28 @@ class RM65PositionCommandExecutionProfile:
             "follow_qpos_alpha": self.follow_qpos_alpha,
             "degraded_speed_scale": self.degraded_speed_scale,
         }
+        sample_aligned_v2 = (
+            not self.sample_aligned_scale_degraded_target
+            or self.sample_aligned_jerk_regularization != 1e-9
+            or self.sample_aligned_jerk_delta_regularization != 0.0
+            or self.sample_aligned_terminal_velocity_regularization != 0.0
+            or self.sample_aligned_terminal_acceleration_regularization != 0.0
+        )
+        if sample_aligned_v2:
+            payload["sample_aligned_governor"] = {
+                "scale_degraded_target": self.sample_aligned_scale_degraded_target,
+                "jerk_regularization": self.sample_aligned_jerk_regularization,
+                "jerk_delta_regularization": (
+                    self.sample_aligned_jerk_delta_regularization
+                ),
+                "terminal_velocity_regularization": (
+                    self.sample_aligned_terminal_velocity_regularization
+                ),
+                "terminal_acceleration_regularization": (
+                    self.sample_aligned_terminal_acceleration_regularization
+                ),
+            }
+        return payload
 
 
 @dataclass(frozen=True)
@@ -449,15 +614,86 @@ RM65_BIMANUAL_POSITION_V2_RESPONSIVE = RM65BimanualPositionProfile(
     ),
 )
 
+# Opt-in execution experiment.  Source shaping and IK stay byte-for-byte equal
+# to V1; only accepted-qref execution changes.  A 15 Hz source cut is projected
+# onto the 120 Hz position/velocity/acceleration/jerk reachable set, and its
+# admitted endpoint becomes the recorded main action.  Selecting V1 is the
+# complete rollback.
+RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1 = (
+    RM65BimanualPositionProfile(
+        name=RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME,
+        rates=PositionControlRates(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            ik_hz=60.0,
+            command_hz=120.0,
+        ),
+        command_execution=RM65PositionCommandExecutionProfile(
+            planner=POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+            target_velocity_filter_tau_sec=0.0,
+            # The jerk bound is max_acceleration / ramp.  The 50 ms initial
+            # value is the only tracking-oriented point already rerun on all
+            # 115 offline episodes: zero q/v/a/jerk/collision failures, while
+            # the worst stored-action pose lag stayed below 2.756 mm / 0.831°.
+            # 75/100 ms remain explicit research overrides for more smoothing.
+            velocity_ramp_sec=0.05,
+            follow_qpos_alpha=1.0,
+        ),
+    )
+)
+
+# Reversible successor to the first sample-aligned experiment.  It restores
+# the responsive normal source path, lets an inactive tracker's frozen target
+# converge to task-scale tolerance, preserves the full admitted target in
+# degraded mode, and adds only soft QP smoothness costs.  All hard position,
+# velocity, acceleration, jerk, collision and singularity contracts remain
+# unchanged.  Selecting the V1 profile atomically restores the old behavior.
+RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2 = (
+    RM65BimanualPositionProfile(
+        name=RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME,
+        rates=RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1.rates,
+        source_shaping=RM65PositionSourceShapingProfile(
+            post_ik_qpos_normal_fast_path=True,
+            post_ik_qpos_normal_fast_path_alpha=0.70,
+            post_ik_qpos_normal_fast_path_guard_deg=4.0,
+            post_ik_qpos_normal_fast_path_quality_grace_sec=0.05,
+            wrist_q5_hysteresis_requires_escape_latch=True,
+            inactive_execution_release_translation_static_m=0.0015,
+            inactive_execution_release_translation_full_m=0.012,
+            inactive_execution_release_rotation_static_deg=0.25,
+            inactive_execution_release_rotation_full_deg=2.0,
+        ),
+        command_execution=RM65PositionCommandExecutionProfile(
+            planner=POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+            target_velocity_filter_tau_sec=0.0,
+            velocity_ramp_sec=0.05,
+            follow_qpos_alpha=1.0,
+            sample_aligned_scale_degraded_target=False,
+            sample_aligned_jerk_regularization=1e-6,
+            sample_aligned_jerk_delta_regularization=1e-5,
+            sample_aligned_terminal_velocity_regularization=0.0,
+            sample_aligned_terminal_acceleration_regularization=0.0,
+        ),
+    )
+)
+
 RM65_BIMANUAL_POSITION_PROFILES = {
     RM65_BIMANUAL_POSITION_V1.name: RM65_BIMANUAL_POSITION_V1,
     RM65_BIMANUAL_POSITION_V2_RESPONSIVE.name: (
         RM65_BIMANUAL_POSITION_V2_RESPONSIVE
     ),
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1.name: (
+        RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1
+    ),
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2.name: (
+        RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2
+    ),
 }
 RM65_POSITION_CONTROL_PROFILE_CHOICES = (
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME,
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME,
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME,
     LEGACY_POSITION_CONTROL_PROFILE_NAME,
 )
 
@@ -482,6 +718,10 @@ __all__ = [
     "RM65_BIMANUAL_POSITION_V1_QREF_PROFILE",
     "RM65_BIMANUAL_POSITION_V2_RESPONSIVE",
     "RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME",
+    "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1",
+    "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME",
+    "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2",
+    "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME",
     "RM65_POSITION_CONTROL_PROFILE_CHOICES",
     "RM65BimanualPositionProfile",
     "RM65PositionCommandExecutionProfile",

@@ -207,6 +207,7 @@ def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_pat
             shared_slot_count=2,
             shared_slot_bytes=4096,
             worker_nice=0,
+            sample_acceptance_receipt_capacity=4,
         ),
     )
     assert sample_builder_config.camera_buffers == {"front": camera_buffer}
@@ -215,7 +216,8 @@ def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_pat
     try:
         worker.start()
         episode_index = worker.start_episode({"formal_dataset": True})
-        assert worker.submit_snapshot(_snapshot()) is True
+        snapshot = _snapshot()
+        assert worker.submit_snapshot(snapshot) is True
         worker.flush()
         stats = worker.stats()
         assert stats.submitted_samples == 1
@@ -225,6 +227,13 @@ def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_pat
         assert stats.shared_payload_bytes["p50"] > 8 * 12 * 3
         assert stats.timing_ms["parent.pack_shared"]["count"] == 1
         assert stats.timing_ms["worker.handle.lerobot_v21.tactile_frame"]["count"] == 1
+        accepted = worker.drain_sample_acceptance_receipts()
+        assert len(accepted) == 1
+        assert accepted[0].episode_index == episode_index
+        assert accepted[0].sample_index == 0
+        assert accepted[0].episode_frame_index == 0
+        assert accepted[0].sample_timestamp == snapshot.step_result.timestamp
+        assert worker.drain_sample_acceptance_receipts() == ()
         # Pause/resume uses this ordered control message before accepting the
         # next continuity segment in the same episode.
         worker.reset_temporal_history()
@@ -274,6 +283,7 @@ def test_process_worker_rejects_stale_v22_sample_without_poisoning_worker(tmp_pa
             shared_slot_count=2,
             shared_slot_bytes=65536,
             worker_nice=0,
+            sample_acceptance_receipt_capacity=4,
         ),
     )
     try:
@@ -287,6 +297,7 @@ def test_process_worker_rejects_stale_v22_sample_without_poisoning_worker(tmp_pa
         assert stale_stats.worker_error is None
         assert stale_stats.sample_rejections == 1
         assert stale_stats.completed_samples == 0
+        assert worker.drain_sample_acceptance_receipts() == ()
 
         assert worker.submit_snapshot(
             _strict_snapshot(timestamp=timestamp + 0.1, joint_timestamp=timestamp + 0.0)
@@ -297,6 +308,9 @@ def test_process_worker_rejects_stale_v22_sample_without_poisoning_worker(tmp_pa
         assert valid_stats.sample_rejections == 1
         assert valid_stats.completed_samples == 1
         assert valid_stats.active_episode_frame_count == 1
+        accepted = worker.drain_sample_acceptance_receipts()
+        assert len(accepted) == 1
+        assert accepted[0].sample_timestamp == pytest.approx(timestamp + 0.1)
         worker.finalize_episode(episode_index, summary={"test": True})
     finally:
         worker.close()

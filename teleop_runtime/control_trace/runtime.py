@@ -172,6 +172,7 @@ class ControlTraceRuntime:
         self._durable_high_watermark = 0
         self._rejected_sequences: set[int] = set()
         self._entries: list[ControlTraceJournalEntry] = []
+        self._entry_by_sequence: dict[int, ControlTraceJournalEntry] = {}
         self._receipts: list[TraceAdmissionReceipt] = []
         self._fact_ids: set[str] = set()
         self._terminal_accepted = False
@@ -182,6 +183,23 @@ class ControlTraceRuntime:
     def episode_membership(self) -> EpisodeTraceMembership | None:
         with self._lock:
             return self._membership
+
+    @property
+    def resident_entry_count(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    @property
+    def issued_sequence(self) -> int:
+        with self._lock:
+            return self._issued
+
+    @property
+    def sink_durable_high_watermark(self) -> int:
+        """Return the durable prefix without materializing a diagnostic snapshot."""
+
+        with self._lock:
+            return self._durable_high_watermark
 
     def bind_episode(self, membership: EpisodeTraceMembership) -> TraceAdmissionReceipt:
         """Bind externally owned episode membership without owning its lifecycle."""
@@ -335,13 +353,13 @@ class ControlTraceRuntime:
                     message="Bounded in-memory journal is full.",
                 )
 
-            self._entries.append(
-                ControlTraceJournalEntry(
-                    journal_sequence=issued,
-                    fact=fact,
-                    episode_membership=self._membership,
-                )
+            entry = ControlTraceJournalEntry(
+                journal_sequence=issued,
+                fact=fact,
+                episode_membership=self._membership,
             )
+            self._entries.append(entry)
+            self._entry_by_sequence[issued] = entry
             self._fact_ids.add(fact.fact_id)
             self._accepted_sequences.add(issued)
             while self._accepted_high_watermark + 1 in self._accepted_sequences:
@@ -424,14 +442,7 @@ class ControlTraceRuntime:
         with self._lock:
             if self._durable_sink_id is None or normalized_sink != self._durable_sink_id:
                 raise ValueError("Durability acknowledgement comes from an unregistered sink.")
-            entry = next(
-                (
-                    item
-                    for item in self._entries
-                    if item.journal_sequence == sequence
-                ),
-                None,
-            )
+            entry = self._entry_by_sequence.get(sequence)
             if entry is None:
                 raise ValueError("Durability acknowledgement references an unaccepted sequence.")
         record = entry.materialize(trace_session_id=self.session.trace_session_id)

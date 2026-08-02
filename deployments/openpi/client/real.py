@@ -7,7 +7,12 @@ from typing import Any
 
 from deployments.client import load_policy_artifact
 from deployments.openpi.client.preflight import preflight_policy_artifact
+from dataset_contracts.model_continuation import (
+    MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
+    normalize_model_continuation_contract,
+)
 from robot_motion.deploy.async_producer import (
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
 )
@@ -236,19 +241,21 @@ def main(argv: list[str] | None = None) -> int:
             "off",
             RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
             RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+            MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
         ),
         default=None,
         help=(
             "Optional default-off shared deployment RTC profile. The OpenPI raw-RTC "
-            "profile keeps the existing final-chunk model/server interface and only "
-            "moves inference into the client worker/timed plan."
+            "profile keeps the existing final-chunk model/server interface; the "
+            "model-RTC profile additionally uses the artifact-bound conditioned "
+            "provider without changing dispatch authority."
         ),
     )
     parser.add_argument(
         "--rtc-real-shadow",
         action="store_true",
         help=(
-            "Explicit live observation/transport no-action shadow for the raw RTC "
+            "Explicit live observation/transport no-action shadow for a model-backed RTC "
             "profile. The checked-in real profile omits qpos-init authority in this mode."
         ),
     )
@@ -304,10 +311,13 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_real_policy(["--help"])
 
-    if args.rtc_real_shadow and args.rtc_profile != RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
+    model_transport_profiles = {
+        RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+        MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+    }
+    if args.rtc_real_shadow and args.rtc_profile not in model_transport_profiles:
         parser.error(
-            "--rtc-real-shadow requires "
-            f"--rtc-profile {RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1}."
+            "--rtc-real-shadow requires a raw or conditioned model RTC profile."
         )
 
     if (
@@ -324,6 +334,28 @@ def main(argv: list[str] | None = None) -> int:
     if artifact_path is not None and not artifact_path.is_file():
         parser.error(f"policy artifact does not exist or is not a file: {artifact_path}")
     policy_artifact = None if artifact_path is None else load_policy_artifact(artifact_path)
+    if (
+        args.rtc_profile
+        == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+        and policy_artifact is not None
+        and policy_artifact.model_continuation is not None
+        and normalize_model_continuation_contract(
+            policy_artifact.model_continuation
+        ).conditioning_origin
+        == MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
+    ):
+        from deployments.openpi.training import (
+            verify_openpi_model_rtc_checkpoint,
+        )
+
+        evidence = verify_openpi_model_rtc_checkpoint(
+            artifact_path.parent
+        )
+        if evidence.artifact.to_dict() != policy_artifact.to_dict():
+            parser.error(
+                "Verified trained model-RTC artifact differs from the "
+                "requested policy artifact."
+            )
     if args.contract_check_only:
         if policy_artifact is None:
             parser.error(
@@ -412,11 +444,36 @@ def main(argv: list[str] | None = None) -> int:
         runtime_args.append("--rtc-real-shadow")
 
     rtc_model_adapter_factory = None
-    if args.rtc_profile == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
+    if args.rtc_profile in model_transport_profiles:
         normalization_hash = _optional_text(args.rtc_normalization_hash)
+        if (
+            args.rtc_profile
+            == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+        ):
+            if (
+                policy_artifact is None
+                or policy_artifact.model_continuation is None
+            ):
+                parser.error(
+                    "model-RTC requires an artifact-bound continuation contract."
+                )
+            contract_normalization_hash = (
+                normalize_model_continuation_contract(
+                    policy_artifact.model_continuation
+                ).runtime.normalization_hash
+            )
+            if (
+                normalization_hash is not None
+                and normalization_hash != contract_normalization_hash
+            ):
+                parser.error(
+                    "--rtc-normalization-hash disagrees with the model-RTC "
+                    "artifact continuation contract."
+                )
+            normalization_hash = contract_normalization_hash
         explicit_frame_hash = _optional_text(args.rtc_frame_contract_hash)
 
-        def _create_openpi_raw_rtc_adapter(**factory_kwargs: Any):
+        def _create_openpi_rtc_adapter(**factory_kwargs: Any):
             policy = factory_kwargs["policy"]
             session_contract = factory_kwargs["deploy_session_contract"]
             runtime_args = factory_kwargs["args"]
@@ -436,28 +493,41 @@ def main(argv: list[str] | None = None) -> int:
                     "OpenPI raw-RTC could not resolve a frame identity; pass "
                     "--rtc-frame-contract-hash for an explicitly bound identity artifact."
                 )
-            creator = getattr(policy, "create_raw_rtc_adapter", None)
+            creator_name = (
+                "create_model_rtc_adapter"
+                if args.rtc_profile
+                == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+                else "create_raw_rtc_adapter"
+            )
+            creator = getattr(policy, creator_name, None)
             if not callable(creator):
                 raise TypeError(
-                    "The selected OpenPI policy does not expose the raw-RTC adapter seam."
+                    "The selected OpenPI policy does not expose the requested "
+                    f"RTC adapter seam {creator_name!r}."
                 )
             action_pose_mode = str(
                 getattr(runtime_args, "policy_action_pose_mode", "absolute")
             ).strip().lower()
-            result_action_representation = (
-                "typed_canonical_v1"
-                if action_pose_mode == "relative"
-                else "legacy_normalized_v1"
-            )
+            creator_kwargs = {
+                "frame_contract_hash": str(frame_hash),
+                "normalization_hash": str(normalization_hash),
+                "active_sides": tuple(factory_kwargs["active_sides"]),
+                "action_pose_mode": action_pose_mode,
+            }
+            if (
+                args.rtc_profile
+                == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
+            ):
+                creator_kwargs["result_action_representation"] = (
+                    "typed_canonical_v1"
+                    if action_pose_mode == "relative"
+                    else "legacy_normalized_v1"
+                )
             return creator(
-                frame_contract_hash=str(frame_hash),
-                normalization_hash=str(normalization_hash),
-                active_sides=tuple(factory_kwargs["active_sides"]),
-                action_pose_mode=action_pose_mode,
-                result_action_representation=result_action_representation,
+                **creator_kwargs,
             )
 
-        rtc_model_adapter_factory = _create_openpi_raw_rtc_adapter
+        rtc_model_adapter_factory = _create_openpi_rtc_adapter
 
     delegated_args = [
         "--policy",

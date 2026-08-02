@@ -118,7 +118,11 @@ from .candidate_authorization import (
     CandidateAuthorizationDraft,
     CandidateAuthorizationStore,
 )
-from .executor import RobotActionResolver
+from .executor import (
+    ActionResolutionError,
+    ActionResolutionFailure,
+    RobotActionResolver,
+)
 from .persistence import (
     ActionPersistencePolicy,
     ActiveExecutionSegment,
@@ -266,6 +270,7 @@ class AuthoritativeControlStep:
     target_completion_receipt: TargetExecutionCompletionReceipt | None = None
     target_dispatch_result: TargetExecutionDispatchResult | None = None
     safety_result: SharedCanonicalSafetyResult | None = None
+    resolution_failure: ActionResolutionFailure | None = None
     command: TeleopCommand | None = None
     dispatch_context: (
         AuthoritativeCommandDispatchContext
@@ -1846,15 +1851,11 @@ class AuthoritativeControlRuntime:
             )
 
         if compound_profile is not None:
-            expected_effectors = tuple(
-                component.component_id
-                for component in (
-                    self.config.action_schema.component_catalog.components
-                )
-            )
             if (
-                tuple(safety_result.safe_action.active_effectors)
-                != expected_effectors
+                set(safety_result.safe_action.active_effectors)
+                != set(
+                    self.action_representation_adapter.expected_output_effectors
+                )
             ):
                 target_completion_receipt = None
                 if (
@@ -1930,12 +1931,17 @@ class AuthoritativeControlRuntime:
                 )
         try:
             command = self.resolver.resolve(safety_result.safe_action)
-        except Exception:
+        except Exception as error:
             if (
                 compound_profile is None
                 and target_execution_request is None
             ):
                 raise
+            resolution_failure = (
+                error.failure
+                if isinstance(error, ActionResolutionError)
+                else None
+            )
             target_completion_receipt = None
             if (
                 target_execution_request is not None
@@ -1952,7 +1958,11 @@ class AuthoritativeControlRuntime:
                         status="failed",
                         completed_at=completed_at,
                         available_at=completed_at,
-                        outcome_code="target_private_resolution_failure",
+                        outcome_code=(
+                            "target_private_resolution_failure"
+                            if resolution_failure is None
+                            else resolution_failure.outcome_code
+                        ),
                     )
                 )
                 step_facts.append(
@@ -1975,6 +1985,7 @@ class AuthoritativeControlRuntime:
                     target_submission_receipt=target_submission_receipt,
                     target_completion_receipt=target_completion_receipt,
                     safety_result=safety_result,
+                    resolution_failure=resolution_failure,
                     trace_facts=tuple(step_facts),
                 )
             failure_fact = self._compound_failure_fact(
@@ -1987,24 +1998,29 @@ class AuthoritativeControlRuntime:
                 ),
             )
             step_facts.append(failure_fact)
-            (
-                cancellation,
-                cancellation_receipt,
-                cancellation_validation,
-                cancellation_facts,
-            ) = self._cancel_execution(
-                reason="hold",
-                authority_epoch=decision.authority_epoch,
-                selection_group_ids=self.config.active_selection_groups,
-                source_event_ids=(
-                    computation.result_id,
-                    publication_attempt.publication_attempt_id,
-                    directive.directive_id,
-                    safety_id,
-                    failure_fact.fact_id,
-                ),
-                force_domain_scope=True,
-            )
+            cancellation = None
+            cancellation_receipt = None
+            cancellation_validation = None
+            cancellation_facts: tuple[ControlTraceFact, ...] = ()
+            if not self._backend_hold_active:
+                (
+                    cancellation,
+                    cancellation_receipt,
+                    cancellation_validation,
+                    cancellation_facts,
+                ) = self._cancel_execution(
+                    reason="hold",
+                    authority_epoch=decision.authority_epoch,
+                    selection_group_ids=self.config.active_selection_groups,
+                    source_event_ids=(
+                        computation.result_id,
+                        publication_attempt.publication_attempt_id,
+                        directive.directive_id,
+                        safety_id,
+                        failure_fact.fact_id,
+                    ),
+                    force_domain_scope=True,
+                )
             step_facts.extend(cancellation_facts)
             self._emit(step_facts)
             return AuthoritativeControlStep(
@@ -2019,6 +2035,7 @@ class AuthoritativeControlRuntime:
                 target_submission_receipt=target_submission_receipt,
                 target_completion_receipt=target_completion_receipt,
                 safety_result=safety_result,
+                resolution_failure=resolution_failure,
                 cancellation=cancellation,
                 cancellation_receipt=cancellation_receipt,
                 cancellation_dispatch_validation=cancellation_validation,

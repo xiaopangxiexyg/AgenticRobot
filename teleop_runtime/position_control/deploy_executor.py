@@ -252,6 +252,9 @@ class _Submission:
     lookahead_observation: DeploymentObservation | None = None
     lookahead_policy_name: str | None = None
     lookahead_discrete_command: TeleopCommand | None = None
+    second_lookahead_source_index: int | None = None
+    second_lookahead_timestamp: float | None = None
+    second_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
     execution_work_item: ExecutionWorkItem | None = None
     lookahead_execution_work_item: ExecutionWorkItem | None = None
 
@@ -662,6 +665,8 @@ class PositionDeployExecutor:
         lookahead_filtered: FilteredNormalizedAction | None = None,
         lookahead_observation: DeploymentObservation | None = None,
         lookahead_discrete_command: TeleopCommand | None = None,
+        second_lookahead_filtered: FilteredNormalizedAction | None = None,
+        second_lookahead_observation: DeploymentObservation | None = None,
         execution_work_item: ExecutionWorkItem | None = None,
         lookahead_execution_work_item: ExecutionWorkItem | None = None,
     ) -> int:
@@ -691,6 +696,24 @@ class PositionDeployExecutor:
             DeploymentObservation,
         ):
             raise TypeError("lookahead_observation must be a DeploymentObservation or None")
+        if second_lookahead_filtered is not None and lookahead_filtered is None:
+            raise ValueError(
+                "second_lookahead_filtered requires lookahead_filtered"
+            )
+        if second_lookahead_filtered is not None and not isinstance(
+            second_lookahead_filtered,
+            FilteredNormalizedAction,
+        ):
+            raise TypeError(
+                "second_lookahead_filtered must be a FilteredNormalizedAction or None"
+            )
+        if second_lookahead_observation is not None and not isinstance(
+            second_lookahead_observation,
+            DeploymentObservation,
+        ):
+            raise TypeError(
+                "second_lookahead_observation must be a DeploymentObservation or None"
+            )
         if filtered.faults:
             self.latch_safety_fault(
                 filtered.faults,
@@ -705,6 +728,16 @@ class PositionDeployExecutor:
             raise PositionDeployExecutorFault(
                 "cannot stage a lookahead keyframe with safety faults: "
                 + ", ".join(str(fault) for fault in lookahead_filtered.faults)
+            )
+        if (
+            second_lookahead_filtered is not None
+            and second_lookahead_filtered.faults
+        ):
+            raise PositionDeployExecutorFault(
+                "cannot stage a second lookahead keyframe with safety faults: "
+                + ", ".join(
+                    str(fault) for fault in second_lookahead_filtered.faults
+                )
             )
         if lookahead_discrete_command is not None and lookahead_filtered is None:
             raise ValueError(
@@ -795,6 +828,21 @@ class PositionDeployExecutor:
                 lookahead_filtered,
                 resolved_lookahead_observation,
             )
+        resolved_second_lookahead_observation = (
+            resolved_lookahead_observation
+            if second_lookahead_observation is None
+            else second_lookahead_observation
+        )
+        second_lookahead_pose_by_side: Mapping[str, np.ndarray] = {}
+        second_lookahead_qpos_by_side: Mapping[str, np.ndarray] = {}
+        if second_lookahead_filtered is not None:
+            (
+                second_lookahead_pose_by_side,
+                second_lookahead_qpos_by_side,
+            ) = self._target_maps(
+                second_lookahead_filtered,
+                resolved_second_lookahead_observation,
+            )
         try:
             self._validate_observation_reference_domain(
                 observation,
@@ -816,6 +864,13 @@ class PositionDeployExecutor:
                 qpos_sides=tuple(lookahead_qpos_by_side),
                 require_fresh_measurement=False,
             )
+        if second_lookahead_filtered is not None:
+            self._validate_observation_reference_domain(
+                resolved_second_lookahead_observation,
+                pose_sides=tuple(second_lookahead_pose_by_side),
+                qpos_sides=tuple(second_lookahead_qpos_by_side),
+                require_fresh_measurement=False,
+            )
         signature = (tuple(sorted(pose_by_side)), tuple(sorted(qpos_by_side)))
         lookahead_signature = (
             tuple(sorted(lookahead_pose_by_side)),
@@ -824,6 +879,17 @@ class PositionDeployExecutor:
         if lookahead_filtered is not None and lookahead_signature != signature:
             raise ValueError(
                 "current and lookahead pose/qpos side modalities must match"
+            )
+        second_lookahead_signature = (
+            tuple(sorted(second_lookahead_pose_by_side)),
+            tuple(sorted(second_lookahead_qpos_by_side)),
+        )
+        if (
+            second_lookahead_filtered is not None
+            and second_lookahead_signature != signature
+        ):
+            raise ValueError(
+                "current and second lookahead pose/qpos side modalities must match"
             )
         if self.config.collision_required:
             if qpos_by_side:
@@ -841,6 +907,13 @@ class PositionDeployExecutor:
             }:
                 raise ValueError(
                     "collision-required lookahead needs left+right target poses"
+                )
+            if (
+                second_lookahead_filtered is not None
+                and set(second_lookahead_pose_by_side) != {"left", "right"}
+            ):
+                raise ValueError(
+                    "collision-required second lookahead needs left+right target poses"
                 )
 
         with self._lock:
@@ -964,6 +1037,17 @@ class PositionDeployExecutor:
                 lookahead_timestamp = (
                     float(logical_timestamp) + self.config.sample_period_sec
                 )
+            second_lookahead_source_index: int | None = None
+            second_lookahead_timestamp: float | None = None
+            if second_lookahead_filtered is not None:
+                # This successor is speculative path-planner input only.  Do
+                # not reserve the source index: on the next pop it becomes
+                # the ordinary first lookahead at exactly this index.
+                second_lookahead_source_index = next_source_index
+                second_lookahead_timestamp = (
+                    float(logical_timestamp)
+                    + 2.0 * self.config.sample_period_sec
+                )
 
             submission = _Submission(
                 generation=self._generation,
@@ -1016,6 +1100,13 @@ class PositionDeployExecutor:
                     None
                     if lookahead_discrete_command is None
                     else _copy_teleop_command(lookahead_discrete_command)
+                ),
+                second_lookahead_source_index=second_lookahead_source_index,
+                second_lookahead_timestamp=second_lookahead_timestamp,
+                second_lookahead_pose_by_side=(
+                    None
+                    if second_lookahead_filtered is None
+                    else dict(second_lookahead_pose_by_side)
                 ),
                 execution_work_item=execution_work_item,
                 lookahead_execution_work_item=lookahead_execution_work_item,
@@ -1093,6 +1184,9 @@ class PositionDeployExecutor:
                     "lookahead_source_index": lookahead_source_index,
                     "lookahead_timestamp_monotonic": lookahead_timestamp,
                     "same_chunk_lookahead": bool(lookahead_filtered is not None),
+                    "same_chunk_second_lookahead": bool(
+                        second_lookahead_filtered is not None
+                    ),
                     "current_already_staged": bool(current_already_staged),
                     "queue_depth": int(self._queue.qsize()),
                 },
@@ -1552,7 +1646,20 @@ class PositionDeployExecutor:
                 "chunk_lookahead_enabled": bool(
                     self.config.chunk_lookahead_enabled
                 ),
-                "no_temporal_smoothing": True,
+                "no_temporal_smoothing": bool(
+                    self._last_collision_metadata is None
+                    or self._last_collision_metadata.get(
+                        "no_temporal_smoothing",
+                        True,
+                    )
+                ),
+                "temporal_smoothing": (
+                    None
+                    if self._last_collision_metadata is None
+                    else self._last_collision_metadata.get(
+                        "temporal_smoothing"
+                    )
+                ),
                 "endpoint_collision_certified": bool(
                     self._last_collision_metadata is not None
                     and self._last_collision_metadata.get(
@@ -2368,6 +2475,47 @@ class PositionDeployExecutor:
                     "collision_planner_reset",
                     reset_metadata,
                 )
+            planner = self._collision_planner
+            stage_source_pose = (
+                None
+                if planner is None
+                else getattr(planner, "stage_source_pose", None)
+            )
+            if callable(stage_source_pose):
+                staged_sources = (
+                    (
+                        submission.anchor_source_index,
+                        submission.anchor_timestamp,
+                        submission.anchor_pose_by_side,
+                    ),
+                    (
+                        submission.source_index,
+                        (
+                            submission.timestamp
+                            if submission.logical_timestamp is None
+                            else submission.logical_timestamp
+                        ),
+                        submission.pose_by_side,
+                    ),
+                    (
+                        submission.lookahead_source_index,
+                        submission.lookahead_timestamp,
+                        submission.lookahead_pose_by_side,
+                    ),
+                    (
+                        submission.second_lookahead_source_index,
+                        submission.second_lookahead_timestamp,
+                        submission.second_lookahead_pose_by_side,
+                    ),
+                )
+                for source_index, source_timestamp, poses in staged_sources:
+                    if source_index is None or source_timestamp is None or not poses:
+                        continue
+                    stage_source_pose(
+                        source_index=int(source_index),
+                        source_timestamp=float(source_timestamp),
+                        pose_by_side=poses,
+                    )
             template = _ReferenceTemplate(
                 filtered=submission.filtered,
                 observation=submission.observation,
@@ -3057,16 +3205,32 @@ class PositionDeployExecutor:
                         "collision planner is not reset from complete dual-arm qpos"
                     )
                 try:
-                    collision_result = planner.plan_pose_reference(
-                        pose_ref.pose_by_side,
-                        target_reference_frame="arm_base",
-                        target_controlled_frame="tool_tcp",
-                        source_timestamp=float(query),
-                        source=(
-                            f"deploy_pose_reference_{_rate_label(self.config.reference_hz)}hz"
-                        ),
-                        metadata=metadata,
+                    plan_horizon = getattr(
+                        planner,
+                        "plan_pose_reference_horizon",
+                        None,
                     )
+                    if callable(plan_horizon):
+                        collision_result = plan_horizon(
+                            pose_ref,
+                            source_timestamp=float(query),
+                            source=(
+                                "deploy_official_source_all_ik_governor_"
+                                f"{_rate_label(self.config.reference_hz)}hz"
+                            ),
+                            metadata=metadata,
+                        )
+                    else:
+                        collision_result = planner.plan_pose_reference(
+                            pose_ref.pose_by_side,
+                            target_reference_frame="arm_base",
+                            target_controlled_frame="tool_tcp",
+                            source_timestamp=float(query),
+                            source=(
+                                f"deploy_pose_reference_{_rate_label(self.config.reference_hz)}hz"
+                            ),
+                            metadata=metadata,
+                        )
                 except Exception as exc:
                     self._notify_reference_resolution_failure_observer(
                         derivations=reference_derivations,
@@ -3642,6 +3806,13 @@ class PositionDeployExecutor:
         endpoint_passed = bool(
             planner_metadata.get("endpoint_collision_passed", False)
         ) and not hold
+        segment_checked = bool(
+            planner_metadata.get("segment_collision_checked", False)
+        )
+        segment_certified = bool(
+            planner_metadata.get("segment_collision_certified", False)
+        ) and not hold
+        temporal_smoothing = planner_metadata.get("temporal_smoothing")
         summary: dict[str, Any] = {
             "position_collision_planner": str(
                 planner_metadata.get("planner", "rm65_coupled_position_collision")
@@ -3667,15 +3838,22 @@ class PositionDeployExecutor:
             ),
             "position_endpoint_collision_checked": endpoint_checked,
             "position_endpoint_collision_passed": endpoint_passed,
-            "position_segment_collision_checked": False,
-            "position_segment_collision_certified": False,
+            "position_segment_collision_checked": segment_checked,
+            "position_segment_collision_certified": segment_certified,
             "position_collision_certification_status": (
-                "reference_endpoint_only_segment_not_certified"
+                "endpoint_and_sampled_interval_certified"
+                if segment_checked and segment_certified
+                else (
+                    "endpoint_and_sampled_interval_checked_not_continuous"
+                    if segment_checked
+                    else "reference_endpoint_only_segment_not_certified"
+                )
             ),
             "position_collision_geometry_model": "selected_scene_profile_fixed_geometry",
             "position_arbitrary_tool_geometry_certified": False,
-            "temporal_smoothing_applied": False,
-            "no_temporal_smoothing": True,
+            "temporal_smoothing_applied": temporal_smoothing is not None,
+            "temporal_smoothing": temporal_smoothing,
+            "no_temporal_smoothing": temporal_smoothing is None,
         }
         if self.config.debug_events_enabled:
             summary["position_collision_debug"] = {

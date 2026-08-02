@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import time
 
 import numpy as np
@@ -153,6 +154,7 @@ def _reset_runtime_motion_state_from_real_qpos(
     components: RealTeleopComponents,
     *,
     required: bool,
+    qpos_snapshot: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, bool]:
     reset_start = time.perf_counter()
     synced = {side: False for side in components.active_sides}
@@ -162,15 +164,28 @@ def _reset_runtime_motion_state_from_real_qpos(
         state_backend = components.left_state_backend if side == "left" else components.right_state_backend
         preview_backend = components.left_preview_backend if side == "left" else components.right_preview_backend
         command_backend = _command_backend_for_side(components, side)
-        if state_backend is None:
-            if required:
-                raise RuntimeError(f"{side}_arm has no real state backend for runtime restart.")
-            timing_parts.append(f"{side}:missing_state_backend")
-            continue
-        refresh_start = time.perf_counter()
-        state = state_backend.refresh_state_from_hardware()
-        refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
-        qpos = state.get("current_qpos")
+        if qpos_snapshot is not None:
+            qpos = qpos_snapshot.get(side)
+            refresh_elapsed_ms = 0.0
+            qpos_source = "atomic_home_snapshot"
+            if qpos is None:
+                if required:
+                    raise RuntimeError(
+                        f"{side}_arm is missing from the atomic runtime Home snapshot."
+                    )
+                timing_parts.append(f"{side}:missing_atomic_home_snapshot")
+                continue
+        else:
+            if state_backend is None:
+                if required:
+                    raise RuntimeError(f"{side}_arm has no real state backend for runtime restart.")
+                timing_parts.append(f"{side}:missing_state_backend")
+                continue
+            refresh_start = time.perf_counter()
+            state = state_backend.refresh_state_from_hardware()
+            refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
+            qpos = state.get("current_qpos")
+            qpos_source = "hardware_reread"
         if qpos is None:
             if required:
                 raise RuntimeError(
@@ -227,7 +242,8 @@ def _reset_runtime_motion_state_from_real_qpos(
         timing_parts.append(
             f"{side}:total={(time.perf_counter() - side_start) * 1000.0:.1f}ms "
             f"refresh={refresh_elapsed_ms:.1f}ms "
-            f"reset={reset_side_elapsed_ms:.1f}ms"
+            f"reset={reset_side_elapsed_ms:.1f}ms "
+            f"source={qpos_source}"
         )
     sync_start = time.perf_counter()
     _sync_dual_arm_retargeter_for_real_control(components)

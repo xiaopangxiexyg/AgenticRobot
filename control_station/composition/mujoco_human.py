@@ -7,6 +7,7 @@ The module is an application leaf: it may import both ``sim`` and
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any, Mapping
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import (
@@ -200,6 +201,8 @@ def build_mujoco_component_human_proposal_adapter(
     *,
     producer_id: str | None = None,
     producer_epoch: int | None = None,
+    component_id_by_effector: Mapping[str, str] | None = None,
+    component_action_projector: Any | None = None,
 ) -> HumanProposalAdapter:
     """Bind one pose-arm + qpos-hand source to an opt-in compound target.
 
@@ -213,39 +216,66 @@ def build_mujoco_component_human_proposal_adapter(
         raise TypeError("runtime must be a MujocoDeployRuntime.")
     if not isinstance(source_spec, PassiveTeleopComponentSourceSpec):
         raise TypeError("source_spec must be a PassiveTeleopComponentSourceSpec.")
-    target_components = {
-        component.component_id: component
-        for component in runtime.catalog.components
-    }
     source_components = {
-        component.component_id: component
+        component.effector_name: component
         for component in source_spec.components
     }
-    if set(source_components) != set(target_components):
+    target_effectors = {
+        component.effector_name: component
+        for component in runtime.catalog.components
+    }
+    if set(source_components) != set(target_effectors):
         raise ValueError(
-            "Compound human source must exactly cover the target components."
+            "Compound human source must exactly cover the target effectors."
         )
-    if {
-        component_id: item.effector_name
-        for component_id, item in source_components.items()
-    } != {
-        component_id: item.effector_name
-        for component_id, item in target_components.items()
-    }:
-        raise ValueError("Compound human source effector mapping mismatch.")
-    target_spec_hashes = dict(
-        runtime.target_runtime_action_contract.action_spec_hash_by_component
+    mapping = (
+        {
+            effector: target_effectors[effector].component_id
+            for effector in target_effectors
+        }
+        if component_id_by_effector is None
+        else {
+            str(effector).strip(): str(component_id).strip()
+            for effector, component_id in dict(
+                component_id_by_effector
+            ).items()
+        }
     )
-    if {
-        component_id: item.action_spec_hash
-        for component_id, item in source_components.items()
-    } != target_spec_hashes:
-        raise ValueError("Compound human action specs mismatch the target contract.")
     if (
-        source_spec.units_convention_id
-        != runtime.target_runtime_action_contract.units_convention_id
+        set(mapping) != set(source_components)
+        or set(mapping.values()) != set(runtime.action_schema.component_ids)
     ):
-        raise ValueError("Compound human units mismatch the target contract.")
+        raise ValueError(
+            "Human effector/component mapping must exactly cover source and "
+            "target schemas."
+        )
+    projection_hash = (
+        None
+        if component_action_projector is None
+        else str(
+            getattr(
+                component_action_projector,
+                "semantic_content_hash",
+                "",
+            )
+        ).strip()
+    )
+    if projection_hash is None:
+        target_spec_hashes = dict(
+            runtime.target_runtime_action_contract.action_spec_hash_by_component
+        )
+        if {
+            mapping[effector]: item.action_spec_hash
+            for effector, item in source_components.items()
+        } != target_spec_hashes:
+            raise ValueError(
+                "Compound human action specs mismatch the target contract."
+            )
+        if (
+            source_spec.units_convention_id
+            != runtime.target_runtime_action_contract.units_convention_id
+        ):
+            raise ValueError("Compound human units mismatch the target contract.")
     arm_specs = source_spec.arm_action_specs_by_side
     hand_specs = source_spec.hand_action_specs_by_side
     if not arm_specs or not hand_specs:
@@ -271,6 +301,8 @@ def build_mujoco_component_human_proposal_adapter(
             effective_clock_domain_id=runtime.config.clock_domain_id,
             component_catalog=runtime.catalog,
             action_schema=runtime.action_schema,
+            component_id_by_effector=mapping,
+            component_projection_contract_hash=projection_hash,
             action_adapter=TeleopCommandActionAdapterConfig(
                 arm_joint_policy="source_pose_when_available",
                 arm_specs=arm_specs,
@@ -278,7 +310,8 @@ def build_mujoco_component_human_proposal_adapter(
                 source="human",
                 include_command_metadata=False,
             ),
-        )
+        ),
+        component_action_projector=component_action_projector,
     )
 
 

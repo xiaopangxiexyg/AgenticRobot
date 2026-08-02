@@ -14,7 +14,7 @@ from robot_motion.runtime.lifecycle import (
 
 from ..session import SessionStepResult
 from .action_record import build_collection_action_record
-from .async_writer import AsyncWriterPool, WriteJob
+from collection_runtime.async_writer import AsyncWriterPool, WriteJob
 from .build_collect_components import CollectorComponents
 
 

@@ -9,13 +9,22 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Iterable, MutableMapping
+from typing import Iterable, Mapping, MutableMapping
 
 import numpy as np
 
+from control_station.umi.control_availability import (
+    UmiControlState,
+    active_controls as umi_active_controls,
+)
+from control_station.umi.input_mapping import (
+    UmiOperatorEvent,
+    foot_pad_test_batch_active,
+    merge_operator_events,
+)
 from robot_motion.runtime.contracts import TeleopObservation, merge_teleop_commands
 
-from ...gui.calibration_web_ui import CalibrationWebUi
+from ...operator_ui_ports import OperatorUiPort
 from ...real_teleop.gui_tracker_status import raw_tracker_pose_state_from_channels
 from ..operator_labels import OperatorLabelStateMachine
 from ..episode_curation import EpisodeCurationSession, load_task_variant_profile
@@ -24,6 +33,7 @@ from .components import UmiComponents
 from .config import UmiCollectionConfig
 from .recorder import UmiDatasetRecorder
 from .snapshot import UmiSnapshotAssembler
+from .topology import HAND_EFFECTOR_BY_SIDE, SIDES
 from .types import SnapshotRejection
 
 
@@ -43,7 +53,7 @@ class UmiCollectionController:
         calibration: UmiCalibrationBinding,
         components: UmiComponents,
         recorder: UmiDatasetRecorder,
-        ui: CalibrationWebUi,
+        ui: OperatorUiPort,
         labels: OperatorLabelStateMachine,
         snapshot_assembler: UmiSnapshotAssembler,
         last_commands: MutableMapping[str, float] | None = None,
@@ -165,46 +175,17 @@ class UmiCollectionController:
             and self.plus_curation.pending_episode_index is not None
             and self.plus_curation.status not in {"saving"}
         )
-        if self._calibration_expired:
-            controls = ["q", "umi_recalibrate", "angle_recalibrate"]
-            if plus_save:
-                controls.append("plus_curation_save")
-            return controls
-
-        controls: list[str] = []
-        if not recording:
-            if not self._startup_collection_blockers():
-                controls.append("episode_start")
-            controls.extend(["episode_delete", "device_retry"])
-        else:
-            controls.append("episode_stop")
-        controls.append("q")
-
-        # Foot pads are an additive source for the same label events.  They do
-        # not own or hide the equivalent keyboard/GUI controls.
-        controls.extend(
-            [
-                "c",
-                "g",
-                "fix_arm_toggle",
-                "init_arm_toggle",
-                "fix_arm_select",
-                "init_arm_select",
-            ]
+        return umi_active_controls(
+            UmiControlState(
+                calibration_expired=bool(self._calibration_expired),
+                recording=recording,
+                collection_blocked=bool(self._startup_collection_blockers()),
+                plus_save_available=plus_save,
+                plus_save_in_flight=self._plus_curation_save_in_flight(),
+                foot_pad_online=self._foot_pad_online(),
+                foot_pad_test_active=bool(self._foot_pad_test_active),
+            )
         )
-        if not recording:
-            controls.extend(["umi_recalibrate", "angle_recalibrate"])
-            if self._foot_pad_online():
-                controls.append(
-                    "foot_pad_test_stop"
-                    if self._foot_pad_test_active
-                    else "foot_pad_test_start"
-                )
-        if plus_save:
-            controls.append("plus_curation_save")
-        if self._plus_curation_save_in_flight():
-            controls = [control for control in controls if control != "episode_delete"]
-        return controls
 
     def _startup_collection_blockers(self) -> tuple[str, ...]:
         ignored_cameras = set(getattr(self.config, "ignored_camera_keys", ()) or ())
@@ -427,15 +408,28 @@ class UmiCollectionController:
             "countdown": countdown,
         }
 
-    def _events(self) -> list[tuple[str, str, float]]:
+    def _events(self) -> list[UmiOperatorEvent]:
         now = time.time()
-        events = [(str(event), "web_gui", now) for event in self.ui.consume_events()]
+        web_events = list(self.ui.consume_events())
+        foot_pad_events: list[str] = []
         foot_pad_state_published = False
         if self.components.foot_pad is not None:
-            events.extend(
-                (str(event), "foot_pad", now)
-                for event in self.components.foot_pad.consume_events()
+            foot_pad_events = list(self.components.foot_pad.consume_events())
+        publish_input_activity = getattr(self.ui, "publish_input_activity", None)
+        if callable(publish_input_activity):
+            for event in foot_pad_events:
+                publish_input_activity(
+                    source="foot_pad",
+                    event=str(event),
+                    pedal_count=self._foot_pad_count(),
+                )
+        events = list(
+            merge_operator_events(
+                web_events,
+                foot_pad_events,
+                timestamp=now,
             )
+        )
         if self._foot_pad_test_active and not self._foot_pad_online():
             self._foot_pad_test_active = False
             self._foot_pad_test_status = (
@@ -458,6 +452,52 @@ class UmiCollectionController:
                 )
         return events
 
+    def _apply_dataset_configuration(
+        self,
+        payload: Mapping[str, object],
+        *,
+        include_modality_selection: bool,
+    ) -> Path:
+        """Rebind the idle UMI recorder without changing its task semantics."""
+
+        if self.recorder.recording:
+            raise RuntimeError("cannot switch UMI dataset while an episode is recording")
+        selected_root = str(payload.get("dataset_base_root", "") or "").strip()
+        root = (
+            Path(os.path.expandvars(selected_root)).expanduser()
+            if selected_root
+            else self.config.dataset_root
+        )
+        ignored_cameras: object = list(self.config.ignored_camera_keys)
+        ignored_tactile: object = list(self.config.ignored_tactile_keys)
+        if include_modality_selection:
+            ignored_cameras = payload.get(
+                "ignored_camera_keys",
+                ignored_cameras,
+            )
+            ignored_tactile = payload.get(
+                "ignored_tactile_keys",
+                ignored_tactile,
+            )
+        if not isinstance(ignored_cameras, list) or not isinstance(
+            ignored_tactile, list
+        ):
+            raise ValueError("ignored camera/tactile settings must be lists")
+        next_config = replace(
+            self.config,
+            dataset_root=root,
+            ignored_camera_keys=tuple(str(item) for item in ignored_cameras),
+            ignored_tactile_keys=tuple(str(item) for item in ignored_tactile),
+        )
+        reconfigure = getattr(self.recorder, "reconfigure_config", None)
+        if callable(reconfigure):
+            reconfigure(next_config)
+        else:
+            self.recorder.reconfigure_dataset_root(root)
+        self.config = next_config
+        self.snapshot_assembler.config = next_config
+        return root
+
     def _handle_events(
         self,
         events: Iterable[tuple[str, str, float]],
@@ -469,9 +509,9 @@ class UmiCollectionController:
         # Treat pedal edges sampled in the same cycle as a test start/stop as
         # diagnostics too.  This prevents a browser click racing the input
         # poll from turning one edge into a real annotation.
-        foot_pad_test_batch = self._foot_pad_test_active or any(
-            event in {"foot_pad_test_start", "foot_pad_test_stop"}
-            for event, _source, _timestamp in event_batch
+        foot_pad_test_batch = foot_pad_test_batch_active(
+            event_batch,
+            test_already_active=bool(self._foot_pad_test_active),
         )
         for event, source, timestamp in event_batch:
             if event == "q":
@@ -495,11 +535,11 @@ class UmiCollectionController:
                 self.should_quit = True
             elif event.startswith("fix_arm_select:"):
                 side = event.split(":", 1)[1]
-                if side in {"left", "right"}:
+                if side in set(SIDES):
                     self._selected_label_side["fix"] = side
             elif event.startswith("init_arm_select:"):
                 side = event.split(":", 1)[1]
-                if side in {"left", "right"}:
+                if side in set(SIDES):
                     self._selected_label_side["init"] = side
             elif event in {"c", "fix_arm_toggle"}:
                 self.labels.toggle(
@@ -523,6 +563,35 @@ class UmiCollectionController:
                 )
             elif event == "labels_reset":
                 self.labels.reset(source=source, timestamp=timestamp)
+            elif event == "task_select" or event.startswith("task_select:"):
+                try:
+                    payload_text = event.split(":", 1)[1] if ":" in event else "{}"
+                    payload = json.loads(payload_text)
+                    if not isinstance(payload, Mapping):
+                        raise ValueError("dataset configuration payload must be an object")
+                    root = self._apply_dataset_configuration(
+                        payload,
+                        include_modality_selection=False,
+                    )
+                    self._event_status = "ready"
+                    self._event_message = (
+                        f"UMI 数据集路径已切换为 {root}；Task/Profile 保持当前配置。"
+                    )
+                    append_message = getattr(self.ui, "append_message", None)
+                    if callable(append_message):
+                        append_message("Dataset", self._event_message)
+                except (
+                    json.JSONDecodeError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ) as exc:
+                    self._event_status = "error"
+                    self._event_message = (
+                        "切换 UMI 数据集路径失败："
+                        f"{type(exc).__name__}: {exc}"
+                    )
             elif event.startswith("episode_delete:"):
                 try:
                     episode_index = int(event.split(":", 1)[1])
@@ -580,45 +649,14 @@ class UmiCollectionController:
                     if event.startswith("episode_start:"):
                         try:
                             payload = json.loads(event.split(":", 1)[1])
-                            selected_root = str(
-                                payload.get("dataset_base_root", "")
-                                if isinstance(payload, dict)
-                                else ""
-                            ).strip()
-                            root = (
-                                Path(os.path.expandvars(selected_root)).expanduser()
-                                if selected_root
-                                else self.config.dataset_root
-                            )
-                            ignored_cameras = payload.get(
-                                "ignored_camera_keys",
-                                list(self.config.ignored_camera_keys),
-                            )
-                            ignored_tactile = payload.get(
-                                "ignored_tactile_keys",
-                                list(self.config.ignored_tactile_keys),
-                            )
-                            if not isinstance(ignored_cameras, list) or not isinstance(
-                                ignored_tactile, list
-                            ):
+                            if not isinstance(payload, Mapping):
                                 raise ValueError(
-                                    "ignored camera/tactile settings must be lists"
+                                    "episode start configuration payload must be an object"
                                 )
-                            next_config = replace(
-                                self.config,
-                                dataset_root=root,
-                                ignored_camera_keys=tuple(ignored_cameras),
-                                ignored_tactile_keys=tuple(ignored_tactile),
+                            self._apply_dataset_configuration(
+                                payload,
+                                include_modality_selection=True,
                             )
-                            reconfigure = getattr(
-                                self.recorder, "reconfigure_config", None
-                            )
-                            if callable(reconfigure):
-                                reconfigure(next_config)
-                            else:
-                                self.recorder.reconfigure_dataset_root(root)
-                            self.config = next_config
-                            self.snapshot_assembler.config = next_config
                             if self.plus_curation.enabled and "plus_variant_id" in payload:
                                 variant_id = str(payload.get("plus_variant_id", "") or "").strip()
                                 self.plus_curation.set_variant(variant_id)
@@ -673,7 +711,7 @@ class UmiCollectionController:
                                         else self.calibration.by_side[side].sha256
                                     ),
                                 }
-                                for side in ("left", "right")
+                                for side in SIDES
                             },
                         }
                     )
@@ -706,37 +744,46 @@ class UmiCollectionController:
                     self.labels.reset(source=event, timestamp=timestamp)
 
     def _update_grippers(self, now: float) -> tuple[bool, str]:
-        channels = self.components.angle_trigger.get_latest_channels()
-        required = {f"{side}_angle_trigger" for side in ("left", "right")}
+        channels = self.components.command_input.get_latest_channels()
+        required = {
+            self.components.command_channel_name(side)
+            for side in SIDES
+        }
         if not required.issubset(channels):
-            return False, "missing_angle_trigger"
+            return False, f"missing_{self.components.command_input_name}"
         for name in required:
             channel = channels[name]
             age = now - float(channel.timestamp)
             if (
                 not channel.valid
                 or age < -1e-3
-                or age > self.config.timing.angle_trigger_max_age_sec
+                or age > self.config.timing.command_input_max_age_sec
             ):
-                return False, f"invalid_or_stale_angle_trigger:{name}:{age:.3f}"
+                return (
+                    False,
+                    f"invalid_or_stale_{self.components.command_input_name}:"
+                    f"{name}:{age:.3f}",
+                )
         observation = TeleopObservation(channels=channels, timestamp=now)
         merged = merge_teleop_commands(
             [
-                self.components.retargeters[side].retarget(observation)
-                for side in ("left", "right")
+                self.components.command_retargeters[side].retarget(observation)
+                for side in SIDES
             ]
         )
-        if set(merged.commands) != {"left_hand", "right_hand"}:
+        if set(merged.commands) != set(HAND_EFFECTOR_BY_SIDE.values()):
             return False, "incomplete_gripper_command"
         pending: dict[str, float] = {}
-        for side in ("left", "right"):
+        for side in SIDES:
             scalar = float(
-                merged.commands[f"{side}_hand"].metadata["gripper_joint_target"]
+                merged.commands[HAND_EFFECTOR_BY_SIDE[side]].metadata[
+                    "gripper_joint_target"
+                ]
             )
             if not np.isfinite(scalar):
                 return False, f"nonfinite_gripper_command:{side}"
             pending[side] = scalar
-        self.components.rig.send_commands(merged)
+        self.components.command_rig.send_commands(merged)
         self.last_commands.update(pending)
         return True, ""
 
@@ -792,15 +839,23 @@ class UmiCollectionController:
         label_state = self.labels.snapshot()
         left_label = label_state.labels_by_side["left"]
         right_label = label_state.labels_by_side["right"]
-        vive_channels = self.components.vive.get_latest_channels_at_or_before(now)
+        vive_channels = self.components.pose_source.get_latest_channels_at_or_before(now)
         gui_vive_channels = {
             f"{side}_wrist_pose": vive_channels.get(
                 self.config.side(side).tracker_channel
             )
-            for side in ("left", "right")
+            for side in SIDES
         }
-        hand_states = self.components.hand_state_poller.latest_at_or_before(now)
-        angle_channels = self.components.angle_trigger.get_latest_channels()
+        hand_states = self.components.state_history.latest_at_or_before(now)
+        angle_channels = self.components.command_input.get_latest_channels()
+        command_channel_by_side = {
+            side: self.components.command_channel_name(side)
+            for side in SIDES
+        }
+        end_effector_diagnostics = {
+            side: self.components.end_effector_diagnostics(side, self.config)
+            for side in SIDES
+        }
         actual_sample_hz = self.recorder.effective_sample_hz(now=now)
         low_frequency = bool(
             self.recorder.recording
@@ -884,33 +939,7 @@ class UmiCollectionController:
             dataset_base_root=str(dataset_root),
             dataset_root=str(dataset_root),
             dataset_modality_contract=self.config.capture_modality_contract.to_dict(),
-            hardware_status={
-                name: {
-                    "online": name not in (getattr(self.components, "startup_errors", {}) or {}),
-                    "health": (
-                        "online" if name not in (getattr(self.components, "startup_errors", {}) or {}) else "error"
-                    ),
-                    "status_level": (
-                        "ok" if name not in (getattr(self.components, "startup_errors", {}) or {}) else "error"
-                    ),
-                    "status_label": (
-                        "在线" if name not in (getattr(self.components, "startup_errors", {}) or {}) else "连接失败"
-                    ),
-                    "requirement": (
-                        "collection_core"
-                        if name in {"vive", "angle_trigger", "dmtac.rig", "dmtac.state_poller"}
-                        else "collection"
-                    ),
-                    "error": (getattr(self.components, "startup_errors", {}) or {}).get(name, ""),
-                }
-                for name in (
-                    "vive",
-                    "angle_trigger",
-                    "dmtac.rig",
-                    "dmtac.state_poller",
-                    *(f"camera.{key}" for key in sorted(self.components.cameras)),
-                )
-            },
+            hardware_status=self.components.hardware_status(),
             collection_task_id=self.config.task_id,
             collection_task_name=self.config.task_description,
             vive_calibration_profile_ready=remaining >= 0.0 and not self._calibration_expired,
@@ -922,7 +951,7 @@ class UmiCollectionController:
             ),
             raw_tracker_poses=raw_tracker_pose_state_from_channels(
                 gui_vive_channels,
-                active_sides=("left", "right"),
+                active_sides=SIDES,
                 now=now,
             ),
             camera_status={
@@ -937,30 +966,51 @@ class UmiCollectionController:
                         key in self.config.ignored_camera_keys
                     ),
                 }
-                for key, camera in self.components.cameras.items()
+                for key, camera in self.components.camera_sources.items()
             },
             gripper_control_available=True,
             gripper_control_enabled=gripper_ready and transmit_gripper_commands,
             gripper_status={
                 side: {
-                    "configured": True,
-                    "is_connected": self.components.grippers[side].is_ready(),
-                    "input_source": "angle_trigger",
+                    "configured": bool(
+                        end_effector_diagnostics[side].get("configured", True)
+                    ),
+                    "is_connected": bool(
+                        end_effector_diagnostics[side].get("is_connected", False)
+                    ),
+                    "input_source": self.components.command_input_name,
                     "q6_control_available": True,
                     "q6_valid": bool(
-                        angle_channels.get(f"{side}_angle_trigger")
-                        and angle_channels[f"{side}_angle_trigger"].valid
+                        angle_channels.get(
+                            command_channel_by_side[side]
+                        )
+                        and angle_channels[
+                            command_channel_by_side[side]
+                        ].valid
                     ),
                     "q6_age_sec": (
                         None
-                        if angle_channels.get(f"{side}_angle_trigger") is None
-                        else now - angle_channels[f"{side}_angle_trigger"].timestamp
+                        if angle_channels.get(
+                            command_channel_by_side[side]
+                        )
+                        is None
+                        else now
+                        - angle_channels[
+                            command_channel_by_side[side]
+                        ].timestamp
                     ),
                     "q6_source_dim": None,
                     "q6_source_value": (
                         None
-                        if angle_channels.get(f"{side}_angle_trigger") is None
-                        else float(angle_channels[f"{side}_angle_trigger"].value)
+                        if angle_channels.get(
+                            command_channel_by_side[side]
+                        )
+                        is None
+                        else float(
+                            angle_channels[
+                                command_channel_by_side[side]
+                            ].value
+                        )
                     ),
                     "q6_target_preview": self.last_commands[side],
                     "q6_values": [],
@@ -982,17 +1032,18 @@ class UmiCollectionController:
                     "commanded": self.last_commands[side],
                     "measured": hand_states.get(side, {}).get("gripper_measured_scalar"),
                     "state": hand_states.get(side, {}).get("gripper_state_scalar"),
-                    "max_action": 1.0,
-                    "speed": self.components.grippers[side].config.speed,
-                    "torque": self.components.grippers[side].config.torque,
+                    "max_action": float(
+                        end_effector_diagnostics[side].get("max_action", 1.0)
+                    ),
+                    "speed": end_effector_diagnostics[side].get("speed"),
+                    "torque": end_effector_diagnostics[side].get("torque"),
                     "tactile_devices": list(
                         hand_states.get(side, {}).get("tactile_devices", ())
                     ),
                     "tactile_read_hz": float(
-                        getattr(
-                            self.components.grippers[side].config,
+                        end_effector_diagnostics[side].get(
                             "tactile_read_hz",
-                            self.config.dmtac_tactile_read_hz,
+                            self.config.tactile_read_hz,
                         )
                     ),
                     "tactile_snapshot_age_sec": hand_states.get(side, {}).get(
@@ -1000,14 +1051,18 @@ class UmiCollectionController:
                     ),
                     "telemetry_error": hand_states.get(side, {}).get("telemetry_error"),
                 }
-                for side in ("left", "right")
+                for side in SIDES
             },
             tactile_camera_status={
                 side: {
                     "timestamp": state.get("tactile_timestamp"),
-                    "is_connected": self.components.grippers[side].is_ready(),
+                    "is_connected": bool(
+                        end_effector_diagnostics[side].get("is_connected", False)
+                    ),
                     "connect_tactile": bool(
-                        self.components.grippers[side].config.connect_tactile
+                        end_effector_diagnostics[side].get(
+                            "connect_tactile", False
+                        )
                     ),
                     "tactile_devices": list(state.get("tactile_devices", ())),
                     "tactile_age_sec": state.get("tactile_snapshot_age_sec"),
@@ -1022,13 +1077,20 @@ class UmiCollectionController:
                         "tactile_worker_receiver_alive"
                     ),
                     "tactile_process_read": bool(
-                        self.components.grippers[side].config.tactile_process_read
+                        end_effector_diagnostics[side].get(
+                            "tactile_process_read", False
+                        )
                     ),
                     "tactile_read_hz": float(
-                        self.components.grippers[side].config.tactile_read_hz
+                        end_effector_diagnostics[side].get(
+                            "tactile_read_hz",
+                            self.config.tactile_read_hz,
+                        )
                     ),
                     "tactile_max_fps": int(
-                        self.components.grippers[side].config.tactile_max_fps
+                        end_effector_diagnostics[side].get(
+                            "tactile_max_fps", 0
+                        )
                     ),
                     "device_count": len(state.get("tactile_devices", ())),
                     "ready_count": len(state.get("tactile_devices", ())),

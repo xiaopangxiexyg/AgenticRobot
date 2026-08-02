@@ -9,7 +9,7 @@ from .components import RealTeleopComponents
 from ..log_utils import log_event as _log
 
 
-MOVEMENT_MULTIPLE_DEFAULT = 1.0
+MOVEMENT_MULTIPLE_DEFAULT = 1.35
 MOVEMENT_MULTIPLE_GUI_MIN = 0.05
 MOVEMENT_MULTIPLE_GUI_MAX = 10.0
 MOVEMENT_MULTIPLE_GUI_STEP = 0.1

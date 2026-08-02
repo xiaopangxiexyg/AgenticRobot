@@ -43,6 +43,8 @@ class BitpackMaskReaderCache:
 
 
 class FinalMaskSource:
+    """Resolve final keep-mask manifests without a depth-mask fallback."""
+
     def __init__(
         self,
         *,
@@ -61,15 +63,26 @@ class FinalMaskSource:
 
     def manifest_path(self, episode_index: int, camera_key: str) -> Path:
         explicit = self.dataset_index.explicit_mask_path(episode_index, camera_key)
-        if explicit is not None:
-            return explicit
-        return (
-            self.final_mask_root
-            / self.dataset_index.dataset_name
-            / episode_tag(episode_index)
-            / str(camera_key)
-            / self.manifest_name
+        path = (
+            explicit
+            if explicit is not None
+            else (
+                self.final_mask_root
+                / self.dataset_index.dataset_name
+                / episode_tag(episode_index)
+                / str(camera_key)
+                / self.manifest_name
+            )
         )
+        if not path.is_file():
+            raise FileNotFoundError(
+                "Final keep-mask manifest is missing: "
+                f"{path}. Capture-time wrist_depth_mask_paths are not an "
+                "implicit training fallback; generate the final keep-mask or "
+                "provide final_mask_paths/wrist_final_mask_paths/"
+                "wrist_keep_mask_paths."
+            )
+        return path.resolve()
 
     def read(self, episode_index: int, camera_key: str, frame_index: int) -> tuple[np.ndarray, Path]:
         manifest = self.manifest_path(episode_index, camera_key)

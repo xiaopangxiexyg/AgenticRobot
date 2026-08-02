@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping, Protocol
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from robot_motion.transforms import validate_pose_matrix
+from .topology import SIDES
+
+
+class UmiPoseAdapterPort(Protocol):
+    """Map an external tracker pose into the frozen UMI raw/desk pose fields."""
+
+    def normalize_tracker_pose(
+        self, tracker_pose: Any
+    ) -> tuple[np.ndarray, dict[str, float | bool]]: ...
+
+    def raw_pose7(self, side: str, tracker_pose: Any) -> np.ndarray: ...
+
+    def desk_pose7(self, side: str, tracker_pose: Any) -> np.ndarray: ...
 
 
 MAX_VIVE_ROTATION_ORTHOGONALITY_ERROR = 1e-2
@@ -116,7 +129,7 @@ class UmiPoseAdapter:
             side: as_rigid_transform(value, name=f"T_tcp_to_tracker_by_side[{side}]")
             for side, value in dict(self.T_tcp_to_tracker_by_side).items()
         }
-        if set(transforms) != {"left", "right"}:
+        if set(transforms) != set(SIDES):
             raise ValueError("T_tcp_to_tracker_by_side must define left and right")
         object.__setattr__(self, "T_tcp_to_tracker_by_side", transforms)
 
@@ -146,6 +159,7 @@ class UmiPoseAdapter:
 
 __all__ = [
     "UmiPoseAdapter",
+    "UmiPoseAdapterPort",
     "as_rigid_transform",
     "normalize_vive_tracker_transform",
     "transform_to_pose7",

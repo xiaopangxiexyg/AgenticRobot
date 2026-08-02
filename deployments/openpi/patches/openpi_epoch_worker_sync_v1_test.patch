@@ -1,0 +1,68 @@
+--- a/src/openpi/training/data_loader_test.py
++++ b/src/openpi/training/data_loader_test.py
+@@ -9,6 +9,37 @@
+ from openpi.training import data_loader as _data_loader
+ 
+ 
++class _EpochProbeDataset:
++    def __init__(self) -> None:
++        self.epoch = 0
++
++    def __len__(self) -> int:
++        return 4
++
++    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
++        return {
++            "base_epoch": np.asarray(self.epoch, dtype=np.int64),
++            "index": np.asarray(index, dtype=np.int64),
++        }
++
++    def set_epoch(self, epoch: int) -> None:
++        self.epoch = int(epoch)
++
++
++class _EpochProbeTransform:
++    def __init__(self) -> None:
++        self.epoch = 0
++
++    def __call__(self, data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
++        return {
++            **data,
++            "transform_epoch": np.asarray(self.epoch, dtype=np.int64),
++        }
++
++    def set_epoch(self, epoch: int) -> None:
++        self.epoch = int(epoch)
++
++
+ def test_optional_model_rtc_action_loss_mask_is_additive() -> None:
+     actions = np.zeros((2, 4, 7), dtype=np.float32)
+     ordinary = {"actions": actions}
+@@ -116,6 +147,27 @@
+         assert all(x.shape[0] == 4 for x in jax.tree.leaves(batch))
+ 
+ 
++@pytest.mark.parametrize("num_workers", (1, 2, 4))
++def test_torch_data_loader_persistent_workers_refresh_epoch(num_workers: int) -> None:
++    dataset = _EpochProbeDataset()
++    transform = _EpochProbeTransform()
++    loader = _data_loader.TorchDataLoader(
++        _data_loader.TransformedDataset(dataset, [transform]),
++        local_batch_size=2,
++        num_batches=4,
++        num_workers=num_workers,
++        framework="pytorch",
++    )
++
++    batches = list(loader)
++    base_epochs = [int(value) for batch in batches for value in batch["base_epoch"].tolist()]
++    transform_epochs = [int(value) for batch in batches for value in batch["transform_epoch"].tolist()]
++
++    assert base_epochs == [0, 0, 1, 1]
++    assert transform_epochs == [0, 0, 1, 1]
++    assert loader._epoch_worker_mode == "shared_epoch_v1"
++
++
+ def test_with_fake_dataset():
+     config = _config.get_config("debug")
+ 

@@ -307,19 +307,20 @@ def test_umi_starts_web_gui_before_attempting_dmtac_preflight(monkeypatch):
         policy_io_layout=Path("layout.json"),
     )
     monkeypatch.setattr(app, "load_policy_io_layout", lambda _path: object())
-    monkeypatch.setattr(
-        app,
-        "prepare_dmtac_hardware_assignment_before_gui",
-        lambda _config: events.append("terminal_dmtac_preflight") or {"assignments": {}},
-    )
     monkeypatch.setattr(app, "CalibrationWebUi", FakeUi)
-    monkeypatch.setattr(
-        app,
-        "_ensure_angle_trigger_from_gui",
-        lambda *_args, **_kwargs: events.append("angle_trigger_attempt") or False,
-    )
 
-    assert app.run_umi_collection(config) == 0
+    assert (
+        app.run_umi_collection(
+            config,
+            hardware_preparer=lambda _config: (
+                events.append("terminal_dmtac_preflight") or {"assignments": {}}
+            ),
+            command_input_initializer=lambda *_args, **_kwargs: (
+                events.append("angle_trigger_attempt") or False
+            ),
+        )
+        == 0
+    )
     assert events == [
         "ui_construct",
         "ui_start",
@@ -362,13 +363,16 @@ def test_umi_dmtac_failure_does_not_skip_angle_trigger_attempt(monkeypatch):
         events.append("dmtac_failed")
         raise RuntimeError("DMTac unavailable")
 
-    monkeypatch.setattr(app, "prepare_dmtac_hardware_assignment_before_gui", fail_dmtac)
     monkeypatch.setattr(app, "CalibrationWebUi", FakeUi)
-    monkeypatch.setattr(
-        app,
-        "_ensure_angle_trigger_from_gui",
-        lambda *_args, **_kwargs: events.append("angle_attempt") or False,
-    )
 
-    assert app.run_umi_collection(config) == 0
+    assert (
+        app.run_umi_collection(
+            config,
+            hardware_preparer=fail_dmtac,
+            command_input_initializer=lambda *_args, **_kwargs: (
+                events.append("angle_attempt") or False
+            ),
+        )
+        == 0
+    )
     assert events == ["ui_start", "dmtac_failed", "angle_attempt", "ui_close"]

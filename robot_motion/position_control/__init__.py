@@ -53,6 +53,18 @@ from .interpolation import (
     interpolate_joint_command_segment,
     reference_age_and_stale,
 )
+from .horizon_governor import (
+    JointHorizonBatchedWorkspace,
+    JointHorizonLimits,
+    JointHorizonPlan,
+    JointHorizonState,
+    plan_jerk_limited_joint_horizon,
+    plan_jerk_limited_joint_horizon_batched,
+)
+from .sample_aligned_trajectory import (
+    SampleAlignedJerkLimitedJointTrajectoryPlanner,
+    SampleAlignedTargetAdmission,
+)
 from .pose_action_motion import (
     POSE_ACTION_MOTION_INTENT_SCHEMA,
     PoseActionMotionIntentConfig,
@@ -91,6 +103,7 @@ from .trajectory import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_CHOICES,
     POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     normalize_position_command_planner,
 )
 from .capability import CANCELLATION_ACK_LEVELS, ExecutionCapabilityProfile
@@ -109,6 +122,10 @@ __all__ = [
     "DEFAULT_POSITION_VELOCITY_RAMP_SEC",
     "DEFAULT_REFERENCE_STALE_AFTER_SEC",
     "JointCommandInterpolator",
+    "JointHorizonLimits",
+    "JointHorizonBatchedWorkspace",
+    "JointHorizonPlan",
+    "JointHorizonState",
     "ExecutionCapabilityProfile",
     "CANCELLATION_ACK_LEVELS",
     "JointTrajectoryLimits",
@@ -121,6 +138,7 @@ __all__ = [
     "POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED",
     "POSITION_COMMAND_PLANNER_CHOICES",
     "POSITION_COMMAND_PLANNER_LINEAR",
+    "POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED",
     "POSITION_45_150_PROFILE",
     "POSITION_45_150_PROFILE_NAME",
     "POSITION_15_60_120_PROFILE",
@@ -170,6 +188,10 @@ __all__ = [
     "position_audit_event_to_dict",
     "position_reference_audit_event",
     "position_qref_fingerprint",
+    "plan_jerk_limited_joint_horizon",
+    "plan_jerk_limited_joint_horizon_batched",
+    "SampleAlignedJerkLimitedJointTrajectoryPlanner",
+    "SampleAlignedTargetAdmission",
     "reference_age_and_stale",
     "resample_motion_targets",
     "resolve_periodic_tick",

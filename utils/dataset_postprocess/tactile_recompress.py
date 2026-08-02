@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -14,8 +16,11 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 
-DEFAULT_CHUNK_FRAMES = 32
+DEFAULT_CHUNK_FRAMES = 8
 DEFAULT_MIN_FREE_BYTES = 20 * 1024**3
+COLLECTION_RECHECK_CHUNKS = 32
+LOSSLESS_PROFILE_V1 = "dmtac_raw_temporal_delta_zstd_v1"
+LOSSLESS_PREDICTOR_V1 = "delta_mod_uint8"
 COLLECTION_PROCESS_MARKERS = (
     "teleop_runtime.collection",
     "teleop_runtime.debug.run_vive_rm65_real_teleop",
@@ -46,6 +51,8 @@ class TactileRecompressionResult:
     compressed_bytes: int
     removed_original_bytes: int
     compression: str = "zstd"
+    profile: str = LOSSLESS_PROFILE_V1
+    receipt_path: str | None = None
 
     @property
     def compression_ratio(self) -> float | None:
@@ -114,6 +121,25 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(dict(payload), handle, ensure_ascii=True, sort_keys=True, indent=2)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -310,8 +336,70 @@ class _ZstdCodec:
         ).stdout
 
 
-def _compressed_path(source: Path) -> Path:
-    return source.with_name(f"{source.name}.zst")
+def _compressed_path(source: Path, *, chunk_frames: int) -> Path:
+    return source.with_name(f"{source.name}.tdelta{int(chunk_frames)}.zst")
+
+
+def _delta_encode(raw: bytes, *, frame_count: int, bytes_per_frame: int) -> bytes:
+    values = np.frombuffer(raw, dtype=np.uint8).reshape((int(frame_count), int(bytes_per_frame)))
+    encoded = np.empty_like(values)
+    encoded[0] = values[0]
+    if int(frame_count) > 1:
+        encoded[1:] = (
+            values[1:].astype(np.uint16) - values[:-1].astype(np.uint16)
+        ).astype(np.uint8)
+    return encoded.tobytes(order="C")
+
+
+def _delta_decode(encoded: bytes, *, frame_count: int, bytes_per_frame: int) -> bytes:
+    values = np.frombuffer(encoded, dtype=np.uint8).reshape(
+        (int(frame_count), int(bytes_per_frame))
+    )
+    restored = np.empty_like(values)
+    restored[0] = values[0]
+    for index in range(1, int(frame_count)):
+        restored[index] = (
+            restored[index - 1].astype(np.int16) + values[index].astype(np.int16)
+        ).astype(np.uint8)
+    return restored.tobytes(order="C")
+
+
+def _validate_compressed_stream(
+    target: Path,
+    chunks: Iterable[Mapping[str, Any]],
+    *,
+    codec: _ZstdCodec,
+    bytes_per_frame: int,
+    expected_sha256: str,
+) -> None:
+    decoded_hash = hashlib.sha256()
+    expected_offset = 0
+    with target.open("rb") as handle:
+        for chunk in chunks:
+            offset = int(chunk["offset"])
+            compressed_bytes = int(chunk["compressed_bytes"])
+            raw_bytes = int(chunk["raw_bytes"])
+            frame_count = int(chunk["frame_count"])
+            if offset != expected_offset:
+                raise ValueError(f"Non-contiguous tactile chunk layout in {target}")
+            handle.seek(offset)
+            payload = handle.read(compressed_bytes)
+            if len(payload) != compressed_bytes:
+                raise ValueError(f"Short compressed tactile chunk read from {target}")
+            encoded = codec.decompress(payload, raw_bytes=raw_bytes)
+            if len(encoded) != raw_bytes:
+                raise ValueError(f"Wrong decompressed tactile chunk size in {target}")
+            decoded = _delta_decode(
+                encoded,
+                frame_count=frame_count,
+                bytes_per_frame=bytes_per_frame,
+            )
+            decoded_hash.update(decoded)
+            expected_offset += compressed_bytes
+        if handle.read(1):
+            raise ValueError(f"Compressed tactile stream has trailing bytes: {target}")
+    if decoded_hash.hexdigest() != str(expected_sha256):
+        raise ValueError(f"Decoded tactile SHA-256 mismatch for {target}")
 
 
 def _compress_stream(
@@ -321,13 +409,17 @@ def _compress_stream(
     *,
     codec: _ZstdCodec,
     chunk_frames: int,
-) -> tuple[list[dict[str, int]], str, int]:
+) -> tuple[list[dict[str, Any]], str, int]:
     if target.exists():
         raise FileExistsError(f"Refusing to overwrite existing compressed stream: {target}")
+    if np.dtype(str(spec.get("dtype") or "")) != np.dtype(np.uint8):
+        raise ValueError(
+            f"{LOSSLESS_PROFILE_V1} only accepts logical uint8 raw tactile streams: {source}"
+        )
     bytes_per_frame = _raw_stream_size({**dict(spec), "frame_count": 1})
     frame_count = int(spec["frame_count"])
     source_hash = hashlib.sha256()
-    chunks: list[dict[str, int]] = []
+    chunks: list[dict[str, Any]] = []
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     temporary = Path(temporary_name)
@@ -335,17 +427,37 @@ def _compress_stream(
     try:
         with source.open("rb") as input_handle, os.fdopen(fd, "wb") as output_handle:
             frame_start = 0
+            chunk_index = 0
             while frame_start < frame_count:
+                if chunk_index and chunk_index % COLLECTION_RECHECK_CHUNKS == 0:
+                    active_collection = _active_collection_processes()
+                    if active_collection:
+                        raise RuntimeError(
+                            "Formal collection started during tactile recompression: "
+                            + "; ".join(active_collection[:3])
+                        )
                 count = min(int(chunk_frames), frame_count - frame_start)
                 raw_bytes = count * bytes_per_frame
                 raw = input_handle.read(raw_bytes)
                 if len(raw) != raw_bytes:
                     raise ValueError(f"Short raw tactile chunk read from {source}")
                 source_hash.update(raw)
-                compressed = codec.compress(raw)
-                restored = codec.decompress(compressed, raw_bytes=raw_bytes)
+                encoded = _delta_encode(
+                    raw,
+                    frame_count=count,
+                    bytes_per_frame=bytes_per_frame,
+                )
+                compressed = codec.compress(encoded)
+                restored_encoded = codec.decompress(compressed, raw_bytes=raw_bytes)
+                restored = _delta_decode(
+                    restored_encoded,
+                    frame_count=count,
+                    bytes_per_frame=bytes_per_frame,
+                )
                 if restored != raw:
-                    raise ValueError(f"Zstd round-trip mismatch for {source} at frame {frame_start}")
+                    raise ValueError(
+                        f"Delta+Zstd round-trip mismatch for {source} at frame {frame_start}"
+                    )
                 offset = output_handle.tell()
                 output_handle.write(compressed)
                 chunks.append(
@@ -355,16 +467,40 @@ def _compress_stream(
                         "offset": int(offset),
                         "compressed_bytes": len(compressed),
                         "raw_bytes": raw_bytes,
+                        "predictor": LOSSLESS_PREDICTOR_V1,
                     }
                 )
                 compressed_total += len(compressed)
                 frame_start += count
+                chunk_index += 1
             if input_handle.read(1):
                 raise ValueError(f"Raw tactile stream has trailing bytes: {source}")
             output_handle.flush()
             os.fsync(output_handle.fileno())
         os.replace(temporary, target)
-        return chunks, source_hash.hexdigest(), compressed_total
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        target_stat = target.stat()
+        source_stat = source.stat()
+        if target_stat.st_dev != source_stat.st_dev or target_stat.st_ino == source_stat.st_ino:
+            raise ValueError(f"Tactile staging target is not an independent inode: {target}")
+        if target_stat.st_nlink != 1:
+            raise ValueError(f"Tactile staging target unexpectedly has links: {target}")
+        digest = source_hash.hexdigest()
+        _validate_compressed_stream(
+            target,
+            chunks,
+            codec=codec,
+            bytes_per_frame=bytes_per_frame,
+            expected_sha256=digest,
+        )
+        return chunks, digest, compressed_total
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -406,90 +542,190 @@ def recompress_tactile_zstd_in_place(
     if max_manifests is not None and int(max_manifests) <= 0:
         raise ValueError("max_manifests must be positive when provided.")
     codec = _ZstdCodec(level=int(level), backend=backend)
+    transaction_id = uuid.uuid4().hex
+    started_ns = time.time_ns()
+    receipt_path = root / "meta" / "tactile_recompression" / f"{transaction_id}.json"
     processed_manifests = 0
     processed_streams = 0
     raw_total = 0
     compressed_total = 0
     removed_total = 0
-    for manifest_path in manifests:
-        manifest, raw_streams = _raw_manifest_streams(root, manifest_path)
-        if not raw_streams:
-            continue
-        if max_manifests is not None and processed_manifests >= int(max_manifests):
-            break
-        required = sum(source.stat().st_size for _, _, source in raw_streams)
-        free = shutil.disk_usage(root).free
-        if free - required < int(min_free_bytes):
-            raise OSError(
-                f"Insufficient free space for atomic manifest conversion: free={free}, "
-                f"required<={required}, reserve={int(min_free_bytes)}"
-            )
-        created: list[Path] = []
-        replacements: dict[str, dict[str, Any]] = {}
-        try:
-            for sensor_key, spec, source in raw_streams:
-                target = _compressed_path(source)
-                chunks, raw_sha256, compressed_bytes = _compress_stream(
-                    source,
-                    target,
-                    spec,
-                    codec=codec,
-                    chunk_frames=int(chunk_frames),
-                )
-                created.append(target)
-                updated = dict(spec)
-                updated.update(
-                    {
-                        "path": _relative_dataset_path(root, target),
-                        "encoding": "chunked_zstd",
-                        "compression": "zstd",
-                        "chunk_frame_count": int(chunk_frames),
-                        "chunks": chunks,
-                        "recompressed_from": {
-                            "path": _relative_dataset_path(root, source),
-                            "encoding": str(spec.get("encoding") or "raw_c_order"),
-                            "compression": "none",
-                            "raw_sha256": raw_sha256,
-                        },
-                    }
-                )
-                replacements[sensor_key] = updated
-                raw_total += source.stat().st_size
-                compressed_total += compressed_bytes
-            updated_manifest = dict(manifest)
-            updated_streams = dict(manifest["streams"])
-            updated_streams.update(replacements)
-            updated_manifest["streams"] = updated_streams
-            updated_manifest["tactile_recompression"] = {
+    def current_result() -> TactileRecompressionResult:
+        return TactileRecompressionResult(
+            dataset_root=str(root),
+            manifest_count=processed_manifests,
+            stream_count=processed_streams,
+            raw_bytes=raw_total,
+            compressed_bytes=compressed_total,
+            removed_original_bytes=removed_total,
+            receipt_path=_relative_dataset_path(root, receipt_path),
+        )
+
+    def write_receipt(*, status: str, error: BaseException | None = None) -> None:
+        payload: dict[str, Any] = {
+            "schema": "dexteleop.tactile_lossless_recompression_receipt.v1",
+            "transaction_id": transaction_id,
+            "started_unix_ns": started_ns,
+            "completed_unix_ns": time.time_ns(),
+            "status": str(status),
+            **current_result().to_dict(),
+            "codec": {
                 "compression": "zstd",
                 "level": int(level),
                 "chunk_frame_count": int(chunk_frames),
+                "predictor": LOSSLESS_PREDICTOR_V1,
                 "backend": codec.backend,
+            },
+        }
+        if error is not None:
+            payload["error"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+                "resume_safe": True,
             }
-            _atomic_write_json(manifest_path, updated_manifest)
+        _atomic_write_json(receipt_path, payload)
+
+    try:
+        for manifest_path in manifests:
+            manifest, raw_streams = _raw_manifest_streams(root, manifest_path)
+            if not raw_streams:
+                continue
+            if max_manifests is not None and processed_manifests >= int(max_manifests):
+                break
+            required = sum(source.stat().st_size for _, _, source in raw_streams)
+            free = shutil.disk_usage(root).free
+            if free - required < int(min_free_bytes):
+                raise OSError(
+                    f"Insufficient free space for atomic manifest conversion: free={free}, "
+                    f"required<={required}, reserve={int(min_free_bytes)}"
+                )
+            created: list[Path] = []
+            replacements: dict[str, dict[str, Any]] = {}
+            source_stats: dict[Path, os.stat_result] = {}
+            original_manifest_bytes = manifest_path.read_bytes()
+            manifest_committed = False
+            manifest_raw_bytes = 0
+            manifest_compressed_bytes = 0
+            try:
+                for sensor_key, spec, source in raw_streams:
+                    initial_stat = source.stat()
+                    if initial_stat.st_nlink != 1:
+                        raise RuntimeError(
+                            f"Refusing tactile source with link_count={initial_stat.st_nlink}: "
+                            f"{source}"
+                        )
+                    source_stats[source] = initial_stat
+                    target = _compressed_path(source, chunk_frames=int(chunk_frames))
+                    chunks, raw_sha256, compressed_bytes = _compress_stream(
+                        source,
+                        target,
+                        spec,
+                        codec=codec,
+                        chunk_frames=int(chunk_frames),
+                    )
+                    created.append(target)
+                    updated = dict(spec)
+                    updated.update(
+                        {
+                            "path": _relative_dataset_path(root, target),
+                            "encoding": "chunked_delta_zstd",
+                            "compression": "zstd",
+                            "storage_dtype": "uint8",
+                            "predictor": LOSSLESS_PREDICTOR_V1,
+                            "chunk_frame_count": int(chunk_frames),
+                            "chunks": chunks,
+                            "recompressed_from": {
+                                "path": _relative_dataset_path(root, source),
+                                "encoding": str(spec.get("encoding") or "raw_c_order"),
+                                "compression": "none",
+                                "raw_sha256": raw_sha256,
+                                "device": int(initial_stat.st_dev),
+                                "inode": int(initial_stat.st_ino),
+                                "link_count": int(initial_stat.st_nlink),
+                            },
+                        }
+                    )
+                    replacements[sensor_key] = updated
+                    manifest_raw_bytes += int(initial_stat.st_size)
+                    manifest_compressed_bytes += compressed_bytes
+                updated_manifest = dict(manifest)
+                updated_streams = dict(manifest["streams"])
+                updated_streams.update(replacements)
+                updated_manifest["streams"] = updated_streams
+                updated_manifest["tactile_recompression"] = {
+                    "profile": LOSSLESS_PROFILE_V1,
+                    "compression": "zstd",
+                    "level": int(level),
+                    "chunk_frame_count": int(chunk_frames),
+                    "predictor": LOSSLESS_PREDICTOR_V1,
+                    "backend": codec.backend,
+                    "transaction_id": transaction_id,
+                }
+                for source, initial_stat in source_stats.items():
+                    current_stat = source.stat()
+                    stable_fields = (
+                        current_stat.st_dev,
+                        current_stat.st_ino,
+                        current_stat.st_nlink,
+                        current_stat.st_size,
+                        current_stat.st_mtime_ns,
+                    )
+                    initial_fields = (
+                        initial_stat.st_dev,
+                        initial_stat.st_ino,
+                        initial_stat.st_nlink,
+                        initial_stat.st_size,
+                        initial_stat.st_mtime_ns,
+                    )
+                    if stable_fields != initial_fields:
+                        raise RuntimeError(
+                            f"Tactile source changed during recompression: {source}"
+                        )
+                active_collection = _active_collection_processes()
+                if active_collection:
+                    raise RuntimeError(
+                        "Formal collection started before tactile manifest commit: "
+                        + "; ".join(active_collection[:3])
+                    )
+                _atomic_write_json(manifest_path, updated_manifest)
+                manifest_committed = True
+                committed_manifest = _read_json(manifest_path)
+                if committed_manifest.get(
+                    "tactile_recompression"
+                ) != updated_manifest.get("tactile_recompression"):
+                    raise ValueError(
+                        f"Committed tactile manifest verification failed: {manifest_path}"
+                    )
+            except BaseException:
+                if manifest_committed:
+                    _atomic_write_bytes(manifest_path, original_manifest_bytes)
+                for target in created:
+                    target.unlink(missing_ok=True)
+                raise
+            processed_manifests += 1
+            processed_streams += len(raw_streams)
+            raw_total += manifest_raw_bytes
+            compressed_total += manifest_compressed_bytes
+            for _, _, source in raw_streams:
+                size = source.stat().st_size
+                source.unlink()
+                removed_total += size
+    except BaseException as exc:
+        try:
+            write_receipt(status="failed_partial", error=exc)
         except BaseException:
-            for target in created:
-                target.unlink(missing_ok=True)
-            raise
-        for _, _, source in raw_streams:
-            size = source.stat().st_size
-            source.unlink()
-            removed_total += size
-        processed_manifests += 1
-        processed_streams += len(raw_streams)
-    return TactileRecompressionResult(
-        dataset_root=str(root),
-        manifest_count=processed_manifests,
-        stream_count=processed_streams,
-        raw_bytes=raw_total,
-        compressed_bytes=compressed_total,
-        removed_original_bytes=removed_total,
-    )
+            pass
+        raise
+    write_receipt(status="completed")
+    return current_result()
 
 
 __all__ = [
     "DEFAULT_CHUNK_FRAMES",
     "DEFAULT_MIN_FREE_BYTES",
+    "COLLECTION_RECHECK_CHUNKS",
+    "LOSSLESS_PROFILE_V1",
+    "LOSSLESS_PREDICTOR_V1",
     "TactileRecompressionPlan",
     "TactileRecompressionResult",
     "plan_tactile_zstd_recompression",

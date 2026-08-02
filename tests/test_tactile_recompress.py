@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,33 +108,21 @@ class TactileRecompressTest(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             spec = manifest["streams"]["sensor"]
             self.assertEqual(spec["compression"], "zstd")
-            self.assertEqual(spec["encoding"], "chunked_zstd")
+            self.assertEqual(spec["encoding"], "chunked_delta_zstd")
+            self.assertEqual(spec["predictor"], "delta_mod_uint8")
             self.assertEqual([chunk["frame_count"] for chunk in spec["chunks"]], [2, 2, 1])
             compressed_path = root / spec["path"]
             self.assertTrue(compressed_path.is_file())
-            restored = bytearray()
-            with compressed_path.open("rb") as handle:
-                for chunk in spec["chunks"]:
-                    handle.seek(int(chunk["offset"]))
-                    payload = handle.read(int(chunk["compressed_bytes"]))
-                    restored.extend(
-                        subprocess.run(
-                            [shutil.which("zstd"), "-q", "-d", "-c"],
-                            input=payload,
-                            stdout=subprocess.PIPE,
-                            check=True,
-                        ).stdout
-                    )
-            actual = np.frombuffer(restored, dtype=np.uint8).reshape(expected.shape)
-            np.testing.assert_array_equal(actual, expected)
-            try:
-                import zstandard  # noqa: F401
-            except ModuleNotFoundError:
-                pass
-            else:
-                reader = ChunkedTactileStream(dataset_root=root, spec=spec)
-                for index in range(len(expected)):
-                    np.testing.assert_array_equal(reader.frame(index), expected[index])
+            reader = ChunkedTactileStream(dataset_root=root, spec=spec)
+            for index in range(len(expected)):
+                np.testing.assert_array_equal(reader.frame(index), expected[index])
+            receipt = root / str(result.receipt_path)
+            self.assertTrue(receipt.is_file())
+            receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt_payload["schema"],
+                "dexteleop.tactile_lossless_recompression_receipt.v1",
+            )
 
     def test_apply_requires_explicit_original_deletion_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -158,6 +146,38 @@ class TactileRecompressTest(unittest.TestCase):
                         delete_originals=True,
                     )
 
+    @unittest.skipUnless(shutil.which("zstd"), "zstd CLI is required")
+    def test_apply_rolls_back_if_collection_starts_before_manifest_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path, stream_path, _ = self._dataset(root)
+            manifest_before = manifest_path.read_bytes()
+            stream_before = stream_path.read_bytes()
+            with mock.patch(
+                "utils.dataset_postprocess.tactile_recompress._active_collection_processes",
+                side_effect=((), ("pid=456 formal collection",)),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "started before tactile manifest"):
+                    recompress_tactile_zstd_in_place(
+                        root,
+                        chunk_frames=2,
+                        min_free_bytes=0,
+                        delete_originals=True,
+                        backend="cli",
+                    )
+
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+            self.assertEqual(stream_path.read_bytes(), stream_before)
+            self.assertFalse(
+                stream_path.with_name(f"{stream_path.name}.tdelta2.zst").exists()
+            )
+            receipts = list((root / "meta" / "tactile_recompression").glob("*.json"))
+            self.assertEqual(len(receipts), 1)
+            receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "failed_partial")
+            self.assertEqual(receipt["manifest_count"], 0)
+            self.assertTrue(receipt["error"]["resume_safe"])
+
     def test_apply_refuses_committed_v24_capture_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -180,7 +200,34 @@ class TactileRecompressTest(unittest.TestCase):
 
             self.assertEqual(manifest_path.read_bytes(), manifest_before)
             self.assertEqual(stream_path.read_bytes(), stream_before)
-            self.assertFalse(stream_path.with_name(f"{stream_path.name}.zst").exists())
+            self.assertFalse(
+                stream_path.with_name(f"{stream_path.name}.tdelta8.zst").exists()
+            )
+
+    def test_apply_refuses_hardlinked_source_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path, stream_path, _ = self._dataset(root)
+            linked_copy = root / "independent-backup-is-not-a-hardlink.uint8.bin"
+            os.link(stream_path, linked_copy)
+            manifest_before = manifest_path.read_bytes()
+
+            with mock.patch(
+                "utils.dataset_postprocess.tactile_recompress._active_collection_processes",
+                return_value=(),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "link_count=2"):
+                    recompress_tactile_zstd_in_place(
+                        root,
+                        min_free_bytes=0,
+                        delete_originals=True,
+                        backend="cli",
+                    )
+
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+            self.assertTrue(stream_path.is_file())
+            self.assertEqual(stream_path.stat().st_ino, linked_copy.stat().st_ino)
+            self.assertFalse(stream_path.with_name(f"{stream_path.name}.tdelta8.zst").exists())
 
 
 if __name__ == "__main__":

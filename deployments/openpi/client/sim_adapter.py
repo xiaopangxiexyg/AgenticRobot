@@ -97,6 +97,12 @@ class OpenPISimAdapterConfig:
             raise TypeError(
                 "policy_artifact must be a PolicyArtifactContract or mapping."
             )
+        if artifact.arm_hold_output is not None:
+            raise ValueError(
+                "OpenPISimAdapter does not yet own action-emission semantic "
+                "resolution; use the non-RTC PolicyDeployRuntime path instead "
+                "of silently ignoring arm-hold output."
+            )
         artifact_normalization = None
         if isinstance(artifact.metadata, Mapping):
             artifact_normalization = artifact.metadata.get("normalization_contract")

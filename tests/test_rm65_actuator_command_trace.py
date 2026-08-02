@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from robot_motion.position_control import PositionCommandAuditEvent
+from robot_motion.runtime.contracts import ObservationChannel
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.real_teleop.actuator_command_trace import (
     ACTUATOR_COMMAND_TRACE_DATA_NAME,
@@ -206,6 +207,82 @@ def test_preallocated_trace_persists_fixed_field_ik_shadow_on_close(
             [0.0, 0.5],
         )
         assert rows["status"][0].decode() == "tracking"
+
+
+def test_preallocated_trace_persists_prefilter_vive_source_on_close(
+    tmp_path: Path,
+) -> None:
+    recorder = ActuatorCommandTraceRecorder(
+        ActuatorCommandTraceConfig(
+            output_dir=tmp_path / "vive_source",
+            active_sides=("left", "right"),
+            command_hz=120.0,
+            reference_hz=60.0,
+            max_duration_sec=1.0,
+        )
+    )
+    poses = (np.eye(4), np.eye(4))
+    poses[0][1, 3] = -0.25
+    poses[1][1, 3] = 0.25
+    channels = {}
+    for index, (side, pose) in enumerate(zip(("left", "right"), poses)):
+        name = f"{side}_wrist_pose"
+        channels[name] = ObservationChannel(
+            channel_name=name,
+            capability="pose6d",
+            side=side,
+            value=pose,
+            frame_name="vive_world",
+            timestamp=1_700_000_000.25,
+            source_name="vive",
+            valid=True,
+            metadata={
+                "seq": 100 + index,
+                "receiver_timestamp": 1_700_000_000.25,
+                "receiver_monotonic_time": 12.25,
+                "availability_monotonic_time": 12.26,
+                "sender_timestamp": 42.5,
+                "pose_sample_timestamp": 42.49,
+                "pose_sample_monotonic_time": 12.24,
+                "capture_receiver_monotonic_estimate": 12.23,
+                "capture_estimate_uncertainty_sec": 0.001,
+                "clock_sync_offset_sec": 0.01,
+                "tracker_name": f"{side}_physical_tracker",
+                "tracker_role": f"{side}_wrist",
+            },
+        )
+
+    assert recorder.record_vive_source(
+        control_wall_time=1_700_000_000.30,
+        control_monotonic_time_ns=12_300_000_000,
+        raw_channels=channels,
+        teleop_state="RUNNING",
+        motion_hold_mode="none",
+    )
+    assert list(recorder.output_dir.iterdir()) == []
+    recorder.close()
+
+    with np.load(
+        recorder.output_dir / ACTUATOR_COMMAND_TRACE_DATA_NAME,
+        allow_pickle=False,
+    ) as data:
+        rows = data["vive_source"]
+        assert rows.shape == (1,)
+        assert rows["present_mask"].tolist() == [3]
+        assert rows["valid_mask"].tolist() == [3]
+        assert rows["channel_seq"][0].tolist() == [100, 101]
+        np.testing.assert_allclose(rows["pose_vive_world"][0, 0], poses[0])
+        np.testing.assert_allclose(rows["pose_vive_world"][0, 1], poses[1])
+        assert rows["tracker_role"][0, 0].decode() == "left_wrist"
+        assert rows["teleop_state"][0].decode() == "RUNNING"
+    manifest = json.loads(
+        (
+            recorder.output_dir / ACTUATOR_COMMAND_TRACE_MANIFEST_NAME
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["schema"] == "dexteleop.rm65_actuator_command_trace.v3"
+    assert manifest["result"]["vive_source_rows"] == 1
+    assert manifest["result"]["vive_source_error_count"] == 0
 
 
 def test_backend_singularity_trace_is_sparse_for_normal_and_dense_for_abnormal() -> None:

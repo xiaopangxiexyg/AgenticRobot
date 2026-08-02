@@ -1,5 +1,8 @@
 # Replay 参数说明
 
+Pose→QPOS 各版本及 0727 离线结果汇总见
+[POSE_LIFT_EXPERIMENTS_0727.md](./POSE_LIFT_EXPERIMENTS_0727.md)。
+
 Replay 重放已有数据；运行命令见 [real README](./README.md)。离线浏览与真机执行使用同一
 GUI 入口，但只有显式提供真实 backend 并经过人工放行才允许运动。
 
@@ -77,6 +80,18 @@ posture task 在持续 Pose 跟踪中积累目标滞后；硬关节、步长和�
 实现“先受限求解、再由独立 admission 认证”。0727 episode 16/35/80/81 的离线验证未发现
 奇异安全指标回退，目标追踪总体持平或改善，qref 加速度与 jerk 峰值下降；因此 V4 已提升为
 deploy/Pose replay 默认并允许经过既有 preflight 的真机输出。选择 V1 可完整回退。
+
+`rm65_pose_lift_v5_sigma_escape` 与 `rm65_pose_lift_v6_structural_branch` 仅用于离线研究。
+V5 增加 sigma-min 软逃逸目标；V6 在其上增加 q3/q5 零点单侧分支锁。两者的 profile metadata
+均明确 `hardware_dispatch_allowed=false`，部署或真机 dispatch 会拒绝它们；V4 默认和真机命令
+不受影响。V6 适合用 episode 96 等结构奇异反例检查“禁止穿零、保留 qdot/qddot/collision
+硬约束”的效果，但可能在极深奇异区形成有限单侧平台，不能直接当作跟手性已经解决。
+
+`rm65_pose_lift_v7_structural_escape` 是在 V6 单侧锁上增加 q3/q5 软外移目标的离线反例探针。
+它在 episode 96 能进一步降低局部 qref 误差和深奇异暴露，但在 0727 的 8 条 guarded
+episode 全局门禁中出现加速度/速度证书回退、parity 回退或 sigma 改善不足，因此保持
+`hardware_dispatch_allowed=false`，不得用于部署或真机。V6 是当前离线结构保护基线，V4
+仍是默认 profile。
 
 离线比较任意两个 Pose Lift profile 时使用只读 evaluator；它不连接设备、不下发动作，并分别报告
 teacher-forced、closed-loop 和 runtime-causal 结果。三种模式都先把保存的 15 Hz pose/qref

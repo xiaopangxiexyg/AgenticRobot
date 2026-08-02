@@ -96,6 +96,80 @@ class ControlTraceSpoolSink:
         entries = self.runtime.journal_entries_from_offset(
             self._next_runtime_entry_offset
         )
+        # A new session has no recovered records.  Persist its pending tail as
+        # one WAL batch so a high-rate ControlTrace pays one fsync per worker
+        # drain, not one fsync per fact.
+        if entries and all(
+            entry.journal_sequence not in self._persisted_hash_by_sequence
+            for entry in entries
+        ):
+            records = tuple(
+                entry.materialize(
+                    trace_session_id=self.runtime.session.trace_session_id
+                )
+                for entry in entries
+                if entry.journal_sequence not in self._acknowledged_sequences
+            )
+            receipts = self.spool.append_batch(records)
+            record_by_sequence = {
+                record.journal_sequence: record for record in records
+            }
+            for receipt in receipts:
+                sequence = receipt.journal_sequence
+                considered.append(sequence)
+                record = record_by_sequence[sequence]
+                if not receipt.accepted or not receipt.durable:
+                    code = str(
+                        receipt.rejection_code
+                        or "spool_append_not_durable"
+                    )
+                    health = self._record_failure(
+                        code=code,
+                        sequence=sequence,
+                        message=receipt.message,
+                    )
+                    return ControlTraceSinkFlushReport(
+                        considered_sequences=tuple(considered),
+                        newly_durable_sequences=tuple(durable),
+                        failed_sequence=sequence,
+                        failure_code=code,
+                        health_receipt=health,
+                        durable_high_watermark=self.runtime.sink_durable_high_watermark,
+                    )
+                self._persisted_hash_by_sequence[sequence] = (
+                    record.record_integrity_hash
+                )
+                try:
+                    self.runtime.acknowledge_durable(
+                        sink_id=self.sink_id,
+                        journal_sequence=sequence,
+                        record_integrity_hash=record.record_integrity_hash,
+                    )
+                except ValueError as exc:
+                    health = self._record_failure(
+                        code="runtime_durable_ack_failed",
+                        sequence=sequence,
+                        message=str(exc),
+                    )
+                    return ControlTraceSinkFlushReport(
+                        considered_sequences=tuple(considered),
+                        newly_durable_sequences=tuple(durable),
+                        failed_sequence=sequence,
+                        failure_code="runtime_durable_ack_failed",
+                        health_receipt=health,
+                        durable_high_watermark=self.runtime.sink_durable_high_watermark,
+                    )
+                self._acknowledged_sequences.add(sequence)
+                durable.append(sequence)
+                self._next_runtime_entry_offset += 1
+            return ControlTraceSinkFlushReport(
+                considered_sequences=tuple(considered),
+                newly_durable_sequences=tuple(durable),
+                failed_sequence=None,
+                failure_code=None,
+                health_receipt=None,
+                durable_high_watermark=self.runtime.sink_durable_high_watermark,
+            )
         for entry in entries:
             sequence = entry.journal_sequence
             if sequence in self._acknowledged_sequences:
@@ -119,7 +193,7 @@ class ControlTraceSpoolSink:
                         failed_sequence=sequence,
                         failure_code="recovered_record_hash_mismatch",
                         health_receipt=health,
-                        durable_high_watermark=self.runtime.snapshot().sink_durable_high_watermark,
+                        durable_high_watermark=self.runtime.sink_durable_high_watermark,
                     )
                 append_durable = True
             else:
@@ -138,7 +212,7 @@ class ControlTraceSpoolSink:
                         failed_sequence=sequence,
                         failure_code=code,
                         health_receipt=health,
-                        durable_high_watermark=self.runtime.snapshot().sink_durable_high_watermark,
+                        durable_high_watermark=self.runtime.sink_durable_high_watermark,
                     )
                 self._persisted_hash_by_sequence[sequence] = record.record_integrity_hash
             if append_durable:
@@ -160,7 +234,7 @@ class ControlTraceSpoolSink:
                         failed_sequence=sequence,
                         failure_code="runtime_durable_ack_failed",
                         health_receipt=health,
-                        durable_high_watermark=self.runtime.snapshot().sink_durable_high_watermark,
+                        durable_high_watermark=self.runtime.sink_durable_high_watermark,
                     )
                 self._acknowledged_sequences.add(sequence)
                 durable.append(sequence)
@@ -171,7 +245,7 @@ class ControlTraceSpoolSink:
             failed_sequence=None,
             failure_code=None,
             health_receipt=None,
-            durable_high_watermark=self.runtime.snapshot().sink_durable_high_watermark,
+            durable_high_watermark=self.runtime.sink_durable_high_watermark,
         )
 
 

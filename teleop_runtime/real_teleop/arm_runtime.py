@@ -9,6 +9,7 @@ import numpy as np
 
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
 )
 
 from ..backends.arms import RM65ArmBackend, RM65ImpedanceArmBackend
@@ -67,7 +68,10 @@ def _acceleration_limited_position_execution_active(
     return bool(active_backends) and all(
         isinstance(backend, RM65ArmBackend)
         and str(getattr(backend.config, "position_command_planner", ""))
-        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }
         for backend in active_backends
     )
 

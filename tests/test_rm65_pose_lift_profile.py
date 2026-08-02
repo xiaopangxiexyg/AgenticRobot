@@ -12,6 +12,17 @@ from robot_motion.rm65 import (
     RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME,
     RM65_POSE_LIFT_V4_QP_CONSTRAINED,
     RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+    RM65_POSE_LIFT_V5_SIGMA_ESCAPE,
+    RM65_POSE_LIFT_V5_SIGMA_ESCAPE_NAME,
+    RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH,
+    RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH_NAME,
+    RM65_POSE_LIFT_V7_STRUCTURAL_ESCAPE_NAME,
+    RM65_POSE_LIFT_V8_NONLINEAR_BEST_CANDIDATE,
+    RM65_POSE_LIFT_V8_NONLINEAR_BEST_CANDIDATE_NAME,
+    RM65_POSE_LIFT_V9_PREDICTIVE_BRANCH_BARRIER,
+    RM65_POSE_LIFT_V9_PREDICTIVE_BRANCH_BARRIER_NAME,
+    RM65_POSE_LIFT_V10_DIRECTIONAL_FEASIBILITY_GUARD,
+    RM65_POSE_LIFT_V10_DIRECTIONAL_FEASIBILITY_GUARD_NAME,
     RM65PositionCollisionPlannerConfig,
     build_rm65_pose_lift_ik_tuning,
     resolve_rm65_pose_lift_profile,
@@ -39,6 +50,12 @@ def test_pose_lift_v2_is_explicit_opt_in_and_profile_names_are_stable() -> None:
         RM65_POSE_LIFT_V2_CONTINUOUS_NAME,
         RM65_POSE_LIFT_V3_BOUNDED_CONTINUOUS_NAME,
         RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+        RM65_POSE_LIFT_V5_SIGMA_ESCAPE_NAME,
+        RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH_NAME,
+        RM65_POSE_LIFT_V7_STRUCTURAL_ESCAPE_NAME,
+        RM65_POSE_LIFT_V8_NONLINEAR_BEST_CANDIDATE_NAME,
+        RM65_POSE_LIFT_V9_PREDICTIVE_BRANCH_BARRIER_NAME,
+        RM65_POSE_LIFT_V10_DIRECTIONAL_FEASIBILITY_GUARD_NAME,
     )
     with pytest.raises(ValueError, match="unknown RM65 pose-lift profile"):
         resolve_rm65_pose_lift_profile("missing")
@@ -91,6 +108,98 @@ def test_pose_lift_v4_is_hardware_default_candidate_with_explicit_v1_rollback() 
         solve_min_iterations=2,
         solve_max_iterations=4,
     ).effective_solve_max_iterations == 4
+
+
+def test_pose_lift_v5_sigma_escape_is_explicit_offline_only_candidate() -> None:
+    profile = resolve_rm65_pose_lift_profile(RM65_POSE_LIFT_V5_SIGMA_ESCAPE_NAME)
+
+    assert profile is RM65_POSE_LIFT_V5_SIGMA_ESCAPE
+    assert profile.qp_sigma_escape_cost == pytest.approx(0.15)
+    assert profile.qp_sigma_escape_guard == pytest.approx(0.04)
+    assert profile.qp_sigma_escape_rate_per_sec == pytest.approx(0.03)
+    assert profile.hardware_dispatch_allowed is False
+    assert profile.semantic_payload()["validation_scope"] == "offline_or_dry_run_only"
+    assert "qp_sigma_escape_cost" not in (
+        RM65_POSE_LIFT_V4_QP_CONSTRAINED.semantic_payload()
+    )
+
+
+def test_pose_lift_v6_structural_branch_is_explicit_offline_only_candidate() -> None:
+    profile = resolve_rm65_pose_lift_profile(
+        RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH_NAME
+    )
+
+    assert profile is RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH
+    assert profile.qp_structural_branch_margin_deg == pytest.approx(0.75)
+    assert profile.qp_structural_branch_guard_sigma == pytest.approx(0.04)
+    assert profile.qp_structural_branch_release_sigma == pytest.approx(0.05)
+    assert profile.hardware_dispatch_allowed is False
+    assert profile.semantic_payload()["validation_scope"] == "offline_or_dry_run_only"
+
+
+def test_pose_lift_v8_nonlinear_best_candidate_is_offline_and_rollback_safe() -> None:
+    profile = resolve_rm65_pose_lift_profile(
+        RM65_POSE_LIFT_V8_NONLINEAR_BEST_CANDIDATE_NAME
+    )
+
+    assert profile is RM65_POSE_LIFT_V8_NONLINEAR_BEST_CANDIDATE
+    assert profile.qp_nonlinear_best_so_far is True
+    assert profile.qp_nonlinear_best_min_iteration == 2
+    assert profile.qp_nonlinear_best_guard_sigma == pytest.approx(0.04)
+    assert profile.hardware_dispatch_allowed is False
+    assert profile.semantic_payload()["validation_scope"] == "offline_or_dry_run_only"
+    assert RM65_POSE_LIFT_V4_QP_CONSTRAINED.qp_nonlinear_best_so_far is False
+
+
+def test_pose_lift_v9_predictive_barrier_is_offline_and_v6_is_unchanged() -> None:
+    profile = resolve_rm65_pose_lift_profile(
+        RM65_POSE_LIFT_V9_PREDICTIVE_BRANCH_BARRIER_NAME
+    )
+
+    assert profile is RM65_POSE_LIFT_V9_PREDICTIVE_BRANCH_BARRIER
+    assert (
+        profile.qp_structural_branch_constraint_mode
+        == "hybrid_deep_barrier"
+    )
+    assert profile.qp_structural_branch_barrier_gain == pytest.approx(6.0)
+    assert profile.qp_structural_branch_barrier_activation_sigma == pytest.approx(
+        0.01
+    )
+    assert profile.qp_structural_branch_prediction_horizon_sec == pytest.approx(
+        0.15
+    )
+    assert profile.hardware_dispatch_allowed is False
+    assert profile.semantic_payload()["validation_scope"] == "offline_or_dry_run_only"
+    assert (
+        RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH.qp_structural_branch_constraint_mode
+        == "hard_margin"
+    )
+    assert RM65_POSE_LIFT_V6_STRUCTURAL_BRANCH.qp_structural_branch_barrier_gain == 0.0
+
+
+def test_pose_lift_v10_directional_guard_is_offline_and_v4_is_unchanged() -> None:
+    profile = resolve_rm65_pose_lift_profile(
+        RM65_POSE_LIFT_V10_DIRECTIONAL_FEASIBILITY_GUARD_NAME
+    )
+
+    assert profile is RM65_POSE_LIFT_V10_DIRECTIONAL_FEASIBILITY_GUARD
+    assert profile.qp_structural_branch_constraint_mode == "barrier"
+    assert profile.qp_structural_branch_margin_deg == pytest.approx(0.25)
+    assert profile.directional_task_guard_max_utilization == pytest.approx(0.85)
+    assert profile.directional_task_guard_enter_utilization == pytest.approx(1.0)
+    assert profile.directional_task_guard_release_utilization == pytest.approx(
+        0.75
+    )
+    assert profile.directional_task_guard_leaving_multiplier == pytest.approx(
+        2.0
+    )
+    assert profile.hardware_dispatch_allowed is False
+    payload = profile.semantic_payload()
+    assert payload["validation_scope"] == "offline_or_dry_run_only"
+    assert payload["directional_task_guard_target_shaping"] == (
+        "local_se3_log_singular_direction_projection"
+    )
+    assert RM65_POSE_LIFT_V4_QP_CONSTRAINED.directional_task_guard_max_utilization == 0.0
 
 
 def test_pose_lift_ik_objective_is_shared_and_profile_identified() -> None:

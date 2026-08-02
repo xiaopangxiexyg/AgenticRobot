@@ -1287,6 +1287,54 @@ def normalize_model_continuation_contract(
     )
 
 
+def require_trained_model_rtc_v1_contract(
+    contract: ModelContinuationContract,
+) -> NormalizedModelContinuationContract:
+    """Validate the first trained model-RTC profile without changing v2.
+
+    Training provenance and runtime continuation semantics are orthogonal.
+    The first trained profile therefore keeps the already implemented
+    ``flow_inpaint`` v3 runtime while requiring an explicit v2 trained origin.
+    More specialized continuation modes need their own later runtime gate.
+    """
+
+    normalized = normalize_model_continuation_contract(contract)
+    if normalized.source_schema != MODEL_CONTINUATION_DATA_SCHEMA_V2:
+        raise DatasetLayoutBindingError(
+            "Trained model-RTC v1 requires an explicit v2 source contract."
+        )
+    if (
+        normalized.conditioning_origin
+        != MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
+    ):
+        raise DatasetLayoutBindingError(
+            "Trained model-RTC v1 requires trained_prefix_conditioning_v1 "
+            "provenance."
+        )
+    if normalized.training is None:
+        raise DatasetLayoutBindingError(
+            "Trained model-RTC v1 requires a training contract."
+        )
+    runtime = normalized.runtime
+    if runtime.continuation_mode != MODEL_CONTINUATION_FLOW_INPAINT_V1:
+        raise DatasetLayoutBindingError(
+            "Trained model-RTC v1 reuses the flow_inpaint v3 runtime."
+        )
+    if "absolute" not in runtime.supported_action_pose_modes:
+        raise DatasetLayoutBindingError(
+            "Trained model-RTC v1 requires absolute action support."
+        )
+    if (
+        TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1
+        not in normalized.training.prefix_source_kinds
+    ):
+        raise DatasetLayoutBindingError(
+            "Trained model-RTC v1 requires trajectory-overlap teacher "
+            "provenance."
+        )
+    return normalized
+
+
 __all__ = [
     "MODEL_CONTINUATION_DATA_HASH_DOMAIN_V2",
     "MODEL_CONTINUATION_DATA_HASH_DOMAIN_V1",
@@ -1319,4 +1367,5 @@ __all__ = [
     "NormalizedModelContinuationContract",
     "model_continuation_contract_from_dict",
     "normalize_model_continuation_contract",
+    "require_trained_model_rtc_v1_contract",
 ]

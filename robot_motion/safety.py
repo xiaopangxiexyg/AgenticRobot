@@ -13,6 +13,12 @@ from .transforms import parse_pose_matrix, rotation_angle_rad, translation_dista
 class MotionSafetyConfig:
     max_translation_jump_m: float = 0.10
     max_rotation_jump_deg: float = 45.0
+    # A pose sampled after a long consumer-side polling gap has no adjacent
+    # sample with which to establish a meaningful jump.  Profiles that poll a
+    # latest-value device stream may opt into resetting the comparison
+    # baseline after this interval.  ``None`` preserves the historical
+    # per-observation behavior.
+    pose_jump_baseline_max_gap_sec: float | None = None
     stale_timeout_sec: float = 0.50
     invalid_frame_limit: int = 1
     freeze_on_fault: bool = True
@@ -35,6 +41,7 @@ class SafetyMonitor:
     def __init__(self, config: MotionSafetyConfig | None = None):
         self.config = config if config is not None else MotionSafetyConfig()
         self._last_pose_by_channel: dict[str, np.ndarray] = {}
+        self._last_pose_observed_at_by_channel: dict[str, float] = {}
         self._consecutive_invalid_by_channel: dict[str, int] = {}
         self._pose_reset_pending_by_channel: set[str] = set()
 
@@ -49,6 +56,7 @@ class SafetyMonitor:
 
     def request_pose_baseline_reset(self, channel_name: str) -> None:
         self._last_pose_by_channel.pop(channel_name, None)
+        self._last_pose_observed_at_by_channel.pop(channel_name, None)
         self._pose_reset_pending_by_channel.add(channel_name)
 
     def request_pose_baseline_reset_many(self, channel_names: Iterable[str]) -> None:
@@ -141,10 +149,20 @@ class SafetyMonitor:
             current_pose = parse_pose_matrix(channel.value)
             if channel_name in self._pose_reset_pending_by_channel:
                 self._last_pose_by_channel[channel_name] = current_pose
+                self._last_pose_observed_at_by_channel[channel_name] = float(now)
                 self._pose_reset_pending_by_channel.discard(channel_name)
                 continue
             previous_pose = self._last_pose_by_channel.get(channel_name)
-            if previous_pose is not None:
+            previous_observed_at = self._last_pose_observed_at_by_channel.get(
+                channel_name
+            )
+            maximum_gap = self.config.pose_jump_baseline_max_gap_sec
+            comparison_gap_expired = bool(
+                maximum_gap is not None
+                and previous_observed_at is not None
+                and float(now) - previous_observed_at > float(maximum_gap)
+            )
+            if previous_pose is not None and not comparison_gap_expired:
                 translation_jump = translation_distance(previous_pose, current_pose)
                 rotation_jump_deg = np.rad2deg(rotation_angle_rad(previous_pose, current_pose))
                 if translation_jump > self.config.max_translation_jump_m:
@@ -172,6 +190,7 @@ class SafetyMonitor:
                         )
                     )
             self._last_pose_by_channel[channel_name] = current_pose
+            self._last_pose_observed_at_by_channel[channel_name] = float(now)
         return violations
 
     def evaluate_control_rate(self, control_hz: float) -> list[SafetyViolation]:

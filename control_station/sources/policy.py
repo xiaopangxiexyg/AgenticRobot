@@ -5,17 +5,21 @@ from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Mapping, Protocol
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from control_composition.composition import (
     CompositionInputDraft,
     TemporallySampledCompositionInput,
+    build_composition_input_draft,
     build_robot_action_v1_composition_input_draft,
     build_temporally_sampled_composition_input,
 )
 from control_composition.temporal_sampling import GuaranteedNextComponentAction
 from control_composition.activation import CompositionActivationScope
-from robot_motion.action.component_action import ComponentActionSchema
+from robot_motion.action import RobotAction
+from robot_motion.action.component_action import ComponentAction, ComponentActionSchema
 from robot_motion.action.component_action_v1 import (
     project_robot_action_v1_to_component_action,
 )
@@ -31,6 +35,14 @@ SYNC_POLICY_RUNTIME_CONFIG_HASH_DOMAIN_V1 = (
 POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.control_station.policy_composition_input_binding.v1"
 )
+
+
+class PolicyComponentActionProjector(Protocol):
+    """Optional source-envelope to canonical component projection."""
+
+    semantic_content_hash: str
+
+    def project(self, action: RobotAction) -> ComponentAction: ...
 
 
 def _policy_representation_metadata(emission: PolicyActionEmission) -> dict[str, object]:
@@ -112,6 +124,8 @@ class PolicyCompositionInputBinding:
     action_space: str
     required_active_effectors: tuple[str, ...]
     action_schema: ComponentActionSchema
+    required_component_ids: tuple[str, ...] | None = None
+    component_projection_contract_hash: str | None = None
     semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -144,12 +158,43 @@ class PolicyCompositionInputBinding:
         object.__setattr__(self, "required_active_effectors", effectors)
         if not isinstance(self.action_schema, ComponentActionSchema):
             raise TypeError("action_schema must be a ComponentActionSchema.")
-        if not set(self.required_active_effectors).issubset(
-            set(self.action_schema.component_ids)
-        ):
-            raise ValueError(
-                "Policy binding effectors are outside the action schema."
+        component_ids = (
+            effectors
+            if self.required_component_ids is None
+            else tuple(
+                str(value).strip() for value in self.required_component_ids
             )
+        )
+        if (
+            not component_ids
+            or any(not value for value in component_ids)
+            or len(component_ids) != len(set(component_ids))
+        ):
+            raise ValueError("required_component_ids must be non-empty and unique.")
+        if not set(component_ids).issubset(set(self.action_schema.component_ids)):
+            raise ValueError(
+                "Policy binding components are outside the action schema."
+            )
+        projection_hash = (
+            None
+            if self.component_projection_contract_hash is None
+            else str(self.component_projection_contract_hash).strip()
+        )
+        if self.component_projection_contract_hash is not None and not projection_hash:
+            raise ValueError(
+                "component_projection_contract_hash must be non-empty."
+            )
+        if projection_hash is None and component_ids != effectors:
+            raise ValueError(
+                "A non-identity effector/component binding requires an explicit "
+                "component projection contract."
+            )
+        object.__setattr__(self, "required_component_ids", component_ids)
+        object.__setattr__(
+            self,
+            "component_projection_contract_hash",
+            projection_hash,
+        )
         payload = {
             "source_slot_id": self.source_slot_id,
             "role": self.role,
@@ -162,6 +207,10 @@ class PolicyCompositionInputBinding:
             "component_catalog_hash": self.component_catalog_hash,
             "action_space": self.action_space,
             "required_active_effectors": self.required_active_effectors,
+            "required_component_ids": self.required_component_ids,
+            "component_projection_contract_hash": (
+                self.component_projection_contract_hash
+            ),
             "action_schema_hash": self.action_schema.semantic_content_hash,
         }
         object.__setattr__(
@@ -227,10 +276,37 @@ class PolicyCompositionInputAdapter:
     receiver; chunk and inference identity remain in ``audit_metadata``.
     """
 
-    def __init__(self, binding: PolicyCompositionInputBinding) -> None:
+    def __init__(
+        self,
+        binding: PolicyCompositionInputBinding,
+        *,
+        component_action_projector: PolicyComponentActionProjector | None = None,
+    ) -> None:
         if not isinstance(binding, PolicyCompositionInputBinding):
             raise TypeError("binding must be a PolicyCompositionInputBinding.")
         self.binding = binding
+        projection_hash = (
+            None
+            if component_action_projector is None
+            else str(
+                getattr(
+                    component_action_projector,
+                    "semantic_content_hash",
+                    "",
+                )
+            ).strip()
+        )
+        if projection_hash != binding.component_projection_contract_hash:
+            raise ValueError(
+                "Policy component projector does not match the binding contract."
+            )
+        if component_action_projector is not None and not callable(
+            getattr(component_action_projector, "project", None)
+        ):
+            raise TypeError(
+                "component_action_projector must expose project(RobotAction)."
+            )
+        self.component_action_projector = component_action_projector
         self._lock = threading.RLock()
         self._next_sequence = 0
         self._draft_by_emission_id: dict[str, CompositionInputDraft] = {}
@@ -293,15 +369,15 @@ class PolicyCompositionInputAdapter:
                 if source_fact_hashes is None
                 else tuple(source_fact_hashes)
             )
-            draft = build_robot_action_v1_composition_input_draft(
+            component_action = self._project_component_action(action)
+            draft = build_composition_input_draft(
                 runtime_session_id=self.binding.runtime_session_id,
                 control_domain_id=self.binding.control_domain_id,
                 producer_id=self.binding.producer_id,
                 producer_epoch=self.binding.producer_epoch,
                 sequence=sequence,
                 input_role=self.binding.role,
-                action=action,
-                action_schema=self.binding.action_schema,
+                action=component_action,
                 produced_at=emission.produced_at,
                 produced_clock_domain_id=emission.produced_clock_domain_id,
                 effective_from=emission.effective_from,
@@ -341,6 +417,32 @@ class PolicyCompositionInputAdapter:
                 emission.semantic_content_hash
             )
             return draft
+
+    def _project_component_action(self, action: RobotAction) -> ComponentAction:
+        projector = self.component_action_projector
+        if projector is None:
+            projected = project_robot_action_v1_to_component_action(
+                action,
+                action_schema=self.binding.action_schema,
+            )
+        else:
+            projected = projector.project(action)
+        if not isinstance(projected, ComponentAction):
+            raise TypeError(
+                "Policy component projector must return ComponentAction."
+            )
+        if (
+            projected.action_schema.semantic_content_hash
+            != self.binding.action_schema.semantic_content_hash
+        ):
+            raise ValueError(
+                "Policy component projector returned another action schema."
+            )
+        if projected.component_coverage != self.binding.required_component_ids:
+            raise ValueError(
+                "Policy component projector returned another component coverage."
+            )
+        return projected
 
     def adapt_interpolated_at(
         self,
@@ -410,10 +512,7 @@ class PolicyCompositionInputAdapter:
             action = emission.pre_safety_robot_action
             assert action is not None
             result = build_temporally_sampled_composition_input(
-                current_action=project_robot_action_v1_to_component_action(
-                    action,
-                    action_schema=self.binding.action_schema,
-                ),
+                current_action=self._project_component_action(action),
                 current_target_effective_at=emission.target_effective_at,
                 current_source_fact_id=emission.emission_id,
                 current_source_fact_hash=emission.semantic_content_hash,

@@ -1,0 +1,57 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "example_three_stage_pick_place_stages",
+  "profile_version": "1",
+  "task_progress_profile_hash": "01fc5eef1c512df34279f939cd0b5e56bb44a0238396f2d839c35adf0817b9b9",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "approach_target",
+      "stage_id": "approach_target.observe",
+      "display_name": "观察与定位",
+      "description": "识别目标并确定接近方向。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "approach_target",
+      "stage_id": "approach_target.align",
+      "display_name": "接近与对准",
+      "description": "到达可抓取的预备位姿。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "acquire_object",
+      "stage_id": "acquire_object.contact",
+      "display_name": "建立接触",
+      "description": "末端与目标建立有效接触。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "acquire_object",
+      "stage_id": "acquire_object.secure",
+      "display_name": "稳定抓取",
+      "description": "完成闭合并验证抓取稳定。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "place_object",
+      "stage_id": "place_object.transport",
+      "display_name": "搬运至目标区",
+      "description": "保持目标并移动到放置区域。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "place_object",
+      "stage_id": "place_object.release",
+      "display_name": "放置与释放",
+      "description": "完成放置、释放并退出。",
+      "ordinal": 2
+    }
+  ],
+  "semantic_content_hash": "7de64527b6e7446b2589ec04ef867a96cdcd2f17636edee13b9049cf683ab42e"
+}

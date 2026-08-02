@@ -472,6 +472,14 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._last_fault: str | None = None
         self._last_send_result_code: int | None = None
         self._last_send_result_text: str | None = None
+        # Deployment-only inference gap lease.  When the policy queue is
+        # empty, the worker freezes a measured joint snapshot instead of
+        # continuing the previous Cartesian interpolation.  A fresh command
+        # releases this lease atomically under ``_state_lock``.
+        self._policy_inference_soft_hold = False
+        self._policy_inference_soft_hold_joint_deg: list[float] | None = None
+        self._policy_inference_soft_hold_reason = ""
+        self._policy_inference_soft_hold_timestamp: float | None = None
         self._enabled = False
         self._state_lock = threading.RLock()
         self._send_lock = threading.RLock()
@@ -645,6 +653,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         del reason
         if self.config.observation_only:
             with self._state_lock:
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = ""
+                self._policy_inference_soft_hold_timestamp = None
                 self._last_send_result_code = 0
                 self._last_send_result_text = "observation_only_hold"
             return
@@ -664,6 +676,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             self._loop_stop_event.set()
             with self._state_lock:
                 self._enabled = False
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = ""
+                self._policy_inference_soft_hold_timestamp = None
                 self._latest_target_pose6 = None
                 self._latest_target_joint_deg = None
                 self._latest_target_sequence = None
@@ -704,6 +720,112 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             if not self._loop_thread.is_alive():
                 self._loop_thread = None
 
+    def request_policy_inference_soft_hold(
+        self,
+        reason: str = "policy_inference_wait",
+    ) -> dict[str, object]:
+        """Freeze the latest valid measured qpos during a synchronous policy gap.
+
+        This is intentionally separate from :meth:`hold_motion`: it does not
+        stop the impedance worker, does not issue a robot stop command, and
+        keeps force sensing/hard-stop checks active.  The next accepted
+        ``send_command`` releases the lease.
+        """
+
+        normalized_reason = str(reason or "policy_inference_wait")
+        if self.config.observation_only or not self.config.connect_hardware:
+            with self._state_lock:
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = normalized_reason
+                self._policy_inference_soft_hold_timestamp = None
+            return {
+                "active": False,
+                "status": "skipped",
+                "reason": "observation_only_or_dry_run",
+            }
+
+        with self._state_lock:
+            if self._emergency_stopped:
+                raise RuntimeError(
+                    f"{self.name} emergency_stop is latched; refusing inference soft hold."
+                )
+            if self._policy_inference_soft_hold:
+                return {
+                    "active": True,
+                    "status": "already_active",
+                    "reason": self._policy_inference_soft_hold_reason,
+                    "joint_deg": (
+                        None
+                        if self._policy_inference_soft_hold_joint_deg is None
+                        else list(self._policy_inference_soft_hold_joint_deg)
+                    ),
+                    "timestamp": self._policy_inference_soft_hold_timestamp,
+                }
+
+        state = self.get_state()
+        if state.get("fault"):
+            raise RuntimeError(
+                f"{self.name} cannot enter inference soft hold while faulted: {state['fault']}"
+            )
+        if not bool(state.get("impedance_enabled", False)):
+            raise RuntimeError(
+                f"{self.name} cannot enter inference soft hold before impedance output is enabled."
+            )
+        if not bool(state.get("hardware_measurement_valid", False)):
+            raise RuntimeError(
+                f"{self.name} cannot enter inference soft hold without valid measured qpos."
+            )
+        current_qpos = _coerce_float_vector(state.get("current_qpos"), expected_len=6)
+        if current_qpos is None:
+            raise RuntimeError(
+                f"{self.name} cannot enter inference soft hold without finite measured qpos."
+            )
+        measured_joint_deg = np.rad2deg(np.asarray(current_qpos, dtype=float)).astype(float).tolist()
+        measured_at = state.get("hardware_measurement_timestamp")
+        with self._state_lock:
+            if self._emergency_stopped:
+                raise RuntimeError(
+                    f"{self.name} emergency_stop was latched while taking inference hold snapshot."
+                )
+            if self._policy_inference_soft_hold:
+                return {
+                    "active": True,
+                    "status": "already_active",
+                    "reason": self._policy_inference_soft_hold_reason,
+                    "joint_deg": list(self._policy_inference_soft_hold_joint_deg or measured_joint_deg),
+                    "timestamp": self._policy_inference_soft_hold_timestamp,
+                }
+            self._policy_inference_soft_hold = True
+            self._policy_inference_soft_hold_joint_deg = list(measured_joint_deg)
+            self._policy_inference_soft_hold_reason = normalized_reason
+            self._policy_inference_soft_hold_timestamp = time.time()
+            self._last_send_result_code = 0
+            self._last_send_result_text = "policy_inference_soft_hold"
+            return {
+                "active": True,
+                "status": "activated",
+                "reason": normalized_reason,
+                "joint_deg": list(measured_joint_deg),
+                "timestamp": self._policy_inference_soft_hold_timestamp,
+                "measurement_timestamp": measured_at,
+            }
+
+    def release_policy_inference_soft_hold(
+        self,
+        reason: str = "fresh_policy_action",
+    ) -> None:
+        """Release the inference-gap lease without changing the target."""
+
+        with self._state_lock:
+            was_active = bool(self._policy_inference_soft_hold)
+            self._policy_inference_soft_hold = False
+            self._policy_inference_soft_hold_joint_deg = None
+            self._policy_inference_soft_hold_reason = ""
+            self._policy_inference_soft_hold_timestamp = None
+            if was_active and self._last_fault is None:
+                self._last_send_result_text = str(reason or "fresh_policy_action")
+
     def reset_motion_state(self, qpos: object | None = None) -> None:
         qpos_array: np.ndarray | None = None
         if qpos is not None:
@@ -712,6 +834,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 raise ValueError(f"{self.name} reset_motion_state qpos must be a finite 6-vector.")
         with self._send_lock:
             with self._state_lock:
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = ""
+                self._policy_inference_soft_hold_timestamp = None
                 self._latest_target_pose6 = None
                 self._latest_target_joint_deg = None
                 self._latest_target_sequence = None
@@ -807,6 +933,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._loop_thread = None
                 self._loop_stop_event.clear()
                 self._enabled = False
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = ""
+                self._policy_inference_soft_hold_timestamp = None
                 self._last_fault = None
                 self._last_step_record = None
                 self._recent_step_records = []
@@ -1222,6 +1352,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
             self._command_sequence += 1
             command_sequence = int(self._command_sequence)
+            self._policy_inference_soft_hold = False
+            self._policy_inference_soft_hold_joint_deg = None
+            self._policy_inference_soft_hold_reason = ""
+            self._policy_inference_soft_hold_timestamp = None
             self._latest_target_pose6 = list(target_pose6)
             self._latest_target_joint_deg = None if target_joint_deg is None else list(target_joint_deg)
             self._latest_target_sequence = command_sequence
@@ -1500,6 +1634,15 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                         if self._latest_target_joint_deg is None
                         else list(self._latest_target_joint_deg)
                     )
+                    policy_inference_soft_hold = bool(self._policy_inference_soft_hold)
+                    policy_inference_soft_hold_joint_deg = (
+                        None
+                        if self._policy_inference_soft_hold_joint_deg is None
+                        else list(self._policy_inference_soft_hold_joint_deg)
+                    )
+                    policy_inference_soft_hold_reason = str(
+                        self._policy_inference_soft_hold_reason
+                    )
                     target_sequence = self._latest_target_sequence
                     target_timestamp = self._last_command_timestamp
                 target_snapshot_wall_time = time.time()
@@ -1518,10 +1661,63 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     with self._state_lock:
                         if self._emergency_stopped or self._loop_stop_event.is_set():
                             break
+                        # ``send_command`` publishes under ``_state_lock`` but
+                        # does not wait for the controller's send lock.  Re-read
+                        # the target/soft-hold lease here so a fresh policy
+                        # action cannot be followed by one stale hold tick.
+                        latest_target = (
+                            None
+                            if self._latest_target_pose6 is None
+                            else list(self._latest_target_pose6)
+                        )
+                        latest_target_joint_deg = (
+                            None
+                            if self._latest_target_joint_deg is None
+                            else list(self._latest_target_joint_deg)
+                        )
+                        latest_target_sequence = self._latest_target_sequence
+                        if latest_target_sequence != target_sequence:
+                            target = latest_target
+                            target_joint_deg = latest_target_joint_deg
+                            target_sequence = latest_target_sequence
+                            target_timestamp = self._last_command_timestamp
+                            target_dispatched_this_step = bool(
+                                target is not None
+                                and target_sequence != last_dispatched_target_sequence
+                            )
+                            step_target = target if target_dispatched_this_step else None
+                            step_target_joint_deg = (
+                                target_joint_deg if target_dispatched_this_step else None
+                            )
+                        policy_inference_soft_hold = bool(
+                            self._policy_inference_soft_hold
+                        )
+                        policy_inference_soft_hold_joint_deg = (
+                            None
+                            if self._policy_inference_soft_hold_joint_deg is None
+                            else list(self._policy_inference_soft_hold_joint_deg)
+                        )
+                        policy_inference_soft_hold_reason = str(
+                            self._policy_inference_soft_hold_reason
+                        )
                     mark_timing("pre_step_check")
                     controller_step_start_wall_time = time.time()
                     controller_step_start_monotonic = time.monotonic()
-                    record = dict(self._controller.step(step_target, target_joint_deg=step_target_joint_deg))
+                    if policy_inference_soft_hold and policy_inference_soft_hold_joint_deg is not None:
+                        record = dict(
+                            self._controller.step(
+                                None,
+                                soft_hold_joint_deg=policy_inference_soft_hold_joint_deg,
+                                soft_hold_reason=policy_inference_soft_hold_reason,
+                            )
+                        )
+                    else:
+                        record = dict(
+                            self._controller.step(
+                                step_target,
+                                target_joint_deg=step_target_joint_deg,
+                            )
+                        )
                     controller_step_end_wall_time = time.time()
                     controller_step_end_monotonic = time.monotonic()
                     if target_dispatched_this_step:
@@ -1534,6 +1730,14 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                             "backend_target_joint_hint_present": target_joint_deg is not None,
                             "backend_target_dispatched_this_step": target_dispatched_this_step,
                             "backend_last_dispatched_target_sequence": last_dispatched_target_sequence,
+                            "backend_policy_inference_soft_hold": bool(
+                                policy_inference_soft_hold
+                            ),
+                            "backend_policy_inference_soft_hold_reason": (
+                                policy_inference_soft_hold_reason
+                                if policy_inference_soft_hold
+                                else None
+                            ),
                             "backend_target_snapshot_wall_time": float(target_snapshot_wall_time),
                             "backend_controller_step_start_wall_time": float(
                                 controller_step_start_wall_time
@@ -1598,6 +1802,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     self._last_send_result_code = -1
                     self._last_send_result_text = fault
                     self._enabled = False
+                    self._policy_inference_soft_hold = False
+                    self._policy_inference_soft_hold_joint_deg = None
+                    self._policy_inference_soft_hold_reason = ""
+                    self._policy_inference_soft_hold_timestamp = None
                     self._exact_qpos_transit_operation_id = None
                     force_hard_stop_callback = self._force_hard_stop_callback
                 hard_stop = _is_force_hard_stop_exception(exc)
@@ -1640,6 +1848,16 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             latest_target_joint_deg = (
                 None if self._latest_target_joint_deg is None else list(self._latest_target_joint_deg)
             )
+            policy_inference_soft_hold = bool(self._policy_inference_soft_hold)
+            policy_inference_soft_hold_joint_deg = (
+                None
+                if self._policy_inference_soft_hold_joint_deg is None
+                else list(self._policy_inference_soft_hold_joint_deg)
+            )
+            policy_inference_soft_hold_reason = str(
+                self._policy_inference_soft_hold_reason
+            )
+            policy_inference_soft_hold_timestamp = self._policy_inference_soft_hold_timestamp
             latest_target_sequence = self._latest_target_sequence
             command_sequence = int(self._command_sequence)
             last_command_controlled_frame = (
@@ -1792,6 +2010,16 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 "latest_target_tcp_pose6": latest_target_pose6,
                 "latest_target_joint_deg": latest_target_joint_deg,
                 "latest_target_sequence": latest_target_sequence,
+                "policy_inference_soft_hold": policy_inference_soft_hold,
+                "policy_inference_soft_hold_joint_deg": policy_inference_soft_hold_joint_deg,
+                "policy_inference_soft_hold_reason": (
+                    policy_inference_soft_hold_reason if policy_inference_soft_hold else None
+                ),
+                "policy_inference_soft_hold_timestamp": (
+                    policy_inference_soft_hold_timestamp
+                    if policy_inference_soft_hold
+                    else None
+                ),
                 "arm_state_source": (
                     "hardware_observation_only"
                     if self.config.observation_only
@@ -1864,6 +2092,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             with self._state_lock:
                 self._enabled = False
                 self._emergency_stopped = True
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = ""
+                self._policy_inference_soft_hold_timestamp = None
                 self._last_send_result_code = 0
                 self._last_send_result_text = "observation_only_emergency_stop"
             return
@@ -1873,6 +2105,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             with self._state_lock:
                 self._enabled = False
                 self._emergency_stopped = True
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = ""
+                self._policy_inference_soft_hold_timestamp = None
                 self._latest_target_pose6 = None
                 self._latest_target_joint_deg = None
                 self._latest_target_sequence = None
@@ -1953,3 +2189,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         finally:
             with self._state_lock:
                 self._enabled = False
+                self._policy_inference_soft_hold = False
+                self._policy_inference_soft_hold_joint_deg = None
+                self._policy_inference_soft_hold_reason = ""
+                self._policy_inference_soft_hold_timestamp = None

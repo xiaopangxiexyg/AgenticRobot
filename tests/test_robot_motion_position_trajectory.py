@@ -8,6 +8,7 @@ from robot_motion.position_control import (
     JointTrajectoryLimits,
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     normalize_position_command_planner,
 )
 
@@ -60,6 +61,10 @@ def test_position_command_planner_names_are_normalized() -> None:
     assert (
         normalize_position_command_planner("velocity")
         == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+    )
+    assert (
+        normalize_position_command_planner("sample_aligned")
+        == POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
     )
     with pytest.raises(ValueError, match="Unsupported position command planner"):
         normalize_position_command_planner("cubic_canfd")
@@ -278,6 +283,25 @@ def test_quick_stop_holds_last_committed_qpos_and_zeros_velocity_immediately() -
     np.testing.assert_allclose(stopped.q_command, moving.q_command)
     np.testing.assert_allclose(stopped.qd_command_rad_s, 0.0)
     np.testing.assert_allclose(stopped.qdd_command_rad_s2, 0.0)
+
+
+def test_post_hold_reference_uses_upstream_publication_timeline() -> None:
+    planner = _planner()
+    _accept(planner, (1.0, 0.0), sequence=1, now=0.0)
+
+    # The local simulation/planner clock may advance faster than the receiver
+    # clock used to publish references in a non-realtime test or replay.
+    planner.quick_stop(sequence=2, monotonic_time=1.0, reason="operator_hold")
+    planner.accept_target(
+        (0.5, 0.0),
+        sequence=3,
+        published_monotonic_time=0.5,
+        monotonic_time=1.1,
+    )
+
+    snapshot = planner.snapshot()
+    assert snapshot["target_sequence"] == 3
+    np.testing.assert_allclose(snapshot["target_qd_raw_rad_s"], 0.0)
 
 
 def test_rejected_proposal_does_not_advance_position_or_velocity_state() -> None:

@@ -94,6 +94,43 @@ def _pose_matrix(value: Any, *, name: str) -> np.ndarray:
     return pose.astype(float, copy=True)
 
 
+def _se3_exp_local(twist_linear_angular: Sequence[float]) -> np.ndarray:
+    """Return a local SE(3) increment in Pinocchio linear/angular order."""
+
+    twist = np.asarray(twist_linear_angular, dtype=float).reshape(6)
+    if not np.all(np.isfinite(twist)):
+        raise ValueError("local SE(3) increment must be finite.")
+    linear = twist[:3]
+    angular = twist[3:]
+    theta = float(np.linalg.norm(angular))
+    skew = np.array(
+        [
+            [0.0, -angular[2], angular[1]],
+            [angular[2], 0.0, -angular[0]],
+            [-angular[1], angular[0], 0.0],
+        ],
+        dtype=float,
+    )
+    if theta <= 1e-9:
+        left_jacobian = (
+            np.eye(3, dtype=float)
+            + 0.5 * skew
+            + (1.0 / 6.0) * (skew @ skew)
+        )
+    else:
+        theta2 = theta * theta
+        left_jacobian = (
+            np.eye(3, dtype=float)
+            + ((1.0 - math.cos(theta)) / theta2) * skew
+            + ((theta - math.sin(theta)) / (theta2 * theta))
+            * (skew @ skew)
+        )
+    result = np.eye(4, dtype=float)
+    result[:3, :3] = R.from_rotvec(angular).as_matrix()
+    result[:3, 3] = left_jacobian @ linear
+    return result
+
+
 def _normalize_pose_mapping(
     values: Mapping[str, Any],
     *,
@@ -721,6 +758,24 @@ class RM65PositionCollisionPlanner:
             "applied": False,
             "reason": "not_planned",
         }
+        self._last_nonlinear_candidate_metadata: dict[str, Any] = {
+            "enabled": bool(
+                self.config.pose_lift_profile.qp_nonlinear_best_so_far
+            ),
+            "reason": "not_planned",
+            "candidates": [],
+        }
+        self._directional_task_guard_active_by_side = {
+            side: False for side in SIDES
+        }
+        self._last_directional_task_guard_metadata: dict[str, Any] = {
+            "enabled": bool(
+                self.config.pose_lift_profile.directional_task_guard_max_utilization
+                > 0.0
+            ),
+            "reason": "not_planned",
+            "sides": {},
+        }
 
     @property
     def collision_pair_count(self) -> int:
@@ -779,6 +834,449 @@ class RM65PositionCollisionPlanner:
                 }
             )
 
+    def observe_endpoint_poses_world(
+        self,
+        qpos_by_side: Mapping[str, Any],
+    ) -> Mapping[str, np.ndarray]:
+        """Return detached endpoint FK for a complete dual-arm configuration.
+
+        This observer is intentionally read-only: it does not reset the
+        planner, advance the Pink configuration, alter the admitted-motion
+        history, or certify the configuration for execution.  Offline
+        path-lift diagnostics use it to construct targets around recorded
+        accepted-qref seeds without reaching through the planner into its
+        private solver.
+        """
+
+        qpos = validate_qpos_by_side(qpos_by_side)
+        if set(qpos) != set(SIDES):
+            missing = sorted(set(SIDES) - set(qpos))
+            raise ValueError(
+                "endpoint FK observation requires qpos for both arms; "
+                f"missing={missing}."
+            )
+        with self._lock:
+            full_q = self._embed_arm_qpos(self._solver_current_q(), qpos)
+            return _freeze_array_mapping(self._realized_endpoint_poses(full_q))
+
+    def analyze_task_conditioning(
+        self,
+        qpos_by_side: Mapping[str, Any],
+        target_endpoint_pose_world_by_side: Mapping[str, Any],
+        *,
+        dt_sec: float | None = None,
+    ) -> Mapping[str, Any]:
+        """Observe target-conditioned Pink task authority for one reference.
+
+        Unlike :meth:`analyze_configuration`, this metric depends on both the
+        candidate configuration and the exact endpoint target.  It calls the
+        same Pink ``FrameTask`` SE(3)-Log error and Jacobian implementation as
+        the planner, but uses an isolated temporary configuration and never
+        advances solver, motion-limit, collision, or admitted-reference state.
+        """
+
+        period = (
+            float(self.config.reference_period_sec)
+            if dt_sec is None
+            else _finite_positive(dt_sec, name="dt_sec")
+        )
+        qpos = validate_qpos_by_side(qpos_by_side)
+        if set(qpos) != set(SIDES):
+            missing = sorted(set(SIDES) - set(qpos))
+            raise ValueError(
+                "task-conditioning diagnostics require qpos for both arms; "
+                f"missing={missing}."
+            )
+        targets = _normalize_pose_mapping(
+            target_endpoint_pose_world_by_side,
+            name="target_endpoint_pose_world_by_side",
+            require_both=True,
+        )
+        analyze = getattr(self.solver, "compute_frame_task_conditioning", None)
+        if not callable(analyze):
+            return _freeze_value(
+                {
+                    "schema": "robot_motion.rm65.task_conditioning/v1",
+                    "available": False,
+                    "observational_only": True,
+                    "reason": "solver_frame_task_conditioning_unavailable",
+                    "sides": {},
+                }
+            )
+        with self._lock:
+            current_full_q = self._solver_current_q()
+            full_q = self._embed_arm_qpos(current_full_q, qpos)
+            full_velocity_limit = self._full_arm_tangent_limit(
+                self.config.max_joint_velocity_rad_s,
+                full_dof=full_q.size,
+            )
+            joint_indices = [
+                np.arange(full_q.size, dtype=int)[self._arm_slices[side]]
+                for side in SIDES
+            ]
+            solver_targets = [
+                self._pose_to_xyzquat(targets[side]) for side in SIDES
+            ]
+            metrics = analyze(
+                solver_targets,
+                q=full_q,
+                joint_indices_by_target=joint_indices,
+                joint_velocity_limit_rad_s=full_velocity_limit,
+                dt_sec=period,
+            )
+            if len(metrics) != len(SIDES):
+                raise RuntimeError(
+                    "solver task-conditioning result does not match arm count."
+                )
+            return _freeze_value(
+                {
+                    "schema": "robot_motion.rm65.task_conditioning/v1",
+                    "available": True,
+                    "observational_only": True,
+                    "control_authority": "none",
+                    "threshold_classification": "not_assigned",
+                    "target_contract": "exact_solver_endpoint_pose_world",
+                    "sides": {
+                        side: dict(side_metrics)
+                        for side, side_metrics in zip(SIDES, metrics)
+                    },
+                }
+            )
+
+    def analyze_constrained_task_feasibility(
+        self,
+        qpos_by_side: Mapping[str, Any],
+        target_endpoint_pose_world_by_side: Mapping[str, Any],
+        *,
+        dt_sec: float | None = None,
+    ) -> Mapping[str, Any]:
+        """Run detached feasibility QPs for one exact endpoint reference."""
+
+        period = (
+            float(self.config.reference_period_sec)
+            if dt_sec is None
+            else _finite_positive(dt_sec, name="dt_sec")
+        )
+        qpos = validate_qpos_by_side(qpos_by_side)
+        if set(qpos) != set(SIDES):
+            missing = sorted(set(SIDES) - set(qpos))
+            raise ValueError(
+                "constrained-feasibility diagnostics require both arms; "
+                f"missing={missing}."
+            )
+        targets = _normalize_pose_mapping(
+            target_endpoint_pose_world_by_side,
+            name="target_endpoint_pose_world_by_side",
+            require_both=True,
+        )
+        analyze = getattr(self.solver, "compute_constrained_task_feasibility", None)
+        if not callable(analyze):
+            return _freeze_value(
+                {
+                    "schema": (
+                        "robot_motion.rm65.constrained_task_feasibility/v1"
+                    ),
+                    "available": False,
+                    "observational_only": True,
+                    "reason": "solver_constrained_task_feasibility_unavailable",
+                }
+            )
+        with self._lock:
+            full_q = self._embed_arm_qpos(self._solver_current_q(), qpos)
+            result = analyze(
+                [self._pose_to_xyzquat(targets[side]) for side in SIDES],
+                q=full_q,
+                dt_sec=period,
+            )
+            return _freeze_value(dict(result))
+
+    def resolve_target_endpoint_pose_world(
+        self,
+        target_pose_by_side: Mapping[str, Any],
+        *,
+        target_reference_frame: Literal["arm_base", "world", "scene_world"] = (
+            "arm_base"
+        ),
+        target_controlled_frame: str = TOOL_TCP_FRAME,
+    ) -> Mapping[str, np.ndarray]:
+        """Resolve planner input poses without planning or advancing state."""
+
+        targets = _normalize_pose_mapping(
+            target_pose_by_side,
+            name="target_pose_by_side",
+            require_both=True,
+        )
+        reference_frame = str(target_reference_frame).strip().lower()
+        if reference_frame == "scene_world":
+            reference_frame = "world"
+        if reference_frame not in {"arm_base", "world"}:
+            raise ValueError(
+                f"unsupported target reference frame {target_reference_frame!r}."
+            )
+        controlled_frame = canonical_rm65_controlled_frame(
+            target_controlled_frame
+        )
+        if controlled_frame not in {TOOL_TCP_FRAME, ARM_ENDPOINT_FRAME}:
+            raise ValueError(
+                f"unsupported target controlled frame {target_controlled_frame!r}."
+            )
+        endpoint_from_controlled_by_side = {
+            side: (
+                self.endpoint_to_tool_by_side[side]
+                if controlled_frame == TOOL_TCP_FRAME
+                else np.eye(4, dtype=float)
+            )
+            for side in SIDES
+        }
+        return _freeze_array_mapping(
+            {
+                side: _pose_matrix(
+                    (
+                        self.world_from_arm_base_by_side[side] @ targets[side]
+                        if reference_frame == "arm_base"
+                        else targets[side]
+                    )
+                    @ invert_pose(endpoint_from_controlled_by_side[side]),
+                    name=f"target_endpoint_pose_world_by_side.{side}",
+                )
+                for side in SIDES
+            }
+        )
+
+    def _directionally_shape_solver_targets(
+        self,
+        reference_full_q: np.ndarray,
+        target_endpoint_world: Mapping[str, np.ndarray],
+        *,
+        active_sides: Sequence[str],
+    ) -> dict[str, np.ndarray]:
+        """Project only over-demanded Pink singular directions.
+
+        This path is gated by an explicit offline-only Pose Lift profile.
+        Original target poses remain authoritative for error reporting; the
+        returned poses are solver-local shaped targets for one control cut.
+        """
+
+        profile = self.config.pose_lift_profile
+        max_utilization = float(
+            profile.directional_task_guard_max_utilization
+        )
+        shaped = {
+            side: np.asarray(target_endpoint_world[side], dtype=float).copy()
+            for side in SIDES
+        }
+        if max_utilization <= 0.0:
+            self._last_directional_task_guard_metadata = {
+                "enabled": False,
+                "reason": "profile_disabled",
+                "sides": {},
+            }
+            return shaped
+        analyze = getattr(self.solver, "compute_frame_task_conditioning", None)
+        if not callable(analyze):
+            raise _PlanningFailure(
+                "directional_task_guard_unavailable",
+                "directional task guard requires Pink FrameTask diagnostics.",
+            )
+        full_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        full_velocity_limit = self._full_arm_tangent_limit(
+            self.config.max_joint_velocity_rad_s,
+            full_dof=full_q.size,
+        )
+        joint_indices = [
+            np.arange(full_q.size, dtype=int)[self._arm_slices[side]]
+            for side in SIDES
+        ]
+        metrics = analyze(
+            [self._pose_to_xyzquat(shaped[side]) for side in SIDES],
+            q=full_q,
+            joint_indices_by_target=joint_indices,
+            joint_velocity_limit_rad_s=full_velocity_limit,
+            dt_sec=float(self.config.reference_period_sec),
+        )
+        if len(metrics) != len(SIDES):
+            raise _PlanningFailure(
+                "directional_task_guard_invalid_metrics",
+                "directional task metrics do not match the dual-arm layout.",
+            )
+        active_set = {normalize_side(str(side)) for side in active_sides}
+        qpos_by_side = self._split_arm_qpos(full_q)
+        metadata_by_side: dict[str, Any] = {}
+        shaped_count = 0
+        for side, side_metrics in zip(SIDES, metrics):
+            qpos = qpos_by_side[side]
+            structural_indices = (2, 4)
+            selected_joint = min(
+                structural_indices,
+                key=lambda index: abs(float(qpos[index])),
+            )
+            structural_abs_deg = float(
+                abs(math.degrees(float(qpos[selected_joint])))
+            )
+            max_required = float(
+                side_metrics["max_required_velocity_utilization"]
+            )
+            was_active = bool(
+                self._directional_task_guard_active_by_side.get(side, False)
+            )
+            if side not in active_set:
+                guard_active = False
+                transition = "passive_side"
+            elif was_active:
+                release = bool(
+                    max_required
+                    <= float(
+                        profile.directional_task_guard_release_utilization
+                    )
+                    or structural_abs_deg
+                    >= float(
+                        profile.directional_task_guard_release_band_deg
+                    )
+                )
+                guard_active = not release
+                transition = "released" if release else "protected"
+            else:
+                guard_active = bool(
+                    structural_abs_deg
+                    <= float(
+                        profile.directional_task_guard_structural_band_deg
+                    )
+                    and max_required
+                    >= float(
+                        profile.directional_task_guard_enter_utilization
+                    )
+                )
+                transition = "entered" if guard_active else "clear"
+            self._directional_task_guard_active_by_side[side] = guard_active
+            side_metadata: dict[str, Any] = {
+                "active": guard_active,
+                "transition": transition,
+                "max_required_velocity_utilization": max_required,
+                "selected_structural_joint": f"q{selected_joint + 1}",
+                "selected_structural_abs_deg": structural_abs_deg,
+                "task_sigma_min": float(
+                    side_metrics["sigma_task_velocity_min"]
+                ),
+                "direction_scales": [1.0] * 6,
+                "away_direction_modes": [],
+            }
+            if not guard_active:
+                metadata_by_side[side] = side_metadata
+                continue
+
+            task_error = np.asarray(
+                side_metrics["task_error_local"],
+                dtype=float,
+            ).reshape(6)
+            task_cost = np.asarray(
+                side_metrics["task_cost"],
+                dtype=float,
+            ).reshape(6)
+            task_direction_rows = np.asarray(
+                side_metrics["task_direction_rows"],
+                dtype=float,
+            ).reshape(6, 6)
+            joint_direction_rows = np.asarray(
+                side_metrics["joint_utilization_direction_rows"],
+                dtype=float,
+            ).reshape(6, 6)
+            singular_values = np.asarray(
+                side_metrics["singular_values_task_velocity"],
+                dtype=float,
+            ).reshape(6)
+            directional_demand = np.asarray(
+                side_metrics["directional_demand"],
+                dtype=float,
+            ).reshape(6)
+            required = np.asarray(
+                side_metrics["directional_required_velocity_utilization"],
+                dtype=float,
+            ).reshape(6)
+            velocity_limit = np.asarray(
+                side_metrics["joint_velocity_limit_rad_s"],
+                dtype=float,
+            ).reshape(6)
+            scales = np.ones(6, dtype=float)
+            away_modes: list[int] = []
+            selected_sign = (
+                1.0 if float(qpos[selected_joint]) >= 0.0 else -1.0
+            )
+            for mode_index in range(6):
+                sigma = float(singular_values[mode_index])
+                demand = float(directional_demand[mode_index])
+                modal_joint_velocity = np.zeros(6, dtype=float)
+                if sigma > 1e-12:
+                    modal_joint_velocity = (
+                        velocity_limit
+                        * joint_direction_rows[mode_index]
+                        * (demand / sigma)
+                    )
+                leaving = bool(
+                    selected_sign
+                    * float(modal_joint_velocity[selected_joint])
+                    > 1e-9
+                )
+                if leaving:
+                    away_modes.append(mode_index)
+                cap = max_utilization * (
+                    float(profile.directional_task_guard_leaving_multiplier)
+                    if leaving
+                    else 1.0
+                )
+                mode_required = float(required[mode_index])
+                if not math.isfinite(mode_required):
+                    scales[mode_index] = float(
+                        profile.directional_task_guard_min_scale
+                    )
+                elif mode_required > cap:
+                    scales[mode_index] = max(
+                        float(profile.directional_task_guard_min_scale),
+                        cap / max(mode_required, 1e-12),
+                    )
+            weighted_error = task_cost * task_error
+            modal_error = task_direction_rows @ weighted_error
+            safe_weighted_error = (
+                task_direction_rows.T @ (scales * modal_error)
+            )
+            safe_error = safe_weighted_error / task_cost
+            current_pose = self._compute_frame_pose(
+                str(getattr(self.scene_profile, f"{side}_frame_name")),
+                full_q,
+            )
+            shaped[side] = _pose_matrix(
+                current_pose @ _se3_exp_local(safe_error),
+                name=f"directionally_shaped_target.{side}",
+            )
+            shaped_count += int(np.any(scales < 1.0 - 1e-12))
+            side_metadata.update(
+                {
+                    "direction_scales": scales.astype(float).tolist(),
+                    "away_direction_modes": away_modes,
+                    "raw_task_error_local": task_error.astype(float).tolist(),
+                    "shaped_task_error_local": safe_error.astype(float).tolist(),
+                    "minimum_direction_scale": float(np.min(scales)),
+                }
+            )
+            metadata_by_side[side] = side_metadata
+        self._last_directional_task_guard_metadata = {
+            "enabled": True,
+            "reason": (
+                "directionally_shaped"
+                if shaped_count > 0
+                else "no_direction_required_shaping"
+            ),
+            "shaped_side_count": shaped_count,
+            "max_utilization": max_utilization,
+            "enter_utilization": float(
+                profile.directional_task_guard_enter_utilization
+            ),
+            "release_utilization": float(
+                profile.directional_task_guard_release_utilization
+            ),
+            "sides": metadata_by_side,
+        }
+        return shaped
+
     def _configuration_singularity_metrics(
         self,
         full_q: np.ndarray,
@@ -813,6 +1311,161 @@ class RM65PositionCollisionPlanner:
             sides[side] = metrics
         return sides
 
+    def _evaluate_nonlinear_iteration_candidate(
+        self,
+        *,
+        iteration: int,
+        candidate_full_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        pose_error_by_side: Mapping[str, Mapping[str, float]],
+    ) -> dict[str, Any]:
+        """Evaluate one SQP iterate using final nonlinear admission geometry.
+
+        This observer is enabled only by an explicit offline Pose Lift profile.
+        It does not advance the admitted reference or solver history.
+        """
+
+        candidate = np.asarray(candidate_full_q, dtype=float).reshape(
+            reference_full_q.shape
+        )
+        result: dict[str, Any] = {
+            "iteration": int(iteration),
+            "eligible": False,
+            "reason": "pending",
+        }
+        try:
+            self._require_arm_qpos_within_limits(
+                candidate,
+                name=f"nonlinear iteration {iteration} qpos",
+            )
+            candidate_by_side = self._split_arm_qpos(candidate)
+            reference_by_side = self._split_arm_qpos(reference_full_q)
+            max_step = self.config.effective_max_joint_step_rad
+            for side in SIDES:
+                constrained = constrain_joint_vector(
+                    candidate_by_side[side],
+                    reference=reference_by_side[side],
+                    lower=self._joint_lower_by_side[side],
+                    upper=self._joint_upper_by_side[side],
+                    max_step_rad=max_step,
+                )
+                if constrained.infeasible or constrained.value is None:
+                    result["reason"] = f"joint_certificate_infeasible:{side}"
+                    return result
+                if not np.allclose(
+                    np.asarray(constrained.value, dtype=float),
+                    candidate_by_side[side],
+                    atol=1e-9,
+                    rtol=0.0,
+                ):
+                    result["reason"] = f"joint_certificate_modified:{side}"
+                    return result
+
+            distance, distance_ms = self._collision_distance(candidate)
+            collision_safe, collision_reason = self._collision_safe(distance)
+            if not collision_safe:
+                result.update(
+                    {
+                        "reason": str(collision_reason or "collision_unsafe"),
+                        "collision_distance_m": distance,
+                        "collision_check_ms": float(distance_ms),
+                    }
+                )
+                return result
+
+            singularity = self._configuration_singularity_metrics(
+                candidate,
+                characteristic_length_m=(
+                    DEFAULT_RM65_JACOBIAN_CHARACTERISTIC_LENGTH_M
+                ),
+            )
+            min_sigma = min(
+                float(singularity[side]["sigma_min"]) for side in SIDES
+            )
+            translation_scale = max(
+                float(self.config.solve_translation_tolerance_m),
+                1e-12,
+            )
+            rotation_scale = max(
+                float(self.config.solve_orientation_tolerance_deg),
+                1e-12,
+            )
+            pose_score = max(
+                max(
+                    float(pose_error_by_side[side]["translation_m"])
+                    / translation_scale,
+                    float(pose_error_by_side[side]["rotation_deg"])
+                    / rotation_scale,
+                )
+                for side in SIDES
+            )
+            result.update(
+                {
+                    "eligible": True,
+                    "reason": "exact_nonlinear_certificate_passed",
+                    "min_sigma": float(min_sigma),
+                    "pose_score": float(pose_score),
+                    "collision_distance_m": distance,
+                    "collision_check_ms": float(distance_ms),
+                    "pose_error": {
+                        side: {
+                            "translation_m": float(
+                                pose_error_by_side[side]["translation_m"]
+                            ),
+                            "rotation_deg": float(
+                                pose_error_by_side[side]["rotation_deg"]
+                            ),
+                        }
+                        for side in SIDES
+                    },
+                    "_candidate_full_q": candidate.copy(),
+                }
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 - candidate is rejected, not fatal.
+            result["reason"] = (
+                f"candidate_evaluation_error:{type(exc).__name__}:{exc}"
+            )
+            return result
+
+    def _nonlinear_iteration_candidate_is_better(
+        self,
+        candidate: Mapping[str, Any],
+        best: Mapping[str, Any],
+    ) -> tuple[bool, str]:
+        profile = self.config.pose_lift_profile
+        candidate_sigma = float(candidate["min_sigma"])
+        best_sigma = float(best["min_sigma"])
+        candidate_pose = float(candidate["pose_score"])
+        best_pose = float(best["pose_score"])
+        sigma_improvement = float(
+            profile.qp_nonlinear_best_sigma_improvement
+        )
+        pose_slack = float(profile.qp_nonlinear_best_pose_score_slack)
+        guarded = min(candidate_sigma, best_sigma) < float(
+            profile.qp_nonlinear_best_guard_sigma
+        )
+        if guarded:
+            if (
+                candidate_sigma >= best_sigma + sigma_improvement
+                and candidate_pose <= best_pose + pose_slack
+            ):
+                return True, "guarded_sigma_improved_within_pose_slack"
+            if (
+                candidate_sigma >= best_sigma - 1e-9
+                and candidate_pose < best_pose - 1e-9
+            ):
+                return True, "guarded_pose_improved_without_sigma_regression"
+            return False, "guarded_candidate_not_lexicographically_better"
+        if candidate_pose < best_pose - 1e-9:
+            return True, "clear_pose_improved"
+        if (
+            candidate_pose <= best_pose + 1e-9
+            and candidate_sigma > best_sigma + sigma_improvement
+        ):
+            return True, "clear_equal_pose_sigma_improved"
+        return False, "clear_candidate_not_lexicographically_better"
+
     def reset(self, current_qpos_by_side: Mapping[str, Any]) -> Mapping[str, Any]:
         """Initialize from the complete measured/authoritative dual-arm qpos."""
 
@@ -834,6 +1487,13 @@ class RM65PositionCollisionPlanner:
             self._require_arm_qpos_within_limits(full_q, name="initial qpos")
             self.solver.set_configuration_q(full_q.copy())
             self._last_admitted_velocity_full = np.zeros_like(full_q)
+            reset_motion_state = getattr(
+                self.solver,
+                "reset_admitted_reference_motion_state",
+                None,
+            )
+            if callable(reset_motion_state):
+                reset_motion_state()
             self._set_qp_motion_reference(
                 full_q,
                 self._last_admitted_velocity_full,
@@ -855,6 +1515,24 @@ class RM65PositionCollisionPlanner:
                 "profile": self.config.pose_lift_profile.to_metadata(),
                 "applied": False,
                 "reason": "reset",
+            }
+            self._last_nonlinear_candidate_metadata = {
+                "enabled": bool(
+                    self.config.pose_lift_profile.qp_nonlinear_best_so_far
+                ),
+                "reason": "reset",
+                "candidates": [],
+            }
+            self._directional_task_guard_active_by_side = {
+                side: False for side in SIDES
+            }
+            self._last_directional_task_guard_metadata = {
+                "enabled": bool(
+                    self.config.pose_lift_profile.directional_task_guard_max_utilization
+                    > 0.0
+                ),
+                "reason": "reset",
+                "sides": {},
             }
             return MappingProxyType(
                 {
@@ -904,6 +1582,21 @@ class RM65PositionCollisionPlanner:
                 "profile": self.config.pose_lift_profile.to_metadata(),
                 "applied": False,
                 "reason": "pending_solver_output",
+            }
+            self._last_nonlinear_candidate_metadata = {
+                "enabled": bool(
+                    self.config.pose_lift_profile.qp_nonlinear_best_so_far
+                ),
+                "reason": "pending_solver_output",
+                "candidates": [],
+            }
+            self._last_directional_task_guard_metadata = {
+                "enabled": bool(
+                    self.config.pose_lift_profile.directional_task_guard_max_utilization
+                    > 0.0
+                ),
+                "reason": "pending_target_resolution",
+                "sides": {},
             }
             try:
                 if source_timestamp is not None and not math.isfinite(float(source_timestamp)):
@@ -971,9 +1664,20 @@ class RM65PositionCollisionPlanner:
                         name=f"target_endpoint_pose_world_by_side.{side}",
                     )
 
+                solver_target_endpoint_world = (
+                    self._directionally_shape_solver_targets(
+                        reference_full_q,
+                        target_endpoint_world,
+                        active_sides=active_sides,
+                    )
+                )
                 solver_targets = [
-                    self._pose_to_xyzquat(target_endpoint_world[LEFT]),
-                    self._pose_to_xyzquat(target_endpoint_world[RIGHT]),
+                    self._pose_to_xyzquat(
+                        solver_target_endpoint_world[LEFT]
+                    ),
+                    self._pose_to_xyzquat(
+                        solver_target_endpoint_world[RIGHT]
+                    ),
                 ]
                 previous_solve_ms: float | None = None
                 iteration_budget_ms = (
@@ -988,6 +1692,7 @@ class RM65PositionCollisionPlanner:
                 )
                 solve_min_iterations = self.config.effective_solve_min_iterations
                 solve_max_iterations = self.config.effective_solve_max_iterations
+                nonlinear_candidates: list[dict[str, Any]] = []
                 for iteration in range(1, solve_max_iterations + 1):
                     if (
                         iteration > solve_min_iterations
@@ -1050,6 +1755,21 @@ class RM65PositionCollisionPlanner:
                             <= float(self.config.solve_orientation_tolerance_deg)
                         )
                     if (
+                        self.config.pose_lift_profile.qp_nonlinear_best_so_far
+                        and iteration
+                        >= int(
+                            self.config.pose_lift_profile.qp_nonlinear_best_min_iteration
+                        )
+                    ):
+                        nonlinear_candidates.append(
+                            self._evaluate_nonlinear_iteration_candidate(
+                                iteration=iteration,
+                                candidate_full_q=raw_full_q,
+                                reference_full_q=reference_full_q,
+                                pose_error_by_side=solve_pose_error,
+                            )
+                        )
+                    if (
                         iteration >= solve_min_iterations
                         and within_tolerance
                     ):
@@ -1066,6 +1786,82 @@ class RM65PositionCollisionPlanner:
                         "invalid_ik_output",
                         "coupled collision IK returned a non-finite or mismatched configuration.",
                     )
+
+                if self.config.pose_lift_profile.qp_nonlinear_best_so_far:
+                    eligible_candidates = [
+                        candidate
+                        for candidate in nonlinear_candidates
+                        if bool(candidate.get("eligible", False))
+                    ]
+                    selection_trace: list[dict[str, Any]] = []
+                    selected: dict[str, Any] | None = None
+                    if eligible_candidates:
+                        selected = eligible_candidates[0]
+                        selection_trace.append(
+                            {
+                                "iteration": int(selected["iteration"]),
+                                "selected": True,
+                                "reason": "first_eligible_candidate",
+                            }
+                        )
+                        for candidate in eligible_candidates[1:]:
+                            better, reason = (
+                                self._nonlinear_iteration_candidate_is_better(
+                                    candidate,
+                                    selected,
+                                )
+                            )
+                            selection_trace.append(
+                                {
+                                    "iteration": int(candidate["iteration"]),
+                                    "selected": bool(better),
+                                    "reason": reason,
+                                }
+                            )
+                            if better:
+                                selected = candidate
+                        raw_full_q = np.asarray(
+                            selected["_candidate_full_q"],
+                            dtype=float,
+                        ).copy()
+                        solve_pose_error = {
+                            side: {
+                                "translation_m": float(
+                                    selected["pose_error"][side]["translation_m"]
+                                ),
+                                "rotation_deg": float(
+                                    selected["pose_error"][side]["rotation_deg"]
+                                ),
+                            }
+                            for side in SIDES
+                        }
+                        self.solver.set_configuration_q(raw_full_q.copy())
+                        solve_stop_reason = (
+                            f"{solve_stop_reason}:best_so_far_iteration_"
+                            f"{int(selected['iteration'])}"
+                        )
+                    self._last_nonlinear_candidate_metadata = {
+                        "enabled": True,
+                        "reason": (
+                            "exact_nonlinear_best_candidate_selected"
+                            if selected is not None
+                            else "no_eligible_nonlinear_candidate"
+                        ),
+                        "selected_iteration": (
+                            None
+                            if selected is None
+                            else int(selected["iteration"])
+                        ),
+                        "selection_trace": selection_trace,
+                        "candidates": [
+                            {
+                                key: copy.deepcopy(value)
+                                for key, value in candidate.items()
+                                if not str(key).startswith("_")
+                            }
+                            for candidate in nonlinear_candidates
+                        ],
+                    }
 
                 solver_raw_full_q = raw_full_q.copy()
                 raw_full_q, self._last_pose_lift_metadata = (
@@ -1995,6 +2791,82 @@ class RM65PositionCollisionPlanner:
                 "acceleration_limit_enabled": bool(
                     self.config.pose_lift_profile.qp_acceleration_limit
                 ),
+                "sigma_escape_enabled": bool(
+                    self.config.pose_lift_profile.qp_sigma_escape_cost > 0.0
+                ),
+                "sigma_escape_cost": float(
+                    self.config.pose_lift_profile.qp_sigma_escape_cost
+                ),
+                "sigma_escape_guard": float(
+                    self.config.pose_lift_profile.qp_sigma_escape_guard
+                ),
+                "sigma_escape_rate_per_sec": float(
+                    self.config.pose_lift_profile.qp_sigma_escape_rate_per_sec
+                ),
+                "sigma_escape_authority": (
+                    "soft_objective_only_hard_motion_and_collision_constraints_win"
+                ),
+                "structural_branch_guard_enabled": bool(
+                    self.config.pose_lift_profile.qp_structural_branch_margin_deg
+                    > 0.0
+                ),
+                "structural_branch_guard_margin_deg": float(
+                    self.config.pose_lift_profile.qp_structural_branch_margin_deg
+                ),
+                "structural_branch_guard_sigma": float(
+                    self.config.pose_lift_profile.qp_structural_branch_guard_sigma
+                ),
+                "structural_branch_release_sigma": float(
+                    self.config.pose_lift_profile.qp_structural_branch_release_sigma
+                ),
+                "structural_branch_escape_cost": float(
+                    self.config.pose_lift_profile.qp_structural_branch_escape_cost
+                ),
+                "structural_branch_escape_target_deg": float(
+                    self.config.pose_lift_profile.qp_structural_branch_escape_target_deg
+                ),
+                "structural_branch_escape_guard_sigma": float(
+                    self.config.pose_lift_profile.qp_structural_branch_escape_guard_sigma
+                ),
+                "structural_branch_constraint_mode": (
+                    self.config.pose_lift_profile.qp_structural_branch_constraint_mode
+                ),
+                "structural_branch_barrier_gain": float(
+                    self.config.pose_lift_profile.qp_structural_branch_barrier_gain
+                ),
+                "structural_branch_barrier_activation_sigma": float(
+                    self.config.pose_lift_profile.qp_structural_branch_barrier_activation_sigma
+                ),
+                "structural_branch_prediction_horizon_sec": float(
+                    self.config.pose_lift_profile.qp_structural_branch_prediction_horizon_sec
+                ),
+                "structural_branch_guard_authority": (
+                    "offline_profile_only_one_sided_q3_q5_zero_lock"
+                ),
+                "structural_branch_guard_runtime": copy.deepcopy(
+                    getattr(
+                        getattr(
+                            self.solver,
+                            "structural_branch_guard_limit",
+                            None,
+                        ),
+                        "metadata",
+                        {},
+                    )
+                ),
+                "directional_task_guard_enabled": bool(
+                    self.config.pose_lift_profile.directional_task_guard_max_utilization
+                    > 0.0
+                ),
+                "directional_task_guard": copy.deepcopy(
+                    self._last_directional_task_guard_metadata
+                ),
+                "nonlinear_best_so_far_enabled": bool(
+                    self.config.pose_lift_profile.qp_nonlinear_best_so_far
+                ),
+                "nonlinear_best_so_far": copy.deepcopy(
+                    self._last_nonlinear_candidate_metadata
+                ),
                 "velocity_limit_rad_s": list(
                     self.config.max_joint_velocity_rad_s
                 ),
@@ -2122,6 +2994,81 @@ class RM65PositionCollisionPlanner:
                 current_full_q,
                 self._last_admitted_velocity_full,
             )
+        if profile.qp_sigma_escape_cost > 0.0:
+            configure_escape = getattr(
+                self.solver,
+                "configure_normalized_sigma_escape_task",
+                None,
+            )
+            if not callable(configure_escape):
+                raise ValueError(
+                    f"pose-lift profile {profile.name!r} requires an IK solver "
+                    "with configure_normalized_sigma_escape_task()."
+                )
+            configure_escape(
+                cost=profile.qp_sigma_escape_cost,
+                guard_sigma=profile.qp_sigma_escape_guard,
+                rate_per_sec=profile.qp_sigma_escape_rate_per_sec,
+            )
+            self._set_qp_motion_reference(
+                current_full_q,
+                self._last_admitted_velocity_full,
+            )
+        if profile.qp_structural_branch_margin_deg > 0.0:
+            configure_branch_guard = getattr(
+                self.solver,
+                "configure_structural_branch_guard",
+                None,
+            )
+            if not callable(configure_branch_guard):
+                raise ValueError(
+                    f"pose-lift profile {profile.name!r} requires an IK solver "
+                    "with configure_structural_branch_guard()."
+                )
+            branch_kwargs = {
+                "guard_sigma": profile.qp_structural_branch_guard_sigma,
+                "margin_deg": profile.qp_structural_branch_margin_deg,
+                "release_sigma": profile.qp_structural_branch_release_sigma,
+            }
+            if (
+                profile.qp_structural_branch_constraint_mode != "hard_margin"
+                or profile.qp_structural_branch_barrier_gain > 0.0
+                or profile.qp_structural_branch_barrier_activation_sigma > 0.0
+                or profile.qp_structural_branch_prediction_horizon_sec > 0.0
+            ):
+                branch_kwargs.update(
+                    {
+                        "constraint_mode": (
+                            profile.qp_structural_branch_constraint_mode
+                        ),
+                        "barrier_gain": (
+                            profile.qp_structural_branch_barrier_gain
+                        ),
+                        "barrier_activation_sigma": (
+                            profile.qp_structural_branch_barrier_activation_sigma
+                        ),
+                        "prediction_horizon_sec": (
+                            profile.qp_structural_branch_prediction_horizon_sec
+                        ),
+                    }
+                )
+            if profile.qp_structural_branch_escape_cost > 0.0:
+                branch_kwargs.update(
+                    {
+                        "escape_cost": profile.qp_structural_branch_escape_cost,
+                        "escape_target_deg": (
+                            profile.qp_structural_branch_escape_target_deg
+                        ),
+                        "escape_guard_sigma": (
+                            profile.qp_structural_branch_escape_guard_sigma
+                        ),
+                    }
+                )
+            configure_branch_guard(**branch_kwargs)
+            self._set_qp_motion_reference(
+                current_full_q,
+                self._last_admitted_velocity_full,
+            )
 
     def _set_qp_motion_reference(
         self,
@@ -2129,7 +3076,12 @@ class RM65PositionCollisionPlanner:
         velocity_full: np.ndarray,
     ) -> None:
         profile = self.config.pose_lift_profile
-        if not (profile.qp_velocity_limit or profile.qp_acceleration_limit):
+        if not (
+            profile.qp_velocity_limit
+            or profile.qp_acceleration_limit
+            or profile.qp_sigma_escape_cost > 0.0
+            or profile.qp_structural_branch_margin_deg > 0.0
+        ):
             return
         setter = getattr(self.solver, "set_admitted_reference_motion", None)
         if not callable(setter):

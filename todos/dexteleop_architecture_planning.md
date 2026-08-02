@@ -75,7 +75,8 @@ human / replay / policy / synthetic
 | `control_station` | GUI/API、typed operator intent、profile 选择、应用 lifecycle、薄 source/target 装配 | 通用融合算法、worker/cursor、canonical safety、dispatch、dataset writer |
 | `deployments` | 模型 artifact、协议、transport 和输出解码 adapter | motion authority 与机器人执行 |
 | `sim` | 仿真 backend、task 和 sim adapter | 真机设备与 `teleop_runtime` |
-| `teleop_runtime` | 真机遥操、collection 和 policy deployment frontend | 通用组合或训练语义 |
+| `collection_runtime` | 与设备/控制/UI 解耦的实时采集 lifecycle、持久化和 episode commitment mechanics | 设备生产、机器人控制、GUI、schema 定义 |
+| `teleop_runtime` | 真机遥操、来源绑定的 collection adapter 和 policy deployment frontend | 通用组合、通用采集持久化或训练语义 |
 | `dataset_contracts` | 纯 schema、identity、hash 和完整性契约 | runtime 与设备 |
 | `dataset_interface` | projection、reader、window/batch 和 validation | 控制 owner 与 episode owner |
 
@@ -446,12 +447,20 @@ no-action、保持既有目标或 domain HOLD。当前兼容 adapter 只在这�
   admission、activation、scheduled interval 和 persistence segment 都只能缩短，
   不能续命。该规则只约束时序有效性，不引入通用 safety/IK/reference。
 
-MuJoCo Sim-HIL 已通过显式 default-off profile gate 迁入该链：adaptation 后由
-MuJoCo handler 接收唯一 request，target-private canonical safety 与 coupled IK
-继续复用已有数值实现，随后产生无 `SafeAction` 声明的 point target。已有
-scheduled-reference receiver 是唯一 target admission/activation owner，并对
-`arms + left_hand + right_hand` 执行一次原子 activation。request、submission、
+MuJoCo Sim-HIL 已通过显式 default-off profile gate 迁入该链：native
+`ComponentAction` adaptation 后由 MuJoCo handler 接收唯一 request，
+target-private canonical safety 与 coupled IK 继续复用已有数值实现，随后产生无
+`SafeAction` 声明的 point target。已有 scheduled-reference receiver 是唯一
+target admission/activation owner，并对 profile 声明的全部 selection groups
+执行一次原子 activation；当前实例为 `right_arm + right_gripper`。request、submission、
 completion、target、admission、activation 六类实际事实均进入 ControlTrace。
+
+Sim-HIL 坐标启动绑定也已拆分：coordinate-only VIVE profile 不含本体/Home；
+MuJoCo 从 exact URDF/scene 派生 `TargetFrameProfile`，从 task tool artifacts 派生
+`ToolFrameProfile`，并在 reset 后测量当前 TCP 形成 `SessionAnchorReceipt`。旧真机
+profile 目前只提供明确标记的 stored human Home，robot Home 不再复用。未来真机
+必须提供实测 target/tool/session evidence；实时 human recenter 仍是待接设备
+lifecycle gate，不以历史 Home 冒充。
 
 旧 `execution_target.ResolvedExecutionTarget` 仍服务于尚未迁移的 MuJoCo profile；
 Sim-HIL 不再使用它。待其他 target owner 分别迁移并确认无 caller 后，再按 legacy
@@ -602,7 +611,7 @@ TrainingView / replay / RL transition
 strategy 也需要时才通过 `CompositionInformationPlan` 接轻量 immutable view/ref。
 
 ControlTrace schema、writer、episode membership、WAL、seal/commit 和 reader 属于
-`dataset_contracts`/`dataset_interface`/capture runtime，不属于
+`dataset_contracts`/`dataset_interface`/`collection_runtime`，不属于
 `control_composition`。
 
 ---
@@ -633,6 +642,16 @@ ControlTrace schema、writer、episode membership、WAL、seal/commit 和 reader
 目标是已有 sim policy、sim target 和真实遥操设备可在 Control Station 中组合，并
 形成完整 capture。
 
+当前自动化落地（2026-07-30）：default-off
+`control_station sim-hil` 已在同一 component-keyed 主线上完成 PPO-only、
+virtual VIVE/Q6 human-only、动态切换/比例混合，以及 subordinate EpisodeTrace
+HOLD→seal→commit→reader 回读。scheduled reference 的 fixed-grid deadline、
+上游 admission margin、source hold/support horizon 已形成显式契约；旧
+SafeAction candidate 不再阻塞 component target successor，旧 scheduled-qpos
+路径的检查保持不变。正式 profile
+`deployable_sim_scheduled_component_policy_human_composer_v1` 已标记
+`runtime_integrated`。
+
 退出条件：
 
 - source adapter 不复制 device/model/replay owner；
@@ -642,6 +661,33 @@ ControlTrace schema、writer、episode membership、WAL、seal/commit 和 reader
 - immediate source difference 可返回；
 - core ControlTrace 可 seal/commit/read；
 - legacy teleop/replay/deploy 默认行为 parity。
+
+设备接入代码已形成 Q6-first 的单侧 profile：默认启动时验证 Q6 可达性，不可达才
+回退 calibrated angle trigger；两者复用真机遥操的 source/retargeter，Station 只
+记录 requested/resolved source、endpoint 与 fallback reason。显式
+`--control-gui --enable` 已提供单一主循环的正式 typed-intent 控制页；
+human-only、PPO-only 和比例混合是三个并列模式，可直接选择任一模式启动，也可在
+同一 runtime 中任意顺序和次数切换。HOLD/re-arm/Home/rebuild 与
+ControlTrace seal/commit 是独立 lifecycle 操作，不承担模式解锁或逐阶段确认。
+PPO-only 启动不接入、也不等待 VIVE、夹爪设备或 VIVE 坐标记录；Human component
+只预留稳定 typed port。首次切到 human-only/比例混合时，Station 才在 HOLD
+边界关闭 setup receiver、接入同一 contract 的实际 device source、完成 passive
+input 与 Runtime Home 验收，然后发布 blend 参数并 re-arm。
+普通 GUI 继续只读；`--acceptance-gui` 仅为命令行兼容别名。可选
+`--vive-calibration-gui` 在构建 target 前完成独立 VIVE 坐标标定，保存后绑定该
+精确记录；普通启动默认选择独立目录最新有效记录，绝不复用真机遥操坐标。上游
+compose 超期采用记录并跳过 missed cuts、不 burst catch-up 的策略，实际 late
+admission/HOLD 仍由下游 target gate 决定。Immediate profile 在 source poll
+完成后重取 observation cut，使本周期 VIVE/Q6/angle-trigger emission 可在同周期
+参与 composition；`right_hand` 输入明确投影到 target 的 `right_gripper`
+component，并已有非零虚拟输入到 MuJoCo gripper actuator 的端到端回归。GUI
+同时显示原始夹爪输入、人类归一化目标、执行器接纳目标和仿真测量值。当前封存只
+声明 ControlTrace core，不冒充包含相机/触觉/native stream 的正式 v2.5
+数据集。
+
+尚未完成的 Gate A 外部验收仍是：真实单 VIVE 与 Q6/angle trigger 设备连接、实时
+recenter/deadman 行为和操作者实际任务试跑。它们不得由虚拟 source 或
+`send_actions=false` 结果代替。
 
 ### Gate B：component-keyed carrier 收口（已完成主干）
 

@@ -78,6 +78,8 @@ def build_contract(
     action_space: str = BIMANUAL_EE_POSE_V1,
     hand_spec: HandActionSpec | None = None,
     missing_behavior: str = "no_action",
+    max_translation_disagreement_m: float | None = 0.10,
+    max_rotation_disagreement_rad: float | None = math.radians(30.0),
 ):
     value_spec = hand_spec or HandActionSpec.inspire_tac("left")
     rule_set = ComponentCompositionRuleSet(
@@ -89,8 +91,10 @@ def build_contract(
                 contributing_roles=("human", "policy"),
                 weight_by_role={"human": 0.75, "policy": 0.25},
                 missing_behavior=missing_behavior,
-                max_translation_disagreement_m=0.10,
-                max_rotation_disagreement_rad=math.radians(30.0),
+                max_translation_disagreement_m=(
+                    max_translation_disagreement_m
+                ),
+                max_rotation_disagreement_rad=max_rotation_disagreement_rad,
             ),
             QposComponentCompositionRule(
                 component_id="left_hand",
@@ -704,6 +708,40 @@ def test_pose_disagreement_and_frame_mismatch_fail_closed() -> None:
             wrong_frame,
             action_schema=policy.action.action_schema,
         )
+
+
+def test_pose_disagreement_can_be_observe_only_without_rejection() -> None:
+    hand_spec, _, composition_spec, strategy = build_contract(
+        max_translation_disagreement_m=None,
+        max_rotation_disagreement_rad=None,
+    )
+    runtime, _, _ = build_runtime(strategy)
+    for producer_id, role, arm_x, hand_value in (
+        ("human-0", "human", 0.0, 0.0),
+        ("policy-0", "policy", 1.0, 1.0),
+    ):
+        assert runtime.admit_composition_input(
+            input_draft(
+                producer_id=producer_id,
+                role=role,
+                sequence=0,
+                arm_x=arm_x,
+                hand_values=np.full(6, hand_value, dtype=np.float32),
+                hand_spec=hand_spec,
+            )
+        ).accepted
+
+    result = runtime.evaluate_composition(
+        spec=composition_spec,
+        target_effective_at=10.1,
+    ).composition_evaluation
+
+    assert result.output_status == "ready"
+    assert result.composed_candidate is not None
+    np.testing.assert_allclose(
+        result.composed_candidate.value("left_arm").values[:3],
+        np.asarray([0.25, 0.0, 0.0], dtype=np.float32),
+    )
 
 
 def test_q16_active_mask_preserves_inactive_padding() -> None:

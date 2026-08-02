@@ -24,7 +24,7 @@ from .control_profile import (
     effective_outer_control_hz as _effective_outer_control_hz,
     effective_position_reference_hz as _effective_position_reference_hz,
 )
-from .dataset_layout import expand_cli_path as _expand_cli_path
+from collection_runtime.dataset_layout import expand_cli_path as _expand_cli_path
 from .debug_timing import debug_timing_metadata as _debug_timing_metadata
 from .gripper_policy import (
     gripper_force_dataset_metadata as _gripper_force_dataset_metadata,
@@ -349,4 +349,3 @@ __all__ = [
     "_start_episode_recording",
     "_stop_episode_recording",
 ]
-

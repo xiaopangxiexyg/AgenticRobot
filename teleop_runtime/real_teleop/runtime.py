@@ -21,8 +21,16 @@ from .control_loop import (
 )
 from .device_retry_runtime import build_device_retry_runtime
 from .episode_recording_runtime import build_episode_recording_runtime
+from .foot_pad_controls import (
+    apply_live_foot_pad_topology,
+    foot_pad_progress_topology_guidance,
+)
 from .gripper_warmup_runtime import build_gripper_warmup_probe_runtime
 from .position_episode_debug import build_position_episode_debug_runtime
+from .progress_adapter import (
+    build_real_teleop_startup_progress_ui_payload,
+    select_real_teleop_managed_progress_profile,
+)
 from .recording_admission import (
     recording_auto_stop_reason as _recording_auto_stop_reason,
     recording_warmup_status as _recording_warmup_status,
@@ -362,7 +370,15 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         str(getattr(args, "hardware_admission_mode", "strict")) == "capability"
     )
     control_ui = (
-        CalibrationWebUi(open_browser=True)
+        CalibrationWebUi(
+            open_browser=True,
+            resizable_sidebars=bool(
+                getattr(args, "gui_resizable_sidebars", True)
+            ),
+            input_activity_indicators=bool(
+                getattr(args, "gui_input_activity_indicators", True)
+            ),
+        )
         if bool(getattr(args, "gui_requested", False))
         else None
     )
@@ -394,9 +410,36 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 message="正在查找虚拟脚踏设备",
                 requirement="optional_input",
             )
+        foot_pad_candidate = None
         try:
-            foot_pad_input = FootPadSpecialArmInput.open_online()
+            foot_pad_candidate = FootPadSpecialArmInput.open_online()
+            live_count = int(
+                getattr(foot_pad_candidate, "foot_pad_count", 0) or 0
+            )
+            live_mode = apply_live_foot_pad_topology(args, live_count)
+            foot_pad_input = foot_pad_candidate
+            _log(
+                "FootPad",
+                "live virtual keyboard topology resolved: "
+                f"count={live_count} mode={live_mode}",
+            )
+            topology_guidance = foot_pad_progress_topology_guidance(
+                live_count,
+                progress_enabled=bool(
+                    getattr(args, "collection_progress_profile", None) is not None
+                    or getattr(args, "collection_progress_gui", False)
+                ),
+            )
+            if topology_guidance:
+                _log("FootPad", topology_guidance)
+                if control_ui is not None:
+                    control_ui.append_message("FootPad", topology_guidance)
         except (FootPadUnavailableError, OSError, RuntimeError, ValueError) as exc:
+            if foot_pad_candidate is not None:
+                try:
+                    foot_pad_candidate.close()
+                except Exception:
+                    pass
             args.foot_pad_startup_error = f"{type(exc).__name__}: {exc}"
             foot_pad_input = FootPadSpecialArmInput.waiting_for_service()
             startup_cleanup.add("foot_pad", foot_pad_input.close)
@@ -655,6 +698,100 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                     "dataset.writer.prepare",
                     message="writer 配置已就绪，尚未启动子进程",
                 )
+
+    startup_progress_ui_signature: tuple[object, ...] | None = None
+    startup_progress_ui_error_signature: tuple[object, ...] | None = None
+    # Profile selection is configuration-only: it does not start an Episode,
+    # move an arm, or mutate the dataset binding.  Make the selector available
+    # as soon as the idle recorder/UI exist instead of making it depend on a
+    # later startup/Home milestone.  The payload still disables it for a
+    # locked dataset or when the managed catalog has no selectable profile.
+    startup_progress_profile_selection_ready = True
+
+    def publish_startup_progress_ui_state(*, force: bool = False) -> None:
+        """Expose profile selection before runtime Home/control-loop startup."""
+
+        nonlocal startup_progress_ui_error_signature
+        nonlocal startup_progress_ui_signature
+        if control_ui is None:
+            return
+        recorder_profile = (
+            None
+            if dataset_recorder is None
+            else getattr(dataset_recorder, "progress_profile", None)
+        )
+        requested_profile = getattr(args, "collection_progress_profile", None)
+        signature = (
+            bool(getattr(args, "collection_progress_gui", False)),
+            bool(startup_progress_profile_selection_ready),
+            str(getattr(args, "collection_task_id", "") or ""),
+            str(Path(args.dataset_root).expanduser().resolve()),
+            id(dataset_recorder),
+            str(
+                getattr(
+                    recorder_profile,
+                    "semantic_content_hash",
+                    "",
+                )
+            ),
+            str(
+                getattr(
+                    requested_profile,
+                    "semantic_content_hash",
+                    "",
+                )
+            ),
+            bool(
+                False
+                if dataset_recorder is None
+                else getattr(
+                    dataset_recorder,
+                    "progress_profile_selection_locked",
+                    False,
+                )
+            ),
+            str(
+                getattr(
+                    args,
+                    "collection_progress_arm_control_mode",
+                    "profile",
+                )
+            ),
+        )
+        if not force and signature == startup_progress_ui_signature:
+            return
+        try:
+            payload = build_real_teleop_startup_progress_ui_payload(
+                args=args,
+                dataset_recorder=dataset_recorder,
+                profile_selection_enabled=(
+                    startup_progress_profile_selection_ready
+                ),
+            )
+            clutch_input.publish_progress_ui_state(payload)
+            startup_progress_ui_signature = signature
+            startup_progress_ui_error_signature = None
+        except Exception as exc:  # noqa: BLE001 - UI remains observational.
+            failure_signature = (
+                *signature,
+                type(exc).__qualname__,
+                str(exc),
+            )
+            startup_progress_ui_signature = signature
+            if failure_signature != startup_progress_ui_error_signature:
+                _log(
+                    "Progress",
+                    "启动阶段长程进度 GUI 状态发布失败；原遥操 GUI 保持可用："
+                    f"{type(exc).__name__}: {exc}",
+                )
+                control_ui.append_message(
+                    "Progress",
+                    "长程进度面板初始化失败："
+                    f"{type(exc).__name__}: {exc}",
+                )
+                startup_progress_ui_error_signature = failure_signature
+
+    publish_startup_progress_ui_state(force=True)
     if control_ui is not None:
         control_ui.publish(
             dataset_modality_contract=(
@@ -833,6 +970,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 f"capacity_per_side={actuator_trace_recorder.config.capacity_per_side} "
                 f"singularity_trace={bool(singularity_attached_count)} "
                 f"ik_shadow_trace={bool(ik_shadow_attached_count)} "
+                "vive_source_trace=true "
                 "hot_path_disk_write=false",
             )
         except Exception as exc:  # noqa: BLE001 - diagnostics must not alter control behavior.
@@ -1339,6 +1477,14 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             nonlocal foot_pad_input
             foot_pad_input = value
 
+        def publish_retry_camera_status() -> None:
+            clutch_input.publish_camera_status(
+                camera_sources=camera_sources,
+                preview_camera_sources=preview_camera_sources,
+                camera_previewer=camera_previewer,
+                force=True,
+            )
+
         device_retry_runtime = build_device_retry_runtime(
             args=args,
             components=components,
@@ -1361,6 +1507,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 _promote_angle_trigger_gripper_input_to_q6
             ),
             log=_log,
+            publish_camera_status=publish_retry_camera_status,
         )
         hardware_requirement = device_retry_runtime.hardware_requirement
         hardware_status_item = device_retry_runtime.hardware_status_item
@@ -1421,9 +1568,57 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         open_camera_preview = visualization_runtime.open_camera_preview
         close_tactile_preview = visualization_runtime.close_tactile_preview
         open_tactile_preview = visualization_runtime.open_tactile_preview
-        handle_startup_visualization_requests = (
+        handle_startup_visualization_requests_base = (
             visualization_runtime.handle_startup_requests
         )
+
+        def handle_startup_visualization_requests(now: float) -> None:
+            """Service optional UI requests while runtime Home is still armed."""
+
+            handle_startup_visualization_requests_base(now)
+            selections = (
+                clutch_input.consume_progress_profile_selection_intents()
+            )
+            arm_mode_selections = (
+                clutch_input.consume_progress_arm_control_mode_selection_intents()
+            )
+            for selection in arm_mode_selections:
+                args.collection_progress_arm_control_mode = selection.mode
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "Progress",
+                        f"已选择长程进度臂控制模式：{selection.mode}。",
+                    )
+                publish_startup_progress_ui_state(force=True)
+            for selection in selections:
+                try:
+                    selected = (
+                        select_real_teleop_managed_progress_profile(
+                            args=args,
+                            dataset_recorder=dataset_recorder,
+                            profile_id=selection.profile_id,
+                        )
+                    )
+                    if control_ui is not None:
+                        control_ui.append_message(
+                            "Progress",
+                            "已选择长程进度 profile："
+                            f"{selected.profile_id}@"
+                            f"{selected.profile_version}；"
+                            "首个 Episode 启动时将按完整 hash 锁定到数据集。",
+                        )
+                except Exception as exc:  # noqa: BLE001 - selection is configuration only.
+                    message = (
+                        "长程进度 profile 选择失败，原配置保持不变："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    _log("Progress", message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Progress", message)
+                finally:
+                    publish_startup_progress_ui_state(force=True)
+            publish_startup_progress_ui_state()
+
         update_startup_visualizations = (
             visualization_runtime.update_startup_visualizations
         )
@@ -1965,8 +2160,27 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 _log("DebugAction", f"standalone log disabled: {type(exc).__name__}: {exc}")
         else:
             action_debug_path = None
+        publish_startup_progress_ui_state(force=True)
         startup_home_captured = False
+        startup_home_qpos_snapshot: dict[str, np.ndarray] = {}
         manual_startup_request = _manual_calibration_confirmation_required(args, components)
+        last_startup_camera_status_at = 0.0
+
+        def update_startup_runtime_status() -> None:
+            nonlocal last_startup_camera_status_at
+            sync_foot_pad_runtime_status()
+            now = time.time()
+            if now - last_startup_camera_status_at < 0.2:
+                return
+            last_startup_camera_status_at = now
+            clutch_input.publish_camera_status(
+                camera_sources=camera_sources,
+                preview_camera_sources=preview_camera_sources,
+                camera_previewer=camera_previewer,
+                now=now,
+                force=True,
+            )
+
         while True:
             startup_request = "home"
             if manual_startup_request:
@@ -1980,7 +2194,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                     ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
                     visualization_request_handler=handle_startup_visualization_requests,
                     visualization_update_handler=update_startup_visualizations,
-                    runtime_status_update_handler=sync_foot_pad_runtime_status,
+                    runtime_status_update_handler=update_startup_runtime_status,
                 )
                 if requested is None:
                     return
@@ -2006,12 +2220,18 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 manual_startup_request = True
                 continue
             try:
-                _runtime_home_calibration(
+                startup_home_qpos_snapshot = _runtime_home_calibration(
                     components,
                     arm_mode="real",
                     timeout_sec=args.calibration_timeout,
                     num_samples=args.calibration_samples,
                     progress_callback=clutch_input.publish_runtime_home_progress,
+                    atomic_robot_home_snapshot=bool(
+                        getattr(args, "runtime_home_atomic_arm_snapshot", True)
+                    ),
+                    late_weighted_human_home=bool(
+                        getattr(args, "runtime_home_late_weighted_vive", True)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 message = _runtime_home_failure_message(exc)
@@ -2045,6 +2265,11 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             clutch_input,
             home_captured=startup_home_captured,
             position_force_guard_monitor=position_force_guard_monitor,
+            runtime_home_qpos_snapshot=(
+                startup_home_qpos_snapshot
+                if bool(getattr(args, "runtime_home_atomic_arm_snapshot", True))
+                else None
+            ),
         )
         clutch_input.consume_episode_start_request()
         clutch_input.consume_episode_stop_request()
@@ -2247,6 +2472,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         run_real_teleop_control_loop(
             RealTeleopControlLoopContext(
                 action_debug_log_recorder=action_debug_log_recorder,
+                actuator_trace_recorder=actuator_trace_recorder,
                 advance_recording_countdown=advance_recording_countdown,
                 args=args,
                 camera_preview_rate=camera_preview_rate,

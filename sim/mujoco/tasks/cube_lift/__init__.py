@@ -12,6 +12,11 @@ from .config import (
 )
 from .env import CubeLiftEnv, DEFAULT_CUBE_LIFT_TASK_CONFIG_PATH
 from .fast_env import FastCubeLiftEnv
+from .action_conditioning import (
+    CubeLiftActionConditioner,
+    CubeLiftActionConditioningResult,
+    CubeLiftFingerContactObserver,
+)
 from .kernel import CubeLiftKernel, CubeLiftKernelStep
 from .pose_action import CubeLiftPoseActionController, CubeLiftPoseActionStep
 from .reward_adapter import CubeLiftRewardState
@@ -40,7 +45,10 @@ __all__ = [
     "NORMAL_POLICY_CLASS",
     "PRIVILEGED_EXPERT_POLICY_CLASS",
     "CubeLiftActionSpec",
+    "CubeLiftActionConditioner",
+    "CubeLiftActionConditioningResult",
     "CubeLiftEnv",
+    "CubeLiftFingerContactObserver",
     "CubeLiftKernel",
     "CubeLiftKernelStep",
     "CubeLiftPoseActionController",

@@ -66,6 +66,20 @@ def _velocity_packet(
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
+def _dual_role_packet(seq: int = 1) -> bytes:
+    payload = json.loads(_packet(seq, 0.25).decode("utf-8"))
+    payload["trackers"].append(
+        {
+            "tracker_name": "synthetic-missing-right",
+            "tracker_role": "right_wrist",
+            "valid": False,
+            "pose_matrix_4x4": np.eye(4).tolist(),
+            "error": "single_tracker_mode:not_connected",
+        }
+    )
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
 def _timed_packet(seq: int, x: float, sample_time: float) -> bytes:
     payload = json.loads(_packet(seq, x).decode("utf-8"))
     payload["pose_sample_monotonic_time"] = sample_time
@@ -131,6 +145,286 @@ def test_vive_pose_source_defaults_to_new_control_listener_and_reads_v1() -> Non
     channel = source.get_latest_channels()["left_wrist_pose"]
     assert channel.valid is True
     assert channel.metadata["clock_sync_status"] == "unavailable"
+
+
+def test_vive_source_role_swap_supports_single_logical_right_channel() -> None:
+    source = VivePoseSource(
+        tracker_configs=[
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="right",
+                role="left_wrist",
+                channel_name="right_wrist_pose",
+                legacy_index=0,
+            )
+        ],
+        host="127.0.0.1",
+        port=0,
+        clock_sync_port=0,
+    )
+    source._process_received_batch([(_packet(1, 0.1), 1000.0, 20.0)])
+    assert source.get_latest_channels()["right_wrist_pose"].valid is True
+
+    receipt = source.swap_left_right_source_roles()
+
+    assert receipt["before_source_role_by_output_channel"] == {
+        "right_wrist_pose": "left_wrist"
+    }
+    assert receipt["after_source_role_by_output_channel"] == {
+        "right_wrist_pose": "right_wrist"
+    }
+    assert source.source_role_by_output_channel == {
+        "right_wrist_pose": "right_wrist"
+    }
+    assert source.get_latest_channels() == {}
+
+
+def test_upstream_role_diagnostics_survive_single_channel_mapping_and_swap() -> None:
+    source = VivePoseSource(
+        tracker_configs=[
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="right",
+                role="left_wrist",
+                channel_name="right_wrist_pose",
+            )
+        ],
+        host="127.0.0.1",
+        port=0,
+        clock_sync_port=0,
+    )
+
+    source._process_received_batch(
+        [(_dual_role_packet(9), 1000.0, 20.0, ("192.0.2.4", 5000))]
+    )
+
+    mapped = source.get_latest_channels()
+    upstream = source.get_latest_upstream_role_channels()
+    stats = source.debug_stats()
+    assert mapped["right_wrist_pose"].metadata["tracker_role"] == "left_wrist"
+    assert upstream["left_wrist"].valid is True
+    assert upstream["left_wrist"].metadata["sender_host"] == "192.0.2.4"
+    assert upstream["right_wrist"].valid is False
+    assert (
+        upstream["right_wrist"].metadata["sender_error"]
+        == "single_tracker_mode:not_connected"
+    )
+    assert stats["latest_upstream_roles"] == ["left_wrist", "right_wrist"]
+    assert stats["upstream_role_update_counts"] == {
+        "left_wrist": 1,
+        "right_wrist": 1,
+    }
+
+    source.swap_left_right_source_roles()
+
+    # Mapping changes clear history but immediately expose the latest sender
+    # snapshot under the new logical mapping.
+    remapped = source.get_latest_channels()["right_wrist_pose"]
+    assert remapped.metadata["tracker_role"] == "right_wrist"
+    assert remapped.valid is False
+    causal_remapped = source.get_latest_channels_at_or_before(1000.0)
+    assert causal_remapped["right_wrist_pose"].valid is False
+    assert causal_remapped["right_wrist_pose"].metadata[
+        "source_mapping_generation"
+    ] == 1
+    upstream_after = source.get_latest_upstream_role_channels()
+    assert upstream_after["left_wrist"].valid is True
+    assert upstream_after["right_wrist"].valid is False
+
+    source._process_received_batch(
+        [(_dual_role_packet(10), 1000.1, 20.1, ("192.0.2.4", 5000))]
+    )
+    remapped = source.get_latest_channels()["right_wrist_pose"]
+    assert remapped.metadata["tracker_role"] == "right_wrist"
+    assert remapped.valid is False
+    assert (
+        remapped.metadata["sender_error"]
+        == "single_tracker_mode:not_connected"
+    )
+
+
+def test_malformed_json_does_not_abort_batch_or_discard_last_valid_sample() -> None:
+    source = _source()
+    malformed = json.loads(_packet(2, 0.2).decode("utf-8"))
+    malformed["sender_timestamp"] = "not-a-float"
+    source._process_received_batch(
+        [
+            (_packet(1, 0.1), 1000.0, 20.0),
+            (json.dumps(malformed).encode("utf-8"), 1000.01, 20.01),
+            (_packet(3, 0.3), 1000.02, 20.02),
+        ]
+    )
+
+    channel = source.get_latest_channels()["left_wrist_pose"]
+    stats = source.debug_stats()
+    assert channel.metadata["seq"] == 3
+    assert stats["packet_count"] == 3
+    assert stats["last_packet_received_monotonic_time"] == 20.02
+    assert stats["last_process_finished_monotonic_time"] is not None
+    assert stats["process_error_count"] == 1
+    assert stats["last_process_parse_error_count"] == 1
+    assert "could not convert string to float" in stats["last_process_error"]
+
+
+@pytest.mark.integration
+def test_vive_receive_worker_survives_malformed_datagram(
+    require_udp_loopback: None,
+) -> None:
+    source = VivePoseSource(
+        tracker_configs=[
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+            )
+        ],
+        host="127.0.0.1",
+        port=0,
+        socket_timeout_sec=0.02,
+        clock_sync_port=0,
+    )
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    source.start()
+    try:
+        assert source.sock is not None
+        address = source.sock.getsockname()
+        malformed = json.loads(_packet(2, 0.2).decode("utf-8"))
+        malformed["sender_timestamp"] = "not-a-float"
+        sender.sendto(json.dumps(malformed).encode("utf-8"), address)
+
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if source.debug_stats()["process_error_count"] >= 1:
+                break
+            time.sleep(0.01)
+        stats = source.debug_stats()
+        assert stats["worker_alive"] is True
+        assert stats["process_error_count"] >= 1
+        assert stats["datagram_count"] >= 1
+        assert stats["last_datagram_received_monotonic_time"] is not None
+
+        sender.sendto(_packet(3, 0.3), address)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            channel = source.get_latest_channels().get("left_wrist_pose")
+            if channel is not None and channel.metadata.get("seq") == 3:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("receiver worker did not resume after malformed packet")
+    finally:
+        sender.close()
+        source.close()
+
+
+@pytest.mark.integration
+def test_vive_receiver_default_does_not_share_udp_port(
+    require_udp_loopback: None,
+) -> None:
+    first = VivePoseSource(
+        tracker_configs=[
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+            )
+        ],
+        host="127.0.0.1",
+        port=0,
+        socket_timeout_sec=0.02,
+        clock_sync_port=0,
+    )
+    first.start()
+    try:
+        assert first.sock is not None
+        port = int(first.sock.getsockname()[1])
+        second = VivePoseSource(
+            tracker_configs=[
+                ViveTrackerConfig(
+                    name="tracker_1",
+                    side="left",
+                    role="left_wrist",
+                    channel_name="left_wrist_pose",
+                )
+            ],
+            host="127.0.0.1",
+            port=port,
+            socket_timeout_sec=0.02,
+            clock_sync_port=0,
+        )
+        try:
+            with pytest.raises(OSError):
+                second.start()
+        finally:
+            second.close()
+    finally:
+        first.close()
+
+
+def test_declared_tracker_role_does_not_fall_back_to_matching_name() -> None:
+    source = VivePoseSource(
+        tracker_configs=[
+            ViveTrackerConfig(
+                name="tracker_1",
+                side="right",
+                role="right_wrist",
+                channel_name="right_wrist_pose",
+            )
+        ],
+        host="127.0.0.1",
+        port=0,
+        clock_sync_port=0,
+    )
+
+    # The name matches, but the packet explicitly declares left_wrist.
+    assert source._parse_packet(_packet(1, 0.1), received_at=1000.0) == {}
+
+    legacy_name_payload = json.loads(_packet(2, 0.2).decode("utf-8"))
+    legacy_name_payload["trackers"][0].pop("tracker_role")
+    parsed = source._parse_packet(
+        json.dumps(legacy_name_payload).encode("utf-8"),
+        received_at=1000.1,
+    )
+    assert parsed["right_wrist_pose"]["tracker_name"] == "tracker_1"
+
+
+def test_vive_source_role_swap_exchanges_bilateral_sources_only() -> None:
+    source = VivePoseSource(
+        tracker_configs=[
+            ViveTrackerConfig(
+                name="left-tracker",
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+            ),
+            ViveTrackerConfig(
+                name="right-tracker",
+                side="right",
+                role="right_wrist",
+                channel_name="right_wrist_pose",
+            ),
+            ViveTrackerConfig(
+                name="aux",
+                side=None,
+                role="auxiliary",
+                channel_name="auxiliary_tracker_pose",
+                critical=False,
+            ),
+        ],
+        host="127.0.0.1",
+        port=0,
+        clock_sync_port=0,
+    )
+
+    source.swap_left_right_source_roles()
+
+    assert source.source_role_by_output_channel == {
+        "left_wrist_pose": "right_wrist",
+        "right_wrist_pose": "left_wrist",
+        "auxiliary_tracker_pose": "auxiliary",
+    }
 
 
 def test_vive_pose_source_accepts_velocity_metadata() -> None:

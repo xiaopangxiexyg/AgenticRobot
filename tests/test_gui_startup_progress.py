@@ -92,6 +92,9 @@ def test_umi_components_publish_each_synchronous_start_step() -> None:
         def start(self) -> None:
             return None
 
+        def close(self) -> None:
+            return None
+
     ready_gripper = SimpleNamespace(is_ready=lambda: True)
     components = UmiComponents(
         vive=_Startable(),
@@ -107,11 +110,11 @@ def test_umi_components_publish_each_synchronous_start_step() -> None:
 
     hardware_status = ui.updates[-1]["hardware_status"]
     assert set(hardware_status) == {
-        "dmtac.rig",
-        "dmtac.state_poller",
-        "vive",
+        "end_effector.rig",
+        "end_effector.state_history",
+        "pose_source",
         "camera.left",
         "camera.right",
-        "angle_trigger",
+        "command_input",
     }
     assert all(item["online"] for item in hardware_status.values())

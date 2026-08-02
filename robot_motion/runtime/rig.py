@@ -79,6 +79,23 @@ class BimanualRig(Rig):
         if missing_effectors:
             raise KeyError(f"Rig backend missing for effectors {missing_effectors}.")
 
+        # Preserve one atomic parent timestamp across parallel backend
+        # dispatch. Consumers that quantize a bimanual command into a slower
+        # source cut must never let two worker start times land on opposite
+        # sides of a bucket boundary.
+        parent_command_timestamp = (
+            time.time()
+            if getattr(command, "timestamp", None) is None
+            else float(command.timestamp)
+        )
+        for effector_command in command.commands.values():
+            metadata = getattr(effector_command, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata.setdefault(
+                    "_parent_command_timestamp",
+                    parent_command_timestamp,
+                )
+
         def send_one(effector_name: str, effector_command) -> tuple[float, object | None]:
             started_at = time.perf_counter()
             receipt = self.backends[effector_name].send_command(effector_command)

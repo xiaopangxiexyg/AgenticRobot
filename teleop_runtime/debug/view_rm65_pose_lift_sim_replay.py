@@ -1,9 +1,13 @@
 """Visualize versioned RM65 Pose Lift replay trajectories in MuJoCo.
 
 This is an offline debug entrypoint.  It loads a recorded pose action, uses the
-saved accepted q_ref for the first-frame initialization, resolves subsequent
-60 Hz pose references through the same ``RM65PositionCollisionPlanner`` used
-by pose replay/deploy, and only then displays the admitted qpos in MuJoCo.
+saved accepted q_ref for the first-frame initialization, and displays resolved
+qpos in MuJoCo.  Registered V1--V10 profiles use the same 60 Hz
+``RM65PositionCollisionPlanner`` as pose replay/deploy.  The explicit
+official-all-IK comparison profile instead reproduces the current default-off
+research chain: source-rate official all-solution IK, collision-safe causal
+branch selection, linear joint reference, and a 120 Hz third-order horizon
+governor.
 
 MuJoCo is a trajectory viewer here.  It does not solve IK again, project the
 planner output, open a device, or dispatch a real command.
@@ -21,17 +25,34 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
-from robot_motion.position_control import TimestampedMotionTarget, resample_motion_targets
+from hardware.rm65.official_all_ik import RM65OfficialAllIK
+from robot_motion.position_control import (
+    JointHorizonLimits,
+    JointHorizonState,
+    TimestampedMotionTarget,
+    plan_jerk_limited_joint_horizon,
+    resample_motion_targets,
+)
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_POSE_LIFT_PROFILE_CHOICES,
     RM65_POSE_LIFT_V1_BASELINE_NAME,
+    RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
     build_rm65_pose_lift_ik_tuning,
     endpoint_to_tool_transform,
     load_rm65_tool_profile,
+    select_nearest_collision_safe_rm65_ik_pair,
+)
+from robot_motion.rm65.constants import (
+    RM65_ABSOLUTE_Q_MAX_RAD,
+    RM65_ABSOLUTE_Q_MIN_RAD,
+)
+from robot_motion.rm65.defaults import (
+    RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
+    RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
 )
 from robot_motion.replay import ReplayGroupSpec
 from robot_motion.transforms import parse_pose_matrix
@@ -65,6 +86,48 @@ DEFAULT_TOOL_PROFILE_BY_SIDE = {
     )
     for side in ("left", "right")
 }
+
+OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME = (
+    "official_source_all_ik_causal_governor_ramp_0p05"
+)
+POSE_LIFT_SIM_PROFILE_CHOICES = (
+    *RM65_POSE_LIFT_PROFILE_CHOICES,
+    OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME,
+)
+REPRESENTATIVE_SUITE_0727_NAME = "0727-v4-vs-official-governor"
+
+
+@dataclass(frozen=True)
+class RepresentativeEpisodeSpec:
+    episode_index: int
+    start_frame: int
+    max_frames: int
+    reason: str
+
+
+# Each range is exactly one recorded continuity segment.  Keeping collection
+# pauses out of the trajectory is part of the A/B contract: a segment restart
+# is an initialization boundary, not a physical command transition.
+REPRESENTATIVE_SUITE_0727 = (
+    RepresentativeEpisodeSpec(
+        episode_index=96,
+        start_frame=40,
+        max_frames=75,
+        reason="V4 right-arm structural branch drift into a deep singular tail",
+    ),
+    RepresentativeEpisodeSpec(
+        episode_index=37,
+        start_frame=157,
+        max_frames=62,
+        reason="recorded left-arm action itself approaches the singular region",
+    ),
+    RepresentativeEpisodeSpec(
+        episode_index=68,
+        start_frame=0,
+        max_frames=163,
+        reason="ordinary responsive motion with meaningful dynamic pressure",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +214,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dataset episode index. Use --list-episodes to inspect available values.",
     )
     parser.add_argument(
+        "--representative-suite",
+        choices=(REPRESENTATIVE_SUITE_0727_NAME,),
+        default=None,
+        help=(
+            "Run the fixed, continuity-safe 0727 visual A/B suite. Unless "
+            "--pose-lift-profile is supplied, each segment plays V4 first and "
+            "the current official-all-IK governor candidate second."
+        ),
+    )
+    parser.add_argument(
         "--list-episodes",
         action="store_true",
         help="List episode indices and exit without building IK or MuJoCo.",
@@ -165,11 +238,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pose-lift-profile",
         action="append",
-        choices=RM65_POSE_LIFT_PROFILE_CHOICES,
+        choices=POSE_LIFT_SIM_PROFILE_CHOICES,
         default=None,
         help=(
-            "Pose Lift version to play. Repeat to compare profiles sequentially. "
-            "Default: rm65_pose_lift_v1_baseline."
+            "Trajectory solver to play. Repeat to compare profiles sequentially. "
+            "Default: V1 for one --episode; V4 then the current official-all-IK "
+            "governor candidate for --representative-suite."
         ),
     )
     parser.add_argument(
@@ -189,6 +263,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scene-profile", default=DEFAULT_COLLISION_SCENE)
     parser.add_argument("--reference-hz", type=_finite_positive, default=60.0)
+    parser.add_argument(
+        "--official-governor-command-hz",
+        type=_finite_positive,
+        default=120.0,
+        help=(
+            "Command rate for the official source all-IK horizon governor. "
+            "The validated current-best contract is 120 Hz."
+        ),
+    )
+    parser.add_argument(
+        "--official-governor-lookahead-source-steps",
+        type=_positive_int,
+        default=2,
+        help="Source intervals in the causal horizon; validated default: 2.",
+    )
+    parser.add_argument(
+        "--official-governor-jerk-ramp-sec",
+        type=_finite_positive,
+        default=0.05,
+        help=(
+            "Derive jerk limits as max_acceleration/ramp_sec; validated "
+            "current-best value: 0.05 s."
+        ),
+    )
     parser.add_argument(
         "--orientation-weight",
         type=_finite_non_negative,
@@ -288,17 +386,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def selected_profiles(args: argparse.Namespace) -> tuple[str, ...]:
-    requested = (
-        tuple(RM65_POSE_LIFT_PROFILE_CHOICES)
-        if bool(args.all_profiles)
-        else tuple(args.pose_lift_profile or (RM65_POSE_LIFT_V1_BASELINE_NAME,))
-    )
+    if bool(args.all_profiles):
+        requested = tuple(RM65_POSE_LIFT_PROFILE_CHOICES)
+    elif args.pose_lift_profile:
+        requested = tuple(args.pose_lift_profile)
+    elif args.representative_suite:
+        requested = (
+            RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+            OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME,
+        )
+    else:
+        requested = (RM65_POSE_LIFT_V1_BASELINE_NAME,)
     return tuple(dict.fromkeys(str(value) for value in requested))
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.episode is None and not bool(args.list_episodes):
-        parser.error("--episode is required unless --list-episodes is used")
+    if (
+        args.episode is None
+        and not bool(args.list_episodes)
+        and args.representative_suite is None
+    ):
+        parser.error(
+            "--episode or --representative-suite is required unless "
+            "--list-episodes is used"
+        )
+    if args.episode is not None and args.representative_suite is not None:
+        parser.error("--episode and --representative-suite are mutually exclusive")
+    if bool(args.all_profiles) and args.representative_suite is not None:
+        parser.error(
+            "--all-profiles cannot be combined with --representative-suite; "
+            "pass explicit --pose-lift-profile values instead"
+        )
     if int(args.start_frame) < 0:
         parser.error("--start-frame must be >= 0")
     if int(args.max_frames) < 0:
@@ -313,27 +431,74 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             "--collision-distance-epsilon-m must not exceed "
             "--collision-min-distance-m"
         )
+    source_steps = int(args.official_governor_lookahead_source_steps)
+    if source_steps < 2:
+        parser.error("--official-governor-lookahead-source-steps must be >= 2")
+    if (
+        OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME in selected_profiles(args)
+        and not math.isclose(
+            float(args.official_governor_command_hz),
+            120.0,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        parser.error(
+            "the current official-all-IK comparison contract requires "
+            "--official-governor-command-hz 120"
+        )
 
 
-def load_group(args: argparse.Namespace) -> Any:
-    start = int(args.start_frame)
-    end = -1 if int(args.max_frames) == 0 else start + int(args.max_frames)
+def resolved_episode_specs(
+    args: argparse.Namespace,
+) -> tuple[RepresentativeEpisodeSpec, ...]:
+    if args.representative_suite == REPRESENTATIVE_SUITE_0727_NAME:
+        return REPRESENTATIVE_SUITE_0727
+    if args.episode is None:
+        return ()
+    return (
+        RepresentativeEpisodeSpec(
+            episode_index=int(args.episode),
+            start_frame=int(args.start_frame),
+            max_frames=int(args.max_frames),
+            reason="explicit episode selection",
+        ),
+    )
+
+
+def load_group(
+    args: argparse.Namespace,
+    *,
+    episode_spec: RepresentativeEpisodeSpec | None = None,
+) -> Any:
+    spec = (
+        episode_spec
+        if episode_spec is not None
+        else RepresentativeEpisodeSpec(
+            episode_index=int(args.episode),
+            start_frame=int(args.start_frame),
+            max_frames=int(args.max_frames),
+            reason="explicit episode selection",
+        )
+    )
+    start = int(spec.start_frame)
+    end = -1 if int(spec.max_frames) == 0 else start + int(spec.max_frames)
     group_args = argparse.Namespace(
         replay_dataset=str(Path(args.dataset_root).expanduser().resolve()),
         replay_parquet="",
-        replay_episode=int(args.episode),
+        replay_episode=int(spec.episode_index),
         replay_action_column="action",
         replay_all_episodes=False,
         active_sides=("left", "right"),
     )
     group = build_replay_group_for_episode(
         group_args,
-        episode_index=int(args.episode),
+        episode_index=int(spec.episode_index),
         group_spec=ReplayGroupSpec(
             key="pose_lift_sim",
             start_index=start,
             end_index=end,
-            episode_range=str(args.episode),
+            episode_range=str(spec.episode_index),
         ),
         balanced_episode_count=1,
         require_arm_joint_targets=True,
@@ -431,7 +596,17 @@ def build_planner(
     *,
     profile_name: str,
 ) -> RM65PositionCollisionPlanner:
-    endpoint_to_tool = {
+    endpoint_to_tool = endpoint_to_tool_by_side_from_args(args)
+    return RM65PositionCollisionPlanner(
+        planner_config_from_args(args, profile_name=profile_name),
+        endpoint_to_tool_by_side=endpoint_to_tool,
+    )
+
+
+def endpoint_to_tool_by_side_from_args(
+    args: argparse.Namespace,
+) -> dict[str, np.ndarray]:
+    return {
         side: endpoint_to_tool_transform(
             load_rm65_tool_profile(
                 getattr(args, f"{side}_tool_profile"),
@@ -440,9 +615,313 @@ def build_planner(
         )
         for side in ("left", "right")
     }
-    return RM65PositionCollisionPlanner(
-        planner_config_from_args(args, profile_name=profile_name),
-        endpoint_to_tool_by_side=endpoint_to_tool,
+
+
+def _build_official_algo() -> Any:
+    # The shared adapter remains lazy internally and opens no device.
+    return RM65OfficialAllIK()
+
+
+def _solve_official_all_ik_candidates(
+    *,
+    algo: Any,
+    seed_rad: np.ndarray,
+    target_endpoint: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    return tuple(
+        algo.solve_candidates(
+            seed_rad=seed_rad,
+            target_endpoint=target_endpoint,
+        )
+    )
+
+
+def _require_single_continuity_segment(group: Any) -> int:
+    try:
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(
+            Path(group.source_path),
+            columns=["collection.continuity_segment_index"],
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "official source all-IK comparison requires the recorded "
+            "collection.continuity_segment_index column"
+        ) from exc
+    all_segment_ids = np.asarray(
+        table["collection.continuity_segment_index"].to_numpy(),
+        dtype=int,
+    )
+    selected = all_segment_ids[int(group.start_index) : int(group.end_index)]
+    unique = np.unique(selected)
+    if selected.shape != (int(group.frame_count),) or unique.size != 1:
+        raise ValueError(
+            "official source all-IK comparison must select exactly one "
+            "continuity segment; choose --start-frame/--max-frames at a "
+            f"segment boundary, got segment_ids={unique.tolist()}."
+        )
+    return int(unique[0])
+
+
+def _official_source_qpos_path(
+    group: Any,
+    *,
+    algo: Any,
+    planner: RM65PositionCollisionPlanner,
+    endpoint_to_tool_by_side: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    _require_single_continuity_segment(group)
+    source_q: list[dict[str, np.ndarray]] = [_saved_qref(group, 0)]
+    planner.reset(source_q[0])
+    inverse_endpoint_to_tool = {
+        side: np.linalg.inv(
+            np.asarray(endpoint_to_tool_by_side[side], dtype=float)
+        )
+        for side in ("left", "right")
+    }
+    for frame_index in range(1, int(group.frame_count)):
+        tcp_targets = _pose_at(group, frame_index)
+        candidate_lists = {
+            side: _solve_official_all_ik_candidates(
+                algo=algo,
+                seed_rad=source_q[-1][side],
+                target_endpoint=(
+                    np.asarray(tcp_targets[side], dtype=float)
+                    @ inverse_endpoint_to_tool[side]
+                ),
+            )
+            for side in ("left", "right")
+        }
+        receipt = select_nearest_collision_safe_rm65_ik_pair(
+            candidate_lists,
+            anchor_qpos_by_side=source_q[-1],
+            validate_pair=lambda pair: planner.validate_qpos_reference(
+                pair,
+                source="pose_lift_sim_official_source_all_ik",
+            ),
+        )
+        if not receipt.accepted or receipt.qpos_by_side is None:
+            raise RuntimeError(
+                "official source all-IK failed to produce a collision-safe "
+                f"dual-arm pair at episode={group.source_episode_index} "
+                f"source_frame={int(group.start_index) + frame_index} "
+                f"reason={receipt.reason} "
+                f"candidate_counts={dict(receipt.candidate_count_by_side)} "
+                f"rejections={dict(receipt.rejection_reason_counts)}"
+            )
+        source_q.append(
+            {
+                side: np.asarray(
+                    receipt.qpos_by_side[side],
+                    dtype=float,
+                ).copy()
+                for side in ("left", "right")
+            }
+        )
+    return {
+        side: np.asarray([row[side] for row in source_q], dtype=float)
+        for side in ("left", "right")
+    }
+
+
+def _linear_source_q_reference_120hz(
+    source_qpos_by_side: Mapping[str, np.ndarray],
+    *,
+    commands_per_source: int = 8,
+) -> dict[str, np.ndarray]:
+    count = int(
+        np.asarray(source_qpos_by_side["left"], dtype=float).shape[0]
+    )
+    if count < 2:
+        raise ValueError("source qpos path must contain at least two frames.")
+    result: dict[str, np.ndarray] = {}
+    for side in ("left", "right"):
+        source = np.asarray(source_qpos_by_side[side], dtype=float)
+        if source.shape != (count, 6):
+            raise ValueError(f"{side} source qpos path must have shape {(count, 6)}.")
+        rows = [
+            (1.0 - step / commands_per_source) * source[source_index]
+            + (step / commands_per_source) * source[source_index + 1]
+            for source_index in range(count - 1)
+            for step in range(commands_per_source)
+        ]
+        rows.append(source[-1].copy())
+        result[side] = np.asarray(rows, dtype=float)
+    return result
+
+
+def _govern_source_q_reference(
+    q_reference_by_side: Mapping[str, np.ndarray],
+    *,
+    lookahead_source_steps: int,
+    jerk_ramp_sec: float,
+    commands_per_source: int = 8,
+    command_hz: float = 120.0,
+) -> dict[str, np.ndarray]:
+    max_acceleration = np.asarray(
+        RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
+        dtype=float,
+    )
+    limits = JointHorizonLimits(
+        min_position_rad=RM65_ABSOLUTE_Q_MIN_RAD,
+        max_position_rad=RM65_ABSOLUTE_Q_MAX_RAD,
+        max_velocity_rad_s=RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
+        max_acceleration_rad_s2=max_acceleration,
+        max_jerk_rad_s3=max_acceleration / float(jerk_ramp_sec),
+    )
+    output: dict[str, np.ndarray] = {}
+    for side in ("left", "right"):
+        reference = np.asarray(q_reference_by_side[side], dtype=float)
+        command = np.empty_like(reference)
+        command[0] = reference[0]
+        state = JointHorizonState(
+            q_rad=command[0],
+            qd_rad_s=np.zeros(6),
+            qdd_rad_s2=np.zeros(6),
+        )
+        final_index = int(reference.shape[0] - 1)
+        start = 0
+        while start < final_index:
+            horizon_end = min(
+                final_index,
+                start
+                + int(lookahead_source_steps) * int(commands_per_source),
+            )
+            commit_count = min(
+                int(commands_per_source),
+                horizon_end - start,
+            )
+            plan = plan_jerk_limited_joint_horizon(
+                reference[start : horizon_end + 1],
+                initial_state=state,
+                limits=limits,
+                dt_sec=1.0 / float(command_hz),
+                commit_count=commit_count,
+            )
+            command[start + 1 : start + commit_count + 1] = (
+                plan.q_control_cut_rad
+            )
+            state = JointHorizonState(
+                q_rad=plan.q_path_rad[commit_count],
+                qd_rad_s=plan.qd_path_rad_s[commit_count],
+                qdd_rad_s2=plan.qdd_path_rad_s2[commit_count],
+            )
+            start += commit_count
+        output[side] = command
+    return output
+
+
+def generate_official_source_all_ik_governed_trajectory(
+    group: Any,
+    *,
+    algo: Any,
+    planner: RM65PositionCollisionPlanner,
+    endpoint_to_tool_by_side: Mapping[str, np.ndarray],
+    command_hz: float = 120.0,
+    lookahead_source_steps: int = 2,
+    jerk_ramp_sec: float = 0.05,
+) -> PoseLiftSimTrajectory:
+    source_qpos = _official_source_qpos_path(
+        group,
+        algo=algo,
+        planner=planner,
+        endpoint_to_tool_by_side=endpoint_to_tool_by_side,
+    )
+    commands_per_source = 8
+    q_reference = _linear_source_q_reference_120hz(
+        source_qpos,
+        commands_per_source=commands_per_source,
+    )
+    q_command = _govern_source_q_reference(
+        q_reference,
+        lookahead_source_steps=int(lookahead_source_steps),
+        jerk_ramp_sec=float(jerk_ramp_sec),
+        commands_per_source=commands_per_source,
+        command_hz=float(command_hz),
+    )
+    frame_count = int(q_command["left"].shape[0])
+    frames: list[PoseLiftSimFrame] = []
+    previous = {
+        side: np.asarray(q_command[side][0], dtype=float).copy()
+        for side in ("left", "right")
+    }
+    for command_index in range(1, frame_count):
+        qpos = {
+            side: np.asarray(q_command[side][command_index], dtype=float).copy()
+            for side in ("left", "right")
+        }
+        validation = planner.validate_qpos_reference(
+            qpos,
+            source="pose_lift_sim_official_governor_endpoint",
+        )
+        if not validation.safe:
+            raise RuntimeError(
+                "official governor endpoint validation failed "
+                f"episode={group.source_episode_index} "
+                f"command_index={command_index} reason={validation.reason}"
+            )
+        for alpha in (0.25, 0.5, 0.75):
+            sample = {
+                side: (1.0 - alpha) * previous[side] + alpha * qpos[side]
+                for side in ("left", "right")
+            }
+            sampled = planner.validate_qpos_reference(
+                sample,
+                source="pose_lift_sim_official_governor_interval_sample",
+            )
+            if not sampled.safe:
+                raise RuntimeError(
+                    "official governor sampled interval validation failed "
+                    f"episode={group.source_episode_index} "
+                    f"command_index={command_index} alpha={alpha} "
+                    f"reason={sampled.reason}"
+                )
+        source_interval = min(
+            int(group.frame_count) - 2,
+            (command_index - 1) // commands_per_source,
+        )
+        interpolation_alpha = (
+            ((command_index - 1) % commands_per_source) + 1
+        ) / float(commands_per_source)
+        frames.append(
+            PoseLiftSimFrame(
+                sequence=command_index,
+                timestamp=command_index / float(command_hz),
+                source_frame_index=(
+                    int(group.start_index) + source_interval + 1
+                ),
+                interpolation_alpha=float(interpolation_alpha),
+                status="tracking",
+                hold=False,
+                qpos_by_side=qpos,
+                modification_reasons=("third_order_horizon_governor",),
+                pose_lift_reason=(
+                    "official_source_all_ik_collision_safe_nearest_branch"
+                ),
+                collision_distance_m=(
+                    None
+                    if validation.collision_distance_m is None
+                    else float(validation.collision_distance_m)
+                ),
+            )
+        )
+        previous = qpos
+    initial_qpos = {
+        side: np.asarray(q_command[side][0], dtype=float).copy()
+        for side in ("left", "right")
+    }
+    return PoseLiftSimTrajectory(
+        profile_name=OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME,
+        source_episode_index=int(group.source_episode_index),
+        source_path=str(group.source_path),
+        source_frame_count=int(group.frame_count),
+        reference_hz=float(command_hz),
+        initial_qpos_by_side=initial_qpos,
+        frames=tuple(frames),
+        status_counts={"tracking": len(frames)},
+        hold_count=0,
+        pose_lift_applied_count=int(group.frame_count) - 1,
     )
 
 
@@ -631,12 +1110,27 @@ def view_trajectories(
                 scene.reset_data()
                 controller.apply(trajectory.initial_qpos_by_side)
                 viewer_handle.sync()
+                comparison_label = (
+                    "B_CURRENT_BETTER_OFFICIAL_ALL_IK_GOVERNOR"
+                    if trajectory.profile_name
+                    == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME
+                    else (
+                        "A_V4_BASELINE"
+                        if trajectory.profile_name
+                        == RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME
+                        else "CUSTOM"
+                    )
+                )
                 print(
+                    "\n"
+                    "============================================================\n"
                     "[PoseLiftSim] "
+                    f"comparison={comparison_label} "
                     f"play profile={trajectory.profile_name} "
                     f"episode={trajectory.source_episode_index} "
                     f"repeat={repeat_index + 1}/{int(args.repeat)} "
-                    f"references={len(trajectory.frames)}",
+                    f"references={len(trajectory.frames)}\n"
+                    "============================================================",
                     flush=True,
                 )
                 previous_timestamp = 0.0
@@ -681,41 +1175,108 @@ def run(
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return payload
 
-    group = load_group(args)
-    references = build_runtime_references(
-        group,
-        reference_hz=float(args.reference_hz),
-    )
+    profiles = selected_profiles(args)
+    episode_specs = resolved_episode_specs(args)
     trajectories: list[PoseLiftSimTrajectory] = []
-    for profile_name in selected_profiles(args):
-        print(
-            f"[PoseLiftSim] solving profile={profile_name} "
-            f"episode={group.source_episode_index} source_frames={group.frame_count}",
-            flush=True,
-        )
-        trajectory = generate_trajectory(
+    official_algo = (
+        _build_official_algo()
+        if OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME in profiles
+        else None
+    )
+    endpoint_to_tool = (
+        endpoint_to_tool_by_side_from_args(args)
+        if official_algo is not None
+        else None
+    )
+    for episode_spec in episode_specs:
+        group = load_group(args, episode_spec=episode_spec)
+        references = build_runtime_references(
             group,
-            profile_name=profile_name,
-            planner=planner_builder(args, profile_name=profile_name),
-            references=references,
+            reference_hz=float(args.reference_hz),
         )
-        trajectories.append(trajectory)
         print(
-            "[PoseLiftSim] solved "
-            + json.dumps(trajectory.summary(), ensure_ascii=False, sort_keys=True),
+            "[PoseLiftSim] segment "
+            f"episode={group.source_episode_index} "
+            f"source_range=[{group.start_index},{group.end_index}) "
+            f"source_frames={group.frame_count} reason={episode_spec.reason}",
             flush=True,
         )
+        for profile_name in profiles:
+            print(
+                f"[PoseLiftSim] solving profile={profile_name} "
+                f"episode={group.source_episode_index}",
+                flush=True,
+            )
+            if profile_name == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME:
+                if official_algo is None or endpoint_to_tool is None:
+                    raise RuntimeError(
+                        "official all-IK algorithm was not initialized"
+                    )
+                trajectory = (
+                    generate_official_source_all_ik_governed_trajectory(
+                        group,
+                        algo=official_algo,
+                        planner=planner_builder(
+                            args,
+                            profile_name=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+                        ),
+                        endpoint_to_tool_by_side=endpoint_to_tool,
+                        command_hz=float(args.official_governor_command_hz),
+                        lookahead_source_steps=int(
+                            args.official_governor_lookahead_source_steps
+                        ),
+                        jerk_ramp_sec=float(
+                            args.official_governor_jerk_ramp_sec
+                        ),
+                    )
+                )
+            else:
+                trajectory = generate_trajectory(
+                    group,
+                    profile_name=profile_name,
+                    planner=planner_builder(args, profile_name=profile_name),
+                    references=references,
+                )
+            trajectories.append(trajectory)
+            print(
+                "[PoseLiftSim] solved "
+                + json.dumps(
+                    trajectory.summary(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     payload = {
-        "schema": "teleop_runtime.rm65_pose_lift_sim_replay/v1",
+        "schema": "teleop_runtime.rm65_pose_lift_sim_replay/v2",
         "device_access": False,
         "dispatch": False,
         "mujoco_role": "kinematic_viewer_of_pose_lift_admitted_qpos",
         "first_frame_contract": "saved_accepted_qref",
         "source_action_contract": "accepted_qref_fk_pose",
-        "profiles": selected_profiles(args),
+        "representative_suite": args.representative_suite,
+        "episode_specs": [
+            {
+                "episode_index": int(spec.episode_index),
+                "start_frame": int(spec.start_frame),
+                "max_frames": int(spec.max_frames),
+                "reason": str(spec.reason),
+            }
+            for spec in episode_specs
+        ],
+        "profiles": profiles,
         "parameters": {
             "reference_hz": float(args.reference_hz),
+            "official_governor_command_hz": float(
+                args.official_governor_command_hz
+            ),
+            "official_governor_lookahead_source_steps": int(
+                args.official_governor_lookahead_source_steps
+            ),
+            "official_governor_jerk_ramp_sec": float(
+                args.official_governor_jerk_ramp_sec
+            ),
             "orientation_weight": float(args.orientation_weight),
             "posture_cost_override": args.posture_cost,
             "damping": float(args.damping),
@@ -768,13 +1329,19 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME",
     "PoseLiftSimFrame",
     "PoseLiftSimTrajectory",
+    "REPRESENTATIVE_SUITE_0727",
+    "REPRESENTATIVE_SUITE_0727_NAME",
+    "RepresentativeEpisodeSpec",
     "build_parser",
     "build_runtime_references",
+    "generate_official_source_all_ik_governed_trajectory",
     "generate_trajectory",
     "main",
     "planner_config_from_args",
+    "resolved_episode_specs",
     "run",
     "selected_profiles",
 ]

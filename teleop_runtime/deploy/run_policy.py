@@ -52,6 +52,8 @@ from robot_motion.deploy.actions import (
 )
 from robot_motion.deploy.canonical_action import CanonicalDeployActionPipeline
 from robot_motion.deploy.async_producer import (
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
     POLICY_ASYNC_PRODUCER_ELIGIBLE,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_V1,
@@ -144,7 +146,10 @@ from .rtc_step_fanout import (
     RtcFrontendStepFanout,
     RtcPolicyEmissionPublisher,
 )
-from deployments.client.rtc_frontend import build_rtc_model_shadow_frontend
+from deployments.client.rtc_frontend import (
+    build_rtc_conditioned_model_shadow_frontend_v3,
+    build_rtc_model_shadow_frontend,
+)
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
     DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
@@ -187,7 +192,11 @@ from ..position_control import (
     PositionDeployExecutor,
     PositionDeployExecutorConfig,
     PositionDeployExecutorFault,
+    OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND,
+    PINK_POSE_LIFT_BACKEND,
+    POSITION_PATH_LIFT_BACKEND_CHOICES,
     apply_rm65_position_profile_defaults,
+    build_official_all_ik_governor_from_started_backends,
     build_position_collision_planner_from_started_backends,
     resolve_real_arm_execution_config,
 )
@@ -1546,13 +1555,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "off",
             RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
             RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+            MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
         ),
         default="off",
         help=(
             "Experimental default-off RTC frontend profile. RTC-3c remains the builtin-hold "
             "virtual shadow; raw_rtc_final_chunk enables an explicit model adapter with "
-            "the existing final-chunk model/server contract. Both force 30 Hz action/decision, "
-            "15 Hz observation requests, disable position chunk lookahead, and forbid motion output."
+            "the existing final-chunk model/server contract; model_rtc_flow_inpaint "
+            "uses the artifact-bound conditioned v3 provider. All force 30 Hz "
+            "action/decision, 15 Hz observation requests, disable position chunk "
+            "lookahead, and forbid motion output."
         ),
     )
     parser.add_argument(
@@ -1560,7 +1572,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "Opt into the explicit live observation/transport no-action shadow. "
-            "Requires the raw final-chunk RTC profile; hardware backends are "
+            "Requires the raw or conditioned model RTC profile; hardware backends are "
             "configured for observation-only startup (no command, force, tool-frame, "
             "singularity, or background-stream writes). Default is off."
         ),
@@ -1693,14 +1705,36 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--position-path-lift-backend",
+        choices=POSITION_PATH_LIFT_BACKEND_CHOICES,
+        default=OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND,
+        help=(
+            "Pose-to-QPOS execution backend. The default promotes the "
+            "offline-validated official source all-IK + two-source-step "
+            "120Hz jerk-limited governor. pink_pose_lift preserves the former "
+            "V4 deployment path and honors --pose-lift-profile."
+        ),
+    )
+    parser.add_argument(
+        "--position-all-ik-lookahead-source-steps",
+        type=int,
+        default=2,
+        help="Source-keyframe horizon for the official all-IK governor (default: 2).",
+    )
+    parser.add_argument(
+        "--position-all-ik-jerk-ramp-sec",
+        type=_positive_float,
+        default=0.05,
+        help="Acceleration-to-jerk ramp used by the official all-IK governor.",
+    )
+    parser.add_argument(
         "--pose-lift-profile",
         choices=RM65_POSE_LIFT_PROFILE_CHOICES,
         default=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
         help=(
-            "Versioned Pose-to-QPOS lift profile. v4_qp_constrained is the "
-            "deployment default and combines bounded continuity with admitted-anchor "
-            "Pink qref velocity/acceleration constraints. v1_baseline remains the "
-            "explicit atomic rollback; v2/v3 preserve intermediate profiles."
+            "Pink Pose-to-QPOS profile used only with "
+            "--position-path-lift-backend pink_pose_lift. V4 is the former "
+            "deployment default; V1 remains its explicit atomic rollback."
         ),
     )
     parser.add_argument(
@@ -1878,6 +1912,24 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Policy inference rate. Omit to match the effective action/control rate."
+        ),
+    )
+    parser.add_argument(
+        "--policy-inference-soft-hold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "During a synchronous policy inference gap, freeze each RM65 impedance arm "
+            "at its latest measured qpos while retaining force monitoring (default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--deployment-full-ik-preempts-local",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the historical dual-rate behavior that holds the previous safe command "
+            "while the full 15 Hz IK worker is busy; default keeps bounded local IK running."
         ),
     )
     parser.add_argument("--min-action-queue", type=_non_negative_int, default=0)
@@ -2495,11 +2547,55 @@ def validate_args(
     active_sides = _parse_active_sides(args.active_sides)
     args.active_sides = active_sides
     pose_lift_profile = resolve_rm65_pose_lift_profile(args.pose_lift_profile)
+    path_lift_backend = str(args.position_path_lift_backend)
     if bool(args.send_actions) and not pose_lift_profile.hardware_dispatch_allowed:
         raise ValueError(
             f"pose-lift profile {pose_lift_profile.name!r} forbids hardware "
             "dispatch; select a profile with hardware_dispatch_allowed=true."
         )
+    if int(args.position_all_ik_lookahead_source_steps) < 2:
+        raise ValueError(
+            "--position-all-ik-lookahead-source-steps must be >= 2."
+        )
+    if path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND:
+        if active_sides != ("left", "right"):
+            if _argument_was_supplied(
+                list(raw_argv),
+                "--position-path-lift-backend",
+            ):
+                raise ValueError(
+                    "official source all-IK governor requires active dual arms; "
+                    "use --position-path-lift-backend pink_pose_lift for single-arm deploy."
+                )
+            # Preserve the existing single-arm compatibility surface.  The
+            # promoted default is authoritative only for formal dual-arm
+            # position deployment.
+            args.position_path_lift_backend = PINK_POSE_LIFT_BACKEND
+            path_lift_backend = PINK_POSE_LIFT_BACKEND
+        if not bool(args.position_chunk_lookahead):
+            if _argument_was_supplied(
+                list(raw_argv),
+                "--position-path-lift-backend",
+            ):
+                raise ValueError(
+                    "official source all-IK governor requires "
+                    "--position-chunk-lookahead."
+                )
+            args.position_path_lift_backend = PINK_POSE_LIFT_BACKEND
+            path_lift_backend = PINK_POSE_LIFT_BACKEND
+        if (
+            path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+            and not bool(args.position_collision_check)
+        ):
+            if _argument_was_supplied(
+                list(raw_argv),
+                "--position-path-lift-backend",
+            ):
+                raise ValueError(
+                    "official source all-IK governor requires "
+                    "--position-collision-check."
+                )
+            args.position_path_lift_backend = PINK_POSE_LIFT_BACKEND
     observation_firewall_mode = str(
         getattr(args, "policy_observation_firewall_mode", "strict")
     ).strip().lower()
@@ -2522,15 +2618,20 @@ def validate_args(
     if rtc_debug_level != RTC_DEBUG_LEVEL_OFF and not rtc_profile_enabled:
         raise ValueError("--rtc-debug-level summary/trace requires an RTC profile.")
     setattr(args, "_rtc_debug_level", rtc_debug_level)
-    if rtc_real_shadow and rtc_profile_id != RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
+    model_transport_profiles = {
+        RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+        MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+    }
+    if rtc_real_shadow and rtc_profile_id not in model_transport_profiles:
         raise ValueError(
-            "--rtc-real-shadow requires the explicit raw final-chunk RTC profile; "
-            "it is not available for RTC-3c virtual policy or sync deployment."
+            "--rtc-real-shadow requires an explicit model-backed RTC profile; "
+            "it is unavailable for RTC-3c virtual policy or sync deployment."
         )
     if rtc_profile_enabled:
         if rtc_profile_id not in {
             RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
             RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+            MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
         }:
             raise ValueError(f"Unsupported RTC profile: {rtc_profile_id!r}.")
         if bool(args.send_actions):
@@ -2554,11 +2655,11 @@ def validate_args(
                 raise ValueError("RTC-3c builtin hold policy accepts no policy kwargs.")
         elif args.policy_artifact_json is None:
             raise ValueError(
-                "raw-RTC final-chunk requires an explicit --policy-artifact-json "
+                "Model-backed RTC requires an explicit --policy-artifact-json "
                 "sidecar; model identity must not be inferred from a model name."
             )
         if (
-            rtc_profile_id == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
+            rtc_profile_id in model_transport_profiles
             and not rtc_real_shadow
             and (
                 bool(args.left_arm_ip)
@@ -2576,7 +2677,7 @@ def validate_args(
             )
         ):
             raise ValueError(
-                "raw-RTC with live hardware endpoints requires explicit "
+                "Model-backed RTC with live hardware endpoints requires explicit "
                 "--rtc-real-shadow; otherwise use synthetic/local inputs."
             )
         if float(args.action_hz) not in {
@@ -2936,6 +3037,8 @@ def _runtime_action_keyframe_period_sec(args: argparse.Namespace) -> float:
         return 1.0 / RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz
     if profile_id == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
         return 1.0 / RAW_RTC_FINAL_CHUNK_PROFILE_V1.action_hz
+    if profile_id == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
+        return 1.0 / MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1.action_hz
     # Preserve the historical PolicyDeployRuntimeConfig default for sync_queue_v1.
     return 1.0 / 15.0
 
@@ -3254,6 +3357,33 @@ def hold_deploy_arm_backends(
         raise RuntimeError("deploy arm hold failed: " + "; ".join(errors))
 
 
+def request_policy_inference_soft_hold(
+    arm_backends: Mapping[str, EffectorBackend],
+    *,
+    reason: str,
+) -> dict[str, dict[str, object]]:
+    """Freeze measured arm state while synchronous policy inference is pending.
+
+    The hook is optional so position-only and non-RM65 backends retain their
+    existing semantics.  An implemented backend must fail closed when it
+    cannot produce a valid measured snapshot.
+    """
+
+    receipts: dict[str, dict[str, object]] = {}
+    for side, backend in arm_backends.items():
+        request = getattr(backend, "request_policy_inference_soft_hold", None)
+        if not callable(request):
+            receipts[str(side)] = {
+                "active": False,
+                "status": "unsupported",
+                "backend_type": type(backend).__name__,
+            }
+            continue
+        receipt = request(str(reason))
+        receipts[str(side)] = dict(receipt or {})
+    return receipts
+
+
 def emergency_stop_deploy_arm_backends(
     arm_backends: Mapping[str, EffectorBackend],
     *,
@@ -3355,15 +3485,17 @@ def build_arm_backends(
                         # Deployment has a 15 Hz policy cadence but must keep
                         # force/admittance and safe output at 40 Hz.  The
                         # controller therefore owns full Pinocchio IK on a
-                        # separate 15 Hz worker; its 40 Hz path is local-only
-                        # and yields while a full solve is in flight.  This is
-                        # intentionally an OpenPI deployment override, never a
-                        # teleoperation default.
+                        # separate 15 Hz worker; its bounded 40 Hz local path
+                        # continues while that advisory solve is in flight.
+                        # The historical fail-closed preemption behavior stays
+                        # available as an explicit rollback/debug switch.
                         "deployment_dual_rate_ik_enabled": True,
                         "deployment_full_ik_hz": 15.0,
                         "deployment_full_ik_deadline_ms": 66.66666666666667,
                         "deployment_local_ik_deadline_ms": 6.0,
-                        "deployment_full_ik_preempts_local": True,
+                        "deployment_full_ik_preempts_local": bool(
+                            getattr(args, "deployment_full_ik_preempts_local", False)
+                        ),
                         "ik_resolver_candidate_provider_names": ["rm65_pinocchio"],
                         "ik_resolver_local_step_provider_names": ["rm65_pinocchio"],
                         "ik_resolver_local_step_max_position_worsen_m": 0.003,
@@ -4025,6 +4157,16 @@ def main(
             args.end_effector_sides = "none" if not layout_sides else " ".join(layout_sides)
         if args.hands_enabled is None:
             args.hands_enabled = bool(layout_sides)
+        if (
+            policy_artifact.arm_hold_output is not None
+            and str(args.rtc_profile)
+            not in {"off", RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1}
+        ):
+            raise ValueError(
+                "arm-hold action semantics support sync deployment and "
+                "raw-RTC final-chunk shadow only; model continuation and "
+                "virtual RTC profiles remain fail closed."
+            )
     active_sides = validate_args(args, raw_argv=raw_argv)
     if rtc_step_fanout is not None and str(args.rtc_profile) != (
         RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
@@ -4131,6 +4273,11 @@ def main(
                 else int(args.action_chunk_execution_steps)
             ),
             action_keyframe_period_sec=_runtime_action_keyframe_period_sec(args),
+            arm_hold_output=(
+                None
+                if policy_artifact is None
+                else policy_artifact.arm_hold_output
+            ),
         )
     )
     policy.metadata["resolved_deploy_session_contract"] = deploy_session_contract.to_dict()
@@ -4492,6 +4639,39 @@ def main(
             worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
             observe_bundle=observe_rtc_transport_exchange,
         )
+    elif (
+        str(args.rtc_profile)
+        == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+    ):
+        if rtc_model_adapter_factory is None:
+            raise ValueError(
+                "model-RTC flow-inpaint requires a model-package adapter "
+                "factory; the generic deploy runtime will not infer one from "
+                "policy names."
+            )
+        model_adapter = rtc_model_adapter_factory(
+            policy=policy,
+            policy_artifact=policy_artifact,
+            deploy_session_contract=deploy_session_contract,
+            deploy_runtime=policy_deploy_runtime,
+            args=args,
+            active_sides=active_sides,
+        )
+        rtc_frontend = build_rtc_conditioned_model_shadow_frontend_v3(
+            model_adapter,
+            runtime_session_id=f"deploy-model-rtc-{uuid.uuid4()}",
+            control_domain_id="deploy-control-0",
+            producer_id=f"policy:{policy.name}:model-rtc",
+            policy_node_id=policy_deploy_runtime.config.policy_node_id,
+            deploy_runtime=policy_deploy_runtime,
+            policy_name=policy.name,
+            preparer=canonical_action_pipeline,
+            created_at=time.monotonic(),
+            profile=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+            request_validity_steps=int(args.rtc_request_validity_steps),
+            worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
+            observe_bundle=observe_rtc_transport_exchange,
+        )
     if rtc_emission_fanout is not None:
         if rtc_frontend is None:
             raise RuntimeError("RTC emission fanout has no RTC frontend.")
@@ -4627,12 +4807,40 @@ def main(
         position_collision_required = bool(
             args.position_collision_check and active_sides == ("left", "right")
         )
+        position_path_lift_backend = str(args.position_path_lift_backend)
         position_reference_hz = effective_position_reference_hz(args)
         position_command_hz = (
             float(backend_control_hz)
             if effective_arm_canfd_follow(args)
             else float(position_reference_hz)
         )
+        if (
+            position_path_lift_backend
+            == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+        ):
+            if not math.isclose(
+                float(effective_action_hz),
+                15.0,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "the promoted official all-IK governor contract requires "
+                    "a 15Hz policy action stream."
+                )
+            if not math.isclose(
+                float(position_command_hz),
+                120.0,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "the promoted official all-IK governor contract requires "
+                    "the 120Hz RM65 command stream."
+                )
+            # Unlike the former Pink path, the governor itself owns the 120Hz
+            # qcmd cut.  The executor must therefore run at the command rate.
+            position_reference_hz = float(position_command_hz)
         arm_only_pipeline = CanonicalDeployActionPipeline(
             safety_filter=safety_filter,
             active_sides=active_sides,
@@ -4723,49 +4931,92 @@ def main(
             ),
             collision_planner_factory=(
                 (
-                    lambda: build_position_collision_planner_from_started_backends(
-                        arm_backends,
-                        reference_hz=float(position_reference_hz),
-                        scene_profile=str(args.position_collision_scene_profile),
-                        collision_min_distance_m=float(
-                            args.position_collision_min_distance_m
-                        ),
-                        collision_distance_epsilon_m=float(
-                            args.position_collision_distance_epsilon_m
-                        ),
-                        max_joint_velocity_rad_s=tuple(
-                            float(value)
-                            for value in (
-                                args.arm_max_angvel
-                                if args.position_qref_max_angvel is None
-                                else args.position_qref_max_angvel
-                            )
-                        ),
-                        max_joint_acceleration_rad_s2=tuple(
-                            float(value)
-                            for value in args.position_max_acceleration_rad_s2
-                        ),
-                        max_joint_step_rad=(
-                            None
-                            if float(args.max_arm_joint_step_rad) <= 0.0
-                            else float(args.max_arm_joint_step_rad)
-                        ),
-                        damping=float(args.position_ik_damping),
-                        solve_max_iterations=int(
-                            args.position_ik_solve_max_iterations
-                        ),
-                        solve_min_iterations=int(
-                            args.position_ik_solve_min_iterations
-                        ),
-                        solve_adaptive_iterations_enabled=bool(
-                            args.position_ik_adaptive_iterations
-                        ),
-                        solve_iteration_reserve_ms=float(
-                            args.position_ik_iteration_reserve_ms
-                        ),
-                        pose_lift_profile=str(args.pose_lift_profile),
-                        debug_profile=bool(args.position_collision_debug_profile),
-                        ik_tuning=_position_deploy_ik_tuning(args),
+                    (
+                        lambda: build_official_all_ik_governor_from_started_backends(
+                            arm_backends,
+                            source_hz=float(effective_action_hz),
+                            command_hz=float(position_command_hz),
+                            lookahead_source_steps=int(
+                                args.position_all_ik_lookahead_source_steps
+                            ),
+                            jerk_ramp_sec=float(
+                                args.position_all_ik_jerk_ramp_sec
+                            ),
+                            scene_profile=str(
+                                args.position_collision_scene_profile
+                            ),
+                            collision_min_distance_m=float(
+                                args.position_collision_min_distance_m
+                            ),
+                            collision_distance_epsilon_m=float(
+                                args.position_collision_distance_epsilon_m
+                            ),
+                            max_joint_velocity_rad_s=tuple(
+                                float(value)
+                                for value in (
+                                    args.arm_max_angvel
+                                    if args.position_qref_max_angvel is None
+                                    else args.position_qref_max_angvel
+                                )
+                            ),
+                            max_joint_acceleration_rad_s2=tuple(
+                                float(value)
+                                for value in args.position_max_acceleration_rad_s2
+                            ),
+                            debug_profile=bool(
+                                args.position_collision_debug_profile
+                            ),
+                        )
+                    )
+                    if position_path_lift_backend
+                    == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+                    else (
+                        lambda: build_position_collision_planner_from_started_backends(
+                            arm_backends,
+                            reference_hz=float(position_reference_hz),
+                            scene_profile=str(args.position_collision_scene_profile),
+                            collision_min_distance_m=float(
+                                args.position_collision_min_distance_m
+                            ),
+                            collision_distance_epsilon_m=float(
+                                args.position_collision_distance_epsilon_m
+                            ),
+                            max_joint_velocity_rad_s=tuple(
+                                float(value)
+                                for value in (
+                                    args.arm_max_angvel
+                                    if args.position_qref_max_angvel is None
+                                    else args.position_qref_max_angvel
+                                )
+                            ),
+                            max_joint_acceleration_rad_s2=tuple(
+                                float(value)
+                                for value in args.position_max_acceleration_rad_s2
+                            ),
+                            max_joint_step_rad=(
+                                None
+                                if float(args.max_arm_joint_step_rad) <= 0.0
+                                else float(args.max_arm_joint_step_rad)
+                            ),
+                            damping=float(args.position_ik_damping),
+                            solve_max_iterations=int(
+                                args.position_ik_solve_max_iterations
+                            ),
+                            solve_min_iterations=int(
+                                args.position_ik_solve_min_iterations
+                            ),
+                            solve_adaptive_iterations_enabled=bool(
+                                args.position_ik_adaptive_iterations
+                            ),
+                            solve_iteration_reserve_ms=float(
+                                args.position_ik_iteration_reserve_ms
+                            ),
+                            pose_lift_profile=str(args.pose_lift_profile),
+                            debug_profile=bool(
+                                args.position_collision_debug_profile
+                            ),
+                            ik_tuning=_position_deploy_ik_tuning(args),
+                        )
                     )
                 )
                 if position_collision_required
@@ -4793,6 +5044,8 @@ def main(
         policy_name: str,
         lookahead_canonical_action: Any | None = None,
         lookahead_observation: Any | None = None,
+        second_lookahead_canonical_action: Any | None = None,
+        second_lookahead_observation: Any | None = None,
     ) -> _PreparedActionExecution:
         command = getattr(canonical_action, "command", None)
         if command is None or not command.commands:
@@ -4838,6 +5091,12 @@ def main(
                     ),
                     lookahead_observation=lookahead_observation,
                     lookahead_discrete_command=lookahead_hand_command,
+                    second_lookahead_filtered=(
+                        None
+                        if second_lookahead_canonical_action is None
+                        else second_lookahead_canonical_action.filtered
+                    ),
+                    second_lookahead_observation=second_lookahead_observation,
                 )
             except PositionDeployExecutorFault:
                 fault_stage = str(
@@ -5070,6 +5329,10 @@ def main(
             )
         if position_deploy_executor is not None:
             executor_config = position_deploy_executor.config
+            official_governor_active = (
+                str(args.position_path_lift_backend)
+                == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+            )
             collision_reset_label = (
                 ("fresh_dual_hardware" if send_actions else "dry_run_state_allowed")
                 if executor_config.collision_required
@@ -5080,10 +5343,12 @@ def main(
                 f"safe_{executor_config.sample_hz:g}hz"
                 f"->causal_{executor_config.reference_hz:g}hz"
                 f"->{executor_config.command_hz:g}hz "
-                "delay=1_action_period interpolation=xyz_linear+shortest_slerp "
-                "temporal_smoothing=off "
+                f"path_lift_backend={args.position_path_lift_backend} "
+                f"delay={'0_action_period' if executor_config.chunk_lookahead_enabled else '1_action_period'} "
+                f"interpolation={'linear_source_qref' if official_governor_active else 'xyz_linear+shortest_slerp'} "
+                f"temporal_smoothing={'third_order_jerk_horizon' if official_governor_active else 'off'} "
                 f"collision_reference={'on' if executor_config.collision_required else 'off(dry-run)'} "
-                "collision_scope=selected_scene_endpoint_only "
+                f"collision_scope={'selected_scene_endpoint+sampled_interval' if official_governor_active else 'selected_scene_endpoint_only'} "
                 "segment_reference_to_command_certified=false "
                 "collision_reset="
                 f"{collision_reset_label} "
@@ -5197,6 +5462,21 @@ def main(
                     "[raw-RTC] OpenPI/model final-chunk shadow active: "
                     "send_actions=false, position_lookahead=false, "
                     "timed-plan admission enabled."
+                    + (
+                        " live observation-only hardware guard enabled."
+                        if bool(getattr(args, "rtc_real_shadow", False))
+                        else ""
+                    ),
+                    flush=True,
+                )
+            elif (
+                str(args.rtc_profile)
+                == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+            ):
+                print(
+                    "[model-RTC] conditioned OpenPI shadow active: "
+                    "send_actions=false, position_lookahead=false, "
+                    "timed-plan admission and prefix conditioning enabled."
                     + (
                         " live observation-only hardware guard enabled."
                         if bool(getattr(args, "rtc_real_shadow", False))
@@ -5682,6 +5962,17 @@ def main(
                     if (
                         rtc_frontend is None
                         and can_run_policy
+                        and bool(send_actions)
+                        and bool(getattr(args, "policy_inference_soft_hold", True))
+                        and policy_deploy_runtime.action_queue_length() == 0
+                    ):
+                        request_policy_inference_soft_hold(
+                            arm_backends,
+                            reason="policy_inference_wait_for_chunk",
+                        )
+                    if (
+                        rtc_frontend is None
+                        and can_run_policy
                         and policy_deploy_runtime.should_predict(
                             now=control_loop_started_at,
                             policy_interval_s=1.0 / float(effective_policy_hz),
@@ -5774,10 +6065,11 @@ def main(
                                     position_deploy_executor.clear()
                                     last_action = observation.hold_action()
 
-                    # An empty policy queue is intentionally a no-op.  The
-                    # impedance backend already keeps its last safe command;
-                    # synthesising the current measured TCP here would
-                    # re-anchor the Cartesian reference on every gap.
+                    # An empty policy queue is a measured-pose soft hold for
+                    # impedance arms.  A fresh policy command releases that
+                    # lease in the backend before the next 40 Hz tick; the
+                    # explicit option above keeps a rollback to legacy
+                    # target continuation available for controlled debugging.
                     allow_policy_output = (
                         can_run_policy and not ik_action_gate.blocks_action_output
                     )
@@ -5996,9 +6288,23 @@ def main(
                                 "arbitration_shadow_step",
                                 arbiter_shadow_step.to_debug_payload(),
                             )
+                    if (
+                        action_step.emission_error is not None
+                        and action_step.raw_action is None
+                    ):
+                        faults.append(
+                            "policy_action_semantic_resolution_error:"
+                            + type(action_step.emission_error).__name__
+                        )
+                        policy_deploy_runtime.clear_action_queue()
+                        if bool(args.pause_on_policy_error):
+                            policy_active = False
                     queue_len_before_pop = action_step.queue_len_before
                     raw_action = action_step.raw_action
                     raw_lookahead_action = action_step.raw_lookahead_action
+                    raw_second_lookahead_action = (
+                        action_step.raw_second_lookahead_action
+                    )
                     queue_len_after_pop = action_step.queue_len_after
                     if raw_action is not None:
                         canonical_action = action_step.prepared_action
@@ -6043,6 +6349,8 @@ def main(
                                 )
                         lookahead_canonical_action = None
                         lookahead_observation = None
+                        second_lookahead_canonical_action = None
+                        second_lookahead_observation = None
                         if (
                             position_deploy_executor is not None
                             and bool(args.position_chunk_lookahead)
@@ -6067,6 +6375,31 @@ def main(
                             )
                             if not prepared_lookahead.faults:
                                 lookahead_canonical_action = prepared_lookahead
+                                if (
+                                    raw_second_lookahead_action is not None
+                                    and action_step.next_step_execution_signal
+                                    is not None
+                                ):
+                                    second_lookahead_observation = replace(
+                                        observation,
+                                        last_action=(
+                                            prepared_lookahead.action.vector.astype(
+                                                np.float32,
+                                                copy=True,
+                                            )
+                                        ),
+                                    )
+                                    prepared_second_lookahead = (
+                                        canonical_action_pipeline.prepare(
+                                            raw_second_lookahead_action,
+                                            second_lookahead_observation,
+                                            policy_name=policy.name,
+                                        )
+                                    )
+                                    if not prepared_second_lookahead.faults:
+                                        second_lookahead_canonical_action = (
+                                            prepared_second_lookahead
+                                        )
                         faults.extend(canonical_action.faults)
                         latch_canonical_safety_fault(
                             canonical_action,
@@ -6119,6 +6452,12 @@ def main(
                                         lookahead_canonical_action
                                     ),
                                     lookahead_observation=lookahead_observation,
+                                    second_lookahead_canonical_action=(
+                                        second_lookahead_canonical_action
+                                    ),
+                                    second_lookahead_observation=(
+                                        second_lookahead_observation
+                                    ),
                                 )
                                 if execution.accepted:
                                     position_action_submitted_this_loop = (

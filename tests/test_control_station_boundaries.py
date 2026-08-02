@@ -75,6 +75,27 @@ def test_station_application_core_does_not_import_concrete_data_planes() -> None
     ) == {}
 
 
+def test_real_teleop_and_umi_ui_packages_do_not_import_entity_data_planes() -> None:
+    ui_paths = (
+        *_python_files(STATION_ROOT / "real_teleop"),
+        *_python_files(STATION_ROOT / "umi"),
+        STATION_ROOT / "web/calibration_web_ui.py",
+        STATION_ROOT / "web/startup_progress.py",
+    )
+
+    assert _violations(
+        tuple(ui_paths),
+        {
+            "collection_runtime",
+            "dataset_interface",
+            "hardware",
+            "robot_motion",
+            "sim",
+            "teleop_runtime",
+        },
+    ) == {}
+
+
 def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None:
     assert _violations(
         _python_files(STATION_ROOT),
@@ -85,6 +106,14 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
         ],
         "control_station/composition/mujoco_sim_hil.py": ["dataset_interface"],
         "control_station/control_trace.py": ["dataset_interface"],
+        # Concrete post-capture application binding. Presentation stays in
+        # Station; discovery/resolution/indexing remain lower-owned.
+        "control_station/refinement_annotation/application.py": [
+            "dataset_interface"
+        ],
+        "control_station/refinement_annotation/cli.py": [
+            "dataset_interface"
+        ],
     }
 
 
@@ -138,6 +167,7 @@ def test_generic_passive_teleop_source_does_not_construct_vive_q6() -> None:
 def test_lower_packages_do_not_reverse_depend_on_control_station() -> None:
     violations: dict[str, list[str]] = {}
     for package_name in (
+        "collection_runtime",
         "control_composition",
         "dataset_contracts",
         "dataset_interface",
@@ -153,4 +183,21 @@ def test_lower_packages_do_not_reverse_depend_on_control_station() -> None:
         violations.update(
             _violations(_python_files(package_root), {"control_station"})
         )
-    assert violations == {}
+    # Temporary application-edge migration seams. They retain the canonical
+    # commands and historic imports while GUI policy moves to Station. The
+    # gui/real_teleop_control coordinator is itself an application-edge seam;
+    # device, motion, safety, and collection ownership remain below it. No
+    # device/control/safety implementation may join this allowlist.
+    assert violations == {
+        "teleop_runtime/collection/umi/app.py": ["control_station"],
+        "teleop_runtime/collection/umi/controller.py": ["control_station"],
+        "teleop_runtime/debug/calibration_web_ui.py": ["control_station"],
+        "teleop_runtime/debug/run_vive_rm65_calibration_debug.py": ["control_station"],
+        "teleop_runtime/debug/run_vive_rm65_real_teleop.py": ["control_station"],
+        "teleop_runtime/gui/calibration_web_ui.py": ["control_station"],
+        "teleop_runtime/gui/startup_progress.py": ["control_station"],
+            "teleop_runtime/real_teleop/gui_controls.py": ["control_station"],
+            "teleop_runtime/real_teleop/operator_control_runtime.py": ["control_station"],
+            "teleop_runtime/real_teleop/control_loop.py": ["control_station"],
+            "teleop_runtime/real_teleop/progress_adapter.py": ["control_station"],
+        }

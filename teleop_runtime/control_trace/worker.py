@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 
 from .sink import ControlTraceSinkFlushReport, ControlTraceSpoolSink
@@ -76,12 +77,23 @@ class ControlTraceSpoolWorker:
 
     def _run(self) -> None:
         try:
+            next_flush_at = time.monotonic() + self.poll_interval_sec
             while not self._stop.is_set():
-                self._wake.wait(self.poll_interval_sec)
+                remaining = max(0.0, next_flush_at - time.monotonic())
+                self._wake.wait(remaining)
+                if self._stop.is_set():
+                    break
+                now = time.monotonic()
+                if now < next_flush_at:
+                    # A burst of per-fact notifications means "work pending";
+                    # coalesce it until this worker's bounded drain deadline.
+                    if self._stop.wait(next_flush_at - now):
+                        break
                 self._wake.clear()
                 report = self.flush_once()
                 if report.failure_code is not None:
                     return
+                next_flush_at = time.monotonic() + self.poll_interval_sec
             self.flush_once()
         except Exception as exc:  # evidence is exposed; frontend decides policy
             with self._state_lock:

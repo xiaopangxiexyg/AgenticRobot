@@ -1,5 +1,22 @@
 # Dataset Interface
 
+## Arm hold-intent derived view
+
+`dataset_interface.arm_hold` projects the optional v2.3 arm-mode columns into
+two float32 targets ordered `[left, right]`, plus separate validity, loss, and
+transition masks. It is an episode-local read-only view and does not append
+columns or rewrite old data.
+
+The baseline auxiliary loss should use BCE-with-logits per side and reduce
+only over `arm_hold_loss_mask` (`valid AND not padding`). Missing labels,
+unknown/init/stopped modes, and malformed positive scope therefore contribute
+zero auxiliary loss without disabling the continuous action loss. Class or
+transition weighting is deliberately not hidden in the data interface:
+training configuration must declare it explicitly after inspecting
+`summarize_arm_hold_coverage()`. In particular, a dataset containing only
+paired states `01` and `10` is perfectly complementary and must not be treated
+as evidence for independent `00` or `11` behavior.
+
 ## Control-composition projection boundary
 
 `dataset_interface.composition_control_trace` is the optional adapter from
@@ -40,8 +57,17 @@ It accepts frozen v1 through its normalized training view and trained-prefix
 v2, but rejects inference-only v2 because `training=null`.
 The sample hash binds the episode/start location, arrays, masks, projection,
 layout, frame, chunk, and continuation contract. It does not normalize values,
-create framework tensors, sample random delays, rewrite source rows, or own a
-dataset episode.
+create framework tensors, rewrite source rows, or own a dataset episode.
+
+The trained-v1 preflight API adds a replayable sampling spec and one combined
+observation/action window without changing the D2 sample schema. The spec
+lists exact legal `(forecast_delay_steps, prefix_steps)` pairs and uses a
+stateless hash over spec/contract/episode/start/draw identity; it owns no
+mutable RNG. The resulting window binds observation and generation start to
+the same source index, derives the first executable index as `start + delay`,
+and exposes spec/causal/window hashes for a later framework adapter. The
+chosen pair remains part of the existing training-sample hash rather than a
+second selection receipt.
 
 `CompositionInformationPlan` is not a dataset capture profile. A camera or
 tactile stream needed only for recording should go directly to the capture
@@ -71,7 +97,186 @@ recorded computation completion time rather than the scheduler tick. The row
 uses `selected_action` with `action_stage=selected_pre_safety` and never creates
 an unqualified `action` training target.
 
-## Provisional v2.5-p read boundary
+## Collection progress read boundary
+
+`dataset_interface.progress_artifacts` is the strict, read-only disk boundary
+for one sealed progress Episode. It loads the existing profile, binding, fact
+log, and manifest without creating directories, opening write handles, or
+repairing source artifacts. Callers may provide the hashes published by the
+Episode owner; the loader verifies those bindings before returning a resolved
+timeline. Missing, unsealed, torn, or ambiguously encoded artifacts fail
+closed. This module adds no persisted schema and does not own Episode
+lifecycle.
+
+`load_dataset_progress_profile()` additionally verifies the dataset-level
+`meta/progress/profile.cjson` binding against every Episode-local profile. It
+accepts a legacy dataset with identical Episode profiles when explicit
+binding is not required, but never guesses across multiple hashes and never
+backfills files. This is the read-side enforcement for the runtime rule that
+one dataset contains at most one exact progress profile.
+
+`dataset_interface.progress_timeline` is the first p2 read-only resolver. It
+independently validates the typed capture-fact sequence and reconstructs:
+
+- canonical Attempt intervals and outcomes;
+- effective progress transitions after immediate Undo is applied;
+- failed-Attempt/retry boundaries with no active Attempt during adjustment;
+- intentional formal-capture pause intervals from applied Pause/Resume
+  operation receipts;
+- open versus sealed timeline status and exact manifest binding.
+
+The resolver does not import `collection_runtime`, persist a second timeline,
+or mutate source facts. Its result dataclasses are provisional derived Python
+views rather than frozen dataset schemas.
+
+`dataset_interface.progress_corrections` adds one intentionally narrow
+retrospective prototype for sealed LINEAR timelines: it can reassign a terminal
+Failure to an earlier Attempt while atomically invalidating the intervening
+Advances and their Attempts. It leaves the sealed capture bundle untouched and
+fails closed when a Retry/later Attempt would require an explicit suffix
+correction. This validates immutable overlay mechanics; it is not the final
+post-annotation correction model. The eventual model may replace a bounded
+retrospective timeline segment, including stage and time boundaries, after
+profile validation.
+
+`dataset_interface.sample_axis` provides the version-neutral, read-time mapping
+from one Episode clock to its contiguous causal sample indices.
+`EpisodeSampleAxis.from_causal_samples(...)` can consume native causal samples
+directly; it rejects gaps in `sample_index`, a foreign clock, and decreasing cut
+times instead of guessing an ordering. Equal cut times are supported and retain
+explicit `first_at_or_after` versus `first_strictly_after` boundary semantics.
+
+`dataset_interface.progress_samples` projects the resolved progress timeline
+onto that sample axis without reading or rewriting stream payloads:
+
+- an Advance closes the preceding Attempt as `[start, advance)`, so samples at
+  the transition cut belong only to the next Attempt;
+- Failure and terminal Attempt cuts are inclusive, matching
+  `[first_at_or_after(start), first_strictly_after(end))`;
+- an intentional formal-capture Pause is `[pause, resume)`;
+- an open Attempt or Pause extends only to the current end of the known sample
+  axis.
+
+`dataset_interface.progress_exclusions` builds the first coarse-only training
+view from a sealed capture-time timeline. Each online failed Attempt contributes
+one exclusion from its Attempt start through its operator-report Failure cut.
+Successful Attempts, Retry Attempts, and intentional Pause intervals are not
+implicitly added. An exclusion with no matching causal sample remains as an
+empty auditable interval instead of deleting the Failure fact. This builder
+does not accept an active timeline and does not infer refinement anchors,
+corrected onset times, or retrospective stage reassignment.
+`ResolvedProgressTimeline.resolution_kind` is a derived-only guard: the capture
+resolver emits `CAPTURE_CAUSAL`, while the current retrospective prototype emits
+`RETROSPECTIVE_CORRECTION`; the coarse builder rejects the latter instead of
+silently losing correction provenance.
+
+`dataset_interface.progress_annotation_jobs` discovers only Episodes already
+published in `meta/episodes.jsonl` whose progress manifest and ordered-stage
+artifacts are complete; the active/latest partial Episode is invisible.
+`progress_stages` validates strict stage order across retries, preserves the
+exact capture Failure timestamp, permits only a final posthoc Failure without
+a capture fact, and derives loader-ready occurrence/exclusion sample intervals.
+A failed stage excludes its own occurrence start through the original Failure
+cut. Whole-Episode abnormal produces `EXCLUDED_EPISODE` without deleting
+existing annotations. Coverage and exclusions remain derived views rather than
+new per-frame columns.
+
+`dataset_interface.training_semantics` is the first composed, read-only
+training-selection layer. It projects sealed Attempts, ordered stage
+occurrences, abnormal intervals, selected Failure-trigger annotations, and
+capture pauses onto one sample axis. A capture-default trigger at Failure end
+is treated as unreviewed; Failure exclusion falls back from a reviewed trigger
+to the linked failed-stage start and then to the failed-Attempt start. Normal
+intervals may cross successful stage and progress-step transitions. Failure,
+abnormal, pause, Episode, and caller-supplied continuity boundaries terminate
+the interval, after which the existing pose-action chunk contract alone decides
+whether an incomplete tail is dropped or padded. Queries assign each window to
+the progress step of its observation/start sample and may alternatively select
+typed Failure or Recovery anchors. These spans, anchors, and window locations
+are rebuildable Python views: they do not rewrite frame rows and are not a new
+persisted dataset schema.
+
+`dataset_interface.prepared_training_view` materializes that rebuildable
+interpretation during explicit dataset organization, not during live capture.
+It can select sealed Episodes from multiple date-based dataset roots, uses the
+Episode capture identity as the global key, and retains each source
+`episode_index` only as provenance. One organized view requires one exact
+Progress Profile, one exact Stage Profile, and one compatible projected
+Parquet field schema. Multiple annotation sets require an explicit per-Episode
+selection; identical Episode identities are deduplicated only when their raw
+content and selected semantic artifacts are identical.
+
+The result is an immutable `derived/training_views/<hash>/` snapshot containing
+an Episode table, semantic interval/anchor tables, explicit source selection,
+and a hashed source inventory. Source roots and files are referenced by
+relative locators; no Parquet, video, Progress fact, or annotation is copied or
+rewritten. A workspace merge may resolve outside the organized root, while
+`require_self_contained=True` provides the stricter release/bundle check. The
+prepared view is provisional and may be deleted and rebuilt; it is not a new
+dataset truth or a `collection_runtime` responsibility.
+
+The first implementation is a Python API rather than a new production
+entrypoint:
+
+```python
+from dataset_interface import (
+    PreparedSourceDataset,
+    build_prepared_training_view,
+)
+
+result = build_prepared_training_view(
+    "/datasets/organized/writing-v1",
+    (
+        PreparedSourceDataset("2026-08-01", "/datasets/2026-08-01_writing"),
+        PreparedSourceDataset("2026-08-02", "/datasets/2026-08-02_writing"),
+    ),
+    column_projection=("timestamp", "action", "observation.state"),
+)
+```
+
+This call writes only below the organized root. The date roots are opened as
+read-only sources. Callers must use the actual logical column names of their
+capture profile; missing or differently typed projected columns fail closed.
+
+`dataset_interface.progress_refinement` is the first validated salvage-anchor
+prototype. `dataset_interface.progress_annotations` verifies the minimal
+immutable binding/chunk/manifest artifacts and reconstructs one caller-selected
+sealed `SelectedRefinementAnnotationSet`; it never writes or repairs annotation
+files. The selected view carries both the source progress-manifest hash and the
+exact source annotation-manifest hash; salvage, coverage, and cache rows retain
+both, so two sealed artifacts that reuse a human-facing annotation-set ID
+cannot overwrite one another. `RefinementBoundaryObservation` remains as a compatibility/read-view
+name for the single persisted `RefinementBoundaryAnnotationV1` contract, not a
+second schema. An exclusion start moves forward only when the refinement
+profile marks that boundary as eligible, certifies the preceding prefix, every
+required predecessor has one unambiguous annotation in valid time order, all
+evidence uses the Episode clock, and confidence meets the explicit resolver
+threshold. Missing evidence, conflicts, invalid ordering, low confidence, or a
+boundary at/after the Failure cut retain the original coarse Attempt-start
+exclusion.
+
+`dataset_interface.progress_coverage` independently derives structural
+refinement coverage for every resolved coarse Attempt. It reports
+`NOT_APPLICABLE`, `UNANNOTATED`, `PARTIAL`, `COMPLETE`, `CONFLICTED`, or
+`INVALID` from profile membership, exact boundary multiplicity, Episode-clock
+intervals, and boundary order. Confidence is intentionally not part of
+structural completeness; the salvage/training resolver applies its own
+explicit confidence threshold.
+
+`dataset_interface.progress_coverage_catalog` is an optional SQLite WAL query
+cache over those derived views. It supports transactional per-set replacement,
+full rebuild, status/Episode queries, and annotation-set issue lookup. The
+cache key includes the exact annotation-manifest hash. The database stores
+canonical hashes only as lookup references; it does not define
+facts or participate in canonical identity. It may be deleted at any time and
+must be rebuilt from sealed progress/annotation artifacts after loss or format
+change. Catalog failure therefore cannot change the validity of an annotation
+commit.
+
+The selected timeline, salvage anchor, and training exclusions remain derived
+Python views. General correction contracts, annotation-set selection policy,
+canonical coverage receipts, and training-exclusion persistence remain outside
+this slice.
 
 `dataset_interface.task_semantics` rebuilds frame-local subtask state from the
 authoritative append-only attempt events; it does not write labels back into
@@ -179,6 +384,10 @@ config = DatasetInterfaceConfig(
     ),
     augmentation=RandomBackgroundAugmentConfig(
         provider="mixed",
+        mixed_original_prob=0.1,
+        real_image_prob=0.4,
+        mixed_black_prob=0.0,
+        wrist_pair_mode="shared_scene_family",
         mask_role="keep",
         edge_blur_px=1,
     ),
@@ -205,6 +414,10 @@ config = DatasetInterfaceConfig(
 )
 ```
 
+`provider="mixed"` 的默认有效分布是 10% original / 40% real-image / 50% procedural。
+`MaskedFramePipeline` 会自动从仓库默认图片池建立 provider，也可以通过
+`DatasetInterfaceConfig(real_image_root=...)` 指定图片根目录；图片池不可用时 fail closed。
+
 ## Front 固定边界增强
 
 front 不使用 wrist 的 `final_keep_mask`。启用后，`MaskedFramePipeline` 会在现有
@@ -218,6 +431,9 @@ config = DatasetInterfaceConfig(
     mask=MaskConfig(final_mask_root=...),  # front 启用固定边界时不会读取此路径
     augmentation=RandomBackgroundAugmentConfig(
         provider="mixed",
+        mixed_original_prob=0.1,
+        real_image_prob=0.4,
+        mixed_black_prob=0.0,
         fixed_mask=FixedBorderMaskConfig(enabled=True),
     ),
 )
@@ -257,7 +473,10 @@ training_augmentation = RandomBackgroundAugmentConfig(
 )
 ```
 
-计划以 `episode + camera + epoch` 为粒度确定性缓存；一个 clip/batch 复用同一套全局颜色、光照和质量
+背景增强默认以左右腕成对的 `episode + epoch` 场景族确定性缓存；程序背景共享 coarse canvas，真实图片
+背景共享 provider/family 但使用独立 donor/crop/运动流，左右腕仍使用独立 view seed。`wrist_pair_mode="independent"`
+可回退到旧的逐 camera 行为。Photometric
+仍以 `episode + camera + epoch` 为粒度确定性缓存；一个 clip/batch 复用同一套全局颜色、光照和质量
 参数。Gaussian/Poisson 噪声仍以 `frame_index` 确定性变化。审计信息仅在
 `MaskedFrameSample.metadata["photometric_augmentation"]` 中可见；
 `read_augmented_frame`、`read_augmented_clip` 和 `TorchMaskedAugmentDataset` 只交付图像数组，
@@ -571,4 +790,6 @@ observation.images.right_wrist.augmented
 
 如果未来 dataset 的 `meta/episodes.jsonl` 中提供 `final_mask_paths`、
 `wrist_final_mask_paths` 或 `wrist_keep_mask_paths`，`dataset_interface` 会优先使用这些显式路径。
+采集期 `wrist_depth_mask_paths` 不属于训练 final-mask key，缺失 final keep-mask 时会 fail closed，
+不会静默退化为 depth-range mask。需要兼容实验时应在上层训练配置显式声明，而不能改变这里的默认契约。
 这不影响启用固定边界增强的 front，相应 mask 在训练时在线生成。

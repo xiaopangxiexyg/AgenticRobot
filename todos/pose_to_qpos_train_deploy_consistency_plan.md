@@ -489,3 +489,581 @@ Pose Lift。
 并继续保留 QP 后的候选、碰撞、关节和 120 Hz qcmd 安全层。测试数组
 `POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS` 基于稳定 V1，仅增加该开关；恢复
 `POSITION_FORMAL_V1_ARGS` 即完整回退。
+
+## 2026-07-29 V4 后续平滑实验与约束证书
+
+在 V4 上继续验证了两条软连续性路径，均未进入 production profile：
+
+- 关节 qdot 连续性可明显降低部分轨迹的 acceleration/jerk，但会延续上一帧朝奇异区运动
+  的关节速度。固定 4 次 IK 迭代时，0727 episode 16/35/80/81 的右臂最小实际
+  `sigma_min` 均下降，因此否决。
+- 改为 Cartesian qdot 连续性并在 guarded band 内对“预测继续降低 sigma”的上一帧速度
+  禁用后，episode 16 的最小 sigma 不再回退，但 episode 81 仍从约 `0.01135` 降到
+  `0.01115`，且最大 jerk 上升；说明只平滑末端速度仍可能诱导更差的内部关节姿态，因此
+  同样否决。
+
+上述两种“追随上一帧速度”的实验代码及其临时 V5 选项均已撤回；deploy/Pose replay 默认
+仍为 V4，遥操仍为显式 opt-in，真机命令不变。下一种候选必须把“方向选择性奇异退化/
+显式 manipulability 或分支路径”直接放入同一个受限优化问题，不能再单独增加速度追随项。
+
+离线 parity evaluator 现增加逐帧 `motion_constraint_certificate`，同时统计 QP raw candidate
+与最终 admitted qref 的速度/加速度利用率、越界 side-frame 数，以及 QP 后腕部规范化、硬
+关节证书和 collision backoff 的最大关节改变量。固定 4 次迭代复核 0727 episode
+16/35/80/81：raw 与 admitted 的速度/加速度越界计数全部为 0；QP 后最大改变量只在 episode
+16 非零，最大约 `0.000445 deg`，其余 episode 为零或数值噪声。这排除了“QP 后处理重新破坏
+运动约束”作为当前主要问题，并把该证书加入 profile 非回退比较。
+
+## 2026-07-29 V5 方向性 sigma escape（离线候选）
+
+新增独立 profile `rm65_pose_lift_v5_sigma_escape`，但明确设置
+`hardware_dispatch_allowed=false`，因此不能用于真机 action dispatch；V4 默认、遥操默认和
+已有真机命令均未改变。V5 在 V4 的 qpos/qdot/qddot/collision 硬约束内增加一个低权重软任务：
+
+- 使用 `LOCAL_WORLD_ALIGNED` geometric Jacobian，线速度行按 `0.5 m` characteristic length
+  归一化；
+- 只在 `sigma_min < 0.04` 时启用；
+- 每个 60 Hz admitted anchor 只计算一次 active-chain central finite-difference 梯度，Pink
+  的 2--4 次数值迭代共享同一逃逸方向，避免每次迭代重新选方向；
+- 目标只是在本周期沿梯度把 sigma 提高最多 `0.03/s`，软任务 cost 为 `0.15`；所有硬运动
+  和碰撞约束拥有更高权威。
+
+同时保留原 `compare_profile_reports` 生产非回退门禁不变，另增
+`sigma_escape_research` 离线 Pareto 验收。后者只有在 guarded side 的 sigma 有实质提升、
+速度/加速度证书越界为 0、hold/branch jump 不增加，并且 teacher-qpos、末端 pose 和 jerk
+回退处于明确小上限内才通过；它不具有任何硬件准入权威。
+
+0727 episode 16/35/80/81 的 `runtime_causal` 回放结果：
+
+- 固定 4 次迭代时，右臂最小 sigma 分别提高约 `0.16% / 0.15% / 3.43% / 16.67%`；
+- 固定 2 次迭代时，分别提高约 `0.18% / 0.14% / 2.31% / 35.30%`；
+- 8 个 episode/迭代组合的 raw/admitted qdot/qddot 越界计数均为 0，hold 和腕部分支跳变
+  均未增加，独立 research gate 全部通过；
+- 最困难的 episode 81 固定 4 次迭代中，平均 teacher 关节误差增加约 `0.071 deg`，平均末端
+  平移误差增加约 `4.9 um`，平均旋转误差增加约 `0.00034 deg`。更强的 `cost=0.2` 虽能把
+  sigma 提高约 `28.5%`，但关节误差代价约 `0.124 deg`，因此未选用。
+
+当前结论仅支持“V5 是值得继续扩大离线数据覆盖的候选”，不支持替换 V4 或真机启用。离线
+评估器提供 `--offline-sigma-escape-cost` 与
+`--offline-sigma-escape-rate-per-sec` 做参数扫描，覆盖只作用于 candidate，registry profile 和
+baseline 均不变。
+
+### 0727 全量覆盖复核
+
+随后将同一天、非 `old` 的
+`2026-07-27_dmtac_rm65_bimanual_position_v2_responsive` 全部 115 个 episode 的
+Parquet/qref 纳入只读扫描，而不是继续只观察最初 4 条轨迹：
+
+- 以 Pose Lift 同模型、同 TCP、同 `0.5 m` 归一化 Jacobian 扫描保存的 teacher qref，只有
+  9 个 episode 进入 `sigma_min < 0.04`：80、81、37、96、16、35、59、68、53；
+- 另取 8 个正常 episode 做固定 2 次迭代对照，V5 与 V4 的 qref、pose、Jacobian 指标逐项
+  相同，说明 V5 的 guard 没有泄漏到抽样的正常工作区；
+- 固定 2 次迭代时，9 条 teacher-guarded 轨迹中实际进入 V4 guard 的 8 条均改善，累计
+  `<0.01` 样本从 66 降到 58，`<0.001` 从 10 降到 8，累计 guard deficit 从约
+  `26.3083` 降到 `25.6854`；
+- 固定 4 次迭代时，7 条改善、episode 53 的 V4/V5 rollout 均未进入 guard，episode 96
+  则出现反例：最小 sigma 从约 `1.557e-4` 降到 `7.828e-5`，`<0.001` 样本从 5 增到
+  10。虽然其 `<0.01` 样本和平均 guard deficit 略有改善，但极深奇异尾部明确恶化；
+- episode 96 保存的 teacher qref 最小 sigma 约为 `0.01055`，而 V4 Pose-to-QPOS
+  closed-loop 会把它带到约 `1e-4`。因此该极深奇异并非演示 qref 原本经过的路径，而是
+  部署 Pose Lift 重建分支造成的训测偏差；
+- 逐帧检查表明 q3 在零点两侧换号，fixed2/fixed4 的单点最小值还会受参考时钟采样相位影响。
+  因此后续判断不能只看最小值，也必须同时看 guard 暴露时间、`<0.01`/`<0.001` 尾部计数
+  和 guard deficit。
+
+离线 evaluator 已补充 `guarded_exposure` 与全 episode
+`--rank-jacobian-episodes`。`sigma_escape_research` 门禁也增加同参考时钟样本数一致、guard
+样本数、深尾部样本数及平均 deficit 非回退要求。新门禁复核 episode 96：fixed2 通过；
+fixed4 同时因最小 sigma 和 `<0.001` 计数回退而失败。
+
+结论更新为：V5 在已观察到的大多数软奇异轨迹上是正向候选，但其逃逸方向在穿越精确结构
+奇异时对数值迭代敏感，尚不具备稳定的极深尾部安全性。它继续保持
+`hardware_dispatch_allowed=false`，V4 默认和真机命令均不改变。下一候选应优先研究
+q3/q5 零点附近的单侧分支保持或显式 barrier/trust-region，而不是提高现有 V5 cost。
+
+## 2026-07-29 V6 结构奇异单侧分支锁（离线候选）
+
+针对 episode 96 已确认的根因，新增独立 profile
+`rm65_pose_lift_v6_structural_branch`，仍设置 `hardware_dispatch_allowed=false`：
+
+- 在 V5 的 sigma guard 内，按当前 admitted anchor 选择 RM65 q3/q5 中更接近零的结构关节；
+- 锁存该关节当前正/负侧，直到 sigma 离开 release band；
+- 在 Pink QP 内加入单侧硬不等式，保留默认 `0.75 deg` 零点裕度，禁止数值迭代穿越 q3/q5=0；
+- V4 的 qpos/qdot/qddot/collision 约束及 V5 的 sigma soft objective 仍保持原有权威关系。
+
+0727 离线结果：
+
+- episode 96 fixed2/fixed4 均不再穿越 q3=0；最小 sigma 分别约为 `0.002132/0.002136`，
+  V4 的对应值为 `8.70e-6/1.56e-4`；`<0.001` 样本 fixed4 从 5 降为 0；无 hold，研究门禁通过；
+- 9 条 teacher-guarded 轨迹 fixed4 中，8 条实际进入 guard 的轨迹全部通过研究门禁；episode 96
+  是收益最大的一条，其余轨迹的 qref/pose/jerk 变化很小；episode 53 的 V4/V6 rollout
+  均未进入 guard，按“无证据”单独标记，不作为收益样本；
+- 8 条正常轨迹 fixed4 与 V4 的 sigma、qref 误差、hold、jerk 均逐项相同；
+- 将裕度提高到 `1.5/2.0 deg` 可把 episode 96 最小 sigma 提升到约 `0.00426/0.00568`，但
+  fixed4 最大 jerk 增加约 3.7%/2.7%，超过当前研究门禁，因此不采用更大裕度；
+- `0.75 deg` 会在极深奇异区形成单侧安全平台（episode 96 q3 约停在 `+0.75 deg`），能避免
+  分支抖动和精确穿零，但不能宣称完全恢复 teacher q3。后续若要进一步跟手，应研究带
+  admitted-motion 方向的软 barrier/局部 trust-region，而不是直接扩大硬裕度。
+
+补充参数扫描显示：把裕度降到 `0.5 deg` 时 episode 96 最小 sigma 约为 `0.00144`，仍无
+`<0.001` 样本且 fixed4 jerk 基本不变；但安全余量更窄，因此暂不替换默认的 `0.75 deg`。
+保持 `0.75 deg` 并将 V5 sigma escape cost 离线提高到 `0.3/0.4/0.5` 时，最小 sigma 约为
+`0.00234/0.00658/0.01144`；`0.3` 通过当前研究门禁，`0.4` 因最大 jerk 回退失败，
+`0.5` 还出现加速度证书越界。说明“加大逃逸权重”确实能更快离开平台，但会把新抖动/约束
+冲突重新引入，当前不采纳。
+
+对 cost=`0.3` 扩展到全部 9 条 guarded episode 后，episode 81/37 的 qref/pose parity
+回退、episode 16 的 guard 暴露帧增加，故不能只凭 episode 96 选择更强权重；V6 默认仍保留
+cost=`0.15`。
+
+V6 只作为可回退离线研究 profile 保留；V4 默认、V5 实验 profile、部署端默认和所有真机命令
+均未改变。
+
+## 2026-07-29 V7 结构分支软外移探针（未通过全局门禁）
+
+为缓解 V6 在 `0.75 deg` 单侧平台上的局部跟手损失，增加了仅离线可用的
+`rm65_pose_lift_v7_structural_escape`：在 q3/q5 单侧硬约束外，按深度 sigma 逐渐增加
+一个朝向 4° 的软外移目标。它不是独立安全 authority，V6 的分支锁、V5 的 sigma 目标和
+V4 的 qpos/qdot/qddot/collision 证书仍优先。
+
+0727 fixed4 结果：episode 96 单独运行时，runtime-causal 的平均最大关节误差约从
+`1.696°` 降到 `1.562°`，最小 sigma 从约 `1.56e-4` 提升到 `6.7e-3`，但 8 条
+guarded episode 的整体门禁失败：episode 80/16/68 出现速度或加速度证书回退，episode
+35/59 的 sigma 改善不足，其他组合还出现 pose/parity 回退。把软外移 cost 从 `0.10` 提高到
+`0.20` 会扩大多条轨迹的 parity 回退；把激活 sigma 收窄到 `0.005` 仍会在 episode 96
+引入 jerk 回退。因此 V7 保持 `hardware_dispatch_allowed=false`，不进入 deploy、Pose
+replay 默认或真机命令。
+
+随后尝试的两种“减少 V6 粘滞”离线覆盖也未通过：首次锁定增加 q3/q5 触发角（4°）以及
+普通区小边界、深 sigma 恢复 0.75° 的分段边界，均在 8 条轨迹中产生 motion certificate
+回退。它们的临时参数没有写入 profile，V6 的 fingerprint 和默认语义保持不变。
+
+当前可复现结论：V6 是结构奇异离线保护基线，V4 仍是唯一默认/可部署 profile；任何新的
+“减小平台”方案必须同时通过 0727 全部 guarded episode 的 pose/parity、sigma 深尾、
+qdot/qddot/jerk、hold 和独立 motion certificate 门禁后才可继续推进。
+
+## 2026-07-30 Path-lift 合同复核与 V8/V9
+
+在继续优化奇异逃逸前，已先核查会影响全部离线结论的三个合同：
+
+- 对 0727 全部 115 个 episode、28,987 帧逐帧验证，stored Pose 与同帧 accepted `q_ref`
+  的 FK 一致。左右最大平移误差约 `7.01e-8/7.59e-8 m`，最大旋转误差约
+  `1.32e-5/1.55e-5 deg`；错开一帧后立即变成毫米/约 0.5° 量级。因此 episode 96 的
+  closed-loop 深奇异是 Pose→QPOS path lifting 分支漂移，不是 Pose/qref 保存语义或时钟
+  对齐错误。
+- fixed2/fixed4 的 Pink 调用共享同一 admitted anchor、上一条正式 admitted velocity 和
+  一个物理 `dt=1/60 s`。内部重新线性化不会提交 previous velocity，也不会把 4 个完整
+  控制周期累计为一帧。
+- evaluator 原先会为非 reference-grid 的最终 source timestamp 使用极短尾间隔计算速度和
+  加速度，而 planner 仍按固定 reference period 积分。这会虚构数百倍动态越界。现已统一
+  以 `1/reference_hz` 计算 planner emission 的 qdot/qddot/jerk，并增加非网格末帧回归
+  测试。
+
+还存在一个尚未统一、但已明确记录的观察口径：evaluator/V5/V6 使用线速度按 `0.5 m`
+归一化的 geometric Jacobian；Pink FrameTask 使用 local SE(3) Log Jacobian 和自身的
+position/orientation task cost。后续 directional-demand guard 必须先统一这套任务度量，
+不能把 evaluator 的固定 `sigma` 阈值直接当成 Pink objective 的同一物理量。
+
+### V8：exact nonlinear best-so-far 未通过 closed-loop 门禁
+
+新增仅离线 profile `rm65_pose_lift_v8_nonlinear_best_candidate`，对 fixed4 的 nonlinear
+iterate 用真实 FK、真实 Jacobian、joint/step certificate 和 endpoint collision 评价，
+并返回当前帧 best-so-far，而不是无条件返回最后一次迭代。
+
+episode 96 的当前帧指标有所改善：最大关节误差约 `14.84°→13.76°`，最小 sigma 保持 V6
+水平。但候选一旦被选中，就会改变后续 closed-loop anchor；扩展到全部 guarded episode
+后，episode 80/16/68 出现动态证书回退，episode 16/81/35/59 还出现 parity、pose 或 guard
+暴露回退。结论是：
+
+> 单帧 exact 最优不等价于关节路径提升最优。
+
+V8 保留为可复现失败探针，`hardware_dispatch_allowed=false`；不得替换 V4 或 V6。
+
+### V9：仅深尾启用的预测式平滑 Barrier
+
+新增仅离线 profile `rm65_pose_lift_v9_predictive_branch_barrier`。初版曾在整个
+`sigma<0.04` guard band 使用上一条 admitted velocity 预测 150 ms，并用单边 CBF
+
+```text
+sign*qdot + gain*(sign*q - margin) >= 0
+```
+
+替代 V6 的一步硬 margin。gain/horizon 扫描没有跨 episode 支配解：提前介入可以改善部分
+软 guard 轨迹，却会提高 episode 96 jerk；进一步增强还会损害 episode 16 pose。
+
+因此注册 V9 收窄为 `hybrid_deep_barrier`：
+
+- `sigma>=0.01` 时完全保留 V6 hard margin；
+- 仅当前或 150 ms 预测 `sigma<0.01` 时启用 gain=`6` 的平滑 Barrier；
+- V4 的 qpos/qdot/qddot/collision admission 和 V5/V6 的已有机制不变；
+- `hardware_dispatch_allowed=false`。
+
+0727 fixed4 closed-loop 结果：
+
+- episode 96 右臂最小 sigma `0.002136→0.002363`，`<0.01` 样本 `52→51`；
+  最大关节误差 `14.844°→14.746°`，平均最大关节误差 `1.674°→1.667°`；
+  最大速度 `137.08→136.39 deg/s`，最大 jerk `368499→368169 deg/s³`；
+  pose p95 不变，无 velocity/acceleration certificate、hold 或 branch 回退。
+- episode 80/81/37/35/59/68 与 V6 的最小 sigma 完全相同；episode 16 仅存在
+  `7.5e-9` 数值差，其他门禁不回退。
+- 正常 episode `88,102,100,46,94,38,2,39` 的完整 compact report 与 V6 逐项相同。
+
+现有 `sigma_escape_research` 要求每个 guarded side 都必须获得实质 sigma 增益，所以整组
+V9 verdict 仍为 false。不能把“其余轨迹中性”改写成“整组通过”。当前只证明 V9 对已观察
+到的 episode 96 深尾有小幅正收益，不能证明它可替换 V6，更不能提升为部署选项。
+
+### 当前权限与下一阶段
+
+```text
+deploy / Pose replay 默认：V4
+显式原子回退：V1
+离线结构基线：V6
+离线深尾候选：V9
+离线失败探针：V7、V8
+严格复现：QPOS replay 直接回放 accepted q_ref
+```
+
+真机命令和默认 profile 均不改变。下一阶段不再扫描单一 gain 或 posture cost，优先级为：
+
+1. 构建独立的 q3/q5 局部奇异风洞，覆盖分支、进入/离开方向、初速度、reference 频率和
+   小扰动，避免继续围绕 episode 96 过拟合。
+2. 统一 evaluator guard 与 Pink task 的位置/姿态尺度，再记录弱奇异方向需求
+   `|u_i^T xi_desired|/(sigma_i+epsilon)`。
+3. 比较 baseline、q3 Barrier、q5 Barrier、双 Barrier 和 directional-relaxed 候选，使用
+   跨帧 rollout 与字典序证书选择，不再使用单帧加权总分。
+4. 将有限时域 terminal 条件改成 task-space tube、合法分支和动态约束，而不是强制回到
+   V4 的同一个关节解。
+5. 只有当目标确实要求跨越结构分支时，才单独设计受控 `REBRANCH`；它必须显式接受有限
+   姿态 slack，不能伪装成普通单帧 IK。
+
+完整实验表与复现边界见 `docs/real/POSE_LIFT_EXPERIMENTS_0727.md`。
+
+## 2026-07-30 跨日期扩大验证
+
+在不改变任何 profile、阈值或 evaluator 代码的前提下，继续盘点并验证远端历史数据：
+
+- 新增可用 teacher 数据为 0723 的 2 episodes/326 帧、0724 的 1 episode/55 帧，以及
+  单独标注为旧遥操 profile 的 0727 `v1_old` 35 episodes/17,422 帧；
+- 加上 responsive 0727，accepted-qref/Jacobian 可审计总覆盖达到
+  153 episodes/46,790 帧；
+- writing 503 episodes、0724 v2.2/filtered 241 episodes、0725 filtered 310 episodes
+  的 replay-qpos 字段全为空，不能将 observation qpos 冒充 accepted-qref teacher。
+
+新增 38 个 episode 已完成 V9↔V6 fixed4 closed-loop 全长对比，共 17,803 source frames、
+72,758 个 60 Hz reference：
+
+- 38/38 的 candidate 与 baseline compact report 逐项完全相同；
+- 38/38 的 production non-regression 不变；
+- old 只有 episode 13/17 进入软 guard，没有任何 episode 进入 `<0.01` 深尾；
+- 0723/0724 跨日期正常轨迹也没有 guard 泄漏。
+
+另对 old episode 13/17 执行 V6↔V4 比较，两条均通过 23 项研究门禁；最小 sigma 分别由
+`0.022089→0.022132`、`0.031528→0.031579`，没有 pose、动态或 certificate 回退。
+
+该结果提高了 V9 “正常/软 guard 中性”的可信度，但没有增加独立深尾收益样本。因此权限
+保持不变：V4 默认、V1 回退、V6 离线结构基线、V9 离线深尾候选。下一步优先获取或合成
+`sigma<0.01` 的独立 path-lift 样本，而不是继续扩大只有正常区的数据量。
+
+## 2026-07-30 branch-aware short-horizon path-lift 规划
+
+已停止的路线：
+
+- [x] 停止继续扫描 V5 sigma cost；
+- [x] 停止继续扫描 V9 gain/margin；
+- [x] 不再使用每帧 nonlinear best candidate 作为 closed-loop 路径选择；
+- [x] 不再使用 exact V4 joint rejoin 作为 horizon terminal hard gate。
+
+### 阶段 1：任务度量与因果诊断统一
+
+- [x] 保留 `sigma_geometric`，不删除已有历史比较合同；
+- [x] evaluator 调用与 Pink 相同的 local SE(3) Log error/Jacobian；
+- [x] 使用 Pink task cost 和正式 joint velocity capability 构造
+  `sigma_task_velocity`；
+- [x] 输出 singular-direction demand 和 required velocity utilization；
+- [x] 增加可选 detached strict directional alpha 与 best constrained residual；
+- [x] strict alpha 改用确定性 LP，避免病态 OSQP 把 max-iteration 当作风险；
+- [x] 区分可用于因果触发的 `pre_solve` 与 post-admission stream；
+- [x] 输出 active inequality source，区分结构 Barrier、普通 joint limit 与
+  admitted motion limit；
+- [x] 完成 10 条、9065 reference 的首轮非深尾对照；确认 strict alpha 在正常自由区
+  可保持 1.0，但会被普通关节限位/动态约束拉低，不能单独作为奇异触发器；
+- [x] 完成 7 条、9065 reference 的首轮 guard 对照；所有 episode 至少一侧
+  directional demand 峰值超过 `1x`，但该集合由已有 guard 筛选，尚不能作为独立阈值；
+- [x] 全量完成 0727 responsive 115 episode、117030 reference 的 V4 closed-loop
+  task metric；demand `>1/2/5x` 分别覆盖 39/20/4 个 episode；
+- [x] 完成 demand `>1x` 全部风险层的逐帧 branch 分类；39 条中只有 ep96 明确跨
+  q3/q5 结构边界；
+- [x] 完成 0723/0724 三条、1877 reference 的跨日期健康 held-out；0725 因缺 accepted
+  q_ref 明确排除；
+- [x] 在现有真实集统计初步 trigger 辨识：demand `>1.5x` 对 episode
+  `max_joint_error>3°` 为 `TP=26/FP=1/FN=0/TN=88`；
+- [ ] 在独立危险风洞上统计触发提前量、false positive 和 false negative，禁止用同集
+  `1.5x` 直接定生产阈值；
+- [x] 定位 ep96 第一次明确结构事件：sequence 435 V4 右 q3 跨负，而 teacher
+  仍为 `+3.652°` 且整段不跨零；新指标在约 3.1 s 前已预警；
+- [ ] 在 q3 符号跨越前进一步区分“可恢复连续偏差起点”和“不可逆 branch commitment”。
+
+阶段 1 不拥有控制权限：不得改变 command、QP、admission、reference advancement 或
+dispatch。`--include-constrained-feasibility` 默认关闭。
+
+### 阶段 2：局部奇异风洞与 branch oracle
+
+- [x] 新增 `evaluate_rm65_singularity_wind_tunnel --no-motion`，从真实 accepted
+  q_ref 生成 q3/q5 结构种子并执行连续 closed-loop rollout；
+- [x] 支持任意 repeatable offset；首轮已覆盖 `±0.75°`，其余
+  `±0.1/0.25/0.5/1/2/4°` 尚待矩阵扩展；
+- [x] 支持左右臂、正负 branch、静止/向内/向外初速度；
+- [x] 支持最弱/次弱/强奇异方向和正负方向；混合 twist 尚未实现；
+- [x] 支持进入—离开和持续推压连续轨迹；可绕行/horizon 目标尚未实现；
+- [x] 按 seed identity 确定性分离 tune 与 held-out 风洞；
+- [x] 完成首轮 0727 `±0.75° × weakest × persistent_push`：
+  tune 36、held-out 52 个有效 case；
+- [x] 定位并修复 structural latch 跨 planner reset 泄漏：reset 新 epoch 必须从当前
+  authoritative q 重新锁存分支；
+- [ ] 只读验证 IK-Geo/EAIK 对 RM65 结构的兼容性；
+- [ ] 将解析多解先作为 branch oracle/seed，不替换在线 Pink 主环。
+
+### 阶段 3：V10 directional feasibility guard
+
+- [x] 注册 default-off、`hardware_dispatch_allowed=false` 的 V10 research profile；
+- [x] 实现 enter/release 双阈值、方向选择性 task scaling、离开方向放宽和平滑 q3/q5
+  Barrier；没有逐帧 V4/V6/V9 candidate 贪心切换；
+- [x] 风洞 tune/held-out 中把 V4 的 `10/10` 个 crossing 均降为 `0/0`，且 V10
+  `0` Hold；最坏 `sigma_task` 分别提升到约 `0.00275/0.00293`；
+- [x] 对真实 guard episode 16/35/37/59/68/80/81/96 完成 runtime-causal
+  production comparison；
+- [x] 明确否决 V10 production：8/8 episode verdict false，ep16/68/81 出现显著
+  parity/动态回退，证明真实路径包含合法/必要 rebranch；
+- [ ] PREVENT/PROTECT/RECOVER 的完整 dwell/subspace tracking 尚未实现；在 V11
+  branch path 判断前暂停继续强化 V10；
+- [ ] 独立 trigger correctness 与 conditional benefit verdict 仍需正式拆分。
+
+### 阶段 4：V11 short-horizon branch path lift
+
+- [x] evaluator 已支持 primary/alternate/shadow 三路 fixed-iteration H8 rollout、
+  plan lock、逐窗口门禁原因和 `task_space_tube` terminal；该原型没有部署权限；
+- [x] 验证 V4→V10 H8：episode 96 的 17 个 guard decision 中只有 3 个同时满足
+  sigma/Pose/terminal，但均动态回退，最终 0 次接管；
+- [x] 验证 V4→V6 H8：严格动态门禁下 0 次接管；只读 1%/2% sensitivity 中，2%
+  在 guard8 的 5 条轨迹实际接管，但 5/5 production verdict false，另外 3 条 pass
+  只是因为 0 次接管；
+- [x] 明确停止继续放宽 selector dynamic slack：现有 V4/V6/V10 profile rollout
+  不是合格的多分支候选生成器；
+- [ ] 离线 Pose replay 实现 all-IK graph 或显式 stay-q3/stay-q5/双 Barrier/
+  authorized-rebranch 多 seed horizon SQP；
+- [ ] 优化完整 `q[1:H]`，不是当前一帧；
+- [x] terminal 已从 exact shadow q 扩展为 task-space tube；
+- [ ] terminal 继续加入合法 branch、release risk 和动态可继续条件；
+- [ ] 候选按 hard certificate → branch → horizon alpha/sigma → pose → dynamics →
+  parity 的字典序选择；
+- [ ] 离线 lookahead 与 runtime-causal predictive capability 分开注册；
+- [ ] 实时版本异步运行，带 epoch/anchor hash/deadline，超时回退 V10。
+
+### 阶段 5：V12 authorized rebranch
+
+- [ ] 只有所有 stay-branch horizon 均不可行时才能请求；
+- [ ] 显式记录 requested/admitted/active/completed/aborted；
+- [ ] 根据 task importance 和弱奇异子空间选择临时 slack 方向；
+- [ ] 规划完整受限 crossing/rejoin 轨迹；
+- [ ] 普通 V4/V10 不允许隐式 branch crossing。
+
+当前权限继续保持：
+
+```text
+默认 deploy / Pose replay：V4
+原子回退：V1
+局部结构离线基线：V6
+深尾 shadow：V9
+下一研究 profile：V10
+中期核心：V11
+最终显式换支：V12
+```
+
+2026-07-30 更新：V10 已完成局部可行性验证，但没有获得 production 权限；它只表示
+V11 的局部 fallback 组件，不是下一部署候选。V11 H8 selector/task-space terminal 原型
+也已落地，但 V4/V6/V10 候选集在 guard8 上没有整体正收益。任何后续 V11 比较仍以 V4
+为 production baseline，V1 为原子回退。
+
+## 2026-07-30 官方全解 IK 路线复核
+
+在不改变默认 deploy 和真机命令的前提下，已完成 bundled RealMan
+`rm_algo_inverse_kinematics_all` 的纯离线合同与全量真实数据验证：
+
+- [x] 空 handle 初始化，无设备枚举、连接、motion 或 dispatch；
+- [x] SDK RM65 FK 与项目 Pinocchio flange/TCP 合同对齐；
+- [x] 0727 responsive 全部 115 episodes、28,987 source frames 双臂 all-IK
+  `0` 失败；
+- [x] 最坏 per-episode source solve p99 低于 `11 us`；
+- [x] source Pose 的官方候选中持续存在 recorded accepted-qref 所属分支；
+- [x] 证实 60 Hz Cartesian 插值不能假设逐帧精确可达：完整集左/右分别有
+  `53/223` 个无 project-valid candidate reference；
+- [x] 证实 source-rate all-IK 后插值 qref 可在完整集保持 teacher 分支：
+  source/runtime endpoint collision failure 均为 0，最坏关节差约
+  `0.043°/0.030°`，最小 sigma 保持 teacher 级别；
+- [x] 否决 shared Cartesian alpha governor；
+- [x] 否决 official remote IK 直接替换 V4；
+- [x] 否决 Pink soft branch anchor 和 frame-local Pink residual；
+- [x] 证实现有 acceleration-limited qcmd planner 不能被误当作任意 15 Hz
+  大目标的无滞后 jerk-limited reference governor。
+
+新的研究职责拆分为：
+
+```text
+source Pose all-IK / branch selection
+        ↓
+explicit qref interpolation
+        ↓
+independent time law / jerk-limited governor
+        ↓
+canonical collision + admission + qcmd execution
+```
+
+下一步只推进 default-off、可原子回退的实现：
+
+- [x] `robot_motion.types.IKCandidate` 继续作为 backend-neutral all-solution
+  candidate；新增 `RM65SourceIKPairSelection` 与
+  `select_nearest_collision_safe_rm65_ik_pair`，vendor 调用和进程隔离仍归
+  `hardware`；
+- [x] source-rate selector 已使用 admitted source qref 距离、canonical collision
+  rejection reason 和 deterministic enumeration tie-break；qdot-aware hysteresis
+  留到 runtime backlog 接入时完成；
+- [ ] 将 `source Pose IK → qref interpolation` 注册为显式 capability/profile，
+  不覆盖现有 `Pose interpolation → V4 IK`；
+- [ ] 对每个 60 Hz qref endpoint 和 joint segment 做 canonical collision certificate；
+- [ ] 为 all-IK failure、合法分支暂时消失、source gap、epoch reset 定义 Hold/
+  Pink fallback，不允许 silent branch switch；
+- [ ] 建立真正 jerk-limited OTG 与现有 planner 的同输入 A/B；依赖未选定前不修改
+  `pyproject.toml`、环境或默认参数；
+- [ ] 离线 Pose replay 使用 future-aware all-IK graph/DP；实时 deploy 只使用
+  causal source candidate 与显式有限 lookahead，能力名称分开；
+- [ ] 全量 production gate 不再把 joint parity 当唯一硬真值，但继续报告 parity，
+  并以 Pose、限位、碰撞、qdot/qddot/jerk、branch continuity 和 latency 为主门禁；
+- [ ] 通过 dry-run replay 后再讨论 hardware dispatch 权限；当前禁止真机启用。
+
+权限保持：
+
+```text
+默认 deploy / Pose replay：V4
+原子回退：V1
+新 default-off 主线：official source all-IK + qref interpolation
+```
+
+### 2026-07-30 qref→qcmd 动态层离线可行性
+
+- [x] 新增 `todos/probes/rm65_qref_dynamics_probe.py`，只读 0727 parquet，
+  不访问设备、不 dispatch。
+- [x] 动态差分按 `collection.continuity_segment_index` 分段，禁止把 pause/gap
+  两侧误当作一个连续控制区间。
+- [x] 在 115 episodes / 28,987 source frames 上验证 future-aware 120 Hz
+  constrained projection：
+  - qdot/qddot 使用 production position limits；
+  - jerk 暂按 `qddot_max / 0.10 s`；
+  - 最坏 qref 偏差左/右 `0.743°/0.757°`；
+  - acceleration 最坏降至 `3031°/s²` / `3002°/s²`；
+  - jerk 最坏降至约 `9.17e4°/s³`。
+- [x] 将完整未来 oracle 改为 2/3/4 个 source step lookahead 的因果
+  receding-horizon 对照；每个 control cut 继承上一 cut 的 q/qdot/qddot。
+  ep96 上 3/4 步无可见收益，全量采用两步（约 133 ms）。
+- [x] 对两步因果候选完成全量 FK Pose、双臂 endpoint collision 和相邻
+  qcmd interval 的 25%/50%/75% 内点采样：
+  - 115 episodes / 229,131 endpoints / 228,736 intervals；
+  - endpoint 与内点采样 failure 均为 0；
+  - FK worst 左 `3.213 mm / 1.069°`，右 `4.771 mm / 1.340°`。
+- [ ] 将 interval 内点采样升级为严格连续 segment collision certificate；
+  当前结果明确标记 `continuous_segment_collision_certified=false`。
+- [x] 全量两步因果动态对照：
+  - acceleration worst 左/右 `2862.5/2842.5°/s²`；
+  - jerk worst 左/右 `91629.5/91598.1°/s³`，未越过约 `91673°/s³` 上限；
+  - qref error worst 左/右 `1.295°/1.817°`，p95 `0.971°/1.462°`；
+  - source keyframe error worst 左/右 `0.759°/1.403°`。
+- [x] 将因果 QP 抽为
+  `robot_motion.position_control.plan_jerk_limited_joint_horizon`：
+  - backend-neutral、无 clock/authority/dispatch/committed-state；
+  - 输入 last-admitted q/qdot/qddot 与有限 qref horizon；
+  - 输出仅是待 canonical admission 的 control-cut candidate；
+  - 离线探针已改为直接调用共享实现，并在 115 episodes 上复现全部结果。
+- [ ] 明确 action backlog/time dilation 合同：若持续目标超出动态能力，选择
+  有界延迟、丢弃旧目标或 fail-closed，不能静默积累。
+- [ ] 将共享 governor 接成独立 default-off execution profile；不得塞入 Pink
+  pose-lift profile，也不得覆盖现有 V4/default qcmd planner。
+
+```text
+60 Hz intermediate exact projection：仅诊断
+official remote IK：已否决直接替换
+```
+
+### 2026-07-31 同集 V4 对照与 governor 参数收敛
+
+- [x] 保存固定 16 episodes 的 V4 closed-loop JSON，避免终端截断；
+- [x] 加入新链路全量 worst 所在的 7 episodes，形成 23 条反向压力集；
+- [x] 对同一 23 条比较 `0.10/0.075/0.05 s` jerk ramp；
+- [x] `0.05 s` 相对 V4：
+  - joint/translation/rotation/acceleration/jerk 均 `23/23` 改善；
+  - velocity peak `12/23` 改善、`11/23` 回退，但整体 worst
+    `109.3°/s < 197.9°/s`，且无逐关节速度违规；
+  - 双臂整体最小 sigma 保持约 `0.01028`，避免 V4 ep96 的
+    `8.70e-6` 深尾；
+- [x] `0.05 s` 重跑完整 115 episodes：
+  - source/dynamic/endpoint/采样 interval failure 全部 `0`；
+  - joint worst 左/右 `0.773°/1.113°`；
+  - Pose worst 左 `1.947 mm / 0.672°`，右
+    `2.756 mm / 0.830°`；
+  - velocity worst 左/右 `93.38/111.06°/s`；
+  - acceleration worst 左/右 `4586.3/4575.3°/s²`；
+  - jerk worst 约 `1.832e5°/s³`；
+- [x] 修复 exact-limit OSQP 数值残差：位置不等式改为 radian 尺度并保留
+  `1e-6 rad` 内缩；完整集 endpoint failure 由 ep24/ep99 的两个数值假阳性降为 0；
+- [x] governor 单元测试断言整个 q path 严格位于硬关节限位内。
+
+当前研究参数固定为：
+
+```text
+source selector: official all-IK + causal nearest collision-safe branch
+qref: linear source-q interpolation
+governor lookahead: 2 source steps
+governor command clock: 120 Hz
+jerk ramp: 0.05 s
+```
+
+`0.10 s` 保留为更平滑但 lag 更大的原子研究回退；不继续缩短 ramp，因为 0.05 s
+已经消除固定 23 条中的 Pose/joint 回退，继续放大 jerk 没有必要。
+
+### 下一步 default-off deploy shadow 的所有权边界
+
+不要把新链路注册成另一个 Pink `pose_lift_profile`。它跨越 source-rate geometry 与
+qcmd time-law 两个阶段，必须使用独立 execution capability：
+
+```text
+rm65_source_pose_lift = v4_reference_ik | official_all_ik_v1
+rm65_qref_governor = existing | jerk_horizon_v1
+```
+
+按以下顺序接入，任何一步失败都保持 V4 默认不变：
+
+1. [ ] 在 `teleop_runtime` source-keyframe acceptance 处调用 backend 提供的
+   all-solution candidate port；不在 `robot_motion` 初始化 vendor SDK；
+2. [ ] selector 只读取上一条 admitted source qref、候选和 canonical collision
+   certificate，输出带 generation/source-index/anchor-hash 的 qref receipt；
+3. [ ] source Pose 成功 lift 后写入独立 qref buffer，不复用或同时推进现有 pose
+   resampler cursor；
+4. [ ] horizon governor 读取同一 epoch 的至少两个 source-step backlog，并以 last
+   admitted qcmd/qdot/qddot 初始化；输出仍只是 candidate；
+5. [ ] final qcmd 继续经过 canonical joint-limit/collision admission，只有 receipt
+   接受后才更新 governor state；
+6. [ ] shadow 模式只记录 V4 与新链路 difference，不影响 authority、dispatch、
+   source cursor 或 episode；
+7. [ ] source all-IK 无解、deadline miss、branch disappearance、anchor hash
+   mismatch 或 backlog 不足时，shadow 只标记失败；未来 active 模式必须整段回退
+   V4/hold，禁止在一个 control cut 内混合两条路径；
+8. [ ] 先完成 dry-run replay 的 p50/p95/p99 latency、fallback rate、candidate
+   count、endpoint 与严格 continuous segment collision，再讨论
+   `hardware_dispatch_allowed=true`。
+
+原子回退要求：
+
+```text
+feature flag 默认 off
+V4 代码路径不改语义
+新 worker/buffer/state 可整体不构造
+一次 generation cut 只允许一个 authoritative path
+异常不得把 shadow qref 写回正式 resampler
+```

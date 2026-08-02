@@ -359,6 +359,31 @@ def test_model_runtime_adapter_projects_exact_request_identity() -> None:
     assert backend.call_thread_ids == []
 
 
+def test_frontend_rejects_adapter_arm_hold_contract_when_runtime_has_no_resolver() -> None:
+    backend = _GenericFinalChunkBackend(horizon=4)
+    adapter = _runtime_adapter(
+        backend=backend,
+        horizon=4,
+        request_spec=replace(
+            _request_spec(4),
+            arm_hold_output_contract_hash="arm-hold:unit-v1",
+        ),
+    )
+    with pytest.raises(ValueError, match="arm-hold output contract mismatch"):
+        build_rtc_model_shadow_frontend(
+            adapter,
+            runtime_session_id="session:arm-hold-mismatch",
+            control_domain_id="domain:arm-hold-mismatch",
+            producer_id="producer:arm-hold-mismatch",
+            policy_node_id="single_policy",
+            deploy_runtime=_runtime(),
+            preparer=_pipeline(),
+            created_at=time.monotonic(),
+            profile=RAW_RTC_FINAL_CHUNK_PROFILE_V1,
+        )
+    assert backend.call_thread_ids == []
+
+
 def test_rtc_observation_cut_separates_causal_identity_from_model_input_content() -> None:
     base = time.monotonic()
     backend = _GenericFinalChunkBackend(horizon=4)

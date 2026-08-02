@@ -357,6 +357,109 @@ def test_capability_negotiation_accepts_model_neutral_binding() -> None:
     assert receipt.selected_continuation_hash is not None
 
 
+def test_arm_hold_contract_is_restricted_to_raw_rtc() -> None:
+    with pytest.raises(ValueError, match="only by raw RTC"):
+        replace(
+            _spec(flow=True),
+            arm_hold_output_contract_hash="arm-hold:unit-v1",
+        )
+    flow = _continuation(
+        RTC_CONTINUATION_FLOW_INPAINT,
+        implementation_id="flow:unit:v1",
+    )
+    with pytest.raises(ValueError, match="only by raw RTC"):
+        replace(
+            flow,
+            arm_hold_output_contract_hash="arm-hold:unit-v1",
+        )
+
+
+def test_raw_rtc_arm_hold_response_is_exactly_contract_bound() -> None:
+    contract_hash = "arm-hold:unit-v1"
+    capability = _capability()
+    none = capability.continuation(RTC_CONTINUATION_NONE)
+    assert none is not None
+    capability = replace(
+        capability,
+        continuations=tuple(
+            replace(
+                value,
+                arm_hold_output_contract_hash=contract_hash,
+            )
+            if value.continuation_mode == RTC_CONTINUATION_NONE
+            else value
+            for value in capability.continuations
+        ),
+    )
+    spec = replace(
+        _spec(flow=False),
+        arm_hold_output_contract_hash=contract_hash,
+    )
+    negotiation = negotiate_rtc_capability(spec, capability)
+    assert negotiation.accepted
+    envelope = build_rtc_inference_envelope(
+        request=_request(flow=False),
+        request_spec=spec,
+        capability=capability,
+        negotiation=negotiation,
+        model_input_hash="model-input-hash:arm-hold",
+    )
+    probabilities = np.zeros((HORIZON, 2), dtype=np.float32)
+    response = replace(
+        _response(envelope, capability),
+        arm_hold_probabilities=probabilities,
+        arm_hold_output_contract_hash=contract_hash,
+    )
+    assert validate_rtc_model_response(
+        envelope=envelope,
+        response=response,
+        capability=capability,
+    ).accepted
+
+    missing = replace(
+        response,
+        arm_hold_probabilities=None,
+        arm_hold_output_contract_hash=None,
+    )
+    missing_receipt = validate_rtc_model_response(
+        envelope=envelope,
+        response=missing,
+        capability=capability,
+    )
+    assert not missing_receipt.accepted
+    assert "arm_hold_output_contract_hash_mismatch" in (
+        missing_receipt.rejection_reasons
+    )
+    assert "arm_hold_output_presence_mismatch" in (
+        missing_receipt.rejection_reasons
+    )
+
+    wrong_hash = replace(
+        response,
+        arm_hold_output_contract_hash="arm-hold:wrong",
+    )
+    wrong_hash_receipt = validate_rtc_model_response(
+        envelope=envelope,
+        response=wrong_hash,
+        capability=capability,
+    )
+    assert not wrong_hash_receipt.accepted
+    assert "arm_hold_output_contract_hash_mismatch" in (
+        wrong_hash_receipt.rejection_reasons
+    )
+
+    with pytest.raises(ValueError, match=r"shape \(4, 2\)"):
+        replace(
+            response,
+            arm_hold_probabilities=np.zeros((HORIZON - 1, 2), dtype=np.float32),
+        )
+    with pytest.raises(ValueError, match=r"probabilities in \[0, 1\]"):
+        replace(
+            response,
+            arm_hold_probabilities=np.full((HORIZON, 2), np.nan),
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     (

@@ -198,6 +198,38 @@ def test_one_queue_pop_creates_one_immutable_emission_and_peek_is_passive() -> N
     assert step1.emission.effective_until == pytest.approx(10.052)
 
 
+def test_final_keyframe_hold_extension_is_explicit_and_additive() -> None:
+    observation = _observation()
+    runtime = PolicyDeployRuntime(
+        PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=False,
+            action_keyframe_period_sec=0.025,
+            action_maximum_hold_sec=0.1,
+            extend_final_keyframe_to_maximum_hold=True,
+        ),
+        monotonic_clock=_Clock(10.001, 10.002, 10.003),
+    )
+    prediction = runtime.predict_and_queue(
+        _Policy(_absolute_action(x=0.12)),
+        observation,
+        now=10.0,
+        action_keyframe_period_sec=0.025,
+    )
+    step = runtime.prepare_next_action(
+        observation,
+        preparer=_pipeline(),
+        policy_name="hold-last-test",
+    )
+
+    assert prediction.chunk_lineage is not None
+    assert prediction.chunk_lineage.schedule.horizon_sec == pytest.approx(0.1)
+    assert step.emission is not None
+    assert step.emission.effective_from == pytest.approx(10.002)
+    assert step.emission.effective_until == pytest.approx(10.102)
+
+
 def test_relative_chunk_emission_preserves_decode_anchor_provenance() -> None:
     observation = _observation()
     absolute = NormalizedAction(vector=_absolute_action(x=0.18))

@@ -16,6 +16,12 @@ def main(argv: list[str] | None = None) -> int:
         from .vive_calibration_cli import main as vive_calibration_main
 
         return int(vive_calibration_main(values[1:]))
+    if values and values[0] == "refinement-annotation":
+        from .refinement_annotation.cli import (
+            main as refinement_annotation_main,
+        )
+
+        return int(refinement_annotation_main(values[1:]))
     parser = argparse.ArgumentParser(
         prog="python -m control_station",
         description="DexTeleop Control Station application entrypoints.",
@@ -23,7 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("sim-hil", "vive-calibration"),
+        choices=(
+            "sim-hil",
+            "vive-calibration",
+            "refinement-annotation",
+        ),
         help="application profile to run",
     )
     if not values:

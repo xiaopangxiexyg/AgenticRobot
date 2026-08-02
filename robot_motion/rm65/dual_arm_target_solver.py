@@ -74,6 +74,14 @@ IK_STEP_MODE_CHOICES = (
     IK_STEP_MODE_LEGACY_ITERATIVE,
     IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE,
 )
+JOINT_LIMIT_GUARD_LEGACY = "legacy"
+JOINT_LIMIT_GUARD_BOUNDARY_HOLD = "boundary_hold"
+JOINT_LIMIT_GUARD_FORCED_ESCAPE_LATCHED = "forced_escape_latched"
+JOINT_LIMIT_GUARD_MODE_CHOICES = (
+    JOINT_LIMIT_GUARD_LEGACY,
+    JOINT_LIMIT_GUARD_BOUNDARY_HOLD,
+    JOINT_LIMIT_GUARD_FORCED_ESCAPE_LATCHED,
+)
 
 
 def _normalize_ik_framework(value: object) -> str:
@@ -480,6 +488,28 @@ class DualArmCollisionAwareRetargeterConfig:
     solver_frequency: float = DEFAULT_DUAL_ARM_SOLVER_FREQUENCY_HZ
     damping: float = 0.01
     posture_cost: float = DEFAULT_DUAL_ARM_POSTURE_COST
+    # Position single-step IK may have several locally equivalent RM65
+    # solutions.  This optional task anchors only the declared structural
+    # joints to the previously admitted qref so a raw QP branch change does
+    # not become a command.  It is disabled for the generic/force facade.
+    branch_continuity_anchor_enabled: bool = False
+    branch_continuity_anchor_cost: float = 0.5
+    branch_continuity_anchor_joint_weights: np.ndarray | Sequence[float] = (
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+    )
+    # Physical-limit protection is deliberately independent from the IK step
+    # mode.  ``legacy`` preserves the stable pre-2026-08-02 selector.
+    # ``boundary_hold`` is the reversible production candidate: it removes
+    # only the inward component of an otherwise admitted solution near a hard
+    # joint limit.  The historical forced escape/latch experiment remains
+    # available for offline comparison but is never enabled implicitly.
+    joint_limit_guard_mode: str = JOINT_LIMIT_GUARD_LEGACY
+    joint_limit_boundary_guard_margin_deg: float = 1.5
     collision_min_distance_m: float = DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M
     collision_distance_epsilon_m: float = DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M
     collision_barrier_gain: float = DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN
@@ -680,6 +710,60 @@ class DualArmCollisionAwareRetargeterConfig:
                 f"solve_step_mode must be one of {IK_STEP_MODE_CHOICES}, "
                 f"got {self.solve_step_mode!r}."
             )
+        self.branch_continuity_anchor_enabled = bool(
+            self.branch_continuity_anchor_enabled
+        )
+        self.branch_continuity_anchor_cost = float(
+            self.branch_continuity_anchor_cost
+        )
+        if (
+            not np.isfinite(self.branch_continuity_anchor_cost)
+            or self.branch_continuity_anchor_cost <= 0.0
+        ):
+            raise ValueError("branch_continuity_anchor_cost must be positive.")
+        branch_weights = np.asarray(
+            self.branch_continuity_anchor_joint_weights,
+            dtype=float,
+        ).reshape(-1)
+        if branch_weights.shape != (6,) or not np.all(np.isfinite(branch_weights)):
+            raise ValueError(
+                "branch_continuity_anchor_joint_weights must contain 6 finite values."
+            )
+        if np.any(branch_weights < 0.0):
+            raise ValueError(
+                "branch_continuity_anchor_joint_weights must be non-negative."
+            )
+        if self.branch_continuity_anchor_enabled and not np.any(branch_weights > 0.0):
+            raise ValueError(
+                "branch_continuity_anchor_joint_weights must activate at least one joint."
+            )
+        self.branch_continuity_anchor_joint_weights = tuple(
+            float(value) for value in branch_weights
+        )
+        if self.branch_continuity_anchor_enabled and (
+            self.solve_step_mode != IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+        ):
+            raise ValueError(
+                "branch_continuity_anchor_enabled requires "
+                "single_step_singularity_aware."
+            )
+        self.joint_limit_guard_mode = str(
+            self.joint_limit_guard_mode
+        ).strip().lower()
+        if self.joint_limit_guard_mode not in JOINT_LIMIT_GUARD_MODE_CHOICES:
+            raise ValueError(
+                "joint_limit_guard_mode must be one of "
+                f"{JOINT_LIMIT_GUARD_MODE_CHOICES}, got "
+                f"{self.joint_limit_guard_mode!r}."
+            )
+        boundary_margin_deg = float(
+            self.joint_limit_boundary_guard_margin_deg
+        )
+        if not np.isfinite(boundary_margin_deg) or boundary_margin_deg < 0.0:
+            raise ValueError(
+                "joint_limit_boundary_guard_margin_deg must be finite and >= 0."
+            )
+        self.joint_limit_boundary_guard_margin_deg = boundary_margin_deg
         self.wrist_coaxial_continuity_enabled = bool(
             self.wrist_coaxial_continuity_enabled
         )
@@ -1091,6 +1175,30 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._last_admitted_velocity_full = np.zeros_like(
             np.asarray(self.ik_solver.current_q, dtype=float)
         )
+        self._branch_continuity_anchor_enabled = False
+        if config.branch_continuity_anchor_enabled:
+            current_q = np.asarray(self.ik_solver.current_q, dtype=float).reshape(-1)
+            branch_weights = np.asarray(
+                config.branch_continuity_anchor_joint_weights,
+                dtype=float,
+            ).reshape(6)
+            full_branch_cost = np.zeros_like(current_q)
+            for indices in self._arm_joint_indices(current_q.size).values():
+                full_branch_cost[indices] = (
+                    float(config.branch_continuity_anchor_cost) * branch_weights
+                )
+            configure_branch_anchor = getattr(
+                self.ik_solver,
+                "configure_branch_continuity_anchor_task",
+                None,
+            )
+            if not callable(configure_branch_anchor):
+                raise ValueError(
+                    "branch_continuity_anchor_enabled requires an IK solver "
+                    "that implements configure_branch_continuity_anchor_task()."
+                )
+            configure_branch_anchor(cost=full_branch_cost)
+            self._branch_continuity_anchor_enabled = True
         self._acceleration_limit_enabled = False
         self._admitted_reference_motion_limit_enabled = False
         if (
@@ -1164,6 +1272,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._last_solve_iteration_budget_exhausted = False
         self._last_solve_iteration_stop_reason: str | None = None
         self._last_raw_solver_q: np.ndarray | None = None
+        self._last_branch_continuity_anchor_metadata: dict[str, object] = {
+            "enabled": bool(self._branch_continuity_anchor_enabled),
+            "active_joint_mask": None,
+            "disabled_for_limit_escape": [],
+        }
         self._last_wrist_coaxial_metadata: dict[str, object] = {
             "enabled": False,
             "applied": False,
@@ -1200,6 +1313,18 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         # alone still allowed the selector to alternate between J3 and J5
         # when both candidates had similar Cartesian scores.
         self._singularity_escape_axis_latch: dict[str, tuple[int, ...]] = {}
+        # A physical joint-limit escape is a safety transition, not an
+        # ordinary pose-scoring alternative.  Keep the admitted outward
+        # direction until the joint clears the activation band with a small
+        # release margin; otherwise the next raw IK frame can immediately
+        # select the opposite (inward) branch and create a qref toggle.
+        self._joint_limit_escape_direction_latch: dict[tuple[str, int], int] = {}
+        # If the joint has crossed the physical release band but the current
+        # raw IK still asks for an inward step, keep the same escape direction
+        # until that demand clears.  Without this short release guard, a
+        # large raw branch can produce an escape/ordinary sawtooth at the
+        # release boundary.
+        self._joint_limit_escape_release_guard: dict[tuple[str, int], int] = {}
         self._wrist_q5_hysteresis_escape_latch = {
             "left": False,
             "right": False,
@@ -1226,6 +1351,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._singularity_escape_direction_latch.clear()
         self._singularity_escape_direction_failures.clear()
         self._singularity_escape_axis_latch.clear()
+        self._joint_limit_escape_direction_latch.clear()
+        self._joint_limit_escape_release_guard.clear()
         self._wrist_q5_hysteresis_escape_latch = {
             "left": False,
             "right": False,
@@ -1309,6 +1436,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             self._singularity_escape_direction_latch.clear()
             self._singularity_escape_direction_failures.clear()
             self._singularity_escape_axis_latch.clear()
+            self._joint_limit_escape_direction_latch.clear()
+            self._joint_limit_escape_release_guard.clear()
             self._wrist_q5_hysteresis_escape_latch = {
                 "left": False,
                 "right": False,
@@ -1601,6 +1730,19 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             ),
             "ik_admitted_reference_motion_limit_enabled": bool(
                 self._admitted_reference_motion_limit_enabled
+            ),
+            "ik_branch_continuity_anchor_enabled": bool(
+                self._branch_continuity_anchor_enabled
+            ),
+            "ik_branch_continuity_anchor_cost": float(
+                self.config.branch_continuity_anchor_cost
+            ),
+            "ik_branch_continuity_anchor_joint_weights": list(
+                self.config.branch_continuity_anchor_joint_weights
+            ),
+            "ik_joint_limit_guard_mode": self._joint_limit_guard_mode(),
+            "ik_joint_limit_boundary_guard_margin_deg": float(
+                self.config.joint_limit_boundary_guard_margin_deg
             ),
             "solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
             "candidate_certification_reserve_ms": float(
@@ -2020,6 +2162,21 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "joint_velocity_limit_profile": (
                     None if self.joint_velocity_profile is None else self.joint_velocity_profile.name
                 ),
+                "ik_branch_continuity_anchor": {
+                    "enabled": bool(self._branch_continuity_anchor_enabled),
+                    "cost": float(self.config.branch_continuity_anchor_cost),
+                    "joint_weights": list(
+                        self.config.branch_continuity_anchor_joint_weights
+                    ),
+                    "anchor": "previous_admitted_qref",
+                    "scope": "structural_q3_q5_by_arm",
+                },
+                "ik_joint_limit_guard": {
+                    "mode": self._joint_limit_guard_mode(),
+                    "boundary_margin_deg": float(
+                        self.config.joint_limit_boundary_guard_margin_deg
+                    ),
+                },
                 "source_target_pose_base": {
                     "left": left_source_target_pose_base,
                     "right": right_source_target_pose_base,
@@ -2065,6 +2222,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         pre_solve_q = self.ik_solver.current_q.copy()
         active_q = pre_solve_q.copy()
         self._last_raw_solver_q = None
+        self._last_branch_continuity_anchor_metadata = {
+            "enabled": bool(self._branch_continuity_anchor_enabled),
+            "active_joint_mask": None,
+            "disabled_for_limit_escape": [],
+        }
         self._last_wrist_coaxial_metadata = {
             "enabled": bool(
                 self.config.solve_step_mode
@@ -2108,6 +2270,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 solved_q, solve_iteration_count, solve_pose_error = self._solve_toward_targets(
                     left_target=left_target,
                     right_target=right_target,
+                    target_activity=target_activity_metadata,
                     profile=profile,
                     frame_start_time=frame_start,
                 )
@@ -2453,6 +2616,26 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         output_qpos_smoothing["wrist_q5_hysteresis_latch"] = (
             q5_hysteresis_latch_metadata
         )
+        joint_limit_escape_hysteresis_metadata = (
+            self._update_joint_limit_escape_direction_latch(
+                reference_full_q=pre_solve_q,
+                admitted_full_q=active_q,
+                raw_full_q=(
+                    raw_solver_q.copy()
+                    if raw_solver_q is not None
+                    else None
+                ),
+                status=status,
+                selection_metadata=(
+                    candidate_selection_metadata
+                    if isinstance(candidate_selection_metadata, Mapping)
+                    else None
+                ),
+            )
+        )
+        output_qpos_smoothing["joint_limit_escape_hysteresis"] = (
+            joint_limit_escape_hysteresis_metadata
+        )
         if (
             output_qpos_smoothing.get("enabled", False)
             or final_canonicalization_changed
@@ -2632,6 +2815,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "collision_distance_m": min_distance_m,
                 "ik_branch_candidate": branch_candidate,
                 "ik_branch_distance_score_deg": branch_score_deg,
+                "ik_branch_continuity_anchor_frame": dict(
+                    self._last_branch_continuity_anchor_metadata
+                ),
                 "ik_solve_iterations": int(solve_iteration_count),
                 "ik_solve_step_mode": str(self.config.solve_step_mode),
                 "ik_solve_iteration_mode": (
@@ -3135,11 +3321,68 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             return pose_world
         return pose_world @ _ARM_LINK6_FROM_HAND_BASE
 
+    def _branch_continuity_anchor_joint_mask(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        target_activity: Mapping[str, object] | None,
+    ) -> tuple[np.ndarray, tuple[str, ...]]:
+        """Disable only structural anchor rows inside the hard-limit escape band.
+
+        The continuity task is useful for ordinary multi-branch IK, but it
+        must not resist a safety transition away from a physical joint limit.
+        The normal limit-escape selector remains authoritative; this mask only
+        removes the soft q3/q5 preference for the affected side/joint.
+        """
+
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        mask = np.ones(reference.shape, dtype=bool)
+        disabled: list[str] = []
+        safety_profile = self.ik_safety_profile
+        activation_margin_deg = (
+            0.0
+            if safety_profile is None
+            else max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_limit_escape_activation_margin_deg",
+                        2.0,
+                    )
+                ),
+            )
+        )
+        activation_margin_rad = np.deg2rad(activation_margin_deg)
+        lower = np.asarray(
+            self.ik_solver.robot.model.lowerPositionLimit,
+            dtype=float,
+        ).reshape(reference.shape)
+        upper = np.asarray(
+            self.ik_solver.robot.model.upperPositionLimit,
+            dtype=float,
+        ).reshape(reference.shape)
+        fixed_sides = self._authority_fixed_sides(target_activity)
+        for side, local_index, full_index in self._arm_joint_entries(reference):
+            if local_index not in {2, 4} or side in fixed_sides:
+                continue
+            if not np.isfinite(reference[full_index]):
+                continue
+            margin = min(
+                float(reference[full_index] - lower[full_index]),
+                float(upper[full_index] - reference[full_index]),
+            )
+            if margin <= activation_margin_rad + 1e-9:
+                mask[full_index] = False
+                disabled.append(f"{side}.q{local_index + 1}")
+        return mask, tuple(disabled)
+
     def _solve_toward_targets(
         self,
         *,
         left_target: np.ndarray,
         right_target: np.ndarray,
+        target_activity: Mapping[str, object] | None = None,
         profile: dict[str, object] | None = None,
         frame_start_time: float | None = None,
     ) -> tuple[np.ndarray, int, dict[str, dict[str, float]]]:
@@ -3161,6 +3404,32 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             )
         )
         self._set_solver_motion_reference(initial_q)
+        if self._branch_continuity_anchor_enabled:
+            anchor_mask, disabled_for_limit_escape = (
+                self._branch_continuity_anchor_joint_mask(
+                    reference_full_q=initial_q,
+                    target_activity=target_activity,
+                )
+            )
+            set_branch_anchor = getattr(
+                self.ik_solver,
+                "set_branch_continuity_anchor_q",
+            )
+            set_branch_anchor(
+                initial_q,
+                active_joint_mask=anchor_mask,
+            )
+            self._last_branch_continuity_anchor_metadata = {
+                "enabled": True,
+                "active_joint_mask": anchor_mask.astype(bool).tolist(),
+                "disabled_for_limit_escape": list(disabled_for_limit_escape),
+            }
+        else:
+            self._last_branch_continuity_anchor_metadata = {
+                "enabled": False,
+                "active_joint_mask": None,
+                "disabled_for_limit_escape": [],
+            }
         pose_error: dict[str, dict[str, float]] = {}
         iterations = 0
         self._last_solve_iteration_budget_exhausted = False
@@ -5740,6 +6009,53 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             if target_activity is None
             else dict(target_activity)
         )
+        authority_fixed_sides = self._authority_fixed_sides(
+            target_activity_metadata
+        )
+        forced_escape_latched = (
+            self._joint_limit_forced_escape_latch_enabled()
+        )
+        boundary_hold_enabled = self._joint_limit_boundary_hold_enabled()
+        if forced_escape_latched:
+            self._refresh_joint_limit_escape_release_guards(
+                raw_full_q=raw_full_q,
+                reference_full_q=reference_full,
+                fixed_sides=authority_fixed_sides,
+            )
+            active_limit_escape_latches = {
+                key: direction
+                for key, direction in self._refresh_joint_limit_escape_latches(
+                    reference_full_q=reference_full,
+                ).items()
+                if key[0] not in authority_fixed_sides
+            }
+        else:
+            self._joint_limit_escape_direction_latch.clear()
+            self._joint_limit_escape_release_guard.clear()
+            active_limit_escape_latches = {}
+        # A latched escape is a separate control mode.  The current limit-band
+        # directions are used only to decide whether the ordinary result would
+        # move inward; they must not filter the ordinary candidate pool before
+        # it has been evaluated, otherwise every near-limit frame enters the
+        # expensive auxiliary search path.
+        limit_escape_required_directions = (
+            self._active_joint_limit_escape_directions(
+                reference_full_q=reference_full,
+                target_activity=target_activity_metadata,
+            )
+            if forced_escape_latched
+            else {}
+        )
+        boundary_hold_directions = (
+            self._active_joint_limit_boundary_directions(
+                reference_full_q=reference_full,
+                target_activity=target_activity_metadata,
+            )
+            if boundary_hold_enabled
+            else {}
+        )
+        limit_escape_active = bool(active_limit_escape_latches)
+        limit_escape_mode = "active" if limit_escape_active else "normal"
         inactive_hold_active = bool(
             target_activity_metadata.get("enabled", False)
             and any(
@@ -5812,14 +6128,25 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             if deadline_reached():
                 stop_for_deadline("branch_budget_exhausted_before_candidates")
 
-        base_candidates, limit_escape_metadata = self._dual_arm_tracking_candidates(
-            raw_full_q=raw_full_q,
-            reference_full_q=reference_full,
-            current_targets=current_targets,
-            include_limit_escape=False,
-            include_posture_escape=False,
-            include_wrist_unload=False,
-        )
+        if limit_escape_active:
+            # An active escape never competes with ordinary tracking or the
+            # other auxiliary branches.  Generate its one bounded candidate
+            # only after the common deadline checks below.
+            base_candidates = []
+            limit_escape_metadata = {
+                "enabled": True,
+                "status": "active_latch_deferred",
+                "candidate_count": 0,
+            }
+        else:
+            base_candidates, limit_escape_metadata = self._dual_arm_tracking_candidates(
+                raw_full_q=raw_full_q,
+                reference_full_q=reference_full,
+                current_targets=current_targets,
+                include_limit_escape=False,
+                include_posture_escape=False,
+                include_wrist_unload=False,
+            )
         scale_factors = _dual_arm_step_scale_factors(safety_profile)
 
         def evaluate_stage(
@@ -5958,6 +6285,30 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "reference_collision_distance_m": reference_min_distance,
                 "target_activity": dict(target_activity_metadata),
                 "inactive_side_hold_active": bool(inactive_hold_active),
+                "joint_limit_guard": {
+                    "mode": self._joint_limit_guard_mode(),
+                    "boundary_margin_deg": float(
+                        self.config.joint_limit_boundary_guard_margin_deg
+                    ),
+                    "boundary_directions": self._joint_limit_escape_latch_metadata(
+                        boundary_hold_directions
+                    ),
+                },
+                "joint_limit_escape_hysteresis": {
+                    "status": (
+                        "latched_escape_only"
+                        if limit_escape_mode == "active"
+                        else "pending_single_escape"
+                        if limit_escape_mode == "pending"
+                        else "normal_tracking"
+                    ),
+                    "active": self._joint_limit_escape_latch_metadata(
+                        active_limit_escape_latches
+                    ),
+                    "required": self._joint_limit_escape_latch_metadata(
+                        limit_escape_required_directions
+                    ),
+                },
                 "limit_escape": dict(combined),
                 "posture_escape": dict(combined.get("posture_escape", {})),
                 "wrist_unload": dict(combined.get("wrist_unload", {})),
@@ -6145,19 +6496,135 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 metadata,
             )
 
-        primary_scales = scale_factors if inactive_hold_active else scale_factors[:1]
-        fallback_scales = () if inactive_hold_active else scale_factors[1:]
+        # A near-limit transition is still a single bounded path even when an
+        # inactive-side hold would normally request all configured scales.
+        # Otherwise the first rejected ordinary candidate can consume the
+        # whole scale ladder before the escape decision is made.
+        primary_scales = (
+            scale_factors
+            if inactive_hold_active and not limit_escape_required_directions
+            else scale_factors[:1]
+        )
+        fallback_scales = (
+            ()
+            if inactive_hold_active or limit_escape_required_directions
+            else scale_factors[1:]
+        )
         evaluate_stage(
             stage="base_primary",
             candidates=base_candidates,
             scales=primary_scales,
             stop_after_first_accept_per_candidate=not inactive_hold_active,
         )
-        if not evaluated and fallback_scales and not candidate_eval_stopped_early:
+        if (
+            not evaluated
+            and fallback_scales
+            and not limit_escape_required_directions
+            and not candidate_eval_stopped_early
+        ):
             evaluate_stage(stage="base_fallback", candidates=base_candidates, scales=fallback_scales)
 
         base_metadata = selection_metadata(candidates=base_candidates)
         base_selection = choose_from_evaluated(metadata=base_metadata)
+        if boundary_hold_enabled and base_selection is not None:
+            # Catch a candidate that enters the guard band from just outside
+            # it; waiting until the following frame would admit one avoidable
+            # inward step at the hard boundary.
+            boundary_hold_directions = (
+                self._active_joint_limit_boundary_directions(
+                    reference_full_q=reference_full,
+                    candidate_full_q=base_selection[0],
+                    target_activity=target_activity_metadata,
+                )
+            )
+        boundary_hold_candidate = (
+            None
+            if base_selection is None
+            else self._joint_limit_boundary_hold_candidate(
+                ordinary_q=base_selection[0],
+                reference_full_q=reference_full,
+                directions=boundary_hold_directions,
+            )
+        )
+        if boundary_hold_candidate is not None:
+            # The ordinary candidate has already passed the normal admission
+            # checks, but one or more near-limit components still point into
+            # the hard stop.  Re-evaluate the projected candidate and its
+            # collision distance; never substitute the historical fixed-size
+            # outward kick here.
+            evaluated.clear()
+            collision_safe_evaluated.clear()
+            evaluate_stage(
+                stage="joint_limit_boundary_hold",
+                candidates=[boundary_hold_candidate],
+                scales=(1.0,),
+            )
+            boundary_metadata = selection_metadata(
+                candidates=[boundary_hold_candidate]
+            )
+            boundary_selection = choose_from_evaluated(
+                metadata=boundary_metadata
+            )
+            if boundary_selection is not None:
+                boundary_selection[4]["candidate_eval_mode"] = (
+                    "joint_limit_boundary_hold"
+                )
+                return boundary_selection
+            boundary_metadata.update(
+                {
+                    "status": "hold_reference",
+                    "selected": "joint_limit_boundary_hold_reference",
+                    "selected_source": "joint_limit_boundary_hold",
+                    "reason": "projected_boundary_candidate_not_admissible",
+                    "candidate_eval_mode": "joint_limit_boundary_hold",
+                    "collision_distance_m": reference_min_distance,
+                }
+            )
+            return (
+                reference_full.copy(),
+                "joint_limit_boundary_hold_reference",
+                0.0,
+                reference_min_distance,
+                boundary_metadata,
+            )
+        limit_escape_pending = bool(limit_escape_active)
+        if not limit_escape_pending and limit_escape_required_directions:
+            if base_selection is None:
+                # A near-limit frame with no safe ordinary result gets one
+                # bounded escape probe, provided the deadline has not already
+                # forced a fail-closed hold.
+                limit_escape_pending = not candidate_eval_stopped_early
+            else:
+                # Do not let an ordinary/canonical branch step back toward a
+                # physical limit.  This is the only first-entry trigger; mere
+                # proximity to a limit does not launch auxiliary search.
+                limit_escape_pending = not self._joint_limit_escape_output_moves_outward(
+                    output_q=base_selection[0],
+                    reference_full_q=reference_full,
+                    directions=limit_escape_required_directions,
+                )
+        if limit_escape_pending:
+            limit_escape_mode = "active" if limit_escape_active else "pending"
+            # The ordinary result has already been proven to be an inward
+            # transition (or an active latch is forcing escape).  Keep its
+            # diagnostics in the stage summary, but remove it from the final
+            # selection pool so it cannot compete with the bounded escape
+            # candidate below.
+            evaluated.clear()
+            collision_safe_evaluated.clear()
+            base_metadata["joint_limit_escape_hysteresis"] = {
+                "status": (
+                    "latched_escape_only"
+                    if limit_escape_active
+                    else "pending_single_escape"
+                ),
+                "active": self._joint_limit_escape_latch_metadata(
+                    active_limit_escape_latches
+                ),
+                "required": self._joint_limit_escape_latch_metadata(
+                    limit_escape_required_directions
+                ),
+            }
         base_selected_singularity = (
             {}
             if base_selection is None
@@ -6215,7 +6682,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             or expand_for_shoulder_singularity
             or expand_for_local_singularity_escape
         )
-        if base_selection is not None and not expand_for_position_singularity:
+        if limit_escape_pending:
+            # Limit escape is mutually exclusive with posture, wrist, and
+            # singularity expansion.  Combining them was the source of the
+            # repeated IK budget overruns in the bad revision.
+            expand_for_elbow_singularity = False
+            expand_for_shoulder_singularity = False
+            expand_for_wrist_singularity = False
+            expand_for_local_singularity_escape = False
+            expand_for_position_singularity = False
+        if (
+            base_selection is not None
+            and not limit_escape_pending
+            and not expand_for_position_singularity
+        ):
             base_selection[4]["candidate_eval_mode"] = (
                 "deadline_partial" if candidate_eval_stopped_early else "base_only"
             )
@@ -6237,11 +6717,23 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             raw_full_q=raw_full_q,
             reference_full_q=reference_full,
             current_targets=current_targets,
+            target_activity=target_activity_metadata,
             include_base=False,
-            include_limit_escape=True,
-            include_posture_escape=not candidate_eval_stopped_early,
-            include_wrist_unload=not candidate_eval_stopped_early,
-            include_singularity_escape=expand_for_local_singularity_escape,
+            # Keep the historical auxiliary limit branch available for the
+            # normal singularity/fallback path.  In the pending/active mode,
+            # the other branches are disabled and this is the only branch
+            # actually evaluated.
+            include_limit_escape=not boundary_hold_enabled,
+            include_posture_escape=(
+                not limit_escape_pending and not candidate_eval_stopped_early
+            ),
+            include_wrist_unload=(
+                not limit_escape_pending and not candidate_eval_stopped_early
+            ),
+            include_singularity_escape=(
+                not limit_escape_pending and expand_for_local_singularity_escape
+            ),
+            limit_escape_max_candidates=1 if limit_escape_pending else None,
             # Use the raw one-step IK result as the escape probe.  The base
             # candidate is already locally clipped and may sit just outside
             # the proxy band even while the raw target is trying to cross it;
@@ -6255,12 +6747,17 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             evaluate_stage(
                 stage="auxiliary_primary",
                 candidates=auxiliary_candidates,
-                scales=primary_scales,
+                # A limit transition has one candidate and one scale attempt.
+                # If that probe is not admissible, holding the last qref is
+                # safer and cheaper than trying posture/wrist alternatives or
+                # repeatedly certifying the same escape at smaller scales.
+                scales=scale_factors[:1] if limit_escape_pending else primary_scales,
                 stop_after_first_accept_per_candidate=not inactive_hold_active,
             )
             if (
                 len(evaluated) == evaluated_before_auxiliary
                 and fallback_scales
+                and not limit_escape_pending
                 and not candidate_eval_stopped_early
             ):
                 evaluate_stage(
@@ -6360,6 +6857,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         raw_full_q: np.ndarray,
         reference_full_q: np.ndarray,
         current_targets: dict[str, np.ndarray],
+        target_activity: dict[str, object] | None = None,
+        limit_escape_max_candidates: int | None = None,
         include_base: bool = True,
         include_limit_escape: bool = True,
         include_posture_escape: bool = True,
@@ -6398,6 +6897,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             limit_candidates, limit_metadata = self._dual_arm_limit_escape_candidates(
                 reference_full_q=reference_full_q,
                 current_targets=current_targets,
+                target_activity=target_activity,
+                max_candidates_override=limit_escape_max_candidates,
             )
         else:
             limit_candidates = []
@@ -7754,11 +8255,617 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         return candidates, metadata
 
+    def _joint_limit_guard_mode(self) -> str:
+        return str(
+            getattr(
+                self.config,
+                "joint_limit_guard_mode",
+                JOINT_LIMIT_GUARD_LEGACY,
+            )
+        )
+
+    def _joint_limit_forced_escape_latch_enabled(self) -> bool:
+        return bool(
+            self._joint_limit_guard_mode()
+            == JOINT_LIMIT_GUARD_FORCED_ESCAPE_LATCHED
+        )
+
+    def _joint_limit_boundary_hold_enabled(self) -> bool:
+        return bool(
+            self._joint_limit_guard_mode()
+            == JOINT_LIMIT_GUARD_BOUNDARY_HOLD
+        )
+
+    def _joint_limit_escape_candidate_key(
+        self,
+        metadata: Mapping[str, object],
+    ) -> tuple[str, int] | None:
+        side = str(metadata.get("local_step_limit_escape_side", "")).strip().lower()
+        try:
+            local_index = int(metadata.get("local_step_limit_escape_joint_index", -1))
+            direction = int(metadata.get("local_step_limit_escape_direction", 0))
+        except (TypeError, ValueError):
+            return None
+        if side not in {"left", "right"}:
+            return None
+        if local_index < 0 or local_index >= 6 or direction not in {-1, 1}:
+            return None
+        return side, local_index
+
+    def _joint_limit_escape_raw_moves_inward(
+        self,
+        *,
+        raw_full_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        key: tuple[str, int],
+        direction: int,
+    ) -> bool:
+        if int(direction) not in {-1, 1}:
+            return False
+        raw = np.asarray(raw_full_q, dtype=float).reshape(-1)
+        reference = np.asarray(reference_full_q, dtype=float).reshape(raw.shape)
+        entry_by_key = {
+            (side, int(local_index)): int(full_index)
+            for side, local_index, full_index in self._arm_joint_entries(reference)
+        }
+        full_index = entry_by_key.get(key)
+        if full_index is None or not np.isfinite(raw[full_index]):
+            return False
+        # ``direction`` is the outward direction.  A negative signed delta
+        # therefore means that raw IK is asking to move inward.
+        return float(direction) * float(raw[full_index] - reference[full_index]) < -1e-9
+
+    def _refresh_joint_limit_escape_release_guards(
+        self,
+        *,
+        raw_full_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        fixed_sides: set[str] | None = None,
+    ) -> dict[tuple[str, int], int]:
+        """Keep a released direction only while raw IK still asks inward."""
+
+        safety_profile = self.ik_safety_profile
+        if (
+            not self._joint_limit_forced_escape_latch_enabled()
+            or safety_profile is None
+            or not bool(
+            getattr(safety_profile, "local_step_limit_escape_enabled", False)
+            )
+        ):
+            self._joint_limit_escape_direction_latch.clear()
+            self._joint_limit_escape_release_guard.clear()
+            return {}
+        fixed = set(fixed_sides or ())
+        for key, direction in list(self._joint_limit_escape_release_guard.items()):
+            if (
+                key[0] in fixed
+                or not self._joint_limit_escape_raw_moves_inward(
+                    raw_full_q=raw_full_q,
+                    reference_full_q=reference_full_q,
+                    key=key,
+                    direction=direction,
+                )
+            ):
+                self._joint_limit_escape_release_guard.pop(key, None)
+                self._joint_limit_escape_direction_latch.pop(key, None)
+                continue
+            # The normal latch refresh path is intentionally unaware of raw
+            # target intent; mirror the guarded direction into its existing
+            # authoritative latch map before it evaluates the release band.
+            self._joint_limit_escape_direction_latch[key] = int(direction)
+        return dict(self._joint_limit_escape_release_guard)
+
+    def _refresh_joint_limit_escape_latches(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        q_min: np.ndarray | None = None,
+        q_max: np.ndarray | None = None,
+    ) -> dict[tuple[str, int], int]:
+        """Keep admitted limit-escape directions until the release band clears.
+
+        This state is deliberately narrow: it only constrains a direction that
+        was already admitted as a physical limit escape, and it is cleared on
+        reset or when the corresponding joint is safely away from that limit.
+        """
+
+        safety_profile = self.ik_safety_profile
+        if (
+            not self._joint_limit_forced_escape_latch_enabled()
+            or safety_profile is None
+            or not bool(
+            getattr(safety_profile, "local_step_limit_escape_enabled", False)
+            )
+        ):
+            self._joint_limit_escape_direction_latch.clear()
+            self._joint_limit_escape_release_guard.clear()
+            return {}
+
+        q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        lower = (
+            np.asarray(self.ik_solver.robot.model.lowerPositionLimit, dtype=float).reshape(q.shape)
+            if q_min is None
+            else np.asarray(q_min, dtype=float).reshape(q.shape)
+        )
+        upper = (
+            np.asarray(self.ik_solver.robot.model.upperPositionLimit, dtype=float).reshape(q.shape)
+            if q_max is None
+            else np.asarray(q_max, dtype=float).reshape(q.shape)
+        )
+        if np.any(upper <= lower):
+            self._joint_limit_escape_direction_latch.clear()
+            self._joint_limit_escape_release_guard.clear()
+            return {}
+
+        activation_margin_rad = np.deg2rad(
+            max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_limit_escape_activation_margin_deg",
+                        2.0,
+                    )
+                ),
+            )
+        )
+        hysteresis_rad = np.deg2rad(
+            max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_limit_escape_direction_hysteresis_deg",
+                        0.0,
+                    )
+                ),
+            )
+        )
+        release_margin_rad = activation_margin_rad + hysteresis_rad
+        entry_by_key = {
+            (side, int(local_index)): int(full_index)
+            for side, local_index, full_index in self._arm_joint_entries(q)
+        }
+        active: dict[tuple[str, int], int] = {}
+        for key, direction_value in list(self._joint_limit_escape_direction_latch.items()):
+            full_index = entry_by_key.get(key)
+            direction = int(direction_value)
+            if (
+                full_index is None
+                or direction not in {-1, 1}
+                or not np.isfinite(q[full_index])
+            ):
+                self._joint_limit_escape_direction_latch.pop(key, None)
+                continue
+            lower_margin = float(q[full_index] - lower[full_index])
+            upper_margin = float(upper[full_index] - q[full_index])
+            min_margin = min(lower_margin, upper_margin)
+            outward_direction = -1 if upper_margin <= lower_margin else 1
+            if direction != outward_direction:
+                self._joint_limit_escape_direction_latch.pop(key, None)
+                self._joint_limit_escape_release_guard.pop(key, None)
+                continue
+            if (
+                min_margin >= release_margin_rad - 1e-9
+                and key not in self._joint_limit_escape_release_guard
+            ):
+                self._joint_limit_escape_direction_latch.pop(key, None)
+                continue
+            active[key] = direction
+        return active
+
+    def _active_joint_limit_escape_directions(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        target_activity: Mapping[str, object] | None = None,
+    ) -> dict[tuple[str, int], int]:
+        """Return latched or currently required outward limit directions.
+
+        A direction latch only exists after a limit-escape candidate has been
+        admitted.  The current reference can nevertheless already be inside
+        the activation band on the first protected frame.  Include that
+        provisional direction here so ordinary IK cannot reselect an inward
+        step before the latch is armed.
+        """
+
+        safety_profile = self.ik_safety_profile
+        if (
+            not self._joint_limit_forced_escape_latch_enabled()
+            or safety_profile is None
+            or not bool(
+            getattr(safety_profile, "local_step_limit_escape_enabled", False)
+            )
+        ):
+            return {}
+
+        q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        q_min = np.asarray(
+            self.ik_solver.robot.model.lowerPositionLimit,
+            dtype=float,
+        ).reshape(q.shape)
+        q_max = np.asarray(
+            self.ik_solver.robot.model.upperPositionLimit,
+            dtype=float,
+        ).reshape(q.shape)
+        if np.any(q_max <= q_min):
+            return {}
+
+        fixed_sides = self._authority_fixed_sides(target_activity)
+        directions = {
+            key: direction
+            for key, direction in self._refresh_joint_limit_escape_latches(
+                reference_full_q=q,
+                q_min=q_min,
+                q_max=q_max,
+            ).items()
+            if key[0] not in fixed_sides
+        }
+        activation_margin_rad = np.deg2rad(
+            max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_limit_escape_activation_margin_deg",
+                        2.0,
+                    )
+                ),
+            )
+        )
+        for side, local_index, full_index in self._arm_joint_entries(q):
+            if side in fixed_sides:
+                continue
+            if not np.isfinite(q[full_index]):
+                continue
+            lower_margin = float(q[full_index] - q_min[full_index])
+            upper_margin = float(q_max[full_index] - q[full_index])
+            if not np.isfinite(lower_margin) or not np.isfinite(upper_margin):
+                continue
+            if min(lower_margin, upper_margin) > activation_margin_rad:
+                continue
+            key = (side, int(local_index))
+            directions.setdefault(
+                key,
+                -1 if upper_margin <= lower_margin else 1,
+            )
+        return directions
+
+    def _active_joint_limit_boundary_directions(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        candidate_full_q: np.ndarray | None = None,
+        target_activity: Mapping[str, object] | None = None,
+    ) -> dict[tuple[str, int], int]:
+        """Return outward directions inside the narrow hard-limit guard band.
+
+        Unlike the legacy escape candidate this helper is stateless and does
+        not manufacture an outward joint step.  It exists only for the
+        opt-in ``boundary_hold`` mode, where an inward component is projected
+        back to the already admitted reference for that joint.
+        """
+
+        if not self._joint_limit_boundary_hold_enabled():
+            return {}
+        q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        candidate = (
+            q
+            if candidate_full_q is None
+            else np.asarray(candidate_full_q, dtype=float).reshape(q.shape)
+        )
+        lower = np.asarray(
+            self.ik_solver.robot.model.lowerPositionLimit,
+            dtype=float,
+        ).reshape(q.shape)
+        upper = np.asarray(
+            self.ik_solver.robot.model.upperPositionLimit,
+            dtype=float,
+        ).reshape(q.shape)
+        if np.any(upper <= lower):
+            return {}
+        margin_rad = np.deg2rad(
+            max(
+                0.0,
+                float(self.config.joint_limit_boundary_guard_margin_deg),
+            )
+        )
+        fixed_sides = self._authority_fixed_sides(target_activity)
+        directions: dict[tuple[str, int], int] = {}
+        for side, local_index, full_index in self._arm_joint_entries(q):
+            if side in fixed_sides or not np.isfinite(q[full_index]):
+                continue
+            reference_lower_margin = float(q[full_index] - lower[full_index])
+            reference_upper_margin = float(upper[full_index] - q[full_index])
+            candidate_lower_margin = float(
+                candidate[full_index] - lower[full_index]
+            )
+            candidate_upper_margin = float(
+                upper[full_index] - candidate[full_index]
+            )
+            lower_margin = min(reference_lower_margin, candidate_lower_margin)
+            upper_margin = min(reference_upper_margin, candidate_upper_margin)
+            if min(lower_margin, upper_margin) > margin_rad:
+                continue
+            directions[(side, int(local_index))] = (
+                -1 if upper_margin <= lower_margin else 1
+            )
+        return directions
+
+    def _joint_limit_boundary_hold_candidate(
+        self,
+        *,
+        ordinary_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        directions: Mapping[tuple[str, int], int],
+    ) -> _DualArmCandidate | None:
+        """Project only inward near-limit joint components to zero motion."""
+
+        if not directions:
+            return None
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        projected = np.asarray(ordinary_q, dtype=float).reshape(
+            reference.shape
+        ).copy()
+        entry_by_key = {
+            (side, int(local_index)): int(full_index)
+            for side, local_index, full_index in self._arm_joint_entries(
+                reference
+            )
+        }
+        held: dict[str, int] = {}
+        for key, outward_direction in directions.items():
+            full_index = entry_by_key.get(key)
+            if full_index is None:
+                continue
+            delta = float(projected[full_index] - reference[full_index])
+            if float(outward_direction) * delta >= -1e-9:
+                continue
+            projected[full_index] = reference[full_index]
+            held[f"{key[0]}:j{int(key[1]) + 1}"] = int(outward_direction)
+        if not held:
+            return None
+        return _DualArmCandidate(
+            name="joint_limit_boundary_hold",
+            qpos=projected,
+            source="joint_limit_boundary_hold",
+            method="project_inward_limit_components",
+            metadata={
+                "joint_limit_boundary_hold_candidate": True,
+                "held_outward_direction_by_joint": held,
+                "guard_margin_deg": float(
+                    self.config.joint_limit_boundary_guard_margin_deg
+                ),
+            },
+        )
+
+    def _joint_limit_escape_latch_metadata(
+        self,
+        latches: Mapping[tuple[str, int], int],
+    ) -> dict[str, int]:
+        return {
+            f"{side}:j{int(local_index) + 1}": int(direction)
+            for (side, local_index), direction in sorted(latches.items())
+        }
+
+    def _joint_limit_escape_candidate_moves_outward(
+        self,
+        *,
+        item: _DualArmEvaluatedCandidate,
+        reference_full_q: np.ndarray,
+        latches: Mapping[tuple[str, int], int],
+    ) -> bool:
+        return self._joint_limit_escape_output_moves_outward(
+            output_q=item.output_qpos,
+            reference_full_q=reference_full_q,
+            directions=latches,
+        )
+
+    def _joint_limit_escape_output_moves_outward(
+        self,
+        *,
+        output_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        directions: Mapping[tuple[str, int], int],
+    ) -> bool:
+        if not directions:
+            return True
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        entry_by_key = {
+            (side, int(local_index)): int(full_index)
+            for side, local_index, full_index in self._arm_joint_entries(reference)
+        }
+        output = np.asarray(output_q, dtype=float).reshape(reference.shape)
+        for key, direction in directions.items():
+            full_index = entry_by_key.get(key)
+            if full_index is None:
+                return False
+            if float(direction) * float(output[full_index] - reference[full_index]) < -1e-9:
+                return False
+        return True
+
+    def _update_joint_limit_escape_direction_latch(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        admitted_full_q: np.ndarray,
+        raw_full_q: np.ndarray | None = None,
+        status: str,
+        selection_metadata: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Arm a physical-limit direction only after its qref is admitted."""
+
+        safety_profile = self.ik_safety_profile
+        enabled = bool(
+            self._joint_limit_forced_escape_latch_enabled()
+            and safety_profile is not None
+            and getattr(safety_profile, "local_step_limit_escape_enabled", False)
+        )
+        if not enabled:
+            self._joint_limit_escape_direction_latch.clear()
+            self._joint_limit_escape_release_guard.clear()
+        before = dict(self._joint_limit_escape_direction_latch)
+        if raw_full_q is not None:
+            self._refresh_joint_limit_escape_release_guards(
+                raw_full_q=np.asarray(raw_full_q, dtype=float),
+                reference_full_q=np.asarray(reference_full_q, dtype=float),
+            )
+        active_before = self._refresh_joint_limit_escape_latches(
+            reference_full_q=np.asarray(admitted_full_q, dtype=float),
+        )
+        armed_key: tuple[str, int] | None = None
+        if enabled and status in {"tracking", "boundary_active"} and selection_metadata:
+            selected_source = str(selection_metadata.get("selected_source", ""))
+            selected_metadata = selection_metadata.get("selected_metadata", {})
+            selected_metadata = (
+                selected_metadata
+                if isinstance(selected_metadata, Mapping)
+                else {}
+            )
+            candidate_metadata = selected_metadata.get("candidate_metadata", {})
+            candidate_metadata = (
+                candidate_metadata
+                if isinstance(candidate_metadata, Mapping)
+                else {}
+            )
+            key = self._joint_limit_escape_candidate_key(candidate_metadata)
+            direction = int(
+                candidate_metadata.get("local_step_limit_escape_direction", 0) or 0
+            )
+            full_index = candidate_metadata.get("local_step_limit_escape_full_joint_index")
+            try:
+                full_index_int = int(full_index)
+            except (TypeError, ValueError):
+                full_index_int = -1
+            reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+            admitted = np.asarray(admitted_full_q, dtype=float).reshape(reference.shape)
+            margin_progress_deg = float(
+                candidate_metadata.get(
+                    "local_step_limit_escape_joint_margin_progress_deg",
+                    candidate_metadata.get(
+                        "local_step_limit_escape_margin_progress_deg",
+                        0.0,
+                    ),
+                )
+                or 0.0
+            )
+            if (
+                selected_source == "joint_limit_escape"
+                and key is not None
+                and direction in {-1, 1}
+                and 0 <= full_index_int < reference.shape[0]
+                and margin_progress_deg > 0.0
+                and float(direction) * float(admitted[full_index_int] - reference[full_index_int])
+                > 1e-9
+            ):
+                self._joint_limit_escape_direction_latch[key] = direction
+                armed_key = key
+                if raw_full_q is not None:
+                    raw = np.asarray(raw_full_q, dtype=float).reshape(reference.shape)
+                    lower = np.asarray(
+                        self.ik_solver.robot.model.lowerPositionLimit,
+                        dtype=float,
+                    ).reshape(reference.shape)
+                    upper = np.asarray(
+                        self.ik_solver.robot.model.upperPositionLimit,
+                        dtype=float,
+                    ).reshape(reference.shape)
+                    release_margin_rad = np.deg2rad(
+                        max(
+                            0.0,
+                            float(
+                                getattr(
+                                    safety_profile,
+                                    "local_step_limit_escape_activation_margin_deg",
+                                    2.0,
+                                )
+                            ),
+                        )
+                        + max(
+                            0.0,
+                            float(
+                                getattr(
+                                    safety_profile,
+                                    "local_step_limit_escape_direction_hysteresis_deg",
+                                    0.0,
+                                )
+                            ),
+                        )
+                    )
+                    full_lower_margin = float(admitted[full_index_int] - lower[full_index_int])
+                    full_upper_margin = float(upper[full_index_int] - admitted[full_index_int])
+                    if (
+                        min(full_lower_margin, full_upper_margin)
+                        >= release_margin_rad - 1e-9
+                        and self._joint_limit_escape_raw_moves_inward(
+                            raw_full_q=raw,
+                            reference_full_q=reference,
+                            key=key,
+                            direction=direction,
+                        )
+                    ):
+                        self._joint_limit_escape_release_guard[key] = direction
+
+        active_after = self._refresh_joint_limit_escape_latches(
+            reference_full_q=np.asarray(admitted_full_q, dtype=float),
+        )
+        activation_margin_deg = (
+            0.0
+            if safety_profile is None
+            else max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_limit_escape_activation_margin_deg",
+                        2.0,
+                    )
+                ),
+            )
+        )
+        hysteresis_deg = (
+            0.0
+            if safety_profile is None
+            else max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_limit_escape_direction_hysteresis_deg",
+                        0.0,
+                    )
+                ),
+            )
+        )
+        return {
+            "enabled": enabled,
+            "activation_margin_deg": activation_margin_deg,
+            "hysteresis_deg": hysteresis_deg,
+            "release_margin_deg": activation_margin_deg + hysteresis_deg,
+            "before": self._joint_limit_escape_latch_metadata(before),
+            "active_before": self._joint_limit_escape_latch_metadata(active_before),
+            "armed": (
+                None
+                if armed_key is None
+                else {
+                    "joint": f"{armed_key[0]}:j{int(armed_key[1]) + 1}",
+                    "direction": int(self._joint_limit_escape_direction_latch.get(armed_key, 0)),
+                }
+            ),
+            "released": sorted(
+                set(self._joint_limit_escape_latch_metadata(before))
+                - set(self._joint_limit_escape_latch_metadata(active_after))
+            ),
+            "active": self._joint_limit_escape_latch_metadata(active_after),
+        }
+
     def _dual_arm_limit_escape_candidates(
         self,
         *,
         reference_full_q: np.ndarray,
         current_targets: dict[str, np.ndarray],
+        target_activity: dict[str, object] | None = None,
+        max_candidates_override: int | None = None,
     ) -> tuple[list[_DualArmCandidate], dict[str, object]]:
         safety_profile = self.ik_safety_profile
         metadata: dict[str, object] = {
@@ -7782,7 +8889,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             metadata["status"] = "invalid_joint_position_limits"
             return [], metadata
 
-        arm_entries = self._arm_joint_entries(q)
+        authority_fixed_sides = self._authority_fixed_sides(target_activity)
+        arm_entries = [
+            entry
+            for entry in self._arm_joint_entries(q)
+            if entry[0] not in authority_fixed_sides
+        ]
+        metadata["authority_fixed_sides"] = sorted(authority_fixed_sides)
+        if not arm_entries:
+            metadata["status"] = "all_sides_fixed_by_authority"
+            return [], metadata
         arm_indices = np.array([entry[2] for entry in arm_entries], dtype=int)
         lower_margin = q - q_min
         upper_margin = q_max - q
@@ -7790,28 +8906,72 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         activation_margin_rad = np.deg2rad(
             max(0.0, float(getattr(safety_profile, "local_step_limit_escape_activation_margin_deg", 2.0)))
         )
+        active_latches = {
+            key: direction
+            for key, direction in self._refresh_joint_limit_escape_latches(
+                reference_full_q=q,
+                q_min=q_min,
+                q_max=q_max,
+            ).items()
+            if key[0] not in authority_fixed_sides
+        }
+        hysteresis_deg = max(
+            0.0,
+            float(
+                getattr(
+                    safety_profile,
+                    "local_step_limit_escape_direction_hysteresis_deg",
+                    0.0,
+                )
+            ),
+        )
+        release_margin_rad = activation_margin_rad + np.deg2rad(hysteresis_deg)
+        entry_by_key = {
+            (side, int(local_index)): int(full_index)
+            for side, local_index, full_index in arm_entries
+        }
+        latched_full_indices = {
+            entry_by_key[key]
+            for key in active_latches
+            if key in entry_by_key
+        }
         active_full_indices = [
             int(index)
             for index in arm_indices.tolist()
             if min_margin[int(index)] <= activation_margin_rad
+            or int(index) in latched_full_indices
         ]
         metadata.update(
             {
                 "status": "inactive" if not active_full_indices else "active",
                 "activation_margin_deg": float(np.rad2deg(activation_margin_rad)),
+                "hysteresis_deg": float(hysteresis_deg),
+                "release_margin_deg": float(np.rad2deg(release_margin_rad)),
                 "active_full_joint_indices": active_full_indices,
                 "active_joints": [
                     f"{side}_j{local_index + 1}"
                     for side, local_index, full_index in arm_entries
                     if int(full_index) in set(active_full_indices)
                 ],
+                "latched_direction_by_joint": self._joint_limit_escape_latch_metadata(
+                    active_latches
+                ),
                 "min_margin_deg": np.rad2deg(min_margin[arm_indices]).astype(float).tolist(),
             }
         )
         if not active_full_indices:
             return [], metadata
 
-        max_candidates = max(0, int(getattr(safety_profile, "local_step_limit_escape_max_candidates", 12)))
+        configured_max_candidates = max(
+            0,
+            int(getattr(safety_profile, "local_step_limit_escape_max_candidates", 12)),
+        )
+        max_candidates = configured_max_candidates
+        if max_candidates_override is not None:
+            max_candidates = min(
+                max_candidates,
+                max(0, int(max_candidates_override)),
+            )
         if max_candidates <= 0:
             metadata["status"] = "max_candidates_zero"
             return [], metadata
@@ -7823,19 +8983,35 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             metadata["status"] = "step_fraction_zero"
             return [], metadata
 
-        before_metrics = self._dual_pose_metrics(q, current_targets)
-        before_score = self._dual_pose_score(before_metrics)
         full_step = np.asarray(self._full_execution_joint_step, dtype=float).reshape(q.shape) * step_fraction
         active_set = set(active_full_indices)
-        scored: list[tuple[float, float, int, int, str, int, np.ndarray, dict[str, object]]] = []
+        # In the bounded hysteresis path only one candidate can be admitted.
+        # Preserve the deterministic margin/latch ordering, but defer the
+        # expensive FK pose score for candidates that will not be emitted.
+        defer_pose_scoring = max_candidates == 1
+        before_score = (
+            None
+            if defer_pose_scoring
+            else self._dual_pose_score(self._dual_pose_metrics(q, current_targets))
+        )
+        scored: list[
+            tuple[int, int, float, float, int, str, int, np.ndarray, dict[str, object]]
+        ] = []
         eps = 1e-9
         for side, local_index, full_index in arm_entries:
-            for direction in (-1, 1):
+            latch_key = (side, int(local_index))
+            latched_direction = active_latches.get(latch_key)
+            directions = (
+                (int(latched_direction),)
+                if latched_direction is not None and int(full_index) in latched_full_indices
+                else (-1, 1)
+            )
+            for direction in directions:
                 if direction < 0 and q[full_index] <= q_min[full_index] + eps:
                     continue
                 if direction > 0 and q[full_index] >= q_max[full_index] - eps:
                     continue
-                if full_index in active_set:
+                if full_index in active_set and latched_direction is None:
                     near_upper = upper_margin[full_index] <= lower_margin[full_index]
                     if near_upper and direction > 0:
                         continue
@@ -7849,11 +9025,24 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     continue
                 candidate_q = q.copy()
                 candidate_q[full_index] += float(direction) * step
-                after_metrics = self._dual_pose_metrics(candidate_q, current_targets)
-                after_score = self._dual_pose_score(after_metrics)
-                pose_progress = before_score - after_score
+                if defer_pose_scoring:
+                    pose_progress = 0.0
+                else:
+                    assert before_score is not None
+                    after_metrics = self._dual_pose_metrics(candidate_q, current_targets)
+                    after_score = self._dual_pose_score(after_metrics)
+                    pose_progress = before_score - after_score
                 candidate_lower_margin = candidate_q - q_min
                 candidate_upper_margin = q_max - candidate_q
+                joint_margin_before = min(
+                    float(lower_margin[full_index]),
+                    float(upper_margin[full_index]),
+                )
+                joint_margin_after = min(
+                    float(candidate_lower_margin[full_index]),
+                    float(candidate_upper_margin[full_index]),
+                )
+                joint_margin_progress = joint_margin_after - joint_margin_before
                 margin_before = float(np.min(min_margin[arm_indices]))
                 margin_after = float(np.min(np.minimum(candidate_lower_margin, candidate_upper_margin)[arm_indices]))
                 margin_progress = margin_after - margin_before
@@ -7868,10 +9057,31 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "local_step_limit_escape_min_margin_before_deg": float(np.rad2deg(margin_before)),
                     "local_step_limit_escape_min_margin_after_deg": float(np.rad2deg(margin_after)),
                     "local_step_limit_escape_margin_progress_deg": float(np.rad2deg(margin_progress)),
+                    "local_step_limit_escape_joint_margin_before_deg": float(
+                        np.rad2deg(joint_margin_before)
+                    ),
+                    "local_step_limit_escape_joint_margin_after_deg": float(
+                        np.rad2deg(joint_margin_after)
+                    ),
+                    "local_step_limit_escape_joint_margin_progress_deg": float(
+                        np.rad2deg(joint_margin_progress)
+                    ),
                     "local_step_limit_escape_pose_progress": float(pose_progress),
+                    "local_step_limit_escape_pose_progress_deferred": bool(
+                        defer_pose_scoring
+                    ),
+                    "local_step_limit_escape_latched": bool(latched_direction is not None),
+                    "local_step_limit_escape_direction_source": (
+                        "latch" if latched_direction is not None else "margin"
+                    ),
                 }
                 scored.append(
                     (
+                        # Once a direction is latched, service that joint
+                        # before a newly-near joint.  Otherwise a one-candidate
+                        # cap could keep servicing the newcomer while the
+                        # already active escape remains parked.
+                        int(latched_direction is None),
                         int(full_index not in active_set),
                         -float(margin_progress),
                         -float(pose_progress),
@@ -7886,7 +9096,17 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         scored.sort(key=lambda item: item[:6])
         candidates: list[_DualArmCandidate] = []
         seen: list[np.ndarray] = []
-        for _non_active, _margin_score, _pose_score, local_index, side, direction, candidate_q, candidate_metadata in scored:
+        for (
+            _latched_priority,
+            _non_active,
+            _margin_score,
+            _pose_score,
+            local_index,
+            side,
+            direction,
+            candidate_q,
+            candidate_metadata,
+        ) in scored:
             if len(candidates) >= max_candidates:
                 break
             if any(np.allclose(candidate_q, existing, atol=1e-9) for existing in seen):
@@ -8203,6 +9423,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             )
             return False, output_q, metadata
         limit_escape_candidate = bool(candidate.metadata.get("local_step_limit_escape_candidate", False))
+        boundary_hold_candidate = bool(
+            candidate.metadata.get("joint_limit_boundary_hold_candidate", False)
+        )
         singularity_escape_candidate = bool(
             candidate.metadata.get("local_step_singularity_escape_candidate", False)
         )
@@ -8481,6 +9704,18 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             progress_accept_reason = "dual_orientation_recovery_bounded_position_worsening"
         elif component_progress_ok:
             progress_accept_reason = "dual_component_progress_bounded_score_regression"
+        elif boundary_hold_candidate and bounded_worsening:
+            # The boundary candidate is derived from an ordinary candidate
+            # that already passed the normal local-step gate, with only the
+            # inward component of a hard-limit joint projected back to the
+            # admitted reference.  Requiring fresh positive Cartesian
+            # progress after that projection can turn a one-joint boundary
+            # stop into an unnecessary bimanual hold when the requested pose
+            # itself lies beyond the reachable boundary.  Preserve the other
+            # admitted components only while they remain inside the ordinary
+            # (not escape-relaxed) bounded-worsening contract; collision and
+            # final joint admission are still rechecked by the caller.
+            progress_accept_reason = "joint_limit_boundary_hold_bounded_worsening"
         elif (
             limit_escape_candidate
             and bool(getattr(safety_profile, "local_step_limit_escape_accept_bounded_worse", True))
@@ -8528,6 +9763,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "dual_max_position_progress_m": float(max_position_progress_m),
                     "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                     "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
+                    "dual_boundary_hold_candidate": bool(boundary_hold_candidate),
+                    "dual_boundary_hold_bounded_worsening": bool(
+                        boundary_hold_candidate and bounded_worsening
+                    ),
                     "dual_singularity_escape_active": bool(singularity_escape_active),
                     "dual_singularity_escape_wide_search": bool(
                         singularity_escape_wide_search
@@ -8596,6 +9835,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "dual_max_position_progress_m": float(max_position_progress_m),
                 "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                 "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
+                "dual_boundary_hold_candidate": bool(boundary_hold_candidate),
+                "dual_boundary_hold_bounded_worsening": bool(
+                    boundary_hold_candidate and bounded_worsening
+                ),
                 "dual_singularity_escape_active": bool(singularity_escape_active),
                 "dual_singularity_escape_wide_search": bool(
                     singularity_escape_wide_search
@@ -8641,24 +9884,28 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "dual_worsen_limits": dict(worsen_limits),
                 "within_pose_tolerance": bool(within_tolerance),
                 "dual_recovery_state": (
-                    "joint_limit_escape"
-                    if progress_accept_reason.startswith("joint_limit_escape")
+                    "joint_limit_boundary_hold"
+                    if progress_accept_reason.startswith("joint_limit_boundary_hold")
                     else (
-                        "singularity_escape"
-                        if progress_accept_reason.startswith("singularity_escape")
+                        "joint_limit_escape"
+                        if progress_accept_reason.startswith("joint_limit_escape")
                         else (
-                            "orientation_recovery"
-                            if progress_accept_reason.startswith("dual_orientation_recovery")
+                            "singularity_escape"
+                            if progress_accept_reason.startswith("singularity_escape")
                             else (
-                                "component_progress"
-                                if progress_accept_reason.startswith("dual_component_progress")
+                                "orientation_recovery"
+                                if progress_accept_reason.startswith("dual_orientation_recovery")
                                 else (
-                                    "posture_escape"
-                                    if progress_accept_reason.startswith("posture_escape")
+                                    "component_progress"
+                                    if progress_accept_reason.startswith("dual_component_progress")
                                     else (
-                                        "wrist_unload"
-                                        if progress_accept_reason.startswith("wrist_unload")
-                                        else "tracking"
+                                        "posture_escape"
+                                        if progress_accept_reason.startswith("posture_escape")
+                                        else (
+                                            "wrist_unload"
+                                            if progress_accept_reason.startswith("wrist_unload")
+                                            else "tracking"
+                                        )
                                     )
                                 )
                             )
@@ -8827,6 +10074,42 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 if source_metadata_by_side is None
                 else source_metadata_by_side.get(side)
             )
+            authority_metadata = (
+                source_metadata
+                if source_metadata is not None
+                else (
+                    None
+                    if cartesian_command is None
+                    else cartesian_command.metadata
+                )
+            )
+            fix_arm_fixed_side = str(
+                (
+                    authority_metadata.get("fix_arm_fixed_side", side)
+                    if authority_metadata is not None
+                    else side
+                )
+                or ""
+            ).strip().lower()
+            if (
+                authority_metadata is not None
+                and bool(authority_metadata.get("fix_arm_frozen", False))
+                and fix_arm_fixed_side == side
+            ):
+                metadata[side] = {
+                    "source": "fix_arm_controller",
+                    "previous_target_available": self._last_target_poses.get(side)
+                    is not None,
+                    "translation_m": 0.0,
+                    "rotation_deg": 0.0,
+                    "activity_ratio": 0.0,
+                    "hold_weight": 1.0,
+                    "inactive": True,
+                    "state": "FIXED",
+                    "fixed_by_authority": True,
+                    "fixed_side": side,
+                }
+                continue
             pose_action_intent_raw = (
                 source_metadata.get("pose_action_motion_intent")
                 if source_metadata is not None
@@ -8929,6 +10212,19 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "inactive": bool(hold_weight > 0.0),
             }
         return metadata
+
+    @staticmethod
+    def _authority_fixed_sides(
+        target_activity: Mapping[str, object] | None,
+    ) -> frozenset[str]:
+        if not isinstance(target_activity, Mapping):
+            return frozenset()
+        return frozenset(
+            side
+            for side in ("left", "right")
+            if isinstance(target_activity.get(side), Mapping)
+            and bool(target_activity[side].get("fixed_by_authority", False))
+        )
 
     def _dual_output_motion_metrics(
         self,

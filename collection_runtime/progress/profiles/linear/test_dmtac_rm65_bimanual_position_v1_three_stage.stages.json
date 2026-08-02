@@ -1,0 +1,81 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "test_dmtac_rm65_bimanual_position_v1_three_stage_stages",
+  "profile_version": "1",
+  "task_progress_profile_hash": "de494ad9c5ab14ec2c4e097c443371b1b8e5aba3af7b5fbcac1aeaf7cb8069f6",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_prepare",
+      "stage_id": "test_prepare.observe",
+      "display_name": "观察工作区",
+      "description": "确认目标、环境和操作起点。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_prepare",
+      "stage_id": "test_prepare.align",
+      "display_name": "接近并对准",
+      "description": "移动到当前操作的预备位置。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_prepare",
+      "stage_id": "test_prepare.ready",
+      "display_name": "形成操作准备",
+      "description": "完成接触前的最终准备。",
+      "ordinal": 3
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_manipulate",
+      "stage_id": "test_manipulate.contact",
+      "display_name": "建立接触",
+      "description": "建立本阶段所需的有效接触。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_manipulate",
+      "stage_id": "test_manipulate.execute",
+      "display_name": "执行主要操作",
+      "description": "执行当前子任务的核心运动。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_manipulate",
+      "stage_id": "test_manipulate.verify",
+      "display_name": "确认阶段结果",
+      "description": "确认中间状态满足进入下一步的条件。",
+      "ordinal": 3
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_finish",
+      "stage_id": "test_finish.place",
+      "display_name": "放置或释放",
+      "description": "完成目标的最终放置或释放。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_finish",
+      "stage_id": "test_finish.retreat",
+      "display_name": "安全退出",
+      "description": "末端从目标附近安全退出。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "test_finish",
+      "stage_id": "test_finish.verify",
+      "display_name": "确认任务完成",
+      "description": "确认最终状态并结束任务。",
+      "ordinal": 3
+    }
+  ],
+  "semantic_content_hash": "779e40b47b96cde4ded6b901eabac5031d7736655638c116912b633822a8feb5"
+}

@@ -35,8 +35,8 @@ from teleop_runtime.collection.v25p_capture_profiles import (
     V25P_UMI_SOURCE,
     build_policy_io_v25p_capture_profiles,
 )
-from teleop_runtime.collection.v25p_native_store import V25pNativeEpisodeStore
-from teleop_runtime.collection.v25p_producer import V25pProducerBindings
+from collection_runtime.v25p_native_store import V25pNativeEpisodeStore
+from collection_runtime.v25p_producer import V25pProducerBindings
 from teleop_runtime.collection.v25p_real_teleop_producer import (
     RealTeleopV25pProducer,
 )

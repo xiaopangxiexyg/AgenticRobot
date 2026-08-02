@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
@@ -27,7 +29,7 @@ from ..retargeters import (
     ScalarToGripperRetargeter,
     ScalarToGripperRetargeterConfig,
 )
-from ..interfaces import EffectorBackend
+from ..interfaces import EffectorBackend, ObservationSource
 from .q6_hardware import load_latest_q6_ports
 from .pose_smoothing import build_bimanual_pose_smoother, load_default_pose_smoothing_config
 
@@ -71,6 +73,31 @@ def default_vive_tracker_configs(
 HandBackendConfig = InspireTacHandBackendConfig | DMTacGripperBackendConfig
 
 
+@dataclass(frozen=True)
+class PassiveHandInputBinding:
+    """Bind one already-constructed observation source to a hand retargeter.
+
+    The source owns device I/O.  This value only declares which observation
+    channel feeds the passive session and, for scalar-to-gripper mappings,
+    whether the scalar is the whole channel or one element of a vector.
+    """
+
+    source: ObservationSource
+    input_channel_name: str
+    source_dim: int | None
+
+    def __post_init__(self) -> None:
+        channel = str(self.input_channel_name).strip()
+        if not channel:
+            raise ValueError("input_channel_name must be non-empty.")
+        object.__setattr__(self, "input_channel_name", channel)
+        if self.source_dim is not None:
+            source_dim = int(self.source_dim)
+            if not 0 <= source_dim < 6:
+                raise ValueError("source_dim must be in [0, 5], or None.")
+            object.__setattr__(self, "source_dim", source_dim)
+
+
 def _build_hand_backend(config: HandBackendConfig) -> EffectorBackend:
     if isinstance(config, DMTacGripperBackendConfig):
         return DMTacGripperBackend(config)
@@ -94,6 +121,7 @@ def _build_hand_retargeter(
     *,
     side: str,
     input_channel_name: str,
+    source_dim: int | None = 2,
 ):
     effector_name = _hand_effector_name(config, side=side)
     if isinstance(config, DMTacGripperBackendConfig):
@@ -102,7 +130,7 @@ def _build_hand_retargeter(
                 side=side,
                 input_channel_name=input_channel_name,
                 effector_name=effector_name,
-                source_dim=2,
+                source_dim=source_dim,
                 output_dim=0,
                 output_max=float(config.max_action),
             )
@@ -377,3 +405,169 @@ def build_bimanual_passive_session(
         safety_config=safety_config,
         _build_rig=False,
     )
+
+
+def build_single_side_passive_session(
+    *,
+    side: str,
+    calibration: TeleopCalibration,
+    session_config: TeleopSessionConfig | None = None,
+    vive_port: int = 9999,
+    vive_clock_sync_port: int | None = None,
+    vive_tracker_name: str = "tracker_1",
+    vive_source_tracker_role: str | None = None,
+    hand_serial_port: str | None = None,
+    hand_input_binding: PassiveHandInputBinding | None = None,
+    hand_backend_config: HandBackendConfig | None = None,
+    vive_tracker_height_correction: bool = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_enabled
+    ),
+    vive_tracker_height_correction_m: float = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m
+    ),
+    safety_config: TeleopSafetyConfig | None = None,
+) -> TeleopSession:
+    """Build one observation-only tracker/hand source without a robot rig.
+
+    The physical tracker occupies legacy packet slot zero but is explicitly
+    mapped to the requested logical side.  This mapping is an application
+    source profile, not a change to the VIVE sender's compatibility behavior.
+    """
+
+    normalized_side = str(side).strip().lower()
+    if normalized_side not in {"left", "right"}:
+        raise ValueError("side must be left or right.")
+    config = session_config or TeleopSessionConfig(
+        mode=f"single_{normalized_side}_passive_pose",
+        record_enabled=False,
+        allow_hardware_after_debug_pass=False,
+    )
+    if config.record_enabled:
+        raise ValueError("Passive single-side session forbids session recording.")
+    if config.allow_hardware_after_debug_pass:
+        raise ValueError(
+            "Passive single-side session forbids hardware-arm eligibility."
+        )
+    if float(vive_tracker_height_correction_m) < 0.0:
+        raise ValueError("vive_tracker_height_correction_m must be >= 0.")
+    if hand_serial_port is not None and hand_input_binding is not None:
+        raise ValueError(
+            "hand_serial_port and hand_input_binding are mutually exclusive."
+        )
+    tracker_channel = f"{normalized_side}_wrist_pose"
+    source_tracker_role = (
+        f"{normalized_side}_wrist"
+        if vive_source_tracker_role is None
+        else str(vive_source_tracker_role).strip()
+    )
+    if source_tracker_role not in {"left_wrist", "right_wrist"}:
+        raise ValueError(
+            "vive_source_tracker_role must be left_wrist or right_wrist."
+        )
+    tracker = ViveTrackerConfig(
+        name=str(vive_tracker_name),
+        side=normalized_side,
+        role=source_tracker_role,
+        channel_name=tracker_channel,
+        legacy_index=0,
+    )
+    sources: list[ObservationSource] = [
+        VivePoseSource(
+            tracker_configs=[tracker],
+            port=vive_port,
+            clock_sync_port=vive_clock_sync_port,
+        )
+    ]
+    tracker_translation_offset = (
+        vive_tracker_height_correction_offset(
+            vive_tracker_height_correction_m
+        )
+        if bool(vive_tracker_height_correction)
+        else None
+    )
+    retargeters = [
+        PoseToArmRetargeter(
+            PoseToArmRetargeterConfig(
+                side=normalized_side,
+                input_channel_name=tracker_channel,
+                effector_name=f"{normalized_side}_arm",
+                # Calibration profiles are keyed by the logical output side.
+                # The possibly different upstream sender role remains in the
+                # observation and command lineage.
+                tracker_role=f"{normalized_side}_wrist",
+                input_local_translation_offset=tracker_translation_offset,
+                input_local_rotation_offset=(
+                    tracker_hand_to_rm65_tcp_rotation()
+                ),
+                tracker_motion_intent_enabled=True,
+            )
+        )
+    ]
+    if hand_serial_port is not None:
+        sources.append(
+            HandQ6Source.from_single_hand(
+                port=str(hand_serial_port),
+                side=normalized_side,
+            )
+        )
+        retargeters.append(
+            _build_hand_retargeter(
+                hand_backend_config,
+                side=normalized_side,
+                input_channel_name=f"{normalized_side}_hand_q6",
+            )
+        )
+    elif hand_input_binding is not None:
+        sources.append(hand_input_binding.source)
+        retargeters.append(
+            _build_hand_retargeter(
+                hand_backend_config,
+                side=normalized_side,
+                input_channel_name=hand_input_binding.input_channel_name,
+                source_dim=hand_input_binding.source_dim,
+            )
+        )
+    return TeleopSession(
+        config=config,
+        sources=sources,
+        retargeters=retargeters,
+        rig=None,
+        calibration=calibration,
+        safety_config=safety_config,
+    )
+
+
+def vive_source_role_mapping(
+    session: TeleopSession,
+) -> dict[str, str]:
+    """Inspect the unique VIVE source's upstream-role/logical-channel map."""
+
+    sources = [
+        source
+        for source in tuple(getattr(session, "sources", ()) or ())
+        if isinstance(source, VivePoseSource)
+    ]
+    if len(sources) != 1:
+        raise RuntimeError(
+            "Expected exactly one VivePoseSource in the teleop session; "
+            f"found {len(sources)}."
+        )
+    return sources[0].source_role_by_output_channel
+
+
+def swap_vive_left_right_sources(
+    session: TeleopSession,
+) -> dict[str, object]:
+    """Swap the unique VIVE source's left/right upstream role binding."""
+
+    sources = [
+        source
+        for source in tuple(getattr(session, "sources", ()) or ())
+        if isinstance(source, VivePoseSource)
+    ]
+    if len(sources) != 1:
+        raise RuntimeError(
+            "Expected exactly one VivePoseSource in the teleop session; "
+            f"found {len(sources)}."
+        )
+    return sources[0].swap_left_right_source_roles()

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from ..recording import RecordingConfig
-from .dataset_layout import expand_cli_path as _expand_cli_path
+from collection_runtime.dataset_layout import expand_cli_path as _expand_cli_path
 
 def _session_record_root_dir(args: argparse.Namespace) -> Path | None:
     cached = str(getattr(args, "_session_record_root_dir", "") or "").strip()

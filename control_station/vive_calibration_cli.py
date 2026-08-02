@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             flush=True,
         )
-        while True:
+        while not controller.shutdown_requested:
             time.sleep(1.0)
     except KeyboardInterrupt:
         return 0

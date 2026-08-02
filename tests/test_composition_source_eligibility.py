@@ -356,6 +356,40 @@ def test_unavailable_source_invalidates_unexpired_action_and_formal_gate_holds(
     assert disposition.reason == "all_inputs_missing"
 
 
+def test_retryable_source_pause_can_request_no_action_without_granting_authority(
+) -> None:
+    _, coordinator, epochs, inputs, states = stores()
+    assert states.admit(
+        source_state(status="paused", rearm_required=False)
+    ).accepted
+    spec, _source_snapshot, input_snapshot = capture(
+        coordinator,
+        epochs,
+        inputs,
+        states,
+        target=10.1,
+    )
+    result = DeterministicComposer().compose(input_snapshot, spec=spec)
+    disposition = decide_composition_authority_disposition(
+        input_snapshot,
+        result,
+        spec=spec,
+        gate_spec=CompositionAuthorityGateSpec(
+            gate_spec_id="retryable-base-gate-v1",
+            composition_spec_hash=spec.semantic_content_hash,
+            composer_producer_id="composer",
+            missing_behavior_by_role={"base": "no_action"},
+            proposal_ttl_sec=0.1,
+            all_inputs_missing_behavior="no_action",
+        ),
+    )
+
+    assert disposition.action == "no_action"
+    assert disposition.downstream_request == "no_action"
+    assert disposition.reason == "all_inputs_missing"
+    assert disposition.authoritative is False
+
+
 def test_expired_source_lease_invalidates_unexpired_action() -> None:
     _, coordinator, epochs, inputs, states = stores()
     assert states.admit(

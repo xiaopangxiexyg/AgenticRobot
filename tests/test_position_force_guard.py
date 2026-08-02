@@ -621,6 +621,142 @@ def test_safety_dispatch_classifies_only_stop_races():
     )
 
 
+def _joint_hard_limit_dispatch_error() -> RuntimeError:
+    cause = ValueError(
+        "right_arm pre-singularity target joint 6=2.094395rad exceeds "
+        "absolute limits [-2.094395, 2.094395]rad."
+    )
+    error = RuntimeError(
+        "bimanual_rig dispatch failed; group fail-stop requested: "
+        f"right_arm: ValueError: {cause}"
+    )
+    error.__cause__ = cause
+    return error
+
+
+def test_joint_hard_limit_dispatch_classifier_is_narrow_and_structured():
+    context = control_loop._joint_hard_limit_dispatch_context(
+        _joint_hard_limit_dispatch_error()
+    )
+
+    assert context is not None
+    assert context["effector_name"] == "right_arm"
+    assert context["target_label"] == "pre-singularity target"
+    assert context["joint_index"] == 6
+    assert context["target_rad"] == pytest.approx(2.094395)
+    assert context["lower_rad"] == pytest.approx(-2.094395)
+    assert context["upper_rad"] == pytest.approx(2.094395)
+    assert context["limit_side"] == "upper"
+
+    assert (
+        control_loop._joint_hard_limit_dispatch_context(
+            ValueError("right_arm transport timeout")
+        )
+        is None
+    )
+    assert (
+        control_loop._joint_hard_limit_dispatch_context(
+            ValueError("right_arm joint_vector must be a 6D joint vector")
+        )
+        is None
+    )
+
+
+def test_joint_hard_limit_dispatch_stops_episode_and_retains_hold():
+    stops = []
+    recording_stops = []
+    countdown_cancels = []
+    hold_reasons = []
+    logs = []
+    messages = []
+    components = SimpleNamespace(name="components")
+    clutch_input = SimpleNamespace(
+        request_hold=lambda *, reason: hold_reasons.append(reason)
+    )
+    control_ui = SimpleNamespace(
+        append_message=lambda tag, message: messages.append((tag, message))
+    )
+
+    consumed = control_loop._consume_joint_hard_limit_dispatch(
+        _joint_hard_limit_dispatch_error(),
+        components=components,
+        clutch_input=clutch_input,
+        recording_active=lambda: True,
+        stop_recording=lambda now, **kwargs: recording_stops.append((now, kwargs)),
+        cancel_recording_countdown=lambda now, **kwargs: countdown_cancels.append(
+            (now, kwargs)
+        ),
+        emergency_stop_real_arms=lambda received, **kwargs: stops.append(
+            (received, kwargs)
+        )
+        or {},
+        now=12.5,
+        step_index=77,
+        last_state="RUNNING",
+        log=lambda tag, message, **kwargs: logs.append((tag, message, kwargs)),
+        control_ui=control_ui,
+    )
+
+    assert consumed is True
+    assert stops == [
+        (
+            components,
+            {
+                "reason": "joint_hard_limit_dispatch:right_arm:joint_6",
+                "now": 12.5,
+                "raise_on_failure": False,
+            },
+        )
+    ]
+    assert countdown_cancels == [(12.5, {"reason": "joint_hard_limit"})]
+    assert len(recording_stops) == 1
+    stop_now, stop_kwargs = recording_stops[0]
+    assert stop_now == 12.5
+    assert stop_kwargs["end_reason"] == "joint_hard_limit"
+    summary = stop_kwargs["summary"]
+    assert summary["joint_hard_limit_detected"] is True
+    assert summary["joint_hard_limit_event"]["joint_index"] == 6
+    assert "force_collision_detected" not in summary
+    assert hold_reasons == ["joint_hard_limit"]
+    assert messages and messages[-1][0] == "JointHardLimit"
+    assert any("GUI/devices retained" in message for _tag, message, _kwargs in logs)
+
+
+def test_joint_hard_limit_dispatch_stop_failure_still_closes_episode_and_holds():
+    recording_stops = []
+    hold_reasons = []
+    messages = []
+
+    def fail_arm_stop(*_args, **_kwargs):
+        raise RuntimeError("Arm_Stop transport failure")
+
+    consumed = control_loop._consume_joint_hard_limit_dispatch(
+        _joint_hard_limit_dispatch_error(),
+        components=SimpleNamespace(),
+        clutch_input=SimpleNamespace(
+            request_hold=lambda *, reason: hold_reasons.append(reason)
+        ),
+        recording_active=lambda: True,
+        stop_recording=lambda now, **kwargs: recording_stops.append((now, kwargs)),
+        cancel_recording_countdown=lambda *_args, **_kwargs: None,
+        emergency_stop_real_arms=fail_arm_stop,
+        now=20.0,
+        step_index=88,
+        last_state="RUNNING",
+        log=lambda *_args, **_kwargs: None,
+        control_ui=SimpleNamespace(
+            append_message=lambda tag, message: messages.append((tag, message))
+        ),
+    )
+
+    assert consumed is True
+    assert recording_stops[0][1]["summary"]["emergency_stop_errors"] == {
+        "__all__": "RuntimeError: Arm_Stop transport failure"
+    }
+    assert hold_reasons == ["joint_hard_limit"]
+    assert "Arm_Stop 未确认" in messages[-1][1]
+
+
 def test_impedance_issue_provider_force_error_enters_collision_callback():
     class Session:
         def __init__(self):

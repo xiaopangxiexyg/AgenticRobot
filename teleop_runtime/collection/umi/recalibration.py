@@ -12,6 +12,7 @@ from utils.umi_hand_eye.config import load_config as load_hand_eye_config
 
 from .calibration import UmiCalibrationSet
 from .config import UmiCollectionConfig
+from .topology import SIDES
 
 
 def validate_hand_eye_config_binding(config: UmiCollectionConfig) -> None:
@@ -24,7 +25,7 @@ def validate_hand_eye_config_binding(config: UmiCollectionConfig) -> None:
         ("vive_clock_sync_port", hand_eye.vive_clock_sync_port, config.vive_clock_sync_port),
     )
     mismatches = [name for name, actual, expected in scalar_fields if actual != expected]
-    for side in ("left", "right"):
+    for side in SIDES:
         source = hand_eye.side(side)
         target = config.side(side)
         fields = {
@@ -49,7 +50,7 @@ def run_default_dual_calibration(config: UmiCollectionConfig) -> UmiCalibrationS
     validate_hand_eye_config_binding(config)
     before = {
         side: _file_digest(config.side(side).hand_eye_result)
-        for side in ("left", "right")
+        for side in SIDES
     }
     # Import lazily: collection startup without calibration must still be able
     # to bring up the web UI before optional OpenCV calibration dependencies.
@@ -67,9 +68,9 @@ def run_default_dual_calibration(config: UmiCollectionConfig) -> UmiCalibrationS
         raise RuntimeError(f"dual UMI calibration exited with code {exit_code}")
     after = {
         side: _file_digest(config.side(side).hand_eye_result)
-        for side in ("left", "right")
+        for side in SIDES
     }
-    unchanged = [side for side in ("left", "right") if after[side] == before[side]]
+    unchanged = [side for side in SIDES if after[side] == before[side]]
     if unchanged:
         raise RuntimeError(
             "标定窗口未生成新的左右结果（可能按 q 取消）：" + ", ".join(unchanged)
@@ -89,7 +90,7 @@ def config_for_calibration_dataset(
         return config
     fingerprint = hashlib.sha256(
         "|".join(
-            calibrations.by_side[side].sha256 for side in ("left", "right")
+            calibrations.by_side[side].sha256 for side in SIDES
         ).encode("ascii")
     ).hexdigest()[:12]
     stamp = calibrations.created_at.strftime("%Y%m%dT%H%M%SZ")
@@ -119,7 +120,7 @@ def _info_matches(info: Mapping[str, object], calibrations: UmiCalibrationSet) -
     values = info.get("tcp_extrinsic_by_side")
     if not isinstance(values, Mapping):
         return False
-    for side in ("left", "right"):
+    for side in SIDES:
         item = values.get(side)
         if not isinstance(item, Mapping):
             return False

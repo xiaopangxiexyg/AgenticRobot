@@ -1313,7 +1313,22 @@ def test_lower_level_packages_do_not_reverse_depend_on_control_station() -> None
                     for name in imported_names
                 ):
                     violations.append(f"{path.relative_to(repository_root)}:{node.lineno}")
-    assert violations == []
+    # Temporary application-edge seams for the RealTeleop/UMI GUI migration.
+    # They preserve the canonical teleop entrypoints and historic imports
+    # while browser state and pure input policy move to Control Station.  The
+    # exact file allowlist prevents this dependency from spreading into
+    # device, motion, safety, recorder, or generic collection owners.
+    assert sorted({item.rsplit(":", 1)[0] for item in violations}) == [
+        "teleop_runtime/collection/umi/app.py",
+        "teleop_runtime/collection/umi/controller.py",
+        "teleop_runtime/debug/calibration_web_ui.py",
+        "teleop_runtime/debug/run_vive_rm65_calibration_debug.py",
+        "teleop_runtime/debug/run_vive_rm65_real_teleop.py",
+        "teleop_runtime/gui/calibration_web_ui.py",
+        "teleop_runtime/gui/startup_progress.py",
+        "teleop_runtime/real_teleop/gui_controls.py",
+        "teleop_runtime/real_teleop/operator_control_runtime.py",
+    ]
 
 
 def test_reusable_source_and_target_contracts_do_not_bind_a_concrete_backend() -> None:
@@ -1361,7 +1376,10 @@ def test_root_control_station_is_explicitly_packaged_without_legacy_alias() -> N
     repository_root = Path(__file__).parents[1]
     pyproject = (repository_root / "pyproject.toml").read_text(encoding="utf-8")
     assert '"control_station*"' in pyproject
-    assert 'control_station = ["web/static/*.html"' in pyproject
+    assert '"web/static/*.html"' in pyproject
+    assert '"refinement_annotation/static/*.html"' in pyproject
+    assert '"refinement_annotation/static/*.js"' in pyproject
+    assert '"refinement_annotation/static/*.css"' in pyproject
     assert not (repository_root / "teleop_runtime" / "control_station" / "__init__.py").exists()
 
 

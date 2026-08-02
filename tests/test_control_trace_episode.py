@@ -19,7 +19,7 @@ from dataset_contracts.stream_catalog import (
     NativeStreamExternalSampleIntent,
 )
 from dataset_interface.streams import load_native_stream_episode
-from teleop_runtime.collection.stream_sink import NativeStreamEpisodeWriter
+from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,
     ControlTraceSpool,

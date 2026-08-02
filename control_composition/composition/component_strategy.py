@@ -82,8 +82,8 @@ def _fuse_pose_values(
     *,
     component_id: str,
     weights: Mapping[str, float],
-    max_translation_disagreement_m: float,
-    max_rotation_disagreement_rad: float,
+    max_translation_disagreement_m: float | None,
+    max_rotation_disagreement_rad: float | None,
 ) -> np.ndarray:
     values = {
         record.input_role: np.asarray(
@@ -104,9 +104,15 @@ def _fuse_pose_values(
                     * Rotation.from_quat(values[second][3:7])
                 ).magnitude()
             )
-            if translation > max_translation_disagreement_m:
+            if (
+                max_translation_disagreement_m is not None
+                and translation > max_translation_disagreement_m
+            ):
                 raise ValueError("translation_disagreement")
-            if rotation > max_rotation_disagreement_rad:
+            if (
+                max_rotation_disagreement_rad is not None
+                and rotation > max_rotation_disagreement_rad
+            ):
                 raise ValueError("rotation_disagreement")
     reference_role = min(
         roles,

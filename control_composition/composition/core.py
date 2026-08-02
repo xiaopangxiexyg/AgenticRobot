@@ -635,10 +635,14 @@ class CompositionAuthorityGateSpec:
                 behavior,
                 field_name=f"missing behavior for {normalized_role}",
             )
-            if normalized_behavior not in {"hold", "drop_and_renormalize"}:
+            if normalized_behavior not in {
+                "hold",
+                "no_action",
+                "drop_and_renormalize",
+            }:
                 raise ValueError(
-                    "Contributor missing behavior must be hold or "
-                    "drop_and_renormalize."
+                    "Contributor missing behavior must be hold, no_action, "
+                    "or drop_and_renormalize."
                 )
             behaviors[normalized_role] = normalized_behavior
         if not behaviors:
@@ -646,13 +650,14 @@ class CompositionAuthorityGateSpec:
         proposal_ttl = float(self.proposal_ttl_sec)
         if not math.isfinite(proposal_ttl) or proposal_ttl <= 0.0:
             raise ValueError("proposal_ttl_sec must be finite and positive.")
-        for name in (
-            "invalid_result_behavior",
-            "composer_error_behavior",
-            "all_inputs_missing_behavior",
-        ):
+        for name in ("invalid_result_behavior", "composer_error_behavior"):
             if getattr(self, name) != "hold":
                 raise ValueError(f"{name} must be hold in formal composition v1.")
+        if self.all_inputs_missing_behavior not in {"hold", "no_action"}:
+            raise ValueError(
+                "all_inputs_missing_behavior must be hold or no_action in "
+                "formal composition v1."
+            )
         if self.allow_parallel_source_proposals:
             raise ValueError(
                 "Formal composition v1 forbids parallel contributor proposals."
@@ -675,15 +680,17 @@ class CompositionAuthorityGateSpec:
             raise ValueError(
                 "Authority gate must classify every composition input role exactly."
             )
-        unsafe_required = {
+        invalid_required_fallback = {
             role
             for role in spec.required_roles
-            if self.missing_behavior_by_role[role] != "hold"
+            if self.missing_behavior_by_role[role]
+            not in {"hold", "no_action"}
         }
-        if unsafe_required:
+        if invalid_required_fallback:
             raise ValueError(
-                "Required formal contributors must HOLD when missing: "
-                f"{sorted(unsafe_required)!r}."
+                "Required formal contributors must request HOLD or no_action "
+                "when missing: "
+                f"{sorted(invalid_required_fallback)!r}."
             )
 
     @property
@@ -983,10 +990,12 @@ class CompositionEvaluation:
 class CompositionAuthorityDisposition:
     """Non-authoritative request bound to one exact composition evaluation.
 
-    ``action="hold"`` means ``request_hold``.  It is not evidence that the
-    lower execution gate entered HOLD.  Only a lower-runtime transition and
-    cancellation receipt can establish that fact.  The legacy field names are
-    retained so existing v1 hashes and stored traces remain readable.
+    ``action="no_action"`` submits no candidate and does not mutate an
+    execution gate. ``action="hold"`` means ``request_hold``; it is not
+    evidence that the lower execution gate entered HOLD. Only a lower-runtime
+    transition and cancellation receipt can establish that fact. The legacy
+    field names are retained so existing v1 hashes and stored traces remain
+    readable.
     """
 
     disposition_id: str
@@ -1002,6 +1011,8 @@ class CompositionAuthorityDisposition:
     def downstream_request(self) -> str:
         if self.action == "publish_proposal":
             return "submit_candidate"
+        if self.action == "no_action":
+            return "no_action"
         if self.action == "hold":
             return "request_hold"
         raise ValueError(
@@ -1020,7 +1031,7 @@ def decide_composition_authority_disposition(
     spec: CompositionSpec,
     gate_spec: CompositionAuthorityGateSpec,
 ) -> CompositionAuthorityDisposition:
-    """Request candidate submission or lower-runtime HOLD without side effects."""
+    """Request candidate submission, no-action, or HOLD without side effects."""
 
     if not isinstance(snapshot, CompositionInputSnapshot):
         raise TypeError("snapshot must be a CompositionInputSnapshot.")
@@ -1045,7 +1056,19 @@ def decide_composition_authority_disposition(
         role for role in spec.required_roles if role in missing
     )
     if missing_required:
-        action = "hold"
+        required_behaviors = tuple(
+            gate_spec.missing_behavior_by_role[role]
+            for role in missing_required
+        )
+        action = (
+            gate_spec.all_inputs_missing_behavior
+            if len(missing) == len(spec.input_roles)
+            else (
+                "hold"
+                if "hold" in required_behaviors
+                else "no_action"
+            )
+        )
         reason = (
             "all_inputs_missing"
             if len(missing) == len(spec.input_roles)
@@ -1064,6 +1087,9 @@ def decide_composition_authority_disposition(
         elif "hold" in missing_behaviors:
             action = "hold"
             reason = "required_contributor_missing"
+        elif "no_action" in missing_behaviors:
+            action = "no_action"
+            reason = "contributor_temporarily_unavailable"
         else:
             # A renormalizing numerical spec should have produced a ready
             # action.  Reaching no-action here is therefore fail-closed.
@@ -1072,6 +1098,9 @@ def decide_composition_authority_disposition(
     elif result.output_status == "invalid":
         action = gate_spec.invalid_result_behavior
         reason = "composition_invalid"
+    elif result.output_status == "no_action":
+        action = "no_action"
+        reason = "composition_no_action"
     else:
         action = "hold"
         reason = "composition_not_publishable"

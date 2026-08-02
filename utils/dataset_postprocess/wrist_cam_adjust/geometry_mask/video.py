@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -223,6 +225,9 @@ class MaskBuildConfig:
     pose_column: str | None = None
     qpos_column: str | None = None
     T_end_tool: np.ndarray | None = None
+    # Maps a stored absolute pose into this side's URDF arm-base frame.
+    # Native arm-base datasets leave this unset.
+    T_base_from_stored_pose: np.ndarray | None = None
     table_margin_m: float = 0.0
     table_height_offset_m: float = 0.0
     table_mask_mode: str = "sampled-raycast"
@@ -241,6 +246,10 @@ class MaskBuildConfig:
             raise ValueError(f"pose_frame must be one of {POSE_FRAME_CHOICES}, got {self.pose_frame!r}")
         if self.pose_source not in POSE_SOURCE_CHOICES:
             raise ValueError(f"pose_source must be one of {POSE_SOURCE_CHOICES}, got {self.pose_source!r}")
+        if self.T_base_from_stored_pose is not None:
+            transform = np.asarray(self.T_base_from_stored_pose, dtype=np.float64)
+            if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+                raise ValueError("T_base_from_stored_pose must be a finite 4x4 transform")
         if self.table_mask_mode not in TABLE_MASK_MODE_CHOICES:
             raise ValueError(
                 f"table_mask_mode must be one of {TABLE_MASK_MODE_CHOICES}, got {self.table_mask_mode!r}"
@@ -299,6 +308,11 @@ class WristMaskBuilder:
         return frame_override or self._pose_frame()
 
     def _camera_pose_from_pose(self, T_base_frame: np.ndarray, *, frame: str) -> np.ndarray:
+        if self.config.T_base_from_stored_pose is not None:
+            T_base_frame = (
+                np.asarray(self.config.T_base_from_stored_pose, dtype=np.float64)
+                @ np.asarray(T_base_frame, dtype=np.float64)
+            )
         if frame == "camera":
             T_base_camera = T_base_frame
         elif frame == "tool_tcp":
@@ -441,6 +455,7 @@ def process_video(
     codec: str = "mp4v",
     size_policy: SizePolicy = "strict",
     max_frames: int = 0,
+    expected_frame_count: int | None = None,
     overwrite: bool = False,
     mask_blur_px: int = 0,
     mask_blur_sigma: float = 0.0,
@@ -457,6 +472,16 @@ def process_video(
         raise FileNotFoundError(f"input video does not exist: {input_path}")
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"output video already exists: {output_path}")
+    if expected_frame_count is not None and int(expected_frame_count) <= 0:
+        raise ValueError(
+            f"expected_frame_count must be positive when provided, got {expected_frame_count}"
+        )
+    # Render to a fresh inode. A previous partial dataset conversion may have
+    # hardlinked this target to the source, so opening the target directly can
+    # otherwise truncate the source video through the shared inode.
+    temporary_output_path = output_path.with_name(
+        f".{output_path.stem}.partial-{os.getpid()}-{uuid.uuid4().hex}{output_path.suffix}"
+    )
 
     row_by_video_index: dict[int, Mapping[str, Any]] = {}
     video_index_column = f"observation.images.{camera_key}.video_frame_index"
@@ -478,6 +503,7 @@ def process_video(
     keep_fractions: list[float] = []
     background_fractions: list[float] = []
     timing = _TimingAccumulator() if bool(debug_timing) else None
+    processing_succeeded = False
     try:
         width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
         height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -496,7 +522,13 @@ def process_video(
                     "use --size-policy scale only if the video was uniformly resized."
                 )
             raise NotImplementedError("size-policy scale is not implemented for wrist_cam_adjust yet")
-        writer = _open_writer(output_path, codec=codec, fps=fps, width=width, height=height)
+        writer = _open_writer(
+            temporary_output_path,
+            codec=codec,
+            fps=fps,
+            width=width,
+            height=height,
+        )
 
         while True:
             if max_frames > 0 and frame_count >= int(max_frames):
@@ -562,10 +594,23 @@ def process_video(
                     timing.add("progress", time.perf_counter() - phase_started)
             if timing is not None:
                 timing.add("frame_total_tracked", time.perf_counter() - frame_started)
+        processing_succeeded = True
     finally:
         capture.release()
         if writer is not None:
             writer.release()
+        if not processing_succeeded:
+            temporary_output_path.unlink(missing_ok=True)
+    try:
+        if expected_frame_count is not None and frame_count != int(expected_frame_count):
+            raise RuntimeError(
+                "decoded frame count does not satisfy the dataset contract: "
+                f"input={input_path}, expected={int(expected_frame_count)}, decoded={frame_count}"
+            )
+        os.replace(temporary_output_path, output_path)
+    except BaseException:
+        temporary_output_path.unlink(missing_ok=True)
+        raise
     elapsed = time.perf_counter() - started
     timing_summary = timing.to_dict(elapsed_sec=elapsed, frame_count=frame_count) if timing is not None else {}
     return VideoAdjustResult(

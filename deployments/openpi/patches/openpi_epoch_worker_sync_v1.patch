@@ -1,0 +1,190 @@
+--- a/src/openpi/training/data_loader.py
++++ b/src/openpi/training/data_loader.py
+@@ -60,12 +60,30 @@
+         raise NotImplementedError("Subclasses of DataLoader should implement set_epoch.")
+ 
+ 
++class _SharedEpoch:
++    """Small spawn-safe epoch cell shared by the parent and DataLoader workers."""
++
++    def __init__(self, value) -> None:
++        self._value = value
++
++    def get(self) -> int:
++        with self._value.get_lock():
++            return int(self._value.value)
++
++    def set(self, epoch: int) -> None:
++        with self._value.get_lock():
++            self._value.value = int(epoch)
++
++
+ class TransformedDataset(Dataset[T_co]):
+     def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+         self._dataset = dataset
+         self._transform = _transforms.compose(transforms)
++        self._shared_epoch: _SharedEpoch | None = None
++        self._local_epoch: int | None = None
+ 
+     def __getitem__(self, index: SupportsIndex) -> T_co:
++        self._sync_worker_epoch()
+         return self._transform(self._dataset[index])
+ 
+     def __len__(self) -> int:
+@@ -74,13 +92,39 @@
+     def set_epoch(self, epoch: int) -> None:
+         """Forward epoch changes to datasets with epoch-dependent augmentation."""
+ 
++        epoch = int(epoch)
++        if self._shared_epoch is not None:
++            self._shared_epoch.set(epoch)
++        self._apply_epoch_local(epoch)
++
++    def bind_epoch_state(self, shared_epoch: _SharedEpoch) -> None:
++        """Bind a state cell before persistent workers are spawned."""
++
++        self._shared_epoch = shared_epoch
++        bind = getattr(self._dataset, "bind_epoch_state", None)
++        if callable(bind):
++            bind(shared_epoch)
++        for transform in self._transform.transforms:
++            bind = getattr(transform, "bind_epoch_state", None)
++            if callable(bind):
++                bind(shared_epoch)
++
++    def _apply_epoch_local(self, epoch: int) -> None:
+         set_epoch = getattr(self._dataset, "set_epoch", None)
+         if callable(set_epoch):
+-            set_epoch(int(epoch))
++            set_epoch(epoch)
+         for transform in self._transform.transforms:
+             set_epoch = getattr(transform, "set_epoch", None)
+             if callable(set_epoch):
+-                set_epoch(int(epoch))
++                set_epoch(epoch)
++        self._local_epoch = epoch
++
++    def _sync_worker_epoch(self) -> None:
++        if self._shared_epoch is None:
++            return
++        epoch = self._shared_epoch.get()
++        if self._local_epoch != epoch:
++            self._apply_epoch_local(epoch)
+ 
+ 
+ class IterableTransformedDataset(IterableDataset[T_co]):
+@@ -94,8 +138,11 @@
+         self._dataset = dataset
+         self._transform = _transforms.compose(transforms)
+         self._is_batched = is_batched
++        self._shared_epoch: _SharedEpoch | None = None
++        self._local_epoch: int | None = None
+ 
+     def __iter__(self):
++        self._sync_worker_epoch()
+         for sample in self._dataset:
+             if self._is_batched:
+                 # Transforms are designed to be applied to individual samples. So we need to split the batch into
+@@ -116,6 +163,39 @@
+     def __len__(self) -> int:
+         return len(self._dataset)
+ 
++    def set_epoch(self, epoch: int) -> None:
++        epoch = int(epoch)
++        if self._shared_epoch is not None:
++            self._shared_epoch.set(epoch)
++        self._apply_epoch_local(epoch)
++
++    def bind_epoch_state(self, shared_epoch: _SharedEpoch) -> None:
++        self._shared_epoch = shared_epoch
++        bind = getattr(self._dataset, "bind_epoch_state", None)
++        if callable(bind):
++            bind(shared_epoch)
++        for transform in self._transform.transforms:
++            bind = getattr(transform, "bind_epoch_state", None)
++            if callable(bind):
++                bind(shared_epoch)
++
++    def _apply_epoch_local(self, epoch: int) -> None:
++        set_epoch = getattr(self._dataset, "set_epoch", None)
++        if callable(set_epoch):
++            set_epoch(epoch)
++        for transform in self._transform.transforms:
++            set_epoch = getattr(transform, "set_epoch", None)
++            if callable(set_epoch):
++                set_epoch(epoch)
++        self._local_epoch = epoch
++
++    def _sync_worker_epoch(self) -> None:
++        if self._shared_epoch is None:
++            return
++        epoch = self._shared_epoch.get()
++        if self._local_epoch != epoch:
++            self._apply_epoch_local(epoch)
++
+ 
+ class FakeDataset(Dataset):
+     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
+@@ -576,9 +656,40 @@
+         self._dataset = dataset
+         self._sampler = sampler
+ 
+-        mp_context = None
+-        if num_workers > 0:
+-            mp_context = multiprocessing.get_context("spawn")
++        # Use the same spawn context for the shared epoch cell and DataLoader
++        # workers.  The cell is intentionally owned by this loader, so two
++        # concurrent loaders cannot change each other's epoch.
++        mp_context = multiprocessing.get_context("spawn")
++        self._shared_epoch = _SharedEpoch(mp_context.Value("q", 0, lock=True))
++        bind_epoch_state = getattr(dataset, "bind_epoch_state", None)
++        has_epoch_state_binding = callable(bind_epoch_state)
++        if has_epoch_state_binding:
++            bind_epoch_state(self._shared_epoch)
++
++        # A legacy epoch-aware dataset that has not adopted the binding
++        # contract remains correct with the configured worker count, but its
++        # workers must be respawned at the epoch boundary.
++        persistent_workers = num_workers > 0
++        if num_workers > 0 and not has_epoch_state_binding and callable(getattr(dataset, "set_epoch", None)):
++            persistent_workers = False
++            logging.warning(
++                "Disabling persistent workers for an epoch-aware dataset without "
++                "bind_epoch_state(); num_workers=%d is preserved.",
++                num_workers,
++            )
++        self._epoch_worker_mode = (
++            "shared_epoch_v1"
++            if has_epoch_state_binding
++            else "respawn_legacy_epoch"
++            if num_workers > 0 and callable(getattr(dataset, "set_epoch", None))
++            else "none"
++        )
++        logging.info(
++            "TorchDataLoader epoch_worker_mode=%s num_workers=%d persistent_workers=%s",
++            self._epoch_worker_mode,
++            int(num_workers),
++            bool(persistent_workers),
++        )
+ 
+         generator = torch.Generator()
+         generator.manual_seed(seed)
+@@ -588,8 +699,8 @@
+             shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+             sampler=sampler,
+             num_workers=num_workers,
+-            multiprocessing_context=mp_context,
+-            persistent_workers=num_workers > 0,
++            multiprocessing_context=mp_context if num_workers > 0 else None,
++            persistent_workers=persistent_workers,
+             collate_fn=_collate_fn,
+             worker_init_fn=_worker_init_fn,
+             drop_last=True,
+@@ -609,6 +720,7 @@
+         self._epoch = max(0, int(epoch))
+ 
+     def _apply_epoch(self) -> None:
++        self._shared_epoch.set(self._epoch)
+         if self._sampler is not None and hasattr(self._sampler, "set_epoch"):
+             self._sampler.set_epoch(self._epoch)
+         set_epoch = getattr(self._dataset, "set_epoch", None)

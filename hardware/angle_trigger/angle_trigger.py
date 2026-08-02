@@ -22,6 +22,8 @@ SIDES = ("left", "right")
 PROBE_SERVO_IDS = (1, 2)
 ASSIGNMENT_SCHEMA_VERSION = "angle_trigger_assignment.v1"
 ANGLE_SCHEMA_VERSION = "angle_trigger_angle_calibration.v1"
+ASSIGNMENT_SCHEMA_VERSION_V2 = "angle_trigger_assignment.v2"
+ANGLE_SCHEMA_VERSION_V2 = "angle_trigger_angle_calibration.v2"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_SAMPLE_HZ = 30.0
 DEFAULT_CAPTURE_SECONDS = 1.0
@@ -31,6 +33,24 @@ DEFAULT_ENDPOINT_MIN_SEPARATION_DEG = 2.0
 
 class AngleTriggerError(RuntimeError):
     """A recoverable angle-trigger discovery or calibration error."""
+
+
+def normalize_active_sides(
+    active_sides: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    """Return a deterministic non-empty subset of the physical side labels."""
+
+    requested = SIDES if active_sides is None else tuple(active_sides)
+    normalized = tuple(str(side).strip().lower() for side in requested)
+    if (
+        not normalized
+        or len(normalized) != len(set(normalized))
+        or any(side not in SIDES for side in normalized)
+    ):
+        raise AngleTriggerError(
+            "active_sides must contain unique left and/or right labels."
+        )
+    return tuple(side for side in SIDES if side in normalized)
 
 
 @dataclass(frozen=True)
@@ -111,12 +131,35 @@ def default_config_root() -> Path:
         return repo_root() / "teleop_runtime" / "configs" / "hardware" / "angle_trigger"
 
 
-def assignment_path(config_root: Path | None = None) -> Path:
-    return (config_root or default_config_root()) / "assignment" / "latest.json"
+def _profile_filename(active_sides: Iterable[str] | None = None) -> str:
+    sides = normalize_active_sides(active_sides)
+    if sides == SIDES:
+        return "latest.json"
+    return f"{sides[0]}.json"
 
 
-def angle_calibration_path(config_root: Path | None = None) -> Path:
-    return (config_root or default_config_root()) / "angles" / "latest.json"
+def assignment_path(
+    config_root: Path | None = None,
+    *,
+    active_sides: Iterable[str] | None = None,
+) -> Path:
+    return (
+        (config_root or default_config_root())
+        / "assignment"
+        / _profile_filename(active_sides)
+    )
+
+
+def angle_calibration_path(
+    config_root: Path | None = None,
+    *,
+    active_sides: Iterable[str] | None = None,
+) -> Path:
+    return (
+        (config_root or default_config_root())
+        / "angles"
+        / _profile_filename(active_sides)
+    )
 
 
 def iso_timestamp() -> str:
@@ -196,15 +239,33 @@ def discover_sensors(*, baudrate: int = DEFAULT_BAUDRATE) -> list[SensorCandidat
     return sensors
 
 
-def _normalize_assignment(payload: Mapping[str, Any]) -> dict[str, Any]:
-    if str(payload.get("schema_version") or "") != ASSIGNMENT_SCHEMA_VERSION:
+def _normalize_assignment(
+    payload: Mapping[str, Any],
+    *,
+    active_sides: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version == ASSIGNMENT_SCHEMA_VERSION:
+        declared_sides = SIDES
+    elif schema_version == ASSIGNMENT_SCHEMA_VERSION_V2:
+        declared_sides = normalize_active_sides(payload.get("active_sides"))
+    else:
         raise AngleTriggerError("Unsupported or missing angle-trigger assignment schema.")
+    requested_sides = (
+        declared_sides
+        if active_sides is None
+        else normalize_active_sides(active_sides)
+    )
+    if not set(requested_sides).issubset(declared_sides):
+        raise AngleTriggerError(
+            "Assignment config does not cover requested active_sides."
+        )
     raw_sides = payload.get("sides")
     if not isinstance(raw_sides, Mapping):
         raise AngleTriggerError("Assignment config must contain a sides object.")
     sides: dict[str, dict[str, str | int]] = {}
     seen_identities: set[tuple[str, str, str, str, int]] = set()
-    for side in SIDES:
+    for side in declared_sides:
         raw = raw_sides.get(side)
         if not isinstance(raw, Mapping):
             raise AngleTriggerError(f"Assignment config is missing {side}.")
@@ -223,7 +284,9 @@ def _normalize_assignment(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise AngleTriggerError(f"Assignment {side} needs a USB serial number or location.")
         unique_key = (location, serial_number, vid, pid, servo_id)
         if unique_key in seen_identities:
-            raise AngleTriggerError("Left and right assignments must refer to different sensors.")
+            raise AngleTriggerError(
+                "Angle-trigger assignments must refer to different sensors."
+            )
         seen_identities.add(unique_key)
         sides[side] = {
             "location": location,
@@ -232,21 +295,42 @@ def _normalize_assignment(payload: Mapping[str, Any]) -> dict[str, Any]:
             "pid": pid,
             "servo_id": servo_id,
         }
-    return {
-        "schema_version": ASSIGNMENT_SCHEMA_VERSION,
+    normalized = {
+        "schema_version": schema_version,
         "updated_at": str(payload.get("updated_at") or iso_timestamp()),
         "sides": sides,
     }
+    if schema_version == ASSIGNMENT_SCHEMA_VERSION_V2:
+        normalized["active_sides"] = list(declared_sides)
+    return normalized
 
 
-def _normalize_angle_calibration(payload: Mapping[str, Any]) -> dict[str, Any]:
-    if str(payload.get("schema_version") or "") != ANGLE_SCHEMA_VERSION:
+def _normalize_angle_calibration(
+    payload: Mapping[str, Any],
+    *,
+    active_sides: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version == ANGLE_SCHEMA_VERSION:
+        declared_sides = SIDES
+    elif schema_version == ANGLE_SCHEMA_VERSION_V2:
+        declared_sides = normalize_active_sides(payload.get("active_sides"))
+    else:
         raise AngleTriggerError("Unsupported or missing angle-trigger angle-calibration schema.")
+    requested_sides = (
+        declared_sides
+        if active_sides is None
+        else normalize_active_sides(active_sides)
+    )
+    if not set(requested_sides).issubset(declared_sides):
+        raise AngleTriggerError(
+            "Angle calibration does not cover requested active_sides."
+        )
     raw_profiles = payload.get("profiles")
     if not isinstance(raw_profiles, Mapping):
         raise AngleTriggerError("Angle calibration config must contain a profiles object.")
     profiles: dict[str, dict[str, float]] = {}
-    for side in SIDES:
+    for side in declared_sides:
         raw = raw_profiles.get(side)
         if not isinstance(raw, Mapping):
             raise AngleTriggerError(f"Angle calibration is missing {side}.")
@@ -260,11 +344,14 @@ def _normalize_angle_calibration(payload: Mapping[str, Any]) -> dict[str, Any]:
         if abs(one_deg - zero_deg) < DEFAULT_ENDPOINT_MIN_SEPARATION_DEG:
             raise AngleTriggerError(f"Angle calibration {side} endpoints are too close together.")
         profiles[side] = {"zero_deg": zero_deg, "one_deg": one_deg}
-    return {
-        "schema_version": ANGLE_SCHEMA_VERSION,
+    normalized = {
+        "schema_version": schema_version,
         "updated_at": str(payload.get("updated_at") or iso_timestamp()),
         "profiles": profiles,
     }
+    if schema_version == ANGLE_SCHEMA_VERSION_V2:
+        normalized["active_sides"] = list(declared_sides)
+    return normalized
 
 
 def _candidate_matches(identity: Mapping[str, Any], candidate: SensorCandidate) -> bool:
@@ -285,13 +372,20 @@ def _candidate_matches(identity: Mapping[str, Any], candidate: SensorCandidate) 
 
 
 def resolve_assignment(
-    assignment: Mapping[str, Any], sensors: Iterable[SensorCandidate]
+    assignment: Mapping[str, Any],
+    sensors: Iterable[SensorCandidate],
+    *,
+    active_sides: Iterable[str] | None = None,
 ) -> tuple[dict[str, SensorCandidate] | None, list[str]]:
-    normalized = _normalize_assignment(assignment)
+    sides = normalize_active_sides(active_sides)
+    normalized = _normalize_assignment(
+        assignment,
+        active_sides=sides,
+    )
     available = list(sensors)
     resolved: dict[str, SensorCandidate] = {}
     errors: list[str] = []
-    for side in SIDES:
+    for side in sides:
         matches = [
             sensor
             for sensor in available
@@ -315,7 +409,7 @@ def resolve_assignment_with_unique_completion(
 ]:
     """Resolve saved sides and fill exactly one unmatched side when unambiguous."""
 
-    normalized = _normalize_assignment(assignment)
+    normalized = _normalize_assignment(assignment, active_sides=SIDES)
     available = list(sensors)
     resolved: dict[str, SensorCandidate] = {}
     unresolved: list[str] = []
@@ -343,29 +437,71 @@ def resolve_assignment_with_unique_completion(
 
 
 def build_assignment(mapping: Mapping[str, SensorCandidate]) -> dict[str, Any]:
-    if set(mapping) != set(SIDES) or mapping["left"] == mapping["right"]:
-        raise AngleTriggerError("Assignment needs two different left and right sensors.")
+    sides = normalize_active_sides(mapping)
+    if set(mapping) != set(sides):
+        raise AngleTriggerError(
+            "Assignment keys must be unique left and/or right labels."
+        )
+    identities = [mapping[side] for side in sides]
+    if len(set(identities)) != len(identities):
+        raise AngleTriggerError(
+            "Angle-trigger assignments must refer to different sensors."
+        )
+    schema_version = (
+        ASSIGNMENT_SCHEMA_VERSION
+        if sides == SIDES
+        else ASSIGNMENT_SCHEMA_VERSION_V2
+    )
+    payload: dict[str, Any] = {
+        "schema_version": schema_version,
+        "updated_at": iso_timestamp(),
+        "sides": {
+            side: {"identity": mapping[side].identity()}
+            for side in sides
+        },
+    }
+    if schema_version == ASSIGNMENT_SCHEMA_VERSION_V2:
+        payload["active_sides"] = list(sides)
     return _normalize_assignment(
-        {
-            "schema_version": ASSIGNMENT_SCHEMA_VERSION,
-            "updated_at": iso_timestamp(),
-            "sides": {side: {"identity": mapping[side].identity()} for side in SIDES},
-        }
+        payload,
+        active_sides=sides,
     )
 
 
 def build_angle_calibration(profiles: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
+    sides = normalize_active_sides(profiles)
+    if set(profiles) != set(sides):
+        raise AngleTriggerError(
+            "Angle calibration keys must be unique left and/or right labels."
+        )
+    schema_version = (
+        ANGLE_SCHEMA_VERSION
+        if sides == SIDES
+        else ANGLE_SCHEMA_VERSION_V2
+    )
+    payload: dict[str, Any] = {
+        "schema_version": schema_version,
+        "updated_at": iso_timestamp(),
+        "profiles": dict(profiles),
+    }
+    if schema_version == ANGLE_SCHEMA_VERSION_V2:
+        payload["active_sides"] = list(sides)
     return _normalize_angle_calibration(
-        {
-            "schema_version": ANGLE_SCHEMA_VERSION,
-            "updated_at": iso_timestamp(),
-            "profiles": dict(profiles),
-        }
+        payload,
+        active_sides=sides,
     )
 
 
 def _open_connections(mapping: Mapping[str, SensorCandidate], *, baudrate: int) -> dict[str, SensorConnection]:
-    connections = {side: SensorConnection(mapping[side], baudrate=baudrate) for side in SIDES}
+    sides = normalize_active_sides(mapping)
+    if set(mapping) != set(sides):
+        raise AngleTriggerError(
+            "Connection mapping keys must be unique left and/or right labels."
+        )
+    connections = {
+        side: SensorConnection(mapping[side], baudrate=baudrate)
+        for side in sides
+    }
     try:
         for connection in connections.values():
             connection.open()
@@ -432,9 +568,16 @@ def assign_sides(
     baudrate: int,
     sample_hz: float,
     min_motion_deg: float,
+    active_sides: Iterable[str] | None = None,
 ) -> dict[str, SensorCandidate]:
-    if len(sensors) != 2:
-        raise AngleTriggerError(f"Exactly two angle sensors are required; found {len(sensors)}.")
+    sides = normalize_active_sides(active_sides)
+    if len(sensors) != len(sides):
+        raise AngleTriggerError(
+            f"Exactly {len(sides)} angle sensor(s) are required for "
+            f"{','.join(sides)}; found {len(sensors)}."
+        )
+    if len(sides) == 1:
+        return {sides[0]: sensors[0]}
     temporary_mapping = {f"sensor_{index}": sensor for index, sensor in enumerate(sensors, start=1)}
     connections = {
         name: SensorConnection(sensor, baudrate=baudrate) for name, sensor in temporary_mapping.items()
@@ -491,10 +634,15 @@ def calibrate_angles(
     duration_s: float,
     sample_hz: float,
 ) -> dict[str, Any]:
+    sides = normalize_active_sides(mapping)
+    if set(mapping) != set(sides):
+        raise AngleTriggerError(
+            "Calibration mapping keys must be unique left and/or right labels."
+        )
     connections = _open_connections(mapping, baudrate=baudrate)
     profiles: dict[str, dict[str, float]] = {}
     try:
-        for side in SIDES:
+        for side in sides:
             zero_deg, zero_std_deg, zero_samples = _capture_endpoint(
                 side, "0", connections[side], duration_s=duration_s, sample_hz=sample_hz
             )
@@ -520,7 +668,7 @@ def calibrate_angles(
 
 
 class AngleTriggerReader:
-    """Read calibrated left/right angles as independently normalized 0-1 values."""
+    """Read one or two calibrated angle sensors as normalized 0-1 values."""
 
     def __init__(
         self,
@@ -529,8 +677,16 @@ class AngleTriggerReader:
         *,
         baudrate: int = DEFAULT_BAUDRATE,
     ) -> None:
+        self.active_sides = normalize_active_sides(mapping)
+        if set(mapping) != set(self.active_sides):
+            raise AngleTriggerError(
+                "Reader mapping keys must be unique left and/or right labels."
+            )
         self.mapping = dict(mapping)
-        self.calibration = _normalize_angle_calibration(calibration)
+        self.calibration = _normalize_angle_calibration(
+            calibration,
+            active_sides=self.active_sides,
+        )
         self.baudrate = baudrate
         self._connections: dict[str, SensorConnection] | None = None
 
@@ -554,7 +710,7 @@ class AngleTriggerReader:
         if self._connections is None:
             raise AngleTriggerError("AngleTriggerReader is not open.")
         values: dict[str, float] = {}
-        for side in SIDES:
+        for side in self.active_sides:
             profile = self.calibration["profiles"][side]
             angle_deg = self._connections[side].read_angle_deg()
             normalized = (angle_deg - profile["zero_deg"]) / (profile["one_deg"] - profile["zero_deg"])
@@ -571,12 +727,43 @@ def _load_optional(path: Path, normalizer: Any) -> tuple[dict[str, Any] | None, 
         return None, str(exc)
 
 
+def _load_profile_with_legacy_fallback(
+    *,
+    root: Path,
+    active_sides: tuple[str, ...],
+    path_factory: Any,
+    normalizer: Any,
+) -> tuple[dict[str, Any] | None, str | None, Path]:
+    primary = path_factory(root, active_sides=active_sides)
+    candidates = [primary]
+    legacy = path_factory(root, active_sides=SIDES)
+    if legacy != primary:
+        candidates.append(legacy)
+    errors: list[str] = []
+    for path in candidates:
+        payload, error = _load_optional(
+            path,
+            lambda value: normalizer(
+                value,
+                active_sides=active_sides,
+            ),
+        )
+        if payload is not None:
+            return payload, None, path
+        errors.append(f"{path}: {error}")
+    return None, "; ".join(errors), primary
+
+
 def save_assignment_config(
     mapping: Mapping[str, SensorCandidate],
     *,
     config_root: Path | None = None,
 ) -> Path:
-    path = assignment_path((config_root or default_config_root()).expanduser().resolve())
+    sides = normalize_active_sides(mapping)
+    path = assignment_path(
+        (config_root or default_config_root()).expanduser().resolve(),
+        active_sides=sides,
+    )
     _write_json(path, build_assignment(mapping))
     return path
 
@@ -586,14 +773,28 @@ def save_angle_calibration_config(
     *,
     config_root: Path | None = None,
 ) -> Path:
-    path = angle_calibration_path((config_root or default_config_root()).expanduser().resolve())
+    sides = normalize_active_sides(profiles)
+    path = angle_calibration_path(
+        (config_root or default_config_root()).expanduser().resolve(),
+        active_sides=sides,
+    )
     _write_json(path, build_angle_calibration(profiles))
     return path
 
 
-def load_assignment_config(*, config_root: Path | None = None) -> dict[str, Any]:
+def load_assignment_config(
+    *,
+    config_root: Path | None = None,
+    active_sides: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    sides = normalize_active_sides(active_sides)
     root = (config_root or default_config_root()).expanduser().resolve()
-    assignment, error = _load_optional(assignment_path(root), _normalize_assignment)
+    assignment, error, _ = _load_profile_with_legacy_fallback(
+        root=root,
+        active_sides=sides,
+        path_factory=assignment_path,
+        normalizer=_normalize_assignment,
+    )
     if assignment is None:
         raise AngleTriggerError(
             "Angle-trigger side assignment is unavailable: "
@@ -602,10 +803,18 @@ def load_assignment_config(*, config_root: Path | None = None) -> dict[str, Any]
     return assignment
 
 
-def load_angle_calibration_config(*, config_root: Path | None = None) -> dict[str, Any]:
+def load_angle_calibration_config(
+    *,
+    config_root: Path | None = None,
+    active_sides: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    sides = normalize_active_sides(active_sides)
     root = (config_root or default_config_root()).expanduser().resolve()
-    calibration, error = _load_optional(
-        angle_calibration_path(root), _normalize_angle_calibration
+    calibration, error, _ = _load_profile_with_legacy_fallback(
+        root=root,
+        active_sides=sides,
+        path_factory=angle_calibration_path,
+        normalizer=_normalize_angle_calibration,
     )
     if calibration is None:
         raise AngleTriggerError(
@@ -619,6 +828,7 @@ def load_configured_reader(
     *,
     config_root: Path | None = None,
     baudrate: int = DEFAULT_BAUDRATE,
+    active_sides: Iterable[str] | None = None,
 ) -> AngleTriggerReader:
     """Load a ready reader without falling back to terminal interaction.
 
@@ -626,28 +836,40 @@ def load_configured_reader(
     be surfaced as a recoverable calibration state instead of calling input().
     """
 
+    sides = normalize_active_sides(active_sides)
     root = (config_root or default_config_root()).expanduser().resolve()
     sensors = discover_sensors(baudrate=baudrate)
-    if len(sensors) != 2:
+    if len(sensors) < len(sides):
         raise AngleTriggerError(
-            f"Exactly two angle sensors are required; found {len(sensors)}."
+            f"At least {len(sides)} angle sensor(s) are required for "
+            f"{','.join(sides)}; found {len(sensors)}."
         )
-    assignment, assignment_error = _load_optional(
-        assignment_path(root), _normalize_assignment
+    assignment, assignment_error, _ = _load_profile_with_legacy_fallback(
+        root=root,
+        active_sides=sides,
+        path_factory=assignment_path,
+        normalizer=_normalize_assignment,
     )
     if assignment is None:
         raise AngleTriggerError(
             "Angle-trigger side assignment is unavailable: "
             + str(assignment_error or "unknown assignment error")
         )
-    mapping, errors = resolve_assignment(assignment, sensors)
+    mapping, errors = resolve_assignment(
+        assignment,
+        sensors,
+        active_sides=sides,
+    )
     if mapping is None:
         raise AngleTriggerError(
             "Angle-trigger side assignment does not match connected sensors: "
             + "; ".join(errors)
         )
-    calibration, calibration_error = _load_optional(
-        angle_calibration_path(root), _normalize_angle_calibration
+    calibration, calibration_error, _ = _load_profile_with_legacy_fallback(
+        root=root,
+        active_sides=sides,
+        path_factory=angle_calibration_path,
+        normalizer=_normalize_angle_calibration,
     )
     if calibration is None:
         raise AngleTriggerError(
@@ -666,18 +888,32 @@ def prepare_reader(
     assignment_motion_min_deg: float = DEFAULT_ASSIGNMENT_MOTION_MIN_DEG,
     reassign: bool = False,
     recalibrate_angles: bool = False,
+    active_sides: Iterable[str] | None = None,
 ) -> AngleTriggerReader:
+    sides = normalize_active_sides(active_sides)
     root = (config_root or default_config_root()).expanduser().resolve()
-    assign_path = assignment_path(root)
-    angles_path = angle_calibration_path(root)
+    assign_path = assignment_path(root, active_sides=sides)
+    angles_path = angle_calibration_path(root, active_sides=sides)
     sensors = discover_sensors(baudrate=baudrate)
-    if len(sensors) != 2:
-        raise AngleTriggerError(f"Exactly two angle sensors are required; found {len(sensors)}.")
+    if len(sensors) < len(sides):
+        raise AngleTriggerError(
+            f"At least {len(sides)} angle sensor(s) are required for "
+            f"{','.join(sides)}; found {len(sensors)}."
+        )
 
-    assignment, assignment_error = _load_optional(assign_path, _normalize_assignment)
+    assignment, assignment_error, _ = _load_profile_with_legacy_fallback(
+        root=root,
+        active_sides=sides,
+        path_factory=assignment_path,
+        normalizer=_normalize_assignment,
+    )
     mapping: dict[str, SensorCandidate] | None = None
     if assignment is not None and not reassign:
-        mapping, errors = resolve_assignment(assignment, sensors)
+        mapping, errors = resolve_assignment(
+            assignment,
+            sensors,
+            active_sides=sides,
+        )
         if errors:
             assignment_error = "; ".join(errors)
     if mapping is None:
@@ -688,12 +924,18 @@ def prepare_reader(
             baudrate=baudrate,
             sample_hz=sample_hz,
             min_motion_deg=assignment_motion_min_deg,
+            active_sides=sides,
         )
         assignment = build_assignment(mapping)
         _write_json(assign_path, assignment)
         print(f"Saved side assignment: {assign_path}")
 
-    calibration, calibration_error = _load_optional(angles_path, _normalize_angle_calibration)
+    calibration, calibration_error, _ = _load_profile_with_legacy_fallback(
+        root=root,
+        active_sides=sides,
+        path_factory=angle_calibration_path,
+        normalizer=_normalize_angle_calibration,
+    )
     if calibration is None or recalibrate_angles:
         if calibration_error:
             print(f"Angle calibration is required: {calibration_error}", file=sys.stderr)
@@ -708,15 +950,82 @@ def prepare_reader(
     return AngleTriggerReader(mapping, calibration, baudrate=baudrate)
 
 
+class DeferredAngleTriggerReader:
+    """Load and open a configured reader only when its source starts.
+
+    GUI construction stays device-free.  This adapter intentionally uses the
+    non-interactive configured-reader path; assignment and endpoint
+    calibration remain explicit hardware setup operations.
+    """
+
+    def __init__(
+        self,
+        *,
+        active_sides: Iterable[str] | None = None,
+        config_root: Path | None = None,
+        baudrate: int = DEFAULT_BAUDRATE,
+    ) -> None:
+        self.active_sides = normalize_active_sides(active_sides)
+        self.config_root = (
+            None
+            if config_root is None
+            else Path(config_root).expanduser()
+        )
+        self.baudrate = int(baudrate)
+        self._reader: AngleTriggerReader | None = None
+
+    def open(self) -> None:
+        if self._reader is not None:
+            return
+        reader = load_configured_reader(
+            config_root=self.config_root,
+            baudrate=self.baudrate,
+            active_sides=self.active_sides,
+        )
+        try:
+            reader.open()
+        except Exception:
+            reader.close()
+            raise
+        self._reader = reader
+
+    def close(self) -> None:
+        reader = self._reader
+        self._reader = None
+        if reader is not None:
+            reader.close()
+
+    def read(self) -> dict[str, float]:
+        if self._reader is None:
+            raise AngleTriggerError("Deferred angle-trigger reader is not open.")
+        return self._reader.read()
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Discover, calibrate, and read two USB angle triggers as left/right 0-1 sensors."
+        description=(
+            "Discover, calibrate, and read one or two USB angle triggers as "
+            "side-keyed 0-1 sensors."
+        )
     )
     parser.add_argument("--config-root", type=Path, help="Directory holding assignment/ and angles/ configs.")
+    parser.add_argument(
+        "--side",
+        choices=("left", "right", "both"),
+        default="both",
+        help=(
+            "Logical sensor topology. Single-side profiles are stored "
+            "separately from the legacy bilateral latest.json files."
+        ),
+    )
     parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
     parser.add_argument("--rate-hz", type=float, default=DEFAULT_SAMPLE_HZ, help="Read/display rate.")
     parser.add_argument("--capture-seconds", type=float, default=DEFAULT_CAPTURE_SECONDS)
-    parser.add_argument("--reassign", action="store_true", help="Redo only left/right USB-port assignment.")
+    parser.add_argument(
+        "--reassign",
+        action="store_true",
+        help="Redo only the selected side profile's USB-port assignment.",
+    )
     parser.add_argument("--recalibrate-angles", action="store_true", help="Redo 0/1 angle endpoints.")
     parser.add_argument("--once", action="store_true", help="Print one calibrated reading and exit.")
     parser.add_argument("--list", action="store_true", help="List detected sensor candidates and exit.")
@@ -729,6 +1038,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("angle_trigger: --rate-hz and --capture-seconds must be positive.", file=sys.stderr)
         return 2
     try:
+        active_sides = (
+            SIDES
+            if args.side == "both"
+            else (str(args.side),)
+        )
         if args.list:
             sensors = discover_sensors(baudrate=args.baudrate)
             if not sensors:
@@ -743,16 +1057,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             capture_seconds=args.capture_seconds,
             reassign=args.reassign,
             recalibrate_angles=args.recalibrate_angles,
+            active_sides=active_sides,
         ) as reader:
             if args.once:
                 print(json.dumps(reader.read(), sort_keys=True))
                 return 0
-            print("Angle-trigger reader started. Press Ctrl-C to stop.")
+            print(
+                "Angle-trigger reader started for "
+                f"{','.join(active_sides)}. Press Ctrl-C to stop."
+            )
             period = 1.0 / args.rate_hz
             while True:
                 started = time.monotonic()
                 values = reader.read()
-                print(f"left={values['left']:.4f} right={values['right']:.4f}", end="\r", flush=True)
+                formatted = " ".join(
+                    f"{side}={values[side]:.4f}"
+                    for side in active_sides
+                )
+                print(formatted, end="\r", flush=True)
                 remaining = period - (time.monotonic() - started)
                 if remaining > 0.0:
                     time.sleep(remaining)

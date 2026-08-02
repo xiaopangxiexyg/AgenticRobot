@@ -1,0 +1,43 @@
+{
+  "schema": "dexteleop.task_progress_profile.v1",
+  "profile_id": "example_three_stage_pick_place_progress",
+  "profile_version": "1",
+  "task_id": "example_three_stage_pick_place",
+  "steps": [
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "approach_target",
+      "semantic_type": "APPROACH_TARGET",
+      "display_name": "接近并对准目标",
+      "ordinal": 1,
+      "allowed_next_step_ids": [
+        "acquire_object"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "acquire_object",
+      "semantic_type": "ACQUIRE_OBJECT",
+      "display_name": "建立并确认稳定抓取",
+      "ordinal": 2,
+      "allowed_next_step_ids": [
+        "place_object"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "place_object",
+      "semantic_type": "PLACE_OBJECT",
+      "display_name": "搬运、放置并释放目标",
+      "ordinal": 3,
+      "allowed_next_step_ids": []
+    }
+  ],
+  "initial_step_id": "approach_target",
+  "terminal_step_ids": [
+    "place_object"
+  ],
+  "topology_kind": "LINEAR",
+  "allow_retry_after_failure": true,
+  "semantic_content_hash": "01fc5eef1c512df34279f939cd0b5e56bb44a0238396f2d839c35adf0817b9b9"
+}

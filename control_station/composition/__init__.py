@@ -185,6 +185,7 @@ __all__ = [
     "MujocoSimHILReadinessEvidence",
     "MujocoSimHILReadinessProvider",
     "build_default_mujoco_sim_hil_contracts",
+    "build_component_keyed_mujoco_sim_hil_contracts",
     "build_mujoco_sim_hil_policy_binding",
     "build_scoped_mujoco_sim_hil_composition",
 ]

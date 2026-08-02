@@ -10,6 +10,39 @@ It never constructs an arm backend. The legacy v2.3 `left.arm.pose` and
 `right.arm.pose` layout components carry measured UMI tool-TCP poses, with
 dataset metadata declaring `embodiment_has_arm=false`.
 
+## Runtime boundary
+
+UMI keeps source production and hardware lifecycle in `teleop_runtime`:
+
+- `components.py` defines the backend-neutral runtime bundle and injectable
+  component-builder, startup-resource, status and diagnostics ports;
+- `default_components.py` is the one default factory that knows VIVE,
+  RealSense, AngleTrigger and DMTac concrete classes, readiness rules and
+  device-specific GUI wording;
+- `pose_adapter.py` exposes the canonical raw/desk pose adapter port, while the
+  default implementation preserves the existing VIVE transform chain;
+- `topology.py` declares the frozen left/right dual-wrist topology once for all
+  UMI source adapters; it is not a dataset schema or a global device registry;
+- `snapshot.py`, `row_encoder.py` and `v25p_producer.py` remain UMI source
+  adapters because they own the fixed dual-wrist meanings.
+
+Generic rejection, async writing, episode maintenance and component-stream
+persistence come directly from `collection_runtime`.  That package never
+imports UMI or device classes.  A different hardware or coordinate adapter may
+be injected into `run_umi_collection()` without changing `UmiSample`, the v2.3
+row encoder, the v2.5-p stream profile, or persisted identities.  The canonical
+CLI continues to use `default_components.py`; no default hardware behavior or
+dataset output changes.
+
+`app.py` is the UMI composition root: it selects the default adapters and
+coordinates their typed ports. `controller.py` consumes only those runtime
+ports and operator intents. Web rendering, event queues and startup-progress
+presentation live under `control_station`; neither the UI nor
+`collection_runtime` creates or inspects a concrete UMI device. Compatibility
+constructor names in `UmiComponents` remain temporarily available to existing
+UMI launch/test glue, but the application and controller use the neutral
+properties.
+
 ## Action temporal semantics
 
 For an accepted source-sample sequence, a stored row uses the current sample as
@@ -126,6 +159,12 @@ After filling the DMTac assignment and producing a fresh UMI calibration:
 python -m teleop_runtime.collection umi \
   --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json
 ```
+
+The shared two-column GUI enables its draggable divider and narrow-column
+wrapping by default. Pass `--no-gui-resizable-sidebars` for the fixed legacy
+layout. Passive A/B/C/G and P1--P5 activity blocks are also enabled by default;
+`--no-gui-input-activity-indicators` hides them without changing operator-event
+or dataset semantics.
 
 The provisional canonical-component v2.5-p shadow is wired but remains off by
 default. Add `--v25p-native-shadow` only for dual-write validation; add

@@ -199,6 +199,236 @@ shadow 会直接报配置错误。该开关不声明 native-v2.5 eligibility，�
 GUI。启用后 action 经过共享 canonical `ComponentAction` 投影，v2.3 writer 仍是权威输出；
 省略开关时不会构建 native store，也不会生成 `meta/v25p/native/`。
 
+### 3.8 可选长程进度语义与独立 GUI
+
+RealTeleop 的 coarse progress/Failure 语义和 Control Station 操作面均为 default-off，
+不新增生产入口。现在有两种等价的选择方式。
+
+当前 DMTAC RM65 正式任务可以在启动命令中固定初始 profile。在原正式命令末尾增加：
+
+```bash
+--collection-progress-profile catalog:dmtac_rm65_bimanual_position_v1_progress \
+--collection-progress-gui
+```
+
+如果希望由数采员在 GUI 中从已有 managed profile 选择，只增加：
+
+```bash
+--collection-progress-gui
+```
+
+推荐真机使用第二种方式。完整操作顺序是：
+
+1. 启动原数采命令并追加 `--collection-progress-gui`。右侧“数据集配置”模块中可修改
+   保存根目录、正式 Task、英文名和中文名；点击“应用配置 / 切换新数据集”后，runtime
+   会计算并切换到对应的最终 dataset 目录，但不会开始 Episode。
+2. “长程任务进度”面板会在设备启动阶段出现；只要当前数据集尚未锁定且 catalog 中有
+   managed LINEAR profile，选择器保持可选，不依赖正式 task/name 或 runtime Home。
+3. 新目录没有 Episode/profile 绑定时，可以选择任意适用的长程 profile。选择本身不会
+   开始 Episode；确认当前 Step 后再按原有数采开始键。也可以不选 profile 直接开始
+   普通数采，长程进度不会阻塞首个 Episode。
+4. 第一个带 profile 的 Episode 开始时 profile 才会绑定到 dataset。若先开始了无
+   profile 的普通 Episode，该目录会保持 profile-less；后续要启用长程 profile 必须
+   切换新的空 dataset。绑定完成后选择器变为只读，后续 Episode 和进程重启都继续
+   使用该绑定。
+5. 如果要换 profile，必须换用新的 dataset 目录，不能在原目录内混装。
+
+数据集配置采用显式草稿/应用语义：在输入框中修改不会暗中切换 writer，也不会误开始
+采集；只有点击应用按钮才提交。录制、暂停、倒计时或封口过程中配置会锁定，必须先结束
+当前 Episode。保留相同 Task、只更换英文名时，`task_id` 不变，最终目录名会随英文名
+变化，因此可以为同一正式任务建立一个新的独立数据集并重新选择该 Task 的 profile。
+
+GUI 列出当前真机 adapter 已准入的全部 LINEAR managed profile，不按正式
+`--collection-task-id` 或 `--collection-task-name` 过滤。profile 自己的 `task_id`、step
+和 transition 仍是它的长程语义元数据；选择 profile 不会修改正式 task、数据集路径或
+启动 Episode。显式文件路径 profile 仍可从 CLI 使用，但不会自动进入 managed GUI 列表。
+
+当前 catalog 的 GUI 会列出包括以下 profile 在内的全部 LINEAR profile：
+
+- `dmtac_rm65_bimanual_position_v1_progress`：单阶段正式 smoke profile；
+- `test_dmtac_rm65_bimanual_position_v1_three_stage_progress`：显式标注为
+  `【测试】` 的三阶段 GUI/Failure/Advance/Undo 测试 profile。
+
+三阶段测试 profile 仍带有自己的 `task_id` 和测试语义；它可以出现在 GUI 选择器中，
+但不是生产任务语义。必须使用全新/空白的最终 dataset 目录测试，不能把它选择到任何
+已经由其他 profile 绑定的既有数据集。测试结束后，生产采集应回到真实任务自己的 profile
+和独立 dataset 目录。
+
+`catalog:example_three_stage_pick_place_progress` 仍是合同与后标注 refinement 演示样例，
+它的 `task_id` 是 `example_three_stage_pick_place`，因此会作为独立选项出现在 GUI 中；
+它仍不代表 DMTAC 的真实任务语义。需要真实三阶段任务时，应创建语义正确的 managed
+profile，而不是依赖正式 dataset task/name 自动推断。
+
+两个开关的责任如下：
+
+- `--collection-progress-profile` 启用 progress Episode、Attempt、Advance/Undo/Failure
+  事实和 Failure→Hold/Pause→Resume/Retry 接线，并提供初始选择；参数可以是
+  `catalog:<profile_id>` 或显式 JSON 路径；
+- `--collection-progress-gui` 显示 Control Station 进度插件并开放 profile 选择和
+  typed progress event。未选择 profile 时仍允许普通 Episode 启动；如果该 Episode
+  已写入，当前 dataset 会保持 profile-less，避免随后在同一目录混入有 profile 的
+  Episode。
+
+每个 coarse `progress_step` 还可以声明左右臂的 `arm_control`：`teleop` 表示该侧由
+VIVE 遥操，`fixed_hold` 表示该侧机械臂和已配置末端一起保持固定。GUI 提供三种执行
+模式，并且只允许在 Episode 空闲时切换：
+
+- `profile`（默认）：进入新子任务时自动对齐声明的活动臂，但仍保留手动 Fix 和单臂
+  踏板；
+- `strict_profile`：严格对齐声明，禁用手动 Fix/单臂踏板，并在正式 writer 接纳样本前
+  校验样本因果时刻的 `progress_step_id` 与左右 `teleop.arm_mode`/固定范围完全一致；
+- `ignore_profile`：忽略子任务臂声明，只使用既有按钮和踏板语义。
+
+Advance 若只减少活动臂会直接切换；若增加活动臂，则只在该侧已有新鲜、稳定的 VIVE
+Home 候选时原子切换。候选不足时，系统保持旧子任务事实，先 Hold 并暂停正式数采；
+暂停期间 writer 不接纳任何样本。下一次“开始遥操”只采目标新活动臂所需的 Home，建立
+目标臂状态后才提交 Advance 并恢复写入，因此新子任务开头不会包含暂停样本。Undo 若
+跨越不同臂声明，一律先进入相同的 Hold/Pause 边界，恢复时按回退后的 profile 建立活动
+臂。Home 或精确 Fix 建立失败时保持 Hold/Pause 和原 progress step，不提交半完成切换。
+
+progress 采集可选用额外的物理踏板快捷键，不改变 GUI typed intent 或
+`collection_runtime` 状态机。四踏板仍兼容既有链路；当已绑定 progress profile 时，
+踏板 3/4 分别复用 GUI 的“推进阶段”和“记录失败并 Hold”。五踏板的踏板 1/2
+与双踏板完全一致：分别进入仅左臂遥操（Fix 右臂）和仅右臂遥操（Fix 左臂）；踏板 3
+推进阶段，踏板 4 记录失败，踏板 5 撤销上一次进度推进。未选择 profile 时，踏板 1/2
+仍可执行 Fix；踏板 3/4/5 保持 fail-closed，
+不会回落到 Init，也不会排队等待后续 profile。某个 progress 操作在当前状态不可用时
+也只会被拒绝，不会改触发其他语义。启动五踏板转发服务使用：
+
+五踏板的 A 仍开始/停止数采；B/C 的派发与双踏板专用 B/C 完全一致：B 负责双臂遥操、
+Hold、快速 Home 和单臂 Fix 释放，C 负责进入常规 Hold。网页和键盘都沿用同一套语义；
+五踏板的 F15/F16/F17 只增加 progress Advance/Failure/Undo，不会覆盖 G/GUI 的 Init。
+
+```bash
+python -m hardware.foot_pad --count 5
+```
+
+安全测试会检查 1–5 全部踏板并在第五个键位确认后自动结束；测试本身不提交
+Advance/Failure/Undo。第一次完整测试后会原子保存
+`teleop_runtime/configs/hardware/foot_pad/five_pedal_test_receipt.json`，之后力控和位控
+共用该验证结果，不再要求重复测试。该 receipt 同时绑定当前五踏板物理 assignment
+指纹和遥操语义版本；重新标定、交换或更换任一踏板后会自动失效并要求重测。它只免除
+GUI 安全测试，不替代 `hardware.foot_pad` 转发服务的启动和设备连接。
+
+首个 progress-enabled Episode 启动前可以在 GUI 中更换选择。启动时，完整
+`TaskProgressProfileV1` 会以 canonical 形式绑定到：
+
+```text
+meta/progress/profile.cjson
+```
+
+从这一刻起当前数据集只接受相同 semantic content hash；相同 `profile_id` 但内容或
+版本不同也会被拒绝。重启后会从该文件恢复并锁定选择。已有 progress Episode 的旧
+数据集只在所有 Episode-local profile 完全一致时允许安全回填；已有正式 Episode
+但没有 progress profile 的数据集不能中途启用，必须使用新的数据集目录。因此一个
+数据集不会混装不同 profile，也不会混装 profile-less 与 profiled Episode。
+
+这里的“一个数据集”是一次正式任务对应的最终 dataset 目录，而不是可以同时容纳多个
+日期/任务目录的上层 `--dataset-root` 容器。唯一绑定文件始终位于该最终目录下：
+
+```text
+<formal-dataset>/meta/progress/profile.cjson
+```
+
+常见拒绝及处理方式：
+
+| 现象 | 含义 | 处理 |
+|---|---|---|
+| GUI 没有可选 profile | 当前 managed LINEAR catalog 为空或 adapter 未准入 | 检查 catalog/adapter；这不是由正式 task/name 匹配失败导致 |
+| 未选择 profile | 当前 Episode 是普通 profile-less 数采，不启用长程进度 | 可继续采集；若要启用 progress，请在首个 Episode 前选择 profile，或切换新的空 dataset |
+| 提示 dataset 已有 Episode 但未绑定 profile | 该目录已经是永久 profile-less 数据集 | 使用新的 dataset 目录 |
+| 提示 profile/hash 冲突 | 目录已经绑定另一 profile，或同 ID 的内容/版本被修改 | 不覆盖旧文件；为新 profile 使用新目录 |
+| 重启后选择器为只读 | 已从 dataset 绑定文件恢复 profile | 正常行为；继续采集即可 |
+
+因此回退是分层且确定的：
+
+- 只去掉 `--collection-progress-gui`、保留
+  `--collection-progress-profile`：保留 progress 数据语义，但恢复原 RealTeleop
+  页面和既有 A/B/C 行为；
+- 同时去掉两个开关：不构建 progress workflow、不创建 `meta/progress/`，回到原正式
+  数采链路；但不能用这种方式向已经绑定 progress profile 的同一数据集追加
+  profile-less Episode。
+
+当前真机 gate 只接受 `LINEAR` profile；Tree、profile 编辑器和 UMI 接入仍未开放。
+已封存 Episode 的独立细粒度阶段标注 GUI 已开放，但它是离线 Control Station 应用，
+不嵌入真机页面，使用方法见
+[`LONG_HORIZON_STAGE_ANNOTATION.md`](./LONG_HORIZON_STAGE_ANNOTATION.md)。
+统一 catalog 位于
+`collection_runtime/progress/profiles/`，并明确分为 `linear/` 和 `tree/`：
+
+- `catalog:dmtac_rm65_bimanual_position_v1_progress` 只有一个 terminal step，只用于
+  单 Attempt/Failure/Retry smoke，因此没有可执行的“下一阶段”；
+- `catalog:test_dmtac_rm65_bimanual_position_v1_three_stage_progress` 是当前 DMTAC
+  task 可直接选择的测试专用三阶段 profile；所有 Step 均带 `【测试】` 标识；
+- `catalog:example_three_stage_pick_place_progress` 是三阶段线性样例，依次为接近对准、
+  稳定抓取、放置释放，并附带每个 coarse step 内的 refinement boundary 样例。
+
+profile 的 `task_id` 只描述该 profile 自己的长程语义，不要求与正式
+`--collection-task-id` 或 `--collection-task-name` 一致；正式 dataset 与 progress profile
+仍分别保留各自的身份字段。样例不能冒充真实任务语义，真实长程任务应建立自己的唯一
+profile/step ID，并在选择后由 dataset hash 绑定保护其内部一致性。
+同名 `.stages.json` 定义封存后使用的有序执行阶段和 recovery 入口；它不会增加在线
+Advance/Failure 按钮。旧 `.refinement.json` 保留为早期 salvage-boundary 兼容资产，
+新细粒度 occurrence 标注使用 stage profile。
+
+普通 Episode 从每个 Step 的首 stage 开始。补采从失败 stage 出发的 recovery 数据时，
+在原真机命令末尾同时增加：
+
+```bash
+--collection-progress-profile catalog:<progress_profile_id> \
+--collection-progress-entry-step <progress_step_id> \
+--collection-progress-entry-stage <stage_id> \
+--collection-progress-entry-condition recovery_from_failure
+```
+
+非首 stage 没有显式 `recovery_from_failure` 会在启动前失败。managed progress profile
+若有同名 stage profile 会自动加载；显式外部 profile 可以另传
+`--collection-stage-profile /absolute/path/task.stages.json`。首个 stage-profiled
+Episode 会将同一 profile 锁定到 `meta/progress/stages.cjson`，同一数据集拒绝不同
+stage profile 或 profiled/unprofiled Episode 混装。
+
+不同任务可以复用 `APPROACH_TARGET`、`ACQUIRE_OBJECT`、`PLACE_OBJECT` 等
+`semantic_type` 作为检索原语，但任务 profile 必须自己保存 step identity、显示名、顺序
+和合法迁移，不能运行时继承一个可变的公共模板。
+
+进度插件位于 `control_station/web/real_teleop_progress.js`，不拥有机器人控制、Hold、
+Episode 或 writer。删除/禁用插件不会改变 progress 合同；`collection_runtime` 也不包含
+任何 GUI 或真机设备逻辑。
+
+“记录当前阶段失败并 Hold”是时间敏感事实：按钮在状态机准入后单击立即提交，不弹出
+二次确认；前端 pending gate 会阻止重复点击。Failure 的事实持久化、Hold 和正式数采
+暂停仍由原有 typed request/receipt 链路完成。
+
+如果数采员因紧急情况先按了普通 Hold，且这次 Hold 确实在当前 progress Attempt 内
+新建了正式采集暂停，则同一个未恢复的 Hold 状态下按钮会改为“将当前 Hold 记为阶段
+失败”。单击后不会再次 Hold 或移动暂停边界：Failure 的 `effective_at` 沿用原
+`formal_capture_pause.effective_at`，稍后的按钮时间记录为 fact `available_at`，
+`timing_semantics=PROMOTED_HOLD_TIME`。原始普通 Hold 仍保留为真实应用事实，正式
+pause segment 只追加 failure-promotion reason；progress receipt 把同一组已生效的
+Hold/Pause 绑定到该 Failure。
+
+这一提升只在“同一 Episode、同一 active Attempt、普通 Hold 后从未恢复、原暂停确由
+本次 Hold 新建”时开放。已恢复、已换 Episode、数采在 Hold 前已因相机/模态健康暂停，
+或由 tracker 丢失、碰撞/急停等自动安全路径触发的 Hold 都不会被回溯提升；Hold 中的
+阶段推进和撤销也保持禁用。这样不会把更早的传感器暂停误当成失败边界，也不会把人工
+调整时间写进失败 Attempt。
+
+右侧操作区按“快捷状态、标定与运动参数、遥操流程、机械臂模式、数据集配置、
+Episode 数采、长程任务、设备/输入/可视化”拆分为独立展示模块。可拖动模块标题改变
+顺序，也可在标题获得焦点后使用
+`↑/↓`；“恢复默认顺序”会清除自定义排列。顺序通过浏览器侧偏好保存，不产生
+Control Station operator event，不改变 A/B/C、Hold、Episode、writer 或安全状态。
+
+RealTeleop 与 UMI 共用的双栏页面现在默认允许调整栏宽。可拖动“当前状态”与“控制”两栏
+之间的分隔条（方向键也可微调，`Home` 或双击恢复 60/40），窄栏内容会自动换行并折叠
+内部网格；窗口小于 1100px 时仍沿用原有单栏布局。显式使用
+`--no-gui-resizable-sidebars` 可完整回退到固定栏宽，且该功能不产生 operator event。
+
+左侧“当前状态”顶部默认显示 A/B/C/G 与 P1–P5 小色块。浏览器快捷键按下时对应按键块
+短暂变绿；运行时从虚拟脚踏键盘收到 press edge 时对应踏板块短暂变橙。它只消费已有
+输入边沿并展示，不会产生新 operator event、改变事件优先级或写入数据集。使用
+`--no-gui-input-activity-indicators` 可完整隐藏色块和其脚本；UMI 命令同样支持该开关。
+
 ## 4. Impedance/力控数采
 
 力控没有被 position profile 替代。当前设备全开 15→40 Hz 命令只在

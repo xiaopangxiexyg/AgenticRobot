@@ -4,8 +4,9 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
+from robot_motion.action import ArmActionSpec
 
-from ..arm_frames import TOOL_TCP_FRAME, TOOL_TCP_SEMANTICS
+from ..arm_frames import TOOL_TCP_FRAME
 from ..calibration import TeleopCalibration
 from ..hand_tcp_alignment import apply_local_pose_rotation
 from ..interfaces import Retargeter
@@ -39,6 +40,8 @@ class PoseToArmRetargeterConfig:
     side: str
     input_channel_name: str
     effector_name: str | None = None
+    # Logical role used to look up the calibration offset.  The observation
+    # metadata still identifies the upstream tracker that produced the sample.
     tracker_role: str | None = None
     control_mode: str = DEFAULT_RETARGET_CONTROL_MODE
     orientation_mode: str = "full"
@@ -120,6 +123,13 @@ class PoseToArmRetargeter(Retargeter):
         return f"pose_to_arm_{self.config.side}"
 
     def set_home_anchors(self, *, human_pose_desk: np.ndarray, robot_pose_desk: np.ndarray) -> None:
+        """Bind raw desk-frame tracker Home to robot Home.
+
+        ``human_pose_desk`` must not be pre-adjusted.  Tracker-local translation
+        and rotation offsets are applied here exactly once, matching
+        :meth:`retarget`.
+        """
+
         self._home_human_pose_desk = self.prepare_input_pose_desk(human_pose_desk)
         self._home_robot_pose_desk = as_pose_matrix(robot_pose_desk)
         self._last_target_pose_desk = self._home_robot_pose_desk.copy()
@@ -172,6 +182,7 @@ class PoseToArmRetargeter(Retargeter):
             "pose_operator": pose_operator,
             "target_pose_desk": target_pose_desk,
             "tracker_role": self._resolve_tracker_role(channel),
+            "source_tracker_role": self._resolve_source_tracker_role(channel),
         }
 
     def build_command_from_target_pose_desk(
@@ -187,6 +198,19 @@ class PoseToArmRetargeter(Retargeter):
         if channel is None or not channel.valid:
             command.metadata["skipped"] = self.config.input_channel_name
             return command
+        channel_metadata = dict(channel.metadata or {})
+        fixed_side = str(
+            channel_metadata.get("fix_arm_fixed_side", self.config.side) or ""
+        ).strip().lower()
+        fix_arm_authority_metadata = (
+            {
+                "fix_arm_frozen": True,
+                "fix_arm_fixed_side": fixed_side,
+            }
+            if bool(channel_metadata.get("fix_arm_frozen", False))
+            and fixed_side == self.config.side
+            else {}
+        )
 
         target_pose_tcp_desk = as_pose_matrix(target_pose_desk)
         self._last_target_pose_desk = target_pose_tcp_desk.copy()
@@ -197,6 +221,16 @@ class PoseToArmRetargeter(Retargeter):
         tracker_motion_intent = self._resolve_tracker_motion_intent(
             channel=channel,
         )
+        calibration_tracker_role = self._resolve_tracker_role(channel)
+        source_tracker_role = self._resolve_source_tracker_role(channel)
+        tracker_lineage_metadata = {
+            "tracker_role": calibration_tracker_role,
+            **(
+                {"source_tracker_role": source_tracker_role}
+                if source_tracker_role != calibration_tracker_role
+                else {}
+            ),
+        }
 
         command.add_command(
             EffectorCommand(
@@ -208,21 +242,15 @@ class PoseToArmRetargeter(Retargeter):
                 metadata={
                     "arm_controlled_frame": TOOL_TCP_FRAME,
                     "arm_reference_frame": self.config.output_frame_name,
-                    "arm_action_spec": {
-                        "side": self.config.side,
-                        "controlled_frame": TOOL_TCP_FRAME,
-                        "reference_frame": self.config.output_frame_name,
-                        "representation": "xyz_quat",
-                        "dof": 7,
-                        "semantics": TOOL_TCP_SEMANTICS,
-                        "metadata": {
-                            "retarget_target_frame": TOOL_TCP_FRAME,
-                        },
-                    },
+                    "arm_action_spec": ArmActionSpec.tool_tcp(
+                        self.config.side,
+                        reference_frame=self.config.output_frame_name,
+                    ).to_metadata(),
                     "control_mode": self.config.control_mode,
                     "orientation_mode": self.config.orientation_mode,
                     "input_channel": self.config.input_channel_name,
-                    "tracker_role": self._resolve_tracker_role(channel),
+                    **tracker_lineage_metadata,
+                    **fix_arm_authority_metadata,
                     "clutch_pressed": False,
                     "tracker_motion_intent": tracker_motion_intent,
                     "target_pose_operator": None
@@ -300,6 +328,10 @@ class PoseToArmRetargeter(Retargeter):
     def _resolve_tracker_role(self, channel) -> str | None:
         if self.config.tracker_role is not None:
             return self.config.tracker_role
+        return self._resolve_source_tracker_role(channel)
+
+    @staticmethod
+    def _resolve_source_tracker_role(channel) -> str | None:
         metadata = channel.metadata or {}
         tracker_role = metadata.get("tracker_role")
         if tracker_role:

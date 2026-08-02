@@ -267,9 +267,61 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertFalse(config.canfd_follow)
         self.assertEqual(config.control_hz, DEFAULT_RM65_ARM_CONTROL_HZ)
         self.assertEqual(config.canfd_follow_stream_hz, DEFAULT_RM65_POSITION_ARM_CONTROL_HZ)
+        self.assertFalse(config.deployment_full_ik_preempts_local)
         backend_config = RM65ImpedanceArmBackendConfig(arm_ip="127.0.0.1", side="left")
         self.assertEqual(backend_config.actual_send_dt_max_scale, 1.0)
         self.assertFalse(backend_config.scale_outer_execution_step_by_actual_dt)
+
+    def test_policy_inference_soft_hold_freezes_measured_joint_and_releases_on_fresh_target(self) -> None:
+        current_joint = [0.0] * 6
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        hold_joint = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=current_pose,
+            ik_retry_pose=current_pose,
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                ik_resolver_enabled=False,
+                joint_rate_limiter_enabled=False,
+            ),
+            robot=robot,
+        )
+        controller.start()
+        controller._previous_command_joint = [20.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        controller._previous_command_pose = list(current_pose)
+
+        held = controller.step(
+            soft_hold_joint_deg=hold_joint,
+            soft_hold_reason="test_inference_gap",
+        )
+
+        self.assertTrue(held["policy_inference_soft_hold"])
+        self.assertEqual(held["policy_inference_soft_hold_reason"], "test_inference_gap")
+        np.testing.assert_allclose(held["command_joint_deg"], hold_joint)
+        self.assertEqual(held["applied_offset"], [0.0] * 6)
+        self.assertEqual(held["ik_method"], "policy_inference_soft_hold")
+
+        # A stale Cartesian reference must not leak through a later hold tick.
+        controller._reference.set_target([0.08, 0.0, 0.35, 0.0, 0.0, 0.0])
+        held_again = controller.step(
+            soft_hold_joint_deg=hold_joint,
+            soft_hold_reason="test_inference_gap",
+        )
+        self.assertTrue(held_again["policy_inference_soft_hold"])
+        np.testing.assert_allclose(held_again["command_joint_deg"], hold_joint)
+
+        released = controller.step(current_pose, target_joint_deg=hold_joint)
+        self.assertFalse(released["policy_inference_soft_hold"])
+        self.assertFalse(controller._soft_hold_active)
 
     def test_dmtac_impedance_profiles_disable_direct_joint_hint_offsets(self) -> None:
         for profile_name in (
@@ -1120,6 +1172,59 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertIsNotNone(backend._last_step_record)
         self.assertFalse(backend._last_step_record["backend_target_dispatched_this_step"])
         self.assertEqual(backend._last_step_record["backend_last_dispatched_target_sequence"], 7)
+
+    def test_impedance_backend_routes_inference_soft_hold_to_controller(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0 / 40.0,
+            )
+        )
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(control_hz=500.0)
+                self.calls: list[dict[str, object]] = []
+
+            def step(
+                self,
+                target,
+                *,
+                target_joint_deg=None,
+                soft_hold_joint_deg=None,
+                soft_hold_reason="",
+            ):
+                self.calls.append(
+                    {
+                        "target": target,
+                        "target_joint_deg": target_joint_deg,
+                        "soft_hold_joint_deg": soft_hold_joint_deg,
+                        "soft_hold_reason": soft_hold_reason,
+                    }
+                )
+                if len(self.calls) >= 2:
+                    backend._loop_stop_event.set()
+                return {"fake_step": len(self.calls)}
+
+        controller = FakeController()
+        backend._controller = controller  # type: ignore[assignment]
+        with backend._state_lock:
+            backend._latest_target_pose6 = [0.1] * 6
+            backend._latest_target_joint_deg = [1.0] * 6
+            backend._latest_target_sequence = 9
+            backend._policy_inference_soft_hold = True
+            backend._policy_inference_soft_hold_joint_deg = [2.0] * 6
+            backend._policy_inference_soft_hold_reason = "test_inference_gap"
+
+        backend._impedance_loop()
+
+        self.assertEqual(controller.calls[0]["target"], None)
+        self.assertEqual(controller.calls[0]["target_joint_deg"], None)
+        self.assertEqual(controller.calls[0]["soft_hold_joint_deg"], [2.0] * 6)
+        self.assertEqual(controller.calls[0]["soft_hold_reason"], "test_inference_gap")
+        self.assertTrue(backend._last_step_record["backend_policy_inference_soft_hold"])
 
     def test_impedance_backend_hard_stop_callback_uses_latched_emergency_stop(self) -> None:
         backend = RM65ImpedanceArmBackend(

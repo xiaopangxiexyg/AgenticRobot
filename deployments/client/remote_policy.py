@@ -12,6 +12,9 @@ from .contracts import (
     MetadataValidationResult,
     validate_server_metadata,
 )
+from dataset_contracts.policy_action_semantics import (
+    PolicyArmHoldOutputContract,
+)
 
 
 class RemoteTransport(Protocol):
@@ -37,6 +40,7 @@ class RemotePolicyConfig:
     action_discrete_dim: int = 0
     contract: DeployPolicyContract = field(default_factory=DeployPolicyContract)
     source: str = "remote_model_policy"
+    arm_hold_output: PolicyArmHoldOutputContract | None = None
 
     def __post_init__(self) -> None:
         action_key = str(self.action_key or DEFAULT_ACTION_KEY)
@@ -57,6 +61,30 @@ class RemotePolicyConfig:
         object.__setattr__(self, "action_discrete_dim", action_discrete_dim)
         object.__setattr__(self, "action_discrete_key", action_discrete_key or None)
         object.__setattr__(self, "source", str(self.source or "remote_model_policy"))
+        arm_hold_output = self.arm_hold_output
+        if arm_hold_output is not None and not isinstance(
+            arm_hold_output,
+            PolicyArmHoldOutputContract,
+        ):
+            raise TypeError(
+                "arm_hold_output must be a PolicyArmHoldOutputContract or None."
+            )
+        object.__setattr__(self, "arm_hold_output", arm_hold_output)
+        if arm_hold_output is None:
+            if self.contract.arm_hold_output_key is not None:
+                raise ValueError(
+                    "RemotePolicyConfig contract declares arm-hold output "
+                    "without its typed output contract."
+                )
+        elif (
+            self.contract.arm_hold_output_key != arm_hold_output.output_key
+            or self.contract.arm_hold_output_contract_hash
+            != arm_hold_output.contract_hash
+        ):
+            raise ValueError(
+                "RemotePolicyConfig arm-hold output disagrees with its "
+                "server contract."
+            )
         if (
             self.contract.action_key != action_key
             or self.contract.action_dim != action_dim
@@ -84,6 +112,10 @@ class RemotePolicyConfig:
                     required_camera_slots=self.contract.required_camera_slots,
                     hand_layout=self.contract.hand_layout,
                     normalization_hash=self.contract.normalization_hash,
+                    arm_hold_output_key=self.contract.arm_hold_output_key,
+                    arm_hold_output_contract_hash=(
+                        self.contract.arm_hold_output_contract_hash
+                    ),
                     metadata_required=self.contract.metadata_required,
                     extra=self.contract.extra,
                 ),
@@ -137,7 +169,7 @@ class RemoteModelPolicy:
 
         if not isinstance(request, Mapping):
             raise TypeError("Prepared remote policy request must be a mapping.")
-        response = dict(self.transport.infer(request))
+        response = dict(self.transport.infer(dict(request)))
         if self.config.action_key not in response:
             raise ValueError(
                 f"Remote response missing action key {self.config.action_key!r}; "
@@ -178,9 +210,41 @@ class RemoteModelPolicy:
                     f"({actions.shape[0]}, {int(self.config.action_discrete_dim)}), "
                     f"got {discrete_actions.shape}."
                 )
+        arm_hold_probabilities = None
+        arm_hold_contract_hash = None
+        arm_hold_output = self.config.arm_hold_output
+        if arm_hold_output is not None:
+            if arm_hold_output.output_key not in response:
+                raise ValueError(
+                    "Remote response missing declared arm-hold key "
+                    f"{arm_hold_output.output_key!r}; "
+                    f"available keys={sorted(str(key) for key in response)}."
+                )
+            arm_hold_probabilities = np.asarray(
+                response[arm_hold_output.output_key],
+                dtype=np.float32,
+            )
+            if arm_hold_probabilities.ndim == 1:
+                arm_hold_probabilities = arm_hold_probabilities.reshape(1, -1)
+            expected_hold_shape = (actions.shape[0], 2)
+            if arm_hold_probabilities.shape != expected_hold_shape:
+                raise ValueError(
+                    "Remote arm-hold shape mismatch: expected "
+                    f"{expected_hold_shape}, got "
+                    f"{arm_hold_probabilities.shape}."
+                )
+            arm_hold_contract_hash = str(
+                response.get("arm_hold_output_contract_hash") or ""
+            )
+            if arm_hold_contract_hash != arm_hold_output.contract_hash:
+                raise ValueError(
+                    "Remote arm-hold output contract hash mismatch."
+                )
         return UnifiedActionChunk(
             actions=actions,
             discrete_actions=discrete_actions,
+            arm_hold_probabilities=arm_hold_probabilities,
+            arm_hold_contract_hash=arm_hold_contract_hash,
             metadata=_action_metadata(
                 source=self.config.source,
                 response=response,

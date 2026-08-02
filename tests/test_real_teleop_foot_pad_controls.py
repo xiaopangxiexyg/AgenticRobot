@@ -1,21 +1,30 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from teleop_runtime.real_teleop.foot_pad_controls import (
     FOOT_PAD_EVENT_BY_KEY_CODE,
     FOOT_PAD_EVENT_BY_KEY_CODE_BY_COUNT,
+    FOOT_PAD_FIVE_EVENT_BY_KEY_CODE,
+    FOOT_PAD_TWO_PEDAL_STYLE_COUNTS,
     FootPadSpecialArmInput,
     FootPadUnavailableError,
     SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
     SPECIAL_ARM_CONTROL_MODE_MANUAL,
+    apply_live_foot_pad_topology,
     foot_pad_count_from_key_codes,
+    foot_pad_progress_topology_guidance,
+    persist_five_pedal_test_receipt,
+    persisted_five_pedal_test_verified,
     resolve_special_arm_control_mode,
 )
 from teleop_runtime.gui.real_teleop_control import RealTeleopControlInput
-from teleop_runtime.real_teleop.gui_controls import (
+from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,
     current_active_controls,
@@ -23,7 +32,77 @@ from teleop_runtime.real_teleop.gui_controls import (
 
 
 class FootPadControlModeTests(unittest.TestCase):
-    def test_gui_status_distinguishes_unavailable_two_and_four_pedals(self) -> None:
+    @staticmethod
+    def _five_pedal_assignment() -> dict[str, object]:
+        return {
+            "schema_version": "foot_pad_assignment.v1",
+            "created_at": "2026-08-02T00:00:00+08:00",
+            "count": 5,
+            "pedals": [
+                {
+                    "slot": slot,
+                    "source": {
+                        "id_path": f"pci-usb-pedal-{slot}",
+                        "vendor_id": "0483",
+                        "model_id": "5750",
+                        "name": "HID 0483:5750",
+                        "key_code": 98,
+                        "key_name": "KEY_KPSLASH",
+                    },
+                    "output": {
+                        "key_name": f"F{12 + slot}",
+                        "key_code": 182 + slot,
+                    },
+                }
+                for slot in range(1, 6)
+            ],
+        }
+
+    def test_five_pedal_test_receipt_is_shared_until_mapping_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            config_path = Path(temporary_dir) / "latest.json"
+            config = self._five_pedal_assignment()
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with mock.patch(
+                "teleop_runtime.real_teleop.foot_pad_controls._load_foot_pad_config",
+                return_value=(config_path, 5),
+            ):
+                receipt_path = persist_five_pedal_test_receipt()
+                self.assertTrue(receipt_path.is_file())
+                self.assertTrue(persisted_five_pedal_test_verified())
+
+                config["created_at"] = "2026-08-02T01:00:00+08:00"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                self.assertTrue(persisted_five_pedal_test_verified())
+
+                config["pedals"][0]["source"]["id_path"] = "remapped-pedal"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                self.assertFalse(persisted_five_pedal_test_verified())
+
+    def test_five_pedal_control_restores_persisted_test_across_modes(self) -> None:
+        for arm_control_mode in ("position", "impedance"):
+            with self.subTest(arm_control_mode=arm_control_mode), mock.patch(
+                "teleop_runtime.real_teleop.operator_control_runtime."
+                "persisted_five_pedal_test_verified",
+                return_value=True,
+            ):
+                control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+                control.args = SimpleNamespace(arm_control_mode=arm_control_mode)
+                control.foot_pad_input = SimpleNamespace(
+                    foot_pad_count=5,
+                    is_online=True,
+                )
+                control._foot_pad_test_completed = False
+                control._foot_pad_test_seen_events = {"stale"}
+                control._foot_pad_test_last_event = "stale"
+                control._foot_pad_test_status = ""
+
+                self.assertTrue(control._restore_persisted_five_pedal_test_state())
+                self.assertTrue(control._foot_pad_test_completed)
+                self.assertEqual(control._foot_pad_test_seen_events, set())
+                self.assertIn("力控/位控共用", control._foot_pad_test_status)
+
+    def test_gui_status_distinguishes_supported_pedal_topologies(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(
             foot_pad_requested=True,
@@ -50,7 +129,7 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertIn("先进入 Hold", waiting["foot_pad_status_message"])
         self.assertIn("重连失败设备", waiting["foot_pad_status_message"])
 
-        for count in (2, 4):
+        for count in (2, 4, 5):
             control.foot_pad_input = SimpleNamespace(
                 foot_pad_count=count,
                 is_online=True,
@@ -114,6 +193,69 @@ class FootPadControlModeTests(unittest.TestCase):
             SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
         )
 
+    def test_five_pedal_topology_is_admitted_before_progress_profile_selection(self) -> None:
+        self.assertEqual(
+            resolve_special_arm_control_mode(
+                None,
+                fix_arm_enabled=True,
+                init_arm_enabled=False,
+                foot_pad_count=5,
+                progress_enabled=True,
+            ),
+            SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+        self.assertEqual(
+            resolve_special_arm_control_mode(
+                None,
+                fix_arm_enabled=True,
+                init_arm_enabled=True,
+                foot_pad_count=5,
+                progress_enabled=False,
+            ),
+            SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+
+    def test_live_five_pedal_topology_replaces_stale_startup_count(self) -> None:
+        args = SimpleNamespace(
+            special_arm_control_mode_requested=None,
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            fix_arm=True,
+            init_arm_available=True,
+            collection_progress_profile=None,
+            collection_progress_gui=True,
+            foot_pad_config_count=2,
+        )
+
+        mode = apply_live_foot_pad_topology(args, 5)
+
+        self.assertEqual(mode, SPECIAL_ARM_CONTROL_MODE_FOOT_PAD)
+        self.assertEqual(args.foot_pad_config_count, 5)
+        self.assertEqual(
+            args.special_arm_control_mode,
+            SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+
+    def test_live_five_pedal_topology_without_progress_keeps_fix_prefix(self) -> None:
+        args = SimpleNamespace(
+            special_arm_control_mode_requested=None,
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            fix_arm=True,
+            init_arm_available=True,
+            collection_progress_profile=None,
+            collection_progress_gui=False,
+            foot_pad_config_count=2,
+        )
+
+        self.assertEqual(
+            apply_live_foot_pad_topology(args, 5),
+            SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+        self.assertEqual(args.foot_pad_config_count, 5)
+        self.assertEqual(
+            args.special_arm_control_mode,
+            SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+
     def test_foot_pad_requires_both_special_arm_features(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires both"):
             resolve_special_arm_control_mode(
@@ -168,6 +310,40 @@ class FootPadControlModeTests(unittest.TestCase):
         )
         source.close()
 
+    def test_five_pedal_mapping_adds_only_progress_undo(self) -> None:
+        self.assertEqual(
+            FOOT_PAD_FIVE_EVENT_BY_KEY_CODE,
+            {
+                183: "fix_arm_left",
+                184: "fix_arm_right",
+                185: "init_arm_left",
+                186: "init_arm_right",
+                187: "progress_undo",
+            },
+        )
+
+        class FakeEvent:
+            type = 1
+            value = 1
+            code = 187
+
+        class FakeCodes:
+            EV_KEY = 1
+
+        class FakeEvdev:
+            ecodes = FakeCodes()
+
+        class Device:
+            def read(self):
+                return [FakeEvent()]
+
+            def close(self):
+                return None
+
+        source = FootPadSpecialArmInput(Device(), FakeEvdev(), foot_pad_count=5)
+        self.assertEqual(source.consume_events(), ["progress_undo"])
+        source.close()
+
     def test_lazy_evdev_eagain_is_a_normal_empty_poll(self) -> None:
         class FakeCodes:
             EV_KEY = 1
@@ -194,7 +370,24 @@ class FootPadControlModeTests(unittest.TestCase):
     def test_live_keyboard_capabilities_identify_two_pedal_topology(self) -> None:
         self.assertEqual(foot_pad_count_from_key_codes({183, 184}), 2)
         self.assertEqual(foot_pad_count_from_key_codes({183, 184, 185, 186}), 4)
+        self.assertEqual(
+            foot_pad_count_from_key_codes({183, 184, 185, 186, 187}),
+            5,
+        )
         self.assertIsNone(foot_pad_count_from_key_codes({183, 185}))
+
+    def test_progress_guidance_explains_replacing_legacy_live_topology(self) -> None:
+        guidance = foot_pad_progress_topology_guidance(
+            2,
+            progress_enabled=True,
+        )
+        self.assertIn("当前 live 虚拟键盘为 2 踏板", guidance)
+        self.assertIn("hardware.foot_pad --count 5", guidance)
+        self.assertIn("不会把旧虚拟键盘热升级", guidance)
+        self.assertEqual(
+            foot_pad_progress_topology_guidance(5, progress_enabled=True),
+            "",
+        )
 
     def test_open_online_accepts_two_pedal_keyboard_without_saved_config(self) -> None:
         class FakeCodes:
@@ -232,6 +425,42 @@ class FootPadControlModeTests(unittest.TestCase):
                 source = FootPadSpecialArmInput.open_online()
             self.assertEqual(source.foot_pad_count, 2)
             source.close()
+
+    def test_open_online_accepts_five_pedal_keyboard_without_saved_config(self) -> None:
+        class FakeCodes:
+            EV_KEY = 1
+
+        class FakeDevice:
+            name = "DexTeleop foot pads"
+
+            def capabilities(self, *, absinfo=False):
+                del absinfo
+                return {FakeCodes.EV_KEY: [183, 184, 185, 186, 187]}
+
+            def close(self):
+                return None
+
+        class FakeEvdev:
+            ecodes = FakeCodes()
+
+            @staticmethod
+            def list_devices():
+                return ["/dev/input/event-five-pads"]
+
+            @staticmethod
+            def InputDevice(_path):
+                return FakeDevice()
+
+        with mock.patch(
+            "teleop_runtime.real_teleop.foot_pad_controls.configured_foot_pad_count",
+            return_value=2,
+        ), mock.patch(
+            "teleop_runtime.real_teleop.foot_pad_controls._require_evdev",
+            return_value=FakeEvdev,
+        ):
+            source = FootPadSpecialArmInput.open_online()
+        self.assertEqual(source.foot_pad_count, 5)
+        source.close()
 
     def test_open_online_reports_inaccessible_named_virtual_keyboard(self) -> None:
         class FakeEvdev:
@@ -289,6 +518,28 @@ class FootPadControlModeTests(unittest.TestCase):
                 FootPadSpecialArmInput.open_online()
 
         self.assertEqual(opened_paths, [])
+
+    def test_missing_service_mentions_five_pedal_progress_command(self) -> None:
+        class FakeEvdev:
+            @staticmethod
+            def list_devices():
+                return []
+
+        with mock.patch(
+            "teleop_runtime.real_teleop.foot_pad_controls.configured_foot_pad_count",
+            return_value=None,
+        ), mock.patch(
+            "teleop_runtime.real_teleop.foot_pad_controls._require_evdev",
+            return_value=FakeEvdev,
+        ), mock.patch(
+            "teleop_runtime.real_teleop.foot_pad_controls._input_permission_hint",
+            return_value="",
+        ):
+            with self.assertRaisesRegex(
+                FootPadUnavailableError,
+                r"--count 5 --recalibrate.*five-pedal",
+            ):
+                FootPadSpecialArmInput.open_online()
 
     def test_four_pedal_mode_keeps_all_gui_special_arm_events(self) -> None:
         controls = current_active_controls(
@@ -348,6 +599,62 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertIn("init_arm_select", controls)
         self.assertIn("init_arm_move_to_qpos", controls)
         self.assertIn("init_arm_move_both_to_qpos", controls)
+
+    def test_five_pedal_mode_uses_the_two_pedal_abc_dispatch_contract(self) -> None:
+        controls = current_active_controls(
+            GuiControlState(
+                teleop_started=True,
+                episode_recording_available=True,
+                fix_arm_available=True,
+                init_arm_available=True,
+                special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+                foot_pad_available=True,
+                foot_pad_count=5,
+            ),
+            GuiControlEvents(),
+        )
+
+        # The shared GUI projection still exposes the common fallback controls;
+        # the entity-side adapter adds the dedicated B/C routes below.
+        self.assertIn("episode_start", controls)
+        self.assertIn("h", controls)
+        self.assertIn("c", controls)
+        self.assertIn("fix_arm_toggle", controls)
+
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+        control.foot_pad_input = SimpleNamespace(foot_pad_count=5, is_online=True)
+        control._foot_pad_mode_enabled = lambda: True
+        control._gui_control_state = lambda: GuiControlState(
+            teleop_started=True,
+            episode_recording_available=True,
+            fix_arm_available=True,
+            init_arm_available=True,
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            foot_pad_available=True,
+            foot_pad_count=5,
+        )
+        control._gui_events = lambda: GuiControlEvents()
+        control._progress_ui_controls = ()
+        control._plus_curation_save_in_flight = lambda: False
+        control.plus_curation = None
+        control._teleop_started = True
+        control._two_pedal_switch_blocked_by_init = lambda: False
+        control._tracker_side_confirmation_pending = False
+        control._tracker_side_request_pending = False
+        control._hold_requested = False
+
+        self.assertIn(5, FOOT_PAD_TWO_PEDAL_STYLE_COUNTS)
+        with mock.patch(
+            "teleop_runtime.real_teleop.operator_control_runtime._gui_current_active_controls",
+            return_value=controls,
+            create=True,
+        ):
+            active_controls = control._current_active_controls()
+        self.assertIn("two_pedal_b", active_controls)
+        self.assertIn("two_pedal_c", active_controls)
 
     def test_unavailable_foot_pad_falls_back_to_manual_arm_maintenance(self) -> None:
         controls = current_active_controls(
@@ -413,6 +720,34 @@ class FootPadControlModeTests(unittest.TestCase):
             set(active) - {"foot_pad_test_stop"},
             set(ready) - {"foot_pad_test_start"},
         )
+
+    def test_five_pedal_test_remains_available_during_regular_hold(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control._gui_control_state = lambda: GuiControlState(
+            teleop_started=True,
+            hold_active=True,
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            foot_pad_available=True,
+            foot_pad_count=5,
+        )
+        control._gui_events = GuiControlEvents
+        control._progress_ui_controls = ()
+        control._two_pedal_mode_active = lambda: False
+        control._teleop_started = True
+        control._tracker_side_confirmation_pending = False
+        control._tracker_side_request_pending = False
+        control._hold_requested = True
+
+        with mock.patch(
+            "teleop_runtime.real_teleop.operator_control_runtime."
+            "_gui_current_active_controls",
+            current_active_controls,
+            create=True,
+        ):
+            self.assertIn(
+                "foot_pad_test_start",
+                control._current_active_controls(),
+            )
 
     def test_disconnected_virtual_keyboard_does_not_scan_during_poll(self) -> None:
         class FakeCodes:
@@ -592,6 +927,48 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertEqual(len(control._foot_pad_test_seen_events), 4)
         self.assertIn("自动完成", control._foot_pad_test_status)
 
+    def test_gui_test_mode_five_pedals_auto_completes_after_all_keys(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.ui = SimpleNamespace(
+            published=[],
+            messages=[],
+            publish=lambda **updates: control.ui.published.append(updates),
+            append_message=lambda tag, message: control.ui.messages.append(
+                (tag, message)
+            ),
+        )
+        control.foot_pad_input = SimpleNamespace(foot_pad_count=5, is_online=True)
+        control._foot_pad_test_active = True
+        control._foot_pad_test_completed = False
+        control._foot_pad_test_seen_events = set()
+        control._foot_pad_test_last_event = ""
+        control._foot_pad_test_status = ""
+        control._current_active_controls = lambda: ["q"]
+        control._control_hint = lambda: "normal"
+        control.args = SimpleNamespace(foot_pad_requested=True)
+
+        events = (
+            "fix_arm_left",
+            "fix_arm_right",
+            "init_arm_left",
+            "init_arm_right",
+            "progress_undo",
+        )
+        for index, event in enumerate(events, start=1):
+            control._record_foot_pad_test_event(event, now=float(index))
+            if index < 5:
+                self.assertTrue(control._foot_pad_test_active)
+
+        self.assertFalse(control._foot_pad_test_active)
+        self.assertTrue(control._foot_pad_test_completed)
+        self.assertEqual(len(control._foot_pad_test_seen_events), 5)
+        self.assertEqual(
+            control._foot_pad_test_last_event,
+            "踏板 5 / F17 → 撤销上一个子任务进度标注",
+        )
+        self.assertIn("踏板 1–5", control._foot_pad_test_status)
+        self.assertIn("自动完成", control._foot_pad_test_status)
+
     def test_fourth_pedal_routes_to_exact_qpos_not_legacy_init_pose(self) -> None:
         class InitController:
             active = False
@@ -622,6 +999,254 @@ class FootPadControlModeTests(unittest.TestCase):
 
         self.assertEqual(controller.selected, ["right"])
         self.assertEqual(exact_calls, [12.5])
+
+    def test_four_pedal_progress_routes_pedals_three_and_four_to_existing_intents(
+        self,
+    ) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(
+            collection_progress_profile=object(),
+        )
+        control.ui = SimpleNamespace(
+            messages=[],
+            append_message=lambda tag, message: control.ui.messages.append(
+                (tag, message)
+            ),
+        )
+        control._progress_operator_intents = __import__("collections").deque()
+        control._progress_operator_intent_sequence = 0
+        control._progress_ui_controls = ("progress_advance", "progress_failure")
+        control._progress_ui_payload = {"enabled": True}
+        control._progress_ui_transport_revision = 0
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 4
+        control._fix_init_allowed_in_controls = lambda: True
+        control.components = SimpleNamespace(
+            init_arm_controller=SimpleNamespace(
+                active=False,
+                selected=[],
+                select_side=lambda side: control.components.init_arm_controller.selected.append(
+                    side
+                ),
+            )
+        )
+        exact_calls: list[float] = []
+        control._handle_init_arm_move_to_qpos_event = (
+            lambda *, now: exact_calls.append(float(now))
+        )
+
+        control._handle_foot_pad_special_arm_event(
+            "init_arm_left",
+            now=20.0,
+        )
+        advance = control.consume_progress_operator_intents()
+        self.assertEqual(len(advance), 1)
+        self.assertEqual(advance[0].kind, "ADVANCE_PROGRESS")
+        self.assertTrue(advance[0].intent_id.startswith(
+            "real-teleop-progress-foot-pad:"
+        ))
+
+        control._progress_ui_controls = ("progress_failure",)
+        control._handle_foot_pad_special_arm_event(
+            "init_arm_right",
+            now=21.0,
+        )
+        failure = control.consume_progress_operator_intents()
+        self.assertEqual(len(failure), 1)
+        self.assertEqual(failure[0].kind, "REPORT_FAILURE")
+        self.assertEqual(exact_calls, [])
+        self.assertEqual(
+            control.components.init_arm_controller.selected,
+            [],
+        )
+
+    def test_four_pedal_progress_unavailable_event_never_falls_back_to_init(
+        self,
+    ) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(
+            collection_progress_profile=object(),
+        )
+        control.ui = None
+        control._progress_operator_intents = __import__("collections").deque()
+        control._progress_operator_intent_sequence = 0
+        control._progress_ui_controls = ()
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 4
+        control._fix_init_allowed_in_controls = lambda: True
+        selected: list[str] = []
+        control.components = SimpleNamespace(
+            init_arm_controller=SimpleNamespace(
+                active=False,
+                select_side=lambda side: selected.append(side),
+            )
+        )
+        exact_calls: list[float] = []
+        control._handle_init_arm_move_to_qpos_event = (
+            lambda *, now: exact_calls.append(float(now))
+        )
+
+        control._handle_foot_pad_special_arm_event(
+            "init_arm_left",
+            now=22.0,
+        )
+        control._handle_foot_pad_special_arm_event(
+            "init_arm_right",
+            now=23.0,
+        )
+
+        self.assertEqual(control.consume_progress_operator_intents(), ())
+        self.assertEqual(selected, [])
+        self.assertEqual(exact_calls, [])
+
+    def test_five_pedal_routes_fifth_pedal_to_existing_undo_intent(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(collection_progress_profile=object())
+        control.ui = None
+        control._progress_operator_intents = __import__("collections").deque()
+        control._progress_operator_intent_sequence = 0
+        control._progress_ui_controls = ("progress_undo",)
+        control._progress_ui_payload = {"enabled": True}
+        control._progress_ui_transport_revision = 0
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 5
+
+        control._handle_foot_pad_special_arm_event("progress_undo", now=24.0)
+
+        intents = control.consume_progress_operator_intents()
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].kind, "UNDO_LAST_ADVANCE")
+        self.assertTrue(
+            intents[0].intent_id.startswith("real-teleop-progress-foot-pad:")
+        )
+
+    def test_five_pedal_undo_is_not_queued_when_current_state_disallows_it(
+        self,
+    ) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(collection_progress_profile=object())
+        control.ui = None
+        control._progress_operator_intents = __import__("collections").deque()
+        control._progress_operator_intent_sequence = 0
+        control._progress_ui_controls = ()
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 5
+
+        control._handle_foot_pad_special_arm_event("progress_undo", now=24.5)
+        self.assertEqual(control.consume_progress_operator_intents(), ())
+
+        control._progress_ui_controls = ("progress_undo",)
+        self.assertEqual(control.consume_progress_operator_intents(), ())
+
+    def test_five_pedal_fix_prefix_matches_two_pedal_side_switch_without_profile(
+        self,
+    ) -> None:
+        for arm_control_mode in ("position", "impedance"):
+            control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+            control.args = SimpleNamespace(
+                arm_control_mode=arm_control_mode,
+                collection_progress_profile=None,
+            )
+            control.ui = None
+            control._foot_pad_mode_enabled = lambda: True
+            control._foot_pad_count = lambda: 5
+            control._two_pedal_mode_active = lambda: True
+            requests: list[tuple[str | None, float, str]] = []
+            control._request_two_pedal_fixed_side = (
+                lambda side, *, now, source: requests.append((side, now, source))
+            )
+
+            control._handle_foot_pad_special_arm_event(
+                "fix_arm_left",
+                now=25.0,
+            )
+            control._handle_foot_pad_special_arm_event(
+                "fix_arm_right",
+                now=26.0,
+            )
+            self.assertEqual(
+                requests,
+                [
+                    ("right", 25.0, "pedal_1"),
+                    ("left", 26.0, "pedal_2"),
+                ],
+            )
+
+    def test_five_pedal_progress_prefix_is_shared_by_position_and_impedance(self) -> None:
+        for arm_control_mode in ("position", "impedance"):
+            control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+            control.args = SimpleNamespace(
+                arm_control_mode=arm_control_mode,
+                collection_progress_profile=object(),
+            )
+            control.ui = None
+            control._progress_operator_intents = __import__("collections").deque()
+            control._progress_operator_intent_sequence = 0
+            control._progress_ui_controls = (
+                "progress_advance",
+                "progress_failure",
+                "progress_undo",
+            )
+            control._progress_ui_payload = {"enabled": True}
+            control._progress_ui_transport_revision = 0
+            control._foot_pad_mode_enabled = lambda: True
+            control._foot_pad_count = lambda: 5
+
+            observed_kinds: list[str] = []
+            for event in (
+                "init_arm_left",
+                "init_arm_right",
+                "progress_undo",
+            ):
+                control._handle_foot_pad_special_arm_event(event, now=28.0)
+                observed_kinds.extend(
+                    intent.kind
+                    for intent in control.consume_progress_operator_intents()
+                )
+                # submit_progress_operator_intent clears one-shot progress
+                # controls until the canonical state is rebuilt. Simulate that
+                # rebuild so the three pedal mappings can be checked in order.
+                control._progress_ui_controls = (
+                    "progress_advance",
+                    "progress_failure",
+                    "progress_undo",
+                )
+
+            self.assertEqual(
+                observed_kinds,
+                ["ADVANCE_PROGRESS", "REPORT_FAILURE", "UNDO_LAST_ADVANCE"],
+            )
+
+    def test_four_pedal_without_progress_keeps_existing_init_mapping(self) -> None:
+        class InitController:
+            active = False
+
+            def __init__(self) -> None:
+                self.selected: list[str] = []
+
+            def select_side(self, side: str):
+                self.selected.append(side)
+                return SimpleNamespace(ok=True, message="selected")
+
+        controller = InitController()
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(collection_progress_profile=None)
+        control.components = SimpleNamespace(init_arm_controller=controller)
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 4
+        control._fix_init_allowed_in_controls = lambda: True
+        exact_calls: list[float] = []
+        control._handle_init_arm_move_to_qpos_event = (
+            lambda *, now: exact_calls.append(float(now))
+        )
+
+        control._handle_foot_pad_special_arm_event(
+            "init_arm_left",
+            now=24.0,
+        )
+
+        self.assertEqual(controller.selected, ["left"])
+        self.assertEqual(exact_calls, [24.0])
 
     def test_two_pedal_routes_mean_moving_side_and_never_init(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)

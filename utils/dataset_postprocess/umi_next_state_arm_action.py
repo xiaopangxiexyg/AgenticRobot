@@ -310,7 +310,8 @@ def _bytes_per_tactile_frame(spec: Mapping[str, Any]) -> int:
     shape = tuple(int(value) for value in spec.get("shape", ()) or ())
     if not shape or any(value <= 0 for value in shape):
         raise ValueError(f"invalid tactile shape: {shape}")
-    return int(math.prod(shape) * np.dtype(str(spec.get("dtype") or "")).itemsize)
+    storage_dtype = str(spec.get("storage_dtype") or spec.get("dtype") or "")
+    return int(math.prod(shape) * np.dtype(storage_dtype).itemsize)
 
 
 def _copy_prefix(source: Path, target: Path, byte_count: int) -> None:
@@ -347,34 +348,35 @@ def _trim_zstd_tactile(
     *,
     keep_count: int,
     codec: _ZstdCodec,
-) -> list[dict[str, int]]:
+) -> list[dict[str, Any]]:
     bytes_per_frame = _bytes_per_tactile_frame(spec)
     chunks = list(spec.get("chunks") or ())
     if not chunks:
         raise ValueError(f"chunked tactile stream has no chunks: {path}")
     temporary = path.with_name(f".{path.name}.umi_arm_align.tmp")
     temporary.unlink(missing_ok=True)
-    updated: list[dict[str, int]] = []
+    updated: list[dict[str, Any]] = []
     try:
         with path.open("rb") as input_handle, temporary.open("wb") as output_handle:
             for raw_chunk in chunks:
-                chunk = {key: int(value) for key, value in dict(raw_chunk).items()}
-                start = chunk["frame_start"]
-                count = chunk["frame_count"]
+                chunk = dict(raw_chunk)
+                start = int(chunk["frame_start"])
+                count = int(chunk["frame_count"])
                 if start >= keep_count:
                     break
-                input_handle.seek(chunk["offset"])
-                compressed = input_handle.read(chunk["compressed_bytes"])
+                input_handle.seek(int(chunk["offset"]))
+                compressed = input_handle.read(int(chunk["compressed_bytes"]))
                 retained = min(count, keep_count - start)
                 if retained < count:
-                    raw = codec.decompress(compressed, raw_bytes=chunk["raw_bytes"])
+                    raw = codec.decompress(compressed, raw_bytes=int(chunk["raw_bytes"]))
                     expected = count * bytes_per_frame
                     if len(raw) != expected:
                         raise ValueError(f"decompressed tactile size mismatch for {path}")
                     compressed = codec.compress(raw[: retained * bytes_per_frame])
                 offset = output_handle.tell()
                 output_handle.write(compressed)
-                updated.append(
+                updated_chunk = dict(chunk)
+                updated_chunk.update(
                     {
                         "frame_start": start,
                         "frame_count": retained,
@@ -383,9 +385,10 @@ def _trim_zstd_tactile(
                         "raw_bytes": retained * bytes_per_frame,
                     }
                 )
+                updated.append(updated_chunk)
             output_handle.flush()
             os.fsync(output_handle.fileno())
-        if sum(chunk["frame_count"] for chunk in updated) != keep_count:
+        if sum(int(chunk["frame_count"]) for chunk in updated) != keep_count:
             raise ValueError(f"trimmed tactile chunk coverage mismatch for {path}")
         os.replace(temporary, path)
     finally:

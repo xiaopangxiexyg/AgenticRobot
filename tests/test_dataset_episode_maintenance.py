@@ -15,10 +15,10 @@ from dataset_contracts.control_trace_episode import (
 )
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v25p import V25P_EPISODE_IDENTITY_FILE_DOMAIN_V1
-from teleop_runtime.collection.dataset_episode_maintenance import delete_episode_and_compact
+from collection_runtime.dataset_episode_maintenance import delete_episode_and_compact
 from teleop_runtime.collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from teleop_runtime.gui.calibration_web_ui import CalibrationWebUi, _encode_http_event_payload
-from teleop_runtime.real_teleop.gui_controls import (
+from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,
     hold_controls,

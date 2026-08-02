@@ -88,8 +88,8 @@ class CompositionActivationScope:
             _required(value, field_name="required_role")
             for value in self.required_roles
         )
-        if not roles or len(roles) != len(set(roles)):
-            raise ValueError("required_roles must be non-empty and unique.")
+        if len(roles) != len(set(roles)):
+            raise ValueError("required_roles must be unique.")
         object.__setattr__(self, "required_roles", roles)
 
     @property

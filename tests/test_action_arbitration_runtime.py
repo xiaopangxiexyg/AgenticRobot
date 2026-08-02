@@ -89,7 +89,65 @@ def test_event_burst_coalesces_without_catch_up_ticks() -> None:
     scheduler.trigger("latest", "proposal")
     second = scheduler.make_tick(cutoff_admission_sequence=101)
     assert second is not None
+    assert second.scheduled_decision_at == pytest.approx(10.0)
     assert scheduler.make_tick(cutoff_admission_sequence=101) is None
+
+
+def test_fixed_scheduler_keeps_grid_under_subperiod_call_jitter() -> None:
+    clock = Clock(10.0)
+    scheduler = DecisionScheduler(
+        DecisionScheduleSpec(
+            spec_id="fixed-20",
+            decision_hz=20,
+            target_lead_time_sec=0.05,
+        ),
+        clock=clock,
+    )
+    first = scheduler.make_tick(cutoff_admission_sequence=1)
+    assert first is not None
+
+    clock.value = 10.052
+    second = scheduler.make_tick(cutoff_admission_sequence=2)
+    assert second is not None
+    assert second.scheduled_decision_at == pytest.approx(10.05)
+    assert second.decision_cutoff_at == pytest.approx(10.052)
+    assert second.target_effective_at - first.target_effective_at == (
+        pytest.approx(0.05)
+    )
+
+
+def test_fixed_scheduler_skips_missed_grid_points_without_catch_up() -> None:
+    clock = Clock(10.0)
+    scheduler = DecisionScheduler(
+        DecisionScheduleSpec(
+            spec_id="fixed-20-skip",
+            decision_hz=20,
+            target_lead_time_sec=0.05,
+        ),
+        clock=clock,
+    )
+    assert scheduler.make_tick(cutoff_admission_sequence=1) is not None
+
+    clock.value = 10.18
+    skipped = scheduler.make_tick(cutoff_admission_sequence=2)
+    assert skipped is not None
+    assert skipped.scheduled_decision_at == pytest.approx(10.15)
+    assert scheduler.make_tick(cutoff_admission_sequence=2) is None
+
+
+def test_immediate_scheduler_preserves_actual_variable_decision_time() -> None:
+    clock = Clock(10.0)
+    scheduler = DecisionScheduler(
+        DecisionScheduleSpec(spec_id="immediate-30", decision_hz=30),
+        clock=clock,
+    )
+    first = scheduler.make_tick(cutoff_admission_sequence=1)
+    assert first is not None
+
+    clock.value = 10.04
+    second = scheduler.make_tick(cutoff_admission_sequence=2)
+    assert second is not None
+    assert second.scheduled_decision_at == pytest.approx(10.04)
 
 
 def test_publication_gate_limits_only_authoritative_selected_decisions() -> None:
@@ -117,6 +175,67 @@ def test_publication_gate_limits_only_authoritative_selected_decisions() -> None
     assert not hasattr(spec, "reference_hz")
     assert not hasattr(spec, "ik_hz")
     assert not hasattr(spec, "command_hz")
+
+
+def test_publication_gate_uses_scheduled_target_spacing_under_compute_jitter() -> None:
+    spec = DecisionScheduleSpec(
+        spec_id="20hz-target-grid",
+        decision_hz=20,
+        max_target_lateness_sec=100,
+    )
+    runtime = ArbitrationRuntime(spec)
+    gate = SimpleNamespace(status="ready", gate_epoch=0)
+    kwargs = {"schedule_hash": spec.semantic_content_hash}
+
+    first_attempt, first = runtime.publish(
+        computation(result_id="target-grid-0", target=10.1, **kwargs),
+        attempted_at=10.01,
+        live_gate_snapshot=gate,
+    )
+    second_attempt, second = runtime.publish(
+        computation(result_id="target-grid-1", target=10.15, **kwargs),
+        attempted_at=10.045,
+        live_gate_snapshot=gate,
+    )
+
+    assert first_attempt.accepted and first is not None
+    assert second_attempt.accepted and second is not None
+
+
+def test_publication_gate_accepts_exact_60hz_grid_at_large_monotonic_time() -> None:
+    spec = DecisionScheduleSpec(
+        spec_id="60hz-large-monotonic-grid",
+        decision_hz=60,
+        max_target_lateness_sec=100,
+    )
+    runtime = ArbitrationRuntime(spec)
+    gate = SimpleNamespace(status="ready", gate_epoch=0)
+    kwargs = {"schedule_hash": spec.semantic_content_hash}
+    first_target = 3_593_000.0
+
+    first_attempt, first = runtime.publish(
+        computation(
+            result_id="large-grid-0",
+            target=first_target,
+            deadline=first_target + 1.0,
+            **kwargs,
+        ),
+        attempted_at=first_target,
+        live_gate_snapshot=gate,
+    )
+    second_attempt, second = runtime.publish(
+        computation(
+            result_id="large-grid-1",
+            target=first_target + 1.0 / 60.0,
+            deadline=first_target + 1.0,
+            **kwargs,
+        ),
+        attempted_at=first_target + 1.0 / 60.0,
+        live_gate_snapshot=gate,
+    )
+
+    assert first_attempt.accepted and first is not None
+    assert second_attempt.accepted and second is not None
 
 
 def test_live_gate_change_and_late_result_reject_publication() -> None:

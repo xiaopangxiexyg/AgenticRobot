@@ -22,6 +22,10 @@ from teleop_runtime.sources.pose import VivePoseSource
 from teleop_runtime.tactile_visualizer import DMTacDistributedForceVisualizer
 from teleop_runtime.tactile_visualizer import dmtac_visualization_snapshot_from_backends
 from dataset_contracts.tactile_calibration import save_tactile_calibration
+from collection_runtime.progress.profiles import (
+    bind_dataset_progress_profile,
+    load_managed_task_profile,
+)
 
 
 class _FakeTerminal:
@@ -2594,6 +2598,39 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(init_controller.cancel_calls[0]["reason"], "hold_requested")
         self.assertEqual(retargeter.reset_count, 1)
 
+    def test_profile_hold_cancel_can_preserve_last_live_fix_snapshot(self) -> None:
+        class FakeFixController:
+            fixed = True
+
+            def __init__(self) -> None:
+                self.cancel_calls: list[dict[str, object]] = []
+
+            def cancel_active(self, **kwargs):
+                self.cancel_calls.append(dict(kwargs))
+                self.fixed = False
+                return SimpleNamespace(ok=True, side="left")
+
+        fix_controller = FakeFixController()
+        components = SimpleNamespace(
+            fix_arm_controller=fix_controller,
+            init_arm_controller=None,
+            dual_arm_retargeter=None,
+            left_command_backend=None,
+            right_command_backend=None,
+        )
+
+        messages = real_teleop._cancel_special_arm_modes_for_hold(
+            components,
+            now=1.0,
+            reason="progress_arm_profile_transition",
+            clear_fix_snapshots=False,
+        )
+
+        self.assertEqual(messages, ["左臂 fix-arm 已停止"])
+        self.assertFalse(
+            fix_controller.cancel_calls[0]["clear_snapshots"]
+        )
+
     def test_hold_gui_allows_stopping_active_ik_debug_log(self) -> None:
         ui = _FakeUi()
         control = real_teleop.RealTeleopControlInput(
@@ -2689,6 +2726,86 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(control.consume_camera_visualization_toggle_request())
         self.assertTrue(control.consume_tactile_visualization_toggle_request())
         self.assertTrue(control.consume_tactile_solving_enable_request())
+
+    def test_progress_gui_without_profile_does_not_block_episode_start(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(
+                collection_progress_gui=True,
+                collection_progress_profile=None,
+            ),
+            components=_components(),
+        )
+        control._teleop_started = True
+
+        admitted, message = control.episode_start_admission()
+
+        self.assertTrue(admitted, message)
+        self.assertEqual(message, "")
+
+    def test_task_selection_adopts_target_binding_without_old_profile_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_root = Path(tmp_dir) / "datasets"
+            task_config = Path(tmp_dir) / "tasks.json"
+            task_config.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "key": "bound_task",
+                                "english_name": "Bound Task",
+                                "chinese_name": "已绑定任务",
+                                "gripper_task": "firm_grasp",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            target_root = base_root / "2026-07-02_Bound_Task"
+            target_profile = load_managed_task_profile(
+                "example_three_stage_pick_place_progress"
+            ).progress_profile
+            bind_dataset_progress_profile(target_root, target_profile)
+            ui = _FakeUi()
+            args = _args(
+                dataset_root=str(base_root),
+                dataset_base_root=str(base_root),
+                task_config=str(task_config),
+                collection_progress_profile=load_managed_task_profile(
+                    "dmtac_rm65_bimanual_position_v1_progress"
+                ).progress_profile,
+            )
+            real_teleop._apply_formal_dataset_layout(args)
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=args,
+                components=_components(),
+            )
+            control._teleop_started = True
+
+            with patch.object(real_teleop, "datetime") as fake_datetime:
+                fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
+                applied = control._apply_episode_start_payload(
+                    json.dumps(
+                        {
+                            "dataset_base_root": str(base_root),
+                            "task_key": "bound_task",
+                            "task_english_name": "",
+                            "task_chinese_name": "",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        self.assertTrue(applied)
+        self.assertEqual(args.collection_task_id, "bound_task")
+        self.assertEqual(
+            args.collection_progress_profile.profile_id,
+            target_profile.profile_id,
+        )
 
     def test_stale_task_select_event_cannot_mutate_active_episode_contract(self) -> None:
         ui = _FakeUi()
@@ -2801,8 +2918,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         control.poll()
 
-        self.assertAlmostEqual(args.movement_multiple, 1.0)
-        self.assertAlmostEqual(args.translation_scale, 1.0)
+        self.assertAlmostEqual(args.movement_multiple, 1.35)
+        self.assertAlmostEqual(args.translation_scale, 1.35)
 
     def test_gui_movement_multiple_change_is_rejected_while_running(self) -> None:
         ui = _FakeUi(["movement_multiple_set:2.5"])
@@ -4244,6 +4361,64 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(args.gripper_task, "soft_grasp")
         self.assertEqual(Path(args.dataset_root), base_root / "2026-07-02_Soft_Pick")
 
+    def test_gui_can_rename_existing_task_into_a_new_dataset_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_root = Path(tmp_dir) / "datasets"
+            task_config = Path(tmp_dir) / "tasks.json"
+            task_config.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "key": "soft_pick",
+                                "english_name": "Soft Pick",
+                                "chinese_name": "轻柔抓取",
+                                "gripper_task": "soft_grasp",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ui = _FakeUi(
+                [
+                    "task_select:"
+                    + json.dumps(
+                        {
+                            "dataset_base_root": str(base_root),
+                            "task_key": "soft_pick",
+                            "task_english_name": "Soft Pick Recovery",
+                            "task_chinese_name": "",
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            )
+            args = _args(dataset_root=str(base_root), task_config=str(task_config))
+            real_teleop._apply_formal_dataset_layout(args)
+            original_root = Path(args.dataset_root)
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=args,
+                components=_components(),
+            )
+            control._teleop_started = True
+
+            with patch.object(real_teleop, "datetime") as fake_datetime:
+                fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
+                control.poll()
+
+        self.assertFalse(control.consume_episode_start_request())
+        self.assertEqual(args.collection_task_id, "soft_pick")
+        self.assertEqual(args.collection_task_name, "Soft Pick Recovery")
+        self.assertEqual(args.collection_task_name_zh, "轻柔抓取")
+        self.assertNotEqual(Path(args.dataset_root), original_root)
+        self.assertEqual(
+            Path(args.dataset_root),
+            base_root / "2026-07-02_Soft_Pick_Recovery",
+        )
+
     def test_gui_round_trip_task_payload_starts_in_and_can_toggle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base_root = Path(tmp_dir) / "datasets"
@@ -4491,7 +4666,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         legacy_script = html[html.rfind("<script>", 0, legacy_index):modern_index]
 
         self.assertNotIn("clearInterval(legacyTimer)", legacy_script)
-        self.assertIn("showRefreshWarning(error);", html)
+        self.assertIn("showRefreshWarning(error, refreshPhase);", html)
+        self.assertIn('render: "页面渲染失败"', html)
         self.assertIn("window.__calibrationWebUiModernRefreshOk = false;", html)
         self.assertIn(
             "if (window.__calibrationWebUiModernRefreshOk) return;\n"
@@ -4522,9 +4698,41 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         self.assertIn("datasetBaseRootInputEl.disabled = pathLocked;", html)
         self.assertIn("datasetChooseRootButtonEl.disabled = pathLocked;", html)
-        self.assertIn("const locked = Boolean(pathLocked || runtimeConfigured);", html)
+        self.assertIn("const taskLocked = Boolean(pathLocked || runtimeConfigured);", html)
+        self.assertIn(
+            "roundTripToggleButtonEl.disabled = taskLocked || !roundTripActive",
+            html,
+        )
+        self.assertNotIn(
+            "roundTripToggleButtonEl.disabled = locked || !roundTripActive",
+            html,
+        )
+        self.assertIn("|| (!runtimeConfigured && !englishName)", html)
+        self.assertIn('? "应用文件夹 / 切换数据集"', html)
         self.assertIn("let datasetBaseRootOverride = null;", html)
         self.assertIn("datasetBaseRootOverride = String(result.path);", html)
+
+    def test_dataset_configuration_has_explicit_draft_apply_flow(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn(
+            'id="datasetConfigurationApplyButton" class="secondary" '
+            'data-event="task_select"',
+            html,
+        )
+        self.assertIn("let taskEnglishNameOverride = null;", html)
+        self.assertIn("let taskChineseNameOverride = null;", html)
+        self.assertIn("markDatasetConfigurationDirty", html)
+        self.assertIn("let datasetConfigurationSubmittedRoot = null;", html)
+        self.assertIn("const submittedRootMatches = (", html)
+        self.assertIn(
+            'eventName === "episode_start" || eventName === "task_select"',
+            html,
+        )
+        self.assertNotIn(
+            'await sendEvent("task_select", collectEpisodeStartPayload());',
+            html,
+        )
 
     def test_episode_delete_controls_are_greyed_while_episode_is_busy(self) -> None:
         html = calibration_web_ui._HTML_PAGE
@@ -5342,6 +5550,36 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(status["warning"]["active"])
         self.assertIn("15.0 Hz", status["warning"]["message"])
 
+    def test_collection_frequency_warning_ignores_hidden_rounding_jitter(self) -> None:
+        recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+            real_teleop.RealTeleopDatasetRecorder
+        )
+        current_time = time.monotonic()
+        recorder.active_episode_index = 0
+        recorder.sample_builder = SimpleNamespace(
+            frame_index=46,
+            last_camera_rejection=None,
+            last_camera_frame_age_sec_by_key={},
+        )
+        recorder.frequency_warning_hz = 15.0
+        recorder.frequency_window_sec = 3.1
+        recorder.frequency_min_elapsed_sec = 2.0
+        recorder._episode_start_monotonic = current_time - 3.1
+        period_sec = 1.0 / 14.96
+        recorder._record_timestamps = deque(
+            current_time - period_sec * offset
+            for offset in reversed(range(46))
+        )
+
+        status = recorder.collection_frequency_status()
+
+        self.assertAlmostEqual(status["sample_hz"], 14.96, places=2)
+        self.assertFalse(status["warning"]["active"])
+        self.assertEqual(
+            status["warning"]["comparison_threshold_hz"],
+            14.95,
+        )
+
     def test_dataset_recorder_pause_blocks_samples_and_resumes_same_episode(self) -> None:
         recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
             real_teleop.RealTeleopDatasetRecorder
@@ -5874,6 +6112,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn('activeControls.has("two_pedal_c")', html_and_fallback)
         self.assertIn('legacyActiveControls["two_pedal_b"]', html_and_fallback)
         self.assertIn('fallbackActiveControls["two_pedal_c"]', html_and_fallback)
+        self.assertIn("5 踏板 3/4/5：推进/失败/撤销；Init 使用 G/GUI", html_and_fallback)
+        self.assertIn("B/C 派发与双踏板专用语义一致", html_and_fallback)
         self.assertIn('code === "keya"', html_and_fallback)
         self.assertIn('code === "keyc"', html_and_fallback)
 

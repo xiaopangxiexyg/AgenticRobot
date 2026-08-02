@@ -13,6 +13,7 @@ from robot_motion.rm65.ik_tuning import load_ik_tuning_config
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     POSITION_15_60_120_PROFILE,
     POSITION_45_150_PROFILE,
     POSITION_60_120_PROFILE,
@@ -25,6 +26,9 @@ from teleop_runtime.position_control import (
     PositionDeployExecutorConfig,
     resolve_control_debug_config,
     resolve_real_arm_execution_config,
+)
+from teleop_runtime.real_teleop.control_profile import (
+    output_qpos_smoothing_singularity_alpha,
 )
 
 
@@ -138,6 +142,79 @@ def test_real_teleop_velocity_planner_is_explicit_opt_in_with_point_one_second_r
     assert enabled.position_degraded_speed_scale == pytest.approx(0.2)
     assert enabled.position_max_acceleration_rad_s2 == pytest.approx(
         (8.0, 8.0, 10.0, 16.0, 16.0, 21.0)
+    )
+
+
+def test_sample_aligned_jerk_profile_resolves_atomically_without_changing_v1() -> None:
+    enabled = _parse_real_teleop_args(
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_sample_aligned_jerk_v1",
+            "--arm-control-mode",
+            "position",
+        ]
+    )
+
+    assert (
+        enabled.position_command_planner
+        == POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+    )
+    assert enabled.hz == pytest.approx(15.0)
+    assert enabled.position_reference_hz == pytest.approx(60.0)
+    assert enabled.dual_arm_ik_hz == pytest.approx(60.0)
+    assert enabled.arm_control_hz == pytest.approx(120.0)
+    assert enabled.position_velocity_ramp_sec == pytest.approx(0.05)
+    assert enabled.position_target_velocity_filter_tau_sec == pytest.approx(0.0)
+    assert enabled.arm_follow_qpos_alpha == pytest.approx(1.0)
+
+    rollback = _parse_real_teleop_args(
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_v1",
+            "--arm-control-mode",
+            "position",
+        ]
+    )
+    assert rollback.position_command_planner == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+    assert rollback.position_velocity_ramp_sec == pytest.approx(0.10)
+    assert rollback.position_target_velocity_filter_tau_sec == pytest.approx(0.03)
+    assert rollback.arm_follow_qpos_alpha == pytest.approx(0.9)
+
+
+def test_sample_aligned_jerk_v2_resolves_convergence_and_governor_contract() -> None:
+    enabled = _parse_real_teleop_args(
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_sample_aligned_jerk_v2",
+            "--arm-control-mode",
+            "position",
+        ]
+    )
+
+    assert (
+        enabled.position_command_planner
+        == POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+    )
+    assert enabled.position_post_ik_qpos_normal_fast_path is True
+    assert enabled.position_post_ik_qpos_normal_fast_path_alpha == pytest.approx(0.70)
+    assert enabled.position_sample_aligned_scale_degraded_target is False
+    assert enabled.position_sample_aligned_jerk_regularization == pytest.approx(1e-6)
+    assert enabled.position_sample_aligned_jerk_delta_regularization == pytest.approx(
+        1e-5
+    )
+    assert enabled.position_sample_aligned_terminal_velocity_regularization == 0.0
+    assert enabled.position_sample_aligned_terminal_acceleration_regularization == 0.0
+    assert enabled.position_inactive_execution_release_translation_static_m == (
+        pytest.approx(0.0015)
+    )
+    assert enabled.position_inactive_execution_release_translation_full_m == (
+        pytest.approx(0.012)
+    )
+    assert enabled.position_inactive_execution_release_rotation_static_deg == (
+        pytest.approx(0.25)
+    )
+    assert enabled.position_inactive_execution_release_rotation_full_deg == (
+        pytest.approx(2.0)
     )
 
 
@@ -461,6 +538,27 @@ def test_shared_impedance_profile_keeps_15hz_outer_and_40hz_backend_by_default()
     assert resolved.arm_control_hz == 40.0
     assert resolved.arm_canfd_follow is False
     assert resolved.position_background_streaming_enabled is False
+
+
+def test_singularity_qpos_smoothing_is_position_only() -> None:
+    assert (
+        output_qpos_smoothing_singularity_alpha(
+            "impedance",
+            slow_alpha=1.0,
+            fast_alpha=0.45,
+        )
+        is None
+    )
+    assert output_qpos_smoothing_singularity_alpha(
+        "position",
+        slow_alpha=0.14,
+        fast_alpha=0.45,
+    ) == pytest.approx(0.65)
+    assert output_qpos_smoothing_singularity_alpha(
+        "position",
+        slow_alpha=0.8,
+        fast_alpha=0.9,
+    ) == pytest.approx(0.9)
 
 
 def test_legacy_position_profile_selects_mode_and_resolves_15_45_150() -> None:

@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from teleop_runtime.collection import run_collect
-from teleop_runtime.collection.async_writer import AsyncWriterStats
+from collection_runtime.async_writer import AsyncWriterStats
 
 
 class _FakeWriterPool:

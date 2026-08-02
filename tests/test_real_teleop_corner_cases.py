@@ -3,7 +3,7 @@ from __future__ import annotations
 from itertools import product
 
 from teleop_runtime.gui.calibration_web_ui import CalibrationWebUi
-from teleop_runtime.real_teleop.gui_controls import (
+from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,
     current_active_controls,
@@ -88,4 +88,3 @@ def test_web_ui_rejects_payloads_for_inactive_controls_without_queueing() -> Non
         assert ui.consume_events() == []
     finally:
         ui.close()
-

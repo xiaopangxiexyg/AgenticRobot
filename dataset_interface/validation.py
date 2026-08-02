@@ -382,6 +382,17 @@ def validate_v23_dataset(
     _validate_metadata_binding(
         report, label="info", metadata=info, contract=contract, layout_hash=layout.layout_hash
     )
+    if (root / "meta" / "progress").exists():
+        try:
+            # Local import keeps the core v2.3 validator usable without
+            # creating a reverse dependency from progress readers.
+            from .progress_artifacts import load_dataset_progress_profile
+
+            load_dataset_progress_profile(root)
+        except Exception as exc:
+            report.errors.append(
+                f"invalid dataset progress profile binding: {exc}"
+            )
     _validate_action_spec_frames(report, label="info", metadata=info, contract=contract)
     for side in contract.source.active_sides:
         expected = (

@@ -32,6 +32,16 @@ dataset = [
     "Pillow==12.3.0",
     "zstandard==0.25.0",
 ]
+annotation = [
+    # Dedicated post-capture annotation machines do not need the complete
+    # robot/sim/model environment. NumPy/PyArrow are used by canonical
+    # dataset reads; SciPy/OSQP remain necessary while the compatibility
+    # package exports share imports with pose/control validation.
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "osqp==1.1.3",
+    "pyarrow==24.0.0",
+]
 sim = [
     "mujoco==3.10.0",
     "gymnasium==1.3.0",
@@ -73,6 +83,7 @@ hardware = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
+    "collection_runtime*",
     "control_composition*",
     "control_station*",
     "dataset_contracts*",
@@ -93,7 +104,15 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.yaml", "*.yml", "*.xml", "*.urdf", "*.obj", "*.stl"]
-control_station = ["web/static/*.html", "web/static/*.js", "web/static/*.css"]
+control_station = [
+    "web/*.js",
+    "web/static/*.html",
+    "web/static/*.js",
+    "web/static/*.css",
+    "refinement_annotation/static/*.html",
+    "refinement_annotation/static/*.js",
+    "refinement_annotation/static/*.css",
+]
 robot_motion = ["configs/*.json", "configs/**/*.json"]
 teleop_runtime = ["configs/*.json", "configs/**/*.json"]
 

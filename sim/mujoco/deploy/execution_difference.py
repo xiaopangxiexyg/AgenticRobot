@@ -8,6 +8,10 @@ the production control path unless a consumer explicitly opts in.
 from __future__ import annotations
 
 import math
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Mapping
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -19,10 +23,14 @@ from control_composition.observability import (
     DIFFERENCE_MODULE_POST_COMPOSITION_EXECUTION,
     DifferenceObservationEnvelope,
     MeasurementReferenceAssociation,
+    associate_measurement_to_reference,
 )
 from robot_motion.action import (
+    ComponentExecutionTarget,
+    ComponentExecutionTargetAdmissionReceipt,
     ExecutionFactReference,
     ExecutionMeasurementObservation,
+    ExecutionObservationWatermark,
     ExecutionReferenceFrameObservation,
     ReferenceSegment,
     ReferenceSegmentAdmissionReceipt,
@@ -52,6 +60,143 @@ MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH = canonical_content_hash(
 )
 
 
+@dataclass(frozen=True)
+class MujocoExecutionDifferenceSnapshot:
+    """Read-only state of the bounded passive MuJoCo observer."""
+
+    latest_association: MeasurementReferenceAssociation | None
+    watermark_by_stream: Mapping[str, ExecutionObservationWatermark]
+    reference_count: int
+    measurement_count: int
+    unmatched_measurement_count: int
+    pending_reference_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "watermark_by_stream",
+            MappingProxyType(dict(self.watermark_by_stream)),
+        )
+
+
+class MujocoExecutionDifferenceObserver:
+    """Pair lower-owned point references and measurements without blocking.
+
+    Pairing uses the exact observation binding, plan hash, and sample time
+    emitted by the MuJoCo target.  It never selects a nearby reference or
+    reconstructs interpolation.  The small pending map is only an observer
+    cache and cannot affect authority, reference generation, or dispatch.
+    """
+
+    def __init__(
+        self,
+        *,
+        selection_group_id: str,
+        component_ids: tuple[str, ...],
+        max_pending_references: int = 8,
+    ) -> None:
+        selection_group = str(selection_group_id).strip()
+        components = tuple(str(value).strip() for value in component_ids)
+        capacity = int(max_pending_references)
+        if not selection_group:
+            raise ValueError("selection_group_id must be non-empty.")
+        if (
+            not components
+            or any(not value for value in components)
+            or len(components) != len(set(components))
+        ):
+            raise ValueError("component_ids must be non-empty and unique.")
+        if capacity <= 0:
+            raise ValueError("max_pending_references must be positive.")
+        self.selection_group_id = selection_group
+        self.component_ids = components
+        self.max_pending_references = capacity
+        self._lock = threading.Lock()
+        self._reference_by_key: OrderedDict[
+            tuple[str, str, float],
+            ExecutionReferenceFrameObservation,
+        ] = OrderedDict()
+        self._latest_association: MeasurementReferenceAssociation | None = None
+        self._watermark_by_stream: dict[str, ExecutionObservationWatermark] = {}
+        self._reference_count = 0
+        self._measurement_count = 0
+        self._unmatched_measurement_count = 0
+
+    @staticmethod
+    def _key(
+        observation: (
+            ExecutionReferenceFrameObservation
+            | ExecutionMeasurementObservation
+        ),
+    ) -> tuple[str, str, float]:
+        binding_id = str(observation.observation_binding_id or "").strip()
+        plan_hash = str(observation.observation_plan_hash or "").strip()
+        if not binding_id or not plan_hash:
+            raise ValueError(
+                "Execution observations require an exact binding and plan hash."
+            )
+        sampled_at = (
+            observation.scheduled_for
+            if isinstance(observation, ExecutionReferenceFrameObservation)
+            else observation.measured_at
+        )
+        return binding_id, plan_hash, float(sampled_at)
+
+    def publish_execution_observation(
+        self,
+        observation: (
+            ExecutionReferenceFrameObservation
+            | ExecutionMeasurementObservation
+            | ExecutionObservationWatermark
+        ),
+    ) -> bool:
+        """Consume one target observation; ``False`` reports invalid input."""
+
+        try:
+            with self._lock:
+                if isinstance(observation, ExecutionReferenceFrameObservation):
+                    key = self._key(observation)
+                    self._reference_by_key[key] = observation
+                    self._reference_by_key.move_to_end(key)
+                    while (
+                        len(self._reference_by_key)
+                        > self.max_pending_references
+                    ):
+                        self._reference_by_key.popitem(last=False)
+                    self._reference_count += 1
+                elif isinstance(observation, ExecutionMeasurementObservation):
+                    key = self._key(observation)
+                    reference = self._reference_by_key.pop(key, None)
+                    association = associate_measurement_to_reference(
+                        observation,
+                        reference,
+                        selection_group_id=self.selection_group_id,
+                        component_ids=self.component_ids,
+                    )
+                    self._latest_association = association
+                    self._measurement_count += 1
+                    if association.status != "available":
+                        self._unmatched_measurement_count += 1
+                elif isinstance(observation, ExecutionObservationWatermark):
+                    self._watermark_by_stream[observation.stream] = observation
+                else:
+                    return False
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def snapshot(self) -> MujocoExecutionDifferenceSnapshot:
+        with self._lock:
+            return MujocoExecutionDifferenceSnapshot(
+                latest_association=self._latest_association,
+                watermark_by_stream=dict(self._watermark_by_stream),
+                reference_count=self._reference_count,
+                measurement_count=self._measurement_count,
+                unmatched_measurement_count=self._unmatched_measurement_count,
+                pending_reference_count=len(self._reference_by_key),
+            )
+
+
 def _finite(value: object, *, name: str) -> float:
     result = float(value)
     if not math.isfinite(result):
@@ -63,13 +208,19 @@ def _side_component_mapping(
     side_to_component_id: Mapping[str, str],
     *,
     expected_sides: tuple[str, ...],
+    allow_subset: bool = False,
 ) -> dict[str, str]:
     normalized = {
         str(side).strip(): str(component_id).strip()
         for side, component_id in side_to_component_id.items()
     }
     if (
-        set(normalized) != set(expected_sides)
+        (
+            not set(normalized).issubset(expected_sides)
+            if allow_subset
+            else set(normalized) != set(expected_sides)
+        )
+        or (allow_subset and not normalized)
         or any(not side or not component_id for side, component_id in normalized.items())
         or len(set(normalized.values())) != len(normalized)
     ):
@@ -304,9 +455,11 @@ def project_mujoco_execution_reference_sample(
     mapping = _side_component_mapping(
         side_to_component_id,
         expected_sides=sides,
+        allow_subset=True,
     )
+    exported_sides = tuple(side for side in sides if side in mapping)
     requested_components = (
-        tuple(mapping[side] for side in sides)
+        tuple(mapping[side] for side in exported_sides)
         if selected_component_ids is None
         else tuple(str(value).strip() for value in selected_component_ids)
     )
@@ -321,7 +474,9 @@ def project_mujoco_execution_reference_sample(
             "components."
         )
     selected_sides = tuple(
-        side for side in sides if mapping[side] in requested_components
+        side
+        for side in exported_sides
+        if mapping[side] in requested_components
     )
     component_ids = tuple(mapping[side] for side in selected_sides)
     if any(
@@ -392,6 +547,97 @@ def project_mujoco_execution_reference_sample(
                 observed_at=activation.observed_at,
                 clock_domain_id=segment.clock_domain_id,
                 status="activated",
+            ),
+        ),
+    )
+
+
+def project_mujoco_immediate_execution_reference_sample(
+    *,
+    target: ComponentExecutionTarget,
+    admission: ComponentExecutionTargetAdmissionReceipt,
+    reference_sequence: int,
+    qref_by_side: Mapping[str, object],
+    sampled_at: float,
+    available_at: float,
+    side_to_component_id: Mapping[str, str],
+    component_schema_hash: str,
+    observation_binding_id: str,
+    observation_plan_hash: str,
+    selected_component_ids: tuple[str, ...],
+) -> ExecutionReferenceFrameObservation:
+    """Project the exact active immediate qref reported by the execution Rig."""
+
+    if not admission.accepted or admission.target_id != target.target_id:
+        raise ValueError("Immediate reference requires its accepted target admission.")
+    sample_time = _finite(sampled_at, name="sampled_at")
+    observed_time = _finite(available_at, name="available_at")
+    sides = tuple(str(side) for side in qref_by_side)
+    mapping = _side_component_mapping(
+        side_to_component_id,
+        expected_sides=sides,
+        allow_subset=True,
+    )
+    requested = tuple(str(value).strip() for value in selected_component_ids)
+    selected_sides = tuple(
+        side for side in sides if mapping.get(side) in requested
+    )
+    if {mapping[side] for side in selected_sides} != set(requested):
+        raise ValueError("Immediate qref does not cover selected components.")
+    values = {
+        mapping[side]: tuple(
+            float(value) for value in qref_by_side[side]
+        )
+        for side in selected_sides
+    }
+    source_hash = canonical_content_hash(
+        {
+            "target_hash": target.semantic_content_hash,
+            "admission_hash": admission.semantic_content_hash,
+            "reference_sequence": int(reference_sequence),
+            "sampled_at": sample_time,
+            "value_by_component": values,
+        },
+        domain="dexteleop.sim.mujoco.immediate_qref_sample.development",
+    )
+    return ExecutionReferenceFrameObservation(
+        reference_frame_id=f"mujoco-immediate-reference-sample:{source_hash}",
+        reference_stage_id="mujoco.active_qref_at_measurement",
+        source_reference_id=admission.receipt_id,
+        source_reference_hash=admission.semantic_content_hash,
+        target_fact_id=target.target_id,
+        target_fact_hash=target.semantic_content_hash,
+        control_domain_id=target.control_domain_id,
+        selection_group_id="arms",
+        execution_fence_sequence=target.execution_fence_sequence,
+        reference_revision=target.execution_fence_sequence,
+        reference_sequence=int(reference_sequence),
+        temporal_semantics="point_sample",
+        scheduled_for=sample_time,
+        generated_at=sample_time,
+        effective_from=None,
+        effective_until=None,
+        available_at=observed_time,
+        clock_domain_id=target.clock_domain_id,
+        value_by_component=values,
+        representation_by_component={
+            component_id: "joint_position"
+            for component_id in requested
+        },
+        schema_hash_by_component={
+            component_id: str(component_schema_hash)
+            for component_id in requested
+        },
+        observation_binding_id=observation_binding_id,
+        observation_plan_hash=observation_plan_hash,
+        parent_facts=(
+            _fact_reference(
+                stage="component_execution_target_admission",
+                fact_id=admission.receipt_id,
+                fact_hash=admission.semantic_content_hash,
+                observed_at=admission.admitted_at,
+                clock_domain_id=admission.clock_domain_id,
+                status="accepted",
             ),
         ),
     )
@@ -543,8 +789,11 @@ __all__ = [
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID",
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH",
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID",
+    "MujocoExecutionDifferenceObserver",
+    "MujocoExecutionDifferenceSnapshot",
     "build_mujoco_qpos_execution_difference_observation",
     "project_mujoco_execution_measurement_observation",
+    "project_mujoco_immediate_execution_reference_sample",
     "project_mujoco_execution_reference_frame",
     "project_mujoco_execution_reference_sample",
 ]

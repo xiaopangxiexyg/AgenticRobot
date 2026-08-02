@@ -6,9 +6,13 @@ import numpy as np
 
 from robot_motion.rm65 import RM65_POSE_LIFT_PROFILE_CHOICES
 from teleop_runtime.debug.view_rm65_pose_lift_sim_replay import (
+    OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME,
+    REPRESENTATIVE_SUITE_0727,
+    REPRESENTATIVE_SUITE_0727_NAME,
     build_parser,
     generate_trajectory,
     planner_config_from_args,
+    resolved_episode_specs,
     selected_profiles,
 )
 
@@ -36,6 +40,30 @@ def test_profile_selection_defaults_and_all_profiles() -> None:
 
     all_profiles = _args("--all-profiles")
     assert selected_profiles(all_profiles) == RM65_POSE_LIFT_PROFILE_CHOICES
+
+
+def test_representative_suite_selects_v4_then_current_better_candidate() -> None:
+    args = build_parser().parse_args(
+        [
+            "--dataset-root",
+            "/tmp/dataset",
+            "--representative-suite",
+            REPRESENTATIVE_SUITE_0727_NAME,
+        ]
+    )
+    assert selected_profiles(args) == (
+        "rm65_pose_lift_v4_qp_constrained",
+        OFFICIAL_SOURCE_ALL_IK_GOVERNOR_PROFILE_NAME,
+    )
+    assert resolved_episode_specs(args) == REPRESENTATIVE_SUITE_0727
+    assert [
+        (spec.episode_index, spec.start_frame, spec.max_frames)
+        for spec in resolved_episode_specs(args)
+    ] == [
+        (96, 40, 75),
+        (37, 157, 62),
+        (68, 0, 163),
+    ]
 
 
 def test_fixed_iterations_override_adaptive_solver() -> None:
@@ -156,4 +184,3 @@ def test_generate_trajectory_uses_saved_qref_then_pose_references() -> None:
     assert trajectory.status_counts == {"tracking": 1, "hold_last_safe": 1}
     assert trajectory.frames[0].source_frame_index == 1
     assert trajectory.frames[0].interpolation_alpha == 0.25
-

@@ -76,6 +76,9 @@ def pose_xyz_rpy_summary(
             "tracker_name": "",
             "tracker_role": "",
             "seq": None,
+            "sender_host": "",
+            "sender_error": None,
+            "sender_read_elapsed_ms": None,
         }
     if channel is None:
         status_level, status_label, stale = tracker_gui_status(
@@ -98,6 +101,9 @@ def pose_xyz_rpy_summary(
             "tracker_name": "",
             "tracker_role": "",
             "seq": None,
+            "sender_host": "",
+            "sender_error": None,
+            "sender_read_elapsed_ms": None,
         }
     metadata = getattr(channel, "metadata", None) or {}
     pose = as_pose_matrix(getattr(channel, "value"))
@@ -134,6 +140,9 @@ def pose_xyz_rpy_summary(
         "tracker_name": str(metadata.get("tracker_name") or ""),
         "tracker_role": str(metadata.get("tracker_role") or ""),
         "seq": metadata.get("seq"),
+        "sender_host": str(metadata.get("sender_host") or ""),
+        "sender_error": metadata.get("sender_error"),
+        "sender_read_elapsed_ms": metadata.get("sender_read_elapsed_ms"),
     }
 
 

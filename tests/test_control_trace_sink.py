@@ -91,6 +91,46 @@ def test_spool_sink_acknowledges_only_post_fsync_records(tmp_path: Path) -> None
         assert not completeness.capture_commit_eligible
 
 
+def test_spool_sink_batches_one_durability_barrier_per_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace = runtime()
+    assert trace.issue(fact(1)).accepted
+    assert trace.issue(fact(2, terminal=True)).accepted
+    with ControlTraceSpool(
+        tmp_path / "batched.wal",
+        trace_session_id="trace-1",
+        max_bytes=1 << 20,
+        physical_preallocation=False,
+    ) as spool, ControlTraceWriterHealthLedger(
+        tmp_path / "batched.health",
+        trace_session_id="trace-1",
+    ) as health:
+        import teleop_runtime.control_trace.spool as spool_module
+
+        fsync_calls: list[int] = []
+        real_fsync = spool_module.os.fsync
+
+        def observed_fsync(fd: int) -> None:
+            fsync_calls.append(fd)
+            real_fsync(fd)
+
+        monkeypatch.setattr(spool_module.os, "fsync", observed_fsync)
+        sink = ControlTraceSpoolSink(
+            sink_id="batched-sink",
+            runtime=trace,
+            spool=spool,
+            health_ledger=health,
+        )
+
+        report = sink.flush_pending()
+
+        assert report.newly_durable_sequences == (1, 2)
+        assert report.failure_code is None
+        assert len(fsync_calls) == 1
+
+
 def test_spool_sink_scans_only_new_runtime_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -126,6 +166,38 @@ def test_spool_sink_scans_only_new_runtime_entries(
         assert sink.flush_pending().newly_durable_sequences == ()
 
     assert offsets == [0, 1, 2]
+
+
+def test_spool_sink_hot_path_does_not_build_full_runtime_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace = runtime()
+    assert trace.issue(fact(1)).accepted
+    with ControlTraceSpool(
+        tmp_path / "no-snapshot.wal",
+        trace_session_id="trace-1",
+        max_bytes=1 << 20,
+        physical_preallocation=False,
+    ) as spool, ControlTraceWriterHealthLedger(
+        tmp_path / "no-snapshot.health",
+        trace_session_id="trace-1",
+    ) as health:
+        sink = ControlTraceSpoolSink(
+            sink_id="no-snapshot-sink",
+            runtime=trace,
+            spool=spool,
+            health_ledger=health,
+        )
+
+        def reject_snapshot():
+            raise AssertionError("storage hot path built a full runtime snapshot")
+
+        monkeypatch.setattr(trace, "snapshot", reject_snapshot)
+        report = sink.flush_pending()
+
+    assert report.newly_durable_sequences == (1,)
+    assert report.durable_high_watermark == 1
 
 
 def test_spool_failure_uses_independent_durable_health_ledger(tmp_path: Path) -> None:

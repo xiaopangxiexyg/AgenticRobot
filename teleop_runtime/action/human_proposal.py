@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import (
@@ -18,6 +18,7 @@ from robot_motion.action import (
     ArmActionSpec,
     HandActionSpec,
     RobotAction,
+    ComponentAction,
     ComponentActionSchema,
     SourceValidationResult,
     split_effector_name,
@@ -49,6 +50,14 @@ _NONCANONICAL_CONTROL_METADATA_KEYS = frozenset(
         "servo_mode",
     }
 )
+
+
+class HumanComponentActionProjector(Protocol):
+    """Optional compatibility-envelope to canonical component projection."""
+
+    semantic_content_hash: str
+
+    def project(self, action: RobotAction) -> ComponentAction: ...
 
 
 def _freeze_metadata(
@@ -577,6 +586,8 @@ class HumanProposalAdapterConfig:
     effective_clock_domain_id: str
     component_catalog: ActionComponentCatalog
     action_schema: ComponentActionSchema
+    component_id_by_effector: Mapping[str, str] = field(default_factory=dict)
+    component_projection_contract_hash: str | None = None
     action_adapter: TeleopCommandActionAdapterConfig = field(
         default_factory=lambda: TeleopCommandActionAdapterConfig(
             include_command_metadata=False,
@@ -602,13 +613,98 @@ class HumanProposalAdapterConfig:
             raise ValueError("producer_epoch must be non-negative.")
         if not isinstance(self.action_schema, ComponentActionSchema):
             raise TypeError("action_schema must be a ComponentActionSchema.")
+        default_mapping = {
+            item.effector_name: item.component_id
+            for item in self.component_catalog.components
+        }
+        requested_mapping = (
+            default_mapping
+            if not self.component_id_by_effector
+            else {
+                str(effector).strip(): str(component_id).strip()
+                for effector, component_id in dict(
+                    self.component_id_by_effector
+                ).items()
+            }
+        )
+        if (
+            set(requested_mapping) != set(default_mapping)
+            or any(
+                not effector or not component_id
+                for effector, component_id in requested_mapping.items()
+            )
+            or len(requested_mapping.values())
+            != len(set(requested_mapping.values()))
+        ):
+            raise ValueError(
+                "component_id_by_effector must map every source effector "
+                "exactly once."
+            )
+        if not set(requested_mapping.values()).issubset(
+            set(self.action_schema.component_ids)
+        ):
+            raise ValueError(
+                "component_id_by_effector targets components outside the "
+                "action schema."
+            )
+        projection_hash = (
+            None
+            if self.component_projection_contract_hash is None
+            else str(self.component_projection_contract_hash).strip()
+        )
+        if self.component_projection_contract_hash is not None and not projection_hash:
+            raise ValueError(
+                "component_projection_contract_hash must be non-empty."
+            )
+        if projection_hash is None and requested_mapping != default_mapping:
+            raise ValueError(
+                "A non-identity human component mapping requires an explicit "
+                "projection contract."
+            )
+        object.__setattr__(
+            self,
+            "component_id_by_effector",
+            MappingProxyType(requested_mapping),
+        )
+        object.__setattr__(
+            self,
+            "component_projection_contract_hash",
+            projection_hash,
+        )
 
 
 class HumanProposalAdapter:
     """Convert one passive pre-filter human emission into a proposal draft."""
 
-    def __init__(self, config: HumanProposalAdapterConfig) -> None:
+    def __init__(
+        self,
+        config: HumanProposalAdapterConfig,
+        *,
+        component_action_projector: HumanComponentActionProjector | None = None,
+    ) -> None:
         self.config = config
+        projection_hash = (
+            None
+            if component_action_projector is None
+            else str(
+                getattr(
+                    component_action_projector,
+                    "semantic_content_hash",
+                    "",
+                )
+            ).strip()
+        )
+        if projection_hash != config.component_projection_contract_hash:
+            raise ValueError(
+                "Human component projector does not match the config contract."
+            )
+        if component_action_projector is not None and not callable(
+            getattr(component_action_projector, "project", None)
+        ):
+            raise TypeError(
+                "component_action_projector must expose project(RobotAction)."
+            )
+        self.component_action_projector = component_action_projector
         adapter = replace(
             config.action_adapter,
             include_command_metadata=False,
@@ -623,6 +719,10 @@ class HumanProposalAdapter:
             {
                 "adapter_contract_id": HUMAN_SOURCE_ADAPTER_CONTRACT_ID_V1,
                 "component_catalog_hash": config.component_catalog.semantic_content_hash,
+                "component_id_by_effector": config.component_id_by_effector,
+                "component_projection_contract_hash": (
+                    config.component_projection_contract_hash
+                ),
                 "arm_joint_policy": adapter.arm_joint_policy,
                 "pose_metadata_keys": adapter.pose_metadata_keys,
                 "hand_slot_dof": adapter.hand_slot_dof,
@@ -721,6 +821,7 @@ class HumanProposalAdapter:
                     if mapping.selection_group_id is not None
                 )
             )
+            component_action = self._project_component_action(action)
             proposal = ActionProposalDraft(
                 runtime_session_id=self.config.runtime_session_id,
                 control_domain_id=self.config.control_domain_id,
@@ -729,14 +830,7 @@ class HumanProposalAdapter:
                 producer_id=self.config.producer_id,
                 producer_epoch=self.config.producer_epoch,
                 sequence=emission.emission_sequence,
-                action=project_robot_action_v1_to_component_action(
-                    action,
-                    action_schema=self.config.action_schema,
-                    component_id_by_effector={
-                        item.effector_name: item.component_id
-                        for item in self.config.component_catalog.components
-                    },
-                ),
+                action=component_action,
                 produced_at=emission.emitted_at,
                 produced_clock_domain_id=self.config.produced_clock_domain_id,
                 effective_from=float(effective_from),
@@ -780,6 +874,42 @@ class HumanProposalAdapter:
             source_validation=validation,
             source_adapter_receipt=receipt,
         )
+
+    def _project_component_action(self, action: RobotAction) -> ComponentAction:
+        projector = self.component_action_projector
+        if projector is None:
+            projected = project_robot_action_v1_to_component_action(
+                action,
+                action_schema=self.config.action_schema,
+                component_id_by_effector=self.config.component_id_by_effector,
+            )
+        else:
+            projected = projector.project(action)
+        if not isinstance(projected, ComponentAction):
+            raise TypeError(
+                "Human component projector must return ComponentAction."
+            )
+        if (
+            projected.action_schema.semantic_content_hash
+            != self.config.action_schema.semantic_content_hash
+        ):
+            raise ValueError(
+                "Human component projector returned another action schema."
+            )
+        active_components = {
+            self.config.component_id_by_effector[effector]
+            for effector in action.active_effectors
+        }
+        expected = tuple(
+            component_id
+            for component_id in self.config.action_schema.component_ids
+            if component_id in active_components
+        )
+        if projected.component_coverage != expected:
+            raise ValueError(
+                "Human component projector returned another component coverage."
+            )
+        return projected
 
     def adapt_legacy_observation(
         self,
@@ -974,9 +1104,21 @@ class HumanProposalAdapter:
         if winner is not None and 0 <= winner < len(emission.contributions):
             retargeter_name = emission.contributions[winner].retargeter_name
         return SourceComponentMappingReceipt(
-            component_id=None if component is None else component.component_id,
+            component_id=(
+                None
+                if component is None
+                else self.config.component_id_by_effector[
+                    command.effector_name
+                ]
+            ),
             selection_group_id=(
-                None if component is None else component.selection_group_id
+                None
+                if component is None
+                else self.config.action_schema.component_catalog.component_by_id[
+                    self.config.component_id_by_effector[
+                        command.effector_name
+                    ]
+                ].selection_group_id
             ),
             effector_name=command.effector_name,
             contribution_index=winner,
@@ -1126,6 +1268,7 @@ __all__ = [
     "HumanCommandContribution",
     "HumanCommandEmission",
     "HumanCommandFilterObservation",
+    "HumanComponentActionProjector",
     "HumanDispatchReceiptSnapshot",
     "HumanLegacyCommandObservation",
     "HumanLegacyActionAdapterResult",

@@ -133,6 +133,12 @@ class DecisionScheduler:
     def now(self) -> float:
         return float(self._clock())
 
+    @property
+    def next_due_at(self) -> float | None:
+        """Return the fixed-grid deadline without advancing scheduler state."""
+
+        return self._next_due_at
+
     def due(self, now: float | None = None) -> bool:
         timestamp = float(self.now() if now is None else now)
         if self._next_due_at is None:
@@ -150,15 +156,27 @@ class DecisionScheduler:
         timestamp = float(self.now() if now is None else now)
         if not self.due(timestamp):
             return None
+        scheduled_at = timestamp
+        if (
+            self._next_due_at is not None
+            and self.spec.target_lead_time_sec > 0.0
+        ):
+            scheduled_at = self._next_due_at
+            lateness = max(0.0, timestamp - scheduled_at)
+            missed_periods = int(
+                math.floor(lateness / self.spec.period_sec)
+            )
+            if missed_periods:
+                scheduled_at += missed_periods * self.spec.period_sec
         triggers = tuple(self._pending_triggers)
         self._pending_triggers.clear()
         trigger_count = self._pending_trigger_count
         self._pending_trigger_count = 0
         cutoff_at = timestamp - float(self.spec.cutoff_lag_sec)
-        target_at = timestamp + float(self.spec.target_lead_time_sec)
+        target_at = scheduled_at + float(self.spec.target_lead_time_sec)
         payload = {
             "tick_index": self._tick_index,
-            "scheduled_decision_at": timestamp,
+            "scheduled_decision_at": scheduled_at,
             "decision_cutoff_at": cutoff_at,
             "cutoff_admission_sequence": int(cutoff_admission_sequence),
             "target_effective_at": target_at,
@@ -177,8 +195,10 @@ class DecisionScheduler:
             semantic_content_hash=semantic_hash,
         )
         self._tick_index += 1
-        # Skip missed periods; never create a catch-up burst.
-        self._next_due_at = timestamp + self.spec.period_sec
+        # Future-target schedules keep a fixed grid so reference segments are
+        # contiguous. Immediate schedules preserve the actual decision time.
+        # Both skip missed work and never create a catch-up burst.
+        self._next_due_at = scheduled_at + self.spec.period_sec
         return tick
 
 
@@ -281,6 +301,7 @@ class ArbitrationRuntime:
     def __init__(self, spec: DecisionScheduleSpec) -> None:
         self.spec = spec
         self._last_published_at: float | None = None
+        self._last_published_target_effective_at: float | None = None
 
     def compute(
         self,
@@ -371,12 +392,33 @@ class ArbitrationRuntime:
         elif reason is None and now - float(computation.target_effective_at) > float(self.spec.max_target_lateness_sec):
             reason = f"target_late:{self.spec.late_decision_policy}"
             fallback = self.spec.late_decision_policy
-        elif reason is None and (
-            self._last_published_at is not None
-            and now - self._last_published_at + 1e-12 < self.spec.period_sec
-        ):
-            reason = "coalesced_before_publication"
-            fallback = "no_action"
+        elif reason is None and self._last_published_at is not None:
+            target = float(computation.target_effective_at)
+            previous_target = self._last_published_target_effective_at
+            if previous_target is not None and target > previous_target + 1e-12:
+                publication_spacing = target - previous_target
+            else:
+                # Compatibility for direct/event callers without a monotonic
+                # scheduled target timeline.
+                publication_spacing = now - self._last_published_at
+            # Subtracting long-running monotonic timestamps loses more than
+            # 1e-12 precision.  Do not coalesce one exact fixed-grid period
+            # merely because its reconstructed spacing is a few ULPs short.
+            spacing_tolerance = max(
+                1e-9,
+                8.0
+                * max(
+                    math.ulp(target),
+                    math.ulp(
+                        target
+                        if previous_target is None
+                        else previous_target
+                    ),
+                ),
+            )
+            if publication_spacing < self.spec.period_sec - spacing_tolerance:
+                reason = "coalesced_before_publication"
+                fallback = "no_action"
 
         accepted = reason is None
         payload = {
@@ -419,6 +461,9 @@ class ArbitrationRuntime:
             domain="dexteleop.authoritative_arbitration_decision.v2",
         )
         self._last_published_at = now
+        self._last_published_target_effective_at = float(
+            computation.target_effective_at
+        )
         return attempt, AuthoritativeArbitrationDecision(
             decision_id=f"arbitration-decision:{decision_hash}",
             result_id=computation.result_id,

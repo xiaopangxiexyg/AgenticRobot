@@ -32,6 +32,7 @@ from dataset_contracts.state_input import (
 from robot_motion.action import EndEffectorTarget, HandActionSpec, RobotAction
 
 from .actions import NormalizedAction
+from .action_semantics import ArmHoldKeyframePrediction
 from .observation import DeploymentObservation
 from .schema import ACTION_ARM_POSE_SLICES, ACTION_DIM, ACTION_HAND_SLICES, STATE_ARM_POSE_SLICES, STATE_HAND_SLICES
 
@@ -108,6 +109,8 @@ class V22PolicyActionChunk:
     actions: np.ndarray
     discrete_actions: np.ndarray = field(default_factory=lambda: np.zeros((1, 0), dtype=np.int64))
     layout_hash: str | None = None
+    arm_hold_probabilities: np.ndarray | None = None
+    arm_hold_contract_hash: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -118,9 +121,38 @@ class V22PolicyActionChunk:
             horizon=actions.shape[0],
         )
         layout_hash = None if self.layout_hash is None else str(self.layout_hash).strip()
+        hold = self.arm_hold_probabilities
+        hold_hash = self.arm_hold_contract_hash
+        if (hold is None) != (hold_hash is None):
+            raise V22DeploymentError(
+                "arm-hold probabilities and contract hash must be supplied together."
+            )
+        if hold is not None:
+            hold = np.asarray(hold, dtype=np.float32)
+            if hold.ndim == 1:
+                hold = hold.reshape(1, -1)
+            if hold.shape != (actions.shape[0], 2):
+                raise V22DeploymentError(
+                    "arm-hold probabilities must align with the action horizon."
+                )
+            if (
+                not np.all(np.isfinite(hold))
+                or np.any(hold < 0.0)
+                or np.any(hold > 1.0)
+            ):
+                raise V22DeploymentError(
+                    "arm-hold probabilities must be finite values in [0, 1]."
+                )
+            hold_hash = str(hold_hash).strip()
+            if not hold_hash:
+                raise V22DeploymentError(
+                    "arm-hold contract hash must be non-empty."
+                )
         object.__setattr__(self, "actions", actions)
         object.__setattr__(self, "discrete_actions", tokens)
         object.__setattr__(self, "layout_hash", layout_hash or None)
+        object.__setattr__(self, "arm_hold_probabilities", hold)
+        object.__setattr__(self, "arm_hold_contract_hash", hold_hash)
         object.__setattr__(self, "metadata", dict(self.metadata))
 
     @property
@@ -314,6 +346,8 @@ def coerce_v22_policy_action_chunk(value: Any) -> V22PolicyActionChunk:
             actions=actions,
             discrete_actions=tokens,
             layout_hash=None if layout_hash is None else str(layout_hash),
+            arm_hold_probabilities=value.get("arm_hold_probabilities"),
+            arm_hold_contract_hash=value.get("arm_hold_contract_hash"),
             metadata=metadata,
         )
     if hasattr(value, "actions"):
@@ -324,6 +358,16 @@ def coerce_v22_policy_action_chunk(value: Any) -> V22PolicyActionChunk:
             actions=getattr(value, "actions"),
             discrete_actions=getattr(value, "discrete_actions", None),
             layout_hash=None if layout_hash is None else str(layout_hash),
+            arm_hold_probabilities=getattr(
+                value,
+                "arm_hold_probabilities",
+                None,
+            ),
+            arm_hold_contract_hash=getattr(
+                value,
+                "arm_hold_contract_hash",
+                None,
+            ),
             metadata=metadata,
         )
     return V22PolicyActionChunk(actions=value)
@@ -548,7 +592,24 @@ class V22DeploymentAdapter:
                 },
                 "v22_policy_action_index": int(index),
             }
-            normalized.append(NormalizedAction(vector=vector, metadata=metadata))
+            hold_prediction = None
+            if chunk.arm_hold_probabilities is not None:
+                assert chunk.arm_hold_contract_hash is not None
+                row = chunk.arm_hold_probabilities[index]
+                hold_prediction = ArmHoldKeyframePrediction(
+                    probabilities=(
+                        float(row[0]),
+                        float(row[1]),
+                    ),
+                    contract_hash=chunk.arm_hold_contract_hash,
+                )
+            normalized.append(
+                NormalizedAction(
+                    vector=vector,
+                    metadata=metadata,
+                    arm_hold_prediction=hold_prediction,
+                )
+            )
         return normalized
 
     def to_native_robot_actions(

@@ -222,3 +222,24 @@ def test_control_facing_admission_is_bounded_and_defers_envelope_encoding() -> N
     assert report.deadline_miss_count == 0
     # Encoding is available to the storage worker, outside issue().
     assert trace.records()[0].record_integrity_hash
+
+
+def test_durable_acknowledgement_uses_sequence_index_not_journal_scan() -> None:
+    trace = ControlTraceRuntime(session(), capacity=4)
+    assert trace.issue(fact("source_validation", 1)).accepted
+    assert trace.issue(fact("source_validation", 2)).accepted
+    record_hash = trace.records()[1].record_integrity_hash
+    trace.register_durable_sink("sink-1")
+
+    class NoIterationEntries(list):
+        def __iter__(self):
+            raise AssertionError("durable acknowledgement scanned the journal")
+
+    trace._entries = NoIterationEntries(trace._entries)
+    trace.acknowledge_durable(
+        sink_id="sink-1",
+        journal_sequence=2,
+        record_integrity_hash=record_hash,
+    )
+
+    assert trace.sink_durable_high_watermark == 0

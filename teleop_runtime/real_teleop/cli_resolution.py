@@ -14,6 +14,12 @@ import sys
 
 import numpy as np
 
+from .progress_adapter import (
+    resolve_real_teleop_progress_entry,
+    resolve_real_teleop_task_stage_profile,
+    validate_real_teleop_initial_progress_profile,
+)
+
 
 _SUPPORT_NAMES = (
     "ANNOTATED_DUAL_RM65_BASE_DISTANCE_M",
@@ -24,6 +30,7 @@ _SUPPORT_NAMES = (
     "POSITION_15_60_120HZ_PROFILE_NAME",
     "POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED",
     "POSITION_COMMAND_PLANNER_LINEAR",
+    "POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED",
     "TOOL_TCP_FRAME",
     "_active_sides_from_args",
     "_apply_default_arm_ips",
@@ -234,10 +241,31 @@ def parse_real_teleop_args() -> argparse.Namespace:
             "--position-ik-admitted-motion-limit requires "
             "--position-ik-step-mode single_step_singularity_aware."
         )
+    if (
+        bool(getattr(args, "position_ik_branch_continuity_anchor", False))
+        and str(args.position_ik_step_mode) != "single_step_singularity_aware"
+    ):
+        parser.error(
+            "--position-ik-branch-continuity-anchor requires "
+            "--position-ik-step-mode single_step_singularity_aware."
+        )
     if args.arm_control_mode != "position" and (
         args.position_ik_orientation_weight is not None
         or str(args.position_ik_step_mode) != "legacy_iterative"
         or bool(getattr(args, "position_ik_admitted_motion_limit", False))
+        or bool(getattr(args, "position_ik_branch_continuity_anchor", False))
+        or str(
+            getattr(args, "position_joint_limit_guard_mode", "legacy")
+        )
+        != "legacy"
+        or float(
+            getattr(
+                args,
+                "position_joint_limit_boundary_margin_deg",
+                1.5,
+            )
+        )
+        != 1.5
         or int(args.position_ik_solve_max_iterations) != 2
         or int(args.position_ik_solve_min_iterations) != 2
         or float(args.position_ik_damping) != 0.03
@@ -254,6 +282,9 @@ def parse_real_teleop_args() -> argparse.Namespace:
         parser.error(
             "--position-ik-orientation-weight, --position-ik-step-mode, "
             "--position-ik-admitted-motion-limit, "
+            "--position-ik-branch-continuity-anchor, "
+            "--position-joint-limit-guard-mode, "
+            "--position-joint-limit-boundary-margin-deg, "
             "--position-ik-solve-max-iterations, "
             "--position-ik-solve-min-iterations, --position-ik-damping, "
             "--position-ik-adaptive-iterations, --position-ik-iteration-reserve-ms, "
@@ -269,13 +300,17 @@ def parse_real_teleop_args() -> argparse.Namespace:
     args.position_command_planner = normalize_position_command_planner(
         args.position_command_planner
     )
+    limited_position_planners = {
+        POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+    }
     if (
-        args.position_command_planner
-        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        args.position_command_planner in limited_position_planners
         and args.arm_control_mode != "position"
     ):
         parser.error(
-            "--position-command-planner acceleration_limited requires position arm control mode."
+            "the selected acceleration/jerk-limited position-command planner "
+            "requires position arm control mode."
         )
     if args.position_max_command_step_deg is not None and args.arm_control_mode != "position":
         parser.error(
@@ -284,30 +319,27 @@ def parse_real_teleop_args() -> argparse.Namespace:
         )
     if (
         args.position_max_command_step_deg is not None
-        and args.position_command_planner
-        != POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        and args.position_command_planner not in limited_position_planners
     ):
         parser.error(
-            "--position-max-command-step-deg requires "
-            "--position-command-planner acceleration_limited."
+            "--position-max-command-step-deg requires an acceleration/jerk-limited "
+            "position-command planner."
         )
     if (
-        args.position_command_planner
-        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        args.position_command_planner in limited_position_planners
         and not args.arm_execution_config.position_background_streaming_enabled
     ):
         parser.error(
-            "--position-command-planner acceleration_limited requires the high-rate position "
+            "the selected acceleration/jerk-limited planner requires the high-rate position "
             "background stream."
         )
     if (
-        args.position_command_planner
-        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+        args.position_command_planner in limited_position_planners
         and float(args.arm_execution_config.position_background_streaming_hz)
         < float(args.arm_execution_config.position_reference_hz)
     ):
         parser.error(
-            "--position-command-planner acceleration_limited requires the final command "
+            "the selected acceleration/jerk-limited planner requires the final command "
             "rate to be at least the position reference rate; otherwise safe references "
             "can be preempted before any qcmd sample is emitted."
         )
@@ -321,6 +353,77 @@ def parse_real_teleop_args() -> argparse.Namespace:
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
     _apply_formal_dataset_layout(args)
+    progress_profile = getattr(args, "collection_progress_profile", None)
+    if bool(getattr(args, "collection_progress_gui", False)) and bool(
+        getattr(args, "no_collection", False)
+    ):
+        parser.error(
+            "--collection-progress-gui requires formal collection; "
+            "remove --no-collection."
+        )
+    if progress_profile is not None:
+        if bool(getattr(args, "no_collection", False)):
+            parser.error(
+                "--collection-progress-profile requires formal collection; "
+                "remove --no-collection."
+            )
+        try:
+            validate_real_teleop_initial_progress_profile(
+                progress_profile,
+                collection_task_id=str(args.collection_task_id),
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        try:
+            stage_profile = resolve_real_teleop_task_stage_profile(
+                progress_profile,
+                getattr(args, "collection_stage_profile", ""),
+            )
+            resolve_real_teleop_progress_entry(
+                progress_profile=progress_profile,
+                stage_profile=stage_profile,
+                entry_step_id=getattr(
+                    args,
+                    "collection_progress_entry_step",
+                    "",
+                ),
+                entry_stage_id=getattr(
+                    args,
+                    "collection_progress_entry_stage",
+                    "",
+                ),
+                entry_condition=getattr(
+                    args,
+                    "collection_progress_entry_condition",
+                    "nominal",
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        args.collection_stage_profile = stage_profile
+    else:
+        advanced_entry_requested = bool(
+            str(getattr(args, "collection_stage_profile", "") or "").strip()
+            or str(
+                getattr(args, "collection_progress_entry_step", "") or ""
+            ).strip()
+            or str(
+                getattr(args, "collection_progress_entry_stage", "") or ""
+            ).strip()
+            or str(
+                getattr(
+                    args,
+                    "collection_progress_entry_condition",
+                    "nominal",
+                )
+            ).strip().lower()
+            != "nominal"
+        )
+        if advanced_entry_requested:
+            parser.error(
+                "Stage profile and partial/recovery entry options require "
+                "--collection-progress-profile."
+            )
     args.pose_frame_contract_source = (
         "explicit" if args.pose_frame_contract is not None else "disabled"
     )
@@ -427,6 +530,10 @@ def parse_real_teleop_args() -> argparse.Namespace:
             fix_arm_enabled=bool(getattr(args, "fix_arm", False)),
             init_arm_enabled=bool(getattr(args, "init_arm_available", False)),
             foot_pad_count=getattr(args, "foot_pad_config_count", None),
+            progress_enabled=bool(
+                getattr(args, "collection_progress_profile", None) is not None
+                or getattr(args, "collection_progress_gui", False)
+            ),
         )
     except ValueError as exc:
         parser.error(str(exc))

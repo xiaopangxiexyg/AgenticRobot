@@ -26,8 +26,8 @@ from ..calibration_flow import (
     pose_from_rotation_translation,
     tracker_offset_from_neutral_pose,
 )
-from ..gui.calibration_web_ui import CalibrationWebUi
 from ..log_utils import ChangeGate, log_event as _log
+from ..operator_ui_ports import OperatorUiPort
 from ..sources.pose import VivePoseSource
 from ..tracker_hand import (
     TRACKER_OFFSET_CALIBRATION_VERSION,
@@ -232,20 +232,29 @@ def _default_gui_vive_calibration_side(
 
 def _select_gui_vive_coordinate_sweep_hand(
     *,
-    ui: CalibrationWebUi,
+    ui: OperatorUiPort,
     args: argparse.Namespace,
     components: object,
     source: object,
 ) -> tuple[str, str]:
     requested = str(getattr(args, "virtual_desk_tracker_role", "auto") or "auto")
-    if requested == "auxiliary":
-        channel_name = _channel_for_tracker_role("auxiliary")
+    interactive_hand_selection = bool(
+        getattr(args, "interactive_virtual_desk_hand_selection", True)
+    )
+    if requested == "auxiliary" or (
+        requested in {"left_wrist", "right_wrist"}
+        and not interactive_hand_selection
+    ):
+        channel_name = _channel_for_tracker_role(requested)
         ui.append_message(
             "ViveCalibration",
-            f"已通过 --virtual-desk-tracker-role auxiliary 指定 {channel_name} 做三轴 sweep。",
+            f"已显式指定 {channel_name} 做三轴 sweep，不再进入额外的手侧确认阶段。",
         )
-        _log("ViveCalibration", f"using explicit auxiliary tracker channel={channel_name}")
-        return "auxiliary", channel_name
+        _log(
+            "ViveCalibration",
+            f"using explicit tracker role={requested} channel={channel_name}",
+        )
+        return requested.removesuffix("_wrist"), channel_name
 
     stage_name = "VIVE 标定手选择"
     stage_id = "ViveCalibrationHand"
@@ -342,7 +351,7 @@ def _select_gui_vive_coordinate_sweep_hand(
 
 
 def _publish_vive_capture_state(
-    ui: CalibrationWebUi,
+    ui: OperatorUiPort,
     args: argparse.Namespace,
     components: object,
     channels: Mapping[str, object],
@@ -400,13 +409,13 @@ def _publish_vive_capture_state(
     )
 
 
-def _consume_vive_capture_events(ui: CalibrationWebUi) -> list[str]:
+def _consume_vive_capture_events(ui: OperatorUiPort) -> list[str]:
     return ui.consume_events()
 
 
 def _capture_single_vive_channel_from_gui(
     *,
-    ui: CalibrationWebUi,
+    ui: OperatorUiPort,
     args: argparse.Namespace,
     components: object,
     source: object,
@@ -677,7 +686,7 @@ def _capture_single_vive_channel_from_gui(
 
 def _capture_dual_wrist_offsets_from_gui(
     *,
-    ui: CalibrationWebUi,
+    ui: OperatorUiPort,
     args: argparse.Namespace,
     components: object,
     source: object,
@@ -874,7 +883,7 @@ def _capture_dual_wrist_offsets_from_gui(
 def calibrate_vive_coordinate_profile(
     args: argparse.Namespace,
     context: ViveCoordinateCalibrationContext | object,
-    ui: CalibrationWebUi,
+    ui: OperatorUiPort,
     *,
     save_profile: Callable[[argparse.Namespace, object], Path] | None = None,
     save_on_complete: bool = True,
@@ -1087,7 +1096,7 @@ def calibrate_vive_coordinate_profile(
 def calibrate_gui_vive_coordinate_profile(
     args: argparse.Namespace,
     components: RealTeleopComponents,
-    ui: CalibrationWebUi,
+    ui: OperatorUiPort,
     *,
     save_profile: Callable[[argparse.Namespace, RealTeleopComponents], Path],
 ) -> Path:

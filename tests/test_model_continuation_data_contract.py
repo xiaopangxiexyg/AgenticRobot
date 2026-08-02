@@ -15,6 +15,7 @@ from dataset_contracts import (
     MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
     MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,
     MODEL_CONTINUATION_SAMPLER_WEIGHTED_V1,
+    MODEL_CONTINUATION_TRAINED_PREFIX_V1,
     RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
     TRAINING_PREFIX_RECORDED_POLICY_OUTPUT_V1,
     TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
@@ -27,6 +28,7 @@ from dataset_contracts import (
     PoseTrainingDataContract,
     model_continuation_contract_from_dict,
     normalize_model_continuation_contract,
+    require_trained_model_rtc_v1_contract,
 )
 from dataset_contracts.v22 import (
     DatasetLayoutBindingError,
@@ -202,6 +204,87 @@ def test_v2_trained_profile_requires_exact_training_contract() -> None:
             runtime=runtime,
             training=training,
         )
+
+
+def test_trained_model_rtc_v1_reuses_flow_inpaint_runtime() -> None:
+    v1 = _contract()
+    runtime = ModelContinuationRuntimeContractV2.from_v1(v1)
+    training = ModelContinuationTrainingContractV2.from_v1(v1)
+    trained = ModelContinuationDataContractV2(
+        conditioning_origin=MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
+        runtime=runtime,
+        training=training,
+    )
+
+    normalized = require_trained_model_rtc_v1_contract(trained)
+
+    assert normalized.source_contract_hash == trained.contract_hash
+    assert (
+        normalized.conditioning_origin
+        == MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
+    )
+    assert (
+        normalized.runtime.continuation_mode
+        == MODEL_CONTINUATION_FLOW_INPAINT_V1
+    )
+
+    inference_only = ModelContinuationDataContractV2(
+        conditioning_origin=MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
+        runtime=runtime,
+        training=None,
+    )
+    with pytest.raises(
+        DatasetLayoutBindingError,
+        match="trained_prefix_conditioning_v1 provenance",
+    ):
+        require_trained_model_rtc_v1_contract(inference_only)
+
+    different_runtime = replace(
+        trained,
+        runtime=replace(
+            runtime,
+            continuation_mode=MODEL_CONTINUATION_TRAINED_PREFIX_V1,
+        ),
+    )
+    with pytest.raises(
+        DatasetLayoutBindingError,
+        match="reuses the flow_inpaint v3 runtime",
+    ):
+        require_trained_model_rtc_v1_contract(different_runtime)
+
+    with pytest.raises(
+        DatasetLayoutBindingError,
+        match="explicit v2 source contract",
+    ):
+        require_trained_model_rtc_v1_contract(v1)
+
+    rejected_profiles = (
+        (
+            replace(
+                trained,
+                runtime=replace(
+                    runtime,
+                    supported_action_pose_modes=("relative",),
+                ),
+            ),
+            "requires absolute action support",
+        ),
+        (
+            replace(
+                trained,
+                training=replace(
+                    training,
+                    prefix_source_kinds=(
+                        TRAINING_PREFIX_RECORDED_POLICY_OUTPUT_V1,
+                    ),
+                ),
+            ),
+            "trajectory-overlap teacher provenance",
+        ),
+    )
+    for invalid, message in rejected_profiles:
+        with pytest.raises(DatasetLayoutBindingError, match=message):
+            require_trained_model_rtc_v1_contract(invalid)
 
 
 def test_contract_identity_binds_training_source_and_loss_semantics() -> None:

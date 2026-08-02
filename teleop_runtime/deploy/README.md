@@ -5,6 +5,34 @@
 
 `teleop_runtime.deploy` 是独立于采集主循环和左臂实验模式的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手、DMTac 1D gripper 和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`，且默认要求先用数据集帧 qpos 初始化。
 
+正式双臂 position deploy 当前默认使用：
+
+```text
+official source all-IK
+→ collision-safe nearest branch
+→ linear source-q reference
+→ two-source-step 120 Hz third-order governor
+→ 0.05 s acceleration-to-jerk ramp
+```
+
+对应参数为
+`--position-path-lift-backend official_source_all_ik_causal_governor`
+（默认值）、`--position-all-ik-lookahead-source-steps 2` 和
+`--position-all-ik-jerk-ramp-sec 0.05`。它要求双臂、position collision、
+15 Hz policy action、120 Hz RM65 command stream 以及 same-chunk lookahead；
+不满足这些条件时显式请求会 fail closed。单臂兼容运行和显式关闭 chunk
+lookahead 的旧命令会保留在 Pink 路径。
+
+旧 V4 的完整回退是：
+
+```bash
+--position-path-lift-backend pink_pose_lift \
+--pose-lift-profile rm65_pose_lift_v4_qp_constrained
+```
+
+这里的 Pose Lift V4 是部署/replay profile，不是 live teleop 的
+`POSITION_FORMAL_V1/V2/V3` profile；不要把两套版本号混用。
+
 当前推荐的 shell 入口是 `python -m teleop_runtime.deploy`。它的薄包装
 `teleop_runtime.deploy.cli.main` 会委托给同一份 `run_policy.main` 运行时；
 `python -m teleop_runtime.deploy.run_policy` 和 `run_policy.main(...)` 不是“已不用”的

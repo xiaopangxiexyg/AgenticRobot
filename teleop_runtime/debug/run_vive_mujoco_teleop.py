@@ -482,9 +482,7 @@ def _capture_runtime_home(
             if channel is None or not channel.valid or len(samples[side]) >= samples_required:
                 continue
             pose_desk = _pose_in_desk(channel, calibration)
-            samples[side].append(
-                pose_retargeters[side].prepare_input_pose_desk(pose_desk)
-            )
+            samples[side].append(pose_desk)
         time.sleep(0.01)
 
     accepted = rig.accepted_qcmd_by_side()

@@ -164,6 +164,11 @@ POSITION_FORMAL_V1_ARGS=(
   # q5 escape hysteresis, and the guarded wrist-branch candidate set.  The
   # three options remain individually reversible on the command line.
   --position-ik-step-mode single_step_singularity_aware
+  # Keep the 2026-08-02 q3/q5 anchor and forced limit-escape experiments out
+  # of the production baseline.  These explicit rollback flags make the
+  # command stable even if parser defaults are changed during later research.
+  --no-position-ik-branch-continuity-anchor
+  --position-joint-limit-guard-mode legacy
   --position-wrist-branch-switch-guard-deg 12.0
   --position-wrist-q5-hysteresis-release-deg 6.0
   --position-force-guard
@@ -185,6 +190,8 @@ POSITION_FORMAL_V2_RESPONSIVE_ARGS=(
   --position-control-profile rm65_bimanual_position_v2_responsive
   --arm-control-mode position
   --position-ik-step-mode single_step_singularity_aware
+  --no-position-ik-branch-continuity-anchor
+  --position-joint-limit-guard-mode legacy
   --position-wrist-branch-switch-guard-deg 12.0
   --position-wrist-q5-hysteresis-release-deg 6.0
   --position-force-guard
@@ -194,6 +201,30 @@ POSITION_FORMAL_V2_RESPONSIVE_ARGS=(
   --position-force-guard-consecutive-samples 1
   --position-force-guard-max-read-errors 3
   --position-force-guard-stale-sec 0.25
+)
+
+# Opt-in 15 Hz action-aligned / 120 Hz jerk-limited execution experiment.
+# It keeps V1 source shaping, 60 Hz IK/collision evaluation, force guard, and
+# all operator semantics.  Only one qref endpoint per 15 Hz source bucket is
+# admitted; the endpoint is projected onto the 120 Hz q/qd/qdd/jerk reachable
+# set and is also the accepted-qref FK action recorded by the dataset.  The
+# three intermediate 60 Hz IK frames are still evaluated upstream for input
+# freshness/safety but do not preempt the cached 120 Hz control cut.
+# POSITION_FORMAL_V1_ARGS is the
+# complete rollback profile.
+POSITION_FORMAL_SAMPLE_ALIGNED_JERK_V1_ARGS=(
+  "${POSITION_FORMAL_V1_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_sample_aligned_jerk_v1
+)
+
+# Reversible successor to the first sample-aligned experiment.  Compared with
+# V1 it keeps the full admitted target under degraded execution, restores the
+# guarded responsive source path, continues converging after the tracker stops,
+# and regularizes the 120 Hz jerk horizon.  The V1 array above is the complete
+# rollback and remains unchanged.
+POSITION_FORMAL_SAMPLE_ALIGNED_JERK_V2_ARGS=(
+  "${POSITION_FORMAL_V1_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_sample_aligned_jerk_v2
 )
 
 # Opt-in Pink QP motion-envelope probe. This keeps the stable V1 source,
@@ -224,6 +255,8 @@ POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS=(
 # 或者不要展开本数组。数据集 action 仍为 accepted qref FK，不变。
 POSITION_SINGULARITY_AWARE_SINGLE_STEP_ARGS=(
   --position-ik-step-mode single_step_singularity_aware
+  --no-position-ik-branch-continuity-anchor
+  --position-joint-limit-guard-mode legacy
   --position-wrist-branch-switch-guard-deg 12.0
   --position-wrist-q5-hysteresis-release-deg 6.0
 )

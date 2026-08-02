@@ -36,7 +36,8 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 - `robot_motion/`：共享动作语义、Rig、Safety、Planner、position control 和 runtime contracts。
 - `hardware/`：厂商 SDK 与设备 backend。
 - `sim/`：仿真 backend、task 和 adapter；不得依赖 `teleop_runtime` 或真实硬件。
-- `teleop_runtime/`：真实遥操、GUI/headless orchestration、collection 和 policy deploy frontend。
+- `collection_runtime/`：与设备、控制和 GUI 解耦的实时采集生命周期与持久化机制。
+- `teleop_runtime/`：真实遥操、GUI/headless orchestration、来源绑定的采集适配和 policy deploy frontend。
 - `dataset_contracts/`、`dataset_interface/`：纯数据合约与数据适配。
 - `deployments/`：模型 client、协议和 artifact 集成。
 - `control_station/`：组合 human/replay/policy/dataset/sim/real target 的应用层。

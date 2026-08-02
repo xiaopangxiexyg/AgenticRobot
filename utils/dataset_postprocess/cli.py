@@ -627,7 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tactile_zstd.add_argument("dataset_root")
     tactile_zstd.add_argument("--level", type=int, default=1)
-    tactile_zstd.add_argument("--chunk-frames", type=int, default=32)
+    tactile_zstd.add_argument("--chunk-frames", type=int, default=8)
     tactile_zstd.add_argument(
         "--min-free-gb",
         type=float,

@@ -352,6 +352,15 @@ class OpenPIFinalChunkRtcConfig:
             raise ValueError(
                 "Relative OpenPI raw-RTC requires typed_canonical_v1 results."
             )
+        if (
+            self.artifact.arm_hold_output is not None
+            and result_representation != OPENPI_RTC_RESULT_LEGACY_NORMALIZED_V1
+        ):
+            raise ValueError(
+                "Raw-RTC arm-hold semantics currently require "
+                "legacy_normalized_v1 absolute actions; typed canonical and "
+                "relative model-RTC integration remains fail closed."
+            )
         if pose_mode == "relative":
             pose_chunk = self.artifact.pose_action_chunk
             if pose_chunk is None or pose_chunk.action_pose_mode != "relative":
@@ -587,6 +596,7 @@ class OpenPIFinalChunkRtcBackend:
                     action_discrete_dim=artifact.policy_io_layout.action_discrete_dim,
                     contract=contract,
                     source=OPENPI_FINAL_CHUNK_RTC_ADAPTER_V1,
+                    arm_hold_output=artifact.arm_hold_output,
                 ),
             )
         )
@@ -596,6 +606,8 @@ class OpenPIFinalChunkRtcBackend:
             != artifact.policy_io_layout.action_dim
             or self._remote_policy.config.action_discrete_dim
             != artifact.policy_io_layout.action_discrete_dim
+            or self._remote_policy.config.arm_hold_output
+            != artifact.arm_hold_output
             or (
                 artifact.policy_io_layout.action_discrete_dim > 0
                 and self._remote_policy.config.action_discrete_key
@@ -658,6 +670,11 @@ class OpenPIFinalChunkRtcBackend:
             prefix_requirement=RTC_PREFIX_FORBIDDEN,
             supports_prefix_mask=False,
             supports_conditioning_receipt=False,
+            arm_hold_output_contract_hash=(
+                None
+                if artifact.arm_hold_output is None
+                else artifact.arm_hold_output.contract_hash
+            ),
         )
         provider_id = f"openpi:{artifact.model_id}:{artifact.checkpoint_step}"
         self._capability = RtcModelCapability(
@@ -687,6 +704,11 @@ class OpenPIFinalChunkRtcBackend:
             normalization_hash=config.normalization_hash,
             prediction_horizon_steps=horizon,
             minimum_execution_horizon_steps=config.minimum_execution_horizon_steps,
+            arm_hold_output_contract_hash=(
+                None
+                if artifact.arm_hold_output is None
+                else artifact.arm_hold_output.contract_hash
+            ),
         )
         if config.result_action_representation == OPENPI_RTC_RESULT_TYPED_CANONICAL_V1:
             native_decoder = OpenPIV22NativeRobotActionDecoder(config)
@@ -944,13 +966,21 @@ class OpenPIFinalChunkRtcBackend:
                 "OpenPI final chunk horizon disagrees with declared model.action_horizon: "
                 f"expected {self._prediction_horizon_steps}, got {chunk.horizon}."
             )
-        model_output_id = canonical_content_hash(
-            {
+        model_output_payload = {
                 "envelope_hash": envelope.semantic_content_hash,
                 "actions": chunk.actions,
                 "discrete_actions": chunk.discrete_actions,
                 "server_metadata_hash": self._server_metadata_hash,
-            },
+            }
+        if chunk.arm_hold_probabilities is not None:
+            model_output_payload["arm_hold_probabilities"] = (
+                chunk.arm_hold_probabilities
+            )
+            model_output_payload["arm_hold_output_contract_hash"] = (
+                chunk.arm_hold_contract_hash
+            )
+        model_output_id = canonical_content_hash(
+            model_output_payload,
             domain=OPENPI_RTC_OUTPUT_ID_DOMAIN_V1,
         )
         return RtcModelResponseEnvelopeV2(
@@ -977,6 +1007,8 @@ class OpenPIFinalChunkRtcBackend:
             inference_completed_at=completed,
             result_received_at=received,
             conditioning_receipt=None,
+            arm_hold_probabilities=chunk.arm_hold_probabilities,
+            arm_hold_output_contract_hash=chunk.arm_hold_contract_hash,
         )
 
     def reset(self) -> None:

@@ -29,12 +29,19 @@ def envelope(sequence: int, *, trace_session_id: str = "trace-1") -> PersistedRe
     )
 
 
-def spool(path: Path, *, max_bytes: int = 1 << 20) -> ControlTraceSpool:
+def spool(
+    path: Path,
+    *,
+    max_bytes: int = 1 << 20,
+    allow_growth: bool = False,
+) -> ControlTraceSpool:
     return ControlTraceSpool(
         path,
         trace_session_id="trace-1",
         max_bytes=max_bytes,
         physical_preallocation=False,
+        allow_growth=allow_growth,
+        growth_bytes=max_bytes,
     )
 
 
@@ -81,6 +88,30 @@ def test_spool_rejects_session_sequence_and_capacity_without_overwrite(
             sequence += 1
         assert sink.write_offset >= before
         assert sink.write_offset <= 4096
+
+
+def test_spool_can_grow_by_bounded_extents_and_reopen(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "growing.wal"
+    sequence = 1
+    with spool(path, max_bytes=4096, allow_growth=True) as sink:
+        while sink.max_bytes == 4096:
+            assert sink.append(envelope(sequence)).accepted
+            sequence += 1
+        expanded_bytes = sink.max_bytes
+        written = sink.write_offset
+
+    assert expanded_bytes >= 8192
+    assert path.stat().st_size == expanded_bytes
+    with spool(
+        path,
+        max_bytes=4096,
+        allow_growth=True,
+    ) as recovered:
+        assert recovered.max_bytes == expanded_bytes
+        assert recovered.recovery_report.valid_bytes == written
+        assert recovered.append(envelope(sequence)).accepted
 
 
 def test_spool_recovers_torn_tail_and_reuses_only_discarded_region(

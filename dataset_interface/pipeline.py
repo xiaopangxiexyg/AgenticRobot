@@ -12,7 +12,11 @@ from .metadata import DexTeleopDatasetIndex, InvalidTrainingDataError, TrainingE
 from .missing_views import MissingViewResolver
 from .sample import FrameRequest, MaskedFrameSample
 from .video_source import VideoReaderCache
-from utils.random_background import LocalImageBackgroundProvider, RandomBackgroundVideoAugmenter
+from utils.random_background import (
+    LocalImageBackgroundProvider,
+    RandomBackgroundVideoAugmenter,
+    default_real_image_root,
+)
 
 
 def convert_layout(image_bgr: np.ndarray, layout: ImageLayout) -> np.ndarray:
@@ -53,6 +57,16 @@ class MaskedFramePipeline:
             cache_size=config.video.mask_cache_size,
             manifest_name=config.mask.manifest_name,
         )
+        if real_image_provider is None and config.augmentation.requires_real_image_provider:
+            manifest_path = config.real_image_manifest
+            real_image_provider = LocalImageBackgroundProvider(
+                image_root=(
+                    None
+                    if manifest_path is not None
+                    else (config.real_image_root or default_real_image_root())
+                ),
+                manifest_path=manifest_path,
+            )
         self.augmenter = RandomBackgroundVideoAugmenter(
             config.augmentation,
             real_image_provider=real_image_provider,
@@ -148,6 +162,16 @@ class MaskedFramePipeline:
                 epoch=request.epoch,
             )
         )
+        background_metadata = (
+            None
+            if source_view_missing
+            else self.augmenter.background_metadata(
+                episode_index=request.episode_index,
+                camera_key=request.camera_key,
+                frame_index=request.frame_index,
+                epoch=request.epoch,
+            )
+        )
         view_occlusion_metadata = self.augmenter.view_occlusion_metadata(
             width=int(image.shape[1]),
             height=int(image.shape[0]),
@@ -185,6 +209,8 @@ class MaskedFramePipeline:
             metadata["fixed_mask"] = fixed_mask_metadata
         if photometric_metadata is not None:
             metadata["photometric_augmentation"] = photometric_metadata
+        if background_metadata is not None:
+            metadata["background_augmentation"] = background_metadata
         if view_occlusion_metadata is not None:
             metadata["view_occlusion"] = view_occlusion_metadata
         return MaskedFrameSample(

@@ -6,6 +6,7 @@ import pytest
 from dataset_contracts.completeness import (
     TRACE_REQUIREMENT_PROFILES_V1,
     TraceRequirementProfile,
+    evaluate_control_trace_lineage,
 )
 from dataset_contracts.control_trace import (
     CONTROL_TRACE_EVENT_TYPES_V24,
@@ -88,6 +89,8 @@ def test_initial_profiles_classify_every_event_type_once() -> None:
         "deployable_sim_scheduled_pose_to_qpos_station_v1",
         "deployable_sim_scheduled_pose_human_replay_station_v1",
         "deployable_sim_scheduled_pose_composer_station_v1",
+        "deployable_sim_immediate_component_policy_human_composer_v1",
+        "deployable_sim_scheduled_component_policy_human_composer_v1",
     }
     for profile in TRACE_REQUIREMENT_PROFILES_V1.values():
         classified = (
@@ -155,6 +158,101 @@ def test_initial_profiles_classify_every_event_type_once() -> None:
         "source_validation",
     } <= rtc_policy_station_sim.required_event_types
     assert "reference_segment" in rtc_policy_station_sim.not_applicable_event_types
+    policy_human_component_sim = TRACE_REQUIREMENT_PROFILES_V1[
+        "deployable_sim_scheduled_component_policy_human_composer_v1"
+    ]
+    assert policy_human_component_sim.lineage_policy_id == (
+        "authoritative_scheduled_component_policy_human_composition_lineage_v1"
+    )
+    assert policy_human_component_sim.profile_scope == "formal_capture"
+    assert (
+        policy_human_component_sim.implementation_status
+        == "runtime_integrated"
+    )
+    assert {
+        "policy_action_emission",
+        "human_command_emission",
+        "source_adapter_receipt",
+        "source_validation",
+        "composition_activation_scope",
+        "composition_activation_binding",
+        "composition_contributor_input",
+        "composition_evaluation",
+        "composition_authority_disposition",
+        "source_difference_observation",
+    } <= policy_human_component_sim.required_event_types
+    assert {
+        "replay_source_frame_emission",
+        "replay_source_adapter_receipt",
+        "station_run_manifest",
+        "station_intent_transition",
+        "station_operation_transition",
+        "station_publication_barrier_transition",
+        "composition_session_spec",
+        "composition_session_transition",
+    } <= policy_human_component_sim.not_applicable_event_types
+
+
+def test_direct_component_activation_does_not_invent_legacy_session_spec() -> None:
+    activation = ControlTraceFact.create(
+        fact_id="composition-activation:direct",
+        event_type="composition_activation_scope",
+        runtime_session_id="runtime-1",
+        control_domain_id="robot-0",
+        embodiment_instance_id="rm65-pair-0",
+        occurred_at=10.0,
+        clock_domain_id="local_monotonic",
+        payload={
+            "activation_id": "composition-activation:direct",
+            "operation_spec_id": "sim-hil-policy-human",
+            "operation_spec_hash": "a" * 64,
+            "session_epoch": 1,
+            "activated_at": 10.0,
+            "clock_domain_id": "local_monotonic",
+            "input_barrier_at": 10.0,
+            "freshness_policy": "strictly_after_input_barrier",
+            "required_roles": ("policy", "human"),
+            "semantic_content_hash": "b" * 64,
+        },
+    )
+    direct_profile = TRACE_REQUIREMENT_PROFILES_V1[
+        "deployable_sim_scheduled_component_policy_human_composer_v1"
+    ]
+    direct_codes = {
+        issue.code
+        for issue in evaluate_control_trace_lineage(
+            (activation,),
+            profile=direct_profile,
+        )
+    }
+    assert "composition_activation_missing_operation_spec" not in direct_codes
+
+    legacy_profile = TRACE_REQUIREMENT_PROFILES_V1[
+        "deployable_sim_scheduled_pose_composer_station_v1"
+    ]
+    legacy_codes = {
+        issue.code
+        for issue in evaluate_control_trace_lineage(
+            (activation,),
+            profile=legacy_profile,
+        )
+    }
+    assert "composition_activation_missing_operation_spec" in legacy_codes
+
+
+def test_policy_component_lineage_requires_real_composition_input() -> None:
+    profile = TRACE_REQUIREMENT_PROFILES_V1[
+        "deployable_sim_scheduled_component_policy_human_composer_v1"
+    ]
+    codes = {
+        issue.code
+        for issue in evaluate_control_trace_lineage(
+            (fact(),),
+            profile=profile,
+        )
+    }
+    assert "policy_component_emission_missing_source_validation" in codes
+    assert "policy_component_emission_missing_input" in codes
 
 
 def test_profile_rejects_unclassified_or_overlapping_events() -> None:

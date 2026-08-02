@@ -14,7 +14,7 @@ from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
 from robot_motion.runtime import TeleopCommand
 
 from ..collection.camera_preview import CameraPreviewer
-from ..gui.status_payloads import _build_camera_status as _default_build_camera_status
+from .status_payloads import _build_camera_status as _default_build_camera_status
 from ..sources.camera import RealSenseRGBSource
 from .arm_state_sync import _state_qpos as _default_state_qpos
 from .components import RealTeleopComponents

@@ -54,6 +54,9 @@ def test_extracted_tracker_status_payload_uses_receiver_time_and_marks_inactive_
         "tracker_name": "tracker-left",
         "tracker_role": "left_wrist",
         "seq": 42,
+        "sender_host": "",
+        "sender_error": None,
+        "sender_read_elapsed_ms": None,
     }
     assert payload["right"]["status_level"] == "disabled"
     assert payload["right"]["enabled"] is False

@@ -21,6 +21,9 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.model_continuation import (
     normalize_model_continuation_contract,
 )
+from dataset_contracts.policy_action_semantics import (
+    PolicyArmHoldOutputContract,
+)
 from robot_motion.relative_action import normalize_action_pose_mode
 
 from .action_representation import PolicyActionRepresentationContext
@@ -123,14 +126,14 @@ def _required(value: object, *, field_name: str) -> str:
     return normalized
 
 
-def _finite(value: object, *, field_name: str) -> float:
+def _finite(value: Any, *, field_name: str) -> float:
     normalized = float(value)
     if not math.isfinite(normalized):
         raise ValueError(f"{field_name} must be finite.")
     return normalized
 
 
-def _positive_integer(value: object, *, field_name: str) -> int:
+def _positive_integer(value: Any, *, field_name: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be a positive integer.")
     normalized = int(value)
@@ -139,7 +142,7 @@ def _positive_integer(value: object, *, field_name: str) -> int:
     return normalized
 
 
-def _nonnegative_integer(value: object, *, field_name: str) -> int:
+def _nonnegative_integer(value: Any, *, field_name: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be a non-negative integer.")
     normalized = int(value)
@@ -522,6 +525,16 @@ class RtcFrontendStep:
             queue_len_before=self.emission_result.queue_len_before,
             queue_len_after=self.emission_result.queue_len_after,
             canonical_action=self.emission_result.canonical_action,
+            model_raw_action=(
+                None
+                if self.emission_result.emission is None
+                else self.emission_result.emission.model_decoded_absolute_action
+            ),
+            arm_hold_resolution=(
+                None
+                if self.emission_result.emission is None
+                else self.emission_result.emission.arm_hold_resolution
+            ),
         )
 
     def to_debug_payload(self) -> dict[str, Any]:
@@ -1406,6 +1419,7 @@ class RtcPolicyShadowFrontend:
             ),
         )
         self._state = transition.state
+        self.deploy_runtime.reset_arm_hold_semantics()
         stop = self._worker.stop(
             timeout_sec=self.config.worker_stop_timeout_sec
         )
@@ -1586,7 +1600,10 @@ class RtcPolicyShadowFrontend:
                         ),
                     )
                 )
-                if emission_result.emission is None:
+                if (
+                    emission_result.emission is None
+                    or emission_result.emission_error is not None
+                ):
                     lifecycle_transition = self.fault(
                         now=decision_at,
                         reason="formal_emission_failed",
@@ -1609,6 +1626,36 @@ class RtcPolicyShadowFrontend:
                         )
                         emission_result = PolicyActionEmissionResult()
                     else:
+                        emission = emission_result.emission
+                        assert emission is not None
+                        staged_arm_hold = (
+                            emission_result.arm_hold_staged_resolution
+                        )
+                        if staged_arm_hold is not None:
+                            try:
+                                self.deploy_runtime.commit_staged_arm_hold(
+                                    staged_arm_hold
+                                )
+                            except Exception as exc:  # noqa: BLE001 - invariant failure faults.
+                                lifecycle_transition = self.fault(
+                                    now=decision_at,
+                                    reason=(
+                                        "arm_hold_semantic_commit_failed:"
+                                        f"{type(exc).__name__}:{exc}"
+                                    ),
+                                )
+                                emission_result = PolicyActionEmissionResult()
+                                continue_commit = False
+                            else:
+                                continue_commit = True
+                        else:
+                            continue_commit = True
+                        if not continue_commit:
+                            emission = None
+                        else:
+                            emission = emission_result.emission
+                            assert emission is not None
+                    if emission_result.emission is not None:
                         emission = emission_result.emission
                         assert emission is not None
                         commit_payload = {
@@ -1796,6 +1843,20 @@ def build_rtc_policy_emission_source_binding_from_contracts(
         or emission_adapter.hands_enabled != runtime_config.hands_enabled
     ):
         raise ValueError("RTC frontend action adapter/runtime coverage differs.")
+    observation_contract = runtime_config.policy_observation_contract
+    if observation_contract is None:
+        raise RuntimeError(
+            "PolicyDeployRuntimeConfig did not normalize "
+            "policy_observation_contract."
+        )
+    arm_hold_output = runtime_config.arm_hold_output
+    if arm_hold_output is not None and not isinstance(
+        arm_hold_output,
+        PolicyArmHoldOutputContract,
+    ):
+        raise RuntimeError(
+            "PolicyDeployRuntimeConfig did not normalize arm_hold_output."
+        )
     runtime_payload = {
         "active_sides": runtime_config.active_sides,
         "arms_enabled": runtime_config.arms_enabled,
@@ -1811,9 +1872,13 @@ def build_rtc_policy_emission_source_binding_from_contracts(
         ),
         "action_chunk_execution_steps": runtime_config.action_chunk_execution_steps,
         "policy_observation_contract_hash": (
-            runtime_config.policy_observation_contract.semantic_content_hash
+            observation_contract.semantic_content_hash
         ),
     }
+    if arm_hold_output is not None:
+        runtime_payload["arm_hold_output_contract_hash"] = (
+            arm_hold_output.contract_hash
+        )
     return RtcPolicyEmissionSourceBinding(
         source_slot_id=f"rtc-policy-source:{config.producer_id}",
         runtime_session_id=config.runtime_session_id,

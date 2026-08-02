@@ -1,0 +1,18 @@
+{
+  "delay_prefix_pairs": [
+    [1, 1],
+    [2, 1],
+    [2, 2],
+    [4, 2],
+    [4, 4],
+    [8, 4],
+    [8, 8],
+    [12, 8],
+    [12, 12],
+    [16, 12],
+    [16, 16]
+  ],
+  "schema": "dexteleop_model_continuation_training_sampling_v1",
+  "selection_salt": "0712-wrist-cube-model-rtc-v1",
+  "strategy": "hash_indexed_uniform_explicit_pairs_v1"
+}

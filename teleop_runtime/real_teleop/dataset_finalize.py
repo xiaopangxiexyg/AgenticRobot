@@ -38,6 +38,9 @@ class RealDatasetFinalizeTask:
     v25p_error: str = ""
     v25p_native_finalize_report: Any | None = field(default=None, repr=False)
     v25p_native_error: str = ""
+    progress_episode: Any | None = field(default=None, repr=False)
+    progress_finalize_report: Any | None = field(default=None, repr=False)
+    progress_error: str = ""
     _state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property

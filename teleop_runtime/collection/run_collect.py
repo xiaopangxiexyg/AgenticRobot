@@ -140,7 +140,7 @@ from ..tactile_visualizer import (
 from ..transforms import as_pose_matrix, interpolate_pose
 from .arm_state_polling import ArmHardwareStatePoller, ArmHardwareStatePollerConfig
 from .hand_state_polling import HandStateHistoryPoller, HandStateHistoryPollerConfig
-from .async_writer import AsyncWriterConfig, AsyncWriterPool
+from collection_runtime.async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
 from .camera_preview import CameraPreviewConfig, CameraPreviewer
 from .diagnostics import (

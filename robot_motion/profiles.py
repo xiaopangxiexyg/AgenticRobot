@@ -116,6 +116,10 @@ class IKSafetyProfile:
     local_step_hold_on_failure: bool = True
     stable_recovery_frames: int = 3
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Once enabled by a profile, keep a limit-escape direction until the joint
+    # clears the activation band by this additional margin.  Zero preserves
+    # the legacy release boundary for hand-built/non-position profiles.
+    local_step_limit_escape_direction_hysteresis_deg: float = 0.0
 
     def hard_branch_limits_array(self) -> np.ndarray:
         limits = np.asarray(self.hard_branch_max_delta_deg, dtype=float).reshape(-1)
@@ -299,6 +303,9 @@ def profile_from_dict(name: str, payload: dict[str, Any]) -> IKSafetyProfile:
         local_step_limit_escape_enabled=bool(payload.get("local_step_limit_escape_enabled", False)),
         local_step_limit_escape_activation_margin_deg=float(
             payload.get("local_step_limit_escape_activation_margin_deg", 2.0)
+        ),
+        local_step_limit_escape_direction_hysteresis_deg=float(
+            payload.get("local_step_limit_escape_direction_hysteresis_deg", 0.0)
         ),
         local_step_limit_escape_step_fraction=float(
             payload.get("local_step_limit_escape_step_fraction", 1.0)

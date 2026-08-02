@@ -80,6 +80,26 @@ rejected before backend publication. This does not authorize real replay.
 Slow/fast topology, hold/fault cancellation, formal sim episode sealing, and
 validated sim2real dynamics are later milestones.
 
+### Realtime trace-consumption rule
+
+Reference receivers and execution rigs expose append-only history snapshots for
+inspection and final capture. A realtime caller must treat those snapshots as a
+log and keep one monotonic cursor per stream. Each control cut may project only
+the newly appended suffix into ControlTrace.
+
+Do not rebuild every historical fact and then deduplicate by `fact_id`: the
+projection and hashing cost has already been paid before deduplication, causing
+control latency to grow with episode length. A successful dispatch performs one
+post-dispatch incremental trace sync; deterministic physics frames requested by
+that call are included in the same sync. Background physics frames are consumed
+at the next cut or at runtime close. History rewind below a published cursor is
+a contract violation and must fail visibly.
+
+Regression tests for a new execution-observation stream must verify both:
+
+- repeated sync with no new records invokes no projector;
+- after a long history, appending one record invokes its projector exactly once.
+
 For policy outputs that contain action chunks, call
 `MujocoDeployRuntime.submit_policy_action_chunk(...)`. Its
 `action_chunk_execution_steps` argument (or the matching
@@ -111,8 +131,13 @@ Formal composer-owned compound motion has an additional default-off gate:
 `ConservativeCompoundAuthorityProfile` must bind the exact composition spec,
 component rule set, formal strategy, complete component catalog, and every
 active selection group. The composer must be the only authorized proposal
-producer, while raw policy and replay authority stay disabled. One proposal is
-valid for one decision period; missing/stale input selects domain HOLD.
+producer, while raw policy and replay authority stay disabled. Sim-HIL enables
+the generic source-eligibility store: source state and action inputs are read
+from one causal cut, and a missing active contributor yields no new proposal
+for that period. Station does not mutate the execution gate for that condition;
+the lower persistence policy remains the sole owner of keep/expiry/HOLD
+behavior. Failures that require operator/lower-runtime repair request latched
+domain HOLD.
 Canonical safety, pose resolution, receiver admission, and all backend
 receipts are fail-closed: any failure cancels every pending/active compound
 group, and the receiver activates arms and required hands only as one guarded

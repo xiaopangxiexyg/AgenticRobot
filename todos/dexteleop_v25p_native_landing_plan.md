@@ -28,9 +28,31 @@ now select V2 only behind their existing default-off switch.
 | Package | Owns | Must not own |
 | --- | --- | --- |
 | `dataset_contracts` | immutable identities, embodiment/stream/task schemas, hashes, manifests, projection receipts | devices, writers, episode lifecycle |
-| `teleop_runtime.collection` | subordinate native persistence driven by an external episode owner | robot-specific schema inference, second episode authority, compatibility writer lifecycle |
+| `collection_runtime` | backend-neutral subordinate writer/persistence, native store, and the planned progress reducer/store driven by an external episode owner | operator intent, robot-specific schema inference, device/control runtime, second episode authority |
 | `dataset_interface` | verification, read views, explicit compatibility projections | source mutation, episode commit, runtime/device control |
-| RealTeleop / UMI recorder | the single episode lifecycle and shared identity | duplicate component semantics or independent sidecar identities |
+| `control_station` | GUI operator intents, application workflow, and typed effect coordination | device polling, robot safety/control, dataset writer or progress reducer |
+| RealTeleop / UMI / sim application | source-specific assembly, lower runtime ports, the current episode lifecycle and shared identity | duplicate component semantics, GUI policy, independent sidecar identities |
+
+The old `teleop_runtime.collection` native imports are compatibility/application
+edges over `collection_runtime`; they are not the owner of new generic writer or
+progress persistence. Runtime code uses capability-oriented ownership paths:
+
+```text
+collection_runtime.component_capture
+    generic component/action/state capture and persistence
+
+collection_runtime.compatibility
+    frozen p1/v2.3 subordinate sidecars
+
+collection_runtime.progress
+    planned p2 online progress reducer/store
+```
+
+Root `collection_runtime.v25p_*` modules and the older
+`teleop_runtime.collection.v25p_*` paths are import-compatibility shims only.
+Persisted `V25p*` contract/hash names remain unchanged because they identify
+existing provisional schemas and artifacts. New production code must not use
+the version-named runtime shims.
 
 The current `legacy_episode_index` field in `EpisodeCaptureIdentity` is a
 transitional owner ordinal. Native readers do not locate or require a legacy
@@ -70,6 +92,11 @@ meta/v25p/native/
     compatibility_projections/<receipt_hash>.cjson
     episode_manifest.cjson
 ```
+
+`profiles/task/`, `task_events/`, and `task_manifest.cjson` are the frozen p1
+Subtask compatibility path. New p2 progress/refinement facts use only
+`meta/v25p2/` as described in the p2 plan; readers must not infer p2 semantics from
+the p1 filenames.
 
 Small numeric/bool component values are canonical inline tensors. Large sensor
 payloads are external artifact references containing an immutable content hash,
@@ -220,23 +247,37 @@ instead of being silently ignored.
    - reusable progress profiles define unique step instances, while each
      episode binding independently declares full-task/window scope, actual
      entry step, and whether prehistory is complete;
-   - failure closes the active attempt before the application-owned Hold;
-     retry requires typed applied Hold/Resume receipts. The current project
+   - topology defaults to a monotonic linear sequence and can explicitly opt
+     into a rooted, non-merging, acyclic tree whose individual branches remain
+     monotonic;
+   - the first reducer/RealTeleop/UMI gate is linear-only; rooted-tree validation
+     and branch resolution have a later independent gate without changing the
+     p2 profile schema;
+   - all online progress-log payloads share one minimal causal fact envelope;
+     annotation sets retain their own append owner; advance and failure are
+     single composite canonical facts rather than separately committed Attempt
+     transitions;
+   - failure closes the active attempt before the Station-coordinated,
+     lower-runtime-owned Hold;
+     the durable Failure fact itself is the idempotent Hold/Pause outbox across
+     restart, and retry requires typed applied Hold/Resume receipts. The current project
      contract fully pauses capture during Hold rather than introducing a second
      raw-capture path;
    - the existing episode owner remains authoritative and passes the same
      capture identity and sample clock to a subordinate semantic writer;
    - capture progress facts and post-capture refinement annotation sets are
-     separately append-only and do not rewrite raw sample/media artifacts;
+     separately append-only; initial annotation sets bind only sealed progress
+     manifests and do not rewrite raw sample/media artifacts;
    - semantic facts are chunked instead of published as one file per event;
    - training exclusion may shrink only at a validated salvage anchor; explicit
      post-annotation corrections may adjust retrospective progress/outcome
      views without mutating capture-time facts;
-   - reusable capture-time semantics will move behind a new backend-neutral
-     `collection_runtime` boundary instead of remaining owned by
-     `teleop_runtime` or being placed in a use-case-shaped `long_horizon`
-     package;
-   - the first implementation gate is pure p2 contracts and offline validation;
+   - the already-extracted backend-neutral `collection_runtime` boundary will
+     gain only an application-neutral progress request/reducer/store subdomain;
+     GUI operator intents and workflow remain owned by `control_station`, while
+     lower device/Episode ports stay in their current runtime owners;
+   - source-of-truth p2 contracts freeze before the reducer prototype; derived
+     coverage/exclusion payloads freeze only after that prototype;
      RealTeleop/UMI attachment remains default-off and long-horizon GUI work is
      explicitly deferred.
 

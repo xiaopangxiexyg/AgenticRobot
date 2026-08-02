@@ -1259,7 +1259,7 @@ def test_formal_composition_gate_rejects_unsafe_required_fallback() -> None:
     )
     with np.testing.assert_raises_regex(
         ValueError,
-        "Required formal contributors must HOLD",
+        "Required formal contributors must request HOLD or no_action",
     ):
         gate.validate_composition_spec(spec)
 

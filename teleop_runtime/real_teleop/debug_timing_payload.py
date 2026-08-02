@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 import inspect
 
 from ..collection.diagnostics import build_end_to_end_latency_breakdown
-from ..gui.status_payloads import _float_or_none as _default_float_or_none
+from .status_payloads import _float_or_none as _default_float_or_none
 from .debug_payload_primitives import _compact_debug_value as _default_compact_debug_value
 
 
@@ -176,4 +176,3 @@ __all__ = [
     "_faults_log_payload",
     "_channels_log_payload",
 ]
-
