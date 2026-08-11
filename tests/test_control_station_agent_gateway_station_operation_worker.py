@@ -4,21 +4,31 @@ import threading
 from collections.abc import Mapping
 from dataclasses import replace
 
-from control_station.agent_gateway import (
-    AgentGatewayService,
+from control_station.agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
-    AgentSkillAccessPolicy,
-    AgentSkillPayloadValidatorRegistry,
-    AgentSkillPayloadValidatorSet,
     AgentSkillRequest,
-    BoundedInMemoryAgentSkillOperationStore,
-    BoundedStationAgentSkillOperationWorker,
-    ReusableStationAgentSkillOperationExecutor,
+)
+from control_station.agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
     SkillParameterProfileRef,
     SkillRouteManifest,
     SkillRouteManifestEntry,
+)
+from control_station.agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
+from control_station.agent_gateway.runtime.operation_store import (
+    BoundedInMemoryAgentSkillOperationStore,
+)
+from control_station.agent_gateway.runtime.payload_validation import (
+    AgentSkillPayloadValidatorRegistry,
+    AgentSkillPayloadValidatorSet,
+)
+from control_station.agent_gateway.runtime.reusable_station_executor import (
+    ReusableStationAgentSkillOperationExecutor,
+)
+from control_station.agent_gateway.runtime.service import AgentGatewayService
+from control_station.agent_gateway.runtime.station_operation_worker import (
+    BoundedStationAgentSkillOperationWorker,
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
     StationLifecycleEvaluationCompletion,

@@ -4,10 +4,10 @@ from dataclasses import replace
 
 import pytest
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.skill_catalog import SkillExecutionRoute
+from control_station.agent_gateway.protocol.state_schemas import (
     TCP_POSE_HISTORY_STATE_SKILL_ID_V1,
     TCP_POSE_STATE_SKILL_ID_V1,
-    SkillExecutionRoute,
     TcpPoseHistoryLimits,
     agent_state_history_slice_content_hash_v1,
     tcp_pose_history_state_definition_v1,

@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillAggregateEvaluationReceipt,
     SkillEvaluationPlan,
     SkillEvaluationReceipt,

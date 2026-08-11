@@ -18,12 +18,16 @@ from collection_runtime.planning_history import (
     PlanningHistoryRecord,
     PlanningHistorySourceBinding,
 )
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.contracts import AgentObservationSnapshot
+from control_station.agent_gateway.protocol.state_schemas import (
+    validate_agent_state_result_v1,
+)
+from control_station.agent_gateway.runtime.service import (
     AgentGatewayObservationOutcome,
     AgentGatewayService,
-    AgentObservationSnapshot,
+)
+from control_station.agent_gateway.runtime.station_revision import (
     AgentStationRevisionTracker,
-    validate_agent_state_result_v1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action.execution_observation import (
@@ -765,9 +769,9 @@ class MujocoAgentObservationProducer:
 
 __all__ = [
     "MUJOCO_AGENT_TCP_POSE_IO_LAYOUT_HASH_V1",
+    "MUJOCO_AGENT_TCP_POSE_MEASUREMENT_HASH_DOMAIN_V1",
     "MUJOCO_AGENT_TCP_POSE_OBSERVATION_CONTRACT_HASH_V1",
     "MUJOCO_AGENT_TCP_POSE_SAMPLE_ID_HASH_DOMAIN_V1",
-    "MUJOCO_AGENT_TCP_POSE_MEASUREMENT_HASH_DOMAIN_V1",
     "MUJOCO_AGENT_TCP_POSE_SNAPSHOT_ID_HASH_DOMAIN_V1",
     "MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1",
     "MujocoAgentObservationProducer",

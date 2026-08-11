@@ -16,21 +16,37 @@ from collection_runtime.planning_history import (
     PlanningHistoryRecorder,
     SQLitePlanningHistoryStore,
 )
-from control_station.agent_gateway import (
-    AgentGatewayAuthoritativePortReceipt,
-    AgentGatewayOperationOutcome,
-    AgentGatewayService,
-    AgentGatewayUnixJsonServer,
-    AgentGatewayUnixPeerClientMap,
-    AgentSkillAccessPolicy,
-    BoundAgentGatewayWireAdapter,
-    BoundedInMemoryAgentSkillOperationStore,
-    PassiveReadResult,
-    PassiveReadSkillExecutor,
-    ReusableStationAgentSkillOperationExecutor,
+from control_station.agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
+from control_station.agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
+)
+from control_station.agent_gateway.runtime.operation_port import (
+    AgentGatewayAuthoritativePortReceipt,
+)
+from control_station.agent_gateway.runtime.operation_store import (
+    BoundedInMemoryAgentSkillOperationStore,
+)
+from control_station.agent_gateway.runtime.passive_read_executor import (
+    PassiveReadResult,
+    PassiveReadSkillExecutor,
+)
+from control_station.agent_gateway.runtime.reusable_station_executor import (
+    ReusableStationAgentSkillOperationExecutor,
+)
+from control_station.agent_gateway.runtime.service import (
+    AgentGatewayOperationOutcome,
+    AgentGatewayService,
+)
+from control_station.agent_gateway.runtime.station_operation_worker import (
     StationOperationWorkerBinding,
+)
+from control_station.agent_gateway.transport.unix_transport import (
+    AgentGatewayUnixJsonServer,
+    AgentGatewayUnixPeerClientMap,
+)
+from control_station.agent_gateway.transport.wire_adapter import (
+    BoundAgentGatewayWireAdapter,
 )
 
 from .motion_application import MujocoAgentSkillMotionApplication

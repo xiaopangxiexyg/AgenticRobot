@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.contracts import (
     AGENT_CONTROL_REASON_CODES_V1,
     AGENT_SKILL_PROTOCOL_VERSION_V1,
     AgentObservationSnapshot,
@@ -15,24 +17,26 @@ from control_station.agent_gateway import (
     AgentOwnOperationCancelRequest,
     AgentOwnOperationQuery,
     AgentSkillOperation,
+    agent_own_domain_hold_request_from_json,
+    agent_own_operation_cancel_request_from_json,
+    agent_own_operation_query_from_json,
+    agent_skill_request_from_json,
+    agent_skill_schema_snapshot_document,
+    agent_skill_schema_snapshot_json,
+)
+from control_station.agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
     SkillParameterProfileRef,
     SkillRouteManifest,
     SkillRouteManifestEntry,
-    agent_skill_request_from_json,
-    agent_own_domain_hold_request_from_json,
-    agent_own_operation_cancel_request_from_json,
-    agent_own_operation_query_from_json,
-    agent_skill_schema_snapshot_document,
-    agent_skill_schema_snapshot_json,
 )
-
 
 _SCHEMA_PATH = (
     Path(__file__).resolve().parents[1]
     / "control_station"
     / "agent_gateway"
+    / "protocol"
     / "agent_skill_v1.schema.json"
 )
 
@@ -384,7 +388,7 @@ def test_checked_in_schema_matches_the_canonical_generator() -> None:
     )
 
 
-def test_agent_gateway_contract_package_has_no_lower_runtime_imports() -> None:
+def test_agent_gateway_protocol_package_has_no_lower_runtime_imports() -> None:
     package_root = _SCHEMA_PATH.parent
     forbidden_roots = {
         "control_composition",
@@ -405,3 +409,28 @@ def test_agent_gateway_contract_package_has_no_lower_runtime_imports() -> None:
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                 imported_roots.add(node.module.split(".", 1)[0])
     assert imported_roots.isdisjoint(forbidden_roots)
+
+
+def test_agent_gateway_root_is_discovery_only_and_lazy() -> None:
+    script = """
+import sys
+import control_station.agent_gateway as gateway
+
+assert gateway.__all__ == ["protocol", "runtime", "transport"]
+allowed = {
+    "control_station.agent_gateway",
+    "control_station.agent_gateway.protocol",
+    "control_station.agent_gateway.runtime",
+    "control_station.agent_gateway.transport",
+}
+unexpected = sorted(
+    name
+    for name in sys.modules
+    if name.startswith("control_station.agent_gateway") and name not in allowed
+)
+assert not unexpected, unexpected
+assert not any(
+    name.startswith("control_station.tasks.cube_lift") for name in sys.modules
+)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)

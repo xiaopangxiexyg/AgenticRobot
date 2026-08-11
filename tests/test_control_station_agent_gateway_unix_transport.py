@@ -13,14 +13,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.transport import unix_transport
+from control_station.agent_gateway.transport.unix_transport import (
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
     AgentGatewayUnixJsonServer,
     AgentGatewayUnixPeerClientMap,
     AgentGatewayUnixPeerCredentials,
+)
+from control_station.agent_gateway.transport.wire_adapter import (
     BoundAgentGatewayWireAdapter,
 )
-from control_station.agent_gateway.transport import unix_transport
 
 _PREFIX = struct.Struct(">I")
 

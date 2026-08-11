@@ -10,20 +10,32 @@ from types import SimpleNamespace
 
 import pytest
 
-from control_station.agent_gateway import (
-    AgentGatewayService,
-    AgentGatewayUnixJsonServer,
-    AgentGatewayUnixPeerClientMap,
+from control_station.agent_gateway.protocol.contracts import (
     AgentOwnOperationQuery,
-    AgentSkillAccessPolicy,
     AgentSkillRequest,
-    AgentStationRevisionTracker,
-    BoundAgentGatewayWireAdapter,
+)
+from control_station.agent_gateway.protocol.skill_catalog import (
+    validate_skill_route_catalog_closure,
+)
+from control_station.agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
+from control_station.agent_gateway.runtime.operation_port import (
     DeterministicNoIoAgentSkillOperationPort,
     NullAgentSkillOperationPort,
+)
+from control_station.agent_gateway.runtime.service import AgentGatewayService
+from control_station.agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
-    validate_skill_route_catalog_closure,
+)
+from control_station.agent_gateway.runtime.station_revision import (
+    AgentStationRevisionTracker,
+)
+from control_station.agent_gateway.transport.unix_transport import (
+    AgentGatewayUnixJsonServer,
+    AgentGatewayUnixPeerClientMap,
+)
+from control_station.agent_gateway.transport.wire_adapter import (
+    BoundAgentGatewayWireAdapter,
 )
 from control_station.composition.mujoco_sim_hil import MujocoSimHILComposition
 from control_station.sim_hil_profile.agent.observation import (

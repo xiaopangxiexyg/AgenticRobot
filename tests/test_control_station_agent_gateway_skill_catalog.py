@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
     AgentSkillSchemaEntry,
     CrossTargetDeploymentReviewRef,

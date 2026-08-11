@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.contracts import (
     AgentSkillOperation,
     AgentSkillRequest,
 )

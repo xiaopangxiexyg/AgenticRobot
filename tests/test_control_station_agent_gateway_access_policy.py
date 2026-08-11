@@ -4,14 +4,16 @@ from dataclasses import replace
 
 import pytest
 
-from control_station.agent_gateway import (
-    AgentSkillAccessPolicy,
-    AgentSkillRequest,
+from control_station.agent_gateway.protocol.contracts import AgentSkillRequest
+from control_station.agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
     SkillParameterProfileRef,
     SkillRouteManifest,
     SkillRouteManifestEntry,
+)
+from control_station.agent_gateway.runtime.access_policy import (
+    AgentSkillAccessPolicy,
     assess_skill_request_access,
     issue_skill_execution_grant,
 )

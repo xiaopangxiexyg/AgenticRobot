@@ -15,20 +15,32 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from control_station.agent_gateway import (
-    AgentGatewayOperationOutcome,
-    AgentGatewayService,
-    AgentGatewayUnixJsonServer,
-    AgentGatewayUnixPeerClientMap,
-    AgentSkillAccessPolicy,
-    BoundAgentGatewayWireAdapter,
-    BoundedInMemoryAgentSkillOperationStore,
-    BoundedStationAgentSkillOperationWorker,
-    PassiveReadResult,
-    PassiveReadSkillExecutor,
+from control_station.agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
+from control_station.agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
+)
+from control_station.agent_gateway.runtime.operation_store import (
+    BoundedInMemoryAgentSkillOperationStore,
+)
+from control_station.agent_gateway.runtime.passive_read_executor import (
+    PassiveReadResult,
+    PassiveReadSkillExecutor,
+)
+from control_station.agent_gateway.runtime.service import (
+    AgentGatewayOperationOutcome,
+    AgentGatewayService,
+)
+from control_station.agent_gateway.runtime.station_operation_worker import (
+    BoundedStationAgentSkillOperationWorker,
     StationOperationWorkerBinding,
+)
+from control_station.agent_gateway.transport.unix_transport import (
+    AgentGatewayUnixJsonServer,
+    AgentGatewayUnixPeerClientMap,
+)
+from control_station.agent_gateway.transport.wire_adapter import (
+    BoundAgentGatewayWireAdapter,
 )
 
 from .deployment import MujocoCubeLiftAgentSkillContractBundle

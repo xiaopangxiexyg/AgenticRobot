@@ -20,7 +20,7 @@ from collection_runtime.planning_history import (
     PlanningHistoryStoreError,
     SQLitePlanningHistoryStore,
 )
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.state_schemas import (
     agent_state_history_slice_content_hash_v1,
     validate_agent_state_parameters_v1,
     validate_agent_state_result_v1,

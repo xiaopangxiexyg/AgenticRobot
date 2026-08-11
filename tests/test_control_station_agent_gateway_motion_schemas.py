@@ -4,18 +4,18 @@ from dataclasses import replace
 
 import pytest
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.motion_schemas import (
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
     REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
     InlineTcpTrajectoryLimits,
-    SkillExecutionRoute,
     inline_tcp_trajectory_schema_entry_v1,
     registered_tcp_trajectory_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
 )
+from control_station.agent_gateway.protocol.skill_catalog import SkillExecutionRoute
 
 
 def _limits() -> InlineTcpTrajectoryLimits:

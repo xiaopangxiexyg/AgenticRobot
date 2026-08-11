@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from control_station.agent_gateway import AgentStationRevisionTracker
+from control_station.agent_gateway.runtime.station_revision import (
+    AgentStationRevisionTracker,
+)
 
 from ...agent.observation import MujocoAgentObservationProducer
 from ...agent.observation_binding import MujocoAgentObservationSourceBinding

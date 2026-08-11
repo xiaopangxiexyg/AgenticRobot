@@ -12,30 +12,38 @@ from collection_runtime.planning_history import (
     PlanningHistorySourceBinding,
     PlanningHistoryStoreLimits,
 )
-from control_station.agent_gateway import (
-    AgentSkillPayloadValidatorRegistry,
-    AgentSkillPayloadValidatorSet,
+from control_station.agent_gateway.protocol.evaluation_contracts import (
+    SkillEvaluationPlan,
+    SkillEvaluatorSpec,
+)
+from control_station.agent_gateway.protocol.motion_schemas import (
+    tcp_pose_target_schema_entry_v1,
+    validate_agent_motion_parameters_v1,
+    validate_agent_motion_route_schema_v1,
+)
+from control_station.agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
     SkillDefinition,
     SkillDefinitionCatalog,
     SkillDeploymentBindingRef,
-    SkillEvaluationPlan,
-    SkillEvaluatorSpec,
     SkillExecutionRoute,
     SkillRouteManifest,
     SkillRouteManifestEntry,
+    validate_skill_route_catalog_closure,
+)
+from control_station.agent_gateway.protocol.state_schemas import (
     TcpPoseHistoryLimits,
     tcp_pose_history_state_definition_v1,
     tcp_pose_history_state_schema_entry_v1,
     tcp_pose_state_definition_v1,
     tcp_pose_state_schema_entry_v1,
-    tcp_pose_target_schema_entry_v1,
-    validate_agent_motion_parameters_v1,
-    validate_agent_motion_route_schema_v1,
     validate_agent_state_parameters_v1,
     validate_agent_state_result_v1,
     validate_agent_state_route_schema_v1,
-    validate_skill_route_catalog_closure,
+)
+from control_station.agent_gateway.runtime.payload_validation import (
+    AgentSkillPayloadValidatorRegistry,
+    AgentSkillPayloadValidatorSet,
 )
 from control_station.contracts import (
     ControlStationRunManifest,

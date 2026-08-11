@@ -8,12 +8,16 @@ from types import SimpleNamespace
 import pytest
 
 import control_station.sim_hil_profile.agent.motion_deployment as deployment
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentSkillOperation,
     AgentSkillRequest,
+)
+from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
+)
+from control_station.agent_gateway.protocol.skill_catalog import (
     SkillExecutionRoute,
     SkillParameterProfileRef,
 )

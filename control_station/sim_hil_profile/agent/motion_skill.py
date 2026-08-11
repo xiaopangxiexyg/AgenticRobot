@@ -10,13 +10,17 @@ from typing import Any
 
 import numpy as np
 
-from control_station.agent_gateway import (
+from control_station.agent_gateway.protocol.contracts import (
     AgentSkillOperation,
     AgentSkillRequest,
+)
+from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillAggregateEvaluationReceipt,
     SkillEvaluationPlan,
     SkillEvaluationReceipt,
-    SkillExecutionRoute,
+)
+from control_station.agent_gateway.protocol.skill_catalog import SkillExecutionRoute
+from control_station.agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
     StationLifecycleEvaluationCompletion,

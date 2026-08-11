@@ -14,18 +14,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from control_station.agent_gateway import (
-    AgentSkillPayloadValidatorRegistry,
+from control_station.agent_gateway.protocol.evaluation_contracts import (
+    SkillEvaluationPlan,
+)
+from control_station.agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
     SkillDefinitionCatalog,
-    SkillEvaluationPlan,
     SkillExecutionRoute,
     SkillRouteManifest,
     SkillRouteManifestEntry,
+    validate_skill_route_catalog_closure,
+)
+from control_station.agent_gateway.protocol.state_schemas import (
     tcp_pose_state_definition_v1,
     tcp_pose_state_schema_entry_v1,
     validate_agent_state_route_schema_v1,
-    validate_skill_route_catalog_closure,
+)
+from control_station.agent_gateway.runtime.payload_validation import (
+    AgentSkillPayloadValidatorRegistry,
 )
 from control_station.composition.mujoco_sim_hil import (
     build_mujoco_sim_hil_agent_skill_execution_manifest,
