@@ -31,8 +31,8 @@ from control_station.agent_gateway import (
     StationOperationWorkerBinding,
 )
 
-from .agent_observation import MujocoCubeLiftAgentObservationProducer
-from .agent_skill_deployment import MujocoCubeLiftAgentSkillContractBundle
+from .deployment import MujocoCubeLiftAgentSkillContractBundle
+from .observation_binding import MujocoCubeLiftAgentObservationProducer
 
 
 def _required(value: object, *, field_name: str) -> str:

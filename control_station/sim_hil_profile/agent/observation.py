@@ -1,4 +1,4 @@
-"""Low-rate TCP planning snapshots for the exact CubeLift Sim-HIL Route.
+"""Low-rate TCP planning snapshots for a bound MuJoCo Agent Route.
 
 The producer reads one application-locked passive cut and publishes only a
 bounded tool-TCP pose summary plus lower-owned identities.  It never starts a
@@ -38,17 +38,18 @@ from sim.mujoco.deploy.sim_hil_target import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
 
-from .agent_motion_deployment import MujocoAgentTcpPoseContractBundle
-from .agent_skill_deployment import MujocoCubeLiftAgentSkillContractBundle
-from .application import MujocoSimHILPassiveApplicationCut
+from ..application import MujocoSimHILPassiveApplicationCut
+from .observation_binding import MujocoAgentObservationSourceBinding
 
-MUJOCO_CUBE_LIFT_AGENT_TCP_SUMMARY_SCHEMA_V1 = (
+MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1 = (
     "dexteleop.agent_observation.mujoco_tcp_pose_summary.v1"
 )
-MUJOCO_CUBE_LIFT_AGENT_TCP_MEASUREMENT_HASH_DOMAIN_V1 = (
+MUJOCO_AGENT_TCP_POSE_MEASUREMENT_HASH_DOMAIN_V1 = (
     "dexteleop.agent_observation.mujoco_tcp_pose_measurement.v1"
 )
-MUJOCO_CUBE_LIFT_AGENT_SNAPSHOT_ID_HASH_DOMAIN_V1 = (
+# The v1 wire domain predates this ownership split; changing its spelling would
+# change every snapshot identity, so only the Python owner/name is generalized.
+MUJOCO_AGENT_TCP_POSE_SNAPSHOT_ID_HASH_DOMAIN_V1 = (
     "dexteleop.agent_observation.mujoco_cube_lift_snapshot_id.v1"
 )
 MUJOCO_AGENT_TCP_POSE_SAMPLE_ID_HASH_DOMAIN_V1 = (
@@ -122,27 +123,24 @@ def _finite(value: object, *, field_name: str) -> float:
     return normalized
 
 
-class MujocoCubeLiftAgentObservationProducer:
+class MujocoAgentObservationProducer:
     """Single-session snapshot/revision owner for one constructed graph."""
 
     def __init__(
         self,
         *,
         application: Any,
-        contract_bundle: (
-            MujocoCubeLiftAgentSkillContractBundle
-            | MujocoAgentTcpPoseContractBundle
-        ),
+        contract_bundle: Any,
+        source_binding: MujocoAgentObservationSourceBinding,
         revision_tracker: AgentStationRevisionTracker | None = None,
     ) -> None:
-        if not isinstance(
-            contract_bundle,
-            (
-                MujocoCubeLiftAgentSkillContractBundle,
-                MujocoAgentTcpPoseContractBundle,
-            ),
-        ):
-            raise TypeError("contract_bundle must be a supported typed bundle.")
+        if not isinstance(source_binding, MujocoAgentObservationSourceBinding):
+            raise TypeError("source_binding must be typed.")
+        for field_name in ("deployment_binding", "route_manifest"):
+            if getattr(contract_bundle, field_name, None) is None:
+                raise TypeError(
+                    f"contract_bundle must expose a typed {field_name}."
+                )
         capture_cut = getattr(application, "capture_passive_application_cut", None)
         if not callable(capture_cut):
             raise TypeError(
@@ -159,6 +157,13 @@ class MujocoCubeLiftAgentObservationProducer:
         runtime = getattr(application, "runtime", None)
         runtime_config = getattr(runtime, "config", None)
         binding = contract_bundle.deployment_binding
+        if (
+            source_binding.runtime_session_id != binding.runtime_session_id
+            or source_binding.control_domain_id != binding.control_domain_id
+        ):
+            raise ValueError(
+                "Observation source binding does not match deployment identity."
+            )
         if (
             getattr(runtime_config, "runtime_session_id", None)
             != binding.runtime_session_id
@@ -250,51 +255,6 @@ class MujocoCubeLiftAgentObservationProducer:
         if getattr(tool_binding, "controlled_frame_id", None) != "tool_tcp":
             raise ValueError("Observation producer requires right_arm tool_tcp.")
 
-        if isinstance(contract_bundle, MujocoCubeLiftAgentSkillContractBundle):
-            composition = getattr(application, "composition", None)
-            policy_binding = getattr(
-                getattr(composition, "policy_input_adapter", None),
-                "binding",
-                None,
-            )
-            source_binding_id = _required(
-                getattr(policy_binding, "source_slot_id", None),
-                field_name="policy source slot",
-            )
-            source_binding_hash = _required(
-                getattr(policy_binding, "semantic_content_hash", None),
-                field_name="policy source binding hash",
-            )
-            producer_epoch = getattr(policy_binding, "producer_epoch", None)
-            producer_epoch_label = "policy producer_epoch"
-        else:
-            source_slots = tuple(contract_bundle.station_manifest.source_slots)
-            direct = getattr(
-                runtime_config,
-                "direct_component_proposal_source",
-                None,
-            )
-            if (
-                len(source_slots) != 1
-                or source_slots[0].source_kind != "agent_skill"
-                or getattr(direct, "producer_kind", None) != "agent_skill"
-                or source_slots[0].producer_id
-                != getattr(direct, "producer_id", None)
-            ):
-                raise ValueError(
-                    "Agent motion observation source does not match its Station slot."
-                )
-            source_binding_id = source_slots[0].source_slot_id
-            source_binding_hash = source_slots[0].semantic_content_hash
-            producer_epoch = getattr(direct, "producer_epoch", None)
-            producer_epoch_label = "agent_skill producer_epoch"
-        if (
-            isinstance(producer_epoch, bool)
-            or not isinstance(producer_epoch, int)
-            or producer_epoch < 0
-        ):
-            raise ValueError(f"{producer_epoch_label} must be non-negative.")
-
         self.application = application
         self.contract_bundle = contract_bundle
         self.revision_tracker = tracker
@@ -304,9 +264,10 @@ class MujocoCubeLiftAgentObservationProducer:
         self.pose_schema_hash = pose_schema_hash
         self.reference_frame_id = reference_frame_id
         self.reference_frame_spec_hash = reference_frame_spec_hash
-        self.source_binding_id = source_binding_id
-        self.source_binding_hash = source_binding_hash
-        self.producer_epoch = producer_epoch
+        self.source_binding = source_binding
+        self.source_binding_id = source_binding.source_binding_id
+        self.source_binding_hash = source_binding.source_binding_hash
+        self.producer_epoch = source_binding.producer_epoch
         history_source_binding = getattr(
             contract_bundle,
             "history_source_binding",
@@ -389,7 +350,7 @@ class MujocoCubeLiftAgentObservationProducer:
             and cut.lifecycle_state not in {"closed", "restart_required"}
         )
         payload = {
-            "schema": MUJOCO_CUBE_LIFT_AGENT_TCP_SUMMARY_SCHEMA_V1,
+            "schema": MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1,
             "status": "valid" if measurement_valid else "invalid",
             "source_kind": "mujoco_scene_ground_truth",
             "component_ids": ["right_arm"],
@@ -411,7 +372,7 @@ class MujocoCubeLiftAgentObservationProducer:
         }
         measurement_hash = canonical_content_hash(
             payload,
-            domain=MUJOCO_CUBE_LIFT_AGENT_TCP_MEASUREMENT_HASH_DOMAIN_V1,
+            domain=MUJOCO_AGENT_TCP_POSE_MEASUREMENT_HASH_DOMAIN_V1,
         )
         return (
             {**payload, "measurement_hash": measurement_hash},
@@ -592,7 +553,7 @@ class MujocoCubeLiftAgentObservationProducer:
                     "captured_at": cut.captured_at,
                     "available_at": available_at,
                 },
-                domain=MUJOCO_CUBE_LIFT_AGENT_SNAPSHOT_ID_HASH_DOMAIN_V1,
+                domain=MUJOCO_AGENT_TCP_POSE_SNAPSHOT_ID_HASH_DOMAIN_V1,
             )
             snapshot = AgentObservationSnapshot(
                 snapshot_id=f"agent-observation:{snapshot_identity_hash}",
@@ -806,14 +767,10 @@ __all__ = [
     "MUJOCO_AGENT_TCP_POSE_IO_LAYOUT_HASH_V1",
     "MUJOCO_AGENT_TCP_POSE_OBSERVATION_CONTRACT_HASH_V1",
     "MUJOCO_AGENT_TCP_POSE_SAMPLE_ID_HASH_DOMAIN_V1",
-    "MUJOCO_CUBE_LIFT_AGENT_SNAPSHOT_ID_HASH_DOMAIN_V1",
-    "MUJOCO_CUBE_LIFT_AGENT_TCP_MEASUREMENT_HASH_DOMAIN_V1",
-    "MUJOCO_CUBE_LIFT_AGENT_TCP_SUMMARY_SCHEMA_V1",
+    "MUJOCO_AGENT_TCP_POSE_MEASUREMENT_HASH_DOMAIN_V1",
+    "MUJOCO_AGENT_TCP_POSE_SNAPSHOT_ID_HASH_DOMAIN_V1",
+    "MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1",
     "MujocoAgentObservationProducer",
     "MujocoAgentTcpPoseHistoryCapture",
     "MujocoAgentTcpPoseStateRead",
-    "MujocoCubeLiftAgentObservationProducer",
 ]
-
-
-MujocoAgentObservationProducer = MujocoCubeLiftAgentObservationProducer

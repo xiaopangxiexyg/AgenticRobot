@@ -11,8 +11,9 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from control_station.agent_gateway.protocol.contracts import (
     AgentSkillOperation,
@@ -28,7 +29,7 @@ from control_station.agent_gateway.runtime.station_operation_worker import (
     StationLifecycleEvaluationCompletion,
     StationLifecycleExecutionCompletion,
 )
-from control_station.agent_gateway.task_schemas import (
+from control_station.tasks.cube_lift.sim_route import (
     CubeLiftSimDeploymentBinding,
     CubeLiftTerminalEvaluatorConfig,
     validate_cube_lift_sim_route_v1,

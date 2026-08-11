@@ -20,7 +20,7 @@ from sim.mujoco.deploy.sim_hil_target import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
 
-from .application import MujocoSimHILPassiveApplicationCut
+from ..application import MujocoSimHILPassiveApplicationCut
 
 
 def _required(value: object, *, field_name: str) -> str:

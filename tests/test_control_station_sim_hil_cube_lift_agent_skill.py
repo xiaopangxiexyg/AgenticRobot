@@ -7,22 +7,25 @@ import pytest
 from control_station.agent_gateway import (
     AgentSkillOperation,
     AgentSkillRequest,
-    CubeLiftSimDeploymentBinding,
-    CubeLiftTerminalEvaluatorConfig,
-    cube_lift_evaluation_plan_v1,
-    cube_lift_schema_entry_v1,
-    cube_lift_sim_route_v1,
-    cube_lift_skill_definition_v1,
 )
-from control_station.sim_hil_profile.agent_skill import (
-    CubeLiftAgentSkillLifecycle,
-    CubeLiftCandidateObservation,
-)
-from control_station.sim_hil_profile.execution_evidence import (
+from control_station.sim_hil_profile.tasks.cube_lift.execution_evidence import (
     CubeLiftExecutionEvidenceCollector,
     CubeLiftExecutionEvidenceCut,
 )
-
+from control_station.sim_hil_profile.tasks.cube_lift.skill import (
+    CubeLiftAgentSkillLifecycle,
+    CubeLiftCandidateObservation,
+)
+from control_station.tasks.cube_lift.definition import (
+    cube_lift_schema_entry_v1,
+    cube_lift_skill_definition_v1,
+)
+from control_station.tasks.cube_lift.sim_route import (
+    CubeLiftSimDeploymentBinding,
+    CubeLiftTerminalEvaluatorConfig,
+    cube_lift_evaluation_plan_v1,
+    cube_lift_sim_route_v1,
+)
 
 RUNTIME_SESSION_ID = "runtime:cube-lift-agent-skill-test"
 CONTROL_DOMAIN_ID = "mujoco-sim-hil"

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import control_station.sim_hil_profile.agent_motion_deployment as deployment
+import control_station.sim_hil_profile.agent.motion_deployment as deployment
 from control_station.agent_gateway import (
     AgentObservationSnapshot,
     AgentSkillOperation,
@@ -17,24 +17,24 @@ from control_station.agent_gateway import (
     SkillExecutionRoute,
     SkillParameterProfileRef,
 )
-from control_station.sim_hil_profile.agent_motion_application import (
+from control_station.sim_hil_profile.agent.motion_application import (
     MujocoAgentSkillMotionApplication,
     MujocoAgentSkillMotionStep,
 )
-from control_station.sim_hil_profile.agent_motion_deployment import (
+from control_station.sim_hil_profile.agent.motion_deployment import (
     MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1,
     MujocoAgentTcpPoseDeploymentBinding,
     MujocoAgentTcpPoseMotionProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
 )
-from control_station.sim_hil_profile.agent_motion_factory import (
+from control_station.sim_hil_profile.agent.motion_factory import (
     mujoco_agent_tcp_pose_execution_observation_plan_v1,
     validate_mujoco_agent_tcp_pose_target_config,
 )
-from control_station.sim_hil_profile.agent_motion_gateway_session import (
+from control_station.sim_hil_profile.agent.motion_gateway_session import (
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
-from control_station.sim_hil_profile.agent_motion_skill import (
+from control_station.sim_hil_profile.agent.motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
 )

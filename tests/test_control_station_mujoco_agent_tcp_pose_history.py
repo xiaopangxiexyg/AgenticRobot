@@ -8,19 +8,19 @@ from types import SimpleNamespace
 
 import pytest
 
-import control_station.sim_hil_profile.agent_motion_deployment as deployment
+import control_station.sim_hil_profile.agent.motion_deployment as deployment
 from collection_runtime.planning_history import SQLitePlanningHistoryStore
-from control_station.sim_hil_profile.agent_motion_application import (
+from control_station.sim_hil_profile.agent.motion_application import (
     MujocoAgentSkillMotionApplication,
 )
-from control_station.sim_hil_profile.agent_motion_deployment import (
+from control_station.sim_hil_profile.agent.motion_deployment import (
     MujocoAgentTcpPoseHistoryProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
 )
-from control_station.sim_hil_profile.agent_motion_factory import (
+from control_station.sim_hil_profile.agent.motion_factory import (
     MujocoAgentTcpPoseHistoryStorageConfig,
 )
-from control_station.sim_hil_profile.agent_motion_gateway_session import (
+from control_station.sim_hil_profile.agent.motion_gateway_session import (
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
 from control_station.sim_hil_profile.application import (

@@ -33,14 +33,17 @@ from control_station.agent_gateway import (
     StationOperationWorkerBinding,
 )
 
-from .agent_motion_application import MujocoAgentSkillMotionApplication
-from .agent_motion_deployment import MujocoAgentTcpPoseContractBundle
-from .agent_motion_skill import (
+from .motion_application import MujocoAgentSkillMotionApplication
+from .motion_deployment import MujocoAgentTcpPoseContractBundle
+from .motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
 )
-from .agent_observation import MujocoAgentObservationProducer
-from .agent_tcp_pose_history import MujocoAgentTcpPoseHistoryProvider
+from .observation import MujocoAgentObservationProducer
+from .observation_binding import (
+    build_mujoco_agent_motion_observation_source_binding,
+)
+from .tcp_pose_history import MujocoAgentTcpPoseHistoryProvider
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -280,6 +283,10 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     observation_producer = MujocoAgentObservationProducer(
         application=application,
         contract_bundle=contract_bundle,
+        source_binding=build_mujoco_agent_motion_observation_source_binding(
+            application=application,
+            contract_bundle=contract_bundle,
+        ),
     )
     history_provider = (
         MujocoAgentTcpPoseHistoryProvider(

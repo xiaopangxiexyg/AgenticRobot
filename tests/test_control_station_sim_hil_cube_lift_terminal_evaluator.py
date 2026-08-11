@@ -8,21 +8,24 @@ import pytest
 from control_station.agent_gateway import (
     AgentSkillOperation,
     AgentSkillRequest,
-    CubeLiftSimDeploymentBinding,
-    CubeLiftTerminalEvaluatorConfig,
-    cube_lift_evaluation_plan_v1,
-    cube_lift_schema_entry_v1,
-    cube_lift_sim_route_v1,
-    cube_lift_skill_definition_v1,
 )
-from control_station.sim_hil_profile.terminal_evaluator import (
+from control_station.sim_hil_profile.tasks.cube_lift.terminal_evaluator import (
     CubeLiftLowerHoldProof,
     CubeLiftTerminalHoldSample,
     CubeLiftTerminalStableHoldEvaluator,
     MujocoCubeLiftTerminalHoldSampler,
     cube_lift_lower_hold_proof_from_transition,
 )
-
+from control_station.tasks.cube_lift.definition import (
+    cube_lift_schema_entry_v1,
+    cube_lift_skill_definition_v1,
+)
+from control_station.tasks.cube_lift.sim_route import (
+    CubeLiftSimDeploymentBinding,
+    CubeLiftTerminalEvaluatorConfig,
+    cube_lift_evaluation_plan_v1,
+    cube_lift_sim_route_v1,
+)
 
 TASK_HASH = "task-config:cube-lift-test"
 

@@ -25,8 +25,8 @@ from control_station.agent_gateway import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
 
-from .agent_motion_application import MujocoAgentSkillMotionApplication
-from .agent_motion_deployment import (
+from .motion_application import MujocoAgentSkillMotionApplication
+from .motion_deployment import (
     MujocoAgentTcpPoseDeploymentBinding,
     MujocoAgentTcpPoseMotionProfile,
 )

@@ -4,25 +4,28 @@ from dataclasses import replace
 
 import pytest
 
-from control_station.agent_gateway import (
-    CUBE_LIFT_ENVIRONMENT_EVALUATOR_ID_V1,
+from control_station.agent_gateway.protocol.skill_catalog import (
+    SkillRouteManifestEntry,
+)
+from control_station.tasks.cube_lift.definition import (
     CUBE_LIFT_PARAMETER_PROFILE_ID_V1,
+    cube_lift_schema_entry_v1,
+    cube_lift_skill_definition_v1,
+    validate_cube_lift_execution_result_v1,
+    validate_cube_lift_parameters_v1,
+)
+from control_station.tasks.cube_lift.sim_route import (
+    CUBE_LIFT_ENVIRONMENT_EVALUATOR_ID_V1,
     CubeLiftSimDeploymentBinding,
     CubeLiftTerminalEvaluatorConfig,
-    SkillRouteManifestEntry,
     cube_lift_evaluation_plan_v1,
     cube_lift_evaluator_input_schema_hash_v1,
     cube_lift_evaluator_input_schema_v1,
     cube_lift_payload_validator_set_v1,
-    cube_lift_schema_entry_v1,
     cube_lift_sim_route_v1,
-    cube_lift_skill_definition_v1,
-    validate_cube_lift_execution_result_v1,
-    validate_cube_lift_parameters_v1,
     validate_cube_lift_sim_route_v1,
     validate_cube_lift_task_evaluation_v1,
 )
-
 
 TASK_CONFIG_HASH = (
     "e3450cc3cc3d58c191095d82eb87f0a2569c0df6561ba778b7451220a1add170"

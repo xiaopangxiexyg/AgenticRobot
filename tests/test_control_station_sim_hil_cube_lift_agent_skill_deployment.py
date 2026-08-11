@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import control_station.sim_hil_profile.agent_skill_deployment as deployment
 from control_station.agent_gateway import (
     AgentGatewayService,
     AgentGatewayUnixJsonServer,
@@ -27,20 +26,23 @@ from control_station.agent_gateway import (
     validate_skill_route_catalog_closure,
 )
 from control_station.composition.mujoco_sim_hil import MujocoSimHILComposition
-from control_station.sim_hil_profile.agent_gateway_session import (
-    assemble_mujoco_cube_lift_agent_gateway_session,
-)
-from control_station.sim_hil_profile.agent_observation import (
-    MUJOCO_CUBE_LIFT_AGENT_TCP_SUMMARY_SCHEMA_V1,
-    MujocoCubeLiftAgentObservationProducer,
-)
-from control_station.sim_hil_profile.agent_skill_deployment import (
-    build_mujoco_cube_lift_agent_skill_contract_bundle,
-    cube_lift_terminal_evaluator_config_from_task,
+from control_station.sim_hil_profile.agent.observation import (
+    MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1,
 )
 from control_station.sim_hil_profile.application import (
     MujocoSimHILApplication,
     MujocoSimHILPassiveApplicationCut,
+)
+from control_station.sim_hil_profile.tasks.cube_lift import deployment
+from control_station.sim_hil_profile.tasks.cube_lift.deployment import (
+    build_mujoco_cube_lift_agent_skill_contract_bundle,
+    cube_lift_terminal_evaluator_config_from_task,
+)
+from control_station.sim_hil_profile.tasks.cube_lift.gateway_session import (
+    assemble_mujoco_cube_lift_agent_gateway_session,
+)
+from control_station.sim_hil_profile.tasks.cube_lift.observation_binding import (
+    MujocoCubeLiftAgentObservationProducer,
 )
 from robot_motion.action import BIMANUAL_EE_POSE_V1
 from robot_motion.runtime.control_admission import ControlCut
@@ -392,7 +394,7 @@ def test_tcp_snapshot_pose_changes_do_not_advance_station_revision(
     assert first.snapshot_id != moved.snapshot_id
     assert moved.measurement_valid
     assert moved.measurement_summary["schema"] == (
-        MUJOCO_CUBE_LIFT_AGENT_TCP_SUMMARY_SCHEMA_V1
+        MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1
     )
     assert moved.measurement_summary[
         "pose_xyz_quat_xyzw_by_component"

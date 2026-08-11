@@ -5,20 +5,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from control_station.agent_gateway.task_schemas import (
-    CUBE_LIFT_EXECUTION_RESULT_SCHEMA_V1,
-)
 from control_station.sim_hil_acceptance import (
     StationControlTraceEpisodeSessionCapture,
     StationControlTraceFinalizationReceipt,
 )
-from control_station.sim_hil_profile.execution_evidence import (
+from control_station.sim_hil_profile.tasks.cube_lift.execution_evidence import (
     CubeLiftExecutionEvidenceCollector,
 )
-from control_station.sim_hil_profile.terminal_evaluator import (
+from control_station.sim_hil_profile.tasks.cube_lift.terminal_evaluator import (
     CubeLiftLowerHoldProof,
 )
-
+from control_station.tasks.cube_lift.definition import (
+    CUBE_LIFT_EXECUTION_RESULT_SCHEMA_V1,
+)
 
 _AUTHORITY_EVENTS = (
     "proposal_snapshot",

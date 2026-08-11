@@ -27,11 +27,11 @@ from control_station.agent_gateway import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .agent_motion_deployment import (
+from .motion_deployment import (
     MujocoAgentTcpPoseContractBundle,
     MujocoAgentTcpPoseHistoryProfile,
 )
-from .agent_observation import (
+from .observation import (
     MujocoAgentObservationProducer,
     MujocoAgentTcpPoseHistoryCapture,
 )

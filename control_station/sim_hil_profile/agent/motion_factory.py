@@ -27,12 +27,12 @@ from sim.mujoco.deploy import (
     prepare_mujoco_sim_hil_target,
 )
 
-from .agent_motion_application import MujocoAgentSkillMotionApplication
-from .agent_motion_deployment import (
+from .motion_application import MujocoAgentSkillMotionApplication
+from .motion_deployment import (
     MujocoAgentTcpPoseHistoryProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
 )
-from .agent_motion_gateway_session import (
+from .motion_gateway_session import (
     MujocoAgentTcpPoseGatewaySession,
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )

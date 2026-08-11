@@ -27,12 +27,14 @@ from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationReceipt,
 )
 from control_station.agent_gateway.protocol.skill_catalog import SkillExecutionRoute
-from control_station.agent_gateway.task_schemas import (
+from control_station.tasks.cube_lift.definition import (
+    CUBE_LIFT_TASK_EVALUATION_SCHEMA_V1,
+)
+from control_station.tasks.cube_lift.sim_route import (
     CUBE_LIFT_AGGREGATION_POLICY_HASH_V1,
     CUBE_LIFT_AGGREGATION_POLICY_ID_V1,
     CUBE_LIFT_ENVIRONMENT_EVALUATOR_ID_V1,
     CUBE_LIFT_EVALUATOR_EVIDENCE_SCHEMA_V1,
-    CUBE_LIFT_TASK_EVALUATION_SCHEMA_V1,
     CubeLiftSimDeploymentBinding,
     CubeLiftTerminalEvaluatorConfig,
     cube_lift_evaluator_input_schema_hash_v1,

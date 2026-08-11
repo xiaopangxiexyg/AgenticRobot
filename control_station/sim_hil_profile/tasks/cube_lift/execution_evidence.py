@@ -11,15 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from dataset_contracts.canonical_encoding import canonical_content_hash
-
-from control_station.agent_gateway.task_schemas import (
+from control_station.tasks.cube_lift.definition import (
     CUBE_LIFT_EXECUTION_RESULT_SCHEMA_V1,
     validate_cube_lift_execution_result_v1,
 )
+from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .terminal_evaluator import CubeLiftLowerHoldProof
-
 
 CUBE_LIFT_EXECUTION_FACT_CHAIN_HASH_DOMAIN_V1 = (
     "dexteleop.sim_hil.cube_lift_execution_fact_chain.v1"

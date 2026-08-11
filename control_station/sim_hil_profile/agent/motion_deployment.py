@@ -53,7 +53,7 @@ from robot_motion.action import (
     build_control_execution_manifest,
 )
 
-from .agent_skill_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
+from .state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
 
 MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.rm65.agent_skill_tcp_pose"
 MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1 = (
