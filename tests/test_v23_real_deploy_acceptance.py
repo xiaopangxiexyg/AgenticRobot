@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from teleop_runtime.deploy.acceptance import compare_real_deploy_debug_logs
+
+
+pytestmark = pytest.mark.integration
 
 
 def _pose(x: float, y: float) -> list[float]:

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from teleop_runtime.collection.arm_mode_labels import (
     InitArmAuditTracker,
@@ -320,6 +321,7 @@ class ArmModeLabelTests(unittest.TestCase):
         self.assertEqual(row["teleop.arm_mode.left.label"], "unknown")
         self.assertEqual(row["teleop.arm_mode.right.label"], "unknown")
 
+    @pytest.mark.optional
     def test_parquet_uses_stable_vector_and_empty_tag_types(self) -> None:
         try:
             import pyarrow as pa

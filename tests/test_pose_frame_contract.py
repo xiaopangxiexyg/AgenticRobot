@@ -156,6 +156,7 @@ def test_contract_round_trip_and_legacy_metadata_fallback() -> None:
     assert fallback.source.source_id == "rm65_real_single_right_v1"
 
 
+@pytest.mark.integration
 def test_explicit_source_and_contract_json_loaders(tmp_path) -> None:
     contract = PoseFrameContract.legacy_v22_raw(active_sides=("left", "right"))
     source_path = tmp_path / "source.json"
@@ -172,6 +173,7 @@ def test_explicit_source_and_contract_json_loaders(tmp_path) -> None:
     assert load_pose_frame_contract(contract_path).to_dict() == contract.to_dict()
 
 
+@pytest.mark.integration
 def test_explicit_contract_loader_reports_missing_file_as_contract_error(tmp_path) -> None:
     missing = tmp_path / "missing_pose_contract.json"
     with pytest.raises(PoseFrameContractError, match="Cannot read pose frame contract"):

@@ -5,9 +5,6 @@ from pathlib import Path
 
 import pytest
 
-pa = pytest.importorskip("pyarrow")
-pq = pytest.importorskip("pyarrow.parquet")
-
 from utils.dataset_postprocess.organize_episodes import (
     _output_relative_path,
     _passes_minimum_duration,
@@ -20,7 +17,14 @@ def _hand_vector(value: float) -> list[float]:
     return [0.0, float(value), 0.0, 0.0, 0.0, 0.0]
 
 
+def _require_pyarrow():
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    return pa, pq
+
+
 def _make_source(root: Path) -> None:
+    pa, pq = _require_pyarrow()
     (root / "data/chunk-000").mkdir(parents=True)
     (root / "videos/observation.images.front/chunk-000").mkdir(parents=True)
     action = [0.0] * 26
@@ -90,7 +94,9 @@ def _make_source(root: Path) -> None:
     (root / "meta/episodes_stats.jsonl").write_text(json.dumps({"episode_index": 5, "frame_count": 2}) + "\n", encoding="utf-8")
 
 
+@pytest.mark.optional
 def test_build_reindexes_and_migrates_legacy_dmtac_slot(tmp_path: Path) -> None:
+    _pa, pq = _require_pyarrow()
     source = tmp_path / "source"
     output = tmp_path / "output"
     _make_source(source)
@@ -184,6 +190,7 @@ def test_minimum_duration_filter_is_inclusive_at_the_threshold() -> None:
     assert _passes_minimum_duration({"episode_index": 9, "duration_sec": 2.001}, 2.0)
 
 
+@pytest.mark.optional
 def test_plan_can_select_one_named_output(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _make_source(source)

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 
 from dataset_contracts.tactile import ChunkedTactileStream
 
@@ -286,6 +287,7 @@ class DMForceCalculateTest(unittest.TestCase):
             self.assertIn("all-zero distributed_force", result.error or "")
             self.assertFalse(output.exists())
 
+    @pytest.mark.optional
     def test_process_raw_tactile_stream_reads_lz4_chunked_source(self) -> None:
         try:
             import lz4.frame

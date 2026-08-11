@@ -37,6 +37,8 @@ class _FakeApplication:
         self.vive_swaps = 0
         self.runtime_home_captures = 0
         self.blend_failure_fallback = "hold"
+        self.blend_failure_grace_sec = 0.0
+        self.allocation_operations: list[str] = []
 
     def clock(self) -> float:
         self._clock += 0.01
@@ -77,14 +79,49 @@ class _FakeApplication:
         self.alpha_updates.append(float(alpha))
         return SimpleNamespace(parameter_snapshot_id=f"alpha:{alpha}")
 
-    def set_blend_failure_fallback(self, source: str):
+    def set_blend_failure_fallback(
+        self,
+        source: str,
+        *,
+        grace_sec: float | None = None,
+    ):
         self.blend_failure_fallback = str(source)
+        if grace_sec is not None:
+            self.blend_failure_grace_sec = float(grace_sec)
         self.calls.append(f"blend_fallback:{source}")
         return {
             "status": "selected",
             "source": str(source),
+            "grace_sec": self.blend_failure_grace_sec,
             "latched_source": None,
         }
+
+    def submit_allocation_button_operation(
+        self,
+        *,
+        signal_name: str,
+        event_id: str,
+        source_fact_id: str,
+        source_fact_hash: str,
+        occurred_at: float,
+    ):
+        assert event_id == source_fact_id
+        assert source_fact_hash
+        assert occurred_at > 0.0
+        self.allocation_operations.append(signal_name)
+        if signal_name == "residual_rebase_and_clear":
+            return SimpleNamespace(
+                receipt_id=f"operation:{signal_name}",
+                semantic_content_hash=f"operation-hash:{signal_name}",
+                override_receipt=None,
+                anchor_request=SimpleNamespace(request_id="anchor:1"),
+            )
+        return SimpleNamespace(
+            receipt_id=f"operation:{signal_name}",
+            semantic_content_hash=f"operation-hash:{signal_name}",
+            override_receipt=SimpleNamespace(receipt_id="override:1"),
+            anchor_request=None,
+        )
 
     def hold(self, *, reason: str):
         self.calls.append(f"hold:{reason}")
@@ -218,9 +255,11 @@ class _FakeViveSetup:
         *,
         input_ready: bool,
         source_role: str = "left_wrist",
+        current_profile_path=None,
     ) -> None:
         self.input_ready = bool(input_ready)
         self.source_role = str(source_role)
+        self.current_profile_path = current_profile_path
         self.workflow_active = False
         self.stage = "idle"
         self.phase = "idle"
@@ -309,8 +348,10 @@ def _intent(
     kind: str,
     stage_id: str | None = None,
     control_mode: str | None = None,
+    allocation_mode: str | None = None,
     alpha: float | None = None,
     fallback_source: str | None = None,
+    blend_failure_grace_sec: float | None = None,
 ) -> SimHILAcceptanceIntent:
     return SimHILAcceptanceIntent(
         client_id="test-client",
@@ -319,8 +360,10 @@ def _intent(
         intent_kind=kind,
         stage_id=stage_id,
         control_mode=control_mode,
+        allocation_mode=allocation_mode,
         human_alpha=alpha,
         fallback_source=fallback_source,
+        blend_failure_grace_sec=blend_failure_grace_sec,
         reason="test",
     )
 
@@ -357,9 +400,11 @@ def test_acceptance_intent_json_is_exact_and_blend_is_bounded() -> None:
             "expected_revision": 0,
             "intent_kind": "set_blend_failure_fallback",
             "fallback_source": "human",
+            "blend_failure_grace_sec": 0.25,
         }
     )
     assert fallback.fallback_source == "human"
+    assert fallback.blend_failure_grace_sec == pytest.approx(0.25)
 
     rebuild = sim_hil_acceptance_intent_from_json(
         {
@@ -393,16 +438,106 @@ def test_acceptance_intent_json_is_exact_and_blend_is_bounded() -> None:
     assert formal_mode.control_mode == "proportional_blend"
     assert formal_mode.human_alpha == 0.35
 
+    allocation_mode = sim_hil_acceptance_intent_from_json(
+        {
+            "client_id": "browser",
+            "client_sequence": 6,
+            "expected_revision": 0,
+            "intent_kind": "set_allocation_mode",
+            "allocation_mode": "relative_overlay",
+        }
+    )
+    assert allocation_mode.allocation_mode == "relative_overlay"
+
+    absolute_allocation_mode = sim_hil_acceptance_intent_from_json(
+        {
+            "client_id": "browser",
+            "client_sequence": 7,
+            "expected_revision": 0,
+            "intent_kind": "set_allocation_mode",
+            "allocation_mode": "absolute_overlay_owner",
+        }
+    )
+    assert absolute_allocation_mode.allocation_mode == "absolute_overlay_owner"
+
+    allocation_start = sim_hil_acceptance_intent_from_json(
+        {
+            "client_id": "browser",
+            "client_sequence": 7,
+            "expected_revision": 0,
+            "intent_kind": "start_allocation_runtime",
+        }
+    )
+    assert allocation_start.control_mode is None
+    assert allocation_start.human_alpha is None
+
+    rebase = sim_hil_acceptance_intent_from_json(
+        {
+            "client_id": "browser",
+            "client_sequence": 8,
+            "expected_revision": 0,
+            "intent_kind": "request_residual_rebase_and_clear",
+        }
+    )
+    assert rebase.allocation_mode is None
+
     with pytest.raises(ValueError, match="requires hold, human, or policy"):
         sim_hil_acceptance_intent_from_json(
             {
                 "client_id": "browser",
-                "client_sequence": 6,
+                "client_sequence": 9,
                 "expected_revision": 0,
                 "intent_kind": "set_blend_failure_fallback",
                 "fallback_source": "automatic",
             }
         )
+
+
+def test_allocation_buttons_are_executed_through_the_acceptance_owner() -> None:
+    application = _FakeApplication()
+    application.started = True
+    controller = SimHILAcceptanceController(application)
+
+    selected = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="set_allocation_mode",
+            allocation_mode="base_only",
+        ),
+    )
+    assert selected["status"] == "allocation_mode_selected"
+    assert selected["allocation_mode"] == "base_only"
+    assert selected["allocation_override_receipt_id"] == "override:1"
+
+    absolute = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="set_allocation_mode",
+            allocation_mode="absolute_overlay_owner",
+        ),
+    )
+    assert absolute["status"] == "allocation_mode_selected"
+    assert absolute["allocation_mode"] == "absolute_overlay_owner"
+
+    rebased = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=3,
+            kind="request_residual_rebase_and_clear",
+        ),
+    )
+    assert rebased["status"] == "residual_rebase_requested"
+    assert rebased["anchor_request_id"] == "anchor:1"
+    assert application.allocation_operations == [
+        "allocation_base_only",
+        "allocation_absolute_overlay_owner",
+        "residual_rebase_and_clear",
+    ]
 
     with pytest.raises(ValueError, match="Unknown acceptance intent"):
         sim_hil_acceptance_intent_from_json(
@@ -414,6 +549,74 @@ def test_acceptance_intent_json_is_exact_and_blend_is_bounded() -> None:
                 "raw_action": [1, 2, 3],
             }
         )
+
+
+def test_allocation_runtime_start_has_no_fixed_alpha_mode_semantics() -> None:
+    application = _FakeApplication()
+    controller = SimHILAcceptanceController(
+        application,
+        allocation_runtime_enabled=True,
+    )
+
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_allocation_runtime",
+        ),
+    )
+
+    assert started["status"] == "running"
+    assert started["control_profile_start"] == "allocation"
+    assert started["human_input_required"] is False
+    assert started["human_input_deferred"] is True
+    assert started["initial_allocation_mode"] == "automatic"
+    assert "control_mode" not in started
+    assert "human_alpha" not in started
+    assert application.alpha_updates == []
+    assert application.calls == ["start"]
+    assert controller.status()["active_control_mode"] is None
+    assert controller.status()["available_control_modes"] == []
+
+
+def test_allocation_profile_rejects_fixed_alpha_intent_before_application() -> None:
+    application = _FakeApplication()
+    application.started = True
+    controller = SimHILAcceptanceController(
+        application,
+        allocation_runtime_enabled=True,
+    )
+
+    failed = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="set_control_mode",
+            control_mode="human_teleop",
+        ),
+    )
+
+    assert failed["status"] == "failed"
+    assert "use set_allocation_mode" in failed["error"]
+    assert application.alpha_updates == []
+
+
+def test_allocation_runtime_start_is_rejected_without_profile_capability() -> None:
+    controller = SimHILAcceptanceController(_FakeApplication())
+
+    failed = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_allocation_runtime",
+        ),
+    )
+
+    assert failed["status"] == "failed"
+    assert "requires an allocation-aware application profile" in failed["error"]
 
 
 def test_formal_runtime_modes_are_freely_switchable_and_not_gated() -> None:
@@ -498,18 +701,41 @@ def test_blend_failure_fallback_is_a_typed_station_intent() -> None:
             sequence=1,
             kind="set_blend_failure_fallback",
             fallback_source="policy",
+            blend_failure_grace_sec=0.3,
         ),
     )
 
     assert result["status"] == "selected"
     assert result["source"] == "policy"
+    assert result["grace_sec"] == pytest.approx(0.3)
     assert application.blend_failure_fallback == "policy"
+    assert application.blend_failure_grace_sec == pytest.approx(0.3)
     assert application.calls == ["blend_fallback:policy"]
     assert controller.status()["available_blend_failure_fallbacks"] == [
         "hold",
         "human",
         "policy",
     ]
+
+
+def test_blend_failure_grace_is_nonnegative_and_intent_scoped() -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        SimHILAcceptanceIntent(
+            client_id="test",
+            client_sequence=1,
+            expected_revision=0,
+            intent_kind="set_blend_failure_fallback",
+            fallback_source="human",
+            blend_failure_grace_sec=-0.01,
+        )
+    with pytest.raises(ValueError, match="only valid"):
+        SimHILAcceptanceIntent(
+            client_id="test",
+            client_sequence=2,
+            expected_revision=0,
+            intent_kind="hold",
+            blend_failure_grace_sec=0.2,
+        )
 
 
 def test_human_timeout_fallback_is_a_separate_typed_intent() -> None:
@@ -632,6 +858,52 @@ def test_lazy_acceptance_keeps_mujoco_unconstructed_until_vive_setup_ready(
     assert controller.current_application is None
 
 
+def test_lazy_acceptance_freezes_loaded_latest_profile_for_runtime(
+    tmp_path,
+) -> None:
+    resolved_profile = tmp_path / "resolved-latest.json"
+    resolved_profile.write_text("{}", encoding="utf-8")
+    setup = _FakeViveSetup(
+        input_ready=True,
+        current_profile_path=resolved_profile,
+    )
+    app = _LazyFakeApplication()
+    factory_paths = []
+
+    def factory(path, _role, _alpha):
+        factory_paths.append(path)
+        return app
+
+    controller = SimHILAcceptanceController(
+        None,
+        application_factory=factory,
+        vive_setup_controller=setup,
+        vive_setup_factory=lambda role: _FakeViveSetup(
+            input_ready=True,
+            source_role=role,
+            current_profile_path=resolved_profile,
+        ),
+        coordinate_profile_path="latest",
+    )
+
+    status = controller.status()
+    assert status["setup"]["selected_profile_path"] == str(resolved_profile)
+    assert status["setup"]["profile_ready"] is True
+
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="human_teleop",
+        ),
+    )
+
+    assert started["status"] == "running"
+    assert factory_paths == [resolved_profile]
+
+
 def test_lazy_acceptance_hands_off_one_vive_owner_before_runtime_build(
     tmp_path,
 ) -> None:
@@ -743,7 +1015,138 @@ def test_lazy_formal_control_can_start_directly_in_any_mode(
             controller.status()["setup"]["phase"]
             == "policy_runtime_human_setup_available"
         )
+
+
+def test_lazy_allocation_start_defers_human_like_policy_only_mode(
+    tmp_path,
+) -> None:
+    profile = tmp_path / "coordinate.json"
+    profile.write_text("{}", encoding="utf-8")
+    setup = _FakeViveSetup(input_ready=True)
+    app = _LazyFakeApplication()
+    factory_alphas: list[float] = []
+
+    def application_factory(_path, _role, initial_alpha):
+        factory_alphas.append(float(initial_alpha))
+        return app
+
+    controller = SimHILAcceptanceController(
+        None,
+        trace_capture=_FakeTraceCapture(),
+        application_factory=application_factory,
+        vive_setup_controller=setup,
+        vive_setup_factory=lambda role: _FakeViveSetup(
+            input_ready=True,
+            source_role=role,
+        ),
+        coordinate_profile_path=profile,
+        allocation_runtime_enabled=True,
+    )
+
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_allocation_runtime",
+        ),
+    )
+
+    assert started["status"] == "running"
+    assert started["control_profile_start"] == "allocation"
+    assert started["human_input_required"] is False
+    assert started["human_input_deferred"] is True
+    assert factory_alphas == [0.0]
+    assert app.alpha_updates == []
+    assert setup.closed is False
+    assert controller.status()["setup"]["phase"] == (
+        "policy_runtime_human_setup_available"
+    )
     assert controller.status()["formal_runtime_started"] is True
+
+
+def test_deferred_allocation_attaches_human_at_relative_mode_boundary(
+    tmp_path,
+) -> None:
+    profile = tmp_path / "coordinate.json"
+    profile.write_text("{}", encoding="utf-8")
+    setup = _FakeViveSetup(input_ready=True)
+
+    class DeferredAllocationApplication(_LazyFakeApplication):
+        def __init__(self) -> None:
+            super().__init__()
+            self.human_input_attached = False
+
+        def prepare_human_attachment(
+            self,
+            *,
+            coordinate_profile_path,
+            source_role,
+        ):
+            assert coordinate_profile_path == profile
+            assert source_role == "left_wrist"
+            return SimpleNamespace(
+                source=SimpleNamespace(close=lambda: None),
+            )
+
+        def activate_human_attachment(self, _attachment):
+            assert self._held is True
+            self.human_input_attached = True
+            self.calls.append("attach_human")
+            return {
+                "status": "attached",
+                "command_dispatched": False,
+                "authoritative": False,
+            }
+
+    app = DeferredAllocationApplication()
+    controller = SimHILAcceptanceController(
+        None,
+        trace_capture=_FakeTraceCapture(),
+        application_factory=lambda _path, _role, _alpha: app,
+        vive_setup_controller=setup,
+        vive_setup_factory=lambda role: _FakeViveSetup(
+            input_ready=True,
+            source_role=role,
+        ),
+        coordinate_profile_path=profile,
+        allocation_runtime_enabled=True,
+    )
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_allocation_runtime",
+        ),
+    )
+
+    switched = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="set_allocation_mode",
+            allocation_mode="relative_overlay",
+        ),
+    )
+
+    assert switched["status"] == "allocation_mode_selected"
+    assert switched["human_preparation"]["attachment"]["status"] == (
+        "attached"
+    )
+    assert app.human_input_attached is True
+    assert app.allocation_operations == ["allocation_relative_overlay"]
+    assert app.calls == [
+        "start",
+        "hold:human_input_attachment",
+        "attach_human",
+        f"device:{controller.device_check_timeout_sec}",
+        "capture_runtime_home",
+        "rearm",
+    ]
+    assert setup.closed is True
+    assert controller.status()["setup"]["phase"] == "runtime_constructed"
 
 
 def test_policy_only_launch_does_not_require_vive_or_coordinate_profile(

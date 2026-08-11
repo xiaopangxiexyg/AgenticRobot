@@ -62,17 +62,20 @@ def test_station_application_core_does_not_import_concrete_data_planes() -> None
             "web/server.py",
         )
     )
-    assert _violations(
-        core_paths,
-        {
-            "deployments",
-            "hardware",
-            "numpy",
-            "scipy",
-            "sim",
-            "teleop_runtime",
-        },
-    ) == {}
+    assert (
+        _violations(
+            core_paths,
+            {
+                "deployments",
+                "hardware",
+                "numpy",
+                "scipy",
+                "sim",
+                "teleop_runtime",
+            },
+        )
+        == {}
+    )
 
 
 def test_real_teleop_and_umi_ui_packages_do_not_import_entity_data_planes() -> None:
@@ -83,17 +86,20 @@ def test_real_teleop_and_umi_ui_packages_do_not_import_entity_data_planes() -> N
         STATION_ROOT / "web/startup_progress.py",
     )
 
-    assert _violations(
-        tuple(ui_paths),
-        {
-            "collection_runtime",
-            "dataset_interface",
-            "hardware",
-            "robot_motion",
-            "sim",
-            "teleop_runtime",
-        },
-    ) == {}
+    assert (
+        _violations(
+            tuple(ui_paths),
+            {
+                "collection_runtime",
+                "dataset_interface",
+                "hardware",
+                "robot_motion",
+                "sim",
+                "teleop_runtime",
+            },
+        )
+        == {}
+    )
 
 
 def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None:
@@ -101,19 +107,13 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
         _python_files(STATION_ROOT),
         {"dataset_interface"},
     ) == {
-        "control_station/composition/mujoco_pose_composer.py": [
-            "dataset_interface"
-        ],
+        "control_station/composition/mujoco_pose_composer.py": ["dataset_interface"],
         "control_station/composition/mujoco_sim_hil.py": ["dataset_interface"],
         "control_station/control_trace.py": ["dataset_interface"],
         # Concrete post-capture application binding. Presentation stays in
         # Station; discovery/resolution/indexing remain lower-owned.
-        "control_station/refinement_annotation/application.py": [
-            "dataset_interface"
-        ],
-        "control_station/refinement_annotation/cli.py": [
-            "dataset_interface"
-        ],
+        "control_station/refinement_annotation/application.py": ["dataset_interface"],
+        "control_station/refinement_annotation/cli.py": ["dataset_interface"],
     }
 
 
@@ -124,9 +124,7 @@ def test_station_model_specific_preflight_debt_is_explicit_and_cannot_spread() -
     ) == {
         "control_station/preflight/openpi_rtc.py": ["deployments"],
     }
-    assert not (
-        STATION_ROOT / "composition/openpi_rtc_source_preflight.py"
-    ).exists()
+    assert not (STATION_ROOT / "composition/openpi_rtc_source_preflight.py").exists()
 
 
 def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
@@ -134,6 +132,12 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         _python_files(STATION_ROOT),
         {"sim"},
     ) == {
+        "control_station/composition/mujoco_allocation_control_cycle.py": ["sim"],
+        "control_station/composition/mujoco_allocation_publication.py": ["sim"],
+        "control_station/composition/mujoco_allocation_shadow.py": ["sim"],
+        "control_station/composition/mujoco_policy_human_allocation_binding.py": [
+            "sim"
+        ],
         "control_station/composition/mujoco_human.py": ["sim"],
         "control_station/composition/mujoco_human_replay.py": ["sim"],
         "control_station/composition/mujoco_human_station.py": ["sim"],
@@ -143,6 +147,13 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/composition/mujoco_rtc_policy.py": ["sim"],
         "control_station/composition/mujoco_sim_hil.py": ["sim"],
         "control_station/sim_hil.py": ["sim"],
+        # Concrete Agent application bindings remain Station leaves; the
+        # simulator, execution, safety, and dispatch owners stay below them.
+        "control_station/sim_hil_profile/agent_motion_application.py": ["sim"],
+        "control_station/sim_hil_profile/agent_motion_factory.py": ["sim"],
+        "control_station/sim_hil_profile/agent_observation.py": ["sim"],
+        "control_station/sim_hil_profile/agent_skill_deployment.py": ["sim"],
+        "control_station/sim_hil_profile/factory.py": ["sim"],
     }
 
 
@@ -151,6 +162,9 @@ def test_station_numerical_source_debt_is_explicit_and_cannot_spread() -> None:
         _python_files(STATION_ROOT),
         {"numpy", "scipy"},
     ) == {
+        # Thin typed-payload materialization for the concrete Agent profile;
+        # no reusable numerical control algorithm is owned here.
+        "control_station/sim_hil_profile/agent_motion_skill.py": ["numpy"],
         "control_station/sources/synthetic_human.py": ["numpy"],
         "control_station/sources/teleop_pose.py": ["numpy"],
     }
@@ -180,24 +194,17 @@ def test_lower_packages_do_not_reverse_depend_on_control_station() -> None:
         package_root = REPO_ROOT / package_name
         if not package_root.exists():
             continue
-        violations.update(
-            _violations(_python_files(package_root), {"control_station"})
-        )
-    # Temporary application-edge migration seams. They retain the canonical
-    # commands and historic imports while GUI policy moves to Station. The
-    # gui/real_teleop_control coordinator is itself an application-edge seam;
-    # device, motion, safety, and collection ownership remain below it. No
-    # device/control/safety implementation may join this allowlist.
+        violations.update(_violations(_python_files(package_root), {"control_station"}))
+    # Temporary application-edge compatibility seams. They retain canonical
+    # commands and historic imports after GUI/application ownership moved to
+    # Station. Device, motion, safety, and collection ownership remain below
+    # the leaf, and no such implementation may join this allowlist.
     assert violations == {
         "teleop_runtime/collection/umi/app.py": ["control_station"],
-        "teleop_runtime/collection/umi/controller.py": ["control_station"],
         "teleop_runtime/debug/calibration_web_ui.py": ["control_station"],
         "teleop_runtime/debug/run_vive_rm65_calibration_debug.py": ["control_station"],
         "teleop_runtime/debug/run_vive_rm65_real_teleop.py": ["control_station"],
         "teleop_runtime/gui/calibration_web_ui.py": ["control_station"],
         "teleop_runtime/gui/startup_progress.py": ["control_station"],
-            "teleop_runtime/real_teleop/gui_controls.py": ["control_station"],
-            "teleop_runtime/real_teleop/operator_control_runtime.py": ["control_station"],
-            "teleop_runtime/real_teleop/control_loop.py": ["control_station"],
-            "teleop_runtime/real_teleop/progress_adapter.py": ["control_station"],
-        }
+        "teleop_runtime/real_teleop/gui_controls.py": ["control_station"],
+    }

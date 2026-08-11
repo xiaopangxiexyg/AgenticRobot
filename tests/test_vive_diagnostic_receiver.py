@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 
 import pytest
 
+import project_paths
 from hardware.VIVE.mocap import vive_diagnostic_receiver
+from runtime_artifact_paths import RUNTIME_ARTIFACT_LAYOUT_CLI_NAME
 
 
 def _pose(*, x: float = 0.0) -> list[list[float]]:
@@ -61,8 +64,61 @@ def test_receiver_cli_defaults_to_300hz_and_teleop_records() -> None:
 
     assert args.expected_hz == 300.0
     assert args.output_root is None
+    assert args.artifact_layout == "legacy"
     assert args.port == 9999
     assert args.duration_sec == 0.0
+
+
+def test_receiver_canonical_artifact_layout_is_explicit_and_side_effect_free(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    monkeypatch.setattr(
+        project_paths,
+        "local_config",
+        lambda: {
+            "runtime_artifacts_root": str(canonical),
+            "teleop_records_root": str(legacy),
+        },
+    )
+
+    legacy_args = vive_diagnostic_receiver.parse_args(["--label", "static"])
+    canonical_args = vive_diagnostic_receiver.parse_args(
+        [
+            "--label",
+            "static",
+            "--artifact-layout",
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ]
+    )
+
+    assert vive_diagnostic_receiver.resolve_diagnostic_output_root(legacy_args) == (
+        legacy / "vive_diagnostics"
+    )
+    assert vive_diagnostic_receiver.resolve_diagnostic_output_root(canonical_args) == (
+        canonical / "evidence" / "preflight" / "vive"
+    )
+    assert not canonical.exists()
+    assert not legacy.exists()
+
+
+def test_receiver_explicit_output_root_precedes_artifact_layout(tmp_path: Path) -> None:
+    explicit = tmp_path / "explicit"
+    args = vive_diagnostic_receiver.parse_args(
+        [
+            "--label",
+            "static",
+            "--artifact-layout",
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+            "--output-root",
+            str(explicit),
+        ]
+    )
+
+    assert vive_diagnostic_receiver.resolve_diagnostic_output_root(args) == explicit
+    assert not explicit.exists()
 
 
 def test_recorder_keeps_every_packet_and_derives_contiguous_pose_velocity(tmp_path) -> None:

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from teleop_runtime.replay.dataset import ReplayDatasetIndex
 from teleop_runtime.replay.media import TactileEpisodeReader, tactile_frame_jpeg
@@ -134,6 +135,7 @@ class ReplayGuiDatasetTest(unittest.TestCase):
             )
         )
 
+    @pytest.mark.optional
     def test_dataset_index_and_external_tactile_reader(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -159,6 +161,7 @@ class ReplayGuiDatasetTest(unittest.TestCase):
             jpeg = tactile_frame_jpeg(frame)
             self.assertTrue(jpeg.startswith(b"\xff\xd8"))
 
+    @pytest.mark.integration
     def test_missing_episode_error_lists_available_indices(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -183,6 +186,7 @@ class ReplayGuiDatasetTest(unittest.TestCase):
             self.assertIn("Could not resolve replay episode '0'", message)
             self.assertIn("Available episode indices: 10", message)
 
+    @pytest.mark.optional
     def test_replay_session_seek_step_and_media_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -205,6 +209,7 @@ class ReplayGuiDatasetTest(unittest.TestCase):
             self.assertTrue(session.tactile_jpeg("left").startswith(b"\xff\xd8"))
             session.close()
 
+    @pytest.mark.integration
     def test_preflight_dispatch_auto_configures_and_connects(self) -> None:
         class _FakeEpisode:
             frame_count = 0

@@ -14,6 +14,8 @@ from robot_motion.deploy import (
     ACTION_ARM_POSE_SLICES,
     DEPLOY_ACTION_DIM,
     POLICY_PLAN_KEYFRAME_MUTABLE,
+    POLICY_SOURCE_ACTION_ABSOLUTE_TARGET,
+    POLICY_SOURCE_ACTION_OBSERVATION_RELATIVE_CHUNK,
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
     CanonicalDeployActionPipeline,
@@ -26,6 +28,7 @@ from robot_motion.deploy import (
     build_deployment_observation,
     nan_vector,
     policy_action_emission_payload,
+    policy_source_projection_from_metadata,
 )
 from robot_motion.deploy.pose_adapter import (
     convert_normalized_action_chunk_to_relative,
@@ -169,6 +172,11 @@ def test_one_queue_pop_creates_one_immutable_emission_and_peek_is_passive() -> N
         == "32008b4cd7a04ca1a90a0c5bd7dac99ad252a07179a0bb48dd53c92745efc499"
     )
     assert step0.emission.chunk_keyframe_index == 0
+    projection = policy_source_projection_from_metadata(
+        step0.emission.decoded_absolute_action.metadata
+    )
+    assert projection is not None
+    assert projection.source_semantics == POLICY_SOURCE_ACTION_ABSOLUTE_TARGET
     assert step0.emission.produced_at == pytest.approx(10.002)
     assert step0.emission.emitted_at == pytest.approx(10.003)
     assert step0.emission.effective_from == pytest.approx(10.002)
@@ -267,6 +275,14 @@ def test_relative_chunk_emission_preserves_decode_anchor_provenance() -> None:
     assert receipt.source_pose_mode == "relative"
     assert receipt.anchor_policy == "current_actual_tcp_fixed_for_chunk"
     assert receipt.anchor_sides == ("right",)
+    projection = policy_source_projection_from_metadata(
+        step.emission.decoded_absolute_action.metadata
+    )
+    assert projection is not None
+    assert projection.source_semantics == (
+        POLICY_SOURCE_ACTION_OBSERVATION_RELATIVE_CHUNK
+    )
+    assert projection.anchor_policy == "observation_tcp_fixed_for_chunk"
     np.testing.assert_allclose(
         step.emission.decoded_absolute_action.vector[
             ACTION_ARM_POSE_SLICES["right"]

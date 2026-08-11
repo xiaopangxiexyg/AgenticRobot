@@ -204,6 +204,59 @@ def test_logical_calibration_role_is_independent_of_upstream_tracker_role() -> N
     assert arm.metadata["source_tracker_role"] == "left_wrist"
 
 
+def test_pose_retarget_projects_bounded_openvr_rotation_drift() -> None:
+    calibration = TeleopCalibration(
+        T_W_O=np.eye(4),
+        T_O_D=np.eye(4),
+        arms={
+            "right_arm": ArmCalibration(
+                name="right_arm",
+                side="right",
+                T_D_B=np.eye(4),
+            )
+        },
+    )
+    retargeter = PoseToArmRetargeter(
+        PoseToArmRetargeterConfig(
+            side="right",
+            input_channel_name="right_wrist_pose",
+            effector_name="right_arm",
+            workspace_clip=False,
+        )
+    )
+    drifted_pose = np.eye(4)
+    drifted_pose[:3, :3] = np.array(
+        [
+            [0.99996, -0.00801, 0.0],
+            [0.00800, 0.99995, 0.00002],
+            [0.0, -0.00002, 1.00001],
+        ]
+    )
+    observation = TeleopObservation(
+        channels={
+            "right_wrist_pose": ObservationChannel(
+                channel_name="right_wrist_pose",
+                capability="pose6d",
+                side="right",
+                value=drifted_pose,
+                frame_name="vive_world",
+                timestamp=1.0,
+                source_name="openvr-drift-regression",
+            )
+        },
+        timestamp=1.0,
+    )
+
+    arm = retargeter.retarget(observation, calibration).commands["right_arm"]
+    rotation = np.asarray(arm.value, dtype=float)[:3, :3]
+    diagnostics = arm.metadata["input_pose_normalization"]
+
+    np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-10)
+    assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-10)
+    assert diagnostics["rotation_projected"] is True
+    assert diagnostics["rotation_projection_frobenius"] > 0.0
+
+
 def test_fix_arm_channel_authority_reaches_cartesian_arm_command() -> None:
     calibration = TeleopCalibration(
         T_W_O=np.eye(4),

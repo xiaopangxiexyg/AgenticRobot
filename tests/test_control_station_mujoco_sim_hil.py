@@ -94,6 +94,10 @@ from teleop_runtime.configs import (
 from teleop_runtime.schemas import ObservationChannel, TeleopObservation
 
 
+def _require_mujoco_runtime() -> None:
+    pytest.importorskip("mujoco")
+
+
 def test_preflight_uses_readiness_required_by_active_mix() -> None:
     """Human-only startup must not require an unused policy emission."""
 
@@ -210,6 +214,79 @@ def test_blend_resolution_fallback_hold_does_not_publish_source_switch() -> None
     assert app._last_blend_failure_fallback["status"] == "hold_selected"
 
 
+def test_blend_resolution_fallback_waits_for_continuous_failure_window() -> None:
+    class Composition:
+        human_alpha_by_component = {"right_arm": 0.5}
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, float]] = []
+
+        def set_human_blend_alpha(self, alpha, *, effective_from):
+            self.calls.append((float(alpha), float(effective_from)))
+            return SimpleNamespace(
+                accepted=True,
+                rejection_code=None,
+                message="",
+                parameter_snapshot_id="alpha:0",
+            )
+
+    app = object.__new__(MujocoSimHILApplication)
+    app.composition = Composition()
+    app.runtime = SimpleNamespace(clock=lambda: 10.5)
+    app._blend_failure_fallback = "policy"
+    app._blend_failure_grace_sec = 0.2
+    app._blend_failure_fallback_latched_source = None
+    app._last_blend_failure_fallback = None
+    app._blend_failure_window_started_at = None
+    app._blend_failure_consecutive_count = 0
+    failure_cycle = SimpleNamespace(
+        cycle_index=3,
+        execution=AuthoritativeControlStep(
+            status="compound_resolution_failure_hold",
+            resolution_failure=ActionResolutionFailure(
+                reason_code="target_unresolvable",
+                resolver_status="hold",
+                message="blend endpoint is infeasible",
+            ),
+        ),
+    )
+
+    app._apply_blend_failure_fallback(failure_cycle, observed_at=10.0)
+    assert app.composition.calls == []
+    assert app._last_blend_failure_fallback["status"] == "grace_active"
+    assert app._last_blend_failure_fallback["consecutive_failure_count"] == 1
+
+    # A scheduling-only not_due cycle is not evidence that resolution recovered.
+    app._apply_blend_failure_fallback(
+        SimpleNamespace(
+            cycle_index=4,
+            execution=AuthoritativeControlStep(status="not_due"),
+        ),
+        observed_at=10.1,
+    )
+    app._apply_blend_failure_fallback(failure_cycle, observed_at=10.19)
+    assert app.composition.calls == []
+
+    # Any actual non-failure outcome closes the continuous failure window.
+    app._apply_blend_failure_fallback(
+        SimpleNamespace(
+            cycle_index=5,
+            execution=AuthoritativeControlStep(status="dispatched"),
+        ),
+        observed_at=10.2,
+    )
+    assert app._blend_failure_window_started_at is None
+
+    app._apply_blend_failure_fallback(failure_cycle, observed_at=10.21)
+    app._apply_blend_failure_fallback(failure_cycle, observed_at=10.42)
+    assert app.composition.calls == [(0.0, 10.5)]
+    assert app._blend_failure_fallback_latched_source == "policy"
+    assert app._last_blend_failure_fallback["status"] == "latched"
+    assert app._last_blend_failure_fallback["failure_elapsed_sec"] == pytest.approx(
+        0.21
+    )
+
+
 def test_human_timeout_policy_fallback_switches_without_reusing_human_pose() -> None:
     class Composition:
         human_alpha_by_component = {"right_arm": 1.0}
@@ -257,6 +334,27 @@ def test_sim_hil_human_timeout_defaults_to_five_seconds_and_hold() -> None:
     config = MujocoSimHILApplicationConfig()
     assert config.human_emission_timeout_sec == pytest.approx(5.0)
     assert config.human_timeout_fallback == "hold"
+    assert config.blend_failure_grace_sec == pytest.approx(0.0)
+    assert config.runtime_session_id == (
+        "control-station-sim-hil-ppo-session"
+    )
+    assert config.control_domain_id == "mujoco-sim-hil"
+
+
+def test_sim_hil_blend_failure_grace_rejects_negative_values() -> None:
+    with pytest.raises(ValueError, match="must be non-negative"):
+        MujocoSimHILApplicationConfig(blend_failure_grace_sec=-0.01)
+
+
+def test_sim_hil_application_config_accepts_explicit_operation_session() -> None:
+    config = MujocoSimHILApplicationConfig(
+        runtime_session_id="agent-skill:cube-lift:operation-7",
+        control_domain_id="agent-skill:mujoco-sim-hil",
+    )
+    assert config.runtime_session_id == "agent-skill:cube-lift:operation-7"
+    assert config.control_domain_id == "agent-skill:mujoco-sim-hil"
+    with pytest.raises(ValueError, match="runtime_session_id"):
+        MujocoSimHILApplicationConfig(runtime_session_id=" ")
 
 
 def _hand_specs() -> dict[str, HandActionSpec]:
@@ -338,9 +436,7 @@ def test_sim_hil_readiness_treats_transient_tracker_grace_as_non_motion_hold() -
     readiness = provider.snapshot(now=10.0)
 
     assert readiness.deadman_ready is True
-    assert readiness.detail_by_check["deadman_ready"] == (
-        "passive_debug_only_grace"
-    )
+    assert readiness.detail_by_check["deadman_ready"] == ("passive_debug_only_grace")
 
 
 def test_single_vive_q6_builder_is_passive_and_topology_selected() -> None:
@@ -385,9 +481,10 @@ def test_single_vive_q6_builder_is_passive_and_topology_selected() -> None:
         tracker.channel_name,
         tracker.legacy_index,
     ) == ("right", "left_wrist", "right_wrist_pose", 0)
-    assert [
-        retargeter.config.effector_name for retargeter in session.retargeters
-    ] == ["right_arm", "right_hand"]
+    assert [retargeter.config.effector_name for retargeter in session.retargeters] == [
+        "right_arm",
+        "right_hand",
+    ]
     assert session.retargeters[0].config.tracker_role == "right_wrist"
     q6_command = session.retargeters[1].retarget(
         TeleopObservation(
@@ -425,19 +522,21 @@ def test_single_vive_gripper_source_contract_uses_target_component_ids() -> None
     )
 
     assert tuple(
-        (item.component_id, item.effector_name)
-        for item in spec.components
+        (item.component_id, item.effector_name) for item in spec.components
     ) == (
         ("right_arm", "right_arm"),
         ("right_gripper", "right_hand"),
     )
 
 
+@pytest.mark.optional
 def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     """Exercise the concrete application without opening VIVE/Q6 devices."""
+
+    _require_mujoco_runtime()
 
     class DebugOnlyState:
         value = "DEBUG_ONLY"
@@ -472,9 +571,7 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
             )
             arm = calibration.get_arm_for_side("right")
             target_home_desk = np.asarray(
-                calibration.metadata["home_capture"][
-                    "right_robot_home_desk"
-                ],
+                calibration.metadata["home_capture"]["right_robot_home_desk"],
                 dtype=np.float64,
             )
             self.pose = np.linalg.inv(arm.T_D_B) @ target_home_desk
@@ -589,11 +686,11 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
         MujocoSimHILApplicationConfig(
             enabled=True,
             gripper_input_source="angle_trigger",
-                device="cpu",
-                realtime_worker=False,
-                warmup_timeout_sec=5.0,
-                human_emission_timeout_sec=30.0,
-                initial_human_alpha=0.0,
+            device="cpu",
+            realtime_worker=False,
+            warmup_timeout_sec=5.0,
+            human_emission_timeout_sec=30.0,
+            initial_human_alpha=0.0,
             position_control_profile_name="position_15_60_120hz",
             # This deterministic fixture manually advances only a minimal
             # non-realtime reference interval; keep its historical cadence.
@@ -676,14 +773,11 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
             rtol=0.0,
             atol=1e-10,
         )
-        selected_human = (
-            human_cycle.composition_step.evaluation.input_snapshot
-            .selected_input_by_role["human"]
-        )
+        selected_human = human_cycle.composition_step.evaluation.input_snapshot.selected_input_by_role[
+            "human"
+        ]
         np.testing.assert_allclose(
-            selected_human.action.values_by_component[
-                "right_gripper"
-            ].values,
+            selected_human.action.values_by_component["right_gripper"].values,
             np.asarray([-0.028, -0.028], dtype=np.float32),
             rtol=0.0,
             atol=1e-7,
@@ -695,17 +789,17 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
         ] == pytest.approx(0.8)
         for _ in range(int(app.task_config.physics_hz)):
             app.runtime.rig.step_physics()
-        assert app.scene.get_gripper_close(
-            app.task_config.right_gripper_name
-        ) > gripper_before_human_motion
+        assert (
+            app.scene.get_gripper_close(app.task_config.right_gripper_name)
+            > gripper_before_human_motion
+        )
         human_evaluation = human_cycle.composition_step.evaluation
         assert human_evaluation is not None
         assert dict(
             [
                 fact
                 for fact in trace_facts
-                if fact.event_type
-                == "composition_dynamic_parameter_snapshot"
+                if fact.event_type == "composition_dynamic_parameter_snapshot"
             ][-1].payload["alpha_by_component"]
         ) == {
             "right_arm": 1.0,
@@ -747,8 +841,7 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
         assert blended is not None
         np.testing.assert_allclose(
             blended.values_by_component["right_gripper"].values,
-            0.75
-            * selected["policy"].action.values_by_component["right_gripper"].values
+            0.75 * selected["policy"].action.values_by_component["right_gripper"].values
             + 0.25
             * selected["human"].action.values_by_component["right_gripper"].values,
             rtol=0.0,
@@ -756,8 +849,7 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
         )
         np.testing.assert_allclose(
             blended.values_by_component["right_arm"].values[:3],
-            0.75
-            * selected["policy"].action.values_by_component["right_arm"].values[:3]
+            0.75 * selected["policy"].action.values_by_component["right_arm"].values[:3]
             + 0.25
             * selected["human"].action.values_by_component["right_arm"].values[:3],
             rtol=0.0,
@@ -798,6 +890,12 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
         assert execution_difference["latest"]["reason"] == (
             "downstream_actual_reference_at_measurement"
         )
+        assert (
+            execution_difference["latest"]["component_difference"]["right_arm"][
+                "metric"
+            ]
+            == "cartesian_pose_residual"
+        )
 
         app.hold(reason="test_pause")
         assert app.status()["execution_gate"]["status"] == "hold"
@@ -813,16 +911,19 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
         app.close()
         capture.close(now=app.clock())
     observed = {item.event_type for item in trace_facts}
-    assert not {
-        "replay_source_frame_emission",
-        "replay_source_adapter_receipt",
-        "station_run_manifest",
-        "station_intent_transition",
-        "station_operation_transition",
-        "station_publication_barrier_transition",
-        "composition_session_spec",
-        "composition_session_transition",
-    } & observed
+    assert (
+        not {
+            "replay_source_frame_emission",
+            "replay_source_adapter_receipt",
+            "station_run_manifest",
+            "station_intent_transition",
+            "station_operation_transition",
+            "station_publication_barrier_transition",
+            "composition_session_spec",
+            "composition_session_transition",
+        }
+        & observed
+    )
     assert {
         "policy_action_emission",
         "human_command_emission",
@@ -845,15 +946,18 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
         profile=profile,
     )
     lineage_issue_codes = {issue.code for issue in lineage_issues}
-    assert not {
-        "policy_component_emission_missing_source_validation",
-        "policy_component_emission_missing_input",
-        "policy_component_input_missing_admission",
-        "human_component_emission_missing_source_receipt",
-        "human_component_emission_missing_source_validation",
-        "human_component_emission_input_count_mismatch",
-        "human_component_input_missing_admission",
-    } & lineage_issue_codes
+    assert (
+        not {
+            "policy_component_emission_missing_source_validation",
+            "policy_component_emission_missing_input",
+            "policy_component_input_missing_admission",
+            "human_component_emission_missing_source_receipt",
+            "human_component_emission_missing_source_validation",
+            "human_component_emission_input_count_mismatch",
+            "human_component_input_missing_admission",
+        }
+        & lineage_issue_codes
+    )
     assert lineage_issue_codes == set(), tuple(
         (
             issue.code,
@@ -869,8 +973,7 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
                     fact.payload.get("target_id"),
                 )
                 for fact in trace_facts
-                if fact.fact_id
-                in (issue.root_fact_id, *issue.related_fact_ids)
+                if fact.fact_id in (issue.root_fact_id, *issue.related_fact_ids)
             ),
         )
         for issue in lineage_issues
@@ -899,9 +1002,9 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
     assert {
         "episode_membership_transition",
         "composition_dynamic_parameter",
-            "composition_dynamic_parameter_snapshot",
-            "source_difference_observation",
-            "measurement_alignment",
+        "composition_dynamic_parameter_snapshot",
+        "source_difference_observation",
+        "measurement_alignment",
         "execution_cancellation",
     } <= captured_event_types
     assert (
@@ -913,9 +1016,12 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
     )
 
 
+@pytest.mark.optional
 def test_policy_only_application_defers_human_device_and_profile_binding(
     monkeypatch,
 ) -> None:
+    _require_mujoco_runtime()
+
     def reject_human_device_resolution(**_kwargs):
         raise AssertionError("policy-only construction touched a human device")
 
@@ -948,9 +1054,7 @@ def test_policy_only_application_defers_human_device_and_profile_binding(
         }
         report = app.start()
         assert report.passed
-        assert app.status()["source_configuration"][
-            "human_input_attached"
-        ] is False
+        assert app.status()["source_configuration"]["human_input_attached"] is False
         assert app.runtime.reference_receiver is None
         assert app.runtime.reference_activation_spec.activation_mode == (
             "immediate_target"
@@ -963,13 +1067,15 @@ def test_policy_only_application_defers_human_device_and_profile_binding(
             app.composition.contracts.authority_gate_spec.proposal_ttl_sec
             == pytest.approx(0.25)
         )
-        assert app.composition.contracts.authority_gate_spec.missing_behavior_by_role == {
-            "human": "no_action",
-            "policy": "no_action",
-        }
         assert (
-            app.composition.contracts.authority_gate_spec
-            .all_inputs_missing_behavior
+            app.composition.contracts.authority_gate_spec.missing_behavior_by_role
+            == {
+                "human": "no_action",
+                "policy": "no_action",
+            }
+        )
+        assert (
+            app.composition.contracts.authority_gate_spec.all_inputs_missing_behavior
             == "no_action"
         )
         assert app.runtime.config.enable_composition_source_eligibility is True
@@ -1026,9 +1132,7 @@ def test_policy_only_application_defers_human_device_and_profile_binding(
                 ),
             )
         )
-        assert np.linalg.norm(
-            app.scene.get_arm_qpos("right") - initial_qpos
-        ) > 1e-5
+        assert np.linalg.norm(app.scene.get_arm_qpos("right") - initial_qpos) > 1e-5
 
         original_resolve = app.runtime.pose_resolver.resolution_for_command
 
@@ -1057,9 +1161,7 @@ def test_policy_only_application_defers_human_device_and_profile_binding(
                 slow_cycle = candidate
                 break
         assert slow_cycle is not None
-        slow_admission = (
-            slow_cycle.execution.target_dispatch_result.target_admission
-        )
+        slow_admission = slow_cycle.execution.target_dispatch_result.target_admission
         assert (
             slow_admission.admitted_at
             - slow_cycle.execution.target_dispatch_result.target.target_effective_at
@@ -1071,15 +1173,16 @@ def test_policy_only_application_defers_human_device_and_profile_binding(
             "component_execution_target_admission",
             "target_execution_completion",
         } <= event_types
-        assert len(
-            app.runtime._immediate_target_by_reference_sequence
-        ) == 1
+        assert len(app.runtime._immediate_target_by_reference_sequence) == 1
         assert app.status()["first_control_fault"] is None
     finally:
         app.close()
 
 
+@pytest.mark.optional
 def test_selected_v5_target_reuses_task_owned_scripted_pregrasp_reset() -> None:
+    _require_mujoco_runtime()
+
     prepared = prepare_mujoco_sim_hil_target(
         MujocoSimHILTargetConfig(
             task_config_path=Path(
@@ -1091,7 +1194,13 @@ def test_selected_v5_target_reuses_task_owned_scripted_pregrasp_reset() -> None:
         )
     )
 
-    assert dict(prepared.task_initialization_info) == {
+    initialization = dict(prepared.task_initialization_info)
+    assert math.isfinite(float(initialization["resting_center_z_m"]))
+    assert {
+        key: value
+        for key, value in initialization.items()
+        if key != "resting_center_z_m"
+    } == {
         "owner": "sim.mujoco.tasks.cube_lift.CubeLiftKernel.reset",
         "seed": 0,
         "scripted_pregrasp_reset": True,
@@ -1114,8 +1223,7 @@ def _action(*, arm_x: float = 0.0) -> RobotAction:
             for side in ("left", "right")
         },
         hand_qpos_by_side={
-            side: np.zeros(6, dtype=np.float32)
-            for side in ("left", "right")
+            side: np.zeros(6, dtype=np.float32) for side in ("left", "right")
         },
         active_effectors=(
             "left_arm",
@@ -1134,8 +1242,7 @@ def _action(*, arm_x: float = 0.0) -> RobotAction:
         source="sim-hil-policy-fixture",
         metadata={
             "hand_action_specs_by_side": {
-                side: spec.to_metadata()
-                for side, spec in _hand_specs().items()
+                side: spec.to_metadata() for side, spec in _hand_specs().items()
             }
         },
     )
@@ -1151,9 +1258,7 @@ def _emission() -> PolicyActionEmission:
         chunk_id=0,
         chunk_keyframe_index=0,
         chunk_size=1,
-        decoded_absolute_action=NormalizedAction(
-            vector=np.zeros(1, dtype=np.float32)
-        ),
+        decoded_absolute_action=NormalizedAction(vector=np.zeros(1, dtype=np.float32)),
         pre_safety_robot_action=_action(),
         source_validation=SourceValidationResult(accepted=True),
         representation_receipt=None,
@@ -1175,9 +1280,7 @@ def _emission() -> PolicyActionEmission:
 
 
 def _human_source_spec(runtime) -> PassiveTeleopComponentSourceSpec:
-    hashes = dict(
-        runtime.target_runtime_action_contract.action_spec_hash_by_component
-    )
+    hashes = dict(runtime.target_runtime_action_contract.action_spec_hash_by_component)
     return PassiveTeleopComponentSourceSpec(
         components=(
             *(
@@ -1298,9 +1401,7 @@ def test_sim_hil_cycle_hash_binds_only_target_facts_carried_at_return() -> None:
             target_dispatch_result=SimpleNamespace(
                 target=dispatch.target,
                 target_admission=dispatch.target_admission,
-                target_activation=SimpleNamespace(
-                    activation_id="activation-1"
-                ),
+                target_activation=SimpleNamespace(activation_id="activation-1"),
             ),
         ),
     )
@@ -1308,9 +1409,7 @@ def test_sim_hil_cycle_hash_binds_only_target_facts_carried_at_return() -> None:
         pending,
         execution=replace(
             execution,
-            target_execution_request=SimpleNamespace(
-                request_id="request-2"
-            ),
+            target_execution_request=SimpleNamespace(request_id="request-2"),
         ),
     )
 
@@ -1318,7 +1417,10 @@ def test_sim_hil_cycle_hash_binds_only_target_facts_carried_at_return() -> None:
     assert pending.semantic_content_hash != another_request.semantic_content_hash
 
 
+@pytest.mark.optional
 def test_sim_hil_target_separates_policy_source_and_compose_controller_rates() -> None:
+    _require_mujoco_runtime()
+
     hands = _hand_specs()
     schema = build_mujoco_pose_action_schema(hands)
     composer_id = "control-station-sim-hil-composer"
@@ -1370,7 +1472,10 @@ def test_sim_hil_target_separates_policy_source_and_compose_controller_rates() -
         target.runtime.close()
 
 
+@pytest.mark.optional
 def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> None:
+    _require_mujoco_runtime()
+
     hands = _hand_specs()
     schema = build_mujoco_pose_action_schema(hands)
     composer_id = "control-station-sim-hil-coordinate-fixture"
@@ -1396,9 +1501,7 @@ def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> N
         source = TeleopCalibration.load_json(DEFAULT_CALIBRATION_PROFILE)
         old_robot_home = {
             side: np.asarray(
-                source.metadata["home_capture"][
-                    f"{side}_robot_home_desk"
-                ],
+                source.metadata["home_capture"][f"{side}_robot_home_desk"],
                 dtype=np.float64,
             )
             for side in ("left", "right")
@@ -1410,9 +1513,7 @@ def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> N
             required_sides=("right",),
         )
         binding["home_profile_path"] = str(DEFAULT_CALIBRATION_PROFILE)
-        binding["home_profile_sha256"] = _file_sha256(
-            DEFAULT_CALIBRATION_PROFILE
-        )
+        binding["home_profile_sha256"] = _file_sha256(DEFAULT_CALIBRATION_PROFILE)
         merged, binding = _bind_sim_target_session_anchors(
             merged,
             target=target,
@@ -1425,10 +1526,7 @@ def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> N
         )
         receipt = binding["session_anchor_receipt"]
 
-        assert (
-            binding["mode"]
-            == "independent_vive_plus_scene_target_session_anchor_v1"
-        )
+        assert binding["mode"] == "independent_vive_plus_scene_target_session_anchor_v1"
         assert receipt["source_anchor_origin"] == (
             "stored_human_home_from_selected_profile"
         )
@@ -1444,12 +1542,10 @@ def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> N
         for side in ("left", "right"):
             component_id = f"{side}_arm"
             reference_frame = f"{side}_arm_base"
-            canonical_from_base = (
-                target.target_frame_profile.frame_graph.resolve(
-                    reference_frame,
-                    target.target_frame_profile.canonical_reference_frame_id,
-                ).matrix_target_source
-            )
+            canonical_from_base = target.target_frame_profile.frame_graph.resolve(
+                reference_frame,
+                target.target_frame_profile.canonical_reference_frame_id,
+            ).matrix_target_source
             np.testing.assert_allclose(
                 source.get_arm_for_side(side).T_D_B,
                 canonical_from_base,
@@ -1463,9 +1559,7 @@ def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> N
                 atol=1e-12,
             )
             robot_home = np.asarray(
-                merged.metadata["home_capture"][
-                    f"{side}_robot_home_desk"
-                ],
+                merged.metadata["home_capture"][f"{side}_robot_home_desk"],
                 dtype=np.float64,
             )
             np.testing.assert_allclose(
@@ -1495,7 +1589,10 @@ def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> N
         target.runtime.close()
 
 
+@pytest.mark.optional
 def test_sim_hil_target_accepts_a_profile_selected_compose_rate() -> None:
+    _require_mujoco_runtime()
+
     hands = _hand_specs()
     schema = build_mujoco_pose_action_schema(hands)
     composer_id = "control-station-sim-hil-composer-custom-rate"
@@ -1530,15 +1627,15 @@ def test_sim_hil_target_accepts_a_profile_selected_compose_rate() -> None:
         assert timing.reference_hz == 60.0
         assert timing.ik_hz == 60.0
         assert timing.command_hz == 120.0
-        assert (
-            target.runtime.pose_resolver.ik.planner.config.reference_hz
-            == 45.0
-        )
+        assert target.runtime.pose_resolver.ik.planner.config.reference_hz == 45.0
     finally:
         target.runtime.close()
 
 
+@pytest.mark.optional
 def test_sim_hil_target_installs_profile_role_specific_input_schemas() -> None:
+    _require_mujoco_runtime()
+
     hands = _hand_specs()
     schema = build_mujoco_pose_action_schema(hands)
     profile = build_mujoco_policy_human_residual_profile(
@@ -1557,12 +1654,10 @@ def test_sim_hil_target_installs_profile_role_specific_input_schemas() -> None:
             transforms=(),
         ),
         concrete_reference_frame_by_component={
-            f"{side}_arm": f"{side}_arm_base"
-            for side in ("left", "right")
+            f"{side}_arm": f"{side}_arm_base" for side in ("left", "right")
         },
         concrete_controlled_frame_by_component={
-            f"{side}_arm": f"{side}_arm/tool_tcp"
-            for side in ("left", "right")
+            f"{side}_arm": f"{side}_arm/tool_tcp" for side in ("left", "right")
         },
         source_binding_id="virtual-human-source",
         source_binding_hash="virtual-human-source-hash",
@@ -1580,9 +1675,7 @@ def test_sim_hil_target_installs_profile_role_specific_input_schemas() -> None:
         ),
         contracts=profile.sim_hil_contracts,
         hand_specs_by_side=hands,
-        composition_input_action_schema_by_role=(
-            profile.input_action_schema_by_role
-        ),
+        composition_input_action_schema_by_role=(profile.input_action_schema_by_role),
     )
     try:
         installed = {
@@ -1592,8 +1685,7 @@ def test_sim_hil_target_installs_profile_role_specific_input_schemas() -> None:
             )
         }
         assert installed == dict(
-            profile.sim_hil_contracts.composition_spec
-            .input_action_schema_hash_by_role
+            profile.sim_hil_contracts.composition_spec.input_action_schema_hash_by_role
         )
         assert installed["policy"] == schema.semantic_content_hash
         assert installed["human_residual"] != schema.semantic_content_hash
@@ -1601,7 +1693,10 @@ def test_sim_hil_target_installs_profile_role_specific_input_schemas() -> None:
         target.runtime.close()
 
 
-def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> None:
+@pytest.mark.optional
+def test_sim_hil_human_transform_anchors_with_identity_then_submits_relative() -> None:
+    _require_mujoco_runtime()
+
     class PassiveSource:
         def __init__(self, spec: PassiveTeleopComponentSourceSpec) -> None:
             self.spec = spec
@@ -1644,12 +1739,10 @@ def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> N
             transforms=(),
         ),
         concrete_reference_frame_by_component={
-            f"{side}_arm": f"{side}_arm_base"
-            for side in ("left", "right")
+            f"{side}_arm": f"{side}_arm_base" for side in ("left", "right")
         },
         concrete_controlled_frame_by_component={
-            f"{side}_arm": f"{side}_arm/tool_tcp"
-            for side in ("left", "right")
+            f"{side}_arm": f"{side}_arm/tool_tcp" for side in ("left", "right")
         },
         source_binding_id="virtual-human-source",
         source_binding_hash="virtual-human-source-hash",
@@ -1667,9 +1760,7 @@ def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> N
         ),
         contracts=profile.sim_hil_contracts,
         hand_specs_by_side=hands,
-        composition_input_action_schema_by_role=(
-            profile.input_action_schema_by_role
-        ),
+        composition_input_action_schema_by_role=(profile.input_action_schema_by_role),
     )
     source_spec = _human_source_spec(target.runtime)
     source = PassiveSource(source_spec)
@@ -1678,9 +1769,7 @@ def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> N
         human_source=source,
         human_source_spec=source_spec,
         human_input_transform=profile.input_adapter,
-        readiness_provider=lambda *, now: (
-            MujocoSimHILReadinessEvidence.all_ready()
-        ),
+        readiness_provider=lambda *, now: (MujocoSimHILReadinessEvidence.all_ready()),
         contracts=profile.sim_hil_contracts,
         config=MujocoSimHILProfileConfig(
             enabled=True,
@@ -1698,15 +1787,19 @@ def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> N
             arm_x=0.2,
             hand_qpos=0.4,
         )
-        assert composition.submit_human_emission(
+        first_submission = composition.submit_human_emission(
             first,
             observed_at=first_at,
-        ) is None
-        assert composition.submit_human_emission(
-            first,
-            observed_at=first_at,
-        ) is None
-        assert len(target.runtime.policy_topology.composition_inputs) == 0
+        )
+        assert first_submission is not None and first_submission.accepted
+        assert (
+            composition.submit_human_emission(
+                first,
+                observed_at=first_at,
+            )
+            is first_submission
+        )
+        assert len(target.runtime.policy_topology.composition_inputs) == 1
 
         second_at = first_at + 0.01
         second = _human_emission(
@@ -1720,7 +1813,7 @@ def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> N
             observed_at=second_at,
         )
         assert submission is not None and submission.accepted
-        assert len(target.runtime.policy_topology.composition_inputs) == 1
+        assert len(target.runtime.policy_topology.composition_inputs) == 2
         cut = target.runtime.capture_control_cut(
             cutoff_at=max(
                 second_at,
@@ -1728,16 +1821,24 @@ def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> N
             )
         )
         records = (
-            target.runtime.policy_topology.composition_inputs
-            .records_at_or_before(cut)
+            target.runtime.policy_topology.composition_inputs.records_at_or_before(cut)
         )
-        assert len(records) == 1
-        record = records[0]
+        assert len(records) == 2
+        anchor_record, record = records
+        for component_id in anchor_record.action.action_schema.component_ids:
+            anchor_value = anchor_record.action.value(component_id)
+            expected_identity = np.zeros_like(anchor_value.values)
+            if anchor_value.payload_schema.representation_family == "cartesian_pose":
+                expected_identity[-1] = 1.0
+            np.testing.assert_allclose(
+                anchor_value.values,
+                expected_identity,
+                atol=1e-12,
+            )
         assert record.input_role == "human_residual"
         assert (
             record.action.action_schema.semantic_content_hash
-            == profile.relative_contracts.residual_action_schema
-            .semantic_content_hash
+            == profile.relative_contracts.residual_action_schema.semantic_content_hash
         )
         for side in ("left", "right"):
             np.testing.assert_allclose(
@@ -1757,7 +1858,10 @@ def test_sim_hil_human_transform_anchors_once_then_submits_relative_input() -> N
         composition.close()
 
 
+@pytest.mark.optional
 def test_sim_hil_target_binds_non_off_execution_observation_plan() -> None:
+    _require_mujoco_runtime()
+
     class ObservationSink:
         def __init__(self) -> None:
             self.values: list[object] = []
@@ -1810,8 +1914,7 @@ def test_sim_hil_target_binds_non_off_execution_observation_plan() -> None:
         target.runtime.start()
         target.runtime.step()
         assert any(
-            isinstance(value, ExecutionMeasurementObservation)
-            for value in sink.values
+            isinstance(value, ExecutionMeasurementObservation) for value in sink.values
         )
         assert {
             value.stream
@@ -1931,9 +2034,7 @@ def test_sim_hil_nonrecoverable_readiness_failure_still_latches_hold() -> None:
         measured_state_ready=False,
         detail_by_check={"measured_state_ready": "mujoco_state_nonfinite"},
     )
-    composition, runtime = _readiness_gate_test_composition(
-        readiness=readiness
-    )
+    composition, runtime = _readiness_gate_test_composition(readiness=readiness)
 
     result = composition.compose_at(
         decision_key="invalid-measured-state",
@@ -2040,7 +2141,10 @@ def test_default_sim_hil_contract_is_all_required_and_compound() -> None:
         MUJOCO_SIM_HIL_HUMAN_ROLE_V1,
         MUJOCO_SIM_HIL_POLICY_ROLE_V1,
     )
-    assert contracts.composition_spec.required_roles == contracts.composition_spec.input_roles
+    assert (
+        contracts.composition_spec.required_roles
+        == contracts.composition_spec.input_roles
+    )
     assert contracts.authority_profile.component_coverage == (
         "left_arm",
         "right_arm",
@@ -2073,7 +2177,9 @@ def test_sim_hil_contract_can_bind_the_exact_mujoco_component_schema() -> None:
     )
 
 
-def test_policy_emission_becomes_non_authoritative_input_with_activation_lineage() -> None:
+def test_policy_emission_becomes_non_authoritative_input_with_activation_lineage() -> (
+    None
+):
     binding = PolicyCompositionInputBinding(
         source_slot_id="sim-policy",
         role=MUJOCO_SIM_HIL_POLICY_ROLE_V1,
@@ -2130,9 +2236,7 @@ def test_policy_emission_becomes_non_authoritative_input_with_activation_lineage
 
 
 def test_policy_adapter_temporal_port_requires_explicit_guaranteed_next() -> None:
-    action_schema = project_robot_action_v1_to_component_action(
-        _action()
-    ).action_schema
+    action_schema = project_robot_action_v1_to_component_action(_action()).action_schema
     binding = PolicyCompositionInputBinding(
         source_slot_id="sim-policy",
         role="policy",
@@ -2179,9 +2283,7 @@ def test_policy_adapter_temporal_port_requires_explicit_guaranteed_next() -> Non
         sampled_at=10.049,
         guaranteed_next_step=guaranteed,
     )
-    assert interpolated.sample.derivation_kind == (
-        "interpolated_guaranteed_next"
-    )
+    assert interpolated.sample.derivation_kind == ("interpolated_guaranteed_next")
     np.testing.assert_allclose(
         interpolated.draft.action.value("left_arm").values[0],
         0.1,

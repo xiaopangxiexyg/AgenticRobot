@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from dataset_contracts.control_trace import ControlTraceFact, PersistedRecordEnvelope
 from dataset_contracts.control_trace_wal import encode_control_trace_wal_frame
 from teleop_runtime.control_trace.spool import ControlTraceSpool
+
+
+pytestmark = pytest.mark.integration
 
 
 def envelope(sequence: int, *, trace_session_id: str = "trace-1") -> PersistedRecordEnvelope:

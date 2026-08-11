@@ -848,11 +848,66 @@ def test_process_collection_worker_reloads_zero_after_dataset_is_removed(tmp_pat
         worker.start()
         assert worker.next_episode_index == 1
         assert worker.next_sample_index == 2
+        assert worker.start_episode({"after_existing_episode": True}) == 1
+        assert worker.next_episode_index == 2
+        assert worker.discard_episode(1) is True
+        assert worker.next_episode_index == 1
+        assert worker.next_sample_index == 2
+        assert worker.start_episode({"after_existing_discard_retry": True}) == 1
+        assert worker.discard_episode(1) is True
         shutil.rmtree(dataset_root)
         worker.reload_finalized_dataset_state()
         assert worker.next_episode_index == 0
         assert worker.next_sample_index == 0
         assert worker.start_episode({"after_external_delete": True}) == 0
+        assert worker.next_episode_index == 1
+        assert worker.discard_episode(0) is True
+        assert worker.next_episode_index == 0
+        assert worker.next_sample_index == 0
+        assert worker.start_episode({"after_discard_retry": True}) == 0
+        assert worker.discard_episode(0) is True
+    finally:
+        worker.close()
+
+
+def test_process_collection_discard_clears_reused_episode_caches(tmp_path) -> None:
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            nominal_fps=15.0,
+            task_id="discard-cache-test",
+            write_parquet=False,
+            write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=2,
+            shared_slot_count=2,
+            shared_slot_bytes=65536,
+            worker_nice=0,
+            sample_acceptance_receipt_capacity=4,
+        ),
+    )
+    try:
+        worker.start()
+        assert worker.start_episode({"attempt": 1}) == 0
+        assert worker.submit_snapshot(_snapshot()) is True
+        worker.flush()
+        assert worker.tactile_frame_counts(0) == {"left": 1}
+
+        assert worker.discard_episode(0) is True
+        assert worker.next_episode_index == 0
+        assert worker.next_sample_index == 0
+        assert worker.active_episode_frame_count == 0
+        assert worker.tactile_frame_counts(0) == {}
+        assert worker.drain_sample_acceptance_receipts() == ()
+
+        assert worker.start_episode({"attempt": 2}) == 0
+        assert worker.tactile_frame_counts(0) == {}
         assert worker.discard_episode(0) is True
     finally:
         worker.close()

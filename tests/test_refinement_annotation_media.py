@@ -14,7 +14,7 @@ from control_station.refinement_annotation.media import BrowserMediaCache
 from control_station.refinement_annotation.server import _AnnotationHandler
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.contract]
 
 
 def _make_mp4v(path: Path) -> None:
@@ -69,6 +69,7 @@ def _codec(path: Path) -> str:
     return result.stdout.strip()
 
 
+@pytest.mark.optional
 def test_mp4v_is_exposed_as_h264_without_touching_source(tmp_path: Path) -> None:
     source = tmp_path / "episode.mp4"
     _make_mp4v(source)
@@ -85,6 +86,7 @@ def test_mp4v_is_exposed_as_h264_without_touching_source(tmp_path: Path) -> None
         cache.close()
 
 
+@pytest.mark.optional
 def test_media_cache_reuses_derived_video_after_reopen(tmp_path: Path) -> None:
     source = tmp_path / "episode.mp4"
     _make_mp4v(source)
@@ -103,6 +105,7 @@ def test_media_cache_reuses_derived_video_after_reopen(tmp_path: Path) -> None:
         second_cache.close()
 
 
+@pytest.mark.optional
 def test_browser_compatible_h264_is_served_without_transcode(tmp_path: Path) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -140,6 +143,7 @@ def test_browser_compatible_h264_is_served_without_transcode(tmp_path: Path) -> 
         cache.close()
 
 
+@pytest.mark.optional
 def test_media_route_returns_browser_compatible_range_response(
     tmp_path: Path,
 ) -> None:

@@ -199,7 +199,7 @@
 2. [`dexteleop_control_core_landing_plan.md`](dexteleop_control_core_landing_plan.md) 定义 M0–M8 控制迁移、真机 gate 和证据；
 3. [`dexteleop_rtc_landing_plan.md`](dexteleop_rtc_landing_plan.md) 定义异步 action chunk/RTC 的 producer-local 语义；
 4. 本文只定义 Control Station 的 application composition、GUI 和多 source/target 管理边界；
-5. [`dexteleop_architecture_visual_guide.md`](dexteleop_architecture_visual_guide.md) 只做导航和事实可视化，不新增 contract。
+5. [`dexteleop_architecture_visual_guide.md`](../docs/architecture/dexteleop_architecture_visual_guide.md) 只做导航和事实可视化，不新增 contract。
 
 若本文与前三份 contract/安全约束冲突，以前三份文档和实际代码为准。Control Station 不能成为绕过 M5.8/M6、
 replay M6.5 或 RTC-7 独立授权的入口。

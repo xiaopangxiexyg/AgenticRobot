@@ -59,6 +59,7 @@ def _task(tmp_path: Path, sensor: str = "M_TEST") -> RawTactileStreamTask:
     )
 
 
+@pytest.mark.integration
 def test_fixed_calibration_round_trip_and_checksum(tmp_path: Path) -> None:
     frame = np.arange(np.prod(BASE_FRAME_SHAPE), dtype=np.uint8).reshape(BASE_FRAME_SHAPE)
     saved = save_tactile_calibration(
@@ -76,6 +77,7 @@ def test_fixed_calibration_round_trip_and_checksum(tmp_path: Path) -> None:
     np.testing.assert_array_equal(loaded.frame, frame)
 
 
+@pytest.mark.integration
 def test_fixed_calibration_rejects_wrong_shape(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="shape"):
         save_tactile_calibration(tmp_path, "M_TEST", np.zeros((4, 5), dtype=np.uint8))
@@ -96,6 +98,7 @@ def test_stable_base_frame_uses_pixelwise_median_and_reports_noise() -> None:
     assert metrics["p99_abs_deviation"] >= metrics["mean_abs_deviation"]
 
 
+@pytest.mark.integration
 def test_postprocess_auto_loads_fixed_sensor_calibration(tmp_path: Path) -> None:
     save_tactile_calibration(
         tmp_path / "calibration",
@@ -123,6 +126,7 @@ def test_postprocess_auto_loads_fixed_sensor_calibration(tmp_path: Path) -> None
     assert float(output[0, 0, 0, 0]) == 1.0
 
 
+@pytest.mark.integration
 def test_postprocess_required_calibration_fails_when_missing(tmp_path: Path) -> None:
     result = process_raw_tactile_stream(
         _task(tmp_path),
@@ -138,6 +142,7 @@ def test_postprocess_required_calibration_fails_when_missing(tmp_path: Path) -> 
     assert "No fixed DM-Tac calibration" in (result.error or "")
 
 
+@pytest.mark.integration
 def test_save_calibration_requires_one_episode_and_explicit_frame(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="base_frame_index"):
         ForceProcessConfig(dataset_root=tmp_path, save_calibration=True).normalized()
@@ -149,6 +154,7 @@ def test_save_calibration_requires_one_episode_and_explicit_frame(tmp_path: Path
         ).normalized()
 
 
+@pytest.mark.integration
 def test_live_device_auto_applies_and_explicit_reset_persists(tmp_path: Path) -> None:
     fixed = np.full(RAW_SHAPE, 11, dtype=np.uint8)
     reset_frame = np.full(RAW_SHAPE, 23, dtype=np.uint8)

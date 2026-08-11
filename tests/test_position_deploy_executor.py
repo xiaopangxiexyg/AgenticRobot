@@ -24,17 +24,39 @@ from robot_motion.deploy.schema import (
     STATE_ARM_POSE_SLICES,
     STATE_ARM_QPOS_SLICES,
 )
+from robot_motion.position_control import (
+    POSITION_PLAN_GAP_HOLD_ACKNOWLEDGED,
+    POSITION_PLAN_GAP_NONE,
+    POSITION_PLAN_RELATION_REPLACEMENT,
+    POSITION_PLAN_RELATION_STREAM_START,
+    POSITION_PLAN_SPLICE_HOLD_RESTART,
+    PositionStreamStartAcquisitionConfig,
+    PositionSourcePlanCut,
+    resolve_position_plan_splice,
+)
 from robot_motion.runtime import CommandDispatchReceipt, EffectorCommand, TeleopCommand
 from teleop_runtime.backends.hands.inspire_tac import (
     InspireTacHandBackend,
     InspireTacHandBackendConfig,
 )
 from teleop_runtime.deploy.run_policy import (
+    DEPLOY_DEBUG_PAYLOAD_FULL,
     DeploymentDebugLogger,
     _PreparedActionExecution,
+    _debug_arm_state_summary,
+    _defer_position_action_after_synchronous_prediction,
     _dispatch_position_discrete_command_checked,
+    _hold_active_position_stream_for_synchronous_chunk_gap,
+    _prepare_position_plan_cut_for_action_step,
+    _position_source_tail_pending_before_synchronous_chunk_gap,
+)
+from teleop_runtime.deploy.position_plan_cut import (
+    DeploymentPositionPlanCutDetector,
 )
 from teleop_runtime.deploy.dispatch import (
+    POSITION_REFERENCE_DISPATCH_AUDIT_FULL,
+    POSITION_REFERENCE_DISPATCH_AUDIT_POST,
+    dispatch_position_reference_command,
     dispatch_teleop_command,
     require_arm_backends_ready_for_position_dispatch,
 )
@@ -44,6 +66,7 @@ from teleop_runtime.position_control.deploy_executor import (
     PositionDeployExecutorFault,
     PositionDeployQueueFullError,
 )
+from teleop_runtime.position_control import deploy_executor as deploy_executor_module
 from teleop_runtime.position_control.reference_observation import (
     LegacyPositionReferenceObservationBatch,
     LegacyPositionReferenceObserverRuntime,
@@ -63,6 +86,57 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
             return
         time.sleep(0.002)
     assert predicate(), "timed out waiting for background position executor"
+
+
+def test_synchronous_position_prediction_requires_next_observation_cut() -> None:
+    assert _defer_position_action_after_synchronous_prediction(
+        prediction_accepted=True,
+        position_executor_enabled=True,
+    )
+    assert not _defer_position_action_after_synchronous_prediction(
+        prediction_accepted=False,
+        position_executor_enabled=True,
+    )
+    assert not _defer_position_action_after_synchronous_prediction(
+        prediction_accepted=True,
+        position_executor_enabled=False,
+    )
+
+
+def test_synchronous_position_chunk_gap_holds_only_an_active_stream() -> None:
+    class FakePositionExecutor:
+        def __init__(self, *, active: bool, tail_drained: bool = True) -> None:
+            self.active = bool(active)
+            self.tail_drained = bool(tail_drained)
+            self.clear_count = 0
+
+        def snapshot(self) -> dict[str, object]:
+            return {"active": self.active}
+
+        def source_tail_drain_status(self) -> dict[str, object]:
+            return {
+                "required": not self.tail_drained,
+                "drained": self.tail_drained,
+            }
+
+        def clear(self) -> None:
+            self.clear_count += 1
+            self.active = False
+
+    active = FakePositionExecutor(active=True)
+    assert _hold_active_position_stream_for_synchronous_chunk_gap(active) is True
+    assert active.clear_count == 1
+    assert active.active is False
+
+    idle = FakePositionExecutor(active=False)
+    assert _hold_active_position_stream_for_synchronous_chunk_gap(idle) is False
+    assert idle.clear_count == 0
+    assert _hold_active_position_stream_for_synchronous_chunk_gap(None) is False
+
+    draining = FakePositionExecutor(active=True, tail_drained=False)
+    assert _position_source_tail_pending_before_synchronous_chunk_gap(draining)
+    assert _hold_active_position_stream_for_synchronous_chunk_gap(draining) is False
+    assert draining.clear_count == 0
 
 
 def _pose(x: float, y: float = 0.0, z: float = 0.3) -> np.ndarray:
@@ -153,6 +227,20 @@ def _filtered_pose(side: str, target_pose: np.ndarray) -> FilteredNormalizedActi
     )
 
 
+def _filtered_qpos(side: str, target_qpos: np.ndarray) -> FilteredNormalizedAction:
+    vector = np.full((ACTION_DIM,), np.nan, dtype=np.float32)
+    return FilteredNormalizedAction(
+        action=NormalizedAction(
+            vector=vector,
+            arm_joint_targets={
+                side: np.asarray(target_qpos, dtype=np.float32).reshape(6)
+            },
+            metadata={"source": "unit_safe_15hz"},
+        ),
+        metadata={"safety_pass_count": 1},
+    )
+
+
 def _hand_command(side: str, value: float) -> TeleopCommand:
     command = TeleopCommand(timestamp=123.0, metadata={"source": "safe_15hz_action"})
     command.add_command(
@@ -196,6 +284,8 @@ class _FakePositionCollisionPlanner:
         self.endpoint_checked = bool(endpoint_checked)
         self.reset_calls: list[dict[str, np.ndarray]] = []
         self.plan_calls: list[dict[str, np.ndarray]] = []
+        self.shutdown_calls: list[float] = []
+        self.prepare_staged_source_horizon_calls = 0
         self.sequence = 0
 
     def reset(self, qpos_by_side):
@@ -247,6 +337,17 @@ class _FakePositionCollisionPlanner:
             },
         )
 
+    def prepare_staged_source_horizon(self):
+        self.prepare_staged_source_horizon_calls += 1
+        return {
+            "prepared": True,
+            "reason": "fake_initial_source_horizon_prepared",
+            "prepare_ms": 0.0,
+        }
+
+    def shutdown_background_workers(self, *, timeout_sec: float) -> None:
+        self.shutdown_calls.append(float(timeout_sec))
+
 
 def _filtered_bimanual_pose(left_x: float, right_x: float) -> FilteredNormalizedAction:
     vector = np.full((ACTION_DIM,), np.nan, dtype=np.float32)
@@ -255,6 +356,51 @@ def _filtered_bimanual_pose(left_x: float, right_x: float) -> FilteredNormalized
     return FilteredNormalizedAction(
         action=NormalizedAction(vector=vector, metadata={"source": "unit_safe_15hz"}),
         metadata={"safety_pass_count": 1},
+    )
+
+
+def _hold_restart_splice_decision():
+    return resolve_position_plan_splice(
+        PositionSourcePlanCut(
+            cut_id="unit-hold-restart",
+            current_source_plan_id="chunk-1",
+            current_source_step=0,
+            previous_source_plan_id="chunk-0",
+            previous_source_step=15,
+            relation=POSITION_PLAN_RELATION_REPLACEMENT,
+            execution_gap=POSITION_PLAN_GAP_HOLD_ACKNOWLEDGED,
+            detected_at=10.0,
+        )
+    )
+
+
+def _stream_start_splice_decision():
+    return resolve_position_plan_splice(
+        PositionSourcePlanCut(
+            cut_id="unit-stream-start",
+            current_source_plan_id="chunk-0",
+            current_source_step=0,
+            previous_source_plan_id=None,
+            previous_source_step=None,
+            relation=POSITION_PLAN_RELATION_STREAM_START,
+            execution_gap=POSITION_PLAN_GAP_NONE,
+            detected_at=10.0,
+        )
+    )
+
+
+def _live_replacement_splice_decision():
+    return resolve_position_plan_splice(
+        PositionSourcePlanCut(
+            cut_id="unit-live-replacement",
+            current_source_plan_id="rtc-1",
+            current_source_step=0,
+            previous_source_plan_id="chunk-0",
+            previous_source_step=0,
+            relation=POSITION_PLAN_RELATION_REPLACEMENT,
+            execution_gap=POSITION_PLAN_GAP_NONE,
+            detected_at=10.0 + 1.0 / 15.0,
+        )
     )
 
 
@@ -278,6 +424,270 @@ def test_collision_adapter_reads_started_backend_active_tcp_state() -> None:
         endpoint_to_tool_transforms_from_started_backends(
             {"right": _Backend(np.zeros(6))}
         )
+
+
+def test_reference_worker_affinity_receipt_is_published(monkeypatch) -> None:
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "bind_current_thread_to_cpu",
+        lambda requested_cpu, *, role: {
+            "requested": True,
+            "applied": True,
+            "requested_cpu": requested_cpu,
+            "effective_cpu_ids": [requested_cpu],
+            "role": role,
+        },
+    )
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(reference_worker_cpu=6),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    executor.start()
+    try:
+        _wait_until(
+            lambda: executor.snapshot()["reference_worker_affinity_receipt"]
+            is not None
+        )
+        snapshot = executor.snapshot()
+        assert snapshot["reference_worker_cpu"] == 6
+        assert snapshot["reference_worker_affinity_receipt"][
+            "effective_cpu_ids"
+        ] == [6]
+    finally:
+        executor.close()
+
+
+def test_reference_worker_affinity_failure_stops_startup(monkeypatch) -> None:
+    def fail_affinity(_requested_cpu, *, role):
+        raise OSError(f"cannot pin {role}")
+
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "bind_current_thread_to_cpu",
+        fail_affinity,
+    )
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(reference_worker_cpu=6),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="CPU-affinity setup failed"):
+            executor.start()
+        _wait_until(lambda: executor.snapshot()["fault_latched"] is True)
+        assert "cannot pin" in executor.snapshot()[
+            "reference_worker_affinity_error"
+        ]
+    finally:
+        executor.close()
+
+
+def test_cyclic_gc_guard_is_refcounted_and_restores_on_last_close(
+    monkeypatch,
+) -> None:
+    gc_state = {"enabled": True}
+    calls: list[object] = []
+
+    monkeypatch.setattr(deploy_executor_module, "_CYCLIC_GC_GUARD_OWNER_COUNT", 0)
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "_CYCLIC_GC_GUARD_RESTORE_ENABLED",
+        False,
+    )
+    monkeypatch.setattr(
+        deploy_executor_module.gc,
+        "isenabled",
+        lambda: bool(gc_state["enabled"]),
+    )
+    monkeypatch.setattr(deploy_executor_module.gc, "get_count", lambda: (7, 2, 1))
+
+    def collect(generation: int) -> int:
+        calls.append(("collect", generation))
+        return 19
+
+    def disable() -> None:
+        calls.append("disable")
+        gc_state["enabled"] = False
+
+    def enable() -> None:
+        calls.append("enable")
+        gc_state["enabled"] = True
+
+    monkeypatch.setattr(deploy_executor_module.gc, "collect", collect)
+    monkeypatch.setattr(deploy_executor_module.gc, "disable", disable)
+    monkeypatch.setattr(deploy_executor_module.gc, "enable", enable)
+
+    first = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(cyclic_gc_guard_enabled=True),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    second = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(cyclic_gc_guard_enabled=True),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    try:
+        assert calls == []
+        first.submit(
+            _filtered_pose("left", _pose(0.11)),
+            _observation(),
+            "unit",
+        )
+        first_activation = first.snapshot()["cyclic_gc_guard_activation"]
+        assert calls == [("collect", 2), "disable"]
+        assert first_activation["owner_count_before"] == 0
+        assert first_activation["owner_count_after"] == 1
+        assert first_activation["collection_count_before"] == [7, 2, 1]
+        assert first_activation["collected_objects"] == 19
+        assert first.snapshot()["cyclic_gc_guard_acquired"] is True
+
+        second.submit(
+            _filtered_pose("left", _pose(0.12)),
+            _observation(),
+            "unit",
+        )
+        second_activation = second.snapshot()["cyclic_gc_guard_activation"]
+        assert calls == [("collect", 2), "disable"]
+        assert second_activation["owner_count_before"] == 1
+        assert second_activation["owner_count_after"] == 2
+
+        first.close()
+        assert calls == [("collect", 2), "disable"]
+        assert first.snapshot()["cyclic_gc_guard_release"]["owner_count_after"] == 1
+        assert gc_state["enabled"] is False
+
+        second.close()
+        assert calls == [("collect", 2), "disable", "enable"]
+        assert second.snapshot()["cyclic_gc_guard_release"]["owner_count_after"] == 0
+        assert gc_state["enabled"] is True
+    finally:
+        if not first.snapshot()["closed"]:
+            first.close()
+        if not second.snapshot()["closed"]:
+            second.close()
+
+
+def test_cyclic_gc_guard_preserves_an_externally_disabled_collector(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(deploy_executor_module, "_CYCLIC_GC_GUARD_OWNER_COUNT", 0)
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "_CYCLIC_GC_GUARD_RESTORE_ENABLED",
+        False,
+    )
+    monkeypatch.setattr(deploy_executor_module.gc, "isenabled", lambda: False)
+    monkeypatch.setattr(deploy_executor_module.gc, "get_count", lambda: (0, 0, 0))
+    monkeypatch.setattr(
+        deploy_executor_module.gc,
+        "collect",
+        lambda generation: calls.append(("collect", generation)),
+    )
+    monkeypatch.setattr(
+        deploy_executor_module.gc,
+        "disable",
+        lambda: calls.append("disable"),
+    )
+    monkeypatch.setattr(
+        deploy_executor_module.gc,
+        "enable",
+        lambda: calls.append("enable"),
+    )
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(cyclic_gc_guard_enabled=True),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    executor.submit(
+        _filtered_pose("left", _pose(0.11)),
+        _observation(),
+        "unit",
+    )
+    activation = executor.snapshot()["cyclic_gc_guard_activation"]
+    assert activation["gc_enabled_before"] is False
+    assert activation["collected_objects"] is None
+    executor.close()
+    assert calls == []
+
+
+def test_cyclic_gc_guard_is_not_restored_after_failed_close(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "_acquire_cyclic_gc_guard",
+        lambda: {
+            "owner_count_before": 0,
+            "owner_count_after": 1,
+            "gc_enabled_before": True,
+            "gc_enabled_after": False,
+        },
+    )
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "_release_cyclic_gc_guard",
+        lambda: calls.append("release"),
+    )
+    monkeypatch.setattr(deploy_executor_module.gc, "isenabled", lambda: False)
+
+    def fail_hold() -> None:
+        raise RuntimeError("hold failed")
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            cyclic_gc_guard_enabled=True,
+            debug_events_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=lambda _command: None,
+        hold_callback=fail_hold,
+    )
+    executor.submit(
+        _filtered_pose("left", _pose(0.11)),
+        _observation(),
+        "unit",
+    )
+
+    with pytest.raises(RuntimeError, match="hold failed"):
+        executor.close()
+
+    snapshot = executor.snapshot()
+    assert calls == []
+    assert snapshot["closed"] is True
+    assert snapshot["cyclic_gc_guard_acquired"] is True
+    assert snapshot["cyclic_gc_guard_release"] is None
+    assert snapshot["cyclic_gc_guard_release_deferred"] == {
+        "reason": "executor_close_failed",
+        "error_count": 1,
+        "gc_enabled": False,
+    }
+    events = executor.drain_debug_events()
+    assert any(
+        event["event"] == "cyclic_gc_guard_release_deferred"
+        for event in events
+    )
+
+
+def test_third_lookahead_requires_second_lookahead() -> None:
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            stale_after_sec=0.5,
+            chunk_lookahead_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    try:
+        with pytest.raises(
+            ValueError,
+            match="third_lookahead_filtered requires second_lookahead_filtered",
+        ):
+            executor.submit(
+                _filtered_pose("left", _pose(0.1)),
+                _observation(),
+                "unit",
+                lookahead_filtered=_filtered_pose("left", _pose(0.11)),
+                third_lookahead_filtered=_filtered_pose("left", _pose(0.13)),
+            )
+    finally:
+        executor.close()
 
 
 def test_pose_segment_emits_reference_points_without_rerunning_safety() -> None:
@@ -595,6 +1005,380 @@ def test_same_chunk_lookahead_interpolates_without_one_action_period_delay() -> 
         executor.close()
 
 
+def test_plan_splice_clock_rebase_requires_typed_governor() -> None:
+    with pytest.raises(
+        ValueError,
+        match="plan_splice_clock_rebase_enabled requires",
+    ):
+        PositionDeployExecutorConfig(plan_splice_clock_rebase_enabled=True)
+
+
+def test_stream_start_acquisition_is_single_shot_and_rtc_replacement_safe() -> None:
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=1.0,
+            plan_splice_governor_enabled=True,
+            stream_start_acquisition=PositionStreamStartAcquisitionConfig(
+                enabled=True,
+                max_translation_step_m=0.005,
+                max_rotation_step_rad=np.deg2rad(0.5),
+                max_source_intervals=16,
+            ),
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    try:
+        first_index = executor.submit(
+            _filtered_pose("left", _pose(0.143)),
+            _observation(left_pose=_pose(0.1)),
+            "rtc_or_sync_policy",
+            timestamp_monotonic=10.0,
+            source_plan_cut=_stream_start_splice_decision().cut,
+        )
+        assert first_index == 9
+        executor._drain_submissions()
+
+        first_sample = executor._pose_resampler.sample_at(10.0)
+        np.testing.assert_allclose(
+            first_sample.pose_by_side["left"][:3, 3],
+            [0.1, 0.0, 0.3],
+            atol=1e-7,
+        )
+        before_replacement = executor.snapshot()
+        assert before_replacement["stream_start_acquisition_count"] == 1
+        assert before_replacement["stream_source_timestamp_offset_sec"] == (
+            pytest.approx(9.0 / 15.0)
+        )
+
+        replacement_index = executor.submit(
+            _filtered_pose("left", _pose(0.145)),
+            _observation(left_pose=_pose(0.1)),
+            "rtc_or_sync_policy",
+            timestamp_monotonic=10.0 + 1.0 / 15.0,
+            source_plan_cut=_live_replacement_splice_decision().cut,
+        )
+        assert replacement_index == 10
+        executor._drain_submissions()
+
+        after_replacement = executor.snapshot()
+        assert after_replacement["stream_start_acquisition_count"] == 1
+        assert after_replacement["stream_source_timestamp_offset_sec"] == (
+            pytest.approx(9.0 / 15.0)
+        )
+        target_sample = executor._pose_resampler.sample_at(
+            10.0 + 9.0 / 15.0
+        )
+        np.testing.assert_allclose(
+            target_sample.pose_by_side["left"][:3, 3],
+            [0.143, 0.0, 0.3],
+            atol=1e-6,
+        )
+    finally:
+        executor.close()
+
+
+def test_synchronous_first_chunk_cut_reaches_stream_start_acquisition() -> None:
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=1.0,
+            plan_splice_governor_enabled=True,
+            stream_start_acquisition=PositionStreamStartAcquisitionConfig(
+                enabled=True,
+                max_translation_step_m=0.005,
+                max_rotation_step_rad=np.deg2rad(0.5),
+                max_source_intervals=16,
+            ),
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    detector = DeploymentPositionPlanCutDetector()
+    raw_action = NormalizedAction(
+        vector=np.full(ACTION_DIM, np.nan, dtype=np.float32),
+        metadata={
+            "deploy_action_chunk_id": 0,
+            "deploy_action_chunk_index": 0,
+            "deploy_action_chunk_size": 16,
+        },
+    )
+    proposal = _prepare_position_plan_cut_for_action_step(
+        detector,
+        SimpleNamespace(raw_action=raw_action, emission=None),
+        rtc_enabled=False,
+        policy_node_id="deploy-policy",
+        # qpos-init/startup may clear the idle executor before policy starts.
+        hold_generation=1,
+        detected_at=10.0,
+    )
+    try:
+        source_index = executor.submit(
+            _filtered_pose("left", _pose(0.143)),
+            _observation(left_pose=_pose(0.1)),
+            "sync_policy",
+            timestamp_monotonic=10.0,
+            source_plan_cut=proposal.cut,
+        )
+        detector.commit(proposal)
+        executor._drain_submissions()
+
+        assert source_index == 9
+        snapshot = executor.snapshot()
+        assert snapshot["stream_start_acquisition_count"] == 1
+        assert snapshot["last_stream_start_acquisition"]["active"] is True
+    finally:
+        executor.close()
+
+
+def test_synchronous_next_chunk_after_hold_restarts_stream_start_acquisition() -> None:
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=1.0,
+            plan_splice_governor_enabled=True,
+            stream_start_acquisition=PositionStreamStartAcquisitionConfig(
+                enabled=True,
+                max_translation_step_m=0.005,
+                max_rotation_step_rad=np.deg2rad(0.5),
+                max_source_intervals=16,
+            ),
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    detector = DeploymentPositionPlanCutDetector()
+
+    def synchronous_action(chunk_id: int) -> NormalizedAction:
+        return NormalizedAction(
+            vector=np.full(ACTION_DIM, np.nan, dtype=np.float32),
+            metadata={
+                "deploy_action_chunk_id": chunk_id,
+                "deploy_action_chunk_index": 0,
+                "deploy_action_chunk_size": 16,
+            },
+        )
+
+    try:
+        first = detector.prepare_synchronous_action(
+            synchronous_action(0),
+            policy_node_id="deploy-policy",
+            detected_at=10.0,
+        )
+        executor.submit(
+            _filtered_pose("left", _pose(0.143)),
+            _observation(left_pose=_pose(0.1)),
+            "sync-policy",
+            timestamp_monotonic=10.0,
+            source_plan_cut=first.cut,
+        )
+        detector.commit(first)
+        executor._drain_submissions()
+        assert executor.snapshot()["stream_start_acquisition_count"] == 1
+
+        executor.clear()
+        second = _prepare_position_plan_cut_for_action_step(
+            detector,
+            SimpleNamespace(
+                raw_action=synchronous_action(1),
+                emission=None,
+            ),
+            rtc_enabled=False,
+            policy_node_id="deploy-policy",
+            hold_generation=int(executor.snapshot()["clear_count"]),
+            detected_at=11.0,
+        )
+        assert resolve_position_plan_splice(second.cut).mode == (
+            POSITION_PLAN_SPLICE_HOLD_RESTART
+        )
+        executor.submit(
+            _filtered_pose("left", _pose(0.19)),
+            _observation(left_pose=_pose(0.143)),
+            "sync-policy",
+            timestamp_monotonic=11.0,
+            source_plan_cut=second.cut,
+        )
+        detector.commit(second)
+        executor._drain_submissions()
+
+        snapshot = executor.snapshot()
+        assert snapshot["stream_start_acquisition_count"] == 2
+        assert snapshot["last_stream_start_acquisition"]["active"] is True
+    finally:
+        executor.close()
+
+
+def test_default_on_stream_start_acquisition_preserves_pure_qpos_streams() -> None:
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=1.0,
+            plan_splice_governor_enabled=True,
+            stream_start_acquisition=PositionStreamStartAcquisitionConfig(
+                enabled=True,
+            ),
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    try:
+        source_index = executor.submit(
+            _filtered_qpos("left", np.full(6, 0.1)),
+            _observation(),
+            "qpos_policy",
+            timestamp_monotonic=10.0,
+            source_plan_cut=_stream_start_splice_decision().cut,
+        )
+        executor._drain_submissions()
+
+        assert source_index == 1
+        assert executor.snapshot()["stream_start_acquisition_count"] == 0
+    finally:
+        executor.close()
+
+
+def test_active_stream_start_acquisition_rebases_after_initial_planning() -> None:
+    observation = _observation(
+        sides=("left", "right"),
+        left_pose=_pose(0.1, 0.2),
+        right_pose=_pose(0.1, -0.2),
+    )
+    started_at = max(
+        float(observation.arm_states[side]["measured_timestamp_monotonic"])
+        for side in ("left", "right")
+    )
+    now = {"value": started_at}
+
+    class AdvancingPlanner(_FakePositionCollisionPlanner):
+        def prepare_staged_source_horizon(self):
+            receipt = super().prepare_staged_source_horizon()
+            now["value"] += 0.050
+            return {**receipt, "prepare_ms": 50.0}
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=1.0,
+            collision_required=True,
+            allow_non_authoritative_collision_reset_in_dry_run=True,
+            plan_splice_governor_enabled=True,
+            plan_splice_clock_rebase_enabled=True,
+            stream_start_acquisition=PositionStreamStartAcquisitionConfig(
+                enabled=True,
+                max_translation_step_m=0.005,
+                max_source_intervals=16,
+            ),
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        collision_planner_factory=AdvancingPlanner,
+        clock=lambda: now["value"],
+        wall_clock=lambda: now["value"],
+    )
+    try:
+        executor.submit(
+            _filtered_bimanual_pose(0.143, 0.143),
+            observation,
+            "stream_start",
+            timestamp_monotonic=started_at,
+            source_plan_cut=_stream_start_splice_decision().cut,
+        )
+        executor._drain_submissions()
+
+        snapshot = executor.snapshot()
+        assert snapshot["stream_start_acquisition_count"] == 1
+        assert snapshot["plan_splice_clock_rebase_count"] == 1
+        assert snapshot["plan_splice_reference_query_offset_sec"] == (
+            pytest.approx(0.050)
+        )
+        assert snapshot["plan_splice_tail_drain_required"] is True
+    finally:
+        executor.close()
+
+
+def test_hold_restart_rebases_after_planning_and_reports_tail_drain() -> None:
+    now = {"value": 10.0}
+
+    class AdvancingPlanner(_FakePositionCollisionPlanner):
+        def prepare_staged_source_horizon(self):
+            receipt = super().prepare_staged_source_horizon()
+            now["value"] += 0.050
+            return {**receipt, "prepare_ms": 50.0}
+
+    planner = AdvancingPlanner()
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=0.5,
+            collision_required=True,
+            allow_non_authoritative_collision_reset_in_dry_run=True,
+            chunk_lookahead_enabled=True,
+            plan_splice_governor_enabled=True,
+            plan_splice_clock_rebase_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        collision_planner_factory=lambda: planner,
+        clock=lambda: now["value"],
+        wall_clock=lambda: now["value"],
+    )
+    try:
+        executor.submit(
+            _filtered_bimanual_pose(0.16, 0.18),
+            _observation(sides=("left", "right")),
+            "hold_restart",
+            timestamp_monotonic=10.0,
+            discrete_command=_hand_command("left", 0.2),
+            lookahead_filtered=_filtered_bimanual_pose(0.20, 0.22),
+            lookahead_observation=_observation(sides=("left", "right")),
+            lookahead_discrete_command=_hand_command("left", 0.4),
+            source_plan_cut=_hold_restart_splice_decision().cut,
+        )
+        executor._drain_submissions()
+
+        prepared = executor.snapshot()
+        assert prepared["plan_splice_reference_query_offset_sec"] == pytest.approx(
+            0.050
+        )
+        assert prepared["plan_splice_clock_rebase_count"] == 1
+
+        executor._emit_reference(scheduled_timestamp=now["value"])
+        first = executor.snapshot()
+        first_metadata = first["last_reference"]
+        assert first_metadata["position_reference_query_monotonic_time"] == pytest.approx(
+            10.0
+        )
+        assert first_metadata["position_interpolation_alpha"] == pytest.approx(0.0)
+        assert first["plan_splice_tail_drain"]["drained"] is False
+        assert first["plan_splice_tail_drain"][
+            "terminal_discrete_drained"
+        ] is False
+        assert _position_source_tail_pending_before_synchronous_chunk_gap(executor)
+        assert _hold_active_position_stream_for_synchronous_chunk_gap(executor) is False
+
+        now["value"] += 1.0 / 15.0
+        executor._emit_reference(scheduled_timestamp=now["value"])
+        drained = executor.source_tail_drain_status()
+        assert drained["required"] is True
+        assert drained["drained"] is True
+        assert drained["reason"] == "terminal_source_emitted"
+        assert drained["terminal_discrete_drained"] is True
+
+        executor.clear()
+        reset = executor.snapshot()
+        assert reset["plan_splice_reference_query_offset_sec"] == 0.0
+        assert reset["plan_splice_tail_drain"]["required"] is False
+    finally:
+        executor.close()
+
+
 def test_chunk_lookahead_discrete_command_is_dispatched_once_per_source() -> None:
     hand_commands: list[TeleopCommand] = []
     executor = PositionDeployExecutor(
@@ -852,6 +1636,159 @@ def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
     finally:
         executor.close()
         observer.close()
+    assert planner.shutdown_calls == [pytest.approx(2.0)]
+    assert planner.prepare_staged_source_horizon_calls == 2
+
+
+def test_collision_dispatch_allows_transient_low_send_rate_receipt() -> None:
+    planner = _FakePositionCollisionPlanner()
+    commands: list[TeleopCommand] = []
+
+    def timing_degraded_dispatch(command: TeleopCommand) -> dict[str, object]:
+        commands.append(command)
+        background = {
+            "enabled": True,
+            "healthy": False,
+            "health_reasons": ["low_send_rate"],
+            "thread_alive": True,
+            "target_active": True,
+            "target_stale": False,
+            "fault": None,
+        }
+        return {
+            "accepted": True,
+            "position_dispatch_timing": {
+                "total_ms": 7.5,
+                "backend_dispatch_ms": 6.25,
+            },
+            "effectors": {
+                name: {
+                    "accepted": True,
+                    "command_type": "joint_vector",
+                    "requested_value": np.asarray(item.value, dtype=float).copy(),
+                    "final_value": np.asarray(item.value, dtype=float).copy(),
+                    "rewritten": False,
+                    "singularity_gate_status": "pass",
+                    "dispatch_timing": {"send_command_ms": 2.5},
+                    "receipt_metadata": {
+                        "target_admission_timing": {
+                            "mode": "latest_nonblocking",
+                            "total_ms": 0.4,
+                            "send_lock_wait_ms": 0.0,
+                        }
+                    },
+                }
+                for name, item in command.commands.items()
+            },
+            "arm_backend_health": {
+                "ready": True,
+                "sides": {
+                    side: {
+                        "ready": True,
+                        "reasons": [],
+                        "backend_ready": True,
+                        "state_error": None,
+                        "background_streaming": dict(background),
+                        "warnings": ["low_send_rate"],
+                    }
+                    for side in ("left", "right")
+                },
+            },
+        }
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            stale_after_sec=0.5,
+            collision_required=True,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        dispatch_callback=timing_degraded_dispatch,
+        collision_planner_factory=lambda: planner,
+    )
+    executor.start()
+    try:
+        executor.submit(
+            _filtered_bimanual_pose(0.16, 0.18),
+            _observation(sides=("left", "right")),
+            "collision_policy_timing_degraded",
+        )
+        _wait_until(lambda: executor.snapshot()["reference_count"] >= 1)
+        snapshot = executor.snapshot()
+        assert snapshot["fault_latched"] is False
+        assert commands
+        assert snapshot["last_reference"][
+            "position_arm_backend_dispatch_verified"
+        ] is True
+        assert snapshot["last_reference"][
+            "position_arm_dispatch_callback_ms"
+        ] >= 0.0
+        assert snapshot["last_reference"][
+            "position_arm_backend_dispatch_timing"
+        ]["backend_dispatch_ms"] == pytest.approx(6.25)
+        left_summary = snapshot["last_reference"][
+            "position_arm_backend_dispatch_by_effector"
+        ]["left_arm"]
+        assert left_summary["dispatch_timing"]["send_command_ms"] == pytest.approx(2.5)
+        assert left_summary["target_admission_timing"]["mode"] == "latest_nonblocking"
+    finally:
+        executor.close()
+
+
+def test_collision_dispatch_still_rejects_stale_background_target_receipt() -> None:
+    planner = _FakePositionCollisionPlanner()
+
+    def stale_target_dispatch(command: TeleopCommand) -> dict[str, object]:
+        background = {
+            "enabled": True,
+            "healthy": False,
+            "health_reasons": ["target_stale", "low_send_rate"],
+            "thread_alive": True,
+            "target_active": True,
+            "target_stale": True,
+            "fault": None,
+        }
+        return {
+            "accepted": True,
+            "effectors": {
+                name: {
+                    "accepted": True,
+                    "backend_ready": True,
+                    "command_type": "joint_vector",
+                    "requested_value": np.asarray(item.value, dtype=float).copy(),
+                    "final_value": np.asarray(item.value, dtype=float).copy(),
+                    "rewritten": False,
+                    "singularity_gate_status": "pass",
+                    "state_error": None,
+                    "background_streaming": dict(background),
+                }
+                for name, item in command.commands.items()
+            },
+        }
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            stale_after_sec=0.5,
+            collision_required=True,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        dispatch_callback=stale_target_dispatch,
+        collision_planner_factory=lambda: planner,
+    )
+    executor.start()
+    try:
+        executor.submit(
+            _filtered_bimanual_pose(0.16, 0.18),
+            _observation(sides=("left", "right")),
+            "collision_policy_stale_target",
+        )
+        _wait_until(lambda: executor.snapshot()["fault_latched"] is True)
+        with pytest.raises(
+            PositionDeployExecutorFault,
+            match="became unhealthy",
+        ):
+            executor.raise_if_fault()
+    finally:
+        executor.close()
 
 
 def test_collision_hold_fault_latches_before_arm_or_hand_dispatch() -> None:
@@ -1029,6 +1966,56 @@ def test_collision_reset_dry_run_fallback_is_explicit_and_observable() -> None:
         assert reset["authoritative"] is False
         assert reset["source"] == "dry_run_observation_state_vector"
         assert reset["real_dispatch_fallback_allowed"] is False
+    finally:
+        executor.close()
+
+
+def test_collision_reset_preflight_waits_without_mutating_planner_or_stream() -> None:
+    planner = _FakePositionCollisionPlanner()
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            collision_required=True,
+            collision_reset_measurement_max_age_sec=0.25,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        dispatch_callback=lambda command: _accepted_collision_arm_dispatch([], command),
+        collision_planner_factory=lambda: planner,
+        clock=lambda: 10.30,
+    )
+    try:
+        stale = _observation(
+            sides=("left", "right"),
+            arm_state_overrides={
+                side: {
+                    "hardware_read_timestamp_monotonic": 10.0,
+                    "measured_timestamp_monotonic": 10.0,
+                }
+                for side in ("left", "right")
+            },
+        )
+        waiting = executor.collision_reset_preflight(stale)
+        assert waiting["required"] is True
+        assert waiting["ready"] is False
+        assert "authoritative qpos is stale" in str(waiting["reason"])
+        assert planner.reset_calls == []
+        assert executor.snapshot()["submitted_count"] == 0
+
+        fresh = _observation(
+            sides=("left", "right"),
+            arm_state_overrides={
+                side: {
+                    "hardware_read_timestamp_monotonic": 10.30,
+                    "measured_timestamp_monotonic": 10.30,
+                }
+                for side in ("left", "right")
+            },
+        )
+        ready = executor.collision_reset_preflight(fresh)
+        assert ready["required"] is True
+        assert ready["ready"] is True
+        assert ready["reason"] == "fresh_collision_reset_available"
+        assert planner.reset_calls == []
+        assert executor.snapshot()["submitted_count"] == 0
     finally:
         executor.close()
 
@@ -1212,6 +2199,82 @@ def test_dispatch_fault_is_latched_and_requests_hold() -> None:
         with pytest.raises(PositionDeployExecutorFault):
             executor.submit(_filtered_pose("left", _pose(0.17)), _observation(), "unit")
         assert executor.snapshot()["fault_stage"] == "reference_worker"
+    finally:
+        executor.close()
+
+
+def test_reference_deadline_burst_faults_instead_of_catching_up() -> None:
+    hold_called = threading.Event()
+
+    def overrun_dispatch(_command: TeleopCommand) -> None:
+        time.sleep(0.060)
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=0.5,
+            max_reference_tick_skip_burst=1,
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=overrun_dispatch,
+        hold_callback=hold_called.set,
+    )
+    executor.start()
+    try:
+        executor.submit(
+            _filtered_pose("left", _pose(0.16)),
+            _observation(),
+            "deadline-overrun",
+        )
+        _wait_until(lambda: executor.snapshot()["fault_latched"])
+        assert hold_called.wait(timeout=0.5)
+        snapshot = executor.snapshot()
+        assert snapshot["fault_stage"] == "reference_worker"
+        assert snapshot["fault_type"] == "TimeoutError"
+        assert snapshot["missed_reference_ticks"] > 1
+        assert snapshot["max_reference_tick_skip_burst"] == 1
+        with pytest.raises(
+            PositionDeployExecutorFault,
+            match="deadline burst exceeded",
+        ) as exc_info:
+            executor.raise_if_fault()
+        message = str(exc_info.value)
+        assert "emit_cpu_elapsed_ms=" in message
+        assert "planner_frame_total_ms=" in message
+        assert "planner_precompute_submit_ms=" in message
+    finally:
+        executor.close()
+
+
+def test_reference_submission_drain_can_be_bounded_to_preserve_emit_deadline() -> None:
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=lambda _command: None,
+    )
+    try:
+        executor.submit(
+            _filtered_pose("left", _pose(0.16)),
+            _observation(),
+            "first",
+        )
+        executor.submit(
+            _filtered_pose("left", _pose(0.17)),
+            _observation(),
+            "second",
+        )
+
+        assert executor.snapshot()["queue_depth"] == 2
+        assert executor._drain_submissions(max_items=1) == 1
+        snapshot = executor.snapshot()
+        assert snapshot["queue_depth"] == 1
+        assert snapshot["active"] is True
+
+        assert executor._drain_submissions(max_items=1) == 1
+        assert executor.snapshot()["queue_depth"] == 0
+        assert executor._drain_submissions(max_items=1) == 0
     finally:
         executor.close()
 
@@ -1632,6 +2695,82 @@ def test_checked_real_hand_dispatch_converts_inspire_swallowed_io_error_to_fault
     assert receipt["status"] == "rejected"
 
 
+@pytest.mark.parametrize(
+    ("audit_mode", "expected_state_reads"),
+    [
+        (POSITION_REFERENCE_DISPATCH_AUDIT_POST, 1),
+        (POSITION_REFERENCE_DISPATCH_AUDIT_FULL, 3),
+    ],
+)
+def test_position_reference_dispatch_audit_mode_bounds_synchronous_state_reads(
+    audit_mode: str,
+    expected_state_reads: int,
+) -> None:
+    class CountingArmBackend:
+        def __init__(self, side: str) -> None:
+            self.side = side
+            self.ready_reads = 0
+            self.state_reads = 0
+
+        def is_ready(self) -> bool:
+            self.ready_reads += 1
+            return True
+
+        def get_state(self) -> dict[str, object]:
+            self.state_reads += 1
+            return {
+                "hardware_ready": True,
+                "emergency_stopped": False,
+                "send_result_code": 0,
+                "background_streaming": {
+                    "enabled": True,
+                    "healthy": True,
+                    "health_reasons": [],
+                    "thread_alive": True,
+                    "target_active": True,
+                    "target_stale": False,
+                    "fault": None,
+                },
+            }
+
+        def send_command(self, command: EffectorCommand) -> CommandDispatchReceipt:
+            command.metadata["singularity_metadata"] = {
+                "singularity_gate_status": "pass"
+            }
+            return CommandDispatchReceipt(
+                effector_name=f"{self.side}_arm",
+                accepted=True,
+                operation="queue_background_joint_target",
+                status="queued",
+            )
+
+    backends = {side: CountingArmBackend(side) for side in ("left", "right")}
+    command = TeleopCommand()
+    for side in ("left", "right"):
+        command.add_command(
+            EffectorCommand(
+                effector_name=f"{side}_arm",
+                side=side,
+                command_type="joint_vector",
+                value=np.full(6, 0.2, dtype=float),
+            )
+        )
+
+    result = dispatch_position_reference_command(
+        command,
+        arm_backends=backends,
+        required_sides=("left", "right"),
+        audit_mode=audit_mode,
+    )
+
+    assert result["accepted"] is True
+    assert result["position_dispatch_audit_mode"] == audit_mode
+    assert result["arm_backend_health"]["ready"] is True
+    for backend in backends.values():
+        assert backend.ready_reads == expected_state_reads
+        assert backend.state_reads == expected_state_reads
+
+
 def test_structured_dispatch_receipt_exposes_backend_joint_rewrite() -> None:
     class RewritingArmBackend:
         def is_ready(self) -> bool:
@@ -1670,6 +2809,10 @@ def test_structured_dispatch_receipt_exposes_backend_joint_rewrite() -> None:
     )
     receipt = result["effectors"]["left_arm"]
     assert result["accepted"] is True
+    assert result["dispatch_timing"]["total_ms"] >= 0.0
+    assert receipt["dispatch_timing"]["send_command_ms"] >= 0.0
+    assert receipt["dispatch_timing"]["evidence_get_state_ms"] >= 0.0
+    assert receipt["dispatch_timing"]["evidence_is_ready_ms"] >= 0.0
     assert receipt["rewritten"] is True
     assert receipt["singularity_gate_status"] == "hold_entry"
     np.testing.assert_allclose(receipt["requested_value"], np.full(6, 0.2))
@@ -1762,6 +2905,70 @@ def test_pre_hand_arm_health_gate_rejects_background_stream_fault() -> None:
         )
 
 
+def test_position_dispatch_allows_transient_low_send_rate_warning() -> None:
+    class TimingDegradedArmBackend:
+        def is_ready(self) -> bool:
+            return True
+
+        def get_state(self) -> dict[str, object]:
+            return {
+                "hardware_ready": True,
+                "background_streaming": {
+                    "enabled": True,
+                    "healthy": False,
+                    "health_reasons": ["low_send_rate"],
+                    "thread_alive": True,
+                    "target_active": True,
+                    "target_stale": False,
+                    "fault": None,
+                    "shutdown_requested": False,
+                    "shutdown_complete": False,
+                },
+            }
+
+    health = require_arm_backends_ready_for_position_dispatch(
+        {
+            "left": TimingDegradedArmBackend(),
+            "right": TimingDegradedArmBackend(),
+        },
+        require_background_target=True,
+        stage="pre_arm_reference_queue",
+    )
+
+    assert health["ready"] is True
+    assert health["sides"]["left"]["reasons"] == []
+    assert health["sides"]["left"]["warnings"] == ["low_send_rate"]
+
+
+def test_position_dispatch_rejects_unknown_background_unhealthy_state() -> None:
+    class UnknownUnhealthyArmBackend:
+        def is_ready(self) -> bool:
+            return True
+
+        def get_state(self) -> dict[str, object]:
+            return {
+                "hardware_ready": True,
+                "background_streaming": {
+                    "enabled": True,
+                    "healthy": False,
+                    "health_reasons": [],
+                    "thread_alive": True,
+                    "target_active": True,
+                    "target_stale": False,
+                    "fault": None,
+                    "shutdown_requested": False,
+                    "shutdown_complete": False,
+                },
+            }
+
+    with pytest.raises(RuntimeError, match="background_unhealthy_unknown"):
+        require_arm_backends_ready_for_position_dispatch(
+            {"left": UnknownUnhealthyArmBackend()},
+            require_background_target=True,
+            stage="pre_arm_reference_queue",
+        )
+
+
 def test_close_rejects_concurrent_submit_and_waits_for_inflight_hand_before_hold() -> None:
     hand_started = threading.Event()
     release_hand = threading.Event()
@@ -1846,6 +3053,11 @@ def test_deploy_debug_marks_position_submission_as_async_queue_not_dispatch(tmp_
             asynchronous=True,
             position_source_index=9,
         ),
+        phase_timing={
+            "before_primary_prepare_ms": 1.25,
+            "position_submit_ms": 2.5,
+            "loop_before_debug_ms": 4.0,
+        },
     )
     path = logger.path
     logger.close()
@@ -1856,6 +3068,243 @@ def test_deploy_debug_marks_position_submission_as_async_queue_not_dispatch(tmp_
     assert record["dispatch_completed"] is False
     assert record["dispatch_asynchronous"] is True
     assert record["position_source_index"] == 9
+    assert record["phase_timing"] == {
+        "before_primary_prepare_ms": 1.25,
+        "position_submit_ms": 2.5,
+        "loop_before_debug_ms": 4.0,
+    }
+
+
+def test_deploy_debug_serialization_error_does_not_disable_later_events(
+    tmp_path,
+) -> None:
+    logger = DeploymentDebugLogger(
+        enabled=True,
+        root_dir=tmp_path,
+        active_sides=("left",),
+    )
+    logger.log_event("bad_payload", {"unsupported": object()})
+    assert logger.enabled is True
+    logger.log_event("good_payload", {"value": 7})
+    path = logger.path
+    logger.close()
+
+    assert path is not None
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[0]["event"] == "debug_serialization_error"
+    assert records[0]["source_event"] == "bad_payload"
+    assert records[1]["event"] == "good_payload"
+    assert records[1]["value"] == 7
+
+
+def test_deploy_debug_compacts_repeated_policy_metadata_by_default(tmp_path) -> None:
+    large_policy_artifact = {
+        "checkpoint": "stage1/150000",
+        "manifest": "x" * 100_000,
+    }
+    action = NormalizedAction(
+        vector=np.zeros(ACTION_DIM, dtype=np.float32),
+        metadata={
+            "source": "unit",
+            "deploy_action_chunk_id": "chunk-1",
+            "remote_policy": {
+                "server": {
+                    "model_id": "writing-stage1",
+                    "policy_artifact": large_policy_artifact,
+                },
+                "server_summary": {
+                    "model_id": "writing-stage1",
+                    "checkpoint_step": "150000",
+                },
+                "policy_timing": {"infer_ms": 12.5},
+            },
+        },
+    )
+    logger = DeploymentDebugLogger(
+        enabled=True,
+        root_dir=tmp_path / "compact",
+        active_sides=("left",),
+    )
+    logger.log_policy_chunk(
+        timestamp=1.0,
+        step_index=2,
+        policy_name="unit",
+        policy_output=object(),
+        actions=[action],
+        accepted=True,
+        discarded_by_ik=False,
+        queue_policy="replace",
+        queue_len_before=0,
+        queue_len_after=1,
+        faults=[],
+    )
+    path = logger.path
+    logger.close()
+
+    assert path is not None
+    encoded = path.read_text(encoding="utf-8").strip()
+    record = json.loads(encoded)
+    remote_policy = record["actions"][0]["metadata"]["remote_policy"]
+    assert record["debug_payload_mode"] == "compact"
+    assert remote_policy["server_summary"]["checkpoint_step"] == "150000"
+    assert remote_policy["server_identity"]["model_id"] == "writing-stage1"
+    assert remote_policy["_debug_omitted_server_detail"] is True
+    assert "policy_artifact" not in remote_policy
+    assert len(encoded) < 20_000
+
+
+def test_deploy_debug_full_payload_mode_is_explicit_rollback(tmp_path) -> None:
+    action = NormalizedAction(
+        vector=np.zeros(ACTION_DIM, dtype=np.float32),
+        metadata={
+            "source": "unit",
+            "remote_policy": {
+                "server": {
+                    "model_id": "writing-stage1",
+                    "policy_artifact": {"manifest": "x" * 20_000},
+                }
+            },
+        },
+    )
+    logger = DeploymentDebugLogger(
+        enabled=True,
+        root_dir=tmp_path / "full",
+        active_sides=("left",),
+        payload_mode=DEPLOY_DEBUG_PAYLOAD_FULL,
+    )
+    logger.log_policy_chunk(
+        timestamp=1.0,
+        step_index=2,
+        policy_name="unit",
+        policy_output=object(),
+        actions=[action],
+        accepted=True,
+        discarded_by_ik=False,
+        queue_policy="replace",
+        queue_len_before=0,
+        queue_len_after=1,
+        faults=[],
+    )
+    path = logger.path
+    logger.close()
+
+    assert path is not None
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["debug_payload_mode"] == "full"
+    assert (
+        record["actions"][0]["metadata"]["remote_policy"]["server"]
+        ["policy_artifact"]["manifest"]
+        == "x" * 20_000
+    )
+
+
+def test_compact_arm_state_keeps_timing_but_drops_duplicate_command_detail() -> None:
+    state = {
+        "current_qpos": np.zeros(6, dtype=np.float32),
+        "hardware_read_phase_timing": {
+            "total_wall_ms": 15.0,
+            "total_thread_cpu_ms": 2.0,
+            "sdk_call_wall_ms": 8.0,
+        },
+        "last_command": {
+            "command_type": "joint_vector",
+            "value": np.ones(6, dtype=np.float32),
+            "execution_work_item": {"large": "x" * 20_000},
+            "metadata": {
+                "position_reference_sequence": 17,
+                "position_collision_status": "safe",
+                "position_collision_frame_total_ms": 2.5,
+                "position_collision_debug": {"large": "x" * 20_000},
+            },
+        },
+    }
+
+    compact_state = _debug_arm_state_summary({"left": state})["left"]
+    full_state = _debug_arm_state_summary(
+        {"left": state},
+        full_payload=True,
+    )["left"]
+    compact = compact_state["last_command"]
+    full = full_state["last_command"]
+
+    assert compact_state["hardware_read_phase_timing"] == state[
+        "hardware_read_phase_timing"
+    ]
+    assert full_state["hardware_read_phase_timing"] == state[
+        "hardware_read_phase_timing"
+    ]
+    assert compact["metadata"]["position_reference_sequence"] == 17
+    assert compact["metadata"]["position_collision_status"] == "safe"
+    assert compact["metadata"]["position_collision_frame_total_ms"] == 2.5
+    assert "position_collision_debug" not in compact["metadata"]
+    assert "execution_work_item" not in compact
+    assert full["metadata"]["position_collision_debug"]["large"] == "x" * 20_000
+    assert full["execution_work_item"]["large"] == "x" * 20_000
+
+
+def test_compact_position_executor_event_keeps_dispatch_evidence_bounded(
+    tmp_path,
+) -> None:
+    logger = DeploymentDebugLogger(
+        enabled=True,
+        root_dir=tmp_path,
+        active_sides=("left",),
+    )
+    logger.log_event(
+        "position_executor_arm_reference_dispatch",
+        {
+            "position_reference_sequence": 21,
+            "position_collision_status": "safe",
+            "position_collision_frame_total_ms": 3.0,
+            "position_collision_debug": {
+                "q_ik_raw_by_side": {"left": [0.0] * 6},
+                "q_ref_by_side": {"left": [0.1] * 6},
+                "planner_metadata": {"large": "x" * 100_000},
+            },
+            "position_arm_backend_dispatch_by_effector": {
+                "left_arm": {
+                    "accepted": True,
+                    "status": "queued",
+                    "dispatch_timing": {"total_ms": 0.4},
+                    "background_streaming": {
+                        "healthy": True,
+                        "target_sequence": 42,
+                        "last_call_ms": 0.2,
+                        "large": "x" * 100_000,
+                    },
+                }
+            },
+            "position_arm_backend_group_health": {
+                "ready": True,
+                "sides": {
+                    "left": {
+                        "ready": True,
+                        "timing": {"total_ms": 0.1},
+                        "background_streaming": {"large": "x" * 100_000},
+                    }
+                },
+            },
+        },
+    )
+    path = logger.path
+    logger.close()
+
+    assert path is not None
+    encoded = path.read_text(encoding="utf-8").strip()
+    record = json.loads(encoded)
+    assert record["position_reference_sequence"] == 21
+    assert record["position_collision_status"] == "safe"
+    assert record["position_collision_debug"]["q_ref_by_side"]["left"] == [0.1] * 6
+    dispatch = record["position_arm_backend_dispatch_by_effector"]["left_arm"]
+    assert dispatch["dispatch_timing"]["total_ms"] == 0.4
+    assert dispatch["background_streaming"]["target_sequence"] == 42
+    assert record["position_arm_backend_group_health"]["sides"]["left"][
+        "timing"
+    ]["total_ms"] == 0.1
+    assert len(encoded) < 10_000
 
 
 def test_blocked_hand_worker_mailbox_keeps_only_latest_pending_keyframe() -> None:

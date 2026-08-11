@@ -14,7 +14,7 @@
 配套文档：
 
 - [`dexteleop_architecture_planning.md`](dexteleop_architecture_planning.md)：长期语义、控制/数据闭环和不变量；
-- [`dexteleop_architecture_visual_guide.md`](dexteleop_architecture_visual_guide.md)：当前实现、数据流、阶段依赖和缺口图；
+- [`dexteleop_architecture_visual_guide.md`](../docs/architecture/dexteleop_architecture_visual_guide.md)：当前实现、数据流、阶段依赖和缺口图；
 - [`dexteleop_rtc_landing_plan.md`](dexteleop_rtc_landing_plan.md)：异步 action chunk/RTC 的独立producer计划；
 - [`dexteleop_control_station_plan.md`](dexteleop_control_station_plan.md)：human/replay/policy与null/sim/real统一实验台；
 - 本文中的批次状态与退出条件优先于 visual guide 的摘要；visual guide 不作为新增授权或验收证据。

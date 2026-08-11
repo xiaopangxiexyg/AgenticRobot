@@ -65,6 +65,17 @@ def test_information_plan_is_deterministic_and_channel_addressable() -> None:
     assert first.requirement_for_channel("tactile.features") is None
 
 
+def test_information_plan_distinguishes_optional_from_required_context() -> None:
+    plan = CompositionInformationPlan(
+        plan_id="optional-guidance-v1",
+        context_requirements=(requirement(required=False),),
+    )
+
+    assert plan.context_channels == ("vision.features",)
+    assert plan.required_context_channels == ()
+    assert plan.optional_context_channels == ("vision.features",)
+
+
 def test_information_plan_rejects_ambiguous_or_unsupported_demands() -> None:
     with pytest.raises(ValueError, match="non-empty and unique"):
         requirement(accepted_payload_contract_hashes=())

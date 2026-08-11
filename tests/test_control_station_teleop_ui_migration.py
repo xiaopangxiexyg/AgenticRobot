@@ -148,6 +148,11 @@ def test_real_teleop_foot_pad_is_additive_to_manual_controls() -> None:
             {"episode_start", "episode_delete"},
         ),
         (
+            UmiControlState(calibration_expired=True, recording=True),
+            {"q", "episode_stop"},
+            {"umi_recalibrate", "angle_recalibrate", "episode_start"},
+        ),
+        (
             UmiControlState(
                 collection_blocked=True,
                 foot_pad_online=True,
@@ -156,6 +161,16 @@ def test_real_teleop_foot_pad_is_additive_to_manual_controls() -> None:
             ),
             {"device_retry", "task_select", "foot_pad_test_stop"},
             {"episode_start", "episode_delete", "foot_pad_test_start"},
+        ),
+        (
+            UmiControlState(dataset_reconfiguration_available=False),
+            {"episode_start", "episode_delete", "device_retry", "q"},
+            {"task_select"},
+        ),
+        (
+            UmiControlState(episode_deletion_available=False),
+            {"episode_start", "task_select", "device_retry", "q"},
+            {"episode_delete"},
         ),
     ),
 )
@@ -280,7 +295,15 @@ def test_web_ui_concurrent_episode_start_is_admitted_exactly_once() -> None:
     from control_station.web.calibration_web_ui import CalibrationWebUi
 
     ui = CalibrationWebUi(open_browser=False)
-    ui.publish(active_controls=["q", "episode_start", "episode_delete"])
+    ui.publish(
+        active_controls=[
+            "q",
+            "episode_start",
+            "episode_delete",
+            "device_retry",
+            "task_select",
+        ]
+    )
     worker_count = 8
     start_barrier = threading.Barrier(worker_count)
     accepted: list[bool] = []
@@ -306,6 +329,97 @@ def test_web_ui_concurrent_episode_start_is_admitted_exactly_once() -> None:
     assert snapshot["episode_event_status"] == "preparing"
     assert "episode_start" not in snapshot["active_controls"]
     assert "episode_delete" not in snapshot["active_controls"]
+    assert "device_retry" not in snapshot["active_controls"]
+    assert "task_select" not in snapshot["active_controls"]
+
+
+def test_web_ui_concurrent_dataset_rebind_is_admitted_exactly_once() -> None:
+    from control_station.web.calibration_web_ui import CalibrationWebUi
+
+    ui = CalibrationWebUi(open_browser=False)
+    ui.publish(
+        active_controls=[
+            "q",
+            "task_select",
+            "episode_start",
+            "episode_delete",
+            "device_retry",
+        ]
+    )
+    event = 'task_select:{"dataset_base_root":"/tmp/next"}'
+    worker_count = 8
+    start_barrier = threading.Barrier(worker_count)
+    accepted: list[bool] = []
+    result_lock = threading.Lock()
+
+    def submit() -> None:
+        start_barrier.wait()
+        result = ui.push_event(event)
+        with result_lock:
+            accepted.append(result)
+
+    threads = [threading.Thread(target=submit) for _ in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert accepted.count(True) == 1
+    assert accepted.count(False) == worker_count - 1
+    assert ui.consume_events() == [event]
+    snapshot = ui.snapshot()
+    assert "task_select" not in snapshot["active_controls"]
+    assert "episode_start" not in snapshot["active_controls"]
+    assert "episode_delete" not in snapshot["active_controls"]
+    assert "device_retry" not in snapshot["active_controls"]
+
+
+def test_web_ui_dataset_rebind_and_episode_start_share_one_pending_slot() -> None:
+    from control_station.web.calibration_web_ui import CalibrationWebUi
+
+    ui = CalibrationWebUi(open_browser=False)
+    ui.publish(
+        active_controls=[
+            "q",
+            "task_select",
+            "episode_start",
+            "episode_delete",
+            "device_retry",
+        ]
+    )
+    events = (
+        'task_select:{"dataset_base_root":"/tmp/next"}',
+        "episode_start",
+    )
+    start_barrier = threading.Barrier(len(events))
+    results: list[tuple[str, bool]] = []
+    result_lock = threading.Lock()
+
+    def submit(event: str) -> None:
+        start_barrier.wait()
+        accepted = ui.push_event(event)
+        with result_lock:
+            results.append((event, accepted))
+
+    threads = [
+        threading.Thread(target=submit, args=(event,)) for event in events
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(accepted for _, accepted in results) == 1
+    queued = ui.consume_events()
+    assert len(queued) == 1
+    assert queued[0] in events
+    snapshot = ui.snapshot()
+    assert "task_select" not in snapshot["active_controls"]
+    assert "episode_start" not in snapshot["active_controls"]
+    assert "episode_delete" not in snapshot["active_controls"]
+    assert "device_retry" not in snapshot["active_controls"]
 
 
 def test_station_web_ui_satisfies_lower_operator_ui_port_shape() -> None:

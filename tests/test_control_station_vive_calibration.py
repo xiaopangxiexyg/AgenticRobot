@@ -273,6 +273,71 @@ def test_coordinate_profile_view_has_no_target_or_home_state() -> None:
     assert not calibration.captured_home_qpos
 
 
+def test_controller_initial_latest_profile_is_loaded_for_setup_and_runtime(
+    tmp_path: Path,
+) -> None:
+    calibration = new_coordinate_calibration(active_sides=("right",))
+    calibration.set_world_to_desk(np.eye(4))
+    calibration.set_tracker_offset("right_wrist", np.eye(4))
+    saved = save_coordinate_profile(
+        calibration,
+        root=tmp_path,
+        profile_name="restart_latest",
+    )
+
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+            initial_profile=LATEST_VIVE_COORDINATE_PROFILE,
+        ),
+        source=_LiveControllerSource(("right_wrist_pose",)),
+    )
+    try:
+        state = controller.snapshot()
+        assert controller.current_profile_path == saved
+        assert state["current_profile_path"] == str(saved)
+        assert state["stage"] == "view"
+        assert state["phase"] == "completed"
+        assert state["profile"]["profile_name"] == "restart_latest"
+    finally:
+        controller.close()
+
+
+def test_controller_missing_initial_latest_preserves_first_calibration_flow(
+    tmp_path: Path,
+) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+            initial_profile=LATEST_VIVE_COORDINATE_PROFILE,
+        ),
+        source=_LiveControllerSource(("right_wrist_pose",)),
+    )
+    try:
+        state = controller.snapshot()
+        assert controller.current_profile_path is None
+        assert state["stage"] == "idle"
+        assert "首次标定" in state["message"]
+    finally:
+        controller.close()
+
+
+def test_controller_missing_explicit_initial_profile_is_not_silently_ignored(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(FileNotFoundError):
+        ViveCoordinateCalibrationController(
+            ViveCoordinateCalibrationConfig(
+                active_sides=("right",),
+                profile_dir=tmp_path,
+                initial_profile="missing-profile",
+            ),
+            source=_LiveControllerSource(("right_wrist_pose",)),
+        )
+
+
 def test_legacy_profile_migration_strips_target_and_home_state(tmp_path: Path) -> None:
     source_path = tmp_path / "legacy.json"
     source = TeleopCalibration(

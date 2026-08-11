@@ -19,6 +19,7 @@ from teleop_runtime.real_teleop.foot_pad_controls import (
     apply_live_foot_pad_topology,
     foot_pad_count_from_key_codes,
     foot_pad_progress_topology_guidance,
+    initialize_startup_foot_pad_input,
     persist_five_pedal_test_receipt,
     persisted_five_pedal_test_verified,
     resolve_special_arm_control_mode,
@@ -29,9 +30,18 @@ from control_station.real_teleop.control_availability import (
     GuiControlState,
     current_active_controls,
 )
+from control_station.real_teleop_application import (
+    build_real_teleop_progress_application,
+)
 
 
 class FootPadControlModeTests(unittest.TestCase):
+    @staticmethod
+    def _attach_progress_application(control: RealTeleopControlInput) -> None:
+        control._progress_application = build_real_teleop_progress_application(
+            control.args
+        )
+
     @staticmethod
     def _five_pedal_assignment() -> dict[str, object]:
         return {
@@ -1007,6 +1017,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control.args = SimpleNamespace(
             collection_progress_profile=object(),
         )
+        self._attach_progress_application(control)
         control.ui = SimpleNamespace(
             messages=[],
             append_message=lambda tag, message: control.ui.messages.append(
@@ -1067,6 +1078,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control.args = SimpleNamespace(
             collection_progress_profile=object(),
         )
+        self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
         control._progress_operator_intent_sequence = 0
@@ -1099,9 +1111,67 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertEqual(selected, [])
         self.assertEqual(exact_calls, [])
 
+    def test_progress_pedal_admission_is_independent_of_hidden_gui(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(collection_progress_profile=object())
+        self._attach_progress_application(control)
+        control.ui = None
+        control._progress_operator_intents = __import__("collections").deque()
+        control._progress_operator_intent_sequence = 0
+        control._progress_ui_controls = ()
+        control._progress_ui_payload = {"enabled": False}
+        control._progress_ui_transport_revision = 0
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 4
+        control.publish_progress_control_availability(
+            configured=True,
+            active_controls=["progress_failure", "progress_advance"],
+            recording_active=True,
+            phase="ACTIVE_ATTEMPT",
+            application_held=False,
+            allowed_next_step_ids=["next"],
+        )
+
+        control._handle_foot_pad_special_arm_event("init_arm_left", now=24.0)
+
+        intents = control.consume_progress_operator_intents()
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].kind, "ADVANCE_PROGRESS")
+
+    def test_progress_pedal_rejection_reports_idle_episode_reason(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(collection_progress_profile=object())
+        self._attach_progress_application(control)
+        control.ui = None
+        control._progress_operator_intents = __import__("collections").deque()
+        control._progress_operator_intent_sequence = 0
+        control._progress_ui_controls = ()
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 4
+        messages: list[str] = []
+        control._publish_progress_pedal_message = (
+            lambda message, *, now: messages.append(str(message))
+        )
+        control.publish_progress_control_availability(
+            configured=True,
+            active_controls=[],
+            recording_active=False,
+            phase="IDLE",
+            application_held=False,
+            allowed_next_step_ids=["next"],
+        )
+
+        control._handle_foot_pad_special_arm_event("init_arm_left", now=25.0)
+
+        self.assertEqual(control.consume_progress_operator_intents(), ())
+        self.assertEqual(len(messages), 1)
+        self.assertIn("当前没有活动的正式 Episode", messages[0])
+        self.assertIn("未执行 Init", messages[0])
+
     def test_five_pedal_routes_fifth_pedal_to_existing_undo_intent(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(collection_progress_profile=object())
+        self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
         control._progress_operator_intent_sequence = 0
@@ -1125,6 +1195,7 @@ class FootPadControlModeTests(unittest.TestCase):
     ) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(collection_progress_profile=object())
+        self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
         control._progress_operator_intent_sequence = 0
@@ -1179,6 +1250,7 @@ class FootPadControlModeTests(unittest.TestCase):
                 arm_control_mode=arm_control_mode,
                 collection_progress_profile=object(),
             )
+            self._attach_progress_application(control)
             control.ui = None
             control._progress_operator_intents = __import__("collections").deque()
             control._progress_operator_intent_sequence = 0
@@ -1334,6 +1406,166 @@ class FootPadControlModeTests(unittest.TestCase):
             [{"now": 12.5, "timeout_sec": 7.0, "min_samples": 12}],
         )
         self.assertIn("Init 数采标签已结束", messages[-1]["message"])
+
+    def test_startup_foot_pad_transaction_registers_live_input_and_guidance(self) -> None:
+        events = []
+
+        class Input:
+            is_online = True
+            foot_pad_count = 5
+
+            @classmethod
+            def open_online(cls):
+                events.append("open")
+                return cls()
+
+            @classmethod
+            def waiting_for_service(cls):
+                raise AssertionError("waiting fallback should not be used")
+
+            def close(self):
+                events.append("close")
+
+        progress = SimpleNamespace(
+            begin=lambda key, **details: events.append(("begin", key, details)),
+            succeed=lambda key, **details: events.append(("succeed", key, details)),
+            fail=lambda *_args, **_kwargs: self.fail("unexpected failure receipt"),
+        )
+        cleanup = SimpleNamespace(
+            add=lambda label, callback: events.append(("cleanup", label, callback))
+        )
+        ui = SimpleNamespace(
+            append_message=lambda tag, message: events.append(("ui", tag, message))
+        )
+        args = SimpleNamespace(
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            collection_progress_profile="linear",
+            collection_progress_gui=True,
+        )
+
+        source = initialize_startup_foot_pad_input(
+            args,
+            foot_pad_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            input_type=Input,
+            unavailable_error_type=FootPadUnavailableError,
+            startup_cleanup=cleanup,
+            startup_progress=progress,
+            control_ui=ui,
+            apply_live_topology=lambda _args, count: (
+                events.append(("topology", count)) or SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
+            ),
+            topology_guidance=lambda count, **_kwargs: f"guidance:{count}",
+            restore_init_after_fallback=lambda _args, **kwargs: (
+                events.append(("restore", kwargs["live_foot_pad_count"])) or (True, "restored")
+            ),
+            log=lambda tag, message: events.append(("log", tag, message)),
+        )
+
+        self.assertIsInstance(source, Input)
+        self.assertTrue(args.foot_pad_requested)
+        self.assertEqual(args.foot_pad_startup_error, "")
+        self.assertIn(("topology", 5), events)
+        self.assertIn(("restore", 5), events)
+        self.assertTrue(any(event[:2] == ("cleanup", "foot_pad") for event in events))
+        self.assertIn(("ui", "FootPad", "guidance:5"), events)
+        self.assertIn(("ui", "InitArm", "restored"), events)
+
+    def test_startup_foot_pad_transaction_installs_retryable_waiting_fallback(self) -> None:
+        events = []
+
+        class Input:
+            is_online = True
+            foot_pad_count = 4
+
+            def __init__(self, *, waiting: bool = False) -> None:
+                self.waiting = waiting
+
+            @classmethod
+            def open_online(cls):
+                source = cls()
+                events.append(("candidate", source))
+                return source
+
+            @classmethod
+            def waiting_for_service(cls):
+                source = cls(waiting=True)
+                source.is_online = False
+                events.append(("waiting", source))
+                return source
+
+            def close(self):
+                events.append(("close", self))
+
+        args = SimpleNamespace(
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            collection_progress_profile=None,
+            collection_progress_gui=False,
+        )
+        progress = SimpleNamespace(
+            begin=lambda *_args, **_kwargs: None,
+            succeed=lambda *_args, **_kwargs: self.fail("unexpected success receipt"),
+            fail=lambda key, detail, **kwargs: events.append(
+                ("fail", key, detail, kwargs)
+            ),
+        )
+
+        source = initialize_startup_foot_pad_input(
+            args,
+            foot_pad_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            input_type=Input,
+            unavailable_error_type=FootPadUnavailableError,
+            startup_cleanup=SimpleNamespace(
+                add=lambda label, callback: events.append(("cleanup", label, callback))
+            ),
+            startup_progress=progress,
+            control_ui=None,
+            apply_live_topology=lambda *_args: (_ for _ in ()).throw(
+                ValueError("unsupported live topology")
+            ),
+            topology_guidance=lambda *_args, **_kwargs: "",
+            restore_init_after_fallback=lambda _args, **kwargs: (
+                events.append(("restore", kwargs["live_foot_pad_count"])) or (False, "")
+            ),
+            log=lambda tag, message: events.append(("log", tag, message)),
+        )
+
+        candidate = next(item[1] for item in events if item[0] == "candidate")
+        self.assertTrue(candidate in [item[1] for item in events if item[0] == "close"])
+        self.assertTrue(source.waiting)
+        self.assertFalse(source.is_online)
+        self.assertEqual(args.foot_pad_startup_error, "ValueError: unsupported live topology")
+        self.assertIn(("restore", None), events)
+        self.assertTrue(any(event[:2] == ("cleanup", "foot_pad") for event in events))
+
+    def test_startup_foot_pad_transaction_keeps_manual_mode_device_free(self) -> None:
+        restored = []
+
+        class Input:
+            @classmethod
+            def open_online(cls):
+                self.fail("manual startup must not open the foot-pad device")
+
+        args = SimpleNamespace(special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_MANUAL)
+        source = initialize_startup_foot_pad_input(
+            args,
+            foot_pad_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            input_type=Input,
+            unavailable_error_type=FootPadUnavailableError,
+            startup_cleanup=SimpleNamespace(add=lambda *_args: None),
+            startup_progress=None,
+            control_ui=None,
+            apply_live_topology=lambda *_args: SPECIAL_ARM_CONTROL_MODE_MANUAL,
+            topology_guidance=lambda *_args, **_kwargs: "",
+            restore_init_after_fallback=lambda _args, **kwargs: (
+                restored.append(kwargs["live_foot_pad_count"]) or (False, "")
+            ),
+            log=lambda *_args: None,
+        )
+
+        self.assertIsNone(source)
+        self.assertFalse(args.foot_pad_requested)
+        self.assertEqual(args.foot_pad_startup_error, "")
+        self.assertEqual(restored, [None])
 
 
 if __name__ == "__main__":

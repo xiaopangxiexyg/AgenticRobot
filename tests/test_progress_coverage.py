@@ -32,7 +32,7 @@ from dataset_interface.progress_timeline import (
 )
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.contract]
 
 
 def _progress_profile() -> TaskProgressProfileV1:
@@ -284,6 +284,7 @@ def test_coverage_requires_exact_sealed_capture_binding() -> None:
         )
 
 
+@pytest.mark.integration
 def test_catalog_is_wal_queryable_and_rebuildable_after_deletion(
     tmp_path: Path,
 ) -> None:
@@ -318,6 +319,7 @@ def test_catalog_is_wal_queryable_and_rebuildable_after_deletion(
         assert rebuilt.list_attempts() == first_attempts
 
 
+@pytest.mark.integration
 def test_catalog_replace_is_atomic_and_rejects_duplicate_rebuild_keys(
     tmp_path: Path,
 ) -> None:
@@ -333,6 +335,7 @@ def test_catalog_replace_is_atomic_and_rejects_duplicate_rebuild_keys(
         assert catalog.list_attempts() == before
 
 
+@pytest.mark.integration
 def test_catalog_keys_same_annotation_set_id_by_exact_manifest(
     tmp_path: Path,
 ) -> None:
@@ -358,6 +361,7 @@ def test_catalog_keys_same_annotation_set_id_by_exact_manifest(
         ) == 1
 
 
+@pytest.mark.integration
 def test_catalog_can_be_recreated_from_views_without_source_mutation(
     tmp_path: Path,
 ) -> None:
@@ -378,6 +382,7 @@ def test_catalog_can_be_recreated_from_views_without_source_mutation(
         assert len(catalog.list_attempts()) == len(view.attempts)
 
 
+@pytest.mark.integration
 def test_catalog_wal_replacement_preserves_an_active_reader_snapshot(
     tmp_path: Path,
 ) -> None:

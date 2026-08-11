@@ -33,6 +33,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hardware.DMTAC_gripper.examples import identify_gripper_actuator as collector
+from project_paths import teleop_records_root
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    ArtifactWriteResolution,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
 from sim.rm65.real2sim import gripper_position_fit as fitter
 
 
@@ -43,6 +52,62 @@ SIDE_CONFIRMATIONS = {
     "right": "RIGHT_GRIPPER_PATH_CLEAR",
 }
 SIDES = ("left", "right")
+ARTIFACT_KIND = "dmtac_gripper_position_suite"
+
+
+def legacy_output_root() -> Path:
+    """Return the compatibility-layout write root owned by teleop records."""
+
+    return teleop_records_root() / "gripper_position_suite"
+
+
+def archived_logs_output_root() -> Path:
+    """Return the read-only location of suites archived from the former logs root."""
+
+    return PROJECT_ROOT / "legacy" / "logs" / "gripper_position_suite"
+
+
+def canonical_output_family_root() -> Path:
+    return RuntimeArtifactLayout.configured().run_family_dir(kind=ARTIFACT_KIND)
+
+
+def canonical_output_root(*, date_partition: str | None = None) -> Path:
+    partition = date_partition or datetime.now().astimezone().date().isoformat()
+    return RuntimeArtifactLayout.configured().run_partition_dir(
+        kind=ARTIFACT_KIND,
+        date_partition=partition,
+    )
+
+
+def resolve_output_root(
+    args: argparse.Namespace,
+    *,
+    date_partition: str | None = None,
+) -> ArtifactWriteResolution:
+    """Resolve one suite parent; an explicit path always takes precedence."""
+
+    return resolve_artifact_write_path(
+        explicit_path=getattr(args, "output_root", None),
+        artifact_layout=getattr(args, "artifact_layout", None),
+        legacy_path=legacy_output_root(),
+        canonical_path=canonical_output_root(date_partition=date_partition),
+    )
+
+
+def recovery_journal_roots(
+    args: argparse.Namespace,
+    *,
+    suite_root: Path,
+) -> tuple[Path, ...]:
+    """Cover standalone and suite journals across both storage layouts."""
+
+    return collector.recovery_journal_roots(
+        legacy_output_root(),
+        archived_logs_output_root(),
+        canonical_output_family_root(),
+        resolve_output_root(args).path,
+        suite_root,
+    )
 
 
 @dataclass(frozen=True)
@@ -249,11 +314,7 @@ def _preflight_suite(
     """Run read-only cross-phase checks before either side may move."""
 
     endpoints = _resolved_endpoints(args)
-    journal_roots = (
-        PROJECT_ROOT / "logs" / "gripper_actuator_identification",
-        args.output_root.expanduser().resolve(),
-        suite_root,
-    )
+    journal_roots = recovery_journal_roots(args, suite_root=suite_root)
     unfinished: list[Path] = []
     occupied: dict[str, list[dict[str, Any]]] = {}
     for side, endpoint in endpoints.items():
@@ -491,7 +552,9 @@ def _start_or_resume_suite(
     if args.resume_suite is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         suite_id = f"dmtac_bimanual_position_{timestamp}"
-        suite_root = args.output_root.expanduser().resolve() / suite_id
+        output_resolution = resolve_output_root(args)
+        output_root = output_resolution.path.resolve()
+        suite_root = output_root / suite_id
         suite_root.mkdir(parents=True, exist_ok=False)
         manifest_path = suite_root / "suite_manifest.json"
         plan_path = suite_root / "suite_plan.json"
@@ -503,6 +566,12 @@ def _start_or_resume_suite(
             "normal_completion": False,
             "started_wall_time_ns": time.time_ns(),
             "suite_root": str(suite_root),
+            "artifact_storage": {
+                "requested_layout": getattr(args, "artifact_layout", None),
+                "selection_source": output_resolution.source,
+                "resolved_layout": output_resolution.layout_name,
+                "resolved_output_root": str(output_root),
+            },
             "plan": plan_payload,
             "resolved_endpoints": None,
             "environment": {
@@ -716,7 +785,24 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--output-root",
             type=Path,
-            default=PROJECT_ROOT / "logs" / "gripper_position_suite",
+            default=None,
+            help=(
+                "Exact suite parent. When provided it overrides --artifact-layout; "
+                "otherwise the validated local managed-layout default is used."
+            ),
+        )
+        subparser.add_argument(
+            "--artifact-layout",
+            choices=(
+                LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+                RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+            ),
+            default=configured_runtime_artifact_layout(),
+            help=(
+                "Select the managed output layout when --output-root is omitted. "
+                "The repository default is legacy; local_paths.json can coordinate "
+                "a project-wide canonical cutover."
+            ),
         )
         if name == "run":
             subparser.add_argument("--apply", action="store_true")

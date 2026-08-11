@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import threading
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,6 +12,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from control_station import sim_hil as sim_hil_module
 from control_station.composition import MujocoSimHILReadinessEvidence
 from control_station.sim_hil import (
     DEFAULT_VIVE_COORDINATE_PROFILE,
@@ -24,7 +27,8 @@ from control_station.sim_hil import (
     _vive_receiver_status,
     build_arg_parser,
 )
-from control_station.sim_hil_gui import SimHILStatusServer
+from control_station.sim_hil_gui import SimHILStatusServer, _HTML
+from control_station.sim_hil_profile.status import _human_channel_status
 from control_station.vive_calibration import (
     ViveCoordinateCalibrationController,
 )
@@ -33,11 +37,25 @@ from control_station.vive_calibration_profiles import (
     save_coordinate_profile,
 )
 from robot_motion.action import (
+    AuthoritativeControlStep,
     TargetExecutionStageStatus,
     TargetExecutionStatusSnapshot,
 )
 from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
+from teleop_runtime.schemas import ObservationChannel
 from teleop_runtime.sources.pose.vive import VivePoseSource, ViveTrackerConfig
+
+
+class _ElementIdParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: list[str] = []
+
+    def handle_starttag(self, tag, attrs) -> None:
+        del tag
+        attributes = dict(attrs)
+        if "id" in attributes:
+            self.ids.append(attributes["id"])
 
 
 def _single_vive_sender_packet() -> bytes:
@@ -64,6 +82,38 @@ def _single_vive_sender_packet() -> bytes:
             ],
         }
     ).encode("utf-8")
+
+
+def test_human_channel_status_exposes_angle_trigger_read_failure() -> None:
+    channel = ObservationChannel(
+        channel_name="right_angle_trigger",
+        capability="scalar",
+        side="right",
+        value=0.25,
+        frame_name=None,
+        timestamp=10.0,
+        source_name="angle_trigger",
+        valid=False,
+        metadata={
+            "read_error": "AngleTriggerError: delayed response",
+            "reader_error_count": 7,
+        },
+    )
+
+    status = _human_channel_status(
+        SimpleNamespace(
+            session_step=SimpleNamespace(
+                channels={"right_angle_trigger": channel}
+            )
+        ),
+        now=10.1,
+    )
+
+    assert status["right_angle_trigger"]["valid"] is False
+    assert status["right_angle_trigger"]["read_error"] == (
+        "AngleTriggerError: delayed response"
+    )
+    assert status["right_angle_trigger"]["reader_error_count"] == 7
 
 
 def test_sim_hil_vive_status_shows_both_sender_roles_before_mapping() -> None:
@@ -143,9 +193,70 @@ def test_sim_hil_rate_config_keeps_compose_rate_explicit_and_legacy_alias() -> N
         )
 
 
+def test_allocation_gui_uses_distinct_typed_start_and_button_intents() -> None:
+    assert 'id="start-allocation-runtime"' in _HTML
+    assert "submitIntent('start_allocation_runtime')" in _HTML
+    assert "submitIntent('start_runtime', 'proportional_blend', 0.5)" not in _HTML
+    assert "acceptance.allocation_runtime_enabled" in _HTML
+    assert "if (!allocationProfile)" in _HTML
+    assert "value.control_profile_id ===" not in _HTML
+    assert 'id="allocation-automatic"' in _HTML
+    assert 'id="allocation-base-only"' in _HTML
+    assert 'id="allocation-relative-overlay"' in _HTML
+    assert 'id="allocation-absolute-overlay-owner" hidden' in _HTML
+    assert "supportedAllocationSignals.has(signalName)" in _HTML
+    assert 'id="allocation-rebase-and-clear"' in _HTML
+
+
+def test_control_gui_prioritizes_operator_workflow_over_raw_diagnostics() -> None:
+    assert 'id="operator-guidance"' in _HTML
+    assert 'id="operator-primary-action"' in _HTML
+    assert 'id="operator-blockers"' in _HTML
+    assert 'id="operator-error"' in _HTML
+    assert 'id="operator-diagnostics" class="diagnostics-panel"' in _HTML
+    assert "renderOperatorGuidance(value)" in _HTML
+    assert "operatorPhaseNames[guidance.phase]" in _HTML
+    assert "starting ? uiValue('STARTING')" in _HTML
+    assert "window.confirm(message)" in _HTML
+
+
+def test_control_gui_renders_read_only_admitted_human_deflection() -> None:
+    assert 'id="human-deflection-panel"' in _HTML
+    assert 'id="human-deflection-status"' in _HTML
+    assert 'id="human-deflection-views"' in _HTML
+    assert "renderHumanDeflection(human.relative_deflection || {})" in _HTML
+    assert "固定量程 ±120 mm" in _HTML
+    assert "该视图只读，不参与控制" in _HTML
+
+
+def test_allocation_gui_has_profile_specific_chinese_operator_copy() -> None:
+    assert "动态分配以策略基线启动" in _HTML
+    assert "首次进入 Human 模式时接入" in _HTML
+    assert "纯 PPO 不要求 VIVE 先就绪" in _HTML
+    assert ">自动分配</button>" in _HTML
+    assert ">仅策略基线</button>" in _HTML
+    assert ">人类相对修正</button>" in _HTML
+    assert ">重新定基并清除修正</button>" in _HTML
+    assert "可在 VIVE 尚未就绪时独立启动" in _HTML
+    assert "按固定 α 融合人类与策略，不使用动态分配规则" in _HTML
+    assert 'id="rebuild-runtime" class="danger"' in _HTML
+    assert 'id="finalize-capture" class="danger"' in _HTML
+    assert "本周期实际选择" in _HTML
+
+
+def test_control_gui_dom_ids_are_unique_and_all_js_targets_exist() -> None:
+    parser = _ElementIdParser()
+    parser.feed(_HTML)
+
+    assert len(parser.ids) == len(set(parser.ids))
+    javascript_targets = set(re.findall(r"\$\('([^']+)'\)", _HTML))
+    assert javascript_targets <= set(parser.ids)
+
+
 def test_sim_hil_rate_cli_exposes_profile_and_compose_cadence() -> None:
     default_config = _config_from_args(build_arg_parser().parse_args([]))
     assert default_config.compose_target_hz == 30.0
+    assert default_config.blend_failure_grace_sec == pytest.approx(0.0)
 
     args = build_arg_parser().parse_args(
         [
@@ -164,6 +275,11 @@ def test_sim_hil_rate_cli_exposes_profile_and_compose_cadence() -> None:
     legacy_config = _config_from_args(legacy_args)
     assert legacy_config.compose_target_hz == 45.0
     assert legacy_config.control_rate_hz == 45.0
+
+    grace_config = _config_from_args(
+        build_arg_parser().parse_args(["--blend-failure-grace", "0.35"])
+    )
+    assert grace_config.blend_failure_grace_sec == pytest.approx(0.35)
 
 
 def test_policy_only_gui_setup_survives_vive_receiver_start_failure(
@@ -188,6 +304,40 @@ def test_policy_only_gui_setup_survives_vive_receiver_start_failure(
     setup.close()
 
 
+def test_sim_hil_setup_controller_receives_selected_initial_profile(
+    monkeypatch,
+) -> None:
+    constructed = []
+
+    class FakeController:
+        def __init__(self, config):
+            self.config = config
+            self.source = SimpleNamespace()
+            self.started = False
+            constructed.append(self)
+
+        def start(self, *, start_source=True):
+            assert start_source is True
+            self.started = True
+
+    monkeypatch.setattr(
+        "control_station.vive_calibration.ViveCoordinateCalibrationController",
+        FakeController,
+    )
+    selected = Path("explicit-coordinate-profile.json")
+
+    setup = _build_sim_hil_vive_setup_controller(
+        MujocoSimHILApplicationConfig(
+            vive_coordinate_profile_path=selected,
+        ),
+        source_role="right_wrist",
+    )
+
+    assert setup is constructed[0]
+    assert setup.config.initial_profile == selected
+    assert setup.started is True
+
+
 def test_sim_hil_control_gui_cli_is_explicit_and_has_a_capture_root() -> None:
     args = build_arg_parser().parse_args(
         [
@@ -204,6 +354,7 @@ def test_sim_hil_control_gui_cli_is_explicit_and_has_a_capture_root() -> None:
     assert args.acceptance_gui is True
     assert args.open_browser is True
     assert str(args.acceptance_root) == "/tmp/sim-hil-acceptance"
+    assert args.artifact_layout == "legacy"
     assert args.acceptance_device_timeout == 4.5
     assert _config_from_args(args).mujoco_viewer_enabled is True
     assert (
@@ -238,6 +389,80 @@ def test_sim_hil_control_gui_cli_is_explicit_and_has_a_capture_root() -> None:
     )
     assert compatibility_args.acceptance_gui is True
     assert build_arg_parser().parse_args(["--no-open-browser"]).open_browser is False
+
+
+def test_sim_hil_acceptance_root_defaults_to_legacy_without_creation() -> None:
+    args = build_arg_parser().parse_args([])
+
+    resolution = sim_hil_module.resolve_acceptance_root(args)
+
+    assert args.acceptance_root is None
+    assert resolution.path == sim_hil_module.legacy_acceptance_root()
+    assert resolution.source == "legacy"
+
+
+def test_sim_hil_acceptance_root_supports_explicit_canonical_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = tmp_path / "canonical-evidence"
+    monkeypatch.setattr(
+        sim_hil_module,
+        "canonical_acceptance_root",
+        lambda: canonical,
+    )
+    args = build_arg_parser().parse_args(
+        ["--artifact-layout", "runtime-artifacts-v1"]
+    )
+
+    resolution = sim_hil_module.resolve_acceptance_root(args)
+
+    assert resolution.path == canonical
+    assert resolution.source == "canonical"
+    assert not canonical.exists()
+
+
+def test_explicit_sim_hil_acceptance_root_wins_over_layout(tmp_path: Path) -> None:
+    explicit = tmp_path / "exact"
+    args = build_arg_parser().parse_args(
+        [
+            "--artifact-layout",
+            "runtime-artifacts-v1",
+            "--acceptance-root",
+            str(explicit),
+        ]
+    )
+
+    resolution = sim_hil_module.resolve_acceptance_root(args)
+
+    assert resolution.path == explicit
+    assert resolution.source == "explicit"
+
+
+def test_sim_hil_acceptance_storage_receipt_is_session_scoped(
+    tmp_path: Path,
+) -> None:
+    session_root = tmp_path / "meta" / "control_trace" / "sessions" / "session-1"
+    session_root.mkdir(parents=True)
+    resolution = sim_hil_module.ArtifactWriteResolution(
+        path=tmp_path,
+        source="canonical",
+        layout_name="runtime-artifacts-v1",
+    )
+
+    receipt = sim_hil_module._write_acceptance_storage_receipt(
+        session_root=session_root,
+        resolution=resolution,
+        requested_layout="runtime-artifacts-v1",
+    )
+
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert receipt.parent == session_root
+    assert payload["schema"] == (
+        "dexteleop.control_station.sim_hil_acceptance_storage.v1"
+    )
+    assert payload["selection_source"] == "canonical"
+    assert payload["evidence_semantics"] == "control_trace_wal_seal_commit"
 
 
 def test_control_profile_base_alpha_is_only_a_factory_fallback() -> None:
@@ -926,6 +1151,43 @@ def test_application_latches_when_lower_gate_holds_or_hold_transition_fails() ->
     assert app._last_error == "RuntimeError:lower hold failed"
 
 
+def test_application_does_not_latch_on_target_lifecycle_skip() -> None:
+    runtime = SimpleNamespace(
+        clock=lambda: 10.0,
+        config=SimpleNamespace(decision_hz=60.0),
+        reference_activation_spec=SimpleNamespace(
+            target_lead_time_sec=1.0 / 30.0
+        ),
+        capture_execution_gate_snapshot=lambda *, now: SimpleNamespace(
+            status="ready"
+        ),
+        next_decision_due_at=None,
+    )
+    cycle = SimpleNamespace(
+        execution=AuthoritativeControlStep(
+            status="target_lifecycle_rejected_keep_existing"
+        )
+    )
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=runtime,
+        composition=SimpleNamespace(
+            step=lambda **_kwargs: cycle,
+        ),
+        policy_source=SimpleNamespace(step=lambda *, now: None),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app._started = True
+
+    assert app.step(now=10.0) is cycle
+    assert app._held is False
+    assert app._last_error is None
+
+
 def test_application_turns_native_viewer_close_into_hold_and_exit_request() -> None:
     holds: list[str] = []
     runtime = SimpleNamespace(
@@ -1461,7 +1723,10 @@ def test_sim_hil_acceptance_endpoint_is_tokened_and_only_submits_intents() -> No
         assert b"set_control_mode" in body
         assert b"set_blend_failure_fallback" in body
         assert b'id="blend-failure-fallback"' in body
+        assert b'id="blend-failure-grace"' in body
+        assert b"blend_failure_grace_sec" in body
         assert "应用回退源".encode("utf-8") in body
+        assert "静止始终立即生效".encode("utf-8") in body
         assert "Sim-HIL 控制与 VIVE 标定".encode("utf-8") in body
         assert b'id="begin-vive-calibration"' in body
         assert b'id="capture-vive-calibration"' in body

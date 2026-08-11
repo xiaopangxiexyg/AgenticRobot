@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import tempfile
 import unittest
@@ -109,6 +110,13 @@ class TactileCompactTest(unittest.TestCase):
             self.assertEqual(spec["frame_count"], 5)
             self.assertEqual(spec["encoding"], "chunked_delta_zstd")
             self.assertTrue(spec["tactile_compaction"]["frequency_preserved"])
+            compact_payload = root / spec["path"]
+            self.assertEqual(spec["stored_size_bytes"], compact_payload.stat().st_size)
+            self.assertEqual(
+                spec["stored_sha256"],
+                hashlib.sha256(compact_payload.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(spec["stored_hash_profile"], "stored_bytes_sha256_v1")
             self.assertEqual(manifest["frames"][0]["shapes"]["raw_sensor"], [120, 160])
             self.assertEqual(manifest["frames"][0]["source_shapes"]["raw_sensor"], [480, 640])
 
@@ -150,6 +158,11 @@ class TactileCompactTest(unittest.TestCase):
             self.assertEqual(spec["tactile_compaction"]["profile"], FORCE_PROFILE_V1)
             self.assertEqual(spec["dtype"], "float32")
             self.assertEqual(spec["storage_dtype"], "int16")
+            compact_payload = root / spec["path"]
+            self.assertEqual(
+                spec["stored_sha256"],
+                hashlib.sha256(compact_payload.read_bytes()).hexdigest(),
+            )
             reader = ChunkedTactileStream(dataset_root=root, spec=spec)
             restored = np.stack([reader.frame(index) for index in range(3)])
             self.assertEqual(restored.dtype, np.float32)

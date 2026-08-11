@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from robot_motion.arm_init import (
     ArmQposTransitionConfig,
@@ -34,6 +35,7 @@ def test_generic_slow_qpos_transition_plans_rate_limited_steps() -> None:
     np.testing.assert_allclose(plan.final_qpos_by_side["arm"], np.deg2rad([25.0, -5.0]))
 
 
+@pytest.mark.integration
 def test_common_qpos_loader_accepts_target_schema(tmp_path: Path) -> None:
     path = tmp_path / "target.json"
     save_qpos_target(QposTargetSpec.from_qpos_by_side({"right": np.ones(6) * 0.1}), path)
@@ -43,6 +45,7 @@ def test_common_qpos_loader_accepts_target_schema(tmp_path: Path) -> None:
     np.testing.assert_allclose(loaded["right"], np.ones(6) * 0.1)
 
 
+@pytest.mark.integration
 def test_rm65_qpos_init_cli_writes_slow_plan_from_target_schema(tmp_path: Path) -> None:
     current_path = tmp_path / "current.json"
     target_path = tmp_path / "target.json"

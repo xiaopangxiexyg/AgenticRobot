@@ -38,7 +38,7 @@ from dataset_contracts.progress_profile import (
 )
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.integration, pytest.mark.contract]
 
 
 def _context(index: int, at: float | None = None) -> ProgressRequestContext:

@@ -84,6 +84,10 @@
   `dataset_interface.progress_stages` 派生索引：Failure 排除从当前失败 stage occurrence
   起点到原始 Failure cut，Retry 继续同一 stage；whole-Episode abnormal 只改变默认
   training eligibility，不删除原始数据或已有标注；
+- Control Station 已将失败 Attempt 的细阶段编辑改为显式选择 terminal failed stage：
+  application 按 profile 生成成功前缀，并确定性重排同一 coarse step 的 Retry suffix，
+  不再由浏览器局部 split 留下错序标签；GUI 的用户保存路径统一为“校验并封存”，切换
+  Episode/数据集时只能选择封存、放弃或取消，旧 draft 仅保留为内部兼容缓存；
 
 ## 0. 数据采集目标优先于架构
 
@@ -141,6 +145,135 @@ step 结束时才能推断 full-task success。数采员不需要额外按“成
 - p1 -> p2 只能通过显式 migration adapter 和 receipt；
 - p2 默认关闭，不改变 v2.3、LeRobot v2.1、RealTeleop 或 UMI 默认输出；
 - v2.4 合并完成前继续保持 `native_v25_eligible=false`。
+
+### 2.1 兼容性验收目标（2026-08-03 补充）
+
+后续兼容性不能只按“p2 是否能读取自身 artifact”验收，必须同时满足三类独立目标：
+
+1. **v2.3 基础混合训练**：p2-enabled Episode 忽略 Progress/Stage sidecar 后，仍可按
+   兼容的 v2.3 action/state/pose-frame 合同与普通 v2.3 Episode 一起训练；这条路径不应
+   强制应用 p2 Failure/异常排除，也不能要求改写原始 Parquet 或视频。
+2. **v2.3 后期升级为 p2**：普通 v2.3 Episode 可通过显式的 retrospective 标注和
+   migration receipt 补齐稳定 Episode identity、Progress profile/binding、coarse
+   timeline、可选 Stage/Failure/Recovery 语义，再进入 p2 reader/prepared view。迁移
+   不得把后标注伪装成在线按钮、Hold/Pause receipt，也不得静默猜测缺失事实。当前只
+   完成了合同边界，端到端 migration adapter 与旧数据粗进度标注入口尚未落地。
+3. **跨 Profile 的公共子任务复用**：一个较大任务 Profile 中经过证明等价的 Progress
+   Step/Stage 子图，应能显式投影成较小 Profile 的训练数据。例如 writing 5-step 中
+   真正等价的 3 个 Step 可以参与 writing 3-step 的对应策略训练。兼容性不能只比较完整
+   Profile hash，也不能只因 `progress_step_id` 或显示名相同就判定等价；必须由显式、
+   可验证、带 receipt 的 profile projection 证明 Step 定义、Stage 语义、动作/本体合同、
+   entry/exit condition 和时间区间均兼容。当前 dataset-wide profile 唯一绑定继续保持，
+   跨 Profile 复用只发生在只读训练投影视图，不反向改写源数据集身份。
+
+跨 Profile 兼容必须是非破坏性的硬约束：不得从源 Profile、源 Stage profile 或源
+Episode 删除 Step/Stage，不得裁剪或覆盖源 Parquet、视频、Progress facts、annotation
+set 和 manifest，不得重编号原始 sample/Attempt，也不得把跳过的中间任务区间拼接成一段
+伪连续轨迹。投影只能追加独立的 selection/projection spec、派生 interval/anchor 和
+可验证 receipt；被省略的区间在派生视图中保留为明确 discontinuity。删除派生视图后，
+必须能够从未修改的源数据和 projection spec 完整重建。
+
+当前第 1 项可通过原 v2.3 loader/训练清单实现；第 2 项仍是明确缺口。第 3 项的第一版已
+落地：`dataset_contracts.progress_skill_projection` 定义最小 Skill、显式 source
+Progress/Stage→Skill projection 和逐 Episode receipt；`dataset_interface` 负责 hash、
+Stage subset、谓词/component/context 验证与只读 sample interval 投影；prepared training
+view 通过显式 `SkillProjectionCatalog + target_skill_id` 可选启用，默认严格同 Profile
+行为不变。Writing 3/4/5 的审核映射保存在
+`dataset_interface/skill_projection_assets/writing_v1.json`。
+
+该第一版只解决“单个公共子任务 VLA 的跨 Profile 训练区间”，尚未实现 profile-less
+v2.3 升级、多个 Skill 的 task-level 重排或跨 omission 拼接。`right_acquire_brush` 的
+共同 `approach + grasp` 只按 `STAGE_SUBSET` 复用；`lift_ready` 与
+`lift_and_present` 继续使用不同 Skill identity；`right_write` 保留前序差异为条件上下文，
+`right_return_brush` 可精确复用。
+
+### 2.2 跨 Profile 投影实现前的确认状态
+
+已确认：上下文采用 2.3 节的最小充分上下文模型；`lift_ready` 与
+`lift_and_present` 默认按不同目标/出口状态处理，不将完整 `right_acquire_brush` 静默
+视为等价。只有 projection 显式选择共同 Stage subset，或未来目标 VLA 显式接收不同目标
+条件时，才允许对应级别的复用。
+
+以下两项已确认：
+
+1. **投影目标粒度**：第一版只把等价 Step/Stage interval 加入对应单子任务 VLA 的训练
+   集合；不把 5-step 的公共 Step 重新解释成一条 3-step task-level Episode，不跨被省略
+   Step 拼接。
+2. **公共训练目标身份**：多个 source Step 映射到一个独立于任务拓扑的最小公共 Skill/
+   子任务训练合同，不采用 3↔4↔5 的 O(N²) 成对 Profile 映射。该合同只冻结训练所需的
+   核心技能 ID、受控 action/component、入口/出口谓词与可条件化字段，不复制完整任务
+   Profile。
+
+至此，跨 Profile 投影开始实现前已无阻塞性语义未决项；任何后来新增的上下文放宽都必须
+通过新 projection/Skill Contract 版本显式表达，不能修改上述默认规则。
+
+不需要额外确认即可采用的安全默认值：
+
+- 源 dataset/profile/annotation 永久不变，投影只生成可重建派生视图；
+- 同名 `progress_step_id`、`semantic_type`、display name 或 Stage ID 均不自动证明等价；
+- omission 一律产生 continuity break，任何 action chunk/window 不得跨断点；
+- Failure、Retry、Recovery、异常区间和 annotation-set selection 原样继承，投影不能把
+  失败片段变成 nominal；
+- 已封存旧 Profile 不原地修改或重算 hash；语义修正使用新 Profile 版本或显式 projection；
+- 纯 projection contract 属于 `dataset_contracts`，只读规划/验证和 prepared-view 集成属于
+  `dataset_interface`，`collection_runtime` 与 `control_station` 不承担训练投影所有权；
+- receipt 至少绑定源 Profile/Stage hash、目标 Skill Contract hash、源 Episode/annotation
+  hash、Step/Stage 映射、
+  action/component coverage、entry/exit 条件、保留区间和 continuity breaks。
+
+### 2.3 推荐的“核心技能 + 最小充分上下文”兼容模型
+
+跨 Profile 复用不应要求完整任务历史一致，也不能完全忽略上下文。投影只比较会改变当前
+策略输入、动作含义或成功条件的最小充分上下文，并把其余信息保留为 provenance：
+
+```text
+核心技能语义
+  + 受控 action/component contract
+  + 必需入口状态谓词
+  + 目标/成功状态谓词
+  + 可作为模型条件的上下文
+  + source provenance（不参与等价判定）
+```
+
+上下文字段分为四类：
+
+1. **硬条件**：对象身份、受控组件、action schema、目标/成功条件等；不一致则不能投影。
+2. **入口/出口状态谓词**：比较边界时的状态，而不是要求此前走过相同 Step 历史。例如
+   `brush_grasped=true`、`brush_ready_for_writing=true`；通过不同历史达到同一入口状态仍可
+   复用。
+3. **可条件化差异**：目标位姿、视觉场景、起始姿态范围等只有在目标 VLA 的 observation/
+   instruction 能看见或显式接收时才允许变化；否则它们仍是硬条件。
+4. **只读 provenance**：源 Profile、ordinal、此前经过的 Step、日期和采集批次等永久
+   保留用于审计，但默认不阻止单子任务复用。
+
+兼容性按用途分级，不能用一个全局布尔值：
+
+- `EXACT_STEP`：完整 Step 的核心技能、入口/出口和受控组件一致，可进入同一个固定目标
+  子任务策略训练；
+- `CONDITIONED_STEP`：核心技能一致但目标或允许上下文不同，只有目标策略显式接收对应条件
+  时可合并；
+- `STAGE_SUBSET`：只复用有连续 sample 区间且已证明相同的 Stage 前缀/后缀，不宣称完整
+  Step 成功；
+- `INCOMPATIBLE`：成功条件、不可见上下文或动作含义冲突，拒绝投影。
+
+Writing 示例按该模型解释：
+
+- `right_acquire_brush.approach` 和 `.grasp` 是共同连续前缀；
+- 3-step 的 `lift_ready` 目标是“进入可直接书写的准备状态”；
+- 4/5-step 的 `lift_and_present` 目标是“进入左手可取盖的交接状态”；
+- 若 acquisition VLA 是固定目标策略，两条完整 Step 不等价，只能作为 `STAGE_SUBSET`
+  共享 approach/grasp；若未来 VLA 显式接收目标谓词或 instruction，则可以审查为
+  `CONDITIONED_STEP`，但不能静默合并；
+- `right_write` 不要求此前历史相同，只要求入口时确实满足诸如“毛笔已正确抓持、已达到
+  书写准备状态、墨量满足任务要求”等状态谓词。取盖/沾墨来自此前 Step 还是 scenario
+  setup 属于 provenance；如果这些状态无法从数据或标注明确，就不能假定兼容；
+- `right_return_brush` 同理，以“毛笔在手”和“目标放回位置/成功条件一致”为核心，不要求
+  此前一定执行过哪种书写流程。
+
+第一版不要求新增在线传感器或把所有状态谓词写成逐帧列。Profile projection 可以先用
+人工维护、hash 绑定的边界条件声明，并把不能验证的条件标为 `UNKNOWN` 后 fail closed；
+未来触觉接触、视觉状态或其他机制性判断成熟后，再作为可验证 evidence 接入同一条件，
+而不更改源 Profile 或历史数据。
 
 ## 3. 在线粗进度的精确定义
 

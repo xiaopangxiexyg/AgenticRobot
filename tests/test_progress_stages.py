@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import json
+import multiprocessing
 from pathlib import Path
 
 import pytest
@@ -18,11 +21,13 @@ from dataset_contracts.progress_profile import (
 )
 from dataset_contracts.progress_stage_annotations import (
     AbnormalIntervalAnnotationV1,
+    CaptureEndStepAnnotationV1,
     EpisodeAbnormalAnnotationV1,
     EpisodeReviewRequestAnnotationV1,
     StageAnnotationBundleV1,
     StageAnnotationSetBindingV1,
     StageOccurrenceAnnotationV1,
+    capture_end_projected_attempt_id,
 )
 from dataset_contracts.progress_stages import (
     ProgressStageContractError,
@@ -37,6 +42,20 @@ from dataset_interface.progress_timeline import (
     ResolvedProgressTimeline,
 )
 from dataset_interface.sample_axis import EpisodeSampleAxis
+
+
+def _hold_episode_annotation_lock(
+    dataset_root: str,
+    ready: object,
+    release: object,
+) -> None:
+    with DatasetStageAnnotationWorkspace(
+        dataset_root,
+        annotator_id="child-process",
+    ) as workspace:
+        workspace.acquire_episode(episode_uuid="episode-cross-process")
+        ready.set()  # type: ignore[attr-defined]
+        release.wait(timeout=5.0)  # type: ignore[attr-defined]
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -568,6 +587,175 @@ def test_posthoc_final_stage_failure_preserves_capture_success_fact() -> None:
     )
 
 
+def test_capture_end_step_projects_manual_stop_over_selected_linear_prefix() -> None:
+    progress = TaskProgressProfileV1(
+        profile_id="capture-end-progress",
+        profile_version="1",
+        task_id="capture-end",
+        steps=(
+            ProgressStepDefinitionV1(
+                "a",
+                "TASK_A",
+                "A",
+                1,
+                allowed_next_step_ids=("b",),
+            ),
+            ProgressStepDefinitionV1(
+                "b",
+                "TASK_B",
+                "B",
+                2,
+                allowed_next_step_ids=("c",),
+            ),
+            ProgressStepDefinitionV1("c", "TASK_C", "C", 3),
+        ),
+        initial_step_id="a",
+        terminal_step_ids=("c",),
+    )
+    stages = TaskStageProfileV1(
+        profile_id="capture-end-stages",
+        profile_version="1",
+        task_progress_profile_hash=progress.semantic_content_hash,
+        stages=(
+            ProgressStageDefinitionV1("a", "a1", "A1", "a1", 1),
+            ProgressStageDefinitionV1("a", "a2", "A2", "a2", 2),
+            ProgressStageDefinitionV1("b", "b1", "B1", "b1", 1),
+            ProgressStageDefinitionV1("c", "c1", "C1", "c1", 1),
+        ),
+    )
+    binding = _binding(progress)
+    timeline = ResolvedProgressTimeline(
+        episode_capture_identity_hash=binding.episode_capture_identity_hash,
+        task_progress_profile_hash=progress.semantic_content_hash,
+        progress_episode_binding_hash=binding.semantic_content_hash,
+        clock_domain_id="episode_clock",
+        fact_bundle_hash="2" * 64,
+        fact_count=2,
+        sealed=True,
+        phase="TERMINATED",
+        attempts=(
+            ResolvedProgressAttempt(
+                attempt_id="attempt:a:manual-stop",
+                progress_step_id="a",
+                attempt_ordinal_in_capture=1,
+                start_fact_id="start",
+                start_at=0.0,
+                clock_domain_id="episode_clock",
+                end_fact_id="termination",
+                end_at=6.0,
+                outcome="ABORTED",
+            ),
+        ),
+        transitions=(),
+        capture_pause_intervals=(),
+        undone_advance_fact_ids=(),
+        invalidated_attempt_ids=(),
+        current_progress_step_id="a",
+        active_attempt_id=None,
+        terminal_fact_id="termination",
+        termination_cause="MANUAL_STOP",
+        full_task_outcome="UNKNOWN",
+        source_progress_manifest_hash="3" * 64,
+    )
+    projected_b = capture_end_projected_attempt_id(
+        source_attempt_id="attempt:a:manual-stop",
+        source_progress_step_id="a",
+        progress_step_id="b",
+    )
+    annotations = StageAnnotationBundleV1(
+        capture_end_step=CaptureEndStepAnnotationV1(
+            annotation_id="capture-end:termination",
+            source_terminal_fact_id="termination",
+            source_attempt_id="attempt:a:manual-stop",
+            end_progress_step_id="b",
+            clock_domain_id="episode_clock",
+        ),
+        occurrences=(
+            StageOccurrenceAnnotationV1(
+                "occ:a1",
+                "attempt:a:manual-stop",
+                "a",
+                "a1",
+                1,
+                0.0,
+                2.0,
+                "episode_clock",
+                "SUCCESS",
+            ),
+            StageOccurrenceAnnotationV1(
+                "occ:a2",
+                "attempt:a:manual-stop",
+                "a",
+                "a2",
+                2,
+                2.0,
+                4.0,
+                "episode_clock",
+                "SUCCESS",
+            ),
+            StageOccurrenceAnnotationV1(
+                "occ:b1",
+                projected_b,
+                "b",
+                "b1",
+                1,
+                4.0,
+                6.0,
+                "episode_clock",
+                "SUCCESS",
+            ),
+        ),
+    )
+
+    index = resolve_stage_training_index(
+        progress_profile=progress,
+        progress_binding=binding,
+        stage_profile=stages,
+        stage_entry_binding=ProgressStageEntryBindingV1(
+            episode_capture_identity_hash="1" * 64,
+            task_stage_profile_hash=stages.semantic_content_hash,
+            entry_stage_id="a1",
+        ),
+        timeline=timeline,
+        annotations=annotations,
+        sample_axis=EpisodeSampleAxis(
+            "episode_clock",
+            tuple(float(value) for value in range(7)),
+        ),
+    )
+
+    assert index.coverage_status == "COMPLETE"
+    assert tuple(value.progress_step_id for value in index.occurrences) == (
+        "a",
+        "a",
+        "b",
+    )
+    round_trip = StageAnnotationBundleV1.from_payload(
+        annotations.to_payload()
+    )
+    assert round_trip == annotations
+    with pytest.raises(
+        ValueError,
+        match="ambiguous or normal window stop",
+    ):
+        resolve_stage_training_index(
+            progress_profile=progress,
+            progress_binding=binding,
+            stage_profile=stages,
+            stage_entry_binding=ProgressStageEntryBindingV1(
+                episode_capture_identity_hash="1" * 64,
+                task_stage_profile_hash=stages.semantic_content_hash,
+                entry_stage_id="a1",
+            ),
+            timeline=replace(timeline, termination_cause="SAFETY_STOP"),
+            annotations=annotations,
+            sample_axis=EpisodeSampleAxis(
+                "episode_clock",
+                tuple(float(value) for value in range(7)),
+            ),
+        )
+
+
 def test_annotation_workspace_lock_and_immutable_commit(tmp_path: Path) -> None:
     progress, stages = _profiles()
     manifest = ProgressEpisodeManifestV1(
@@ -597,7 +785,20 @@ def test_annotation_workspace_lock_and_immutable_commit(tmp_path: Path) -> None:
         )
     )
 
-    with DatasetStageAnnotationWorkspace(tmp_path) as workspace:
+    with DatasetStageAnnotationWorkspace(
+        tmp_path,
+        annotator_id="fixture",
+    ) as workspace:
+        workspace.acquire_episode(episode_uuid="episode-1")
+        owner = json.loads(
+            (
+                workspace.episode_lock_path(episode_uuid="episode-1")
+                / "owner.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert owner["episode_uuid"] == "episode-1"
+        assert owner["annotator_id"] == "fixture"
+        assert owner["lock_id"]
         workspace.save_draft(
             episode_uuid="episode-1",
             draft={"cursor": 1.5},
@@ -605,9 +806,20 @@ def test_annotation_workspace_lock_and_immutable_commit(tmp_path: Path) -> None:
         assert workspace.load_draft(
             episode_uuid="episode-1"
         ) == {"cursor": 1.5}
-        with pytest.raises(StageAnnotationStoreError, match="already owns"):
-            with DatasetStageAnnotationWorkspace(tmp_path):
-                pass
+        with DatasetStageAnnotationWorkspace(
+            tmp_path,
+            annotator_id="other",
+        ) as concurrent:
+            concurrent.acquire_episode(episode_uuid="episode-2")
+            concurrent.save_draft(
+                episode_uuid="episode-2",
+                draft={"cursor": 2.5},
+            )
+            with pytest.raises(
+                StageAnnotationStoreError,
+                match="already being annotated",
+            ):
+                concurrent.acquire_episode(episode_uuid="episode-1")
 
         report = commit_stage_annotation_set(
             dataset_root=tmp_path,
@@ -622,3 +834,45 @@ def test_annotation_workspace_lock_and_immutable_commit(tmp_path: Path) -> None:
     assert loaded.binding == binding
     assert loaded.bundle == bundle
     assert loaded.manifest == report.manifest
+
+    with DatasetStageAnnotationWorkspace(
+        tmp_path,
+        annotator_id="replacement",
+    ) as replacement:
+        replacement.acquire_episode(episode_uuid="episode-1")
+        assert replacement.load_draft(episode_uuid="episode-1") == {
+            "cursor": 1.5
+        }
+
+
+def test_episode_annotation_lock_excludes_a_separate_process(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_episode_annotation_lock,
+        args=(str(tmp_path), ready, release),
+    )
+    process.start()
+    try:
+        assert ready.wait(timeout=5.0)
+        with DatasetStageAnnotationWorkspace(
+            tmp_path,
+            annotator_id="parent-process",
+        ) as workspace:
+            with pytest.raises(
+                StageAnnotationStoreError,
+                match="already being annotated.*child-process",
+            ):
+                workspace.acquire_episode(
+                    episode_uuid="episode-cross-process"
+                )
+    finally:
+        release.set()
+        process.join(timeout=5.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2.0)
+    assert process.exitcode == 0

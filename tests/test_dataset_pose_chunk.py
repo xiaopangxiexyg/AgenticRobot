@@ -188,6 +188,7 @@ def test_dataset_metadata_adapter_checks_episode_contract() -> None:
         )
 
 
+@pytest.mark.integration
 def test_dataset_index_enumerates_episode_local_chunk_locations(tmp_path) -> None:
     meta = tmp_path / "meta"
     meta.mkdir()

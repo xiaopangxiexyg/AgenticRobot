@@ -362,6 +362,8 @@ class OpenPICommonDeployTest(unittest.TestCase):
             serial="123",
             camera_key="left_wrist",
             keep_last=2,
+            color_format="yuyv",
+            startup_warmup_policy="legacy",
         )
         with mock.patch(
             "teleop_runtime.deploy.run_policy.load_realsense_camera_config_map",
@@ -376,6 +378,44 @@ class OpenPICommonDeployTest(unittest.TestCase):
             )
 
         self.assertEqual(sources["left_wrist"].keep_last, 4)
+        self.assertEqual(sources["left_wrist"].color_format, "bgr8")
+        self.assertEqual(
+            sources["left_wrist"].startup_warmup_policy,
+            "bounded_first_frame",
+        )
+        self.assertEqual(
+            sources["left_wrist"].metadata["configured_color_format"],
+            "yuyv",
+        )
+        self.assertEqual(
+            sources["left_wrist"].metadata[
+                "configured_startup_warmup_policy"
+            ],
+            "legacy",
+        )
+
+    def test_runtime_serial_camera_uses_formal_collection_startup_defaults(self) -> None:
+        parser = argparse.ArgumentParser()
+        run_policy.add_args(parser)
+        args = parser.parse_args(
+            [
+                "--camera-mode",
+                "single",
+                "--camera-serial",
+                "123",
+            ]
+        )
+
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.RealSenseRGBSource",
+            side_effect=lambda config: config,
+        ):
+            sources = run_policy.build_camera_sources(args)
+
+        config = sources["front"]
+        self.assertEqual(config.color_format, "bgr8")
+        self.assertEqual(config.startup_warmup_policy, "bounded_first_frame")
+        self.assertFalse(config.startup_hardware_reset)
 
     def test_deployment_camera_age_default_has_jitter_margin(self) -> None:
         parser = argparse.ArgumentParser()
@@ -417,6 +457,20 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertEqual(request["observation.images.front"].dtype, np.uint8)
         self.assertEqual(request["state"].shape, (OBSERVATION_STATE_DIM,))
         self.assertEqual(request["prompt"], "test prompt")
+
+    def test_openpi_observation_adapter_enforces_artifact_prompt_allowlist(self) -> None:
+        allowed = OpenPIObservationAdapterConfig(
+            allowed_prompts=("test prompt", "return the brush"),
+        )
+        request = deployment_observation_to_openpi(_observation(), allowed)
+        self.assertEqual(request["prompt"], "test prompt")
+
+        rejected = OpenPIObservationAdapterConfig(
+            prompt="unknown stage",
+            allowed_prompts=("test prompt", "return the brush"),
+        )
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            deployment_observation_to_openpi(_observation(), rejected)
 
     def test_openpi_observation_adapter_requires_front_image(self) -> None:
         observation = _observation()
@@ -931,6 +985,40 @@ class OpenPICommonDeployTest(unittest.TestCase):
         )
         self.assertIn("--no-arm-canfd-follow", launched_args)
 
+    def test_openpi_profile_forwards_no_init_qpos_over_injected_dataset_default(self) -> None:
+        resolved: list[tuple[bool, bool, object, object]] = []
+
+        def validate_runtime(argv):
+            parser = argparse.ArgumentParser()
+            run_policy.add_args(parser)
+            args = parser.parse_args(argv)
+            run_policy.validate_args(args, raw_argv=argv)
+            resolved.append(
+                (
+                    bool(args.no_init_qpos),
+                    bool(args.policy_qpos_init_suppressed),
+                    args.policy_qpos_init_dataset,
+                    args.policy_qpos_init_parquet,
+                )
+            )
+            return 0
+
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.main",
+            side_effect=validate_runtime,
+        ):
+            result = openpi_real_launcher.main(
+                [
+                    "--deployment-profile",
+                    "rm65_bimanual_dmtac",
+                    "--no-init-qpos",
+                    "--send-actions",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(resolved, [(True, True, None, None)])
+
     def test_openpi_launcher_reaches_shared_execution_profile_resolver(self) -> None:
         resolved: list[tuple[str, float, float, bool]] = []
 
@@ -1042,6 +1130,8 @@ class OpenPICommonDeployTest(unittest.TestCase):
                     "--debug",
                     "--debug-dir",
                     "logs/rtc-debug-test",
+                    "--debug-payload-mode",
+                    "full",
                     "--rtc-debug-level",
                     "trace",
                     "--rtc-debug-queue-capacity",
@@ -1062,6 +1152,10 @@ class OpenPICommonDeployTest(unittest.TestCase):
             "logs/rtc-debug-test",
         )
         self.assertEqual(
+            launched_args[launched_args.index("--debug-payload-mode") + 1],
+            "full",
+        )
+        self.assertEqual(
             launched_args[launched_args.index("--rtc-debug-level") + 1],
             "trace",
         )
@@ -1072,6 +1166,17 @@ class OpenPICommonDeployTest(unittest.TestCase):
             "32",
         )
         self.assertIn("--max-steps", launched_args)
+
+    def test_openpi_real_launcher_defaults_debug_payload_to_compact(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+            result = openpi_real_launcher.main(["--debug", "--max-steps", "1"])
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        self.assertEqual(
+            launched_args[launched_args.index("--debug-payload-mode") + 1],
+            "compact",
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,11 @@
 前者不代表后者已经完成。界面分别显示 `Progress 已封存` 和
 `阶段标注已封存 N 版`。
 
+对于没有 capture-causal Progress facts 的 v2.3 writing 历史数据，正式方案是在对应数据集内
+建立 namespaced `RETROSPECTIVE_MIGRATED` semantic layer；writing adapter 只负责一个 v2.3
+数据集的标注，不承担跨数据集 workspace 管理。该入口尚待实现，目标操作合同见
+[Writing 第一子任务 retrospective 三阶段标注](WRITING_STAGE1_RETROSPECTIVE_ANNOTATION.md)。
+
 ## 0. 独立标注机器环境
 
 后期标注不需要完整 DexTeleop 真机环境。从仓库根创建专用 Python 3.10 环境：
@@ -66,8 +71,9 @@ Episode 时，工作草稿中的待复核标签会自动清除。只有再次校
 
 页面会在确认后才取得 writer lock；路径必须是已经存在的数据集绝对路径，输入错误不会
 创建新目录。浏览器会在本机保存最近使用过的路径和标注员 ID，供下次从下拉建议中选择。
-进入标注后可点击顶部“更换数据集”，选择新目录并确认切换；如果当前存在未保存草稿，
-切换前会明确提示该草稿不会自动带到新目录。
+进入标注后可点击顶部“更换数据集”，选择新目录并确认切换；如果当前存在未封存修改，
+切换前必须选择“校验封存并切换”“放弃修改并切换”或“取消切换”。界面不再提供容易
+与正式完成混淆的“保存草稿”操作。
 
 只检查指定数据集当前有多少 Episode 可标注、不启动 GUI，也不取得标注 writer lock：
 
@@ -77,9 +83,30 @@ python -m control_station refinement-annotation \
   --dry-run
 ```
 
-服务器只允许绑定 loopback。一个数据集目录同时只允许一个细粒度标注程序持有
-`meta/progress/stage_annotations/.writer.lock`；它可以与采集程序并行，因为采集写新
-Episode，标注只读取已封存旧 Episode，并写独立草稿/annotation-set 目录。
+服务器只允许绑定 loopback。升级后的多个标注程序可以通过 SSHFS/NFS 同时打开同一个
+数据集，但同一时刻只能有一个程序编辑某个 Episode。跨机器互斥使用服务端原子创建的
+`meta/progress/stage_annotation_locks/<episode_uuid>.lock/` 目录；其中 `owner.json`
+记录标注员、主机、PID、取得时间和随机 lock ID。程序切换 Episode 或关闭时，只有再次
+核对 lock ID 后才会用同目录原子 rename 释放锁。锁不会按时间自动抢占；如果机器崩溃或
+网络中断留下陈旧目录，必须先核实记录的 owner 已经停止，再人工处理，禁止仅凭“时间较
+久”删除。
+
+历史的 `meta/progress/stage_annotations/.writer.lock` 现在只作为旧客户端兼容 guard：
+新程序持有共享锁，旧程序仍请求独占锁。SSHFS 配置不一定跨机器传播 `flock`，因此共享
+数据集上的所有标注机器必须一起升级，不能依赖该 guard 安全混用新旧版本。不同 Episode
+的 draft 和不可变 annotation set 位于互不重叠的目录，可以并行写入；它仍可与采集程序
+并行，因为采集只写新的 Episode。旧版本留下的本地 draft 文件仍可读取，但只作为内部
+兼容工作缓存，不是用户可选择的正式保存结果。
+如果旧 draft 没有对应的不可变 annotation set，页面会明确把它视为“尚未封存”，即使
+本次打开后还没有继续拖动时间轴，切换 Episode 或数据集时也必须封存或明确放弃。只有
+草稿的可编辑语义与最新封存版本一致时，才会作为已封存缓存处理；这里不依赖经常变化的
+运行配置 hash。
+
+旧数据集是否能使用“失败发生于”和 `failure_trigger`，取决于它自身已封存的 Progress
+快照是否包含完整 stage profile、stage-entry binding 和采集时记录的 Failure fact。满足
+这些既有事实条件的旧数据集可直接使用；只有回溯 Progress、没有真实 capture Failure
+的旧数据不会被静默伪造成 Failure。当前版本也不会把后标注的 SUCCESS 改 FAILURE 当成
+新的采集 Failure。
 
 ## 2. 时间轴语义
 
@@ -96,10 +123,37 @@ Episode，标注只读取已封存旧 Episode，并写独立草稿/annotation-se
 第一次打开 Episode 时，系统按照 coarse Attempt 均分生成可编辑草稿。对于类似
 “A1 成功、A2 失败”的第一次 Attempt：
 
-1. 将视频定位到 A1 完成/A2 开始的画面；
-2. 点击“在当前画面前完成上一阶段”；
-3. 原始 Failure 保持在原时间，失败归属自动推进到 A2；
-4. 后续 Retry 从 A2 开始，已有草稿标签会按 profile 顺序重新对齐。
+1. 在失败 Attempt 卡片的“失败发生于”中选择 A2；
+2. 系统生成 `A1 SUCCESS + A2 FAILURE`，原始 Failure 保持在原时间；
+3. 后续 Retry 自动从 A2 开始，并按 profile 确定性重排；
+4. 将视频定位到 A1 完成/A2 开始的画面，再拖动白色边界精调。
+
+若选择 A3，系统会一次性生成
+`A1 SUCCESS + A2 SUCCESS + A3 FAILURE`，而不是要求重复点击添加。更改失败 stage
+会重新均分当前 Attempt 和同一 coarse step 的后续 Retry 边界，因此已有人工边界时会
+先要求确认。系统不会添加任意 stage：成功前缀和 terminal Failure 都必须严格服从
+profile；有效 sample 不足以让每个 occurrence 至少拥有一个样本时会拒绝重排。
+
+如果正式数采在非最终子任务直接按“数采结束”，采集事实会保留为
+`MANUAL_STOP + ABORTED`（窗口采集也可能是 `WINDOW_COMPLETED +
+TRUNCATED_AT_CAPTURE_END`），不会伪造成 `FULL_TASK_COMPLETED`。后标注界面此时显示
+“采集结束位置”选择器：明确的 `MANUAL_STOP` 新建草稿默认选择 profile 最后一个
+子任务，表示常规完整完成；若本条只采集了前几个子任务，标注员选择实际最后正常完成
+的子任务。`ABORTED/UNKNOWN` 等旧式或模糊中止不自动套用这个默认值，必须由标注员
+显式选择。系统随后按线性
+profile 重建所选结束位置对应的成功子阶段，并允许继续拖动白色边界精调；如果采集端
+已经误启动了下一个 Attempt，再选择前一个子任务会从该子任务最近一次 Attempt 起点
+覆盖到 Episode 结束，而不会把后续误启动 Attempt 当成已完成任务。封存结果在原 stage
+annotation bundle 中以可选
+`capture_end_step` 记录，绑定原 terminal fact、原 final Attempt、所选 Step 和 Episode
+clock；训练阶段投影可以据此验证，而原 Progress facts、视频、样本及 full-task outcome
+均不修改。安全停机、带真实 Failure 的 Attempt、非线性 profile、早于 Episode 入口或
+没有对应原始 Attempt 可锚定的选择会被拒绝。
+
+没有 `capture_end_step` 的旧 draft 和旧 annotation set 继续按原语义读取，哈希不变，
+不会在打开时自动覆盖已有人工边界；但符合上述事实条件的旧草稿可通过选择器显式重排，
+重排前会提示它将重置最终一段的人工子阶段边界。若该段已有可恢复失误区间或重叠异常
+区间，必须先处理这些附加标注，服务端不会猜测迁移其引用。
 
 拖动阶段间的白色游标时，前端会把一帧内的多个鼠标事件合并为一次视频定位，并只在
 拖动结束时重绘阶段说明；上方普通视频进度条独立工作。当前视频使用浏览器自动预读，
@@ -116,9 +170,9 @@ Failure 在对应颜色上叠加红色斜纹，而不是抹掉 Progress Step 身
 的阶段跳跃。删除只移除阶段标签，并把其完整时间范围并入同一 coarse Attempt、同一
 Progress Step 内的前一或后一有效阶段，不会产生未标注时间空洞，也不会跨 Attempt
 或改写原始 Failure；承载原始 Failure 的阶段本身仍不可删除。“撤销删除”按后进先出
-顺序恢复被删 occurrence 和合并前的精确边界。逆操作记录只属于 mutable draft，不进入
-正式 annotation contract；保存草稿后重启程序仍可继续撤销。若后续边界编辑已经改变
-接收阶段，则回退 fail closed，不猜测覆盖更新后的边界。
+顺序恢复被删 occurrence 和合并前的精确边界。逆操作记录只属于当前页面编辑，不进入
+正式 annotation contract。若后续边界编辑已经改变接收阶段，则回退 fail closed，不
+猜测覆盖更新后的边界。
 
 标注视频与时间轴以 Parquet 中正式接受的 sample timestamp 对齐，而不是按 Episode
 首尾 wall time 做简单线性映射。相邻正式样本之间超过 1 秒的 Hold/Pause 空洞只在
@@ -164,6 +218,30 @@ GUI 显示轴压缩为 1 秒，并用灰色斜纹标出；视频、Parquet、原
 但本版本不会为这种“成功改失败”情况创建 `failure_trigger`，也不会把它伪装成 capture
 Failure。
 
+### 3.2 中间失误后恢复
+
+一次 Attempt 最终成功，但某个中间子阶段内短暂失误并自行恢复时，不应伪造成 capture
+Failure，也不应生成 Retry。界面的“中间失误后恢复”记录一份独立、分析用途的
+`recoverable_failures` 信息：
+
+- 依次选择“失误发生”和“恢复正常”两个点；服务端将两个时间吸附到 Parquet 的离散
+  sample index，连续时间不是协议真值。超出 Episode sample axis 的时间会直接拒绝，
+  不会静默夹到首尾样本；
+- 两个样本必须共同落在同一个现有 `SUCCESS` stage occurrence 内，系统据此自动确定
+  coarse Attempt、Progress Step 和 stage。跨越白色阶段边界、落在真实 Failure 阶段，
+  或之后调整边界导致原 occurrence 引用变化时都会 fail closed，不会猜测改挂到相邻阶段；
+- 同一 stage occurrence 内的多个区间不能重叠，也不能把同一个离散样本同时作为前一
+  区间的“恢复正常”和后一段的“失误发生”；两段之间至少保留一个明确正常样本；
+- GUI 取点时立即显示吸附后的 sample index 和所属 SUCCESS 子阶段，可取消当前取点、
+  定位已有区间或进行安全重标。重标期间原区间保持不变，只有新起止点通过服务端校验
+  后才原子替换页面草稿中的旧区间；
+- 该信息不会改变 `StageOccurrenceAnnotationV1.outcome`、原始 Failure、Retry、
+  `failure_trigger` 或默认训练 exclusion；需要使用它的后续分析必须显式读取 sidecar；
+- 封存后写入同一 annotation-set 目录下可选的
+  `recoverable_failures.cjson`。没有该字段和文件的旧 draft、旧 annotation set 均解释为
+  “没有记录可恢复失误”，不会回填或修改旧数据。早期若已存在共享边界样本的两个
+  V1 区间，仍可读取和查看，但生成新封存版本前需要通过重标消除该离散语义歧义。
+
 ## 4. 特殊工具
 
 特殊工具默认关闭，需要显式勾选后才能使用：
@@ -194,40 +272,49 @@ Episode 列表每 4 秒重新读取一次，只会增量显示已经完成正式
 新 Episode；当前仍在写入的 Episode 始终不可见。若标注服务进程退出或连接断开，页面
 会显示红色离线状态并冻结标注操作；连接恢复后自动解锁。
 
-左侧 Episode 区可收起。展开态只显示 Episode 编号、时长、帧数以及草稿/封存版本状态，
-完整 UUID 保留在悬停信息中；展开态和收起态都可以用“上一条/下一条”切换。收起后仅
-保留当前 Episode 编号与列表位置，为视频和时间轴释放横向空间。浏览器会记住该布局
-偏好；若刷新后处于收起态且尚未选择 Episode，点击“下一条”会从列表第一条开始。
+左侧 Episode 区可收起。展开态显示 Episode 编号、时长、帧数、封存版本、整条异常、
+待二次复核和二次复核完成状态；这些 annotation 摘要只对当前可见行按需读取，避免大
+数据集启动时扫描每个 annotation bundle。完整 UUID 保留在悬停信息中；收起态显示当前
+Episode 编号、列表位置以及整条异常/复核状态，展开态和收起态都可以用“上一条/下一条”
+切换。浏览器会记住该布局偏好；若刷新后处于收起态且尚未选择 Episode，点击“下一条”
+会从列表第一条开始。
 
-## 5. 草稿、封存与回退
+## 5. 封存与回退
 
-“保存草稿”使用临时 inode、fsync 和原子替换，落在：
-
-```text
-meta/progress/stage_annotation_drafts/<episode_uuid>/draft.json
-```
-
-草稿不是数据合同，可以继续修改。“校验并封存标注”会执行严格 profile 顺序、
-Attempt/Fault 归属、时钟、coverage 和 exclusion 检查，通过后把不可变集合发布到：
+界面只有“校验并封存标注”一个正式保存动作。它会执行严格 profile 顺序、Attempt/Fault
+归属、时钟、coverage 和 exclusion 检查，通过后把不可变集合发布到：
 
 ```text
 meta/progress/stage_annotations/<episode_uuid>/<annotation_set_id>/
   binding.cjson
   annotations.cjson
+  failure_triggers.cjson       # 可选附加信息
+  recoverable_failures.cjson  # 可选、仅分析用途
   manifest.cjson
 ```
 
-manifest 最后发布。封存不会删除草稿或旧 annotation set，也不会在 Parquet 中添加
+所有存在的 sidecar 先写入，`manifest.cjson` 最后发布并作为整套结果的可见性边界。
+封存不会删除旧 annotation set，也不会在 Parquet 中添加
 逐帧布尔列；loader 通过 sample-time 索引快速得到 occurrence 和排除区间。当前尚未
 默认选择多个 annotation set 中的某一个，训练发布前仍需显式 selection policy。
+
+为了兼容已经存在的数据，服务端仍可读取旧的 mutable draft 文件，并会在成功封存后
+缓存最近发布状态；但 GUI 不再允许标注员把“只保存草稿”当作完成操作。切换 Episode
+或数据集时，有修改就直接要求封存、放弃或取消。
+
+数据集位于 SSHFS 等远程文件系统时，封存发布仍遵守同一不可变、manifest 最后写入的
+协议。对可证明可重入的瞬时 I/O 故障，应用只使用同一个 `annotation_set_id` 做一次短暂
+重试；持续权限或连接错误会返回结构化错误，浏览器中的修改不会被清空。sidecar 写入
+失败时 Stage manifest 不会发布，因此不会暴露半套结果；若完整不可变 set 已完成、仅
+mutable draft 缓存更新失败，界面会明确报告“封存成功但缓存失败”，不会要求再次发布
+一个重复 set；重新打开时可从最新封存版本重建。
 
 已经存在封存阶段标注的 Episode 可以通过“强制重新编辑所选版本”进入二次编辑：
 
 1. GUI 列出该 Episode 下所有完整且绑定一致的不可变 annotation set；
 2. 标注员选择一个版本并二次确认；
-3. 服务只读取该封存版本并在页面内物化为新草稿，不立即覆盖磁盘草稿；
-4. 点击“保存草稿”后才替换 mutable draft；
-5. 再次“校验并封存”始终生成新的 annotation set，旧版本永久保持只读。
+3. 服务只读取该封存版本并在页面内物化为新的页面编辑，不立即发布任何结果；
+4. 再次“校验并封存”始终生成新的 annotation set，旧版本永久保持只读。
 
 该入口不会定义“最新版本自动获胜”的训练选择策略；下游仍必须显式选择 annotation
 set，避免一次返修静默改变既有训练数据视图。
@@ -249,15 +336,17 @@ Episode-local `stages.cjson` 和 `stage_entry.cjson`，并在 dataset 级
 `meta/progress/stages.cjson` 锁定唯一 stage profile；同一数据集不能混装不同 stage
 profile 或 profiled/unprofiled progress Episode。
 
-## 7. 无真机 mock 流程
+## 7. 无真机 mock 流程（仅完整源码仓库）
 
-仓库提供一个仅用于离线界面验证的 probe。它不连接硬件，也不是生产采集入口：
+完整 DexTeleop 源码仓库提供一个仅用于离线界面验证的 probe。它复用真实采集侧的
+`RealTeleopProgressEpisode` 来生成 capture-causal Progress facts，因此刻意不进入不含
+`teleop_runtime` 的 portable refinement-annotation projection。它不连接硬件，也不是生产采集入口：
 
 ```bash
 conda activate dexteleop310
 cd /home/zc/HandMotion/Developing/DexTeleop
 
-python -m todos.probes.generate_refinement_annotation_mock \
+python -m scripts.generate_refinement_annotation_mock \
   --output datasets/mock_refinement_annotation_test \
   --background-root utils/random_background \
   --seed 2502

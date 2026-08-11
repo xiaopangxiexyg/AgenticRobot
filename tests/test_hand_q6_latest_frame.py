@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from hardware.teleop_hand import hand_q6_reader as runtime_hand_q6_reader
 from hardware.teleop_hand.hand_q6_reader import (
@@ -127,6 +128,7 @@ class BufferedSerialLineReaderTests(unittest.TestCase):
 
 
 class HandQ6NormalizationTests(unittest.TestCase):
+    @pytest.mark.integration
     def test_runtime_calibration_prefers_current_port_specific_zero_pose(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "exo_hand_zero_pose.json"
@@ -161,6 +163,7 @@ class HandQ6NormalizationTests(unittest.TestCase):
         self.assertEqual(calib["deg_at_0"].tolist(), [200.0] * 6)
         self.assertEqual(calib["deg_at_1"].tolist(), [240.0, 130.0, 260.0, 260.0, 260.0, 260.0])
 
+    @pytest.mark.integration
     def test_runtime_calibration_rejects_saved_zero_pose_from_different_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "exo_hand_zero_pose.json"
@@ -193,6 +196,7 @@ class HandQ6NormalizationTests(unittest.TestCase):
                     port="/dev/current-q6",
                 )
 
+    @pytest.mark.integration
     def test_runtime_calibration_update_records_current_port_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "exo_hand_zero_pose.json"
@@ -214,6 +218,7 @@ class HandQ6NormalizationTests(unittest.TestCase):
         self.assertEqual(calib["deg_at_0"].tolist(), [200.0] * 6)
         self.assertEqual(calib["deg_at_1"].tolist(), [240.0, 130.0, 260.0, 260.0, 260.0, 260.0])
 
+    @pytest.mark.integration
     def test_single_hand_reader_auto_calibrates_missing_current_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "exo_hand_zero_pose.json"

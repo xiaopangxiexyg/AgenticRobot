@@ -24,6 +24,11 @@ from teleop_runtime.action import robot_action_from_teleop_command
 from teleop_runtime.backends.grippers import DMTacGripperBackend
 from teleop_runtime.deploy import run_policy as deploy_run_policy
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.real_teleop import cli_runtime_config
+from teleop_runtime.real_teleop.gripper_policy import (
+    GripperForceRequestError,
+    parse_gripper_force_request,
+)
 from teleop_runtime.collection import run_collect
 from teleop_runtime.collection.sample_assembler import CollectorSample
 from teleop_runtime.collection.schema_v21 import collector_sample_to_row
@@ -37,6 +42,37 @@ from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopOb
 
 
 class DMTacGripperBimanualConfigTest(unittest.TestCase):
+    def test_gui_gripper_force_request_parser_is_pure_and_side_bounded(self) -> None:
+        self.assertEqual(
+            parse_gripper_force_request(
+                '{"left": 0.31, "right": "0.64"}',
+                require_nonempty=True,
+            ),
+            {"left": 0.31, "right": 0.64},
+        )
+        self.assertEqual(
+            parse_gripper_force_request("{}", require_nonempty=False),
+            {},
+        )
+        with self.assertRaisesRegex(
+            GripperForceRequestError,
+            "未提供可设置的左/右夹爪力度",
+        ):
+            parse_gripper_force_request("{}", require_nonempty=True)
+
+        invalid_requests = (
+            ("[]", "JSON 对象"),
+            ('{"left": true}', "left 必须是"),
+            ('{"right": 1.1}', "right 必须在"),
+            ('{"left": "nan"}', "left 必须在"),
+        )
+        for text, reason in invalid_requests:
+            with self.subTest(text=text), self.assertRaisesRegex(
+                GripperForceRequestError,
+                reason,
+            ):
+                parse_gripper_force_request(text, require_nonempty=False)
+
     def test_tactile_worker_failure_is_cleared_and_restarted(self) -> None:
         class _DeadProcess:
             exitcode = 7
@@ -769,7 +805,11 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             }
         }
 
-        with patch.object(real_teleop, "load_dmtac_hardware_assignment", return_value=assignment):
+        with patch.object(
+            cli_runtime_config,
+            "load_dmtac_hardware_assignment",
+            return_value=assignment,
+        ):
             configs = real_teleop._dmtac_backend_configs(args, ("right",))
 
         self.assertIn("right", configs)
@@ -1713,6 +1753,78 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         self.assertEqual(payload["parent_pid"], os.getpid())
         self.assertEqual(payload["worker_name"], "dmtac_right_tac")
+
+    def test_dmtac_tactile_worker_ignores_terminal_sigint_owned_by_parent(self) -> None:
+        from teleop_runtime.backends.grippers import dmtac as dmtac_backend
+
+        with patch.object(dmtac_backend.signal, "signal") as install:
+            dmtac_backend._isolate_tactile_worker_terminal_interrupt()
+
+        install.assert_called_once_with(
+            dmtac_backend.signal.SIGINT,
+            dmtac_backend.signal.SIG_IGN,
+        )
+
+    def test_dmtac_close_terminates_worker_even_if_join_is_interrupted(self) -> None:
+        class _StopEvent:
+            def __init__(self) -> None:
+                self.set_calls = 0
+
+            def set(self) -> None:
+                self.set_calls += 1
+
+        class _InterruptedProcess:
+            def __init__(self) -> None:
+                self.join_calls: list[float | None] = []
+                self.terminate_calls = 0
+
+            def join(self, timeout=None) -> None:
+                self.join_calls.append(timeout)
+                if len(self.join_calls) == 1:
+                    raise KeyboardInterrupt()
+
+            def is_alive(self) -> bool:
+                return self.terminate_calls == 0
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+        class _Queue:
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.cancel_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+            def cancel_join_thread(self) -> None:
+                self.cancel_calls += 1
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="left",
+                connect_hardware=False,
+                connect_tactile=True,
+                tactile_process_read=True,
+            )
+        )
+        stop_event = _StopEvent()
+        process = _InterruptedProcess()
+        worker_queue = _Queue()
+        backend._tactile_worker_stop_event = stop_event
+        backend._tactile_worker_process = process
+        backend._tactile_worker_queue = worker_queue
+
+        with self.assertRaises(KeyboardInterrupt):
+            backend.close()
+
+        self.assertEqual(stop_event.set_calls, 1)
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.join_calls, [3.0, 1.0])
+        self.assertEqual(worker_queue.close_calls, 1)
+        self.assertEqual(worker_queue.cancel_calls, 1)
+        self.assertIsNone(backend._tactile_worker_process)
+        self.assertIsNone(backend._tactile_worker_queue)
 
     def test_dmtac_tactile_worker_parent_watchdog_sets_stop_event(self) -> None:
         from teleop_runtime.backends.grippers import dmtac as dmtac_backend

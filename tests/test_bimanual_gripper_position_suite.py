@@ -53,6 +53,68 @@ def test_plan_is_bimanual_and_does_not_call_hardware(
     assert payload["analysis"]["canonical_profile_update"] is False
 
 
+def test_suite_output_root_defaults_to_teleop_records_without_creating_directories() -> None:
+    args = suite.build_parser().parse_args(["plan"])
+
+    resolution = suite.resolve_output_root(
+        args,
+        date_partition="2026-08-09",
+    )
+
+    assert resolution.path == suite.legacy_output_root()
+    assert resolution.path == (
+        suite.PROJECT_ROOT / "teleop_records" / "gripper_position_suite"
+    )
+    assert resolution.source == "legacy"
+    assert args.output_root is None
+
+
+def test_suite_output_root_supports_explicit_canonical_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = tmp_path / "canonical" / "2026-08-09"
+    monkeypatch.setattr(
+        suite,
+        "canonical_output_root",
+        lambda *, date_partition=None: canonical,
+    )
+    args = suite.build_parser().parse_args(
+        [
+            "run",
+            "--artifact-layout",
+            suite.RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ]
+    )
+
+    resolution = suite.resolve_output_root(
+        args,
+        date_partition="2026-08-09",
+    )
+
+    assert resolution.path == canonical
+    assert resolution.source == "canonical"
+    assert not (tmp_path / "canonical").exists()
+
+
+def test_suite_explicit_output_root_wins_over_layout(tmp_path: Path) -> None:
+    explicit = tmp_path / "exact"
+    args = suite.build_parser().parse_args(
+        [
+            "run",
+            "--artifact-layout",
+            suite.RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+            "--output-root",
+            str(explicit),
+        ]
+    )
+
+    resolution = suite.resolve_output_root(args)
+
+    assert resolution.path == explicit
+    assert resolution.source == "explicit"
+
+
 def test_run_requires_suite_acknowledgement_before_hardware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,6 +212,69 @@ def test_suite_preflight_rejects_unfinished_recovery_journal(
 
     with pytest.raises(suite.collector.RecoveryError, match="must be restored"):
         suite._preflight_suite(args, suite_root=tmp_path / "suite")
+
+
+def test_suite_recovery_roots_span_both_layouts_and_selected_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector_teleop = tmp_path / "collector-teleop"
+    collector_archive = tmp_path / "collector-archive"
+    collector_canonical = tmp_path / "collector-canonical"
+    suite_teleop = tmp_path / "suite-teleop"
+    suite_archive = tmp_path / "suite-archive"
+    suite_canonical = tmp_path / "suite-canonical"
+    explicit = tmp_path / "explicit"
+    suite_root = explicit / "suite-001"
+    monkeypatch.setattr(
+        suite.collector,
+        "legacy_output_root",
+        lambda: collector_teleop,
+    )
+    monkeypatch.setattr(
+        suite.collector,
+        "archived_logs_output_root",
+        lambda: collector_archive,
+    )
+    monkeypatch.setattr(
+        suite.collector,
+        "canonical_output_family_root",
+        lambda: collector_canonical,
+    )
+    monkeypatch.setattr(
+        suite,
+        "legacy_output_root",
+        lambda: suite_teleop,
+    )
+    monkeypatch.setattr(
+        suite,
+        "archived_logs_output_root",
+        lambda: suite_archive,
+    )
+    monkeypatch.setattr(
+        suite,
+        "canonical_output_family_root",
+        lambda: suite_canonical,
+    )
+    args = suite.build_parser().parse_args(
+        ["plan", "--output-root", str(explicit)]
+    )
+
+    roots = suite.recovery_journal_roots(args, suite_root=suite_root)
+
+    assert roots == tuple(
+        path.resolve()
+        for path in (
+            collector_teleop,
+            collector_archive,
+            collector_canonical,
+            suite_teleop,
+            suite_archive,
+            suite_canonical,
+            explicit,
+            suite_root,
+        )
+    )
 
 
 def test_fit_coverage_requires_both_directions_and_held_out_groups() -> None:

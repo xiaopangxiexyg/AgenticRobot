@@ -31,10 +31,6 @@ from utils.dataset_postprocess.v22_to_v23_desk import (
 )
 
 
-pa = pytest.importorskip("pyarrow")
-pq = pytest.importorskip("pyarrow.parquet")
-
-
 def _pose(x: float, y: float = 0.0) -> list[float]:
     return [x, y, 0.3, 0.0, 0.0, 0.0, 1.0]
 
@@ -79,7 +75,14 @@ def _sample_metadata(action: list[float]) -> str:
     )
 
 
+def _require_pyarrow():
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    return pa, pq
+
+
 def _write_dataset(root: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+    pa, pq = _require_pyarrow()
     layout = _source_layout()
     left_state = _pose(0.1, 0.2)
     right_state = _pose(-0.1, -0.2)
@@ -159,7 +162,9 @@ def _write_dataset(root: Path) -> tuple[dict[str, object], list[dict[str, object
     return info, rows
 
 
+@pytest.mark.optional
 def test_v22_desk_conversion_is_dry_run_then_copy_on_write(tmp_path: Path) -> None:
+    _pa, pq = _require_pyarrow()
     source = tmp_path / "source"
     output = tmp_path / "output"
     source_info, source_rows = _write_dataset(source)

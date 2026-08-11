@@ -171,14 +171,57 @@ def _parse_deploy_args(*argv: str):
     return parser.parse_args(list(argv))
 
 
-def test_rtc_profile_is_default_off_and_does_not_change_sync_lookahead() -> None:
+def test_rtc_profile_is_default_off_while_position_splice_is_default_on() -> None:
     args = _parse_deploy_args()
     assert args.rtc_profile == "off"
     assert args.rtc_debug_level is None
     assert args.position_chunk_lookahead is True
+    assert args.position_plan_splice_governor is True
+    assert args.position_stream_start_acquisition is True
     run_policy.validate_args(args)
     assert args._rtc_debug_level == "off"
     assert args.position_chunk_lookahead is True
+
+
+def test_stream_start_acquisition_accepts_rtc_dry_run_and_real_dispatch() -> None:
+    profile_id = "rtc_3c_virtual_shadow_15_30_60_120_v1"
+    args = _parse_deploy_args(
+        "--rtc-profile",
+        profile_id,
+        "--position-plan-splice-governor",
+        "--position-stream-start-acquisition",
+    )
+    run_policy.validate_args(args)
+    assert args.position_chunk_lookahead is False
+    assert args.position_stream_start_acquisition is True
+    assert args.send_actions is False
+
+    active = _parse_deploy_args(
+        "--send-actions",
+        "--start-init_qpos",
+        "--left-arm-ip",
+        "192.0.2.1",
+        "--right-arm-ip",
+        "192.0.2.2",
+        "--arm-control-mode",
+        "position",
+        "--debug",
+    )
+    run_policy.validate_args(active)
+    assert active.position_plan_splice_governor is True
+    assert active.position_stream_start_acquisition is True
+    assert active.send_actions is True
+
+
+def test_position_plan_splice_and_stream_start_have_atomic_cli_rollback() -> None:
+    args = _parse_deploy_args(
+        "--no-position-plan-splice-governor",
+        "--no-position-stream-start-acquisition",
+    )
+    run_policy.validate_args(args)
+
+    assert args.position_plan_splice_governor is False
+    assert args.position_stream_start_acquisition is False
 
 
 def test_rtc_debug_defaults_to_summary_and_requires_explicit_debug() -> None:
@@ -225,7 +268,31 @@ def test_rtc_profile_forces_dry_run_cadence_and_disables_lookahead() -> None:
     assert args.position_reference_hz == 60.0
     assert args.arm_control_hz == 120.0
     assert args.position_chunk_lookahead is False
+    assert args.position_path_lift_backend == run_policy.PINK_POSE_LIFT_BACKEND
+    assert args.position_continuous_waypoint_profile_effective == (
+        "formal_third_order"
+    )
+    assert args.position_continuous_waypoint_async_precompute is False
     assert not args.send_actions
+
+    explicit_c2 = _parse_deploy_args(
+        "--rtc-profile",
+        profile_id,
+        "--debug",
+        "--position-continuous-waypoint-profile",
+        "async_c2",
+    )
+    with pytest.raises(ValueError, match="async_c2 requires the effective"):
+        run_policy.validate_args(
+            explicit_c2,
+            raw_argv=(
+                "--rtc-profile",
+                profile_id,
+                "--debug",
+                "--position-continuous-waypoint-profile",
+                "async_c2",
+            ),
+        )
 
     with pytest.raises(ValueError, match="forbids --send-actions"):
         run_policy.validate_args(

@@ -21,6 +21,7 @@ from teleop_runtime.backends.hands.inspire_tac import (
     InspireTacHandBackendConfig,
 )
 from teleop_runtime.deploy import run_policy
+from teleop_runtime.real_teleop import camera_runtime
 
 
 RAW_PROFILE = "raw_rtc_final_chunk_15_30_60_120_v1"
@@ -100,14 +101,19 @@ def test_openpi_real_shadow_profile_drops_qpos_init_authority() -> None:
     assert "--policy-qpos-init-dataset" not in shadow
     assert "--policy-qpos-init-collision-check" not in shadow
     assert "--wait-for-ready-confirm" in ordinary
+    assert "--dmtac-no-tactile" in ordinary
     assert "--auto-start" in shadow
     assert "--no-wait-for-ready-confirm" in shadow
     assert "--dmtac-no-tactile" in shadow
     assert "--camera-startup-hardware-reset" not in ordinary
     assert "--camera-start-stagger-sec" not in ordinary
-    assert "--camera-startup-hardware-reset" in shadow
+    assert "--camera-startup-hardware-reset" not in shadow
     stagger_index = shadow.index("--camera-start-stagger-sec")
     assert shadow[stagger_index + 1] == "0.5"
+    parser = argparse.ArgumentParser()
+    run_policy.add_args(parser)
+    tactile_opt_in = parser.parse_args([*ordinary, "--dmtac-with-tactile"])
+    assert tactile_opt_in.dmtac_tactile is True
 
 
 def test_real_shadow_manual_dmtac_ports_bypass_stale_assignment_without_command_authority() -> None:
@@ -142,33 +148,144 @@ def test_real_shadow_manual_dmtac_ports_bypass_stale_assignment_without_command_
     assert all(config.connect_tactile is False for config in configs.values())
 
 
-def test_deploy_camera_sources_start_in_config_order_with_stagger() -> None:
+def test_deploy_camera_sources_use_collection_priority_order_with_stagger() -> None:
     started: list[str] = []
 
     class _Config:
-        def __init__(self, serial: str) -> None:
+        def __init__(self, serial: str, priority: int) -> None:
             self.serial = serial
             self.startup_hardware_reset = True
+            self.startup_warmup_policy = "bounded_first_frame"
+            self.metadata = {"startup_priority": priority}
 
     class _Source:
-        def __init__(self, name: str, serial: str) -> None:
+        startup_timing: dict[str, float] = {}
+
+        def __init__(self, name: str, serial: str, priority: int) -> None:
             self.name = name
-            self.config = _Config(serial)
+            self.config = _Config(serial, priority)
 
         def start(self) -> None:
             started.append(self.name)
 
     sources = {
-        "front": _Source("front", "FRONT"),
-        "left_wrist": _Source("left_wrist", "LEFT"),
-        "right_wrist": _Source("right_wrist", "RIGHT"),
+        "front": _Source("front", "FRONT", 0),
+        "left_wrist": _Source("left_wrist", "LEFT", 20),
+        "right_wrist": _Source("right_wrist", "RIGHT", 10),
     }
 
-    with patch.object(run_policy.time, "sleep") as sleep_mock:
+    with patch.object(camera_runtime.time, "sleep") as sleep_mock:
         run_policy.start_camera_sources(sources, stagger_sec=0.5)
 
-    assert started == ["front", "left_wrist", "right_wrist"]
+    assert started == ["front", "right_wrist", "left_wrist"]
     assert sleep_mock.call_args_list == [call(0.5), call(0.5)]
+
+
+def test_deploy_camera_startup_reuses_collection_deferred_retry() -> None:
+    calls: list[str] = []
+
+    class _Source:
+        startup_timing: dict[str, float] = {}
+
+        def __init__(self, name: str, priority: int, *, fail_first: bool = False) -> None:
+            self.name = name
+            self.config = argparse.Namespace(
+                metadata={"startup_priority": priority},
+                startup_warmup_policy="bounded_first_frame",
+            )
+            self.fail_first = fail_first
+            self.start_count = 0
+
+        def start(self) -> None:
+            self.start_count += 1
+            calls.append(f"start:{self.name}:{self.start_count}")
+            if self.fail_first and self.start_count == 1:
+                raise RuntimeError(
+                    "startup_warmup_failed:policy=bounded_first_frame:"
+                    "no_frames_within_sec=5.000:attempts=5"
+                )
+
+        def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+    sources = {
+        "front": _Source("front", 0, fail_first=True),
+        "left_wrist": _Source("left_wrist", 20),
+        "right_wrist": _Source("right_wrist", 10),
+    }
+
+    with patch.object(camera_runtime.time, "sleep") as sleep_mock:
+        run_policy.start_camera_sources(sources, stagger_sec=0.5)
+
+    assert calls == [
+        "start:front:1",
+        "start:right_wrist:1",
+        "start:left_wrist:1",
+        "close:front",
+        "start:front:2",
+    ]
+    assert sleep_mock.call_args_list == [call(0.5), call(0.5), call(1.0)]
+
+
+def test_deploy_camera_startup_fails_closed_after_collection_retry() -> None:
+    class _Source:
+        config = argparse.Namespace(
+            metadata={"startup_priority": 0},
+            startup_warmup_policy="bounded_first_frame",
+        )
+        startup_timing: dict[str, float] = {}
+
+        def start(self) -> None:
+            raise RuntimeError(
+                "startup_warmup_failed:policy=bounded_first_frame:"
+                "no_frames_within_sec=5.000:attempts=5"
+            )
+
+        def close(self) -> None:
+            return None
+
+    with patch.object(camera_runtime.time, "sleep"):
+        with pytest.raises(
+            RuntimeError,
+            match="failed after the formal real-teleop deferred retry lifecycle",
+        ):
+            run_policy.start_camera_sources({"front": _Source()})
+
+
+def test_deploy_camera_defaults_match_formal_collection_startup() -> None:
+    args = _parser().parse_args([])
+
+    assert args.camera_color_format == "bgr8"
+    assert args.camera_startup_warmup_policy == "bounded_first_frame"
+    assert args.camera_start_stagger_sec == camera_runtime.CAMERA_START_STAGGER_SEC
+
+
+def test_deploy_camera_self_check_uses_collection_freshness_gate() -> None:
+    class _Source:
+        name = "front"
+        config = argparse.Namespace(
+            serial="FRONT",
+            stale_after_sec=2.0,
+            enable_depth=False,
+        )
+
+        def __init__(self) -> None:
+            self.frame_count = 0
+
+        def device_info(self) -> dict[str, object]:
+            self.frame_count += 1
+            return {
+                "frame_count": self.frame_count,
+                "last_frame_age_sec": 0.01,
+                "stale_after_sec": 2.0,
+            }
+
+    source = _Source()
+    with patch.object(run_policy.time, "sleep") as sleep_mock:
+        run_policy.run_camera_startup_self_check({"front": source})
+
+    assert source.frame_count == 3
+    assert sleep_mock.call_count == 2
 
 
 def test_deploy_camera_reset_override_is_explicit_and_applies_to_each_config() -> None:

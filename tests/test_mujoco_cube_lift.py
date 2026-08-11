@@ -37,6 +37,7 @@ def test_cube_lift_cli_parses_random_viewer_options_without_launching_gui() -> N
     assert args.steps == 300
 
 
+@pytest.mark.integration
 def test_cube_lift_config_freezes_center_cube_and_task_local_layouts() -> None:
     config = CubeLiftTaskConfig.load(TASK_CONFIG_PATH)
     contract = config.base_contract()
@@ -62,6 +63,7 @@ def test_cube_lift_specs_reject_invalid_action_and_observation() -> None:
         observation_spec.coerce(np.zeros(30, dtype=np.float32))
 
 
+@pytest.mark.integration
 def test_physical_cube_lift_uses_tcp_pose_action_contract() -> None:
     config = CubeLiftTaskConfig.load(
         "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v1.json"
@@ -71,6 +73,7 @@ def test_physical_cube_lift_uses_tcp_pose_action_contract() -> None:
     assert CubeLiftActionSpec(layout_version=config.action_layout).dim == 7
 
 
+@pytest.mark.optional
 def test_scene_freejoint_helper_resets_center_cube_and_reports_table_contact() -> None:
     pytest.importorskip("mujoco")
     config = CubeLiftTaskConfig.load(TASK_CONFIG_PATH)
@@ -99,6 +102,7 @@ def test_scene_freejoint_helper_resets_center_cube_and_reports_table_contact() -
     assert scene.state_is_finite()
 
 
+@pytest.mark.optional
 def test_cube_lift_env_has_gymnasium_reset_step_contract() -> None:
     pytest.importorskip("gymnasium")
     from gymnasium.utils.env_checker import check_env
@@ -125,6 +129,7 @@ def test_cube_lift_env_has_gymnasium_reset_step_contract() -> None:
     env.close()
 
 
+@pytest.mark.optional
 def test_cube_lift_reset_and_action_trace_are_deterministic() -> None:
     pytest.importorskip("gymnasium")
     env = CubeLiftEnv(TASK_CONFIG_PATH)
@@ -150,6 +155,7 @@ def test_cube_lift_reset_and_action_trace_are_deterministic() -> None:
     env.close()
 
 
+@pytest.mark.optional
 def test_cube_lift_holds_left_home_and_maps_right_delta_action() -> None:
     pytest.importorskip("gymnasium")
     env = CubeLiftEnv(TASK_CONFIG_PATH)
@@ -181,6 +187,7 @@ def test_cube_lift_holds_left_home_and_maps_right_delta_action() -> None:
         env.close()
 
 
+@pytest.mark.optional
 def test_cube_lift_success_and_out_of_bounds_termination_predicates() -> None:
     pytest.importorskip("gymnasium")
     env = CubeLiftEnv(TASK_CONFIG_PATH)
@@ -212,6 +219,7 @@ def test_cube_lift_success_and_out_of_bounds_termination_predicates() -> None:
         env.close()
 
 
+@pytest.mark.optional
 def test_normal_v2_lift_requires_bilateral_finger_contact() -> None:
     pytest.importorskip("mujoco")
     from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
@@ -245,6 +253,7 @@ def test_normal_v2_lift_requires_bilateral_finger_contact() -> None:
         env.close()
 
 
+@pytest.mark.optional
 def test_cube_lift_hundred_random_headless_resets_remain_finite() -> None:
     pytest.importorskip("gymnasium")
     rng = np.random.default_rng(20260715)

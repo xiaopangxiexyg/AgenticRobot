@@ -266,6 +266,7 @@ def test_current_runtime_rejects_unimplemented_client_owned_transform() -> None:
         )
 
 
+@pytest.mark.integration
 def test_openpi_runtime_registry_publishes_explicit_artifact_hash(tmp_path: Path) -> None:
     contract = NormalizationContract(
         state=NormalizationDomainSpec(
@@ -305,6 +306,7 @@ def test_openpi_runtime_registry_publishes_explicit_artifact_hash(tmp_path: Path
         )
 
 
+@pytest.mark.integration
 def test_openpi_runtime_registry_distinguishes_missing_from_identity(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoints" / "legacy-policy" / "11"
     checkpoint.mkdir(parents=True)

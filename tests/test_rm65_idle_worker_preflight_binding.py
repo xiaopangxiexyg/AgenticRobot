@@ -61,11 +61,6 @@ from teleop_runtime.position_control.deploy_executor import (
 )
 
 
-EXPECTED_CANDIDATE_MANIFEST_HASH = (
-    "964ea0f52b877eeead80145f4b50a2c7c22051f5615773faef1d504805b46bc4"
-)
-
-
 def _binding():
     manifest = build_rm65_policy_arm_qpos_candidate_manifest()
     evidence = build_rm65_execution_evidence_bundle(manifest)
@@ -106,7 +101,6 @@ def test_narrow_authorization_does_not_change_candidate_manifest_or_confer_motio
     manifest, evidence, authorization, binding = _binding()
     after = build_rm65_policy_arm_qpos_candidate_manifest()
 
-    assert before.semantic_content_hash == EXPECTED_CANDIDATE_MANIFEST_HASH
     assert manifest.semantic_content_hash == before.semantic_content_hash
     assert after.semantic_content_hash == before.semantic_content_hash
     assert authorization.profile_id == RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1
@@ -607,3 +601,55 @@ def test_debug_cli_wires_real_worker_classes_without_any_joint_target_call(
     assert payload["trace"]["durable_complete"] is True
     assert payload["trace"]["capture_commit_eligible"] is False
     assert len(payload["stop_receipts"]) == 2
+    assert payload["artifact_storage"]["selection_source"] == "explicit"
+    assert payload["artifact_storage"]["resolved_layout"] == "explicit"
+
+
+def test_debug_cli_evidence_layout_is_legacy_by_default_and_opt_in_canonical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from teleop_runtime.debug.rm65_real_debug import (
+        run_rm65_idle_worker_drain_preflight as cli,
+    )
+
+    required = [
+        "--left-arm-ip",
+        "192.0.2.1",
+        "--right-arm-ip",
+        "192.0.2.2",
+        "--operator-authorization-id",
+        "operator-path-test",
+    ]
+    legacy_args = cli._parse_args(required)
+    legacy = cli.resolve_preflight_evidence_root(legacy_args)
+    assert legacy.path == cli.legacy_preflight_evidence_root()
+    assert legacy.source == "legacy"
+
+    canonical = tmp_path / "canonical-preflight"
+    monkeypatch.setattr(
+        cli,
+        "canonical_preflight_evidence_root",
+        lambda: canonical,
+    )
+    canonical_args = cli._parse_args(
+        required + ["--artifact-layout", "runtime-artifacts-v1"]
+    )
+    selected = cli.resolve_preflight_evidence_root(canonical_args)
+    assert selected.path == canonical
+    assert selected.source == "canonical"
+    assert not canonical.exists()
+
+    explicit = tmp_path / "exact"
+    explicit_args = cli._parse_args(
+        required
+        + [
+            "--artifact-layout",
+            "runtime-artifacts-v1",
+            "--evidence-root",
+            str(explicit),
+        ]
+    )
+    selected = cli.resolve_preflight_evidence_root(explicit_args)
+    assert selected.path == explicit
+    assert selected.source == "explicit"

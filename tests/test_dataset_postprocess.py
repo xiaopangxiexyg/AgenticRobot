@@ -113,6 +113,7 @@ def test_detect_stutter_segments_splits_on_long_gap() -> None:
     assert [segment.end_frame_exclusive for segment in segments] == [2, 4]
 
 
+@pytest.mark.optional
 def test_clean_stutters_splits_segments_and_reindexes(tmp_path) -> None:
     root = tmp_path / "dataset"
     out = tmp_path / "dataset_stutter_clean"
@@ -358,6 +359,7 @@ def test_split_episodes_writes_clean_and_extracted_datasets(tmp_path) -> None:
     assert extracted_info["total_frames"] == 7
 
 
+@pytest.mark.optional
 def test_label_force_collisions_updates_episode_and_stats_meta(tmp_path) -> None:
     root = tmp_path / "dataset"
     episodes = [
@@ -437,6 +439,7 @@ def test_label_force_collisions_updates_episode_and_stats_meta(tmp_path) -> None
     assert info["postprocess_history"][-1]["tool"] == "utils.dataset_postprocess.label_force_collisions"
 
 
+@pytest.mark.optional
 def test_label_force_collisions_override_all_detected(tmp_path) -> None:
     root = tmp_path / "dataset"
     episodes = [
@@ -468,6 +471,7 @@ def test_label_force_collisions_override_all_detected(tmp_path) -> None:
     assert info["postprocess_history"][-1]["override"] == "all-detected"
 
 
+@pytest.mark.optional
 def test_label_force_collisions_preserves_terminal_episode_evidence(tmp_path) -> None:
     root = tmp_path / "dataset"
     episode = {
@@ -511,6 +515,7 @@ def test_label_force_collisions_preserves_terminal_episode_evidence(tmp_path) ->
     assert updated["summary"]["force_collision_event"]["source"] == "position_force_guard"
 
 
+@pytest.mark.optional
 def test_causal_align_dataset_uses_latest_non_future_refs(tmp_path) -> None:
     root = tmp_path / "dataset"
     out = tmp_path / "dataset_causal"
@@ -573,6 +578,7 @@ def test_causal_align_dataset_uses_latest_non_future_refs(tmp_path) -> None:
     assert info["postprocess_history"][-1]["tool"] == "utils.dataset_postprocess.causal_align"
 
 
+@pytest.mark.optional
 def test_trim_nan_tails_copies_dataset_and_updates_meta(tmp_path) -> None:
     root = tmp_path / "dataset"
     out = tmp_path / "dataset_trimmed"

@@ -9,6 +9,9 @@ from control_station import (
     StationPublicationBarrier,
     admit_station_operation_result,
 )
+from control_station.publication_barrier import (
+    StationPublicationBarrierObserverPort,
+)
 
 
 def _authority_result(*, succeeded: bool = True):
@@ -112,3 +115,41 @@ def test_release_linearizes_after_inflight_publication() -> None:
     assert publication_done.is_set()
     assert release_done.is_set()
     assert not barrier.snapshot().enabled
+
+
+def test_publication_barrier_observer_port_preserves_delivery_policy() -> None:
+    snapshot = StationPublicationBarrier(
+        source_slot_id="human-primary"
+    ).snapshot()
+    observed = []
+    port = StationPublicationBarrierObserverPort(
+        suppress_callback_errors=True
+    )
+    port.bind(lambda item, **metadata: observed.append((item, metadata)))
+    metadata = {
+        "causal_station_fact_id": "intent:observe",
+        "occurred_at": 3.0,
+        "clock_domain_id": "control-monotonic",
+    }
+    port.observe(snapshot, **metadata)
+    port.observe(snapshot, **metadata)
+    assert len(observed) == 1
+    assert port.failure_count == 0
+
+    failing = StationPublicationBarrierObserverPort(
+        suppress_callback_errors=True
+    )
+
+    def fail(*_args, **_kwargs) -> None:
+        raise RuntimeError("observer unavailable")
+
+    failing.bind(fail)
+    failing.observe(snapshot, **metadata)
+    assert failing.failure_count == 1
+
+    strict = StationPublicationBarrierObserverPort(
+        suppress_callback_errors=False
+    )
+    strict.bind(fail)
+    with pytest.raises(RuntimeError, match="observer unavailable"):
+        strict.observe(snapshot, **metadata)

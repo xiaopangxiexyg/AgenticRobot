@@ -2990,6 +2990,15 @@ def test_cs6b1f_sim_hil_promotes_passive_pose_and_keeps_publish_seam_unique(
         ) + 0.1
         human_step = station.step(now=clock(), physics_ticks_after_dispatch=60)
         assert human_step.status == "dispatched"
+        assert human_step.snapshot is not None
+        assert (
+            human_step.snapshot.decision_schedule_tick.late_tick_policy
+            == "skip_to_next_legal_reference_tick"
+        )
+        assert (
+            human_step.snapshot.decision_schedule_tick.skipped_late_tick_count
+            >= 1
+        )
 
         clock.value += 0.2
         next_human = station.step_passive_human_pose_source(now=clock())

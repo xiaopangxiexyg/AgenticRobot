@@ -280,7 +280,7 @@ def test_dmtac_unique_completion_is_confirmed_and_saved_before_gui(
 
 
 def test_umi_starts_web_gui_before_attempting_dmtac_preflight(monkeypatch):
-    from teleop_runtime.collection.umi import app
+    from control_station import umi_application as app
 
     events = []
 
@@ -331,7 +331,7 @@ def test_umi_starts_web_gui_before_attempting_dmtac_preflight(monkeypatch):
 
 
 def test_umi_dmtac_failure_does_not_skip_angle_trigger_attempt(monkeypatch):
-    from teleop_runtime.collection.umi import app
+    from control_station import umi_application as app
 
     events = []
 

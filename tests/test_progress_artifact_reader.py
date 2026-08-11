@@ -23,6 +23,7 @@ from dataset_contracts.progress_profile import (
 )
 from dataset_interface.progress_artifacts import (
     DATASET_PROGRESS_PROFILE_RELATIVE_PATH,
+    ProgressArtifactReadCache,
     ProgressArtifactReadError,
     load_dataset_progress_profile,
     load_sealed_progress_episode,
@@ -135,6 +136,39 @@ def test_load_sealed_progress_episode_is_read_only_and_resolves_timeline(
     assert loaded.timeline.phase == "TERMINATED"
     assert loaded.timeline.full_task_outcome == "SUCCESS"
     assert loaded.timeline.attempts[0].outcome == "SUCCESS"
+
+
+def test_sealed_episode_read_cache_reuses_manifest_bound_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dataset_interface.progress_artifacts as artifacts_module
+
+    episode_dir = tmp_path / "progress"
+    identity, _, _, _ = _progress_episode(episode_dir, seal=True)
+    original = artifacts_module._read_profile
+    calls = 0
+
+    def counted(path: Path) -> TaskProgressProfileV1:
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(artifacts_module, "_read_profile", counted)
+    cache = ProgressArtifactReadCache()
+    first = load_sealed_progress_episode(
+        episode_dir,
+        expected_episode_identity_hash=identity.semantic_content_hash,
+        read_cache=cache,
+    )
+    second = load_sealed_progress_episode(
+        episode_dir,
+        expected_episode_identity_hash=identity.semantic_content_hash,
+        read_cache=cache,
+    )
+
+    assert first.profile is second.profile
+    assert calls == 1
 
 
 def test_progress_artifact_reader_rejects_unsealed_episode(

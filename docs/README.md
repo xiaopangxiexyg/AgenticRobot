@@ -8,10 +8,13 @@
 | 环境安装与基础检查 | [setup](./setup/README.md) | [环境与复现权威说明](../README_ENV.md) |
 | 真机遥操、数采、Replay、Deploy | [real](./real/README.md) | [参数数组](./real/teleop_args.sh)、[遥操数采与长程 Progress Profile](./real/TELEOP_COLLECTION.md)、[Replay](./real/REPLAY.md)、[Deploy](./real/DEPLOY.md)、[UMI](./real/UMI.md)、[OpenPI](./real/OPENPI.md) |
 | MuJoCo 与仿真 | [sim](./sim/README.md) | [MuJoCo/仿真说明](./sim/MUJOCO.md) |
-| Sim human-in-the-loop | [HIL](./HIL/README.md) | [CS-6b1f 使用说明、capture 与策略兼容矩阵](./HIL/README.md) |
+| Sim human-in-the-loop | [HIL](./HIL/README.md) | [单右臂 PPO + VIVE/gripper、Scheme-A、ControlTrace 与历史 CS-6b1f](./HIL/README.md) |
 | 设备、USB、标定 | [hardware](./hardware/README.md) | [设备与标定](./hardware/DEVICES_AND_CALIBRATION.md)、[DMTAC/Q6](./hardware/DMTAC.md) |
-| 数据后处理、分析、测试、验收 | [data](./data/README.md) | [长程任务细粒度阶段标注](./real/LONG_HORIZON_STAGE_ANNOTATION.md)、[后处理与测试](./data/POSTPROCESS_AND_TESTING.md)、[v2.3 验收](./data/ACCEPTANCE_V23.md) |
+| 数据格式、后处理、分析、测试、验收 | [data](./data/README.md) | [v2.5-p2 数据格式](./data/v25p2/README.md)、[数据集内容与交付](./data/v25p2/DATASET_CONTENT_AND_HANDOFF.md)、[长程任务细粒度阶段标注](./real/LONG_HORIZON_STAGE_ANNOTATION.md)、[后处理与测试](./data/POSTPROCESS_AND_TESTING.md)、[v2.3 验收](./data/ACCEPTANCE_V23.md) |
+| 跨层端到端指南 | [showcase](./showcase/README.md) | 已落地合同、训练接口和部署链路的贯通说明；不作为新的运行入口 |
 | 被替代命令和历史报告 | [legacy](./legacy/README.md) | 仅用于追溯和复现实验 |
+
+跨模块的只读架构与 RTC 图示集中在 [architecture](./architecture/README.md)；它们不是运行入口，也不新增实施契约。
 
 ## 使用方式
 
@@ -67,3 +70,4 @@
 - 参数、验收或安全语义变化：更新同领域专题文件。
 - 实验命令通过验收后再提升；旧说明迁入 `legacy/`，保留替代关系。
 - 真机遥操参数数组只在 [`docs/real/teleop_args.sh`](./real/teleop_args.sh)维护。
+- 带日期、数据来源和源码哈希的评估结果放入所属领域的 `reports/`，不与当前运行入口并列。

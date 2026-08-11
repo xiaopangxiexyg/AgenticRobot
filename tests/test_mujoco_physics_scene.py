@@ -53,6 +53,7 @@ def _drop_scene(urdf_path: Path) -> SceneSpec:
     )
 
 
+@pytest.mark.integration
 def test_scene_composition_adds_ground_and_explicit_inertial_free_body(
     tmp_path: Path,
 ) -> None:
@@ -79,6 +80,7 @@ def test_scene_composition_adds_ground_and_explicit_inertial_free_body(
     assert body.find("./geom[@name='drop_cube_collision']").attrib["contype"] == "8"
 
 
+@pytest.mark.optional
 def test_isolated_free_body_falls_and_settles_reproducibly(tmp_path: Path) -> None:
     mujoco = pytest.importorskip("mujoco")
     urdf_path = _isolated_table_world(tmp_path)
@@ -108,6 +110,7 @@ def test_isolated_free_body_falls_and_settles_reproducibly(tmp_path: Path) -> No
     assert contacts_a >= 1 and contacts_b >= 1
 
 
+@pytest.mark.optional
 def test_rm65_physics_profile_has_one_urdf_table_and_no_initial_contact() -> None:
     mujoco = pytest.importorskip("mujoco")
     contract = SimulationContract.load(CONTRACT)

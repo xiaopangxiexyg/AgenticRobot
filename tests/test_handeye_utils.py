@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from utils.head_eye.calibration import (
     CalibrationResult,
@@ -71,6 +72,7 @@ class HeadEyePackageTest(unittest.TestCase):
         self.assertEqual((pair[0].width, pair[0].height, pair[0].fps), (1280, 720, 30))
         self.assertEqual(pair[0].describe(), "color 1280x720@30 bgr8")
 
+    @pytest.mark.integration
     def test_module_and_direct_script_help_entrypoints(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         commands = [

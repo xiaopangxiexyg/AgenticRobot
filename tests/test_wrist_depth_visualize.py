@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from utils.dataset_postprocess.wrist_cam_adjust.depth import (
     DepthRangeMaskConfig,
@@ -109,6 +110,7 @@ class WristDepthMaskVisualizationTest(unittest.TestCase):
             self.assertEqual(stream.label, "direct")
             np.testing.assert_array_equal(next(iter_mask_frames(stream)), mask)
 
+    @pytest.mark.optional
     def test_preview_frame_and_video_are_written(self) -> None:
         try:
             import cv2  # noqa: F401

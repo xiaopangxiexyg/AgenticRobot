@@ -72,6 +72,7 @@ def test_collection_runtime_does_not_reverse_depend_on_application_planes() -> N
         "rm65_inspire_tac",
         "sim",
         "teleop_runtime",
+        "utils",
     }
     violations = {
         str(path.relative_to(REPO_ROOT)): sorted(
@@ -168,6 +169,32 @@ def test_legacy_real_teleop_dataset_layout_is_a_thin_reexport() -> None:
     assert {
         node.module for node in executable_nodes if isinstance(node, ast.ImportFrom)
     } == {"collection_runtime.dataset_layout"}
+
+
+def test_dataset_postprocess_modality_storage_is_a_thin_reexport() -> None:
+    path = REPO_ROOT / "utils" / "dataset_postprocess" / "modality_storage.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    executable_nodes = [
+        node
+        for node in tree.body
+        if not (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+        and not (
+            isinstance(node, ast.Assign)
+            and all(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+    ]
+    assert executable_nodes
+    assert all(isinstance(node, ast.ImportFrom) for node in executable_nodes)
+    assert {
+        node.module for node in executable_nodes if isinstance(node, ast.ImportFrom)
+    } == {"collection_runtime.modality_storage"}
 
 
 def test_umi_runtime_bundle_is_separate_from_default_concrete_devices() -> None:

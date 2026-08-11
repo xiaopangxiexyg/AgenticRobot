@@ -216,8 +216,8 @@ def test_sample_result_and_default_config_round_trip(tmp_path):
     assert config.camera_resolution == (1280, 720)
     assert config.camera_fps == 15
     assert config.target["allow_aruco_board_fallback"] is True
-    assert config.side("left").camera_serial == "261122273924"
-    assert config.side("right").camera_serial == "260522278055"
+    assert config.side("left").camera_serial == "260522278055"
+    assert config.side("right").camera_serial == "261122273924"
     assert config.side("left").tcp_profile == "dmgripper"
     assert config.urdf_path.name == "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 

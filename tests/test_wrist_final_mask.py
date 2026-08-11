@@ -67,6 +67,7 @@ def test_native_arm_base_pose_contract_does_not_add_a_transform() -> None:
     assert transforms == {}
 
 
+@pytest.mark.optional
 def test_compose_final_mask_ors_postprocessed_depth_and_table_without_proxy(tmp_path) -> None:
     cv2 = pytest.importorskip("cv2")
     session = tmp_path / "session"

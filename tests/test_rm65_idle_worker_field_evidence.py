@@ -3,15 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from dataset_contracts.completeness import trace_requirement_profile
 from teleop_runtime.backends.arms.rm65_idle_worker_preflight_binding import (
     RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1,
 )
-from teleop_runtime.deploy.rm65_candidate_manifest import (
-    build_rm65_policy_arm_qpos_candidate_manifest,
-)
 from teleop_runtime.deploy.rm65_execution_evidence import (
-    build_rm65_execution_evidence_bundle,
+    resolve_rm65_historical_execution_evidence_contract,
 )
 
 
@@ -25,11 +24,19 @@ _EXPECTED_SOURCE_SHA256 = (
 )
 
 
-def test_m5_8b1_real_a_field_evidence_matches_current_bounded_contract() -> None:
+def test_historical_contract_resolver_rejects_unknown_schema() -> None:
+    with pytest.raises(ValueError, match="Unknown RM65 historical"):
+        resolve_rm65_historical_execution_evidence_contract(
+            "rm65_unknown_field_evidence_v1"
+        )
+
+
+def test_m5_8b1_real_a_field_evidence_matches_declared_historical_contract() -> None:
     record = json.loads(_EVIDENCE.read_text(encoding="utf-8"))
     payload = record["payload"]
-    manifest = build_rm65_policy_arm_qpos_candidate_manifest()
-    bundle = build_rm65_execution_evidence_bundle(manifest)
+    contract = resolve_rm65_historical_execution_evidence_contract(
+        record["evidence_schema"]
+    )
     profile = trace_requirement_profile(RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1)
 
     assert record["evidence_scope"] == "scoped_idle_worker_drain_stop_field_evidence"
@@ -37,9 +44,11 @@ def test_m5_8b1_real_a_field_evidence_matches_current_bounded_contract() -> None
     assert record["source_sha256"] == _EXPECTED_SOURCE_SHA256
     assert payload["status"] == "idle_worker_drain_stop_only_completed"
     assert payload["profile_id"] == profile.profile_id
-    assert payload["manifest_hash"] == manifest.semantic_content_hash
-    assert payload["inventory_hash"] == bundle.dispatch_inventory.semantic_content_hash
-    assert payload["worker_drain_plan_hash"] == bundle.worker_drain_plan.semantic_content_hash
+    assert contract.manifest_payload_status == "hash_only_not_archived"
+    assert payload["manifest_id"] == contract.manifest_identity.manifest_id
+    assert payload["manifest_hash"] == contract.manifest_identity.manifest_hash
+    assert payload["inventory_hash"] == contract.dispatch_inventory_hash
+    assert payload["worker_drain_plan_hash"] == contract.worker_drain_plan_hash
 
     assert payload["canonical_defaults_modified"] is False
     assert payload["motion_authorized"] is False
@@ -49,7 +58,7 @@ def test_m5_8b1_real_a_field_evidence_matches_current_bounded_contract() -> None
     assert payload["binding"]["motion_authorized"] is False
     assert payload["binding"]["lifecycle_authorized"] is False
 
-    required = [item.participant_id for item in bundle.worker_drain_plan.participants]
+    required = list(contract.required_worker_participant_ids)
     aggregate = payload["drain_aggregate"]
     assert aggregate["complete"] is True
     assert aggregate["status"] == "complete"
@@ -92,4 +101,3 @@ def test_m5_8b1_real_a_field_evidence_matches_current_bounded_contract() -> None
     assert trace["in_memory_complete"] is True
     assert trace["durable_complete"] is True
     assert trace["capture_commit_eligible"] is False
-

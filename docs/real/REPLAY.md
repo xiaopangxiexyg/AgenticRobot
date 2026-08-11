@@ -1,7 +1,7 @@
 # Replay 参数说明
 
 Pose→QPOS 各版本及 0727 离线结果汇总见
-[POSE_LIFT_EXPERIMENTS_0727.md](./POSE_LIFT_EXPERIMENTS_0727.md)。
+[POSE_LIFT_EXPERIMENTS_0727.md](./reports/POSE_LIFT_EXPERIMENTS_0727.md)。
 
 Replay 重放已有数据；运行命令见 [real README](./README.md)。离线浏览与真机执行使用同一
 GUI 入口，但只有显式提供真实 backend 并经过人工放行才允许运动。

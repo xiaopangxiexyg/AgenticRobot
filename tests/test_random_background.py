@@ -697,6 +697,7 @@ def test_fixed_front_border_mask_mixed_provider_never_falls_back_to_original_or_
     assert not np.array_equal(out[0:2, 10:14], rgb[0:2, 10:14])
 
 
+@pytest.mark.integration
 def test_augment_sample_from_bitpack_manifest(tmp_path) -> None:
     masks = [
         np.asarray([[1, 0], [0, 1]], dtype=np.uint8),
@@ -749,6 +750,7 @@ def test_augment_sample_from_bitpack_manifest(tmp_path) -> None:
     assert not np.array_equal(out[0, 0], rgb[0, 0])
 
 
+@pytest.mark.optional
 def test_real_image_background_provider(tmp_path) -> None:
     cv2 = __import__("cv2")
     image_root = tmp_path / "real_bg"
@@ -806,6 +808,7 @@ def test_real_image_background_provider(tmp_path) -> None:
     assert not np.array_equal(fixed_first[0, 10], rgb[0, 10])
 
 
+@pytest.mark.optional
 def test_real_image_manifest_is_portable_with_its_image_directory(tmp_path) -> None:
     cv2 = __import__("cv2")
     source_root = tmp_path / "source_pool"
@@ -828,6 +831,7 @@ def test_real_image_manifest_is_portable_with_its_image_directory(tmp_path) -> N
     assert provider.paths == [(copied_root / "images/background.png").resolve()]
 
 
+@pytest.mark.optional
 def test_manifest_image_root_can_be_overridden_for_legacy_absolute_manifest(
     tmp_path,
 ) -> None:
@@ -858,6 +862,7 @@ def test_manifest_image_root_can_be_overridden_for_legacy_absolute_manifest(
     assert provider.paths == [(image_root / "background.png").resolve()]
 
 
+@pytest.mark.optional
 def test_paired_real_image_background_shares_source_but_not_view(tmp_path) -> None:
     cv2 = __import__("cv2")
     image_root = tmp_path / "real_pool"
@@ -917,6 +922,7 @@ def test_paired_real_image_background_shares_source_but_not_view(tmp_path) -> No
     assert left_metadata["scene_canvas_source"] == "shared_real_image_independent_views"
 
 
+@pytest.mark.optional
 def test_real_image_provider_applies_seeded_scale_and_aspect_stretch(tmp_path) -> None:
     cv2 = __import__("cv2")
     image_root = tmp_path / "real_bg"

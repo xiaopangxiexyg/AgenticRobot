@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -311,6 +313,45 @@ def test_trained_artifact_derivation_is_additive_and_v22_compatible(
         == MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
     )
     assert normalized.training is not None
+
+
+def test_training_entrypoint_registers_future_dataclass_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "openpi"
+    package_path = checkout / "src" / "openpi" / "__init__.py"
+    package_path.parent.mkdir(parents=True)
+    package_path.write_text("", encoding="utf-8")
+    train_path = checkout / "scripts" / "train.py"
+    train_path.parent.mkdir()
+    train_path.write_text(
+        """from __future__ import annotations
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class Args:
+    value: int = 17
+
+
+def main(config):
+    return config
+""",
+        encoding="utf-8",
+    )
+    openpi_module = ModuleType("openpi")
+    openpi_module.__file__ = str(package_path)
+    monkeypatch.setitem(sys.modules, "openpi", openpi_module)
+    monkeypatch.delitem(sys.modules, "_dexteleop_openpi_train", raising=False)
+
+    train_main, resolved_checkout = training_launch._openpi_train_main()
+
+    loaded = sys.modules["_dexteleop_openpi_train"]
+    assert resolved_checkout == checkout
+    assert train_main is loaded.main
+    assert loaded.Args().value == 17
 
 
 def test_training_entrypoint_uses_openpi_checkout_cwd_and_restores_caller(

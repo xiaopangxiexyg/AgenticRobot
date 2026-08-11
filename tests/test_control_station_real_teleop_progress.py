@@ -19,9 +19,16 @@ from control_station.real_teleop.progress import (
     progress_arm_control_mode_selection_intent_from_event,
     progress_intent_from_event,
 )
+from control_station.real_teleop_application import (
+    build_real_teleop_progress_application,
+)
 from control_station.web.calibration_web_ui import CalibrationWebUi, _HTML_PAGE
 from teleop_runtime.real_teleop.operator_control_runtime import (
     RealTeleopControlInput,
+)
+from teleop_runtime.real_teleop.progress_contracts import (
+    ProgressArmControlModeSelectionCommand,
+    ProgressProfileSelectionCommand,
 )
 import teleop_runtime.real_teleop.operator_control_runtime as operator_runtime
 
@@ -380,6 +387,11 @@ def test_progress_failure_is_immediate_and_does_not_open_confirmation() -> None:
     assert 'document.getElementById("longHorizonProgressMount")' in script
     assert "item.task_id" in script
     assert "Keep the operator's local draft while polling" in script
+    assert 'let renderedDatasetRoot = "";' in script
+    assert "const datasetChanged = currentDatasetRoot !== renderedDatasetRoot;" in script
+    assert "!datasetChanged" in script
+    assert "!Boolean(progress.profile_selection_locked)" in script
+    assert "renderedDatasetRoot = currentDatasetRoot;" in script
     assert "当前阶段（本次采集）" in script
     assert "下一阶段（完成当前后进入）" in script
     assert "renderNextStagePreview" in script
@@ -512,6 +524,9 @@ def test_bare_linear_advance_requires_exactly_one_published_target() -> None:
 
 def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
     control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+    control._progress_application = build_real_teleop_progress_application(
+        SimpleNamespace()
+    )
     control._progress_operator_intents = __import__("collections").deque()
     control._progress_profile_selection_intents = (
         __import__("collections").deque()
@@ -545,8 +560,8 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
     )
     selections = control.consume_progress_profile_selection_intents()
     assert selections == (
-        ProgressProfileSelectionIntent(
-            intent_id="real-teleop-progress-profile-gui:7",
+        ProgressProfileSelectionCommand(
+            command_id="real-teleop-progress-profile-gui:7",
             profile_id="fixture-progress",
         ),
     )
@@ -558,8 +573,8 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
         control.consume_progress_arm_control_mode_selection_intents()
     )
     assert arm_mode_selections == (
-        ProgressArmControlModeSelectionIntent(
-            intent_id="real-teleop-progress-arm-mode-gui:9",
+        ProgressArmControlModeSelectionCommand(
+            command_id="real-teleop-progress-arm-mode-gui:9",
             mode="strict_profile",
         ),
     )
@@ -569,6 +584,9 @@ def test_strict_profile_blocks_manual_fix_and_single_arm_pedal_routes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+    control._progress_application = build_real_teleop_progress_application(
+        SimpleNamespace()
+    )
     control._progress_ui_payload = {
         "configured": True,
         "arm_control_mode": "strict_profile",

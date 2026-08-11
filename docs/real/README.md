@@ -107,6 +107,11 @@ python -m hardware.foot_pad --count 2
 
 ### 1.3 正式 position 数采（M）
 
+新建的正式 RealTeleop/headless 数据集统一写入
+`/home/user/zc/datasets/RealmanDMTAC/FormalCollection`；collector 继续在其下创建
+`<YYYY-MM-DD>_<collection-task-name>`。`DATASET_BASE` 的显式覆盖仍然保留给旧数据兼容、
+离线测试和受控回退，但不会迁移已有数据，也不应作为新的正式采集位置。
+
 ```bash
 : "${DEXTELEOP_ROOT:=/home/user/zc/DexTeleop}"
 (
@@ -121,7 +126,7 @@ python -m hardware.foot_pad --count 2
   set -euo pipefail
   : "${LEFT_ARM_IP:=192.168.101.21}"
   : "${RIGHT_ARM_IP:=192.168.1.20}"
-  : "${DATASET_BASE:=datasets}"
+  : "${DATASET_BASE:=/home/user/zc/datasets/RealmanDMTAC/FormalCollection}"
   export LEFT_ARM_IP RIGHT_ARM_IP DATASET_BASE
   source docs/real/teleop_args.sh
 
@@ -159,9 +164,15 @@ q5 回滞 release=6°），因此上面的正式命令就是稳定版命令，�
 `"${POSITION_FORMAL_V2_RESPONSIVE_ARGS[@]}"`，并将 task name 改为
 `dmtac_rm65_bimanual_position_v2_responsive`。V2 仅在单侧状态为 `tracking`、tracker
 运动窗口有效、q3/q5 均在 4° guard 外且腕部 null projection 未介入时，把该侧
-post-IK alpha 提升到 1；进入 guard、发生 hold/boundary 或 q5 escape latch 仍使用受保护
+post-IK alpha 提升到 0.70；进入 guard、发生 hold/boundary 或 q5 escape latch 仍使用受保护
 路径。恢复 `POSITION_FORMAL_V1_ARGS` 即完整回退，不能把 V1/V2 episode 写入同一个
 task/profile 数据集合。
+
+`POSITION_FORMAL_V2_BALANCED_ARGS` 是已经过真机 A/B 的冻结稳定基线。它只把上述
+普通区 alpha 从 0.70 降为 0.55；IK、限位/分支保护、力急停和 120 Hz 执行配置均与
+V2 相同。若继续验证残余约 30 Hz 微振动，使用默认关闭的
+`POSITION_FORMAL_V2_SMOOTH_ARGS`；它只把该 alpha 进一步降到 0.45。切回 BALANCED
+即完整回退，RESPONSIVE/BALANCED/SMOOTH 不得写入同一个 task。
 
 J3/J5 物理限位附近的 `joint_limit_escape` 仍保留在 `legacy` 回退链路中。验证不制造
 固定向外步的边界保护时，在 V1 或 V2 数组之后显式追加
@@ -188,26 +199,31 @@ J3/J5 物理限位附近的 `joint_limit_escape` 仍保留在 `legacy` 回退链
 
 真机多相机默认使用 `bgr8` 颜色传输；它不改变 640×480 等请求分辨率，只避免多台
 RealSense 同时协商 `yuyv` 时出现首帧迟到和底层 SDK 重启。启动首帧等待（5 秒）与
-运行期新鲜度等待（1 秒）分开，启动期间不会因首帧迟到反复重建 pipeline。现在每台
+运行期新鲜度等待（1 秒）分开。现在每台
 相机成功启动时还会打印 `pipeline_start_sec`、`sensor_configure_sec` 和 `warmup_sec`：
 前者偏大表示 USB/UVC/设备内部协商耗时，后者偏大表示首帧等待；这三段都发生在相机
 源启动阶段，与 parquet/video writer 无关。只有在已验证的单站环境中才应显式改用
 `--camera-color-format yuyv`。
 
-相机协商仍必须串行。若 `warmup_sec` 明显偏大，可在原完整命令末尾追加
-`--camera-startup-warmup-policy bounded_first_frame`：每台相机在 `pipeline.start()` 后
-只等待第一帧，且总等待受 `startup_frame_grace_sec`（当前默认 5 秒）约束；随后仍由
+相机协商仍必须串行。默认的
+`--camera-startup-warmup-policy bounded_first_frame` 会让每台相机在 `pipeline.start()` 后
+只等待第一帧，且每次 pipeline 尝试受 `startup_frame_grace_sec`（当前默认 5 秒）约束；随后仍由
 原有的三相机连续新帧自检完成正式 admission。这个开关不会更改视频内容、分辨率、
-颜色格式或全局自检，也不会并行启动 native pipeline。首帧等待会完整使用这 5 秒预算，
-不再被 legacy 的 `startup_warmup_frames` 截短；例如 1 秒 SDK wait 会最多连续尝试 5 次，
-而不是仅因 legacy 配置为 2 帧就只等约 2 秒。删除该参数或显式使用
-`--camera-startup-warmup-policy legacy` 即原子回退到旧的 10 帧同步 warmup 与 reset
+颜色格式或全局自检，也不会并行启动 native pipeline。单次 SDK wait 使用运行期等待上限
+（当前默认 1 秒），不再出现一次 `Frame didn't arrive in 4999` 吞掉完整预算；每次 pipeline
+最多连续尝试 5 次。首次仍无首帧时，只关闭并重新打开这一台失败相机的 pipeline 一次，
+不做 USB hardware reset，也不影响已启动的其他相机。第二次仍失败才进入 GUI 等待人工重连。
+人工重连成功后会重新执行三台相机的连续新帧自检，并用新结果替换 GUI 中旧的“启动自检失败”
+快照。显式使用 `--camera-startup-warmup-policy legacy` 可原子回退到旧的 10 帧同步 warmup 与 reset
 retry。若日志中偏大的是 `pipeline_start_sec` 而非 `warmup_sec`，该开关不会缩短 SDK
 自身的 USB/UVC 协商时间，应继续检查 USB 拓扑、独占占用和设备状态。
 
 `POSITION_FORMAL_V1_ARGS` 会强制启用独立的双臂位控受力急停：通过左右 RM65
-状态连接以 20 Hz 读取 tool-zero 六维力，默认任一侧 `|F| > 15 N` 或
-`|T| > 2 Nm` 即锁存并并行请求左右臂 `Arm_Stop`。启动时必须看到
+状态连接以 20 Hz 读取 tool-zero 六维力，默认任一侧 `|F| > 30 N` 或
+`|T| > 5 Nm` 即锁存并并行请求左右臂 `Arm_Stop`。需要恢复此前更保守的完整
+`15 N / 2 Nm` 配置时，在所选正式 position 数组后追加
+`"${POSITION_FORCE_GUARD_CONSERVATIVE_ARGS[@]}"`；该数组同时保留 tool source、20 Hz、
+单样本触发、3 次读取错误上限和 0.4 s stale watchdog。启动时必须看到
 `force_limits_armed=true stale_watchdog=deferred_until_camera_ready`，随后在相机启动
 完成且任何归位/遥操动作前看到
 `stale_watchdog=armed_after_fresh_post_camera_samples motion_admission=ready`。
@@ -242,7 +258,7 @@ Home。若任一 Arm_Stop 未确认或控制线程无法退出，则保持 fail-
   set -euo pipefail
   : "${LEFT_ARM_IP:=192.168.101.21}"
   : "${RIGHT_ARM_IP:=192.168.1.20}"
-  : "${DATASET_BASE:=datasets}"
+  : "${DATASET_BASE:=/home/user/zc/datasets/RealmanDMTAC/FormalCollection}"
   export LEFT_ARM_IP RIGHT_ARM_IP DATASET_BASE
   source docs/real/teleop_args.sh
 
@@ -288,7 +304,7 @@ writer、不启动腕部 depth stream，也不写 standalone debug 文件。它�
   set -euo pipefail
   : "${LEFT_ARM_IP:=192.168.101.21}"
   : "${RIGHT_ARM_IP:=192.168.1.20}"
-  : "${DATASET_BASE:=datasets}"
+  : "${DATASET_BASE:=/home/user/zc/datasets/RealmanDMTAC/FormalCollection}"
   export LEFT_ARM_IP RIGHT_ARM_IP DATASET_BASE
   source docs/real/teleop_args.sh
 
@@ -329,6 +345,7 @@ python -m teleop_runtime.collection --help
 ```bash
 python -m teleop_runtime.collection umi \
   --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist \
   --validate-only
 ```
 

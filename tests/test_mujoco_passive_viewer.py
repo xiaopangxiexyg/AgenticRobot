@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 import sim.mujoco.diagnostics.cube_drop as mujoco_diagnostics
-import mujoco.viewer as mujoco_viewer
+
+mujoco_viewer = pytest.importorskip("mujoco.viewer")
 
 from sim.mujoco.scene import MujocoScene
 from sim.mujoco.viewer import MujocoPassiveViewerSession
@@ -26,6 +27,7 @@ class _FakeViewerHandle:
         self.running = False
 
 
+@pytest.mark.optional
 def test_passive_viewer_session_owns_handle_and_uses_lock_aware_sync() -> None:
     scene = object.__new__(MujocoScene)
     scene.model = object()
@@ -65,6 +67,7 @@ def test_passive_viewer_session_owns_handle_and_uses_lock_aware_sync() -> None:
     assert viewer.status()["teardown_confirmed"] is True
 
 
+@pytest.mark.optional
 def test_passive_viewer_window_close_is_observational_not_control_fault() -> None:
     scene = object.__new__(MujocoScene)
     scene.model = object()
@@ -82,6 +85,7 @@ def test_passive_viewer_window_close_is_observational_not_control_fault() -> Non
     assert viewer.status()["last_error"] is None
 
 
+@pytest.mark.optional
 def test_passive_viewer_close_failure_is_not_reported_as_drained() -> None:
     scene = object.__new__(MujocoScene)
     scene.model = object()
@@ -105,6 +109,7 @@ def test_passive_viewer_close_failure_is_not_reported_as_drained() -> None:
     assert status["teardown_confirmed"] is False
 
 
+@pytest.mark.optional
 def test_default_viewer_launch_does_not_use_terminating_glfw_probe(
     monkeypatch,
 ) -> None:

@@ -123,6 +123,7 @@ def test_side_dropout_masks_every_continuous_component_for_that_side_only() -> N
                 )
 
 
+@pytest.mark.optional
 def test_torch_adapter_keeps_normalized_state_augmentation_on_the_tensor_device() -> None:
     torch = pytest.importorskip("torch")
     layout = _layout()

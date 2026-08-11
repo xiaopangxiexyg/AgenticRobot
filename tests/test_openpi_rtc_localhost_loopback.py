@@ -86,6 +86,7 @@ def _wait_for_close(transport: OpenPIWebsocketTransport) -> None:
     raise AssertionError("localhost transport close did not complete")
 
 
+@pytest.mark.optional
 def test_localhost_final_chunk_loopback_reconnects_with_identical_metadata(
     monkeypatch,
 ) -> None:
@@ -156,6 +157,7 @@ def test_localhost_final_chunk_loopback_reconnects_with_identical_metadata(
     assert all(receipt.status == "completed" for receipt in receipts)
 
 
+@pytest.mark.optional
 def test_localhost_late_final_chunk_times_out_without_fallback(monkeypatch) -> None:
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")

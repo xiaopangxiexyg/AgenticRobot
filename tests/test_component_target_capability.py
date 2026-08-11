@@ -471,6 +471,7 @@ def test_target_can_inject_component_to_robot_action_materializer() -> None:
         adapter_contract_id="hybrid-target-handler",
         adapter_contract_hash="hybrid-target-handler-hash",
         materializer=materialize,
+        expected_output_effectors=("right_arm",),
         clock=lambda: 13.1,
     )
     result = adapter.adapt(request)

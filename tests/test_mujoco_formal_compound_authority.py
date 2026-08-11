@@ -30,6 +30,7 @@ from robot_motion.action import (
     ActionProposalDraft,
     HandActionSpec,
     HandQposSafetyLimits,
+    IMMEDIATE_QREF_SIM_V1,
     RobotAction,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
     SharedCanonicalSafetyResult,
@@ -185,6 +186,8 @@ def _runtime(
     *,
     omit_authority_profile: bool = False,
     component_execution_handoff: bool = False,
+    reference_activation_profile_id: str = SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
+    target_admission_margin_sec: float | None = None,
 ):
     pytest.importorskip("mujoco")
     clock = ManualClock()
@@ -251,7 +254,7 @@ def _runtime(
             enable_primary_policy_authority=False,
             enable_composer_authority=True,
             enable_replay_authority=False,
-            reference_activation_profile_id=SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
+            reference_activation_profile_id=reference_activation_profile_id,
             pose_frame_contract_hash="formal-compound-arm-base-frame-v1",
             compound_hand_action_specs_by_side=hand_specs,
             compound_composer_authority_profile=(
@@ -260,6 +263,7 @@ def _runtime(
             enable_component_execution_handoff=(
                 component_execution_handoff
             ),
+            target_admission_margin_sec=target_admission_margin_sec,
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(
             RM65CanonicalIK(scene, Planner(scene))
@@ -349,6 +353,7 @@ def _admit_ready_composition(
     *,
     composition_spec: CompositionSpec,
     hand_specs: dict[str, HandActionSpec],
+    target_effective_at: float = 10.05,
 ):
     runtime.start()
     for role, hand_close in (
@@ -367,7 +372,7 @@ def _admit_ready_composition(
         assert receipt.accepted
     submission = runtime.compose_and_submit(
         spec=composition_spec,
-        target_effective_at=10.05,
+        target_effective_at=target_effective_at,
     )
     assert submission.proposal_admission is not None
     assert submission.proposal_admission.accepted
@@ -568,6 +573,111 @@ def test_component_target_handoff_closes_rejected_private_safety_work() -> None:
     ]
     assert len(completions) == 1
     assert completions[0].payload["status"] == "rejected"
+
+
+def test_component_target_short_support_margin_skips_only_current_cycle() -> None:
+    (
+        clock,
+        _scene,
+        runtime,
+        hand_specs,
+        composition_spec,
+        _authority_profile,
+    ) = _runtime(
+        component_execution_handoff=True,
+        target_admission_margin_sec=0.20,
+    )
+    _admit_ready_composition(
+        runtime,
+        composition_spec=composition_spec,
+        hand_specs=hand_specs,
+    )
+
+    step = runtime.step(now=10.0)
+
+    assert step.status == "target_lifecycle_rejected_keep_existing"
+    assert step.target_execution_request is not None
+    assert step.target_submission_receipt is not None
+    assert not step.target_submission_receipt.accepted_for_processing
+    assert step.target_submission_receipt.rejection_code == (
+        "insufficient_support_margin"
+    )
+    assert step.target_completion_receipt is None
+    assert step.target_dispatch_result is None
+    assert step.cancellation is None
+    assert runtime.capture_execution_gate_snapshot(now=clock.value).status == (
+        "ready"
+    )
+    lifecycle = runtime.capture_target_execution_status_snapshot(
+        now=clock.value
+    )
+    assert lifecycle is not None
+    assert lifecycle.submission.status == "rejected"
+    assert lifecycle.completion.status == "not_applicable"
+    assert lifecycle.admission.status == "not_applicable"
+    assert runtime.reference_receiver is not None
+    assert runtime.reference_receiver.component_targets == ()
+    runtime.close()
+
+
+def test_immediate_component_target_expiry_after_resolution_is_nonfatal() -> None:
+    (
+        clock,
+        _scene,
+        runtime,
+        hand_specs,
+        composition_spec,
+        _authority_profile,
+    ) = _runtime(
+        component_execution_handoff=True,
+        reference_activation_profile_id=IMMEDIATE_QREF_SIM_V1,
+    )
+    _admit_ready_composition(
+        runtime,
+        composition_spec=composition_spec,
+        hand_specs=hand_specs,
+        target_effective_at=10.0,
+    )
+    base_resolver = runtime.core.resolver
+
+    class DelayedResolver:
+        def resolve(self, action, *, observation=None, context=None):
+            command = base_resolver.resolve(
+                action,
+                observation=observation,
+                context=context,
+            )
+            clock.value += 0.20
+            return command
+
+    runtime.core.resolver = DelayedResolver()
+
+    step = runtime.step(now=10.0)
+
+    assert step.status == "target_lifecycle_rejected_keep_existing"
+    assert step.target_completion_receipt is not None
+    assert step.target_completion_receipt.status == "resolved"
+    assert step.target_dispatch_result is not None
+    assert not step.target_dispatch_result.target_admission.accepted
+    assert step.target_dispatch_result.target_admission.rejection_code == (
+        "target_support_expired_before_admission"
+    )
+    assert step.cancellation is None
+    assert runtime.capture_execution_gate_snapshot(now=clock.value).status == (
+        "ready"
+    )
+    lifecycle = runtime.capture_target_execution_status_snapshot(
+        now=clock.value
+    )
+    assert lifecycle is not None
+    assert lifecycle.completion.status == "resolved"
+    assert lifecycle.admission.status == "rejected"
+    assert step.dispatch_receipts is not None
+    assert not any(
+        receipt.accepted for receipt in step.dispatch_receipts.values()
+    )
+    assert runtime._immediate_target_by_reference_sequence == {}
+    runtime.close()
 
 
 def test_component_target_pending_activation_is_terminal_on_cancel() -> None:

@@ -1,28 +1,40 @@
 # Sim Human-in-the-Loop（HIL）使用说明
 
-本文档对应当前已经落地的 `CS-6b1f` 窄分支：在 MuJoCo 中让 replay 保持
-初始 authority，被动 human pose source 通过 typed takeover 完成一次安全接管，
-并由外部 episode recorder 形成可重放的 control trace。
+本文档主线对应当前 default-off 的单右臂 Sim-HIL 应用：临时 PPO 与真实或虚拟
+VIVE + Q6/angle-trigger 输入经过 component-keyed composition 后，只驱动 MuJoCo。
+它不会构造真实 RM65 backend，也不会改变既有 teleop、replay、deploy 或 RTC 路径。
+后文仍保留历史 `CS-6b1f` replay→human takeover 说明，并明确标为历史 profile。
 
-当前 profile 是 **sim-only、default-off、library/test composition**，不是新的
-production entrypoint，也不会改变既有 teleop、replay、deploy 或 RTC 路径。
-
-本文同时保留历史 replay→human takeover profile 的说明。当前面向
-`PPO + 单 VIVE + Q6/angle trigger` 的应用主线是：
+当前推荐的 Scheme-A 本地无设备 preflight 是：
 
 ```bash
-PYTHONPATH=. python -m control_station sim-hil --dry-run --device cpu
 PYTHONPATH=. python -m control_station sim-hil \
-  --enable --human-alpha 0.5
+  --dry-run --device cpu \
+  --control-profile policy_human_allocation_scheme_a
 ```
+
+需要验证三态切换与连续 target handoff 时，显式切换到 Scheme-B：
+
+```bash
+PYTHONPATH=. python -m control_station sim-hil \
+  --dry-run --device cpu \
+  --control-profile policy_human_allocation_scheme_b
+```
+
+两个 profile 共用相同的 source、composition、proposal 和下游执行端口。Scheme-A
+只允许 baseline/relative；Scheme-B 允许 absolute takeover，并在 composition target
+层生成可记录的 continuity receipt。该 receipt 不代替下游 Reference/IK/限幅/安全或
+dispatch 证据。
 
 该主线不依赖 replay，也不伪造 replay cursor 或旧 Station session。它使用
 component-keyed `right_arm: cartesian_pose` 与
 `right_gripper: physical_joint_qpos`，只在 MuJoCo target 私有边界物化当前兼容
 执行表示。当前自动验收分为：
 
-1. 同一 HITL 主线分别运行 PPO-only（alpha=0）和 passive human-only（alpha=1）；
-2. 运行 0/1 切换与中间 alpha 的 pose/qpos 比例混合；
+1. fixed-alpha compatibility 保留 PPO-only、human-only 与比例混合回归；
+2. 显式 Scheme-A profile 验证 Policy baseline、Human relative correction、Auto
+   allocation 与 Rebase-and-clear；Scheme-B 在此基础上验证连续的 Human absolute
+   takeover/handback；
 3. episode end 先 HOLD/cancel，再完成 ControlTrace WAL、seal、commit 与回读，
    核对 source、composition、target/reference/measurement、两层 difference 和
    cancellation 事实。
@@ -45,20 +57,23 @@ PYTHONPATH=. python -m pytest -q \
 | 项目 | 当前语义 |
 |---|---|
 | 运行目标 | MuJoCo authoritative runtime |
-| 初始 authority | replay |
-| human 输入 | `PassiveTeleopPoseSessionSource`，只观察、不自动发布 |
-| takeover | typed `request_human_takeover`，先 HOLD/cancel，再等待 fresh emission |
-| readiness | 当前 sim 使用 `VirtualSimHumanTakeoverReadinessProvider`；只产生虚拟 deadman/rebase evidence |
-| arm 表示 | HIL seam 按声明的 pose effectors 工作；当前 CS-6b1f target profile 是 `bimanual_ee_pose_v1`，target 内部才 pose→coupled IK→qpos |
-| capture | 外部 `EpisodeTraceRecorderSink`；`hold_before_unbind` 后 WAL/seal/commit |
-| 真机副作用 | 无。接入真实遥操设备时也只能作为 passive source，不能绕过 real deadman/rebase gate |
-| production caller | 无。必须由显式测试/应用代码组装和启动 |
+| policy 输入 | 临时单右臂 PPO，经正式 `PolicyActionEmission` seam 输出 pose + gripper qpos |
+| human 输入 | `PassiveTeleopComponentSessionSource`；右臂 pose + 右夹爪 qpos，不拥有 dispatch |
+| composition | 默认 fixed-alpha compatibility；Scheme-A（相对-only）和 Scheme-B（三态连续切换）都必须通过 `--control-profile` 显式选择 |
+| 操作 | Policy baseline、Human relative correction、Auto allocation、Rebase-and-clear、HOLD/re-arm；Scheme-B 另有 Human absolute takeover |
+| arm 表示 | composition 主线保持 Cartesian pose；MuJoCo target 内部才 pose→coupled IK→qpos |
+| capture | ControlTrace core WAL/seal/commit/readback；不冒充包含视觉/触觉的正式数据集 |
+| 真机副作用 | 可打开真实 VIVE/gripper 输入；执行目标仍是 MuJoCo，`real_arm_motion=false` |
+| application caller | `python -m control_station sim-hil`，default-off，必须显式 `--enable` |
 
-当前 HIL 没有第二套 queue、replay cursor、epoch、dispatcher 或 episode owner。
+当前主线没有第二套 policy queue、dispatcher 或 episode owner。
 新的遥操设备、sim target 或模型 source 应优先复用已有 source/target/provider/emission
 seam；不要按设备、checkpoint 或 simulator 新建 composition。
 
-### 1.1 本体切换：通用 HIL seam 与当前 MuJoCo profile 分开
+### 1.1 历史 CS-6b1f：pose takeover seam 与本体切换
+
+本节只记录早期 replay→human pose-takeover profile，不是当前单右臂 PPO +
+VIVE/gripper 应用的启动契约。
 
 HIL 的 takeover、HOLD/cancel、readiness、emission promotion、publication barrier
 和外部 recorder 都不携带“双臂”假设。`PassiveTeleopPoseSourceSpec` 现在按声明的
@@ -93,7 +108,7 @@ catalog、pose/frame/IK（或其它 execution）adapter 与 capability/manifest 
 实现。夹爪、6DOF/16DOF 灵巧手仍属于独立的 qpos/native component gate，不因 arm
 cardinality 改成 pose。
 
-## 2. 最小可运行验证（R1，无真实设备）
+## 2. 历史 CS-6b1f 最小验证（R1，无真实设备）
 
 从仓库根目录、激活 `dexteleop310` 环境执行：
 
@@ -128,8 +143,14 @@ PYTHONPATH=. python -m pytest -q \
 
 ```bash
 PYTHONPATH=. python -m control_station sim-hil --help
-PYTHONPATH=. python -m control_station sim-hil --dry-run --device cpu
+PYTHONPATH=. python -m control_station sim-hil \
+  --dry-run --device cpu \
+  --control-profile policy_human_allocation_scheme_a
 ```
+
+将最后一个 profile ID 改为 `policy_human_allocation_scheme_b` 即可切换到三态方案；
+不能在同一个 activation 内热换 profile，切换时应重新构造应用，从而得到新的
+profile hash、allocation spec 和 continuity state。
 
 只有显式传入 `--enable` 才会启动当前右侧 profile；`--left-q6-port` 会明确拒绝，
 而不是被静默忽略。默认 `--gripper-input-source auto`：先探测显式
@@ -151,28 +172,53 @@ trigger 复用真机遥操的 observation source 和 `ScalarToGripperRetargeter`
 
 推荐从仓库根目录启动：
 
-```bash
-# VIVE/OpenVR 主机；当前单 tracker compatibility 会发送 packet slot 0
-python hardware/VIVE/mocap/vive_data_sender.py \
-  --single --host <sim-hil-receiver-ip> --port 9999 --hz 300
+纯策略 + MuJoCo（无需 VIVE/夹爪/坐标 profile）可先直接启动同一 GUI：
 
-# DexTeleop / MuJoCo 主机
+```bash
 PYTHONPATH=. python -m control_station sim-hil \
   --enable --control-gui \
-  --gripper-input-source auto \
+  --control-profile policy_human_allocation_scheme_a \
   --acceptance-root teleop_records/sim_hil_acceptance
 ```
 
-该命令只把真实 VIVE 与 Q6/angle trigger 用作 passive input，执行目标仍是
+页面打开后点击“以策略基线启动动态分配”。该路径不会为了启动而探测 Q6、打开
+angle-trigger 或等待 VIVE；若以后在同一 session 选择 Human 模式，才按当时的
+设备选项和坐标 profile 执行接入。
+
+```bash
+# VIVE/OpenVR 主机；当前单 tracker compatibility 会发送 packet slot 0
+SIM_HIL_RECEIVER_IP=127.0.0.1
+python hardware/VIVE/mocap/vive_data_sender.py \
+  --single --host "$SIM_HIL_RECEIVER_IP" --port 9999 --hz 300
+
+# DexTeleop / MuJoCo 主机；单右臂 PPO + VIVE + angle-trigger Scheme-A
+PYTHONPATH=. python -m control_station sim-hil \
+  --enable --control-gui \
+  --control-profile policy_human_allocation_scheme_a \
+  --gripper-input-source angle_trigger \
+  --acceptance-root teleop_records/sim_hil_acceptance
+```
+
+sender 与 receiver 不在同一台主机时，将 `SIM_HIL_RECEIVER_IP` 改为 MuJoCo 主机
+的实际可达地址。该命令只把真实 VIVE 与 angle-trigger 用作 passive input，执行目标仍是
 MuJoCo，`real_arm_motion=false`。命令启动后会自动在默认浏览器打开
 `http://127.0.0.1:8787/`（可用 `--no-open-browser` 关闭），先只打开一个 Station 网页和一个
 VIVE setup receiver；此时不会构造 MuJoCo target、PPO runtime 或 gripper reader。
-网页同时显示实时左右 VIVE 来源、当前选中的坐标 profile 和按需标定控件。只有
-所选来源新鲜有效、且已有保存成功的 profile 时，才允许启动正式 runtime。
+网页同时显示实时左右 VIVE 来源、当前选中的坐标 profile 和按需标定控件。
+Scheme-A/B 可直接点击“以策略基线启动动态分配”，此时不要求 VIVE、夹爪或坐标
+profile 就绪，也不会打开这些设备；首次选择自动分配、人类相对修正、绝对接管或
+rebase 时，才要求 Human 输入就绪并执行 HOLD → 接入 → Runtime Home → re-arm。
+默认的 `--vive-coordinate-profile latest` 会在 setup controller 创建时解析并加载
+最新有效 profile；GUI 展示和随后 runtime 构造绑定同一个具体文件，而不是分别
+二次解析 `latest`。若目录中尚无有效 profile，则保留首次标定流程。
+若 angle-trigger 使用非默认配置目录，再显式追加
+`--angle-trigger-config-root <config-root>`；验收指定设备时不要使用 `auto`
+代替明确的 `angle_trigger`，避免 Q6 探测或 fallback 改变本轮设备拓扑。
 
-从任一控制模式启动时，Station 先关闭 setup receiver，再把其精确来源映射和
+从需要 Human 的控制模式启动时，Station 先关闭 setup receiver，再把其精确来源映射和
 profile 路径交给新 application；随后解析 Q6/angle trigger 并验证 passive human
-emission。原生 MuJoCo passive viewer 在首次来源检查通过后、realtime physics
+emission。纯策略/策略基线启动保留 setup owner，供之后按需接入 Human。原生
+MuJoCo passive viewer 在所需来源检查通过后、realtime physics
 worker 启动前构造；构造完成后会重新采集并验证一帧当前 human/policy emission，
 再进入 composition preflight。这样既不会因窗口构造耗时把健康来源误判为 stale，
 也不会放宽 TTL 或把旧帧改写为新帧。无 VIVE 等首次来源错误只留在网页中，不会
@@ -392,35 +438,40 @@ tool frame 或刚体变换不一致都会在 passive source 构造前拒绝。
 target/tool/session evidence，不能复用 sim receipt，也不能把 URDF 派生结果声明为
 真机测量。
 
-```text
-build MuJoCo runtime + pose target
-    -> build replay source/binding
-    -> build PassiveTeleopPoseSessionSource (optional)
-    -> build_scoped_cs6b1f_mujoco_pose_human_replay_station(...)
-    -> external EpisodeTraceRecorderSink.prepare/bind
-    -> connect target, replay, human; run preflight
-    -> request replay candidate + replay authority
-    -> poll passive human pose (observe only)
-    -> register HumanTakeoverOperationSpec + readiness provider
-    -> request_human_takeover (worker performs HOLD/invalidation/authority transfer)
-    -> poll one post-boundary pose emission
-    -> wait for human_takeover_ready
-    -> promote_human_takeover_emission(spec_id) exactly once
-    -> step MuJoCo / record decisions
-    -> release human authority, verify HOLD
-    -> recorder.release_episode(..., hold_before_unbind)
-    -> seal / commit / committed reader
-```
-
-真实 VIVE 或其它设备只替换 passive source 的构造部分。可复用现有
-`teleop_runtime.configs.build_bimanual_passive_session(...)`，然后包装为
-`PassiveTeleopPoseSessionSource`；该 session 必须保持 `rig=None`、`recorder=None`，
-并在实际连接前完成设备侧只读检查。当前 real deadman/rebase typed receipt 尚未实现，
-因此真实设备不能把 `VirtualSimHumanTakeoverReadinessProvider` 替代为 production READY。
-
 ## 4. 使用 `sim/mujoco_temp_pipeline` checkpoint
 
 ### 4.1 先做独立策略基线
+
+当前 randomized Pick checkpoint 必须与其 task config 成对传入；不要只替换
+`--checkpoint` 而沿用 Sim-HIL 的默认 task：
+
+```bash
+CHECKPOINT=sim/mujoco_temp_pipeline/checkpoints/cube_pick_goal_delta_xyz_gripper_v2_s211_bootstrap.pt
+TASK=sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json
+
+# 不启动设备、authority、worker 或控制循环；只构造 MuJoCo task 做契约 preflight。
+PYTHONPATH=. python -m control_station sim-hil \
+  --dry-run --device cpu \
+  --control-profile policy_human_allocation_scheme_a \
+  --checkpoint "$CHECKPOINT" \
+  --task-config "$TASK"
+
+# 通过 preflight 后，才显式启动 sim-only 的交互应用。
+PYTHONPATH=. python -m control_station sim-hil \
+  --enable --control-gui \
+  --control-profile policy_human_allocation_scheme_a \
+  --checkpoint "$CHECKPOINT" \
+  --task-config "$TASK" \
+  --gripper-input-source angle_trigger
+```
+
+该策略是 31-D actor observation、4-D `xyz+gripper` latent、7-D task action；
+adapter 将其作为 `sequential_target_delta` 物化为绝对右臂 pose 与绝对 gripper
+qpos 后才进入通用 composition。它不是 absolute policy，也不是 action chunk/RTC
+preview。当前本地 artifact identity 为 checkpoint SHA256
+`a5d6c28a063df3969bd2044dc310f3236a75853dd599c98f05037cfe237ed57e`，配套 task
+hash 为 `d52b82bd8aaa9ea8a2baa450edb7ee496ad6174d1649e0d15e17eb9db8c23431`；若文件发生
+变化，应重新做 compatibility preflight，而不能沿用这里的身份结论。
 
 临时 PPO pipeline 的默认 checkpoint 和 task config：
 
@@ -477,25 +528,22 @@ policy source。
 
 | temp pipeline 输出 | CS-6b1f 要求 |
 |---|---|
-| 7-D：右臂 6 维 normalized joint-target delta + 右夹爪 close delta | 双臂 `bimanual_ee_pose_v1` arm action |
+| 7-D：右 TCP xyz/rotvec delta + 右夹爪 close delta | 双臂 `bimanual_ee_pose_v1` arm action |
 | 右臂控制，左臂固定 home | 左右 arm 同一 coupled selection group |
 | qpos/native gripper action | arm source/selected/safe pose；hand 另有 qpos component gate |
 | `CubeLiftEnv` 自己的 observation/safety/task loop | 已启动的 authoritative MuJoCo runtime + immutable emission |
 | normal 15-D observation；privileged 31-D observation | 目标 runtime 的已声明 observation contract |
 
-因此 checkpoint **不能直接**传给
-`build_scoped_cs6b1f_mujoco_pose_human_replay_station()`，也不能把 7-D qpos delta
-伪装成 pose emission。当前推荐顺序是：
+因此 checkpoint 仍不能直接传给历史
+`build_scoped_cs6b1f_mujoco_pose_human_replay_station()`。当前单右臂应用使用
+`TempPPOHILPolicySource`：它验证 checkpoint/task/normalizer，读取当前 MuJoCo TCP
+作为初始 anchor，把 7-D policy delta 解码为持续维护的绝对右臂 tool pose 与绝对
+gripper qpos，再形成正式 `PolicyActionEmission`。它不实现第二套 IK、安全、authority
+或 dispatch；这些仍由下游 MuJoCo target/runtime 所有。
 
-1. 用 `evaluate/play` 验证 checkpoint 的任务成功率、collision projection、rejection 和 tracking error；
-2. 在不取得 authority、不发送动作的 shadow adapter 中加载同一 checkpoint 和 normalizer，记录 observation/action/hash；
-3. 只有完成显式 observation contract、delta→target 解码、right-arm FK→pose、gripper component contract、safety 和 downstream admission receipt 后，才考虑接入 policy source；
-4. 当前新增的 `control_station` `mujoco_sim_hil` profile 是独立的、default-off
-   的双臂 pose + 双手 qpos formal component path。它只接收已经产生的
-   `PolicyActionEmission` 和 passive human emission，不能把 7-D qpos delta
-   直接伪装成 pose，也不会改变 CS-6b1f 的 replay/human 路径。即使是
-   virtual source 也必须提供显式 readiness evidence；HOLD 后需要显式
-   rearm，不能自动清门。
+当前 `control_station sim-hil` profile 是独立、default-off 的
+`right_arm: cartesian_pose + right_gripper: physical_joint_qpos` component path，
+不会改变历史 CS-6b1f replay/human 路径。HOLD 后仍需显式 re-arm，不能自动清门。
 
 这条路径仍然复用 `PolicyActionEmission` / `PolicyDeployRuntime` 的 lower-owned
 emission seam；模型侧不需要为 RTC 或 Station 增加专用 adapter。需要的只是应用侧
@@ -512,23 +560,25 @@ alignment；旧 replay emission、旧 Station
 intent/operation/publication barrier 以及旧 composition-session reducer facts 明确为
 not applicable，不能为了 seal 而合成。
 
-该 profile 当前标记为 `planned`：事实投影和外部 `trace_sink` seam 已存在，但本
-Sim-HIL 应用尚未完成 `EpisodeTraceRecorderSink` 的 prepare/bind/release/seal/commit
-联动与完整 fixture，因此不能据此声称已经具备正式 capture eligibility。完成该联动
-并验证完整 lineage 后，才可将状态提升为 `runtime_integrated`。
+该 profile 当前标记为 `runtime_integrated`。控制 GUI 已接
+`EpisodeTraceRecorderSink` 的 prepare/bind/release/seal/commit 与 committed-reader
+回读；writer/journal 失败会使本次 capture 不可提交并触发下游 HOLD。这里的完成范围
+仅是 ControlTrace core，不包含视觉、触觉或其它 native streams，也不等同于正式
+v2.5 数据集。
 
 ## 5. 进入下一阶段前的验收
 
 - `evaluate` 使用的 checkpoint/task hash 一致；normal policy 而非 privileged expert；
 - shadow adapter 输出 finite、shape 与 contract 一致，且不调用 `submit_*` 或 authority API；
 - 每个 policy output 有唯一 immutable emission identity、source validation 和 timing；
-- qpos delta 不直接进入当前 arm mixed source；转换为 pose 后才能进入 pose source seam；
+- PPO 原始 TCP delta 必须先由 `TempPPOHILPolicySource` 解码为绝对 pose；arm qpos
+  不进入 composition；
 - hand/gripper qpos 只有在 active-mask、joint order、units、bounds、safety 和 downstream receipt 都冻结后才可 compound；
 - 默认关闭时，既有 `sync_queue_v1`、legacy replay、teleop、deploy 和 RTC 测试结果不变。
 
 ## 6. 相关入口
 
 - [Control Station README](../../control_station/README.md)
-- [Control Station architecture visual guide](../../todos/dexteleop_architecture_visual_guide.md)
+- [Control Station architecture visual guide](../architecture/dexteleop_architecture_visual_guide.md)
 - [MuJoCo temporary PPO pipeline](../../sim/mujoco_temp_pipeline/README.md)
 - [MuJoCo simulation README](../sim/README.md)

@@ -87,7 +87,11 @@ canonical composition root；实际站点应显式提供设备、profile、datas
 | `DATASET_COMMON_ARGS` | Dataset、相机、sample 公共配置 | 不改变位控参数 |
 | `POSITION_FORMAL_V1_ARGS` | 选择正式 position profile 和 control mode | 不配置 writer/debug |
 | `POSITION_FORMAL_V2_RESPONSIVE_ARGS` | 选择 opt-in 响应性 V2；硬执行包络与 V1 相同 | 不与 V1 task 混写 |
+| `POSITION_FORMAL_V2_BALANCED_ARGS` | 选择冻结的 V2 平滑稳定基线；普通区 fast-path alpha=0.55 | 不与 V2 responsive task 混写 |
+| `POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS` | 在 V2 Balanced 的 pre-IK target 上叠加已验收双臂平移+旋转 bounded admittance | 不修改 60 Hz IK、碰撞、qref、force guard 或数采 action 语义 |
+| `POSITION_FORMAL_V2_SMOOTH_ARGS` | 选择默认关闭的残余微振动 A/B；普通区 fast-path alpha=0.45 | 不与 balanced task 混写 |
 | `POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS` | 选择 opt-in admitted-anchor QP 约束；其余使用稳定 V1 | 不与 V1/V2 task 混写 |
+| `POSITION_FORCE_GUARD_CONSERVATIVE_ARGS` | 在正式 position 数组后恢复完整 `15 N / 2 Nm` 保守受力急停档 | 不改变 IK、qref 或执行 profile |
 | `POSITION_COLLECTION_PROCESS_ARGS` | Spawn writer、共享内存槽、CPU `8-11` | 不改变 main action |
 | `POSITION_COLLECTION_PRODUCTION_ARGS` | 关闭高频 JSON/FK debug，保留预分配数值 trace | 不关闭正式 dataset |
 | `NO_COLLECTION_SENSOR_BASELINE_ARGS` | 禁用 collection/episode writer，形成控制与传感器基线 | 不禁用 RGB 相机或 DMTAC 触觉 |
@@ -95,6 +99,20 @@ canonical composition root；实际站点应显式提供设备、profile、datas
 | `NO_DEBUG_DISK_WRITE_ARGS` | 关闭所有 standalone debug 写盘 | 不关闭正式 dataset |
 
 Argparse 使用后出现的值覆盖前值。正式命令中不要在这些数组之后随意追加历史 position flag。
+
+正式 60 Hz admittance 的可调入口是 source `teleop_args.sh` 前设置的四个环境变量：
+
+- `POSITION_ADMITTANCE_TRANSLATION_RESPONSE_WEIGHT` 与
+  `POSITION_ADMITTANCE_ROTATION_RESPONSE_WEIGHT`：相对真机验收基线的顺应倍率，默认
+  `1.0 / 1.0`；Active 只接受 `[0.25, 4]`。它们不改变最终 `80 mm / 60 mm/s`
+  平移 modifier 或 `5 deg / 9 deg/s` 旋转 modifier 包络。
+- `POSITION_ADMITTANCE_TRANSLATION_FILTER_TAU_SEC` 与
+  `POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC`：当前 `profile_compliance` 真正生效的
+  受力/扭矩输入阻尼，默认均为 `0.010857362 s`，值越大越平滑但响应越慢；Active
+  上限为 `0.1 s`。
+
+`--position-admittance-shadow-damping-n-s-m` 只属于旧 `second_order` 研究模型，在正式
+`profile_compliance` 链路中不参与计算，不应把它当作已生效的正式阻尼参数。
 
 ### 3.3 启动后确认
 
@@ -110,11 +128,22 @@ Dataset `meta/info.json` 的 runtime metadata 至少应满足：
 - `position_reference_hz=60`、`arm_control_hz=120`；
 - `position_target_velocity_filter_tau_sec=0.03`；
 - `position_force_guard.enabled=true`、`source=tool`；
-- `position_force_guard.max_force_n=15`、`max_torque_nm=2`；
+- 默认 `position_force_guard.max_force_n=30`、`max_torque_nm=5`；追加保守数组时应为 `15/2`；
+- `position_force_guard.stale_timeout_sec=0.4`；
 - `position_force_guard.fail_closed=true`、`latched=true`、`stop_scope=bimanual`；
 - `position_max_command_step_deg=0.675`；
 - `collection_worker_mode=process`、`control_debug.level=off`；
 - `actuator_trace=true`、`actuator_singularity_trace=true`。
+
+启用正式 60 Hz admittance 时，还应确认
+`position_admittance_response.schema_version=teleop.position_admittance_response/v1`、
+`modifier_stage=pre_ik_target`、`ik_logic_modified=false`，并核对其中平移/旋转的
+`response_weight`、`input_filter_tau_sec`、`effective_compliance_*` 和完整
+`effective_config` 与本次采集记录一致。
+
+`actuator_trace` v4 还会在同一个预分配 NPZ 中记录 60 Hz 的 pre-filter VIVE
+`pose_vive_world`、OpenVR 原生线速度/角速度、各自 validity、tracker role 与采样/接收/
+控制时间戳。速度字段只用于观测和离线分析，不进入遥操控制。
 
 正常退出后还应确认 `collection_integrity_valid=true`、`submitted_samples == completed_samples`
 以及 actuator trace 的 drop/error count 均为 `0`。
@@ -207,7 +236,7 @@ RealTeleop 的 coarse progress/Failure 语义和 Control Station 操作面均为
 当前 DMTAC RM65 正式任务可以在启动命令中固定初始 profile。在原正式命令末尾增加：
 
 ```bash
---collection-progress-profile catalog:dmtac_rm65_bimanual_position_v1_progress \
+--collection-progress-profile catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress \
 --collection-progress-gui
 ```
 
@@ -216,6 +245,11 @@ RealTeleop 的 coarse progress/Failure 语义和 Control Station 操作面均为
 ```bash
 --collection-progress-gui
 ```
+
+对新的空数据集，单独启用 GUI 时默认选择
+`dmtac_rm65_bimanual_position_writing_four_stage_progress`；数采员仍可在首个 Episode
+开始前切换其他 profile，显式 `--collection-progress-profile` 的优先级更高。已有 profile
+绑定或已写入的 profile-less 数据集不受这个默认值影响，仍以数据集合同为准。
 
 推荐真机使用第二种方式。完整操作顺序是：
 
@@ -245,6 +279,10 @@ GUI 列出当前真机 adapter 已准入的全部 LINEAR managed profile，不�
 
 当前 catalog 的 GUI 会列出包括以下 profile 在内的全部 LINEAR profile：
 
+- `dmtac_rm65_bimanual_position_writing_four_stage_progress`：新空数据集的默认
+  writing profile，依次为拿笔、取笔盖、书写、放回毛笔；
+- `dmtac_rm65_bimanual_position_writing_five_stage_progress`：在四阶段流程中增加独立的
+  沾墨阶段；
 - `dmtac_rm65_bimanual_position_v1_progress`：单阶段正式 smoke profile；
 - `test_dmtac_rm65_bimanual_position_v1_three_stage_progress`：显式标注为
   `【测试】` 的三阶段 GUI/Failure/Advance/Undo 测试 profile。
@@ -268,6 +306,12 @@ profile，而不是依赖正式 dataset task/name 自动推断。
   typed progress event。未选择 profile 时仍允许普通 Episode 启动；如果该 Episode
   已写入，当前 dataset 会保持 profile-less，避免随后在同一目录混入有 profile 的
   Episode。
+
+物理进度踏板的准入来自活动 Episode 的 progress 状态，不依赖进度面板是否显示。
+因此通过 `--collection-progress-profile` 固定 profile 后，即使不启用
+`--collection-progress-gui`，踏板 Advance/Failure 仍可工作；GUI flag 只控制面板与
+浏览器事件。Episode 空闲、Failure/Hold、等待 Retry、末阶段或已有请求处理中，踏板会
+fail-closed，并在日志中说明具体拒绝原因，且绝不会回落执行旧 Init 语义。
 
 每个 coarse `progress_step` 还可以声明左右臂的 `arm_control`：`teleop` 表示该侧由
 VIVE 遥操，`fixed_hold` 表示该侧机械臂和已配置末端一起保持固定。GUI 提供三种执行
@@ -394,6 +438,57 @@ stage profile 或 profiled/unprofiled Episode 混装。
 进度插件位于 `control_station/web/real_teleop_progress.js`，不拥有机器人控制、Hold、
 Episode 或 writer。删除/禁用插件不会改变 progress 合同；`collection_runtime` 也不包含
 任何 GUI 或真机设备逻辑。
+
+### 空闲期触觉无损压缩（默认关闭）
+
+正式 external-tactile 数采可在原命令末尾追加
+`"${IDLE_TACTILE_COMPRESSION_ARGS[@]}"`（即 `--idle-tactile-compression`）。该功能不在
+遥操/数采热路径压缩：只有设备启动完成，并且处于首次 Home 前或 Hold，同时不存在活动、
+倒计时或 finalizing 的正式 Episode 时，才会以低优先级独立进程把已封存 raw tactile
+流转换为逐块 delta+zstd 无损流。失败后暂停但仍保持 `is_recording` 的 Episode 不满足
+准入条件。
+
+开始 runtime Home 时先发出协作停止请求，已有 2 秒准备期用于完成当前小块；Home、快速
+单臂切换或正式 Episode 真正开始前，还必须确认子进程已经退出并完成文件系统写入屏障。
+切换 dataset recorder 和退出程序使用同一屏障。压缩按 manifest 原子提交，提交前会完整
+解码并校验原始 SHA；只有 manifest 验证成功后才删除原始流。
+
+完整回退无需迁移数据：不传该参数即可保持历史行为；也可在命令最后追加
+`"${NO_IDLE_TACTILE_COMPRESSION_ARGS[@]}"`。已经无损转换的 Episode 继续由既有 reader
+透明读取，不需要反向解压。该 overlay 要求 `--tactile-storage external` 和
+`--tactile-compression none`，避免与同步热路径压缩混用。
+
+### 采集期触觉 artifact hash（默认关闭）
+
+正式 external-tactile 数采可以在原命令末尾增加：
+
+```bash
+--tactile-artifact-integrity
+```
+
+该参数让 collection writer 对实际落盘的 tactile stored bytes 增量计算 SHA-256，并在每个 Episode
+完整封口后自动发布 detachable-modality inventory。hash 不扫描历史 payload，也不运行在机械臂控制
+循环；raw、zstd、lz4 都按各自精确落盘表示绑定。回退参数为
+`--no-tactile-artifact-integrity`，默认仍关闭。
+
+该参数必须从一个新数据集的第一个 Episode 开始持续使用，或用于已有全部 stream 都已带
+`stored_bytes_sha256_v1` 封存信息的数据集。对包含未封存历史 tactile 的旧数据集临时开启会在创建
+任何新目录/新 Episode 前直接拒绝；请改用新数据集 root，或保持该参数关闭并在采集完成后走离线
+全量扫描的 detach proposal。这样不会在每次 Episode 封口时反复扫描历史大文件。
+
+该参数可以与 `--idle-tactile-compression` 同时开启。组合模式下，Episode 封口先发布 raw
+tactile revision；空闲进程完成无损 zstd 转换后发布新的 current revision，下一 Episode 继续沿
+同一 inventory 链追加。二者共同要求正式数采和 external tactile；空闲压缩还要求热路径
+`--tactile-compression none`。若子进程不能在 2 秒内协作退出，系统会停留在首次 Home/Hold
+边界并拒绝进入遥操，而不是在 artifact 状态不确定时继续采集；去掉任一参数即可独立回退。
+
+启用该功能不等于允许在写入过程中拆目录。detach/rehydrate 仍是离线事务，并要求没有活动 writer、
+reader 或 storage transaction。若目标数据集的 tactile 已合法拆出、手工缺失、部分缺失或 inventory
+与当前字节不一致，RealTeleop 会在创建新 Episode 前拒绝启动正式 writer；必须先 rehydrate/修复，
+不能让新 Episode 与冷端旧 Episode 混用同一个 `tactile/` 前缀。
+
+采集期 inventory 只减少拆出前的准备和重复 hash 扫描，不替代 cold copy hash、独立 inode、restore
+drill、destructive boundary 全量复核或 rehydrate 后完整 v2.3 validation。
 
 “记录当前阶段失败并 Hold”是时间敏感事实：按钮在状态机准入后单击立即提交，不弹出
 二次确认；前端 pending gate 会阻止重复点击。Failure 的事实持久化、Hold 和正式数采

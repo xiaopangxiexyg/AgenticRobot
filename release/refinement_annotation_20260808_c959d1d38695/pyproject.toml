@@ -1,0 +1,122 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dexteleop"
+version = "0.1.0"
+description = "Dex robot teleoperation, dataset, deployment, and simulation runtime"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = []
+
+# The project deliberately keeps the base install dependency-free.  The
+# supported installation is the Python 3.10 conda environment described in
+# README_ENV.md, which installs the required extras together and supplies the
+# conda-only Pinocchio package.
+[project.optional-dependencies]
+core = [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "typing-extensions>=4.12,<5",
+    "qpsolvers==4.11.0",
+    "osqp==1.1.3",
+    "loop-rate-limiters==1.2.0",
+]
+test = [
+    "pytest==9.1.1",
+]
+dataset = [
+    "pandas==2.3.3",
+    "pyarrow==24.0.0",
+    "Pillow==12.3.0",
+    "zstandard==0.25.0",
+]
+annotation = [
+    # Dedicated post-capture annotation machines do not need the complete
+    # robot/sim/model environment. NumPy/PyArrow are used by canonical
+    # dataset reads; package-root compatibility exports are loaded lazily.
+    "numpy==1.26.4",
+    "pyarrow==24.0.0",
+]
+sim = [
+    "mujoco==3.10.0",
+    "gymnasium==1.3.0",
+    "sapien==3.0.3",
+]
+model = [
+    # Direct official wheel URL keeps uv export -> pip --require-hashes
+    # reproducible while remaining usable on CPU-only debug machines.
+    "torch @ https://download.pytorch.org/whl/cu126/torch-2.10.0%2Bcu126-cp310-cp310-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+openpi = [
+    "websockets==16.0",
+    "msgpack==1.2.1",
+]
+vla_scratch = [
+    # Optional only for a DexTeleop process that directly owns the native
+    # vla-scratch ZMQ client. The model/server environment remains external.
+    "pyzmq==27.1.0",
+]
+hardware = [
+    "opencv-contrib-python==4.10.0.84",
+    "pyserial==3.5",
+    "pymodbus==2.5.3",
+    "pyrealsense2==2.58.2.10647",
+    "transforms3d==0.4.1",
+    "evdev>=1.7,<2",
+    "pyudev==0.24.4",
+    # Runtime dependencies of the bundled DM-Tac SDK.  The SDK itself is a
+    # local editable install performed by scripts/install_conda_env.sh.
+    "h5py==3.16.0",
+    "cryptography>=41,<50",
+    "grpcio==1.81.1",
+    "grpcio-tools==1.81.1",
+    "protobuf==6.33.6",
+    "onnxruntime-gpu==1.22.0",
+    "dearpygui==1.9.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "collection_runtime*",
+    "control_composition*",
+    "control_station*",
+    "dataset_contracts*",
+    "dataset_interface*",
+    "deployments*",
+    "hardware*",
+    "rm65_inspire_tac*",
+    "robot_motion*",
+    "sim*",
+    "teleop_runtime*",
+    "utils*",
+]
+exclude = ["tests*", "legacy*", "assets*"]
+namespaces = false
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.yaml", "*.yml", "*.xml", "*.urdf", "*.obj", "*.stl"]
+control_station = [
+    "web/*.js",
+    "web/static/*.html",
+    "web/static/*.js",
+    "web/static/*.css",
+    "refinement_annotation/static/*.html",
+    "refinement_annotation/static/*.js",
+    "refinement_annotation/static/*.css",
+]
+robot_motion = ["configs/*.json", "configs/**/*.json"]
+teleop_runtime = ["configs/*.json", "configs/**/*.json"]
+
+
+[tool.dexteleop.environment]
+name = "dexteleop310"
+python = "3.10"
+conda_packages = ["numpy=1.26.4", "scipy=1.13.1", "pinocchio=3.7.0"]
+pip_no_deps_packages = ["pin-pink==4.2.0"]
+vendor_sdk = "assets/DM_Tac_SDK_Publish_1.2.10"

@@ -18,11 +18,20 @@
 
 export LEFT_ARM_IP="${LEFT_ARM_IP:-192.168.101.21}"
 export RIGHT_ARM_IP="${RIGHT_ARM_IP:-192.168.1.20}"
-# 防止 --dataset-root "$DATASET_BASE" 被展开为空字符串；可在source前覆盖到独立数据盘。
-export DATASET_BASE="${DATASET_BASE:-datasets}"
+# 新正式采集统一写入 canonical 数据盘；仍可在 source 前显式覆盖，用于旧数据兼容、
+# 离线测试或受控回退。已有数据和历史路径不会被迁移或改写。
+export DATASET_BASE="${DATASET_BASE:-/home/user/zc/datasets/RealmanDMTAC/FormalCollection}"
 # 触觉读取子进程CPU亲和性可在source本文件之前覆盖；默认值保持原4核行为。
 # 例如只使用2核：export DMTAC_TACTILE_WORKER_CPUS=12,13
 export DMTAC_TACTILE_WORKER_CPUS="${DMTAC_TACTILE_WORKER_CPUS:-12,13,14,15}"
+# 已通过双臂验收的 60 Hz profile-compliance 响应参数。可在 source 本文件前覆盖；
+# weight 是相对验收基线的顺应倍率（1.0 保持验收行为），不是 IK objective weight。
+# 当前正式链路没有独立的 M/B/K 物理阻尼项；两个 tau 才是实际生效的受力/扭矩
+# 输入阻尼，值越大越平滑但响应越慢。最终平移/旋转及 slew 安全包络不会随它们变化。
+export POSITION_ADMITTANCE_TRANSLATION_RESPONSE_WEIGHT="${POSITION_ADMITTANCE_TRANSLATION_RESPONSE_WEIGHT:-1.0}"
+export POSITION_ADMITTANCE_ROTATION_RESPONSE_WEIGHT="${POSITION_ADMITTANCE_ROTATION_RESPONSE_WEIGHT:-1.0}"
+export POSITION_ADMITTANCE_TRANSLATION_FILTER_TAU_SEC="${POSITION_ADMITTANCE_TRANSLATION_FILTER_TAU_SEC:-0.010857362}"
+export POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC="${POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC:-0.010857362}"
 
 COMMON_REAL_TELEOP_ARGS=(
   --active-sides both
@@ -145,6 +154,20 @@ IMPEDANCE_40HZ_ARGS=(
   --no-arm-canfd-follow
 )
 
+# Conservative rollback for the position-mode force guard. Append this array
+# after POSITION_FORMAL_V1_ARGS or any V2/V3 position array so argparse's
+# last-value-wins rule restores the previous complete 15 N / 2 Nm guard.
+POSITION_FORCE_GUARD_CONSERVATIVE_ARGS=(
+  --position-force-guard
+  --position-force-guard-source tool
+  --position-force-guard-max-force-n 15
+  --position-force-guard-max-torque-nm 2
+  --position-force-guard-hz 20
+  --position-force-guard-consecutive-samples 1
+  --position-force-guard-max-read-errors 3
+  --position-force-guard-stale-sec 0.4
+)
+
 # 正式版双臂位控 profile。该数组单独使用，不要再叠加下面历史调试用的
 # POSITION_CONTROL_ARGS / POSITION_ACCELERATION_LIMITED_*，否则会显式覆盖正式值。
 # live teleop 会在主 action 生成前应用 inactive 与 0.14->0.45 自适应 qref 整形；
@@ -173,12 +196,12 @@ POSITION_FORMAL_V1_ARGS=(
   --position-wrist-q5-hysteresis-release-deg 6.0
   --position-force-guard
   --position-force-guard-source tool
-  --position-force-guard-max-force-n 15
-  --position-force-guard-max-torque-nm 2
+  --position-force-guard-max-force-n 30
+  --position-force-guard-max-torque-nm 5
   --position-force-guard-hz 20
   --position-force-guard-consecutive-samples 1
   --position-force-guard-max-read-errors 3
-  --position-force-guard-stale-sec 0.25
+  --position-force-guard-stale-sec 0.4
 )
 
 # Opt-in responsive successor.  V1 above remains the exact rollback profile.
@@ -196,11 +219,72 @@ POSITION_FORMAL_V2_RESPONSIVE_ARGS=(
   --position-wrist-q5-hysteresis-release-deg 6.0
   --position-force-guard
   --position-force-guard-source tool
-  --position-force-guard-max-force-n 15
-  --position-force-guard-max-torque-nm 2
+  --position-force-guard-max-force-n 30
+  --position-force-guard-max-torque-nm 5
   --position-force-guard-consecutive-samples 1
   --position-force-guard-max-read-errors 3
-  --position-force-guard-stale-sec 0.25
+  --position-force-guard-stale-sec 0.4
+)
+
+# Frozen stable smoothness baseline for responsive V2.  The last profile
+# argument is intentional: it preserves the complete V2 command/safety surface
+# while only selecting the balanced source-shaping profile.  Switching back to
+# POSITION_FORMAL_V2_RESPONSIVE_ARGS is the atomic rollback.
+POSITION_FORMAL_V2_BALANCED_ARGS=(
+  "${POSITION_FORMAL_V2_RESPONSIVE_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_v2_balanced
+)
+
+# 正式双臂 60 Hz 平移+旋转阻抗 overlay。该组保持 V2 Balanced 的 60 Hz 解 IK、
+# 碰撞/关节/动力学 admission、30 N / 5 Nm 力急停与数采语义，只在 pre-IK
+# copied target 上加入已经验收的 bounded modifier。四个环境变量是正式可调入口；
+# Active 会拒绝超出响应权重 [0.25,4] 或 filter tau > 0.1 s 的配置。
+POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS=(
+  "${POSITION_FORMAL_V2_BALANCED_ARGS[@]}"
+  --no-fix-arm
+  --no-position-admittance-shadow
+  --position-admittance-active
+  --position-admittance-active-side both
+  --position-admittance-active-envelope normal_parity
+  --position-admittance-active-endpoint-policy formal_teleop
+  --position-admittance-rotation-active
+  --position-admittance-combined-active
+  --position-admittance-rotation-active-profile rotation-emphasis-5deg
+  --position-admittance-response-model profile_compliance
+  --position-admittance-translation-response-weight "$POSITION_ADMITTANCE_TRANSLATION_RESPONSE_WEIGHT"
+  --position-admittance-rotation-response-weight "$POSITION_ADMITTANCE_ROTATION_RESPONSE_WEIGHT"
+  --position-admittance-shadow-axes xyz
+  --position-admittance-shadow-stiffness-n-m 250
+  --position-admittance-shadow-deadband-n 0.45
+  --position-admittance-translation-filter-tau-sec "$POSITION_ADMITTANCE_TRANSLATION_FILTER_TAU_SEC"
+  --position-admittance-rotation-filter-tau-sec "$POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC"
+  --position-admittance-shadow-max-offset-m 0.08
+  --position-admittance-shadow-max-velocity-m-s 0.06
+  --position-admittance-shadow-max-return-velocity-m-s 0.03
+  --position-admittance-shadow-max-slew-m-s 0.06
+  --position-admittance-shadow-return-deadband-n 0.45
+  --position-admittance-shadow-return-rate-s 1
+  --position-admittance-response-reference-hz 40
+  --position-admittance-shadow-stale-sec 0.15
+  --position-admittance-shadow-max-force-dt-sec 0.15
+)
+
+# Default-off qref-to-qcmd execution successor for the formal 60 Hz combined
+# admittance path.  The final repeated profile option intentionally replaces
+# only V2 Balanced's execution profile while retaining the complete admitted
+# target, IK, collision, force-guard and admittance argument surface above.
+# POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS is the atomic rollback.
+POSITION_FORMAL_V2_BALANCED_60HZ_JERK_ADMITTANCE_ARGS=(
+  "${POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_v2_balanced_60hz_jerk_v1
+)
+
+# Default-off successor for residual ~30 Hz micro-vibration.  It changes only
+# the ordinary-region alpha from balanced 0.55 to 0.45.  BALANCED above is the
+# complete rollback and must remain a separate task/profile dataset.
+POSITION_FORMAL_V2_SMOOTH_ARGS=(
+  "${POSITION_FORMAL_V2_BALANCED_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_v2_smooth
 )
 
 # Opt-in 15 Hz action-aligned / 120 Hz jerk-limited execution experiment.
@@ -225,6 +309,15 @@ POSITION_FORMAL_SAMPLE_ALIGNED_JERK_V1_ARGS=(
 POSITION_FORMAL_SAMPLE_ALIGNED_JERK_V2_ARGS=(
   "${POSITION_FORMAL_V1_ARGS[@]}"
   --position-control-profile rm65_bimanual_position_sample_aligned_jerk_v2
+)
+
+# Default-off V3 execution experiment.  It preserves V2's 15 Hz action and the
+# complete terminal q/qd/qdd state, and only smooths the eight executed 120 Hz
+# jerk samples inside that terminal-state null space.  V2 above is the complete
+# rollback.
+POSITION_FORMAL_SAMPLE_ALIGNED_JERK_V3_ARGS=(
+  "${POSITION_FORMAL_V1_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_sample_aligned_jerk_v3
 )
 
 # Opt-in Pink QP motion-envelope probe. This keeps the stable V1 source,
@@ -457,8 +550,9 @@ CONTROL_DEBUG_FULL_ARGS=(
 )
 
 # 正式数采默认档：正式 dataset 仍由隔离进程写入；关闭会竞争GIL的JSON/FK sidecar，
-# 只保留已验证低扰动的预分配数值qcmd trace。trace在命令热路径不排队、不做JSON/FK、
-# 不写盘，机械臂命令worker停止后才一次性保存。该档不改变位控、力控或主 action 语义。
+# 只保留已验证低扰动的预分配数值trace：120 Hz qcmd、60 Hz IK shadow、原始VIVE
+# pose/OpenVR速度和对应时间戳。trace在命令热路径不排队、不做JSON/FK、不写盘，
+# 机械臂命令worker停止后才一次性保存。该档不改变位控、力控或主 action 语义。
 POSITION_COLLECTION_PRODUCTION_ARGS=(
   --control-debug off
   --no-debug-action
@@ -579,5 +673,11 @@ DMTAC_DISTRIBUTED_FORCE_ARGS=(
 )
 
 DMTAC_FLAT_VECTOR_ARGS=(--dmtac-tactile-flat-vector)
+
+# 可回退的空闲期触觉无损压缩 overlay。默认不启用；仅适用于 external tactile
+# 且热路径保持 --tactile-compression none 的正式 collection。删除该数组或在命令
+# 末尾追加 NO_IDLE_TACTILE_COMPRESSION_ARGS 即回到原始 raw-only 行为。
+IDLE_TACTILE_COMPRESSION_ARGS=(--idle-tactile-compression)
+NO_IDLE_TACTILE_COMPRESSION_ARGS=(--no-idle-tactile-compression)
 
 echo "遥操作参数已加载（含 DMTAC 与无夹爪版本）；尚未执行任何遥操作命令。"

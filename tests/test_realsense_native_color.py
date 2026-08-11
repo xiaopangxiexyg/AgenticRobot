@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+import pytest
 
 from hardware.realsense.color import color_image_to_bgr
 from teleop_runtime.sources.camera.realsense_rgb import RealSenseRGBCameraConfig
@@ -21,6 +22,7 @@ class RealSenseNativeColorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported RealSense color_format"):
             RealSenseConfig(color_format="mjpeg")
 
+    @pytest.mark.optional
     def test_yuyv_payload_is_converted_to_bgr(self) -> None:
         try:
             import cv2  # type: ignore
@@ -42,6 +44,7 @@ class RealSenseNativeColorTest(unittest.TestCase):
         np.testing.assert_array_equal(converted, cv2.cvtColor(payload, cv2.COLOR_YUV2BGR_YUY2))
         np.testing.assert_array_equal(converted, shared_converted)
 
+    @pytest.mark.optional
     def test_packed_uint16_yuyv_payload_is_converted_to_bgr(self) -> None:
         try:
             import cv2  # type: ignore

@@ -6,7 +6,13 @@ from pathlib import Path
 
 import numpy as np
 
-from robot_motion.deploy import DeployRobotActionAdapter, build_deployment_observation
+from robot_motion.deploy import (
+    POLICY_SOURCE_ACTION_SEQUENTIAL_TARGET_DELTA,
+    DeployRobotActionAdapter,
+    build_deployment_observation,
+    policy_source_projection_from_metadata,
+    pose_matrix_to_xyzquat,
+)
 from sim.mujoco.tasks.cube_lift.action_conditioning import (
     CubeLiftActionConditioner,
 )
@@ -14,6 +20,8 @@ from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
 from sim.mujoco_temp_pipeline.hil_policy import (
     TempPPOHILObservationAdapter,
     _TempPPOAbsolutePoseDecoder,
+    _TempPPOModel,
+    validate_temp_ppo_hil_profile,
 )
 
 
@@ -31,6 +39,27 @@ TASK_CONFIG_35_PATH = (
     / "configs"
     / "tasks"
     / "rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json"
+)
+TASK_CONFIG_38_PATH = (
+    REPO_ROOT
+    / "sim"
+    / "configs"
+    / "tasks"
+    / "rm65_right_cube_reach_goal_delta_progress_xyz_v3.json"
+)
+TASK_CONFIG_38_OVERHEAD_PATH = (
+    REPO_ROOT
+    / "sim"
+    / "configs"
+    / "tasks"
+    / "rm65_right_cube_reach_goal_delta_overhead_progress_xyz_v4.json"
+)
+TASK_CONFIG_PICK_XYZ_GRIPPER_PATH = (
+    REPO_ROOT
+    / "sim"
+    / "configs"
+    / "tasks"
+    / "rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json"
 )
 
 
@@ -65,6 +94,8 @@ class _ObservationAdapter:
 
 
 class _ObservationScene:
+    arm_specs = {"right": SimpleNamespace(controlled_body="right_tcp")}
+
     def __init__(self) -> None:
         self.qpos = np.zeros(6, dtype=np.float32)
         self.close = 0.2
@@ -84,6 +115,18 @@ class _ObservationScene:
     def freejoint_qpos(self, name: str) -> np.ndarray:
         assert name == "debug_cube_freejoint"
         return self.cube_pose.copy()
+
+    @staticmethod
+    def has_body(name: str) -> bool:
+        return name in {"right_arm_base_link", "right_tcp"}
+
+    @staticmethod
+    def body_pose(name: str) -> np.ndarray:
+        assert name in {"right_arm_base_link", "right_tcp"}
+        pose = np.eye(4, dtype=float)
+        if name == "right_tcp":
+            pose[:3, 3] = (0.3, -0.1, 0.2)
+        return pose
 
 
 class _BaseObservation:
@@ -144,6 +187,17 @@ def test_temp_ppo_gripper_delta_uses_the_shared_robot_action_carrier() -> None:
     assert capture_count == 1
     assert normalized.metadata["policy_hand_control"] == (
         "right_gripper_delta_to_absolute_qpos_v1"
+    )
+    projection = policy_source_projection_from_metadata(normalized.metadata)
+    assert projection is not None
+    assert projection.source_semantics == (
+        POLICY_SOURCE_ACTION_SEQUENTIAL_TARGET_DELTA
+    )
+    assert projection.target_generation == 0
+    assert projection.anchor_policy == "previous_policy_target"
+    np.testing.assert_allclose(
+        projection.anchor_value_by_component["right_arm"],
+        pose_matrix_to_xyzquat(decoder._current_tool_pose_arm_base()),
     )
     assert normalized.metadata["end_effector_enabled_sides"] == ("right",)
     np.testing.assert_allclose(normalized.vector[20:26], [0.3, 0, 0, 0, 0, 0])
@@ -231,6 +285,208 @@ def test_35d_observation_includes_cube_and_deltas_advance_at_policy_cadence() ->
     np.testing.assert_allclose(
         next_policy_sample.state_dict["temp_ppo_state"][7:13],
         0.1,
+    )
+
+
+def test_goal_delta_observation_is_deployable_and_uses_pose_action_frame() -> None:
+    scene = _ObservationScene()
+    config = CubeLiftTaskConfig.load(TASK_CONFIG_38_PATH)
+    adapter = TempPPOHILObservationAdapter(
+        scene,
+        config,
+        _BaseObservation(),
+    )
+    policy = SimpleNamespace(
+        observation_dim=31,
+        action_dim=3,
+        environment_action_dim=7,
+        active_action_indices=(0, 1, 2),
+    )
+
+    validate_temp_ppo_hil_profile(config, policy)
+    observation = adapter.capture(step_index=0)
+
+    endpoint_pose = scene.body_pose("right_tcp")
+    tool_position = (endpoint_pose @ adapter._endpoint_to_tool)[:3, 3]
+    expected = scene.cube_pose[:3].astype(float, copy=True)
+    expected[2] += config.reach_target_height_offset_m
+    expected -= tool_position
+    np.testing.assert_allclose(
+        observation.state_dict["temp_ppo_state"][28:35],
+        scene.cube_pose,
+    )
+    np.testing.assert_allclose(
+        observation.state_dict["reach_target_delta"],
+        expected,
+        atol=1e-7,
+    )
+    assert observation.metadata["policy_observation_dim"] == 38
+
+
+def test_overhead_goal_delta_has_matching_nonprivileged_hil_semantics() -> None:
+    from sim.mujoco.tasks.cube_lift.learning import build_policy_action_transform
+    from sim.mujoco.tasks.cube_lift.reach_guidance import (
+        build_reach_guidance,
+        coarse_to_fine_reach_action_scale,
+    )
+
+    scene = _ObservationScene()
+    config = CubeLiftTaskConfig.load(TASK_CONFIG_38_OVERHEAD_PATH)
+    adapter = TempPPOHILObservationAdapter(
+        scene,
+        config,
+        _BaseObservation(),
+    )
+    observation = adapter.capture(step_index=0)
+
+    base_pose = scene.body_pose("right_arm_base_link")
+    endpoint_pose = scene.body_pose("right_tcp")
+    tool_position = (endpoint_pose @ adapter._endpoint_to_tool)[:3, 3]
+    expected = build_reach_guidance(
+        scene.cube_pose[:3],
+        tool_position,
+        base_pose[:3, :3],
+        target_height_offset_m=config.reach_target_height_offset_m,
+        guidance_height_offset_m=config.reach_guidance_height_offset_m,
+        guidance_xy_blend_radius_m=(
+            config.reach_guidance_xy_blend_radius_m
+        ),
+    )
+    np.testing.assert_allclose(
+        observation.state_dict["reach_target_delta"],
+        expected.delta_in_base,
+        atol=1e-7,
+    )
+    compact_state = observation.state_dict["temp_ppo_state"]
+    expected_scale = coarse_to_fine_reach_action_scale(
+        compact_state[35:38],
+        minimum_scale=config.reach_action_min_scale,
+        slow_radius_m=config.reach_action_slow_radius_m,
+    )
+    public_action = build_policy_action_transform(config).transform(
+        np.ones(3, dtype=np.float32),
+        observation=compact_state,
+    )
+    np.testing.assert_allclose(public_action[:3], expected_scale)
+    np.testing.assert_allclose(public_action[3:], 0.0)
+    assert expected.overhead_blend == 1.0
+    assert config.reach_guidance_enabled is True
+    assert config.reach_action_distance_scaling_enabled is True
+
+
+def test_temp_ppo_model_decodes_latent_action_from_the_same_compact_state() -> None:
+    import torch
+
+    from robot_motion.deploy.observation_view import PolicyObservationView
+    from sim.mujoco.tasks.cube_lift.learning import build_policy_action_transform
+    from sim.mujoco.tasks.cube_lift.reach_guidance import (
+        coarse_to_fine_reach_action_scale,
+    )
+
+    class OnesPolicy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def predict_action(self, observation, *, deterministic):
+            assert deterministic is True
+            return torch.ones(
+                (observation.shape[0], 3),
+                dtype=observation.dtype,
+                device=observation.device,
+            ), None
+
+    class IdentityNormalizer:
+        def __init__(self) -> None:
+            self.seen = None
+
+        def normalize(self, values):
+            self.seen = np.asarray(values, dtype=np.float32).copy()
+            return self.seen
+
+    config = CubeLiftTaskConfig.load(TASK_CONFIG_38_OVERHEAD_PATH)
+    compact_state = np.zeros(38, dtype=np.float32)
+    compact_state[35:38] = (0.04, 0.0, 0.0)
+    normalizer = IdentityNormalizer()
+    model = _TempPPOModel(
+        OnesPolicy(),
+        normalizer,
+        build_policy_action_transform(config),
+        task_config=config,
+    )
+    view = PolicyObservationView(
+        contract_id="test.temp_ppo.compact_state.v1",
+        contract_hash="test-hash",
+        payload={"state": compact_state},
+    )
+
+    public_action = model.predict(view)
+
+    expected_scale = coarse_to_fine_reach_action_scale(
+        compact_state[35:38],
+        minimum_scale=config.reach_action_min_scale,
+        slow_radius_m=config.reach_action_slow_radius_m,
+    )
+    assert normalizer.seen.shape == (31,)
+    np.testing.assert_allclose(normalizer.seen[-3:], compact_state[35:38])
+    np.testing.assert_allclose(public_action[:3], expected_scale)
+    np.testing.assert_allclose(public_action[3:], 0.0)
+
+
+def test_pick_goal_delta_xyz_gripper_profile_uses_generic_hil_projection() -> None:
+    import torch
+
+    from robot_motion.deploy.observation_view import PolicyObservationView
+    from sim.mujoco.tasks.cube_lift.learning import build_policy_action_transform
+
+    latent = np.asarray([0.25, -0.5, 0.75, -1.0], dtype=np.float32)
+
+    class FixedPolicy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def predict_action(self, observation, *, deterministic):
+            assert deterministic is True
+            assert observation.shape == (1, 31)
+            return torch.as_tensor(
+                latent[None, :],
+                dtype=observation.dtype,
+                device=observation.device,
+            ), None
+
+    class IdentityNormalizer:
+        def normalize(self, values):
+            values = np.asarray(values, dtype=np.float32)
+            assert values.shape == (31,)
+            return values
+
+    config = CubeLiftTaskConfig.load(TASK_CONFIG_PICK_XYZ_GRIPPER_PATH)
+    policy_contract = SimpleNamespace(
+        observation_dim=31,
+        action_dim=4,
+        environment_action_dim=7,
+        active_action_indices=(0, 1, 2, 6),
+    )
+    validate_temp_ppo_hil_profile(config, policy_contract)
+
+    model = _TempPPOModel(
+        FixedPolicy(),
+        IdentityNormalizer(),
+        build_policy_action_transform(config),
+        task_config=config,
+    )
+    view = PolicyObservationView(
+        contract_id="test.temp_ppo.pick_xyz_gripper.v1",
+        contract_hash="test-hash",
+        payload={"state": np.zeros(38, dtype=np.float32)},
+    )
+
+    public_action = model.predict(view)
+
+    np.testing.assert_allclose(
+        public_action,
+        [0.25, -0.5, 0.75, 0.0, 0.0, 0.0, -1.0],
     )
 
 

@@ -191,6 +191,87 @@ class FixArmCommandControllerTests(unittest.TestCase):
             "stable_tracker_sample_accepted",
         )
 
+    def test_profile_transition_can_rebase_from_latest_fresh_moving_sample(self) -> None:
+        controller = _controller("right")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        first_pose = np.eye(4)
+        moving_pose = np.eye(4)
+        moving_pose[0, 3] = 0.02
+        controller.observe_two_pedal_home_cache(
+            "right",
+            first_pose,
+            source_timestamp=1.10,
+        )
+        controller.observe_two_pedal_home_cache(
+            "right",
+            moving_pose,
+            source_timestamp=1.20,
+        )
+        stable_only = controller.passive_home_cache_status("right", now=1.22)
+        self.assertFalse(stable_only["ready"])
+        transition_status = controller.passive_home_cache_status(
+            "right",
+            now=1.22,
+            allow_fresh_rebase=True,
+        )
+        self.assertTrue(transition_status["ready"])
+        self.assertEqual(transition_status["quality"], "fresh_rebase")
+
+        transition = controller.start_two_pedal_transition(
+            fixed_side="left",
+            now=1.22,
+            timeout_sec=1.0,
+            min_samples=1,
+            allow_fresh_home_rebase=True,
+        )
+
+        self.assertTrue(transition.ok)
+        self.assertEqual(controller.sample_count, 1)
+        np.testing.assert_allclose(
+            controller.recalibration_samples()[0],
+            moving_pose,
+        )
+        self.assertEqual(
+            controller.recalibration_stability_reason,
+            "fresh_tracker_rebase_reused",
+        )
+
+    def test_profile_transition_rejects_stale_moving_sample(self) -> None:
+        controller = _controller("right")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        controller.observe_two_pedal_home_cache(
+            "right",
+            np.eye(4),
+            source_timestamp=1.10,
+        )
+
+        status = controller.passive_home_cache_status(
+            "right",
+            now=1.30,
+            allow_fresh_rebase=True,
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertFalse(status["fresh_rebase_ready"])
+
     def test_single_arm_mode_caches_both_sides_for_immediate_followup_switch(self) -> None:
         controller = _controller("right")
         controller.filter_channels(

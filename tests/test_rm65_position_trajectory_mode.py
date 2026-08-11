@@ -11,10 +11,13 @@ from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
     POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+    SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
 )
 from teleop_runtime.backends.arms.rm65 import (
     RM65ArmBackend,
     RM65ArmBackendConfig,
+    RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
     _final_follow_qpos_target,
     _position_trajectory_policy,
 )
@@ -54,7 +57,62 @@ class _RecordingDualArmRetargeter:
         self.calls.append(dict(kwargs))
 
 
-def _backend(*, result: int = 0, target_max_age_sec: float = 1.0) -> tuple[RM65ArmBackend, _FakeArm]:
+def test_sample_aligned_backend_builds_configured_source_latch_mode() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            background_streaming_hz=120.0,
+            position_command_planner=(
+                POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+            ),
+            position_sample_aligned_source_hz=60.0,
+            position_sample_aligned_source_latch_mode=(
+                SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP
+            ),
+            position_sample_aligned_horizon_source_steps=2,
+            position_velocity_ramp_sec=0.05,
+            position_max_command_step_deg=0.675,
+            arm_follow_qpos_alpha=1.0,
+            singularity_protection_enabled=False,
+        )
+    )
+
+    assert backend._stream_planner.snapshot()["source_latch_mode"] == (
+        SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP
+    )
+
+    backend.arm = _FakeArm()
+    first = _command(0.05)
+    first.metadata["sample_aligned_source_timestamp"] = 100.0
+    backend.send_command(first)
+    assert first.metadata[
+        "position_transport_sample_aligned_bucket_held"
+    ] is False
+
+    # This is intentionally inside the historical 1/60 s time bucket.  The
+    # strict-timestamp successor must still admit it as the next source cut.
+    second = _command(0.10)
+    second.metadata["sample_aligned_source_timestamp"] = 100.012
+    backend.send_command(second)
+    assert second.metadata[
+        "position_transport_sample_aligned_bucket_held"
+    ] is False
+    assert second.metadata["sample_aligned_admission"]["source_bucket"] == 1
+    assert second.metadata["sample_aligned_admission"]["source_latch_mode"] == (
+        SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP
+    )
+
+
+def _backend(
+    *,
+    result: int = 0,
+    target_max_age_sec: float = 1.0,
+    target_admission_mode: str = RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
+) -> tuple[RM65ArmBackend, _FakeArm]:
     backend = RM65ArmBackend(
         RM65ArmBackendConfig(
             arm_ip="0.0.0.0",
@@ -67,6 +125,7 @@ def _backend(*, result: int = 0, target_max_age_sec: float = 1.0) -> tuple[RM65A
             background_streaming_enabled=True,
             background_streaming_hz=150.0,
             background_streaming_target_max_age_sec=target_max_age_sec,
+            background_streaming_target_admission_mode=target_admission_mode,
             position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
             position_velocity_ramp_sec=0.10,
             position_degraded_speed_scale=0.10,
@@ -82,25 +141,29 @@ def _command(
     *,
     collision_status: str = "tracking",
     step_limited: bool = False,
+    source: str | None = None,
 ) -> EffectorCommand:
+    metadata = {
+        "action_pose_source": "limited_solver_output_qpos",
+        "collision_avoidance_status": collision_status,
+        "ik_jump_gate_status": "pass",
+        "execution_step_metadata": {
+            "enabled": True,
+            "step_limited": bool(step_limited),
+        },
+        "ik_solve_pose_error": {
+            "translation_m": 0.0,
+            "rotation_deg": 0.0,
+        },
+    }
+    if source is not None:
+        metadata["source"] = source
     return EffectorCommand(
         effector_name="left_arm",
         side="left",
         command_type="joint_vector",
         value=np.full(6, target),
-        metadata={
-            "action_pose_source": "limited_solver_output_qpos",
-            "collision_avoidance_status": collision_status,
-            "ik_jump_gate_status": "pass",
-            "execution_step_metadata": {
-                "enabled": True,
-                "step_limited": bool(step_limited),
-            },
-            "ik_solve_pose_error": {
-                "translation_m": 0.0,
-                "rotation_deg": 0.0,
-            },
-        },
+        metadata=metadata,
     )
 
 
@@ -111,6 +174,206 @@ def test_rm65_position_planner_default_remains_linear() -> None:
         connect_hardware=False,
     )
     assert config.position_command_planner == POSITION_COMMAND_PLANNER_LINEAR
+
+
+def test_rm65_singularity_analysis_exposes_lock_and_sdk_timing() -> None:
+    class AnalyzingArm(_FakeArm):
+        def Algo_Kin_Singularity_Analyse(self, _joint_deg):
+            return 0, 0.2
+
+    backend, _arm = _backend()
+    backend.arm = AnalyzingArm()
+
+    result = backend._analyze_singularity(np.zeros(6))
+
+    timing = result["analysis_timing"]
+    assert result["status_code"] == 0
+    assert timing["lock_wait_ms"] >= 0.0
+    assert timing["sdk_call_ms"] >= 0.0
+    assert timing["total_ms"] >= timing["sdk_call_ms"]
+
+
+def test_latest_target_admission_does_not_wait_for_inflight_sdk_send_lock() -> None:
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    )
+    completed = threading.Event()
+    receipts = []
+    errors: list[BaseException] = []
+
+    def admit_target() -> None:
+        try:
+            receipts.append(backend.send_command(_command(0.05)))
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    with backend._send_lock:
+        thread = threading.Thread(target=admit_target, daemon=True)
+        thread.start()
+        assert completed.wait(0.25), "latest target admission waited for _send_lock"
+    thread.join(timeout=0.25)
+
+    assert not errors
+    assert len(receipts) == 1
+    timing = receipts[0].metadata["target_admission_timing"]
+    assert timing["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+    assert timing["send_lock_wait_ms"] == 0.0
+    phase_timing = receipts[0].metadata["command_phase_timing"]
+    assert phase_timing["entry_state_lock_wait_ms"] >= 0.0
+    assert phase_timing["singularity_protection_ms"] >= 0.0
+    assert phase_timing["singularity_analysis_lock_wait_ms"] == 0.0
+    assert phase_timing["singularity_analysis_sdk_call_ms"] == 0.0
+    assert phase_timing["target_admission_ms"] == pytest.approx(
+        timing["total_ms"]
+    )
+    assert phase_timing["total_through_target_admission_ms"] >= timing["total_ms"]
+    assert phase_timing["post_admission_metadata_ms"] >= 0.0
+    assert phase_timing["final_state_lock_wait_ms"] >= 0.0
+    assert phase_timing["final_state_snapshot_ms"] >= 0.0
+    assert phase_timing["quick_stop_metadata_ms"] >= 0.0
+    assert phase_timing["singularity_transition_trace_ms"] >= 0.0
+    assert phase_timing["total_send_command_ms"] >= phase_timing[
+        "total_through_target_admission_ms"
+    ]
+    assert backend.get_state()["background_streaming"][
+        "last_target_admission_timing"
+    ]["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+
+
+@pytest.mark.parametrize(
+    "source",
+    ("replay_qpos_init", "replay_qpos_init_final_hold"),
+)
+def test_qpos_init_serializes_target_admission_for_velocity_continuity(
+    source: str,
+) -> None:
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    )
+    completed = threading.Event()
+    receipts = []
+    errors: list[BaseException] = []
+
+    def admit_target() -> None:
+        try:
+            receipts.append(backend.send_command(_command(0.05, source=source)))
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    with backend._send_lock:
+        thread = threading.Thread(target=admit_target, daemon=True)
+        thread.start()
+        assert not completed.wait(0.03)
+    assert completed.wait(0.25)
+    thread.join(timeout=0.25)
+
+    assert not errors
+    assert len(receipts) == 1
+    timing = receipts[0].metadata["target_admission_timing"]
+    assert timing["requested_mode"] == (
+        RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+    )
+    assert timing["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+    assert timing["fallback_reason"] == (
+        "qpos_init_requires_serialized_velocity_continuity"
+    )
+    assert timing["send_lock_wait_ms"] >= 20.0
+
+
+def test_synchronous_target_admission_remains_explicit_rollback() -> None:
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
+    )
+    completed = threading.Event()
+    receipts = []
+    errors: list[BaseException] = []
+
+    def admit_target() -> None:
+        try:
+            receipts.append(backend.send_command(_command(0.05)))
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    with backend._send_lock:
+        thread = threading.Thread(target=admit_target, daemon=True)
+        thread.start()
+        assert not completed.wait(0.03)
+    assert completed.wait(0.25)
+    thread.join(timeout=0.25)
+
+    assert not errors
+    assert len(receipts) == 1
+    timing = receipts[0].metadata["target_admission_timing"]
+    assert timing["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+    assert timing["send_lock_wait_ms"] >= 20.0
+
+
+def test_inflight_sdk_completion_rebases_planner_onto_latest_target() -> None:
+    class BlockingFirstSendArm(_FakeArm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_send_entered = threading.Event()
+            self.release_first_send = threading.Event()
+
+        def Movej_CANFD(self, joint_deg, follow=False, trajectory_mode=0, radio=0):
+            if not self.first_send_entered.is_set():
+                self.first_send_entered.set()
+                if not self.release_first_send.wait(0.5):
+                    raise TimeoutError("unit test did not release first SDK send")
+            return super().Movej_CANFD(
+                joint_deg,
+                follow=follow,
+                trajectory_mode=trajectory_mode,
+                radio=radio,
+            )
+
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    )
+    blocking_arm = BlockingFirstSendArm()
+    backend.arm = blocking_arm
+    backend.send_command(_command(0.04))
+    backend._stream_thread = threading.Thread(
+        target=backend._background_stream_loop,
+        daemon=True,
+    )
+    backend._stream_thread.start()
+    try:
+        assert blocking_arm.first_send_entered.wait(0.25)
+        admitted_started = time.perf_counter()
+        latest_receipt = backend.send_command(_command(0.08))
+        admission_ms = (time.perf_counter() - admitted_started) * 1000.0
+        assert admission_ms < 20.0
+        blocking_arm.release_first_send.set()
+
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            stream = backend.get_state()["background_streaming"]
+            if (
+                stream["inflight_target_preemption_count"] >= 1
+                and len(blocking_arm.sent_joint_deg) >= 2
+            ):
+                break
+            time.sleep(0.001)
+        stream = backend.get_state()["background_streaming"]
+        assert stream["fault"] is None
+        assert stream["inflight_target_preemption_count"] == 1
+        assert stream["last_inflight_target_preemption"][
+            "completed_target_sequence"
+        ] < stream["last_inflight_target_preemption"]["active_target_sequence"]
+        assert stream["target_sequence"] == latest_receipt.metadata[
+            "transport_target_sequence"
+        ]
+        assert len(blocking_arm.sent_joint_deg) >= 2
+    finally:
+        blocking_arm.release_first_send.set()
+        backend.close()
 
 
 def test_acceleration_planner_defaults_to_30ms_target_velocity_filter() -> None:
@@ -229,6 +492,9 @@ def test_sample_aligned_backend_stamps_admitted_endpoint_and_holds_inner_frames(
             control_dt=1.0 / 60.0,
             background_streaming_enabled=True,
             background_streaming_hz=120.0,
+            background_streaming_target_admission_mode=(
+                RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+            ),
             position_command_planner=(
                 POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
             ),
@@ -251,7 +517,17 @@ def test_sample_aligned_backend_stamps_admitted_endpoint_and_holds_inner_frames(
 
     first = _command(1.0)
     first.metadata["sample_aligned_source_timestamp"] = 100.0
-    backend.send_command(first)
+    first_receipt = backend.send_command(first)
+    first_admission_timing = first_receipt.metadata["target_admission_timing"]
+    assert first_admission_timing["requested_mode"] == (
+        RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+    )
+    assert first_admission_timing["mode"] == (
+        RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+    )
+    assert first_admission_timing["fallback_reason"] == (
+        "sample_aligned_jerk_limited_planner_requires_synchronous_activation"
+    )
     admitted = np.asarray(first.metadata["backend_final_target_qpos"], dtype=float)
     assert np.max(admitted) < 0.1
     assert first.metadata["sample_aligned_admission"]["admission_limited"] is True
@@ -270,6 +546,43 @@ def test_sample_aligned_backend_stamps_admitted_endpoint_and_holds_inner_frames(
     next_cut.metadata["sample_aligned_source_timestamp"] = 100.0 + 4.0 / 60.0
     backend.send_command(next_cut)
     assert next_cut.metadata["position_transport_sample_aligned_bucket_held"] is False
+
+
+def test_sample_aligned_backend_builds_causal_observer_planner() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            background_streaming_hz=120.0,
+            position_command_planner=(
+                POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+            ),
+            position_sample_aligned_source_hz=15.0,
+            position_sample_aligned_initial_jerk_delta_regularization=1e-5,
+            position_sample_aligned_reference_mode="causal_hermite",
+            position_sample_aligned_observer_window=4,
+            position_sample_aligned_observer_efficiency_power=2.0,
+            position_sample_aligned_observer_velocity_ema_alpha=0.5,
+            position_sample_aligned_observer_velocity_cap_scale=0.5,
+            position_sample_aligned_observer_coherence_min=0.5,
+            position_sample_aligned_observer_speed_guard_scale=0.4,
+            position_sample_aligned_terminal_velocity_displacement_scale=0.75,
+            position_max_command_step_deg=0.675,
+            arm_follow_qpos_alpha=1.0,
+            singularity_protection_enabled=False,
+        )
+    )
+
+    snapshot = backend._stream_planner.snapshot()
+    assert snapshot["reference_mode"] == "causal_hermite"
+    assert snapshot["observer_window"] == 4
+    assert snapshot["terminal_velocity_displacement_scale"] == pytest.approx(0.75)
+    assert snapshot["governor_regularization"]["initial_jerk_delta"] == pytest.approx(
+        1e-5
+    )
 
 def test_command_step_envelope_default_remains_velocity_times_control_dt() -> None:
     max_angvel = np.asarray((0.7, 0.7, 0.9, 1.5, 1.5, 2.0), dtype=float)
@@ -642,6 +955,61 @@ def test_stale_target_becomes_persistent_quick_stop_in_acceleration_mode() -> No
     assert stream["quick_stop_active"] is True
     assert stream["target_stale"] is False
     assert stream["stale_count"] == 1
+
+
+def test_stale_sample_aligned_target_reanchors_command_space_hold() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            background_streaming_hz=120.0,
+            background_streaming_target_max_age_sec=0.1,
+            position_command_planner=(
+                POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+            ),
+            position_sample_aligned_source_hz=60.0,
+            position_sample_aligned_horizon_source_steps=2,
+            position_sample_aligned_safety_horizon_source_steps=20,
+            position_velocity_ramp_sec=0.05,
+            position_max_acceleration_rad_s2=(
+                56.0,
+                56.0,
+                72.0,
+                120.0,
+                120.0,
+                160.0,
+            ),
+            position_max_command_step_deg=0.675,
+            singularity_protection_enabled=False,
+        )
+    )
+    backend.arm = _FakeArm()
+    command = _command(0.2)
+    command.metadata["sample_aligned_source_timestamp"] = 100.0
+    backend.send_command(command)
+
+    with backend._state_lock:
+        proposal = backend._stream_planner.propose(monotonic_time=100.0)
+        backend._stream_planner.commit(proposal)
+        accepted = np.asarray(proposal.q_command, dtype=float)
+        backend._record_command_accepted_locked(
+            accepted,
+            timestamp=time.time(),
+            monotonic_time=100.0,
+        )
+        backend._stream_target_monotonic = 99.8
+    before = backend._stream_planner.snapshot()
+    assert np.max(np.abs(before["qd_command_rad_s"])) > 0.0
+
+    assert backend._expire_stale_stream_target(now_monotonic=100.0) is True
+    after = backend._stream_planner.snapshot()
+    np.testing.assert_allclose(after["q_command"], accepted)
+    np.testing.assert_allclose(after["qd_command_rad_s"], 0.0)
+    np.testing.assert_allclose(after["qdd_command_rad_s2"], 0.0)
+    assert backend.get_state()["background_streaming"]["target_active"] is False
 
 
 def test_failed_sdk_send_does_not_commit_online_trajectory_state() -> None:

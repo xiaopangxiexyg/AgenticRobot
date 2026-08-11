@@ -368,6 +368,22 @@ def test_failed_feedback_refresh_keeps_last_success_timestamp_and_sequence() -> 
     assert failed["hardware_read_time"] == 200.0
     assert failed["hardware_read_sequence"] == 2
     assert failed["hardware_read_success"] is False
+    phase_timing = failed["hardware_read_phase_timing"]
+    assert set(phase_timing) == {
+        "total_wall_ms",
+        "total_thread_cpu_ms",
+        "hardware_read_lock_wait_wall_ms",
+        "hardware_read_lock_wait_thread_cpu_ms",
+        "sdk_call_wall_ms",
+        "sdk_call_thread_cpu_ms",
+        "parse_validation_wall_ms",
+        "parse_validation_thread_cpu_ms",
+        "retry_sleep_wall_ms",
+        "attempt_count",
+    }
+    assert phase_timing["attempt_count"] == 1.0
+    assert all(value >= 0.0 for value in phase_timing.values())
+    assert phase_timing["total_wall_ms"] >= phase_timing["sdk_call_wall_ms"]
     np.testing.assert_allclose(failed["hardware_qpos"], np.deg2rad([10.0] * 6))
 
 

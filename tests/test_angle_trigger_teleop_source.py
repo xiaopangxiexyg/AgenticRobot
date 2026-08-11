@@ -13,6 +13,7 @@ from teleop_runtime.retargeters import ScalarToGripperRetargeter, ScalarToGrippe
 from teleop_runtime.schemas import ObservationChannel, TeleopObservation
 from teleop_runtime.sources.hand import AngleTriggerSource
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.real_teleop import cli_runtime_config
 from teleop_runtime.real_teleop.device_retry_runtime import (
     build_device_retry_runtime,
 )
@@ -141,6 +142,56 @@ def test_single_side_missing_reader_value_publishes_invalid_without_deadlock() -
         source.close()
 
 
+def test_transient_read_failure_retries_open_connection_before_rediscovery() -> None:
+    class FlakyReader(_FakeReader):
+        def __init__(self) -> None:
+            super().__init__()
+            self.open_count = 0
+            self.close_count = 0
+            self.read_count = 0
+
+        def open(self) -> None:
+            super().open()
+            self.open_count += 1
+
+        def close(self) -> None:
+            super().close()
+            self.close_count += 1
+
+        def read(self) -> dict[str, float]:
+            assert self.opened
+            self.read_count += 1
+            if self.read_count == 1:
+                raise RuntimeError("one delayed response")
+            return {"right": 0.75}
+
+    reader = FlakyReader()
+    source = AngleTriggerSource(
+        reader,
+        rate_hz=100.0,
+        active_sides=("right",),
+        reconnect_after_consecutive_errors=3,
+    )
+    source.start()
+    try:
+        deadline = time.monotonic() + 0.5
+        channel = None
+        while time.monotonic() < deadline:
+            channel = source.get_latest_channels().get("right_angle_trigger")
+            if channel is not None and channel.valid:
+                break
+            time.sleep(0.005)
+        assert channel is not None and channel.valid
+        assert channel.value == 0.75
+        assert reader.read_count >= 2
+        assert reader.open_count == 1
+        assert reader.close_count == 0
+    finally:
+        source.close()
+
+    assert reader.close_count == 1
+
+
 def test_scalar_retargeter_accepts_angle_trigger_scalar() -> None:
     retargeter = ScalarToGripperRetargeter(
         ScalarToGripperRetargeterConfig(
@@ -188,6 +239,7 @@ def test_gripper_input_selection_prefers_q6_and_falls_back_to_angle_trigger() ->
     ):
         real_teleop._resolve_gripper_input_source(args, ("left", "right"))
     assert args.gripper_input_source == "angle_trigger"
+    assert "detected only 0 q6" in args.q6_startup_error.lower()
 
     with patch(
         "hardware.teleop_hand.q6_assignment.scan_q6_devices",
@@ -195,10 +247,136 @@ def test_gripper_input_selection_prefers_q6_and_falls_back_to_angle_trigger() ->
     ):
         real_teleop._resolve_gripper_input_source(args, ("left", "right"))
     assert args.gripper_input_source == "q6"
+    assert args.q6_startup_error == ""
 
     args.gripper_angle_trigger = True
     real_teleop._resolve_gripper_input_source(args, ("left", "right"))
     assert args.gripper_input_source == "angle_trigger"
+
+
+def test_partial_q6_isolated_for_gui_capability_admission() -> None:
+    args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_angle_trigger=False,
+        gui_requested=True,
+        hardware_admission_mode="capability",
+    )
+    with patch(
+        "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+        return_value={"q6_devices": [{}]},
+    ):
+        real_teleop._resolve_gripper_input_source(args, ("left", "right"))
+
+    assert args.gripper_input_source == "angle_trigger"
+    assert "detected only 1 q6" in args.q6_startup_error.lower()
+
+
+def test_partial_q6_remains_fail_closed_outside_gui_capability_mode() -> None:
+    args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_angle_trigger=False,
+        gui_requested=False,
+        hardware_admission_mode="strict",
+    )
+    with (
+        patch(
+            "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+            return_value={"q6_devices": [{}]},
+        ),
+        pytest.raises(ValueError, match="Detected only 1 Q6"),
+    ):
+        real_teleop._resolve_gripper_input_source(args, ("left", "right"))
+
+
+def test_q6_scanner_value_error_isolated_only_for_gui_capability_mode() -> None:
+    args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_angle_trigger=False,
+        gui_requested=True,
+        hardware_admission_mode="capability",
+    )
+    with patch(
+        "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+        side_effect=ValueError("malformed Q6 scan"),
+    ):
+        real_teleop._resolve_gripper_input_source(args, ("left", "right"))
+
+    assert args.gripper_input_source == "angle_trigger"
+    assert "malformed Q6 scan" in args.q6_startup_error
+
+
+def test_inactive_arm_ip_is_accepted_when_active_sides_select_one_arm() -> None:
+    args = SimpleNamespace(
+        swap_arm_sides=False,
+        left_arm_ip="192.168.101.21",
+        right_arm_ip="192.168.1.20",
+    )
+
+    real_teleop._validate_required_arm_ips(args, ("left",))
+
+
+def test_gui_q6_preflight_failure_isolated_for_runtime_retry() -> None:
+    args = SimpleNamespace(
+        gui_requested=True,
+        hardware_admission_mode="capability",
+        device_preflight=True,
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="q6",
+        visualize_tactile=False,
+        dmtac_tactile=None,
+        no_camera=True,
+    )
+    parser = SimpleNamespace(error=lambda message: pytest.fail(message))
+    with patch.object(
+        cli_runtime_config,
+        "prepare_devices_for_teleop",
+        side_effect=real_teleop.DevicePreflightError(
+            "Q6 count is insufficient: detected 1, expected 2."
+        ),
+    ):
+        real_teleop._run_gui_device_preflight(
+            args,
+            active_sides=("left", "right"),
+            parser=parser,
+        )
+
+    assert args.gripper_input_source == "angle_trigger"
+    assert "Q6 count is insufficient" in args.q6_startup_error
+
+
+def test_gui_required_q6_assignment_failure_isolated_for_runtime_retry() -> None:
+    args = SimpleNamespace(
+        active_sides=("left", "right"),
+        gui_requested=True,
+        hardware_admission_mode="capability",
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="q6",
+        q6_default_config=True,
+        q6_config="latest",
+        q6_config_required=True,
+        left_hand_port="",
+        right_hand_port="",
+    )
+    parser = SimpleNamespace(error=lambda message: pytest.fail(message))
+    with patch.object(
+        cli_runtime_config,
+        "load_latest_q6_ports",
+        side_effect=FileNotFoundError("missing latest assignment"),
+    ):
+        real_teleop._apply_default_q6_ports(args, parser=parser)
+
+    assert args.gripper_input_source == "angle_trigger"
+    assert "missing latest assignment" in args.q6_startup_error
 
 
 def test_runtime_reconnect_promotes_angle_trigger_to_q6_atomically() -> None:
@@ -448,6 +626,75 @@ def test_device_retry_wires_angle_trigger_fallback_to_q6_promotion() -> None:
     assert "recording_active()" not in retry_source
     assert "episode_start_countdown_deadline" not in retry_source
     assert "clutch_input.hold_active()" in retry_source
+
+
+def test_successful_q6_retry_clears_recoverable_input_failures() -> None:
+    startup_errors = {
+        "gripper.input": "Q6UnavailableError: missing",
+        "angle_trigger": "AngleTriggerError: missing fallback",
+    }
+    published: list[dict[str, object]] = []
+    messages: list[str] = []
+    clutch = SimpleNamespace(
+        _teleop_started=False,
+        _gripper_control_enabled=True,
+        _episode_busy=lambda: False,
+        hold_active=lambda: False,
+        device_retry_admission=lambda: (True, ""),
+        _current_active_controls=lambda: ["device_retry"],
+        publish_gripper_status=lambda **_kwargs: None,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="angle_trigger",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=object(),
+        right_hand_backend=object(),
+    )
+    args = SimpleNamespace(
+        q6_config_required=True,
+        q6_startup_error=startup_errors["gripper.input"],
+        angle_trigger_startup_error=startup_errors["angle_trigger"],
+        foot_pad_requested=False,
+        ignore_camera=(),
+    )
+    ui = SimpleNamespace(
+        publish=lambda **updates: published.append(updates),
+        append_message=lambda _kind, message: messages.append(str(message)),
+    )
+    runtime = build_device_retry_runtime(
+        args=args,
+        components=components,
+        control_ui=ui,
+        clutch_input=clutch,
+        camera_sources={},
+        vive_source=None,
+        startup_device_errors=startup_errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: None,
+        set_dataset_recorder=lambda _value: None,
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda _value: None,
+        dataset_recorder_type=object,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: True,
+        promote_angle_trigger_gripper_input_to_q6=lambda *_args, **_kwargs: (
+            True,
+            "Q6 reconnected",
+        ),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    runtime.retry_failed_devices()
+
+    assert startup_errors == {}
+    assert args.q6_startup_error == ""
+    assert args.angle_trigger_startup_error == ""
+    assert clutch._gripper_control_enabled is False
+    assert any("Q6 reconnected" in message for message in messages)
+    assert published[-1]["hardware_status"]["dataset.writer"]["online"] is True
 
 
 def test_manual_foot_pad_retry_updates_status_provider_atomically() -> None:

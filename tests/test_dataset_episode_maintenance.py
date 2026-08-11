@@ -5,9 +5,6 @@ from pathlib import Path
 
 import pytest
 
-pa = pytest.importorskip("pyarrow")
-pq = pytest.importorskip("pyarrow.parquet")
-
 from dataset_contracts.canonical_encoding import canonical_bytes
 from dataset_contracts.control_trace_episode import (
     EPISODE_COMMIT_FILE_DOMAIN_V1,
@@ -31,7 +28,15 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
+def _require_pyarrow():
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    return pa, pq
+
+
 def _dataset(root: Path) -> None:
+    pa, pq = _require_pyarrow()
+
     episodes: list[dict[str, object]] = []
     stats: list[dict[str, object]] = []
     global_index = 0
@@ -85,7 +90,9 @@ def _dataset(root: Path) -> None:
     )
 
 
+@pytest.mark.optional
 def test_delete_middle_episode_compacts_artifacts_metadata_and_parquet(tmp_path: Path) -> None:
+    _pa, pq = _require_pyarrow()
     root = tmp_path / "dataset"
     _dataset(root)
 
@@ -134,6 +141,7 @@ def test_delete_middle_episode_compacts_artifacts_metadata_and_parquet(tmp_path:
     assert writer.discard_episode(2)
 
 
+@pytest.mark.optional
 def test_missing_episode_does_not_replace_original_dataset(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     _dataset(root)
@@ -228,6 +236,7 @@ def test_gui_event_consumption_is_bounded_per_control_poll() -> None:
     assert ui.consume_events() == ["movement_multiple_up"]
 
 
+@pytest.mark.optional
 def test_committed_v24_episode_compaction_fails_closed_without_mutation(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     _dataset(root)
@@ -271,6 +280,7 @@ def test_committed_v24_episode_compaction_fails_closed_without_mutation(tmp_path
     assert not list(tmp_path.glob("dataset.before_delete_episode_*"))
 
 
+@pytest.mark.optional
 def test_v25p_episode_compaction_fails_closed_without_mutation(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     _dataset(root)

@@ -77,6 +77,20 @@ have one authoritative owner. Passive bounded observers, fanout queues, and UI
 caches are allowed, but they must not mutate or independently reconstruct the
 owned state.
 
+## Delivery scope and evidence
+
+- Judge completion against the user-requested outcome. A contract, module,
+  fixture, or profile may be complete in its own requested scope, but does not
+  prove downstream runtime integration. When broader integration could
+  reasonably be inferred, state the actual caller or its absence, the
+  environment and furthest boundary exercised, and the next relevant unverified
+  boundary. Do not impose a fixed evidence sequence.
+- New plans, profiles, adapters, fixtures, wrappers, exports, or modules are not
+  progress by themselves. Add one only when requested or needed for the current
+  implementation, compatibility or rollback, or relevant verification. Describe
+  structural progress by the responsibility, dependency, or call edge changed,
+  not merely by files moved, abstractions added, or test counts.
+
 ## Safety and change protocol
 
 - Prefer read-only, dry-run, mock, contract, and `--help` checks.
@@ -96,6 +110,16 @@ owned state.
 - Ask for clarification when an unresolved choice affects safety, public
   control/data semantics, ownership, or destructive behavior; otherwise state
   assumptions and proceed.
+- For any stateful control modifier, bound the final composed output including
+  persistent terms at the last authoritative boundary. Component and rate
+  limits are not total-action limits; persistent feedback must use an explicit
+  incremental baseline rather than an absolute target-to-command residual.
+- Shadow evidence cannot authorize Active-only feedback or state transitions;
+  exercise them offline in closed loop, including nonzero nominal residuals,
+  before any real-motion command is provided.
+- After unexpected real motion, freeze that Active path and preserve its exact
+  command, configuration, logs, and process evidence. Diagnose read-only and do
+  not tune or retry until both the cause and the missing safety gate are closed.
 - Use `AGENT_TEMP_NOTE:` only for active collaboration and remove obsolete notes.
 
 ## Verification and environment metadata

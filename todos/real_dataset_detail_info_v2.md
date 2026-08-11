@@ -365,9 +365,11 @@ annotation identity；author/tool/completeness report、source snapshot content 
 
 首版区分两个 hash，不能混成一个：
 
-- `source_dataset_base_fingerprint`：当前 v1 由 `meta/info.json`、`meta/tasks.jsonl` 和
-  `meta/modality_validity.json` 的相对路径/内容 hash 组成，明确排除会随 append 变化的
-  `meta/episodes.jsonl`；不含目录位置或外部 annotation root。单个 episode 另存
+- `source_dataset_base_fingerprint`：新写入使用 append-stable v2；由
+  `meta/info.json` 的稳定字段（明确排除 seal 时更新的 episode/frame 等计数）、
+  `meta/tasks.jsonl` 和 `meta/modality_validity.json` 的相对路径/内容 hash 组成，并排除会随
+  append 变化的 `meta/episodes.jsonl`；不含目录位置或外部 annotation root。旧 provisional
+  v1 manifest 只作兼容读取/续写，不用新算法静默重解释。单个 episode 另存
   `source_episode_manifest_hash`，完整 snapshot projection 仍属于后续版本；
 - `source_snapshot_content_hash`：一个显式、不可变 `SourceDatasetSnapshot` 的内容绑定，固定成员
   episode、逻辑 manifest record 边界，以及成员的 Parquet、已声明媒体/触觉/depth 和存在且已

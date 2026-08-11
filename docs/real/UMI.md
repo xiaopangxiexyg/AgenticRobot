@@ -26,7 +26,8 @@ python -m utils.umi_hand_eye --side right
 
 ```bash
 python -m teleop_runtime.collection umi \
-  --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json
+  --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist
 ```
 
 调试时保持状态采集但禁止真实夹爪指令：
@@ -34,6 +35,7 @@ python -m teleop_runtime.collection umi \
 ```bash
 python -m teleop_runtime.collection umi \
   --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist \
   --no-send-gripper
 ```
 
@@ -52,6 +54,7 @@ episode 仍是权威输出，UMI 的 next-observation action 对齐和每侧 pos
 ```bash
 python -m teleop_runtime.collection umi \
   --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist \
   --foot-pad
 ```
 

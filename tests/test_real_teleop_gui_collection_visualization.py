@@ -1021,22 +1021,37 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         request_times: list[float] = []
         update_times: list[float] = []
         runtime_status_updates: list[bool] = []
+
+        class StateBackend:
+            def __init__(self) -> None:
+                self.refresh_count = 0
+
+            def refresh_state_from_hardware(self):
+                self.refresh_count += 1
+                raise RuntimeError("idle startup must not read RM65 state")
+
+        left_state = StateBackend()
+        right_state = StateBackend()
         components = SimpleNamespace(
-            active_sides=(),
+            active_sides=("left", "right"),
+            arm_state_read_executor=None,
+            left_command_backend=None,
+            right_command_backend=None,
+            left_state_backend=left_state,
+            right_state_backend=right_state,
+            left_preview_backend=SimpleNamespace(),
+            right_preview_backend=SimpleNamespace(),
             session=SimpleNamespace(poll_sources=lambda now: ({}, [])),
         )
         with patch.object(real_teleop, "_handle_ik_debug_log_toggle_request"), patch.object(
             real_teleop,
             "_advance_startup_gui_qpos_maintenance",
-        ), patch.object(real_teleop, "_sync_preview_from_real_state_real"), patch.object(
-            real_teleop.time,
-            "sleep",
-        ):
+        ), patch.object(real_teleop.time, "sleep"):
             result = real_teleop._wait_for_real_teleop_start_request(
                 components,
                 clutch,
                 arm_mode="real",
-                args=_args(),
+                args=_args(arm_control_mode="position"),
                 control_ui=None,
                 ik_debug_log_recorder=SimpleNamespace(),
                 ik_debug_profile_base_enabled=False,
@@ -1050,6 +1065,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(len(update_times), 1)
         self.assertEqual(len(runtime_status_updates), 2)
         self.assertEqual(clutch.startup_enabled, [True, False])
+        self.assertEqual(left_state.refresh_count, 0)
+        self.assertEqual(right_state.refresh_count, 0)
 
     def test_preview_apply_does_not_mutate_recorded_active_command(self) -> None:
         class _MutatingPreviewBackend:
@@ -1300,6 +1317,45 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
             self.assertEqual(ctx.exception.code, 2)
             self.assertIn("requires --active-sides both", stderr.getvalue())
+
+    def test_single_arm_defaults_cannot_be_restored_as_requested_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            calibration_profile = (
+                profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
+            )
+            calibration_profile.write_text("{}", encoding="utf-8")
+            with patch.object(
+                real_teleop,
+                "DEFAULT_CALIBRATION_PROFILE_DIR",
+                profile_dir,
+            ), patch.object(
+                sys,
+                "argv",
+                [
+                    "prog",
+                    "--active-sides",
+                    "left",
+                    "--left-arm-ip",
+                    "192.0.2.10",
+                    "--no-arm-ip-save-latest",
+                    "--no-camera",
+                    "--no-video",
+                    "--headless",
+                    "--no-gui",
+                ],
+            ):
+                args = real_teleop.parse_args()
+
+        self.assertFalse(args.fix_arm)
+        self.assertFalse(args.init_arm_available)
+        self.assertFalse(args.init_arm_requested)
+        restored, _message = real_teleop._restore_init_arm_after_foot_pad_fallback(
+            args,
+            live_foot_pad_count=None,
+        )
+        self.assertFalse(restored)
+        self.assertFalse(args.init_arm_available)
 
     def test_parse_args_accepts_workspace_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2807,6 +2863,43 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             target_profile.profile_id,
         )
 
+    def test_task_selection_defaults_new_blank_dataset_to_four_stage_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_root = Path(tmp_dir) / "datasets"
+            args = _args(
+                dataset_root=str(base_root),
+                dataset_base_root=str(base_root),
+                collection_progress_gui=True,
+                collection_progress_profile=None,
+            )
+            real_teleop._apply_formal_dataset_layout(args)
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=_FakeUi(),
+                args=args,
+                components=_components(),
+            )
+
+            with patch.object(real_teleop, "datetime") as fake_datetime:
+                fake_datetime.now.return_value.strftime.return_value = "2026-08-03"
+                applied = control._apply_episode_start_payload(
+                    json.dumps(
+                        {
+                            "dataset_base_root": str(base_root),
+                            "task_key": "writing",
+                            "task_english_name": "Writing",
+                            "task_chinese_name": "书写",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        self.assertTrue(applied)
+        self.assertEqual(
+            args.collection_progress_profile.profile_id,
+            "dmtac_rm65_bimanual_position_writing_four_stage_progress",
+        )
+
     def test_stale_task_select_event_cannot_mutate_active_episode_contract(self) -> None:
         ui = _FakeUi()
         args = _args(
@@ -3251,6 +3344,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         event = 'task_select:{"task_key":"soft_grasp"}'
         self.assertTrue(ui.push_event(event))
         self.assertEqual(ui.consume_events(), [event])
+        self.assertNotIn("task_select", ui.snapshot()["active_controls"])
 
     def test_http_task_select_payload_is_encoded_for_runtime(self) -> None:
         payload = {
@@ -4693,7 +4787,11 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         html = calibration_web_ui._HTML_PAGE
 
         self.assertIn(
-            "const pathLocked = Boolean(recording || preparing || finalizing);",
+            "|| datasetConfigurationSubmissionPending",
+            html,
+        )
+        self.assertIn(
+            'const datasetConfigurationAvailable = activeControls.has("task_select");',
             html,
         )
         self.assertIn("datasetBaseRootInputEl.disabled = pathLocked;", html)
@@ -5454,6 +5552,62 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(payload["fresh_frame_streaks"], {"front": 3})
         self.assertLess(float(payload["elapsed_sec"]), 1.0)
 
+    def test_camera_retry_self_check_replaces_snapshot_without_nested_input_poll(self) -> None:
+        class _FreshCameraSource:
+            def __init__(self) -> None:
+                self.frame_count = 0
+                self.config = SimpleNamespace(
+                    serial="reconnected-camera",
+                    width=640,
+                    height=480,
+                    fps=15,
+                    color_space="bgr",
+                    enable_depth=False,
+                    depth_width=640,
+                    depth_height=480,
+                    depth_fps=15,
+                )
+                self.name = "reconnected_camera"
+
+            def device_info(self) -> dict[str, object]:
+                self.frame_count += 1
+                return {
+                    "camera_key": "front",
+                    "serial": "reconnected-camera",
+                    "frame_count": self.frame_count,
+                    "last_frame_age_sec": 0.01,
+                    "stale_after_sec": 1.0,
+                }
+
+        ui = _FakeUi()
+        clutch_input = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        with patch.object(
+            clutch_input,
+            "poll",
+            side_effect=AssertionError("retry callback must not recursively poll input"),
+        ):
+            payload = real_teleop._run_camera_startup_self_check(
+                camera_sources={"front": _FreshCameraSource()},
+                clutch_input=clutch_input,
+                duration_sec=1.0,
+                interval_sec=0.01,
+                poll_input=False,
+            )
+
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["completion_reason"], "fresh_frames")
+        published_checks = [
+            item["camera_self_check"]
+            for item in ui.published
+            if "camera_self_check" in item
+        ]
+        self.assertEqual(published_checks[-1]["status"], "passed")
+
     def test_camera_startup_self_check_fails_empty_sources_when_wrist_depth_required(self) -> None:
         ui = _FakeUi()
         clutch_input = real_teleop.RealTeleopControlInput(
@@ -5948,6 +6102,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         active_controls = set(ui.published[-1]["active_controls"])
         self.assertIn("h", active_controls)
         self.assertIn("episode_start", active_controls)
+        self.assertIn("task_select", active_controls)
 
     def test_episode_paused_state_keeps_stop_available_in_hold(self) -> None:
         ui = _FakeUi()

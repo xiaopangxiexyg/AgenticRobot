@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from hardware.teleop_hand import q6_assignment
 from hardware.teleop_hand.q6_assignment import (
     build_assignment_from_tokens,
@@ -86,6 +88,7 @@ class Q6AssignmentTest(unittest.TestCase):
             ROOT / "teleop_runtime" / "configs" / "hardware" / "q6",
         )
 
+    @pytest.mark.integration
     def test_scan_build_save_and_load_latest_assignment(self) -> None:
         scan = scan_q6_devices(serial_devices=_serial_ports(), probe_func=_probe)
         assignment = build_assignment_from_tokens(scan, left="1", right="0")
@@ -111,6 +114,7 @@ class Q6AssignmentTest(unittest.TestCase):
             },
         )
 
+    @pytest.mark.integration
     def test_latest_falls_back_to_legacy_config_dir_but_saves_new_default(self) -> None:
         scan = scan_q6_devices(serial_devices=_serial_ports(), probe_func=_probe)
         assignment = build_assignment_from_tokens(scan, left="0", right="1")
@@ -158,6 +162,7 @@ class Q6AssignmentTest(unittest.TestCase):
             {"left": "/dev/serial/by-id/q6-left"},
         )
 
+    @pytest.mark.integration
     def test_collection_default_q6_ports_fill_missing_cli_args(self) -> None:
         scan = scan_q6_devices(serial_devices=_serial_ports(), probe_func=_probe)
         assignment = build_assignment_from_tokens(scan, left="0", right="1")

@@ -38,7 +38,7 @@ from dataset_interface.progress_timeline import (
 from dataset_interface.sample_axis import EpisodeSampleAxis
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.contract]
 
 
 def _timeline() -> ResolvedProgressTimeline:
@@ -196,6 +196,7 @@ def test_trigger_outside_current_failed_stage_is_rejected() -> None:
         )
 
 
+@pytest.mark.integration
 def test_trigger_sidecar_is_additive_and_immutable(tmp_path) -> None:
     axis = _axis()
     annotation = build_failure_trigger_annotations(
@@ -241,6 +242,7 @@ def test_trigger_sidecar_is_additive_and_immutable(tmp_path) -> None:
     assert load_optional_failure_trigger_annotation_set(tmp_path / "legacy") is None
 
 
+@pytest.mark.integration
 def test_capture_receipt_is_optional_immutable_and_source_keyed(tmp_path) -> None:
     record = FailureTriggerCaptureRecordV1(
         source_failure_fact_id="fact:failure",

@@ -16,6 +16,12 @@ from collection_runtime.progress.profiles import (
     bind_dataset_progress_profile,
     load_task_progress_profile_file,
 )
+from control_station.umi.application_policy import (
+    DEFAULT_STATION_UMI_OPERATOR_POLICY,
+)
+from control_station.umi_application import (
+    run_umi_collection as run_station_umi_collection,
+)
 from dataset_contracts.v23_validation import validate_v23_row_causal_snapshots
 from teleop_runtime.collection.operator_labels import (
     LABEL_FIX_ARM,
@@ -41,6 +47,9 @@ from teleop_runtime.collection.umi.components import (
 from teleop_runtime.collection.umi.app import run_umi_collection
 from teleop_runtime.collection.umi.angle_trigger_calibration import (
     ensure_default_command_input_from_gui,
+)
+from teleop_runtime.collection.umi.application_ports import (
+    UmiOperatorPolicyPort,
 )
 from teleop_runtime.collection.umi.default_components import (
     DEFAULT_UMI_HARDWARE_PRESENTATION,
@@ -74,6 +83,7 @@ ROOT = Path(__file__).parents[1]
 
 
 def test_umi_runtime_factories_are_injectable_without_changing_cli_defaults():
+    assert run_umi_collection is run_station_umi_collection
     signature = inspect.signature(run_umi_collection)
     assert (
         signature.parameters["hardware_preparer"].default
@@ -91,6 +101,14 @@ def test_umi_runtime_factories_are_injectable_without_changing_cli_defaults():
     assert (
         signature.parameters["command_input_initializer"].default
         is ensure_default_command_input_from_gui
+    )
+    assert (
+        signature.parameters["operator_policy"].default
+        is DEFAULT_STATION_UMI_OPERATOR_POLICY
+    )
+    assert isinstance(
+        DEFAULT_STATION_UMI_OPERATOR_POLICY,
+        UmiOperatorPolicyPort,
     )
 
 
@@ -271,8 +289,8 @@ def test_default_config_and_layout_are_umi_specific():
     config = load_umi_collection_config(
         ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
     )
-    assert config.left.camera_serial == "261122273924"
-    assert config.right.camera_serial == "260522278055"
+    assert config.left.camera_serial == "260522278055"
+    assert config.right.camera_serial == "261122273924"
     assert not config.left.uses_identity_tcp_placeholder
     assert not config.right.uses_identity_tcp_placeholder
     assert config.left.tcp_profile == "dmgripper"
@@ -491,7 +509,7 @@ def _calibration_payload(now: datetime) -> dict:
         "expires_at_utc": "2026-07-17T01:00:00Z",
         "desk_definition": "calibration_board_frame",
         "side": "left",
-        "camera_serial": "261122273924",
+        "camera_serial": "260522278055",
         "tracker_name": "tracker_1",
         "tracker_role": "left_wrist",
         "T_vive_world_to_desk": np.eye(4).tolist(),
@@ -506,7 +524,7 @@ def _calibration_payload_with_tcp(*, side: str, now: datetime, tx: float) -> dic
             "created_at_utc": now.isoformat(),
             "expires_at_utc": (now + timedelta(minutes=30)).isoformat(),
             "side": side,
-            "camera_serial": "261122273924" if side == "left" else "260522278055",
+            "camera_serial": "260522278055" if side == "left" else "261122273924",
             "tracker_name": f"tracker_{index}",
             "tracker_role": f"{side}_wrist",
             "tcp_extrinsic": {
@@ -543,13 +561,13 @@ def test_calibration_set_requires_and_loads_independent_left_right_tcp_results(t
                 "allow_identity_tcp_placeholder": False,
                 "sides": {
                     "left": {
-                        "camera_serial": "261122273924",
+                        "camera_serial": "260522278055",
                         "tracker_name": "tracker_1",
                         "hand_eye_result": str(result_paths["left"]),
                         "tcp_profile": "dmgripper",
                     },
                     "right": {
-                        "camera_serial": "260522278055",
+                        "camera_serial": "261122273924",
                         "tracker_name": "tracker_2",
                         "hand_eye_result": str(result_paths["right"]),
                         "tcp_profile": "dmgripper",
@@ -752,7 +770,7 @@ def test_native_umi_row_is_validated_then_stored_in_desk(tmp_path):
         "expires_at_utc": "2026-07-17T01:00:00Z",
         "desk_definition": "calibration_board_frame",
         "side": "left",
-        "camera_serial": "261122273924",
+        "camera_serial": "260522278055",
         "tracker_name": "tracker_1",
         "tracker_role": "left_wrist",
         "T_vive_world_to_desk": np.array(
@@ -1109,6 +1127,7 @@ def _controller_for_logic_tests(*, ui, recorder, assembler):
         components=SimpleNamespace(foot_pad=None),
         recorder=recorder,
         ui=ui,
+        operator_policy=DEFAULT_STATION_UMI_OPERATOR_POLICY,
         labels=OperatorLabelStateMachine(),
         snapshot_assembler=assembler,
     )
@@ -1352,6 +1371,78 @@ def test_umi_start_request_reports_gripper_blocker_instead_of_being_disabled():
     assert controller._event_message == "cannot start: missing_angle_trigger"
 
 
+def test_umi_start_runtime_error_is_reported_without_killing_gui():
+    config = load_umi_collection_config(
+        ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
+    )
+    messages = []
+    recorder = SimpleNamespace(
+        recording=False,
+        start_episode=lambda _metadata: (_ for _ in ()).throw(
+            OSError("simulated disk admission failure")
+        ),
+    )
+    controller = _controller_for_logic_tests(
+        ui=SimpleNamespace(
+            append_message=lambda tag, message: messages.append((tag, message))
+        ),
+        recorder=recorder,
+        assembler=SimpleNamespace(assemble=lambda **_kwargs: object(), config=config),
+    )
+    controller.config = config
+    controller.calibration = SimpleNamespace(
+        require_valid=lambda _config: None,
+        sha256="sha256:test",
+        T_tcp_to_tracker_by_side={
+            "left": np.eye(4),
+            "right": np.eye(4),
+        },
+        by_side={},
+    )
+
+    controller._handle_events(
+        [("episode_start", "web_gui", 1.0)],
+        gripper_ready=True,
+        gripper_reason="",
+    )
+
+    assert recorder.recording is False
+    assert controller._event_status == "error"
+    assert controller.last_rejection == ("episode_start_failed:OSError",)
+    assert "simulated disk admission failure" in controller._event_message
+    assert messages[-1][0] == "Dataset"
+
+
+def test_umi_finalize_runtime_error_keeps_episode_open_and_allows_retry():
+    messages = []
+    recorder = SimpleNamespace(
+        recording=True,
+        stop_episode=lambda **_kwargs: (_ for _ in ()).throw(
+            OSError("simulated finalize failure")
+        ),
+    )
+    controller = _controller_for_logic_tests(
+        ui=SimpleNamespace(
+            publish=lambda **_kwargs: None,
+            append_message=lambda tag, message: messages.append((tag, message)),
+        ),
+        recorder=recorder,
+        assembler=SimpleNamespace(),
+    )
+
+    controller._handle_events(
+        [("episode_stop", "web_gui", 1.0)],
+        gripper_ready=True,
+        gripper_reason="",
+    )
+
+    assert recorder.recording is True
+    assert controller._event_status == "error"
+    assert controller.last_rejection == ("episode_finalize_failed:OSError",)
+    assert "可重试停止" in controller._event_message
+    assert messages[-1][0] == "Dataset"
+
+
 def test_umi_delete_request_during_recording_is_rejected_explicitly():
     delete_calls = []
     recorder = SimpleNamespace(
@@ -1493,6 +1584,89 @@ def test_umi_task_select_fails_closed_while_recording(tmp_path):
     assert assembler.config.dataset_root == tmp_path / "before"
     assert controller._event_status == "error"
     assert "while an episode is recording" in controller._event_message
+
+
+def test_umi_native_shadow_disables_root_switch_but_allows_same_binding(tmp_path):
+    config = replace(
+        load_umi_collection_config(
+            ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
+        ),
+        dataset_root=tmp_path / "current",
+    )
+    applied = []
+    recorder = SimpleNamespace(
+        recording=False,
+        v25p_sidecar_store=None,
+        v25p_native_shadow=object(),
+        reconfigure_config=lambda next_config: applied.append(next_config),
+    )
+    assembler = SimpleNamespace(config=config)
+    controller = _controller_for_logic_tests(
+        ui=SimpleNamespace(),
+        recorder=recorder,
+        assembler=assembler,
+    )
+    controller.config = config
+
+    assert "task_select" not in controller._active_controls()
+    controller._apply_dataset_configuration(
+        {"dataset_base_root": str(config.dataset_root)},
+        include_modality_selection=False,
+    )
+    assert len(applied) == 1
+
+    with pytest.raises(RuntimeError, match="native shadow"):
+        controller._apply_dataset_configuration(
+            {"dataset_base_root": str(tmp_path / "other")},
+            include_modality_selection=False,
+        )
+
+
+def test_umi_expired_state_executes_admitted_dataset_rebind(tmp_path):
+    config = replace(
+        load_umi_collection_config(
+            ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"
+        ),
+        dataset_root=tmp_path / "before",
+    )
+    selected = tmp_path / "selected"
+    applied = []
+    event_batches = iter(
+        [[
+            "task_select:"
+            + json.dumps({"dataset_base_root": str(selected)})
+        ], []]
+    )
+    recorder = SimpleNamespace(
+        recording=False,
+        last_outcome="ready",
+        reconfigure_config=lambda next_config: applied.append(next_config),
+    )
+    assembler = SimpleNamespace(config=config)
+    controller = _controller_for_logic_tests(
+        ui=SimpleNamespace(
+            consume_events=lambda: next(event_batches, []),
+            append_message=lambda *_args: None,
+        ),
+        recorder=recorder,
+        assembler=assembler,
+    )
+    controller.config = config
+    controller.calibration = SimpleNamespace(
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        require_valid=lambda _config: (_ for _ in ()).throw(RuntimeError("expired")),
+    )
+
+    def publish_once(*_args, **_kwargs):
+        controller.should_quit = True
+
+    controller._publish = publish_once
+    controller.run()
+
+    assert len(applied) == 1
+    assert applied[0].dataset_root == selected
+    assert controller.config.dataset_root == selected
+    assert assembler.config.dataset_root == selected
 
 
 def test_umi_dataset_switch_rejects_progress_profiled_target(tmp_path):
@@ -1660,6 +1834,7 @@ def test_umi_gui_reports_selected_label_side_and_no_send_truthfully():
         components=components,
         recorder=recorder,
         ui=SimpleNamespace(publish=lambda **kwargs: published.update(kwargs)),
+        operator_policy=DEFAULT_STATION_UMI_OPERATOR_POLICY,
         labels=labels,
         snapshot_assembler=SimpleNamespace(),
     )
@@ -1767,8 +1942,8 @@ def test_validate_only_cli_does_not_initialize_devices(tmp_path, capsys):
                 ),
                 "allow_identity_tcp_placeholder": True,
                 "sides": {
-                    "left": {"camera_serial": "261122273924", "tracker_name": "tracker_1"},
-                    "right": {"camera_serial": "260522278055", "tracker_name": "tracker_2"},
+                    "left": {"camera_serial": "260522278055", "tracker_name": "tracker_1"},
+                    "right": {"camera_serial": "261122273924", "tracker_name": "tracker_2"},
                 },
             }
         )
@@ -1817,6 +1992,27 @@ def test_runtime_cli_can_override_new_calibration_validity_in_hours(monkeypatch)
         ]
     ) == 0
     assert calls[0].calibration_validity_sec == pytest.approx(5.5 * 3600.0)
+
+
+def test_runtime_cli_treats_keyboard_interrupt_as_clean_operator_cancel(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        "teleop_runtime.collection.umi.app.run_umi_collection",
+        lambda _config: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    result = umi_cli_main(
+        [
+            "--config",
+            str(ROOT / "teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json"),
+            "--no-open-browser",
+        ]
+    )
+
+    assert result == 130
+    assert "Ctrl+C" in capsys.readouterr().out
 
 
 def test_umi_config_rejects_ambiguous_calibration_validity_units(tmp_path):

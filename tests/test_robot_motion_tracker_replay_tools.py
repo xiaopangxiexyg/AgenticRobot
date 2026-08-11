@@ -126,6 +126,7 @@ def test_offline_tracker_thresholds_check_ik_error() -> None:
     assert failures == ["left.translation_error_m.max=0.02 > 0.015"]
 
 
+@pytest.mark.integration
 def test_offline_tracker_gui_writes_portable_html(tmp_path: Path) -> None:
     report = OfflineTrackerReplayReport(
         dataset_root=tmp_path,

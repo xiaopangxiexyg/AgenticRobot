@@ -166,6 +166,78 @@ def test_batched_horizon_governor_matches_independent_joint_solver() -> None:
     assert reused.metadata["solver_workspace_reused"] is True
 
 
+def test_reused_horizon_can_regularize_jerk_across_source_cuts() -> None:
+    dt = 1.0 / 120.0
+    limits = _limits(1)
+    state = JointHorizonState(
+        q_rad=np.zeros(1),
+        qd_rad_s=np.zeros(1),
+        qdd_rad_s2=np.zeros(1),
+    )
+    reference = np.linspace(0.0, 0.08, 17).reshape(-1, 1)
+    previous_jerk = np.array([-8.0])
+    baseline_workspace = JointHorizonBatchedWorkspace(
+        limits=limits,
+        dt_sec=dt,
+        horizon_transitions=16,
+        solver_tolerance=1e-7,
+    )
+    continuous_workspace = JointHorizonBatchedWorkspace(
+        limits=limits,
+        dt_sec=dt,
+        horizon_transitions=16,
+        solver_tolerance=1e-7,
+        initial_jerk_delta_regularization=1.0,
+    )
+
+    baseline = baseline_workspace.solve(
+        reference,
+        initial_state=state,
+        commit_count=8,
+        previous_jerk_rad_s3=previous_jerk,
+    )
+    continuous = continuous_workspace.solve(
+        reference,
+        initial_state=state,
+        commit_count=8,
+        previous_jerk_rad_s3=previous_jerk,
+    )
+
+    baseline_first_jerk = (
+        baseline.qdd_path_rad_s2[1] - baseline.qdd_path_rad_s2[0]
+    ) / dt
+    continuous_first_jerk = (
+        continuous.qdd_path_rad_s2[1] - continuous.qdd_path_rad_s2[0]
+    ) / dt
+    assert np.linalg.norm(continuous_first_jerk - previous_jerk) < np.linalg.norm(
+        baseline_first_jerk - previous_jerk
+    )
+    assert np.max(np.abs(continuous.qd_path_rad_s[1:])) <= 1.0 + 1e-6
+    assert np.max(np.abs(continuous.qdd_path_rad_s2[1:])) <= 2.0 + 1e-6
+    assert np.max(
+        np.abs(np.diff(continuous.qdd_path_rad_s2, axis=0) / dt)
+    ) <= 10.0 + 1e-5
+
+
+def test_reused_horizon_rejects_invalid_previous_jerk() -> None:
+    workspace = JointHorizonBatchedWorkspace(
+        limits=_limits(1),
+        dt_sec=1.0 / 120.0,
+        horizon_transitions=4,
+    )
+    with pytest.raises(ValueError, match="previous_jerk_rad_s3"):
+        workspace.solve(
+            np.zeros((5, 1)),
+            initial_state=JointHorizonState(
+                q_rad=np.zeros(1),
+                qd_rad_s=np.zeros(1),
+                qdd_rad_s2=np.zeros(1),
+            ),
+            commit_count=2,
+            previous_jerk_rad_s3=np.zeros(2),
+        )
+
+
 def test_horizon_governor_rejects_invalid_contracts() -> None:
     state = JointHorizonState(
         q_rad=np.zeros(2),
@@ -291,3 +363,39 @@ def test_horizon_governor_accepts_high_recoverable_state() -> None:
         np.max(np.abs(plan.qdd_path_rad_s2[1:]))
         <= max_acceleration[0] + 1e-8
     )
+
+
+def test_horizon_governor_certifies_first_transition_from_moving_state() -> None:
+    dt = 1.0 / 60.0
+    max_velocity = np.array([2.0])
+    max_acceleration = np.array([6.0])
+    max_jerk = np.array([30.0])
+    limits = JointHorizonLimits(
+        min_position_rad=np.array([-2.0]),
+        max_position_rad=np.array([2.0]),
+        max_velocity_rad_s=max_velocity,
+        max_acceleration_rad_s2=max_acceleration,
+        max_jerk_rad_s3=max_jerk,
+    )
+    moving = JointHorizonState(
+        q_rad=np.array([0.1]),
+        qd_rad_s=np.array([0.4]),
+        qdd_rad_s2=np.array([1.5]),
+    )
+    reference = np.linspace(0.1, 0.3, 9).reshape(-1, 1)
+
+    plan = plan_jerk_limited_joint_horizon(
+        reference,
+        initial_state=moving,
+        limits=limits,
+        dt_sec=dt,
+        commit_count=4,
+    )
+
+    assert plan.qd_path_rad_s[0, 0] == pytest.approx(0.4)
+    assert plan.qdd_path_rad_s2[0, 0] == pytest.approx(1.5)
+    first_jerk = (
+        plan.qdd_path_rad_s2[1, 0] - moving.qdd_rad_s2[0]
+    ) / dt
+    assert abs(first_jerk) <= max_jerk[0] + 1e-8
+    assert np.max(np.abs(plan.qdd_path_rad_s2[1:])) <= max_acceleration[0] + 1e-8

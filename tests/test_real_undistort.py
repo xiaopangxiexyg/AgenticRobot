@@ -36,7 +36,9 @@ def _write_video(path: Path, *, frame_count: int = 4, size: tuple[int, int] = (6
     writer.release()
 
 
+@pytest.mark.optional
 def test_build_undistort_maps_returns_zero_distortion_intrinsics() -> None:
+    pytest.importorskip("cv2")
     intrinsics = CameraIntrinsics(
         width=64,
         height=48,
@@ -55,7 +57,9 @@ def test_build_undistort_maps_returns_zero_distortion_intrinsics() -> None:
     assert maps.output.coeffs == (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+@pytest.mark.optional
 def test_process_video_writes_undistorted_video(tmp_path: Path) -> None:
+    pytest.importorskip("cv2")
     source = tmp_path / "source.mp4"
     output = tmp_path / "output.mp4"
     _write_video(source)
@@ -76,7 +80,9 @@ def test_process_video_writes_undistorted_video(tmp_path: Path) -> None:
     assert result.output_intrinsics.coeffs == (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+@pytest.mark.optional
 def test_process_video_does_not_write_through_hardlinked_target(tmp_path: Path) -> None:
+    pytest.importorskip("cv2")
     source = tmp_path / "source.mp4"
     output = tmp_path / "output.mp4"
     _write_video(source, frame_count=4)
@@ -119,7 +125,9 @@ def test_process_video_does_not_write_through_hardlinked_target(tmp_path: Path) 
     assert source.read_bytes() == source_before
 
 
+@pytest.mark.optional
 def test_undistort_dataset_updates_devices_and_manifest(tmp_path: Path) -> None:
+    pytest.importorskip("cv2")
     source_root = tmp_path / "dataset"
     output_root = tmp_path / "dataset_undistorted"
     video_rel = "videos/observation.images.left_wrist/chunk-000/episode_000000.mp4"
@@ -169,6 +177,7 @@ def test_undistort_dataset_updates_devices_and_manifest(tmp_path: Path) -> None:
     assert (output_root / "meta/devices/realsense_raw_before_undistort.json").exists()
 
 
+@pytest.mark.integration
 def test_inspect_intrinsics_selects_distorted_cameras(tmp_path: Path) -> None:
     devices_path = tmp_path / "realsense.json"
     _write_json(

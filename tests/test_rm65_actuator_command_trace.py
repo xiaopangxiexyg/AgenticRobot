@@ -249,6 +249,12 @@ def test_preallocated_trace_persists_prefilter_vive_source_on_close(
                 "clock_sync_offset_sec": 0.01,
                 "tracker_name": f"{side}_physical_tracker",
                 "tracker_role": f"{side}_wrist",
+                "linear_velocity_m_s": [0.1 + index, -0.2, 0.3],
+                "angular_velocity_rad_s": [-1.0, 2.0 + index, -3.0],
+                "velocity_frame_name": "vive_world",
+                "velocity_source": "openvr_tracked_device_pose",
+                "velocity_valid": True,
+                "velocity_error": None,
             },
         )
 
@@ -270,17 +276,31 @@ def test_preallocated_trace_persists_prefilter_vive_source_on_close(
         assert rows.shape == (1,)
         assert rows["present_mask"].tolist() == [3]
         assert rows["valid_mask"].tolist() == [3]
+        assert rows["velocity_valid_mask"].tolist() == [3]
         assert rows["channel_seq"][0].tolist() == [100, 101]
         np.testing.assert_allclose(rows["pose_vive_world"][0, 0], poses[0])
         np.testing.assert_allclose(rows["pose_vive_world"][0, 1], poses[1])
+        np.testing.assert_allclose(
+            rows["linear_velocity_m_s"][0],
+            [[0.1, -0.2, 0.3], [1.1, -0.2, 0.3]],
+        )
+        np.testing.assert_allclose(
+            rows["angular_velocity_rad_s"][0],
+            [[-1.0, 2.0, -3.0], [-1.0, 3.0, -3.0]],
+        )
         assert rows["tracker_role"][0, 0].decode() == "left_wrist"
+        assert rows["velocity_frame_name"][0, 0].decode() == "vive_world"
+        assert (
+            rows["velocity_source"][0, 0].decode()
+            == "openvr_tracked_device_pose"
+        )
         assert rows["teleop_state"][0].decode() == "RUNNING"
     manifest = json.loads(
         (
             recorder.output_dir / ACTUATOR_COMMAND_TRACE_MANIFEST_NAME
         ).read_text(encoding="utf-8")
     )
-    assert manifest["schema"] == "dexteleop.rm65_actuator_command_trace.v3"
+    assert manifest["schema"] == "dexteleop.rm65_actuator_command_trace.v4"
     assert manifest["result"]["vive_source_rows"] == 1
     assert manifest["result"]["vive_source_error_count"] == 0
 

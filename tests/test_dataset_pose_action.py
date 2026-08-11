@@ -177,6 +177,7 @@ def test_episode_contract_cannot_override_dataset_contract() -> None:
         )
 
 
+@pytest.mark.optional
 def test_replay_index_explicit_pose_window_keeps_loaded_storage_rows_raw(tmp_path) -> None:
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")

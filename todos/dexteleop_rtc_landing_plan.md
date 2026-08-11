@@ -541,11 +541,12 @@ typed preview/lookahead仍是独立target gate，不阻塞RTC-4b，且RTC profil
 2. [`dexteleop_control_core_landing_plan.md`](./dexteleop_control_core_landing_plan.md) 负责当前 M0–M8
    控制主线、完成状态与真机 gate；
 3. 本文只负责 RTC-0–RTC-7 的局部顺序、contract、文件边界和验收；
-4. [`dexteleop_rtc_visual_guide.md`](./dexteleop_rtc_visual_guide.md) 只负责把当前实现、兼容链和阶段gate可视化，
+4. [`dexteleop_rtc_visual_guide.md`](../docs/architecture/dexteleop_rtc_visual_guide.md) 只负责把当前实现、兼容链和阶段gate可视化，
    不新增规范或授权；
 5. [`dexteleop_control_station_plan.md`](./dexteleop_control_station_plan.md) 负责统一GUI如何观察和编排RTC
    policy source，但不拥有worker/plan/pop；
-6. [`temp_rtc.md`](./temp_rtc.md) 是研究备忘，不是规范来源。其内容与项目 action/frame/time/authority
+6. [`RTC 异步 Action Chunk 研究备忘`](../docs/legacy/reports/rtc_research_memo_20260721.md)
+   不是规范来源。其内容与项目 action/frame/time/authority
    contract 冲突时，以前三份文档和代码事实为准。
 
 如果本文与主架构或 control-core landing plan 冲突，主架构和 control-core landing plan 优先。RTC 的

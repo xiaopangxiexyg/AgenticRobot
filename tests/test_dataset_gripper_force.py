@@ -11,6 +11,9 @@ from dataset_interface.gripper_force import (
 )
 
 
+pytestmark = pytest.mark.integration
+
+
 def _populate(root) -> None:
     meta = root / "meta"
     meta.mkdir(parents=True, exist_ok=True)

@@ -26,6 +26,31 @@ class _EmptyReplyQueue:
         raise queue.Empty
 
 
+class _ProgressThenEmptyReplyQueue:
+    def __init__(self) -> None:
+        self._sent = False
+
+    def get(self, *, timeout: float):
+        del timeout
+        if not self._sent:
+            self._sent = True
+            return {
+                "kind": "startup_progress",
+                "phase": "initialize_legacy_writer",
+            }
+        raise queue.Empty
+
+
+class _AliveProcess:
+    exitcode = None
+
+    def start(self) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        return True
+
+
 class _WorkerErrorAckQueue:
     def __init__(self) -> None:
         self._messages = [
@@ -83,7 +108,31 @@ def test_process_worker_reports_exit_before_ready_without_waiting_for_timeout() 
 
     with pytest.raises(
         RuntimeError,
-        match=r"collection worker exited before becoming ready \(exitcode=23\)",
+        match=(
+            r"collection worker exited before becoming ready "
+            r"\(exitcode=23, last_phase=process_spawn\)"
+        ),
+    ):
+        worker.start()
+
+    assert close_calls == [True]
+
+
+def test_process_worker_timeout_reports_last_startup_phase() -> None:
+    worker = object.__new__(ProcessCollectionWorker)
+    worker._started = False
+    worker._process = _AliveProcess()
+    worker._reply_queue = _ProgressThenEmptyReplyQueue()
+    worker.config = SimpleNamespace(startup_timeout_sec=0.01)
+    close_calls: list[bool] = []
+    worker.close = lambda *, force=False: close_calls.append(bool(force))
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"collection worker did not become ready within 0\.010s "
+            r"\(last_phase=initialize_legacy_writer\)"
+        ),
     ):
         worker.start()
 

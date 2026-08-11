@@ -3,11 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from teleop_runtime.backends.arms.rm65_dispatch_inventory import (
-    build_rm65_arms_only_dispatch_inventory,
-)
-from teleop_runtime.deploy.rm65_candidate_manifest import (
-    build_rm65_policy_arm_qpos_candidate_manifest,
+from teleop_runtime.deploy.rm65_execution_evidence import (
+    resolve_rm65_historical_execution_evidence_contract,
 )
 
 
@@ -17,17 +14,25 @@ _EVIDENCE = (
 )
 
 
-def test_m5_8b0_field_evidence_matches_current_manifest_and_bounded_claims() -> None:
+def test_m5_8b0_field_evidence_matches_declared_historical_contract() -> None:
     record = json.loads(_EVIDENCE.read_text(encoding="utf-8"))
     payload = record["payload"]
-    manifest = build_rm65_policy_arm_qpos_candidate_manifest()
-    inventory = build_rm65_arms_only_dispatch_inventory(manifest)
+    contract = resolve_rm65_historical_execution_evidence_contract(
+        record["evidence_schema"]
+    )
 
     assert record["evidence_scope"] == "scoped_final_call_field_evidence"
     assert record["lineage_completeness"].startswith("partial_v1_")
     assert payload["status"] == "stop_only_completed"
-    assert payload["manifest_hash"] == manifest.semantic_content_hash
-    assert payload["inventory_hash"] == inventory.semantic_content_hash
+    assert payload["manifest_id"] == contract.manifest_identity.manifest_id
+    assert payload["manifest_hash"] == contract.manifest_identity.manifest_hash
+    assert payload["binding"]["execution_manifest_hash"] == (
+        contract.manifest_identity.manifest_hash
+    )
+    assert payload["inventory_hash"] == contract.dispatch_inventory_hash
+    assert payload["binding"]["dispatch_inventory_hash"] == (
+        contract.dispatch_inventory_hash
+    )
     assert payload["binding"]["production_binding_enabled"] is True
     assert payload["binding"]["motion_authorized"] is False
     assert payload["binding"]["attempted_sides"] == ["left", "right"]

@@ -19,6 +19,9 @@ from robot_motion.runtime.observation_cut import ObservationSampleRef
 from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 
 
+pytestmark = pytest.mark.integration
+
+
 def _contract(stream_id: str) -> NativeStreamContract:
     return NativeStreamContract(
         stream_id=stream_id,

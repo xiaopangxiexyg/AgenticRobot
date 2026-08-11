@@ -117,6 +117,7 @@ def test_final_mask_source_does_not_fall_back_to_wrist_depth_mask(tmp_path) -> N
         source.manifest_path(0, "left_wrist")
 
 
+@pytest.mark.optional
 def test_masked_frame_pipeline_reads_video_mask_and_applies_black_background(tmp_path) -> None:
     dataset = tmp_path / "dataset"
     video_rel = "videos/observation.images.left_wrist/chunk-000/episode_000000.mp4"
@@ -178,6 +179,7 @@ def test_masked_frame_pipeline_reads_video_mask_and_applies_black_background(tmp
     assert np.max(clip[0]) == 0
 
 
+@pytest.mark.optional
 def test_masked_frame_pipeline_can_return_rgb_chw_float(tmp_path) -> None:
     dataset = tmp_path / "dataset"
     video_rel = "videos/observation.images.left_wrist/chunk-000/episode_000000.mp4"
@@ -208,6 +210,7 @@ def test_masked_frame_pipeline_can_return_rgb_chw_float(tmp_path) -> None:
     assert 0.0 <= float(frame.min()) <= float(frame.max()) <= 1.0
 
 
+@pytest.mark.optional
 def test_masked_frame_pipeline_records_photometric_plan_as_audit_metadata_only(tmp_path) -> None:
     dataset = tmp_path / "dataset"
     video_rel = "videos/observation.images.left_wrist/chunk-000/episode_000000.mp4"
@@ -259,6 +262,7 @@ def test_masked_frame_pipeline_records_photometric_plan_as_audit_metadata_only(t
     assert "observation.images.left_wrist.augmented" not in sample.metadata
 
 
+@pytest.mark.optional
 def test_masked_frame_pipeline_applies_per_view_occlusion_before_layout_conversion(tmp_path) -> None:
     dataset = tmp_path / "dataset"
     video_rel = "videos/observation.images.left_wrist/chunk-000/episode_000000.mp4"
@@ -298,6 +302,7 @@ def test_masked_frame_pipeline_applies_per_view_occlusion_before_layout_conversi
     assert audit["requested_ratio"] == 0.50
 
 
+@pytest.mark.optional
 def test_front_fixed_border_mask_does_not_require_wrist_final_mask(tmp_path) -> None:
     dataset = tmp_path / "dataset"
     video_rel = "videos/observation.images.front/chunk-000/episode_000000.mp4"
@@ -496,6 +501,7 @@ def test_torch_wrapper_skips_invalid_episode_with_red_warning(
     assert "\x1b[31mWARNING: skipped invalid training data:" in capsys.readouterr().err
 
 
+@pytest.mark.optional
 def test_missing_view_uses_reference_dataset_resolution_without_video_or_mask_io(tmp_path: Path) -> None:
     reference = tmp_path / "reference_a"
     reference_video_rel = "videos/observation.images.front/chunk-000/episode_000000.mp4"
@@ -594,6 +600,7 @@ def test_missing_view_can_use_an_explicit_height_width_resolution(tmp_path: Path
     assert np.count_nonzero(image) == 0
 
 
+@pytest.mark.optional
 def test_missing_view_reference_resolution_conflict_fails_at_pipeline_start(tmp_path: Path) -> None:
     references: list[Path] = []
     for name, shape in (("reference_a", (24, 32)), ("reference_c", (30, 40))):

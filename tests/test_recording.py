@@ -5,10 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from teleop_runtime.recording import RecordingConfig, SessionRecorder
 
 
 class SessionRecorderConfigTest(unittest.TestCase):
+    @pytest.mark.integration
     def test_can_disable_command_stream_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             recorder = SessionRecorder(
@@ -23,6 +26,7 @@ class SessionRecorderConfigTest(unittest.TestCase):
             self.assertTrue((root / "raw_inputs.jsonl").exists())
             self.assertFalse((root / "commands.jsonl").exists())
 
+    @pytest.mark.integration
     def test_flush_every_buffers_until_close(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             recorder = SessionRecorder(

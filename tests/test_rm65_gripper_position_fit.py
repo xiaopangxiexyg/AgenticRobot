@@ -159,6 +159,7 @@ def _write_v2_trace(root: Path, *, continuous: bool = True) -> None:
     )
 
 
+@pytest.mark.integration
 def test_v2_loader_and_artifact_keep_position_only_claims(tmp_path: Path) -> None:
     _write_v2_trace(tmp_path)
 
@@ -183,6 +184,7 @@ def test_v2_loader_and_artifact_keep_position_only_claims(tmp_path: Path) -> Non
     assert len(artifact["payload_sha256"]) == 64
 
 
+@pytest.mark.integration
 def test_artifact_rejects_source_settings_that_do_not_match_profile(
     tmp_path: Path,
 ) -> None:

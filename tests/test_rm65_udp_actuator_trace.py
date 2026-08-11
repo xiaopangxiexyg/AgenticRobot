@@ -185,6 +185,160 @@ def test_capture_parser_exposes_backward_compatible_full_and_compact_format() ->
     assert compact_args.trace_format == "compact"
 
 
+def test_capture_output_root_defaults_to_configured_legacy_location() -> None:
+    args = trace.build_parser().parse_args(["capture", "--duration-sec", "30"])
+
+    resolution = trace.resolve_output_root(
+        args,
+        date_partition="2026-08-09",
+    )
+
+    assert resolution.path == trace.legacy_output_root()
+    assert resolution.source == "legacy"
+    assert args.output_root is None
+
+
+def test_capture_output_root_supports_explicit_canonical_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = tmp_path / "canonical" / "2026-08-09"
+    monkeypatch.setattr(
+        trace,
+        "canonical_output_root",
+        lambda *, date_partition=None: canonical,
+    )
+    args = trace.build_parser().parse_args(
+        [
+            "capture",
+            "--duration-sec",
+            "30",
+            "--artifact-layout",
+            trace.RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ]
+    )
+
+    resolution = trace.resolve_output_root(
+        args,
+        date_partition="2026-08-09",
+    )
+
+    assert resolution.path == canonical
+    assert resolution.source == "canonical"
+    assert not (tmp_path / "canonical").exists()
+
+
+def test_explicit_capture_output_root_wins_over_layout(tmp_path: Path) -> None:
+    explicit = tmp_path / "exact"
+    args = trace.build_parser().parse_args(
+        [
+            "capture",
+            "--duration-sec",
+            "30",
+            "--artifact-layout",
+            trace.RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+            "--output-root",
+            str(explicit),
+        ]
+    )
+
+    resolution = trace.resolve_output_root(args)
+
+    assert resolution.path == explicit
+    assert resolution.source == "explicit"
+
+
+def test_canonical_capture_is_allocated_as_one_run_directory(tmp_path: Path) -> None:
+    resolution = trace.ArtifactWriteResolution(
+        path=tmp_path / "canonical-date",
+        source="canonical",
+        layout_name=trace.RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    )
+
+    paths = trace.allocate_capture_artifact_paths(
+        resolution,
+        timestamp="20260809_010203_000004",
+    )
+
+    expected_run = (
+        tmp_path
+        / "canonical-date"
+        / "rm65_udp_actuator_trace_20260809_010203_000004"
+    )
+    assert paths.run_directory == expected_run
+    assert paths.trace_path.parent == expected_run
+    assert paths.journal_path.parent == expected_run
+    assert not expected_run.exists()
+
+
+def test_legacy_capture_keeps_flat_file_layout(tmp_path: Path) -> None:
+    resolution = trace.ArtifactWriteResolution(
+        path=tmp_path / "legacy",
+        source="legacy",
+        layout_name=trace.LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    )
+
+    paths = trace.allocate_capture_artifact_paths(
+        resolution,
+        timestamp="20260809_010203_000004",
+    )
+
+    assert paths.run_directory == tmp_path / "legacy"
+    assert paths.trace_path.parent == tmp_path / "legacy"
+    assert paths.journal_path.parent == tmp_path / "legacy"
+
+
+def test_recovery_discovery_covers_nested_canonical_runs(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy"
+    canonical = tmp_path / "canonical"
+    legacy.mkdir()
+    nested = canonical / "2026-08-09" / "run-001"
+    nested.mkdir(parents=True)
+    legacy_journal = legacy / "legacy.recovery.json"
+    canonical_journal = nested / "canonical.recovery.json"
+    legacy_journal.write_text("{}", encoding="utf-8")
+    canonical_journal.write_text("{}", encoding="utf-8")
+
+    paths = trace.recovery_journal_paths((legacy, canonical, legacy))
+
+    assert paths == tuple(
+        sorted((legacy_journal.resolve(), canonical_journal.resolve()))
+    )
+
+
+def test_recovery_roots_cover_legacy_canonical_family_and_explicit_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = tmp_path / "legacy"
+    canonical = tmp_path / "canonical"
+    explicit = tmp_path / "explicit"
+    monkeypatch.setattr(trace, "legacy_output_root", lambda: legacy)
+    monkeypatch.setattr(trace, "canonical_output_family_root", lambda: canonical)
+
+    roots = trace.recovery_journal_roots(explicit, legacy)
+
+    assert roots == (legacy.resolve(), canonical.resolve(), explicit.resolve())
+    assert all(not root.exists() for root in roots)
+
+
+def test_capture_lock_prevents_parallel_capture_across_output_layouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trace, "legacy_output_root", lambda: tmp_path / "legacy")
+    monkeypatch.setattr(trace, "_process_lock_root", lambda: tmp_path / "locks")
+
+    with trace.exclusive_capture_locks(
+        trace._capture_lock_roots(tmp_path / "layout-a")
+    ):
+        with pytest.raises(RuntimeError, match="another UDP actuator capture"):
+            with trace.exclusive_capture_locks(
+                trace._capture_lock_roots(tmp_path / "layout-b")
+            ):
+                pytest.fail("capture must have one cross-layout process owner")
+
+
 def test_restore_journal_restores_right_then_left_and_marks_verified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

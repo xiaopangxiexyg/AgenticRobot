@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import tempfile
@@ -10,6 +11,8 @@ from unittest import mock
 import numpy as np
 import pytest
 
+from collection_runtime.modality_inventory import build_and_publish_modality_inventory
+from dataset_interface.modality_artifacts import build_modality_artifact_inventory
 from utils.dataset_postprocess.cli import build_parser
 from utils.dataset_postprocess.umi_next_state_arm_action import (
     MIGRATION_ID,
@@ -187,6 +190,10 @@ class UmiNextStateArmActionTest(unittest.TestCase):
             root = parent / "dataset"
             backup = parent / "backup"
             self._dataset(root)
+            source_inventory = build_and_publish_modality_inventory(
+                root,
+                payload_hash_mode="scan",
+            )
 
             dry_run = migrate_umi_arm_action_to_next_observation(root)
             self.assertEqual(dry_run.source_frame_count, 3)
@@ -251,10 +258,29 @@ class UmiNextStateArmActionTest(unittest.TestCase):
                 self.assertEqual(manifest["frame_count"], 2)
                 stream = root / manifest["streams"]["sensor"]["path"]
                 self.assertEqual(stream.stat().st_size, 8)
+                spec = manifest["streams"]["sensor"]
+                self.assertEqual(spec["stored_size_bytes"], stream.stat().st_size)
+                self.assertEqual(
+                    spec["stored_sha256"],
+                    hashlib.sha256(stream.read_bytes()).hexdigest(),
+                )
             backup_episode = json.loads(
                 (backup / "meta/episodes.jsonl").read_text(encoding="utf-8")
             )
             self.assertEqual(backup_episode["frame_count"], 3)
+
+            current_inventory = build_modality_artifact_inventory(root)
+            self.assertNotEqual(
+                current_inventory.semantic_content_hash,
+                source_inventory.semantic_content_hash,
+            )
+            self.assertTrue(
+                (
+                    root
+                    / "meta/modality_artifacts/tactile/inventories"
+                    / f"{current_inventory.semantic_content_hash}.json"
+                ).is_file()
+            )
 
             with self.assertRaisesRegex(RuntimeError, "already declares"):
                 migrate_umi_arm_action_to_next_observation(root)
@@ -268,7 +294,7 @@ class UmiNextStateArmActionTest(unittest.TestCase):
             root = parent / "dataset"
             self._dataset(root)
             with mock.patch(
-                "utils.dataset_postprocess.tactile_recompress._active_collection_processes",
+                "collection_runtime.tactile_recompression._active_collection_processes",
                 return_value=(),
             ):
                 recompress_tactile_zstd_in_place(
@@ -297,6 +323,11 @@ class UmiNextStateArmActionTest(unittest.TestCase):
                 self.assertEqual(spec["compression"], "zstd")
                 self.assertEqual(spec["frame_count"], 2)
                 self.assertEqual(sum(c["frame_count"] for c in spec["chunks"]), 2)
+                stream = root / spec["path"]
+                self.assertEqual(
+                    spec["stored_sha256"],
+                    hashlib.sha256(stream.read_bytes()).hexdigest(),
+                )
                 reader = ChunkedTactileStream(dataset_root=root, spec=spec)
                 np.testing.assert_array_equal(
                     reader.frame(1), np.arange(12, dtype=np.uint8).reshape(3, 2, 2)[1]

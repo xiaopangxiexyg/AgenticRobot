@@ -29,6 +29,7 @@ def test_canonical_mujoco_package_replaces_legacy_namespace() -> None:
     assert importlib.util.find_spec(legacy_namespace) is None
 
 
+@pytest.mark.integration
 def test_discovers_registry_cameras_from_explicit_urdf() -> None:
     model = parse_urdf(URDF)
 
@@ -41,6 +42,7 @@ def test_discovers_registry_cameras_from_explicit_urdf() -> None:
     ]
 
 
+@pytest.mark.integration
 def test_mjcf_conversion_promotes_camera_links_to_mujoco_cameras() -> None:
     model = parse_urdf(URDF)
     cameras = discover_camera_mounts(model)
@@ -54,6 +56,7 @@ def test_mjcf_conversion_promotes_camera_links_to_mujoco_cameras() -> None:
     assert {"left_arm_joint1", "right_arm_joint6"} <= joint_names
 
 
+@pytest.mark.integration
 def test_mjcf_conversion_preserves_prismatic_joint_limits(tmp_path: Path) -> None:
     urdf_path = tmp_path / "slider.urdf"
     urdf_path.write_text(
@@ -82,6 +85,7 @@ def test_mjcf_conversion_preserves_prismatic_joint_limits(tmp_path: Path) -> Non
     assert joint.attrib["limited"] == "true"
 
 
+@pytest.mark.integration
 def test_mjcf_conversion_splits_obj_mtl_visual_meshes_by_diffuse_color(tmp_path: Path) -> None:
     obj_path = tmp_path / "colored.obj"
     mtl_path = tmp_path / "colored.mtl"
@@ -135,6 +139,7 @@ f 1 3 4
     assert all("dexteleop_mujoco_obj_materials_v1" in path for path in mesh_paths)
 
 
+@pytest.mark.integration
 def test_obj_mtl_texture_mapping_falls_back_without_partial_color_conversion(tmp_path: Path) -> None:
     obj_path = tmp_path / "textured.obj"
     (tmp_path / "textured.mtl").write_text(
@@ -160,6 +165,7 @@ f 1 2 3
     assert obj_material_mesh_parts(obj_path) == ()
 
 
+@pytest.mark.integration
 def test_mjcf_conversion_preserves_v3_rm65_base_link_obj_mtl_colors() -> None:
     root = ET.fromstring(convert_urdf_to_mjcf_xml(parse_urdf(URDF), camera_mounts=()))
     geoms = root.findall(".//geom[@name]")
@@ -180,6 +186,7 @@ def test_mjcf_conversion_preserves_v3_rm65_base_link_obj_mtl_colors() -> None:
     assert root.find(".//geom[@name='left_arm_base_link_visual_0']") is None
 
 
+@pytest.mark.integration
 def test_mjcf_conversion_hides_proxy_visuals_by_default(tmp_path: Path) -> None:
     urdf_path = tmp_path / "proxy.urdf"
     urdf_path.write_text(
@@ -230,6 +237,7 @@ def test_mjcf_conversion_hides_proxy_visuals_by_default(tmp_path: Path) -> None:
     assert debug_geoms["camera_pole_visual_0"].attrib["group"] == "4"
 
 
+@pytest.mark.integration
 def test_mjcf_conversion_keeps_render_camera_on_fovy_projection(tmp_path: Path) -> None:
     urdf_path = tmp_path / "camera.urdf"
     urdf_path.write_text(
@@ -271,6 +279,7 @@ def test_mjcf_conversion_keeps_render_camera_on_fovy_projection(tmp_path: Path) 
     assert "sensorsize" not in camera.attrib
 
 
+@pytest.mark.integration
 def test_dump_mjcf_only_does_not_require_mujoco_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -298,6 +307,7 @@ def test_dump_mjcf_only_does_not_require_mujoco_runtime(
     assert root.find(".//joint[@name='right_arm_joint6']") is not None
 
 
+@pytest.mark.optional
 def test_mujoco_scene_loads_arms_and_cameras() -> None:
     pytest.importorskip("mujoco")
 
@@ -321,6 +331,7 @@ def test_gripper_spec_maps_normalized_close_to_joint_qpos() -> None:
     assert spec.close_from_qpos((-0.0175, -0.0175)) == pytest.approx(0.5)
 
 
+@pytest.mark.optional
 def test_mujoco_scene_infers_and_controls_parallel_gripper(tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
     urdf_path = tmp_path / "parallel_gripper.urdf"
@@ -379,6 +390,7 @@ def test_mujoco_scene_infers_and_controls_parallel_gripper(tmp_path: Path) -> No
     assert scene.get_gripper_close("parallel_gripper") == pytest.approx(0.75)
 
 
+@pytest.mark.optional
 def test_mujoco_gripper_backend_accepts_scalar_and_hand_vector(tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
     urdf_path = tmp_path / "parallel_gripper.urdf"

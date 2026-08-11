@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DexTeleop 细粒度阶段标注</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">CONTROL STATION · POST-CAPTURE</div>
+      <h1>子任务阶段标注</h1>
+    </div>
+    <div class="top-actions">
+      <span id="annotation-mode" class="path-chip">普通标注</span>
+      <span id="dataset-root" class="path-chip">尚未选择数据集</span>
+      <button id="change-dataset-root" class="secondary" type="button" disabled>
+        更换数据集
+      </button>
+      <button id="refresh-episodes" class="secondary" disabled>刷新</button>
+    </div>
+  </header>
+  <div id="connection-status" class="connection-status hidden" role="alert">
+    标注服务连接已断开：页面已进入只读状态，不会接受新的本地标注。请确认程序仍在运行。
+  </div>
+  <div id="operation-progress" class="operation-progress hidden" role="status" aria-live="polite">
+    <div class="operation-progress-heading">
+      <span id="operation-progress-label">正在处理</span>
+      <span id="operation-progress-percent">0%</span>
+    </div>
+    <div class="operation-progress-track" aria-hidden="true">
+      <div id="operation-progress-fill" class="operation-progress-fill"></div>
+    </div>
+  </div>
+
+  <section id="workspace-launcher" class="launcher-shell">
+    <div class="launcher-card panel">
+      <div>
+        <div class="eyebrow">OPEN ANNOTATION WORKSPACE</div>
+        <h2>选择数据集与标注身份</h2>
+        <p>
+          这里只会读取 Progress 已封存且带阶段 profile 的 Episode；历史数据必须通过
+          RETROSPECTIVE_MIGRATED semantic workspace 显式接入。
+          这不表示二次阶段标注已经完成。确认后才会取得该数据集的唯一标注 writer lock。
+        </p>
+      </div>
+      <label>
+        数据集绝对路径
+        <span class="path-picker">
+          <input
+            id="launcher-dataset-root"
+            type="text"
+            list="recent-dataset-roots"
+            autocomplete="off"
+            placeholder="/absolute/path/to/dataset"
+          >
+          <button
+            id="choose-dataset-root"
+            class="secondary compact"
+            type="button"
+            title="在页面内浏览服务器目录"
+          >浏览目录</button>
+        </span>
+        <datalist id="recent-dataset-roots"></datalist>
+      </label>
+      <label>
+        标注员 ID
+        <input
+          id="launcher-annotator-id"
+          type="text"
+          list="recent-annotator-ids"
+          autocomplete="off"
+          placeholder="operator_02"
+        >
+        <datalist id="recent-annotator-ids"></datalist>
+      </label>
+      <label class="launcher-mode-toggle">
+        <input id="launcher-second-review" type="checkbox">
+        <span>
+          <strong>二次复核模式</strong>
+          <small>打开 Episode 时自动清除其“需要二次复核”工作标签；封存后生成二次复核版本。</small>
+        </span>
+      </label>
+      <button id="open-workspace" class="primary">打开标注工作区</button>
+      <p id="launcher-status" class="launcher-status">
+        路径必须已经存在；输入错误不会创建新数据集目录。
+      </p>
+    </div>
+  </section>
+
+  <main id="annotation-workspace" class="workspace hidden">
+    <aside id="episode-panel" class="episode-panel panel">
+      <div id="episode-panel-expanded" class="episode-panel-expanded">
+        <div class="panel-heading episode-panel-heading">
+          <div>
+            <span class="section-index">01</span>
+            <h2>可标注 Episode</h2>
+          </div>
+          <div class="episode-heading-actions">
+            <span id="episode-count" class="count-badge">0</span>
+            <button
+              id="collapse-episode-panel"
+              class="secondary compact episode-panel-toggle"
+              type="button"
+              title="收起 Episode 列表，为时间轴释放空间"
+              aria-label="收起 Episode 列表"
+            >‹</button>
+          </div>
+        </div>
+        <div class="episode-quick-nav" aria-label="Episode 快速切换">
+          <button id="previous-episode" class="secondary compact" type="button">↑ 上一条</button>
+          <span id="episode-position" class="episode-position">— / —</span>
+          <button id="next-episode" class="secondary compact" type="button">下一条 ↓</button>
+        </div>
+        <p class="panel-note">
+          每 4 秒自动发现新封存 Episode；采集中的最新 Episode 不会出现。
+        </p>
+        <div id="episode-list" class="episode-list"></div>
+      </div>
+      <div id="episode-panel-collapsed" class="episode-panel-collapsed-content hidden">
+        <button
+          id="expand-episode-panel"
+          class="secondary compact episode-panel-toggle"
+          type="button"
+          title="展开 Episode 列表"
+          aria-label="展开 Episode 列表"
+        >›</button>
+        <span class="section-index">EP</span>
+        <button
+          id="previous-episode-collapsed"
+          class="secondary compact collapsed-nav-button"
+          type="button"
+          title="上一条 Episode"
+          aria-label="上一条 Episode"
+        >↑</button>
+        <strong id="collapsed-episode-number" class="collapsed-episode-number">—</strong>
+        <small id="collapsed-episode-position" class="collapsed-episode-position">0 / 0</small>
+        <button
+          id="next-episode-collapsed"
+          class="secondary compact collapsed-nav-button"
+          type="button"
+          title="下一条 Episode"
+          aria-label="下一条 Episode"
+        >↓</button>
+      </div>
+    </aside>
+
+    <section class="editor">
+      <div id="empty-state" class="empty-state panel">
+        <div class="empty-symbol">⌁</div>
+        <h2>选择一个 Episode 开始标注</h2>
+        <p>原始 Failure 与粗粒度进度来自封存事实，只读且不可移动。</p>
+      </div>
+
+      <div id="editor-content" class="hidden">
+        <section class="video-panel panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-index">02</span>
+              <h2 id="episode-title">视频核验</h2>
+              <p id="episode-semantics" class="panel-note"></p>
+            </div>
+            <div class="camera-tabs" id="camera-tabs"></div>
+          </div>
+          <div class="video-shell">
+            <video id="episode-video" preload="auto"></video>
+            <div class="video-overlay">
+              <span id="video-timecode">00:00.000</span>
+              <span id="video-context">—</span>
+            </div>
+          </div>
+          <div class="playback-row">
+            <button id="load-video" class="secondary compact hidden" type="button">
+              加载视频
+            </button>
+            <button id="play-toggle" class="primary compact">播放</button>
+            <label>速度
+              <select id="playback-rate">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
+            <input id="video-scrubber" class="wide-slider" type="range" min="0" max="1000" value="0">
+          </div>
+        </section>
+
+        <section class="timeline-panel panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-index">03</span>
+              <h2>阶段时间轴</h2>
+            </div>
+            <div class="timeline-heading-actions">
+              <div class="legend">
+                <span><i class="legend-success"></i>子任务色系 / 阶段明暗</span>
+                <span><i class="legend-failure"></i>失败阶段</span>
+                <span><i class="legend-fixed"></i>原始 Failure</span>
+                <span><i class="legend-trigger"></i>failure_trigger</span>
+                <span><i class="legend-abnormal"></i>异常区间</span>
+              </div>
+              <button id="delete-selected" class="danger compact" disabled>
+                删除所选阶段
+              </button>
+              <button id="undo-delete" class="secondary compact" disabled>
+                撤销删除
+              </button>
+            </div>
+          </div>
+          <div id="coarse-track" class="timeline-track coarse-track"></div>
+          <div id="stage-track" class="timeline-track stage-track"></div>
+          <div
+            id="failure-trigger-track"
+            class="timeline-track failure-trigger-track"
+            aria-label="failure_trigger 时间轴"
+          ></div>
+          <div
+            id="failed-attempt-editors"
+            class="failed-attempt-editors"
+            aria-label="失败 Attempt 子阶段选择"
+          ></div>
+          <div id="stage-descriptions" class="stage-descriptions"></div>
+          <div class="edit-actions">
+            <button id="toggle-tail-outcome" class="secondary">末段改为失败</button>
+          </div>
+          <p class="hint">
+            点击彩色阶段块后可用右上角红色按钮删除；被删阶段的完整时间范围会自动并入
+            同一 Attempt 内的前一或后一有效阶段，不会留下未标注空洞；“撤销删除”可按
+            相反顺序恢复。拖动白色阶段边界会实时定位视频。
+            红色 Failure 刻度来自第一次采集，不能移动。每个采集 Failure 下方都有一个
+            failure_trigger 时间轴；可拖动白色触发柄，但只能在失败阶段起点到原始 Failure
+            样本之间移动。失败 Attempt 请先在其卡片中选择“失败发生于”哪个子阶段；系统
+            会按 profile 自动生成此前成功阶段，并同步重排同一子任务的后续 Retry。长 Hold
+            只在显示轴压缩为 1 秒。“末段改为成功/失败”只修正
+            最后一个 Attempt 的末段编辑，仍需点击“封存标注”写入新版本。
+          </p>
+        </section>
+
+        <section class="advanced-panel panel">
+          <div class="review-request-card">
+            <div>
+              <strong>需要二次复核</strong>
+              <small id="review-request-status">
+                标记后整条 Episode 默认不进入训练，直到二次复核版本封存。
+              </small>
+            </div>
+            <input id="review-request-note" type="text" placeholder="可选：说明复杂或偶发情况">
+            <button id="toggle-review-request" class="secondary" type="button">
+              标记需要二次复核
+            </button>
+          </div>
+          <label class="privileged-toggle">
+            <input id="privileged-toggle" type="checkbox">
+            <span>
+              <strong>启用特殊修正工具</strong>
+              <small>异常区间、粗粒度边界修正和整条异常；默认关闭。</small>
+            </span>
+          </label>
+          <div id="privileged-tools" class="hidden privileged-tools">
+            <div class="tool-card">
+              <h3>异常区间</h3>
+              <p>
+                异常区间相当于一次局部 Episode 断开，其前后阶段无需完整。
+                添加异常不会自动删除阶段；重叠阶段会高亮并等待人工调整或删除。
+              </p>
+              <div class="tool-row">
+                <button id="mark-abnormal-start" class="secondary compact">取当前为起点</button>
+                <button id="mark-abnormal-end" class="secondary compact">取当前为终点并添加</button>
+                <span id="abnormal-pending">尚未取点</span>
+              </div>
+              <div id="abnormal-list" class="compact-list"></div>
+            </div>
+            <div class="tool-card">
+              <h3>粗粒度边界修正</h3>
+              <p>只改变 retrospective view；原始 Advance 事实保持不变。</p>
+              <div id="coarse-overrides" class="compact-list"></div>
+            </div>
+            <div class="tool-card danger-card">
+              <h3>整条 Episode 异常</h3>
+              <div class="tool-row">
+                <select id="episode-abnormal-reason">
+                  <option value="BAD_CAPTURE">采集错误</option>
+                  <option value="WRONG_TASK_OR_SETUP">任务或布置错误</option>
+                  <option value="DATA_OR_DEVICE_FAILURE">数据或设备故障</option>
+                  <option value="OTHER">其他</option>
+                </select>
+                <input id="episode-abnormal-note" type="text" placeholder="可选说明">
+                <button id="toggle-episode-abnormal" class="danger">标记整条异常</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="commit-panel panel">
+          <div>
+            <h2>校验与封存</h2>
+            <p id="coverage-preview">提交时将执行严格顺序、Failure 归属与训练排除校验。</p>
+            <div id="sealed-reedit-controls" class="sealed-reedit-controls hidden">
+              <label>
+                已封存版本
+                <select id="sealed-annotation-set"></select>
+              </label>
+              <button id="reopen-sealed" class="danger compact">
+                强制重新编辑所选版本
+              </button>
+              <button id="cancel-reopen-sealed" class="secondary compact hidden">
+                取消本次重新编辑
+              </button>
+              <span id="sealed-reedit-status"></span>
+            </div>
+          </div>
+          <div class="commit-actions">
+            <button id="commit-annotations" class="primary">校验并封存标注</button>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div
+    id="dataset-browser-modal"
+    class="modal hidden"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="dataset-browser-title"
+  >
+    <section class="dataset-browser-card panel">
+      <div class="modal-heading">
+        <div>
+          <div class="eyebrow">DATASET DIRECTORY BROWSER</div>
+          <h2 id="dataset-browser-title">选择数据集目录</h2>
+        </div>
+        <button id="dataset-browser-cancel-top" class="secondary compact" type="button">
+          关闭
+        </button>
+      </div>
+      <div class="dataset-browser-toolbar">
+        <input
+          id="dataset-browser-path"
+          type="text"
+          autocomplete="off"
+          placeholder="/absolute/path/to/dataset"
+          aria-label="当前目录路径"
+        >
+        <button id="dataset-browser-go" class="secondary compact" type="button">
+          转到
+        </button>
+      </div>
+      <div class="dataset-browser-nav">
+        <button id="dataset-browser-parent" class="secondary compact" type="button">
+          ↑ 上级目录
+        </button>
+        <span id="dataset-browser-current" class="path-chip">—</span>
+      </div>
+      <div id="dataset-browser-list" class="dataset-browser-list"></div>
+      <p id="dataset-browser-status" class="dataset-browser-status">
+        只显示目录；选择当前目录不会自动创建或修改任何文件。
+      </p>
+      <div class="modal-actions">
+        <button id="dataset-browser-cancel" class="secondary" type="button">取消</button>
+        <button id="dataset-browser-select" class="primary" type="button">
+          选择当前目录
+        </button>
+      </div>
+    </section>
+  </div>
+
+  <div
+    id="draft-warning-modal"
+    class="modal hidden"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="draft-warning-title"
+  >
+    <section class="draft-warning-card panel">
+      <div class="modal-heading">
+        <div>
+          <div class="eyebrow">UNSEALED CHANGES</div>
+          <h2 id="draft-warning-title">当前 Episode 有未封存修改</h2>
+        </div>
+      </div>
+      <p>
+        当前修改还没有发布为不可变标注版本。若直接离开，内存中的修改将丢失。
+        请先选择如何处理后再继续<span id="draft-warning-target">切换</span>。
+      </p>
+      <div class="modal-actions draft-warning-actions">
+        <button id="draft-warning-cancel" class="secondary" type="button">
+          取消切换
+        </button>
+        <button id="draft-warning-discard" class="danger" type="button">
+          放弃修改并切换
+        </button>
+        <button id="draft-warning-save" class="primary" type="button">
+          校验封存并切换
+        </button>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from utils.dataset_postprocess.task_organized_catalog import (
     MoveSpec,
     _inventory,
 )
 
 
+@pytest.mark.integration
 def test_inventory_is_stable_across_same_filesystem_directory_rename(
     tmp_path: Path,
 ) -> None:

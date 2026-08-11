@@ -1,8 +1,10 @@
 # DexTeleop test suite
 
-The test suite is being classified before any bulk path migration.  Keep
-behavior changes, test refactors, and file moves in separate reviewable
-batches.
+The current compatibility layout keeps general pytest modules at
+`tests/test_<owner-or-domain>_<feature>.py` and classifies execution semantics
+with markers.  The primary goal is to make tests easy to find, extend, and run;
+directory symmetry is not a goal by itself.  Keep behavior changes, test
+refactors, marker changes, and file moves in separate reviewable batches.
 
 ## Concurrent development mode
 
@@ -11,6 +13,11 @@ classification instead of physical migration.  Do not move or split a test
 module while it is modified, untracked, imported by another test, or named by
 an active plan or command.  Marker-only governance changes may proceed when
 they are isolated from the files under active ownership.
+
+Treat existing root-level test paths as compatibility interfaces during
+parallel development.  New general tests should also use a clear root-level
+basename unless an owner already has a stable, reviewed test subtree.  Do not
+create a new directory merely to classify one or two files.
 
 A physical migration batch may start only when its exact file list has a short
 exclusive ownership window, every file is tracked, and the relevant pre-move
@@ -54,6 +61,24 @@ mechanism that preserves current pytest node IDs.  New tests should carry the
 most precise marker possible; unclassified tests must not silently grow into
 multi-component or optional-dependency tests.
 
+## Finding and adding tests
+
+Use the production owner or domain in the basename, followed by the behavior
+under test.  Prefer adding a related case to an existing feature module; create
+a new `test_<owner-or-domain>_<feature>.py` only when the responsibility is
+distinct or the existing module is no longer maintainable.
+
+Before adding a test, identify:
+
+1. the production owner or cross-owner flow it verifies;
+2. whether it is unit, integration, optional, contract, or hardware;
+3. whether an existing test module already owns that behavior.
+
+Keep static inputs under `tests/fixtures/`.  Introduce `tests/support/` helpers
+only when they remove real duplication and have a reviewed import contract.
+Do not add wrapper test modules, path aliases, symlinks, or a second pytest
+entrypoint to simulate an organizational hierarchy.
+
 ## Real-hardware gate
 
 Plain pytest runs must never connect to or change a real device.  Hardware tests
@@ -80,11 +105,20 @@ project config intentionally limits default discovery to `test_*.py` so a
 legacy operator tool cannot be imported merely because its name ends in
 `_test.py`.
 
-## Target layout
+The tracked field-validation scripts formerly kept in `tests/` were migrated
+on 2026-08-09.  RM65 state/force/configuration tools now live under
+`hardware/rm65/tools/field_validation/`; the combined camera/tactile health
+probe lives under `teleop_runtime/tools/field_validation/`.  Each destination
+README records the exact old-to-new path map and hardware gates.  These tools
+are outside pytest collection and were verified offline only during the move.
+
+## Optional long-term layout
 
 Execution risk is the primary directory axis; package ownership is the second
 axis.  `contract` and `optional` remain orthogonal markers rather than competing
-top-level directories.
+top-level directories.  This is an optional long-term direction for owners
+that become stable enough to migrate as a complete, reviewable group; it is not
+the required location for new tests during active parallel development.
 
 ```text
 tests/
@@ -115,8 +149,9 @@ location and retain the `hardware` marker plus explicit execution gate.
 
 ## Safe migration protocol
 
-Migrate one domain at a time only after its files are tracked, stable, and not
-being edited by another owner:
+If a physical migration has a concrete maintenance benefit, migrate one domain
+at a time only after its files are tracked, stable, and not being edited by
+another owner:
 
 1. Record collection count, test names, parameter IDs, markers, skips, and
    errors.
@@ -129,6 +164,6 @@ being edited by another owner:
 5. Run the smallest affected tier plus `git diff --check`.
 6. Never use an ordinary test migration as authorization for hardware access.
 
-The project-wide target above supersedes the narrower simulation-era example
-in `sim/STRUCTURE_PLAN.md`.  Until migration is complete, classification and
+The optional layout above supersedes the narrower simulation-era example in
+`sim/STRUCTURE_PLAN.md`.  Logical classification, old-path compatibility, and
 reliable collection take priority over visual directory uniformity.

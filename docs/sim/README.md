@@ -35,5 +35,6 @@ python -m sim.mujoco.replay \
 ```
 
 需要验证 replay-authoritative 的 sim human-in-the-loop capture 时，使用独立的
-[HIL 使用说明](../HIL/README.md)。该 profile 是显式、default-off 的 library/test
-composition；它与临时 PPO pipeline 的 checkpoint 试用、RTC 和真机 deployment 分开。
+[HIL 使用说明](../HIL/README.md)。当前 operational profile 是显式、default-off 的
+单右臂 PPO + passive VIVE/gripper → MuJoCo 应用；同一文档另行保留历史
+replay-authoritative CS-6b1f 验证。它与 RTC 和真机机械臂 deployment 分开。

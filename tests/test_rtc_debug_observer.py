@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from teleop_runtime.deploy.rtc_debug import (
     RTC_DEBUG_LEVEL_SUMMARY,
     RTC_DEBUG_LEVEL_TRACE,
@@ -85,6 +87,7 @@ def test_debug_sink_failure_is_observational_only() -> None:
     assert "synthetic debug sink failure" in status.last_sink_error
 
 
+@pytest.mark.integration
 def test_rtc_observer_and_batched_jsonl_flush_on_close(tmp_path) -> None:
     logger = DeploymentDebugLogger(
         enabled=True,

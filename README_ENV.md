@@ -58,6 +58,12 @@ GUI 打开后可在数据集路径旁点击“浏览目录”通过页面内目�
 数据集目录内，原始 Parquet 和视频不会被改写；当前视频会自动预读，下一个多阶段 Episode
 会后台预热，单阶段 Episode 则默认按需加载；因此 Python 环境仍不需要 OpenCV。
 
+多个升级后的标注程序可以从不同机器通过 SSHFS/NFS 同时打开同一数据集；程序使用共享
+数据集上的原子 Episode 锁目录保证同一 Episode 只有一个编辑者。共享数据集的所有标注机
+必须使用同一新版标注代码，不能在不确认跨机 `flock` 语义的情况下混用旧版整数据集锁。
+进程或网络异常留下的 Episode 锁不会按超时自动抢占，处理方式见
+[`LONG_HORIZON_STAGE_ANNOTATION.md`](./docs/real/LONG_HORIZON_STAGE_ANNOTATION.md)。
+
 默认环境目录是仓库内被 git 忽略的 `.venv-annotation`。可以显式指定其他位置或 Python：
 
 ```bash
@@ -68,8 +74,8 @@ source /opt/dexteleop-annotation/bin/activate
 ```
 
 重复运行安装脚本会按照冻结的 `uv.lock` 同步环境，不会安装其他 extras。该环境当前仅包含
-项目代码、NumPy、SciPy、OSQP、PyArrow 及其传递依赖；SciPy/OSQP 是现有公共包级兼容
-导出的暂时依赖，并不授予标注程序控制或执行机器人能力。
+项目代码、NumPy、PyArrow 及其传递依赖；包根兼容导出按需加载，不会因为导入标注入口而
+安装或载入控制、机器人、硬件、仿真、部署和训练依赖。
 
 只读检查某个数据集能否形成标注工作项：
 
@@ -78,6 +84,31 @@ python -m control_station refinement-annotation \
   /absolute/path/to/dataset \
   --dry-run
 ```
+
+标注源码继续以 DexTeleop 主仓为唯一来源。需要维护稀疏 checkout 或检查异机标注所需
+文件时，使用 [`release/annotation_projection.toml`](./release/annotation_projection.toml)
+声明的原路径投影；它不是独立 package，也不复制数据合同。每次修改标注 import 后先运行：
+
+```bash
+python scripts/check_annotation_projection.py
+```
+
+该检查会重新计算标注入口的本地 Python import closure，拒绝控制、机器人、硬件、仿真、
+部署或训练依赖，并确认所有闭包文件和静态资源仍在投影中。数据集、draft、annotation set
+和视频转码缓存不属于源码投影。
+
+需要生成可直接复制发布的源码目录时，为每次发布选择一个新的空目录：
+
+```bash
+python scripts/export_annotation_projection.py \
+  --output release/refinement_annotation
+python scripts/export_annotation_projection.py \
+  --verify release/refinement_annotation
+```
+
+导出器按清单保留原项目结构，并生成代码文件摘要 receipt；摘要仅用于验证发布代码完整性，
+不参与数据集、Episode 或频繁变化配置的准入判断。输出目录已存在时导出器会拒绝覆盖，更新
+时应使用新的版本目录，验证后再替换部署指向。
 
 ## 3. 创建、更新与重建主环境
 

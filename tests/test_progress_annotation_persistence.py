@@ -39,7 +39,7 @@ from dataset_interface.progress_annotations import (
 )
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.integration, pytest.mark.contract]
 
 
 def _progress_profile() -> TaskProgressProfileV1:

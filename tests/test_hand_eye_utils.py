@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from utils.hand_eye.calibration import (
     CalibrationResult,
@@ -27,6 +28,7 @@ from utils.hand_eye.camera import RealSenseCamera, RealSenseConfig, _set_sensor_
 
 
 class HandEyeEyeInHandTest(unittest.TestCase):
+    @pytest.mark.optional
     def test_synthetic_eye_in_hand_solution_recovers_camera_to_gripper(self) -> None:
         try:
             import cv2  # noqa: F401
@@ -77,6 +79,7 @@ class HandEyeEyeInHandTest(unittest.TestCase):
         self.assertLess(metrics["target_in_base_translation_rms_m"], 1e-6)
         self.assertLess(metrics["target_in_base_rotation_rms_deg"], 1e-4)
 
+    @pytest.mark.optional
     def test_auto_reject_outliers_records_history(self) -> None:
         try:
             import cv2  # noqa: F401

@@ -231,6 +231,7 @@ def _human_takeover_ready_state(manifest: ControlStationRunManifest):
         kind="acquire_control_lease",
     )
     assert lease_transition.receipt.accepted
+    assert lease_transition.receipt.intent_hash is None
     return replace(
         state,
         lifecycle_state="running",
@@ -1327,7 +1328,6 @@ def test_lower_level_packages_do_not_reverse_depend_on_control_station() -> None
         "teleop_runtime/gui/calibration_web_ui.py",
         "teleop_runtime/gui/startup_progress.py",
         "teleop_runtime/real_teleop/gui_controls.py",
-        "teleop_runtime/real_teleop/operator_control_runtime.py",
     ]
 
 
@@ -1506,3 +1506,72 @@ def test_cs0b_null_and_fake_adapters_expose_no_action_or_dispatch_api() -> None:
     }
     assert not any(hasattr(target, name) for name in forbidden)
     assert not any(hasattr(source, name) for name in forbidden)
+
+
+def test_residual_rebase_intent_requires_one_active_composer() -> None:
+    composer = _source_slot(
+        "composer-primary",
+        source_kind="composite",
+        producer_id="composer:primary",
+        supported_uses=("candidate", "authority"),
+    )
+    base = _manifest(target_kind="sim", slots=(composer,))
+    manifest = replace(
+        base,
+        manifest_id="control-station:residual-rebase-development",
+        allowed_intent_kinds=tuple(
+            sorted(
+                set(base.allowed_intent_kinds)
+                | {"request_residual_rebase_and_clear"}
+            )
+        ),
+    )
+    state = initial_control_station_state(
+        manifest,
+        runtime_session_id="session:residual-rebase",
+    )
+    state, lease_transition = _apply(
+        manifest,
+        state,
+        sequence=0,
+        kind="acquire_control_lease",
+    )
+    assert lease_transition.receipt.accepted
+    state = replace(
+        state,
+        lifecycle_state="running",
+        target_state="preflighted",
+        source_state_by_slot={"composer-primary": "active"},
+    )
+
+    next_state, transition = _apply(
+        manifest,
+        state,
+        sequence=1,
+        kind="request_residual_rebase_and_clear",
+        subject_id="composer-primary",
+        resource_binding_id="active-residual-anchor:0",
+        operation_spec_id="residual-rebase-profile:1",
+    )
+
+    assert transition.receipt.accepted
+    assert transition.receipt.status == "residual_rebase_intent_accepted"
+    assert transition.receipt.intent_hash == transition.intent.semantic_content_hash
+    assert next_state.pending_operation_by_subject == {}
+    inactive = replace(
+        next_state,
+        lifecycle_state="armed",
+        source_state_by_slot={"composer-primary": "candidate"},
+    )
+    _unchanged, rejected = _apply(
+        manifest,
+        inactive,
+        sequence=2,
+        kind="request_residual_rebase_and_clear",
+        subject_id="composer-primary",
+        resource_binding_id="active-residual-anchor:0",
+        operation_spec_id="residual-rebase-profile:1",
+    )
+    assert not rejected.receipt.accepted
+    assert rejected.receipt.status == "residual_rebase_requires_active_composer"
+    assert rejected.receipt.intent_hash == rejected.intent.semantic_content_hash

@@ -41,7 +41,7 @@ from dataset_interface.progress_corrections import (
 )
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.integration, pytest.mark.contract]
 
 
 def _context(

@@ -624,6 +624,132 @@ def test_parser_defaults_to_runtime_equivalent_timing() -> None:
     assert args.manual_gauge_timeout_sec == 30.0
 
 
+def test_output_root_defaults_to_teleop_records_without_creating_directories() -> None:
+    args = identify.build_parser().parse_args(["run", "--side", "left"])
+
+    resolution = identify.resolve_output_root(
+        args,
+        date_partition="2026-08-09",
+    )
+
+    assert resolution.path == identify.legacy_output_root()
+    assert resolution.path == (
+        identify.PROJECT_ROOT
+        / "teleop_records"
+        / "gripper_actuator_identification"
+    )
+    assert resolution.source == "legacy"
+    assert args.output_root is None
+
+
+def test_output_root_supports_explicit_canonical_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = tmp_path / "canonical" / "2026-08-09"
+    monkeypatch.setattr(
+        identify,
+        "canonical_output_root",
+        lambda *, date_partition=None: canonical,
+    )
+    args = identify.build_parser().parse_args(
+        [
+            "run",
+            "--side",
+            "left",
+            "--artifact-layout",
+            identify.RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ]
+    )
+
+    resolution = identify.resolve_output_root(
+        args,
+        date_partition="2026-08-09",
+    )
+
+    assert resolution.path == canonical
+    assert resolution.source == "canonical"
+    assert not (tmp_path / "canonical").exists()
+
+
+def test_explicit_output_root_wins_over_canonical_layout(tmp_path: Path) -> None:
+    explicit = tmp_path / "exact"
+    args = identify.build_parser().parse_args(
+        [
+            "run",
+            "--side",
+            "left",
+            "--artifact-layout",
+            identify.RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+            "--output-root",
+            str(explicit),
+        ]
+    )
+
+    resolution = identify.resolve_output_root(args)
+
+    assert resolution.path == explicit
+    assert resolution.source == "explicit"
+
+
+def test_recovery_roots_cover_teleop_archive_canonical_and_explicit_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    teleop_records = tmp_path / "teleop-records"
+    archived_logs = tmp_path / "legacy" / "logs"
+    canonical_family = tmp_path / "canonical-family"
+    explicit = tmp_path / "explicit"
+    monkeypatch.setattr(identify, "legacy_output_root", lambda: teleop_records)
+    monkeypatch.setattr(
+        identify,
+        "archived_logs_output_root",
+        lambda: archived_logs,
+    )
+    monkeypatch.setattr(
+        identify,
+        "canonical_output_family_root",
+        lambda: canonical_family,
+    )
+
+    roots = identify.recovery_journal_roots(explicit, teleop_records)
+
+    assert roots == tuple(
+        path.resolve()
+        for path in (
+            teleop_records,
+            archived_logs,
+            canonical_family,
+            explicit,
+        )
+    )
+    assert not any(path.exists() for path in roots)
+
+
+def test_process_lock_prevents_same_endpoint_across_output_layouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(identify, "legacy_output_root", lambda: tmp_path / "legacy")
+    monkeypatch.setattr(identify, "_process_lock_root", lambda: tmp_path / "locks")
+    endpoint = identify.Endpoint(
+        side="left",
+        port="/dev/fake-shared-gripper",
+        gripper_id=1,
+        baudrate=115200,
+        timeout=0.05,
+        source="test",
+    )
+
+    with identify._run_locks(identify._run_lock_roots(tmp_path / "layout-a"), endpoint):
+        with pytest.raises(RuntimeError, match="another identification process"):
+            with identify._run_locks(
+                identify._run_lock_roots(tmp_path / "layout-b"),
+                endpoint,
+            ):
+                pytest.fail("the same endpoint must not be locked twice")
+
+
 def test_run_requires_motion_acknowledgement_before_hardware() -> None:
     parser = identify.build_parser()
     args = parser.parse_args(["run", "--side", "left"])

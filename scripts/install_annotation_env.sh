@@ -98,8 +98,6 @@ if sys.version_info[:2] != (3, 10):
 
 required = (
     "numpy",
-    "scipy",
-    "osqp",
     "pyarrow",
     "collection_runtime",
     "control_station",

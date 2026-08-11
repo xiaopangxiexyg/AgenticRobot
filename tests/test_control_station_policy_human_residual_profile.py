@@ -128,7 +128,7 @@ def test_profile_is_default_off_and_does_not_capture_implicitly() -> None:
     assert bundle.input_adapter.anchor is None
 
 
-def test_first_post_barrier_action_only_captures_anchor_then_emits_residual() -> None:
+def test_first_post_barrier_action_captures_anchor_and_emits_identity_residual() -> None:
     bundle = _build(enabled=True)
     request = bundle.input_adapter.request_anchor(
         _activation(bundle, epoch=1, at=10.0),
@@ -146,8 +146,15 @@ def test_first_post_barrier_action_only_captures_anchor_then_emits_residual() ->
         observed_clock_domain_id="control.monotonic",
     )
 
-    assert first.status == "anchor_captured"
-    assert first.relative_action is None
+    assert first.status == "anchor_captured_relative_action_ready"
+    np.testing.assert_allclose(
+        first.relative_action.value("arm").values,
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    )
+    np.testing.assert_allclose(
+        first.relative_action.value("hand").values,
+        (0.0, 0.0),
+    )
     assert bundle.input_adapter.ready
     assert first.anchor_request_id == request.request_id
 
@@ -197,7 +204,7 @@ def test_recenter_clears_ready_state_and_next_action_only_reanchors() -> None:
         _activation(bundle, epoch=2, at=11.0),
         requested_at=11.0,
     )
-    assert recenter.request_generation == 1
+    assert recenter.request_generation == 0
     assert not bundle.input_adapter.ready
     second_action = _action(0.8, (0.9, 0.1))
     step = bundle.input_adapter.process_absolute_action(
@@ -211,8 +218,64 @@ def test_recenter_clears_ready_state_and_next_action_only_reanchors() -> None:
         observed_clock_domain_id="control.monotonic",
     )
 
-    assert step.status == "anchor_captured"
-    assert step.relative_action is None
+    assert step.status == "anchor_captured_relative_action_ready"
+    np.testing.assert_allclose(
+        step.relative_action.value("arm").values,
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def test_allocation_derivation_keeps_fixed_absolute_and_residual_roles() -> None:
+    bundle = _build(enabled=True)
+    bundle.input_adapter.request_anchor(
+        _activation(bundle, epoch=1, at=10.0),
+        requested_at=10.0,
+    )
+    anchor_action = _action(0.2, (0.4, 0.6))
+    anchor = bundle.input_adapter.derive_allocation_actions(
+        anchor_action,
+        source_action_id="human:0",
+        source_action_hash=anchor_action.semantic_content_hash,
+        source_available_at=10.01,
+        measured_at=20.0,
+        measured_clock_domain_id="human.source",
+        observed_at=10.02,
+        observed_clock_domain_id="control.monotonic",
+    )
+    assert anchor.ready
+    assert anchor.captured_anchor
+    assert set(anchor.action_by_role) == {
+        "human_absolute",
+        "human_residual",
+    }
+    np.testing.assert_allclose(
+        anchor.action_by_role["human_residual"].value("hand").values,
+        (0.0, 0.0),
+    )
+
+    moved_action = _action(0.3, (0.5, 0.2))
+    derived = bundle.input_adapter.derive_allocation_actions(
+        moved_action,
+        source_action_id="human:1",
+        source_action_hash=moved_action.semantic_content_hash,
+        source_available_at=10.1,
+        measured_at=20.1,
+        measured_clock_domain_id="human.source",
+        observed_at=10.11,
+        observed_clock_domain_id="control.monotonic",
+    )
+
+    assert derived.ready
+    assert set(derived.action_by_role) == {
+        "human_absolute",
+        "human_residual",
+    }
+    assert derived.action_by_role["human_absolute"] is moved_action
+    np.testing.assert_allclose(
+        derived.action_by_role["human_residual"].value("arm").values[:3],
+        (0.1, 0.0, 0.0),
+    )
+    assert derived.profile_step.source_action_id == "human:1"
 
 
 def test_profile_contract_names_are_concrete_but_generic_contract_is_role_keyed() -> None:

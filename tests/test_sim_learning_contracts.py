@@ -8,12 +8,75 @@ from sim.mujoco.learning import (
     ObservationFieldSpec,
     ObservationRole,
     PolicyActionBinding,
+    PolicyActionTransform,
     compose_embodiment_reward,
     compose_reward,
     dry_run_model_io,
     encode_model_input,
     PolicyModelManifest,
 )
+
+
+def test_policy_action_transform_keeps_latent_and_task_actions_distinct() -> None:
+    policy = PolicyActionBinding(
+        "latent.xyz.v1",
+        "continuous",
+        3,
+        "right_base",
+        "relative",
+    )
+    task = PolicyActionBinding(
+        "task.pose.v1",
+        "continuous",
+        7,
+        "right_base",
+        "relative",
+    )
+    transform = PolicyActionTransform(
+        transform_id="latent_xyz_to_pose7.v1",
+        policy_action_binding_hash=policy.semantic_content_hash,
+        task_action_binding_hash=task.semantic_content_hash,
+        policy_components=("x", "y", "z"),
+        task_components=("x", "y", "z", "rx", "ry", "rz", "gripper"),
+        task_defaults=(0.0,) * 7,
+    )
+    transform.validate_bindings(policy, task)
+    latent = np.asarray([[0.25, -0.5, 0.75]], dtype=np.float32)
+    mapped = transform.transform(latent)
+    np.testing.assert_allclose(mapped[:, :3], latent)
+    np.testing.assert_allclose(mapped[:, 3:], 0.0)
+    assert transform.policy_dim == 3
+    assert transform.task_dim == 7
+
+
+def test_policy_action_transform_applies_hashed_affine_scaling() -> None:
+    policy = PolicyActionBinding(
+        "latent.xy.v1", "continuous", 2, "right_base", "relative"
+    )
+    task = PolicyActionBinding(
+        "task.pose.v1", "continuous", 7, "right_base", "relative"
+    )
+    identity = PolicyActionTransform(
+        transform_id="latent_xy_to_pose7.v1",
+        policy_action_binding_hash=policy.semantic_content_hash,
+        task_action_binding_hash=task.semantic_content_hash,
+        policy_components=("x", "y"),
+        task_components=("x", "y", "z", "rx", "ry", "rz", "gripper"),
+        task_defaults=(0.0,) * 7,
+    )
+    scaled = PolicyActionTransform(
+        transform_id="latent_xy_to_pose7.affine.v1",
+        policy_action_binding_hash=policy.semantic_content_hash,
+        task_action_binding_hash=task.semantic_content_hash,
+        policy_components=("x", "y"),
+        task_components=("x", "y", "z", "rx", "ry", "rz", "gripper"),
+        task_defaults=(0.0,) * 7,
+        policy_scales=(0.2, 0.5),
+        policy_biases=(0.1, 0.0),
+    )
+    latent = np.asarray((1.0, -1.0), dtype=np.float32)
+    np.testing.assert_allclose(scaled.transform(latent)[:2], (0.3, -0.5))
+    assert scaled.semantic_content_hash != identity.semantic_content_hash
 
 
 def _contract() -> ObservationContract:
@@ -229,6 +292,8 @@ def test_cube_lift_fixture_projection_is_lossless_and_has_a_firewall() -> None:
     assert metadata["model_input_dim"] == normal.observation_dim
     assert metadata["model_output_dim"] == 7
     assert metadata["action_dim"] == 7
+    assert metadata["policy_action_dim"] == 7
+    assert metadata["task_action_dim"] == 7
 
     expert = CubeLiftTaskConfig.load(
         "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_rgb_v2.json"
@@ -288,3 +353,92 @@ def test_checkpoint_compatibility_checks_learning_contract_hashes() -> None:
     payload["task_metadata"]["learning_contract"]["action_binding_hash"] = "bad"
     with pytest.raises(ValueError, match="Learning contract"):
         check_task_config_compatibility(payload, path)
+
+
+def test_checkpoint_compatibility_recognizes_legacy_compact_action_metadata() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import build_learning_metadata
+    from sim.mujoco_temp_pipeline.checkpoint import (
+        check_task_config_compatibility,
+        task_config_sha256,
+    )
+
+    path = "sim/configs/tasks/rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
+    config = CubeLiftTaskConfig.load(path)
+    learning = build_learning_metadata(config)
+    legacy_learning = dict(learning)
+    legacy_learning["action_binding_hash"] = learning[
+        "task_action_binding_hash"
+    ]
+    legacy_learning["model_output_dim"] = config.action_dim
+    for key in (
+        "policy_action_layout",
+        "policy_action_components",
+        "policy_action_transform_id",
+        "policy_action_transform_hash",
+        "task_action_binding_id",
+        "task_action_binding_hash",
+        "task_action_layout",
+        "task_action_components",
+        "policy_action_dim",
+        "task_action_dim",
+    ):
+        legacy_learning.pop(key, None)
+    payload = {
+        "task_config_sha256": task_config_sha256(path),
+        "policy": {
+            "action_dim": 1,
+            "environment_action_dim": 7,
+            "active_action_indices": [2],
+        },
+        "task_metadata": {
+            "action_layout": config.action_layout,
+            "observation_layout": config.observation_layout,
+            "learning_contract": legacy_learning,
+        },
+    }
+    result = check_task_config_compatibility(payload, path)
+    assert result["legacy_compact_action_contract_migration"] is True
+
+
+def test_checkpoint_compatibility_allows_explicit_named_action_transfer() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import build_learning_metadata
+    from sim.mujoco_temp_pipeline.checkpoint import (
+        check_task_config_compatibility,
+        task_config_sha256,
+    )
+
+    source_path = "sim/configs/tasks/rm65_right_cube_reach_pose_xyz_v1.json"
+    target_path = (
+        "sim/configs/tasks/"
+        "rm65_right_cube_contact_acquire_pose_xyz_gripper_v1.json"
+    )
+    source = CubeLiftTaskConfig.load(source_path)
+    payload = {
+        "task_config_sha256": task_config_sha256(source_path),
+        "policy": {
+            "action_dim": source.policy_action_dim,
+            "environment_action_dim": source.action_dim,
+            "active_action_indices": list(source.policy_active_action_indices),
+        },
+        "task_metadata": {
+            "action_layout": source.action_layout,
+            "observation_layout": source.observation_layout,
+            "learning_contract": build_learning_metadata(source),
+        },
+    }
+    result = check_task_config_compatibility(
+        payload,
+        target_path,
+        allow_mismatch=True,
+        allow_policy_action_component_transfer=True,
+    )
+    transfer = result["policy_action_component_transfer"]
+    assert transfer is not None
+    assert transfer["shared_components"] == (
+        "right_tcp_delta_x",
+        "right_tcp_delta_y",
+        "right_tcp_delta_z",
+    )
+    assert transfer["new_components"] == ("right_gripper_delta",)

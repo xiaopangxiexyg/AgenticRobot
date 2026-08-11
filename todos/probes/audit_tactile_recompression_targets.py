@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from utils.dataset_postprocess.tactile_recompress import (
+from collection_runtime.tactile_recompression import (
     _active_collection_processes,
     _finalized_manifest_paths,
     _raw_manifest_streams,

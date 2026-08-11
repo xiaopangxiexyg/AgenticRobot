@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from dataset_contracts import parquet as parquet_contract
 from dataset_contracts.stats import EpisodeStatsAccumulator
 from dataset_contracts.tactile import ChunkedTactileStream
@@ -210,6 +212,7 @@ def test_rm65_support_package_is_archived() -> None:
     assert _python_files(REPO_ROOT / "rm65_inspire_tac") == []
 
 
+@pytest.mark.integration
 def test_data_packages_import_without_loading_runtime_or_hardware() -> None:
     code = """
 import sys

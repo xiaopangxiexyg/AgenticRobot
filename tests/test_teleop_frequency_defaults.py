@@ -14,6 +14,7 @@ from dataset_contracts.pose_training import PoseTrainingDataContract
 from robot_motion.rm65 import (
     RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65_POSE_LIFT_V5_SIGMA_ESCAPE_NAME,
+    RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
 )
 from teleop_runtime.collection import run_collect
@@ -21,6 +22,8 @@ from teleop_runtime.collection.writer_v21 import LeRobotV21WriterConfig
 from teleop_runtime.backends.arms import (
     RM65ArmBackend,
     RM65ArmBackendConfig,
+    RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
     RM65ImpedanceArmBackend,
 )
 from teleop_runtime.debug import run_vive_rm65_calibration_debug as calibration_debug
@@ -35,6 +38,10 @@ from teleop_runtime.defaults import (
     DEFAULT_TELEOP_SAMPLE_HZ,
 )
 from teleop_runtime.deploy import run_policy
+from teleop_runtime.deploy.dispatch import (
+    POSITION_REFERENCE_DISPATCH_AUDIT_FULL,
+    POSITION_REFERENCE_DISPATCH_AUDIT_POST,
+)
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand
 
 
@@ -47,6 +54,16 @@ def _parse_deploy_args(argv: list[str]):
     parser = argparse.ArgumentParser()
     run_policy.add_args(parser)
     return parser.parse_args(argv)
+
+
+def test_deploy_cyclic_gc_guard_defaults_on_with_explicit_rollback() -> None:
+    assert _parse_deploy_args([]).position_cyclic_gc_guard is True
+    assert (
+        _parse_deploy_args(
+            ["--no-position-cyclic-gc-guard"]
+        ).position_cyclic_gc_guard
+        is False
+    )
 
 
 def _parse_real_teleop_args(argv: list[str]):
@@ -62,6 +79,44 @@ def _parse_calibration_debug_args(argv: list[str]):
 def _parse_virtual_teleop_args(argv: list[str]):
     with patch.object(sys, "argv", ["prog", *argv]):
         return virtual_teleop.parse_args()
+
+
+def test_deploy_position_target_admission_defaults_nonblocking_with_rollback() -> None:
+    default_args = _parse_deploy_args([])
+    rollback_args = _parse_deploy_args(
+        [
+            "--position-background-target-admission",
+            RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
+        ]
+    )
+
+    assert (
+        default_args.position_background_target_admission
+        == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+    )
+    assert (
+        rollback_args.position_background_target_admission
+        == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+    )
+
+
+def test_deploy_position_reference_dispatch_audit_defaults_post_with_full_rollback() -> None:
+    default_args = _parse_deploy_args([])
+    rollback_args = _parse_deploy_args(
+        [
+            "--position-reference-dispatch-audit-mode",
+            POSITION_REFERENCE_DISPATCH_AUDIT_FULL,
+        ]
+    )
+
+    assert (
+        default_args.position_reference_dispatch_audit_mode
+        == POSITION_REFERENCE_DISPATCH_AUDIT_POST
+    )
+    assert (
+        rollback_args.position_reference_dispatch_audit_mode
+        == POSITION_REFERENCE_DISPATCH_AUDIT_FULL
+    )
 
 
 def test_collect_defaults_to_15hz_for_bimanual() -> None:
@@ -189,7 +244,9 @@ def test_collect_defaults_to_15hz_for_single_arm() -> None:
 
 
 def test_collect_nominal_fps_follows_explicit_hz_when_omitted() -> None:
-    args = _parse_collect_args(["--active-sides", "right", "--no-camera", "--no-video", "--hz", "12"])
+    args = _parse_collect_args(
+        ["--active-sides", "right", "--no-camera", "--no-video", "--hz", "12"]
+    )
 
     assert args.hz == 12.0
     assert args.nominal_fps == 12.0
@@ -202,9 +259,7 @@ def test_lerobot_writer_default_nominal_fps_is_15hz(tmp_path) -> None:
 
 
 def test_dual_rm65_collection_defaults_to_workspace_near_boundary_desk() -> None:
-    args = _parse_collect_args(
-        ["--active-sides", "both", "--no-camera", "--no-video"]
-    )
+    args = _parse_collect_args(["--active-sides", "both", "--no-camera", "--no-video"])
 
     assert args.pose_frame_contract is not None
     assert args.pose_frame_contract.pose_storage_frame == "desk_absolute"
@@ -213,7 +268,10 @@ def test_dual_rm65_collection_defaults_to_workspace_near_boundary_desk() -> None
         == "rm65_real_dual_arm_workspace_near_boundary_v1"
     )
     assert args.policy_io_layout == "auto"
-    assert args.pose_frame_contract_source == "default_rm65_dual_arm_workspace_near_boundary_v1"
+    assert (
+        args.pose_frame_contract_source
+        == "default_rm65_dual_arm_workspace_near_boundary_v1"
+    )
 
 
 def test_collection_can_explicitly_disable_default_pose_contract() -> None:
@@ -243,9 +301,7 @@ def test_real_teleop_custom_station_geometry_requires_explicit_pose_choice() -> 
 
 
 def test_single_rm65_collection_does_not_reuse_dual_station_extrinsics() -> None:
-    args = _parse_collect_args(
-        ["--active-sides", "right", "--no-camera", "--no-video"]
-    )
+    args = _parse_collect_args(["--active-sides", "right", "--no-camera", "--no-video"])
 
     assert args.pose_frame_contract is None
 
@@ -281,7 +337,9 @@ def test_collection_explicit_pose_contract_is_loaded_before_runtime(tmp_path) ->
     assert real_args.pose_frame_contract.to_dict() == contract.to_dict()
 
 
-def test_native_v23_deploy_defaults_to_rm65_workspace_near_boundary_runtime_contract() -> None:
+def test_native_v23_deploy_defaults_to_rm65_workspace_near_boundary_runtime_contract() -> (
+    None
+):
     artifact = SimpleNamespace(pose_training_data=PoseTrainingDataContract.native_v23())
 
     contract, source = run_policy._resolve_runtime_pose_frame_contract(
@@ -419,12 +477,20 @@ def test_real_teleop_legacy_session_recording_can_be_enabled() -> None:
 def test_real_teleop_console_heartbeats_and_orientation_debug_are_opt_in() -> None:
     defaults = _parse_real_teleop_args([])
     debug = _parse_real_teleop_args(
-        ["--status-sec", "2.5", "--debug-orientation-console"]
+        [
+            "--status-sec",
+            "2.5",
+            "--status-change-min-sec",
+            "0.25",
+            "--debug-orientation-console",
+        ]
     )
 
     assert defaults.status_sec == 0.0
+    assert defaults.status_change_min_sec == 1.0
     assert defaults.debug_orientation_console is False
     assert debug.status_sec == 2.5
+    assert debug.status_change_min_sec == 0.25
     assert debug.debug_orientation_console is True
 
 
@@ -640,24 +706,26 @@ def test_action_debug_jitter_focus_includes_position_motion_stream_fields() -> N
 
 
 def test_real_teleop_canfd_follow_options_parse() -> None:
-    args = _parse_real_teleop_args([
-        "--arm-canfd-follow",
-        "--position-post-ik-qpos-smoothing-alpha",
-        "0.8",
-        "--arm-follow-qpos-alpha",
-        "0.1",
-        "--arm-canfd-follow-stream-hz",
-        "120",
-        "--arm-canfd-follow-warning-ratio",
-        "0.85",
-        "--arm-canfd-trajectory-mode",
-        "1",
-        "--arm-canfd-radio",
-        "50",
-        "--arm-state-read-every",
-        "6",
-        "--arm-disable-force-admittance",
-    ])
+    args = _parse_real_teleop_args(
+        [
+            "--arm-canfd-follow",
+            "--position-post-ik-qpos-smoothing-alpha",
+            "0.8",
+            "--arm-follow-qpos-alpha",
+            "0.1",
+            "--arm-canfd-follow-stream-hz",
+            "120",
+            "--arm-canfd-follow-warning-ratio",
+            "0.85",
+            "--arm-canfd-trajectory-mode",
+            "1",
+            "--arm-canfd-radio",
+            "50",
+            "--arm-state-read-every",
+            "6",
+            "--arm-disable-force-admittance",
+        ]
+    )
 
     assert args.arm_canfd_follow is True
     assert args.position_post_ik_qpos_smoothing_alpha == 0.8
@@ -694,8 +762,14 @@ def test_real_teleop_position_defaults_to_formal_120hz_profile() -> None:
 
     assert args.hz == DEFAULT_TELEOP_SAMPLE_HZ
     assert args.position_reference_hz == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
-    assert real_teleop._effective_outer_control_hz(args) == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
-    assert real_teleop._effective_dual_arm_ik_hz(args) == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
+    assert (
+        real_teleop._effective_outer_control_hz(args)
+        == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
+    )
+    assert (
+        real_teleop._effective_dual_arm_ik_hz(args)
+        == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
+    )
     assert args.arm_control_hz == 120.0
     assert args.arm_canfd_follow is True
     assert args.position_control_profile_resolved == "rm65_bimanual_position_v1"
@@ -708,8 +782,9 @@ def test_real_teleop_position_defaults_to_formal_120hz_profile() -> None:
     assert args.arm_canfd_trajectory_mode == 0
     assert args.arm_canfd_radio == 0
     assert args.position_post_ik_qpos_smoothing_alpha == pytest.approx(0.14)
-    assert args.arm_execution_config.position_post_ik_qpos_smoothing_alpha == pytest.approx(
-        0.14
+    assert (
+        args.arm_execution_config.position_post_ik_qpos_smoothing_alpha
+        == pytest.approx(0.14)
     )
     assert real_teleop._effective_position_post_ik_qpos_smoothing_alpha(
         args
@@ -720,11 +795,17 @@ def test_real_teleop_position_defaults_to_formal_120hz_profile() -> None:
         args.position_post_ik_qpos_smoothing_fast_alpha
         >= real_teleop._effective_position_post_ik_qpos_smoothing_alpha(args)
     )
-    assert real_teleop._effective_arm_control_hz(args) == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    assert (
+        real_teleop._effective_arm_control_hz(args)
+        == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    )
     assert real_teleop._effective_arm_canfd_follow(args) is True
     canfd_config = real_teleop._canfd_follow_runtime_config(args)
     assert canfd_config["position_background_streaming_enabled"] is True
-    assert canfd_config["position_background_streaming_hz"] == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    assert (
+        canfd_config["position_background_streaming_hz"]
+        == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    )
     assert canfd_config["canfd_follow_warning_ratio"] == 0.9
     assert canfd_config["canfd_trajectory_mode"] == 0
     assert canfd_config["canfd_radio"] == 0
@@ -758,8 +839,9 @@ def test_real_teleop_responsive_v2_enables_only_new_source_shaping_switches() ->
     assert args.position_post_ik_qpos_normal_fast_path is True
     assert args.position_post_ik_qpos_normal_fast_path_alpha == pytest.approx(0.70)
     assert args.position_post_ik_qpos_normal_fast_path_guard_deg == pytest.approx(4.0)
-    assert args.position_post_ik_qpos_normal_fast_path_quality_grace_sec == pytest.approx(
-        0.05
+    assert (
+        args.position_post_ik_qpos_normal_fast_path_quality_grace_sec
+        == pytest.approx(0.05)
     )
     assert args.position_wrist_q5_hysteresis_requires_escape_latch is True
     # V2 changes only live source shaping.  The hard 15/60/120 execution
@@ -768,6 +850,72 @@ def test_real_teleop_responsive_v2_enables_only_new_source_shaping_switches() ->
     assert args.position_post_ik_qpos_smoothing_fast_alpha == pytest.approx(0.45)
     assert args.position_reference_hz == pytest.approx(60.0)
     assert args.arm_control_hz == pytest.approx(120.0)
+
+
+def test_real_teleop_balanced_v2_changes_only_normal_fast_path_alpha() -> None:
+    responsive = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_responsive",
+        ]
+    )
+    balanced = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_balanced",
+        ]
+    )
+
+    assert balanced.position_control_profile_resolved == (
+        "rm65_bimanual_position_v2_balanced"
+    )
+    assert balanced.position_post_ik_qpos_normal_fast_path is True
+    assert balanced.position_post_ik_qpos_normal_fast_path_alpha == pytest.approx(0.55)
+    assert balanced.position_post_ik_qpos_normal_fast_path_guard_deg == pytest.approx(
+        responsive.position_post_ik_qpos_normal_fast_path_guard_deg
+    )
+    assert balanced.position_post_ik_qpos_normal_fast_path_quality_grace_sec == (
+        pytest.approx(
+            responsive.position_post_ik_qpos_normal_fast_path_quality_grace_sec
+        )
+    )
+    assert balanced.position_wrist_q5_hysteresis_requires_escape_latch is True
+
+
+def test_real_teleop_smooth_v2_changes_only_balanced_fast_path_alpha() -> None:
+    balanced = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_balanced",
+        ]
+    )
+    smooth = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_smooth",
+        ]
+    )
+
+    assert smooth.position_control_profile_resolved == (
+        "rm65_bimanual_position_v2_smooth"
+    )
+    assert smooth.position_post_ik_qpos_normal_fast_path is True
+    assert smooth.position_post_ik_qpos_normal_fast_path_alpha == pytest.approx(0.45)
+    assert smooth.position_post_ik_qpos_normal_fast_path_guard_deg == pytest.approx(
+        balanced.position_post_ik_qpos_normal_fast_path_guard_deg
+    )
+    assert smooth.position_post_ik_qpos_normal_fast_path_quality_grace_sec == (
+        pytest.approx(balanced.position_post_ik_qpos_normal_fast_path_quality_grace_sec)
+    )
+    assert smooth.position_wrist_q5_hysteresis_requires_escape_latch is True
 
 
 def test_real_teleop_single_step_singularity_mode_has_explicit_rollback() -> None:
@@ -809,11 +957,36 @@ def test_real_teleop_single_step_singularity_mode_has_explicit_rollback() -> Non
     assert guarded.position_joint_limit_guard_mode == "boundary_hold"
 
 
-def test_real_teleop_progress_gui_allows_pre_episode_profile_selection() -> None:
-    args = _parse_real_teleop_args(["--collection-progress-gui"])
+def test_real_teleop_progress_gui_defaults_blank_dataset_to_four_stage_writing(
+    tmp_path,
+) -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--collection-progress-gui",
+            "--dataset-root",
+            str(tmp_path / "default_progress"),
+        ]
+    )
 
     assert args.collection_progress_gui is True
-    assert args.collection_progress_profile is None
+    assert args.collection_progress_profile.profile_id == (
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress"
+    )
+    assert len(args.collection_progress_profile.steps) == 4
+
+    explicit = _parse_real_teleop_args(
+        [
+            "--collection-progress-gui",
+            "--collection-progress-profile",
+            "catalog:dmtac_rm65_bimanual_position_v1_progress",
+            "--dataset-root",
+            str(tmp_path / "explicit_progress"),
+        ]
+    )
+    assert explicit.collection_progress_profile.profile_id == (
+        "dmtac_rm65_bimanual_position_v1_progress"
+    )
+    assert _parse_real_teleop_args([]).collection_progress_profile is None
 
     with pytest.raises(SystemExit):
         _parse_real_teleop_args(
@@ -881,13 +1054,21 @@ def test_position_safe_debug_disable_hold_only_disables_hold_features() -> None:
     assert switches["hold_disabled"] is True
 
 
-def test_real_teleop_impedance_decouples_15hz_collection_from_30hz_outer_defaults() -> None:
+def test_real_teleop_impedance_decouples_15hz_collection_from_30hz_outer_defaults() -> (
+    None
+):
     args = _parse_real_teleop_args([])
 
     assert args.arm_control_mode == "impedance"
     assert args.hz == DEFAULT_TELEOP_SAMPLE_HZ
-    assert real_teleop._effective_outer_control_hz(args) == DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ
-    assert real_teleop._effective_dual_arm_ik_hz(args) == DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ
+    assert (
+        real_teleop._effective_outer_control_hz(args)
+        == DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ
+    )
+    assert (
+        real_teleop._effective_dual_arm_ik_hz(args)
+        == DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ
+    )
     assert real_teleop._effective_arm_control_hz(args) == DEFAULT_RM65_ARM_CONTROL_HZ
     assert args.arm_step_dt_max_scale == 3.0
 
@@ -900,7 +1081,10 @@ def test_real_teleop_impedance_control_rate_is_independent_from_dataset_hz() -> 
     assert real_teleop._effective_outer_control_hz(explicit) == 36.0
     assert real_teleop._effective_dual_arm_ik_hz(explicit) == 36.0
     assert legacy.hz == 20.0
-    assert real_teleop._effective_outer_control_hz(legacy) == DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ
+    assert (
+        real_teleop._effective_outer_control_hz(legacy)
+        == DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ
+    )
 
 
 def test_real_teleop_position_dt_scaling_uses_reference_rate_not_sample_rate() -> None:
@@ -915,7 +1099,9 @@ def test_real_teleop_position_dt_scaling_uses_reference_rate_not_sample_rate() -
     assert args.arm_step_dt_max_scale == expected
 
 
-def test_real_teleop_impedance_uses_pre_ik_safety_instead_of_temporary_output_limiter() -> None:
+def test_real_teleop_impedance_uses_pre_ik_safety_instead_of_temporary_output_limiter() -> (
+    None
+):
     args = _parse_real_teleop_args([])
 
     temp_safety = real_teleop._effective_dual_arm_temporary_safety(
@@ -925,7 +1111,9 @@ def test_real_teleop_impedance_uses_pre_ik_safety_instead_of_temporary_output_li
 
     assert temp_safety["requested"] is True
     assert temp_safety["enabled"] is False
-    assert temp_safety["disabled_reason"] == "impedance_uses_pre_ik_coupled_safety_bounds"
+    assert (
+        temp_safety["disabled_reason"] == "impedance_uses_pre_ik_coupled_safety_bounds"
+    )
 
 
 def test_real_teleop_position_can_override_follow_and_control_hz() -> None:
@@ -971,7 +1159,9 @@ def test_real_teleop_disable_force_admittance_keeps_impedance_follow_disabled() 
     assert real_teleop._effective_arm_canfd_follow(args) is False
 
 
-def test_real_teleop_step_limit_sync_prefers_explicit_backend_steps_over_profile() -> None:
+def test_real_teleop_step_limit_sync_prefers_explicit_backend_steps_over_profile() -> (
+    None
+):
     calls: list[tuple[str, object, object]] = []
 
     class _Retargeter:
@@ -983,8 +1173,12 @@ def test_real_teleop_step_limit_sync_prefers_explicit_backend_steps_over_profile
                 joint_velocity_profile=object(),
             )
 
-        def set_execution_max_joint_step(self, *, left_step_rad, right_step_rad) -> None:
-            calls.append(("explicit", np.asarray(left_step_rad), np.asarray(right_step_rad)))
+        def set_execution_max_joint_step(
+            self, *, left_step_rad, right_step_rad
+        ) -> None:
+            calls.append(
+                ("explicit", np.asarray(left_step_rad), np.asarray(right_step_rad))
+            )
 
         def set_execution_dt_sec(self, dt_sec: float) -> None:
             calls.append(("profile", float(dt_sec), None))
@@ -1018,7 +1212,9 @@ def test_real_teleop_step_limit_sync_prefers_explicit_backend_steps_over_profile
     assert np.allclose(calls[0][2], np.asarray(right_config.max_angvel) * 0.05)
 
 
-def test_real_teleop_impedance_step_limit_sync_never_catches_up_after_slow_frame() -> None:
+def test_real_teleop_impedance_step_limit_sync_never_catches_up_after_slow_frame() -> (
+    None
+):
     calls: list[tuple[str, object, object]] = []
 
     class _Retargeter:
@@ -1030,8 +1226,12 @@ def test_real_teleop_impedance_step_limit_sync_never_catches_up_after_slow_frame
                 joint_velocity_profile=object(),
             )
 
-        def set_execution_max_joint_step(self, *, left_step_rad, right_step_rad) -> None:
-            calls.append(("explicit", np.asarray(left_step_rad), np.asarray(right_step_rad)))
+        def set_execution_max_joint_step(
+            self, *, left_step_rad, right_step_rad
+        ) -> None:
+            calls.append(
+                ("explicit", np.asarray(left_step_rad), np.asarray(right_step_rad))
+            )
 
         def set_execution_dt_sec(self, dt_sec: float) -> None:
             calls.append(("profile", float(dt_sec), None))
@@ -1064,10 +1264,14 @@ def test_real_teleop_impedance_step_limit_sync_never_catches_up_after_slow_frame
     assert calls and calls[0][0] == "explicit"
     assert np.allclose(calls[0][1], np.asarray(left_config.max_angvel) / 15.0)
     assert np.allclose(calls[0][2], np.asarray(right_config.max_angvel) / 15.0)
-    assert components.arm_loop_step_dt_tracker["smoothed_loop_dt"] == pytest.approx(1.0 / 15.0)
+    assert components.arm_loop_step_dt_tracker["smoothed_loop_dt"] == pytest.approx(
+        1.0 / 15.0
+    )
 
 
-def test_real_teleop_wrist_depth_resolution_also_sets_wrist_rgb_resolution(tmp_path) -> None:
+def test_real_teleop_wrist_depth_resolution_also_sets_wrist_rgb_resolution(
+    tmp_path,
+) -> None:
     camera_config = tmp_path / "realsense.json"
     camera_config.write_text(
         json.dumps(
@@ -1119,31 +1323,40 @@ def test_real_teleop_wrist_depth_resolution_also_sets_wrist_rgb_resolution(tmp_p
     assert right_config.depth_height == 240
 
 
-def test_real_teleop_camera_color_format_defaults_to_bgr8_and_allows_explicit_yuyv() -> None:
+def test_real_teleop_camera_color_format_defaults_to_bgr8_and_allows_explicit_yuyv() -> (
+    None
+):
     assert _parse_real_teleop_args(["--no-camera"]).camera_color_format == "bgr8"
-    assert _parse_real_teleop_args(
-        ["--no-camera", "--camera-color-format", "yuyv"]
-    ).camera_color_format == "yuyv"
+    assert (
+        _parse_real_teleop_args(
+            ["--no-camera", "--camera-color-format", "yuyv"]
+        ).camera_color_format
+        == "yuyv"
+    )
 
 
-def test_real_teleop_camera_startup_warmup_policy_is_opt_in_and_reversible() -> None:
+def test_real_teleop_camera_startup_warmup_policy_defaults_bounded_and_is_reversible() -> (
+    None
+):
     assert (
         _parse_real_teleop_args(["--no-camera"]).camera_startup_warmup_policy
-        == "legacy"
+        == "bounded_first_frame"
     )
     assert (
         _parse_real_teleop_args(
             [
                 "--no-camera",
                 "--camera-startup-warmup-policy",
-                "bounded_first_frame",
+                "legacy",
             ]
         ).camera_startup_warmup_policy
-        == "bounded_first_frame"
+        == "legacy"
     )
 
 
-def test_real_teleop_camera_startup_warmup_policy_reaches_every_source(tmp_path) -> None:
+def test_real_teleop_camera_startup_warmup_policy_reaches_every_source(
+    tmp_path,
+) -> None:
     camera_config = tmp_path / "realsense.json"
     camera_config.write_text(
         json.dumps(
@@ -1175,7 +1388,10 @@ def test_real_teleop_camera_startup_warmup_policy_reaches_every_source(tmp_path)
     assert set(sources) == {"front", "left_wrist"}
     for source in sources.values():
         assert source.config.startup_warmup_policy == "bounded_first_frame"
-        assert source.config.metadata["configured_startup_warmup_policy"] == "legacy"
+        assert (
+            source.config.metadata["configured_startup_warmup_policy"]
+            == "bounded_first_frame"
+        )
         assert (
             source.config.metadata["real_teleop_startup_warmup_policy"]
             == "bounded_first_frame"
@@ -1241,6 +1457,42 @@ def test_real_teleop_camera_sources_start_staggered() -> None:
     sleep_mock.assert_has_calls([call(0.5)])
 
 
+def test_real_teleop_camera_sources_honor_hardware_startup_priority() -> None:
+    started: list[str] = []
+
+    class _Source:
+        def __init__(self, name: str, priority: int) -> None:
+            self.name = name
+            self.config = SimpleNamespace(
+                metadata={"startup_priority": priority},
+                startup_warmup_policy="bounded_first_frame",
+            )
+
+        def start(self) -> None:
+            started.append(self.name)
+
+    sources = {
+        "front": _Source("front", 0),
+        "left_wrist": _Source("left_wrist", 20),
+        "right_wrist": _Source("right_wrist", 10),
+    }
+
+    with patch.object(real_teleop.time, "sleep") as sleep_mock:
+        real_teleop._start_camera_sources(sources, stagger_sec=0.5)
+
+    assert started == ["front", "right_wrist", "left_wrist"]
+    assert sleep_mock.call_args_list == [call(0.5), call(0.5)]
+
+
+def test_real_teleop_camera_startup_priority_must_be_numeric() -> None:
+    source = SimpleNamespace(
+        config=SimpleNamespace(metadata={"startup_priority": "first"})
+    )
+
+    with pytest.raises(ValueError, match="startup_priority must be numeric"):
+        camera_runtime._camera_startup_items({"front": source})
+
+
 def test_real_teleop_camera_sources_report_serial_batch_timing() -> None:
     class _Source:
         startup_timing = {
@@ -1269,6 +1521,124 @@ def test_real_teleop_camera_sources_report_serial_batch_timing() -> None:
     assert "left_wrist:" in timing_messages[0]
 
 
+def test_real_teleop_camera_best_effort_defers_bounded_retry_until_after_first_pass() -> (
+    None
+):
+    calls: list[str] = []
+
+    class _Source:
+        startup_timing = {"warmup_sec": 0.1}
+
+        def __init__(self, name: str, *, fail_first: bool = False) -> None:
+            self.name = name
+            self.config = SimpleNamespace(startup_warmup_policy="bounded_first_frame")
+            self.fail_first = fail_first
+            self.start_count = 0
+
+        def start(self) -> None:
+            self.start_count += 1
+            calls.append(f"start:{self.name}:{self.start_count}")
+            if self.fail_first and self.start_count == 1:
+                raise RuntimeError(
+                    "startup_warmup_failed:policy=bounded_first_frame:"
+                    "no_frames_within_sec=5.000:attempts=5:"
+                    "last_error=RuntimeError: Frame didn't arrive within 999"
+                )
+
+        def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+    front = _Source("front", fail_first=True)
+    left = _Source("left_wrist")
+    right = _Source("right_wrist")
+
+    with (
+        patch.object(camera_runtime.time, "sleep") as sleep_mock,
+        patch.object(camera_runtime, "_log") as log_mock,
+    ):
+        errors = camera_runtime._start_camera_sources_best_effort(
+            {"front": front, "left_wrist": left, "right_wrist": right},
+            stagger_sec=0.0,
+            deferred_retry_cooldown_sec=1.0,
+        )
+
+    assert errors == {}
+    assert calls == [
+        "start:front:1",
+        "start:left_wrist:1",
+        "start:right_wrist:1",
+        "close:front",
+        "start:front:2",
+    ]
+    sleep_mock.assert_called_once_with(1.0)
+    timing_messages = [
+        str(call_args.args[1])
+        for call_args in log_mock.call_args_list
+        if call_args.args and call_args.args[0] == "CameraTiming"
+    ]
+    assert len(timing_messages) == 1
+    assert "retry_per_camera={front:" in timing_messages[0]
+    assert "recovered=front" in timing_messages[0]
+
+
+def test_real_teleop_camera_best_effort_keeps_second_pass_failure_visible() -> None:
+    class _Source:
+        config = SimpleNamespace(startup_warmup_policy="bounded_first_frame")
+        startup_timing: dict[str, float] = {}
+
+        def start(self) -> None:
+            raise RuntimeError(
+                "startup_warmup_failed:policy=bounded_first_frame:"
+                "no_frames_within_sec=5.000:attempts=5:"
+                "last_error=RuntimeError: Frame didn't arrive within 999"
+            )
+
+        def close(self) -> None:
+            return None
+
+    with patch.object(camera_runtime.time, "sleep"):
+        errors = camera_runtime._start_camera_sources_best_effort(
+            {"right_wrist": _Source()},
+            stagger_sec=0.0,
+            deferred_retry_cooldown_sec=1.0,
+        )
+
+    assert set(errors) == {"right_wrist"}
+    assert errors["right_wrist"].startswith("deferred_startup_retry_failed:")
+    assert "first=RuntimeError: startup_warmup_failed" in errors["right_wrist"]
+    assert "retry=RuntimeError: startup_warmup_failed" in errors["right_wrist"]
+
+
+def test_real_teleop_camera_best_effort_does_not_retry_profile_failure() -> None:
+    calls: list[str] = []
+
+    class _Source:
+        config = SimpleNamespace(startup_warmup_policy="bounded_first_frame")
+        startup_timing: dict[str, float] = {}
+
+        def start(self) -> None:
+            calls.append("start")
+            raise RuntimeError("RealSense pipeline start failed: profile unsupported")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    with patch.object(camera_runtime.time, "sleep") as sleep_mock:
+        errors = camera_runtime._start_camera_sources_best_effort(
+            {"right_wrist": _Source()},
+            stagger_sec=0.0,
+            deferred_retry_cooldown_sec=1.0,
+        )
+
+    assert calls == ["start"]
+    sleep_mock.assert_not_called()
+    assert errors == {
+        "right_wrist": (
+            "RuntimeError: RealSense pipeline start failed: profile unsupported"
+        )
+    }
+
+
 def test_deploy_default_fallback_action_hz_is_15hz_for_bimanual() -> None:
     args = _parse_deploy_args(["--active-sides", "both"])
     active_sides = run_policy.validate_args(args)
@@ -1276,6 +1646,7 @@ def test_deploy_default_fallback_action_hz_is_15hz_for_bimanual() -> None:
 
     assert active_sides == ("left", "right")
     assert args.hz == DEFAULT_TELEOP_SAMPLE_HZ
+    assert args.status_sec == pytest.approx(3.0)
     assert args.position_reference_hz == 60.0
     assert args.arm_control_hz == 120.0
     assert args.position_chunk_lookahead is True
@@ -1290,12 +1661,541 @@ def test_deploy_default_fallback_action_hz_is_15hz_for_bimanual() -> None:
     )
     assert args.position_all_ik_lookahead_source_steps == 2
     assert args.position_all_ik_jerk_ramp_sec == pytest.approx(0.05)
+    assert args.position_qref_acceleration_profile == "comfort_75_v1"
+    assert args.position_qref_acceleration_scale_resolved == pytest.approx(0.75)
+    assert args.position_qref_max_acceleration_rad_s2_resolved == pytest.approx(
+        np.asarray(args.position_max_acceleration_rad_s2) * 0.75
+    )
+    assert args.position_all_ik_batched_solver_tolerance == pytest.approx(1e-6)
+    assert args.position_plan_splice_dynamics_profile == "off"
+    assert args.position_continuous_waypoint_profile == "formal_third_order"
+    assert args.position_continuous_waypoint_profile_effective == ("formal_third_order")
+    assert args.position_continuous_waypoint_shadow is False
+    assert args.position_continuous_waypoint_experimental_admission is False
+    assert args.position_continuous_waypoint_async_precompute is False
     assert args.pose_lift_profile == RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME
     assert args.position_control_profile_metadata["source_shaping_applied"] is False
     assert args.position_control_profile_metadata["source_shaping_reapplied"] is False
     assert args.position_ik_iteration_reserve_ms == pytest.approx(5.0)
     assert hz == DEFAULT_TELEOP_SAMPLE_HZ
     assert info["source"] == "cli.hz"
+
+
+def test_deploy_qref_acceleration_profile_is_isolated_from_backend_hard_limit() -> None:
+    args = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-qref-acceleration-profile",
+            "comfort_50_v1",
+        ]
+    )
+
+    run_policy.validate_args(args)
+
+    assert args.position_qref_acceleration_scale_resolved == pytest.approx(0.5)
+    assert args.position_qref_max_acceleration_rad_s2_resolved == pytest.approx(
+        np.asarray(args.position_max_acceleration_rad_s2) * 0.5
+    )
+    assert args.position_max_acceleration_rad_s2 == pytest.approx(
+        RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2
+    )
+    backends = run_policy.build_arm_backends(
+        args,
+        ("left", "right"),
+        control_hz=args.arm_control_hz,
+    )
+    for backend in backends.values():
+        assert backend.config.position_max_acceleration_rad_s2 == pytest.approx(
+            RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2
+        )
+
+
+def test_deploy_nonhard_qref_acceleration_requires_official_governor() -> None:
+    argv = [
+        "--active-sides",
+        "both",
+        "--position-path-lift-backend",
+        "pink_pose_lift",
+        "--position-qref-acceleration-profile",
+        "comfort_50_v1",
+    ]
+    args = _parse_deploy_args(argv)
+
+    with pytest.raises(
+        ValueError,
+        match="requires the effective official source all-IK",
+    ):
+        run_policy.validate_args(args, raw_argv=argv)
+
+    automatic_argv = [
+        "--active-sides",
+        "right",
+        "--position-qref-acceleration-profile",
+        "comfort_50_v1",
+    ]
+    automatic_fallback = _parse_deploy_args(automatic_argv)
+    with pytest.raises(
+        ValueError,
+        match="requires the effective official source all-IK",
+    ):
+        run_policy.validate_args(
+            automatic_fallback,
+            raw_argv=automatic_argv,
+        )
+
+
+def test_deploy_implicit_comfort_default_preserves_nonofficial_fallback() -> None:
+    args = _parse_deploy_args(["--active-sides", "right"])
+
+    run_policy.validate_args(args)
+
+    assert args.position_path_lift_backend == run_policy.PINK_POSE_LIFT_BACKEND
+    assert args.position_qref_acceleration_profile == "hard_v1"
+    assert args.position_qref_acceleration_scale_resolved == pytest.approx(1.0)
+    assert args.position_qref_max_acceleration_rad_s2_resolved == pytest.approx(
+        args.position_max_acceleration_rad_s2
+    )
+
+
+def test_deploy_official_governor_keeps_60hz_reference_above_120hz_canfd() -> None:
+    args = _parse_deploy_args(["--active-sides", "both"])
+    run_policy.validate_args(args)
+
+    assert run_policy._resolve_position_reference_and_command_hz(
+        args,
+        backend_control_hz=float(args.arm_control_hz),
+    ) == pytest.approx((60.0, 120.0))
+
+
+def test_deploy_continuous_waypoint_shadow_is_explicit_debug_only() -> None:
+    missing_debug = _parse_deploy_args(
+        ["--active-sides", "both", "--position-continuous-waypoint-shadow"]
+    )
+    with pytest.raises(ValueError, match="requires --debug"):
+        run_policy.validate_args(missing_debug)
+
+    enabled = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--debug",
+            "--position-continuous-waypoint-profile",
+            "formal_third_order",
+            "--position-continuous-waypoint-shadow",
+        ]
+    )
+    assert run_policy.validate_args(enabled) == ("left", "right")
+    assert enabled.position_continuous_waypoint_shadow is True
+    assert (
+        enabled.position_path_lift_backend
+        == run_policy.OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+    )
+
+    wrong_backend = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--debug",
+            "--position-continuous-waypoint-profile",
+            "formal_third_order",
+            "--position-continuous-waypoint-shadow",
+            "--position-path-lift-backend",
+            run_policy.PINK_POSE_LIFT_BACKEND,
+        ]
+    )
+    with pytest.raises(ValueError, match="cannot follow an automatic fallback"):
+        run_policy.validate_args(wrong_backend)
+
+    admitted = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--debug",
+            "--position-continuous-waypoint-profile",
+            "formal_third_order",
+            "--position-continuous-waypoint-experimental-admission",
+        ]
+    )
+    assert run_policy.validate_args(admitted) == ("left", "right")
+    assert admitted.position_continuous_waypoint_shadow is False
+    assert admitted.position_continuous_waypoint_experimental_admission is True
+    assert admitted.position_continuous_waypoint_async_precompute is False
+
+    async_precompute = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--debug",
+            "--position-continuous-waypoint-profile",
+            "formal_third_order",
+            "--position-continuous-waypoint-experimental-admission",
+            "--position-continuous-waypoint-async-precompute",
+        ]
+    )
+    assert run_policy.validate_args(async_precompute) == ("left", "right")
+    assert async_precompute.position_continuous_waypoint_async_precompute is True
+
+    async_without_admission = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--debug",
+            "--position-continuous-waypoint-profile",
+            "formal_third_order",
+            "--position-continuous-waypoint-async-precompute",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires .*experimental-admission"):
+        run_policy.validate_args(async_without_admission)
+
+    admission_missing_debug = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-continuous-waypoint-profile",
+            "formal_third_order",
+            "--position-continuous-waypoint-experimental-admission",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires --debug"):
+        run_policy.validate_args(admission_missing_debug)
+
+
+def test_deploy_continuous_waypoint_profile_defaults_to_formal() -> None:
+    formal = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-continuous-waypoint-profile",
+            "formal_third_order",
+        ]
+    )
+
+    assert run_policy.validate_args(formal) == ("left", "right")
+    assert formal.position_continuous_waypoint_profile_effective == (
+        "formal_third_order"
+    )
+    assert formal.position_continuous_waypoint_shadow is False
+    assert formal.position_continuous_waypoint_experimental_admission is False
+    assert formal.position_continuous_waypoint_async_precompute is False
+
+
+def test_deploy_async_c2_remains_an_explicit_atomic_research_profile() -> None:
+    missing_debug = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-continuous-waypoint-profile",
+            "async_c2",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires --debug"):
+        run_policy.validate_args(missing_debug)
+
+    argv = [
+        "--active-sides",
+        "both",
+        "--debug",
+        "--position-continuous-waypoint-profile",
+        "async_c2",
+    ]
+    experimental = _parse_deploy_args(argv)
+
+    assert run_policy.validate_args(experimental, raw_argv=argv) == (
+        "left",
+        "right",
+    )
+    assert experimental.position_continuous_waypoint_profile_effective == ("async_c2")
+    assert experimental.position_continuous_waypoint_shadow is True
+    assert experimental.position_continuous_waypoint_experimental_admission is True
+    assert experimental.position_continuous_waypoint_async_precompute is True
+
+    hardware_argv = [*argv, "--send-actions"]
+    hardware = _parse_deploy_args(hardware_argv)
+    with pytest.raises(ValueError, match="not authorized for real hardware"):
+        run_policy.validate_args(hardware, raw_argv=hardware_argv)
+
+
+def test_deploy_async_c2_cpu_isolation_is_paired_distinct_and_default_off(
+    monkeypatch,
+) -> None:
+    defaults = _parse_deploy_args(["--active-sides", "both"])
+    assert defaults.position_reference_worker_cpu is None
+    assert defaults.position_continuous_waypoint_worker_cpu is None
+    assert defaults.position_continuous_waypoint_worker_isolation == "thread"
+    assert defaults.position_worker_cpu_reservation is False
+
+    base = [
+        "--active-sides",
+        "both",
+        "--debug",
+        "--position-continuous-waypoint-profile",
+        "async_c2",
+    ]
+    one_sided = _parse_deploy_args([*base, "--position-reference-worker-cpu", "6"])
+    with pytest.raises(ValueError, match="async_c2 CPU isolation requires both"):
+        run_policy.validate_args(one_sided, raw_argv=base)
+
+    same = _parse_deploy_args(
+        [
+            *base,
+            "--position-reference-worker-cpu",
+            "6",
+            "--position-continuous-waypoint-worker-cpu",
+            "6",
+        ]
+    )
+    with pytest.raises(ValueError, match="require distinct CPUs"):
+        run_policy.validate_args(same, raw_argv=base)
+
+    monkeypatch.setattr(run_policy, "available_cpu_ids", lambda: (4, 5, 6, 7))
+    monkeypatch.setattr(
+        run_policy,
+        "cpu_thread_sibling_ids",
+        lambda cpu: (int(cpu),),
+    )
+    formal_reference_only_argv = [
+        "--active-sides",
+        "both",
+        "--position-continuous-waypoint-profile",
+        "formal_third_order",
+        "--position-reference-worker-cpu",
+        "6",
+    ]
+    formal_reference_only = _parse_deploy_args(formal_reference_only_argv)
+    assert run_policy.validate_args(
+        formal_reference_only,
+        raw_argv=formal_reference_only_argv,
+    ) == ("left", "right")
+    assert formal_reference_only.position_reference_worker_cpu == 6
+    assert formal_reference_only.position_continuous_waypoint_worker_cpu is None
+    assert formal_reference_only.position_worker_cpu_affinity_allowed == (
+        4,
+        5,
+        6,
+        7,
+    )
+
+    formal_reserved_argv = [
+        *formal_reference_only_argv,
+        "--position-worker-cpu-reservation",
+    ]
+    formal_reserved = _parse_deploy_args(formal_reserved_argv)
+    assert run_policy.validate_args(
+        formal_reserved,
+        raw_argv=formal_reserved_argv,
+    ) == ("left", "right")
+    assert formal_reserved.position_worker_cpu_reservation is True
+    assert formal_reserved.position_worker_cpu_reservation_cpu_ids == (6,)
+
+    isolated_argv = [
+        *base,
+        "--position-reference-worker-cpu",
+        "6",
+        "--position-continuous-waypoint-worker-cpu",
+        "7",
+        "--no-init-qpos",
+        "--init-time-s",
+        "0",
+        "--auto-start",
+        "--no-wait-for-ready-confirm",
+    ]
+    isolated = _parse_deploy_args(isolated_argv)
+    assert run_policy.validate_args(isolated, raw_argv=isolated_argv) == (
+        "left",
+        "right",
+    )
+    assert isolated.position_reference_worker_cpu == 6
+    assert isolated.position_continuous_waypoint_worker_cpu == 7
+    assert isolated.position_continuous_waypoint_worker_isolation == "thread"
+    assert isolated.position_worker_cpu_affinity_allowed == (4, 5, 6, 7)
+    assert isolated.no_init_qpos is True
+    assert isolated.init_time_s == pytest.approx(0.0)
+    assert isolated.auto_start is True
+    assert isolated.wait_for_ready_confirm is False
+
+    no_debug_soak_argv = [
+        "--active-sides",
+        "both",
+        "--position-continuous-waypoint-profile",
+        "async_c2",
+        "--position-continuous-waypoint-no-debug-deadline-soak",
+        "--position-reference-worker-cpu",
+        "6",
+        "--position-continuous-waypoint-worker-cpu",
+        "7",
+        "--no-init-qpos",
+        "--init-time-s",
+        "0",
+        "--auto-start",
+        "--no-wait-for-ready-confirm",
+        "--max-steps",
+        "900",
+    ]
+    no_debug_soak = _parse_deploy_args(no_debug_soak_argv)
+    assert run_policy.validate_args(
+        no_debug_soak,
+        raw_argv=no_debug_soak_argv,
+    ) == ("left", "right")
+    assert no_debug_soak.debug is False
+    assert no_debug_soak.send_actions is False
+    assert no_debug_soak.position_continuous_waypoint_profile_effective == "async_c2"
+
+    process_soak_argv = [
+        *no_debug_soak_argv,
+        "--position-continuous-waypoint-worker-isolation",
+        "process",
+    ]
+    process_soak = _parse_deploy_args(process_soak_argv)
+    assert run_policy.validate_args(
+        process_soak,
+        raw_argv=process_soak_argv,
+    ) == ("left", "right")
+    assert process_soak.position_continuous_waypoint_worker_isolation == ("process")
+
+    reserved_process_soak_argv = [
+        *process_soak_argv,
+        "--position-worker-cpu-reservation",
+    ]
+    reserved_process_soak = _parse_deploy_args(reserved_process_soak_argv)
+    assert run_policy.validate_args(
+        reserved_process_soak,
+        raw_argv=reserved_process_soak_argv,
+    ) == ("left", "right")
+    assert reserved_process_soak.position_worker_cpu_reservation is True
+    assert reserved_process_soak.position_worker_cpu_reservation_cpu_ids == (
+        6,
+        7,
+    )
+
+    thread_reservation_argv = [
+        *no_debug_soak_argv,
+        "--position-worker-cpu-reservation",
+    ]
+    thread_reservation = _parse_deploy_args(thread_reservation_argv)
+    with pytest.raises(ValueError, match="worker-isolation process is required"):
+        run_policy.validate_args(
+            thread_reservation,
+            raw_argv=thread_reservation_argv,
+        )
+
+    formal_process_argv = [
+        "--active-sides",
+        "both",
+        "--position-continuous-waypoint-worker-isolation",
+        "process",
+    ]
+    formal_process = _parse_deploy_args(formal_process_argv)
+    with pytest.raises(ValueError, match="requires async_c2 precompute"):
+        run_policy.validate_args(
+            formal_process,
+            raw_argv=formal_process_argv,
+        )
+
+    hardware_soak_argv = [*no_debug_soak_argv, "--send-actions"]
+    hardware_soak = _parse_deploy_args(hardware_soak_argv)
+    with pytest.raises(ValueError, match="--send-actions is forbidden"):
+        run_policy.validate_args(hardware_soak, raw_argv=hardware_soak_argv)
+
+    unbounded_soak_argv = [
+        value for value in no_debug_soak_argv if value not in {"--max-steps", "900"}
+    ]
+    unbounded_soak = _parse_deploy_args(unbounded_soak_argv)
+    with pytest.raises(ValueError, match="--max-steps must be in"):
+        run_policy.validate_args(unbounded_soak, raw_argv=unbounded_soak_argv)
+
+
+def test_deploy_arm_hold_artifact_uses_semantics_safe_non_lookahead_path() -> None:
+    args = _parse_deploy_args(["--active-sides", "both"])
+
+    assert run_policy.validate_args(
+        args,
+        policy_artifact_has_arm_hold_output=True,
+    ) == ("left", "right")
+    assert args.position_chunk_lookahead is False
+    assert args.position_path_lift_backend == run_policy.PINK_POSE_LIFT_BACKEND
+    assert args.position_continuous_waypoint_profile_effective == ("formal_third_order")
+    assert args.position_continuous_waypoint_shadow is False
+    assert args.position_continuous_waypoint_experimental_admission is False
+    assert args.position_continuous_waypoint_async_precompute is False
+
+    explicit_argv = [
+        "--active-sides",
+        "both",
+        "--debug",
+        "--position-continuous-waypoint-profile",
+        "async_c2",
+    ]
+    explicit = _parse_deploy_args(explicit_argv)
+    with pytest.raises(ValueError, match="async_c2 requires the effective"):
+        run_policy.validate_args(
+            explicit,
+            raw_argv=explicit_argv,
+            policy_artifact_has_arm_hold_output=True,
+        )
+
+
+def test_deploy_all_ik_batched_tolerance_has_explicit_rollback() -> None:
+    rollback = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-all-ik-batched-solver-tolerance",
+            "1e-4",
+        ]
+    )
+    assert run_policy.validate_args(rollback) == ("left", "right")
+    assert rollback.position_all_ik_batched_solver_tolerance == pytest.approx(1e-4)
+
+    invalid = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-all-ik-batched-solver-tolerance",
+            "2e-4",
+        ]
+    )
+    with pytest.raises(ValueError, match="must be <= 1e-4"):
+        run_policy.validate_args(invalid)
+
+
+def test_deploy_plan_splice_dynamics_profile_is_opt_in_and_bounded() -> None:
+    enabled = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-plan-splice-dynamics-profile",
+            "conservative_v1",
+        ]
+    )
+    assert run_policy.validate_args(enabled) == ("left", "right")
+
+    disabled_governor = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-plan-splice-dynamics-profile",
+            "conservative_v1",
+            "--no-position-plan-splice-governor",
+            "--no-position-stream-start-acquisition",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires --position-plan-splice-governor"):
+        run_policy.validate_args(disabled_governor)
+
+    pink_backend = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-plan-splice-dynamics-profile",
+            "conservative_v1",
+            "--position-path-lift-backend",
+            run_policy.PINK_POSE_LIFT_BACKEND,
+        ]
+    )
+    with pytest.raises(ValueError, match="requires the official source all-IK"):
+        run_policy.validate_args(pink_backend)
 
 
 def test_deploy_position_chunk_lookahead_has_explicit_rollback_switch() -> None:
@@ -1306,6 +2206,45 @@ def test_deploy_position_chunk_lookahead_has_explicit_rollback_switch() -> None:
 
     assert args.position_chunk_lookahead is False
     assert args.position_path_lift_backend == run_policy.PINK_POSE_LIFT_BACKEND
+    assert args.position_continuous_waypoint_profile_effective == ("formal_third_order")
+    assert args.position_continuous_waypoint_experimental_admission is False
+    assert args.position_continuous_waypoint_async_precompute is False
+
+    explicit_c2_argv = [
+        "--active-sides",
+        "both",
+        "--debug",
+        "--no-position-chunk-lookahead",
+        "--position-continuous-waypoint-profile",
+        "async_c2",
+    ]
+    explicit_c2 = _parse_deploy_args(explicit_c2_argv)
+    with pytest.raises(ValueError, match="async_c2 requires the effective"):
+        run_policy.validate_args(explicit_c2, raw_argv=explicit_c2_argv)
+
+
+def test_deploy_disabled_collision_cannot_accidentally_enable_async_c2() -> None:
+    args = _parse_deploy_args(
+        ["--active-sides", "both", "--no-position-collision-check"]
+    )
+
+    assert run_policy.validate_args(args) == ("left", "right")
+    assert args.position_path_lift_backend == run_policy.PINK_POSE_LIFT_BACKEND
+    assert args.position_continuous_waypoint_profile_effective == ("formal_third_order")
+    assert args.position_continuous_waypoint_experimental_admission is False
+    assert args.position_continuous_waypoint_async_precompute is False
+
+    explicit_argv = [
+        "--active-sides",
+        "both",
+        "--debug",
+        "--no-position-collision-check",
+        "--position-continuous-waypoint-profile",
+        "async_c2",
+    ]
+    explicit = _parse_deploy_args(explicit_argv)
+    with pytest.raises(ValueError, match="async_c2 requires the effective"):
+        run_policy.validate_args(explicit, raw_argv=explicit_argv)
 
 
 def test_deploy_qp_constrained_pose_lift_allows_hardware_and_v1_is_rollback() -> None:
@@ -1382,11 +2321,16 @@ def test_deploy_dry_run_arm_backend_uses_position_control_default() -> None:
     args = _parse_deploy_args(["--active-sides", "right"])
     active_sides = run_policy.validate_args(args)
 
-    backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
+    backends = run_policy.build_arm_backends(
+        args, active_sides, control_hz=args.arm_control_hz
+    )
 
     assert args.arm_control_mode == "position"
     assert backends["right"].config.control_dt == 1.0 / 60.0
     assert backends["right"].config.background_streaming_hz == 120.0
+    assert backends["right"].config.background_streaming_target_admission_mode == (
+        RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+    )
     assert backends["right"].config.canfd_follow is True
 
 
@@ -1404,23 +2348,32 @@ def test_collect_position_backend_uses_reference_dt_and_stream_control_hz() -> N
         rm65_ik_framework="robot_motion",
     )
 
-    with patch.object(run_collect, "require_asset_path", return_value="rm65_arm.urdf"), patch.object(
-        run_collect,
-        "RM65ArmBackend",
-        side_effect=lambda config: SimpleNamespace(config=config),
+    with (
+        patch.object(run_collect, "require_asset_path", return_value="rm65_arm.urdf"),
+        patch.object(
+            run_collect,
+            "RM65ArmBackend",
+            side_effect=lambda config: SimpleNamespace(config=config),
+        ),
     ):
         all_backends, _rig_backends = run_collect._build_backends(args, ("right",))
 
     backend = all_backends["right_arm"]
     assert backend.config.control_dt == 1.0 / DEFAULT_TELEOP_POSITION_REFERENCE_HZ
-    assert backend.config.background_streaming_hz == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    assert (
+        backend.config.background_streaming_hz == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    )
 
 
 def test_deploy_impedance_arm_backend_uses_40hz_no_follow_default() -> None:
-    args = _parse_deploy_args(["--active-sides", "right", "--arm-control-mode", "impedance"])
+    args = _parse_deploy_args(
+        ["--active-sides", "right", "--arm-control-mode", "impedance"]
+    )
     active_sides = run_policy.validate_args(args)
 
-    backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
+    backends = run_policy.build_arm_backends(
+        args, active_sides, control_hz=args.arm_control_hz
+    )
 
     assert args.arm_control_hz == DEFAULT_RM65_ARM_CONTROL_HZ
     assert args.arm_canfd_follow is False
@@ -1458,9 +2411,12 @@ def test_deploy_impedance_arm_backend_uses_40hz_no_follow_default() -> None:
         rollback_sides,
         control_hz=rollback_args.arm_control_hz,
     )
-    assert rollback_backends["right"].config.impedance_overrides[
-        "deployment_full_ik_preempts_local"
-    ] is True
+    assert (
+        rollback_backends["right"].config.impedance_overrides[
+            "deployment_full_ik_preempts_local"
+        ]
+        is True
+    )
 
 
 def test_deploy_named_execution_profiles_use_shared_real_config_resolver() -> None:
@@ -1476,8 +2432,7 @@ def test_deploy_named_execution_profiles_use_shared_real_config_resolver() -> No
     assert impedance_args.arm_control_hz == 40.0
     assert impedance_args.arm_canfd_follow is False
     assert (
-        impedance_args._real_arm_execution_config.resolved_profile
-        == "impedance_40hz"
+        impedance_args._real_arm_execution_config.resolved_profile == "impedance_40hz"
     )
 
     position_argv = [
@@ -1492,10 +2447,7 @@ def test_deploy_named_execution_profiles_use_shared_real_config_resolver() -> No
     assert position_args.position_reference_hz == 60.0
     assert position_args.arm_control_hz == 120.0
     assert position_args.arm_canfd_follow is True
-    assert (
-        position_args._real_arm_execution_config.resolved_profile
-        == "position"
-    )
+    assert position_args._real_arm_execution_config.resolved_profile == "position"
 
 
 def test_deploy_named_profile_rejects_conflicting_explicit_mode() -> None:
@@ -1522,7 +2474,9 @@ def test_deploy_position_can_disable_canfd_follow() -> None:
     )
     active_sides = run_policy.validate_args(args)
 
-    backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
+    backends = run_policy.build_arm_backends(
+        args, active_sides, control_hz=args.arm_control_hz
+    )
 
     assert args.arm_control_hz == 120.0
     assert args.arm_canfd_follow is False
@@ -1534,7 +2488,9 @@ def test_deploy_arm_limits_match_real_teleop_defaults() -> None:
     args = _parse_deploy_args(["--active-sides", "right"])
     active_sides = run_policy.validate_args(args)
 
-    backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
+    backends = run_policy.build_arm_backends(
+        args, active_sides, control_hz=args.arm_control_hz
+    )
 
     assert args.arm_max_angvel == RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
     assert args.arm_step_dt_scaling is True
@@ -1544,23 +2500,78 @@ def test_deploy_arm_limits_match_real_teleop_defaults() -> None:
         args.arm_step_dt_max_scale,
         max(
             run_policy.DEPLOY_ARM_STEP_DT_MAX_SCALE,
-            120.0
-            / 60.0
-            * 1.1,
+            120.0 / 60.0 * 1.1,
         ),
     )
     assert args.arm_step_dt_max_scale_auto is True
     assert np.isclose(args.max_arm_joint_step_rad, np.deg2rad(6.0))
     assert (
-        backends["right"].config.max_angvel
-        == RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
+        backends["right"].config.max_angvel == RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
     )
     assert backends["right"].config.position_command_planner == "acceleration_limited"
     assert backends["right"].config.position_target_velocity_filter_tau_sec == 0.03
     assert backends["right"].config.position_max_command_step_deg == 0.675
     assert backends["right"].config.arm_follow_qpos_alpha == 0.9
     assert backends["right"].config.use_actual_send_dt_scaling is True
-    assert backends["right"].config.actual_send_dt_max_scale == args.arm_step_dt_max_scale
+    assert (
+        backends["right"].config.actual_send_dt_max_scale == args.arm_step_dt_max_scale
+    )
+
+
+def test_deploy_position_force_guard_defaults_fail_closed() -> None:
+    args = _parse_deploy_args([])
+
+    assert args.position_force_guard is True
+    assert args.position_force_guard_source == "tool"
+    assert args.position_force_guard_max_force_n == pytest.approx(30.0)
+    assert args.position_force_guard_max_torque_nm == pytest.approx(5.0)
+    assert args.position_force_guard_hz == pytest.approx(20.0)
+    assert args.position_force_guard_consecutive_samples == 1
+    assert args.position_force_guard_max_read_errors == 3
+    assert args.position_force_guard_stale_sec == pytest.approx(0.4)
+
+
+def test_deploy_position_force_guard_rejects_unsafe_poll_rate_before_hardware() -> None:
+    args = _parse_deploy_args(["--position-force-guard-hz", "20.1"])
+
+    with pytest.raises(ValueError, match="poll_hz must be <= 20 Hz"):
+        run_policy.validate_args(args)
+
+
+def test_deploy_ctrl_c_requests_arm_stop_only_for_real_position_output() -> None:
+    args = SimpleNamespace(
+        arms_enabled=True,
+        arm_control_mode="position",
+    )
+    backends = {"left": object(), "right": object()}
+
+    with patch.object(
+        run_policy,
+        "emergency_stop_deploy_arm_backends",
+    ) as emergency_stop:
+        assert (
+            run_policy.emergency_stop_position_deploy_on_keyboard_interrupt(
+                args,
+                send_actions=True,
+                arm_backends=backends,
+            )
+            is True
+        )
+        emergency_stop.assert_called_once_with(
+            backends,
+            reason="keyboard_interrupt",
+        )
+
+        emergency_stop.reset_mock()
+        assert (
+            run_policy.emergency_stop_position_deploy_on_keyboard_interrupt(
+                args,
+                send_actions=False,
+                arm_backends=backends,
+            )
+            is False
+        )
+        emergency_stop.assert_not_called()
 
 
 def test_deploy_arm_step_dt_max_scale_auto_follows_position_reference_rate() -> None:
@@ -1576,11 +2587,15 @@ def test_deploy_arm_step_dt_max_scale_auto_follows_position_reference_rate() -> 
     )
     active_sides = run_policy.validate_args(args)
 
-    backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
+    backends = run_policy.build_arm_backends(
+        args, active_sides, control_hz=args.arm_control_hz
+    )
 
     assert args.arm_step_dt_max_scale == run_policy.DEPLOY_ARM_STEP_DT_MAX_SCALE
     assert args.arm_step_dt_max_scale_auto is True
-    assert backends["right"].config.actual_send_dt_max_scale == args.arm_step_dt_max_scale
+    assert (
+        backends["right"].config.actual_send_dt_max_scale == args.arm_step_dt_max_scale
+    )
 
 
 def test_deploy_arm_step_dt_max_scale_keeps_explicit_value() -> None:
@@ -1627,7 +2642,10 @@ def test_deploy_policy_arm_command_limit_uses_action_dt() -> None:
     expected = np.asarray(RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S) / 15.0
     actual = command.commands["right_arm"].metadata["max_joint_step_rad"]
     assert np.allclose(actual, expected)
-    assert command.commands["right_arm"].metadata["deploy_action_step_dt_sec"] == 1.0 / 15.0
+    assert (
+        command.commands["right_arm"].metadata["deploy_action_step_dt_sec"]
+        == 1.0 / 15.0
+    )
     assert command.commands["right_arm"].metadata["deploy_backend_control_dt_sec"] == (
         1.0 / 60.0
     )
@@ -1670,6 +2688,8 @@ def test_deploy_arm_backend_accepts_qpos_init_singularity_slowdown() -> None:
     )
     active_sides = run_policy.validate_args(args)
 
-    backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
+    backends = run_policy.build_arm_backends(
+        args, active_sides, control_hz=args.arm_control_hz
+    )
 
     assert backends["right"].config.singularity_qpos_init_slowdown == 0.35

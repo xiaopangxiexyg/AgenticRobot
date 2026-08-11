@@ -4,7 +4,9 @@ import pytest
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import (
+    EXECUTION_OBSERVATION_PLAN_HASH_DOMAIN,
     ExecutionMeasurementObservation,
     ExecutionObservationCapabilitySpec,
     ExecutionObservationPlan,
@@ -57,6 +59,18 @@ def test_execution_observation_plan_is_default_off_and_demand_bounded() -> None:
     assert decimated.reference_mode == "decimated_frames"
     assert decimated.maximum_reference_publish_hz == 20.0
     assert disabled.semantic_content_hash != decimated.semantic_content_hash
+    assert disabled.semantic_content_hash == canonical_content_hash(
+        {
+            "plan_id": "execution-observation:off",
+            "reference_mode": "off",
+            "measurement_mode": "off",
+            "component_ids": (),
+            "maximum_reference_publish_hz": None,
+            "maximum_measurement_publish_hz": None,
+            "include_debug_lineage": False,
+        },
+        domain=EXECUTION_OBSERVATION_PLAN_HASH_DOMAIN,
+    )
 
     with pytest.raises(ValueError, match="requires maximum"):
         ExecutionObservationPlan(
@@ -137,6 +151,51 @@ def test_non_off_plan_requires_exact_capability_binding() -> None:
             ExecutionObservationPlan(plan_id="execution-observation:off"),
             capability,
             bound_at=9.0,
+        )
+
+
+def test_observation_plan_can_require_an_exact_component_representation() -> None:
+    capability = _capability()
+    joint_plan = ExecutionObservationPlan(
+        plan_id="execution-observation:joint-position",
+        reference_mode="full_frames",
+        measurement_mode="full_frames",
+        component_ids=("right_arm",),
+        required_representation_by_component={
+            "right_arm": "joint_position",
+        },
+    )
+    binding = bind_execution_observation_plan(
+        joint_plan,
+        capability,
+        bound_at=9.0,
+    )
+    assert binding.component_ids == ("right_arm",)
+
+    pose_plan = ExecutionObservationPlan(
+        plan_id="execution-observation:cartesian-pose",
+        reference_mode="full_frames",
+        measurement_mode="full_frames",
+        component_ids=("right_arm",),
+        required_representation_by_component={
+            "right_arm": "cartesian_pose",
+        },
+    )
+    with pytest.raises(ValueError, match="requested component representations"):
+        bind_execution_observation_plan(
+            pose_plan,
+            capability,
+            bound_at=9.0,
+        )
+
+    with pytest.raises(ValueError, match="cover exactly"):
+        ExecutionObservationPlan(
+            plan_id="execution-observation:partial-representation",
+            reference_mode="full_frames",
+            component_ids=("left_arm", "right_arm"),
+            required_representation_by_component={
+                "right_arm": "cartesian_pose",
+            },
         )
 
 

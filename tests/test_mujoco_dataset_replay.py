@@ -146,6 +146,7 @@ def test_debug_qpos_runner_is_explicit_and_uses_shared_position_rates() -> None:
     assert alias_args.control_hz == pytest.approx(137.0)
 
 
+@pytest.mark.integration
 def test_source_dataset_intrinsics_override_front_camera_fovy() -> None:
     if not DATASET.exists():
         pytest.skip(f"Local replay dataset not found: {DATASET}")
@@ -162,6 +163,7 @@ def test_source_dataset_intrinsics_override_front_camera_fovy() -> None:
     assert by_name["front"].intrinsics["fy"] == pytest.approx(605.2217, abs=1e-3)
 
 
+@pytest.mark.optional
 def test_dataset_qpos_can_drive_mujoco_scene_first_frame() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("pyarrow")
@@ -189,6 +191,7 @@ def test_dataset_qpos_can_drive_mujoco_scene_first_frame() -> None:
     np.testing.assert_allclose(result["right"], sample.qpos_by_side["right"])
 
 
+@pytest.mark.optional
 def test_qpos_replay_runner_no_render_smoke(capsys: pytest.CaptureFixture[str]) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("pyarrow")
@@ -226,6 +229,7 @@ def test_qpos_replay_runner_no_render_smoke(capsys: pytest.CaptureFixture[str]) 
     assert '"processed_action_frames": 2' in captured.out
 
 
+@pytest.mark.optional
 def test_qpos_replay_exports_lerobot_style_sim_dataset(
     tmp_path: Path,
 ) -> None:

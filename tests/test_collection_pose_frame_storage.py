@@ -374,6 +374,7 @@ def test_v23_causal_validator_rejects_future_hand_snapshot() -> None:
         validate_v23_row_causal_snapshots(row)
 
 
+@pytest.mark.optional
 def test_native_v23_dataset_acceptance_scan(tmp_path) -> None:
     pytest.importorskip("pyarrow")
     contract = PoseFrameContract.v23_forced_raw(_source())

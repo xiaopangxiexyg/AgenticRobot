@@ -12,6 +12,7 @@ from control_station.composition import (
     build_component_keyed_mujoco_sim_hil_contracts,
 )
 import numpy as np
+import pytest
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     ArmActionSpec,
@@ -25,6 +26,7 @@ from sim.mujoco.deploy import (
     MujocoComponentActionRobotActionV1Materializer,
     MujocoRobotActionV1ComponentIngressAdapter,
     build_mujoco_component_execution_binding,
+    build_mujoco_pose_component_target_profile,
     build_mujoco_pose_qpos_component_target_profile,
     build_rm65_right_cube_lift_component_target_profile,
     build_mujoco_sim_hil_target,
@@ -129,6 +131,57 @@ def test_generic_profile_cardinality_is_declared_by_maps_not_side_constants() ->
         "primary_tool",
         "support_tool",
     )
+
+
+def test_arms_only_profile_exposes_right_tcp_without_a_hand_component() -> None:
+    profile = build_mujoco_pose_component_target_profile(
+        _scene(),
+        profile_id="fixture.right_arm_only_pose",
+        arm_side_by_component={"right_arm": "right"},
+        arm_reference_frame_by_component={"right_arm": "right_arm_base"},
+        arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
+        selection_group_by_component={"right_arm": "arms"},
+    )
+
+    assert profile.action_schema.component_ids == ("right_arm",)
+    assert profile.arm_side_by_component == {"right_arm": "right"}
+    assert profile.gripper_name_by_component == {}
+    assert profile.action_schema.semantic_parameters[
+        "canonical_end_effector_representation"
+    ] == "none"
+
+    materializer = MujocoComponentActionRobotActionV1Materializer(
+        _scene(),
+        profile,
+        hand_action_spec_by_component={},
+        support_arm_pose_provider=lambda: {
+            "left": np.asarray(
+                [0.3, 0.2, 0.4, 0.0, 0.0, 0.0, 1.0],
+                dtype=np.float32,
+            )
+        },
+        support_arm_sides=("left",),
+        support_pose_contract_id="fixture.measured-left-support.v1",
+    )
+    target = materializer(
+        ComponentAction(
+            action_schema=profile.action_schema,
+            values_by_component={
+                "right_arm": np.asarray(
+                    [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0],
+                    dtype=np.float32,
+                )
+            },
+        ),
+        timestamp=1.0,
+        source="agent_skill",
+    )
+    binding = build_mujoco_component_execution_binding(profile, materializer)
+
+    assert target.active_effectors == ("left_arm", "right_arm")
+    assert target.hand_qpos_by_side == {}
+    assert binding.output_effector_by_component == {"right_arm": "right_arm"}
+    assert binding.support_only_output_effectors == ("left_arm",)
 
 
 def test_component_keyed_sim_hil_contract_uses_schema_and_observe_only_pose_gate() -> None:
@@ -360,6 +413,9 @@ def test_native_component_profile_reaches_one_atomic_mujoco_target() -> None:
             "human": profile.action_schema,
             "policy": profile.action_schema,
         },
+    )
+    assert target.runtime.config.target_admission_margin_sec == pytest.approx(
+        target_config.target_admission_margin_sec
     )
     current_pose = pose_matrix_to_xyzquat(
         capture_mujoco_sim_hil_tool_tcp_pose_by_side(

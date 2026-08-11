@@ -23,6 +23,9 @@ from teleop_runtime.action.human_shadow_frontend import (
 )
 
 
+pytestmark = pytest.mark.integration
+
+
 def _command(value: float = 0.1) -> TeleopCommand:
     pose = np.eye(4, dtype=np.float64)
     pose[0, 3] = value

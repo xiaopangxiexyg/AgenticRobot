@@ -75,6 +75,9 @@ def test_scheduled_profile_uses_keyframe_period_plus_reference_margin() -> None:
     assert spec.required_admission_deadline == "before_segment_start"
     assert spec.late_admission_policy == "reject_and_hold"
     assert spec.anchor_commit_policy == "endpoint_effective_time"
+    assert spec.late_tick_recovery_policy == (
+        "skip_to_next_legal_reference_tick"
+    )
 
 
 def test_scheduled_profile_rejects_insufficient_lead_or_margin() -> None:

@@ -54,6 +54,7 @@ def test_isolated_drop_keeps_only_contract_ground_table_and_object() -> None:
     assert scene.object_spec == contract.scene.objects[0]
 
 
+@pytest.mark.optional
 def test_isolated_contract_cube_falls_and_settles_on_urdf_table() -> None:
     mujoco = pytest.importorskip("mujoco")
     contract = SimulationContract.load(CONTRACT_PATH)

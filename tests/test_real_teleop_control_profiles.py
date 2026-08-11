@@ -19,6 +19,8 @@ from robot_motion.position_control import (
     POSITION_60_120_PROFILE,
     POSITION_PROFILE,
     PositionControlRates,
+    SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
+    SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET,
 )
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.position_control import (
@@ -218,6 +220,111 @@ def test_sample_aligned_jerk_v2_resolves_convergence_and_governor_contract() -> 
     )
 
 
+def test_sample_aligned_jerk_v3_resolves_nullspace_smoothing_contract() -> None:
+    enabled = _parse_real_teleop_args(
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_sample_aligned_jerk_v3",
+            "--arm-control-mode",
+            "position",
+        ]
+    )
+
+    assert (
+        enabled.position_sample_aligned_reference_mode
+        == "linear_hold_nullspace_smooth"
+    )
+    assert enabled.position_sample_aligned_observer_stop_threshold_deg == pytest.approx(
+        0.01
+    )
+    assert enabled.position_sample_aligned_observer_stop_velocity_decay == pytest.approx(
+        0.0
+    )
+    assert enabled.position_sample_aligned_observer_window == 4
+    assert enabled.position_sample_aligned_observer_efficiency_power == pytest.approx(
+        2.0
+    )
+    assert enabled.position_sample_aligned_observer_velocity_ema_alpha == pytest.approx(
+        0.5
+    )
+    assert enabled.position_sample_aligned_observer_velocity_cap_scale == pytest.approx(
+        0.5
+    )
+    assert enabled.position_sample_aligned_observer_coherence_min == pytest.approx(0.5)
+    assert enabled.position_sample_aligned_observer_speed_guard_scale == pytest.approx(
+        0.4
+    )
+    assert (
+        enabled.position_sample_aligned_terminal_velocity_displacement_scale
+        == pytest.approx(0.75)
+    )
+    assert (
+        enabled.position_sample_aligned_initial_jerk_delta_regularization
+        == pytest.approx(0.0)
+    )
+
+
+def test_balanced_60hz_jerk_profile_preserves_ik_and_separates_execution_clock() -> None:
+    balanced = _parse_real_teleop_args(
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_balanced",
+            "--arm-control-mode",
+            "position",
+        ]
+    )
+    enabled = _parse_real_teleop_args(
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_balanced_60hz_jerk_v1",
+            "--arm-control-mode",
+            "position",
+        ]
+    )
+    optimized = _parse_real_teleop_args(
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_v2_balanced_60hz_jerk_v2",
+            "--arm-control-mode",
+            "position",
+        ]
+    )
+
+    assert enabled.hz == pytest.approx(15.0)
+    assert enabled.position_reference_hz == pytest.approx(60.0)
+    assert enabled.dual_arm_ik_hz == pytest.approx(60.0)
+    assert enabled.arm_control_hz == pytest.approx(120.0)
+    assert enabled.position_sample_aligned_source_hz == pytest.approx(60.0)
+    assert enabled.position_sample_aligned_source_latch_mode == (
+        SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET
+    )
+    assert optimized.position_sample_aligned_source_latch_mode == (
+        SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP
+    )
+    assert enabled.position_sample_aligned_horizon_source_steps == 2
+    assert enabled.position_sample_aligned_safety_horizon_source_steps == 20
+    assert enabled.position_command_planner == (
+        POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+    )
+    assert enabled.position_sample_aligned_jerk_delta_regularization == pytest.approx(
+        1e-4
+    )
+    for attr in (
+        "position_ik_orientation_weight",
+        "position_ik_solve_min_iterations",
+        "position_ik_solve_max_iterations",
+        "position_ik_damping",
+        "position_ik_adaptive_iterations",
+        "position_ik_iteration_reserve_ms",
+        "position_ik_candidate_certification_reserve_ms",
+        "position_ik_local_step_clip_scale",
+        "position_joint_velocity_limit_profile",
+        "position_post_ik_qpos_normal_fast_path_alpha",
+    ):
+        assert getattr(enabled, attr) == getattr(balanced, attr)
+        assert getattr(optimized, attr) == getattr(balanced, attr)
+
+
 def test_formal_collection_process_is_position_auto_only_with_thread_rollback() -> None:
     impedance = _parse_real_teleop_args([])
     assert impedance.collection_worker_mode == "auto"
@@ -257,6 +364,430 @@ def test_dmtac_tactile_worker_cpu_affinity_accepts_two_core_profile() -> None:
 def test_dataset_root_rejects_explicit_empty_string() -> None:
     with pytest.raises(SystemExit):
         _parse_real_teleop_args(["--dataset-root", ""])
+
+
+def test_position_admittance_requires_coupled_dual_arm_topology(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    common = [
+        "--position-control-profile",
+        "rm65_bimanual_position_v1",
+        "--arm-control-mode",
+        "position",
+        "--position-force-guard",
+        "--position-force-guard-source",
+        "tool",
+    ]
+
+    shadow = _parse_real_teleop_args(
+        [*common, "--active-sides", "both", "--position-admittance-shadow"]
+    )
+    assert shadow.active_sides == ("left", "right")
+    assert shadow.position_admittance_shadow is True
+
+    rotation_shadow = _parse_real_teleop_args(
+        [
+            *common,
+            "--active-sides",
+            "both",
+            "--position-admittance-shadow",
+            "--position-admittance-rotation-shadow",
+            "--position-admittance-rotation-shadow-profile",
+            "balanced-5deg",
+        ]
+    )
+    assert rotation_shadow.position_admittance_rotation_shadow is True
+    assert (
+        rotation_shadow.position_admittance_rotation_shadow_profile
+        == "balanced-5deg"
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *common,
+                "--active-sides",
+                "both",
+                "--position-admittance-shadow",
+                "--position-admittance-translation-response-weight",
+                "2",
+            ]
+        )
+    assert "requires profile_compliance" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *common,
+                "--active-sides",
+                "both",
+                "--position-admittance-rotation-shadow",
+            ]
+        )
+    assert "requires --position-admittance-shadow" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *common,
+                "--active-sides",
+                "both",
+                "--position-admittance-rotation-shadow-profile",
+                "balanced-5deg",
+            ]
+        )
+    assert "requires --position-admittance-rotation-shadow" in capsys.readouterr().err
+
+    cautious_active_args = [
+        *common,
+        "--active-sides",
+        "both",
+        "--position-admittance-active",
+        "--position-admittance-active-side",
+        "left",
+        "--position-admittance-response-model",
+        "profile_compliance",
+        "--position-admittance-shadow-max-offset-m",
+        "0.002",
+        "--position-admittance-shadow-max-velocity-m-s",
+        "0.005",
+        "--position-admittance-shadow-max-return-velocity-m-s",
+        "0.005",
+        "--position-admittance-shadow-max-slew-m-s",
+        "0.005",
+        "--position-admittance-shadow-stale-sec",
+        "0.15",
+        "--position-admittance-shadow-max-force-dt-sec",
+        "0.15",
+    ]
+    active = _parse_real_teleop_args(cautious_active_args)
+    assert active.position_admittance_active is True
+    assert active.position_admittance_active_side == "left"
+    assert active.position_admittance_active_envelope == "cautious"
+    assert (
+        active.position_admittance_active_endpoint_policy
+        == "runtime_home_hold"
+    )
+    assert active.position_admittance_active_max_tool_excursion_m == pytest.approx(
+        0.08
+    )
+
+    rotation_active_args = [
+        *cautious_active_args,
+        "--position-admittance-rotation-active",
+        "--position-admittance-rotation-active-profile",
+        "cautious-3deg",
+        "--position-admittance-active-max-tool-rotation-excursion-deg",
+        "3.5",
+    ]
+    rotation_active = _parse_real_teleop_args(rotation_active_args)
+    assert rotation_active.position_admittance_rotation_active is True
+    assert rotation_active.position_admittance_combined_active is False
+    assert (
+        rotation_active.position_admittance_rotation_active_profile
+        == "cautious-3deg"
+    )
+    assert (
+        rotation_active.position_admittance_active_max_tool_rotation_excursion_deg
+        == pytest.approx(3.5)
+    )
+
+    combined_active = _parse_real_teleop_args(
+        [*rotation_active_args, "--position-admittance-combined-active"]
+    )
+    assert combined_active.position_admittance_rotation_active is True
+    assert combined_active.position_admittance_combined_active is True
+
+    normal_combined_args = [
+        *rotation_active_args,
+        "--position-admittance-combined-active",
+        "--position-admittance-active-envelope",
+        "normal_parity",
+        "--position-admittance-shadow-max-offset-m",
+        "0.08",
+        "--position-admittance-shadow-max-velocity-m-s",
+        "0.06",
+        "--position-admittance-shadow-max-return-velocity-m-s",
+        "0.03",
+        "--position-admittance-shadow-max-slew-m-s",
+        "0.06",
+        "--position-admittance-rotation-active-profile",
+        "balanced-5deg",
+        "--position-admittance-active-max-tool-rotation-excursion-deg",
+        "5.5",
+    ]
+    normal_combined = _parse_real_teleop_args(normal_combined_args)
+    assert normal_combined.position_admittance_active_envelope == "normal_parity"
+    assert normal_combined.position_admittance_shadow_max_offset_m == pytest.approx(
+        0.08
+    )
+    assert normal_combined.position_admittance_shadow_max_velocity_m_s == pytest.approx(
+        0.06
+    )
+    assert normal_combined.position_admittance_rotation_active_profile == (
+        "balanced-5deg"
+    )
+    assert (
+        normal_combined.position_admittance_active_max_tool_rotation_excursion_deg
+        == pytest.approx(5.5)
+    )
+
+    formal_teleop = _parse_real_teleop_args(
+        [
+            *normal_combined_args,
+            "--position-admittance-active-endpoint-policy",
+            "formal_teleop",
+        ]
+    )
+    assert (
+        formal_teleop.position_admittance_active_endpoint_policy
+        == "formal_teleop"
+    )
+
+    dual_formal_args = list(normal_combined_args)
+    active_side_index = dual_formal_args.index(
+        "--position-admittance-active-side"
+    )
+    dual_formal_args[active_side_index + 1] = "both"
+    dual_formal = _parse_real_teleop_args(
+        [
+            *dual_formal_args,
+            "--position-admittance-active-endpoint-policy",
+            "formal_teleop",
+            "--no-fix-arm",
+        ]
+    )
+    assert dual_formal.position_admittance_active_side == "both"
+    assert dual_formal.fix_arm is False
+
+    tuned_dual_formal_args = [
+        *dual_formal_args,
+        "--position-admittance-active-endpoint-policy",
+        "formal_teleop",
+        "--no-fix-arm",
+        "--position-admittance-translation-response-weight",
+        "1.25",
+        "--position-admittance-rotation-response-weight",
+        "1.75",
+        "--position-admittance-translation-filter-tau-sec",
+        "0.03",
+        "--position-admittance-rotation-filter-tau-sec",
+        "0.04",
+    ]
+    tuned_dual_formal = _parse_real_teleop_args(tuned_dual_formal_args)
+    tuning_metadata = real_teleop._position_ik_iteration_metadata(
+        tuned_dual_formal
+    )["position_admittance_response"]
+    assert tuning_metadata["translation"]["response_weight"] == pytest.approx(
+        1.25
+    )
+    assert tuning_metadata["rotation"]["response_weight"] == pytest.approx(1.75)
+    assert tuning_metadata["translation"]["input_filter_tau_sec"] == pytest.approx(
+        0.03
+    )
+    assert tuning_metadata["rotation"]["input_filter_tau_sec"] == pytest.approx(
+        0.04
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *tuned_dual_formal_args,
+                "--position-admittance-rotation-response-weight",
+                "4.01",
+            ]
+        )
+    assert "response weight must be in [0.25, 4]" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *tuned_dual_formal_args,
+                "--position-admittance-translation-filter-tau-sec",
+                "0.101",
+            ]
+        )
+    assert "translation filter tau must be <= 0.1 s" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args([*dual_formal_args, "--no-fix-arm"])
+    assert "dual-side Active requires formal_teleop" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *dual_formal_args,
+                "--position-admittance-active-endpoint-policy",
+                "formal_teleop",
+            ]
+        )
+    assert "requires --no-fix-arm" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *rotation_active_args,
+                "--position-admittance-active-endpoint-policy",
+                "formal_teleop",
+            ]
+        )
+    assert "requires exact combined normal_parity" in capsys.readouterr().err
+
+    emphasis_args = [
+        (
+            "rotation-emphasis-5deg"
+            if value == "balanced-5deg"
+            else value
+        )
+        for value in normal_combined_args
+    ]
+    emphasis = _parse_real_teleop_args(emphasis_args)
+    assert emphasis.position_admittance_rotation_active_profile == (
+        "rotation-emphasis-5deg"
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *normal_combined_args,
+                "--no-position-admittance-combined-active",
+            ]
+        )
+    assert "requires explicit combined" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *normal_combined_args,
+                "--position-admittance-active-max-tool-rotation-excursion-deg",
+                "5.51",
+            ]
+        )
+    assert "must be <= 5.5" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [*cautious_active_args, "--position-admittance-combined-active"]
+        )
+    assert "requires both" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *common,
+                "--active-sides",
+                "both",
+                "--position-admittance-rotation-active",
+            ]
+        )
+    assert "requires --position-admittance-active" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *rotation_active_args,
+                "--position-admittance-active-max-tool-rotation-excursion-deg",
+                "3.51",
+            ]
+        )
+    assert "must be <= 3.5" in capsys.readouterr().err
+
+    half_active_args = [
+        *cautious_active_args,
+        "--position-admittance-active-envelope",
+        "half_normal",
+        "--position-admittance-shadow-max-offset-m",
+        "0.04",
+        "--position-admittance-shadow-max-velocity-m-s",
+        "0.03",
+        "--position-admittance-shadow-max-return-velocity-m-s",
+        "0.015",
+        "--position-admittance-shadow-max-slew-m-s",
+        "0.03",
+        "--position-admittance-active-max-tool-excursion-m",
+        "0.08",
+    ]
+    half_active = _parse_real_teleop_args(half_active_args)
+    assert half_active.position_admittance_active_envelope == "half_normal"
+    assert half_active.position_admittance_shadow_max_offset_m == pytest.approx(0.04)
+    assert half_active.position_admittance_active_max_tool_excursion_m == pytest.approx(
+        0.08
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *half_active_args,
+                "--position-admittance-active-max-tool-excursion-m",
+                "0.081",
+            ]
+        )
+    assert "max tool excursion must be <= 0.08" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *half_active_args,
+                "--position-admittance-shadow-max-offset-m",
+                "0.08",
+            ]
+        )
+    assert "max_offset_m must be <= 0.04" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_real_teleop_args(
+            [
+                *cautious_active_args,
+                "--position-admittance-shadow-max-offset-m",
+                "0.08",
+            ]
+        )
+    assert "max_offset_m must be <= 0.002" in capsys.readouterr().err
+
+    for unsupported in (
+        ["--active-sides", "left", "--position-admittance-shadow"],
+        ["--active-sides", "right", "--position-admittance-shadow"],
+        [
+            "--active-sides",
+            "left",
+            "--position-admittance-active",
+            "--position-admittance-active-side",
+            "left",
+        ],
+        [
+            "--active-sides",
+            "both",
+            "--no-collision",
+            "--position-admittance-shadow",
+        ],
+    ):
+        with pytest.raises(SystemExit):
+            _parse_real_teleop_args([*common, *unsupported])
+
+
+def test_idle_tactile_compression_is_opt_in_and_rejects_hot_path_conflicts() -> None:
+    defaults = _parse_real_teleop_args([])
+    assert defaults.idle_tactile_compression is False
+    enabled = _parse_real_teleop_args(["--idle-tactile-compression"])
+    assert enabled.idle_tactile_compression is True
+    rollback = _parse_real_teleop_args(
+        ["--idle-tactile-compression", "--no-idle-tactile-compression"]
+    )
+    assert rollback.idle_tactile_compression is False
+
+    combined = _parse_real_teleop_args(
+        ["--idle-tactile-compression", "--tactile-artifact-integrity"]
+    )
+    assert combined.idle_tactile_compression is True
+    assert combined.tactile_artifact_integrity is True
+
+    for conflicting in (
+        ["--idle-tactile-compression", "--no-collection"],
+        ["--idle-tactile-compression", "--tactile-storage", "parquet"],
+        ["--idle-tactile-compression", "--tactile-compression", "zstd"],
+    ):
+        with pytest.raises(SystemExit):
+            _parse_real_teleop_args(conflicting)
 
 
 def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() -> None:

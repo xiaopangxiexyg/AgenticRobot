@@ -55,6 +55,7 @@ def _camera_sample(
 
 
 class WriterVideoStatsTest(unittest.TestCase):
+    @pytest.mark.optional
     def test_finalize_rewrites_dataset_global_index(self) -> None:
         pytest.importorskip("pyarrow.parquet")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -122,6 +123,7 @@ class WriterVideoStatsTest(unittest.TestCase):
             self.assertFalse(quality["force_collision_detected"])
             self.assertEqual(quality["force_collision_label"], "clean")
 
+    @pytest.mark.optional
     def test_opt_in_finalize_artifact_report_binds_written_video_frames(self) -> None:
         pytest.importorskip("cv2")
         with tempfile.TemporaryDirectory() as tmpdir:

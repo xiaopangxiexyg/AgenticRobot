@@ -51,6 +51,7 @@ def test_openpi_artifact_preflight_resolves_v22_relative_identity_binding() -> N
     assert "v22_raw_identity_compatibility_policy_state_binding" in session["warnings"]
 
 
+@pytest.mark.integration
 def test_openpi_real_contract_check_only_does_not_start_runtime(
     tmp_path, monkeypatch, capsys
 ) -> None:

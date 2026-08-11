@@ -135,6 +135,59 @@ def test_fixed_scheduler_skips_missed_grid_points_without_catch_up() -> None:
     assert scheduler.make_tick(cutoff_admission_sequence=2) is None
 
 
+def test_fixed_scheduler_skips_exact_float_boundary_without_stale_tick() -> None:
+    clock = Clock(20.0)
+    scheduler = DecisionScheduler(
+        DecisionScheduleSpec(
+            spec_id="fixed-30-exact-boundary",
+            decision_hz=30,
+            target_lead_time_sec=0.05,
+        ),
+        clock=clock,
+    )
+    assert scheduler.make_tick(cutoff_admission_sequence=1) is not None
+
+    clock.value = 20.2
+    skipped = scheduler.make_tick(cutoff_admission_sequence=2)
+    assert skipped is not None
+    assert skipped.scheduled_decision_at == pytest.approx(20.2)
+    assert skipped.target_effective_at == pytest.approx(20.25)
+
+
+def test_scheduled_reference_late_tick_skips_to_next_legal_grid() -> None:
+    """A late scheduled tick is never handed to the receiver after START."""
+
+    clock = Clock(10.0)
+    period = 1.0 / 30.0
+    margin = 1.0 / 60.0
+    scheduler = DecisionScheduler(
+        DecisionScheduleSpec(
+            spec_id="scheduled-reference-late-recovery-v1",
+            decision_hz=30.0,
+            target_lead_time_sec=period + margin,
+            late_tick_policy="skip_to_next_legal_reference_tick",
+            required_start_margin_sec=margin,
+        ),
+        clock=clock,
+    )
+    first = scheduler.make_tick(cutoff_admission_sequence=1)
+    assert first is not None
+
+    # The publication arrives 28 ms after the next fixed-grid decision.  The
+    # old tick's START is already behind this observation, while the following
+    # grid still has a legal START margin.
+    clock.value = 10.0 + period + 0.028
+    recovered = scheduler.make_tick(cutoff_admission_sequence=2)
+    assert recovered is not None
+    assert recovered.late_tick_policy == "skip_to_next_legal_reference_tick"
+    assert recovered.skipped_late_tick_count == 1
+    assert recovered.scheduled_decision_at == pytest.approx(10.0 + 2.0 * period)
+    assert (
+        recovered.scheduled_decision_at + margin
+        > clock.value
+    )
+
+
 def test_immediate_scheduler_preserves_actual_variable_decision_time() -> None:
     clock = Clock(10.0)
     scheduler = DecisionScheduler(

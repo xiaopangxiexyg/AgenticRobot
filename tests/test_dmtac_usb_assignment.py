@@ -19,7 +19,11 @@ if str(DMTAC_ROOT) not in sys.path:
 from teleop_runtime.configs.dmtac_hardware import dmtac_backend_configs_from_assignment
 from portable_dm_tac import DMTacDevice, DMTacMultiDevice, DeviceConfig, TacFrame  # noqa: E402
 from portable_dmtac_gripper.device import TactileConfig, tactile_device_config  # noqa: E402
-from portable_dmtac_gripper.cli import _motion_confirmed_gripper_tokens, _print_scan_summary  # noqa: E402
+from portable_dmtac_gripper.cli import (  # noqa: E402
+    _motion_confirmed_gripper_tokens,
+    _print_scan_summary,
+    build_parser,
+)
 from portable_dmtac_gripper import usb_assignment  # noqa: E402
 from portable_dmtac_gripper.usb_assignment import (  # noqa: E402
     _extract_unexpected_slave_id,
@@ -43,6 +47,8 @@ from portable_dmtac_gripper.tactile_assignment_gui import (  # noqa: E402
     empty_tactile_slot_map,
     normal_grid_display_components,
     positive_normal_pressure_grid,
+    default_tactile_debug_record_root,
+    resolve_tactile_debug_record_root,
     tactile_items_for_gui,
     tactile_slot_tokens_from_assignment,
     xz_plane_vector_grid,
@@ -1118,7 +1124,67 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
 
         self.assertEqual(metadata["schema_version"], "dmtac_tactile_gui_debug.v1")
         self.assertEqual(metadata["dev_ids"], ["L_IN"])
+        self.assertEqual(metadata["artifact_storage"]["selection_source"], "explicit")
         self.assertEqual(frame["loop_index"], 1)
+
+    def test_tactile_gui_debug_layout_is_legacy_default_and_canonical_opt_in(
+        self,
+    ) -> None:
+        with patch(
+            "portable_dmtac_gripper.tactile_assignment_gui.canonical_tactile_debug_record_root",
+            side_effect=AssertionError("legacy resolution must not load canonical paths"),
+        ):
+            legacy = resolve_tactile_debug_record_root(None)
+        self.assertEqual(legacy.path, default_tactile_debug_record_root())
+        self.assertEqual(legacy.source, "legacy")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = Path(tmp) / "canonical"
+            with patch(
+                "portable_dmtac_gripper.tactile_assignment_gui.canonical_tactile_debug_record_root",
+                return_value=canonical,
+            ):
+                selected = resolve_tactile_debug_record_root(
+                    None,
+                    artifact_layout="runtime-artifacts-v1",
+                )
+            self.assertEqual(selected.path, canonical)
+            self.assertEqual(selected.source, "canonical")
+            self.assertFalse(canonical.exists())
+
+            explicit = Path(tmp) / "exact"
+            with patch(
+                "portable_dmtac_gripper.tactile_assignment_gui.canonical_tactile_debug_record_root",
+                side_effect=AssertionError("explicit paths must take precedence"),
+            ):
+                selected = resolve_tactile_debug_record_root(
+                    explicit,
+                    artifact_layout="runtime-artifacts-v1",
+                )
+            self.assertEqual(selected.path, explicit)
+            self.assertEqual(selected.source, "explicit")
+
+        with self.assertRaisesRegex(ValueError, "unsupported artifact layout"):
+            resolve_tactile_debug_record_root(None, artifact_layout="unknown")
+
+        args = build_parser().parse_args(
+            [
+                "configure-usb",
+                "--tactile-gui-artifact-layout",
+                "runtime-artifacts-v1",
+            ]
+        )
+        self.assertEqual(args.tactile_gui_artifact_layout, "runtime-artifacts-v1")
+
+        with patch(
+            "portable_dmtac_gripper.cli._tactile_gui_artifact_layout_default",
+            return_value="runtime-artifacts-v1",
+        ):
+            configured_default = build_parser().parse_args(["configure-usb"])
+        self.assertEqual(
+            configured_default.tactile_gui_artifact_layout,
+            "runtime-artifacts-v1",
+        )
 
 
 if __name__ == "__main__":

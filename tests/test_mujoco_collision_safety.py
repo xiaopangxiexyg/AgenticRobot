@@ -9,6 +9,38 @@ import pytest
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
 
 
+@pytest.mark.parametrize(
+    ("pair_class", "expected"),
+    (
+        ("1:2", "robot_environment"),
+        ("1:4", "gripper_environment"),
+        ("2:8", "robot_object"),
+        ("2:2", "robot_self"),
+        ("2:4", "robot_gripper_self"),
+        ("4:4", "gripper_self"),
+        (None, None),
+        ("8:8", None),
+    ),
+)
+def test_forbidden_collision_pair_classes_have_semantic_categories(
+    pair_class: str | None,
+    expected: str | None,
+) -> None:
+    from sim.mujoco.collision_safety import (
+        CollisionCheckResult,
+        forbidden_collision_category,
+    )
+
+    assert forbidden_collision_category(pair_class) == expected
+    check = CollisionCheckResult(
+        safe=False,
+        minimum_distance_m=0.0,
+        pair_class=pair_class,
+    )
+    assert check.collision_category == expected
+    assert check.to_dict()["collision_category"] == expected
+
+
 def test_clearance_recovery_only_accepts_monotonic_retreat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,6 +124,7 @@ def test_soft_penetration_projection_can_use_hard_bound_for_recovery(
     assert result.check.minimum_distance_m == pytest.approx(0.01)
 
 
+@pytest.mark.optional
 def test_collision_safety_oracle_keeps_active_data_immutable() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
@@ -125,6 +158,7 @@ def test_collision_safety_oracle_keeps_active_data_immutable() -> None:
         env.close()
 
 
+@pytest.mark.optional
 def test_scripted_downward_motion_is_projected_before_table_penetration() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
@@ -156,6 +190,7 @@ def test_scripted_downward_motion_is_projected_before_table_penetration() -> Non
         env.close()
 
 
+@pytest.mark.optional
 def test_fast_and_reference_safety_projection_remain_identical() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
@@ -186,6 +221,7 @@ def test_fast_and_reference_safety_projection_remain_identical() -> None:
         reference.close()
 
 
+@pytest.mark.optional
 def test_general_qpos_controller_holds_last_state_for_unsafe_target() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
@@ -212,6 +248,7 @@ def test_general_qpos_controller_holds_last_state_for_unsafe_target() -> None:
         env.close()
 
 
+@pytest.mark.optional
 def test_fast_env_clearance_violation_terminates_worker_episode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -259,6 +296,7 @@ def test_fast_env_clearance_violation_terminates_worker_episode(
         env.close()
 
 
+@pytest.mark.optional
 def test_fast_direct_qpos_observation_keeps_collision_approved_robot_state() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")

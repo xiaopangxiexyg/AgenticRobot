@@ -54,6 +54,7 @@ def test_rm65_bimanual_dmtac_layout_is_the_real_collector_contract() -> None:
         assert channel.units == "normalized_0_1"
 
 
+@pytest.mark.optional
 def test_native_mujoco_v22_writer_binds_layout_and_marks_force_unavailable(tmp_path: Path) -> None:
     pytest.importorskip("cv2")
     pq = pytest.importorskip("pyarrow.parquet")

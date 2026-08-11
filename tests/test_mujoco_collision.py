@@ -3,6 +3,8 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
+
 from sim.contracts.scene import CollisionSpec, GroundSpec, SceneSpec
 from sim.mujoco.mjcf import convert_urdf_to_mjcf_xml
 from sim.mujoco.modeling.collision import (
@@ -51,6 +53,7 @@ def _scene_for(urdf_path: Path) -> SceneSpec:
     )
 
 
+@pytest.mark.integration
 def test_urdf_parser_keeps_visual_and_collision_geometry_separate(tmp_path: Path) -> None:
     model = parse_urdf(_write_collision_urdf(tmp_path / "fixture.urdf"))
 
@@ -62,6 +65,7 @@ def test_urdf_parser_keeps_visual_and_collision_geometry_separate(tmp_path: Path
     assert model.links["finger"].collisions[0].geometry.kind == "sphere"
 
 
+@pytest.mark.integration
 def test_physics_conversion_emits_invisible_contact_geom_beside_visual(tmp_path: Path) -> None:
     urdf_path = _write_collision_urdf(tmp_path / "fixture.urdf")
     model = parse_urdf(urdf_path)
@@ -105,6 +109,7 @@ def test_collision_group_allow_matrix_and_masks_are_symmetric() -> None:
     assert collision_filter.masks_for_group(OBJECT_GROUP) == (8, 15)
 
 
+@pytest.mark.integration
 def test_parent_child_and_explicit_deny_pairs_compile_to_contact_excludes(
     tmp_path: Path,
 ) -> None:

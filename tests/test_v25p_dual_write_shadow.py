@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
@@ -232,9 +233,11 @@ def test_shadow_long_episode_preserves_exact_projection_for_every_sample(
     assert len(loaded.samples) == sample_count
 
 
+@pytest.mark.optional
 def test_parquet_shadow_long_episode_preserves_v23_projection_and_chunks(
     tmp_path: Path,
 ) -> None:
+    pytest.importorskip("pyarrow")
     _bundle, shadow, identity = _setup(
         tmp_path,
         physical_storage_layout=V25P_PARQUET_CHUNK_LAYOUT_V1,

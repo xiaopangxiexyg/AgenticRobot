@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from dataset_contracts import (
     PolicyArtifactContract,
     PolicyCameraInput,
@@ -12,6 +14,9 @@ from dataset_contracts import (
 from dataset_contracts.v22 import PolicyIOLayout
 from deployments.openpi import server as openpi_server
 from deployments.openpi.client import real as openpi_real
+
+
+pytestmark = pytest.mark.integration
 
 
 def _write_checkpoint(root: Path) -> tuple[Path, PolicyArtifactContract]:
@@ -100,6 +105,10 @@ def test_server_dry_run_builds_registry_from_artifact(
             str(checkpoint),
             "--openpi-root",
             str(openpi_root),
+            "--exclude-cpu",
+            "14",
+            "--exclude-cpu",
+            "15",
             "--dry-run",
         ]
     ) == 0
@@ -109,6 +118,7 @@ def test_server_dry_run_builds_registry_from_artifact(
     assert report["environment"]["PYTHONPATH"].split(":")[0] == str(
         Path(openpi_server.__file__).resolve().parents[2]
     )
+    assert report["excluded_cpu_ids"] == [14, 15]
     registry_path = Path(report["command"][report["command"].index("--registry") + 1])
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     entry = registry["models"][artifact.model_id]
@@ -116,3 +126,53 @@ def test_server_dry_run_builds_registry_from_artifact(
     assert entry["checkpoint_dir"] == str(checkpoint)
     assert entry["action_dim"] == artifact.policy_io_layout.action_dim
     assert entry["camera_slots"] == ["base_0_rgb"]
+
+
+def test_server_applies_process_cpu_exclusion_immediately_before_exec(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    openpi_root = tmp_path / "openpi"
+    checkpoint, _artifact = _write_checkpoint(openpi_root)
+    (openpi_root / "scripts").mkdir()
+    (openpi_root / "scripts/serve_dexteleop_policy.py").write_text(
+        "# test fixture\n",
+        encoding="utf-8",
+    )
+    (openpi_root / "configs").mkdir()
+    (openpi_root / "configs/dexteleop_policy_registry.json").write_text(
+        json.dumps({"models": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(openpi_server.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(openpi_server.os, "chdir", lambda _path: None)
+    calls: list[tuple[int, ...]] = []
+
+    def fake_exclude(cpu_ids):
+        calls.append(tuple(cpu_ids))
+        return {
+            "native_threads_migrated": 1,
+            "excluded_cpu_ids": list(cpu_ids),
+        }
+
+    monkeypatch.setattr(
+        openpi_server,
+        "_exclude_server_cpus_before_exec",
+        fake_exclude,
+    )
+    monkeypatch.setattr(openpi_server.os, "execv", lambda _exe, _cmd: None)
+
+    assert openpi_server.main(
+        [
+            "--checkpoint-dir",
+            str(checkpoint),
+            "--openpi-root",
+            str(openpi_root),
+            "--exclude-cpu",
+            "15",
+            "--exclude-cpu",
+            "14",
+        ]
+    ) == 0
+
+    assert calls == [(14, 15)]

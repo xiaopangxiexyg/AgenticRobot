@@ -38,6 +38,9 @@ def _timing() -> TimingSpec:
 def test_rm65_execution_config_defaults_to_fitted_arm_and_grippers() -> None:
     config = MujocoPositionExecutionConfig(timing=_timing())
 
+    assert config.position_command_planner == "acceleration_limited"
+    assert config.sample_aligned_source_hz == pytest.approx(15.0)
+    assert config.sample_aligned_horizon_source_steps == 2
     assert config.actuation_profile is not None
     assert config.actuation_profile.name == "rm65_bimanual_udp_feedback_20260721.v4"
     assert config.gripper_actuation_profile is not None
@@ -99,6 +102,7 @@ def _command(sequence: int, qpos_by_side) -> DirectQposCommand:
     )
 
 
+@pytest.mark.optional
 def test_actuated_executor_is_only_the_120hz_sender_and_physical_plant() -> None:
     pytest.importorskip("mujoco")
     scene, profile = _scene_and_profile()
@@ -142,6 +146,7 @@ def test_actuated_executor_is_only_the_120hz_sender_and_physical_plant() -> None
     assert sender.execution_metadata["command_hz"] == 120.0
 
 
+@pytest.mark.optional
 def test_high_speed_distal_target_lag_is_causal_and_keeps_raw_targets() -> None:
     pytest.importorskip("mujoco")
     scene, profile = _scene_and_profile()
@@ -172,6 +177,7 @@ def test_high_speed_distal_target_lag_is_causal_and_keeps_raw_targets() -> None:
     assert sender.snapshot()["pending_delayed_targets"] < 60
 
 
+@pytest.mark.optional
 def test_real_aligned_rig_keeps_15_60_120_and_swaps_only_sender() -> None:
     pytest.importorskip("mujoco")
     scene, profile = _scene_and_profile()

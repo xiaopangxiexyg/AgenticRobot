@@ -1,9 +1,16 @@
 # OpenPI 策略部署
 
 OpenPI 使用两个进程：OpenPI 环境中的 server 加载模型，`dexteleop310` 中的 DexTeleop
-client 负责 observation、contract、现场安全门和可选真实下发。两端以 checkpoint 目录内的
-`policy_artifact.json` 为共同事实源，不应在命令行再次手工覆盖 action pose mode、相机或
-state/action layout。
+client 负责 observation、contract、现场安全门和可选真实下发。通常两端以 checkpoint
+目录内的 `policy_artifact.json` 为共同事实源。历史 wrist-only checkpoint 在当前物理左右
+绑定下部署时，两端必须显式选择同一份、且绑定原 checkpoint artifact hash 的版本化兼容
+artifact；不得用零散命令行参数手工覆盖 action pose mode、相机或 state/action layout。
+
+训练侧另有一条独立边界：普通 wrist `-corrected-v1` config 必须通过
+`python -m deployments.openpi.corrected_train --dry-run -- ...` 先审计数据来源，再去掉
+wrapper 的 `--dry-run` 启动。历史无后缀 config 保持冻结；model-RTC 从 92599 续训时必须从
+`0712-wrist-cube-92599-legacy-wrist-compat.policy_artifact.json` 派生 template。完整命令见
+[`deployments/openpi/README.md`](../../deployments/openpi/README.md)。
 
 ## 0. 一次性设置路径
 

@@ -35,11 +35,8 @@ dataset = [
 annotation = [
     # Dedicated post-capture annotation machines do not need the complete
     # robot/sim/model environment. NumPy/PyArrow are used by canonical
-    # dataset reads; SciPy/OSQP remain necessary while the compatibility
-    # package exports share imports with pose/control validation.
+    # dataset reads; package-root compatibility exports are loaded lazily.
     "numpy==1.26.4",
-    "scipy==1.13.1",
-    "osqp==1.1.3",
     "pyarrow==24.0.0",
 ]
 sim = [

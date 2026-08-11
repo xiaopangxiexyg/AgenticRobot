@@ -292,6 +292,31 @@ def test_load_triad_openvr_supports_explicit_canonical_file(tmp_path) -> None:
     assert module.triad_openvr.__name__ == "triad_openvr"
 
 
+def test_load_triad_openvr_registers_future_dataclass_module(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    module_path = tmp_path / "triad_openvr.py"
+    module_path.write_text(
+        """from __future__ import annotations
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class triad_openvr:
+    value: int = 13
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "dexteleop_triad_openvr", raising=False)
+
+    module = vive_data_sender.load_triad_openvr(module_path)
+
+    assert sys.modules["dexteleop_triad_openvr"] is module
+    assert module.triad_openvr().value == 13
+
+
 def test_load_triad_openvr_searches_relative_to_sender(monkeypatch, tmp_path) -> None:
     sender_path = tmp_path / "bundle" / "mocap" / "vive_data_sender.py"
     sender_path.parent.mkdir(parents=True)

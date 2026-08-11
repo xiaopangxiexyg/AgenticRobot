@@ -17,6 +17,9 @@ from teleop_runtime.control_trace import (
 )
 
 
+pytestmark = pytest.mark.integration
+
+
 def runtime() -> ControlTraceRuntime:
     return ControlTraceRuntime(
         RuntimeTraceSession(

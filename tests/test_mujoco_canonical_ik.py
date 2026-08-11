@@ -278,6 +278,7 @@ def test_mujoco_backend_does_not_label_endpoint_as_tcp_without_profile(
     )
 
 
+@pytest.mark.optional
 def test_rm65_arm_endpoint_fk_matches_mujoco_for_both_sides() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("pinocchio")

@@ -16,13 +16,23 @@ from control_station.real_teleop.progress import (
     ProgressControlAvailability,
     build_real_teleop_progress_ui_payload,
 )
+from control_station.real_teleop_application import (
+    build_real_teleop_startup_progress_ui_payload,
+)
 from collection_runtime.progress.profiles import (
     DATASET_PROGRESS_PROFILE_RELATIVE_PATH,
     DatasetProgressProfileBindingError,
+    bind_dataset_progress_profile,
     read_dataset_progress_profile,
 )
 from collection_runtime.sample_acceptance import (
     SampleAcceptanceReceiptBuffer,
+)
+from collection_runtime.modality_storage import (
+    detach_modality,
+    plan_modality_detach,
+    plan_modality_rehydrate,
+    rehydrate_modality,
 )
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.pose_frames import PoseFrameContract, PoseSourceProfile
@@ -32,7 +42,17 @@ from dataset_contracts.progress_profile import (
 )
 from dataset_contracts.v22 import PolicyIOLayout
 from dataset_interface.progress_artifacts import load_sealed_progress_episode
-from dataset_interface.validation import validate_v23_dataset
+from dataset_interface.modality_artifacts import (
+    DETACHED_VERIFIED,
+    PAYLOAD_ONLY_DETACH,
+    WHOLE_PREFIX_DETACH,
+    build_modality_artifact_inventory,
+    resolve_modality_availability,
+)
+from dataset_interface.validation import (
+    validate_v23_core_dataset,
+    validate_v23_dataset,
+)
 from teleop_runtime.collection.sample_assembler import CollectorSample
 from teleop_runtime.collection.writer_v21 import (
     LeRobotV21Writer,
@@ -42,10 +62,12 @@ from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
 from teleop_runtime.real_teleop.dataset_finalize import RealDatasetFinalizeTask
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 from teleop_runtime.real_teleop.progress_adapter import (
+    DEFAULT_REAL_TELEOP_MANAGED_PROGRESS_PROFILE_ID,
     RealTeleopProgressEpisode,
-    build_real_teleop_startup_progress_ui_payload,
+    load_real_teleop_managed_progress_profile,
     load_real_teleop_progress_profile,
     resolve_real_teleop_progress_entry,
+    resolve_real_teleop_default_progress_profile,
     resolve_real_teleop_task_stage_profile,
     select_real_teleop_managed_progress_profile,
     validate_real_teleop_initial_progress_profile,
@@ -436,6 +458,7 @@ def test_progress_gui_is_visible_and_selectable_before_runtime_home(
         item["profile_id"]
         for item in initial["available_profiles"]
     ] == [
+        "dmtac_bimanual_writing_acquire_present_window_v1",
         "dmtac_rm65_bimanual_position_v1_progress",
         "dmtac_rm65_bimanual_position_writing_five_stage_progress",
         "dmtac_rm65_bimanual_position_writing_four_stage_progress",
@@ -477,7 +500,7 @@ def test_progress_gui_keeps_profile_selection_available_for_any_formal_task(
     )
 
     assert payload["configured"] is False
-    assert len(payload["available_profiles"]) == 6
+    assert len(payload["available_profiles"]) == 7
     assert payload["profile_selection_enabled"] is True
     assert "长程任务进度 profile" in str(payload["message"])
     assert "dmtac_impedance_15_40hz" not in str(payload["message"])
@@ -497,6 +520,94 @@ def test_progress_gui_keeps_profile_selection_available_for_any_formal_task(
     )
     assert configured["configured"] is True
     assert configured["profile_id"] == selected.profile_id
+
+
+def test_four_stage_writing_is_default_only_for_blank_gui_dataset(
+    tmp_path: Path,
+) -> None:
+    blank_root = tmp_path / "blank"
+    populated_root = tmp_path / "populated_profileless"
+    (populated_root / "meta").mkdir(parents=True)
+    (populated_root / "meta" / "episodes.jsonl").write_text(
+        '{"episode_index":0}\n',
+        encoding="utf-8",
+    )
+    bound_root = tmp_path / "bound"
+    bound_profile = load_real_teleop_managed_progress_profile(
+        "dmtac_rm65_bimanual_position_v1_progress"
+    )
+    bind_dataset_progress_profile(bound_root, bound_profile)
+
+    default_profile = resolve_real_teleop_default_progress_profile(
+        dataset_root=blank_root,
+        requested_profile=None,
+        gui_enabled=True,
+    )
+
+    assert default_profile is not None
+    assert default_profile.profile_id == (
+        DEFAULT_REAL_TELEOP_MANAGED_PROGRESS_PROFILE_ID
+    )
+    assert len(default_profile.steps) == 4
+    assert resolve_real_teleop_default_progress_profile(
+        dataset_root=blank_root,
+        requested_profile=bound_profile,
+        gui_enabled=True,
+    ) == bound_profile
+    assert resolve_real_teleop_default_progress_profile(
+        dataset_root=blank_root,
+        requested_profile=None,
+        gui_enabled=False,
+    ) is None
+    assert resolve_real_teleop_default_progress_profile(
+        dataset_root=populated_root,
+        requested_profile=None,
+        gui_enabled=True,
+    ) is None
+    assert resolve_real_teleop_default_progress_profile(
+        dataset_root=bound_root,
+        requested_profile=None,
+        gui_enabled=True,
+    ) is None
+
+
+def test_switching_to_new_dataset_unlocks_profile_without_mutating_old_recorder(
+    tmp_path: Path,
+) -> None:
+    old_root = tmp_path / "old_dataset"
+    new_root = tmp_path / "new_dataset"
+    old_profile = load_real_teleop_progress_profile(_FORMAL_PROGRESS_PROFILE)
+    old_selection_attempts: list[TaskProgressProfileV1] = []
+    old_recorder = SimpleNamespace(
+        dataset_root=old_root,
+        writer_storage_config=SimpleNamespace(task_id="formal-task"),
+        progress_profile=old_profile,
+        progress_profile_selection_locked=True,
+        progress_profile_binding_source="dataset_binding",
+        select_progress_profile=old_selection_attempts.append,
+    )
+    args = SimpleNamespace(
+        collection_progress_gui=True,
+        collection_progress_profile=old_profile,
+        collection_task_id="formal-task",
+        dataset_root=new_root,
+    )
+
+    switched = build_real_teleop_startup_progress_ui_payload(
+        args=args,
+        dataset_recorder=old_recorder,
+    )
+    selected = select_real_teleop_managed_progress_profile(
+        args=args,
+        dataset_recorder=old_recorder,
+        profile_id="example_three_stage_pick_place_progress",
+    )
+
+    assert switched["profile_selection_locked"] is False
+    assert "progress_profile_select" in switched["active_controls"]
+    assert selected.profile_id == "example_three_stage_pick_place_progress"
+    assert args.collection_progress_profile == selected
+    assert old_selection_attempts == []
 
 
 def test_progress_episode_prepare_bind_complete_and_seal(tmp_path: Path) -> None:
@@ -1045,6 +1156,144 @@ def test_actual_v23_writer_and_progress_artifacts_share_one_episode_identity(
         for previous, current in zip(loaded.facts, loaded.facts[1:])
     )
     assert loaded.manifest.sealed_clock_domain_id == "local_wall_time"
+
+
+@pytest.mark.parametrize(
+    "detachment_scope",
+    (PAYLOAD_ONLY_DETACH, WHOLE_PREFIX_DETACH),
+)
+def test_actual_v23_core_validation_accepts_only_verified_detached_tactile(
+    tmp_path: Path,
+    detachment_scope: str,
+) -> None:
+    pytest.importorskip("pyarrow")
+    recorder = _recorder(tmp_path, progress=True)
+    _use_actual_v23_writer(recorder, dataset_root=tmp_path)
+    _write_and_finalize_actual_v23_episode(recorder)
+
+    manifest_relative = (
+        "tactile/observation.hand.left.tactile/chunk-000/"
+        "episode_000000/manifest.json"
+    )
+    payload_relative = (
+        "tactile/observation.hand.left.tactile/chunk-000/"
+        "episode_000000/L_RAW.uint8.bin"
+    )
+    payload_path = tmp_path / payload_relative
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_bytes(b"fixture")
+    (tmp_path / manifest_relative).write_text(
+        json.dumps(
+            {
+                "format": "binary_stream_v1",
+                "side": "left",
+                "frame_count": 1,
+                "sensor_keys": ["L_RAW"],
+                "streams": {
+                    "L_RAW": {
+                        "path": payload_relative,
+                        "dtype": "uint8",
+                        "shape": [7],
+                        "frame_count": 1,
+                        "encoding": "raw_c_order",
+                        "compression": "none",
+                    }
+                },
+                "frames": [
+                    {
+                        "sample_frame_index": 0,
+                        "tactile_frame_index": 0,
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = tmp_path / "meta" / "episodes.jsonl"
+    episode_record = json.loads(catalog_path.read_text(encoding="utf-8"))
+    episode_record["tactile_paths"] = {"left": manifest_relative}
+    catalog_path.write_text(
+        json.dumps(episode_record, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    inventory = build_modality_artifact_inventory(tmp_path)
+    if detachment_scope == WHOLE_PREFIX_DETACH:
+        unreceipted_tree = tmp_path.parent / f"{tmp_path.name}-unreceipted-tactile"
+        os.replace(tmp_path / "tactile", unreceipted_tree)
+        unreceipted_core = validate_v23_core_dataset(
+            tmp_path,
+            verified_inventories=(inventory,),
+            verified_detachment_scopes={"tactile": WHOLE_PREFIX_DETACH},
+        )
+        assert not unreceipted_core.ok
+        assert any(
+            "durable retirement receipt" in error
+            for error in unreceipted_core.errors
+        )
+        os.replace(unreceipted_tree, tmp_path / "tactile")
+    cold_root = tmp_path.parent / f"{tmp_path.name}-cold"
+    cold_root.mkdir()
+    detach_plan = plan_modality_detach(
+        tmp_path,
+        cold_root,
+        detachment_scope=detachment_scope,
+        require_distinct_device=False,
+        min_free_bytes=0,
+    )
+    assert detach_plan.ready, detach_plan.errors
+    detached_result = detach_modality(
+        tmp_path,
+        cold_root,
+        expected_plan_hash=detach_plan.plan_hash,
+        confirm_dataset_fingerprint=detach_plan.dataset_fingerprint,
+        detachment_scope=detachment_scope,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        confirm_no_active_readers=True,
+    )
+    assert detached_result.inventory_hash == inventory.semantic_content_hash
+
+    availability = resolve_modality_availability(
+        tmp_path,
+        inventory,
+        detachment_scope=detachment_scope,
+    )
+    assert availability.status == DETACHED_VERIFIED
+    assert availability.core_training_eligible is True
+    assert availability.tactile_read_eligible is False
+    strict = validate_v23_dataset(tmp_path)
+    assert not strict.ok
+    assert any("missing" in error for error in strict.errors)
+    core = validate_v23_core_dataset(
+        tmp_path,
+        verified_inventories=(inventory,),
+        verified_detachment_scopes={"tactile": detachment_scope},
+    )
+    assert core.ok, core.errors
+    assert any("DETACHED_VERIFIED" in warning for warning in core.warnings)
+
+    rehydrate_plan = plan_modality_rehydrate(
+        tmp_path,
+        cold_root,
+        inventory.semantic_content_hash,
+        require_distinct_device=False,
+        min_free_bytes=0,
+    )
+    assert rehydrate_plan.ready, rehydrate_plan.errors
+    restored_result = rehydrate_modality(
+        tmp_path,
+        cold_root,
+        inventory.semantic_content_hash,
+        expected_plan_hash=rehydrate_plan.plan_hash,
+        confirm_dataset_fingerprint=rehydrate_plan.dataset_fingerprint,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        confirm_no_active_readers=True,
+    )
+    assert restored_result.final_status == "SELF_CONTAINED"
+    restored_validation = validate_v23_dataset(tmp_path)
+    assert restored_validation.ok, restored_validation.errors
 
 
 def test_actual_v23_writer_disabled_path_emits_no_progress_artifacts(

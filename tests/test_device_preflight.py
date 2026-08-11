@@ -13,6 +13,7 @@ from unittest.mock import patch
 from teleop_runtime.configs import rm65_arm_ips
 from teleop_runtime import device_preflight
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.real_teleop import cli_runtime_config
 
 
 def _dmtac_scan() -> dict:
@@ -98,6 +99,58 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertEqual(comparison["missing"], [{"camera_key": "left_wrist", "serial": "B"}])
         self.assertEqual(len(comparison["matched"]), 1)
         self.assertEqual(comparison["extra"][0]["serial"], "C")
+
+    def test_noninteractive_realsense_assignment_preserves_explicit_serial_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "realsense.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "left_wrist": {"serial": "LEFT"},
+                        "right_wrist": {"serial": "RIGHT"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            device_preflight.configure_realsense_interactive(
+                path,
+                [
+                    {"index": 0, "serial": "RIGHT"},
+                    {"index": 1, "serial": "LEFT"},
+                ],
+                assume_yes=True,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["left_wrist"]["serial"], "LEFT")
+        self.assertEqual(payload["right_wrist"]["serial"], "RIGHT")
+
+    def test_noninteractive_realsense_assignment_rejects_unknown_role_serial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "realsense.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "left_wrist": {"serial": "LEFT"},
+                        "right_wrist": {"serial": "RIGHT"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                device_preflight.DevicePreflightError,
+                "refuses to infer physical camera roles",
+            ):
+                device_preflight.configure_realsense_interactive(
+                    path,
+                    [
+                        {"index": 0, "serial": "OTHER_A"},
+                        {"index": 1, "serial": "OTHER_B"},
+                    ],
+                    assume_yes=True,
+                )
 
     def test_permission_report_for_unwritable_path_includes_repair_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -773,12 +826,17 @@ class DevicePreflightTests(unittest.TestCase):
             "--no-arm-ip-save-latest",
             "--hand-backend",
             "dmtac-gripper",
+            "--gripper-angle-trigger",
             "--no-camera",
             "--device-preflight-yes",
             "--device-preflight-probe-all-serial",
             "--device-preflight-force-reconfigure",
         ]
-        with patch.object(sys, "argv", argv), patch.object(real_teleop, "prepare_devices_for_teleop", fake_prepare):
+        with patch.object(sys, "argv", argv), patch.object(
+            cli_runtime_config,
+            "prepare_devices_for_teleop",
+            fake_prepare,
+        ):
             args = real_teleop.parse_args()
 
         self.assertEqual(args.left_hand_port, "/dev/q6-left")
@@ -819,11 +877,16 @@ class DevicePreflightTests(unittest.TestCase):
             "--no-arm-ip-save-latest",
             "--hand-backend",
             "dmtac-gripper",
+            "--gripper-angle-trigger",
             "--dmtac-with-tactile",
             "--no-camera",
             "--device-preflight-yes",
         ]
-        with patch.object(sys, "argv", argv), patch.object(real_teleop, "prepare_devices_for_teleop", fake_prepare):
+        with patch.object(sys, "argv", argv), patch.object(
+            cli_runtime_config,
+            "prepare_devices_for_teleop",
+            fake_prepare,
+        ):
             args = real_teleop.parse_args()
 
         self.assertTrue(args.dmtac_tactile)
@@ -839,11 +902,15 @@ class DevicePreflightTests(unittest.TestCase):
             "--no-arm-ip-default-config",
             "--hand-backend",
             "dmtac-gripper",
+            "--gripper-angle-trigger",
             "--no-camera",
         ]
         with (
             patch.object(sys, "argv", argv),
-            patch.object(real_teleop, "prepare_devices_for_teleop") as mocked_prepare,
+            patch.object(
+                cli_runtime_config,
+                "prepare_devices_for_teleop",
+            ) as mocked_prepare,
             self.assertRaises(SystemExit) as raised,
         ):
             real_teleop.parse_args()

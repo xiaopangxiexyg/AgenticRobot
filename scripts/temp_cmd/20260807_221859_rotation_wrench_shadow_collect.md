@@ -1,0 +1,35 @@
+cd /home/user/zc/DexTeleop && \
+source /home/user/miniconda3/etc/profile.d/conda.sh && \
+conda activate /home/user/miniconda3/envs/dexteleop310 && \
+source docs/real/teleop_args.sh && \
+taskset -c 0-7 \
+python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+  "${NO_GRIPPER_COMMON_ARGS[@]}" \
+  "${POSITION_FORMAL_V2_BALANCED_ARGS[@]}" \
+  --active-sides both \
+  --no-init-arm-available \
+  "${FIX_ARM_ARGS[@]}" \
+  --fix-arm-side right \
+  --position-admittance-shadow \
+  --no-position-admittance-active \
+  --position-admittance-response-model profile_compliance \
+  --position-admittance-shadow-axes xyz \
+  --position-admittance-shadow-stiffness-n-m 250 \
+  --position-admittance-shadow-deadband-n 0.45 \
+  --position-admittance-shadow-filter-tau-sec 0.010857362 \
+  --position-admittance-shadow-max-offset-m 0.08 \
+  --position-admittance-shadow-max-velocity-m-s 0.06 \
+  --position-admittance-shadow-max-return-velocity-m-s 0.03 \
+  --position-admittance-shadow-max-slew-m-s 0.06 \
+  --position-admittance-shadow-return-deadband-n 0.45 \
+  --position-admittance-shadow-return-rate-s 1 \
+  --position-admittance-response-reference-hz 40 \
+  --position-admittance-shadow-stale-sec 0.15 \
+  --position-admittance-shadow-max-force-dt-sec 0.15 \
+  --control-debug off \
+  --debug-action \
+  --debug-action-log-root teleop_records/action_debug/left_rotation_wrench_position_shadow_20260807_221859 \
+  --debug-action-flush-every 10 \
+  --debug-action-queue-size 8192 \
+  --debug-action-sample-hz 60 \
+  "${CONSOLE_TIMING_ARGS[@]}"

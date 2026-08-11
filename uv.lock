@@ -176,9 +176,7 @@ source = { editable = "." }
 [package.optional-dependencies]
 annotation = [
     { name = "numpy" },
-    { name = "osqp" },
     { name = "pyarrow" },
-    { name = "scipy" },
 ]
 core = [
     { name = "loop-rate-limiters" },
@@ -245,7 +243,6 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'core'", specifier = "==1.26.4" },
     { name = "onnxruntime-gpu", marker = "extra == 'hardware'", specifier = "==1.22.0" },
     { name = "opencv-contrib-python", marker = "extra == 'hardware'", specifier = "==4.10.0.84" },
-    { name = "osqp", marker = "extra == 'annotation'", specifier = "==1.1.3" },
     { name = "osqp", marker = "extra == 'core'", specifier = "==1.1.3" },
     { name = "pandas", marker = "extra == 'dataset'", specifier = "==2.3.3" },
     { name = "pillow", marker = "extra == 'dataset'", specifier = "==12.3.0" },
@@ -260,7 +257,6 @@ requires-dist = [
     { name = "pyzmq", marker = "extra == 'vla-scratch'", specifier = "==27.1.0" },
     { name = "qpsolvers", marker = "extra == 'core'", specifier = "==4.11.0" },
     { name = "sapien", marker = "extra == 'sim'", specifier = "==3.0.3" },
-    { name = "scipy", marker = "extra == 'annotation'", specifier = "==1.13.1" },
     { name = "scipy", marker = "extra == 'core'", specifier = "==1.13.1" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'model'", url = "https://download.pytorch.org/whl/cu126/torch-2.10.0%2Bcu126-cp310-cp310-manylinux_2_28_x86_64.whl" },
     { name = "transforms3d", marker = "extra == 'hardware'", specifier = "==0.4.1" },

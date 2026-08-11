@@ -83,6 +83,7 @@ from deployments.openpi.client.rtc_conditioned import (
 from robot_motion.deploy import (
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
+    ArmHoldResolvedHistoryBinding,
     CanonicalDeployActionPipeline,
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     POLICY_ASYNC_PRODUCER_FAULT,
@@ -649,6 +650,7 @@ def test_openpi_raw_rtc_adapter_runs_through_shared_frontend_without_dispatch() 
     )
     frontend.start()
     emitting_step = None
+    emitting_history = None
     try:
         for index in range(160):
             now = base + index / 30.0
@@ -667,6 +669,11 @@ def test_openpi_raw_rtc_adapter_runs_through_shared_frontend_without_dispatch() 
 
 def test_openpi_raw_rtc_arm_hold_sidecar_resolves_and_commits_at_emission() -> None:
     artifact = _arm_hold_artifact()
+    history_binding = ArmHoldResolvedHistoryBinding(
+        binding_id="policy-source:openpi-raw-rtc-arm-hold",
+        epoch=2,
+        contract_hash=artifact.arm_hold_output.contract_hash,
+    )
     actions = _absolute_actions(artifact.policy_io_layout.action_dim)
     actions[:, 0] = 0.5
     actions[:, 7] = -0.5
@@ -687,7 +694,8 @@ def test_openpi_raw_rtc_arm_hold_sidecar_resolves_and_commits_at_emission() -> N
             action_keyframe_period_sec=1.0 / 30.0,
             action_maximum_hold_sec=1.0 / 30.0,
             arm_hold_output=artifact.arm_hold_output,
-        )
+        ),
+        arm_hold_history_binding=history_binding,
     )
     pipeline = CanonicalDeployActionPipeline(
         safety_filter=ActionSafetyFilter(
@@ -728,6 +736,7 @@ def test_openpi_raw_rtc_arm_hold_sidecar_resolves_and_commits_at_emission() -> N
             )
             if step.emission_result.emission is not None:
                 emitting_step = step
+                emitting_history = runtime.arm_hold_resolved_history_snapshot()
                 break
             time.sleep(0.001)
     finally:
@@ -748,11 +757,34 @@ def test_openpi_raw_rtc_arm_hold_sidecar_resolves_and_commits_at_emission() -> N
     assert emitting_step.action_preparation.arm_hold_resolution is (
         emission.arm_hold_resolution
     )
+    assert emitting_history is not None
+    assert emitting_history.binding.semantic_content_hash == (
+        history_binding.semantic_content_hash
+    )
+    assert emitting_history.last_resolution_sequence == 1
+    assert emitting_history.context.previous_mode.tolist() == [1.0, 0.0]
+    assert emitting_history.context.dwell_steps.tolist() == [1, 1]
+    closed_history = runtime.arm_hold_resolved_history_snapshot()
+    assert closed_history is not None
+    assert closed_history.binding.epoch == history_binding.epoch + 1
+    assert closed_history.context.available_mask.tolist() == [False, False]
+    runtime.clear_action_queue()
+    runtime.reset_prediction_schedule()
+    repeated_close_reset = runtime.arm_hold_resolved_history_snapshot()
+    assert repeated_close_reset is not None
+    assert repeated_close_reset.binding.semantic_content_hash == (
+        closed_history.binding.semantic_content_hash
+    )
     assert emitting_step.to_debug_payload()["send_actions"] is False
 
 
 def test_openpi_raw_rtc_arm_hold_missing_reference_faults_without_partial_commit() -> None:
     artifact = _arm_hold_artifact()
+    history_binding = ArmHoldResolvedHistoryBinding(
+        binding_id="policy-source:openpi-raw-rtc-arm-hold-fault",
+        epoch=0,
+        contract_hash=artifact.arm_hold_output.contract_hash,
+    )
     probabilities = np.tile(
         np.asarray(((1.0, 1.0),), dtype=np.float32),
         (HORIZON, 1),
@@ -769,7 +801,8 @@ def test_openpi_raw_rtc_arm_hold_missing_reference_faults_without_partial_commit
             action_keyframe_period_sec=1.0 / 30.0,
             action_maximum_hold_sec=1.0 / 30.0,
             arm_hold_output=artifact.arm_hold_output,
-        )
+        ),
+        arm_hold_history_binding=history_binding,
     )
     observation = _observation()
     state = observation.state.copy()
@@ -823,6 +856,14 @@ def test_openpi_raw_rtc_arm_hold_missing_reference_faults_without_partial_commit
     assert fault_step.emission_result.emission is None
     assert fault_step.emission_commit_transition is None
     assert runtime._arm_hold_resolver.resolved_combination == "00"
+    history = runtime.arm_hold_resolved_history_snapshot()
+    assert history is not None
+    assert history.binding.semantic_content_hash == (
+        history_binding.semantic_content_hash
+    )
+    assert history.binding.epoch == history_binding.epoch
+    assert history.last_resolution_sequence is None
+    assert history.context.available_mask.tolist() == [False, False]
 
 
 def test_openpi_relative_raw_rtc_runs_through_shared_frontend_without_dispatch() -> None:

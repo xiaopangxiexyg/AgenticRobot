@@ -225,6 +225,7 @@ def test_v22_dual_continuous_dmtac_native_selects_end_effector_components() -> N
     np.testing.assert_allclose(right.values, [0.8])
 
 
+@pytest.mark.optional
 def test_gui_episode_replay_group_bridges_v23_umi_16d_action_to_canonical_26d(
     tmp_path: Path,
 ) -> None:
@@ -741,6 +742,7 @@ def test_v22_replay_relative_output_round_trips_through_deployment_anchor(tmp_pa
         assert metrics.max_rotation_error_rad < 1e-6
 
 
+@pytest.mark.optional
 def test_v22_parquet_absolute_relative_replay_round_trip_is_zero_error(tmp_path) -> None:
     pyarrow = pytest.importorskip("pyarrow")
     import pyarrow.parquet as pq

@@ -235,6 +235,7 @@ def test_v22_row_adapter_preserves_singularity_pose_quality_sentinel() -> None:
     assert row["teleop.pose_quality.special_code"] == "singularity"
 
 
+@pytest.mark.integration
 def test_v22_writer_binds_layout_to_info_episode_and_row(tmp_path) -> None:
     layout = PolicyIOLayout(
         name="left_gripper_right_none",
@@ -272,6 +273,7 @@ def test_v22_writer_binds_layout_to_info_episode_and_row(tmp_path) -> None:
     assert writer._episodes[0].metadata["policy_io_layout_hash"] == layout.layout_hash
 
 
+@pytest.mark.integration
 def test_v22_writer_refuses_to_append_with_a_different_layout_hash(tmp_path) -> None:
     first = PolicyIOLayout(
         name="left_gripper",
@@ -372,6 +374,7 @@ def test_training_reader_keeps_discrete_tokens_out_of_float_state_and_action() -
     assert batch.model_dict()["observation.state.discrete"].shape == (2, 1)
 
 
+@pytest.mark.integration
 def test_v21_to_v22_copy_on_write_plan_and_layout_file(tmp_path) -> None:
     source = tmp_path / "legacy"
     (source / "meta").mkdir(parents=True)
@@ -402,6 +405,7 @@ def test_v21_to_v22_copy_on_write_plan_and_layout_file(tmp_path) -> None:
     assert not (tmp_path / "converted").exists()
 
 
+@pytest.mark.integration
 def test_v21_to_v22_preflight_rejects_missing_parquet_before_output_creation(tmp_path) -> None:
     source = tmp_path / "legacy"
     (source / "meta").mkdir(parents=True)

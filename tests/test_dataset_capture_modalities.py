@@ -27,6 +27,7 @@ def _populate(root) -> None:
     )
 
 
+@pytest.mark.integration
 def test_blank_dataset_can_bind_and_replace_capture_contract(tmp_path) -> None:
     root = tmp_path / "dataset"
     first = CaptureModalityContract(ignored_camera_keys=("right_wrist",))
@@ -39,6 +40,7 @@ def test_blank_dataset_can_bind_and_replace_capture_contract(tmp_path) -> None:
     assert read_capture_modality_contract(root) == second
 
 
+@pytest.mark.integration
 def test_populated_dataset_requires_exact_capture_contract(tmp_path) -> None:
     root = tmp_path / "dataset"
     expected = CaptureModalityContract(
@@ -53,6 +55,7 @@ def test_populated_dataset_requires_exact_capture_contract(tmp_path) -> None:
         bind_capture_modality_contract(root, CaptureModalityContract())
 
 
+@pytest.mark.integration
 def test_populated_legacy_dataset_means_no_modalities_ignored(tmp_path) -> None:
     root = tmp_path / "dataset"
     _populate(root)
@@ -65,6 +68,7 @@ def test_populated_legacy_dataset_means_no_modalities_ignored(tmp_path) -> None:
         )
 
 
+@pytest.mark.integration
 def test_dataset_index_exposes_dataset_level_ignore_declaration(tmp_path) -> None:
     root = tmp_path / "dataset"
     contract = CaptureModalityContract(
@@ -81,6 +85,7 @@ def test_dataset_index_exposes_dataset_level_ignore_declaration(tmp_path) -> Non
     assert index.ignored_tactile_keys == ("right",)
 
 
+@pytest.mark.integration
 def test_capture_contract_is_only_dataset_metadata_not_episode_metadata(tmp_path) -> None:
     root = tmp_path / "dataset"
     contract = CaptureModalityContract(ignored_camera_keys=("right_wrist",))

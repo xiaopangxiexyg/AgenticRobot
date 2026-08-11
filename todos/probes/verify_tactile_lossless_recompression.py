@@ -10,7 +10,7 @@ from typing import Any
 
 from dataset_contracts.tactile import ChunkedTactileStream
 from dataset_interface.validation import validate_v23_dataset
-from utils.dataset_postprocess.tactile_recompress import (
+from collection_runtime.tactile_recompression import (
     LOSSLESS_PROFILE_V1,
     _finalized_manifest_paths,
     _read_json,

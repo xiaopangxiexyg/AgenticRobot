@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -9,6 +11,7 @@ from robot_motion.deploy.observation_view import (
     PolicyObservationContract,
     PolicyObservationFieldSpec,
     build_policy_observation_view,
+    compare_policy_observation_view,
 )
 
 
@@ -82,6 +85,40 @@ def test_actor_view_is_allowlisted_and_detached_from_runtime_state() -> None:
     assert view.payload["images"]["front"][0, 0, 0] == 0
     model_input["state"][1] = 777.0
     assert view.payload["state"][1] == 1.0
+
+
+def test_parity_uses_artifact_bound_custom_hand_state_keys() -> None:
+    observation = replace(
+        _observation(),
+        hands_enabled=True,
+        end_effector_sides=("right",),
+        hand_states={
+            "right": {
+                "joint_pos": np.asarray([0.4], dtype=np.float32),
+                "gripper_measured_scalar": 0.4,
+                "private_backend_detail": "must remain filtered",
+            }
+        },
+    )
+    contract = PolicyObservationContract(
+        contract_id="dmtac-measured-state-parity",
+        fields=_contract().fields,
+        last_action_contract=_contract().last_action_contract,
+        compatibility_hand_state_keys=("gripper_measured_scalar",),
+    )
+
+    view = build_policy_observation_view(observation, contract=contract)
+    parity = compare_policy_observation_view(observation, view)
+
+    assert parity.matched
+    assert parity.difference_paths == ()
+    assert view.compatibility_payload["hand_states"]["right"][
+        "gripper_measured_scalar"
+    ] == pytest.approx(0.4)
+    assert (
+        "private_backend_detail"
+        not in view.compatibility_payload["hand_states"]["right"]
+    )
 
 
 def test_control_private_and_unbound_last_action_contracts_fail_closed() -> None:

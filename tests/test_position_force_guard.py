@@ -12,11 +12,13 @@ pytestmark = pytest.mark.integration
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.real_teleop import control_loop
+from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
 from teleop_runtime.real_teleop.position_force_guard import (
     PositionForceGuardConfig,
     PositionForceGuardFault,
     PositionForceGuardMonitor,
     PositionForceGuardTripped,
+    position_force_guard_config,
 )
 
 
@@ -44,6 +46,22 @@ def test_position_force_guard_rejects_fractional_sample_counts():
         PositionForceGuardConfig(consecutive_limit_samples=1.5)
 
 
+def test_position_force_guard_defaults_are_30n_5nm_with_400ms_stale_timeout():
+    config = PositionForceGuardConfig()
+    namespace_config = position_force_guard_config(SimpleNamespace())
+    args = build_real_teleop_argument_parser().parse_args([])
+
+    assert config.max_force_n == pytest.approx(30.0)
+    assert config.max_torque_nm == pytest.approx(5.0)
+    assert config.stale_timeout_sec == pytest.approx(0.4)
+    assert namespace_config.max_force_n == pytest.approx(30.0)
+    assert namespace_config.max_torque_nm == pytest.approx(5.0)
+    assert namespace_config.stale_timeout_sec == pytest.approx(0.4)
+    assert args.position_force_guard_max_force_n == pytest.approx(30.0)
+    assert args.position_force_guard_max_torque_nm == pytest.approx(5.0)
+    assert args.position_force_guard_stale_sec == pytest.approx(0.4)
+
+
 def test_position_force_guard_arms_after_both_valid_samples():
     stops = []
     monitor = PositionForceGuardMonitor(
@@ -65,6 +83,37 @@ def test_position_force_guard_arms_after_both_valid_samples():
         assert snapshot["motion_ready"] is True
         assert set(snapshot["last_reading_by_side"]) == {"left", "right"}
         assert stops == []
+    finally:
+        monitor.close()
+
+
+def test_position_force_guard_preserves_backend_read_phase_timing():
+    phase_timing = {
+        "total_wall_ms": 12.5,
+        "total_thread_cpu_ms": 1.25,
+        "sdk_call_wall_ms": 4.0,
+    }
+
+    def reader():
+        payload = _payload(force_x=1.0)
+        payload["read_elapsed_sec"] = 0.0125
+        payload["read_phase_timing"] = phase_timing
+        return payload
+
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": reader, "right": reader},
+        emergency_stop=lambda _fault: None,
+        config=PositionForceGuardConfig(
+            poll_hz=20.0,
+            stale_timeout_sec=0.2,
+            startup_timeout_sec=0.5,
+        ),
+    )
+    try:
+        snapshot = monitor.start()
+        for reading in snapshot["last_reading_by_side"].values():
+            assert reading["read_elapsed_sec"] == pytest.approx(0.0125)
+            assert reading["read_phase_timing"] == phase_timing
     finally:
         monitor.close()
 
@@ -192,7 +241,7 @@ def test_position_force_guard_latches_fault_when_stop_callback_fails():
         raise OSError("Arm_Stop timeout")
 
     monitor = PositionForceGuardMonitor(
-        readers_by_side={"left": lambda: _payload(force_x=16.0)},
+        readers_by_side={"left": lambda: _payload(force_x=31.0)},
         emergency_stop=fail_stop,
         config=PositionForceGuardConfig(startup_timeout_sec=0.5),
     )
@@ -315,6 +364,79 @@ def test_deferred_stale_watchdog_arm_fails_closed_without_fresh_sample():
         monitor.close()
 
 
+def test_non_motion_read_window_suppresses_only_stale_until_fresh_rearm():
+    stops = []
+    calls = 0
+    block = threading.Event()
+
+    def reader():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _payload()
+        block.wait(1.0)
+        return _payload()
+
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": reader},
+        emergency_stop=stops.append,
+        config=PositionForceGuardConfig(
+            poll_hz=20.0,
+            stale_timeout_sec=0.08,
+            startup_timeout_sec=0.5,
+        ),
+    )
+    try:
+        monitor.start()
+        token = monitor.suspend_stale_watchdog_for_non_motion()
+        assert monitor.motion_ready is False
+        time.sleep(0.12)
+        assert monitor.fault is None
+        assert stops == []
+
+        block.set()
+        snapshot = monitor.resume_stale_watchdog_after_non_motion(
+            token,
+            timeout_sec=0.5,
+        )
+        assert snapshot["motion_ready"] is True
+        assert snapshot["non_motion_read_window_active"] is False
+        assert monitor.fault is None
+    finally:
+        block.set()
+        monitor.close()
+
+
+def test_force_limit_still_trips_inside_non_motion_read_window():
+    stops = []
+    over_limit = threading.Event()
+
+    def reader():
+        return _payload(force_x=31.0 if over_limit.is_set() else 0.0)
+
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": reader},
+        emergency_stop=stops.append,
+        config=PositionForceGuardConfig(
+            poll_hz=20.0,
+            stale_timeout_sec=0.08,
+            startup_timeout_sec=0.5,
+        ),
+    )
+    try:
+        monitor.start()
+        monitor.suspend_stale_watchdog_for_non_motion()
+        over_limit.set()
+        deadline = time.monotonic() + 0.5
+        while monitor.fault is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert monitor.fault is not None
+        assert monitor.fault.reason == "force_limit_exceeded"
+        assert len(stops) == 1
+    finally:
+        monitor.close()
+
+
 def test_force_limit_still_trips_while_stale_watchdog_is_deferred():
     stops = []
     calls = 0
@@ -322,7 +444,7 @@ def test_force_limit_still_trips_while_stale_watchdog_is_deferred():
     def reader():
         nonlocal calls
         calls += 1
-        return _payload(force_x=0.0 if calls == 1 else 16.0)
+        return _payload(force_x=0.0 if calls == 1 else 31.0)
 
     monitor = PositionForceGuardMonitor(
         readers_by_side={"left": reader},
@@ -437,6 +559,22 @@ def test_rm65_backend_force_read_validates_and_serializes_payload():
     payload = backend.read_force_data()
     assert payload["result_code"] == 0
     assert payload["sources"]["tool"].tolist() == [7, 8, 9, 1, 2, 3]
+    phase_timing = payload["read_phase_timing"]
+    assert set(phase_timing) == {
+        "total_wall_ms",
+        "total_thread_cpu_ms",
+        "pacing_wait_requested_ms",
+        "pacing_wait_wall_ms",
+        "pacing_wait_thread_cpu_ms",
+        "hardware_read_lock_wait_wall_ms",
+        "hardware_read_lock_wait_thread_cpu_ms",
+        "sdk_call_wall_ms",
+        "sdk_call_thread_cpu_ms",
+        "validation_wall_ms",
+        "validation_thread_cpu_ms",
+    }
+    assert all(value >= 0.0 for value in phase_timing.values())
+    assert phase_timing["total_wall_ms"] >= phase_timing["sdk_call_wall_ms"]
 
 
 def test_rm65_backend_serializes_concurrent_force_reads():

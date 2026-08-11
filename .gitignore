@@ -1,6 +1,10 @@
 __pycache__
 .idea/
 data/
+# The unanchored data rule also matches documentation taxonomy directories.
+# Keep real data ignored while allowing versioned documentation under docs/data.
+!docs/data/
+!docs/data/**
 build
 dist
 *.egg
@@ -51,6 +55,8 @@ playwright-report/
 .agents
 .realtime_sync_ssh.exclude
 logs/
+# Canonical local runtime outputs; versioned configs remain package-owned.
+/runtime_artifacts/
 
 # Local scratch outputs and raw UMI data are not repository artifacts.
 temp/
@@ -64,7 +70,8 @@ utils/random_background/generated/
 utils/random_background/samples/
 utils/random_background/real_images/
 codex_remote/
-legacy/
+# Ignore the root code archive without hiding versioned documentation under docs/legacy.
+/legacy/
 
 datasets_debug
 teleop_records/*

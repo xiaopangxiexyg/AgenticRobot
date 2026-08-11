@@ -6,9 +6,13 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DMROBOTICS_PACKAGE_DIR = REPO_ROOT / "assets" / "DM_Tac_SDK_Publish_1.2.10" / "dmrobotics"
+
+pytestmark = pytest.mark.integration
 
 
 def _run_import_check(code: str) -> subprocess.CompletedProcess[str]:

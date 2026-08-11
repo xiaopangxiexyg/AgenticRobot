@@ -31,6 +31,7 @@ from robot_motion.deploy import (
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
     ArmHoldKeyframePrediction,
+    ArmHoldResolvedHistoryBinding,
     ArmHoldSemanticResolver,
     CanonicalDeployActionPipeline,
     NormalizedAction,
@@ -1013,6 +1014,7 @@ def _runtime(
     contract: PolicyArmHoldOutputContract,
     *,
     execution_steps: int | None = None,
+    history_binding: ArmHoldResolvedHistoryBinding | None = None,
 ) -> PolicyDeployRuntime:
     return PolicyDeployRuntime(
         PolicyDeployRuntimeConfig(
@@ -1023,7 +1025,182 @@ def _runtime(
             action_chunk_execution_steps=execution_steps,
         ),
         monotonic_clock=_Clock(),
+        arm_hold_history_binding=history_binding,
     )
+
+
+def _history_binding(
+    contract: PolicyArmHoldOutputContract,
+    *,
+    epoch: int = 4,
+) -> ArmHoldResolvedHistoryBinding:
+    return ArmHoldResolvedHistoryBinding(
+        binding_id="policy-source:arm-hold-test",
+        epoch=epoch,
+        contract_hash=contract.contract_hash,
+    )
+
+
+def test_runtime_resolved_history_is_default_off_and_validated_at_construction() -> None:
+    contract = _contract()
+    assert _runtime(contract).arm_hold_resolved_history_snapshot() is None
+
+    binding = _history_binding(contract)
+    with pytest.raises(ValueError, match="requires arm_hold_output"):
+        PolicyDeployRuntime(
+            PolicyDeployRuntimeConfig(active_sides=("left", "right")),
+            arm_hold_history_binding=binding,
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        _runtime(
+            contract,
+            history_binding=ArmHoldResolvedHistoryBinding(
+                binding_id="policy-source:wrong-contract",
+                epoch=0,
+                contract_hash="wrong-contract",
+            ),
+        )
+
+
+def test_sync_runtime_advances_history_at_each_resolver_commit() -> None:
+    contract = _contract()
+    binding = _history_binding(contract)
+    observation = _observation()
+    runtime = _runtime(contract, history_binding=binding)
+    bootstrap = runtime.arm_hold_resolved_history_snapshot()
+    assert bootstrap is not None
+    assert bootstrap.context.available_mask.tolist() == [False, False]
+    runtime.predict_and_queue(
+        _Policy(_policy_output(contract, ((1.0, 0.0), (1.0, 0.0)))),
+        observation,
+        now=10.0,
+    )
+
+    first = runtime.prepare_next_action(observation, preparer=_pipeline())
+    after_first = runtime.arm_hold_resolved_history_snapshot()
+    second = runtime.prepare_next_action(observation, preparer=_pipeline())
+    after_second = runtime.arm_hold_resolved_history_snapshot()
+
+    assert first.arm_hold_resolution is not None
+    assert second.arm_hold_resolution is not None
+    assert after_first is not None
+    assert after_first.last_resolution_sequence == 1
+    assert after_first.context.previous_mode.tolist() == [1.0, 0.0]
+    assert after_first.context.dwell_steps.tolist() == [1, 1]
+    assert after_second is not None
+    assert after_second.last_resolution_sequence == 2
+    assert after_second.context.previous_mode.tolist() == [1.0, 0.0]
+    assert after_second.context.dwell_steps.tolist() == [2, 2]
+
+
+def test_history_sidecar_does_not_change_sync_action_or_emission_identity() -> None:
+    contract = _contract()
+    observation = _observation()
+    output = _policy_output(contract, ((1.0, 0.0),))
+    default_runtime = _runtime(contract)
+    history_runtime = _runtime(
+        contract,
+        history_binding=_history_binding(contract),
+    )
+    for runtime in (default_runtime, history_runtime):
+        prediction = runtime.predict_and_queue(
+            _Policy(output),
+            observation,
+            now=10.0,
+        )
+        assert prediction.accepted is True
+
+    default_step = default_runtime.prepare_next_action(
+        observation,
+        preparer=_pipeline(),
+    )
+    history_step = history_runtime.prepare_next_action(
+        observation,
+        preparer=_pipeline(),
+    )
+
+    assert default_step.raw_action is not None
+    assert history_step.raw_action is not None
+    np.testing.assert_array_equal(
+        default_step.raw_action.vector,
+        history_step.raw_action.vector,
+    )
+    assert default_step.emission is not None
+    assert history_step.emission is not None
+    assert (
+        default_step.emission.semantic_content_hash
+        == history_step.emission.semantic_content_hash
+    )
+    assert default_runtime.action_queue_pop_count() == 1
+    assert history_runtime.action_queue_pop_count() == 1
+
+
+def test_runtime_semantic_reset_rotates_history_epoch_and_bootstrap() -> None:
+    contract = _contract()
+    binding = _history_binding(contract, epoch=8)
+    observation = _observation()
+    runtime = _runtime(contract, history_binding=binding)
+    runtime.predict_and_queue(
+        _Policy(_policy_output(contract, ((1.0, 0.0),))),
+        observation,
+        now=10.0,
+    )
+    runtime.prepare_next_action(observation, preparer=_pipeline())
+
+    runtime.reset_arm_hold_semantics()
+    reset = runtime.arm_hold_resolved_history_snapshot()
+
+    assert reset is not None
+    assert reset.binding.binding_id == binding.binding_id
+    assert reset.binding.epoch == 9
+    assert reset.context.available_mask.tolist() == [False, False]
+    assert reset.context.dwell_steps.tolist() == [0, 0]
+    assert reset.last_resolution_sequence is None
+
+    runtime.clear_action_queue()
+    runtime.reset_prediction_schedule()
+    repeated = runtime.arm_hold_resolved_history_snapshot()
+
+    assert repeated is not None
+    assert repeated.binding.semantic_content_hash == (
+        reset.binding.semantic_content_hash
+    )
+    assert repeated.binding.epoch == 9
+    assert repeated.context.available_mask.tolist() == [False, False]
+
+    runtime.predict_and_queue(
+        _Policy(_policy_output(contract, ((0.0, 1.0),))),
+        observation,
+        now=11.0,
+    )
+    runtime.prepare_next_action(observation, preparer=_pipeline())
+    recommitted = runtime.arm_hold_resolved_history_snapshot()
+    assert recommitted is not None
+    assert recommitted.binding.epoch == 9
+    assert recommitted.last_resolution_sequence == 1
+
+    runtime.reset_arm_hold_semantics()
+    second_boundary = runtime.arm_hold_resolved_history_snapshot()
+    assert second_boundary is not None
+    assert second_boundary.binding.epoch == 10
+    assert second_boundary.last_resolution_sequence is None
+
+
+def test_runtime_semantic_reset_is_idempotent_before_first_history_commit() -> None:
+    contract = _contract()
+    binding = _history_binding(contract, epoch=12)
+    runtime = _runtime(contract, history_binding=binding)
+
+    runtime.reset_arm_hold_semantics()
+    runtime.clear_action_queue()
+    runtime.reset_prediction_schedule()
+    reset = runtime.arm_hold_resolved_history_snapshot()
+
+    assert reset is not None
+    assert reset.binding.semantic_content_hash == binding.semantic_content_hash
+    assert reset.binding.epoch == 12
+    assert reset.context.available_mask.tolist() == [False, False]
+    assert reset.last_resolution_sequence is None
 
 
 def _policy_output(
@@ -1130,7 +1307,7 @@ def test_runtime_execution_prefix_keeps_matching_first_semantic_row() -> None:
 def test_runtime_pop_reference_failure_is_no_action_and_does_not_partially_commit() -> None:
     contract = _contract()
     observation = _observation()
-    runtime = _runtime(contract)
+    runtime = _runtime(contract, history_binding=_history_binding(contract))
     runtime.predict_and_queue(
         _Policy(_policy_output(contract, ((1.0, 0.0),))),
         observation,
@@ -1165,6 +1342,9 @@ def test_runtime_pop_reference_failure_is_no_action_and_does_not_partially_commi
     assert failed.emission is None
     assert failed.model_raw_action is not None
     assert runtime._arm_hold_resolver.resolved_combination == "10"
+    committed_history = runtime.arm_hold_resolved_history_snapshot()
+    assert committed_history is not None
+    assert committed_history.last_resolution_sequence == 1
     assert runtime.action_queue_length() == 0
 
 

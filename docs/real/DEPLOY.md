@@ -37,6 +37,37 @@ velocity”为外层锚点。一次 reference 内的 2–4 次 Pink 调用只是
 用于部署 parity 检查的 Pose replay 默认也选择 V4；QPOS replay 是保存 q_ref 的严格复现，
 不经过 Pose Lift。V2/V3 仅保留为中间诊断 profile。
 
+### Position source-cut 执行与回退
+
+兼容的双臂 position deploy 默认使用：
+
+```bash
+--position-continuous-waypoint-profile formal_third_order
+```
+
+真实部署 trace 显示，`async_c2` bounded worker 在整机负载下可与权威 60 Hz
+reference worker 竞争，并导致跨过两个 16.7 ms tick。因此正式默认恢复为
+third-order governor；这不改变 official all-IK、chunk/stream-start splice、collision owner 或
+15/60/120 Hz 频率。
+
+隔离研究 C2 时才显式传：
+
+```bash
+--position-continuous-waypoint-profile async_c2
+```
+
+该 profile 仍按完整 source cut 原子选择 C2 或 formal，但只作为可回退实验面；
+在 CPU 隔离与真实 executor deadline soak 再次通过前，不得用于真机下发。显式请求
+`async_c2` 需要 `--debug`，且运行条件不兼容时会 fail closed。历史 experimental/shadow 参数仅用于
+`--debug` 研究对照；任一 C2 Active admission 与 `--send-actions` 的组合会在创建
+真机 backend 前被拒绝。
+
+RTC frontend 与声明 `arm_hold_output` 的 policy artifact 不会提供已经完成语义解析的
+same-chunk successor。两类运行会在 planner/profile 解析前关闭 chunk lookahead，回退到
+`pink_pose_lift` 兼容路径，并将 C2 effective profile 标为 `formal_third_order`（即 C2 关闭）；
+显式请求 `async_c2` 会 fail closed。这样不会把
+尚未解析的未来 arm-hold 状态送入 IK/C2，也不会在日志中把不可用的 C2 标为 effective。
+
 ## 2. OpenPI 两进程部署
 
 OpenPI server 使用 OpenPI 环境，DexTeleop client 使用 `dexteleop310`。Checkpoint 目录必须

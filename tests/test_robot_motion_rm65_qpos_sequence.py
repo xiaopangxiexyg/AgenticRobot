@@ -94,6 +94,7 @@ def test_dry_run_qpos_test_sequence_rejects_j6_outside_120_deg() -> None:
         )
 
 
+@pytest.mark.optional
 def test_sample_episode_qpos_records_from_parquet(tmp_path: Path) -> None:
     pq, pa = _require_pyarrow()
     episode_path = tmp_path / "episode_000000.parquet"
@@ -117,6 +118,7 @@ def test_sample_episode_qpos_records_from_parquet(tmp_path: Path) -> None:
         assert record["qpos_by_side"]["right"].shape == (6,)
 
 
+@pytest.mark.optional
 def test_build_qpos_test_sequence_from_dataset_samples_each_episode(tmp_path: Path) -> None:
     pq, pa = _require_pyarrow()
     data_dir = tmp_path / "data" / "chunk-000"

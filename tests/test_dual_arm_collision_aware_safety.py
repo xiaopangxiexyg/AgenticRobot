@@ -832,6 +832,61 @@ def test_single_step_singularity_mode_advances_solver_once_per_outer_tick() -> N
     assert retargeter._last_solve_iteration_stop_reason == "pose_tolerance"
 
 
+def test_single_step_position_admittance_preserves_one_solve_per_tick() -> None:
+    solver = _FakeDualArmSolver()
+    solve_calls = 0
+
+    def solve(*, targets):
+        nonlocal solve_calls
+        del targets
+        solve_calls += 1
+        return solver.current_q
+
+    solver.solve = solve  # type: ignore[attr-defined]
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_max_iterations=4,
+            solve_min_iterations=2,
+            solve_adaptive_iterations_enabled=True,
+            solve_time_budget_ms=1000.0 / 60.0,
+            solve_iteration_reserve_ms=5.0,
+            solve_step_mode="single_step_singularity_aware",
+            solve_translation_tolerance_m=100.0,
+            solve_orientation_tolerance_deg=360.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+
+    profile: dict[str, object] = {}
+    _, iterations, _ = retargeter._solve_toward_targets(
+        left_target=np.eye(4, dtype=float),
+        right_target=np.eye(4, dtype=float),
+        target_activity={
+            "left": {
+                "source": "position_admittance_active_modifier",
+                "state": "ACTIVE",
+                "inactive": False,
+            },
+            "right": {
+                "source": "tracker_motion_intent",
+                "state": "INACTIVE",
+                "inactive": True,
+            },
+        },
+        profile=profile,
+    )
+
+    assert solve_calls == 1
+    assert iterations == 1
+    assert retargeter._last_solve_iteration_stop_reason == "pose_tolerance"
+    assert profile["solve_iteration_mode"] == "single_physical_step"
+    assert profile["solve_iteration_effective_min"] == 1
+    assert profile["solve_iteration_effective_max"] == 1
+
+
 def test_single_step_admitted_motion_limit_uses_formal_velocity_and_admitted_anchor() -> None:
     solver = _FakeDualArmSolver()
     acceleration = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
@@ -3581,6 +3636,256 @@ def test_normal_zone_fast_path_filters_micro_reversals_and_syncs_alpha_state() -
     assert np.rad2deg(second[0] - first[0]) == pytest.approx(-1.19)
 
 
+def test_active_admittance_fast_path_is_modifier_only_and_inherits_guards() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.45,
+            output_qpos_normal_fast_path_enabled=True,
+            output_qpos_normal_fast_path_alpha=0.55,
+            output_qpos_normal_fast_path_guard_deg=4.0,
+            output_qpos_admittance_fast_path_enabled=True,
+            output_qpos_admittance_fast_path_alpha=0.85,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[2, 4, 8, 10]] = np.deg2rad([30.0, 20.0, 30.0, 20.0])
+    candidate = reference.copy()
+    candidate[0] += np.deg2rad(1.0)
+    candidate[6] -= np.deg2rad(1.0)
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    retargeter._last_wrist_coaxial_metadata = {
+        "sides": {
+            "left": {"effective_null_scale": 1.0},
+            "right": {"effective_null_scale": 1.0},
+        }
+    }
+    quality = {"quality_valid": False}
+    activity = {
+        "left": {
+            "source": "position_admittance_active_modifier",
+            "modifier_active": True,
+            "modifier_qpos_fast_path_alpha": 0.80,
+            "inactive": False,
+            "evidence": dict(quality),
+        },
+        "right": {"evidence": dict(quality)},
+    }
+
+    output, _left, _right, metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=candidate,
+            left_qpos=candidate[:6],
+            right_qpos=candidate[6:12],
+            reference_full_q=reference,
+            target_activity=activity,
+            admission_status="tracking",
+        )
+    )
+
+    assert metadata["alpha_by_side"]["left"] == pytest.approx(0.80)
+    assert metadata["alpha_by_side"]["right"] == pytest.approx(0.14)
+    assert metadata["admittance_fast_path"]["left"]["eligible"] is True
+    assert metadata["admittance_fast_path"]["right"]["eligible"] is False
+    assert (
+        metadata["admittance_fast_path"]["left"]["tracker_quality_required"]
+        is False
+    )
+    assert np.rad2deg(output[0] - reference[0]) == pytest.approx(0.80)
+    assert np.rad2deg(output[6] - reference[6]) == pytest.approx(-0.14)
+
+    retargeter._last_wrist_coaxial_metadata["sides"]["left"] = {
+        "effective_null_scale": 0.5
+    }
+    _output, _left, _right, guarded = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=candidate,
+            left_qpos=candidate[:6],
+            right_qpos=candidate[6:12],
+            reference_full_q=output,
+            target_activity=activity,
+            admission_status="tracking",
+        )
+    )
+    assert guarded["normal_fast_path"]["left"]["eligible"] is False
+    assert guarded["admittance_fast_path"]["left"]["eligible"] is False
+    assert guarded["alpha_by_side"]["left"] < 0.80
+
+
+def test_rotational_admittance_owns_contact_and_return_smoothing_endpoints() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_adaptive_enabled=False,
+            output_qpos_admittance_fast_path_enabled=True,
+            output_qpos_admittance_fast_path_alpha=0.85,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[2, 4, 8, 10]] = np.deg2rad([30.0, 20.0, 30.0, 20.0])
+    candidate = reference.copy()
+    candidate[0] += np.deg2rad(1.0)
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    retargeter._last_wrist_coaxial_metadata = {
+        "sides": {
+            "left": {"effective_null_scale": 1.0},
+            "right": {"effective_null_scale": 1.0},
+        }
+    }
+
+    def smooth(alpha: float, phase: str) -> tuple[np.ndarray, dict[str, object]]:
+        output, _left, _right, metadata = (
+            retargeter._smooth_output_qpos_before_action(
+                active_q=candidate,
+                left_qpos=candidate[:6],
+                right_qpos=candidate[6:12],
+                reference_full_q=reference,
+                target_activity={
+                    "left": {
+                        "source": "position_admittance_active_modifier",
+                        "modifier_active": True,
+                        "modifier_rotation_offset_norm_rad": 0.01,
+                        "modifier_qpos_fast_path_alpha": alpha,
+                        "modifier_phase": phase,
+                        "inactive": False,
+                    },
+                    "right": {},
+                },
+                admission_status="tracking",
+            )
+        )
+        return output, metadata
+
+    contact, contact_metadata = smooth(0.55, "contact")
+    assert contact_metadata["alpha_by_side"]["left"] == pytest.approx(0.55)
+    assert np.rad2deg(contact[0] - reference[0]) == pytest.approx(0.55)
+    assert contact_metadata["admittance_fast_path"]["left"][
+        "rotational_modifier"
+    ] is True
+
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    returning, return_metadata = smooth(0.85, "return")
+    assert return_metadata["alpha_by_side"]["left"] == pytest.approx(0.85)
+    assert np.rad2deg(returning[0] - reference[0]) == pytest.approx(0.85)
+    assert return_metadata["admittance_fast_path"]["left"][
+        "modifier_phase"
+    ] == "return"
+
+
+def test_active_admittance_holds_one_tiny_qpos_reversal_then_confirms_it() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.45,
+            output_qpos_normal_fast_path_enabled=True,
+            output_qpos_normal_fast_path_alpha=0.55,
+            output_qpos_normal_fast_path_guard_deg=4.0,
+            output_qpos_admittance_fast_path_enabled=True,
+            output_qpos_admittance_fast_path_alpha=0.85,
+            output_qpos_admittance_micro_reversal_hold_deg=0.05,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[[2, 4, 8, 10]] = np.deg2rad([30.0, 20.0, 30.0, 20.0])
+    retargeter._last_output_qpos_smoothing_full_q = reference.copy()
+    retargeter._last_wrist_coaxial_metadata = {
+        "sides": {
+            "left": {"effective_null_scale": 1.0},
+            "right": {"effective_null_scale": 1.0},
+        }
+    }
+    activity = {
+        "left": {
+            "source": "position_admittance_active_modifier",
+            "modifier_active": True,
+            "modifier_qpos_fast_path_alpha": 0.80,
+            "inactive": False,
+            "evidence": {"quality_valid": False},
+        },
+        "right": {"evidence": {"quality_valid": False}},
+    }
+
+    positive = reference.copy()
+    positive[0] += np.deg2rad(0.05)
+    first, _left, _right, _metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=positive,
+            left_qpos=positive[:6],
+            right_qpos=positive[6:12],
+            reference_full_q=reference,
+            target_activity=activity,
+            admission_status="tracking",
+        )
+    )
+    assert np.rad2deg(first[0] - reference[0]) == pytest.approx(0.04)
+    retargeter._commit_admitted_velocity(
+        reference_full_q=reference,
+        admitted_full_q=first,
+    )
+
+    reversed_candidate = first.copy()
+    reversed_candidate[0] -= np.deg2rad(0.06875)
+    held, _left, _right, held_metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=reversed_candidate,
+            left_qpos=reversed_candidate[:6],
+            right_qpos=reversed_candidate[6:12],
+            reference_full_q=first,
+            target_activity=activity,
+            admission_status="tracking",
+        )
+    )
+    assert held[0] == pytest.approx(first[0])
+    assert held_metadata["admittance_fast_path"]["left"][
+        "micro_reversal_held_joint_indices"
+    ] == [0]
+    assert held_metadata["admittance_fast_path"]["left"][
+        "micro_reversal_pending_joint_indices"
+    ] == [0]
+    assert held_metadata["left"]["admittance_fast_path"][
+        "micro_reversal_held_joint_indices"
+    ] == [0]
+    retargeter._commit_admitted_velocity(
+        reference_full_q=first,
+        admitted_full_q=held,
+    )
+
+    confirmed, _left, _right, confirmed_metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=reversed_candidate,
+            left_qpos=reversed_candidate[:6],
+            right_qpos=reversed_candidate[6:12],
+            reference_full_q=held,
+            target_activity=activity,
+            admission_status="tracking",
+        )
+    )
+    assert np.rad2deg(confirmed[0] - held[0]) == pytest.approx(-0.055)
+    assert confirmed_metadata["admittance_fast_path"]["left"][
+        "micro_reversal_held_joint_indices"
+    ] == []
+    assert confirmed_metadata["admittance_fast_path"]["left"][
+        "micro_reversal_pending_joint_indices"
+    ] == []
+
+
 def test_normal_zone_fast_path_graces_soft_quality_dropout_but_not_hard_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3815,6 +4120,140 @@ def test_q5_hysteresis_latch_arms_only_after_admitted_escape() -> None:
     assert held_metadata["sides"]["left"]["hysteresis_allowed"] is True
     assert held_metadata["sides"]["left"]["hysteresis_hold"] is True
     assert held[4] == pytest.approx(escaped[4])
+
+
+def test_q5_latch_mode_holds_only_first_inward_boundary_entry() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_q5_hysteresis_requires_escape_latch=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[4] = np.deg2rad(-3.7)
+    reference[10] = np.deg2rad(20.0)
+    inward = reference.copy()
+    inward[1] += 0.01
+    inward[4] = np.deg2rad(-2.8)
+
+    held = retargeter._wrist_q5_entry_boundary_hold_candidate(
+        ordinary_q=inward,
+        reference_full_q=reference,
+    )
+
+    assert held is not None
+    assert held.source == "wrist_q5_boundary_hold"
+    assert held.qpos[4] == pytest.approx(reference[4])
+    assert held.qpos[1] == pytest.approx(inward[1])
+    assert held.metadata["held_sides"]["left"]["reason"] == (
+        "inward_entry_or_near_crossing"
+    )
+
+    outward = reference.copy()
+    outward[4] = np.deg2rad(-4.2)
+    assert (
+        retargeter._wrist_q5_entry_boundary_hold_candidate(
+            ordinary_q=outward,
+            reference_full_q=reference,
+        )
+        is None
+    )
+
+    inside = reference.copy()
+    inside[4] = np.deg2rad(-2.5)
+    inside_candidate = inside.copy()
+    inside_candidate[4] = np.deg2rad(-1.5)
+    assert (
+        retargeter._wrist_q5_entry_boundary_hold_candidate(
+            ordinary_q=inside_candidate,
+            reference_full_q=inside,
+        )
+        is None
+    )
+
+    rollback = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_q5_hysteresis_requires_escape_latch=False,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    assert (
+        rollback._wrist_q5_entry_boundary_hold_candidate(
+            ordinary_q=inward,
+            reference_full_q=reference,
+        )
+        is None
+    )
+
+
+def test_q5_entry_boundary_hold_bypasses_auxiliary_escape_search(
+    monkeypatch,
+) -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_q5_hysteresis_requires_escape_latch=True,
+            ik_safety_profile=replace(
+                _profile(),
+                local_step_singularity_escape_enabled=True,
+                local_step_singularity_escape_directional_enabled=True,
+            ),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[4] = np.deg2rad(-3.7)
+    reference[10] = np.deg2rad(20.0)
+    ordinary = reference.copy()
+    ordinary[1] += 0.002
+    ordinary[4] = np.deg2rad(-2.8)
+    candidate = target_solver_module._DualArmCandidate(
+        name="ordinary_inward_q5",
+        qpos=ordinary,
+        source="multitask",
+        method="ordinary_inward_q5",
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_candidates(**kwargs):
+        calls.append(dict(kwargs))
+        return [candidate], {"enabled": True, "status": "active"}
+
+    def fake_evaluate(*, candidate, step_scale, **_kwargs):
+        return True, candidate.qpos.copy(), {
+            "candidate_metadata": dict(candidate.metadata),
+            "score": 0.0,
+            "step_scale": float(step_scale),
+        }
+
+    monkeypatch.setattr(retargeter, "_dual_arm_tracking_candidates", fake_candidates)
+    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", fake_evaluate)
+
+    qpos, name, _score, _distance, metadata = (
+        retargeter._select_safe_tracking_candidate(
+            raw_full_q=ordinary,
+            reference_full_q=reference,
+            current_targets=retargeter.current_world_targets(),
+            profile=None,
+        )
+    )
+
+    assert name == "wrist_q5_entry_boundary_hold"
+    assert metadata["selected_source"] == "wrist_q5_boundary_hold"
+    assert metadata["candidate_eval_mode"] == "wrist_q5_entry_boundary_hold"
+    assert qpos[4] == pytest.approx(reference[4])
+    assert qpos[1] == pytest.approx(ordinary[1])
+    assert len(calls) == 1
 
 
 def test_dual_arm_output_qpos_smoothing_uses_motion_window_validity() -> None:
@@ -4229,6 +4668,25 @@ def test_final_qpos_pair_collision_check_is_read_only_and_fail_closed() -> None:
     )
     assert not unsafe.safe
     assert unsafe.reason == "collision_margin_low"
+    np.testing.assert_allclose(solver.current_q, initial_q)
+
+
+def test_admitted_qref_fk_is_read_only_and_uses_both_final_arm_vectors() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    initial_q = solver.current_q.copy()
+    left_qpos = np.zeros(6, dtype=float)
+    right_qpos = np.zeros(6, dtype=float)
+    left_qpos[0] = 0.2
+    right_qpos[0] = 0.3
+
+    poses = retargeter.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=left_qpos,
+        right_qpos=right_qpos,
+    )
+
+    assert poses["left"][0, 3] == pytest.approx(-0.2)
+    assert poses["right"][0, 3] == pytest.approx(0.3)
     np.testing.assert_allclose(solver.current_q, initial_q)
 
 

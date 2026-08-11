@@ -18,7 +18,7 @@ from dataset_interface.control_trace import (
 from robot_motion.action import (
     RobotAction,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
-    build_m6_candidate_policy_arm_qpos_manifest,
+    build_m6_runtime_policy_arm_qpos_manifest,
 )
 from robot_motion.action.authoritative_trace import (
     project_control_execution_manifest,
@@ -195,10 +195,14 @@ def _run_scheduled_qpos_formal_capture(
         trace_sink=admit_trace,
         clock=clock,
     )
-    execution_manifest = build_m6_candidate_policy_arm_qpos_manifest(
+    execution_manifest = build_m6_runtime_policy_arm_qpos_manifest(
         catalog=sim_runtime.catalog,
         capability=sim_runtime.execution_capability,
         activation=sim_runtime.reference_activation_spec,
+        component_target_capability=sim_runtime.component_target_capability,
+        target_runtime_action_contract_hash=(
+            sim_runtime.target_runtime_action_contract.semantic_content_hash
+        ),
     )
     manifest_fact = project_control_execution_manifest(
         sim_runtime.core.trace_context,
@@ -326,6 +330,7 @@ def test_scheduled_qpos_runtime_seals_commits_and_rebuilds_formal_capture(
     assert captured.committed
 
 
+@pytest.mark.optional
 def test_real_mujoco_actuated_backend_seals_and_rebuilds_same_formal_lineage(
     tmp_path: Path,
 ) -> None:

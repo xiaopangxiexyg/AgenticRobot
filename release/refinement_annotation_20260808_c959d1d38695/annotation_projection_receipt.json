@@ -1,0 +1,368 @@
+{
+  "entrypoint": "python -m control_station refinement-annotation",
+  "file_count": 59,
+  "files": [
+    {
+      "byte_count": 1084,
+      "kind": "generated",
+      "path": "ANNOTATION_RELEASE.md",
+      "sha256": "1264cd93d89980edc900cde82d70de8ee6e250f32dbe1bf00ffe569feccc7d57"
+    },
+    {
+      "byte_count": 3012,
+      "kind": "source",
+      "path": "README.md",
+      "sha256": "a5208e0a53364f4d8ffe9a42b74f455433307da6d6270ee6e6d7e0cc4753cc1d"
+    },
+    {
+      "byte_count": 23037,
+      "kind": "source",
+      "path": "README_ENV.md",
+      "sha256": "190bb5fa76703012d36262b568866a0df2fb01cf7f18d24609b3c5406143bc8b"
+    },
+    {
+      "byte_count": 494,
+      "kind": "source",
+      "path": "collection_runtime/__init__.py",
+      "sha256": "3442a9a2557aed621c7ace3c4f6434ac98440632465d889b9ea7b0187f03ebfe"
+    },
+    {
+      "byte_count": 1661,
+      "kind": "source",
+      "path": "collection_runtime/immutable_canonical_store.py",
+      "sha256": "b14c9fb5b7be00b26f7e0a855d2597a1664a0950b715bad910eca27832a5bbfa"
+    },
+    {
+      "byte_count": 6130,
+      "kind": "source",
+      "path": "collection_runtime/progress/__init__.py",
+      "sha256": "96b0bbf1c08827d3653732407d9aba98ce50c8ebb629c6000abeeea718933f26"
+    },
+    {
+      "byte_count": 2854,
+      "kind": "source",
+      "path": "collection_runtime/progress/failure_trigger_store.py",
+      "sha256": "2566797d086e6b916f64207a419e9c48ec17e9ccf8210b3209136fd9b2a2d182"
+    },
+    {
+      "byte_count": 2907,
+      "kind": "source",
+      "path": "collection_runtime/progress/recoverable_failure_store.py",
+      "sha256": "e6449f15741a54e377be1df06aa5e1519b032d0a986c0a612672cf83b972e985"
+    },
+    {
+      "byte_count": 21027,
+      "kind": "source",
+      "path": "collection_runtime/progress/retrospective_store.py",
+      "sha256": "4ffababf5d5bdd0e1d4097dca278d59158e9d48d1735cb4be37ea08adbf5c6b1"
+    },
+    {
+      "byte_count": 22047,
+      "kind": "source",
+      "path": "collection_runtime/progress/stage_annotation_store.py",
+      "sha256": "1b6f43bf3dc8d49d2e1af42c6a26ae8865e5516caff9bf66faa87db37a4c654c"
+    },
+    {
+      "byte_count": 9227,
+      "kind": "source",
+      "path": "control_station/__init__.py",
+      "sha256": "7a3f64738e85f6572e861aef5d8cf82b6062addd7cb025581d989a4013c792ed"
+    },
+    {
+      "byte_count": 1440,
+      "kind": "source",
+      "path": "control_station/__main__.py",
+      "sha256": "7f6994019202aa50721e7ee3fe2f76cce4ae0477076f187460143d2715c74b30"
+    },
+    {
+      "byte_count": 261,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/__init__.py",
+      "sha256": "2d19c523304e20bbd8884e9986301b83fa0e6db8a6543a9ec123af8df30c9360"
+    },
+    {
+      "byte_count": 112963,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/application.py",
+      "sha256": "ed66095f140bdd1d5eca118028840fbd97c6419c9007b98fb1e29d46900f4e8f"
+    },
+    {
+      "byte_count": 4704,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/cli.py",
+      "sha256": "0d1dbd99e28b73ccdaf231d48c0dffdd9acbfa36c6f632560dd68a0fd4db1ab4"
+    },
+    {
+      "byte_count": 10147,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/media.py",
+      "sha256": "438e52e92a7a4375e6b36480d145ca510e765890c4ee38394efcd970d2a8372f"
+    },
+    {
+      "byte_count": 42303,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/server.py",
+      "sha256": "01c87c532e1ff97e2e1f7d9081db9e9fd33eb11b1e5eb6fce6e810051baf6472"
+    },
+    {
+      "byte_count": 115919,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/static/app.js",
+      "sha256": "a1a7020e6b7e12eaa76755fa181f955679831d662b3a71bcee41511713ce76be"
+    },
+    {
+      "byte_count": 18893,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/static/index.html",
+      "sha256": "5722a77bbcca00a951c5876f9ca81d87167892bbe4e936adf1c9719d8943e0c0"
+    },
+    {
+      "byte_count": 23195,
+      "kind": "source",
+      "path": "control_station/refinement_annotation/static/styles.css",
+      "sha256": "b54e9b1cda89a39dbe252289713c48cbdfc764c3277295b0f9267914df7059be"
+    },
+    {
+      "byte_count": 79061,
+      "kind": "source",
+      "path": "dataset_contracts/__init__.py",
+      "sha256": "d54ce045276f7f36be3a7928bd213ee270730a5238ed2dec9031522e13f17e39"
+    },
+    {
+      "byte_count": 11592,
+      "kind": "source",
+      "path": "dataset_contracts/canonical_encoding.py",
+      "sha256": "d4e34543a70e2a30d55484faf5e0dba7ac6208e91455084b33fa0324db827591"
+    },
+    {
+      "byte_count": 4481,
+      "kind": "source",
+      "path": "dataset_contracts/causal_snapshot.py",
+      "sha256": "789c88e6961f969b593394b84f2122fa1366df6ce0e7461aa92ab6f0d7f160d7"
+    },
+    {
+      "byte_count": 13699,
+      "kind": "source",
+      "path": "dataset_contracts/episode_curation.py",
+      "sha256": "669cee1fdd2067840925294c1d884162e6fcadb15a3c68ff9dd699116c1c854f"
+    },
+    {
+      "byte_count": 41942,
+      "kind": "source",
+      "path": "dataset_contracts/progress_facts.py",
+      "sha256": "dc3c6d4a4645fe4bd996dd50239b5d6c5d61a0e1d13878905355757fe75ecbeb"
+    },
+    {
+      "byte_count": 19937,
+      "kind": "source",
+      "path": "dataset_contracts/progress_failure_triggers.py",
+      "sha256": "f44ebea8fd9b3713653daf01a295502abe62c4be46dc851098258cd4901a2f1b"
+    },
+    {
+      "byte_count": 26136,
+      "kind": "source",
+      "path": "dataset_contracts/progress_profile.py",
+      "sha256": "c58e8803b87f444754e9bfc68daf096708c173bcbf43c4cfd41fe103840cb270"
+    },
+    {
+      "byte_count": 15030,
+      "kind": "source",
+      "path": "dataset_contracts/progress_recoverable_failures.py",
+      "sha256": "4183cda08f9aa1831dc58d4592c295503bb9e74309a33b530ba08fd40416be5f"
+    },
+    {
+      "byte_count": 34451,
+      "kind": "source",
+      "path": "dataset_contracts/progress_stage_annotations.py",
+      "sha256": "41d7e072bf25dc93ca6f635f241087653c472ec80ee56c2e15e80ecb9dc81a61"
+    },
+    {
+      "byte_count": 15529,
+      "kind": "source",
+      "path": "dataset_contracts/progress_stages.py",
+      "sha256": "d70d95bbd879e50f721d048763488d876d9d140c9712013fb2bd77e6c80955f2"
+    },
+    {
+      "byte_count": 13080,
+      "kind": "source",
+      "path": "dataset_contracts/retrospective_campaign.py",
+      "sha256": "ed0164819c39d598f0b23c70ad144b8e9e3cad71cf9a13709a3929d3d374ba43"
+    },
+    {
+      "byte_count": 26477,
+      "kind": "source",
+      "path": "dataset_contracts/retrospective_progress.py",
+      "sha256": "5de617c3e64b2fa1aecc943ccb3c19d3c5fbe121e959dab1abb0a24224d2162e"
+    },
+    {
+      "byte_count": 38515,
+      "kind": "source",
+      "path": "dataset_interface/__init__.py",
+      "sha256": "833c82f5d58e8ec37094e6f8ba3fe0150a70860c04347bf9de81cadee8faa23c"
+    },
+    {
+      "byte_count": 10351,
+      "kind": "source",
+      "path": "dataset_interface/episode_curation.py",
+      "sha256": "539786013643737b6597395d6777d6e0fde8bb19595770158eb06a8b0804aef0"
+    },
+    {
+      "byte_count": 23905,
+      "kind": "source",
+      "path": "dataset_interface/progress_annotation_jobs.py",
+      "sha256": "1fab16622be8d4b1ae4b37581e879bfeb4062ca4d1ac7bbe95e72114ed4db8e7"
+    },
+    {
+      "byte_count": 15201,
+      "kind": "source",
+      "path": "dataset_interface/progress_artifacts.py",
+      "sha256": "185c65063d216c07bf5430290796fba385559b11ae74780fb33365ef68473a30"
+    },
+    {
+      "byte_count": 15585,
+      "kind": "source",
+      "path": "dataset_interface/progress_failure_triggers.py",
+      "sha256": "c9fc75db5512688caf842f4d01551594710158be8791e879eb7fe9ebd1ff3e7e"
+    },
+    {
+      "byte_count": 5298,
+      "kind": "source",
+      "path": "dataset_interface/progress_recoverable_failure_artifacts.py",
+      "sha256": "46573c2069eddf9ef317cafb31c457f776ca06ef484cb885ebf582d6804cfd31"
+    },
+    {
+      "byte_count": 12087,
+      "kind": "source",
+      "path": "dataset_interface/progress_recoverable_failures.py",
+      "sha256": "08e894fe632317ea60151faab49cb8a00bccfd4a3b0b724bb74844ba79991da4"
+    },
+    {
+      "byte_count": 4550,
+      "kind": "source",
+      "path": "dataset_interface/progress_samples.py",
+      "sha256": "ba6884b047233aa53e7f48c6bc506965b455d3ff32650a8fb5962c081579a445"
+    },
+    {
+      "byte_count": 2968,
+      "kind": "source",
+      "path": "dataset_interface/progress_stage_annotation_artifacts.py",
+      "sha256": "390dbce99090cc2e6c944c983f91fdc1f105125b0b90ca011fd6f42c7f6be011"
+    },
+    {
+      "byte_count": 27862,
+      "kind": "source",
+      "path": "dataset_interface/progress_stages.py",
+      "sha256": "4c6dc40006e7a558f7269671d6f4d1a43e45402b27ce706416955705deaf2895"
+    },
+    {
+      "byte_count": 34309,
+      "kind": "source",
+      "path": "dataset_interface/progress_timeline.py",
+      "sha256": "570bfeb75af2b532a2c86d8aa2cab12a8b122834bc260bb3663029bc73b96e95"
+    },
+    {
+      "byte_count": 9712,
+      "kind": "source",
+      "path": "dataset_interface/retrospective_campaign_artifacts.py",
+      "sha256": "75000b0955870a3994146643debc43f988242e76f321f9e035b60409695ad8c0"
+    },
+    {
+      "byte_count": 10012,
+      "kind": "source",
+      "path": "dataset_interface/retrospective_progress.py",
+      "sha256": "b56017713b3ab5f0163cd7225a23f0a8a4416c3bd052b0bd47e4a8815eab9cd9"
+    },
+    {
+      "byte_count": 12090,
+      "kind": "source",
+      "path": "dataset_interface/retrospective_progress_artifacts.py",
+      "sha256": "78dc28a6de0a07f43a150fa3e887d2a295cdfef3d3f189edf3243b9c50214d4d"
+    },
+    {
+      "byte_count": 5519,
+      "kind": "source",
+      "path": "dataset_interface/sample_axis.py",
+      "sha256": "52ed70485071bef83f926fedf368a3d0f4a626700eb627117c5264ca9892d6dc"
+    },
+    {
+      "byte_count": 17725,
+      "kind": "source",
+      "path": "dataset_interface/writing_stage1_cohort.py",
+      "sha256": "e73d4ff8196bd99a3137477709f09c8609a830d26ad23f48123a8f0d03fc31b8"
+    },
+    {
+      "byte_count": 7858,
+      "kind": "source",
+      "path": "dataset_interface/writing_stage1_v23.py",
+      "sha256": "b2f947e7341eb652829b070591da8f5a652cd3f831deaf90cb3b1c7ee8d667d8"
+    },
+    {
+      "byte_count": 21586,
+      "kind": "source",
+      "path": "docs/real/LONG_HORIZON_STAGE_ANNOTATION.md",
+      "sha256": "e00d49d3d546cd30d2c06a9595e57add950fe40e29394dea7795a751bdabfebb"
+    },
+    {
+      "byte_count": 7121,
+      "kind": "source",
+      "path": "docs/real/WRITING_STAGE1_RETROSPECTIVE_ANNOTATION.md",
+      "sha256": "937e73df2b930b344ea5957437433ea8dfb680a09c5b02fe324fdc978317f40e"
+    },
+    {
+      "byte_count": 3465,
+      "kind": "source",
+      "path": "pyproject.toml",
+      "sha256": "680a8b24b999837d9f3acc71e26144d2e14feee5fb3aa21f1d51e375b5aa3450"
+    },
+    {
+      "byte_count": 3262,
+      "kind": "source",
+      "path": "release/annotation_projection.toml",
+      "sha256": "d00ee867ec793f2130c630a6187ccb788ce02517aa685a9a84e86bb455c73bf8"
+    },
+    {
+      "byte_count": 12799,
+      "kind": "source",
+      "path": "scripts/check_annotation_projection.py",
+      "sha256": "55d9294d27decffba968797d435b81de2ab9dd96d07f213a6c5c847bfc9a19ba"
+    },
+    {
+      "byte_count": 11944,
+      "kind": "source",
+      "path": "scripts/export_annotation_projection.py",
+      "sha256": "9ed70ed17a69504722fb034b7d81eefe01fa0586b096f52e16f35e5fe14e1cb5"
+    },
+    {
+      "byte_count": 3482,
+      "kind": "source",
+      "path": "scripts/install_annotation_env.sh",
+      "sha256": "ba84caa6977fd162083abbad17e7aef9edbf2e53b89f2797f76091acf07aee5c"
+    },
+    {
+      "byte_count": 16357,
+      "kind": "source",
+      "path": "tests/test_annotation_projection.py",
+      "sha256": "3d0943697adaf89603a4ed806671b1ff719b5e0182bab456aad09d047bc7caa9"
+    },
+    {
+      "byte_count": 1610,
+      "kind": "source",
+      "path": "tests/test_refinement_annotation_import_boundaries.py",
+      "sha256": "0047e2127aa1245673d4f9a912e77653770b915849a3d05f6009ce622ec6e47f"
+    },
+    {
+      "byte_count": 153342,
+      "kind": "source",
+      "path": "uv.lock",
+      "sha256": "8fa6bf9d3c1def9a4371727b2da0e3a80aba0e81e7c75004168132e465a291ae"
+    }
+  ],
+  "generated_at": "2026-08-08T15:44:52.742346+00:00",
+  "manifest": "release/annotation_projection.toml",
+  "release_hash": "734a048108db902535f591a21372120f586149fbda356abff99f385897d4fb75",
+  "schema": "dexteleop.annotation-source-projection-receipt.v1",
+  "source_file_count": 58,
+  "source_git_commit": "3f94c77b6ea4780533132cb647840f5f1ff5004e",
+  "source_projection_dirty": true,
+  "source_projection_hash": "c959d1d38695721dee7f48143ea6f81e893f31c463862945d059017b53e8b5af"
+}

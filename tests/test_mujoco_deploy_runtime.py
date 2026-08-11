@@ -73,7 +73,11 @@ from sim.mujoco.adapters import (
     MujocoPositionExecutionConfig,
     MujocoPositionExecutionRig,
 )
-from sim.mujoco.deploy import MujocoDeployConfig, MujocoDeployRuntime
+from sim.mujoco.deploy import (
+    MujocoDeployConfig,
+    MujocoDeployRuntime,
+    MujocoDirectComponentProposalSource,
+)
 from sim.mujoco.deploy.observation import MUJOCO_QPOS_STREAM_ID_V1
 
 
@@ -373,6 +377,83 @@ def action(left: float = 0.2, right: float = -0.2) -> RobotAction:
         timestamp=10.0,
         source="policy",
     )
+
+
+def test_direct_component_ingress_has_fixed_agent_skill_identity() -> None:
+    clock = ManualClock()
+    scene = FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+        monotonic_clock=clock,
+    )
+    source = MujocoDirectComponentProposalSource(
+        producer_id="control-station-agent-skill-test",
+        producer_epoch=7,
+        authority_priority=23,
+    )
+    runtime = MujocoDeployRuntime(
+        rig,
+        MujocoDeployConfig(
+            runtime_session_id="session-agent-skill-direct",
+            control_domain_id="domain-agent-skill-direct",
+            embodiment_instance_id="embodiment-agent-skill-direct",
+            enable_primary_policy_authority=False,
+            enable_composer_authority=False,
+            enable_replay_authority=False,
+            initial_control_mode="agent_skill",
+            direct_component_proposal_source=source,
+        ),
+        clock=clock,
+    )
+    native = project_robot_action_v1_to_component_action(
+        action(),
+        action_schema=runtime.action_schema,
+    )
+
+    with pytest.raises(RuntimeError, match="start"):
+        runtime.submit_component_action(
+            native,
+            source_event_id="agent-target-before-start",
+        )
+
+    runtime.start()
+    receipt = runtime.submit_component_action(
+        native,
+        source_event_id="agent-target:1",
+        produced_at=10.0,
+        target_effective_at=10.0,
+        context_ids=("operation:1", "agent-observation:1"),
+    )
+
+    assert receipt.accepted
+    assert receipt.proposal is not None
+    assert receipt.proposal.producer_kind == "agent_skill"
+    assert receipt.proposal.producer_id == source.producer_id
+    assert receipt.proposal.producer_epoch == 7
+    assert receipt.proposal.authority_priority == 23
+    assert receipt.proposal.observation_cut_id is None
+    assert receipt.proposal.context_ids == (
+        "operation:1",
+        "agent-observation:1",
+    )
+    assert receipt.proposal.audit_metadata == {
+        "direct_component_source_event_id": "agent-target:1"
+    }
+
+    step = runtime.step(now=10.0)
+    assert step.status == "dispatched"
+    assert step.decision is not None
+    assert step.decision.selected_by_group == {
+        "arms": receipt.proposal.proposal_id
+    }
+    runtime.close()
 
 
 def replay_source(runtime: MujocoDeployRuntime) -> ReplayProposalSource:
@@ -738,6 +819,15 @@ def test_deployable_sim_preserves_the_arbiter_only_60hz_ceiling() -> None:
         physics_hz=1000.0,
     )
     assert faster_non_arbiter_profile.command_hz == 240.0
+
+
+def test_target_admission_margin_is_opt_in_and_positive() -> None:
+    assert MujocoDeployConfig().target_admission_margin_sec is None
+    assert MujocoDeployConfig(
+        target_admission_margin_sec=0.05
+    ).target_admission_margin_sec == pytest.approx(0.05)
+    with pytest.raises(ValueError, match="target_admission_margin_sec"):
+        MujocoDeployConfig(target_admission_margin_sec=0.0)
 
 
 def test_mujoco_reference_activation_profiles_do_not_redefine_existing_default() -> None:

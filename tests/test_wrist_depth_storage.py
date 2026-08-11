@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from utils.dataset_postprocess.wrist_cam_adjust.depth import (
     DepthRangeMaskConfig,
@@ -119,6 +120,7 @@ class WristDepthStorageTest(unittest.TestCase):
         self.assertAlmostEqual(result.foreground_fraction, 2.0 / 5.0)
         self.assertAlmostEqual(result.valid_fraction, 4.0 / 5.0)
 
+    @pytest.mark.integration
     def test_writer_saves_wrist_depth_mask_and_raw_streams(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(
@@ -169,6 +171,7 @@ class WristDepthStorageTest(unittest.TestCase):
                 _sample_with_depth().camera_frames["left_wrist"].frame.depth_image,
             )
 
+    @pytest.mark.integration
     def test_writer_ignores_front_depth_for_wrist_streams(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(
@@ -185,6 +188,7 @@ class WristDepthStorageTest(unittest.TestCase):
             self.assertFalse(any(job.kind == WRIST_DEPTH_FRAME_JOB_KIND for job in jobs))
             self.assertTrue(any(job.kind == ROW_JOB_KIND for job in jobs))
 
+    @pytest.mark.integration
     def test_writer_marks_wrist_depth_missing_in_episode_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(
@@ -225,6 +229,7 @@ class WristDepthStorageTest(unittest.TestCase):
                 {"missing_depth_image": 1},
             )
 
+    @pytest.mark.integration
     def test_writer_flags_repeated_wrist_depth_frame_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(

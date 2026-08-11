@@ -152,6 +152,7 @@ def _sample_values(timestamp: float):
     }
 
 
+@pytest.mark.integration
 def test_native_store_seals_without_any_v23_episode_record(tmp_path: Path) -> None:
     embodiment, native, projection = _profiles()
     store = V25pNativeEpisodeStore(
@@ -237,6 +238,7 @@ def test_native_store_seals_without_any_v23_episode_record(tmp_path: Path) -> No
     }
 
 
+@pytest.mark.integration
 def test_native_store_can_defer_sample_files_until_seal(tmp_path: Path) -> None:
     embodiment, native, _ = _profiles()
     store = V25pNativeEpisodeStore(
@@ -282,7 +284,9 @@ def test_native_store_can_defer_sample_files_until_seal(tmp_path: Path) -> None:
     assert (episode_dir / "native_capture_manifest.cjson").is_file()
 
 
+@pytest.mark.optional
 def test_parquet_chunks_round_trip_exactly_matches_record_cjson(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
     embodiment, native, projection = _profiles()
     identity = _identity()
 
@@ -366,9 +370,11 @@ def test_parquet_chunks_round_trip_exactly_matches_record_cjson(tmp_path: Path) 
     )
 
 
+@pytest.mark.optional
 def test_parquet_unsealed_interruption_keeps_chunks_but_publishes_no_episode(
     tmp_path: Path,
 ) -> None:
+    pytest.importorskip("pyarrow")
     embodiment, native, _ = _profiles()
     identity = _identity()
     store = V25pNativeEpisodeStore(
@@ -411,10 +417,12 @@ def test_parquet_unsealed_interruption_keeps_chunks_but_publishes_no_episode(
         load_v25p_native_episode(tmp_path, identity.episode_uuid)
 
 
+@pytest.mark.optional
 def test_parquet_full_chunk_publication_runs_off_the_append_caller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("pyarrow")
     original_write_chunk = V25pParquetChunkEpisodeWriter._write_chunk
     worker_started = threading.Event()
     release_worker = threading.Event()
@@ -466,11 +474,13 @@ def test_parquet_full_chunk_publication_runs_off_the_append_caller(
     )
 
 
+@pytest.mark.optional
 @pytest.mark.parametrize("compression", ["none", "zstd"])
 def test_parquet_chunk_compression_preserves_logical_content(
     tmp_path: Path,
     compression: str,
 ) -> None:
+    pytest.importorskip("pyarrow")
     embodiment, native, _ = _profiles()
     identity = _identity()
     store = V25pNativeEpisodeStore(
@@ -514,7 +524,9 @@ def test_parquet_chunk_compression_preserves_logical_content(
     )
 
 
+@pytest.mark.optional
 def test_parquet_chunk_reader_rejects_physical_corruption(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
     embodiment, native, _ = _profiles()
     identity = _identity()
     store = V25pNativeEpisodeStore(
@@ -560,6 +572,7 @@ def test_parquet_chunk_reader_rejects_physical_corruption(tmp_path: Path) -> Non
         load_v25p_native_episode(tmp_path, identity.episode_uuid)
 
 
+@pytest.mark.integration
 def test_native_store_rejects_missing_required_stream_and_future_data(
     tmp_path: Path,
 ) -> None:
@@ -607,6 +620,7 @@ def test_native_store_rejects_missing_required_stream_and_future_data(
         )
 
 
+@pytest.mark.integration
 def test_complete_v23_receipt_rechecks_the_exact_legacy_episode_row(
     tmp_path: Path,
 ) -> None:
@@ -722,6 +736,7 @@ def test_v23_projection_fails_instead_of_guessing_an_incompatible_stage() -> Non
         )
 
 
+@pytest.mark.integration
 def test_native_external_observation_is_hash_bound_and_explicitly_lossy_for_v23(
     tmp_path: Path,
 ) -> None:
@@ -833,6 +848,7 @@ def test_native_external_observation_is_hash_bound_and_explicitly_lossy_for_v23(
     assert plan.omitted_stream_ids == ("camera.front.rgb",)
 
 
+@pytest.mark.integration
 def test_native_task_timeline_preserves_failure_then_recovery_success(
     tmp_path: Path,
 ) -> None:

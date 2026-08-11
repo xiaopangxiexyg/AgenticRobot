@@ -33,8 +33,10 @@ from teleop_runtime.real_teleop import (
     component_builder,
     components,
     control_loop,
+    dataset_recorder as dataset_recorder_module,
     dataset_finalize,
     dataset_layout,
+    dataset_selection,
     debug_payload_primitives,
     debug_ik_payload,
     debug_log_frames,
@@ -58,6 +60,7 @@ from teleop_runtime.real_teleop import (
     position_force_guard,
     position_episode_debug,
     position_tuning,
+    plus_curation_runtime,
     recording_admission,
     runtime,
     runtime_debug,
@@ -76,6 +79,45 @@ from teleop_runtime.real_teleop import (
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "teleop_runtime/debug/run_vive_rm65_real_teleop.py"
+
+
+def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
+    assert control_loop._fresh_control_step_timestamp(
+        10.0,
+        clock=lambda: 11.25,
+    ) == pytest.approx(11.25)
+    assert control_loop._fresh_control_step_timestamp(
+        10.0,
+        clock=lambda: 9.5,
+    ) == pytest.approx(10.0)
+
+
+def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = object.__new__(dataset_recorder_module.RealTeleopDatasetRecorder)
+    recorder.args = SimpleNamespace(
+        dataset_root=tmp_path,
+        ignore_camera=(),
+        ignore_tactile=(),
+    )
+    recorder.components = SimpleNamespace(active_sides=())
+    recorder.dataset_root = tmp_path
+    recorder.gripper_force_contract = None
+    recorder.configured_for_current_args = lambda: True
+    calls: list[str] = []
+    recorder.reload_finalized_dataset_state = lambda: calls.append("reload")
+    recorder.write_camera_device_config = lambda: calls.append("camera_config")
+    monkeypatch.setattr(
+        dataset_recorder_module,
+        "_gripper_force_dataset_contract_from_args",
+        lambda _args: None,
+    )
+
+    recorder.reconfigure_for_current_args()
+
+    assert calls == []
 
 
 def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
@@ -410,16 +452,64 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 404
-    assert sum(len(action.option_strings) for action in parser._actions) == 454
+    assert len(parser._actions) == 439
+    assert sum(len(action.option_strings) for action in parser._actions) == 497
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
+    assert parser.parse_args([]).artifact_layout == "legacy"
     assert parser.parse_args([]).v25p_native_shadow is False
     assert parser.parse_args([]).v25p_native_storage_layout == "record_cjson_v1"
     assert parser.parse_args([]).position_ik_branch_continuity_anchor is False
     assert parser.parse_args([]).position_joint_limit_guard_mode == "legacy"
     assert parser.parse_args([]).runtime_home_atomic_arm_snapshot is True
     assert parser.parse_args([]).runtime_home_late_weighted_vive is True
+    assert parser.parse_args([]).position_admittance_shadow is False
+    assert parser.parse_args([]).position_admittance_active is False
+    assert parser.parse_args([]).position_admittance_combined_active is False
+    assert parser.parse_args([]).position_admittance_active_side is None
+    assert parser.parse_args([]).position_admittance_active_envelope == "cautious"
+    assert parser.parse_args([]).position_admittance_active_max_tool_excursion_m == 0.08
+    assert parser.parse_args([]).position_admittance_translation_response_weight == 1.0
+    assert parser.parse_args([]).position_admittance_rotation_response_weight == 1.0
+    assert parser.parse_args([]).position_admittance_rotation_filter_tau_sec == pytest.approx(
+        0.010857362
+    )
+    assert (
+        parser.parse_args(
+            ["--position-admittance-shadow"]
+        ).position_admittance_shadow
+        is True
+    )
+    assert (
+        parser.parse_args(
+            ["--position-admittance-active"]
+        ).position_admittance_active
+        is True
+    )
+    assert parser.parse_args([]).idle_tactile_compression is False
+    assert (
+        parser.parse_args(["--idle-tactile-compression"]).idle_tactile_compression
+        is True
+    )
+    assert (
+        parser.parse_args(
+            ["--no-idle-tactile-compression"]
+        ).idle_tactile_compression
+        is False
+    )
+    assert parser.parse_args([]).tactile_artifact_integrity is False
+    assert (
+        parser.parse_args(
+            ["--tactile-artifact-integrity"]
+        ).tactile_artifact_integrity
+        is True
+    )
+    assert (
+        parser.parse_args(
+            ["--no-tactile-artifact-integrity"]
+        ).tactile_artifact_integrity
+        is False
+    )
     rollback_args = parser.parse_args(
         [
             "--no-runtime-home-atomic-arm-snapshot",
@@ -596,6 +686,8 @@ def test_runtime_setup_helpers_live_in_non_authoritative_modules() -> None:
     assert list(
         inspect.signature(cli_runtime_config._discover_runtime_q6_ports).parameters
     ) == ["args", "active_sides"]
+    assert not hasattr(cli_runtime_config, "bind_legacy_support")
+    assert not hasattr(legacy_entrypoint, "_refresh_cli_runtime_config_support")
 
 
 def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
@@ -720,15 +812,32 @@ def test_real_component_builder_preserves_legacy_wrapper_and_import_boundary(
     assert "from ..debug" not in source
 
 
+def test_component_builder_uses_active_sides_for_arm_ip_admission() -> None:
+    args = SimpleNamespace(
+        swap_arm_sides=False,
+        left_arm_ip="192.168.101.21",
+        right_arm_ip="192.168.1.20",
+    )
+
+    assert component_builder._active_arm_ip_by_side(args, ("left",)) == {
+        "left": ("left_arm_ip", "192.168.101.21"),
+    }
+
+
 def test_extracted_application_runtime_preserves_entrypoint_support_contract() -> None:
     runtime.bind_legacy_support(vars(legacy_entrypoint))
-    assert list(inspect.signature(runtime.run_real_teleop).parameters) == ["args"]
+    assert list(inspect.signature(runtime.run_real_teleop).parameters) == [
+        "args",
+        "progress_application",
+        "input_batch_prioritizer",
+    ]
     assert list(inspect.signature(legacy_entrypoint.main).parameters) == []
 
     source = (ROOT / "teleop_runtime/real_teleop/runtime.py").read_text(
         encoding="utf-8"
     )
-    assert "def run_real_teleop(args: argparse.Namespace) -> None:" in source
+    assert "progress_application: ProgressApplicationPort | None = None" in source
+    assert "input_batch_prioritizer: RealTeleopInputBatchPrioritizer | None" in source
     assert "from teleop_runtime.debug" not in source
     assert "from ..debug" not in source
     assert set(runtime._REQUIRED_SUPPORT_NAMES).issubset(vars(legacy_entrypoint))
@@ -1214,9 +1323,55 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
     assert "from ..debug" not in source
 
 
-def test_arm_force_gripper_and_debug_frame_modules_preserve_legacy_seams(
+def test_startup_home_wait_quiesces_idle_maintenance_during_delay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_advance_startup_gui_qpos_maintenance",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_handle_ik_debug_log_toggle_request",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_impedance_force_control_not_ready_sides",
+        lambda args, components: [],
+    )
+    startup_runtime.bind_legacy_support(vars(legacy_entrypoint))
+    clutch = SimpleNamespace(
+        enabled=True,
+        poll=lambda: None,
+        should_quit=False,
+        set_startup_qpos_maintenance_enabled=lambda enabled: None,
+        consume_init_qpos_emergency_stop_request=lambda: False,
+        consume_calibration_request=lambda: True,
+        before_calibration_start_delay=lambda *args, **kwargs: (
+            calls.append("delay") or True
+        ),
+    )
+
+    result = legacy_entrypoint._wait_for_real_teleop_start_request(
+        SimpleNamespace(init_arm_controller=None),
+        clutch,
+        arm_mode="position",
+        args=SimpleNamespace(),
+        control_ui=None,
+        ik_debug_log_recorder=SimpleNamespace(),
+        ik_debug_profile_base_enabled=False,
+        begin_home_transition_handler=lambda: calls.append("begin"),
+        require_home_transition_ready_handler=lambda: calls.append("require"),
+    )
+
+    assert result == "home"
+    assert calls == ["begin", "delay", "require"]
+
+
+def test_arm_force_gripper_and_debug_frame_modules_preserve_legacy_seams() -> None:
     for name in (
         "_acceleration_limited_position_execution_active",
         "_active_command_backend",
@@ -1275,24 +1430,11 @@ def test_arm_force_gripper_and_debug_frame_modules_preserve_legacy_seams(
         "_build_debug_timing_log_frame",
     ):
         assert getattr(legacy_entrypoint, name) is getattr(debug_log_frames, name)
+    assert not hasattr(debug_log_frames, "bind_legacy_support")
     assert (
         legacy_entrypoint._build_pose_quality_display_payload
         is status_payloads._build_pose_quality_display_payload
     )
-
-    sentinel_status = {"overhead": {"status_level": "ok", "frame_count": 7}}
-    monkeypatch.setattr(
-        legacy_entrypoint,
-        "_build_camera_status",
-        lambda *args, **kwargs: sentinel_status,
-    )
-    debug_log_frames.bind_legacy_support(vars(legacy_entrypoint))
-    assert legacy_entrypoint._camera_status_log_payload(
-        {},
-        preview_camera_sources={},
-        camera_previewer=None,
-        now=1.0,
-    ) == {"overhead": {"status_level": "ok", "frame_count": 7}}
 
     for path in (
         ROOT / "teleop_runtime/real_teleop/arm_runtime.py",
@@ -1514,15 +1656,20 @@ def test_vive_calibration_runtime_and_shared_math_preserve_legacy_contracts() ->
             vive_calibration_profiles,
             name,
         )
-    for name in (
-        "_latest_vive_calibration_profile_path",
-        "_gui_vive_calibration_load_path",
-        "_save_gui_vive_calibration_profile",
-        "_load_gui_vive_calibration_profile",
-    ):
-        assert list(inspect.signature(getattr(legacy_entrypoint, name)).parameters) == list(
+    expected_profile_parameters = {
+        "_latest_vive_calibration_profile_path": [],
+        "_gui_vive_calibration_load_path": ["args"],
+        "_save_gui_vive_calibration_profile": ["args", "components"],
+        "_load_gui_vive_calibration_profile": ["args", "components"],
+    }
+    for name, expected_parameters in expected_profile_parameters.items():
+        assert list(
+            inspect.signature(getattr(legacy_entrypoint, name)).parameters
+        ) == expected_parameters
+        assert list(
             inspect.signature(getattr(vive_calibration_profiles, name)).parameters
-        )
+        ) == [*expected_parameters, "profile_dir"]
+    assert not hasattr(vive_calibration_profiles, "bind_legacy_support")
 
     for name in (
         "AxisFitQuality",
@@ -1645,6 +1792,43 @@ def test_dataset_layout_module_preserves_legacy_adapters_and_import_boundary() -
         source = path.read_text(encoding="utf-8")
         assert "run_vive_rm65_real_teleop" not in source
         assert "teleop_runtime.debug" not in source
+
+
+def test_dataset_selection_owns_pending_contract_admission_without_ui_or_devices() -> None:
+    selection_source = (
+        ROOT / "teleop_runtime/real_teleop/dataset_selection.py"
+    ).read_text(encoding="utf-8")
+    coordinator_source = (
+        ROOT / "teleop_runtime/real_teleop/operator_control_runtime.py"
+    ).read_text(encoding="utf-8")
+
+    assert callable(dataset_selection.apply_real_teleop_dataset_selection)
+    assert "inspect_dataset_progress_profile" in selection_source
+    assert "inspect_dataset_task_stage_profile" in selection_source
+    assert "inspect_dataset_progress_profile" not in coordinator_source
+    assert "inspect_dataset_task_stage_profile" not in coordinator_source
+    assert "apply_real_teleop_dataset_selection(" in coordinator_source
+    assert "control_station" not in selection_source
+    assert "teleop_runtime.debug" not in selection_source
+    assert "hardware" not in selection_source
+
+
+def test_plus_curation_runtime_owns_request_and_writer_thread_lifecycle() -> None:
+    runtime_source = (
+        ROOT / "teleop_runtime/real_teleop/plus_curation_runtime.py"
+    ).read_text(encoding="utf-8")
+    coordinator_source = (
+        ROOT / "teleop_runtime/real_teleop/operator_control_runtime.py"
+    ).read_text(encoding="utf-8")
+
+    assert callable(plus_curation_runtime.RealTeleopPlusCurationRuntime)
+    assert "threading.Thread(" in runtime_source
+    assert "_pending_request" in runtime_source
+    assert "threading.Thread(" not in coordinator_source
+    assert "_plus_curation_save_thread" not in coordinator_source
+    assert "self._plus_curation_request" not in coordinator_source
+    assert "control_station" not in runtime_source
+    assert "hardware" not in runtime_source
 
 
 def test_debug_ik_payload_module_preserves_legacy_identity_and_import_boundary() -> None:

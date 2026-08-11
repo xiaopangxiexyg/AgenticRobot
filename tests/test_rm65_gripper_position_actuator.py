@@ -45,6 +45,7 @@ def _write_artifact(path: Path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+@pytest.mark.integration
 def test_profile_loads_hashed_directional_position_fit(tmp_path: Path) -> None:
     artifact_path = tmp_path / "fit.json"
     _write_artifact(artifact_path)
@@ -59,6 +60,7 @@ def test_profile_loads_hashed_directional_position_fit(tmp_path: Path) -> None:
     assert profile.source_conditions["force_setting"] == [0.2]
 
 
+@pytest.mark.integration
 def test_profile_rejects_modified_fit_payload(tmp_path: Path) -> None:
     artifact_path = tmp_path / "fit.json"
     _write_artifact(artifact_path)
@@ -87,6 +89,7 @@ def test_canonical_bilateral_stage_profile_is_content_addressed() -> None:
     )
 
 
+@pytest.mark.integration
 def test_actuator_applies_delay_rate_limit_threshold_and_reverse_fit(
     tmp_path: Path,
 ) -> None:

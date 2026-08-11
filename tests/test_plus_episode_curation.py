@@ -90,6 +90,55 @@ def test_store_writes_external_append_only_overlay_and_is_idempotent(tmp_path: P
     assert reader.for_episode(dataset, 0) == record
 
 
+def test_base_fingerprint_and_store_remain_stable_across_episode_counter_updates(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _legacy_dataset(dataset)
+    info_path = dataset / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info.update({"episode_count": 2, "frame_count": 5})
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    initial_fingerprint = source_dataset_base_fingerprint(dataset)
+
+    annotations = tmp_path / "annotations"
+    first = EpisodeCurationStore(
+        annotation_root=annotations,
+        source_dataset_root=dataset,
+    ).append_for_episode(episode_index=0, disposition="keep_nominal")
+    info.update({"episode_count": 3, "frame_count": 6})
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    assert source_dataset_base_fingerprint(dataset) == initial_fingerprint
+    second = EpisodeCurationStore(
+        annotation_root=annotations,
+        source_dataset_root=dataset,
+    ).append_for_episode(episode_index=1, disposition="keep_nominal")
+    reader = EpisodeCurationReader(annotations)
+    assert reader.for_episode(dataset, 0) == first
+    assert reader.for_episode(dataset, 1) == second
+
+
+def test_persisted_plus_records_lock_live_source_reindexing(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    _legacy_dataset(dataset)
+    session = EpisodeCurationSession(
+        enabled=True,
+        annotation_root=tmp_path / "annotations",
+        source_binding="v23_compat_content_locator_v1",
+        source_schema="dexteleop_dataset_v2.3",
+        status="ready",
+    )
+    assert session.persisted_binding_lock_reason() == ""
+    session.mark_pending(dataset_root=dataset, episode_index=0)
+    session.save(
+        disposition="keep_nominal",
+        pending_token=session.pending_token,
+    )
+
+    assert "禁止切换数据集或原地删除" in session.persisted_binding_lock_reason()
+
+
 def test_v24_compatibility_binding_reuses_the_same_overlay_contract(tmp_path: Path) -> None:
     dataset = tmp_path / "v24_dataset"
     _legacy_dataset(dataset)

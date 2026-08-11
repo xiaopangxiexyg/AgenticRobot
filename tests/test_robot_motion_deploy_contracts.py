@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import inspect
+import sys
+from types import MappingProxyType, ModuleType
 
 import numpy as np
 import pytest
@@ -20,6 +22,7 @@ import teleop_runtime.deploy.canonical_action as legacy_canonical
 import teleop_runtime.deploy.observation as legacy_observation
 import teleop_runtime.deploy.schema as legacy_schema
 import teleop_runtime.deploy.policy as legacy_policy
+import teleop_runtime.deploy.run_policy as run_policy
 from robot_motion.action import EE_POSE_VECTOR_DIM
 
 
@@ -208,8 +211,13 @@ def test_deploy_schema_active_sides_and_serialization_reference_samples() -> Non
         {
             "payload": Payload(path=Path("run"), value=np.asarray([1, 2], dtype=np.int64)),
             "scalar": np.float32(0.5),
+            "readonly": MappingProxyType({"nested": np.float64(1.25)}),
         }
-    ) == {"payload": {"path": "run", "value": [1, 2]}, "scalar": 0.5}
+    ) == {
+        "payload": {"path": "run", "value": [1, 2]},
+        "scalar": 0.5,
+        "readonly": {"nested": 1.25},
+    }
 
 
 def test_robot_motion_deploy_schema_does_not_import_teleop_runtime() -> None:
@@ -238,6 +246,51 @@ def test_policy_loader_is_shared_with_legacy_teleop_import() -> None:
     loaded = common_policy.load_policy("hold")
     assert isinstance(loaded.policy, common_policy.HoldPolicy)
     assert loaded.name == "hold"
+
+
+def test_policy_file_loader_registers_future_dataclass_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy_path = tmp_path / "future_dataclass_policy.py"
+    policy_path.write_text(
+        """from __future__ import annotations
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class Policy:
+    value: int = 7
+""",
+        encoding="utf-8",
+    )
+    module_name = "_dexteleop_deployment_policy_future_dataclass_policy"
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    loaded = common_policy.load_policy(f"{policy_path}:Policy")
+
+    assert loaded.policy.value == 7
+    assert sys.modules[module_name].Policy is type(loaded.policy)
+
+
+def test_policy_file_loader_restores_previous_module_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy_path = tmp_path / "broken_policy.py"
+    policy_path.write_text(
+        "raise RuntimeError('policy import failed')\n",
+        encoding="utf-8",
+    )
+    module_name = "_dexteleop_deployment_policy_broken_policy"
+    previous = ModuleType(module_name)
+    monkeypatch.setitem(sys.modules, module_name, previous)
+
+    with pytest.raises(RuntimeError, match="policy import failed"):
+        common_policy.load_policy(f"{policy_path}:Policy")
+
+    assert sys.modules[module_name] is previous
 
 
 def test_teleop_deploy_defaults_use_robot_motion_common_pipeline() -> None:
@@ -458,6 +511,52 @@ def test_policy_deploy_runtime_owns_schedule_transaction_and_chunk_queue() -> No
     assert runtime.action_queue_length() == 0
 
 
+def test_sync_position_prediction_waits_for_fresh_observation_without_popping() -> None:
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+        )
+    )
+    policy = _TransactionalPolicy(_right_arm_policy_action())
+    stale_request_observation = _right_arm_policy_observation()
+
+    prediction = runtime.predict_and_queue(
+        policy,
+        stale_request_observation,
+        now=10.0,
+        queue_policy="replace",
+    )
+    defer = run_policy._defer_position_action_after_synchronous_prediction(
+        prediction_accepted=prediction.accepted,
+        position_executor_enabled=True,
+    )
+
+    deferred_step = runtime.prepare_next_action(
+        stale_request_observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+        allow_output=not defer,
+    )
+    assert deferred_step.raw_action is None
+    assert deferred_step.queue_len_before == 1
+    assert deferred_step.queue_len_after == 1
+    assert runtime.action_queue_pop_count() == 0
+
+    fresh_execution_observation = _right_arm_policy_observation()
+    execution_step = runtime.prepare_next_action(
+        fresh_execution_observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+        allow_output=True,
+    )
+    assert execution_step.raw_action is not None
+    assert execution_step.queue_len_before == 1
+    assert execution_step.queue_len_after == 0
+    assert runtime.action_queue_pop_count() == 1
+
+
 def test_policy_deploy_runtime_exposes_only_same_chunk_successor_as_lookahead() -> None:
     observation = _right_arm_policy_observation()
     runtime = robot_runtime.PolicyDeployRuntime(
@@ -532,6 +631,41 @@ def test_policy_deploy_runtime_exposes_two_same_chunk_successors_without_pop() -
         == 2
     )
     assert runtime.action_queue_length() == 2
+
+
+def test_policy_deploy_runtime_exposes_three_speculative_same_chunk_successors() -> None:
+    observation = _right_arm_policy_observation()
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+        )
+    )
+    first = _right_arm_policy_action()
+    actions = []
+    for index in range(4):
+        action = np.asarray(first, dtype=np.float32).copy()
+        action[7] += 0.01 * index
+        actions.append(action)
+    policy = _TransactionalPolicy(np.stack(actions, axis=0))
+    prediction = runtime.predict_and_queue(policy, observation, now=10.0)
+    assert prediction.accepted is True
+
+    step = runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    )
+
+    assert step.raw_action is not None
+    assert step.raw_lookahead_action is not None
+    assert step.raw_second_lookahead_action is not None
+    assert step.raw_third_lookahead_action is not None
+    assert step.raw_lookahead_action.metadata["deploy_action_chunk_index"] == 1
+    assert step.raw_second_lookahead_action.metadata["deploy_action_chunk_index"] == 2
+    assert step.raw_third_lookahead_action.metadata["deploy_action_chunk_index"] == 3
+    assert runtime.action_queue_length() == 3
 
 
 def test_policy_deploy_runtime_executes_only_configured_chunk_prefix() -> None:

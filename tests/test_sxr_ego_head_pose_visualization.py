@@ -5,6 +5,7 @@ from pathlib import Path
 import struct
 
 import numpy as np
+import pytest
 
 from utils.portable_vis.sxr_ego_head_pose.visualize_head_extrinsics import (
     CAMERA_OPTICAL_TO_CALIBRATION_ROTATION,
@@ -45,6 +46,7 @@ def test_first_frame_mode_recenters_head_pose() -> None:
     np.testing.assert_allclose(transforms[1][:3, 3], [0.1, 0.2, 0.3], atol=1e-6)
 
 
+@pytest.mark.integration
 def test_loads_all_selected_camera_extrinsics(tmp_path: Path) -> None:
     identity = np.eye(4).tolist()
     calibration = {

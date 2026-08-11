@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -11,6 +13,8 @@ from control_composition.observability import (
     validate_difference_observation_lineage,
 )
 from robot_motion.action import (
+    ExecutionMeasurementObservation,
+    ExecutionReferenceFrameObservation,
     admit_reference_segment,
     build_reference_endpoint_parent,
     build_reference_segment,
@@ -271,6 +275,76 @@ def test_mujoco_owner_can_return_measurement_coupled_reference_point_sample() ->
     assert reference.temporal_semantics == "point_sample"
     assert association.status == "available"
     assert association.reason == "downstream_actual_reference_at_measurement"
+
+
+def test_execution_difference_compares_fk_pose_reference_and_measurement() -> None:
+    reference = ExecutionReferenceFrameObservation(
+        reference_frame_id="mujoco-fk-reference:1",
+        reference_stage_id="mujoco.active_qref_fk_pose_at_measurement",
+        source_reference_id="qref:1",
+        source_reference_hash="qref-hash:1",
+        target_fact_id="target:1",
+        target_fact_hash="target-hash:1",
+        control_domain_id="robot-0",
+        selection_group_id="arms",
+        execution_fence_sequence=2,
+        reference_revision=3,
+        reference_sequence=4,
+        temporal_semantics="point_sample",
+        scheduled_for=10.2,
+        generated_at=10.21,
+        effective_from=None,
+        effective_until=None,
+        available_at=10.21,
+        clock_domain_id="control.monotonic",
+        value_by_component={
+            "right_arm": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        },
+        representation_by_component={"right_arm": "cartesian_pose"},
+        schema_hash_by_component={"right_arm": "right-arm-pose-schema"},
+        observation_binding_id="binding:pose",
+        observation_plan_hash="plan:pose",
+    )
+    measurement = ExecutionMeasurementObservation(
+        measurement_id="mujoco-fk-measurement:1",
+        source_measurement_hash="qpos-measurement-hash:1",
+        control_domain_id="robot-0",
+        measured_at=10.2,
+        available_at=10.22,
+        clock_domain_id="control.monotonic",
+        value_by_component={
+            "right_arm": (
+                0.01,
+                -0.02,
+                0.0,
+                0.0,
+                0.0,
+                2**-0.5,
+                2**-0.5,
+            ),
+        },
+        representation_by_component={"right_arm": "cartesian_pose"},
+        schema_hash_by_component={"right_arm": "right-arm-pose-schema"},
+        observation_binding_id="binding:pose",
+        observation_plan_hash="plan:pose",
+    )
+
+    association = associate_measurement_to_reference(
+        measurement,
+        reference,
+        selection_group_id="arms",
+        component_ids=("right_arm",),
+    )
+
+    assert association.status == "available"
+    metric = association.component_difference["right_arm"]
+    assert metric["metric"] == "cartesian_pose_residual"
+    assert metric["translation_signed_m"] == pytest.approx(
+        (0.01, -0.02, 0.0)
+    )
+    assert metric["rotation_angle_rad"] == pytest.approx(
+        math.pi / 2.0
+    )
 
 
 def test_bounded_observer_pairs_only_exact_target_owned_sample() -> None:

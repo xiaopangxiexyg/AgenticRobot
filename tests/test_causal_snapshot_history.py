@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pytest
 
+from robot_motion.runtime import EffectorCommand, ExecutionWorkItem
 from robot_motion.runtime.causal_history import CausalSnapshotHistory
 from teleop_runtime.collection.hand_state_polling import (
     HandStateHistoryPoller,
@@ -36,6 +37,44 @@ def test_history_freezes_numpy_payload_and_requires_both_timestamps() -> None:
     selected = history.latest_at_or_before(10.5)
     assert selected is not None
     assert selected[1].sequence == 1  # the future-source record is rejected
+
+
+def test_history_freezes_typed_command_with_mappingproxy_lineage() -> None:
+    history = CausalSnapshotHistory(maxlen=4)
+    command = EffectorCommand(
+        effector_name="left_arm",
+        side="left",
+        command_type="joint_vector",
+        value=np.arange(6, dtype=float),
+        metadata={"nested": {"values": [1, 2]}},
+        execution_work_item=ExecutionWorkItem(
+            work_item_id="backend-command-1",
+            work_kind="backend_command",
+            control_domain_id="deploy-control-0",
+            authority_epoch=0,
+            execution_epoch=1,
+            segment_generation_by_group={"left_arm": 3},
+        ),
+    )
+
+    published = history.publish(
+        {"last_command": command},
+        source_timestamp=10.0,
+        available_timestamp=10.1,
+    )
+    command.value[0] = 99.0
+    command.metadata["nested"]["values"][0] = 88
+    published["last_command"].value[1] = 77.0
+
+    selected = history.latest_at_or_before(10.2)
+    assert selected is not None
+    frozen_command = selected[0]["last_command"]
+    assert isinstance(frozen_command, EffectorCommand)
+    np.testing.assert_allclose(frozen_command.value, np.arange(6, dtype=float))
+    assert frozen_command.metadata["nested"]["values"] == [1, 2]
+    assert dict(
+        frozen_command.execution_work_item.segment_generation_by_group
+    ) == {"left_arm": 3}
 
 
 class _FakeHandBackend:

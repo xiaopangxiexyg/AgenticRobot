@@ -219,6 +219,7 @@ def test_coverage_reports_complementary_pair_bias() -> None:
     assert report.perfectly_complementary is True
 
 
+@pytest.mark.integration
 def test_collection_constants_and_writer_metadata_use_pure_contract(tmp_path) -> None:
     assert COLLECTION_ARM_MODE_SCHEMA == ARM_MODE_SCHEMA_V2
     assert COLLECTION_ARM_MODE_IDS is ARM_MODE_IDS

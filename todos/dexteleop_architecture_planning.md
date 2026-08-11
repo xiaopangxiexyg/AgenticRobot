@@ -19,7 +19,7 @@
 | 控制主线分批落地 | [`dexteleop_control_core_landing_plan.md`](dexteleop_control_core_landing_plan.md) |
 | Control Station | [`dexteleop_control_station_plan.md`](dexteleop_control_station_plan.md) |
 | RTC | [`dexteleop_rtc_landing_plan.md`](dexteleop_rtc_landing_plan.md) |
-| 图示 | [`dexteleop_architecture_visual_guide.md`](dexteleop_architecture_visual_guide.md) |
+| 图示 | [`dexteleop_architecture_visual_guide.md`](../docs/architecture/dexteleop_architecture_visual_guide.md) |
 | v2.4 数据契约 | [`dataset_contracts/README.md`](../dataset_contracts/README.md) |
 
 ---

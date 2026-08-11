@@ -31,11 +31,20 @@ from dataset_contracts.progress_stages import (
     ProgressStageEntryBindingV1,
     TaskStageProfileV1,
 )
+from dataset_contracts.progress_skill_projection import (
+    ProgressSkillProjectionV1,
+    SkillTrainingContractV1,
+)
+from dataset_interface.progress_skill_projection import SkillProjectionCatalog
+from dataset_interface.modality_artifacts import build_modality_artifact_inventory
 from dataset_interface.prepared_training_view import (
     PreparedSourceDataset,
     PreparedTrainingViewError,
     build_prepared_training_view,
     load_prepared_training_view,
+)
+from dataset_interface.prepared_training import (
+    select_strict_successful_skill_episodes,
 )
 
 
@@ -233,6 +242,58 @@ def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
     }
 
 
+def _add_then_detach_tactile(root: Path) -> None:
+    manifest_relative = (
+        "tactile/observation.hand.left.tactile/chunk-000/"
+        "episode_000000/manifest.json"
+    )
+    payload_relative = (
+        "tactile/observation.hand.left.tactile/chunk-000/"
+        "episode_000000/L_RAW.uint8.bin"
+    )
+    payload_path = root / payload_relative
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_bytes(b"1234")
+    (root / manifest_relative).write_text(
+        json.dumps(
+            {
+                "format": "binary_stream_v1",
+                "side": "left",
+                "frame_count": 4,
+                "sensor_keys": ["L_RAW"],
+                "streams": {
+                    "L_RAW": {
+                        "path": payload_relative,
+                        "dtype": "uint8",
+                        "shape": [1],
+                        "frame_count": 4,
+                        "encoding": "raw_c_order",
+                        "compression": "none",
+                    }
+                },
+                "frames": [
+                    {
+                        "sample_frame_index": index,
+                        "tactile_frame_index": index,
+                    }
+                    for index in range(4)
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = root / "meta" / "episodes.jsonl"
+    record = json.loads(catalog_path.read_text(encoding="utf-8"))
+    record["tactile_paths"] = {"left": manifest_relative}
+    catalog_path.write_text(
+        json.dumps(record, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    build_modality_artifact_inventory(root)
+    payload_path.unlink()
+
+
 def test_multi_source_build_is_read_only_relative_and_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -301,6 +362,211 @@ def test_multi_source_build_is_read_only_relative_and_idempotent(
     )
     assert repeated.training_view_hash == result.training_view_hash
     assert repeated.idempotent is True
+
+
+def test_visual_prepared_view_never_requires_detached_tactile_payload(
+    tmp_path: Path,
+) -> None:
+    profiles = _profiles()
+    source = tmp_path / "source"
+    _dataset(
+        source,
+        episode_uuid="episode-visual-detached",
+        episode_index=0,
+        profiles=profiles,
+        annotate=False,
+    )
+    _add_then_detach_tactile(source)
+
+    result = build_prepared_training_view(
+        tmp_path / "organized",
+        (PreparedSourceDataset("detached-source", source),),
+        modality_selection=("numeric", "video"),
+        column_projection=("timestamp", "observation.state"),
+    )
+    loaded = load_prepared_training_view(
+        result.view_root,
+        verify_source_files=True,
+    )
+
+    assert loaded.episodes.num_rows == 1
+    assert tuple(loaded.manifest["modality_selection"]) == ("numeric", "video")
+    assert all(
+        not str(record.get("relative_path", "")).startswith("tactile/")
+        for record in loaded.source_inventory
+    )
+
+
+def test_prepared_view_camera_selection_is_hash_bound_and_inventory_scoped(
+    tmp_path: Path,
+) -> None:
+    profiles = _profiles()
+    source = tmp_path / "source"
+    _dataset(
+        source,
+        episode_uuid="episode-camera-selection",
+        episode_index=0,
+        profiles=profiles,
+        annotate=False,
+    )
+    wrist = source / "videos/left_wrist/episode_000000.mp4"
+    wrist.parent.mkdir(parents=True, exist_ok=True)
+    wrist.write_bytes(b"left-wrist")
+    catalog_path = source / "meta/episodes.jsonl"
+    record = json.loads(catalog_path.read_text(encoding="utf-8"))
+    record["video_paths"]["left_wrist"] = wrist.relative_to(source).as_posix()
+    catalog_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    front = build_prepared_training_view(
+        tmp_path / "front-organized",
+        (PreparedSourceDataset("source", source),),
+        camera_selection=("front",),
+    )
+    all_views = build_prepared_training_view(
+        tmp_path / "all-organized",
+        (PreparedSourceDataset("source", source),),
+    )
+    loaded = load_prepared_training_view(front.view_root)
+
+    assert loaded.manifest["camera_selection"] == ["front"]
+    assert loaded.episodes["camera_keys"].to_pylist() == [["front"]]
+    assert {
+        record["role"]
+        for record in loaded.source_inventory
+        if str(record["role"]).startswith("EPISODE_VIDEO:")
+    } == {"EPISODE_VIDEO:front"}
+    assert front.training_view_hash != all_views.training_view_hash
+
+
+def test_strict_skill_selection_accepts_episode_uuid_annotation_selector(
+    tmp_path: Path,
+) -> None:
+    profiles = _profiles()
+    source = tmp_path / "source"
+    identity = _dataset(
+        source,
+        episode_uuid="episode-selector",
+        episode_index=0,
+        profiles=profiles,
+        annotate=True,
+    )
+    _dataset_annotation_copy(source, profiles, annotation_set_id="set-2")
+    skill = SkillTrainingContractV1(
+        skill_id="fixture.write",
+        skill_version="1",
+        semantic_type="WRITE",
+        controlled_component_ids=("right_arm",),
+        entry_predicate_ids=("writing.ready",),
+        success_predicate_ids=("writing.complete",),
+    )
+    progress, stages = profiles
+    catalog = SkillProjectionCatalog(
+        skills=(skill,),
+        projections=(
+            ProgressSkillProjectionV1(
+                projection_id="fixture.write",
+                projection_version="1",
+                source_progress_profile_hash=progress.semantic_content_hash,
+                source_stage_profile_hash=stages.semantic_content_hash,
+                source_progress_step_id="write",
+                source_stage_ids=("write-main",),
+                projection_kind="EXACT_STEP",
+                skill_training_contract_hash=skill.semantic_content_hash,
+                projected_component_ids=("right_arm",),
+                asserted_entry_predicate_ids=("writing.ready",),
+                asserted_success_predicate_ids=("writing.complete",),
+            ),
+        ),
+    )
+
+    report = select_strict_successful_skill_episodes(
+        (PreparedSourceDataset("source", source),),
+        skill_projection_catalog=catalog,
+        target_skill_id=skill.skill_id,
+        annotation_selection={"episode-selector": "set-2"},
+    )
+
+    assert report.included_episode_identities == (identity,)
+    assert report.annotation_selection == {identity: "set-2"}
+    assert report.exclusions == ()
+
+
+def test_cross_profile_skill_projection_is_explicit_and_non_destructive(
+    tmp_path: Path,
+) -> None:
+    first_profiles = _profiles(variant="first")
+    second_profiles = _profiles(variant="second")
+    first = tmp_path / "2026-08-01"
+    second = tmp_path / "2026-08-02"
+    _dataset(
+        first,
+        episode_uuid="episode-a",
+        episode_index=0,
+        profiles=first_profiles,
+        annotate=True,
+    )
+    _dataset(
+        second,
+        episode_uuid="episode-b",
+        episode_index=0,
+        profiles=second_profiles,
+        annotate=True,
+    )
+    before = {"first": _snapshot(first), "second": _snapshot(second)}
+    skill = SkillTrainingContractV1(
+        skill_id="fixture.write",
+        skill_version="1",
+        semantic_type="WRITE",
+        controlled_component_ids=("right_arm",),
+        entry_predicate_ids=("writing.ready",),
+        success_predicate_ids=("writing.complete",),
+    )
+    projections = tuple(
+        ProgressSkillProjectionV1(
+            projection_id=f"fixture.{label}.write",
+            projection_version="1",
+            source_progress_profile_hash=progress.semantic_content_hash,
+            source_stage_profile_hash=stages.semantic_content_hash,
+            source_progress_step_id="write",
+            source_stage_ids=("write-main",),
+            projection_kind="EXACT_STEP",
+            skill_training_contract_hash=skill.semantic_content_hash,
+            projected_component_ids=("right_arm",),
+            asserted_entry_predicate_ids=("writing.ready",),
+            asserted_success_predicate_ids=("writing.complete",),
+        )
+        for label, (progress, stages) in (
+            ("first", first_profiles),
+            ("second", second_profiles),
+        )
+    )
+    catalog = SkillProjectionCatalog(
+        skills=(skill,),
+        projections=projections,
+    )
+    result = build_prepared_training_view(
+        tmp_path / "organized",
+        (
+            PreparedSourceDataset("date-0801", first),
+            PreparedSourceDataset("date-0802", second),
+        ),
+        skill_projection_catalog=catalog,
+        target_skill_id=skill.skill_id,
+    )
+    loaded = load_prepared_training_view(
+        result.view_root,
+        verify_source_files=True,
+    )
+    assert result.skill_interval_count == 2
+    assert loaded.skill_intervals is not None
+    assert loaded.skill_intervals.num_rows == 2
+    assert set(loaded.skill_intervals["skill_id"].to_pylist()) == {
+        "fixture.write"
+    }
+    assert len(loaded.skill_projection_receipts) == 2
+    assert loaded.manifest["progress_profile_hash"] is None
+    assert len(loaded.manifest["progress_profile_hashes"]) == 2
+    assert before == {"first": _snapshot(first), "second": _snapshot(second)}
 
 
 def canonical_source_payload(view_root: Path) -> dict[str, object]:

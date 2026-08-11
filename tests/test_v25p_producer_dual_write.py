@@ -336,6 +336,7 @@ def _umi_sample(*, frame_index: int = 0, timestamp: float = 100.0) -> UmiSample:
     )
 
 
+@pytest.mark.integration
 def test_real_teleop_native_producer_matches_existing_v23_encoder(tmp_path: Path) -> None:
     layout = _layout()
     embodiment, streams, projection, bindings = _profiles(
@@ -380,6 +381,7 @@ def test_producer_bindings_fail_closed_on_missing_stream_or_wrong_action_stage()
         UmiV25pProducer(stream_profile=streams, bindings=bindings)
 
 
+@pytest.mark.integration
 def test_umi_native_producer_matches_existing_v23_encoder_and_detects_drift(
     tmp_path: Path,
 ) -> None:
@@ -434,6 +436,7 @@ def test_umi_native_producer_matches_existing_v23_encoder_and_detects_drift(
     assert missing_report.fields["observation.right_arm.pose"].reason == "legacy_field_missing"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     ("source", "source_id"),
     (
@@ -512,6 +515,7 @@ def test_builtin_canonical_component_action_producers_round_trip_exact_v23(
     )
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("source", ("real", "umi"))
 def test_multi_frame_native_episode_remains_equivalent_to_legacy_rows(
     tmp_path: Path,
