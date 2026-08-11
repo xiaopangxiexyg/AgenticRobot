@@ -5,7 +5,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from robot_motion.deploy.normalization import (
+from dataset_contracts.normalization import (
     NormalizationContract,
     NormalizationContractError,
     normalization_contract_hash,
@@ -22,6 +22,7 @@ DEFAULT_IMAGE_KEY_MAP: dict[str, str] = {
 @dataclass(frozen=True)
 class OpenPIObservationAdapterConfig:
     prompt: str | None = None
+    allowed_prompts: tuple[str, ...] | None = None
     image_key_map: Mapping[str, str] | None = None
     required_image_keys: tuple[str, ...] | None = None
     include_debug_metadata: bool = True
@@ -34,6 +35,19 @@ class OpenPIObservationAdapterConfig:
     normalization_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.allowed_prompts is not None:
+            allowed = tuple(
+                str(value).strip() for value in self.allowed_prompts
+            )
+            if (
+                not allowed
+                or any(not value for value in allowed)
+                or len(set(allowed)) != len(allowed)
+            ):
+                raise ValueError(
+                    "OpenPI allowed_prompts must be non-empty and unique."
+                )
+            object.__setattr__(self, "allowed_prompts", allowed)
         image_key_map = DEFAULT_IMAGE_KEY_MAP if self.image_key_map is None else dict(self.image_key_map)
         normalized_map: dict[str, str] = {}
         for source_key, model_input_key in image_key_map.items():
@@ -152,6 +166,23 @@ def deployment_observation_to_openpi(
 
 
 def _resolve_prompt(observation: Any, config: OpenPIObservationAdapterConfig) -> str | None:
+    prompt = _unvalidated_prompt(observation, config)
+    if config.allowed_prompts is not None:
+        if prompt is None:
+            raise ValueError(
+                "OpenPI prompt-conditioned artifact requires an explicit prompt."
+            )
+        if prompt not in config.allowed_prompts:
+            raise ValueError(
+                "OpenPI prompt is not allowed by the checkpoint artifact."
+            )
+    return prompt
+
+
+def _unvalidated_prompt(
+    observation: Any,
+    config: OpenPIObservationAdapterConfig,
+) -> str | None:
     if config.prompt:
         return str(config.prompt)
     for key in ("prompt", "instruction", "task_instruction"):
@@ -170,6 +201,33 @@ def _resolve_prompt(observation: Any, config: OpenPIObservationAdapterConfig) ->
             if value:
                 return str(value)
     return None
+
+
+def prepared_allowed_prompts(
+    artifact_metadata: Mapping[str, Any] | None,
+) -> tuple[str, ...] | None:
+    """Return the exact prompt allowlist from a prepared deployment artifact."""
+
+    if not isinstance(artifact_metadata, Mapping):
+        return None
+    binding = artifact_metadata.get("openpi_prepared_deployment_binding")
+    if not isinstance(binding, Mapping):
+        return None
+    raw_stages = binding.get("prompt_stages")
+    if raw_stages is None:
+        return None
+    if not isinstance(raw_stages, (list, tuple)) or any(
+        not isinstance(item, Mapping) for item in raw_stages
+    ):
+        raise ValueError(
+            "Prepared deployment prompt_stages must be a sequence of mappings."
+        )
+    prompts = tuple(str(item.get("prompt") or "").strip() for item in raw_stages)
+    if not prompts or any(not prompt for prompt in prompts) or len(set(prompts)) != len(prompts):
+        raise ValueError(
+            "Prepared deployment prompt allowlist must be non-empty and unique."
+        )
+    return prompts
 
 
 def _as_uint8_hwc(value: Any, *, key: str) -> np.ndarray:

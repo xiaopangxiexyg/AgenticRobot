@@ -79,7 +79,22 @@ Host dex-remote
   IdentityFile ~/.ssh/id_ed25519
 ```
 
-后续 wrapper 统一使用 `dex-remote`，避免在脚本和文档中散落 IP 地址。
+当前工作站中，`dex-remote` 是 `192.168.20.170` 的默认 SSH alias。Codex
+调用 wrapper 时仍应始终显式传入 `-H/--host`：用户未指定目标时使用
+`-H dex-remote`；用户指定 IP、`user@host[:port]` 或其他 SSH alias 时使用
+该目标。显式目标连接失败后不得回退到 `dex-remote`。
+
+```bash
+# 默认目标：当前 SSH 配置中的 192.168.20.170
+./remote_whoami.sh -H dex-remote
+
+# 用户指定的其他远端
+./remote_whoami.sh -H user@192.168.20.171
+```
+
+裸 IP 只表达 SSH 主机，不能自动确定远端用户名、项目目录、Python 环境或
+设备布局。`-H/--host` 表示执行 wrapper 的远端电脑；`--arm-ip` 等参数表示
+由该电脑访问的机器人或控制器，两者不得混用。
 
 ### 2. 选择代码访问方式
 
@@ -669,7 +684,7 @@ ssh -L 127.0.0.1:8080:127.0.0.1:8080 dex-remote
 所有 wrapper 尽量使用一致参数：
 
 ```text
--H, --host          SSH host，例如 dex-remote
+-H, --host          SSH host、IP、user@host[:port] 或 alias；Codex 每次显式传入
 -u, --user          SSH user，优先使用 ~/.ssh/config 时可省略
 -p, --port          SSH port
 --project           远程项目目录
@@ -1069,6 +1084,7 @@ remote_sync_check.sh
 
 ```bash
 ./remote_whoami.sh -H dex-remote
+./remote_whoami.sh -H user@192.168.20.171
 ./remote_rsync_project.sh -H dex-remote --local ~/Release --remote '~/Release' --dry-run
 ./remote_python.sh -H dex-remote --project '~/DexTeleop' --env dexteleop310 -- script.py --arg value
 ./remote_camera_snapshot.sh -H dex-remote --device /dev/video0 --local-out ./debug/camera
@@ -1079,9 +1095,9 @@ remote_sync_check.sh
 
 ### 实际同步和执行模型
 
-常见真机开发时，本地工作目录已经通过上层脚本
-`/home/user/Release/util_scripts/Connection/realtime_sync_ssh.sh` 以 no-delete
-模式实时同步到远程指定工作目录。同步脚本必须加载项目根目录的
+常见真机开发时，本地工作目录可能已通过确认过的
+`connection/realtime_sync_ssh.sh` 实例，以 no-delete 模式实时同步到远程
+指定工作目录。同步脚本必须加载项目根目录的
 `.realtime_sync_ssh.exclude`；设备发现/分配、标定结果、相机注册表、工作站几何、
 数据集和本机路径配置均由远端机器持有，不得由本地同路径文件实时覆盖。
 修改排除清单后需要重启既有实时同步进程，lsyncd 才会重新生成配置并生效。
@@ -1161,14 +1177,16 @@ remote_rsync_project.sh --delete
 
 本目录带有一个子目录级 `AGENTS.md`，用于把远程 wrapper 和真机安全规则限制在本目录内。它不是全局规则。
 
+从仓库根目录调用 `./codex_remote/remote_*.sh` 时，`remote-access` skill 仍应
+生效，不需要为远端任务单独切换到旧的绝对路径。若要修改 wrapper 本身，
+可以把会话根目录设为本目录，使子目录级 `AGENTS.md` 自动参与约束。
+
 建议：
 
 ```text
 远程 wrapper / 真机调试任务
-  从 /home/user/Release/util_scripts/Connection/codex 启动单独的 Codex 会话。
+  可以从项目根目录调用 codex_remote wrapper；每条命令都显式携带 -H。
 
 普通本地开发任务
-  从对应项目目录启动 Codex，不要复用本目录的远程 wrapper 会话。
+  不要让远端 wrapper 规则扩展到无关的本地任务。
 ```
-
-注意：在 VSCode 中仅仅打开本目录里的某个文件，不一定等同于让 Codex 以本目录作为当前工作目录。若需要这些规则稳定生效，应让 Codex 会话根目录/当前目录指向本目录。

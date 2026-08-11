@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Any, Sequence, TextIO
 
 from project_paths import teleop_records_root
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
 
 
 EXPECTED_PROTOCOL = "teleop_runtime.vive/v1"
@@ -1028,7 +1035,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--output-root",
         type=Path,
         default=None,
-        help="Capture parent directory (default: teleop_records/vive_diagnostics).",
+        help=(
+            "Exact capture parent directory. When provided, this takes precedence "
+            "over --artifact-layout."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-layout",
+        choices=(
+            LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ),
+        default=configured_runtime_artifact_layout(),
+        help=(
+            "Default output layout used only when --output-root is omitted: "
+            "'legacy' writes teleop_records/vive_diagnostics; "
+            "'runtime-artifacts-v1' writes the canonical "
+            "evidence/preflight/vive subtree."
+        ),
     )
     parser.add_argument(
         "--receive-buffer-bytes",
@@ -1057,12 +1081,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run_receiver(args: argparse.Namespace) -> Path:
-    output_root = (
-        Path(args.output_root)
-        if args.output_root is not None
-        else teleop_records_root() / "vive_diagnostics"
+def resolve_diagnostic_output_root(args: argparse.Namespace) -> Path:
+    """Resolve one write root with explicit-path precedence and no side effects."""
+
+    canonical_root = (
+        RuntimeArtifactLayout.configured().evidence_dir(kind="preflight") / "vive"
     )
+    return resolve_artifact_write_path(
+        explicit_path=args.output_root,
+        artifact_layout=getattr(args, "artifact_layout", None),
+        legacy_path=teleop_records_root() / "vive_diagnostics",
+        canonical_path=canonical_root,
+    ).path
+
+
+def run_receiver(args: argparse.Namespace) -> Path:
+    output_root = resolve_diagnostic_output_root(args)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(

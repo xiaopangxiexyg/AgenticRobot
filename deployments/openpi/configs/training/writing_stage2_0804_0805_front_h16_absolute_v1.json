@@ -1,0 +1,44 @@
+{
+  "schema": "dexteleop.openpi_prepared_skill_training_profile.v1",
+  "profile_id": "writing_stage2_0804_0805_front_h16_absolute_v1",
+  "organized_dataset_root": "/home/user/zc/DexTeleop/datasets/training_workspaces/writing_stage2_0804_0805_front_h16_absolute_v1",
+  "sources": [
+    {
+      "source_dataset_id": "writing4_2026_08_04",
+      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_eligible_episode_count": 344
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_05",
+      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_eligible_episode_count": 247
+    }
+  ],
+  "expected_total_eligible_episode_count": 591,
+  "skill_projection_catalog_id": "writing_four_stage_subtasks_v2",
+  "target_skill_id": "writing.remove_brush_cap_and_return_cap",
+  "training_domain": "NOMINAL",
+  "require_no_abnormal_intervals": true,
+  "camera_selection": ["front"],
+  "camera_slot_to_dataset_key": {"base_0_rgb": "front"},
+  "action_horizon": 16,
+  "action_pose_mode": "absolute",
+  "source_mixing_policy": "natural_concat_shuffle_v1",
+  "tail_policy": "drop",
+  "expected_policy_io_layout_hash": "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16",
+  "expected_progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
+  "expected_stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b",
+  "annotation_selection": {
+    "a7290543-3b08-488b-909c-cfbce1123006": "stage-1785840272085-e43e8daf",
+    "e9d1ed12-a5d0-43ba-a63c-c95804348e08": "stage-1785898817316-c18d20dc",
+    "8c4df0a2-7044-4166-baff-c96b3ea73fd1": "stage-1785900010047-28130000",
+    "28842dd1-bd4e-4d86-9625-c6b6682c4e2e": "stage-1785907794626-8e3134b8"
+  },
+  "openpi_checkout": "/home/user/zc/openpi",
+  "openpi_base_config": "writing-phase1-grap-pen-front-only-h16-absolute-task-ready-state-dropout-v2",
+  "openpi_state_augmentation_from_config": "writing-phase1-grap-pen-front-only-h16-absolute-task-ready-state-dropout-v2",
+  "openpi_config_name": "writing-stage2-0804-0805-front-h16-absolute-prepared-v1",
+  "openpi_asset_id": "writing_stage2_0804_0805_front_h16_absolute_prepared_v1",
+  "openpi_num_workers": 4,
+  "default_exp_name": "writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1"
+}

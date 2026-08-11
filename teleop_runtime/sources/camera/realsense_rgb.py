@@ -75,9 +75,12 @@ class RealSenseRGBCameraConfig:
     startup_warmup_frames: int = 10
     # ``legacy`` preserves the historical N-frame synchronous warmup and its
     # hardware-reset retry. ``bounded_first_frame`` waits only for the first
-    # valid frameset within startup_frame_grace_sec; the existing global camera
-    # self-check remains responsible for proving multi-frame freshness.
-    startup_warmup_policy: str = REALSENSE_STARTUP_WARMUP_LEGACY
+    # valid frameset within startup_frame_grace_sec.  Multi-camera callers own
+    # any deferred second pass so a failed pipeline is not reopened
+    # immediately while the remaining cameras have not yet been initialized;
+    # the existing global camera self-check remains responsible for proving
+    # multi-frame freshness.
+    startup_warmup_policy: str = REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
     startup_hardware_reset: bool = False
     startup_hardware_reset_on_failure: bool = True
     startup_hardware_reset_retry_attempts: int = 1
@@ -319,35 +322,36 @@ class RealSenseRGBSource(ObservationSource):
 
     def _start_pipeline(self, rs: Any) -> tuple[Any, Any]:
         self._hardware_reset_device_if_requested(rs, reason="configured_startup_reset")
-        attempts = 1
-        if bool(self.config.startup_hardware_reset_on_failure):
-            attempts += int(self.config.startup_hardware_reset_retry_attempts)
-        last_error: RuntimeError | None = None
-        for attempt_index in range(attempts):
+        hardware_reset_retries_remaining = (
+            int(self.config.startup_hardware_reset_retry_attempts)
+            if bool(self.config.startup_hardware_reset_on_failure)
+            else 0
+        )
+        attempt_index = 0
+        while True:
             if self._shutdown_event.is_set():
                 raise RuntimeError("startup_cancelled:shutdown_requested")
+            attempt_index += 1
             try:
                 return self._start_pipeline_once(rs)
             except RuntimeError as exc:
-                last_error = exc
+                message = str(exc)
                 if (
-                    attempt_index + 1 >= attempts
-                    or not self._should_hardware_reset_retry_startup_error(str(exc))
+                    hardware_reset_retries_remaining <= 0
+                    or not self._should_hardware_reset_retry_startup_error(message)
                 ):
                     raise
+                hardware_reset_retries_remaining -= 1
                 with self._lock:
                     self._last_runtime_error = (
                         "startup_connection_error_reset_retry:"
-                        f"attempt={attempt_index + 1}/{attempts}:{exc}"
+                        f"attempt={attempt_index}:{exc}"
                     )
                 self._hardware_reset_device(
                     rs,
                     reason="startup_connection_error",
                     force=True,
                 )
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("RealSense pipeline start failed without an exception.")
 
     def _start_pipeline_once(self, rs: Any) -> tuple[Any, Any]:
         startup_started = time.perf_counter()
@@ -486,6 +490,14 @@ class RealSenseRGBSource(ObservationSource):
         grace_sec = float(self.config.startup_frame_grace_sec)
         deadline = time.monotonic() + grace_sec
         configured_timeout_ms = int(self.config.startup_wait_timeout_ms)
+        # Keep each SDK call short even when startup_wait_timeout_ms equals the
+        # entire grace period (the default is 5000/5000). This preserves the
+        # same total deadline while allowing late frames and cancellation
+        # checks instead of one opaque 4999 ms wait.
+        attempt_timeout_ms = min(
+            configured_timeout_ms,
+            int(self.config.wait_timeout_ms),
+        )
         failure_count = 0
         last_error: str | None = None
         # ``warmup_frames`` belongs to the legacy N-frame policy.  It must not
@@ -501,7 +513,7 @@ class RealSenseRGBSource(ObservationSource):
             1,
             int(
                 math.ceil(
-                    (grace_sec * 1000.0) / max(1, configured_timeout_ms)
+                    (grace_sec * 1000.0) / max(1, attempt_timeout_ms)
                 )
             ),
         )
@@ -513,7 +525,7 @@ class RealSenseRGBSource(ObservationSource):
                 break
             timeout_ms = max(
                 1,
-                min(configured_timeout_ms, int(remaining_sec * 1000.0)),
+                min(attempt_timeout_ms, int(remaining_sec * 1000.0)),
             )
             try:
                 pipeline.wait_for_frames(timeout_ms=timeout_ms)
@@ -612,7 +624,7 @@ class RealSenseRGBSource(ObservationSource):
         )
 
     def _should_hardware_reset_retry_startup_error(self, message: str) -> bool:
-        # A missing first frame is deliberately fail-fast in the opt-in
+        # A missing first frame is deliberately fail-fast in the bounded
         # bounded policy. Hardware reset adds reset/re-enumeration latency and
         # has historically destabilized sibling cameras. Explicit device,
         # USB, UVC, or exclusive-access failures still use the legacy retry.

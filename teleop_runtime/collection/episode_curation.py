@@ -8,7 +8,7 @@ changes whether the original episode is saved or discarded.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
@@ -31,6 +31,7 @@ from dataset_contracts.episode_curation import (
 from dataset_interface.episode_curation import (
     MANIFEST_FILENAME,
     SIDECAR_FILENAME,
+    SOURCE_DATASET_BASE_FINGERPRINT_V2,
     source_dataset_base_fingerprint,
     source_episode_manifest_hash,
 )
@@ -99,8 +100,36 @@ class EpisodeCurationStore:
         if self.source_binding not in PLUS_SOURCE_BINDINGS:
             raise ValueError(f"unsupported Plus source binding: {self.source_binding!r}")
         self.base_fingerprint = source_dataset_base_fingerprint(self.source_dataset_root)
+        self.base_fingerprint_schema = SOURCE_DATASET_BASE_FINGERPRINT_V2
         self.episode_sidecar_path = self.annotation_root / SIDECAR_FILENAME
         self.manifest_path = self.annotation_root / MANIFEST_FILENAME
+        if self.manifest_path.is_file():
+            try:
+                existing_manifest = json.loads(
+                    self.manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid Plus annotation manifest: {self.manifest_path}"
+                ) from exc
+            if isinstance(existing_manifest, Mapping):
+                existing_schema = str(
+                    existing_manifest.get(
+                        "source_dataset_base_fingerprint_schema", ""
+                    )
+                    or ""
+                )
+                existing_fingerprint = str(
+                    existing_manifest.get("source_dataset_base_fingerprint", "")
+                    or ""
+                )
+                if not existing_schema and existing_fingerprint:
+                    # Read/write compatibility for an already-created
+                    # provisional v1 set.  Its manifest owns the original
+                    # lineage token; do not silently rewrite it after the
+                    # dataset's mutable counters advance.
+                    self.base_fingerprint = existing_fingerprint
+                    self.base_fingerprint_schema = "dexteleop_plus_source_fingerprint_v1"
         profile_id = None if self.task_profile is None else self.task_profile.task_profile_id
         self.annotation_set_id = annotation_set_id(
             source_dataset_base_fingerprint=self.base_fingerprint,
@@ -114,6 +143,7 @@ class EpisodeCurationStore:
             "annotation_set_id": self.annotation_set_id,
             "status": "draft",
             "source_dataset_base_fingerprint": self.base_fingerprint,
+            "source_dataset_base_fingerprint_schema": self.base_fingerprint_schema,
             "source_dataset_schema": self.source_schema,
             "source_binding": self.source_binding,
             "task_profile": None if self.task_profile is None else self.task_profile.to_dict(),
@@ -132,6 +162,13 @@ class EpisodeCurationStore:
                 raise ValueError("Plus annotation manifest is bound to another source/profile")
             if value.get("source_dataset_base_fingerprint") != self.base_fingerprint:
                 raise ValueError("Plus annotation manifest source fingerprint mismatch")
+            manifest_fingerprint_schema = str(
+                value.get("source_dataset_base_fingerprint_schema", "") or ""
+            )
+            if manifest_fingerprint_schema and (
+                manifest_fingerprint_schema != self.base_fingerprint_schema
+            ):
+                raise ValueError("Plus annotation manifest fingerprint schema mismatch")
             if value.get("source_binding") != self.source_binding:
                 raise ValueError("Plus annotation manifest source binding mismatch")
             if value.get("source_dataset_schema") != self.source_schema:
@@ -280,6 +317,11 @@ class EpisodeCurationSession:
     pending_token: str = ""
     status: str = "off"
     message: str = ""
+    _persisted_binding_lock_message: str = field(
+        default="",
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
@@ -287,6 +329,29 @@ class EpisodeCurationSession:
             self.annotation_root = Path(self.annotation_root).expanduser().resolve()
         if not self.enabled:
             self.status = "off"
+            return
+        if self.annotation_root is None:
+            return
+        sidecar_path = self.annotation_root / SIDECAR_FILENAME
+        try:
+            has_records = bool(
+                sidecar_path.is_file()
+                and any(
+                    line.strip()
+                    for line in sidecar_path.read_text(encoding="utf-8").splitlines()
+                )
+            )
+        except OSError as exc:
+            self._persisted_binding_lock_message = (
+                "无法确认 Plus 外部整理绑定，已禁止原地切换/重编号："
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            if has_records:
+                self._persisted_binding_lock_message = (
+                    "Plus 外部整理记录已绑定当前数据集的 episode 身份；"
+                    "本次运行禁止切换数据集或原地删除/重编号。"
+                )
 
     @classmethod
     def from_args(cls, args: Any, *, source_binding: str, source_schema: str = "") -> "EpisodeCurationSession":
@@ -326,6 +391,19 @@ class EpisodeCurationSession:
             "plus_curation_status": self.status,
             "plus_curation_message": self.message,
         }
+
+    def persisted_binding_lock_reason(self) -> str:
+        """Return a conservative blocker for in-place source reconfiguration.
+
+        A persisted Plus record contains the source episode index and manifest
+        hash.  Deleting/reindexing the source dataset, or rebinding this live
+        session to another source root, would make that immutable external
+        locator ambiguous.  The raw dataset remains independently valid, but
+        the GUI must not offer those mutations once this annotation set has
+        received at least one durable record.
+        """
+
+        return str(self._persisted_binding_lock_message or "")
 
     def set_variant(self, variant_id: str | None) -> None:
         value = str(variant_id or "").strip()
@@ -470,6 +548,10 @@ class EpisodeCurationSession:
             disposition=disposition,
             reason_code=reason_code,
             variant_id=pending_variant_id,
+        )
+        self._persisted_binding_lock_message = (
+            "Plus 外部整理记录已绑定当前数据集的 episode 身份；"
+            "本次运行禁止切换数据集或原地删除/重编号。"
         )
         # Do not clobber a newer episode's state if the operator started it
         # before the sidecar thread completed.

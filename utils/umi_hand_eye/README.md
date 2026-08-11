@@ -38,8 +38,8 @@ URDF desk 配置。
 
 默认配置是 `configs/rm65_dual_wrist_umi_v1.json`：
 
-- 左腕相机：`261122273924`，tracker：`tracker_1`
-- 右腕相机：`260522278055`，tracker：`tracker_2`
+- 左腕相机：`260522278055`，tracker：`tracker_1`
+- 右腕相机：`261122273924`，tracker：`tracker_2`
 - 相机请求分辨率：`1280×720@15 FPS`（与 `utils/head_eye` 默认值一致；不支持时由
   RealSense profile fallback 选择兼容模式）
 - 标定有效期：3600 秒

@@ -315,6 +315,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pose-force-delta-n", type=float, default=0.6)
     parser.add_argument("--max-pose-torque-delta-nm", type=float, default=0.08)
     parser.add_argument("--diagnostic-only", action="store_true")
+    parser.add_argument(
+        "--no-motion",
+        action="store_true",
+        help=(
+            "Explicit remote-safety declaration. This utility is read-only and "
+            "never commands motion or clears force data."
+        ),
+    )
+    parser.add_argument(
+        "--no-output",
+        action="store_true",
+        help="Do not write a validation JSON; useful for strictly read-only remote checks.",
+    )
     parser.add_argument("--output-json", default="")
     return parser
 
@@ -330,6 +343,8 @@ def _validate_args(args) -> None:
         raise RuntimeError("--checkpoint-wait-sec must be >= 0")
     if args.non_interactive and args.checkpoints != 1:
         raise RuntimeError("--non-interactive only supports one checkpoint")
+    if args.no_output and args.output_json:
+        raise RuntimeError("--no-output and --output-json are mutually exclusive")
     for name in (
         "max_payload_error_kg",
         "max_com_error_m",
@@ -354,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     side, ip = _selected_ip(args)
+    if args.no_motion:
+        print("NO-MOTION DECLARATION: read-only SDK queries only.")
     print(f"fit_json={fit_path}")
     fit_tool_label = str(fit_payload.get("tool_label") or args.expected_tool or args.tool_label or "")
     print(f"fit_arm={fit_payload.get('arm')} fit_tool_label={fit_tool_label}")
@@ -413,11 +430,13 @@ def main(argv: list[str] | None = None) -> int:
         "passed": passed,
         "failures": failures,
     }
-    output_path = Path(args.output_json) if args.output_json else (
-        tool_payload_validation_path(side, args.expected_tool or fit_tool_label)
-        if (args.expected_tool or fit_tool_label)
-        else None
-    )
+    output_path = None
+    if not args.no_output:
+        output_path = Path(args.output_json) if args.output_json else (
+            tool_payload_validation_path(side, args.expected_tool or fit_tool_label)
+            if (args.expected_tool or fit_tool_label)
+            else None
+        )
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

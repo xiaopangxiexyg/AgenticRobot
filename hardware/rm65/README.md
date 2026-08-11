@@ -507,6 +507,18 @@ python hardware/rm65/utils/scripts/rm65_replay_teach_trajectory_qpos_impedance.p
   --output-json hardware/rm65/utils/results/rm65_right_teach_trajectory_qpos_impedance_replay.json
 ```
 
+## Read-only Force/State Contention Probe
+
+`rm65_force_state_read_rate_probe.py` only calls `Get_Force_Data`,
+`Get_Current_Arm_State`, and `Arm_Socket_Close` to measure dual-arm SDK read
+contention. It does not enable an arm, clear a force sensor, change a frame, or
+send a motion command. It still opens real robot connections, so run it only
+with both arms stationary and explicit H1 read scope:
+
+```bash
+python hardware/rm65/utils/scripts/rm65_force_state_read_rate_probe.py --no-motion
+```
+
 ## Runtime API
 
 Profiles can be loaded directly from application code:

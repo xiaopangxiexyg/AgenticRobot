@@ -1,25 +1,12 @@
-"""Filesystem boundary for versioned policy artifact sidecars."""
+"""Client contract derivation for versioned policy artifact sidecars."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any, Mapping
-
+from dataset_contracts.normalization import NormalizationContract
 from dataset_contracts.policy_artifact import PolicyArtifactContract
+from deployments.policy_artifact import load_policy_artifact
 
 from .contracts import DeployPolicyContract
-
-
-def load_policy_artifact(path: str | Path) -> PolicyArtifactContract:
-    """Load and validate a checkpoint/server policy artifact JSON sidecar."""
-
-    artifact_path = Path(path).expanduser()
-    with artifact_path.open("r", encoding="utf-8") as stream:
-        payload = json.load(stream)
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"Policy artifact {artifact_path} must contain a JSON object.")
-    return PolicyArtifactContract.from_dict(payload)
 
 
 def deploy_contract_from_policy_artifact(
@@ -51,6 +38,15 @@ def deploy_contract_from_policy_artifact(
         camera_slots = requested_slots
     else:
         camera_slots = artifact_slots
+    raw_normalization = artifact.metadata.get("normalization_contract")
+    normalization = (
+        None
+        if raw_normalization is None
+        else NormalizationContract.from_optional_mapping(
+            raw_normalization,
+            allow_legacy=True,
+        )
+    )
     return DeployPolicyContract(
         protocol_version=protocol_version,
         deploy_schema_version=artifact.deploy_schema_version,
@@ -68,6 +64,9 @@ def deploy_contract_from_policy_artifact(
         active_sides=active_sides,
         required_camera_slots=camera_slots,
         hand_layout=None,
+        normalization_hash=(
+            None if normalization is None else normalization.contract_hash
+        ),
         arm_hold_output_key=(
             None
             if artifact.arm_hold_output is None

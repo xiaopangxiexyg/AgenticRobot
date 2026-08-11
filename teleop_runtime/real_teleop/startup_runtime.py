@@ -18,9 +18,15 @@ import numpy as np
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 
 from ..collection.camera_preview import CameraPreviewer
-from ..collection.sample_assembler import DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
 from ..log_utils import ChangeGate
 from ..sources.camera import RealSenseRGBSource
+from .camera_runtime import (
+    CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES,
+    CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
+    CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC,
+    CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
+    CameraStartupFreshnessGate,
+)
 
 if TYPE_CHECKING:
     from ..operator_ui_ports import OperatorUiPort
@@ -28,11 +34,6 @@ if TYPE_CHECKING:
     from ..special_tasks.init_arm import InitArmCommandController
     from .components import RealTeleopComponents
 
-
-CAMERA_STARTUP_SELF_CHECK_DURATION_SEC = 3.0
-CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC = 0.2
-CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES = 3
-CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC = DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
 
 _SUPPORT_NAMES = (
     "DEFAULT_RUNTIME_HOME_START_DELAY_SEC",
@@ -52,10 +53,113 @@ _SUPPORT_NAMES = (
     "_safe_float_value",
     "_safe_int_value",
     "_startup_gui_qpos_seed_command",
-    "_sync_preview_from_real_state_real",
     "_warm_start_impedance_force_control_before_home",
     "_with_expected_wrist_depth_camera_statuses",
 )
+
+
+_ACTIVE_STARTUP_CLEANUP: "StartupCleanupRegistry | None" = None
+
+
+class StartupCleanupRegistry:
+    """Release resources created before normal runtime shutdown takes ownership.
+
+    The canonical runtime enters its complete shutdown ``finally`` only after
+    the initial UI, inputs, and component bundle exist.  This small LIFO owner
+    covers that startup preamble and is explicitly disarmed at the handoff to
+    normal shutdown.
+    """
+
+    def __init__(self, *, logger: Callable[..., None] | None = None) -> None:
+        self._steps: list[tuple[str, Callable[[], None]]] = []
+        self._active = True
+        self._logger = logger
+
+    def add(self, label: str, callback: Callable[[], None]) -> None:
+        if self._active and callable(callback):
+            self._steps.append((str(label), callback))
+
+    def disarm(self) -> None:
+        global _ACTIVE_STARTUP_CLEANUP
+        self._active = False
+        if _ACTIVE_STARTUP_CLEANUP is self:
+            _ACTIVE_STARTUP_CLEANUP = None
+        self._steps.clear()
+
+    def close(self) -> None:
+        global _ACTIVE_STARTUP_CLEANUP
+        if not self._active:
+            return
+        self._active = False
+        if _ACTIVE_STARTUP_CLEANUP is self:
+            _ACTIVE_STARTUP_CLEANUP = None
+        failures: list[str] = []
+        for label, callback in reversed(self._steps):
+            try:
+                callback()
+            except BaseException as exc:  # noqa: BLE001 - never mask Ctrl+C.
+                failures.append(f"{label}: {type(exc).__name__}: {exc}")
+        self._steps.clear()
+        if failures and callable(self._logger):
+            self._logger(
+                "Shutdown",
+                "startup Ctrl+C cleanup completed with recoverable failures: "
+                + "; ".join(failures),
+            )
+
+
+def activate_startup_cleanup(
+    *,
+    logger: Callable[..., None] | None = None,
+) -> StartupCleanupRegistry:
+    """Activate the sole early-startup cleanup owner for this process."""
+
+    global _ACTIVE_STARTUP_CLEANUP
+    if _ACTIVE_STARTUP_CLEANUP is not None:
+        _ACTIVE_STARTUP_CLEANUP.close()
+    registry = StartupCleanupRegistry(logger=logger)
+    _ACTIVE_STARTUP_CLEANUP = registry
+    return registry
+
+
+def deactivate_startup_cleanup() -> None:
+    """Transfer all registered resources to normal runtime shutdown."""
+
+    registry = _ACTIVE_STARTUP_CLEANUP
+    if registry is not None:
+        registry.disarm()
+
+
+def cleanup_active_startup() -> None:
+    """Close resources created before normal runtime shutdown takes ownership."""
+
+    registry = _ACTIVE_STARTUP_CLEANUP
+    if registry is not None:
+        registry.close()
+
+
+def register_component_startup_cleanup(
+    registry: StartupCleanupRegistry,
+    components: object,
+) -> None:
+    """Register only idempotent component close hooks for early cancellation."""
+
+    for side in ("right", "left"):
+        state_backend = getattr(components, f"{side}_state_backend", None)
+        if state_backend is not None:
+            registry.add(f"{side}_state_backend", state_backend.close)
+        hand_backend = getattr(components, f"{side}_hand_backend", None)
+        if hand_backend is not None:
+            registry.add(f"{side}_hand_backend", hand_backend.close)
+    executor = getattr(components, "arm_state_read_executor", None)
+    if executor is not None:
+        registry.add(
+            "arm_state_read_executor",
+            lambda executor=executor: executor.shutdown(wait=True),
+        )
+    session = getattr(components, "session", None)
+    if session is not None:
+        registry.add("teleop_session", session.close)
 
 
 class _LegacyFunctionProxy:
@@ -102,6 +206,7 @@ def _run_camera_startup_self_check(
     camera_previewer: CameraPreviewer | None = None,
     duration_sec: float = CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
     interval_sec: float = CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
+    poll_input: bool = True,
 ) -> dict[str, object]:
     started_at = time.time()
     duration_sec = max(0.0, float(duration_sec))
@@ -137,12 +242,9 @@ def _run_camera_startup_self_check(
         f"age<={CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC:.3f}s",
         now=started_at,
     )
-    previous_frame_counts: dict[str, int | None] = {
-        str(camera_key): None for camera_key in camera_sources
-    }
-    fresh_frame_streaks: dict[str, int] = {
-        str(camera_key): 0 for camera_key in camera_sources
-    }
+    freshness_gate = CameraStartupFreshnessGate(
+        tuple(str(camera_key) for camera_key in camera_sources)
+    )
     while True:
         now = time.time()
         timed_out = now - started_at >= duration_sec
@@ -153,31 +255,7 @@ def _run_camera_startup_self_check(
             now=now,
             force=True,
         )
-        for camera_key in camera_sources:
-            key = str(camera_key)
-            item = status.get(key)
-            frame_count = _safe_int_value(item.get("frame_count")) if isinstance(item, Mapping) else None
-            frame_age_sec = (
-                _safe_float_value(item.get("last_frame_age_sec"))
-                if isinstance(item, Mapping)
-                else None
-            )
-            status_level = str(item.get("status_level") or "") if isinstance(item, Mapping) else ""
-            previous_count = previous_frame_counts[key]
-            is_new_fresh_frame = bool(
-                frame_count is not None
-                and int(frame_count) > 0
-                and (previous_count is None or int(frame_count) > previous_count)
-                and frame_age_sec is not None
-                and 0.0 <= float(frame_age_sec) <= CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC
-                and status_level == "ok"
-            )
-            fresh_frame_streaks[key] = fresh_frame_streaks[key] + 1 if is_new_fresh_frame else 0
-            previous_frame_counts[key] = frame_count
-        early_success = bool(fresh_frame_streaks) and all(
-            streak >= CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES
-            for streak in fresh_frame_streaks.values()
-        )
+        early_success = freshness_gate.update(status)
         completed = bool(timed_out or early_success)
         final_payload = _camera_self_check_payload(
             status,
@@ -193,7 +271,7 @@ def _run_camera_startup_self_check(
                 ),
                 "fresh_frame_max_age_sec": CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC,
                 "fresh_frame_required_consecutive_samples": CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES,
-                "fresh_frame_streaks": dict(fresh_frame_streaks),
+                "fresh_frame_streaks": dict(freshness_gate.fresh_frame_streaks),
             }
         )
         if clutch_input.ui is not None:
@@ -203,9 +281,10 @@ def _run_camera_startup_self_check(
             clutch_input.ui.publish(**updates)
         if completed:
             break
-        clutch_input.poll()
-        if clutch_input.should_quit:
-            break
+        if poll_input:
+            clutch_input.poll()
+            if clutch_input.should_quit:
+                break
         sleep_sec = min(interval_sec, max(0.0, duration_sec - (time.time() - started_at)))
         if sleep_sec > 0.0:
             time.sleep(sleep_sec)
@@ -517,6 +596,8 @@ def _wait_for_real_teleop_start_request(
     visualization_request_handler: Callable[[float], None] | None = None,
     visualization_update_handler: Callable[[float], None] | None = None,
     runtime_status_update_handler: Callable[[], None] | None = None,
+    begin_home_transition_handler: Callable[[], None] | None = None,
+    require_home_transition_ready_handler: Callable[[], None] | None = None,
 ) -> str | None:
     if not clutch_input.enabled:
         _log(
@@ -531,18 +612,14 @@ def _wait_for_real_teleop_start_request(
         "Pre-Home exact-qpos maintenance is available from the GUI.",
     )
     status_gate = ChangeGate()
-    # The startup wait loop is not a control loop.  Before runtime Home is
-    # captured, the state backends are still live because the GUI needs a
-    # fresh qpos for an explicit Init/hold operation, but polling them every
-    # 20 ms needlessly competes with PositionForceGuard's 20 Hz
-    # ``Get_Force_Data`` calls on the same RM65 SDK connection.  The vendor
-    # request/response API is serialized by the backend read lock; an
-    # occasional delayed state response can therefore make the force sample
-    # appear stale and trip the fail-closed watchdog.  Five Hz is sufficient
-    # for the startup preview, while the explicit Init action still performs
-    # its own fresh qpos read when requested.
-    startup_state_sync_period_sec = 0.2
-    last_startup_state_sync_monotonic: float | None = None
+    # The startup wait loop is not a control loop.  Keep the preview on the
+    # startup snapshot while the operator is idle instead of periodically
+    # calling Get_Current_Arm_State on the state connection.  That connection
+    # also serves PositionForceGuard's 20 Hz Get_Force_Data calls, and one slow
+    # state response can otherwise hold the serialized SDK lock beyond the
+    # 250 ms stale deadline and cause a false fail-closed trip.  Explicit Init
+    # reads fresh qpos before planning and during feedback checks; runtime Home
+    # captures its own final atomic dual-arm hardware snapshot.
     clutch_input.set_startup_qpos_maintenance_enabled(True)
     try:
         initial_force_sides = _impedance_force_control_not_ready_sides(args, components)
@@ -627,23 +704,40 @@ def _wait_for_real_teleop_start_request(
                             "如无需归位，请再次点击“开始遥操”采集 runtime Home 并进入遥操。"
                         )
                     continue
+                if begin_home_transition_handler is not None:
+                    try:
+                        begin_home_transition_handler()
+                    except Exception as exc:  # noqa: BLE001 - remain in startup Hold.
+                        message = (
+                            "Home 前后台维护停止请求失败："
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        _log("TactileCompression", message, now=loop_start)
+                        clutch_input.publish_calibration_waiting(
+                            message + "；保持停臂，请重试。"
+                        )
+                        continue
                 if clutch_input.before_calibration_start_delay(
                     DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
                     arm_mode=arm_mode,
                 ):
+                    if require_home_transition_ready_handler is not None:
+                        try:
+                            require_home_transition_ready_handler()
+                        except Exception as exc:  # noqa: BLE001 - remain in startup Hold.
+                            message = (
+                                "Home 前后台维护未能安全停止："
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            _log("TactileCompression", message, now=time.time())
+                            clutch_input.publish_calibration_waiting(
+                                message + "；保持停臂，请重试。"
+                            )
+                            continue
                     return "home"
                 if clutch_input.should_quit:
                     return None
                 clutch_input.publish_calibration_waiting("Home 标定已取消，回到等待状态。")
-
-            now_monotonic = time.monotonic()
-            if (
-                last_startup_state_sync_monotonic is None
-                or now_monotonic - last_startup_state_sync_monotonic
-                >= startup_state_sync_period_sec
-            ):
-                _sync_preview_from_real_state_real(components, required=False)
-                last_startup_state_sync_monotonic = time.monotonic()
 
             channels, _ = components.session.poll_sources(loop_start)
             clutch_input.publish_raw_tracker_pose_state(channels=channels, now=loop_start)
@@ -747,6 +841,20 @@ def _arm_after_start_calibration(
             return
         reset_elapsed_ms = (time.perf_counter() - reset_start) * 1000.0
         _log("Calibration", f"runtime restart motion state reset from live real qpos synced={synced}")
+        endpoint_guard = getattr(
+            components,
+            "position_admittance_endpoint_guard",
+            None,
+        )
+        if endpoint_guard is not None:
+            endpoint_guard_snapshot = endpoint_guard.reset_anchor_from_qpos(
+                runtime_home_qpos_snapshot
+            )
+            _log(
+                "PositionAdmittance",
+                "Active endpoint excursion guard armed from runtime Home: "
+                f"{endpoint_guard_snapshot}",
+            )
         if position_force_guard_monitor is not None:
             guard_fault = getattr(position_force_guard_monitor, "fault", None)
             rearm = getattr(
@@ -872,7 +980,12 @@ __all__ = [
     "CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC",
     "CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES",
     "CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC",
+    "StartupCleanupRegistry",
+    "activate_startup_cleanup",
     "bind_legacy_support",
+    "cleanup_active_startup",
+    "deactivate_startup_cleanup",
+    "register_component_startup_cleanup",
     "_update_init_arm_arrival_from_hardware",
     "_run_camera_startup_self_check",
     "_release_runtime_state_readers",

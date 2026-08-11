@@ -127,7 +127,7 @@ VIVE 侧如果沿用当前默认配置，receiver 默认读取：
 
 ```bash
 python -m teleop_runtime.collection \
-  --dataset-root datasets/demo_bimanual_no_camera \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection \
   --task grasp_demo \
   --active-sides both \
   --load-profile teleop_records/calibration_profiles/20260420_150620_vive_rm65_virtual_desk.json \
@@ -591,7 +591,7 @@ collector 不为旧 state/action 维度做额外兼容语义。
 最常用的参数是：
 
 - `--dataset-root`
-  基础输出目录；实际数据集目录会自动命名为 `<dataset-root>/<YYYY-MM-DD>_<task-name>`。未显式传入时读取 `local_paths.json` 的 `dataset_root`，再回退到仓库内 `datasets/`。
+  基础输出目录；实际数据集目录会自动命名为 `<dataset-root>/<YYYY-MM-DD>_<task-name>`。未显式传入时读取 `local_paths.json` 的 `dataset_root`，再回退到 canonical 正式采集根 `/home/user/zc/datasets/RealmanDMTAC/FormalCollection`。显式参数仍可用于旧数据兼容和离线测试，但不会迁移或改写已有数据。
 - `--task-name`
   任务名称，用于数据集目录命名和 episode metadata。旧的 `--task` 仍兼容，会在未提供 `--task-name` 时作为任务名和 task id。
 - `--active-sides left|right|both`
@@ -1010,6 +1010,9 @@ find /tmp/collect_bimanual_bihand_short -maxdepth 3 -type f | sort
 元数据和 v2.4 episode 级 ControlTrace 绑定；后续 episode 会向前连续压紧，writer
 刷新后下一次采集从新的末尾序号继续。操作期间不能开始数采。为便于误操作恢复，
 原数据集会以 `*.before_delete_episode_*` 目录保留在数据集旁边。
+已提交 Plus 外部整理记录、已 commit v2.4 ControlTrace 或 v2.5-p immutable identity
+的数据集会拒绝原地删除/重编号，避免旁路语义或 commit 身份静默指向错误 Episode；
+此类修改应生成 copy-on-write 派生数据集。
 
 #### F. 加相机短测
 

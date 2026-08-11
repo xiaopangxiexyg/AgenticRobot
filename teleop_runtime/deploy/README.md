@@ -11,17 +11,57 @@
 official source all-IK
 → collision-safe nearest branch
 → linear source-q reference
-→ two-source-step 120 Hz third-order governor
+→ formal third-order jerk-limited source-cut governor
 → 0.05 s acceleration-to-jerk ramp
 ```
 
 对应参数为
 `--position-path-lift-backend official_source_all_ik_causal_governor`
 （默认值）、`--position-all-ik-lookahead-source-steps 2` 和
-`--position-all-ik-jerk-ramp-sec 0.05`。它要求双臂、position collision、
+`--position-all-ik-jerk-ramp-sec 0.05`，以及默认的
+`--position-continuous-waypoint-profile formal_third_order`。真实部署 trace 显示，
+`async_c2` 的后台预计算在整机负载下可与权威 60 Hz reference worker 竞争，
+导致跨过两个 16.7 ms tick。因此 C2 已恢复为显式研究 profile；它只在完整
+15 Hz source cut 具有同 chunk 未来覆盖、连续时间/离散动态证书和整段采样碰撞
+准入时接管；worker 迟到、anchor 变化或任一证书失败时，整个 cut 回退为
+third-order governor，不在 cut 内混切。它要求 `--debug`、双臂、position collision、
 15 Hz policy action、120 Hz RM65 command stream 以及 same-chunk lookahead；
 不满足这些条件时显式请求会 fail closed。单臂兼容运行和显式关闭 chunk
 lookahead 的旧命令会保留在 Pink 路径。
+
+RTC frontend 和带 `arm_hold_output` 的 policy artifact 没有可直接用于规划的、已完成语义
+解析的 same-chunk successor，因此会在 backend/profile 解析前关闭 lookahead、回退到
+`pink_pose_lift`，并把 C2 effective profile 标为 `formal_third_order`（即 C2 关闭）。不得为
+获得 C2 而直接暴露未解析的未来 arm-hold action。
+
+要显式固定当前正式 source-q third-order 执行，传：
+
+```bash
+--position-continuous-waypoint-profile formal_third_order
+```
+
+该配置不改变 official all-IK 分支选择、collision owner、15/60/120 Hz 频率或其他
+deploy 参数。`async_c2`、历史
+`--position-continuous-waypoint-experimental-admission`与
+`--position-continuous-waypoint-async-precompute`只保留给隔离的 debug/离线研究对照，
+不是当前真机推荐；它们与 `--send-actions` 的组合会在设备创建前 fail closed。
+
+async C2 的 deadline 复核可显式把权威 reference worker 与 proposal worker 固定到
+两个不同的 Linux logical CPU：
+
+```bash
+--position-reference-worker-cpu 14 \
+--position-continuous-waypoint-worker-cpu 15
+```
+
+两个参数必须成对出现、CPU 必须不同且属于进程启动时可用的 affinity mask；worker
+启动后还会按 native thread ID 重新读取实际 mask，不能精确验证为单 CPU 时 fail
+closed。远端部署机的 2026-08-09 只读审计显示 CPU 14/30 与 15/31 分别为两组不同
+物理核的 SMT siblings，因此隔离对照使用 14（60 Hz reference）和 15（C2）。这只保证
+两条指定 worker 不共享同一个 logical CPU，不等价于系统级 exclusive cpuset；同机其他
+进程仍需由部署环境隔离。删除这两个参数即可原子回退为原调度行为，删除
+`--position-continuous-waypoint-profile async_c2` 或改回 `formal_third_order` 则同时回退
+C2 路径。CPU 隔离在 no-action/full-load deadline soak 通过前不解除上述真机下发门禁。
 
 旧 V4 的完整回退是：
 
@@ -446,9 +486,17 @@ python -m teleop_runtime.deploy \
 
 - 真实 arm 下发时，默认必须提供 `--policy-qpos-init-dataset` 或
   `--policy-qpos-init-parquet`。
-- 如果确实要从当前 qpos 原地开始推理/执行，必须显式加 `--start-init_qpos`。
-  这是强制覆盖模式，日志会打印 override 提示；只应在确认当前姿态、末端、工作空间和
-  policy 首帧都安全时使用。
+- 如果确实要从当前 qpos 原地开始推理/执行，优先显式加 `--no-init-qpos`。该参数会覆盖
+  deployment profile 或同一命令中注入的 `--policy-qpos-init-*` 数据集初始化输入，使
+  `init-source=current` 的同位姿 Cartesian startup init 直接判定为已满足，不再进入
+  dataset-frame qpos-init，也不再要求先按 `g` 发送冗余保持流；手动部署仍需按 `A` 通过
+  ready confirm 后才会执行 policy。
+  `--no--init-qpos` 是兼容拼写；新命令统一使用 `--no-init-qpos`。
+- 旧的 `--start-init_qpos` 仍保留兼容，但它只在命令本来没有注入
+  `--policy-qpos-init-*` 时允许从当前 qpos 启动，不负责覆盖 profile 默认值。
+- `--no-init-qpos` 是强制安全覆盖模式，日志会明确打印被抑制的 qpos-init 输入；它不会
+  自动启用 `--auto-start`，也不会关闭当前位姿 observation/reference、ready confirm、碰撞、
+  受力或 observation 安全门。只应在确认当前姿态、末端、工作空间和 policy 首帧都安全时使用。
 - dry-run 不受该限制，可以不提供 qpos init 数据集。
 
 ## 运行时操作和按键
@@ -476,7 +524,8 @@ python -m teleop_runtime.deploy \
 - 加 `--auto-start` 且配置了 `--policy-qpos-init-*` 时，启动后自动进入 qpos init；
   qpos init 完成后才释放 startup init / policy。
 - 加 `--send-actions` 才会真实下发；真实 arm 下发还需要数据集 qpos init，或显式
-  `--start-init_qpos` 覆盖。不加 `--send-actions` 时是 dry-run，只构造 observation、过滤动作并打印状态。
+  `--no-init-qpos` 从当前 qpos 启动（旧的无 profile 路径也可用 `--start-init_qpos`）。
+  不加 `--send-actions` 时是 dry-run，只构造 observation、过滤动作并打印状态。
 
 状态行常见字段：
 

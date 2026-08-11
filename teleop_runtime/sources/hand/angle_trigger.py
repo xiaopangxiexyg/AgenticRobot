@@ -19,6 +19,7 @@ class AngleTriggerSource(ObservationSource):
         rate_hz: float = 30.0,
         config_root: Path | None = None,
         active_sides: tuple[str, ...] | None = None,
+        reconnect_after_consecutive_errors: int = 3,
     ) -> None:
         if rate_hz <= 0.0:
             raise ValueError("rate_hz must be positive.")
@@ -42,11 +43,18 @@ class AngleTriggerSource(ObservationSource):
         self._active_sides = tuple(
             side for side in ("left", "right") if side in sides
         )
+        reconnect_threshold = int(reconnect_after_consecutive_errors)
+        if reconnect_threshold <= 0:
+            raise ValueError(
+                "reconnect_after_consecutive_errors must be positive."
+            )
+        self._reconnect_after_consecutive_errors = reconnect_threshold
         self._lock = threading.Lock()
         self._latest: dict[str, ObservationChannel] = {}
         self._running = False
         self._thread: threading.Thread | None = None
         self._errors = 0
+        self._consecutive_errors = 0
 
     @property
     def name(self) -> str:
@@ -109,15 +117,26 @@ class AngleTriggerSource(ObservationSource):
                     )
                 with self._lock:
                     self._latest.update(published)
+                    self._consecutive_errors = 0
             except Exception as exc:  # pragma: no cover - hardware recovery path
                 self._errors += 1
+                with self._lock:
+                    self._consecutive_errors += 1
+                    consecutive_errors = self._consecutive_errors
                 self._publish_invalid(f"{type(exc).__name__}: {exc}")
-                try:
-                    self._reader.close()
-                    if self._running:
-                        self._reader.open()
-                except Exception:
-                    pass
+                # A single delayed or malformed serial reply is not evidence
+                # that the port identity changed. Retrying the open connection
+                # avoids turning one bad frame into a full deferred discovery
+                # cycle. Persistent failures still trigger bounded recovery.
+                if consecutive_errors >= self._reconnect_after_consecutive_errors:
+                    try:
+                        self._reader.close()
+                        if self._running:
+                            self._reader.open()
+                            with self._lock:
+                                self._consecutive_errors = 0
+                    except Exception:
+                        pass
             remaining = period - (time.monotonic() - started)
             if remaining > 0.0:
                 time.sleep(remaining)

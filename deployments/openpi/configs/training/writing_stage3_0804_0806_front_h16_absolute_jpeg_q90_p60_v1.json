@@ -1,0 +1,89 @@
+{
+  "schema": "dexteleop.openpi_prepared_skill_training_profile.v1",
+  "profile_id": "writing_stage3_0804_0806_front_h16_absolute_jpeg_q90_p60_v1",
+  "organized_dataset_root": "/home/user/zc/DexTeleop/datasets/training_workspaces/writing_stage3_0804_0806_front_h16_absolute_v1",
+  "sources": [
+    {
+      "source_dataset_id": "writing4_2026_08_04",
+      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_eligible_episode_count": 344
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_05",
+      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_eligible_episode_count": 246
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part1",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_eligible_episode_count": 35
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part2",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_1453",
+      "expected_eligible_episode_count": 203
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part3",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
+      "expected_eligible_episode_count": 51
+    }
+  ],
+  "expected_total_eligible_episode_count": 879,
+  "expected_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+  "skill_projection_catalog_id": "writing_four_stage_subtasks_v2",
+  "target_skill_id": "writing.write_with_brush",
+  "training_domain": "NOMINAL",
+  "require_no_abnormal_intervals": true,
+  "camera_selection": [
+    "front"
+  ],
+  "camera_slot_to_dataset_key": {
+    "base_0_rgb": "front"
+  },
+  "action_horizon": 16,
+  "action_pose_mode": "absolute",
+  "source_mixing_policy": "natural_concat_shuffle_v1",
+  "tail_policy": "drop",
+  "expected_policy_io_layout_hash": "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16",
+  "expected_progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
+  "expected_stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b",
+  "annotation_selection": {
+    "0477d0dc77fb05a9916cd642a9b78acb255e2f283195ba3cd072fcef6a9264ad": "stage-1785998824686-d587ecb4",
+    "3dc2df14329333dac379986ab195bf5b29ee25e25ce1ae0e4f1d7533ec44a0fe": "stage-1786184463776-392e5861",
+    "4b7d78f2e03f3433d0cb4e8092538e8d61da0a281ee8a70e1ef4ea18c947f6da": "stage-1786182430820-f0a952e5",
+    "611174a83ee72825cb66a4c62d256a1f1f50964fbb7314ec5138274cd157aff3": "stage-1786176239224-610092ed",
+    "699d5486a3c6ffadfb225557dd6990567779494c210fe79bf24a1135e57116f8": "stage-1786180839374-a3360e18",
+    "6a199e8bd96085f3289e0dfa794d42d649dfb54537bcf5329b6a0bb56efd958a": "stage-1785907794626-8e3134b8",
+    "98dc9ac18e44c8fee7332dd215fe756b58f17c4f87521957910e5ec7897c8910": "stage-1786004779628-b61c6319",
+    "7d7c3969d375ec3ad6498e45099977754f26dba01cb95381c3e5ce31ddd9467f": "stage-1785996431946-dae64488",
+    "91b18532cb56a2090d0189c0c98e17045788594c02bf6e722abe995e52f51d4c": "stage-1786184398878-51dc27c2",
+    "9a93e85dd15d911ba5dab16e75c0c0927c03804d706f33af23230c7f7945435c": "stage-1786181966622-8bd28af6",
+    "aa8bc881c8f5ecc140e74d1ba28e1a7445d2da064fb29f210bb9c43fb8387071": "stage-1786182264025-1fb809fb",
+    "ace1426a8269ced855b42ed88d999a71130faf4edf03a0c3a7af74ca4a7fd84a": "stage-1786183072405-999ef8fc",
+    "c9c7729cb9f5aaa62b9b41081dd5f73c02fde24b968538d6fb4008e362fad199": "stage-1786184501847-5df701c9",
+    "ed396dc03e4d15dd3b5f1c958618a079b8e3985de48f524b239d6c842f1d0402": "stage-1786176263952-848a4184",
+    "eea62da96c18b2632f8e843cc59d8bb4ff70a18fe786d1623c28263bf16a6943": "stage-1785900010047-28130000",
+    "ef0c4f141d25eacfa66db42050b1f596a6d0871bc71574066161a5f65e25affb": "stage-1786180968178-c4360b5a",
+    "f3635d3f82c730e7d559870e42206b5e5f076ab8f28657e9ac6dc3a415f97700": "stage-1785898817316-c18d20dc",
+    "f453b4dcd4154885d38282a30d8186c64b143a64c299ba0fa4f74420f0958559": "stage-1785840272085-e43e8daf"
+  },
+  "openpi_checkout": "/home/user/zc/openpi",
+  "openpi_base_config": "writing-phase1-grap-pen-front-only-h16-absolute-task-ready-state-dropout-v2",
+  "openpi_state_augmentation_from_config": "writing-phase1-grap-pen-front-only-h16-absolute-task-ready-state-dropout-v2",
+  "openpi_config_name": "writing-stage3-0804-0806-front-h16-absolute-jpeg-q90-p60-prepared-v1",
+  "openpi_asset_id": "writing_stage3_0804_0806_front_h16_absolute_prepared_v1",
+  "openpi_num_workers": 4,
+  "default_exp_name": "writing-stage3-0804-0806-front-h16-absolute-b1-nw4-meta-jpeg-q90-p60-v1",
+  "openpi_image_wire_training": {
+    "schema": "dexteleop.openpi_image_wire.training_alignment.v2",
+    "profile": "jpeg",
+    "target_shape": [
+      224,
+      224,
+      3
+    ],
+    "jpeg_quality": 90,
+    "application_probability": 0.6
+  }
+}

@@ -77,6 +77,17 @@ from ..position_control import (
     PositionReferencePublisher,
     PositionReferencePublisherConfig,
 )
+from .position_admittance_shadow import (
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+    POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA,
+    POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG,
+    PositionAdmittanceEndpointExcursionGuard,
+    position_admittance_active_apply_sides,
+    position_admittance_active_config,
+    position_admittance_active_uses_home_endpoint_guard,
+    position_rotational_admittance_config,
+    validate_position_admittance_active_authority,
+)
 from ..recording import SessionRecorder
 from ..retargeters import (
     DualArmCollisionAwareRetargeter,
@@ -205,6 +216,24 @@ def _collision_debug_box_templates(
     return boxes
 
 
+def _active_arm_ip_by_side(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> dict[str, tuple[str, str]]:
+    """Return only arm-IP assignments admitted by ``active_sides``.
+
+    A shared command may contain configuration for both arms even when this
+    runtime is intentionally single-arm. Active-side selection owns
+    admission; inactive values remain inert configuration context.
+    """
+
+    return {
+        logical_side: (source_name, arm_ip)
+        for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items()
+        if logical_side in active_sides and arm_ip
+    }
+
+
 def build_real_teleop_components(
     args: argparse.Namespace,
     *,
@@ -218,20 +247,12 @@ def build_real_teleop_components(
     impedance_mode = _impedance_mode_arg(args)
     strict_tool_profile = _strict_tool_profile_arg(args)
     force_tare_sec = _force_tare_sec_arg(args)
-    logical_ip_by_side: dict[str, tuple[str, str]] = {}
-    inactive_arm_config: list[str] = []
-    for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
-        if not arm_ip:
-            continue
-        if logical_side not in active_sides:
-            inactive_arm_config.append(f"{source_name}->{logical_side}")
-            continue
-        logical_ip_by_side[logical_side] = (source_name, arm_ip)
-    if inactive_arm_config:
-        raise ValueError(
-            "Inactive logical side received an arm IP; remove it or include that side "
-            f"in --active-sides. inactive={inactive_arm_config}"
-        )
+    # ``active_sides`` is the authority for this runtime.  The command may
+    # intentionally carry both saved/configured arm IPs while operating one
+    # arm (for example, a shared command template or a later side switch).
+    # Inactive-side IPs are configuration context and must not make component
+    # construction fail; only active sides need a usable IP.
+    logical_ip_by_side = _active_arm_ip_by_side(args, active_sides)
     missing_arm_sides = [side for side in active_sides if side not in logical_ip_by_side]
     if missing_arm_sides:
         raise ValueError(
@@ -674,6 +695,13 @@ def build_real_teleop_components(
                     True,
                 )
             ),
+            "position_sample_aligned_source_latch_mode": str(
+                getattr(
+                    args,
+                    "position_sample_aligned_source_latch_mode",
+                    "time_bucket",
+                )
+            ),
             "position_sample_aligned_governor_regularization": {
                 "jerk": float(
                     getattr(
@@ -689,6 +717,13 @@ def build_real_teleop_components(
                         0.0,
                     )
                 ),
+                "initial_jerk_delta": float(
+                    getattr(
+                        args,
+                        "position_sample_aligned_initial_jerk_delta_regularization",
+                        0.0,
+                    )
+                ),
                 "terminal_velocity": float(
                     getattr(
                         args,
@@ -700,6 +735,34 @@ def build_real_teleop_components(
                     getattr(
                         args,
                         "position_sample_aligned_terminal_acceleration_regularization",
+                        0.0,
+                    )
+                ),
+                "reference_mode": str(
+                    getattr(
+                        args,
+                        "position_sample_aligned_reference_mode",
+                        "linear_hold",
+                    )
+                ),
+                "observer_window": int(
+                    getattr(
+                        args,
+                        "position_sample_aligned_observer_window",
+                        4,
+                    )
+                ),
+                "observer_stop_threshold_deg": float(
+                    getattr(
+                        args,
+                        "position_sample_aligned_observer_stop_threshold_deg",
+                        0.01,
+                    )
+                ),
+                "observer_stop_velocity_decay": float(
+                    getattr(
+                        args,
+                        "position_sample_aligned_observer_stop_velocity_decay",
                         0.0,
                     )
                 ),
@@ -1142,6 +1205,20 @@ def build_real_teleop_components(
                                 0.0,
                             )
                         ),
+                        output_qpos_admittance_fast_path_enabled=bool(
+                            arm_control_mode == "position"
+                            and getattr(
+                                args,
+                                "position_admittance_active",
+                                False,
+                            )
+                        ),
+                        output_qpos_admittance_fast_path_alpha=float(
+                            POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA
+                        ),
+                        output_qpos_admittance_micro_reversal_hold_deg=float(
+                            POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG
+                        ),
                         # A singular wrist uses a bounded, responsive endpoint
                         # only inside the narrow q5 escape band.  This avoids
                         # the normal 0.14 alpha making the guarded wrist feel
@@ -1293,6 +1370,80 @@ def build_real_teleop_components(
     if dual_arm_retargeter is None:
         side_retargeters = {"left": left_retargeter, "right": right_retargeter}
         retargeters.extend(side_retargeters[side] for side in active_sides)
+
+    position_admittance_endpoint_guard = None
+    if bool(getattr(args, "position_admittance_active", False)):
+        if dual_arm_retargeter is None:
+            raise RuntimeError(
+                "Active position admittance endpoint excursion guard requires "
+                "the coupled dual-arm retargeter"
+            )
+        rotation_active = bool(
+            getattr(args, "position_admittance_rotation_active", False)
+        )
+        rotational_config = (
+            position_rotational_admittance_config(
+                args,
+                profile=str(args.position_admittance_rotation_active_profile),
+            )
+            if rotation_active
+            else None
+        )
+        active_endpoint_policy = str(
+            getattr(
+                args,
+                "position_admittance_active_endpoint_policy",
+                POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+            )
+        )
+        active_apply_sides = position_admittance_active_apply_sides(
+            str(args.position_admittance_active_side)
+        )
+        maximum_allowed_rotation_excursion_deg = (
+            validate_position_admittance_active_authority(
+                position_admittance_active_config(args),
+                active_envelope=str(args.position_admittance_active_envelope),
+                rotational_config=rotational_config,
+                combined_translation_rotation_active=bool(
+                    getattr(args, "position_admittance_combined_active", False)
+                ),
+                endpoint_policy=active_endpoint_policy,
+                apply_sides=active_apply_sides,
+                max_tool_excursion_m=float(
+                    args.position_admittance_active_max_tool_excursion_m
+                ),
+                max_tool_rotation_excursion_deg=(
+                    float(
+                        args.position_admittance_active_max_tool_rotation_excursion_deg
+                    )
+                    if rotation_active
+                    else None
+                ),
+            )
+        )
+        if position_admittance_active_uses_home_endpoint_guard(
+            active_endpoint_policy
+        ):
+            endpoint_guard_kwargs: dict[str, float] = {}
+            if maximum_allowed_rotation_excursion_deg is not None:
+                endpoint_guard_kwargs[
+                    "maximum_allowed_tool_rotation_excursion_deg"
+                ] = maximum_allowed_rotation_excursion_deg
+            position_admittance_endpoint_guard = PositionAdmittanceEndpointExcursionGuard(
+                retargeter=dual_arm_retargeter,
+                active_side=active_apply_sides[0],
+                max_tool_excursion_m=float(
+                    args.position_admittance_active_max_tool_excursion_m
+                ),
+                max_tool_rotation_excursion_deg=(
+                    float(
+                        args.position_admittance_active_max_tool_rotation_excursion_deg
+                    )
+                    if rotation_active
+                    else None
+                ),
+                **endpoint_guard_kwargs,
+            )
 
     calibration.metadata.update(
         {
@@ -1616,7 +1767,39 @@ def build_real_teleop_components(
                             DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
                         )
                     ),
-                    position_sample_aligned_source_hz=float(args.hz),
+                    position_sample_aligned_source_hz=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_source_hz",
+                            args.hz,
+                        )
+                    ),
+                    position_sample_aligned_source_latch_mode=str(
+                        getattr(
+                            args,
+                            "position_sample_aligned_source_latch_mode",
+                            "time_bucket",
+                        )
+                    ),
+                    position_sample_aligned_horizon_source_steps=int(
+                        getattr(
+                            args,
+                            "position_sample_aligned_horizon_source_steps",
+                            2,
+                        )
+                    ),
+                    position_sample_aligned_safety_horizon_source_steps=(
+                        None
+                        if getattr(
+                            args,
+                            "position_sample_aligned_safety_horizon_source_steps",
+                            None,
+                        )
+                        is None
+                        else int(
+                            args.position_sample_aligned_safety_horizon_source_steps
+                        )
+                    ),
                     position_sample_aligned_scale_degraded_target=bool(
                         getattr(
                             args,
@@ -1638,6 +1821,13 @@ def build_real_teleop_components(
                             0.0,
                         )
                     ),
+                    position_sample_aligned_initial_jerk_delta_regularization=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_initial_jerk_delta_regularization",
+                            0.0,
+                        )
+                    ),
                     position_sample_aligned_terminal_velocity_regularization=float(
                         getattr(
                             args,
@@ -1649,6 +1839,76 @@ def build_real_teleop_components(
                         getattr(
                             args,
                             "position_sample_aligned_terminal_acceleration_regularization",
+                            0.0,
+                        )
+                    ),
+                    position_sample_aligned_reference_mode=str(
+                        getattr(
+                            args,
+                            "position_sample_aligned_reference_mode",
+                            "linear_hold",
+                        )
+                    ),
+                    position_sample_aligned_observer_window=int(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_window",
+                            4,
+                        )
+                    ),
+                    position_sample_aligned_observer_efficiency_power=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_efficiency_power",
+                            2.0,
+                        )
+                    ),
+                    position_sample_aligned_observer_velocity_ema_alpha=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_velocity_ema_alpha",
+                            0.5,
+                        )
+                    ),
+                    position_sample_aligned_observer_velocity_cap_scale=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_velocity_cap_scale",
+                            0.5,
+                        )
+                    ),
+                    position_sample_aligned_observer_coherence_min=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_coherence_min",
+                            0.5,
+                        )
+                    ),
+                    position_sample_aligned_observer_speed_guard_scale=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_speed_guard_scale",
+                            0.4,
+                        )
+                    ),
+                    position_sample_aligned_terminal_velocity_displacement_scale=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_terminal_velocity_displacement_scale",
+                            0.75,
+                        )
+                    ),
+                    position_sample_aligned_observer_stop_threshold_deg=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_stop_threshold_deg",
+                            0.01,
+                        )
+                    ),
+                    position_sample_aligned_observer_stop_velocity_decay=float(
+                        getattr(
+                            args,
+                            "position_sample_aligned_observer_stop_velocity_decay",
                             0.0,
                         )
                     ),
@@ -1930,6 +2190,9 @@ def build_real_teleop_components(
             temporary_safety_limiter=temporary_safety_limiter,
             fix_arm_controller=fix_arm_controller,
             init_arm_controller=init_arm_controller,
+            position_admittance_endpoint_guard=(
+                position_admittance_endpoint_guard
+            ),
         ),
         command_guard=_compose_real_command_guard(
             fix_arm_controller=fix_arm_controller,
@@ -2133,6 +2396,7 @@ def build_real_teleop_components(
         },
         human_shadow_frontend=human_shadow_frontend,
         temporary_safety_limiter=temporary_safety_limiter,
+        position_admittance_endpoint_guard=position_admittance_endpoint_guard,
         fix_arm_controller=fix_arm_controller,
         init_arm_controller=init_arm_controller,
         position_reference_publisher=position_reference_publisher,

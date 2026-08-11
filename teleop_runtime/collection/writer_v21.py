@@ -5,14 +5,21 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
+from collection_runtime.artifact_integrity import IncrementalArtifactDigest
 from collection_runtime.async_writer import WriteJob
+from collection_runtime.dataset_capture_recovery import (
+    prepare_dataset_capture_writable,
+)
+from collection_runtime.modality_inventory import build_and_publish_modality_inventory
 from dataset_contracts.arm_mode import (
     ARM_HOLD_TRAINING_PROJECTION_ID_V1,
     arm_hold_training_projection_metadata,
@@ -51,6 +58,9 @@ from dataset_contracts.wrist_depth import (
     mask_manifest_payload,
     pack_binary_mask,
     raw_depth_manifest_payload,
+)
+from dataset_interface.modality_artifacts import (
+    assert_dataset_capture_integrity_compatible,
 )
 
 from ..action import (
@@ -196,6 +206,32 @@ def _write_json(path: Path, payload: Any) -> None:
     )
 
 
+def _atomic_write_json_fsync(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                _to_serializable(payload),
+                handle,
+                indent=2,
+                ensure_ascii=True,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _append_jsonl(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -259,6 +295,7 @@ class LeRobotV21WriterConfig:
     write_video: bool = True
     tactile_storage: str = TACTILE_STORAGE_EXTERNAL
     tactile_compression: str = TACTILE_COMPRESSION_NONE
+    tactile_artifact_integrity: bool = False
     allow_missing_video_frames: bool = False
     arm_action_specs: Mapping[str, Any] | None = None
     hand_action_specs: Mapping[str, Any] | None = None
@@ -292,6 +329,11 @@ class LeRobotV21WriterConfig:
             raise ValueError("tactile_storage must be parquet or external.")
         self.tactile_storage = storage
         self.tactile_compression = _normalize_tactile_compression(self.tactile_compression)
+        self.tactile_artifact_integrity = bool(self.tactile_artifact_integrity)
+        if self.tactile_artifact_integrity and storage != TACTILE_STORAGE_EXTERNAL:
+            raise ValueError(
+                "tactile_artifact_integrity requires tactile_storage='external'"
+            )
         requested_arm_action_specs = self.arm_action_specs
         self.hand_action_specs = normalize_hand_action_specs(self.hand_action_specs)
         self.policy_io_layout_provenance = dict(self.policy_io_layout_provenance or {})
@@ -401,6 +443,7 @@ class _TactileSensorStream:
     path: Path
     compression: str = TACTILE_COMPRESSION_NONE
     chunk_frame_count: int = TACTILE_CHUNK_FRAME_COUNT
+    artifact_integrity: bool = False
     dtype: str | None = None
     shape: tuple[int, ...] | None = None
     frame_count: int = 0
@@ -409,6 +452,15 @@ class _TactileSensorStream:
     _chunk_start_frame: int | None = None
     _chunk_frame_count: int = 0
     _chunk_raw_bytes: bytearray = field(default_factory=bytearray)
+    _stored_digest: IncrementalArtifactDigest = field(init=False, repr=False)
+    stored_size_bytes: int | None = None
+    stored_sha256: str | None = None
+    stored_hash_profile: str | None = None
+
+    def __post_init__(self) -> None:
+        self._stored_digest = IncrementalArtifactDigest(
+            enabled=bool(self.artifact_integrity)
+        )
 
     @property
     def encoding(self) -> str:
@@ -419,7 +471,21 @@ class _TactileSensorStream:
     def _ensure_handle(self) -> None:
         if self.handle is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.handle = self.path.open("ab")
+            if self.artifact_integrity and self.path.exists():
+                raise FileExistsError(
+                    f"Refusing to append to a pre-existing sealed tactile stream: {self.path}"
+                )
+            self.handle = self.path.open("xb" if self.artifact_integrity else "ab")
+
+    def _write_stored_bytes(self, payload: bytes) -> None:
+        assert self.handle is not None
+        written = self.handle.write(payload)
+        if written != len(payload):
+            raise OSError(
+                f"Short tactile stream write for {self.sensor_key}: "
+                f"{written}/{len(payload)} bytes"
+            )
+        self._stored_digest.update(payload)
 
     def _flush_chunk(self) -> None:
         if self._chunk_frame_count <= 0:
@@ -429,7 +495,7 @@ class _TactileSensorStream:
         raw_payload = bytes(self._chunk_raw_bytes)
         compressed = _compress_tactile_chunk(raw_payload, compression=self.compression)
         offset = int(self.handle.tell())
-        self.handle.write(compressed)
+        self._write_stored_bytes(compressed)
         self.chunks.append(
             {
                 "frame_start": int(self._chunk_start_frame or 0),
@@ -467,7 +533,7 @@ class _TactileSensorStream:
         if self.compression == TACTILE_COMPRESSION_NONE:
             self._ensure_handle()
             assert self.handle is not None
-            self.handle.write(payload)
+            self._write_stored_bytes(payload)
         else:
             if self._chunk_start_frame is None:
                 self._chunk_start_frame = int(self.frame_count)
@@ -480,8 +546,23 @@ class _TactileSensorStream:
     def close(self) -> None:
         self._flush_chunk()
         if self.handle is not None:
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
             self.handle.close()
             self.handle = None
+        sealed = self._stored_digest.seal()
+        if sealed is not None:
+            if not self.path.is_file():
+                raise RuntimeError(
+                    f"Sealed tactile stream is missing: {self.path}"
+                )
+            if int(self.path.stat().st_size) != int(sealed.size_bytes):
+                raise RuntimeError(
+                    f"Sealed tactile stream size mismatch: {self.path}"
+                )
+            self.stored_size_bytes = int(sealed.size_bytes)
+            self.stored_sha256 = sealed.sha256
+            self.stored_hash_profile = sealed.profile
 
 
 @dataclass
@@ -560,6 +641,14 @@ class LeRobotV21Writer:
         self._planned_tactile_snapshot_refs: dict[
             tuple[int, str], tuple[int, int]
         ] = {}
+        self.last_tactile_inventory_hash: str | None = None
+        self.last_tactile_inventory_error: str | None = None
+        self.tactile_inventory_publication_deferred = False
+        prepare_dataset_capture_writable(self.root_dir)
+        if self.config.tactile_artifact_integrity:
+            self.tactile_inventory_publication_deferred = not (
+                assert_dataset_capture_integrity_compatible(self.root_dir)
+            )
         self._prepare_dataset_root()
 
     @property
@@ -599,6 +688,11 @@ class LeRobotV21Writer:
             # The complete dataset directory may have been removed while this
             # idle writer remained alive. Recreate the required structure and
             # then discover persisted counters from the current filesystem.
+            prepare_dataset_capture_writable(self.root_dir)
+            if self.config.tactile_artifact_integrity:
+                self.tactile_inventory_publication_deferred = not (
+                    assert_dataset_capture_integrity_compatible(self.root_dir)
+                )
             self._prepare_dataset_root()
 
     @property
@@ -801,6 +895,9 @@ class LeRobotV21Writer:
                     str(self.config.tactile_compression)
                     if self.config.tactile_storage == TACTILE_STORAGE_EXTERNAL
                     else None
+                ),
+                "tactile_artifact_integrity": bool(
+                    self.config.tactile_artifact_integrity
                 ),
                 "tactile_stream_format": (
                     TACTILE_STREAM_FORMAT
@@ -1884,6 +1981,7 @@ class LeRobotV21Writer:
             path=self.root_dir / relative_path,
             compression=compression,
             chunk_frame_count=TACTILE_CHUNK_FRAME_COUNT,
+            artifact_integrity=bool(self.config.tactile_artifact_integrity),
             dtype=str(dtype),
         )
         state.streams[sensor_key] = stream
@@ -2116,8 +2214,9 @@ class LeRobotV21Writer:
             stream.close()
         if not state.frame_records:
             return None
-        streams = {
-            sensor_key: {
+        streams: dict[str, dict[str, Any]] = {}
+        for sensor_key, stream in state.streams.items():
+            spec: dict[str, Any] = {
                 "path": stream.relative_path,
                 "dtype": stream.dtype,
                 "shape": [] if stream.shape is None else list(stream.shape),
@@ -2135,9 +2234,16 @@ class LeRobotV21Writer:
                     else []
                 ),
             }
-            for sensor_key, stream in state.streams.items()
-        }
-        _write_json(
+            if stream.stored_sha256 is not None:
+                spec.update(
+                    {
+                        "stored_size_bytes": int(stream.stored_size_bytes or 0),
+                        "stored_sha256": stream.stored_sha256,
+                        "stored_hash_profile": stream.stored_hash_profile,
+                    }
+                )
+            streams[sensor_key] = spec
+        _atomic_write_json_fsync(
             state.manifest_path,
             {
                 "format": TACTILE_STREAM_FORMAT,
@@ -2475,6 +2581,40 @@ class LeRobotV21Writer:
         self._finalized_episode_count += 1
         self._finalized_frame_count += int(stats.frame_count)
         self._write_info_locked()
+        if tactile_paths and self.config.tactile_artifact_integrity:
+            try:
+                all_streams_sealed = assert_dataset_capture_integrity_compatible(
+                    self.root_dir
+                )
+                inventory = (
+                    build_and_publish_modality_inventory(
+                        self.root_dir,
+                        payload_hash_mode="require_sealed",
+                    )
+                    if all_streams_sealed
+                    else None
+                )
+            except Exception as exc:
+                # The Episode is already durably committed.  Never make its caller
+                # retry finalization and duplicate catalog rows because an optional
+                # detachable-storage index failed; offline scan remains available.
+                self.tactile_inventory_publication_deferred = True
+                self.last_tactile_inventory_hash = None
+                self.last_tactile_inventory_error = f"{type(exc).__name__}: {exc}"
+                warnings.warn(
+                    "tactile artifact inventory publication failed after Episode "
+                    f"commit; detach will require an offline full scan: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                self.tactile_inventory_publication_deferred = not all_streams_sealed
+                if inventory is None:
+                    self.last_tactile_inventory_hash = None
+                    self.last_tactile_inventory_error = None
+                else:
+                    self.last_tactile_inventory_hash = inventory.semantic_content_hash
+                    self.last_tactile_inventory_error = None
         for key in tuple(self._planned_tactile_snapshot_refs):
             if key[0] == int(episode_index):
                 self._planned_tactile_snapshot_refs.pop(key, None)

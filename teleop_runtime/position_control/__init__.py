@@ -73,9 +73,13 @@ from .rm65_collision import (
     endpoint_to_tool_transforms_from_started_backends,
 )
 from .official_all_ik_governor import (
+    CONTINUOUS_WAYPOINT_WORKER_ISOLATION_CHOICES,
+    CONTINUOUS_WAYPOINT_WORKER_PROCESS,
+    CONTINUOUS_WAYPOINT_WORKER_THREAD,
     OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND,
     PINK_POSE_LIFT_BACKEND,
     POSITION_PATH_LIFT_BACKEND_CHOICES,
+    RM65ContinuousWaypointProcessSpec,
     RM65OfficialAllIKGovernorPlanner,
 )
 
@@ -135,8 +139,12 @@ __all__ = [
     "build_position_collision_planner_from_started_backends",
     "build_official_all_ik_governor_from_started_backends",
     "endpoint_to_tool_transforms_from_started_backends",
+    "CONTINUOUS_WAYPOINT_WORKER_ISOLATION_CHOICES",
+    "CONTINUOUS_WAYPOINT_WORKER_PROCESS",
+    "CONTINUOUS_WAYPOINT_WORKER_THREAD",
     "OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND",
     "PINK_POSE_LIFT_BACKEND",
     "POSITION_PATH_LIFT_BACKEND_CHOICES",
+    "RM65ContinuousWaypointProcessSpec",
     "RM65OfficialAllIKGovernorPlanner",
 ]

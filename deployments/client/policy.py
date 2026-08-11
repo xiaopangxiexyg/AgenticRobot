@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -94,7 +95,17 @@ def _load_module_from_path(path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not import policy module from {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    had_previous = module_name in sys.modules
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if had_previous:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+        raise
     return module
 
 

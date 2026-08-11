@@ -6,27 +6,30 @@
     "fps": 15,
     "color_format": "bgr8",
     "metadata": {
-      "mount": "single_front"
+      "mount": "single_front",
+      "startup_priority": 0
     }
   },
   "left_wrist": {
-    "serial": "261122273924",
-    "width": 640,
-    "height": 480,
-    "fps": 15,
-    "color_format": "bgr8",
-    "metadata": {
-      "mount": "single_left_wrist"
-    }
-  },
-  "right_wrist": {
     "serial": "260522278055",
     "width": 640,
     "height": 480,
     "fps": 15,
     "color_format": "bgr8",
     "metadata": {
-      "mount": "single_right_wrist"
+      "mount": "single_left_wrist",
+      "startup_priority": 20
+    }
+  },
+  "right_wrist": {
+    "serial": "261122273924",
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "color_format": "bgr8",
+    "metadata": {
+      "mount": "single_right_wrist",
+      "startup_priority": 10
     }
   }
 }

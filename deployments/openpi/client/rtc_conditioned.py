@@ -23,6 +23,9 @@ from dataset_contracts.model_continuation import (
     normalize_model_continuation_contract,
 )
 from dataset_contracts.policy_artifact import PolicyArtifactContract
+from deployments.openpi.artifact_identity import (
+    openpi_conditioned_provider_capability_hash,
+)
 from deployments.client.rtc_conditioned_client import (
     RtcConditionedModelClientV3,
 )
@@ -117,77 +120,6 @@ def _positive_int(value: object, *, name: str) -> int:
     if normalized != value or normalized <= 0:
         raise ValueError(f"{name} must be a positive integer.")
     return normalized
-
-
-def openpi_conditioned_provider_capability_hash(
-    provider: Mapping[str, Any],
-) -> str:
-    """Portable identity for the loaded provider facts, excluding its hash."""
-
-    if not isinstance(provider, Mapping):
-        raise TypeError("provider capability must be a mapping.")
-    schema = _nonempty(
-        provider.get("provider_capability_schema"),
-        name="provider_capability_schema",
-    )
-    if schema != OPENPI_CONDITIONED_PROVIDER_CAPABILITY_SCHEMA_V1:
-        raise ValueError("OpenPI provider capability schema mismatch.")
-    if provider.get("wire_protocol") != OPENPI_CONDITIONED_RTC_WIRE_V1:
-        raise ValueError("OpenPI provider capability wire protocol mismatch.")
-    if provider.get("enabled") is not True:
-        raise ValueError("OpenPI provider capability must be enabled.")
-    if (
-        provider.get("conditioning_transform_owner")
-        != RTC_CONDITIONING_TRANSFORM_PROVIDER_V1
-    ):
-        raise ValueError(
-            "OpenPI provider capability must own its conditioning transform."
-        )
-    supports_bootstrap = provider.get("supports_unconditioned_bootstrap")
-    if not isinstance(supports_bootstrap, bool):
-        raise ValueError(
-            "OpenPI provider bootstrap capability must be explicitly boolean."
-        )
-    payload = {
-        "schema": schema,
-        "wire_protocol": OPENPI_CONDITIONED_RTC_WIRE_V1,
-        "enabled": True,
-        "conditioning_transform_owner": (
-            RTC_CONDITIONING_TRANSFORM_PROVIDER_V1
-        ),
-        "external_action_dim": _positive_int(
-            provider.get("external_action_dim"),
-            name="OpenPI external_action_dim",
-        ),
-        "internal_sampler_action_dim": _positive_int(
-            provider.get("internal_sampler_action_dim"),
-            name="OpenPI internal_sampler_action_dim",
-        ),
-        "prediction_horizon_steps": _positive_int(
-            provider.get("prediction_horizon_steps"),
-            name="OpenPI prediction_horizon_steps",
-        ),
-        "sampler_constraint": _nonempty(
-            provider.get("sampler_constraint"),
-            name="OpenPI sampler_constraint",
-        ),
-        "supports_unconditioned_bootstrap": supports_bootstrap,
-        "continuation_implementation_id": _nonempty(
-            provider.get("continuation_implementation_id"),
-            name="OpenPI continuation_implementation_id",
-        ),
-        "continuation_implementation_parameters_hash": _sha256(
-            provider.get("continuation_implementation_parameters_hash"),
-            name="OpenPI continuation_implementation_parameters_hash",
-        ),
-    }
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 @dataclass(frozen=True)

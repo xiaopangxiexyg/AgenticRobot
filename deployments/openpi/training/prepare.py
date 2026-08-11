@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from deployments.client import load_policy_artifact
+from deployments.policy_artifact import load_policy_artifact
 
 from .artifact import (
     build_openpi_v22_absolute_model_rtc_artifact_template,

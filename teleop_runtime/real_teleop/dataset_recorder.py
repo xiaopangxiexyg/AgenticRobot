@@ -29,6 +29,9 @@ from dataset_interface.gripper_force import (
     bind_gripper_force_contract,
     read_gripper_force_contract,
 )
+from dataset_interface.modality_artifacts import (
+    assert_dataset_capture_integrity_compatible,
+)
 from robot_motion.action import HandActionSpec
 from robot_motion.runtime import (
     LifecycleStartupError,
@@ -67,6 +70,9 @@ from ..collection.schema_v22 import (
 from ..collection.writer_runtime import CollectionWriterRuntime
 from ..collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from collection_runtime.compatibility import CompatibilityEpisodeSidecarStore
+from collection_runtime.dataset_capture_recovery import (
+    prepare_dataset_capture_writable,
+)
 from collection_runtime.progress.profiles import (
     bind_dataset_progress_profile,
     bind_dataset_task_stage_profile,
@@ -117,7 +123,7 @@ from .progress_adapter import (
     resolve_real_teleop_task_stage_profile,
 )
 from .progress_arm_control import strict_progress_arm_sample_rejection
-from control_station.real_teleop.progress import (
+from .progress_contracts import (
     PROGRESS_ARM_CONTROL_MODE_STRICT,
     normalize_progress_arm_control_mode,
 )
@@ -156,6 +162,9 @@ class RealTeleopDatasetRecorder:
         self.args = args
         self.components = components
         self.dataset_root = Path(args.dataset_root)
+        prepare_dataset_capture_writable(self.dataset_root)
+        if bool(getattr(args, "tactile_artifact_integrity", False)):
+            assert_dataset_capture_integrity_compatible(self.dataset_root)
         configured_force_contract = _gripper_force_dataset_contract_from_args(args)
         persisted_force_contract = read_gripper_force_contract(self.dataset_root)
         if persisted_force_contract is not None:
@@ -227,6 +236,9 @@ class RealTeleopDatasetRecorder:
             write_video=bool(args.write_video and not args.no_camera),
             tactile_storage=str(args.tactile_storage),
             tactile_compression=str(getattr(args, "tactile_compression", "none")),
+            tactile_artifact_integrity=bool(
+                getattr(args, "tactile_artifact_integrity", False)
+            ),
             allow_missing_video_frames=int(args.storage_queue_size) > 0,
             write_wrist_depth_mask=bool(getattr(args, "wrist_depth_mask", False)),
             write_wrist_depth_raw=bool(getattr(args, "wrist_depth_raw", False)),
@@ -735,8 +747,14 @@ class RealTeleopDatasetRecorder:
                     f"current={None if current_force_contract is None else current_force_contract.to_dict()}"
                 )
         if self.configured_for_current_args():
-            self.reload_finalized_dataset_state()
-            self.write_camera_device_config()
+            # The live writer is the authoritative owner of episode/sample
+            # counters for this process.  Re-scanning the complete finalized
+            # dataset here used to put filesystem/process-RPC work directly in
+            # the teleop hot loop every time the operator started an episode.
+            # On a populated dataset that pause can exceed the VIVE history
+            # window and the arm target-stale watchdog.  Explicit dataset
+            # maintenance already updates the live writer, while a task/root/
+            # modality change takes the rebuild path below.
             return
         if self.is_recording:
             raise RuntimeError("Cannot reconfigure dataset recorder while recording.")

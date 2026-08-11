@@ -20,7 +20,7 @@ dies. No command in this tool writes persistent/save/default parameters.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import fcntl
@@ -37,6 +37,7 @@ import statistics
 import subprocess
 import sys
 import termios
+import tempfile
 import threading
 import time
 from typing import Any, Iterable, Mapping, Protocol
@@ -44,8 +45,20 @@ from typing import Any, Iterable, Mapping, Protocol
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DMTAC_ROOT = PROJECT_ROOT / "hardware" / "DMTAC_gripper"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(DMTAC_ROOT) not in sys.path:
     sys.path.insert(0, str(DMTAC_ROOT))
+
+from project_paths import teleop_records_root
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    ArtifactWriteResolution,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
 
 
 TRACE_SCHEMA = "dmtac_gripper_actuator_trace_v2"
@@ -55,6 +68,85 @@ SPEED_NORMALIZED = 1.0
 MOTION_CONFIRMATION = "GRIPPER_ONLY_TEST"
 RESTORE_CONFIRMATION = "RESTORE_GRIPPER_SETTINGS"
 COMMAND_MODES = ("runtime-equivalent", "inline-config")
+ARTIFACT_KIND = "dmtac_gripper_actuator"
+
+
+def legacy_output_root() -> Path:
+    """Return the compatibility-layout write root owned by teleop records."""
+
+    return teleop_records_root() / "gripper_actuator_identification"
+
+
+def archived_logs_output_root() -> Path:
+    """Return the read-only location of runs archived from the former logs root."""
+
+    return PROJECT_ROOT / "legacy" / "logs" / "gripper_actuator_identification"
+
+
+def canonical_output_family_root() -> Path:
+    return RuntimeArtifactLayout.configured().run_family_dir(kind=ARTIFACT_KIND)
+
+
+def canonical_output_root(*, date_partition: str | None = None) -> Path:
+    partition = date_partition or datetime.now().astimezone().date().isoformat()
+    return RuntimeArtifactLayout.configured().run_partition_dir(
+        kind=ARTIFACT_KIND,
+        date_partition=partition,
+    )
+
+
+def resolve_output_root(
+    args: argparse.Namespace,
+    *,
+    date_partition: str | None = None,
+) -> ArtifactWriteResolution:
+    """Resolve one effective root; explicit CLI paths always take precedence."""
+
+    return resolve_artifact_write_path(
+        explicit_path=getattr(args, "output_root", None),
+        artifact_layout=getattr(args, "artifact_layout", None),
+        legacy_path=legacy_output_root(),
+        canonical_path=canonical_output_root(date_partition=date_partition),
+    )
+
+
+def recovery_journal_roots(*additional_roots: Path) -> tuple[Path, ...]:
+    """Return all known roots that may own an unfinished settings journal."""
+
+    roots = (
+        legacy_output_root(),
+        archived_logs_output_root(),
+        canonical_output_family_root(),
+        *additional_roots,
+    )
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.expanduser().resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def _process_lock_root() -> Path:
+    return (
+        Path(tempfile.gettempdir())
+        / f"dexteleop-{os.getuid()}"
+        / "runtime_locks"
+        / ARTIFACT_KIND
+    )
+
+
+def _run_lock_roots(selected_root: Path) -> tuple[Path, ...]:
+    """Bridge old root-local locks while providing one cross-layout lock."""
+
+    selected = selected_root.expanduser().resolve()
+    roots = [_process_lock_root(), selected]
+    legacy = legacy_output_root().resolve()
+    if legacy == selected or legacy.exists():
+        roots.append(legacy)
+    return tuple(sorted(set(roots), key=str))
 
 
 class GripperLike(Protocol):
@@ -651,6 +743,16 @@ def _run_lock(root: Path, endpoint: Endpoint):
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(f"another identification process owns {path}") from exc
+        yield
+
+
+@contextmanager
+def _run_locks(roots: Iterable[Path], endpoint: Endpoint):
+    """Acquire layout-independent and compatibility locks in stable order."""
+
+    with ExitStack() as stack:
+        for root in sorted({path.resolve() for path in roots}, key=str):
+            stack.enter_context(_run_lock(root, endpoint))
         yield
 
 
@@ -1376,9 +1478,16 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--queue-size must be within [1024,1000000]")
     if not 1.0 <= float(args.manual_gauge_timeout_sec) <= 300.0:
         raise ValueError("--manual-gauge-timeout-sec must be within [1,300]")
-    root = args.output_root.resolve()
-    with _run_lock(root, endpoint):
-        unfinished = _unfinished_journals(root, endpoint)
+    output_resolution = resolve_output_root(args)
+    root = output_resolution.path.resolve()
+    with _run_locks(_run_lock_roots(root), endpoint):
+        unfinished = [
+            journal
+            for journal_root in recovery_journal_roots(root)
+            if journal_root.exists()
+            for journal in _unfinished_journals(journal_root, endpoint)
+        ]
+        unfinished = sorted({path.resolve() for path in unfinished})
         if unfinished:
             raise RecoveryError(
                 "unfinished recovery journal(s) exist; run the explicit restore command first: "
@@ -1463,6 +1572,12 @@ def run(args: argparse.Namespace) -> int:
                 "schema": TRACE_SCHEMA,
                 "endpoint": asdict(endpoint),
                 "speed_fixed": SPEED_NORMALIZED,
+                "artifact_storage": {
+                    "requested_layout": getattr(args, "artifact_layout", None),
+                    "selection_source": output_resolution.source,
+                    "resolved_layout": output_resolution.layout_name,
+                    "resolved_output_root": str(root),
+                },
                 "args": {
                     key: str(value) if isinstance(value, Path) else value
                     for key, value in vars(args).items()
@@ -1965,7 +2080,24 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--output-root",
         type=Path,
-        default=PROJECT_ROOT / "logs" / "gripper_actuator_identification",
+        default=None,
+        help=(
+            "Exact output root. When provided it overrides --artifact-layout; "
+            "otherwise the validated local managed-layout default is used."
+        ),
+    )
+    run_parser.add_argument(
+        "--artifact-layout",
+        choices=(
+            LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ),
+        default=configured_runtime_artifact_layout(),
+        help=(
+            "Select the managed output layout when --output-root is omitted. "
+            "The repository default is legacy; local_paths.json can coordinate "
+            "a project-wide canonical cutover."
+        ),
     )
     run_parser.add_argument("--motion-timeout-sec", type=float, default=5.0)
     run_parser.add_argument("--cooldown-sec", type=float, default=2.0)

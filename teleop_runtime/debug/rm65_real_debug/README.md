@@ -63,8 +63,11 @@ execution epoch，依次 drain position-reference、left sender、right sender�
 - 不修改 `m6_candidate_policy_arm_qpos_v1`、canonical deploy 参数或 backend 默认值；
 - 不提供 motion、home、enable、rearm、force-position 或 lifecycle authority；
 - authorization、owner token、epoch registry 和 worker 只在本次进程内有效；
-- 证据只写入 `teleop_records/preflight_evidence/m5_8b1_real_a/<runtime_session_id>/` 的诊断 WAL 与
-  `evidence.json`，明确不能 seal/commit 为公开 v2.4 capture；
+- 证据默认仍写入 `teleop_records/preflight_evidence/m5_8b1_real_a/<runtime_session_id>/`；显式传入
+  `--artifact-layout runtime-artifacts-v1` 时改写到
+  `runtime_artifacts/evidence/preflight/rm65_idle_worker_drain_stop_only/<runtime_session_id>/`，而
+  `--evidence-root` 始终优先；两种布局都会在 `evidence.json` 记录实际存储选择；
+- 诊断 WAL 与 `evidence.json` 明确不能 seal/commit 为公开 v2.4 capture；
 - 后续真实运动必须重新构造对应 execution profile 和 authorization，不能继承本入口的 deny-motion、
   无target或一次性stop设置。
 

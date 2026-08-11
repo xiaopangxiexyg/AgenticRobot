@@ -32,6 +32,15 @@ TACTILE_SLOT_LABELS: dict[tuple[str, str], str] = {
     ("right", "inner"): "right inner",
     ("right", "outer"): "right outer",
 }
+LEGACY_TACTILE_DEBUG_LAYOUT = "legacy"
+CANONICAL_TACTILE_DEBUG_LAYOUT = "runtime-artifacts-v1"
+
+
+@dataclass(frozen=True)
+class TactileDebugRootResolution:
+    path: Path
+    source: str
+    layout_name: str
 
 
 @dataclass
@@ -58,6 +67,7 @@ class TactileAssignmentGuiConfig:
     normal_vector_ref: float = 5e-5
     record_readings: bool = True
     record_dir: str | Path | None = None
+    artifact_layout: str = LEGACY_TACTILE_DEBUG_LAYOUT
     record_every_n: int = 1
     record_grid: bool = False
     window: str = "DM-Tac tactile assignment"
@@ -99,9 +109,70 @@ def default_tactile_debug_record_root() -> Path:
         return repo_root() / "teleop_records" / "dmtac_tactile_debug"
 
 
+def canonical_tactile_debug_record_root(*, now: float | None = None) -> Path:
+    import sys
+
+    root = repo_root()
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    from runtime_artifact_paths import RuntimeArtifactLayout
+
+    timestamp = time.time() if now is None else float(now)
+    date_partition = time.strftime("%Y-%m-%d", time.localtime(timestamp))
+    return RuntimeArtifactLayout.configured().run_partition_dir(
+        kind="dmtac_tactile_gui",
+        date_partition=date_partition,
+    )
+
+
+def resolve_tactile_debug_record_root(
+    record_dir: str | Path | None,
+    *,
+    artifact_layout: str = LEGACY_TACTILE_DEBUG_LAYOUT,
+    now: float | None = None,
+) -> TactileDebugRootResolution:
+    # Keep the portable package's established explicit and legacy paths usable
+    # without importing repository-level helpers.  Only the opt-in canonical
+    # layout requires the surrounding DexTeleop checkout.
+    if record_dir not in (None, ""):
+        return TactileDebugRootResolution(
+            path=Path(record_dir).expanduser(),
+            source="explicit",
+            layout_name="explicit",
+        )
+
+    selected_layout = str(
+        artifact_layout or LEGACY_TACTILE_DEBUG_LAYOUT
+    ).strip()
+    if selected_layout == LEGACY_TACTILE_DEBUG_LAYOUT:
+        return TactileDebugRootResolution(
+            path=default_tactile_debug_record_root().expanduser(),
+            source="legacy",
+            layout_name=LEGACY_TACTILE_DEBUG_LAYOUT,
+        )
+    if selected_layout == CANONICAL_TACTILE_DEBUG_LAYOUT:
+        return TactileDebugRootResolution(
+            path=canonical_tactile_debug_record_root(now=now).expanduser(),
+            source="canonical",
+            layout_name=CANONICAL_TACTILE_DEBUG_LAYOUT,
+        )
+    raise ValueError(f"unsupported artifact layout: {selected_layout!r}")
+
+
 class TactileGuiDebugRecorder:
-    def __init__(self, record_dir: str | Path | None, *, metadata: Mapping[str, Any]) -> None:
-        root = Path(record_dir).expanduser() if record_dir not in (None, "") else default_tactile_debug_record_root()
+    def __init__(
+        self,
+        record_dir: str | Path | None,
+        *,
+        metadata: Mapping[str, Any],
+        artifact_layout: str = LEGACY_TACTILE_DEBUG_LAYOUT,
+    ) -> None:
+        resolution = resolve_tactile_debug_record_root(
+            record_dir,
+            artifact_layout=artifact_layout,
+        )
+        root = resolution.path.expanduser()
         if root.suffix:
             self.record_dir = root.parent / root.stem
         else:
@@ -110,7 +181,18 @@ class TactileGuiDebugRecorder:
         self.metadata_path = self.record_dir / "metadata.json"
         self.frames_path = self.record_dir / "frames.jsonl"
         self._fh = self.frames_path.open("a", encoding="utf-8", buffering=1)
-        self.write_metadata(metadata)
+        self.write_metadata(
+            {
+                **dict(metadata),
+                "artifact_storage": {
+                    "requested_layout": str(artifact_layout),
+                    "selection_source": resolution.source,
+                    "resolved_layout": resolution.layout_name,
+                    "resolved_family_root": str(root.resolve()),
+                    "semantics": "dmtac_tactile_assignment_gui_debug_run",
+                },
+            }
+        )
 
     def write_metadata(self, metadata: Mapping[str, Any]) -> None:
         payload = {
@@ -393,6 +475,7 @@ def run_tactile_assignment_gui(
         if bool(cfg.record_readings):
             recorder = TactileGuiDebugRecorder(
                 cfg.record_dir,
+                artifact_layout=str(cfg.artifact_layout),
                 metadata={
                     "dev_ids": dev_ids,
                     "selected_items": items,

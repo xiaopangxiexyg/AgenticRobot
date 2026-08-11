@@ -40,6 +40,85 @@ active.
 
 ## Main Commands
 
+### Probe Controller-Native Force-Position Pass-Through
+
+`rm65_native_force_position_passthrough_probe.py` is an isolated hardware
+capability probe. It is not used by formal teleoperation. The first run must use
+the default `transport-only` mode: it repeatedly transmits the current qpos,
+sets all six axes to movement mode, and enables no force-tracking axis.
+
+The probe pre-opens a second SDK connection in an independent process. Once the
+native mode is armed, Ctrl-C or SIGTERM requests `Arm_Stop` on that connection;
+an abnormal parent exit is also detected by the guard. If that stop is not
+acknowledged promptly, another isolated process still makes a redundant
+`Arm_Stop` request; it also covers a signal arriving while the mode-start call
+is returning. Blocking SDK calls therefore cannot hold the parent process open.
+The JSON result records both receipts. A successful process exit alone is not
+an emergency-stop receipt: inspect
+`emergency_stop_receipts[].code` and require at least one code `0`.
+
+Run one arm at a time, with the other arm stopped and the workspace clear:
+
+```bash
+python hardware/rm65/utils/scripts/rm65_native_force_position_passthrough_probe.py \
+  --arm left \
+  --probe-mode transport-only \
+  --duration-sec 5 \
+  --hz 20 \
+  --state-hz 10 \
+  --execute \
+  --confirm TEST_RM65_NATIVE_FORCE_POSITION_PASSTHROUGH
+```
+
+Do not enable `force-track` until the transport-only result and Ctrl-C stop
+receipt have been reviewed. Controller mode 4 is a contact-only constant-force
+mode: free space does not provide a physical force equilibrium. The probe
+therefore refuses to promote a measured free-space sensor residual to a force
+target. `force-track` requires all of the following:
+
+- an explicit `--desired-force`;
+- `--contact-fixture-confirmed` for a known compliant contact fixture;
+- the separate confirmation text `TEST_RM65_NATIVE_FORCE_TRACK`;
+- a stable measured contact-force baseline close to the requested target.
+
+`spring-axis` is the separate controller mode-2 capability probe. It requires
+`TEST_RM65_NATIVE_SPRING_AXIS` and refuses to arm unless the unloaded external
+force/torque residual is below its strict spring preflight limits. It never
+calls `Clear_Force_Data`: a cable preload, changed tool assembly, or degraded
+force calibration must be corrected rather than hidden by a one-pose zero.
+
+`float-axis` is an isolated mode-1 diagnostic comparison only. It is not a
+teleoperation option and is never selected by default. Unlike `spring-axis`,
+the controller does not return the selected direction to its pre-force pose
+after the external force is removed, so use a tight displacement guard and the
+separate `TEST_RM65_NATIVE_FLOAT_AXIS` confirmation string. Its purpose is only
+to distinguish an inactive force-control path from a stiff spring response.
+
+A known stable cable preload can be declared with
+`--static-cable-preload-confirmed`. This does not disable the baseline gate: it
+uses a separate confirmation string, caps the total preload, and still requires
+the selected compliant axis to have a small force/torque component. Start on the
+least-loaded axis and run a no-touch test before applying any external force.
+Do not use this override for payload mismatch, contact with the environment, or
+an unstable baseline.
+
+Both compliant probes require an explicit RM65 calibration profile and refuse
+to arm unless the controller's active tool name, payload mass, and CoM match
+that profile. Their default motion-drift guards are deliberately tighter than
+transport-only (`0.3 deg`, `2 mm`, and `0.5 deg`). A passed payload/CoM check is
+not a substitute for the live unloaded-force residual check.
+
+The 2026-08-06 left-arm DMTAC_M validation proved that mode-1 `float` produces
+real motion along the selected tool axis, but the current controller tuning has
+a large low-force dead zone followed by a steep response above roughly 7 N.
+It is therefore not approved for formal teleoperation. Do not repeat the
+relaxed 16 mm/s, 10.5 N-delta, 50 mm-drift experiment or treat `limit_vel` as a
+hard safety guard. The retained probe now supports independent measured
+linear/angular speed guards in addition to force, torque, joint and pose drift
+guards. The evidence, invalid early unit conversion, exact results and future
+re-entry conditions are recorded in
+[`docs/real/reports/RM65_NATIVE_FORCE_POSITION_PROBE_20260806.md`](../../../docs/real/reports/RM65_NATIVE_FORCE_POSITION_PROBE_20260806.md).
+
 ### QPOS Init Planning
 
 The old hardware-side Cartesian standard-pose init scripts were removed. Build

@@ -5,11 +5,16 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Mapping, TypeVar
 
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from deployments.openpi.image_wire import (
+    OpenPIImageWireClientConfig,
+    OpenPIImageWireEncodeReceipt,
+    encode_openpi_image_wire_request,
+)
 from deployments.client.rtc_transport import (
     RTC_TRANSPORT_PHASE_CANCELLED,
     RTC_TRANSPORT_PHASE_CLOSE,
@@ -82,6 +87,9 @@ class OpenPIWebsocketTransportConfig:
     retry_interval_s: float = 2.0
     deadline_spec: RtcTransportDeadlineSpec = field(
         default_factory=RtcTransportDeadlineSpec
+    )
+    image_wire_config: OpenPIImageWireClientConfig = field(
+        default_factory=OpenPIImageWireClientConfig
     )
 
 
@@ -198,6 +206,7 @@ class OpenPIWebsocketTransport:
         api_key: str | None = None,
         retry_interval_s: float = 2.0,
         deadline_spec: RtcTransportDeadlineSpec | None = None,
+        image_wire_config: OpenPIImageWireClientConfig | Mapping[str, Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         resolved_deadline_spec = (
@@ -209,12 +218,16 @@ class OpenPIWebsocketTransport:
             raise TypeError("deadline_spec must be an RtcTransportDeadlineSpec.")
         if not callable(clock):
             raise TypeError("clock must be callable.")
+        resolved_image_wire_config = OpenPIImageWireClientConfig.from_value(
+            image_wire_config
+        )
         self.config = OpenPIWebsocketTransportConfig(
             host=str(host),
             port=int(port),
             api_key=api_key,
             retry_interval_s=float(retry_interval_s),
             deadline_spec=resolved_deadline_spec,
+            image_wire_config=resolved_image_wire_config,
         )
         self._clock = clock
         self._lock = threading.RLock()
@@ -233,6 +246,7 @@ class OpenPIWebsocketTransport:
         self._phase_receipts: deque[RtcTransportPhaseReceipt] = deque(
             maxlen=OPENPI_TRANSPORT_PHASE_RECEIPT_HISTORY_LIMIT
         )
+        self._last_image_wire_receipt: OpenPIImageWireEncodeReceipt | None = None
 
     @property
     def uri(self) -> str:
@@ -269,6 +283,13 @@ class OpenPIWebsocketTransport:
     def last_phase_receipt(self) -> RtcTransportPhaseReceipt | None:
         with self._lock:
             return self._phase_receipts[-1] if self._phase_receipts else None
+
+    @property
+    def last_image_wire_receipt(self) -> OpenPIImageWireEncodeReceipt | None:
+        """Return sizes and effective codec for the last optimized request."""
+
+        with self._lock:
+            return self._last_image_wire_receipt
 
     def phase_receipts_snapshot(self) -> tuple[RtcTransportPhaseReceipt, ...]:
         """Return bounded transport evidence without consuming it."""
@@ -435,12 +456,19 @@ class OpenPIWebsocketTransport:
         with self._lock:
             self._raise_if_cancelled()
             connection = self._ws
+            metadata = dict(self._metadata or {})
         if connection is None:
             raise RuntimeError("OpenPI websocket connection is unavailable.")
 
         def exchange(deadline: float | None) -> Any:
+            wire_request, wire_receipt = encode_openpi_image_wire_request(
+                observation,
+                self.config.image_wire_config,
+                metadata,
+            )
+            packed_request = packb(wire_request)
             try:
-                connection.send(packb(observation))
+                connection.send(packed_request)
                 response = self._recv(connection, deadline)
             except Exception as error:
                 if self._cancel_requested.is_set():
@@ -456,6 +484,15 @@ class OpenPIWebsocketTransport:
                 raise RuntimeError(
                     "OpenPI inference response must be a dict, got "
                     f"{type(result).__name__}."
+                )
+            with self._lock:
+                self._last_image_wire_receipt = (
+                    None
+                    if wire_receipt is None
+                    else wire_receipt.with_exchange_sizes(
+                        packed_request_bytes=len(packed_request),
+                        response_bytes=len(response),
+                    )
                 )
             return result
 

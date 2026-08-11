@@ -804,14 +804,27 @@ def _worker_main(
     external_intent_and_sample_frame_by_identity: dict[
         tuple[str, str], tuple[NativeStreamExternalSampleIntent, int]
     ] = {}
+
+    def publish_startup_progress(phase: str) -> None:
+        reply_queue.put(
+            {
+                "kind": "startup_progress",
+                "phase": str(phase),
+            }
+        )
+
     try:
+        publish_startup_progress("configure_process")
         process_status = _configure_worker_process(process_config)
+        publish_startup_progress("attach_shared_memory")
         blocks = {
             name: shared_memory.SharedMemory(name=name, create=False)
             for name in shm_names
         }
+        publish_startup_progress("initialize_legacy_writer")
         writer = LeRobotV21Writer(writer_config)
         if v25p_shadow_config is not None:
+            publish_startup_progress("initialize_native_shadow")
             if writer_config.policy_io_layout is None:
                 raise ValueError("v2.5-p native shadow requires a policy-I/O layout.")
             from .v25p_capture_profiles import (
@@ -856,6 +869,7 @@ def _worker_main(
                     ),
                 ),
             )
+        publish_startup_progress("initialize_sample_builder")
         detached_builder_config = replace(
             sample_builder_config,
             camera_buffers={},
@@ -1350,7 +1364,26 @@ def _worker_main(
                         )
                         v25p_native_shadow_identity = None
                         v25p_native_shadow_error = ""
-                    result = bool(writer.discard_episode(int(message["episode_index"])))
+                    discarded = bool(
+                        writer.discard_episode(int(message["episode_index"]))
+                    )
+                    # ``start_episode`` advances both the legacy writer and the
+                    # process-local sample builder before the frontend binds its
+                    # subordinate episode artifacts.  A later startup rollback
+                    # (or a zero-frame stop) may therefore make the discarded
+                    # index reusable.  Return the authoritative cursors from the
+                    # worker so the frontend does not keep the optimistic
+                    # ``episode_index + 1`` value from ``start_episode``.
+                    if discarded:
+                        builder.set_dataset_position(
+                            episode_index=int(writer.next_episode_index),
+                            sample_index=int(writer.next_sample_index),
+                        )
+                    result = {
+                        "discarded": discarded,
+                        "next_episode_index": int(writer.next_episode_index),
+                        "next_sample_index": int(writer.next_sample_index),
+                    }
                 elif kind == "native_stream_note_drops":
                     if native_writer is None:
                         raise RuntimeError(
@@ -1707,14 +1740,26 @@ class ProcessCollectionWorker:
             self.close(force=True)
             raise
         deadline = time.monotonic() + float(self.config.startup_timeout_sec)
+        last_phase = "process_spawn"
         ready: Any
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 self.close(force=True)
-                raise RuntimeError("collection worker did not become ready")
+                raise RuntimeError(
+                    "collection worker did not become ready "
+                    f"within {float(self.config.startup_timeout_sec):.3f}s "
+                    f"(last_phase={last_phase})"
+                )
             try:
-                ready = self._reply_queue.get(timeout=min(0.05, remaining))
+                message = self._reply_queue.get(timeout=min(0.05, remaining))
+                if (
+                    isinstance(message, Mapping)
+                    and str(message.get("kind", "")) == "startup_progress"
+                ):
+                    last_phase = str(message.get("phase") or "unknown")
+                    continue
+                ready = message
                 break
             except queue.Empty:
                 if self._process.is_alive():
@@ -1723,7 +1768,7 @@ class ProcessCollectionWorker:
                 self.close(force=True)
                 raise RuntimeError(
                     "collection worker exited before becoming ready "
-                    f"(exitcode={exitcode})"
+                    f"(exitcode={exitcode}, last_phase={last_phase})"
                 )
         if not isinstance(ready, Mapping) or not bool(ready.get("ok")):
             worker_traceback = (
@@ -2333,9 +2378,25 @@ class ProcessCollectionWorker:
         return result
 
     def discard_episode(self, episode_index: int) -> bool:
-        discarded = bool(
-            self._request("discard_episode", episode_index=int(episode_index))
+        # Discard is a lifecycle boundary.  Settle every accepted sample before
+        # deleting worker-owned artifacts so no late acknowledgement can
+        # repopulate parent-side caches for a subsequently reused index.
+        self.flush()
+        result = self._request(
+            "discard_episode",
+            episode_index=int(episode_index),
         )
+        if not isinstance(result, Mapping):
+            raise RuntimeError(
+                "collection worker returned invalid dataset discard state"
+            )
+        discarded = bool(result.get("discarded", False))
+        self.next_episode_index = int(result.get("next_episode_index", 0))
+        self.next_sample_index = int(result.get("next_sample_index", 0))
+        if discarded:
+            self._active_episode_frame_count = 0
+            self._tactile_counts_by_episode.pop(int(episode_index), None)
+            self._sample_acceptance_receipt_buffer.reset()
         if int(episode_index) == self._active_native_episode_index:
             self._active_native_episode_uuid = None
             self._active_native_episode_index = None

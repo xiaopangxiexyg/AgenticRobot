@@ -8,7 +8,7 @@ from typing import Any, Mapping, Protocol
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from robot_motion.transforms import validate_pose_matrix
+from robot_motion.transforms import project_near_rigid_pose, validate_pose_matrix
 from .topology import SIDES
 
 
@@ -57,54 +57,13 @@ def normalize_vive_tracker_transform(
 ) -> tuple[np.ndarray, dict[str, float | bool]]:
     """Project small OpenVR float drift onto SO(3), rejecting malformed poses."""
 
-    result = np.asarray(value, dtype=float)
-    if result.shape != (4, 4):
-        raise ValueError(f"{name} must be a 4x4 matrix")
-    if not np.all(np.isfinite(result)):
-        raise ValueError(f"{name}: Pose contains non-finite values.")
-    if not np.allclose(result[3], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-5):
-        raise ValueError(f"{name}: Pose last row is not [0, 0, 0, 1].")
-
-    raw_rotation = result[:3, :3]
-    orthogonality_error = float(
-        np.max(np.abs(raw_rotation.T @ raw_rotation - np.eye(3)))
+    return project_near_rigid_pose(
+        value,
+        name=name,
+        max_orthogonality_error=MAX_VIVE_ROTATION_ORTHOGONALITY_ERROR,
+        max_determinant_error=MAX_VIVE_ROTATION_DETERMINANT_ERROR,
+        max_projection_frobenius=MAX_VIVE_ROTATION_PROJECTION_FROBENIUS,
     )
-    determinant = float(np.linalg.det(raw_rotation))
-    determinant_error = abs(determinant - 1.0)
-    if determinant <= 0.0:
-        raise ValueError(
-            f"{name}: Rotation determinant must be positive, got {determinant:.6g}."
-        )
-    try:
-        u, _singular_values, vt = np.linalg.svd(raw_rotation)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"{name}: Rotation SVD failed: {exc}") from exc
-    projected = u @ vt
-    if float(np.linalg.det(projected)) <= 0.0:
-        u[:, -1] *= -1.0
-        projected = u @ vt
-    projection_frobenius = float(np.linalg.norm(raw_rotation - projected, ord="fro"))
-    if (
-        orthogonality_error > MAX_VIVE_ROTATION_ORTHOGONALITY_ERROR
-        or determinant_error > MAX_VIVE_ROTATION_DETERMINANT_ERROR
-        or projection_frobenius > MAX_VIVE_ROTATION_PROJECTION_FROBENIUS
-    ):
-        raise ValueError(
-            f"{name}: Rotation is too far from SO(3) "
-            f"(orth_err={orthogonality_error:.6g}, det={determinant:.6g}, "
-            f"projection_fro={projection_frobenius:.6g})."
-        )
-    normalized = result.copy()
-    normalized[:3, :3] = projected
-    valid, reason = validate_pose_matrix(normalized, atol=1e-8)
-    if not valid:
-        raise ValueError(f"{name}: {reason}")
-    return normalized, {
-        "rotation_projected": bool(projection_frobenius > 1e-12),
-        "rotation_orthogonality_error": orthogonality_error,
-        "rotation_determinant": determinant,
-        "rotation_projection_frobenius": projection_frobenius,
-    }
 
 
 def transform_to_pose7(transform: object) -> np.ndarray:

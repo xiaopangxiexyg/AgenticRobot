@@ -34,14 +34,15 @@ row encoder, the v2.5-p stream profile, or persisted identities.  The canonical
 CLI continues to use `default_components.py`; no default hardware behavior or
 dataset output changes.
 
-`app.py` is the UMI composition root: it selects the default adapters and
-coordinates their typed ports. `controller.py` consumes only those runtime
-ports and operator intents. Web rendering, event queues and startup-progress
-presentation live under `control_station`; neither the UI nor
-`collection_runtime` creates or inspects a concrete UMI device. Compatibility
-constructor names in `UmiComponents` remain temporarily available to existing
-UMI launch/test glue, but the application and controller use the neutral
-properties.
+`control_station/umi_application.py` is the UMI GUI composition root: it
+selects the default lower-owned adapters and binds their typed ports to the
+Station Web UI and operator policy. `controller.py` consumes only runtime ports
+and operator intents. `app.py` is now a thin compatibility import that preserves
+the existing CLI and public Python path without duplicating the implementation.
+Neither the UI nor `collection_runtime` creates or inspects a concrete UMI
+device. Compatibility constructor names in `UmiComponents` remain temporarily
+available to existing UMI launch/test glue, but the application and controller
+use the neutral properties.
 
 ## Action temporal semantics
 
@@ -86,8 +87,18 @@ Identity remains available only for explicit compatibility configs with
 
 The default profile contains the current real-collection wrist camera serials:
 
-- left: `261122273924`
-- right: `260522278055`
+- left: `260522278055`
+- right: `261122273924`
+
+The default UMI application launch selects
+`/home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist`. This is a
+dedicated dataset below the shared formal-collection container; it must not be
+changed to the container itself because UMI writes dataset metadata directly at
+`dataset_root`. The selection is applied only when `--config` is omitted, rather
+than rewriting the synchronized hardware profile. Every explicitly named config
+retains its own `dataset_root`; `--dataset-root` explicitly overrides either
+case. This keeps legacy data, offline fixtures, and controlled rollback
+compatible and does not migrate existing rows.
 
 Validate config, policy layout, calibration expiry, and device bindings without
 initializing any device:
@@ -95,6 +106,7 @@ initializing any device:
 ```bash
 python -m teleop_runtime.collection umi \
   --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist \
   --validate-only
 ```
 
@@ -141,6 +153,19 @@ reason. A temporarily rejected row is shown as **等待有效快照**; the episo
 stays open and automatically resumes accepting rows when all required sensors
 are fresh.
 
+Optional detachable-artifact integrity is enabled with
+`--tactile-artifact-integrity` or `tactile_artifact_integrity: true` in the UMI
+config. It incrementally hashes exact stored tactile bytes in the collection
+writer and publishes an immutable inventory only after an Episode is sealed.
+The default is off and `--no-tactile-artifact-integrity` is the rollback path.
+Enable it from Episode zero of a new dataset.  If an existing dataset contains
+legacy tactile streams without sealed stored-byte metadata, UMI rejects the
+opt-in before creating capture state; keep it disabled and use the offline
+full-scan detach workflow, or select a new dataset root.
+UMI refuses to append to a dataset whose tactile tree is detached, partially
+missing, or covered by an unresolved storage transaction; rehydrate it before
+starting device initialization and capture.
+
 Gripper commands and position telemetry default to 20 Hz, with a 20 ms
 post-write read guard (`dmtac_gripper_command_hz`,
 `dmtac_gripper_telemetry_hz`, and
@@ -157,7 +182,8 @@ After filling the DMTac assignment and producing a fresh UMI calibration:
 ```bash
 # Collect a new UMI v2.3 dataset through the formal Web GUI.
 python -m teleop_runtime.collection umi \
-  --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json
+  --config teleop_runtime/configs/umi/dual_wrist_dmtac_v1.json \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist
 ```
 
 The shared two-column GUI enables its draggable divider and narrow-column
@@ -219,8 +245,10 @@ task profile is supplied) and one post-save `disposition/reason` submission.
 The sidecar writer runs after the existing episode has been saved and never
 changes UMI rows, media, rejection rules, or episode success. Without the
 flag, the Plus panel and sidecar writer are inactive; no Plus files are
-created. Plus saves carry an episode-scoped token, and episode deletion is
-temporarily blocked while the sidecar write is in flight. For a v2.4 compatibility view, pass
+created. Plus saves carry an episode-scoped token. Episode deletion is
+temporarily blocked while the sidecar write is in flight and remains disabled
+after the first durable external record, because in-place reindexing would
+invalidate immutable locators. For a v2.4 compatibility view, pass
 `--plus-source-binding v24_compatibility_content_locator_v1` explicitly; no
 native v2.4 identity is inferred from paths.
 
@@ -235,7 +263,8 @@ GUI 的 episode message/control hint 中显示具体 `cannot start: ...` 原因�
 
 空闲时还可在 GUI 输入 episode 序号删除错误数据。删除会连续重编号剩余 episode，
 并刷新 writer 的下一 episode/全局 sample 索引，因此可直接继续采集。操作前版本保留
-在数据集相邻的 `*.before_delete_episode_*` 恢复目录中。
+在数据集相邻的 `*.before_delete_episode_*` 恢复目录中。若当前 Plus annotation root
+已经写入记录，则该入口会保持禁用；需要修改身份时应另做 copy-on-write 派生数据集。
 
 ## Dataset replay
 
@@ -246,7 +275,7 @@ hardware connection and action output.
 ```bash
 # Replay episode 0 with wrist video, TCP trajectory, gripper state and tactile data.
 python -m teleop_runtime.replay \
-  --dataset-root datasets/umi_dual_wrist \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection/umi_dual_wrist \
   --episode 0 \
   --no-connect-hardware \
   --host 127.0.0.1 \

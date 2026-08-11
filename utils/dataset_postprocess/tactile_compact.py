@@ -19,7 +19,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from collection_runtime.artifact_integrity import digest_stored_file
+from collection_runtime.modality_inventory import publish_tracked_modality_inventory
 from dataset_contracts.tactile import ChunkedTactileStream, tactile_stream_compression
+from dataset_interface.modality_artifacts import PAYLOAD_HASH_PREFER_SEALED
 
 from .tactile_recompress import _ZstdCodec, _active_collection_processes, _atomic_write_json
 
@@ -70,6 +73,7 @@ class TactileCompactionResult:
     compacted_bytes: int
     removed_source_bytes: int
     complete: bool
+    published_modality_inventory_hash: str | None = None
 
     @property
     def stored_ratio(self) -> float | None:
@@ -420,6 +424,19 @@ def _write_compact_stream(
             },
         }
     )
+    sealed = digest_stored_file(target)
+    if sealed.size_bytes != written:
+        raise RuntimeError(
+            f"compacted stored-byte count mismatch for {target}: "
+            f"written={written}, sealed={sealed.size_bytes}"
+        )
+    updated.update(
+        {
+            "stored_size_bytes": int(sealed.size_bytes),
+            "stored_sha256": sealed.sha256,
+            "stored_hash_profile": sealed.profile,
+        }
+    )
     return target, updated, source.path.stat().st_size, written
 
 
@@ -628,6 +645,10 @@ def compact_tactile_dataset_in_place(
         processed_manifests += 1
     remaining = plan_tactile_compaction(root, min_free_bytes=min_free_bytes)
     complete = remaining.raw_stream_count == 0 and remaining.force_stream_count == 0
+    published_inventory_hash = publish_tracked_modality_inventory(
+        root,
+        payload_hash_mode=PAYLOAD_HASH_PREFER_SEALED,
+    )
     result = TactileCompactionResult(
         dataset_root=str(root),
         manifest_count=processed_manifests,
@@ -639,6 +660,7 @@ def compact_tactile_dataset_in_place(
         compacted_bytes=compact_total,
         removed_source_bytes=removed_total,
         complete=complete,
+        published_modality_inventory_hash=published_inventory_hash,
     )
     if complete:
         _write_receipt(root, result)

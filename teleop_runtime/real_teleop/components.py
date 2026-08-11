@@ -51,6 +51,7 @@ class RealTeleopComponents:
     arm_loop_step_dt_tracker: dict[str, float | None]
     human_shadow_frontend: HumanShadowFrontend | None
     temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None
+    position_admittance_endpoint_guard: PositionAdmittanceEndpointExcursionGuard | None
     fix_arm_controller: FixArmCommandController | None
     init_arm_controller: InitArmCommandController | None
     position_reference_publisher: PositionReferencePublisher | None

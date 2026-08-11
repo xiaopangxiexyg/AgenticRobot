@@ -1,70 +1,28 @@
 """Action-debug payload construction for the real teleoperation runtime.
 
 This module owns only snapshot-to-payload serialization and aggregation.  It
-does not decide when to read a backend.  The legacy entrypoint keeps the
-backend reader seam (including get_state() calls) and binds it explicitly to
-preserve timing and compatibility behavior.
+does not decide when to read a backend.  Runtime diagnostics own the backend
+snapshot and fallback-read seam.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-import inspect
-import time
 from typing import Any
 
-
-_SUPPORT_NAMES = (
-    "_backend_compact_debug_payload",
-    "_channels_log_payload",
-    "_command_compact_debug_payload",
-    "_compact_debug_value",
-    "_faults_log_payload",
-    "_float_or_none",
-    "_phase_timings_log_payload",
-    "_pose_delta_compact_debug",
-    "_preloaded_action_debug_backend_snapshot",
+from .debug_ik_payload import _command_compact_debug_payload
+from .debug_payload_primitives import _compact_debug_value
+from .debug_timing_payload import (
+    _channels_log_payload,
+    _faults_log_payload,
+    _phase_timings_log_payload,
 )
-
-
-class _LegacyFunctionProxy:
-    """Resolve legacy helpers dynamically so old patch points remain live."""
-
-    __slots__ = ("_namespace", "_name")
-
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(f"recursive action-debug support proxy: {self._name}")
-        return target(*args, **kwargs)  # type: ignore[operator]
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
-
-
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    """Bind readers/compact serializers owned by the runtime entrypoint."""
-
-    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "action-debug payload support is incomplete: "
-            + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _SUPPORT_NAMES
-        }
-    )
+from .gui_special_arm_status import fix_arm_debug_state
+from .runtime_debug import (
+    _action_debug_backend_snapshot_from_state,
+    _preloaded_action_debug_backend_snapshot,
+)
+from .status_payloads import _float_or_none
 
 
 def _action_debug_active_sides(components: Any | None) -> tuple[str, ...]:
@@ -79,98 +37,6 @@ def _action_debug_active_sides(components: Any | None) -> tuple[str, ...]:
         ):
             inferred.append(side)
     return tuple(inferred or ("left", "right"))
-
-def _action_debug_backend_snapshot_from_state(
-    state: object,
-    *,
-    backend: Any | None,
-    side: str,
-    role: str,
-    sample_timestamp: float | None,
-    record_wall_time: float,
-    read_start: float | None = None,
-    read_end: float | None = None,
-) -> dict[str, Any]:
-    start = float(time.time() if read_start is None else read_start)
-    end = float(start if read_end is None else read_end)
-    if backend is None:
-        return {
-            "available": False,
-            "side": str(side),
-            "role": str(role),
-            "reason": "missing_backend",
-        }
-    if not isinstance(state, Mapping):
-        return {
-            "available": False,
-            "side": str(side),
-            "role": str(role),
-            "backend_class": type(backend).__name__,
-            "reason": "state_not_mapping",
-            "state_type": type(state).__name__,
-            "read_start_wall_time": start,
-            "read_end_wall_time": end,
-            "read_elapsed_s": float(end - start),
-        }
-
-    sample_ts = _float_or_none(sample_timestamp)
-    record_ts = _float_or_none(record_wall_time)
-    last_command_ts = _float_or_none(state.get("last_command_timestamp"))
-    pose_tracking_error = _pose_delta_compact_debug(
-        state.get("current_tcp_pose"),
-        state.get("last_target_tcp_pose"),
-    )
-    compact_state = _backend_compact_debug_payload(state)
-    out: dict[str, Any] = {
-        "available": True,
-        "side": str(side),
-        "role": str(role),
-        "backend_class": type(backend).__name__,
-        "arm_state_source": state.get("arm_state_source"),
-        "read_start_wall_time": start,
-        "read_end_wall_time": end,
-        "read_elapsed_s": float(end - start),
-        "sample_timestamp": sample_ts,
-        "record_wall_time": record_ts,
-        "last_command_timestamp": last_command_ts,
-        "last_command_sequence": compact_state.get("last_command_sequence"),
-        "command_sequence": compact_state.get("command_sequence"),
-        "latest_target_sequence": compact_state.get("latest_target_sequence"),
-        "hardware_result_code": state.get("hardware_result_code"),
-        "hardware_result_text": state.get("hardware_result_text"),
-        "send_result_code": state.get("send_result_code"),
-        "send_result_text": state.get("send_result_text"),
-        "effective_control_dt_sec": state.get("effective_control_dt_sec"),
-        "effective_step_scale": state.get("effective_step_scale"),
-        "latest_target_tcp_pose6": compact_state.get("latest_target_tcp_pose6"),
-        "latest_target_joint_deg": compact_state.get("latest_target_joint_deg"),
-        "current_qpos": compact_state.get("current_qpos"),
-        "last_target_qpos": compact_state.get("last_target_qpos"),
-        "current_tcp_pose": compact_state.get("current_tcp_pose"),
-        "last_target_tcp_pose": compact_state.get("last_target_tcp_pose"),
-        "pose_tracking_error": pose_tracking_error,
-        "last_send_command_timing": compact_state.get("last_send_command_timing"),
-        "last_impedance_loop_timing": compact_state.get("last_impedance_loop_timing"),
-        "last_impedance_record": compact_state.get("last_impedance_record"),
-        "recent_impedance_records": compact_state.get("recent_impedance_records"),
-        "backend_state_compact": compact_state,
-    }
-    if last_command_ts is not None and sample_ts is not None:
-        out["last_command_age_sec_at_sample"] = float(sample_ts - last_command_ts)
-        out["sample_to_last_command_dt_sec"] = float(last_command_ts - sample_ts)
-    else:
-        out["last_command_age_sec_at_sample"] = None
-        out["sample_to_last_command_dt_sec"] = None
-    if last_command_ts is not None and record_ts is not None:
-        out["last_command_age_sec_at_record"] = float(record_ts - last_command_ts)
-        out["record_to_last_command_dt_sec"] = float(last_command_ts - record_ts)
-    else:
-        out["last_command_age_sec_at_record"] = None
-        out["record_to_last_command_dt_sec"] = None
-    if pose_tracking_error is not None:
-        out["target_current_translation_m"] = pose_tracking_error.get("translation_m")
-        out["target_current_rotation_deg"] = pose_tracking_error.get("rotation_deg")
-    return out
 
 def _action_debug_jitter_focus(
     command_backend_by_side: Mapping[str, Any],
@@ -505,6 +371,7 @@ def _build_action_debug_metadata(
         "tracker_loss_channels": list(
             getattr(step_result, "tracker_loss_channels", ()) or ()
         ),
+        "fix_arm": fix_arm_debug_state(components),
         "home_recalibration_required": bool(
             getattr(step_result, "home_recalibration_required", False)
         ),
@@ -547,10 +414,8 @@ def _build_action_debug_metadata(
     return out
 
 __all__ = [
-    "bind_legacy_support",
     "_action_debug_active_sides",
     "_action_debug_backend_snapshot_from_state",
     "_action_debug_jitter_focus",
     "_build_action_debug_metadata",
 ]
-

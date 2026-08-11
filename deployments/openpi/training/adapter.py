@@ -24,13 +24,14 @@ from dataset_contracts.model_continuation_training import (
     ModelContinuationTrainingSourceBinding,
 )
 from dataset_contracts.policy_artifact import PolicyArtifactContract
+from dataset_interface.camera_semantics import DatasetCameraSemanticResolver
 from dataset_interface.model_continuation import (
     ModelContinuationTrainingSamplingSpec,
     model_continuation_training_masks,
     select_model_continuation_training_delay_prefix,
 )
 
-from deployments.openpi.client.rtc import openpi_rtc_artifact_hash
+from deployments.openpi.artifact_identity import openpi_rtc_artifact_hash
 
 
 OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1 = (
@@ -54,6 +55,9 @@ OPENPI_MODEL_RTC_TRAINER_PARAMETERS_HASH_DOMAIN_V1 = (
 OPENPI_MODEL_RTC_SAMPLE_IDENTITY_KEY_V1 = (
     "_dexteleop_v22_augmentation_key"
 )
+OPENPI_CAMERA_SEMANTIC_TRANSFORM_ID_V1 = (
+    "dexteleop.openpi.camera_semantic_transform.v1"
+)
 
 
 def _nonempty(value: object, *, name: str) -> str:
@@ -61,6 +65,76 @@ def _nonempty(value: object, *, name: str) -> str:
     if not normalized:
         raise ValueError(f"{name} must be non-empty.")
     return normalized
+
+
+@dataclass(frozen=True)
+class OpenPICameraSemanticTransform:
+    """Project stored dataset views into artifact-bound model image keys.
+
+    Dataset media remains untouched. For every sample the recorded RealSense
+    serial first resolves the canonical physical role to its stored dataset
+    key; the policy artifact then routes that canonical role into the model's
+    checkpoint-native input key.
+    """
+
+    artifact: PolicyArtifactContract
+    resolver: DatasetCameraSemanticResolver
+    identity_key: str = OPENPI_MODEL_RTC_SAMPLE_IDENTITY_KEY_V1
+    stored_image_key_prefix: str = "observation.images"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.artifact, PolicyArtifactContract):
+            raise TypeError("artifact must be a PolicyArtifactContract.")
+        if not isinstance(self.resolver, DatasetCameraSemanticResolver):
+            raise TypeError("resolver must be a DatasetCameraSemanticResolver.")
+        if self.artifact.camera_input is None:
+            raise ValueError(
+                "OpenPI camera semantic transform requires an artifact camera_input."
+            )
+        object.__setattr__(
+            self,
+            "identity_key",
+            _nonempty(self.identity_key, name="identity_key"),
+        )
+        object.__setattr__(
+            self,
+            "stored_image_key_prefix",
+            _nonempty(
+                self.stored_image_key_prefix,
+                name="stored_image_key_prefix",
+            ).rstrip("."),
+        )
+
+    def __call__(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        output = dict(data)
+        identity = np.asarray(output.get(self.identity_key))
+        if identity.shape != (2,):
+            raise ValueError(
+                f"{self.identity_key} must contain [episode_index, row_index]."
+            )
+        episode_index = int(identity[0])
+        if episode_index < 0:
+            raise ValueError("OpenPI camera sample episode_index must be non-negative.")
+        resolution = self.resolver.resolution_for_episode(episode_index)
+        source_values: dict[str, Any] = {}
+        assert self.artifact.camera_input is not None
+        for camera in self.artifact.camera_input.inputs:
+            canonical_role = camera.source_key
+            stored_key = (
+                resolution.stored_key_for(canonical_role)
+                if canonical_role in self.resolver.binding.canonical_roles
+                else canonical_role
+            )
+            stored_input_key = f"{self.stored_image_key_prefix}.{stored_key}"
+            if stored_input_key not in data:
+                raise ValueError(
+                    "OpenPI stored camera input is missing: "
+                    f"episode={episode_index} canonical_role={canonical_role!r} "
+                    f"stored_key={stored_key!r} input_key={stored_input_key!r}."
+                )
+            source_values[camera.model_input_key] = data[stored_input_key]
+        output.update(source_values)
+        return output
 
 
 @dataclass
@@ -200,6 +274,7 @@ class OpenPIModelRtcDataConfigFactory:
 
     base_factory: Any
     transform: OpenPIModelRtcTrainingTransform
+    camera_transform: OpenPICameraSemanticTransform | None = None
 
     def create(self, assets_dirs: Path, model_config: Any) -> Any:
         if not callable(getattr(self.base_factory, "create", None)):
@@ -216,11 +291,13 @@ class OpenPIModelRtcDataConfigFactory:
             )
         from openpi import transforms as openpi_transforms
 
+        prepended = (
+            (self.transform,)
+            if self.camera_transform is None
+            else (self.camera_transform, self.transform)
+        )
         adapted = openpi_transforms.Group(
-            inputs=(
-                self.transform,
-                *tuple(training_transforms.inputs),
-            ),
+            inputs=(*prepended, *tuple(training_transforms.inputs)),
             outputs=tuple(training_transforms.outputs),
         )
         return replace(data_config, training_transforms=adapted)
@@ -325,9 +402,11 @@ __all__ = [
     "OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1",
     "OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1",
     "OPENPI_MODEL_RTC_SAMPLE_IDENTITY_KEY_V1",
+    "OPENPI_CAMERA_SEMANTIC_TRANSFORM_ID_V1",
     "OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V1",
     "OpenPIModelRtcDataConfigFactory",
     "OpenPIModelRtcTrainingTransform",
+    "OpenPICameraSemanticTransform",
     "OpenPIOverlayCheckpointWeightLoader",
     "build_openpi_model_rtc_training_manifest",
 ]

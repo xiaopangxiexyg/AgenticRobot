@@ -359,6 +359,12 @@ available/valid mask；不足 horizon 时可 repeat-last 或 zero-pad，但必�
 已经 safety-filter 接受或实际 dispatch 的 action，而不是未过滤 raw output。relative policy 的 last-action frame/mode
 必须与 `pose_action_chunk_contract` 一致。
 
+Arm-hold 的 `previous_resolved_mode_v1` 是独立的单步状态上下文，不复用 `last_action` 或 model-RTC future-action
+conditioning。它包含左右侧 `previous_mode`、`available_mask` 和 `dwell_steps`，仅由 authoritative
+`ArmHoldSemanticResolver` commit 推进；reset 必须旋转 binding epoch 并恢复 unavailable。当前该能力通过可选 typed
+binding 在 `PolicyDeployRuntime` 内默认关闭地维护，receipt 不代表 target acceptance 或硬件执行；尚未声明
+artifact/server 输入字段的普通 checkpoint 不得接收或伪造该上下文。
+
 ## 7. Policy output
 
 ### 7.1 v2 typed output

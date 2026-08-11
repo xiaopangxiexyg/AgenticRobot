@@ -36,6 +36,11 @@ checkpoint 解释、复现和回退。不要用同名配置续训成另一种输
 `docs/dexteleop_corrected_training_configs.md`。本目录中早期的三个实验 patch 已被版本化配置方案
 取代，不应再直接应用到包含历史 checkpoint 的 OpenPI checkout。
 
+新的 writing front-only h16 训练默认选择 `...-task-ready-state-dropout-v2`
+配置：保留 10% whole-state dropout，并增加每侧独立的 15% arm-pose
+dropout；`num_workers` 固定为 4。既有 `...-task-ready-v1` 名称不变，作为
+旧 checkpoint 的显式回退，禁止跨名称 resume。
+
 ## 1. 不可变契约
 
 `policy_artifact.json` 是 checkpoint 的唯一 I/O 权威。客户端传入 `--policy-artifact-json` 后会强制校验：
@@ -44,6 +49,20 @@ checkpoint 解释、复现和回退。不要用同名配置续训成另一种输
 - v2 schema、16D state/action、layout hash；
 - 左右 wrist 的逻辑相机键、OpenPI 输入键和 server slots；
 - DMTAC 的连续 gripper 映射。
+
+### Prepared training checkpoint 的部署恢复
+
+`writing_stage1_0804_0805_*_v1.json` 这类训练 profile 会在进程内派生 OpenPI
+config，不应把派生名称静态写回 OpenPI 的共享 registry。部署时由
+`deployments.openpi.server --prepared-training-profile ...` 生成一次性的
+checkpoint-bound artifact 和 registry，再由
+`deployments.openpi.prepared_server_runtime` 在 server 进程内恢复同一 config。
+
+绑定同时覆盖原 checkpoint artifact、训练 profile hash、base/derived config 名称、
+asset id、camera slots、action horizon/mode/tail、layout hash、state-augmentation
+契约和 checkpoint 内实际 norm-stats bytes。校验只在部署层生效，不改 checkpoint、
+数据集、OpenPI checkout、`teleop_runtime` 配置或遥操默认值。完整远端命令见
+[`cmd_list.md` 第 13 节](./cmd_list.md#13-08040805-front--absolute-prepared-checkpoint-部署绑定)。
 
 ### v2.2 raw 数据训练出的 relative 模型
 
@@ -100,6 +119,42 @@ pose hash 不匹配或误用 native-v2.3 语义都会直接失败；DexTeleop �
 切换模型实例的硬绑定。需要逐实例审计时，显式使用
 `--strict-model-identity --model ... --checkpoint-step ...`。
 
+### 旧 wrist-only checkpoint 的物理左右兼容
+
+当前物理绑定是 `left_wrist=260522278055`、
+`right_wrist=261122273924`。历史 wrist-only checkpoint 的 left/right model
+slots 则来自旧的反向采集标签。使用以下版本化兼容 artifact，保持 checkpoint 权重和
+原始数据不变：
+
+```bash
+export LEGACY_WRIST_COMPAT_ARTIFACT="$DEXTELEOP_ROOT/deployments/openpi/configs/model_rtc/0712-wrist-cube-92599-legacy-wrist-compat.policy_artifact.json"
+```
+
+server 仍从原 checkpoint 加载 params，但必须显式使用同一兼容 artifact 构造协议：
+
+```bash
+"$OPENPI_ROOT/.venv/bin/python" -m deployments.openpi.server \
+  --checkpoint-dir "$CHECKPOINT_DIR" \
+  --policy-artifact-json "$LEGACY_WRIST_COMPAT_ARTIFACT" \
+  --port 8078
+```
+
+client 同样传入该 artifact，而不是 checkpoint 内旧的 sidecar：
+
+```bash
+"$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
+  --policy-artifact-json "$LEGACY_WRIST_COMPAT_ARTIFACT" \
+  --deployment-profile rm65_bimanual_dmtac \
+  --host "$SERVER_IP" --port 8078 \
+  --contract-check-only
+```
+
+兼容 artifact 将 canonical runtime `right_wrist` 路由到旧模型 left slot，将
+canonical runtime `left_wrist` 路由到旧模型 right slot。server 会校验它绑定的原
+checkpoint artifact hash；client 会在创建相机或机器人前校验 camera-role binding
+hash。训练入口默认按数据快照 serial 解析历史/新数据；显式
+`--disable-camera-semantic-resolution` 仅作为回滚，不应用于混合 wrist 数据。
+
 ### RTC-4b-A OpenPI raw-RTC final-chunk 边界
 
 这里的 raw-RTC 指 OpenPI 仍执行既有 `observation -> final action chunk` 推理，模型和 server 不接收未来动作；
@@ -142,7 +197,7 @@ config/checkpoint。
 
 ```bash
 python -m deployments.openpi.training.prepare \
-  --source-artifact-json deployments/openpi/configs/model_rtc/0712-wrist-cube-92599.policy_artifact.json \
+  --source-artifact-json deployments/openpi/configs/model_rtc/0712-wrist-cube-92599-legacy-wrist-compat.policy_artifact.json \
   --output-artifact-json deployments/openpi/configs/model_rtc/0712-wrist-cube-model-rtc-v1.template.policy_artifact.json \
   --output-model-id 0712-wrist-cube-model-rtc-v1 \
   --source-dataset-root /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success
@@ -153,10 +208,36 @@ python -m deployments.openpi.training.launch \
   --artifact-template-json deployments/openpi/configs/model_rtc/0712-wrist-cube-model-rtc-v1.template.policy_artifact.json \
   --sampling-spec-json deployments/openpi/configs/model_rtc/0712-wrist-cube-model-rtc-v1.sampling.json \
   --source-dataset-root /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success \
-  --camera-key left_wrist --camera-key right_wrist \
+  --camera-key right_wrist --camera-key left_wrist \
   --output-config-name 0712-wrist-cube-model-rtc-v1 \
   --exp-name EXPERIMENT --dry-run
 ```
+
+这里必须从 legacy wrist compat artifact 派生 template，并保持其 artifact source-key
+顺序。否则虽然历史数据可按 serial 转成规范左右，继承自 92599 的模型 input slot
+语义却会同时被翻转，形成权重与输入不一致；launcher 会拒绝没有绑定 base artifact
+hash 的替代路由。
+
+### 普通 OpenPI corrected-v1 训练
+
+常规 `scripts/train.py` 不经过上述 model-RTC transform。包含 wrist 输入的
+`-corrected-v1` config 必须通过 serial-resolution wrapper 启动；wrapper 会先只读审计
+每个 source 的 RealSense snapshot，再通过环境契约让每个 dataset worker 在读取视频和
+mask 时按物理角色解析：
+
+```bash
+PYTHONPATH="$DEXTELEOP_ROOT:$OPENPI_ROOT/src" \
+"$OPENPI_ROOT/.venv/bin/python" -m deployments.openpi.corrected_train \
+  --dry-run --sample-check -- \
+  0712-wrist-cube-corrected-v1 \
+  --exp-name NEW_EXPERIMENT
+```
+
+`--sample-check` 还会在不创建 trainer、不加载模型权重的前提下实际 decode/transform 每个
+source 的一个 sample。确认审计后同时去掉 wrapper 的 `--dry-run --sample-check` 才会训练。
+wrapper 拒绝无后缀历史 config；
+不得用 corrected config resume 无后缀旧 checkpoint。直接运行历史
+`scripts/train.py 0712-wrist-cube` 仍是显式复现旧语义，不会自动纠正。
 
 去掉`--dry-run`才会加载权重和训练。每个checkpoint同时写artifact、training-run manifest和checkpoint receipt；trained
 deployment会在连接server/设备前验证三者。部署仅开放显式
@@ -291,6 +372,14 @@ print(policy.metadata["validation"])
 4. `observation.*.actual_qpos`
 
 对 `bimanual-cube-new-success` 的 episode 0/frame 0，当前会选择 `observation_arm_qpos`，左右臂各为 6D。读取/规划失败时策略保持被阻塞，不能自动退化为任意当前姿态。
+
+连续任务明确要求保留当前姿态时，可显式传入 `--no-init-qpos`。该参数在共享 runtime
+解析层覆盖 deployment profile 或命令行注入的 dataset-frame qpos-init 输入；当 profile 的
+startup source 为 `current` 时，该同位姿 Cartesian 初始化会直接判定为已满足，无需再按
+`g` 发送一段冗余保持流。手动部署仍需等待 observation/碰撞/受力门正常后按 `A` 确认并启动
+策略。兼容拼写 `--no--init-qpos` 也可解析，但文档和新命令统一使用 `--no-init-qpos`。该覆盖
+不关闭 ready confirm、碰撞、受力、observation 或 dispatch 安全门，也不提供跨任务 action
+queue/model history 的连续 handoff。
 
 可在没有硬件的情况下验证 qpos-init 数据读取：
 

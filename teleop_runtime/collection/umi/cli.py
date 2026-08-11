@@ -10,23 +10,67 @@ from pathlib import Path
 from typing import Sequence
 
 from dataset_contracts.v25p_native_storage import V25P_NATIVE_STORAGE_LAYOUTS_V1
+from project_paths import DEFAULT_FORMAL_COLLECTION_ROOT
 
 from ..policy_io import load_policy_io_layout
 from .calibration import UmiCalibrationSet
-from .config import load_umi_collection_config
+from .config import UmiCollectionConfig, load_umi_collection_config
 from .topology import CAMERA_KEYS, SIDES
 
 
 DEFAULT_CONFIG = (
     Path(__file__).resolve().parents[2] / "configs" / "umi" / "dual_wrist_dmtac_v1.json"
 )
+DEFAULT_UMI_FORMAL_DATASET_ROOT = (
+    DEFAULT_FORMAL_COLLECTION_ROOT / "umi_dual_wrist"
+)
+
+
+def apply_dataset_root_selection(
+    config: UmiCollectionConfig,
+    *,
+    default_profile_implicit: bool,
+    dataset_root: str | Path | None,
+) -> UmiCollectionConfig:
+    """Select the runtime output root without rewriting hardware profiles.
+
+    The repository default hardware profile is intentionally allowed to differ
+    across synchronized hosts.  Its historical dataset_root therefore remains
+    untouched.  Only a launch that omits --config gets the new formal root
+    implicitly; every explicitly named profile retains its own root unless the
+    operator also supplies --dataset-root.
+    """
+
+    selected = dataset_root
+    if selected in (None, ""):
+        if not default_profile_implicit:
+            return config
+        selected = DEFAULT_UMI_FORMAL_DATASET_ROOT
+    return replace(config, dataset_root=Path(selected).expanduser())
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Collect arm-free dual-wrist UMI demonstrations in DexTeleop v2.3."
     )
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "UMI hardware/profile config. Omitted selects the repository default "
+            "profile plus the canonical formal dataset root. An explicitly named "
+            "profile retains its own dataset_root unless --dataset-root is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=None,
+        help=(
+            "UMI dataset directory. The repository default profile uses "
+            f"{DEFAULT_UMI_FORMAL_DATASET_ROOT}; custom profiles retain their "
+            "configured dataset_root unless this option is supplied."
+        ),
+    )
     parser.add_argument(
         "--validate-only",
         action="store_true",
@@ -49,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Show passive A/B/C/G and P1--P5 input activity blocks. Enabled "
             "by the default config; --no-gui-input-activity-indicators rolls back the display."
+        ),
+    )
+    parser.add_argument(
+        "--tactile-artifact-integrity",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Incrementally hash exact tactile artifact bytes and publish a detachable "
+            "inventory after each sealed Episode. Default comes from the UMI config."
         ),
     )
     parser.add_argument(
@@ -153,7 +206,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    config = load_umi_collection_config(args.config)
+    config_path = DEFAULT_CONFIG if args.config is None else Path(args.config)
+    config = load_umi_collection_config(config_path)
+    config = apply_dataset_root_selection(
+        config,
+        default_profile_implicit=args.config is None,
+        dataset_root=args.dataset_root,
+    )
     config = replace(
         config,
         open_browser=False if args.no_open_browser else config.open_browser,
@@ -166,6 +225,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             config.gui_input_activity_indicators
             if args.gui_input_activity_indicators is None
             else bool(args.gui_input_activity_indicators)
+        ),
+        tactile_artifact_integrity=(
+            config.tactile_artifact_integrity
+            if args.tactile_artifact_integrity is None
+            else bool(args.tactile_artifact_integrity)
         ),
         send_gripper_commands=False if args.no_send_gripper else config.send_gripper_commands,
         foot_pad_enabled=(
@@ -271,7 +335,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     from .app import run_umi_collection
 
-    return run_umi_collection(config)
+    try:
+        return run_umi_collection(config)
+    except KeyboardInterrupt:
+        # Application/component finally blocks own the actual cleanup.  Treat
+        # Ctrl+C as an ordinary operator cancellation instead of printing a
+        # misleading Python traceback after resources have been released.
+        print("\n[UMI] 已收到 Ctrl+C，启动/数采已安全取消。")
+        return 130
 
 
-__all__ = ["build_parser", "main"]
+__all__ = [
+    "DEFAULT_UMI_FORMAL_DATASET_ROOT",
+    "apply_dataset_root_selection",
+    "build_parser",
+    "main",
+]

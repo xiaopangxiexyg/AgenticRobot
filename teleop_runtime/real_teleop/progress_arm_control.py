@@ -5,12 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from control_station.real_teleop.progress import (
+from .progress_contracts import (
     PROGRESS_ARM_CONTROL_MODE_IGNORE,
     PROGRESS_ARM_CONTROL_MODE_PROFILE,
     PROGRESS_ARM_CONTROL_MODE_STRICT,
+    ProgressMutationCommand,
     normalize_progress_arm_control_mode,
-    ProgressOperatorIntent,
 )
 from dataset_contracts.progress_profile import (
     ProgressStepArmControlV1,
@@ -44,7 +44,7 @@ class ProgressArmTransitionPlan:
 class PendingProgressArmTransition:
     """An entry/Advance/Undo waiting behind Hold and runtime Home."""
 
-    intent: ProgressOperatorIntent | None
+    intent: ProgressMutationCommand | None
     plan: ProgressArmTransitionPlan
     capture_sides: tuple[str, ...]
 

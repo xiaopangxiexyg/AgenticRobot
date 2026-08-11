@@ -16,7 +16,11 @@ from ..sources.pose.vive_motion import (
     TrackerMotionIntentConfig,
     TrackerMotionIntentStateMachine,
 )
-from ..transforms import as_pose_matrix, rotation_is_orthonormal
+from ..transforms import (
+    as_pose_matrix,
+    project_near_rigid_pose,
+    rotation_is_orthonormal,
+)
 
 
 DEFAULT_RETARGET_CONTROL_MODE = "absolute"
@@ -165,7 +169,11 @@ class PoseToArmRetargeter(Retargeter):
         channel = observation.get_channel(self.config.input_channel_name)
         if channel is None or not channel.valid:
             return None
-        pose_desk, pose_operator = self._resolve_pose_desk_and_operator(
+        (
+            pose_desk,
+            pose_operator,
+            input_pose_normalization,
+        ) = self._resolve_pose_desk_and_operator(
             channel=channel,
             calibration=calibration,
         )
@@ -181,6 +189,7 @@ class PoseToArmRetargeter(Retargeter):
             "clutch_pressed": False,
             "pose_operator": pose_operator,
             "target_pose_desk": target_pose_desk,
+            "input_pose_normalization": input_pose_normalization,
             "tracker_role": self._resolve_tracker_role(channel),
             "source_tracker_role": self._resolve_source_tracker_role(channel),
         }
@@ -192,6 +201,7 @@ class PoseToArmRetargeter(Retargeter):
         observation: TeleopObservation,
         calibration: TeleopCalibration,
         pose_operator: np.ndarray | None = None,
+        input_pose_normalization: dict[str, float | bool] | None = None,
     ) -> TeleopCommand:
         command = TeleopCommand(timestamp=observation.timestamp)
         channel = observation.get_channel(self.config.input_channel_name)
@@ -249,6 +259,15 @@ class PoseToArmRetargeter(Retargeter):
                     "control_mode": self.config.control_mode,
                     "orientation_mode": self.config.orientation_mode,
                     "input_channel": self.config.input_channel_name,
+                    **(
+                        {}
+                        if input_pose_normalization is None
+                        else {
+                            "input_pose_normalization": dict(
+                                input_pose_normalization
+                            )
+                        }
+                    ),
                     **tracker_lineage_metadata,
                     **fix_arm_authority_metadata,
                     "clutch_pressed": False,
@@ -305,7 +324,11 @@ class PoseToArmRetargeter(Retargeter):
         if calibration is None:
             raise RuntimeError(f"{self.name} requires a TeleopCalibration instance.")
 
-        pose_desk, pose_operator = self._resolve_pose_desk_and_operator(
+        (
+            pose_desk,
+            pose_operator,
+            input_pose_normalization,
+        ) = self._resolve_pose_desk_and_operator(
             channel=channel,
             calibration=calibration,
         )
@@ -323,6 +346,7 @@ class PoseToArmRetargeter(Retargeter):
             observation=observation,
             calibration=calibration,
             pose_operator=pose_operator,
+            input_pose_normalization=input_pose_normalization,
         )
 
     def _resolve_tracker_role(self, channel) -> str | None:
@@ -344,8 +368,11 @@ class PoseToArmRetargeter(Retargeter):
         *,
         channel,
         calibration: TeleopCalibration,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        pose = as_pose_matrix(channel.value)
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float | bool]]:
+        pose, normalization = project_near_rigid_pose(
+            channel.value,
+            name=f"{self.config.input_channel_name} input pose",
+        )
         frame_name = channel.frame_name or ""
         tracker_role = self._resolve_tracker_role(channel)
 
@@ -355,6 +382,7 @@ class PoseToArmRetargeter(Retargeter):
             return (
                 self.prepare_input_pose_desk(pose_desk),
                 self._apply_input_pose_adjustments(pose_operator),
+                normalization,
             )
         if frame_name.endswith("_operator") or frame_name == "operator":
             pose_operator = pose
@@ -362,6 +390,7 @@ class PoseToArmRetargeter(Retargeter):
             return (
                 self.prepare_input_pose_desk(pose_desk),
                 self._apply_input_pose_adjustments(pose_operator),
+                normalization,
             )
         if frame_name in {calibration.desk_frame.name, "desk"}:
             pose_desk = pose
@@ -371,6 +400,7 @@ class PoseToArmRetargeter(Retargeter):
             return (
                 self.prepare_input_pose_desk(pose_desk),
                 self._apply_input_pose_adjustments(pose_operator),
+                normalization,
             )
         raise ValueError(
             f"{self.name} does not know how to map input frame '{frame_name or '<none>'}' to desk."

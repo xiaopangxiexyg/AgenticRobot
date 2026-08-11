@@ -225,6 +225,30 @@ def apply_rm65_position_profile_defaults(
     # selecting V1 restores the complete predecessor behavior.
     setattr(
         args,
+        "position_sample_aligned_source_hz",
+        (
+            profile.rates.sample_hz
+            if command.sample_aligned_source_hz is None
+            else command.sample_aligned_source_hz
+        ),
+    )
+    setattr(
+        args,
+        "position_sample_aligned_source_latch_mode",
+        command.sample_aligned_source_latch_mode,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_horizon_source_steps",
+        command.sample_aligned_horizon_source_steps,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_safety_horizon_source_steps",
+        command.sample_aligned_safety_horizon_source_steps,
+    )
+    setattr(
+        args,
         "position_sample_aligned_scale_degraded_target",
         command.sample_aligned_scale_degraded_target,
     )
@@ -240,6 +264,11 @@ def apply_rm65_position_profile_defaults(
     )
     setattr(
         args,
+        "position_sample_aligned_initial_jerk_delta_regularization",
+        command.sample_aligned_initial_jerk_delta_regularization,
+    )
+    setattr(
+        args,
         "position_sample_aligned_terminal_velocity_regularization",
         command.sample_aligned_terminal_velocity_regularization,
     )
@@ -247,6 +276,56 @@ def apply_rm65_position_profile_defaults(
         args,
         "position_sample_aligned_terminal_acceleration_regularization",
         command.sample_aligned_terminal_acceleration_regularization,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_reference_mode",
+        command.sample_aligned_reference_mode,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_window",
+        command.sample_aligned_observer_window,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_efficiency_power",
+        command.sample_aligned_observer_efficiency_power,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_velocity_ema_alpha",
+        command.sample_aligned_observer_velocity_ema_alpha,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_velocity_cap_scale",
+        command.sample_aligned_observer_velocity_cap_scale,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_coherence_min",
+        command.sample_aligned_observer_coherence_min,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_speed_guard_scale",
+        command.sample_aligned_observer_speed_guard_scale,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_terminal_velocity_displacement_scale",
+        command.sample_aligned_terminal_velocity_displacement_scale,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_stop_threshold_deg",
+        command.sample_aligned_observer_stop_threshold_deg,
+    )
+    setattr(
+        args,
+        "position_sample_aligned_observer_stop_velocity_decay",
+        command.sample_aligned_observer_stop_velocity_decay,
     )
 
     if include_source_shaping:

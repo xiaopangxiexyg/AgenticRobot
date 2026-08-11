@@ -9,7 +9,6 @@ owner without moving identity or commit ownership.
 from __future__ import annotations
 
 import argparse
-from functools import lru_cache
 from pathlib import Path
 import shutil
 from typing import Any
@@ -37,11 +36,6 @@ from collection_runtime.progress.profiles import (
     resolve_task_stage_profile_reference,
 )
 from collection_runtime.sample_acceptance import AcceptedSampleReceipt
-from control_station.real_teleop.progress import (
-    ProgressControlAvailability,
-    ProgressProfileOption,
-    build_real_teleop_progress_ui_payload,
-)
 from dataset_contracts.causal_snapshot import LOCAL_WALL_CLOCK
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.progress_facts import (
@@ -82,6 +76,9 @@ _SAFETY_STOP_REASONS = frozenset(
 _MANUAL_ABORT_REASONS = frozenset(
     {"manual_key_stop", "quit_requested", "shutdown"}
 )
+DEFAULT_REAL_TELEOP_MANAGED_PROGRESS_PROFILE_ID = (
+    "dmtac_rm65_bimanual_position_writing_four_stage_progress"
+)
 
 
 def load_real_teleop_progress_profile(reference: str) -> TaskProgressProfileV1:
@@ -93,6 +90,32 @@ def load_real_teleop_progress_profile(reference: str) -> TaskProgressProfileV1:
         raise ValueError(f"Invalid collection progress profile: {exc}") from exc
     validate_real_teleop_initial_progress_profile(profile)
     return profile
+
+
+def resolve_real_teleop_default_progress_profile(
+    *,
+    dataset_root: str | Path,
+    requested_profile: TaskProgressProfileV1 | None,
+    gui_enabled: bool,
+) -> TaskProgressProfileV1 | None:
+    """Choose the GUI default only for a blank, unbound dataset.
+
+    Existing dataset bindings remain authoritative. A populated profile-less
+    dataset also stays profile-less instead of being made incompatible by a
+    new application default.
+    """
+
+    if requested_profile is not None or not bool(gui_enabled):
+        return requested_profile
+    admission = inspect_dataset_progress_profile(
+        Path(dataset_root),
+        requested_profile=None,
+    )
+    if admission.locked or admission.profile is not None:
+        return None
+    return load_real_teleop_managed_progress_profile(
+        DEFAULT_REAL_TELEOP_MANAGED_PROGRESS_PROFILE_ID,
+    )
 
 
 def validate_real_teleop_initial_progress_profile(
@@ -260,32 +283,6 @@ def list_real_teleop_managed_progress_profiles(
     return tuple(sorted(profiles, key=lambda item: item.profile_id))
 
 
-@lru_cache(maxsize=32)
-def list_real_teleop_managed_progress_profile_options(
-    *,
-    collection_task_id: str | None = None,
-) -> tuple[ProgressProfileOption, ...]:
-    """Build immutable GUI options for one formal task.
-
-    Managed catalog assets do not change during one process lifetime. Caching
-    prevents the startup/Home polling loop from reopening profile resources at
-    50 Hz. The retained task argument is not a semantic filter.
-    """
-
-    return tuple(
-        ProgressProfileOption(
-            profile_id=profile.profile_id,
-            profile_version=profile.profile_version,
-            task_id=profile.task_id,
-            display_name=profile.profile_id,
-            step_count=len(profile.steps),
-        )
-        for profile in list_real_teleop_managed_progress_profiles(
-            collection_task_id=collection_task_id,
-        )
-    )
-
-
 def load_real_teleop_managed_progress_profile(
     profile_id: str,
     *,
@@ -355,89 +352,6 @@ def select_real_teleop_managed_progress_profile(
         )
         args.collection_progress_profile = selected
     return selected
-
-
-def build_real_teleop_startup_progress_ui_payload(
-    *,
-    args: argparse.Namespace,
-    dataset_recorder: object | None,
-    profile_selection_enabled: bool = True,
-) -> dict[str, object]:
-    """Build the pre-Home projection used before the main control loop exists."""
-
-    recorder_matches = _dataset_recorder_matches_progress_selection(
-        args=args,
-        dataset_recorder=dataset_recorder,
-    )
-    if recorder_matches:
-        profile = getattr(dataset_recorder, "progress_profile", None)
-        profile_selection_locked = bool(
-            getattr(
-                dataset_recorder,
-                "progress_profile_selection_locked",
-                False,
-            )
-        )
-        profile_binding_source = str(
-            getattr(
-                dataset_recorder,
-                "progress_profile_binding_source",
-                "",
-            )
-        )
-    else:
-        admission = inspect_dataset_progress_profile(
-            Path(args.dataset_root),
-            requested_profile=getattr(
-                args,
-                "collection_progress_profile",
-                None,
-            ),
-        )
-        profile = admission.profile
-        profile_selection_locked = admission.locked
-        profile_binding_source = admission.source
-    available_profiles = list_real_teleop_managed_progress_profile_options(
-        collection_task_id=str(args.collection_task_id),
-    )
-    payload = build_real_teleop_progress_ui_payload(
-        profile=profile,
-        episode=None,
-        availability=ProgressControlAvailability(),
-        gui_enabled=bool(getattr(args, "collection_progress_gui", False)),
-        available_profiles=available_profiles,
-        profile_selection_enabled=profile_selection_enabled,
-        profile_selection_locked=profile_selection_locked,
-        profile_binding_source=profile_binding_source,
-        arm_control_mode=str(
-            getattr(
-                args,
-                "collection_progress_arm_control_mode",
-                "profile",
-            )
-        ),
-        arm_control_mode_selection_enabled=profile_selection_enabled,
-    )
-    if (
-        bool(getattr(args, "collection_progress_gui", False))
-        and profile is None
-        and not profile_selection_locked
-        and not available_profiles
-    ):
-        payload["message"] = (
-            "当前没有可选的 managed LINEAR progress profile；"
-            "请检查 progress profile catalog。"
-        )
-    if (
-        bool(getattr(args, "collection_progress_gui", False))
-        and not profile_selection_enabled
-        and not profile_selection_locked
-        and available_profiles
-    ):
-        payload["message"] = (
-            "设备仍在启动；完成连接检查后即可在 runtime Home 前选择进度 profile。"
-        )
-    return payload
 
 
 def _request_context(
@@ -905,14 +819,14 @@ class RealTeleopProgressEpisode:
 
 
 __all__ = [
+    "DEFAULT_REAL_TELEOP_MANAGED_PROGRESS_PROFILE_ID",
     "REAL_TELEOP_PROGRESS_CLOCK_DOMAIN",
     "REAL_TELEOP_PROGRESS_REFERENCE_SCHEMA_V1",
     "REAL_TELEOP_PROGRESS_RELATIVE_ROOT",
     "RealTeleopProgressEpisode",
-    "build_real_teleop_startup_progress_ui_payload",
-    "list_real_teleop_managed_progress_profile_options",
     "load_real_teleop_progress_profile",
     "resolve_real_teleop_progress_profile",
+    "resolve_real_teleop_default_progress_profile",
     "select_real_teleop_managed_progress_profile",
     "validate_real_teleop_initial_progress_profile",
 ]

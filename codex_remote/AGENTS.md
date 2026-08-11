@@ -1,9 +1,8 @@
 # Connection Codex Agent Rules
 
-These are agent instructions, not a full user manual. Apply them only when the
-Codex session current directory is
-`/home/zc/Release/util_scripts/Connection/codex` or a child directory. If they
-are loaded during unrelated local-only work, do not let them steer that task.
+These are agent instructions, not a full user manual. Apply them to changes
+under this directory and to tasks that invoke these wrappers, including calls
+made from the repository root. Do not let them steer unrelated local-only work.
 
 ## Hard Rules
 
@@ -22,11 +21,28 @@ are loaded during unrelated local-only work, do not let them steer that task.
 - Do not assume `Agent (Full Access)`. Respect the active sandbox and approval
   mode.
 
+## Target Selection
+
+- Pass `-H/--host` explicitly on every wrapper invocation. Do not rely on an
+  ambient `REMOTE_HOST` value.
+- If the user identifies an SSH host, IP, `user@host[:port]`, or SSH alias, use
+  that exact target. Otherwise use `-H dex-remote`, the configured default for
+  the 192.168.20.170 host.
+- Keep one target across a related operation chain. If an explicit target
+  fails, stop; never fall back to `dex-remote`.
+- Treat a target change as a new remote context. Re-verify identity, project
+  path, environment, devices, safety token, and write scope as applicable.
+- Distinguish the SSH execution target (`-H/--host`) from robot or controller
+  addresses such as `--arm-ip`; ask when an IP is ambiguous.
+- Do not infer usernames, project paths, environments, or device layouts from
+  an IP. Run `remote_whoami.sh` first on a non-default target before L2/L3 or
+  hardware work.
+
 ## Sync Model
 
-- When the user states that realtime sync is active via
-  `/home/zc/Release/util_scripts/Connection/realtime_sync_ssh.sh` in no-delete
-  mode, treat the local directory as the only code editing surface.
+- When the user states that a confirmed no-delete realtime sync is active, such
+  as `connection/realtime_sync_ssh.sh`, treat the local directory as the only
+  code editing surface.
 - Edit source code locally only. Do not edit remote source files with SSH, sed,
   vim, Python snippets, or ad hoc shell commands.
 - Do not run `remote_rsync_project.sh` for routine edits while realtime sync is

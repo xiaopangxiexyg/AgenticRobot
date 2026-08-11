@@ -25,12 +25,12 @@ POSITION_FORCE_SOURCES = ("raw", "zero", "work", "tool")
 @dataclass(frozen=True)
 class PositionForceGuardConfig:
     source: str = "tool"
-    max_force_n: float = 15.0
-    max_torque_nm: float = 2.0
+    max_force_n: float = 30.0
+    max_torque_nm: float = 5.0
     poll_hz: float = 20.0
     consecutive_limit_samples: int = 1
     max_consecutive_read_errors: int = 3
-    stale_timeout_sec: float = 0.25
+    stale_timeout_sec: float = 0.4
     startup_timeout_sec: float = 2.0
 
     def __post_init__(self) -> None:
@@ -86,10 +86,10 @@ def position_force_guard_config(
     return PositionForceGuardConfig(
         source=str(getattr(args, "position_force_guard_source", "tool")),
         max_force_n=float(
-            getattr(args, "position_force_guard_max_force_n", 15.0)
+            getattr(args, "position_force_guard_max_force_n", 30.0)
         ),
         max_torque_nm=float(
-            getattr(args, "position_force_guard_max_torque_nm", 2.0)
+            getattr(args, "position_force_guard_max_torque_nm", 5.0)
         ),
         poll_hz=float(getattr(args, "position_force_guard_hz", 20.0)),
         consecutive_limit_samples=int(
@@ -99,7 +99,7 @@ def position_force_guard_config(
             getattr(args, "position_force_guard_max_read_errors", 3)
         ),
         stale_timeout_sec=float(
-            getattr(args, "position_force_guard_stale_sec", 0.25)
+            getattr(args, "position_force_guard_stale_sec", 0.4)
         ),
         startup_timeout_sec=float(
             getattr(args, "position_force_guard_startup_timeout_sec", 2.0)
@@ -117,6 +117,7 @@ class PositionForceReading:
     monotonic_time_sec: float
     wall_time_sec: float
     read_elapsed_sec: float | None = None
+    read_phase_timing: tuple[tuple[str, float], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -128,6 +129,7 @@ class PositionForceReading:
             "monotonic_time_sec": self.monotonic_time_sec,
             "wall_time_sec": self.wall_time_sec,
             "read_elapsed_sec": self.read_elapsed_sec,
+            "read_phase_timing": dict(self.read_phase_timing),
         }
 
 
@@ -183,6 +185,8 @@ class PositionForceGuardMonitor:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._stale_watchdog_armed = threading.Event()
+        self._stale_watchdog_generation = 0
+        self._non_motion_read_window_active = False
         self._ready_by_side = {
             side: threading.Event() for side in self._readers
         }
@@ -217,6 +221,54 @@ class PositionForceGuardMonitor:
     @property
     def motion_ready(self) -> bool:
         return bool(self.ready and self.stale_watchdog_armed)
+
+    def suspend_stale_watchdog_for_non_motion(self) -> int:
+        """Pause only stale trips while a caller performs blocking reads.
+
+        This window is valid only while no motion can be admitted. Force/torque
+        limits and consecutive reader errors remain active in the pollers. The
+        returned generation token must be passed to
+        :meth:`resume_stale_watchdog_after_non_motion`, which requires a new
+        valid force sample from every side before motion readiness is restored.
+        """
+
+        if not self._threads:
+            raise RuntimeError(
+                "position force guard must be started before a non-motion read window"
+            )
+        with self._lock:
+            if self._fault is not None:
+                raise PositionForceGuardTripped(self._fault)
+            if self._non_motion_read_window_active:
+                raise RuntimeError(
+                    "position force guard non-motion read window is already active"
+                )
+            self._non_motion_read_window_active = True
+            self._stale_watchdog_armed.clear()
+            self._stale_watchdog_generation += 1
+            return int(self._stale_watchdog_generation)
+
+    def resume_stale_watchdog_after_non_motion(
+        self,
+        token: int,
+        *,
+        timeout_sec: float | None = None,
+    ) -> dict[str, object]:
+        """Require post-window force samples before restoring motion readiness."""
+
+        with self._lock:
+            if self._fault is not None:
+                raise PositionForceGuardTripped(self._fault)
+            if not self._non_motion_read_window_active:
+                raise RuntimeError(
+                    "position force guard non-motion read window is not active"
+                )
+            if int(token) != int(self._stale_watchdog_generation):
+                raise RuntimeError(
+                    "position force guard non-motion read window token is stale"
+                )
+            self._non_motion_read_window_active = False
+        return self.arm_stale_watchdog(timeout_sec=timeout_sec)
 
     def start(
         self,
@@ -277,7 +329,9 @@ class PositionForceGuardMonitor:
         if arm_stale_watchdog:
             # Startup readiness already guarantees one valid sample per side.
             # Immediate arming preserves the historical standalone behavior.
-            self._stale_watchdog_armed.set()
+            with self._lock:
+                self._stale_watchdog_generation += 1
+                self._stale_watchdog_armed.set()
         return self.snapshot()
 
     def arm_stale_watchdog(
@@ -323,7 +377,9 @@ class PositionForceGuardMonitor:
                     <= requested_at
                 ]
             if not missing:
-                self._stale_watchdog_armed.set()
+                with self._lock:
+                    self._stale_watchdog_generation += 1
+                    self._stale_watchdog_armed.set()
                 return self.snapshot()
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -405,6 +461,8 @@ class PositionForceGuardMonitor:
             self._watchdog_thread = None
             self._stop_event.clear()
             self._stale_watchdog_armed.clear()
+            self._stale_watchdog_generation += 1
+            self._non_motion_read_window_active = False
             self._ready_by_side = {
                 side: threading.Event() for side in self._readers
             }
@@ -449,6 +507,12 @@ class PositionForceGuardMonitor:
             return {
                 "ready": self.ready,
                 "stale_watchdog_armed": self.stale_watchdog_armed,
+                "stale_watchdog_generation": int(
+                    self._stale_watchdog_generation
+                ),
+                "non_motion_read_window_active": bool(
+                    self._non_motion_read_window_active
+                ),
                 "motion_ready": self.motion_ready,
                 "config": self.config.to_dict(),
                 "last_reading_by_side": {
@@ -561,6 +625,7 @@ class PositionForceGuardMonitor:
                 continue
             now = time.monotonic()
             with self._lock:
+                watchdog_generation = int(self._stale_watchdog_generation)
                 stale = [
                     (side, now - timestamp)
                     for side, timestamp in self._last_success_monotonic_by_side.items()
@@ -585,7 +650,7 @@ class PositionForceGuardMonitor:
                     and last_reading.read_elapsed_sec is not None
                     else ""
                 )
-                self._trip(
+                tripped = self._trip(
                     PositionForceGuardFault(
                         reason="force_read_stale",
                         side=side,
@@ -597,20 +662,34 @@ class PositionForceGuardMonitor:
                         ),
                         monotonic_time_sec=now,
                         wall_time_sec=time.time(),
-                    )
+                    ),
+                    stale_watchdog_generation=watchdog_generation,
                 )
-                return
+                if tripped:
+                    return
 
-    def _trip(self, fault: PositionForceGuardFault) -> None:
+    def _trip(
+        self,
+        fault: PositionForceGuardFault,
+        *,
+        stale_watchdog_generation: int | None = None,
+    ) -> bool:
         with self._lock:
             if self._fault is not None:
-                return
+                return False
+            if stale_watchdog_generation is not None and (
+                not self._stale_watchdog_armed.is_set()
+                or int(stale_watchdog_generation)
+                != int(self._stale_watchdog_generation)
+            ):
+                return False
             self._fault = fault
         try:
             self._emergency_stop(fault)
         except Exception as exc:  # noqa: BLE001 - the fault remains latched.
             with self._lock:
                 self._emergency_stop_error = f"{type(exc).__name__}: {exc}"
+        return True
 
     def _parse_reading(
         self,
@@ -637,6 +716,18 @@ class PositionForceGuardMonitor:
             read_elapsed_sec = float(raw_read_elapsed)
             if not math.isfinite(read_elapsed_sec) or read_elapsed_sec < 0.0:
                 raise ValueError("force reader read_elapsed_sec must be finite and non-negative")
+        raw_phase_timing = payload.get("read_phase_timing", {})
+        if not isinstance(raw_phase_timing, Mapping):
+            raise ValueError("force reader read_phase_timing must be a mapping")
+        read_phase_timing: list[tuple[str, float]] = []
+        for raw_name, raw_value in raw_phase_timing.items():
+            name = str(raw_name)
+            value = float(raw_value)
+            if not name or not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    "force reader read_phase_timing values must be finite and non-negative"
+                )
+            read_phase_timing.append((name, value))
         return PositionForceReading(
             side=side,
             source=self.config.source,
@@ -646,6 +737,7 @@ class PositionForceGuardMonitor:
             monotonic_time_sec=monotonic_time_sec,
             wall_time_sec=wall_time_sec,
             read_elapsed_sec=read_elapsed_sec,
+            read_phase_timing=tuple(read_phase_timing),
         )
 
 

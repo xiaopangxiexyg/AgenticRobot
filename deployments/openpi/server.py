@@ -16,11 +16,64 @@ import re
 import sys
 import tempfile
 
-from deployments.client import load_policy_artifact
-from robot_motion.deploy.normalization import (
+from dataset_contracts.normalization import (
     NormalizationContract,
     NormalizationContractError,
 )
+from deployments.policy_artifact import load_policy_artifact
+from deployments.openpi.camera_semantics import (
+    validate_declared_camera_semantics,
+    validate_legacy_swapped_wrist_artifact,
+)
+from deployments.openpi.prepared_deployment import (
+    prepare_checkpoint_deployment_artifact,
+    validate_prepared_deployment_artifact,
+)
+from deployments.openpi.image_wire import OpenPIImageWireServerConfig
+
+
+def _non_negative_cpu_id(text: str) -> int:
+    try:
+        value = int(text)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("CPU id must be an integer") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("CPU id must be non-negative")
+    return value
+
+
+def _exclude_server_cpus_before_exec(
+    excluded_cpu_ids: tuple[int, ...],
+) -> dict[str, object]:
+    """Reduce the launcher-thread mask inherited by the exec'd server."""
+
+    getter = getattr(os, "sched_getaffinity", None)
+    setter = getattr(os, "sched_setaffinity", None)
+    if not callable(getter) or not callable(setter):
+        raise RuntimeError("server CPU affinity is unavailable on this platform")
+    before = set(int(cpu) for cpu in getter(0))
+    excluded = set(int(cpu) for cpu in excluded_cpu_ids)
+    missing = excluded.difference(before)
+    if missing:
+        raise RuntimeError(
+            "requested OpenPI server CPU exclusion is outside the launcher "
+            f"affinity mask: missing={sorted(missing)} allowed={sorted(before)}"
+        )
+    target = before.difference(excluded)
+    if not target:
+        raise RuntimeError("OpenPI server CPU exclusion leaves no runnable CPU")
+    setter(0, target)
+    after = set(int(cpu) for cpu in getter(0))
+    if after != target:
+        raise RuntimeError(
+            "failed to verify OpenPI server CPU exclusion: "
+            f"requested={sorted(target)} effective={sorted(after)}"
+        )
+    return {
+        "excluded_cpu_ids": sorted(excluded),
+        "effective_cpu_ids": sorted(after),
+        "native_threads_migrated": 1,
+    }
 
 
 def _openpi_root_from_checkpoint(checkpoint_dir: Path) -> Path | None:
@@ -47,11 +100,41 @@ def _pythonpath_with_project(project_root: Path, current: str | None) -> str:
 def build_runtime_registry_entry(
     checkpoint_dir: Path,
     *,
+    policy_artifact_json: Path | None = None,
+    prepared_training_profile: Path | None = None,
+    model_rtc_profile: Path | None = None,
     config_name: str | None = None,
     default_prompt: str | None = None,
     action_horizon: int = 50,
 ) -> tuple[str, dict[str, object]]:
-    artifact = load_policy_artifact(checkpoint_dir / "policy_artifact.json")
+    if model_rtc_profile is not None and prepared_training_profile is None:
+        raise ValueError(
+            "model_rtc_profile requires prepared_training_profile."
+        )
+    checkpoint_artifact = load_policy_artifact(
+        checkpoint_dir / "policy_artifact.json"
+    )
+    artifact = checkpoint_artifact
+    if policy_artifact_json is not None:
+        artifact = load_policy_artifact(policy_artifact_json)
+        if prepared_training_profile is not None:
+            validate_prepared_deployment_artifact(
+                checkpoint_dir,
+                prepared_training_profile,
+                policy_artifact_json,
+                model_rtc_profile_path=model_rtc_profile,
+            )
+        else:
+            validate_legacy_swapped_wrist_artifact(
+                checkpoint_artifact,
+                artifact,
+            )
+    elif prepared_training_profile is not None:
+        raise ValueError(
+            "prepared_training_profile requires a generated policy artifact."
+        )
+    else:
+        validate_declared_camera_semantics(artifact)
     model_id = artifact.model_id
     if model_id is None:
         raise ValueError("policy artifact must declare model_id for server launch")
@@ -112,6 +195,9 @@ def write_runtime_registry(
     *,
     base_registry: Path,
     checkpoint_dir: Path,
+    policy_artifact_json: Path | None = None,
+    prepared_training_profile: Path | None = None,
+    model_rtc_profile: Path | None = None,
     config_name: str | None = None,
     default_prompt: str | None = None,
     action_horizon: int = 50,
@@ -122,6 +208,9 @@ def write_runtime_registry(
         raise ValueError(f"registry 'models' must be an object: {base_registry}")
     model_id, entry = build_runtime_registry_entry(
         checkpoint_dir,
+        policy_artifact_json=policy_artifact_json,
+        prepared_training_profile=prepared_training_profile,
+        model_rtc_profile=model_rtc_profile,
         config_name=config_name,
         default_prompt=default_prompt,
         action_horizon=action_horizon,
@@ -140,12 +229,52 @@ def main(argv: list[str] | None = None) -> int:
         description="Launch scripts/serve_dexteleop_policy.py from a checkpoint directory."
     )
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument(
+        "--policy-artifact-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional versioned compatibility artifact bound to the immutable "
+            "checkpoint artifact. The checkpoint params remain unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--prepared-training-profile",
+        type=Path,
+        default=None,
+        help=(
+            "Checked-in prepared training profile used to reconstruct the exact "
+            "OpenPI config and bind checkpoint norm-stats. This is mutually "
+            "exclusive with --policy-artifact-json and --config."
+        ),
+    )
+    parser.add_argument(
+        "--model-rtc-profile",
+        type=Path,
+        default=None,
+        help=(
+            "Optional trained model-RTC profile bound together with "
+            "--prepared-training-profile and the checkpoint receipt."
+        ),
+    )
     parser.add_argument("--openpi-root", type=Path, default=None)
     parser.add_argument("--config", default=None, help="Training config override.")
     parser.add_argument("--default-prompt", default=None)
     parser.add_argument("--action-horizon", type=int, default=50)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8078)
+    parser.add_argument(
+        "--exclude-cpu",
+        type=_non_negative_cpu_id,
+        action="append",
+        default=[],
+        help=(
+            "Default-off process-local CPU exclusion applied immediately "
+            "before exec. Repeat once per control CPU reserved for another "
+            "process. The exec'd server and its future threads inherit the "
+            "reduced mask; omitting all occurrences is the rollback."
+        ),
+    )
     parser.add_argument("--record", action="store_true")
     parser.add_argument(
         "--enable-rtc-continuation",
@@ -156,11 +285,40 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--image-wire-profile",
+        choices=("off", "resize-raw", "jpeg"),
+        default="off",
+        help=(
+            "Optional prepared-server image codec capability. off preserves "
+            "the historical server command and metadata."
+        ),
+    )
+    parser.add_argument("--image-wire-height", type=int, default=224)
+    parser.add_argument("--image-wire-width", type=int, default=224)
+    parser.add_argument("--image-wire-jpeg-quality", type=int, default=90)
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Write the temporary registry and print the server command without starting it.",
     )
+    parser.add_argument(
+        "--prepared-config-check-only",
+        action="store_true",
+        help=(
+            "Rebuild and temporarily register a prepared OpenPI config, then "
+            "exit without loading model weights or starting the server."
+        ),
+    )
     args = parser.parse_args(argv)
+    try:
+        image_wire_config = OpenPIImageWireServerConfig(
+            profile=args.image_wire_profile,
+            target_height=args.image_wire_height,
+            target_width=args.image_wire_width,
+            jpeg_quality=args.image_wire_jpeg_quality,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
     artifact_path = checkpoint_dir / "policy_artifact.json"
@@ -168,6 +326,73 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"checkpoint directory does not exist: {checkpoint_dir}")
     if not artifact_path.is_file():
         parser.error(f"checkpoint has no policy_artifact.json: {checkpoint_dir}")
+    policy_artifact_json = (
+        None
+        if args.policy_artifact_json is None
+        else args.policy_artifact_json.expanduser().resolve()
+    )
+    if policy_artifact_json is not None and not policy_artifact_json.is_file():
+        parser.error(
+            "compatibility policy artifact does not exist: "
+            f"{policy_artifact_json}"
+        )
+    prepared_training_profile = (
+        None
+        if args.prepared_training_profile is None
+        else args.prepared_training_profile.expanduser().resolve()
+    )
+    model_rtc_profile = (
+        None
+        if args.model_rtc_profile is None
+        else args.model_rtc_profile.expanduser().resolve()
+    )
+    if model_rtc_profile is not None and prepared_training_profile is None:
+        parser.error(
+            "--model-rtc-profile requires --prepared-training-profile."
+        )
+    if model_rtc_profile is not None and not model_rtc_profile.is_file():
+        parser.error(
+            f"model-RTC profile does not exist: {model_rtc_profile}"
+        )
+    if (
+        prepared_training_profile is not None
+        and policy_artifact_json is not None
+    ):
+        parser.error(
+            "--prepared-training-profile and --policy-artifact-json are "
+            "mutually exclusive."
+        )
+    if prepared_training_profile is not None and args.config is not None:
+        parser.error(
+            "--prepared-training-profile owns the exact config; omit --config."
+        )
+    if args.prepared_config_check_only and prepared_training_profile is None:
+        parser.error(
+            "--prepared-config-check-only requires "
+            "--prepared-training-profile."
+        )
+    if args.prepared_config_check_only and args.dry_run:
+        parser.error(
+            "--prepared-config-check-only and --dry-run are mutually exclusive."
+        )
+    prepared_resolution = None
+    if prepared_training_profile is not None:
+        if not prepared_training_profile.is_file():
+            parser.error(
+                "prepared training profile does not exist: "
+                f"{prepared_training_profile}"
+            )
+        prepared_resolution = prepare_checkpoint_deployment_artifact(
+            checkpoint_dir,
+            prepared_training_profile,
+            model_rtc_profile_path=model_rtc_profile,
+        )
+        policy_artifact_json = prepared_resolution.deployment_artifact_path
+    if image_wire_config.enabled and prepared_resolution is None:
+        parser.error(
+            "Optimized --image-wire-profile requires "
+            "--prepared-training-profile so the adapter remains process-local."
+        )
 
     inferred_root = _openpi_root_from_checkpoint(checkpoint_dir)
     openpi_root = (
@@ -177,6 +402,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     if openpi_root is None:
         parser.error("cannot infer OpenPI root; pass --openpi-root")
+    if prepared_resolution is not None:
+        profile_openpi_root = Path(
+            str(prepared_resolution.profile["openpi_checkout"])
+        ).expanduser().resolve()
+        if profile_openpi_root != openpi_root:
+            parser.error(
+                "--openpi-root differs from the prepared training profile: "
+                f"{openpi_root} != {profile_openpi_root}"
+            )
     server_script = openpi_root / "scripts/serve_dexteleop_policy.py"
     base_registry = openpi_root / "configs/dexteleop_policy_registry.json"
     if not server_script.is_file():
@@ -187,28 +421,75 @@ def main(argv: list[str] | None = None) -> int:
     model_id, runtime_registry = write_runtime_registry(
         base_registry=base_registry,
         checkpoint_dir=checkpoint_dir,
-        config_name=args.config,
+        policy_artifact_json=policy_artifact_json,
+        prepared_training_profile=prepared_training_profile,
+        model_rtc_profile=model_rtc_profile,
+        config_name=(
+            prepared_resolution.openpi_config_name
+            if prepared_resolution is not None
+            else args.config
+        ),
         default_prompt=args.default_prompt,
         action_horizon=args.action_horizon,
     )
-    command = [
-        sys.executable,
-        str(server_script),
-        "--model",
-        model_id,
-        "--registry",
-        str(runtime_registry),
-        "--host",
-        str(args.host),
-        "--port",
-        str(args.port),
-    ]
+    if prepared_resolution is None:
+        command = [
+            sys.executable,
+            str(server_script),
+            "--model",
+            model_id,
+            "--registry",
+            str(runtime_registry),
+            "--host",
+            str(args.host),
+            "--port",
+            str(args.port),
+        ]
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "deployments.openpi.prepared_server_runtime",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--policy-artifact-json",
+            str(prepared_resolution.deployment_artifact_path),
+            "--prepared-training-profile",
+            str(prepared_training_profile),
+            "--openpi-root",
+            str(openpi_root),
+            "--model",
+            model_id,
+            "--registry",
+            str(runtime_registry),
+            "--host",
+            str(args.host),
+            "--port",
+            str(args.port),
+        ]
+        if model_rtc_profile is not None:
+            command.extend(("--model-rtc-profile", str(model_rtc_profile)))
     if args.default_prompt is not None:
         command.extend(("--default-prompt", args.default_prompt))
     if args.record:
         command.append("--record")
     if args.enable_rtc_continuation:
         command.append("--enable-rtc-continuation")
+    if image_wire_config.enabled:
+        command.extend(
+            (
+                "--image-wire-profile",
+                image_wire_config.profile,
+                "--image-wire-height",
+                str(image_wire_config.target_height),
+                "--image-wire-width",
+                str(image_wire_config.target_width),
+                "--image-wire-jpeg-quality",
+                str(image_wire_config.jpeg_quality),
+            )
+        )
+    if args.prepared_config_check_only:
+        command.append("--validate-only")
     project_root = Path(__file__).resolve().parents[2]
     runtime_pythonpath = _pythonpath_with_project(
         project_root,
@@ -221,12 +502,59 @@ def main(argv: list[str] | None = None) -> int:
                     "model_id": model_id,
                     "command": command,
                     "environment": {"PYTHONPATH": runtime_pythonpath},
+                    "excluded_cpu_ids": sorted(
+                        set(int(cpu) for cpu in args.exclude_cpu)
+                    ),
+                    "policy_artifact_json": (
+                        str(artifact_path)
+                        if policy_artifact_json is None
+                        else str(policy_artifact_json)
+                    ),
+                    "prepared_deployment_binding": (
+                        None
+                        if prepared_resolution is None
+                        else dict(prepared_resolution.binding)
+                    ),
+                    "norm_stats_path": (
+                        None
+                        if prepared_resolution is None
+                        else str(prepared_resolution.norm_stats_path)
+                    ),
+                    "model_rtc_profile": (
+                        None
+                        if model_rtc_profile is None
+                        else str(model_rtc_profile)
+                    ),
+                    **(
+                        {
+                            "image_wire": {
+                                "profile": image_wire_config.profile,
+                                "target_shape": [
+                                    image_wire_config.target_height,
+                                    image_wire_config.target_width,
+                                    3,
+                                ],
+                                "jpeg_quality": image_wire_config.jpeg_quality,
+                            }
+                        }
+                        if image_wire_config.enabled
+                        else {}
+                    ),
                 },
                 indent=2,
             )
         )
         return 0
 
+    excluded_cpu_ids = tuple(sorted(set(int(cpu) for cpu in args.exclude_cpu)))
+    if excluded_cpu_ids:
+        reservation = _exclude_server_cpus_before_exec(excluded_cpu_ids)
+        print(
+            "[OpenPICPU] READY: server process excludes control CPUs "
+            f"{list(excluded_cpu_ids)}; migrated_native_threads="
+            f"{reservation['native_threads_migrated']} inherited_after_exec=true.",
+            flush=True,
+        )
     os.environ["PYTHONPATH"] = runtime_pythonpath
     os.chdir(openpi_root)
     os.execv(sys.executable, command)

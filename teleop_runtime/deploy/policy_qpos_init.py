@@ -7,7 +7,13 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from robot_motion.deploy.schema import ACTION_DIM, ARM_JOINT_DOF
+from robot_motion.action import HandActionSpec
+from robot_motion.deploy.schema import (
+    ACTION_DIM,
+    ACTION_HAND_SLICES,
+    ARM_JOINT_DOF,
+    HAND_DOF,
+)
 from robot_motion.replay.trajectory import (
     QPOS_INIT_AUTO,
     ReplayTrajectoryGroup,
@@ -49,6 +55,13 @@ from .replay import (
 # should remain in teleop_runtime.
 
 
+_QPOS_INIT_FRESH_HARDWARE_MAX_AGE_SEC = 0.25
+_DMTAC_COMMAND_CONFIRM_TOLERANCE = 0.002
+_DMTAC_ACCEPTED_SEND_STATUSES = frozenset(
+    {"sent", "skipped_threshold", "rate_limited"}
+)
+
+
 @dataclass(frozen=True)
 class DeployPolicyQposInitPlan:
     source_path: str
@@ -82,13 +95,32 @@ class DeployPolicyQposInitSettings:
     qpos_init_branch_search: bool = DEFAULT_QPOS_INIT_BRANCH_SEARCH
     qpos_init_branch_search_max_branches: int = DEFAULT_QPOS_INIT_BRANCH_SEARCH_MAX_BRANCHES
     qpos_init_branch_neutral_qpos_path: str | Path | None = DEFAULT_QPOS_TARGET_PATH
+    initialize_hands: bool = True
+    hand_reached_tolerance: float = 0.05
+    dmtac_hand_reached_tolerance: float = 0.18
+    hand_state_max_age_sec: float = 0.5
+    hand_progress_timeout_sec: float = 2.0
+    hand_progress_epsilon: float = 0.02
+    hand_reconnect_attempts: int = 1
 
 
 @dataclass(frozen=True)
 class PolicyQposInitStepResult:
+    # Qpos init never admits a Cartesian action. In particular, plan.action
+    # may be stored in canonical_desk while the live deployment observation is
+    # runtime_raw, so it must not become the runtime safety/reference anchor.
     last_action: np.ndarray | None = None
     completed: bool = False
+    requires_fresh_observation: bool = False
     message: str = ""
+
+
+@dataclass(frozen=True)
+class _HandInitEvaluation:
+    reached: bool
+    status_text: str
+    reconnect_sides: tuple[str, ...] = ()
+    exhausted_sides: tuple[str, ...] = ()
 
 
 def _load_policy_qpos_init_actions(
@@ -101,8 +133,9 @@ def _load_policy_qpos_init_actions(
     """Load one display/hold action without assuming a legacy 26D source row.
 
     Qpos target selection below uses only audited joint-state columns.  The
-    action retained on the init plan is nevertheless consumed by status/debug
-    paths, so it must always be a canonical 26D deployment action.  v2.2
+    action retained on the init plan is diagnostic metadata only and must not
+    become the runtime ``last_action`` reference. It must nevertheless remain
+    a canonical 26D deployment action. v2.2
     datasets store a compact layout-bound action (16D for dual DMTAC), which
     must take the same explicit bridge used by dataset replay.
     """
@@ -231,6 +264,7 @@ class DeployPolicyQposInitController:
         plan: DeployPolicyQposInitPlan,
         *,
         active_sides: Sequence[str],
+        hand_action_specs_by_side: Mapping[str, Any] | None = None,
         settings: DeployPolicyQposInitSettings | None = None,
     ) -> None:
         self.plan = plan
@@ -245,6 +279,22 @@ class DeployPolicyQposInitController:
         self._effective_timeout_s = float(self.settings.move_to_start_timeout_s)
         self._last_message = ""
         self._last_qpos_error_text = ""
+        self._last_hand_error_text = ""
+        self._hand_command_attempted_at_by_side: dict[str, float] = {}
+        self._hand_best_error_by_side: dict[str, float] = {}
+        self._hand_last_progress_at_by_side: dict[str, float] = {}
+        self._hand_reconnect_attempts_by_side: dict[str, int] = {}
+        self._hand_action_specs_by_side = _normalize_hand_action_specs(
+            hand_action_specs_by_side
+        )
+        self._target_hand_by_side = (
+            _hand_targets_from_action(
+                self.plan.action,
+                specs_by_side=self._hand_action_specs_by_side,
+            )
+            if bool(self.settings.initialize_hands)
+            else {}
+        )
 
     @property
     def blocks_policy(self) -> bool:
@@ -252,7 +302,12 @@ class DeployPolicyQposInitController:
 
     @property
     def running(self) -> bool:
-        return self.state in {"planning", "moving", "final_hold"}
+        return self.state in {
+            "planning",
+            "moving",
+            "final_hold",
+            "hand_final_hold",
+        }
 
     @property
     def status_text(self) -> str:
@@ -265,6 +320,9 @@ class DeployPolicyQposInitController:
         if self.state == "final_hold":
             suffix = "" if not self._last_qpos_error_text else f",err={self._last_qpos_error_text}"
             return f"policy_qpos_init=final_hold{suffix}"
+        if self.state == "hand_final_hold":
+            suffix = "" if not self._last_hand_error_text else f",err={self._last_hand_error_text}"
+            return f"policy_qpos_init=hands{suffix}"
         if self.state == "failed":
             return "policy_qpos_init=failed:g"
         if self.state == "timeout":
@@ -288,6 +346,11 @@ class DeployPolicyQposInitController:
         self._step_count = 0
         self._effective_timeout_s = float(self.settings.move_to_start_timeout_s)
         self._last_qpos_error_text = ""
+        self._last_hand_error_text = ""
+        self._hand_command_attempted_at_by_side.clear()
+        self._hand_best_error_by_side.clear()
+        self._hand_last_progress_at_by_side.clear()
+        self._hand_reconnect_attempts_by_side.clear()
         try:
             self._build_plan(arm_backends)
         except Exception as exc:  # noqa: BLE001 - planning failed before any command is sent.
@@ -305,7 +368,8 @@ class DeployPolicyQposInitController:
         )
         self._last_message = (
             "[PolicyQposInit] qpos init plan ready "
-            f"frame={self.plan.frame_index} steps={self._step_count} sources={sources}"
+            f"frame={self.plan.frame_index} steps={self._step_count} sources={sources} "
+            f"hand_sides={list(self._target_hand_by_side)}"
         )
         return self._last_message
 
@@ -315,21 +379,23 @@ class DeployPolicyQposInitController:
         now: float,
         send_actions: bool,
         arm_backends: Mapping[str, Any],
+        hand_backends: Mapping[str, Any] | None = None,
     ) -> PolicyQposInitStepResult:
         if self.state in {"idle", "planning", "failed", "timeout", "released"}:
             return PolicyQposInitStepResult()
-        timeout_message = self._timeout_message(arm_backends)
+        hand_backend_map = {} if hand_backends is None else hand_backends
+        timeout_message = self._timeout_message(
+            arm_backends,
+            hand_backends=hand_backend_map,
+        )
         if timeout_message:
             self.state = "timeout"
             self._started_monotonic = None
             self._last_message = timeout_message
-            return PolicyQposInitStepResult(
-                last_action=self.plan.action,
-                message=timeout_message,
-            )
+            return PolicyQposInitStepResult(message=timeout_message)
         if self.state == "moving":
             if float(now) + 1e-9 < float(self._next_send_at):
-                return PolicyQposInitStepResult(last_action=self.plan.action)
+                return PolicyQposInitStepResult()
             if self._step_index < self._step_count:
                 step = self._plan_steps[self._step_index]
                 if send_actions:
@@ -346,14 +412,11 @@ class DeployPolicyQposInitController:
                             exc,
                         )
                         self._last_message = message
-                        return PolicyQposInitStepResult(
-                            last_action=self.plan.action,
-                            message=message,
-                        )
+                        return PolicyQposInitStepResult(message=message)
                 self._step_index += 1
                 self._next_send_at = float(now) + max(0.001, float(self.settings.qpos_init_dt_sec))
                 if self._step_index < self._step_count:
-                    return PolicyQposInitStepResult(last_action=self.plan.action)
+                    return PolicyQposInitStepResult()
             self.state = "final_hold"
 
         if self.state == "final_hold":
@@ -365,13 +428,20 @@ class DeployPolicyQposInitController:
             )
             self._last_qpos_error_text = error_text
             if reached:
-                self.state = "released"
-                return PolicyQposInitStepResult(
-                    last_action=self.plan.action,
-                    completed=True,
-                    message="[PolicyQposInit] dataset frame qpos reached; policy startup is released.",
-                )
-            if send_actions:
+                if self._target_hand_by_side:
+                    self.state = "hand_final_hold"
+                    self._next_send_at = min(float(self._next_send_at), float(now))
+                else:
+                    self.state = "released"
+                    return PolicyQposInitStepResult(
+                        completed=True,
+                        requires_fresh_observation=True,
+                        message=(
+                            "[PolicyQposInit] dataset frame qpos reached; "
+                            "policy startup is released."
+                        ),
+                    )
+            if send_actions and not reached:
                 try:
                     _send_qpos_targets(
                         self.plan.target_qpos_by_side,
@@ -385,11 +455,133 @@ class DeployPolicyQposInitController:
                         exc,
                     )
                     self._last_message = message
-                    return PolicyQposInitStepResult(
-                        last_action=self.plan.action,
-                        message=message,
+                    return PolicyQposInitStepResult(message=message)
+            if self.state == "final_hold":
+                return PolicyQposInitStepResult()
+
+        if self.state == "hand_final_hold":
+            evaluation = _hand_reached_status(
+                self._target_hand_by_side,
+                specs_by_side=self._hand_action_specs_by_side,
+                hand_backends=hand_backend_map,
+                tolerance=float(self.settings.hand_reached_tolerance),
+                dmtac_tolerance=float(
+                    self.settings.dmtac_hand_reached_tolerance
+                ),
+                max_age_sec=float(self.settings.hand_state_max_age_sec),
+                progress_timeout_sec=float(
+                    self.settings.hand_progress_timeout_sec
+                ),
+                progress_epsilon=float(self.settings.hand_progress_epsilon),
+                reconnect_attempt_limit=int(
+                    self.settings.hand_reconnect_attempts
+                ),
+                command_attempted_at_by_side=(
+                    self._hand_command_attempted_at_by_side
+                ),
+                best_error_by_side=self._hand_best_error_by_side,
+                last_progress_at_by_side=(
+                    self._hand_last_progress_at_by_side
+                ),
+                reconnect_attempts_by_side=(
+                    self._hand_reconnect_attempts_by_side
+                ),
+                send_actions=send_actions,
+                now=float(now),
+            )
+            self._last_hand_error_text = evaluation.status_text
+            if evaluation.reached:
+                self.state = "released"
+                return PolicyQposInitStepResult(
+                    completed=True,
+                    requires_fresh_observation=True,
+                    message=(
+                        "[PolicyQposInit] dataset frame qpos and end-effector "
+                        "targets reached; policy startup is released."
+                    ),
+                )
+            if evaluation.exhausted_sides:
+                self.state = "failed"
+                sides = ",".join(evaluation.exhausted_sides)
+                message = (
+                    "[PolicyQposInit] end-effector init failed closed after "
+                    f"reconnect and force-resend; sides={sides} "
+                    f"status={evaluation.status_text}. Policy remains blocked."
+                )
+                self._last_message = message
+                return PolicyQposInitStepResult(message=message)
+            if evaluation.reconnect_sides:
+                try:
+                    _reconnect_and_force_send_hand_targets(
+                        evaluation.reconnect_sides,
+                        targets_by_side=self._target_hand_by_side,
+                        hand_backends=hand_backend_map,
+                        frame_index=int(self.plan.frame_index),
                     )
-            return PolicyQposInitStepResult(last_action=self.plan.action)
+                except Exception as exc:  # noqa: BLE001
+                    self.state = "failed"
+                    message = _format_execution_failure(
+                        "end-effector reconnect/force-resend failed",
+                        exc,
+                    )
+                    self._last_message = message
+                    return PolicyQposInitStepResult(message=message)
+                for side in evaluation.reconnect_sides:
+                    side_key = str(side)
+                    self._hand_reconnect_attempts_by_side[side_key] = (
+                        int(
+                            self._hand_reconnect_attempts_by_side.get(
+                                side_key,
+                                0,
+                            )
+                        )
+                        + 1
+                    )
+                    self._hand_command_attempted_at_by_side[side_key] = float(now)
+                    self._hand_best_error_by_side.pop(side_key, None)
+                    self._hand_last_progress_at_by_side.pop(side_key, None)
+                self._next_send_at = float(now) + max(
+                    0.001,
+                    float(self.settings.qpos_init_dt_sec),
+                )
+                attempts_text = ",".join(
+                    f"{side}={self._hand_reconnect_attempts_by_side[str(side)]}/"
+                    f"{int(self.settings.hand_reconnect_attempts)}"
+                    for side in evaluation.reconnect_sides
+                )
+                return PolicyQposInitStepResult(
+                    message=(
+                        "[PolicyQposInit] no measured end-effector progress; "
+                        "reconnected gripper and force-resent the recorded "
+                        f"target ({attempts_text})."
+                    )
+                )
+            if send_actions and float(now) + 1e-9 >= float(self._next_send_at):
+                try:
+                    _send_hand_targets(
+                        self._target_hand_by_side,
+                        hand_backends=hand_backend_map,
+                        frame_index=int(self.plan.frame_index),
+                        source="policy_qpos_init_hand_final_hold",
+                    )
+                    for side in self._target_hand_by_side:
+                        self._hand_command_attempted_at_by_side.setdefault(
+                            str(side),
+                            float(now),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self.state = "failed"
+                    message = _format_execution_failure(
+                        "end-effector init command send failed",
+                        exc,
+                    )
+                    self._last_message = message
+                    return PolicyQposInitStepResult(message=message)
+                self._next_send_at = float(now) + max(
+                    0.001,
+                    float(self.settings.qpos_init_dt_sec),
+                )
+            return PolicyQposInitStepResult()
         return PolicyQposInitStepResult()
 
     def _build_plan(self, arm_backends: Mapping[str, Any]) -> None:
@@ -432,7 +624,12 @@ class DeployPolicyQposInitController:
             planned_duration_s + execution_margin_s,
         )
 
-    def _timeout_message(self, arm_backends: Mapping[str, Any]) -> str:
+    def _timeout_message(
+        self,
+        arm_backends: Mapping[str, Any],
+        *,
+        hand_backends: Mapping[str, Any],
+    ) -> str:
         if self._started_monotonic is None:
             return ""
         if time.monotonic() - float(self._started_monotonic) <= float(self._effective_timeout_s):
@@ -444,13 +641,47 @@ class DeployPolicyQposInitController:
             send_actions=True,
         )
         self._last_qpos_error_text = error_text
+        hand_error_text = ""
+        if self._target_hand_by_side:
+            evaluation = _hand_reached_status(
+                self._target_hand_by_side,
+                specs_by_side=self._hand_action_specs_by_side,
+                hand_backends=hand_backends,
+                tolerance=float(self.settings.hand_reached_tolerance),
+                dmtac_tolerance=float(
+                    self.settings.dmtac_hand_reached_tolerance
+                ),
+                max_age_sec=float(self.settings.hand_state_max_age_sec),
+                progress_timeout_sec=float(
+                    self.settings.hand_progress_timeout_sec
+                ),
+                progress_epsilon=float(self.settings.hand_progress_epsilon),
+                reconnect_attempt_limit=int(
+                    self.settings.hand_reconnect_attempts
+                ),
+                command_attempted_at_by_side=(
+                    self._hand_command_attempted_at_by_side
+                ),
+                best_error_by_side=self._hand_best_error_by_side,
+                last_progress_at_by_side=(
+                    self._hand_last_progress_at_by_side
+                ),
+                reconnect_attempts_by_side=(
+                    self._hand_reconnect_attempts_by_side
+                ),
+                send_actions=True,
+                now=time.time(),
+            )
+            hand_error_text = evaluation.status_text
+            self._last_hand_error_text = hand_error_text
         return (
             "[PolicyQposInit] timed out while moving to dataset frame; "
             "policy remains blocked and no further qpos-init commands will be sent. "
             f"state={self.state} step={self._step_index}/{self._step_count} "
             f"timeout_s={float(self._effective_timeout_s):.2f} "
             f"tolerance_rad={float(self.settings.qpos_reached_tolerance_rad):.4f} "
-            f"{error_text}"
+            f"{error_text} "
+            f"hand={hand_error_text or 'not_configured'}"
         )
 
 
@@ -495,7 +726,7 @@ def _current_qpos_by_side(
         state_source = str(state.get("_qpos_state_source") or "")
         keys = (
             ("hardware_qpos", "measured_qpos")
-            if state_source == "hardware_refresh"
+            if state_source in {"hardware_refresh", "fresh_hardware_snapshot"}
             else ("hardware_qpos", "measured_qpos", "current_qpos")
         )
         for key in keys:
@@ -512,17 +743,326 @@ def _current_qpos_by_side(
 
 
 def _backend_state(backend: Any) -> Mapping[str, Any]:
+    get_state = getattr(backend, "get_state", None)
+    if callable(get_state):
+        cached = dict(get_state())
+        qpos = cached.get("hardware_qpos")
+        measured_at = cached.get("measured_timestamp_monotonic")
+        try:
+            vector = np.asarray(qpos, dtype=float).reshape(-1)
+            measured_monotonic = float(measured_at)
+            age_sec = time.monotonic() - measured_monotonic
+            fresh_hardware = bool(
+                vector.shape == (ARM_JOINT_DOF,)
+                and np.all(np.isfinite(vector))
+                and np.isfinite(measured_monotonic)
+                and 0.0 <= age_sec <= _QPOS_INIT_FRESH_HARDWARE_MAX_AGE_SEC
+                and bool(cached.get("hardware_measurement_valid"))
+                and bool(cached.get("hardware_read_success"))
+                and int(cached.get("hardware_measurement_sequence") or 0) > 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            fresh_hardware = False
+        if fresh_hardware:
+            cached["_qpos_state_source"] = "fresh_hardware_snapshot"
+            cached["_qpos_hardware_age_sec"] = float(age_sec)
+            return cached
     refresh = getattr(backend, "refresh_state_from_hardware", None)
     if callable(refresh):
         state = dict(refresh())
         state["_qpos_state_source"] = "hardware_refresh"
         return state
-    get_state = getattr(backend, "get_state", None)
     if not callable(get_state):
         raise RuntimeError("arm backend exposes neither hardware refresh nor state read.")
-    state = dict(get_state())
+    state = cached
     state["_qpos_state_source"] = "compatibility_state"
     return state
+
+
+def _normalize_hand_action_specs(
+    specs_by_side: Mapping[str, Any] | None,
+) -> dict[str, HandActionSpec]:
+    normalized: dict[str, HandActionSpec] = {}
+    for side, payload in dict(specs_by_side or {}).items():
+        if isinstance(payload, HandActionSpec):
+            spec = payload
+        elif isinstance(payload, Mapping):
+            spec = HandActionSpec.from_metadata(payload)
+        else:
+            raise TypeError(
+                f"Policy qpos init hand spec for {side!r} must be HandActionSpec or metadata."
+            )
+        if int(spec.slot_count) != HAND_DOF:
+            raise ValueError(
+                f"Policy qpos init requires {HAND_DOF}-slot canonical hand actions; "
+                f"{side} declares {spec.slot_count}."
+            )
+        normalized[str(side)] = spec
+    return normalized
+
+
+def _hand_targets_from_action(
+    action: Any,
+    *,
+    specs_by_side: Mapping[str, HandActionSpec],
+) -> dict[str, np.ndarray]:
+    vector = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
+    targets: dict[str, np.ndarray] = {}
+    for side, spec in specs_by_side.items():
+        slots = np.asarray(
+            vector[ACTION_HAND_SLICES[str(side)]],
+            dtype=np.float32,
+        ).reshape(HAND_DOF)
+        validated = spec.validate_vector(slots)
+        active = spec.active_values(validated)
+        if np.any(active < 0.0) or np.any(active > 1.0):
+            raise ValueError(
+                f"Policy qpos init {side} hand target must be normalized to [0, 1]."
+            )
+        targets[str(side)] = active.astype(np.float32, copy=True)
+    return targets
+
+
+def _send_hand_targets(
+    targets_by_side: Mapping[str, Any],
+    *,
+    hand_backends: Mapping[str, Any],
+    frame_index: int,
+    source: str,
+) -> None:
+    for side, target in targets_by_side.items():
+        backend = hand_backends.get(str(side))
+        if backend is None:
+            raise RuntimeError(
+                f"Policy qpos init missing backend for {side}_hand."
+            )
+        backend.send_command(
+            EffectorCommand(
+                effector_name=f"{side}_hand",
+                side=str(side),
+                command_type="joint_vector",
+                value=np.asarray(target, dtype=np.float32).reshape(-1).copy(),
+                frame_name=None,
+                metadata={
+                    "source": str(source),
+                    "policy_qpos_init_frame": int(frame_index),
+                },
+            )
+        )
+
+
+def _reconnect_and_force_send_hand_targets(
+    sides: Sequence[str],
+    *,
+    targets_by_side: Mapping[str, Any],
+    hand_backends: Mapping[str, Any],
+    frame_index: int,
+) -> None:
+    del frame_index  # Reserved for future backend receipt metadata.
+    for side in sides:
+        side_key = str(side)
+        backend = hand_backends.get(side_key)
+        if backend is None:
+            raise RuntimeError(
+                f"Policy qpos init missing backend for {side_key}_hand."
+            )
+        reconnect = getattr(backend, "force_reconnect_gripper", None)
+        force_send = getattr(backend, "send_fixed_joint_pos", None)
+        if not callable(reconnect) or not callable(force_send):
+            raise RuntimeError(
+                f"{side_key}_hand does not expose DMTAC reconnect/force-send."
+            )
+        if not bool(reconnect("policy_qpos_init_no_measured_progress")):
+            raise RuntimeError(f"{side_key}_hand gripper reconnect returned false.")
+        target = np.asarray(targets_by_side[side_key], dtype=float).reshape(-1)
+        if target.shape != (1,) or not np.all(np.isfinite(target)):
+            raise ValueError(
+                f"{side_key}_hand DMTAC target must be one finite scalar."
+            )
+        if not bool(force_send(float(target[0]))):
+            raise RuntimeError(f"{side_key}_hand force-resend returned false.")
+
+
+def _measured_hand_target(
+    state: Mapping[str, Any],
+    *,
+    spec: HandActionSpec,
+) -> np.ndarray | None:
+    if int(spec.active_dof) == 1:
+        scalar = state.get("gripper_measured_scalar")
+        if scalar is not None:
+            try:
+                value = np.asarray([float(scalar)], dtype=float)
+            except (TypeError, ValueError, OverflowError):
+                value = np.asarray([], dtype=float)
+            if value.shape == (1,) and np.all(np.isfinite(value)):
+                return value
+    for key in ("measured_joint_pos", "joint_pos"):
+        raw = state.get(key)
+        if raw is None:
+            continue
+        try:
+            vector = np.asarray(raw, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            continue
+        if vector.shape == (int(spec.active_dof),) and np.all(np.isfinite(vector)):
+            return vector.copy()
+        if vector.shape == (int(spec.slot_count),) and np.all(np.isfinite(vector)):
+            return spec.active_values(vector).astype(float, copy=True)
+    return None
+
+
+def _hand_reached_status(
+    targets_by_side: Mapping[str, Any],
+    *,
+    specs_by_side: Mapping[str, HandActionSpec],
+    hand_backends: Mapping[str, Any],
+    tolerance: float,
+    dmtac_tolerance: float,
+    max_age_sec: float,
+    progress_timeout_sec: float,
+    progress_epsilon: float,
+    reconnect_attempt_limit: int,
+    command_attempted_at_by_side: Mapping[str, float],
+    best_error_by_side: dict[str, float],
+    last_progress_at_by_side: dict[str, float],
+    reconnect_attempts_by_side: Mapping[str, int],
+    send_actions: bool,
+    now: float,
+) -> _HandInitEvaluation:
+    if not send_actions:
+        return _HandInitEvaluation(reached=True, status_text="dry-run")
+    status_by_side: dict[str, str] = {}
+    all_reached = True
+    reconnect_sides: list[str] = []
+    exhausted_sides: list[str] = []
+    for side, target in targets_by_side.items():
+        side_key = str(side)
+        backend = hand_backends.get(str(side))
+        spec = specs_by_side.get(str(side))
+        if backend is None or spec is None:
+            return _HandInitEvaluation(
+                reached=False,
+                status_text=f"{side}:backend_or_spec_unavailable",
+            )
+        try:
+            state = dict(backend.get_state())
+        except Exception as exc:  # noqa: BLE001
+            return _HandInitEvaluation(
+                reached=False,
+                status_text=f"{side}:state_read_failed:{type(exc).__name__}:{exc}",
+            )
+        measured_at = state.get("joint_timestamp")
+        try:
+            measurement_age_sec = float(now) - float(measured_at)
+        except (TypeError, ValueError, OverflowError):
+            return _HandInitEvaluation(
+                reached=False,
+                status_text=f"{side}:measurement_timestamp_unavailable",
+            )
+        if (
+            not np.isfinite(measurement_age_sec)
+            or measurement_age_sec < -float(max_age_sec)
+            or measurement_age_sec > float(max_age_sec)
+        ):
+            return _HandInitEvaluation(
+                reached=False,
+                status_text=f"{side}:measurement_stale:{measurement_age_sec:.3f}s",
+            )
+        measured = _measured_hand_target(state, spec=spec)
+        if measured is None:
+            return _HandInitEvaluation(
+                reached=False,
+                status_text=f"{side}:measured_target_unavailable",
+            )
+        requested = np.asarray(target, dtype=float).reshape(int(spec.active_dof))
+        error = float(np.max(np.abs(requested - measured)))
+        if str(spec.hand_model) != "dmtac_gripper":
+            reached = error <= float(tolerance)
+            all_reached = all_reached and reached
+            status_by_side[side_key] = (
+                f"measured_err={error:.4f}"
+                if reached
+                else f"measured_wait={error:.4f}"
+            )
+            continue
+
+        attempted_at = command_attempted_at_by_side.get(side_key)
+        if attempted_at is None:
+            all_reached = False
+            status_by_side[side_key] = "command_not_attempted"
+            continue
+        send_status = str(state.get("gripper_last_send_status") or "unknown")
+        commanded_scalar = state.get("gripper_commanded_scalar")
+        try:
+            commanded_error = abs(float(commanded_scalar) - float(requested[0]))
+        except (TypeError, ValueError, OverflowError):
+            commanded_error = float("inf")
+        command_confirmed = bool(
+            send_status in _DMTAC_ACCEPTED_SEND_STATUSES
+            and np.isfinite(commanded_error)
+            and commanded_error <= _DMTAC_COMMAND_CONFIRM_TOLERANCE
+        )
+        if not command_confirmed:
+            all_reached = False
+            status_by_side[side_key] = (
+                f"command_unconfirmed:{send_status}:err={commanded_error:.4f}"
+            )
+            continue
+        feedback_after_attempt = bool(
+            float(measured_at) + 1e-6 >= float(attempted_at)
+        )
+        if not feedback_after_attempt:
+            all_reached = False
+            status_by_side[side_key] = (
+                f"feedback_pre_command:measured_err={error:.4f}"
+            )
+            continue
+        if error <= float(dmtac_tolerance):
+            status_by_side[side_key] = (
+                f"measured_reached:{send_status}:err={error:.4f}"
+            )
+            continue
+        all_reached = False
+        previous_best = best_error_by_side.get(side_key)
+        if previous_best is None:
+            best_error_by_side[side_key] = error
+            last_progress_at_by_side[side_key] = float(attempted_at)
+        elif error <= float(previous_best) - max(0.0, float(progress_epsilon)):
+            best_error_by_side[side_key] = error
+            last_progress_at_by_side[side_key] = float(now)
+        best_error = float(best_error_by_side.get(side_key, error))
+        last_progress_at = float(
+            last_progress_at_by_side.get(side_key, attempted_at)
+        )
+        stalled_for = max(0.0, float(now) - last_progress_at)
+        if stalled_for + 1e-9 < max(0.0, float(progress_timeout_sec)):
+            status_by_side[side_key] = (
+                f"moving_wait:err={error:.4f}:best={best_error:.4f}"
+                f":stall={stalled_for:.2f}s"
+            )
+            continue
+        reconnect_count = int(reconnect_attempts_by_side.get(side_key, 0))
+        if reconnect_count < max(0, int(reconnect_attempt_limit)):
+            reconnect_sides.append(side_key)
+            status_by_side[side_key] = (
+                f"reconnect_required:err={error:.4f}:best={best_error:.4f}"
+                f":stall={stalled_for:.2f}s"
+            )
+        else:
+            exhausted_sides.append(side_key)
+            status_by_side[side_key] = (
+                f"reconnect_exhausted:err={error:.4f}:best={best_error:.4f}"
+                f":stall={stalled_for:.2f}s"
+            )
+    return _HandInitEvaluation(
+        reached=all_reached,
+        status_text=";".join(
+            f"{side}={status}" for side, status in status_by_side.items()
+        ),
+        reconnect_sides=tuple(reconnect_sides),
+        exhausted_sides=tuple(exhausted_sides),
+    )
 
 
 def _send_qpos_targets(

@@ -15,8 +15,8 @@ from dataset_contracts.model_continuation_training import (
     ModelContinuationTrainingRunManifest,
 )
 from dataset_contracts.policy_artifact import PolicyArtifactContract
-from deployments.client import load_policy_artifact
-from deployments.openpi.client.rtc import openpi_rtc_artifact_hash
+from deployments.policy_artifact import load_policy_artifact
+from deployments.openpi.artifact_identity import openpi_rtc_artifact_hash
 
 
 MODEL_CONTINUATION_TRAINING_RUN_FILENAME_V1 = (

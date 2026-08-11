@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import gc
 import math
 import queue
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 import numpy as np
@@ -34,9 +35,17 @@ from robot_motion.position_control import (
     DEFAULT_POSITION_COMMAND_HZ,
     DEFAULT_POSITION_REFERENCE_HZ,
     DEFAULT_POSITION_SAMPLE_HZ,
+    POSITION_PLAN_SPLICE_HOLD_RESTART,
+    POSITION_PLAN_SPLICE_STREAM_START,
     PositionControlProfile,
     ResampledMotionReference,
     TimestampedMotionTarget,
+    PositionPlanSpliceDecision,
+    PositionStreamStartAcquisitionConfig,
+    PositionSourcePlanCut,
+    build_position_stream_start_acquisition,
+    requires_clock_rebase_and_tail_drain_for_position_plan_splice,
+    resolve_position_plan_splice,
 )
 from robot_motion.rm65 import (
     RM65PositionCollisionPlanResult,
@@ -49,6 +58,7 @@ from robot_motion.runtime import (
     ExecutionEpochGuard,
     ExecutionWorkItem,
     WorkerEpochDrainReceipt,
+    bind_current_thread_to_cpu,
 )
 from robot_motion.safety_constraints import (
     constrain_joint_vector,
@@ -69,6 +79,83 @@ _TIME_EPSILON_SEC = 1e-12
 _DEFAULT_SAMPLE_HZ = DEFAULT_POSITION_SAMPLE_HZ
 _DEFAULT_REFERENCE_HZ = DEFAULT_POSITION_REFERENCE_HZ
 _DEFAULT_COMMAND_HZ = DEFAULT_POSITION_COMMAND_HZ
+
+
+# CPython's cyclic collector is process-global and runs while holding the GIL.
+# A ref-counted lease keeps multiple executor instances from restoring it while
+# another authoritative reference stream still relies on suppression.
+_CYCLIC_GC_GUARD_LOCK = threading.Lock()
+_CYCLIC_GC_GUARD_OWNER_COUNT = 0
+_CYCLIC_GC_GUARD_RESTORE_ENABLED = False
+
+
+def _acquire_cyclic_gc_guard() -> dict[str, Any]:
+    global _CYCLIC_GC_GUARD_OWNER_COUNT
+    global _CYCLIC_GC_GUARD_RESTORE_ENABLED
+
+    with _CYCLIC_GC_GUARD_LOCK:
+        owner_count_before = int(_CYCLIC_GC_GUARD_OWNER_COUNT)
+        enabled_before = bool(gc.isenabled())
+        collection_count_before = tuple(int(value) for value in gc.get_count())
+        collected_objects: int | None = None
+        collection_wall_ms = 0.0
+        collection_cpu_ms = 0.0
+        if owner_count_before == 0:
+            _CYCLIC_GC_GUARD_RESTORE_ENABLED = enabled_before
+            if enabled_before:
+                wall_started = time.perf_counter()
+                cpu_started = time.thread_time()
+                collected_objects = int(gc.collect(2))
+                collection_cpu_ms = max(
+                    0.0,
+                    (time.thread_time() - cpu_started) * 1000.0,
+                )
+                collection_wall_ms = max(
+                    0.0,
+                    (time.perf_counter() - wall_started) * 1000.0,
+                )
+                gc.disable()
+        elif enabled_before:
+            # Repair an out-of-band gc.enable() while another executor owns
+            # the process-wide lease. Do not collect inside an active stream.
+            gc.disable()
+        _CYCLIC_GC_GUARD_OWNER_COUNT += 1
+        return {
+            "owner_count_before": owner_count_before,
+            "owner_count_after": int(_CYCLIC_GC_GUARD_OWNER_COUNT),
+            "gc_enabled_before": enabled_before,
+            "gc_enabled_after": bool(gc.isenabled()),
+            "collection_generation": 2 if collected_objects is not None else None,
+            "collection_count_before": list(collection_count_before),
+            "collected_objects": collected_objects,
+            "collection_wall_ms": float(collection_wall_ms),
+            "collection_cpu_ms": float(collection_cpu_ms),
+        }
+
+
+def _release_cyclic_gc_guard() -> dict[str, Any]:
+    global _CYCLIC_GC_GUARD_OWNER_COUNT
+    global _CYCLIC_GC_GUARD_RESTORE_ENABLED
+
+    with _CYCLIC_GC_GUARD_LOCK:
+        owner_count_before = int(_CYCLIC_GC_GUARD_OWNER_COUNT)
+        if owner_count_before <= 0:
+            raise RuntimeError("cyclic GC guard release has no active owner")
+        _CYCLIC_GC_GUARD_OWNER_COUNT -= 1
+        restore_enabled = bool(
+            _CYCLIC_GC_GUARD_OWNER_COUNT == 0
+            and _CYCLIC_GC_GUARD_RESTORE_ENABLED
+        )
+        if _CYCLIC_GC_GUARD_OWNER_COUNT == 0:
+            _CYCLIC_GC_GUARD_RESTORE_ENABLED = False
+            if restore_enabled:
+                gc.enable()
+        return {
+            "owner_count_before": owner_count_before,
+            "owner_count_after": int(_CYCLIC_GC_GUARD_OWNER_COUNT),
+            "gc_restore_requested": restore_enabled,
+            "gc_enabled_after": bool(gc.isenabled()),
+        }
 
 
 class PositionDeployQueueFullError(RuntimeError):
@@ -109,6 +196,32 @@ class PositionDeployExecutorConfig:
     # current sample-rate action is consumed, so references query the current logical
     # time instead of adding the legacy one-sample causal delay.
     chunk_lookahead_enabled: bool = False
+    # Default-off typed source-plan splice handoff. Deployment detects the
+    # source cut; robot_motion resolves its dynamic-state semantics.
+    plan_splice_governor_enabled: bool = False
+    # Default-off non-RTC timing half of the splice contract. A Hold restart
+    # gets a fresh source-clock epoch after planner preparation, and the upper
+    # deployment loop must drain the shifted tail before clearing again.
+    plan_splice_clock_rebase_enabled: bool = False
+    # Default-off first-source acquisition.  Deployment supplies only the
+    # typed stream-start cut; robot_motion owns the bounded SE(3) subdivision.
+    stream_start_acquisition: PositionStreamStartAcquisitionConfig = field(
+        default_factory=PositionStreamStartAcquisitionConfig
+    )
+    # Optional fail-closed bound on a single reference-worker overrun burst.
+    # ``None`` preserves compatibility for callers that have not admitted a
+    # real-time planner. Production position deployment enables this guard.
+    max_reference_tick_skip_burst: int | None = None
+    # Default-off Linux native-thread pinning. This isolates the authoritative
+    # reference worker from an explicitly pinned proposal worker without
+    # changing process-wide scheduling or the formal rollback profile.
+    reference_worker_cpu: int | None = None
+    # Default-off low-level lease. The real deployment CLI enables it so a
+    # stop-the-world cyclic collection cannot starve the authoritative 60 Hz
+    # reference worker after the first stream is admitted. Ordinary reference
+    # counting remains enabled; the prior process-wide cyclic-GC state is
+    # restored when the executor closes.
+    cyclic_gc_guard_enabled: bool = False
 
     @classmethod
     def from_position_profile(
@@ -193,6 +306,11 @@ class PositionDeployExecutorConfig:
             "debug_events_enabled",
             bool(self.debug_events_enabled),
         )
+        object.__setattr__(
+            self,
+            "cyclic_gc_guard_enabled",
+            bool(self.cyclic_gc_guard_enabled),
+        )
         if (
             isinstance(self.debug_event_queue_size, bool)
             or int(self.debug_event_queue_size) != self.debug_event_queue_size
@@ -212,6 +330,70 @@ class PositionDeployExecutorConfig:
         )
         object.__setattr__(
             self,
+            "plan_splice_governor_enabled",
+            bool(self.plan_splice_governor_enabled),
+        )
+        object.__setattr__(
+            self,
+            "plan_splice_clock_rebase_enabled",
+            bool(self.plan_splice_clock_rebase_enabled),
+        )
+        if not isinstance(
+            self.stream_start_acquisition,
+            PositionStreamStartAcquisitionConfig,
+        ):
+            raise TypeError(
+                "stream_start_acquisition must be a "
+                "PositionStreamStartAcquisitionConfig."
+            )
+        if (
+            self.plan_splice_clock_rebase_enabled
+            and not self.plan_splice_governor_enabled
+        ):
+            raise ValueError(
+                "plan_splice_clock_rebase_enabled requires "
+                "plan_splice_governor_enabled=True"
+            )
+        if (
+            self.stream_start_acquisition.enabled
+            and not self.plan_splice_governor_enabled
+        ):
+            raise ValueError(
+                "stream-start acquisition requires "
+                "plan_splice_governor_enabled=True"
+            )
+        if self.max_reference_tick_skip_burst is not None:
+            if (
+                isinstance(self.max_reference_tick_skip_burst, bool)
+                or int(self.max_reference_tick_skip_burst)
+                != self.max_reference_tick_skip_burst
+                or int(self.max_reference_tick_skip_burst) < 0
+            ):
+                raise ValueError(
+                    "max_reference_tick_skip_burst must be a non-negative "
+                    "integer or None"
+                )
+            object.__setattr__(
+                self,
+                "max_reference_tick_skip_burst",
+                int(self.max_reference_tick_skip_burst),
+            )
+        if self.reference_worker_cpu is not None:
+            if (
+                isinstance(self.reference_worker_cpu, bool)
+                or int(self.reference_worker_cpu) != self.reference_worker_cpu
+                or int(self.reference_worker_cpu) < 0
+            ):
+                raise ValueError(
+                    "reference_worker_cpu must be a non-negative integer or None"
+                )
+            object.__setattr__(
+                self,
+                "reference_worker_cpu",
+                int(self.reference_worker_cpu),
+            )
+        object.__setattr__(
+            self,
             "allow_non_authoritative_collision_reset_in_dry_run",
             bool(self.allow_non_authoritative_collision_reset_in_dry_run),
         )
@@ -223,6 +405,14 @@ class PositionDeployExecutorConfig:
     @property
     def reference_period_sec(self) -> float:
         return 1.0 / self.reference_hz
+
+
+@dataclass(frozen=True)
+class _StreamStartPreludeSource:
+    source_index: int
+    source_timestamp: float
+    pose_by_side: Mapping[str, np.ndarray]
+    plan_splice_decision: PositionPlanSpliceDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -255,8 +445,14 @@ class _Submission:
     second_lookahead_source_index: int | None = None
     second_lookahead_timestamp: float | None = None
     second_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
+    third_lookahead_source_index: int | None = None
+    third_lookahead_timestamp: float | None = None
+    third_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
     execution_work_item: ExecutionWorkItem | None = None
     lookahead_execution_work_item: ExecutionWorkItem | None = None
+    plan_splice_decision: PositionPlanSpliceDecision | None = None
+    stream_start_prelude: tuple[_StreamStartPreludeSource, ...] = ()
+    stream_start_acquisition_metadata: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -267,6 +463,7 @@ class _ReferenceTemplate:
     source_timestamp: float
     discrete_command: TeleopCommand | None = None
     execution_work_item: ExecutionWorkItem | None = None
+    plan_splice_decision: PositionPlanSpliceDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -515,6 +712,7 @@ class PositionDeployExecutor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._discrete_thread: threading.Thread | None = None
+        self._reference_worker_affinity_ready = threading.Event()
 
         self._started = False
         self._closing = False
@@ -529,6 +727,13 @@ class PositionDeployExecutor:
         self._last_submitted_timestamp: float | None = None
         self._last_source_timestamp: float | None = None
         self._next_tick_timestamp: float | None = None
+        self._reference_query_offset_sec = 0.0
+        self._stream_source_timestamp_offset_sec = 0.0
+        self._stream_start_acquisition_count = 0
+        self._last_stream_start_acquisition_metadata: dict[str, Any] | None = None
+        self._plan_splice_tail_drain_required = False
+        self._plan_splice_clock_rebase_count = 0
+        self._last_committed_reference_query_timestamp: float | None = None
         self._staged_lookahead_source_index: int | None = None
         self._staged_lookahead_timestamp: float | None = None
         self._staged_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
@@ -570,6 +775,8 @@ class PositionDeployExecutor:
         self._hold_retry_required = False
         self._hold_callback_thread_id: int | None = None
         self._missed_reference_ticks = 0
+        self._reference_worker_affinity_receipt: dict[str, Any] | None = None
+        self._reference_worker_affinity_error: str | None = None
         self._last_reference_metadata: dict[str, Any] | None = None
         self._last_discrete_metadata: dict[str, Any] | None = None
         self._debug_events: deque[dict[str, Any]] = deque(
@@ -590,6 +797,11 @@ class PositionDeployExecutor:
         self._last_completed_execution_work_item: ExecutionWorkItem | None = None
         self._last_old_epoch_invocation_started_at: float | None = None
         self._last_old_epoch_invocation_completed_at: float | None = None
+        self._cyclic_gc_guard_acquired = False
+        self._cyclic_gc_guard_activation_count = 0
+        self._cyclic_gc_guard_activation_metadata: dict[str, Any] | None = None
+        self._cyclic_gc_guard_release_metadata: dict[str, Any] | None = None
+        self._cyclic_gc_guard_release_deferred: dict[str, Any] | None = None
 
     @property
     def dry_run(self) -> bool:
@@ -654,6 +866,17 @@ class PositionDeployExecutor:
             thread.start()
             if discrete_thread is not None:
                 discrete_thread.start()
+        if self.config.reference_worker_cpu is not None:
+            if not self._reference_worker_affinity_ready.wait(timeout=1.0):
+                raise RuntimeError(
+                    "position reference worker did not publish its CPU-affinity "
+                    "receipt within 1.000s"
+                )
+            if self._reference_worker_affinity_error is not None:
+                raise RuntimeError(
+                    "position reference worker CPU-affinity setup failed: "
+                    f"{self._reference_worker_affinity_error}"
+                )
 
     def submit(
         self,
@@ -667,8 +890,11 @@ class PositionDeployExecutor:
         lookahead_discrete_command: TeleopCommand | None = None,
         second_lookahead_filtered: FilteredNormalizedAction | None = None,
         second_lookahead_observation: DeploymentObservation | None = None,
+        third_lookahead_filtered: FilteredNormalizedAction | None = None,
+        third_lookahead_observation: DeploymentObservation | None = None,
         execution_work_item: ExecutionWorkItem | None = None,
         lookahead_execution_work_item: ExecutionWorkItem | None = None,
+        source_plan_cut: PositionSourcePlanCut | None = None,
     ) -> int:
         """Enqueue one safe keyframe without applying its safety filter again.
 
@@ -682,6 +908,20 @@ class PositionDeployExecutor:
             raise TypeError("filtered must be a FilteredNormalizedAction")
         if not isinstance(observation, DeploymentObservation):
             raise TypeError("observation must be a DeploymentObservation")
+        if source_plan_cut is not None and not isinstance(
+            source_plan_cut,
+            PositionSourcePlanCut,
+        ):
+            raise TypeError("source_plan_cut must be a PositionSourcePlanCut or None")
+        if source_plan_cut is not None and not self.config.plan_splice_governor_enabled:
+            raise ValueError(
+                "source_plan_cut requires plan_splice_governor_enabled=True"
+            )
+        plan_splice_decision = (
+            None
+            if source_plan_cut is None
+            else resolve_position_plan_splice(source_plan_cut)
+        )
         if lookahead_filtered is not None and not self.config.chunk_lookahead_enabled:
             raise ValueError(
                 "lookahead_filtered requires chunk_lookahead_enabled=True"
@@ -714,6 +954,24 @@ class PositionDeployExecutor:
             raise TypeError(
                 "second_lookahead_observation must be a DeploymentObservation or None"
             )
+        if third_lookahead_filtered is not None and second_lookahead_filtered is None:
+            raise ValueError(
+                "third_lookahead_filtered requires second_lookahead_filtered"
+            )
+        if third_lookahead_filtered is not None and not isinstance(
+            third_lookahead_filtered,
+            FilteredNormalizedAction,
+        ):
+            raise TypeError(
+                "third_lookahead_filtered must be a FilteredNormalizedAction or None"
+            )
+        if third_lookahead_observation is not None and not isinstance(
+            third_lookahead_observation,
+            DeploymentObservation,
+        ):
+            raise TypeError(
+                "third_lookahead_observation must be a DeploymentObservation or None"
+            )
         if filtered.faults:
             self.latch_safety_fault(
                 filtered.faults,
@@ -738,6 +996,11 @@ class PositionDeployExecutor:
                 + ", ".join(
                     str(fault) for fault in second_lookahead_filtered.faults
                 )
+            )
+        if third_lookahead_filtered is not None and third_lookahead_filtered.faults:
+            raise PositionDeployExecutorFault(
+                "cannot stage a third lookahead keyframe with safety faults: "
+                + ", ".join(str(fault) for fault in third_lookahead_filtered.faults)
             )
         if lookahead_discrete_command is not None and lookahead_filtered is None:
             raise ValueError(
@@ -843,6 +1106,21 @@ class PositionDeployExecutor:
                 second_lookahead_filtered,
                 resolved_second_lookahead_observation,
             )
+        resolved_third_lookahead_observation = (
+            resolved_second_lookahead_observation
+            if third_lookahead_observation is None
+            else third_lookahead_observation
+        )
+        third_lookahead_pose_by_side: Mapping[str, np.ndarray] = {}
+        third_lookahead_qpos_by_side: Mapping[str, np.ndarray] = {}
+        if third_lookahead_filtered is not None:
+            (
+                third_lookahead_pose_by_side,
+                third_lookahead_qpos_by_side,
+            ) = self._target_maps(
+                third_lookahead_filtered,
+                resolved_third_lookahead_observation,
+            )
         try:
             self._validate_observation_reference_domain(
                 observation,
@@ -871,6 +1149,13 @@ class PositionDeployExecutor:
                 qpos_sides=tuple(second_lookahead_qpos_by_side),
                 require_fresh_measurement=False,
             )
+        if third_lookahead_filtered is not None:
+            self._validate_observation_reference_domain(
+                resolved_third_lookahead_observation,
+                pose_sides=tuple(third_lookahead_pose_by_side),
+                qpos_sides=tuple(third_lookahead_qpos_by_side),
+                require_fresh_measurement=False,
+            )
         signature = (tuple(sorted(pose_by_side)), tuple(sorted(qpos_by_side)))
         lookahead_signature = (
             tuple(sorted(lookahead_pose_by_side)),
@@ -890,6 +1175,17 @@ class PositionDeployExecutor:
         ):
             raise ValueError(
                 "current and second lookahead pose/qpos side modalities must match"
+            )
+        third_lookahead_signature = (
+            tuple(sorted(third_lookahead_pose_by_side)),
+            tuple(sorted(third_lookahead_qpos_by_side)),
+        )
+        if (
+            third_lookahead_filtered is not None
+            and third_lookahead_signature != signature
+        ):
+            raise ValueError(
+                "current and third lookahead pose/qpos side modalities must match"
             )
         if self.config.collision_required:
             if qpos_by_side:
@@ -915,6 +1211,13 @@ class PositionDeployExecutor:
                 raise ValueError(
                     "collision-required second lookahead needs left+right target poses"
                 )
+            if (
+                third_lookahead_filtered is not None
+                and set(third_lookahead_pose_by_side) != {"left", "right"}
+            ):
+                raise ValueError(
+                    "collision-required third lookahead needs left+right target poses"
+                )
 
         with self._lock:
             if self._closing or self._closed:
@@ -939,11 +1242,99 @@ class PositionDeployExecutor:
             collision_reset_qpos: Mapping[str, np.ndarray] | None = None
             collision_reset_metadata: Mapping[str, Any] | None = None
             next_source_index = self._next_source_index
-            logical_timestamp = timestamp
+            logical_timestamp = (
+                timestamp + self._stream_source_timestamp_offset_sec
+            )
+            next_stream_source_timestamp_offset_sec = (
+                self._stream_source_timestamp_offset_sec
+            )
+            stream_start_prelude: tuple[_StreamStartPreludeSource, ...] = ()
+            stream_start_acquisition_metadata: Mapping[str, Any] | None = None
             current_already_staged = False
             staged_discrete_was_present = False
             effective_discrete_command = discrete_command
-            if self.config.chunk_lookahead_enabled:
+            if (
+                first
+                and self.config.stream_start_acquisition.enabled
+                and pose_by_side
+            ):
+                if qpos_by_side:
+                    raise ValueError(
+                        "stream-start acquisition does not accept mixed Pose/QPOS "
+                        "targets."
+                    )
+                if (
+                    plan_splice_decision is None
+                    or plan_splice_decision.mode
+                    not in {
+                        POSITION_PLAN_SPLICE_STREAM_START,
+                        POSITION_PLAN_SPLICE_HOLD_RESTART,
+                    }
+                ):
+                    raise ValueError(
+                        "stream-start acquisition requires a typed reset-state "
+                        "or acknowledged-Hold source-plan cut."
+                    )
+                measured_pose, _measured_qpos = self._anchor_maps(
+                    observation,
+                    pose_sides=tuple(pose_by_side),
+                    qpos_sides=(),
+                )
+                acquisition = build_position_stream_start_acquisition(
+                    measured_pose,
+                    pose_by_side,
+                    config=self.config.stream_start_acquisition,
+                )
+                stream_start_acquisition_metadata = acquisition.to_metadata()
+                if acquisition.active:
+                    prelude: list[_StreamStartPreludeSource] = []
+                    for offset, prelude_pose in enumerate(
+                        acquisition.prelude_pose_by_side
+                    ):
+                        prelude.append(
+                            _StreamStartPreludeSource(
+                                source_index=next_source_index,
+                                source_timestamp=(
+                                    timestamp
+                                    + float(offset)
+                                    * self.config.sample_period_sec
+                                ),
+                                pose_by_side={
+                                    side: np.asarray(value, dtype=float).copy()
+                                    for side, value in prelude_pose.items()
+                                },
+                                plan_splice_decision=(
+                                    plan_splice_decision
+                                    if offset == 0
+                                    else None
+                                ),
+                            )
+                        )
+                        next_source_index += 1
+                    stream_start_prelude = tuple(prelude)
+                    source_index = next_source_index
+                    next_source_index += 1
+                    logical_timestamp = (
+                        timestamp
+                        + float(acquisition.source_intervals)
+                        * self.config.sample_period_sec
+                    )
+                    next_stream_source_timestamp_offset_sec = (
+                        float(acquisition.source_intervals)
+                        * self.config.sample_period_sec
+                    )
+                    if self.config.collision_required:
+                        (
+                            collision_reset_qpos,
+                            collision_reset_metadata,
+                        ) = self._collision_reset_qpos(
+                            observation,
+                            now_monotonic=timestamp,
+                        )
+
+            if stream_start_prelude:
+                pass
+            elif self.config.chunk_lookahead_enabled:
                 staged_matches = bool(
                     self._staged_lookahead_source_index is not None
                     and self._staged_lookahead_timestamp is not None
@@ -1048,6 +1439,17 @@ class PositionDeployExecutor:
                     float(logical_timestamp)
                     + 2.0 * self.config.sample_period_sec
                 )
+            third_lookahead_source_index: int | None = None
+            third_lookahead_timestamp: float | None = None
+            if third_lookahead_filtered is not None:
+                # Like the second successor, this is speculative planner input
+                # only. It is exposed so a two-interval C2 plan for the next
+                # source cut can finish before that cut becomes authoritative.
+                third_lookahead_source_index = next_source_index + 1
+                third_lookahead_timestamp = (
+                    float(logical_timestamp)
+                    + 3.0 * self.config.sample_period_sec
+                )
 
             submission = _Submission(
                 generation=self._generation,
@@ -1108,18 +1510,50 @@ class PositionDeployExecutor:
                     if second_lookahead_filtered is None
                     else dict(second_lookahead_pose_by_side)
                 ),
+                third_lookahead_source_index=third_lookahead_source_index,
+                third_lookahead_timestamp=third_lookahead_timestamp,
+                third_lookahead_pose_by_side=(
+                    None
+                    if third_lookahead_filtered is None
+                    else dict(third_lookahead_pose_by_side)
+                ),
                 execution_work_item=execution_work_item,
                 lookahead_execution_work_item=lookahead_execution_work_item,
+                plan_splice_decision=plan_splice_decision,
+                stream_start_prelude=stream_start_prelude,
+                stream_start_acquisition_metadata=(
+                    stream_start_acquisition_metadata
+                ),
             )
+            guard_acquired_before_submit = self._cyclic_gc_guard_acquired
+            if first and self.config.cyclic_gc_guard_enabled:
+                self._activate_cyclic_gc_guard_locked()
             try:
                 self._queue.put_nowait(submission)
             except queue.Full as exc:
                 self._queue_full_count += 1
+                if (
+                    not guard_acquired_before_submit
+                    and self._cyclic_gc_guard_acquired
+                ):
+                    self._release_cyclic_gc_guard_locked()
                 raise PositionDeployQueueFullError(
                     f"position deploy input FIFO is full ({self.config.queue_size})"
                 ) from exc
 
             self._next_source_index = next_source_index
+            self._stream_source_timestamp_offset_sec = (
+                next_stream_source_timestamp_offset_sec
+            )
+            if stream_start_prelude:
+                self._stream_start_acquisition_count += 1
+                self._last_stream_start_acquisition_metadata = {
+                    **dict(stream_start_acquisition_metadata or {}),
+                    "source_timestamp_offset_sec": float(
+                        next_stream_source_timestamp_offset_sec
+                    ),
+                    "first_policy_source_index": int(source_index),
+                }
             self._submission_stream_initialized = True
             self._stream_signature = signature
             self._last_submitted_timestamp = timestamp
@@ -1187,7 +1621,27 @@ class PositionDeployExecutor:
                     "same_chunk_second_lookahead": bool(
                         second_lookahead_filtered is not None
                     ),
+                    "same_chunk_third_lookahead": bool(
+                        third_lookahead_filtered is not None
+                    ),
                     "current_already_staged": bool(current_already_staged),
+                    "position_plan_splice": (
+                        None
+                        if plan_splice_decision is None
+                        else plan_splice_decision.to_metadata()
+                    ),
+                    "stream_start_acquisition": (
+                        None
+                        if stream_start_acquisition_metadata is None
+                        else dict(stream_start_acquisition_metadata)
+                    ),
+                    "stream_start_prelude_source_indices": [
+                        int(item.source_index)
+                        for item in stream_start_prelude
+                    ],
+                    "logical_source_timestamp_monotonic": float(
+                        logical_timestamp
+                    ),
                     "queue_depth": int(self._queue.qsize()),
                 },
             )
@@ -1515,15 +1969,141 @@ class PositionDeployExecutor:
             details["sides"][side] = side_details
         return details
 
+    def source_tail_drain_status(self) -> Mapping[str, Any]:
+        """Report whether an opt-in rebased non-RTC source tail is complete.
+
+        Deployment owns the decision to end an exhausted policy chunk.  This
+        motion-owned receipt exposes only whether the last staged source time
+        has actually produced an accepted (or dry-run) reference, so the
+        caller need not reconstruct interpolation or planner state.
+        """
+
+        with self._lock:
+            return self._source_tail_drain_status_locked()
+
+    def _source_tail_drain_status_locked(self) -> dict[str, Any]:
+        required = bool(
+            self.config.plan_splice_clock_rebase_enabled
+            and self._plan_splice_tail_drain_required
+        )
+        terminal = self._terminal_timestamp
+        committed_query = self._last_committed_reference_query_timestamp
+        queue_depth = int(self._queue.qsize())
+        terminal_discrete_candidates = [
+            (int(source_index), float(template.source_timestamp))
+            for source_index, template in self._templates.items()
+            if terminal is not None
+            and template.source_timestamp <= float(terminal) + _TIME_EPSILON_SEC
+            and template.discrete_command is not None
+            and bool(template.discrete_command.commands)
+        ]
+        terminal_discrete_source_index = (
+            None
+            if not terminal_discrete_candidates
+            else max(
+                terminal_discrete_candidates,
+                key=lambda item: (item[1], item[0]),
+            )[0]
+        )
+        last_discrete = self._last_discrete_metadata
+        last_discrete_source_index = (
+            None
+            if last_discrete is None
+            else last_discrete.get("position_discrete_source_index")
+        )
+        last_discrete_status = (
+            None
+            if last_discrete is None
+            else last_discrete.get("position_discrete_dispatch_status")
+        )
+        discrete_drained = bool(
+            terminal_discrete_source_index is None
+            or (
+                last_discrete_source_index is not None
+                and int(last_discrete_source_index)
+                >= int(terminal_discrete_source_index)
+                and str(last_discrete_status)
+                in {"accepted", "backend_skipped", "dry_run"}
+            )
+        )
+        if not required:
+            drained = True
+            reason = "not_required"
+        elif queue_depth:
+            drained = False
+            reason = "accepted_source_queue_not_empty"
+        elif terminal is None:
+            drained = False
+            reason = "terminal_source_timestamp_unavailable"
+        elif committed_query is None:
+            drained = False
+            reason = "no_committed_reference"
+        else:
+            arm_drained = bool(
+                committed_query + _TIME_EPSILON_SEC >= float(terminal)
+            )
+            drained = bool(arm_drained and discrete_drained)
+            if not arm_drained:
+                reason = "terminal_source_pending"
+            elif not discrete_drained:
+                reason = "terminal_discrete_dispatch_pending"
+            else:
+                reason = "terminal_source_emitted"
+        return {
+            "required": required,
+            "drained": bool(drained),
+            "reason": reason,
+            "active": bool(self._active),
+            "accepted_source_queue_depth": queue_depth,
+            "terminal_source_timestamp": terminal,
+            "last_committed_reference_query_timestamp": committed_query,
+            "reference_query_offset_sec": float(self._reference_query_offset_sec),
+            "terminal_discrete_source_index": terminal_discrete_source_index,
+            "last_discrete_source_index": last_discrete_source_index,
+            "last_discrete_dispatch_status": last_discrete_status,
+            "terminal_discrete_drained": discrete_drained,
+        }
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             fault = self._fault
+            tail_drain = self._source_tail_drain_status_locked()
             return {
                 "started": bool(self._started),
                 "active": bool(self._active),
                 "closing": bool(self._closing),
                 "closed": bool(self._closed),
                 "dry_run": bool(self.dry_run),
+                "plan_splice_governor_enabled": bool(
+                    self.config.plan_splice_governor_enabled
+                ),
+                "plan_splice_clock_rebase_enabled": bool(
+                    self.config.plan_splice_clock_rebase_enabled
+                ),
+                "plan_splice_reference_query_offset_sec": float(
+                    self._reference_query_offset_sec
+                ),
+                "plan_splice_tail_drain_required": bool(
+                    self._plan_splice_tail_drain_required
+                ),
+                "plan_splice_clock_rebase_count": int(
+                    self._plan_splice_clock_rebase_count
+                ),
+                "stream_source_timestamp_offset_sec": float(
+                    self._stream_source_timestamp_offset_sec
+                ),
+                "stream_start_acquisition_enabled": bool(
+                    self.config.stream_start_acquisition.enabled
+                ),
+                "stream_start_acquisition_count": int(
+                    self._stream_start_acquisition_count
+                ),
+                "last_stream_start_acquisition": (
+                    None
+                    if self._last_stream_start_acquisition_metadata is None
+                    else dict(self._last_stream_start_acquisition_metadata)
+                ),
+                "plan_splice_tail_drain": tail_drain,
                 "queue_depth": int(self._queue.qsize()),
                 "queue_capacity": int(self.config.queue_size),
                 "submitted_count": int(self._submitted_count),
@@ -1559,6 +2139,43 @@ class PositionDeployExecutor:
                 "last_hold_error": self._last_hold_error,
                 "hold_retry_required": bool(self._hold_retry_required),
                 "missed_reference_ticks": int(self._missed_reference_ticks),
+                "max_reference_tick_skip_burst": (
+                    self.config.max_reference_tick_skip_burst
+                ),
+                "reference_worker_cpu": self.config.reference_worker_cpu,
+                "cyclic_gc_guard_enabled": bool(
+                    self.config.cyclic_gc_guard_enabled
+                ),
+                "cyclic_gc_guard_acquired": bool(
+                    self._cyclic_gc_guard_acquired
+                ),
+                "cyclic_gc_guard_activation_count": int(
+                    self._cyclic_gc_guard_activation_count
+                ),
+                "cyclic_gc_guard_activation": (
+                    None
+                    if self._cyclic_gc_guard_activation_metadata is None
+                    else dict(self._cyclic_gc_guard_activation_metadata)
+                ),
+                "cyclic_gc_guard_release": (
+                    None
+                    if self._cyclic_gc_guard_release_metadata is None
+                    else dict(self._cyclic_gc_guard_release_metadata)
+                ),
+                "cyclic_gc_guard_release_deferred": (
+                    None
+                    if self._cyclic_gc_guard_release_deferred is None
+                    else dict(self._cyclic_gc_guard_release_deferred)
+                ),
+                "cyclic_gc_process_enabled": bool(gc.isenabled()),
+                "reference_worker_affinity_receipt": (
+                    None
+                    if self._reference_worker_affinity_receipt is None
+                    else dict(self._reference_worker_affinity_receipt)
+                ),
+                "reference_worker_affinity_error": (
+                    self._reference_worker_affinity_error
+                ),
                 "last_submitted_timestamp": self._last_submitted_timestamp,
                 "last_source_timestamp": self._last_source_timestamp,
                 "fault_latched": fault is not None,
@@ -1670,6 +2287,59 @@ class PositionDeployExecutor:
                 "segment_collision_certified": False,
             }
 
+    def collision_reset_preflight(
+        self,
+        observation: DeploymentObservation,
+        *,
+        timestamp_monotonic: float | None = None,
+    ) -> Mapping[str, Any]:
+        """Check whether the first collision reset can use this observation.
+
+        This is a passive admission probe: it neither initializes the planner
+        nor mutates the submission stream. Frontends with synchronous model
+        inference use it to retain a queued action until a fresh causal
+        hardware snapshot is available. ``submit()`` still repeats the exact
+        same fail-closed check at the authoritative execution cut.
+        """
+
+        if not isinstance(observation, DeploymentObservation):
+            raise TypeError("observation must be a DeploymentObservation")
+        now = _finite_time(
+            self._clock()
+            if timestamp_monotonic is None
+            else timestamp_monotonic,
+            name="timestamp_monotonic",
+        )
+        with self._lock:
+            required = bool(
+                self.config.collision_required
+                and not self._submission_stream_initialized
+            )
+        if not required:
+            return {
+                "ready": True,
+                "required": False,
+                "reason": "collision_reset_not_required",
+            }
+        try:
+            _qpos_by_side, metadata = self._collision_reset_qpos(
+                observation,
+                now_monotonic=now,
+            )
+        except ValueError as exc:
+            return {
+                "ready": False,
+                "required": True,
+                "reason": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        return {
+            "ready": True,
+            "required": True,
+            "reason": "fresh_collision_reset_available",
+            "metadata": dict(metadata),
+        }
+
     def drain_debug_events(self) -> list[dict[str, Any]]:
         """Drain bounded observational events without touching control state."""
 
@@ -1768,6 +2438,36 @@ class PositionDeployExecutor:
                             )
                     except BaseException as exc:
                         close_errors.append(exc)
+            planner = self._collision_planner
+            shutdown_planner_workers = (
+                None
+                if planner is None
+                else getattr(planner, "shutdown_background_workers", None)
+            )
+            if callable(shutdown_planner_workers):
+                try:
+                    shutdown_planner_workers(timeout_sec=timeout)
+                except BaseException as exc:
+                    close_errors.append(exc)
+            if close_errors:
+                with self._lock:
+                    if self._cyclic_gc_guard_acquired:
+                        self._defer_cyclic_gc_guard_release_locked(
+                            reason="executor_close_failed",
+                            error_count=len(close_errors),
+                        )
+            else:
+                try:
+                    with self._lock:
+                        self._release_cyclic_gc_guard_locked()
+                except BaseException as exc:
+                    close_errors.append(exc)
+                    with self._lock:
+                        if self._cyclic_gc_guard_acquired:
+                            self._defer_cyclic_gc_guard_release_locked(
+                                reason="gc_restore_failed",
+                                error_count=len(close_errors),
+                            )
             if close_errors:
                 details = "; ".join(
                     f"{type(error).__name__}: {error}" for error in close_errors
@@ -2030,8 +2730,34 @@ class PositionDeployExecutor:
 
     def _run(self) -> None:
         try:
+            try:
+                affinity_receipt = bind_current_thread_to_cpu(
+                    self.config.reference_worker_cpu,
+                    role="position_reference_worker",
+                )
+            except Exception as exc:  # noqa: BLE001 - affinity is fail-closed.
+                self._reference_worker_affinity_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._reference_worker_affinity_ready.set()
+                raise
+            with self._lock:
+                self._reference_worker_affinity_receipt = dict(affinity_receipt)
+                self._append_debug_event_locked(
+                    "reference_worker_affinity",
+                    dict(affinity_receipt),
+                )
+            self._reference_worker_affinity_ready.set()
             while not self._stop.is_set():
-                self._drain_submissions()
+                # Admit at most one 15 Hz source update before returning to the
+                # authoritative 60 Hz deadline.  An unbounded drain can starve
+                # the first reference when a second source point arrives while
+                # the stream-start/collision preparation for the first point is
+                # still completing.
+                drain_started = _finite_time(self._clock(), name="clock")
+                drained_submissions = self._drain_submissions(max_items=1)
+                drain_completed = _finite_time(self._clock(), name="clock")
+                queue_depth_after_drain = self._queue.qsize()
                 with self._lock:
                     active = bool(
                         self._active
@@ -2057,7 +2783,13 @@ class PositionDeployExecutor:
                     self._wake.clear()
                     continue
 
+                emit_started = now
+                emit_cpu_started = time.thread_time()
                 self._emit_reference(scheduled_timestamp=next_tick)
+                emit_cpu_elapsed_ms = max(
+                    0.0,
+                    time.thread_time() - emit_cpu_started,
+                ) * 1000.0
                 after = _finite_time(self._clock(), name="clock")
                 with self._lock:
                     if not self._active:
@@ -2074,6 +2806,91 @@ class PositionDeployExecutor:
                         )
                         following += skipped * self.config.reference_period_sec
                         self._missed_reference_ticks += skipped
+                        max_skip_burst = self.config.max_reference_tick_skip_burst
+                        if (
+                            max_skip_burst is not None
+                            and skipped > max_skip_burst
+                        ):
+                            start_late_ms = max(
+                                0.0,
+                                emit_started - next_tick,
+                            ) * 1000.0
+                            emit_elapsed_ms = max(
+                                0.0,
+                                after - emit_started,
+                            ) * 1000.0
+                            following_late_ms = max(
+                                0.0,
+                                after - (next_tick + self.config.reference_period_sec),
+                            ) * 1000.0
+                            last_reference_metadata = dict(
+                                self._last_reference_metadata or {}
+                            )
+                            planner_frame_total_ms = last_reference_metadata.get(
+                                "position_collision_frame_total_ms"
+                            )
+                            planner_precompute_submit_ms = (
+                                last_reference_metadata.get(
+                                    "position_collision_precompute_submit_ms"
+                                )
+                            )
+                            planner_timing_labels = {
+                                label: (
+                                    "n/a"
+                                    if value is None
+                                    else f"{float(value):.3f}"
+                                )
+                                for label, value in {
+                                    "frame_total": planner_frame_total_ms,
+                                    "selection": last_reference_metadata.get(
+                                        "position_collision_selection_ms"
+                                    ),
+                                    "horizon": last_reference_metadata.get(
+                                        "position_collision_horizon_plan_ms"
+                                    ),
+                                    "validation": last_reference_metadata.get(
+                                        "position_collision_validation_ms"
+                                    ),
+                                    "endpoint_fk": last_reference_metadata.get(
+                                        "position_collision_endpoint_fk_ms"
+                                    ),
+                                    "shadow": last_reference_metadata.get(
+                                        "position_collision_shadow_metadata_ms"
+                                    ),
+                                    "precompute_submit": (
+                                        planner_precompute_submit_ms
+                                    ),
+                                }.items()
+                            }
+                            raise TimeoutError(
+                                "position reference worker deadline burst exceeded: "
+                                f"skipped={skipped} limit={max_skip_burst} "
+                                f"reference_hz={self.config.reference_hz:g} "
+                                f"start_late_ms={start_late_ms:.3f} "
+                                f"emit_elapsed_ms={emit_elapsed_ms:.3f} "
+                                f"emit_cpu_elapsed_ms={emit_cpu_elapsed_ms:.3f} "
+                                f"following_late_ms={following_late_ms:.3f} "
+                                "submission_drain_count="
+                                f"{drained_submissions} "
+                                "submission_drain_elapsed_ms="
+                                f"{max(0.0, drain_completed - drain_started) * 1000.0:.3f} "
+                                "queue_depth_after_drain="
+                                f"{queue_depth_after_drain} "
+                                "planner_frame_total_ms="
+                                f"{planner_timing_labels['frame_total']} "
+                                "planner_selection_ms="
+                                f"{planner_timing_labels['selection']} "
+                                "planner_horizon_ms="
+                                f"{planner_timing_labels['horizon']} "
+                                "planner_validation_ms="
+                                f"{planner_timing_labels['validation']} "
+                                "planner_endpoint_fk_ms="
+                                f"{planner_timing_labels['endpoint_fk']} "
+                                "planner_shadow_ms="
+                                f"{planner_timing_labels['shadow']} "
+                                "planner_precompute_submit_ms="
+                                f"{planner_timing_labels['precompute_submit']}"
+                            )
                     self._next_tick_timestamp = following
         except Exception as exc:  # noqa: BLE001 - a worker failure must be latched.
             self._mark_fault_pending(exc, stage="reference_worker")
@@ -2201,8 +3018,9 @@ class PositionDeployExecutor:
                         "position_discrete_callback_skipped": bool(skipped),
                         "position_discrete_commands": self._command_debug_payload(
                             item.command
-                        ),
-                    }
+                ),
+            }
+
                     if dispatch_error is not None:
                         outcome.update(
                             {
@@ -2288,6 +3106,23 @@ class PositionDeployExecutor:
                 "collision-required arm dispatch did not produce complete dual joint_vector targets"
             )
 
+        group_health = batch.get("arm_backend_health")
+        if group_health is not None and (
+            not isinstance(group_health, Mapping)
+            or not bool(group_health.get("ready", False))
+        ):
+            raise RuntimeError(
+                "collision-required dual-arm health check failed after backend queueing"
+            )
+        raw_health_sides = (
+            group_health.get("sides")
+            if isinstance(group_health, Mapping)
+            else None
+        )
+        health_sides = (
+            dict(raw_health_sides) if isinstance(raw_health_sides, Mapping) else {}
+        )
+
         summary_by_effector: dict[str, dict[str, Any]] = {}
         for effector_name in sorted(expected_names):
             raw_receipt = raw_effectors.get(effector_name)
@@ -2304,14 +3139,25 @@ class PositionDeployExecutor:
                 raise RuntimeError(
                     f"collision-required arm dispatch changed {effector_name} modality"
                 )
-            if receipt.get("backend_ready") is not True:
+            side = str(effector_name).removesuffix("_arm")
+            raw_side_health = health_sides.get(side)
+            side_health = (
+                dict(raw_side_health)
+                if isinstance(raw_side_health, Mapping)
+                else {}
+            )
+            backend_ready = receipt.get("backend_ready")
+            if backend_ready is None:
+                backend_ready = side_health.get("backend_ready")
+            if backend_ready is not True:
                 raise RuntimeError(
                     f"collision-required arm backend {effector_name} is not ready"
                 )
-            if receipt.get("state_error"):
+            state_error = receipt.get("state_error") or side_health.get("state_error")
+            if state_error:
                 raise RuntimeError(
                     f"collision-required arm backend {effector_name} state check failed: "
-                    f"{receipt.get('state_error')}"
+                    f"{state_error}"
                 )
 
             expected = np.asarray(
@@ -2365,11 +3211,26 @@ class PositionDeployExecutor:
                 )
 
             background = receipt.get("background_streaming")
+            if not isinstance(background, Mapping) or not background:
+                background = side_health.get("background_streaming")
             background = dict(background) if isinstance(background, Mapping) else {}
             if background.get("enabled"):
+                health_reasons = tuple(
+                    str(reason)
+                    for reason in (background.get("health_reasons") or ())
+                )
+                blocking_health_reasons = tuple(
+                    reason
+                    for reason in health_reasons
+                    if reason != "low_send_rate"
+                )
+                unhealthy_blocks_dispatch = bool(
+                    background.get("healthy") is False
+                    and (blocking_health_reasons or not health_reasons)
+                )
                 if (
                     background.get("fault")
-                    or background.get("healthy") is False
+                    or unhealthy_blocks_dispatch
                     or background.get("thread_alive") is not True
                     or background.get("target_active") is not True
                     or bool(background.get("target_stale", False))
@@ -2381,12 +3242,35 @@ class PositionDeployExecutor:
             item = {
                 "accepted": True,
                 "rewritten": False,
-                "backend_ready": True,
+                "backend_ready": bool(backend_ready),
                 "operation": receipt.get("operation"),
                 "status": receipt.get("status"),
                 "result_code": receipt.get("result_code"),
                 "singularity_gate_status": singularity_status or None,
                 "background_streaming": background,
+                "dispatch_timing": (
+                    dict(receipt.get("dispatch_timing"))
+                    if isinstance(receipt.get("dispatch_timing"), Mapping)
+                    else {}
+                ),
+                "target_admission_timing": (
+                    dict(receipt.get("receipt_metadata", {}).get("target_admission_timing"))
+                    if isinstance(receipt.get("receipt_metadata"), Mapping)
+                    and isinstance(
+                        receipt.get("receipt_metadata", {}).get("target_admission_timing"),
+                        Mapping,
+                    )
+                    else {}
+                ),
+                "command_phase_timing": (
+                    dict(receipt.get("receipt_metadata", {}).get("command_phase_timing"))
+                    if isinstance(receipt.get("receipt_metadata"), Mapping)
+                    and isinstance(
+                        receipt.get("receipt_metadata", {}).get("command_phase_timing"),
+                        Mapping,
+                    )
+                    else {}
+                ),
             }
             if self.config.debug_events_enabled:
                 item["expected_qpos"] = expected.copy()
@@ -2397,32 +3281,34 @@ class PositionDeployExecutor:
                 )
             summary_by_effector[effector_name] = item
 
-        group_health = batch.get("arm_backend_health")
-        if group_health is not None:
-            if not isinstance(group_health, Mapping) or not bool(
-                group_health.get("ready", False)
-            ):
-                raise RuntimeError(
-                    "collision-required dual-arm health check failed after backend queueing"
-                )
         return {
             "position_arm_backend_dispatch_verified": True,
             "position_arm_backend_dispatch_by_effector": summary_by_effector,
+            "position_arm_backend_dispatch_timing": (
+                dict(batch.get("position_dispatch_timing"))
+                if isinstance(batch.get("position_dispatch_timing"), Mapping)
+                else {}
+            ),
             "position_arm_backend_group_health": (
                 dict(group_health) if isinstance(group_health, Mapping) else None
             ),
         }
 
-    def _drain_submissions(self) -> None:
-        while True:
+    def _drain_submissions(self, *, max_items: int | None = None) -> int:
+        if max_items is not None and max_items <= 0:
+            raise ValueError("max_items must be positive or None")
+        drained = 0
+        while max_items is None or drained < max_items:
             try:
                 submission = self._queue.get_nowait()
             except queue.Empty:
-                return
+                return drained
             try:
                 self._accept_submission(submission)
             finally:
                 self._queue.task_done()
+            drained += 1
+        return drained
 
     def _accept_submission(self, submission: _Submission) -> None:
         guard = self._execution_epoch_guard
@@ -2483,10 +3369,20 @@ class PositionDeployExecutor:
             )
             if callable(stage_source_pose):
                 staged_sources = (
+                    *tuple(
+                        (
+                            item.source_index,
+                            item.source_timestamp,
+                            item.pose_by_side,
+                            item.plan_splice_decision,
+                        )
+                        for item in submission.stream_start_prelude
+                    ),
                     (
                         submission.anchor_source_index,
                         submission.anchor_timestamp,
                         submission.anchor_pose_by_side,
+                        None,
                     ),
                     (
                         submission.source_index,
@@ -2496,25 +3392,108 @@ class PositionDeployExecutor:
                             else submission.logical_timestamp
                         ),
                         submission.pose_by_side,
+                        (
+                            None
+                            if submission.stream_start_prelude
+                            else submission.plan_splice_decision
+                        ),
                     ),
                     (
                         submission.lookahead_source_index,
                         submission.lookahead_timestamp,
                         submission.lookahead_pose_by_side,
+                        None,
                     ),
                     (
                         submission.second_lookahead_source_index,
                         submission.second_lookahead_timestamp,
                         submission.second_lookahead_pose_by_side,
+                        None,
+                    ),
+                    (
+                        submission.third_lookahead_source_index,
+                        submission.third_lookahead_timestamp,
+                        submission.third_lookahead_pose_by_side,
+                        None,
                     ),
                 )
-                for source_index, source_timestamp, poses in staged_sources:
+                for (
+                    source_index,
+                    source_timestamp,
+                    poses,
+                    plan_splice_decision,
+                ) in staged_sources:
                     if source_index is None or source_timestamp is None or not poses:
                         continue
-                    stage_source_pose(
-                        source_index=int(source_index),
-                        source_timestamp=float(source_timestamp),
-                        pose_by_side=poses,
+                    stage_kwargs = {
+                        "source_index": int(source_index),
+                        "source_timestamp": float(source_timestamp),
+                        "pose_by_side": poses,
+                    }
+                    if plan_splice_decision is not None:
+                        stage_kwargs["plan_splice_decision"] = plan_splice_decision
+                    stage_source_pose(**stage_kwargs)
+            if submission.collision_reset_qpos_by_side is not None:
+                prepare_staged_source_horizon = (
+                    None
+                    if planner is None
+                    else getattr(planner, "prepare_staged_source_horizon", None)
+                )
+                if callable(prepare_staged_source_horizon):
+                    preparation_receipt = dict(prepare_staged_source_horizon())
+                    if self._last_collision_reset_metadata is not None:
+                        self._last_collision_reset_metadata = {
+                            **self._last_collision_reset_metadata,
+                            "source_horizon_preparation": preparation_receipt,
+                        }
+                    self._append_debug_event_locked(
+                        "collision_planner_source_horizon_prepared",
+                        preparation_receipt,
+                    )
+                if (
+                    self.config.plan_splice_clock_rebase_enabled
+                    and (
+                        bool(submission.stream_start_prelude)
+                        or requires_clock_rebase_and_tail_drain_for_position_plan_splice(
+                            submission.plan_splice_decision
+                        )
+                    )
+                ):
+                    logical_cut_timestamp = (
+                        float(submission.stream_start_prelude[0].source_timestamp)
+                        if submission.stream_start_prelude
+                        else submission.timestamp
+                        if submission.logical_timestamp is None
+                        else float(submission.logical_timestamp)
+                    )
+                    preparation_completed_at = _finite_time(
+                        self._clock(),
+                        name="post-plan-splice preparation clock",
+                    )
+                    self._reference_query_offset_sec = max(
+                        0.0,
+                        preparation_completed_at - logical_cut_timestamp,
+                    )
+                    self._plan_splice_tail_drain_required = True
+                    self._plan_splice_clock_rebase_count += 1
+                    self._append_debug_event_locked(
+                        "plan_splice_clock_rebased",
+                        {
+                            "source_index": int(submission.source_index),
+                            "logical_cut_timestamp": float(logical_cut_timestamp),
+                            "preparation_completed_at": float(
+                                preparation_completed_at
+                            ),
+                            "reference_query_offset_sec": float(
+                                self._reference_query_offset_sec
+                            ),
+                            "tail_drain_required": True,
+                            "plan_splice_mode": (
+                                None
+                                if submission.plan_splice_decision is None
+                                else submission.plan_splice_decision.mode
+                            ),
+                        },
                     )
             template = _ReferenceTemplate(
                 filtered=submission.filtered,
@@ -2527,12 +3506,56 @@ class PositionDeployExecutor:
                 ),
                 discrete_command=submission.discrete_command,
                 execution_work_item=submission.execution_work_item,
+                plan_splice_decision=(
+                    None
+                    if submission.stream_start_prelude
+                    else submission.plan_splice_decision
+                ),
             )
             logical_timestamp = (
                 submission.timestamp
                 if submission.logical_timestamp is None
                 else float(submission.logical_timestamp)
             )
+            for prelude_offset, prelude_source in enumerate(
+                submission.stream_start_prelude
+            ):
+                stage = (
+                    "stream_start_measured_anchor"
+                    if prelude_offset == 0
+                    else "stream_start_acquisition_intermediate"
+                )
+                self._store_legacy_reference_source_fact_locked(
+                    modality="pose",
+                    source_index=prelude_source.source_index,
+                    source_timestamp=prelude_source.source_timestamp,
+                    source_stage=stage,
+                    target_by_side=prelude_source.pose_by_side,
+                )
+                self._pose_resampler.push(
+                    TimestampedMotionTarget(
+                        timestamp=prelude_source.source_timestamp,
+                        source_index=prelude_source.source_index,
+                        pose_by_side=prelude_source.pose_by_side,
+                        metadata={
+                            "stage": stage,
+                            "stream_start_acquisition": True,
+                            "prelude_offset": int(prelude_offset),
+                        },
+                        available_timestamp=submission.timestamp,
+                    )
+                )
+                self._store_template_locked(
+                    prelude_source.source_index,
+                    replace(
+                        template,
+                        source_timestamp=prelude_source.source_timestamp,
+                        discrete_command=None,
+                        plan_splice_decision=(
+                            prelude_source.plan_splice_decision
+                        ),
+                    ),
+                )
             if submission.anchor_source_index is not None:
                 assert submission.anchor_timestamp is not None
                 if submission.pose_by_side:
@@ -2583,6 +3606,7 @@ class PositionDeployExecutor:
                         template,
                         source_timestamp=submission.anchor_timestamp,
                         discrete_command=None,
+                        plan_splice_decision=None,
                     ),
                 )
 
@@ -2708,12 +3732,21 @@ class PositionDeployExecutor:
                         execution_work_item=(
                             submission.lookahead_execution_work_item
                         ),
+                        plan_splice_decision=None,
                     ),
                 )
             self._last_source_timestamp = submission.timestamp
             self._active = True
             if self._next_tick_timestamp is None:
-                self._next_tick_timestamp = max(logical_timestamp, self._clock())
+                first_motion_timestamp = (
+                    float(submission.stream_start_prelude[0].source_timestamp)
+                    if submission.stream_start_prelude
+                    else logical_timestamp
+                )
+                self._next_tick_timestamp = max(
+                    first_motion_timestamp,
+                    self._clock(),
+                )
 
     def _collision_reset_metadata_at_apply(
         self,
@@ -3144,6 +4177,7 @@ class PositionDeployExecutor:
                     or self._closed
                 ):
                     return
+                query -= self._reference_query_offset_sec
                 generation = self._generation
                 pose_ref = (
                     self._pose_resampler.sample_at(
@@ -3184,6 +4218,10 @@ class PositionDeployExecutor:
                 qpos_ref=qpos_ref,
                 parent_indices=parent_indices,
             )
+            if template.plan_splice_decision is not None:
+                metadata["position_plan_splice"] = (
+                    template.plan_splice_decision.to_metadata()
+                )
             reference_derivations = self._notify_reference_observer(
                 generation=generation,
                 scheduled_timestamp=scheduled_timestamp,
@@ -3375,9 +4413,32 @@ class PositionDeployExecutor:
                             self._last_old_epoch_invocation_started_at = float(
                                 self._clock()
                             )
+                    dispatch_callback_started = _finite_time(
+                        self._clock(),
+                        name="clock",
+                    )
                     try:
                         dispatch_result = self.dispatch_callback(command)
                     finally:
+                        dispatch_callback_completed = _finite_time(
+                            self._clock(),
+                            name="clock",
+                        )
+                        dispatch_callback_ms = max(
+                            0.0,
+                            (dispatch_callback_completed - dispatch_callback_started)
+                            * 1000.0,
+                        )
+                        metadata["position_arm_dispatch_callback_ms"] = (
+                            dispatch_callback_ms
+                        )
+                        command.metadata["position_arm_dispatch_callback_ms"] = (
+                            dispatch_callback_ms
+                        )
+                        for effector_command in command.commands.values():
+                            effector_command.metadata[
+                                "position_arm_dispatch_callback_ms"
+                            ] = dispatch_callback_ms
                         if guard is not None:
                             with self._lock:
                                 self._last_old_epoch_invocation_completed_at = float(
@@ -3510,6 +4571,7 @@ class PositionDeployExecutor:
                     ),
                     "position_arm_commands": self._command_debug_payload(command),
                 }
+                self._last_committed_reference_query_timestamp = float(query)
                 self._last_reference_metadata = dict(committed_metadata)
                 self._append_debug_event_locked(
                     "arm_reference_dispatch",
@@ -3755,6 +4817,12 @@ class PositionDeployExecutor:
             "position_reference_emitted_monotonic_time": float(actual_emit),
             "position_reference_query_monotonic_time": float(query),
             "position_causal_output_lag_sec": float(actual_emit - query),
+            "position_plan_splice_reference_query_offset_sec": float(
+                self._reference_query_offset_sec
+            ),
+            "position_plan_splice_tail_drain_required": bool(
+                self._plan_splice_tail_drain_required
+            ),
             "position_causal_delay_periods": (
                 0 if self.config.chunk_lookahead_enabled else 1
             ),
@@ -3833,6 +4901,24 @@ class PositionDeployExecutor:
             ),
             "position_collision_solve_ms": planner_metadata.get("solve_ms"),
             "position_collision_frame_total_ms": planner_metadata.get("frame_total_ms"),
+            "position_collision_selection_ms": planner_metadata.get(
+                "selection_ms"
+            ),
+            "position_collision_horizon_plan_ms": planner_metadata.get(
+                "horizon_plan_ms"
+            ),
+            "position_collision_validation_ms": planner_metadata.get(
+                "collision_validation_ms"
+            ),
+            "position_collision_endpoint_fk_ms": planner_metadata.get(
+                "endpoint_fk_ms"
+            ),
+            "position_collision_shadow_metadata_ms": planner_metadata.get(
+                "continuous_waypoint_shadow_metadata_ms"
+            ),
+            "position_collision_precompute_submit_ms": planner_metadata.get(
+                "continuous_waypoint_precompute_submit_ms"
+            ),
             "position_collision_time_budget_exceeded": bool(
                 planner_metadata.get("solve_time_budget_exceeded", False)
             ),
@@ -4201,6 +5287,49 @@ class PositionDeployExecutor:
                 if self._hold_callback_thread_id == callback_thread_id:
                     self._hold_callback_thread_id = None
 
+    def _activate_cyclic_gc_guard_locked(self) -> None:
+        if self._cyclic_gc_guard_acquired:
+            return
+        metadata = _acquire_cyclic_gc_guard()
+        self._cyclic_gc_guard_acquired = True
+        self._cyclic_gc_guard_activation_count += 1
+        self._cyclic_gc_guard_activation_metadata = dict(metadata)
+        self._cyclic_gc_guard_release_metadata = None
+        self._cyclic_gc_guard_release_deferred = None
+        self._append_debug_event_locked(
+            "cyclic_gc_guard_activated",
+            metadata,
+        )
+
+    def _release_cyclic_gc_guard_locked(self) -> None:
+        if not self._cyclic_gc_guard_acquired:
+            return
+        metadata = _release_cyclic_gc_guard()
+        self._cyclic_gc_guard_acquired = False
+        self._cyclic_gc_guard_release_metadata = dict(metadata)
+        self._cyclic_gc_guard_release_deferred = None
+        self._append_debug_event_locked(
+            "cyclic_gc_guard_released",
+            metadata,
+        )
+
+    def _defer_cyclic_gc_guard_release_locked(
+        self,
+        *,
+        reason: str,
+        error_count: int,
+    ) -> None:
+        metadata = {
+            "reason": str(reason),
+            "error_count": int(error_count),
+            "gc_enabled": bool(gc.isenabled()),
+        }
+        self._cyclic_gc_guard_release_deferred = dict(metadata)
+        self._append_debug_event_locked(
+            "cyclic_gc_guard_release_deferred",
+            metadata,
+        )
+
     def _append_debug_event_locked(
         self,
         event: str,
@@ -4245,6 +5374,11 @@ class PositionDeployExecutor:
         self._last_submitted_timestamp = None
         self._last_source_timestamp = None
         self._next_tick_timestamp = None
+        self._reference_query_offset_sec = 0.0
+        self._stream_source_timestamp_offset_sec = 0.0
+        self._last_stream_start_acquisition_metadata = None
+        self._plan_splice_tail_drain_required = False
+        self._last_committed_reference_query_timestamp = None
         self._staged_lookahead_source_index = None
         self._staged_lookahead_timestamp = None
         self._staged_lookahead_pose_by_side = None

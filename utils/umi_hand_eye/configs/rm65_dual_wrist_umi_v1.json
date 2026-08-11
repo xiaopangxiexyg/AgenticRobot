@@ -9,14 +9,14 @@
   "urdf_path": "../../../assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
   "sides": {
     "left": {
-      "camera_serial": "261122273924",
+      "camera_serial": "260522278055",
       "tracker_name": "tracker_1",
       "tracker_role": "left_wrist",
       "channel_name": "left_wrist_pose",
       "tcp_profile": "dmgripper"
     },
     "right": {
-      "camera_serial": "260522278055",
+      "camera_serial": "261122273924",
       "tracker_name": "tracker_2",
       "tracker_role": "right_wrist",
       "channel_name": "right_wrist_pose",

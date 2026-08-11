@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -12,7 +13,14 @@ from hardware.realsense.color import normalize_color_format
 from robot_motion.runtime import run_best_effort_cleanup
 
 from ..log_utils import log_event as _log
-from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_map
+from ..collection.sample_assembler import DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
+from ..sources.camera import (
+    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+    REALSENSE_STARTUP_WARMUP_POLICIES,
+    RealSenseRGBCameraConfig,
+    RealSenseRGBSource,
+    load_realsense_camera_config_map,
+)
 from .wrist_depth_freshness import (
     DEFAULT_WRIST_DEPTH_SAVE_FPS,
     DEFAULT_WRIST_DEPTH_STREAM_FPS,
@@ -21,6 +29,11 @@ from .wrist_depth_freshness import (
 
 
 CAMERA_START_STAGGER_SEC = 0.5
+CAMERA_DEFERRED_RETRY_COOLDOWN_SEC = 1.0
+CAMERA_STARTUP_SELF_CHECK_DURATION_SEC = 3.0
+CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC = 0.2
+CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES = 3
+CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC = DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
 
 
 class CameraStartupProgress(Protocol):
@@ -42,9 +55,150 @@ class CameraStartupProgress(Protocol):
     def fail(self, key: str, error: str, *, message: str = "连接失败") -> None: ...
 
 
+@dataclass
+class CameraStartupFreshnessGate:
+    """Shared consecutive-new-frame admission used after camera startup."""
+
+    camera_keys: tuple[str, ...]
+    required_consecutive_samples: int = (
+        CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES
+    )
+    max_frame_age_sec: float = CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC
+    previous_frame_counts: dict[str, int | None] = field(init=False)
+    fresh_frame_streaks: dict[str, int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.camera_keys = tuple(str(key) for key in self.camera_keys)
+        self.required_consecutive_samples = max(
+            1,
+            int(self.required_consecutive_samples),
+        )
+        self.max_frame_age_sec = max(0.0, float(self.max_frame_age_sec))
+        self.previous_frame_counts = {key: None for key in self.camera_keys}
+        self.fresh_frame_streaks = {key: 0 for key in self.camera_keys}
+
+    def update(self, status: Mapping[str, object]) -> bool:
+        for key in self.camera_keys:
+            item = status.get(key)
+            item = item if isinstance(item, Mapping) else {}
+            try:
+                frame_count = int(item.get("frame_count"))
+            except (TypeError, ValueError):
+                frame_count = None
+            try:
+                frame_age_sec = float(item.get("last_frame_age_sec"))
+            except (TypeError, ValueError):
+                frame_age_sec = None
+            previous_count = self.previous_frame_counts[key]
+            is_new_fresh_frame = bool(
+                frame_count is not None
+                and frame_count > 0
+                and (previous_count is None or frame_count > previous_count)
+                and frame_age_sec is not None
+                and 0.0 <= frame_age_sec <= self.max_frame_age_sec
+                and str(item.get("status_level") or "") == "ok"
+            )
+            self.fresh_frame_streaks[key] = (
+                self.fresh_frame_streaks[key] + 1
+                if is_new_fresh_frame
+                else 0
+            )
+            self.previous_frame_counts[key] = frame_count
+        return bool(self.fresh_frame_streaks) and all(
+            streak >= self.required_consecutive_samples
+            for streak in self.fresh_frame_streaks.values()
+        )
+
+
 def _camera_warmup_policy(source: object) -> str:
     config = getattr(source, "config", None)
     return str(getattr(config, "startup_warmup_policy", "unknown"))
+
+
+def _is_bounded_first_frame_startup_failure(
+    source: object,
+    detail: str,
+) -> bool:
+    return bool(
+        _camera_warmup_policy(source) == "bounded_first_frame"
+        and "startup_warmup_failed:policy=bounded_first_frame" in str(detail).lower()
+    )
+
+
+def _camera_startup_items(
+    camera_sources: Mapping[str, RealSenseRGBSource],
+) -> tuple[tuple[str, RealSenseRGBSource], ...]:
+    """Return a deterministic hardware-start order independent of camera role.
+
+    RealSense devices on the same station can be sensitive to multi-pipeline
+    negotiation order.  Logical keys must continue to describe the physical
+    mount, so an optional numeric ``metadata.startup_priority`` controls only
+    lifecycle ordering.  Config declaration order remains the stable fallback.
+    """
+
+    ranked: list[tuple[float, int, str, RealSenseRGBSource]] = []
+    for declaration_index, (camera_key, source) in enumerate(camera_sources.items()):
+        config = getattr(source, "config", None)
+        metadata = getattr(config, "metadata", {})
+        raw_priority = (
+            metadata.get("startup_priority", declaration_index)
+            if isinstance(metadata, Mapping)
+            else declaration_index
+        )
+        try:
+            priority = float(raw_priority)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"camera {camera_key!r} metadata.startup_priority must be numeric; "
+                f"got {raw_priority!r}."
+            ) from exc
+        ranked.append((priority, declaration_index, str(camera_key), source))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return tuple((camera_key, source) for _, _, camera_key, source in ranked)
+
+
+def apply_real_teleop_camera_startup_defaults(
+    camera_configs: Mapping[str, RealSenseRGBCameraConfig],
+    *,
+    color_format: str = "bgr8",
+    warmup_policy: str = REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+) -> None:
+    """Apply the canonical formal-collection RealSense startup contract."""
+
+    requested_color_format = normalize_color_format(
+        str(color_format or "bgr8").strip().lower()
+    )
+    requested_warmup_policy = str(
+        warmup_policy or REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+    ).strip().lower()
+    if requested_warmup_policy not in REALSENSE_STARTUP_WARMUP_POLICIES:
+        raise ValueError(
+            "camera startup warmup policy must be one of "
+            f"{REALSENSE_STARTUP_WARMUP_POLICIES}; got "
+            f"{requested_warmup_policy!r}."
+        )
+    for camera_key, config in camera_configs.items():
+        configured_warmup_policy = str(config.startup_warmup_policy)
+        config.startup_warmup_policy = requested_warmup_policy
+        config.metadata = dict(config.metadata)
+        config.metadata["configured_startup_warmup_policy"] = (
+            configured_warmup_policy
+        )
+        config.metadata["real_teleop_startup_warmup_policy"] = (
+            requested_warmup_policy
+        )
+        configured_color_format = str(config.color_format)
+        if configured_color_format != requested_color_format:
+            config.metadata["configured_color_format"] = configured_color_format
+            config.metadata["real_teleop_color_format_override"] = (
+                requested_color_format
+            )
+            _log(
+                "Camera",
+                f"{camera_key} color transport overridden for real teleop: "
+                f"{configured_color_format} -> {requested_color_format}",
+            )
+            config.color_format = requested_color_format
 
 
 def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSource]:
@@ -75,29 +229,18 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
     # Apply an explicit real-teleop default so stale machine-local configs do
     # not reintroduce the crash.  Users can still request another transport
     # with --camera-color-format for a validated setup.
-    requested_color_format = normalize_color_format(
-        str(getattr(args, "camera_color_format", "bgr8") or "bgr8").strip().lower()
-    )
-    requested_warmup_policy = str(
-        getattr(args, "camera_startup_warmup_policy", "legacy") or "legacy"
-    ).strip().lower()
-    for camera_key, config in camera_configs.items():
-        configured_warmup_policy = str(config.startup_warmup_policy)
-        config.startup_warmup_policy = requested_warmup_policy
-        config.metadata = dict(config.metadata)
-        config.metadata["configured_startup_warmup_policy"] = configured_warmup_policy
-        config.metadata["real_teleop_startup_warmup_policy"] = requested_warmup_policy
-        configured_color_format = str(config.color_format)
-        if configured_color_format != requested_color_format:
-            config.metadata = dict(config.metadata)
-            config.metadata["configured_color_format"] = configured_color_format
-            config.metadata["real_teleop_color_format_override"] = requested_color_format
-            _log(
-                "Camera",
-                f"{camera_key} color transport overridden for real teleop: "
-                f"{configured_color_format} -> {requested_color_format}",
+    apply_real_teleop_camera_startup_defaults(
+        camera_configs,
+        color_format=str(getattr(args, "camera_color_format", "bgr8") or "bgr8"),
+        warmup_policy=str(
+            getattr(
+                args,
+                "camera_startup_warmup_policy",
+                REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
             )
-            config.color_format = requested_color_format
+            or REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+        ),
+    )
     wrist_depth_requested = bool(getattr(args, "wrist_depth_mask", False)) or bool(
         getattr(args, "wrist_depth_raw", False)
     )
@@ -198,7 +341,9 @@ def _start_camera_sources(
     batch_started = time.perf_counter()
     source_elapsed_sec: dict[str, float] = {}
     stagger_elapsed_sec = 0.0
-    for index, (camera_key, source) in enumerate(camera_sources.items()):
+    startup_items = _camera_startup_items(camera_sources)
+    _log("Camera", f"serial startup order={[key for key, _ in startup_items]}")
+    for index, (camera_key, source) in enumerate(startup_items):
         progress_key = f"camera.{camera_key}"
         if startup_progress is not None:
             startup_progress.begin(
@@ -258,14 +403,26 @@ def _start_camera_sources_best_effort(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
     stagger_sec: float = CAMERA_START_STAGGER_SEC,
+    deferred_retry_cooldown_sec: float = CAMERA_DEFERRED_RETRY_COOLDOWN_SEC,
     startup_progress: CameraStartupProgress | None = None,
 ) -> dict[str, str]:
-    """Attempt every configured camera without making cameras a GUI gate."""
+    """Attempt every camera, then retry bounded first-frame failures once.
+
+    The first pass remains deliberately serial.  A failed RealSense pipeline
+    is retried only after the other configured cameras have completed their
+    first startup attempt and a short cooldown has elapsed.  This mirrors the
+    successful manual reconnect timing without parallel pipeline negotiation
+    or a USB hardware reset.
+    """
     errors: dict[str, str] = {}
+    first_pass_errors: dict[str, str] = {}
     batch_started = time.perf_counter()
     source_elapsed_sec: dict[str, float] = {}
+    retry_elapsed_sec: dict[str, float] = {}
     stagger_elapsed_sec = 0.0
-    for index, (camera_key, source) in enumerate(camera_sources.items()):
+    startup_items = _camera_startup_items(camera_sources)
+    _log("Camera", f"serial startup order={[key for key, _ in startup_items]}")
+    for index, (camera_key, source) in enumerate(startup_items):
         progress_key = f"camera.{camera_key}"
         if startup_progress is not None:
             startup_progress.begin(
@@ -293,9 +450,16 @@ def _start_camera_sources_best_effort(
             source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             detail = f"{type(exc).__name__}: {exc}"
             errors[str(camera_key)] = detail
+            first_pass_errors[str(camera_key)] = detail
             _log("Camera", f"WARNING: camera {camera_key} unavailable: {detail}")
             if startup_progress is not None:
-                startup_progress.fail(progress_key, detail)
+                if _is_bounded_first_frame_startup_failure(source, detail):
+                    startup_progress.update(
+                        progress_key,
+                        message="首轮未收到视频帧；等待批次结束后串行重试",
+                    )
+                else:
+                    startup_progress.fail(progress_key, detail)
         else:
             source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             _log(
@@ -307,10 +471,81 @@ def _start_camera_sources_best_effort(
             )
             if startup_progress is not None:
                 startup_progress.succeed(progress_key, message="视频流已启动")
+
+    deferred_retry_keys = [
+        str(camera_key)
+        for camera_key, source in startup_items
+        if str(camera_key) in errors
+        and _is_bounded_first_frame_startup_failure(
+            source,
+            first_pass_errors[str(camera_key)],
+        )
+    ]
+    retry_cooldown_elapsed_sec = 0.0
+    recovered_keys: list[str] = []
+    if deferred_retry_keys:
+        cooldown_sec = max(0.0, float(deferred_retry_cooldown_sec))
+        _log(
+            "Camera",
+            "bounded first-frame deferred retry scheduled after serial first pass: "
+            f"cameras={deferred_retry_keys} cooldown={cooldown_sec:.2f}s",
+        )
+        if cooldown_sec > 0.0:
+            cooldown_started = time.perf_counter()
+            time.sleep(cooldown_sec)
+            retry_cooldown_elapsed_sec = time.perf_counter() - cooldown_started
+        for camera_key in deferred_retry_keys:
+            source = camera_sources[camera_key]
+            progress_key = f"camera.{camera_key}"
+            if startup_progress is not None:
+                startup_progress.update(
+                    progress_key,
+                    message="正在执行延迟串行重试",
+                )
+            _log("Camera", f"deferred retry starting camera {camera_key}")
+            retry_started = time.perf_counter()
+            try:
+                # A failed start already tears its pipeline down.  ``close``
+                # also makes this robust to a source implementation that
+                # retained partial state before raising.
+                source.close()
+                source.start()
+            except Exception as exc:  # noqa: BLE001 - preserve GUI/device admission.
+                retry_elapsed_sec[camera_key] = time.perf_counter() - retry_started
+                retry_detail = f"{type(exc).__name__}: {exc}"
+                errors[camera_key] = (
+                    "deferred_startup_retry_failed:"
+                    f"first={first_pass_errors[camera_key]};retry={retry_detail}"
+                )
+                _log(
+                    "Camera",
+                    f"WARNING: camera {camera_key} deferred retry unavailable: "
+                    f"{retry_detail}",
+                )
+                if startup_progress is not None:
+                    startup_progress.fail(progress_key, errors[camera_key])
+            else:
+                retry_elapsed_sec[camera_key] = time.perf_counter() - retry_started
+                errors.pop(camera_key, None)
+                recovered_keys.append(camera_key)
+                _log(
+                    "Camera",
+                    f"camera {camera_key} recovered on deferred serial retry; "
+                    f"retry_elapsed={retry_elapsed_sec[camera_key]:.3f}s "
+                    f"stages={getattr(source, 'startup_timing', {})}",
+                )
+                if startup_progress is not None:
+                    startup_progress.succeed(
+                        progress_key,
+                        message="延迟串行重试成功，视频流已启动",
+                    )
     _log_camera_startup_batch_timing(
         batch_started=batch_started,
         source_elapsed_sec=source_elapsed_sec,
         stagger_elapsed_sec=stagger_elapsed_sec,
+        retry_elapsed_sec=retry_elapsed_sec,
+        retry_cooldown_elapsed_sec=retry_cooldown_elapsed_sec,
+        recovered_cameras=recovered_keys,
         failed_camera=",".join(sorted(errors)) if errors else None,
     )
     return errors
@@ -321,6 +556,9 @@ def _log_camera_startup_batch_timing(
     batch_started: float,
     source_elapsed_sec: Mapping[str, float],
     stagger_elapsed_sec: float,
+    retry_elapsed_sec: Mapping[str, float] | None = None,
+    retry_cooldown_elapsed_sec: float = 0.0,
+    recovered_cameras: list[str] | None = None,
     failed_camera: str | None = None,
 ) -> None:
     """Emit one compact receipt for the deliberately serial startup policy."""
@@ -329,13 +567,21 @@ def _log_camera_startup_batch_timing(
     per_camera = ",".join(
         f"{key}:{float(value):.3f}s" for key, value in source_elapsed_sec.items()
     ) or "none"
+    retry_elapsed_sec = retry_elapsed_sec or {}
+    retry_per_camera = ",".join(
+        f"{key}:{float(value):.3f}s" for key, value in retry_elapsed_sec.items()
+    ) or "none"
+    recovered_text = ",".join(recovered_cameras or ()) or "none"
     failure_text = f" failed={failed_camera}" if failed_camera else ""
     _log(
         "CameraTiming",
         "serial_start "
         f"total={total_sec:.3f}s source_start_sum={source_total_sec:.3f}s "
         f"stagger_wait={max(0.0, float(stagger_elapsed_sec)):.3f}s "
-        f"per_camera={{{per_camera}}}{failure_text}",
+        f"per_camera={{{per_camera}}} "
+        f"deferred_retry_cooldown={max(0.0, float(retry_cooldown_elapsed_sec)):.3f}s "
+        f"retry_per_camera={{{retry_per_camera}}} recovered={recovered_text}"
+        f"{failure_text}",
     )
 
 
@@ -349,7 +595,15 @@ def _close_camera_sources(camera_sources: Mapping[str, RealSenseRGBSource]) -> N
     )
 
 __all__ = [
+    "CAMERA_DEFERRED_RETRY_COOLDOWN_SEC",
     "CAMERA_START_STAGGER_SEC",
+    "CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES",
+    "CAMERA_STARTUP_SELF_CHECK_DURATION_SEC",
+    "CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC",
+    "CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC",
+    "CameraStartupFreshnessGate",
+    "apply_real_teleop_camera_startup_defaults",
+    "_camera_startup_items",
     "_build_camera_sources",
     "_close_camera_sources",
     "_select_preview_camera_sources",

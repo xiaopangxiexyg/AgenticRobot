@@ -20,6 +20,14 @@ import numpy as np
 
 from dataset_contracts.completeness import trace_requirement_profile
 from dataset_contracts.control_trace import ControlTraceFact
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    ArtifactWriteResolution,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
 from robot_motion.action.authoritative_trace import (
     AuthoritativeTraceContext,
     project_execution_cancellation,
@@ -72,7 +80,29 @@ from teleop_runtime.position_control.deploy_executor import (
 )
 
 
-def _parse_args() -> argparse.Namespace:
+def legacy_preflight_evidence_root() -> Path:
+    return Path("teleop_records/preflight_evidence/m5_8b1_real_a")
+
+
+def canonical_preflight_evidence_root() -> Path:
+    return (
+        RuntimeArtifactLayout.configured().evidence_dir(kind="preflight")
+        / "rm65_idle_worker_drain_stop_only"
+    )
+
+
+def resolve_preflight_evidence_root(
+    args: argparse.Namespace,
+) -> ArtifactWriteResolution:
+    return resolve_artifact_write_path(
+        explicit_path=getattr(args, "evidence_root", None),
+        artifact_layout=getattr(args, "artifact_layout", None),
+        legacy_path=legacy_preflight_evidence_root(),
+        canonical_path=canonical_preflight_evidence_root(),
+    )
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "M5.8-b1-real-A: run target-free RM65 workers, drain one execution "
@@ -93,9 +123,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--evidence-root",
         type=Path,
-        default=Path("teleop_records/preflight_evidence/m5_8b1_real_a"),
+        default=None,
+        help=(
+            "Exact evidence root. When provided it overrides --artifact-layout."
+        ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--artifact-layout",
+        choices=(
+            LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ),
+        default=configured_runtime_artifact_layout(),
+        help=(
+            "Select the managed evidence root when --evidence-root is omitted. "
+            "The repository default is legacy; local_paths.json can coordinate "
+            "a project-wide canonical cutover."
+        ),
+    )
+    return parser.parse_args(argv)
 
 
 def _require_explicit_scope(args: argparse.Namespace) -> None:
@@ -198,6 +244,7 @@ def _close_without_hiding_primary_error(
 def main() -> None:
     args = _parse_args()
     _require_explicit_scope(args)
+    storage_resolution = resolve_preflight_evidence_root(args)
     print(
         "[M5.8-b1-real-A] AUTHORIZED STATE CHANGE: idle workers + one epoch "
         "drain + one Arm_Slow_Stop per stationary arm"
@@ -255,7 +302,9 @@ def main() -> None:
         clock_domain_id="control-monotonic",
     )
 
-    session_root = Path(args.evidence_root).expanduser().resolve() / runtime_session_id
+    session_root = (
+        storage_resolution.path.expanduser().resolve() / runtime_session_id
+    )
     session_root.mkdir(parents=True, exist_ok=False)
     spool: ControlTraceSpool | None = ControlTraceSpool(
         session_root / "control_trace.wal",
@@ -288,6 +337,15 @@ def main() -> None:
         "runtime_session_id": runtime_session_id,
         "trace_session_id": trace_session_id,
         "evidence_root": str(session_root),
+        "artifact_storage": {
+            "requested_layout": str(args.artifact_layout),
+            "selection_source": storage_resolution.source,
+            "resolved_layout": storage_resolution.layout_name,
+            "resolved_family_root": str(
+                storage_resolution.path.expanduser().resolve()
+            ),
+            "semantics": "preflight_control_trace_wal_and_terminal_evidence",
+        },
         "authorization": asdict(authorization),
         "manifest_id": manifest.manifest_id,
         "manifest_hash": manifest.semantic_content_hash,

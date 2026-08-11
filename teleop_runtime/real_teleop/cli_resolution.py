@@ -14,7 +14,18 @@ import sys
 
 import numpy as np
 
+from .artifact_context import configure_real_teleop_artifact_paths
+from .position_admittance_shadow import (
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE,
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+    position_admittance_active_apply_sides,
+    position_admittance_active_config,
+    position_admittance_shadow_config,
+    position_rotational_admittance_config,
+    validate_position_admittance_active_authority,
+)
 from .progress_adapter import (
+    resolve_real_teleop_default_progress_profile,
     resolve_real_teleop_progress_entry,
     resolve_real_teleop_task_stage_profile,
     validate_real_teleop_initial_progress_profile,
@@ -111,6 +122,13 @@ def parse_real_teleop_args() -> argparse.Namespace:
         getattr(args, "plus_annotation_root", "") or ""
     ).strip():
         parser.error("--plus-annotation-root is required with --plus-episode-curation")
+    try:
+        configure_real_teleop_artifact_paths(
+            args,
+            raw_argv=raw_argv,
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
     raw_arg_set = set(raw_argv)
     if bool(getattr(args, "no_debug_disk_write", False)):
         args.control_debug = "off"
@@ -173,6 +191,218 @@ def parse_real_teleop_args() -> argparse.Namespace:
     # Fine-grained legacy fields retain their original raw values so callers can
     # still distinguish explicit overrides from mode-derived defaults.
     args.arm_control_mode = args.arm_execution_config.mode
+    position_admittance_shadow = bool(
+        getattr(args, "position_admittance_shadow", False)
+    )
+    position_admittance_active = bool(
+        getattr(args, "position_admittance_active", False)
+    )
+    position_admittance_rotation_shadow = bool(
+        getattr(args, "position_admittance_rotation_shadow", False)
+    )
+    position_admittance_rotation_active = bool(
+        getattr(args, "position_admittance_rotation_active", False)
+    )
+    position_admittance_combined_active = bool(
+        getattr(args, "position_admittance_combined_active", False)
+    )
+    position_admittance_active_envelope = str(
+        getattr(
+            args,
+            "position_admittance_active_envelope",
+            POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE,
+        )
+    )
+    position_admittance_active_endpoint_policy = str(
+        getattr(
+            args,
+            "position_admittance_active_endpoint_policy",
+            POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+        )
+    )
+    if position_admittance_shadow and position_admittance_active:
+        parser.error(
+            "--position-admittance-shadow and --position-admittance-active "
+            "are mutually exclusive."
+        )
+    if (
+        position_admittance_rotation_shadow
+        and not position_admittance_shadow
+    ):
+        parser.error(
+            "--position-admittance-rotation-shadow requires "
+            "--position-admittance-shadow."
+        )
+    if (
+        not position_admittance_rotation_shadow
+        and _argv_has_option(
+            raw_argv,
+            "--position-admittance-rotation-shadow-profile",
+        )
+    ):
+        parser.error(
+            "--position-admittance-rotation-shadow-profile requires "
+            "--position-admittance-rotation-shadow."
+        )
+    if position_admittance_rotation_active and not position_admittance_active:
+        parser.error(
+            "--position-admittance-rotation-active requires "
+            "--position-admittance-active."
+        )
+    if position_admittance_combined_active and not (
+        position_admittance_active and position_admittance_rotation_active
+    ):
+        parser.error(
+            "--position-admittance-combined-active requires both "
+            "--position-admittance-active and "
+            "--position-admittance-rotation-active."
+        )
+    if (
+        not position_admittance_rotation_active
+        and _argv_has_option(
+            raw_argv,
+            "--position-admittance-rotation-active-profile",
+        )
+    ):
+        parser.error(
+            "--position-admittance-rotation-active-profile requires "
+            "--position-admittance-rotation-active."
+        )
+    if (
+        not position_admittance_rotation_active
+        and _argv_has_option(
+            raw_argv,
+            "--position-admittance-active-max-tool-rotation-excursion-deg",
+        )
+    ):
+        parser.error(
+            "--position-admittance-active-max-tool-rotation-excursion-deg "
+            "requires --position-admittance-rotation-active."
+        )
+    position_admittance_active_side = getattr(
+        args,
+        "position_admittance_active_side",
+        None,
+    )
+    if position_admittance_active and position_admittance_active_side is None:
+        parser.error(
+            "--position-admittance-active requires the explicit authority "
+            "selection --position-admittance-active-side {left,right,both}."
+        )
+    if not position_admittance_active and position_admittance_active_side is not None:
+        parser.error(
+            "--position-admittance-active-side requires "
+            "--position-admittance-active."
+        )
+    if (
+        not position_admittance_active
+        and position_admittance_active_envelope
+        != POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE
+    ):
+        parser.error(
+            "--position-admittance-active-envelope other than cautious requires "
+            "--position-admittance-active."
+        )
+    if (
+        not position_admittance_active
+        and position_admittance_active_endpoint_policy
+        != POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY
+    ):
+        parser.error(
+            "--position-admittance-active-endpoint-policy other than "
+            "runtime_home_hold requires --position-admittance-active."
+        )
+    position_admittance_apply_sides: tuple[str, ...] = ()
+    if position_admittance_active_side is not None:
+        try:
+            position_admittance_apply_sides = (
+                position_admittance_active_apply_sides(
+                    str(position_admittance_active_side)
+                )
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if not set(position_admittance_apply_sides).issubset(
+            set(_active_sides_from_args(args))
+        ):
+            parser.error(
+                "--position-admittance-active-side must be included in --active-sides."
+            )
+        if (
+            set(position_admittance_apply_sides) == {"left", "right"}
+            and bool(getattr(args, "fix_arm", False))
+        ):
+            parser.error(
+                "dual-side position admittance Active requires --no-fix-arm so "
+                "both commanded sides retain live authority"
+            )
+    if position_admittance_shadow or position_admittance_active:
+        if args.arm_control_mode != "position":
+            parser.error("Position admittance requires position arm control mode.")
+        admittance_active_sides = set(_active_sides_from_args(args))
+        if admittance_active_sides != {"left", "right"}:
+            parser.error(
+                "Position admittance requires the coupled dual-arm topology; "
+                "use --active-sides both, then select the explicit overlay "
+                "authority with --position-admittance-active-side."
+            )
+        if bool(getattr(args, "disable_dual_arm_collision_avoidance", False)):
+            parser.error(
+                "Position admittance requires the coupled pre-IK target filter; "
+                "--no-collision/--disable-dual-arm-collision-avoidance is not supported."
+            )
+        if not bool(getattr(args, "position_force_guard", False)):
+            parser.error(
+                "Position admittance requires --position-force-guard so the "
+                "20 Hz wrench reader and independent emergency stop remain authoritative."
+            )
+        if str(getattr(args, "position_force_guard_source", "tool")) != "tool":
+            parser.error(
+                "Position admittance currently requires "
+                "--position-force-guard-source tool."
+            )
+        try:
+            translation_config = (
+                position_admittance_active_config(args)
+                if position_admittance_active
+                else position_admittance_shadow_config(args)
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        if position_admittance_active:
+            try:
+                rotation_config = (
+                    position_rotational_admittance_config(
+                        args,
+                        profile=str(
+                            args.position_admittance_rotation_active_profile
+                        ),
+                    )
+                    if position_admittance_rotation_active
+                    else None
+                )
+                validate_position_admittance_active_authority(
+                    translation_config,
+                    active_envelope=position_admittance_active_envelope,
+                    rotational_config=rotation_config,
+                    combined_translation_rotation_active=(
+                        position_admittance_combined_active
+                    ),
+                    endpoint_policy=position_admittance_active_endpoint_policy,
+                    apply_sides=position_admittance_apply_sides,
+                    max_tool_excursion_m=float(
+                        args.position_admittance_active_max_tool_excursion_m
+                    ),
+                    max_tool_rotation_excursion_deg=(
+                        float(
+                            args.position_admittance_active_max_tool_rotation_excursion_deg
+                        )
+                        if position_admittance_rotation_active
+                        else None
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                parser.error(str(exc))
     if bool(getattr(args, "actuator_trace", False)):
         if args.arm_control_mode != "position":
             parser.error("--actuator-trace requires position arm control mode.")
@@ -219,6 +449,31 @@ def parse_real_teleop_args() -> argparse.Namespace:
             "--collection-worker-mode process is currently position-only; "
             "force/impedance collection intentionally retains the established thread path."
         )
+    if bool(getattr(args, "idle_tactile_compression", False)):
+        if bool(getattr(args, "no_collection", False)):
+            parser.error(
+                "--idle-tactile-compression requires formal collection; "
+                "remove --no-collection."
+            )
+        if str(getattr(args, "tactile_storage", "external")) != "external":
+            parser.error(
+                "--idle-tactile-compression requires --tactile-storage external."
+            )
+        if str(getattr(args, "tactile_compression", "none")) != "none":
+            parser.error(
+                "--idle-tactile-compression requires --tactile-compression none; "
+                "inline compression and idle recompression are mutually exclusive."
+            )
+    if bool(getattr(args, "tactile_artifact_integrity", False)):
+        if bool(getattr(args, "no_collection", False)):
+            parser.error(
+                "--tactile-artifact-integrity requires formal collection; "
+                "remove --no-collection."
+            )
+        if str(getattr(args, "tactile_storage", "external")) != "external":
+            parser.error(
+                "--tactile-artifact-integrity requires --tactile-storage external."
+            )
     if int(args.position_ik_solve_min_iterations) > int(
         args.position_ik_solve_max_iterations
     ):
@@ -361,6 +616,18 @@ def parse_real_teleop_args() -> argparse.Namespace:
             "--collection-progress-gui requires formal collection; "
             "remove --no-collection."
         )
+    if progress_profile is None and bool(
+        getattr(args, "collection_progress_gui", False)
+    ):
+        try:
+            progress_profile = resolve_real_teleop_default_progress_profile(
+                dataset_root=args.dataset_root,
+                requested_profile=None,
+                gui_enabled=True,
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        args.collection_progress_profile = progress_profile
     if progress_profile is not None:
         if bool(getattr(args, "no_collection", False)):
             parser.error(
@@ -491,7 +758,6 @@ def parse_real_teleop_args() -> argparse.Namespace:
         parser.error("--wrist-depth-mask/--wrist-depth-raw require cameras; remove --no-camera.")
     # The saved foot-pad topology only selects an additional input mapping.
     # It must not enable/disable Fix/Init controllers or GUI capabilities.
-    args.init_arm_requested = bool(getattr(args, "init_arm_available", False))
     args.foot_pad_config_count = configured_foot_pad_count()
     args.init_arm_disabled_reason = ""
     if bool(getattr(args, "init_arm_available", False)) and not str(
@@ -523,6 +789,11 @@ def parse_real_teleop_args() -> argparse.Namespace:
             args.fix_arm = False
         if not explicit_init_arm:
             args.init_arm_available = False
+    # Capture the effective operator request after topology defaults are
+    # resolved.  Otherwise the parser's dual-arm default (True) survives as a
+    # stale request in single-arm mode and startup incorrectly restores an
+    # Init controller that the component builder must reject.
+    args.init_arm_requested = bool(getattr(args, "init_arm_available", False))
     args.special_arm_control_mode_requested = getattr(args, "special_arm_control_mode", None)
     try:
         args.special_arm_control_mode = resolve_special_arm_control_mode(

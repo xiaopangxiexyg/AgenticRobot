@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,45 @@ GRIPPER_POLICY_DEFAULTS = {
     "telemetry_hz": DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
     "telemetry_command_grace_s": DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
 }
+
+
+class GripperForceRequestError(ValueError):
+    """A malformed GUI request to override left/right gripper force."""
+
+
+def parse_gripper_force_request(
+    text: str,
+    *,
+    require_nonempty: bool,
+) -> dict[str, float]:
+    """Decode finite normalized left/right forces without touching hardware."""
+
+    try:
+        payload = json.loads(str(text or "{}"))
+    except json.JSONDecodeError as exc:
+        raise GripperForceRequestError(str(exc)) from exc
+    if not isinstance(payload, Mapping):
+        raise GripperForceRequestError(
+            "必须是包含 left/right 的 JSON 对象。"
+        )
+
+    requested: dict[str, float] = {}
+    try:
+        for side in ("left", "right"):
+            value = payload.get(side)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError(f"{side} 必须是 0 到 1 的数字。")
+            force = float(value)
+            if not math.isfinite(force) or not 0.0 <= force <= 1.0:
+                raise ValueError(f"{side} 必须在 [0, 1] 内。")
+            requested[side] = force
+    except (TypeError, ValueError) as exc:
+        raise GripperForceRequestError(str(exc)) from exc
+    if require_nonempty and not requested:
+        raise GripperForceRequestError("未提供可设置的左/右夹爪力度。")
+    return requested
 
 
 def profile_value(profile: Mapping[str, Any], *keys: str) -> Any:
@@ -417,6 +457,7 @@ def clear_gripper_policy_cache(args: argparse.Namespace) -> None:
 
 __all__ = [
     "GRIPPER_POLICY_DEFAULTS",
+    "GripperForceRequestError",
     "clear_gripper_policy_cache",
     "current_gripper_force_dataset_contract",
     "gripper_force_dataset_contract_from_args",
@@ -424,6 +465,7 @@ __all__ = [
     "gripper_side_override",
     "load_gripper_task_profile",
     "merge_gripper_profile",
+    "parse_gripper_force_request",
     "profile_value",
     "resolved_gripper_policies_by_side",
     "resolved_gripper_policy",

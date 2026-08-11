@@ -1,0 +1,88 @@
+{
+  "schema": "dexteleop.openpi_prepared_prompt_training_profile.v1",
+  "profile_id": "writing_multistage_prompt_0804_0806_front_h16_absolute_v1",
+  "organized_dataset_root": "/home/user/zc/DexTeleop/datasets/training_workspaces/writing_multistage_prompt_0804_0806_front_h16_absolute_v1",
+  "expected_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+  "sources": [
+    {
+      "source_dataset_id": "writing4_2026_08_04",
+      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage"
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_05",
+      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage"
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part1",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage"
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part2",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_1453"
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part3",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable"
+    }
+  ],
+  "prompt_stages": [
+    {
+      "stage_id": "stage1",
+      "skill_id": "writing.bimanual_acquire_brush_and_present_for_cap_removal",
+      "profile": "writing_stage1_0804_0806_front_h16_absolute_v1.json",
+      "expected_child_binding_hash": "21e05445bf265eb08d68b22d035ee4f727c1019d65c5972bb2f9ca5580fdc64f",
+      "prompt": "Pick up the capped brush with the right gripper and present it to the left gripper for cap removal.",
+      "expected_window_count": 71818,
+      "expected_openpi_window_count": 64999
+    },
+    {
+      "stage_id": "stage2",
+      "skill_id": "writing.remove_brush_cap_and_return_cap",
+      "profile": "writing_stage2_0804_0806_front_h16_absolute_v1.json",
+      "expected_child_binding_hash": "c6c22c888ce2d0b2f753f4e109ae463db7088ac00fa9264c8205d2fd74c974a3",
+      "prompt": "Remove the brush cap with the left gripper and return the cap to its designated location while the right gripper holds the brush steady.",
+      "expected_window_count": 53911,
+      "expected_openpi_window_count": 51459
+    },
+    {
+      "stage_id": "stage3",
+      "skill_id": "writing.write_with_brush",
+      "profile": "writing_stage3_0804_0806_front_h16_absolute_v1.json",
+      "expected_child_binding_hash": "28c9d7693324fe738f635e6da11ab8875dd793302af6e4dcf3081687b838f39e",
+      "prompt": "Write with the uncapped brush using the right gripper while keeping the left arm and gripper still.",
+      "expected_window_count": 96649,
+      "expected_openpi_window_count": 79078
+    },
+    {
+      "stage_id": "stage4",
+      "skill_id": "writing.return_brush",
+      "profile": "writing_stage4_0804_0806_front_h16_absolute_v1.json",
+      "expected_child_binding_hash": "1ea9c3bfe9d36b509de1f73e6409f93b39ee071845c25590e790e974bae0ade7",
+      "prompt": "Return the brush to its storage location with the right gripper while keeping the left arm and gripper still.",
+      "expected_window_count": 78048,
+      "expected_openpi_window_count": 8995
+    }
+  ],
+  "expected_union_episode_count": 890,
+  "expected_total_window_count": 300426,
+  "camera_selection": ["front"],
+  "camera_slot_to_dataset_key": {"base_0_rgb": "front"},
+  "action_horizon": 16,
+  "action_pose_mode": "absolute",
+  "source_mixing_policy": "natural_concat_shuffle_v1",
+  "prompt_stage_sampling_policy": "balanced_min_windows_rotate_v1",
+  "prompt_stage_sampling_seed": 20260811,
+  "expected_effective_epoch_window_count": 35980,
+  "tail_policy": "drop",
+  "expected_policy_io_layout_hash": "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16",
+  "openpi_checkout": "/home/user/zc/openpi",
+  "openpi_base_config": "writing-phase1-grap-pen-front-only-h16-absolute-task-ready-state-dropout-v2",
+  "openpi_state_augmentation_from_config": "writing-phase1-grap-pen-front-only-h16-absolute-task-ready-state-dropout-v2",
+  "openpi_config_name": "writing-multistage-prompt-0804-0806-front-h16-absolute-prepared-v1",
+  "openpi_asset_id": "writing_multistage_prompt_0804_0806_front_h16_absolute_prepared_v1",
+  "openpi_num_workers": 4,
+  "openpi_num_train_steps": 600000,
+  "openpi_save_interval": 30000,
+  "openpi_keep_period": 30000,
+  "default_exp_name": "writing-multistage-prompt-0804-0806-front-h16-absolute-b1-nw4-v1"
+}

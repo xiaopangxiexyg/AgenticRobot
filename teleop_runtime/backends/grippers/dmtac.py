@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -119,6 +120,15 @@ def _set_worker_process_name(name: str) -> None:
     try:
         Path("/proc/self/comm").write_text(text)
     except OSError:
+        pass
+
+
+def _isolate_tactile_worker_terminal_interrupt() -> None:
+    """Make the parent the sole Ctrl+C lifecycle owner for this worker."""
+
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
         pass
 
 
@@ -302,6 +312,12 @@ def _dmtac_tactile_worker_main(
     stop_event: Any,
     read_gate: Any,
 ) -> None:
+    # The terminal foreground process group includes multiprocessing workers.
+    # Ctrl+C belongs to the real-teleop parent, which owns ordered shutdown and
+    # signals this worker through ``stop_event``.  Letting the child also raise
+    # KeyboardInterrupt can abort the vendor SDK disconnect, race the restart
+    # supervisor, and leave the parent waiting on a half-closed worker.
+    _isolate_tactile_worker_terminal_interrupt()
     _set_worker_process_name(str(config_payload.get("worker_name") or "dmtac_tactile"))
     _start_parent_watchdog(
         stop_event,
@@ -1940,10 +1956,14 @@ class DMTacGripperBackend(EffectorBackend):
 
     def close(self) -> None:
         self._closing = True
+        deferred_interrupt: BaseException | None = None
         if self._stop_event is not None:
             self._stop_event.set()
         if self._telemetry_thread is not None:
-            self._telemetry_thread.join(timeout=DMTAC_TELEMETRY_STOP_TIMEOUT_S)
+            try:
+                self._telemetry_thread.join(timeout=DMTAC_TELEMETRY_STOP_TIMEOUT_S)
+            except BaseException as exc:  # noqa: BLE001 - continue bounded child cleanup.
+                deferred_interrupt = exc
             if self._telemetry_thread.is_alive():
                 self._telemetry_error = "telemetry_stop_timeout: closing device while telemetry thread exits"
             else:
@@ -1952,20 +1972,50 @@ class DMTacGripperBackend(EffectorBackend):
             self._tactile_worker_stop_event.set()
         if self._tactile_worker_receiver_stop is not None:
             self._tactile_worker_receiver_stop.set()
-        if self._tactile_worker_receiver_thread is not None:
-            self._tactile_worker_receiver_thread.join(timeout=1.0)
-            if self._tactile_worker_receiver_thread.is_alive():
+        receiver = self._tactile_worker_receiver_thread
+        if receiver is not None:
+            try:
+                receiver.join(timeout=1.0)
+            except BaseException as exc:  # noqa: BLE001 - finish bounded process cleanup.
+                deferred_interrupt = exc
+            if receiver.is_alive():
                 self._telemetry_error = (
                     "tactile_receiver_stop_timeout: closing tactile worker while receiver exits"
                 )
             else:
                 self._tactile_worker_receiver_thread = None
-        if self._tactile_worker_process is not None:
-            self._tactile_worker_process.join(timeout=DMTAC_TACTILE_PROCESS_STOP_TIMEOUT_S)
-            if self._tactile_worker_process.is_alive():
-                self._tactile_worker_process.terminate()
-                self._tactile_worker_process.join(timeout=1.0)
+        process = self._tactile_worker_process
+        if process is not None:
+            try:
+                process.join(timeout=DMTAC_TACTILE_PROCESS_STOP_TIMEOUT_S)
+            except BaseException as exc:  # noqa: BLE001 - still terminate the child below.
+                if deferred_interrupt is None:
+                    deferred_interrupt = exc
+            try:
+                process_alive = bool(process.is_alive())
+            except BaseException as exc:  # noqa: BLE001
+                process_alive = True
+                if deferred_interrupt is None:
+                    deferred_interrupt = exc
+            if process_alive:
+                try:
+                    process.terminate()
+                except BaseException as exc:  # noqa: BLE001
+                    if deferred_interrupt is None:
+                        deferred_interrupt = exc
+                try:
+                    process.join(timeout=1.0)
+                except BaseException as exc:  # noqa: BLE001
+                    if deferred_interrupt is None:
+                        deferred_interrupt = exc
             self._tactile_worker_process = None
+        worker_queue = self._tactile_worker_queue
+        if worker_queue is not None:
+            try:
+                worker_queue.close()
+                worker_queue.cancel_join_thread()
+            except (AttributeError, OSError, ValueError):
+                pass
         self._tactile_worker_queue = None
         self._tactile_worker_stop_event = None
         self._tactile_worker_receiver_stop = None
@@ -1984,3 +2034,5 @@ class DMTacGripperBackend(EffectorBackend):
                 if acquired_tactile_lock:
                     self._tactile_lock.release()
         self._stop_event = None
+        if deferred_interrupt is not None:
+            raise deferred_interrupt

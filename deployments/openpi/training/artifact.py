@@ -28,7 +28,7 @@ def build_openpi_trained_model_rtc_artifact_template(
     source_artifact: PolicyArtifactContract,
     *,
     output_model_id: str,
-    source_dataset_root: str | Path,
+    source_dataset_root: str | Path | None = None,
     pose_action_chunk: PoseActionChunkContract,
     pose_training_data: PoseTrainingDataContract,
     pose_frame_contract_hash: str,
@@ -85,7 +85,11 @@ def build_openpi_trained_model_rtc_artifact_template(
         model_id=str(output_model_id),
         checkpoint_step=None,
         source_datasets=(
-            str(Path(source_dataset_root).expanduser().resolve()),
+            source_artifact.source_datasets
+            if source_dataset_root is None
+            else (
+                str(Path(source_dataset_root).expanduser().resolve()),
+            )
         ),
         dataset_schema=DEXTELEOP_DATASET_SCHEMA_V23,
         pose_action_chunk=pose_action_chunk,

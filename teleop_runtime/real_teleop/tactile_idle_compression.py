@@ -1,0 +1,241 @@
+"""Thin RealTeleop admission adapter for idle tactile lossless compression."""
+
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from collection_runtime.idle_maintenance import (
+    IdleMaintenanceConfig,
+    IdleMaintenanceProcessController,
+    IdleMaintenanceQuiesceReceipt,
+    IdleMaintenanceSnapshot,
+)
+from collection_runtime.tactile_recompression import (
+    run_idle_tactile_recompression_worker,
+)
+from dataset_interface.modality_artifacts import (
+    assert_dataset_capture_integrity_compatible,
+    assert_dataset_capture_writable,
+)
+
+
+def _catalog_revision(dataset_root: Path) -> str | None:
+    episodes_path = dataset_root / "meta" / "episodes.jsonl"
+    if not episodes_path.is_file():
+        return None
+    stat = episodes_path.stat()
+    if stat.st_size <= 0:
+        return None
+    payload = (
+        f"{dataset_root}:{stat.st_dev}:{stat.st_ino}:"
+        f"{stat.st_size}:{stat.st_mtime_ns}"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def assert_idle_tactile_transition_safe(
+    receipt: IdleMaintenanceQuiesceReceipt,
+    *,
+    dataset_root: str | Path | None,
+    integrity_enabled: bool,
+) -> None:
+    """Fail closed before returning from idle mutation to a hot runtime.
+
+    A cooperative worker error can be tolerated only after the canonical
+    dataset admission checks prove that the currently referenced graph is
+    complete.  Forced termination is different: the worker may have been
+    killed inside a codec subprocess or atomic transaction boundary, so the
+    operator must retry/recover from the idle state instead of entering Home
+    or starting an Episode with uncertain process/file state.
+    """
+
+    if not receipt.quiesced:
+        raise RuntimeError(
+            f"idle tactile compression did not quiesce: {receipt.reason}"
+        )
+    if receipt.forced_termination:
+        raise RuntimeError(
+            "idle tactile compression required forced termination; remain in "
+            "the idle/Hold state and retry after artifact recovery"
+        )
+    if not receipt.worker_error:
+        return
+    if dataset_root is None:
+        raise RuntimeError(
+            "idle tactile compression reported an error but no dataset root "
+            "is available for capture-admission validation"
+        )
+    assert_dataset_capture_writable(dataset_root)
+    if bool(integrity_enabled):
+        assert_dataset_capture_integrity_compatible(dataset_root)
+
+
+class RealTeleopIdleTactileCompression:
+    """Map authoritative RealTeleop state onto a generic maintenance process."""
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._last_runtime_status: tuple[object, ...] | None = None
+        self.controller = IdleMaintenanceProcessController(
+            run_idle_tactile_recompression_worker,
+            config=IdleMaintenanceConfig(
+                process_name="real_teleop_idle_tactile_compression",
+                worker_nice=19,
+                stop_timeout_sec=2.0,
+                terminate_timeout_sec=1.0,
+            ),
+            enabled=self.enabled,
+        )
+
+    def tick_runtime(
+        self,
+        *,
+        dataset_recorder: Any | None,
+        teleop_started: bool,
+        hold_active: bool,
+        episode_countdown_active: bool,
+        startup_and_devices_ready: bool,
+        log: Callable[..., None],
+    ) -> IdleMaintenanceSnapshot | None:
+        """Tick optional idle work and emit only changed runtime status.
+
+        An admission/probe failure is intentionally isolated from formal
+        collection and teleoperation.  Quiesce validation remains fail closed
+        in :meth:`require_safe_transition`.
+        """
+
+        try:
+            snapshot = self.tick(
+                dataset_recorder=dataset_recorder,
+                teleop_started=teleop_started,
+                hold_active=hold_active,
+                episode_countdown_active=episode_countdown_active,
+                startup_and_devices_ready=startup_and_devices_ready,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional idle work stays isolated.
+            signature = ("tick_error", type(exc).__name__, str(exc))
+            if signature != self._last_runtime_status:
+                self._last_runtime_status = signature
+                log(
+                    "TactileCompression",
+                    "idle worker admission failed; formal collection/teleop "
+                    f"remain available: {type(exc).__name__}: {exc}",
+                )
+            return None
+        signature = (
+            snapshot.phase,
+            snapshot.dataset_root,
+            snapshot.revision,
+            snapshot.outcome,
+            snapshot.error,
+        )
+        if signature != self._last_runtime_status:
+            self._last_runtime_status = signature
+            log(
+                "TactileCompression",
+                "idle worker "
+                f"phase={snapshot.phase} outcome={snapshot.outcome or '-'} "
+                f"pid={snapshot.pid or '-'} root={snapshot.dataset_root or '-'}"
+                + (f" error={snapshot.error}" if snapshot.error else ""),
+            )
+        return snapshot
+
+    def tick(
+        self,
+        *,
+        dataset_recorder: Any | None,
+        teleop_started: bool,
+        hold_active: bool,
+        episode_countdown_active: bool,
+        startup_and_devices_ready: bool,
+        shutdown_requested: bool = False,
+    ) -> IdleMaintenanceSnapshot:
+        snapshot = self.controller.poll()
+        recorder_idle = bool(
+            dataset_recorder is not None
+            and not bool(getattr(dataset_recorder, "is_recording", False))
+            and not bool(getattr(dataset_recorder, "finalizing", False))
+        )
+        eligible = bool(
+            self.enabled
+            and startup_and_devices_ready
+            and (not teleop_started or hold_active)
+            and not episode_countdown_active
+            and recorder_idle
+            and not shutdown_requested
+        )
+        if not eligible:
+            self.controller.request_quiesce(reason="real_teleop_not_idle")
+            return self.controller.snapshot()
+        root = Path(dataset_recorder.dataset_root).expanduser().resolve()
+        revision = _catalog_revision(root)
+        if revision is None:
+            return self.controller.snapshot()
+        if snapshot.dataset_root not in {None, str(root)} and self.controller.running:
+            self.controller.request_quiesce(reason="dataset_root_changed")
+            return self.controller.snapshot()
+        self.controller.start_if_eligible(root, revision=revision)
+        return self.controller.snapshot()
+
+    def begin_latency_sensitive_transition(self, *, reason: str) -> None:
+        self.controller.request_quiesce(reason=reason)
+
+    def require_quiesced(
+        self,
+        *,
+        reason: str,
+        timeout_sec: float | None = None,
+    ) -> IdleMaintenanceQuiesceReceipt:
+        return self.controller.quiesce(reason=reason, timeout_sec=timeout_sec)
+
+    def acknowledge_safe_transition(
+        self,
+        receipt: IdleMaintenanceQuiesceReceipt,
+    ) -> None:
+        """Consume a sticky worker error after dataset admission succeeds."""
+
+        self.controller.acknowledge_quiesce_receipt(receipt)
+
+    def require_safe_transition(
+        self,
+        *,
+        reason: str,
+        dataset_root: str | Path | None,
+        integrity_enabled: bool,
+        log: Callable[..., None],
+        timeout_sec: float | None = None,
+    ) -> IdleMaintenanceQuiesceReceipt:
+        """Quiesce, validate the referenced dataset, then consume the receipt."""
+
+        receipt = self.require_quiesced(
+            reason=reason,
+            timeout_sec=timeout_sec,
+        )
+        assert_idle_tactile_transition_safe(
+            receipt,
+            dataset_root=dataset_root,
+            integrity_enabled=integrity_enabled,
+        )
+        self.acknowledge_safe_transition(receipt)
+        log(
+            "TactileCompression",
+            "quiesced before latency-sensitive transition "
+            f"reason={reason} forced={receipt.forced_termination} "
+            f"syncfs={receipt.filesystem_barrier_applied}",
+        )
+        return receipt
+
+    def snapshot(self) -> IdleMaintenanceSnapshot:
+        return self.controller.poll()
+
+    def close(self) -> None:
+        self.controller.close()
+
+
+__all__ = [
+    "RealTeleopIdleTactileCompression",
+    "assert_idle_tactile_transition_safe",
+]

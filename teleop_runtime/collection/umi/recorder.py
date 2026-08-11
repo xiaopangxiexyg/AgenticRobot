@@ -17,11 +17,17 @@ from dataset_interface.capture_modalities import (
     bind_capture_modality_contract,
     dataset_is_blank,
 )
+from dataset_interface.modality_artifacts import (
+    assert_dataset_capture_integrity_compatible,
+)
 
 from collection_runtime.async_writer import AsyncWriterConfig, AsyncWriterPool
 from collection_runtime.dataset_episode_maintenance import (
     EpisodeDeleteResult,
     delete_episode_and_compact,
+)
+from collection_runtime.dataset_capture_recovery import (
+    prepare_dataset_capture_writable,
 )
 from collection_runtime.progress.profiles import inspect_dataset_progress_profile
 from ..schema_v22 import (
@@ -93,6 +99,9 @@ class UmiDatasetRecorder:
         self.config = config
         self.policy_io_layout = policy_io_layout
         self.capture_modality_contract = config.capture_modality_contract
+        prepare_dataset_capture_writable(config.dataset_root)
+        if config.tactile_artifact_integrity:
+            assert_dataset_capture_integrity_compatible(config.dataset_root)
         _validate_umi_dataset_admission(
             config.dataset_root,
             task_id=config.task_id,
@@ -120,6 +129,7 @@ class UmiDatasetRecorder:
                 write_video=True,
                 tactile_storage="external",
                 tactile_compression=config.tactile_compression,
+                tactile_artifact_integrity=config.tactile_artifact_integrity,
                 allow_missing_video_frames=bool(
                     self.capture_modality_contract.ignored_camera_keys
                 ),
@@ -444,6 +454,9 @@ class UmiDatasetRecorder:
                 "A UMI recorder with a v2.5-p native shadow cannot change "
                 "dataset_root; construct a new recorder/shadow pair."
             )
+        prepare_dataset_capture_writable(resolved_root)
+        if next_config.tactile_artifact_integrity:
+            assert_dataset_capture_integrity_compatible(resolved_root)
         _validate_umi_dataset_admission(
             resolved_root,
             task_id=next_config.task_id,
@@ -464,6 +477,8 @@ class UmiDatasetRecorder:
             replace(
                 self.writer.config,
                 root_dir=resolved_root,
+                tactile_compression=next_config.tactile_compression,
+                tactile_artifact_integrity=next_config.tactile_artifact_integrity,
                 allow_missing_video_frames=bool(next_contract.ignored_camera_keys),
             )
         )

@@ -1,65 +1,22 @@
 """Pure debug-timing payload projections for already-read snapshots.
 
 This module does not read backends, inspect cameras, publish to a UI, or
-dispatch commands.  The legacy entrypoint binds the two serializer helpers
-dynamically so existing monkeypatch points remain live.
+dispatch commands.  Serializer helpers are imported directly from their
+owning projection modules.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-import inspect
+
+import numpy as np
 
 from ..collection.diagnostics import build_end_to_end_latency_breakdown
-from .status_payloads import _float_or_none as _default_float_or_none
-from .debug_payload_primitives import _compact_debug_value as _default_compact_debug_value
-
-
-_float_or_none = _default_float_or_none
-_compact_debug_value = _default_compact_debug_value
-_SUPPORT_NAMES = ("_compact_debug_value", "_float_or_none")
-
-
-class _LegacyFunctionProxy:
-    """Resolve legacy serializer helpers dynamically."""
-
-    __slots__ = ("_namespace", "_name")
-
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(
-                f"recursive debug-timing payload support proxy: {self._name}"
-            )
-        return target(*args, **kwargs)  # type: ignore[operator]
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
-
-
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    """Bind legacy compact serializer patch points."""
-
-    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "debug-timing payload support is incomplete: "
-            + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _SUPPORT_NAMES
-        }
-    )
+from .status_payloads import _float_or_none
+from .debug_payload_primitives import (
+    _compact_debug_value,
+    _pose_compact_debug,
+)
 
 
 def _fault_signature(faults: Sequence[object]) -> tuple[str, ...]:
@@ -150,10 +107,11 @@ def _channels_log_payload(result: object, *, now: float) -> dict[str, object]:
         metadata = getattr(channel, "metadata", {}) or {}
         if not isinstance(metadata, Mapping):
             metadata = {}
-        out[str(channel_name)] = {
+        capability = getattr(channel, "capability", None)
+        channel_payload: dict[str, object] = {
             "valid": bool(getattr(channel, "valid", False)),
             "critical": bool(getattr(channel, "critical", False)),
-            "capability": getattr(channel, "capability", None),
+            "capability": capability,
             "side": getattr(channel, "side", None),
             "frame_name": getattr(channel, "frame_name", None),
             "source_name": getattr(channel, "source_name", None),
@@ -165,10 +123,49 @@ def _channels_log_payload(result: object, *, now: float) -> dict[str, object]:
                 if key in metadata
             },
         }
+        if capability == "pose6d":
+            channel_payload["pose_stage"] = "observation_channel_before_retarget"
+            raw_pose = getattr(channel, "value", None)
+            pose_payload = _pose_compact_debug(raw_pose)
+            try:
+                pose_matrix = np.asarray(raw_pose, dtype=float)
+            except (TypeError, ValueError):
+                pose_matrix = np.empty((0, 0), dtype=float)
+            if (
+                pose_payload is not None
+                and pose_matrix.shape == (4, 4)
+                and np.all(np.isfinite(pose_matrix))
+            ):
+                # Preserve exact SO(3) evidence; RPY is display-only and can
+                # become ambiguous near gimbal lock.
+                pose_payload["rotation_matrix"] = [
+                    [float(value) for value in row]
+                    for row in pose_matrix[:3, :3].tolist()
+                ]
+            channel_payload["pose"] = pose_payload
+            motion_window = metadata.get("tracker_motion_window")
+            if isinstance(motion_window, Mapping):
+                channel_payload["motion_window"] = _compact_debug_value(
+                    dict(motion_window),
+                    max_items=24,
+                )
+            motion_keys = (
+                "linear_velocity_m_s",
+                "angular_velocity_rad_s",
+                "velocity_frame_name",
+                "velocity_source",
+                "velocity_valid",
+                "velocity_error",
+            )
+            channel_payload["motion"] = {
+                key: _compact_debug_value(metadata.get(key), max_items=8)
+                for key in motion_keys
+                if key in metadata
+            }
+        out[str(channel_name)] = channel_payload
     return out
 
 __all__ = [
-    "bind_legacy_support",
     "_fault_signature",
     "_phase_timings_log_payload",
     "_latency_items_log_payload",

@@ -1,56 +1,54 @@
-"""Post-parse hardware and loop configuration for real teleoperation.
+"""Post-parse configuration and hardware admission for real teleoperation.
 
-This module owns configuration resolution only.  It does not construct or start
-hardware.  The legacy entrypoint refreshes the support namespace before each
-call so its historical monkeypatch seams remain effective.
+This module adapts resolved CLI arguments to the existing configuration,
+device-preflight, and hardware-assignment owners.  It may probe or persist
+assignments when the corresponding CLI policy requests that behavior, but it
+does not construct long-lived runtime devices or issue robot commands.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from typing import Any
 
-
-_REQUIRED_SUPPORT_NAMES = (
-    "DEFAULT_CAMERA_CONFIG_PATH",
-    "DevicePreflightError",
-    "DevicePreflightOptions",
-    "_active_sides_from_args",
-    "_apply_gripper_policy_to_dmtac_config",
-    "_dmtac_sides",
-    "_dmtac_tactile_enabled",
-    "_effective_arm_control_hz",
-    "_effective_outer_control_hz",
-    "_log",
-    "_resolve_logical_side_assignments",
-    "_resolved_gripper_policies_by_side",
-    "_resolved_gripper_policy",
-    "arm_ips_for_sides",
-    "build_rm65_arm_ip_assignment",
-    "dmtac_backend_configs_from_assignment",
-    "load_dmtac_hardware_assignment",
-    "load_latest_q6_ports",
-    "load_rm65_arm_ip_assignment",
-    "manual_dmtac_backend_config_for_side",
-    "prepare_devices_for_teleop",
-    "require_dmtac_sides_resolved",
-    "save_rm65_arm_ip_assignment_for_config",
+from ..backends.grippers import DMTacGripperBackendConfig
+from ..cli_value_parsers import _active_sides_from_args
+from ..configs.dmtac_hardware import (
+    dmtac_backend_configs_from_assignment,
+    load_dmtac_hardware_assignment,
+    manual_dmtac_backend_config_for_side,
+    require_dmtac_sides_resolved,
 )
-
-
-def bind_legacy_support(namespace: Mapping[str, Any]) -> None:
-    """Refresh dependencies owned by the compatibility entrypoint."""
-
-    missing = [name for name in _REQUIRED_SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "real-teleop CLI runtime configuration support is incomplete: "
-            + ", ".join(missing)
-        )
-    module_globals = globals()
-    for name in _REQUIRED_SUPPORT_NAMES:
-        module_globals[name] = namespace[name]
+from ..configs.q6_hardware import load_latest_q6_ports
+from ..configs.rm65_arm_ips import (
+    arm_ips_for_sides,
+    build_assignment as build_rm65_arm_ip_assignment,
+    load_assignment as load_rm65_arm_ip_assignment,
+    save_assignment_for_config as save_rm65_arm_ip_assignment_for_config,
+)
+from ..device_preflight import (
+    DevicePreflightError,
+    DevicePreflightOptions,
+    prepare_devices_for_teleop,
+)
+from ..log_utils import log_event as _log
+from .control_profile import (
+    effective_arm_control_hz as _effective_arm_control_hz,
+    effective_outer_control_hz as _effective_outer_control_hz,
+)
+from .defaults import DEFAULT_CAMERA_CONFIG_PATH
+from .dmtac_config import (
+    apply_gripper_policy_to_dmtac_config as _apply_gripper_policy_to_dmtac_config,
+    dmtac_tactile_enabled as _dmtac_tactile_enabled,
+)
+from .gripper_policy import (
+    resolved_gripper_policies_by_side as _resolved_gripper_policies_by_side,
+    resolved_gripper_policy as _resolved_gripper_policy,
+)
+from .hand_config import dmtac_sides as _dmtac_sides
+from .side_mapping import (
+    resolve_logical_side_assignments as _resolve_logical_side_assignments,
+)
 
 
 def _apply_default_q6_ports(
@@ -81,6 +79,15 @@ def _apply_default_q6_ports(
         )
     except Exception as exc:  # noqa: BLE001
         message = f"Failed to load hand Q6 assignment {getattr(args, 'q6_config', 'latest')!r}: {exc}"
+        if _gui_capability_admission(args):
+            args.q6_startup_error = message
+            args.gripper_input_source = "angle_trigger"
+            _log(
+                "GripperInput",
+                "WARNING: Q6 assignment loading was isolated from GUI startup; "
+                f"manual device retry remains available: {message}",
+            )
+            return
         if parser is not None:
             parser.error(message)
         raise RuntimeError(message) from exc
@@ -132,6 +139,22 @@ def _run_gui_device_preflight(
     try:
         result = prepare_devices_for_teleop(options)
     except DevicePreflightError as exc:
+        detail = str(exc)
+        if _gui_capability_admission(args) and detail.startswith(
+            "Q6 count is insufficient:"
+        ):
+            args.q6_startup_error = f"DevicePreflightError: {detail}"
+            # Keep the stable scalar gripper command contract while leaving
+            # the reconnectable Q6 source absent.  The runtime retry path can
+            # then atomically promote this fallback to Q6 after the operator
+            # reconnects the devices.
+            args.gripper_input_source = "angle_trigger"
+            _log(
+                "DevicePreflight",
+                "WARNING: Q6 preflight failure was isolated from GUI startup; "
+                f"press 'retry failed devices' after reconnecting: {detail}",
+            )
+            return
         parser.error(f"device preflight failed: {exc}")
     if not bool(getattr(result, "ok", True)):
         parser.error("device preflight permission fix failed; rerun the permission script with sudo.")
@@ -147,8 +170,15 @@ def _run_gui_device_preflight(
                 setattr(args, f"{side}_hand_port", str(port))
 
 
+def _gui_capability_admission(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "gui_requested", False)) and str(
+        getattr(args, "hardware_admission_mode", "strict")
+    ) == "capability"
+
+
 def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
     """Prefer usable Q6 input; fall back to the calibrated angle triggers."""
+    args.q6_startup_error = ""
     if not _dmtac_sides(args, active_sides):
         args.gripper_input_source = "none"
         return
@@ -162,18 +192,35 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
             probe_all_serial=True,
             show_raw_lines=False,
         )
-        expected = len(active_sides)
-        if len(scan.get("q6_devices") or ()) >= expected:
-            args.gripper_input_source = "q6"
-            return
-        if len(scan.get("q6_devices") or ()):
-            raise ValueError(
-                f"Detected only {len(scan.get('q6_devices') or ())} Q6 device(s), expected {expected}."
-            )
-    except ValueError:
-        raise
     except Exception as exc:  # noqa: BLE001 - Q6 probing is optional when triggers are available.
-        _log("GripperInput", f"Q6 probe unavailable; trying angle trigger: {type(exc).__name__}: {exc}")
+        # Preserve the historical strict behavior for scanner validation
+        # errors, while allowing GUI capability admission to surface the
+        # fault and keep the manual retry control alive.
+        if isinstance(exc, ValueError) and not _gui_capability_admission(args):
+            raise
+        args.q6_startup_error = f"{type(exc).__name__}: {exc}"
+        _log(
+            "GripperInput",
+            "Q6 probe unavailable; GUI will remain available and the runtime "
+            f"will try angle trigger until manual Q6 reconnect: {args.q6_startup_error}",
+        )
+        args.gripper_input_source = "angle_trigger"
+        return
+
+    expected = len(active_sides)
+    detected = len(scan.get("q6_devices") or ())
+    if detected >= expected:
+        args.gripper_input_source = "q6"
+        return
+    detail = f"Detected only {detected} Q6 device(s), expected {expected}."
+    if detected and not _gui_capability_admission(args):
+        raise ValueError(detail)
+    args.q6_startup_error = f"Q6UnavailableError: {detail}"
+    _log(
+        "GripperInput",
+        "Q6 input is unavailable at startup; GUI will remain available "
+        f"for manual reconnect: {detail}",
+    )
     args.gripper_input_source = "angle_trigger"
 
 
@@ -276,12 +323,12 @@ def _save_explicit_arm_ips_latest(
 
 def _validate_required_arm_ips(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
     logical_ip_by_side: dict[str, tuple[str, str]] = {}
-    inactive_config: list[str] = []
     for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
-        if not arm_ip:
-            continue
-        if logical_side not in active_sides:
-            inactive_config.append(f"{source_name}->{logical_side}")
+        # ``active_sides`` is the authority for this runtime.  A command may
+        # deliberately carry both saved/configured IPs while operating one
+        # arm; inactive-side values are retained as configuration context and
+        # must not turn into a startup error.
+        if logical_side not in active_sides or not arm_ip:
             continue
         logical_ip_by_side[logical_side] = (source_name, arm_ip)
     missing = [side for side in active_sides if side not in logical_ip_by_side]
@@ -293,13 +340,6 @@ def _validate_required_arm_ips(args: argparse.Namespace, active_sides: tuple[str
             "Check that LEFT_ARM_IP/RIGHT_ARM_IP are exported in this shell, or pass "
             "--left-arm-ip/--right-arm-ip literal IPs."
         )
-    if inactive_config:
-        raise ValueError(
-            "Inactive logical side received an arm IP; remove it or include that side "
-            f"in --active-sides. inactive={inactive_config}"
-        )
-
-
 def _dmtac_backend_configs(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
@@ -428,10 +468,10 @@ def _discover_runtime_q6_ports(
     return {side: str(ports[side]) for side in sides}
 
 __all__ = [
-    "bind_legacy_support",
     "_apply_default_q6_ports",
     "_run_gui_device_preflight",
     "_resolve_gripper_input_source",
+    "_gui_capability_admission",
     "_argv_has_option",
     "_apply_real_loop_timing_defaults",
     "_source_arm_ip_fields_for_active_sides",
@@ -441,4 +481,3 @@ __all__ = [
     "_dmtac_backend_configs",
     "_discover_runtime_q6_ports",
 ]
-

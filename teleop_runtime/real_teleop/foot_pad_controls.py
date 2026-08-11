@@ -233,6 +233,107 @@ def foot_pad_progress_topology_guidance(
     )
 
 
+def initialize_startup_foot_pad_input(
+    args: Any,
+    *,
+    foot_pad_control_mode: str,
+    input_type: type,
+    unavailable_error_type: type[Exception],
+    startup_cleanup: Any,
+    startup_progress: Any | None,
+    control_ui: Any | None,
+    apply_live_topology: Callable[[Any, int], str],
+    topology_guidance: Callable[..., str],
+    restore_init_after_fallback: Callable[..., tuple[bool, str]],
+    log: Callable[..., None],
+) -> Any | None:
+    """Open the optional foot-pad input or install its retryable fallback.
+
+    This is the sole initial-startup transaction for the independently
+    managed virtual keyboard.  Manual retry remains owned by
+    ``device_retry_runtime``.
+    """
+
+    requested = (
+        str(getattr(args, "special_arm_control_mode", ""))
+        == str(foot_pad_control_mode)
+    )
+    args.foot_pad_requested = bool(requested)
+    args.foot_pad_startup_error = ""
+    foot_pad_input = None
+    if requested:
+        if startup_progress is not None:
+            startup_progress.begin(
+                "foot_pad",
+                label="脚踏输入",
+                message="正在查找虚拟脚踏设备",
+                requirement="optional_input",
+            )
+        candidate = None
+        try:
+            candidate = input_type.open_online()
+            live_count = int(getattr(candidate, "foot_pad_count", 0) or 0)
+            live_mode = apply_live_topology(args, live_count)
+            foot_pad_input = candidate
+            log(
+                "FootPad",
+                "live virtual keyboard topology resolved: "
+                f"count={live_count} mode={live_mode}",
+            )
+            guidance = topology_guidance(
+                live_count,
+                progress_enabled=bool(
+                    getattr(args, "collection_progress_profile", None) is not None
+                    or getattr(args, "collection_progress_gui", False)
+                ),
+            )
+            if guidance:
+                log("FootPad", guidance)
+                if control_ui is not None:
+                    control_ui.append_message("FootPad", guidance)
+        except (unavailable_error_type, OSError, RuntimeError, ValueError) as exc:
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+            args.foot_pad_startup_error = f"{type(exc).__name__}: {exc}"
+            foot_pad_input = input_type.waiting_for_service()
+            startup_cleanup.add("foot_pad", foot_pad_input.close)
+            if startup_progress is not None:
+                startup_progress.fail(
+                    "foot_pad",
+                    args.foot_pad_startup_error,
+                    message="未就绪；点击“重连失败设备”后才会重新扫描",
+                )
+            log(
+                "FootPad",
+                "foot-pad input is unavailable; GUI/keyboard special-arm controls "
+                "remain available; press 'retry failed devices' in the GUI to "
+                "scan for the virtual keyboard again: "
+                f"{exc}",
+            )
+        else:
+            startup_cleanup.add("foot_pad", foot_pad_input.close)
+            if startup_progress is not None:
+                startup_progress.succeed("foot_pad", message="脚踏输入已连接")
+
+    _init_restored, init_restore_message = restore_init_after_fallback(
+        args,
+        live_foot_pad_count=(
+            None
+            if foot_pad_input is None
+            or not bool(getattr(foot_pad_input, "is_online", False))
+            else int(getattr(foot_pad_input, "foot_pad_count", 0) or 0)
+        ),
+    )
+    if init_restore_message:
+        log("InitArm", init_restore_message)
+        if control_ui is not None:
+            control_ui.append_message("InitArm", init_restore_message)
+    return foot_pad_input
+
+
 def _require_evdev() -> Any:
     try:
         import evdev
@@ -692,6 +793,7 @@ __all__ = [
     "configured_foot_pad_count",
     "foot_pad_count_from_key_codes",
     "foot_pad_progress_topology_guidance",
+    "initialize_startup_foot_pad_input",
     "persist_five_pedal_test_receipt",
     "persisted_five_pedal_test_verified",
     "apply_live_foot_pad_topology",

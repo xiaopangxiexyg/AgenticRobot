@@ -12,37 +12,36 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping
 import inspect
-import threading
-
-from collection_runtime.progress.profiles import (
-    inspect_dataset_progress_profile,
-    inspect_dataset_task_stage_profile,
-)
-from control_station.real_teleop.input_mapping import prioritize_input_batch
-from control_station.real_teleop.progress import (
-    PROGRESS_ARM_CONTROL_MODE_STRICT,
-    PROGRESS_ADVANCE_EVENT,
-    PROGRESS_FAILURE_EVENT,
-    PROGRESS_UNDO_EVENT,
-    ProgressOperatorIntent,
-    ProgressArmControlModeSelectionIntent,
-    ProgressProfileSelectionIntent,
-    progress_intent_from_event,
-    progress_arm_control_mode_selection_intent_from_event,
-    progress_profile_selection_intent_from_event,
-)
 
 from ..collection.episode_curation import EpisodeCurationSession
-from ..operator_ui_ports import OperatorUiPort
+from ..operator_ui_ports import (
+    OperatorUiPort,
+    RealTeleopInputBatchPrioritizer,
+)
 from .foot_pad_controls import (
     FOOT_PAD_FIVE_PROGRESS_EVENTS,
     FOOT_PAD_TWO_PEDAL_STYLE_COUNTS,
     persist_five_pedal_test_receipt,
     persisted_five_pedal_test_verified,
 )
-from .progress_adapter import (
-    resolve_real_teleop_task_stage_profile,
+from .dataset_selection import (
+    RealTeleopDatasetSelectionError,
+    apply_real_teleop_dataset_selection,
 )
+from .progress_contracts import (
+    PROGRESS_ARM_CONTROL_MODE_STRICT,
+    ProgressApplicationPort,
+    ProgressArmControlModeSelectionCommand,
+    ProgressMutationCommand,
+    ProgressProfileSelectionCommand,
+    PromotableHoldPause,
+    RealTeleopProgressWorkflowPort,
+)
+from .gripper_policy import (
+    GripperForceRequestError,
+    parse_gripper_force_request,
+)
+from .plus_curation_runtime import RealTeleopPlusCurationRuntime
 from .tracker_side_check import evaluate_tracker_side_assignment
 
 
@@ -137,10 +136,12 @@ _SUPPORT_NAMES = (
     "argparse",
     "bind_capture_modality_contract",
     "bind_gripper_force_contract",
+    "build_real_teleop_progress_application",
     "gui_collection_tasks",
     "json",
     "np",
     "Path",
+    "prioritize_input_batch",
     "run_best_effort_cleanup",
     "time",
 )
@@ -321,12 +322,12 @@ class RealTeleopControlInput:
         self._camera_depth_monitor = WristDepthFreshnessMonitor()
         self._episode_start_requested = False
         self._episode_stop_requested = False
-        self._progress_operator_intents: deque[ProgressOperatorIntent] = deque()
+        self._progress_operator_intents: deque[ProgressMutationCommand] = deque()
         self._progress_profile_selection_intents: deque[
-            ProgressProfileSelectionIntent
+            ProgressProfileSelectionCommand
         ] = deque()
         self._progress_arm_control_mode_selection_intents: deque[
-            ProgressArmControlModeSelectionIntent
+            ProgressArmControlModeSelectionCommand
         ] = deque()
         # Force-control warmup may need to sample the browser queue only for a
         # quit request. Preserve every other event so profile selection and
@@ -336,6 +337,19 @@ class RealTeleopControlInput:
         self._progress_ui_transport_revision = 0
         self._progress_ui_payload: dict[str, object] = {"enabled": False}
         self._progress_ui_controls: tuple[str, ...] = ()
+        # Physical progress pedals are an application input, not a rendered
+        # GUI detail.  Keep their canonical admission state separate from the
+        # optional progress panel so a CLI-selected profile remains operable
+        # when ``--collection-progress-gui`` is disabled.
+        self._progress_runtime_controls: tuple[str, ...] = ()
+        self._progress_runtime_state: dict[str, object] = {
+            "configured": False,
+            "recording_active": False,
+            "phase": "IDLE",
+            "application_held": False,
+            "allowed_next_step_ids": (),
+            "blocked_reason": "progress_not_configured",
+        }
         self._episode_delete_requested: int | None = None
         self._episode_last_episode_index: int | None = None
         self._episode_last_frame_count: int | None = None
@@ -350,8 +364,9 @@ class RealTeleopControlInput:
             ),
             source_schema="dexteleop_dataset_v2.3",
         )
-        self._plus_curation_request: dict[str, object] | None = None
-        self._plus_curation_save_thread: threading.Thread | None = None
+        self._plus_curation_runtime = RealTeleopPlusCurationRuntime(
+            self.plus_curation
+        )
         self._foot_pad_test_active = False
         self._foot_pad_test_completed = False
         self._foot_pad_test_seen_events: set[str] = set()
@@ -390,6 +405,29 @@ class RealTeleopControlInput:
             movement_multiple_events=tuple(MOVEMENT_MULTIPLE_GUI_EVENTS),
         )
 
+    def bind_application_ports(
+        self,
+        *,
+        progress_application: ProgressApplicationPort,
+        input_batch_prioritizer: RealTeleopInputBatchPrioritizer,
+    ) -> None:
+        """Bind Station policy before the runtime begins polling inputs."""
+
+        if not callable(input_batch_prioritizer):
+            raise TypeError("input_batch_prioritizer must be callable.")
+        existing_application = getattr(self, "_progress_application", None)
+        existing_prioritizer = getattr(self, "_input_batch_prioritizer", None)
+        if (
+            existing_application is not None
+            and existing_application is not progress_application
+        ) or (
+            existing_prioritizer is not None
+            and existing_prioritizer is not input_batch_prioritizer
+        ):
+            raise RuntimeError("RealTeleop application ports are already bound.")
+        self._progress_application = progress_application
+        self._input_batch_prioritizer = input_batch_prioritizer
+
     def _gui_control_state(self) -> GuiControlState:
         init_controller = getattr(self.components, "init_arm_controller", None)
         arm_control_mode = str(getattr(self.args, "arm_control_mode", "position"))
@@ -403,6 +441,12 @@ class RealTeleopControlInput:
                 )
             )
         )
+        plus_curation = getattr(self, "plus_curation", None)
+        plus_binding_blocker = (
+            plus_curation.persisted_binding_lock_reason()
+            if plus_curation is not None
+            else ""
+        )
         return GuiControlState(
             teleop_started=bool(getattr(self, "_teleop_started", False)),
             hold_active=bool(getattr(self, "_hold_active", False)),
@@ -412,7 +456,8 @@ class RealTeleopControlInput:
             ),
             episode_delete_available=not bool(
                 getattr(self.args, "no_collection", False)
-            ),
+            ) and not bool(plus_binding_blocker),
+            dataset_reconfiguration_available=not bool(plus_binding_blocker),
             episode_recording_active=bool(
                 getattr(self, "_episode_recording_ui_active", False)
             ),
@@ -710,23 +755,20 @@ class RealTeleopControlInput:
             )
 
     def consume_plus_curation_request(self) -> dict[str, object] | None:
-        request = self._plus_curation_request
-        self._plus_curation_request = None
-        return request
+        runtime = getattr(self, "_plus_curation_runtime", None)
+        if runtime is None:
+            return None
+        return runtime.consume_request()
 
     def _plus_curation_save_in_flight(self) -> bool:
+        runtime = getattr(self, "_plus_curation_runtime", None)
+        if runtime is not None:
+            return runtime.save_in_flight()
         plus_curation = getattr(self, "plus_curation", None)
-        save_thread = getattr(self, "_plus_curation_save_thread", None)
         return bool(
             plus_curation is not None
             and plus_curation.enabled
-            and (
-                plus_curation.status == "saving"
-                or (
-                    save_thread is not None
-                    and save_thread.is_alive()
-                )
-            )
+            and plus_curation.status == "saving"
         )
 
     def plus_curation_save_in_flight(self) -> bool:
@@ -740,85 +782,41 @@ class RealTeleopControlInput:
         disposition: str,
         reason_code: str,
     ) -> None:
-        if not self.plus_curation.enabled:
-            return
-        if self._plus_curation_save_thread is not None and self._plus_curation_save_thread.is_alive():
-            return
-        if not self.plus_curation.matches_pending(
-            episode_index=int(episode_index), pending_token=str(pending_token)
-        ):
-            self.plus_curation.status = "error"
-            self.plus_curation.message = "Plus 整理请求已过期：当前待整理 episode 已变化。"
+        runtime = getattr(self, "_plus_curation_runtime", None)
+        if runtime is None:
+            runtime = RealTeleopPlusCurationRuntime(self.plus_curation)
+            self._plus_curation_runtime = runtime
+
+        def publish_state() -> None:
             if self.ui is not None:
                 self.ui.publish(
                     **self.plus_curation.ui_state(),
+                    dataset_configuration_blocked_reason=(
+                        self._dataset_configuration_blocked_reason()
+                    ),
                     active_controls=self._current_active_controls(),
                 )
-            return
-        try:
-            self.plus_curation.set_review(
-                disposition=str(disposition), reason_code=str(reason_code)
-            )
-        except ValueError as exc:
-            self.plus_curation.status = "error"
-            self.plus_curation.message = f"Plus 整理参数无效: {exc}"
-            if self.ui is not None:
-                self.ui.publish(
-                    **self.plus_curation.ui_state(),
-                    active_controls=self._current_active_controls(),
-                )
-            return
-        request_episode_index = self.plus_curation.pending_episode_index
-        request_dataset_root = self.plus_curation.pending_dataset_root
-        request_pending_token = self.plus_curation.pending_token
-        request_variant_id = self.plus_curation.variant_id
-        self.plus_curation.status = "saving"
-        self.plus_curation.message = "Plus sidecar 正在后台写入。"
-        if self.ui is not None:
-            self.ui.publish(
-                **self.plus_curation.ui_state(),
-                active_controls=self._current_active_controls(),
-            )
 
-        def write_sidecar() -> None:
-            try:
-                record = self.plus_curation.save(
-                    disposition=str(disposition),
-                    reason_code=str(reason_code),
-                    pending_token=request_pending_token,
-                    variant_id=request_variant_id,
-                    source_episode_index=request_episode_index,
-                    source_dataset_root=request_dataset_root,
+        runtime.start_save(
+            episode_index=episode_index,
+            pending_token=pending_token,
+            disposition=disposition,
+            reason_code=reason_code,
+            on_state_changed=publish_state,
+            on_failure=lambda message: (
+                self.ui.append_message("Plus", message)
+                if self.ui is not None
+                else None
+            ),
+            on_success=lambda record: (
+                self.ui.append_message(
+                    "Plus",
+                    f"已写入 Plus sidecar: {record.annotation_episode_id}",
                 )
-            except Exception as exc:  # noqa: BLE001 - overlay failure is non-fatal to collection.
-                if (
-                    self.plus_curation.pending_episode_index == request_episode_index
-                    and self.plus_curation.pending_dataset_root == request_dataset_root
-                    and self.plus_curation.pending_token == request_pending_token
-                ):
-                    self.plus_curation.status = "error"
-                    self.plus_curation.message = f"Plus sidecar 写入失败: {type(exc).__name__}: {exc}"
-                if self.ui is not None:
-                    self.ui.append_message(
-                        "Plus",
-                        f"Plus sidecar 写入失败: {type(exc).__name__}: {exc}",
-                    )
-            else:
-                if self.ui is not None:
-                    self.ui.append_message("Plus", f"已写入 Plus sidecar: {record.annotation_episode_id}")
-            finally:
-                if self.ui is not None:
-                    self.ui.publish(
-                        **self.plus_curation.ui_state(),
-                        active_controls=self._current_active_controls(),
-                    )
-
-        self._plus_curation_save_thread = threading.Thread(
-            target=write_sidecar,
-            name="plus-episode-curation-save",
-            daemon=True,
+                if self.ui is not None
+                else None
+            ),
         )
-        self._plus_curation_save_thread.start()
 
     def _camera_visualization_available(self) -> bool:
         return self._gui_control_state().camera_visualization_available
@@ -837,6 +835,9 @@ class RealTeleopControlInput:
 
     def _collection_task_controls(self) -> list[str]:
         return _gui_collection_task_controls(self._gui_control_state())
+
+    def _dataset_configuration_blocked_reason(self) -> str:
+        return self.plus_curation.persisted_binding_lock_reason()
 
     def _episode_busy(self) -> bool:
         return _gui_episode_busy(self._gui_control_state())
@@ -1076,6 +1077,9 @@ class RealTeleopControlInput:
             ),
             episode_last_episode_index=None,
             episode_last_frame_count=None,
+            dataset_configuration_blocked_reason=(
+                self._dataset_configuration_blocked_reason()
+            ),
             **self.plus_curation.ui_state(),
             **_collection_task_ui_state(self.args),
             **_fix_arm_ui_state(self.components),
@@ -1148,6 +1152,29 @@ class RealTeleopControlInput:
         except TypeError:
             return
 
+    def _progress_application_port(self) -> ProgressApplicationPort:
+        application = getattr(self, "_progress_application", None)
+        if application is None:
+            factory = globals().get("build_real_teleop_progress_application")
+            if not callable(factory):
+                raise RuntimeError(
+                    "RealTeleop progress application was not injected."
+                )
+            application = factory(getattr(self, "args", None))
+            self._progress_application = application
+        return application
+
+    def _input_batch_policy(self) -> RealTeleopInputBatchPrioritizer:
+        policy = getattr(self, "_input_batch_prioritizer", None)
+        if policy is None:
+            policy = globals().get("prioritize_input_batch")
+            if not callable(policy):
+                raise RuntimeError(
+                    "RealTeleop input-batch prioritizer was not injected."
+                )
+            self._input_batch_prioritizer = policy
+        return policy
+
     def poll(self) -> None:
         current_time = time.time()
         self._poll_two_pedal_alert_timeout(now=current_time)
@@ -1162,7 +1189,7 @@ class RealTeleopControlInput:
         )
         # Station owns application-level input precedence. Device polling and
         # all resulting entity operations remain in this lower runtime.
-        input_batch = prioritize_input_batch(
+        input_batch = self._input_batch_policy()(
             ui_events,
             terminal_quit_requested=bool(self.terminal.should_quit),
             teleop_started=bool(self._teleop_started),
@@ -1352,26 +1379,13 @@ class RealTeleopControlInput:
                     ):
                         self._handle_init_arm_move_both_to_qpos_event(now=current_time)
                 elif event.startswith("plus_curation_save:"):
-                    try:
-                        payload = json.loads(event.split(":", 1)[1])
-                        if not isinstance(payload, Mapping):
-                            raise ValueError("Plus curation payload must be an object")
-                        self._plus_curation_request = {
-                            "episode_index": int(payload.get("episode_index")),
-                            "pending_token": str(payload.get("pending_token", "") or "").strip(),
-                            "disposition": str(payload.get("disposition", "unknown")),
-                            "reason_code": str(payload.get("reason_code", "unknown")),
-                        }
-                        self.plus_curation.status = "saving"
-                        self.plus_curation.message = "Plus 整理提交已接收。"
-                        self.ui.publish(
+                    self._plus_curation_runtime.submit_request_text(
+                        event.split(":", 1)[1],
+                        on_state_changed=lambda: self.ui.publish(
                             **self.plus_curation.ui_state(),
                             active_controls=self._current_active_controls(),
-                        )
-                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                        self.plus_curation.status = "error"
-                        self.plus_curation.message = f"Plus 整理参数无效: {exc}"
-                        self.ui.publish(**self.plus_curation.ui_state())
+                        ),
+                    )
                 elif (
                     event in {"progress_failure", "progress_undo"}
                     or event == "progress_advance"
@@ -1425,10 +1439,19 @@ class RealTeleopControlInput:
                         if payload_applied:
                             self._episode_start_requested = True
                 elif event.startswith("task_select:"):
-                    self._apply_episode_start_payload(
-                        event.split(":", 1)[1],
-                        bind_dataset_contract=True,
-                    )
+                    blocker = self.plus_curation.persisted_binding_lock_reason()
+                    if blocker:
+                        if self.ui is not None:
+                            self.ui.append_message("Dataset", blocker)
+                            self.ui.publish(
+                                dataset_configuration_blocked_reason=blocker,
+                                active_controls=self._current_active_controls(),
+                            )
+                    else:
+                        self._apply_episode_start_payload(
+                            event.split(":", 1)[1],
+                            bind_dataset_contract=True,
+                        )
                 elif event.startswith("gripper_force_set:"):
                     self._set_gripper_force_from_gui(event.split(":", 1)[1])
                 elif event.startswith("gripper_force_persist:"):
@@ -1681,33 +1704,71 @@ class RealTeleopControlInput:
 
         if not self._progress_pedal_routing_enabled():
             return False
+        event_bindings = self._progress_application_port().event_bindings
         progress_event_by_legacy_label = {
-            "init_arm_left": PROGRESS_ADVANCE_EVENT,
-            "init_arm_right": PROGRESS_FAILURE_EVENT,
-            "progress_undo": PROGRESS_UNDO_EVENT,
+            "init_arm_left": event_bindings.advance,
+            "init_arm_right": event_bindings.failure,
+            "progress_undo": event_bindings.undo,
         }
         progress_event = progress_event_by_legacy_label.get(str(event))
         if progress_event is None:
             return False
         pedal_number_by_event = {
-            PROGRESS_ADVANCE_EVENT: 3,
-            PROGRESS_FAILURE_EVENT: 4,
-            PROGRESS_UNDO_EVENT: 5,
+            event_bindings.advance: 3,
+            event_bindings.failure: 4,
+            event_bindings.undo: 5,
         }
         operation_label_by_event = {
-            PROGRESS_ADVANCE_EVENT: "进入下一子任务阶段",
-            PROGRESS_FAILURE_EVENT: "记录当前子任务失败并 Hold",
-            PROGRESS_UNDO_EVENT: "撤销上一个子任务进度标注",
+            event_bindings.advance: "进入下一子任务阶段",
+            event_bindings.failure: "记录当前子任务失败并 Hold",
+            event_bindings.undo: "撤销上一个子任务进度标注",
         }
         pedal_number = pedal_number_by_event[progress_event]
         operation_label = operation_label_by_event[progress_event]
         active_controls = set(
-            getattr(self, "_progress_ui_controls", ())
+            getattr(
+                self,
+                "_progress_runtime_controls",
+                # Compatibility for small tests/embedders constructed before
+                # runtime/UI admission was split.  Normal initialized objects
+                # always own ``_progress_runtime_controls``.
+                getattr(self, "_progress_ui_controls", ()),
+            )
         )
         if progress_event not in active_controls:
+            runtime_state = dict(
+                getattr(self, "_progress_runtime_state", {}) or {}
+            )
+            blocked_reason = str(
+                runtime_state.get("blocked_reason", "") or ""
+            ).strip()
+            phase = str(runtime_state.get("phase", "") or "IDLE")
+            recording_active = bool(
+                runtime_state.get("recording_active", False)
+            )
+            if getattr(self, "_progress_operator_intents", ()):
+                reason = "已有 progress 请求等待控制循环处理"
+            elif blocked_reason == "arm_transition_home_pending":
+                reason = "上一条阶段切换正在等待目标活动臂 runtime Home"
+            elif not bool(runtime_state.get("configured", False)):
+                reason = "当前 Episode 未配置 progress profile"
+            elif not recording_active or phase == "IDLE":
+                reason = "当前没有活动的正式 Episode"
+            elif bool(runtime_state.get("application_held", False)):
+                reason = f"当前处于 Hold（phase={phase}）"
+            elif phase != "ACTIVE_ATTEMPT":
+                reason = f"当前 progress phase={phase}"
+            elif not tuple(
+                runtime_state.get("allowed_next_step_ids", ()) or ()
+            ):
+                reason = "当前已经是 profile 的末阶段，没有合法后继"
+            elif blocked_reason:
+                reason = blocked_reason
+            else:
+                reason = "progress 准入状态尚未刷新"
             message = (
                 f"踏板 {pedal_number} 已忽略：当前 progress 状态不允许"
-                f"“{operation_label}”；未执行 Init。"
+                f"“{operation_label}”（{reason}）；未执行 Init。"
             )
             self._publish_progress_pedal_message(message, now=now)
             return True
@@ -3478,41 +3539,17 @@ class RealTeleopControlInput:
                 self.ui.append_message("GripperForce", message)
             return
         try:
-            payload = json.loads(str(text or "{}"))
-        except json.JSONDecodeError as exc:
-            payload = None
-            parse_error = str(exc)
-        else:
-            parse_error = ""
-        if not isinstance(payload, Mapping):
-            message = (
-                f"夹爪力度参数无效: {parse_error or '必须是包含 left/right 的 JSON 对象。'}"
+            requested = parse_gripper_force_request(
+                text,
+                require_nonempty=True,
             )
-            _log("GripperForce", message)
-            if self.ui is not None:
-                self.ui.append_message("GripperForce", message)
-            return
-
-        requested: dict[str, float] = {}
-        try:
-            for side in ("left", "right"):
-                value = payload.get(side)
-                if value is None:
-                    continue
-                if isinstance(value, bool):
-                    raise ValueError(f"{side} 必须是 0 到 1 的数字")
-                force = float(value)
-                if not np.isfinite(force) or not 0.0 <= force <= 1.0:
-                    raise ValueError(f"{side} 必须在 [0, 1] 内")
-                requested[side] = force
-        except (TypeError, ValueError) as exc:
-            message = f"夹爪力度参数无效: {exc}。"
-            _log("GripperForce", message)
-            if self.ui is not None:
-                self.ui.append_message("GripperForce", message)
-            return
-        if not requested:
-            message = "未提供可设置的左/右夹爪力度。"
+        except GripperForceRequestError as exc:
+            reason = str(exc)
+            message = (
+                reason
+                if reason == "未提供可设置的左/右夹爪力度。"
+                else f"夹爪力度参数无效: {reason}"
+            )
             _log("GripperForce", message)
             if self.ui is not None:
                 self.ui.append_message("GripperForce", message)
@@ -3566,32 +3603,12 @@ class RealTeleopControlInput:
                 self.ui.append_message("GripperForce", message)
             return
         try:
-            payload = json.loads(str(text or "{}"))
-        except json.JSONDecodeError as exc:
-            payload = None
-            parse_error = str(exc)
-        else:
-            parse_error = ""
-        if not isinstance(payload, Mapping):
-            message = f"永久夹爪力度参数无效: {parse_error or '必须是包含 left/right 的 JSON 对象。'}"
-            if self.ui is not None:
-                self.ui.append_message("GripperForce", message)
-            return
-
-        requested: dict[str, float] = {}
-        try:
-            for side in ("left", "right"):
-                value = payload.get(side)
-                if value is None:
-                    continue
-                if isinstance(value, bool):
-                    raise ValueError(f"{side} 必须是 0 到 1 的数字")
-                force = float(value)
-                if not np.isfinite(force) or not 0.0 <= force <= 1.0:
-                    raise ValueError(f"{side} 必须在 [0, 1] 内")
-                requested[side] = force
-        except (TypeError, ValueError) as exc:
-            message = f"永久夹爪力度参数无效: {exc}。"
+            requested = parse_gripper_force_request(
+                text,
+                require_nonempty=False,
+            )
+        except GripperForceRequestError as exc:
+            message = f"永久夹爪力度参数无效: {exc}"
             if self.ui is not None:
                 self.ui.append_message("GripperForce", message)
             return
@@ -3712,203 +3729,17 @@ class RealTeleopControlInput:
                 "请先停止当前 episode。"
             )
         try:
-            payload = json.loads(str(text or "{}"))
-        except json.JSONDecodeError as exc:
-            return reject(f"数采参数无效: {exc}")
-        if not isinstance(payload, Mapping):
-            return reject("数采参数无效：payload 必须是对象。")
-        dataset_base_root = str(payload.get("dataset_base_root") or "").strip()
-        task_key = str(payload.get("task_key") or "").strip()
-        english_name = str(payload.get("task_english_name") or "").strip()
-        chinese_name = str(payload.get("task_chinese_name") or "").strip()
-        payload_task_type = str(payload.get("task_type") or "").strip()
-        payload_round_trip_phase = str(payload.get("round_trip_phase") or "").strip()
-        if "ignored_camera_keys" in payload or "ignored_tactile_keys" in payload:
-            ignored_camera_keys = payload.get("ignored_camera_keys", ())
-            ignored_tactile_keys = payload.get("ignored_tactile_keys", ())
-            if not isinstance(ignored_camera_keys, list) or not isinstance(
-                ignored_tactile_keys, list
-            ):
-                return reject("数据集忽视规则无效：camera/tactile 必须是列表。")
-            camera_keys = tuple(
-                sorted(
-                    {
-                        str(value).strip()
-                        for value in ignored_camera_keys
-                        if str(value).strip()
-                    }
-                )
-            )
-            configured_camera_keys = set(
-                str(value)
-                for value in (
-                    getattr(self.args, "configured_camera_keys", ()) or ()
-                )
-            )
-            unknown_camera_keys = sorted(set(camera_keys) - configured_camera_keys)
-            if configured_camera_keys and unknown_camera_keys:
-                return reject(
-                    "相机忽视规则包含当前配置中不存在的视角："
-                    + ", ".join(unknown_camera_keys)
-                )
-            tactile_keys = tuple(
-                sorted({str(value).strip() for value in ignored_tactile_keys})
-            )
-            if any(value not in {"left", "right"} for value in tactile_keys):
-                return reject("触觉忽视规则仅支持 left/right。")
-            self.args.ignore_camera = list(camera_keys)
-            self.args.ignore_tactile = list(tactile_keys)
-        task_def = _task_definition_for_key(self.args, task_key)
-        if task_def is not None:
-            if not english_name:
-                english_name = str(task_def.get("english_name") or task_key)
-            if not chinese_name:
-                chinese_name = str(task_def.get("chinese_name") or "")
-            gripper_task = str(task_def.get("gripper_task") or task_key)
-            task_type = (
-                gui_collection_tasks.normalize_task_type(payload_task_type)
-                if payload_task_type
-                else gui_collection_tasks.normalize_task_type(task_def.get("task_type", ""))
-            )
-        else:
-            gripper_task = task_key
-            task_type = (
-                gui_collection_tasks.normalize_task_type(payload_task_type)
-                if payload_task_type
-                else gui_collection_tasks.normalize_task_type(getattr(self.args, "collection_task_type", ""))
-            )
-        if dataset_base_root:
-            self.args.dataset_root = dataset_base_root
-            self.args.dataset_base_root = str(_expand_cli_path(dataset_base_root))
-        if gripper_task:
-            self.args.gripper_task = gripper_task
-        task_name = (
-            english_name
-            or gripper_task
-            or gui_collection_tasks.strip_round_trip_suffix(
-                str(getattr(self.args, "collection_task_name", "") or "")
-            )
-        )
-        if task_name:
-            self.args.collection_task_name = task_name
-        if chinese_name:
-            self.args.collection_task_name_zh = chinese_name
-        elif task_def is None and "task_chinese_name" in payload:
-            # A custom task has no registry label to inherit. Do not leak the
-            # previous task's Chinese display name into the new dataset.
-            self.args.collection_task_name_zh = ""
-        base_task_id = task_key or _default_task_id_from_name(task_name or gripper_task)
-        self.args.collection_task_id = base_task_id
-        self.args.collection_task_key = task_key
-        self.args.collection_task_type = task_type
-        task_description = (
-            str(task_def.get("description") or "").strip()
-            if task_def is not None
-            else ""
-        )
-        self.args.collection_task_description = task_description or chinese_name or task_name
-        if task_type == gui_collection_tasks.ROUND_TRIP_TASK_TYPE:
-            phase = (
-                gui_collection_tasks.normalize_round_trip_phase(payload_round_trip_phase)
-                if payload_round_trip_phase
-                else gui_collection_tasks.ROUND_TRIP_IN
-            )
-            self.args.collection_round_trip_phase = phase
-            self.args.collection_round_trip_base_name = task_name
-            self.args.collection_round_trip_base_id = base_task_id
-            self.args.collection_round_trip_base_name_zh = chinese_name
-            self.args.collection_round_trip_base_description = self.args.collection_task_description
-        else:
-            self.args.collection_round_trip_phase = gui_collection_tasks.ROUND_TRIP_IN
-            self.args.collection_round_trip_base_name = gui_collection_tasks.strip_round_trip_suffix(task_name)
-            self.args.collection_round_trip_base_id = gui_collection_tasks.strip_round_trip_suffix(base_task_id)
-            self.args.collection_round_trip_base_name_zh = chinese_name
-            self.args.collection_round_trip_base_description = self.args.collection_task_description
-        _refresh_formal_dataset_layout(self.args)
-        try:
-            target_dataset_root = Path(self.args.dataset_root)
-            requested_progress_profile = getattr(
+            payload = apply_real_teleop_dataset_selection(
                 self.args,
-                "collection_progress_profile",
-                None,
+                text,
+                bind_dataset_contract=bind_dataset_contract,
+                task_definition_for_key=_task_definition_for_key,
+                refresh_formal_dataset_layout=_refresh_formal_dataset_layout,
+                expand_cli_path=_expand_cli_path,
+                bind_capture_modality_contract=bind_capture_modality_contract,
             )
-            # A task/root change is a dataset-selection operation, not a
-            # profile compatibility check against the previous task.  First
-            # inspect the target without the old draft profile: a bound target
-            # owns its profile, while a blank target may carry the operator's
-            # current draft forward.  This keeps task and profile selection
-            # order-independent without allowing a dataset to mix hashes.
-            target_binding = inspect_dataset_progress_profile(
-                target_dataset_root,
-                requested_profile=None,
-            )
-            progress_admission = (
-                target_binding
-                if target_binding.locked or target_binding.profile is not None
-                else inspect_dataset_progress_profile(
-                    target_dataset_root,
-                    requested_profile=requested_progress_profile,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - restore the full args snapshot below.
-            return reject(
-                "数据集 progress profile 校验失败，已恢复原配置："
-                f"{type(exc).__name__}: {exc}"
-            )
-        if progress_admission.profile is not None:
-            self.args.collection_progress_profile = (
-                progress_admission.profile
-            )
-            try:
-                requested_stage_profile = (
-                    None
-                    if target_binding.profile is not None
-                    else resolve_real_teleop_task_stage_profile(
-                        progress_admission.profile,
-                        getattr(
-                            self.args,
-                            "collection_stage_profile",
-                            None,
-                        ),
-                    )
-                )
-                stage_admission = inspect_dataset_task_stage_profile(
-                    Path(self.args.dataset_root),
-                    progress_profile=progress_admission.profile,
-                    requested_profile=requested_stage_profile,
-                )
-            except Exception as exc:  # noqa: BLE001 - restore args below.
-                return reject(
-                    "数据集 stage profile 校验失败，已恢复原配置："
-                    f"{type(exc).__name__}: {exc}"
-                )
-            self.args.collection_stage_profile = stage_admission.profile
-        else:
-            # A target dataset may already be permanently profile-less.  Do
-            # not leave the old task's profile in args, otherwise the next
-            # recorder reconfiguration would report a misleading hash
-            # conflict and make task selection appear to be blocked by the
-            # unrelated profile draft.
-            self.args.collection_progress_profile = None
-            self.args.collection_stage_profile = None
-        if bind_dataset_contract:
-            try:
-                bind_capture_modality_contract(
-                    Path(self.args.dataset_root),
-                    CaptureModalityContract(
-                        ignored_camera_keys=tuple(
-                            getattr(self.args, "ignore_camera", ()) or ()
-                        ),
-                        ignored_tactile_keys=tuple(
-                            getattr(self.args, "ignore_tactile", ()) or ()
-                        ),
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001 - keep current selection usable.
-                return reject(
-                    "数据集忽视规则绑定失败，已恢复原配置："
-                    f"{type(exc).__name__}: {exc}"
-                )
+        except RealTeleopDatasetSelectionError as exc:
+            return reject(str(exc))
         plus_variant_id = str(payload.get("plus_variant_id", "") or "").strip()
         if self.plus_curation.enabled and "plus_variant_id" in payload:
             try:
@@ -4093,23 +3924,88 @@ class RealTeleopControlInput:
         self._episode_stop_requested = False
         return bool(self.terminal.consume_episode_stop_request() or requested)
 
+    def build_progress_workflow(
+        self,
+        recorder: object,
+    ) -> RealTeleopProgressWorkflowPort:
+        """Request the Station coordinator through the injected port."""
+
+        return self._progress_application_port().build_progress_workflow(
+            recorder
+        )
+
+    def build_startup_progress_ui_payload(
+        self,
+        *,
+        dataset_recorder: object | None,
+        profile_selection_enabled: bool,
+    ) -> dict[str, object]:
+        return self._progress_application_port().build_startup_progress_ui_payload(
+            dataset_recorder=dataset_recorder,
+            profile_selection_enabled=profile_selection_enabled,
+        )
+
+    def select_managed_progress_profile(
+        self,
+        *,
+        dataset_recorder: object | None,
+        profile_id: str,
+    ):
+        return self._progress_application_port().select_managed_progress_profile(
+            dataset_recorder=dataset_recorder,
+            profile_id=profile_id,
+        )
+
+    def publish_progress_application_state(
+        self,
+        *,
+        dataset_recorder: object | None,
+        progress_workflow: object | None,
+        promotable_hold_pause: PromotableHoldPause | None,
+        arm_transition_pending: bool,
+    ) -> None:
+        """Project lower progress state through the Station application leaf."""
+
+        projection = (
+            self._progress_application_port().project_progress_application_state(
+                dataset_recorder=dataset_recorder,
+                progress_workflow=progress_workflow,
+                promotable_hold_pause=promotable_hold_pause,
+                application_held=self.hold_active(),
+                arm_transition_pending=arm_transition_pending,
+                profile_selection_enabled=not self._episode_busy(),
+            )
+        )
+        self.publish_progress_control_availability(
+            configured=projection.configured,
+            active_controls=projection.active_controls,
+            recording_active=projection.recording_active,
+            phase=projection.phase,
+            application_held=projection.application_held,
+            allowed_next_step_ids=projection.allowed_next_step_ids,
+            blocked_reason=projection.blocked_reason,
+        )
+        self.publish_progress_ui_state(projection.ui_payload)
+
     def submit_progress_operator_intent(
         self,
-        intent: ProgressOperatorIntent,
+        command: ProgressMutationCommand,
     ) -> bool:
         """Admit at most one mutation before rebuilt state is observed."""
 
-        if not isinstance(intent, ProgressOperatorIntent):
-            raise TypeError("intent must be ProgressOperatorIntent.")
+        if not isinstance(command, ProgressMutationCommand):
+            raise TypeError("command must be ProgressMutationCommand.")
         if self._progress_operator_intents:
             return False
-        self._progress_operator_intents.append(intent)
+        self._progress_operator_intents.append(command)
         # The HTTP admission layer removes one-shot controls immediately.
         # Force the next canonical projection to be published even when a
         # lower layer rejects the request and the canonical state is
         # unchanged, otherwise the button would remain disabled forever.
         self._progress_ui_payload = {}
         self._progress_ui_controls = ()
+        if hasattr(self, "_progress_runtime_controls"):
+            self._progress_runtime_controls = ()
         self._progress_ui_transport_revision = int(
             getattr(self, "_progress_ui_transport_revision", 0)
         ) + 1
@@ -4119,45 +4015,80 @@ class RealTeleopControlInput:
         """Translate one admitted browser event into the typed application port."""
 
         self._progress_operator_intent_sequence += 1
-        intent = progress_intent_from_event(
-            str(event),
-            intent_id=(
+        command = self._progress_application_port().command_from_event(
+            event=str(event),
+            command_id=(
                 "real-teleop-progress-gui:"
                 f"{self._progress_operator_intent_sequence}"
             ),
         )
-        if intent is None:
+        if command is None:
             return False
-        return self.submit_progress_operator_intent(intent)
+        return self.submit_progress_operator_intent(command)
+
+    def publish_progress_control_availability(
+        self,
+        *,
+        configured: bool,
+        active_controls: tuple[str, ...] | list[str],
+        recording_active: bool,
+        phase: str,
+        application_held: bool,
+        allowed_next_step_ids: tuple[str, ...] | list[str],
+        blocked_reason: str = "",
+    ) -> None:
+        """Publish backend progress admission independently of GUI rendering."""
+
+        if not isinstance(active_controls, (list, tuple)):
+            raise TypeError("progress active_controls must be a list or tuple.")
+        if not isinstance(allowed_next_step_ids, (list, tuple)):
+            raise TypeError(
+                "progress allowed_next_step_ids must be a list or tuple."
+            )
+        self._progress_runtime_controls = (
+            tuple(str(item) for item in active_controls)
+            if bool(configured)
+            else ()
+        )
+        self._progress_runtime_state = {
+            "configured": bool(configured),
+            "recording_active": bool(recording_active),
+            "phase": str(phase),
+            "application_held": bool(application_held),
+            "allowed_next_step_ids": tuple(
+                str(item) for item in allowed_next_step_ids
+            ),
+            "blocked_reason": str(blocked_reason),
+        }
 
     def submit_progress_foot_pad_event(self, event: str) -> bool:
         """Translate one admitted progress-pedal edge into the same typed port."""
 
         self._progress_operator_intent_sequence += 1
-        intent = progress_intent_from_event(
-            str(event),
-            intent_id=(
+        command = self._progress_application_port().command_from_event(
+            event=str(event),
+            command_id=(
                 "real-teleop-progress-foot-pad:"
                 f"{self._progress_operator_intent_sequence}"
             ),
         )
-        if intent is None:
+        if command is None:
             return False
-        return self.submit_progress_operator_intent(intent)
+        return self.submit_progress_operator_intent(command)
 
     def submit_progress_profile_selection_intent(
         self,
-        intent: ProgressProfileSelectionIntent,
+        command: ProgressProfileSelectionCommand,
     ) -> bool:
         """Admit one configuration selection before rebuilt state is observed."""
 
-        if not isinstance(intent, ProgressProfileSelectionIntent):
+        if not isinstance(command, ProgressProfileSelectionCommand):
             raise TypeError(
-                "intent must be ProgressProfileSelectionIntent."
+                "command must be ProgressProfileSelectionCommand."
             )
         if self._progress_profile_selection_intents:
             return False
-        self._progress_profile_selection_intents.append(intent)
+        self._progress_profile_selection_intents.append(command)
         self._progress_ui_payload = {}
         self._progress_ui_controls = ()
         self._progress_ui_transport_revision = int(
@@ -4170,26 +4101,26 @@ class RealTeleopControlInput:
         event: str,
     ) -> bool:
         self._progress_operator_intent_sequence += 1
-        intent = progress_profile_selection_intent_from_event(
-            str(event),
-            intent_id=(
+        command = self._progress_application_port().profile_selection_from_event(
+            event=str(event),
+            command_id=(
                 "real-teleop-progress-profile-gui:"
                 f"{self._progress_operator_intent_sequence}"
             ),
         )
-        if intent is None:
+        if command is None:
             return False
-        return self.submit_progress_profile_selection_intent(intent)
+        return self.submit_progress_profile_selection_intent(command)
 
     def submit_progress_arm_control_mode_selection_intent(
         self,
-        intent: ProgressArmControlModeSelectionIntent,
+        command: ProgressArmControlModeSelectionCommand,
     ) -> bool:
         """Admit one idle-time arm-control enforcement selection."""
 
-        if not isinstance(intent, ProgressArmControlModeSelectionIntent):
+        if not isinstance(command, ProgressArmControlModeSelectionCommand):
             raise TypeError(
-                "intent must be ProgressArmControlModeSelectionIntent."
+                "command must be ProgressArmControlModeSelectionCommand."
             )
         pending = getattr(
             self,
@@ -4201,7 +4132,7 @@ class RealTeleopControlInput:
             self._progress_arm_control_mode_selection_intents = pending
         if pending:
             return False
-        pending.append(intent)
+        pending.append(command)
         # Keep the last backend-published mode authoritative until the control
         # loop consumes this selection. Clearing the payload here would create
         # a brief strict->permissive window for a second event in the same GUI
@@ -4216,16 +4147,18 @@ class RealTeleopControlInput:
         event: str,
     ) -> bool:
         self._progress_operator_intent_sequence += 1
-        intent = progress_arm_control_mode_selection_intent_from_event(
-            str(event),
-            intent_id=(
-                "real-teleop-progress-arm-mode-gui:"
-                f"{self._progress_operator_intent_sequence}"
-            ),
+        command = (
+            self._progress_application_port().arm_control_mode_selection_from_event(
+                event=str(event),
+                command_id=(
+                    "real-teleop-progress-arm-mode-gui:"
+                    f"{self._progress_operator_intent_sequence}"
+                ),
+            )
         )
-        if intent is None:
+        if command is None:
             return False
-        return self.submit_progress_arm_control_mode_selection_intent(intent)
+        return self.submit_progress_arm_control_mode_selection_intent(command)
 
     def publish_progress_ui_state(
         self,
@@ -4270,20 +4203,31 @@ class RealTeleopControlInput:
         self,
         *,
         max_intents: int = 8,
-    ) -> tuple[ProgressOperatorIntent, ...]:
+    ) -> tuple[ProgressMutationCommand, ...]:
         pending = getattr(self, "_progress_operator_intents", None)
         if pending is None:
             return ()
-        result: list[ProgressOperatorIntent] = []
+        result: list[ProgressMutationCommand] = []
         for _ in range(max(1, int(max_intents))):
             if not pending:
                 break
             result.append(pending.popleft())
         return tuple(result)
 
+    def consume_progress_commands(
+        self,
+        *,
+        max_commands: int = 8,
+    ) -> tuple[ProgressMutationCommand, ...]:
+        """Consume Station-admitted lower commands exactly once."""
+
+        return self.consume_progress_operator_intents(
+            max_intents=max_commands,
+        )
+
     def consume_progress_profile_selection_intents(
         self,
-    ) -> tuple[ProgressProfileSelectionIntent, ...]:
+    ) -> tuple[ProgressProfileSelectionCommand, ...]:
         pending = getattr(
             self,
             "_progress_profile_selection_intents",
@@ -4298,7 +4242,7 @@ class RealTeleopControlInput:
 
     def consume_progress_arm_control_mode_selection_intents(
         self,
-    ) -> tuple[ProgressArmControlModeSelectionIntent, ...]:
+    ) -> tuple[ProgressArmControlModeSelectionCommand, ...]:
         pending = getattr(
             self,
             "_progress_arm_control_mode_selection_intents",

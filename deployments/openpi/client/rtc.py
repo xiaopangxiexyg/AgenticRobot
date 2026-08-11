@@ -16,6 +16,15 @@ import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.policy_artifact import PolicyArtifactContract
+from deployments.openpi.artifact_identity import (
+    OPENPI_RTC_ARTIFACT_HASH_DOMAIN_V1,
+    OPENPI_RTC_CODEC_HASH_DOMAIN_V1,
+    openpi_rtc_artifact_hash,
+    openpi_rtc_component_scope,
+    openpi_v22_legacy_codec_hash,
+    openpi_v22_native_codec_hash,
+    openpi_v22_relative_native_codec_hash,
+)
 from deployments.client.artifact import deploy_contract_from_policy_artifact
 from deployments.client.remote_policy import (
     RemoteModelPolicy,
@@ -64,14 +73,13 @@ from robot_motion.runtime.immutable import deep_freeze, deep_thaw
 from .observation_adapter import (
     OpenPIObservationAdapterConfig,
     deployment_observation_to_openpi,
+    prepared_allowed_prompts,
 )
 from .policy import OPENPI_LOCAL_PROTOCOL_VERSION
 
 
 OPENPI_FINAL_CHUNK_RTC_ADAPTER_V1 = "openpi_final_chunk_rtc_adapter_v1"
 OPENPI_FINAL_CHUNK_MODEL_ACTION_SPACE_V1 = "dexteleop_policy_io_layout_v22"
-OPENPI_RTC_ARTIFACT_HASH_DOMAIN_V1 = "dexteleop.openpi_rtc_artifact.v1"
-OPENPI_RTC_CODEC_HASH_DOMAIN_V1 = "dexteleop.openpi_rtc_v22_codec.v1"
 OPENPI_RTC_INPUT_HASH_DOMAIN_V1 = "dexteleop.openpi_rtc_input.v1"
 OPENPI_RTC_SERVER_HASH_DOMAIN_V1 = "dexteleop.openpi_rtc_server_metadata.v1"
 OPENPI_RTC_IMPLEMENTATION_HASH_DOMAIN_V1 = (
@@ -97,67 +105,6 @@ def _nonempty(value: str, *, name: str) -> str:
     if not normalized:
         raise ValueError(f"{name} must be non-empty.")
     return normalized
-
-
-def openpi_rtc_artifact_hash(artifact: PolicyArtifactContract) -> str:
-    """Hash the full sidecar, not only its layout."""
-
-    if not isinstance(artifact, PolicyArtifactContract):
-        raise TypeError("artifact must be a PolicyArtifactContract.")
-    return canonical_content_hash(
-        artifact.to_dict(),
-        domain=OPENPI_RTC_ARTIFACT_HASH_DOMAIN_V1,
-    )
-
-
-def openpi_v22_legacy_codec_hash(artifact: PolicyArtifactContract) -> str:
-    """Bind the exact typed-layout to legacy NormalizedAction bridge."""
-
-    return canonical_content_hash(
-        {
-            "adapter": "V22DeploymentAdapter.to_legacy_normalized_actions",
-            "adapter_version": "v1",
-            "layout_hash": artifact.layout_hash,
-            "action_pose_mode": "absolute",
-            "output_type": "NormalizedAction",
-        },
-        domain=OPENPI_RTC_CODEC_HASH_DOMAIN_V1,
-    )
-
-
-def openpi_v22_native_codec_hash(artifact: PolicyArtifactContract) -> str:
-    """Bind the exact typed layout to its native RobotAction projection."""
-
-    return canonical_content_hash(
-        {
-            "adapter": "V22DeploymentAdapter.to_native_robot_actions",
-            "adapter_version": "v1",
-            "layout_hash": artifact.layout_hash,
-            "action_pose_mode": "absolute",
-            "output_type": "CanonicalPolicyAction",
-        },
-        domain=OPENPI_RTC_CODEC_HASH_DOMAIN_V1,
-    )
-
-
-def openpi_v22_relative_native_codec_hash(
-    artifact: PolicyArtifactContract,
-) -> str:
-    """Bind relative arm decode plus the typed v2.2 component projection."""
-
-    return canonical_content_hash(
-        {
-            "adapter": (
-                "RelativePolicyActionChunkCanonicalizer+"
-                "V22DeploymentAdapter.to_native_robot_actions"
-            ),
-            "adapter_version": "v1",
-            "layout_hash": artifact.layout_hash,
-            "action_pose_mode": "relative",
-            "output_type": "CanonicalPolicyAction",
-        },
-        domain=OPENPI_RTC_CODEC_HASH_DOMAIN_V1,
-    )
 
 
 def openpi_arm_pose_slices(
@@ -263,15 +210,6 @@ def openpi_relative_conversion_contract_hash(
         },
         domain=OPENPI_RTC_RELATIVE_CONVERSION_HASH_DOMAIN_V1,
     )
-
-
-def openpi_rtc_component_scope(artifact: PolicyArtifactContract) -> tuple[str, ...]:
-    layout = artifact.policy_io_layout
-    names = (
-        *(component.name for component in layout.components("action", "continuous")),
-        *(component.name for component in layout.components("action", "discrete")),
-    )
-    return tuple(dict.fromkeys(str(name) for name in names))
 
 
 @dataclass(frozen=True)
@@ -572,6 +510,7 @@ class OpenPIFinalChunkRtcBackend:
         assert camera is not None
         self._observation_config = OpenPIObservationAdapterConfig(
             prompt=config.prompt,
+            allowed_prompts=prepared_allowed_prompts(artifact.metadata),
             image_key_map=camera.image_key_map,
             required_image_keys=(camera.source_keys if camera.required else ()),
             include_debug_metadata=config.include_debug_observation_metadata,

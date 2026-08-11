@@ -5,8 +5,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from deployments.client import load_policy_artifact
+from deployments.policy_artifact import load_policy_artifact
 from deployments.openpi.client.preflight import preflight_policy_artifact
+from deployments.openpi.camera_semantics import validate_declared_camera_semantics
+from deployments.openpi.image_wire import (
+    OPENPI_IMAGE_WIRE_JPEG_V1,
+    OPENPI_IMAGE_WIRE_LEGACY_RAW_V1,
+    OPENPI_IMAGE_WIRE_RESIZE_RAW_V1,
+)
+from dataset_interface.camera_semantics import load_camera_role_binding
 from dataset_contracts.model_continuation import (
     MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
     normalize_model_continuation_contract,
@@ -20,6 +27,11 @@ from robot_motion.deploy.async_producer import (
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _DEPLOYMENT_PROFILES = ("rm65_bimanual_dmtac",)
+_IMAGE_WIRE_CLI_TO_CODEC = {
+    "legacy-raw": OPENPI_IMAGE_WIRE_LEGACY_RAW_V1,
+    "resize-raw": OPENPI_IMAGE_WIRE_RESIZE_RAW_V1,
+    "jpeg": OPENPI_IMAGE_WIRE_JPEG_V1,
+}
 
 
 def _rm65_bimanual_dmtac_args(*, rtc_real_shadow: bool = False) -> list[str]:
@@ -52,6 +64,14 @@ def _rm65_bimanual_dmtac_args(*, rtc_real_shadow: bool = False) -> list[str]:
         "--dmtac-config",
         "latest",
         "--require-dmtac-config",
+        # The prepared OpenPI deployment contract consumes only each DMTac
+        # gripper's measured scalar state.  Raw tactile frames are not a model
+        # input here, and receiving their large multiprocessing payloads in the
+        # parent can hold the Python GIL long enough to starve the 60/120 Hz arm
+        # workers.  Keep tactile as an explicit opt-in; later user arguments are
+        # appended after this profile and --dmtac-with-tactile remains the exact
+        # rollback.
+        "--dmtac-no-tactile",
         "--camera-mode",
         "multi",
         "--camera-config",
@@ -70,8 +90,6 @@ def _rm65_bimanual_dmtac_args(*, rtc_real_shadow: bool = False) -> list[str]:
             [
                 "--auto-start",
                 "--no-wait-for-ready-confirm",
-                "--dmtac-no-tactile",
-                "--camera-startup-hardware-reset",
                 "--camera-start-stagger-sec",
                 "0.5",
             ]
@@ -148,6 +166,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument(
+        "--image-wire-codec",
+        choices=tuple(_IMAGE_WIRE_CLI_TO_CODEC),
+        default="legacy-raw",
+        help=(
+            "Optional negotiated image transport. legacy-raw preserves the "
+            "existing ndarray protocol; resize-raw and jpeg require a prepared "
+            "server that advertises the matching v1 capability."
+        ),
+    )
+    parser.add_argument(
+        "--image-wire-strict",
+        action="store_true",
+        help=(
+            "Fail before sending if no negotiated optimized image codec is "
+            "available. JPEG may still roll back to resize-raw; without this "
+            "flag, the final rollback is the historical raw ndarray path."
+        ),
+    )
+    parser.add_argument(
         "--model",
         "--expected-model-id",
         dest="expected_model_id",
@@ -183,6 +220,17 @@ def main(argv: list[str] | None = None) -> int:
             "passed to both the OpenPI client and the shared deployment runtime."
         ),
     )
+    parser.add_argument(
+        "--camera-role-registry",
+        type=Path,
+        default=(
+            _PROJECT_ROOT / "robot_motion/configs/rm65_camera_registry.json"
+        ),
+        help=(
+            "Registry used to validate an artifact camera_role_binding_hash "
+            "before any real runtime resources are created."
+        ),
+    )
     artifact_group.add_argument(
         "--checkpoint-dir",
         type=Path,
@@ -190,6 +238,25 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Checkpoint directory containing policy_artifact.json. This is a "
             "short alias for --policy-artifact-json CHECKPOINT/policy_artifact.json."
+        ),
+    )
+    parser.add_argument(
+        "--prepared-training-profile",
+        type=Path,
+        default=None,
+        help=(
+            "Checked-in prepared training profile used with --checkpoint-dir "
+            "to derive and validate the same normalization-bound deployment "
+            "artifact as the OpenPI server."
+        ),
+    )
+    parser.add_argument(
+        "--model-rtc-profile",
+        type=Path,
+        default=None,
+        help=(
+            "Optional trained model-RTC profile used with the prepared "
+            "training profile to verify checkpoint receipt and deployment binding."
         ),
     )
     parser.add_argument(
@@ -288,6 +355,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Directory for deployment debug JSONL.",
     )
     parser.add_argument(
+        "--debug-payload-mode",
+        choices=("compact", "full"),
+        default="compact",
+        help=(
+            "Deployment debug detail. compact is bounded for live control; "
+            "full restores historical unbounded payloads for offline diagnosis."
+        ),
+    )
+    parser.add_argument(
         "--rtc-debug-level",
         choices=("off", "summary", "trace"),
         default=None,
@@ -319,6 +395,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--rtc-real-shadow requires a raw or conditioned model RTC profile."
         )
+    if args.image_wire_strict and args.image_wire_codec == "legacy-raw":
+        parser.error("--image-wire-strict requires an optimized image-wire codec.")
 
     if (
         args.rtc_profile == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
@@ -329,11 +407,50 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     artifact_path = args.policy_artifact_json
+    prepared_resolution = None
     if args.checkpoint_dir is not None:
         artifact_path = _artifact_path_from_checkpoint(args.checkpoint_dir)
+    if args.prepared_training_profile is not None:
+        if args.checkpoint_dir is None:
+            parser.error(
+                "--prepared-training-profile requires --checkpoint-dir."
+            )
+        if args.policy_artifact_json is not None:
+            parser.error(
+                "--prepared-training-profile cannot be combined with "
+                "--policy-artifact-json."
+            )
+        from deployments.openpi.prepared_deployment import (
+            prepare_checkpoint_deployment_artifact,
+        )
+
+        prepared_resolution = prepare_checkpoint_deployment_artifact(
+            args.checkpoint_dir,
+            args.prepared_training_profile,
+            model_rtc_profile_path=args.model_rtc_profile,
+        )
+        artifact_path = prepared_resolution.deployment_artifact_path
+    elif args.model_rtc_profile is not None:
+        parser.error(
+            "--model-rtc-profile requires --prepared-training-profile."
+        )
     if artifact_path is not None and not artifact_path.is_file():
         parser.error(f"policy artifact does not exist or is not a file: {artifact_path}")
     policy_artifact = None if artifact_path is None else load_policy_artifact(artifact_path)
+    if policy_artifact is not None:
+        validate_declared_camera_semantics(policy_artifact)
+        expected_camera_binding_hash = str(
+            policy_artifact.metadata.get("camera_role_binding_hash") or ""
+        ).strip()
+        if expected_camera_binding_hash:
+            actual_camera_binding_hash = load_camera_role_binding(
+                args.camera_role_registry
+            ).contract_hash
+            if expected_camera_binding_hash != actual_camera_binding_hash:
+                parser.error(
+                    "policy artifact camera_role_binding_hash differs from "
+                    "--camera-role-registry."
+                )
     if (
         args.rtc_profile
         == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
@@ -350,8 +467,15 @@ def main(argv: list[str] | None = None) -> int:
 
         evidence = verify_openpi_model_rtc_checkpoint(
             artifact_path.parent
+            if prepared_resolution is None
+            else prepared_resolution.checkpoint_dir
         )
-        if evidence.artifact.to_dict() != policy_artifact.to_dict():
+        expected_checkpoint_artifact = (
+            policy_artifact
+            if prepared_resolution is None
+            else prepared_resolution.checkpoint_artifact
+        )
+        if evidence.artifact.to_dict() != expected_checkpoint_artifact.to_dict():
             parser.error(
                 "Verified trained model-RTC artifact differs from the "
                 "requested policy artifact."
@@ -412,6 +536,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "normalization_contract": args.normalization_contract_json,
     }
+    if args.image_wire_codec != "legacy-raw":
+        policy_kwargs["image_wire_config"] = {
+            "preferred_codec": _IMAGE_WIRE_CLI_TO_CODEC[args.image_wire_codec],
+            "allow_legacy_fallback": not bool(args.image_wire_strict),
+        }
     policy_kwargs = {key: value for key, value in policy_kwargs.items() if value is not None}
 
     from teleop_runtime.deploy.run_policy import main as run_real_policy
@@ -428,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
         runtime_args.append("--debug")
     if args.debug_dir is not None:
         runtime_args.extend(("--debug-dir", str(args.debug_dir)))
+    if args.debug:
+        runtime_args.extend(("--debug-payload-mode", str(args.debug_payload_mode)))
     if args.rtc_debug_level is not None:
         runtime_args.extend(("--rtc-debug-level", str(args.rtc_debug_level)))
     if args.rtc_debug_queue_capacity is not None:

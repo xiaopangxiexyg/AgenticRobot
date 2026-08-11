@@ -15,7 +15,8 @@ from typing import Any, Mapping, Sequence
 from dataset_contracts.policy_artifact import PolicyArtifactContract
 from dataset_contracts.pose_frames import PoseFrameContract
 from dataset_contracts.pose_training import RUNTIME_POSE_BINDING_EXPLICIT_CANONICAL_DESK
-from deployments.client import deploy_contract_from_policy_artifact, load_policy_artifact
+from deployments.client.artifact import deploy_contract_from_policy_artifact
+from deployments.policy_artifact import load_policy_artifact
 from robot_motion.deploy.session_contract import (
     resolve_deploy_session_contract,
     resolve_policy_action_pose_mode_from_artifact,

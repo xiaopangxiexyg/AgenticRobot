@@ -86,17 +86,51 @@ def send_command(
     cmd: str,
     delay_s: float = 0.01,
     clear_input: bool = False,
+    *,
+    response_pattern: re.Pattern[str] | None = None,
+    timeout_s: float | None = None,
+    poll_interval_s: float = 0.001,
 ) -> str:
+    """Send one command and optionally wait for its protocol response.
+
+    ``serial.read_all()`` is non-blocking even when the port has a configured
+    timeout.  A single read after ``delay_s`` therefore drops otherwise valid
+    replies that arrive a few milliseconds later.  Read-only queries pass an
+    exact response pattern and use this bounded polling path; write commands
+    retain the historical one-shot behavior.
+    """
+
     if clear_input:
         ser.reset_input_buffer()
     ser.write(cmd.encode("ascii"))
     ser.flush()
     time.sleep(delay_s)
-    return ser.read_all().decode("ascii", errors="ignore")
+    response = bytearray(ser.read_all())
+    if response_pattern is None:
+        return response.decode("ascii", errors="ignore")
+    if timeout_s is None or timeout_s <= 0.0:
+        raise ValueError("timeout_s must be positive when response_pattern is set")
+    if poll_interval_s <= 0.0:
+        raise ValueError("poll_interval_s must be positive")
+    deadline = time.monotonic() + float(timeout_s)
+    while True:
+        decoded = response.decode("ascii", errors="ignore")
+        if response_pattern.search(decoded) is not None:
+            return decoded
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return decoded
+        time.sleep(min(float(poll_interval_s), remaining))
+        response.extend(ser.read_all())
 
 
-def parse_position(response: str) -> Tuple[Optional[int], Optional[float]]:
-    match = re.search(r"#(\d{3})P(\d{4})", response)
+def parse_position(
+    response: str,
+    *,
+    servo_id: int | None = None,
+) -> Tuple[Optional[int], Optional[float]]:
+    prefix = r"\d{3}" if servo_id is None else f"{int(servo_id):03d}"
+    match = re.search(rf"#({prefix})P(\d{{4}})", response)
     if not match:
         return None, None
 
@@ -139,6 +173,8 @@ class ExoDriver:
             validate_servo_id(servo_id)
         if self.cfg.command_delay_s <= 0.0:
             raise ValueError("command_delay_s must be positive")
+        if self.cfg.timeout_s <= 0.0:
+            raise ValueError("timeout_s must be positive")
         if self.cfg.read_hz <= 0.0:
             raise ValueError("read_hz must be positive")
         if self.estimated_min_cycle_s > self.period_s:
@@ -175,12 +211,23 @@ class ExoDriver:
             raise RuntimeError("ExoDriver is not open")
         return self.ser
 
-    def command(self, servo_id: int, body: str, delay_s: Optional[float] = None) -> str:
+    def command(
+        self,
+        servo_id: int,
+        body: str,
+        delay_s: Optional[float] = None,
+        *,
+        response_pattern: re.Pattern[str] | None = None,
+    ) -> str:
         return send_command(
             self._serial(),
             build_cmd(servo_id, body),
             delay_s=self.cfg.command_delay_s if delay_s is None else delay_s,
             clear_input=self.cfg.clear_input_before_command,
+            response_pattern=response_pattern,
+            timeout_s=(
+                self.cfg.timeout_s if response_pattern is not None else None
+            ),
         )
 
     def read_servo_id(self, servo_id: int) -> str:
@@ -219,8 +266,12 @@ class ExoDriver:
 
     def read_position(self, servo_id: int) -> ExoRead:
         timestamp_s = time.monotonic()
-        response = self.command(servo_id, "PRAD")
-        raw_pos, _angle_deg = parse_position(response)
+        response = self.command(
+            servo_id,
+            "PRAD",
+            response_pattern=re.compile(rf"#{servo_id:03d}P\d{{4}}"),
+        )
+        raw_pos, _angle_deg = parse_position(response, servo_id=servo_id)
         angle_deg = self.raw_pos_to_angle_deg(raw_pos) if raw_pos is not None else None
         return ExoRead(
             servo_id=servo_id,

@@ -3,19 +3,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from deployments.client import (
+from deployments.client.contracts import (
     DEXTELEOP_DEPLOY_SCHEMA_VERSION,
     DEXTELEOP_DEPLOY_SCHEMA_V2,
     DeployPolicyContract,
+    validate_server_metadata,
+)
+from deployments.client.remote_policy import (
     RemoteModelPolicy,
     RemotePolicyConfig,
-    validate_server_metadata,
 )
 from dataset_contracts.v22 import PolicyIOLayout
 from dataset_contracts.policy_artifact import PolicyArtifactContract, policy_artifact_from_metadata
+from deployments.openpi.image_wire import OpenPIImageWireClientConfig
 from robot_motion.deploy.v22 import V22DeploymentAdapter
 
-from .observation_adapter import OpenPIObservationAdapterConfig, deployment_observation_to_openpi
+from .observation_adapter import (
+    OpenPIObservationAdapterConfig,
+    deployment_observation_to_openpi,
+    prepared_allowed_prompts,
+)
 from .transport import OpenPIWebsocketTransport
 
 
@@ -28,6 +35,7 @@ class OpenPIClientPolicyConfig:
     port: int = 8000
     api_key: str | None = None
     prompt: str | None = None
+    allowed_prompts: tuple[str, ...] | None = None
     expected_model_id: str | None = None
     expected_checkpoint_step: int | str | None = None
     deploy_schema_version: str | None = DEXTELEOP_DEPLOY_SCHEMA_VERSION
@@ -51,6 +59,7 @@ class OpenPIClientPolicyConfig:
     # The server remains the owner for non-identity transforms unless a future
     # model-specific adapter implements a client-owned executor.
     normalization_contract: Mapping[str, Any] | None = None
+    image_wire_config: OpenPIImageWireClientConfig | Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "port", int(self.port))
@@ -60,10 +69,28 @@ class OpenPIClientPolicyConfig:
         elif artifact is not None and not isinstance(artifact, PolicyArtifactContract):
             raise TypeError("policy_artifact must be a PolicyArtifactContract, mapping, or None.")
         artifact_normalization_contract = None
+        artifact_allowed_prompts = None
         if artifact is not None and isinstance(artifact.metadata, Mapping):
             candidate = artifact.metadata.get("normalization_contract")
             if candidate is not None:
                 artifact_normalization_contract = candidate
+            artifact_allowed_prompts = prepared_allowed_prompts(
+                artifact.metadata
+            )
+        requested_allowed_prompts = self.allowed_prompts
+        if requested_allowed_prompts is None:
+            requested_allowed_prompts = artifact_allowed_prompts
+        else:
+            requested_allowed_prompts = tuple(
+                str(value).strip() for value in requested_allowed_prompts
+            )
+            if (
+                artifact_allowed_prompts is not None
+                and requested_allowed_prompts != artifact_allowed_prompts
+            ):
+                raise ValueError(
+                    "allowed_prompts disagrees with policy_artifact metadata."
+                )
         requested_normalization_contract = self.normalization_contract
         if requested_normalization_contract is None:
             requested_normalization_contract = artifact_normalization_contract
@@ -182,6 +209,15 @@ class OpenPIClientPolicyConfig:
         object.__setattr__(self, "required_image_keys", required_image_keys)
         object.__setattr__(self, "image_key_map", image_key_map)
         object.__setattr__(self, "retry_interval_s", float(self.retry_interval_s))
+        object.__setattr__(self, "allowed_prompts", requested_allowed_prompts)
+        object.__setattr__(
+            self,
+            "image_wire_config",
+            OpenPIImageWireClientConfig.from_value(
+                self.image_wire_config,
+                image_keys=required_camera_slots,
+            ),
+        )
         if requested_normalization_contract is not None:
             # Reuse the observation adapter's strict parser so a policy cannot
             # carry a malformed or ambiguously named normalization payload.
@@ -261,6 +297,7 @@ class OpenPIClientPolicy:
         if remote_policy is None:
             observation_config = OpenPIObservationAdapterConfig(
                 prompt=self.config.prompt,
+                allowed_prompts=self.config.allowed_prompts,
                 image_key_map=self.config.image_key_map,
                 required_image_keys=self.config.required_image_keys,
                 include_debug_metadata=self.config.include_debug_metadata,
@@ -275,6 +312,7 @@ class OpenPIClientPolicy:
                 port=self.config.port,
                 api_key=self.config.api_key,
                 retry_interval_s=self.config.retry_interval_s,
+                image_wire_config=self.config.image_wire_config,
             )
             remote_policy = RemoteModelPolicy(
                 transport=transport,
@@ -446,6 +484,7 @@ def create_policy(
     policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None,
     policy_artifact: PolicyArtifactContract | Mapping[str, Any] | None = None,
     normalization_contract: Mapping[str, Any] | None = None,
+    image_wire_config: OpenPIImageWireClientConfig | Mapping[str, Any] | None = None,
 ) -> OpenPIClientPolicy:
     return OpenPIClientPolicy(
         OpenPIClientPolicyConfig(
@@ -481,6 +520,7 @@ def create_policy(
             policy_io_layout=policy_io_layout,
             policy_artifact=policy_artifact,
             normalization_contract=normalization_contract,
+            image_wire_config=image_wire_config,
         )
     )
 

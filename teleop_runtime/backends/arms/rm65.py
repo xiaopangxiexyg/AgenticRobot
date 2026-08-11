@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 import math
@@ -74,8 +75,10 @@ from robot_motion.position_control.trajectory import (
 )
 from robot_motion.position_control.horizon_governor import JointHorizonLimits
 from robot_motion.position_control.sample_aligned_trajectory import (
+    SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET,
     SampleAlignedJerkLimitedJointTrajectoryPlanner,
     SampleAlignedTargetAdmission,
+    normalize_sample_aligned_source_latch_mode,
 )
 from robot_motion.runtime.dispatch import BackendDispatchError, CommandDispatchReceipt
 from robot_motion.runtime import (
@@ -87,7 +90,11 @@ from robot_motion.runtime import (
 )
 
 from ...interfaces import EffectorBackend
+from ...log_utils import log_event as _console_log_event
 from ...registry import register_backend
+
+
+_BACKGROUND_STREAM_WARNING_PRINT_INTERVAL_SEC = 5.0
 from ...schemas import EffectorCommand
 from ...defaults import DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
 from .rm65_dispatch_call import (
@@ -102,6 +109,12 @@ from .rm65_control_dispatch_call import (
 
 RM65_IK_FRAMEWORK_ROBOT_MOTION = "robot_motion"
 RM65_IK_FRAMEWORK_CHOICES = (RM65_IK_FRAMEWORK_ROBOT_MOTION,)
+RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK = "synchronous_lock"
+RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING = "latest_nonblocking"
+RM65_BACKGROUND_TARGET_ADMISSION_CHOICES = (
+    RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
+    RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+)
 HAND_BASE_POSE_FLANGE_M_RAD = (0.0, 0.0, 0.009, 0.0, 0.0, 0.0)
 _SINGULARITY_WARNING_INTERVAL_SEC = 1.0
 DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN = 0.2
@@ -112,6 +125,12 @@ _SINGULARITY_QPOS_INIT_SLOW_SOURCES = frozenset(
         "replay_qpos_init_final_hold",
         "deploy_fixed_init_qpos",
         "gui_init_qpos_plan",
+    }
+)
+_SERIALIZED_QPOS_INIT_TARGET_SOURCES = frozenset(
+    {
+        "replay_qpos_init",
+        "replay_qpos_init_final_hold",
     }
 )
 _SINGULARITY_LABELS = {
@@ -426,6 +445,12 @@ class RM65ArmBackendConfig:
     background_streaming_warning_ratio: float = 0.9
     background_streaming_target_max_age_sec: float = 0.25
     background_streaming_shutdown_timeout_sec: float = 1.0
+    # Keep the backend-wide default compatible for teleop/replay callers.
+    # Policy deployment explicitly selects latest_nonblocking so a slow SDK
+    # call cannot make 60 Hz reference admission wait on the 120 Hz worker.
+    background_streaming_target_admission_mode: str = (
+        RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+    )
     position_command_planner: str = POSITION_COMMAND_PLANNER_LINEAR
     position_velocity_ramp_sec: float = DEFAULT_POSITION_VELOCITY_RAMP_SEC
     position_target_velocity_filter_tau_sec: float = (
@@ -437,16 +462,31 @@ class RM65ArmBackendConfig:
     # guard does not reduce sustained tracking velocity.
     position_max_command_step_deg: float | None = None
     position_degraded_speed_scale: float = DEFAULT_POSITION_DEGRADED_SPEED_SCALE
-    # Experimental, default-off execution profile. Incoming 60 Hz qrefs keep
-    # running for IK/safety, while the transport admits one reachable endpoint
-    # per dataset-rate bucket and caches its 120 Hz jerk-limited control cut.
+    # Experimental, default-off execution profile. Incoming qrefs keep running
+    # for IK/safety, while the selected latch admits one reachable endpoint per
+    # source cut and caches its high-rate jerk-limited control cut.
     position_sample_aligned_source_hz: float = 15.0
+    position_sample_aligned_source_latch_mode: str = (
+        SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET
+    )
     position_sample_aligned_horizon_source_steps: int = 2
+    position_sample_aligned_safety_horizon_source_steps: int | None = None
     position_sample_aligned_scale_degraded_target: bool = True
     position_sample_aligned_jerk_regularization: float = 1e-9
     position_sample_aligned_jerk_delta_regularization: float = 0.0
+    position_sample_aligned_initial_jerk_delta_regularization: float = 0.0
     position_sample_aligned_terminal_velocity_regularization: float = 0.0
     position_sample_aligned_terminal_acceleration_regularization: float = 0.0
+    position_sample_aligned_reference_mode: str = "linear_hold"
+    position_sample_aligned_observer_window: int = 4
+    position_sample_aligned_observer_efficiency_power: float = 2.0
+    position_sample_aligned_observer_velocity_ema_alpha: float = 0.5
+    position_sample_aligned_observer_velocity_cap_scale: float = 0.5
+    position_sample_aligned_observer_coherence_min: float = 0.5
+    position_sample_aligned_observer_speed_guard_scale: float = 0.4
+    position_sample_aligned_terminal_velocity_displacement_scale: float = 0.75
+    position_sample_aligned_observer_stop_threshold_deg: float = 0.01
+    position_sample_aligned_observer_stop_velocity_decay: float = 0.0
     arm_follow_qpos_alpha: float = 1.0
     canfd_follow: bool = True
     canfd_trajectory_mode: int = 0
@@ -568,6 +608,16 @@ class RM65ArmBackendConfig:
             raise ValueError("background_streaming_target_max_age_sec must be positive.")
         if float(self.background_streaming_shutdown_timeout_sec) <= 0.0:
             raise ValueError("background_streaming_shutdown_timeout_sec must be positive.")
+        target_admission_mode = str(
+            self.background_streaming_target_admission_mode
+        ).strip().lower()
+        if target_admission_mode not in RM65_BACKGROUND_TARGET_ADMISSION_CHOICES:
+            raise ValueError(
+                "background_streaming_target_admission_mode must be one of "
+                f"{RM65_BACKGROUND_TARGET_ADMISSION_CHOICES}; got "
+                f"{self.background_streaming_target_admission_mode!r}."
+            )
+        self.background_streaming_target_admission_mode = target_admission_mode
         self.position_command_planner = normalize_position_command_planner(
             self.position_command_planner
         )
@@ -641,9 +691,15 @@ class RM65ArmBackendConfig:
             self.position_sample_aligned_scale_degraded_target = bool(
                 self.position_sample_aligned_scale_degraded_target
             )
+            self.position_sample_aligned_source_latch_mode = (
+                normalize_sample_aligned_source_latch_mode(
+                    self.position_sample_aligned_source_latch_mode
+                )
+            )
             for name in (
                 "position_sample_aligned_jerk_regularization",
                 "position_sample_aligned_jerk_delta_regularization",
+                "position_sample_aligned_initial_jerk_delta_regularization",
                 "position_sample_aligned_terminal_velocity_regularization",
                 "position_sample_aligned_terminal_acceleration_regularization",
             ):
@@ -651,6 +707,65 @@ class RM65ArmBackendConfig:
                 if not math.isfinite(value) or value < 0.0:
                     raise ValueError(f"{name} must be finite and non-negative.")
                 setattr(self, name, value)
+            reference_mode = str(
+                self.position_sample_aligned_reference_mode
+            ).strip().lower()
+            if reference_mode not in {
+                "linear_hold",
+                "linear_hold_nullspace_smooth",
+                "causal_hermite",
+                "causal_hermite_selective",
+            }:
+                raise ValueError(
+                    "position_sample_aligned_reference_mode must be "
+                    "'linear_hold', 'linear_hold_nullspace_smooth', "
+                    "'causal_hermite' or 'causal_hermite_selective'."
+                )
+            self.position_sample_aligned_reference_mode = reference_mode
+            observer_window = self.position_sample_aligned_observer_window
+            if (
+                isinstance(observer_window, bool)
+                or int(observer_window) != observer_window
+                or int(observer_window) < 2
+            ):
+                raise ValueError(
+                    "position_sample_aligned_observer_window must be an integer >= 2."
+                )
+            self.position_sample_aligned_observer_window = int(observer_window)
+            for name in (
+                "position_sample_aligned_observer_efficiency_power",
+                "position_sample_aligned_observer_velocity_ema_alpha",
+                "position_sample_aligned_observer_velocity_cap_scale",
+                "position_sample_aligned_observer_speed_guard_scale",
+                "position_sample_aligned_terminal_velocity_displacement_scale",
+                "position_sample_aligned_observer_stop_threshold_deg",
+                "position_sample_aligned_observer_stop_velocity_decay",
+            ):
+                value = float(getattr(self, name))
+                if not math.isfinite(value) or value < 0.0:
+                    raise ValueError(f"{name} must be finite and non-negative.")
+                setattr(self, name, value)
+            for name in (
+                "position_sample_aligned_observer_velocity_ema_alpha",
+                "position_sample_aligned_observer_velocity_cap_scale",
+                "position_sample_aligned_observer_speed_guard_scale",
+                "position_sample_aligned_observer_stop_velocity_decay",
+            ):
+                if float(getattr(self, name)) > 1.0:
+                    raise ValueError(f"{name} must be <= 1.")
+            coherence = float(
+                self.position_sample_aligned_observer_coherence_min
+            )
+            if not math.isfinite(coherence) or not -1.0 <= coherence <= 1.0:
+                raise ValueError(
+                    "position_sample_aligned_observer_coherence_min must be in [-1, 1]."
+                )
+            self.position_sample_aligned_observer_coherence_min = coherence
+            if self.position_sample_aligned_terminal_velocity_displacement_scale <= 0.0:
+                raise ValueError(
+                    "position_sample_aligned_terminal_velocity_displacement_scale "
+                    "must be positive."
+                )
             horizon_steps = self.position_sample_aligned_horizon_source_steps
             if (
                 isinstance(horizon_steps, bool)
@@ -659,6 +774,28 @@ class RM65ArmBackendConfig:
             ):
                 raise ValueError(
                     "position_sample_aligned_horizon_source_steps must be an integer >= 2."
+                )
+            safety_horizon_steps = (
+                None
+                if self.position_sample_aligned_safety_horizon_source_steps
+                is None
+                else int(
+                    self.position_sample_aligned_safety_horizon_source_steps
+                )
+            )
+            if safety_horizon_steps is not None and (
+                isinstance(
+                    self.position_sample_aligned_safety_horizon_source_steps,
+                    bool,
+                )
+                or safety_horizon_steps
+                != self.position_sample_aligned_safety_horizon_source_steps
+                or safety_horizon_steps <= int(horizon_steps)
+            ):
+                raise ValueError(
+                    "position_sample_aligned_safety_horizon_source_steps must "
+                    "be an integer greater than "
+                    "position_sample_aligned_horizon_source_steps."
                 )
             if not math.isclose(
                 float(self.arm_follow_qpos_alpha),
@@ -672,6 +809,9 @@ class RM65ArmBackendConfig:
                 )
             self.position_sample_aligned_source_hz = source_hz
             self.position_sample_aligned_horizon_source_steps = int(horizon_steps)
+            self.position_sample_aligned_safety_horizon_source_steps = (
+                safety_horizon_steps
+            )
         if int(self.canfd_trajectory_mode) not in (0, 1, 2):
             raise ValueError("canfd_trajectory_mode must be one of 0, 1, or 2.")
         if not 0 <= int(self.canfd_radio) <= 100:
@@ -879,6 +1019,7 @@ class RM65ArmBackend(EffectorBackend):
         self._last_hardware_read_time: float | None = None
         self._last_hardware_read_monotonic: float | None = None
         self._last_hardware_read_success: bool | None = None
+        self._last_hardware_read_phase_timing: dict[str, float] = {}
         self._hardware_read_sequence = 0
         self._last_hardware_result_code: int | None = None
         self._last_hardware_result_text: str | None = None
@@ -923,6 +1064,9 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_target_timestamp: float | None = None
         self._stream_target_monotonic: float | None = None
         self._stream_target_sequence = 0
+        self._last_background_target_admission_timing: dict[str, object] = {}
+        self._stream_inflight_target_preemption_count = 0
+        self._stream_last_inflight_target_preemption: dict[str, object] = {}
         self._stream_segment_start_qpos: np.ndarray | None = None
         self._stream_segment_start_time: float | None = None
         self._stream_segment_duration_sec = self._base_control_dt
@@ -980,8 +1124,14 @@ class RM65ArmBackend(EffectorBackend):
                         ),
                         source_hz=float(config.position_sample_aligned_source_hz),
                         command_hz=float(config.background_streaming_hz),
+                        source_latch_mode=str(
+                            config.position_sample_aligned_source_latch_mode
+                        ),
                         horizon_source_steps=int(
                             config.position_sample_aligned_horizon_source_steps
+                        ),
+                        safety_horizon_source_steps=(
+                            config.position_sample_aligned_safety_horizon_source_steps
                         ),
                         scale_degraded_target=bool(
                             config.position_sample_aligned_scale_degraded_target
@@ -992,11 +1142,46 @@ class RM65ArmBackend(EffectorBackend):
                         jerk_delta_regularization=float(
                             config.position_sample_aligned_jerk_delta_regularization
                         ),
+                        initial_jerk_delta_regularization=float(
+                            config.position_sample_aligned_initial_jerk_delta_regularization
+                        ),
                         terminal_velocity_regularization=float(
                             config.position_sample_aligned_terminal_velocity_regularization
                         ),
                         terminal_acceleration_regularization=float(
                             config.position_sample_aligned_terminal_acceleration_regularization
+                        ),
+                        reference_mode=str(
+                            config.position_sample_aligned_reference_mode
+                        ),
+                        observer_window=int(
+                            config.position_sample_aligned_observer_window
+                        ),
+                        observer_efficiency_power=float(
+                            config.position_sample_aligned_observer_efficiency_power
+                        ),
+                        observer_velocity_ema_alpha=float(
+                            config.position_sample_aligned_observer_velocity_ema_alpha
+                        ),
+                        observer_velocity_cap_scale=float(
+                            config.position_sample_aligned_observer_velocity_cap_scale
+                        ),
+                        observer_coherence_min=float(
+                            config.position_sample_aligned_observer_coherence_min
+                        ),
+                        observer_speed_guard_scale=float(
+                            config.position_sample_aligned_observer_speed_guard_scale
+                        ),
+                        terminal_velocity_displacement_scale=float(
+                            config.position_sample_aligned_terminal_velocity_displacement_scale
+                        ),
+                        observer_stop_threshold_rad=math.radians(
+                            float(
+                                config.position_sample_aligned_observer_stop_threshold_deg
+                            )
+                        ),
+                        observer_stop_velocity_decay=float(
+                            config.position_sample_aligned_observer_stop_velocity_decay
                         ),
                     )
                 )
@@ -1459,6 +1644,87 @@ class RM65ArmBackend(EffectorBackend):
             )
         else:
             self._stream_planner.reset(anchor, monotonic_time=monotonic_time)
+
+    def _rebase_acceleration_planner_after_inflight_target_preemption_locked(
+        self,
+        *,
+        accepted_qpos: np.ndarray,
+        completed_monotonic_time: float,
+        completed_target_sequence: int,
+    ) -> None:
+        """Reconcile an unavoidable old SDK completion with the newest target.
+
+        A CANFD call already inside the vendor SDK cannot be cancelled. In
+        latest-target admission mode a newer validated target may therefore be
+        published while that call is in flight. The physical command must be
+        committed as the new planner anchor, then the newest target is safely
+        re-applied; committing the stale transactional proposal would either
+        fault or leave the planner one accepted qcmd behind the robot.
+
+        This operation intentionally restarts velocity history from zero. That
+        is a bounded conservative response to preemption, not an attempt to
+        infer motion across an SDK call whose exact application time is unknown.
+        """
+
+        if not isinstance(
+            self._stream_planner,
+            AccelerationLimitedJointTrajectoryPlanner,
+        ):
+            raise RuntimeError(
+                "in-flight target preemption rebase requires the acceleration-limited planner"
+            )
+        active_target = (
+            None
+            if self._stream_target_qpos is None
+            else self._stream_target_qpos.copy()
+        )
+        active_sequence = int(self._stream_target_sequence)
+        active_published = self._stream_target_monotonic
+        active_quick_stop = bool(self._stream_quick_stop_active)
+        active_reason = str(self._stream_planner_policy_reason or "normal")
+        accepted = np.asarray(accepted_qpos, dtype=float).reshape(6).copy()
+        completed = float(completed_monotonic_time)
+
+        self._reset_stream_planner_locked(accepted, monotonic_time=completed)
+        if active_target is not None:
+            if active_quick_stop:
+                self._stream_planner.quick_stop(
+                    sequence=active_sequence,
+                    monotonic_time=completed,
+                    reason=active_reason,
+                )
+                self._stream_target_qpos = accepted.copy()
+            else:
+                published = (
+                    completed
+                    if active_published is None
+                    else min(float(active_published), completed)
+                )
+                self._stream_planner.accept_target(
+                    active_target,
+                    sequence=active_sequence,
+                    published_monotonic_time=published,
+                    monotonic_time=completed,
+                    speed_scale=float(self._stream_planner_policy_speed_scale),
+                    mode=str(self._stream_planner_policy_mode),
+                    reason=active_reason,
+                    anchor_q_command=accepted,
+                )
+            self._stream_segment_start_qpos = accepted.copy()
+            self._stream_segment_start_time = completed
+            self._stream_segment_duration_sec = float(
+                self.config.position_velocity_ramp_sec
+            )
+
+        self._stream_inflight_target_preemption_count += 1
+        self._stream_last_inflight_target_preemption = {
+            "completed_target_sequence": int(completed_target_sequence),
+            "active_target_sequence": active_sequence,
+            "completed_monotonic_time": completed,
+            "active_target_present": active_target is not None,
+            "quick_stop_active": active_quick_stop,
+            "planner_rebased_from_zero_velocity": True,
+        }
 
     def _activate_stream_quick_stop_locked(
         self,
@@ -2231,28 +2497,63 @@ class RM65ArmBackend(EffectorBackend):
             print(f"WARNING: {self.name} failed to read singularity thresholds after setting: {exc}")
 
     def _analyze_singularity(self, qpos_rad: Sequence[float] | np.ndarray) -> dict[str, object]:
+        analysis_started = time.perf_counter()
+        lock_wait_started = analysis_started
         with self._singularity_analysis_lock:
+            lock_acquired = time.perf_counter()
             if self.arm is None:
-                return {"status_code": None, "label": "unavailable", "reason": "no_arm"}
+                return {
+                    "status_code": None,
+                    "label": "unavailable",
+                    "reason": "no_arm",
+                    "analysis_timing": {
+                        "lock_wait_ms": (lock_acquired - lock_wait_started) * 1000.0,
+                        "sdk_call_ms": 0.0,
+                        "total_ms": (time.perf_counter() - analysis_started) * 1000.0,
+                    },
+                }
             analyzer = getattr(self.arm, "Algo_Kin_Singularity_Analyse", None)
             if analyzer is None:
                 return {
                     "status_code": None,
                     "label": "unavailable",
                     "reason": "missing_sdk_method",
+                    "analysis_timing": {
+                        "lock_wait_ms": (lock_acquired - lock_wait_started) * 1000.0,
+                        "sdk_call_ms": 0.0,
+                        "total_ms": (time.perf_counter() - analysis_started) * 1000.0,
+                    },
                 }
             joint_deg = (
                 np.asarray(qpos_rad, dtype=float).reshape(6) / np.pi * 180.0
             ).tolist()
+            sdk_call_started = time.perf_counter()
             try:
                 result = analyzer(joint_deg)
             except Exception as exc:  # noqa: BLE001 - protection should fail open for teleop.
-                return {"status_code": None, "label": "unavailable", "reason": str(exc)}
+                sdk_call_completed = time.perf_counter()
+                return {
+                    "status_code": None,
+                    "label": "unavailable",
+                    "reason": str(exc),
+                    "analysis_timing": {
+                        "lock_wait_ms": (lock_acquired - lock_wait_started) * 1000.0,
+                        "sdk_call_ms": (sdk_call_completed - sdk_call_started) * 1000.0,
+                        "total_ms": (sdk_call_completed - analysis_started) * 1000.0,
+                    },
+                }
+            sdk_call_completed = time.perf_counter()
+        analysis_timing = {
+            "lock_wait_ms": (lock_acquired - lock_wait_started) * 1000.0,
+            "sdk_call_ms": (sdk_call_completed - sdk_call_started) * 1000.0,
+            "total_ms": (sdk_call_completed - analysis_started) * 1000.0,
+        }
         if not isinstance(result, tuple) or len(result) < 2:
             return {
                 "status_code": None,
                 "label": "unavailable",
                 "reason": f"unexpected_result:{result}",
+                "analysis_timing": analysis_timing,
             }
         status, distance = result[:2]
         try:
@@ -2262,10 +2563,12 @@ class RM65ArmBackend(EffectorBackend):
                 "status_code": None,
                 "label": "unavailable",
                 "reason": f"unexpected_status:{status}",
+                "analysis_timing": analysis_timing,
             }
         metadata: dict[str, object] = {
             "status_code": status_code,
             "label": _singularity_status_label(status_code),
+            "analysis_timing": analysis_timing,
         }
         try:
             metadata["wrist_center_distance_m"] = float(distance)
@@ -2741,6 +3044,12 @@ class RM65ArmBackend(EffectorBackend):
             "position_sdk_singularity_advisory_used": bool(
                 position_sdk_singularity_advisory_used
             ),
+            "target_singularity_analysis_timing": dict(
+                target_status.get("analysis_timing") or {}
+            ),
+            "current_singularity_analysis_timing": dict(
+                current_status.get("analysis_timing") or {}
+            ),
         }
         if position_candidate_certificate_validation is not None:
             metadata["position_candidate_certificate_validation"] = dict(
@@ -2934,6 +3243,7 @@ class RM65ArmBackend(EffectorBackend):
         )
 
     def send_command(self, command: EffectorCommand) -> CommandDispatchReceipt:
+        command_phase_started = time.perf_counter()
         if command.effector_name != self.name:
             raise ValueError(
                 f"{self.name} received command for effector '{command.effector_name}'."
@@ -2942,7 +3252,9 @@ class RM65ArmBackend(EffectorBackend):
             raise RuntimeError(
                 f"{self.name} is observation-only; refusing RM65 command dispatch."
             )
+        entry_state_lock_wait_started = time.perf_counter()
         with self._state_lock:
+            entry_state_lock_acquired = time.perf_counter()
             if self._closed:
                 raise RuntimeError(f"{self.name} is closed; refusing command dispatch.")
             if self._emergency_stopped:
@@ -2961,6 +3273,7 @@ class RM65ArmBackend(EffectorBackend):
                 reference_qpos = np.zeros(6, dtype=float)
                 self._last_accepted_qpos = reference_qpos.copy()
                 self._current_qpos = reference_qpos.copy()
+        entry_state_snapshot_completed = time.perf_counter()
         command_start_time = time.time()
         command_source = _command_source(command)
         upstream_execution_work = command.execution_work_item
@@ -3004,6 +3317,7 @@ class RM65ArmBackend(EffectorBackend):
         command_max_joint_step = _command_max_joint_step(command)
         if command_max_joint_step is not None:
             max_joint_step = command_max_joint_step
+        max_joint_step_completed = time.perf_counter()
         ik_solve_elapsed_ms: float | None = None
 
         if command.command_type == "joint_vector":
@@ -3223,6 +3537,7 @@ class RM65ArmBackend(EffectorBackend):
             and fallback_position_side.get("is_shoulder_singular", False)
             and certificate_allows_fallback
         )
+        pre_singularity_completed = time.perf_counter()
         qpos_target = self._apply_singularity_protection(
             qpos_target,
             reference_qpos=reference_qpos,
@@ -3239,6 +3554,7 @@ class RM65ArmBackend(EffectorBackend):
                 candidate_certificate_validation
             ),
         )
+        singularity_completed = time.perf_counter()
         qpos_target = self._validate_final_joint_target(qpos_target, label="final target")
 
         trajectory_policy: _PositionTrajectoryPolicy | None = None
@@ -3336,7 +3652,57 @@ class RM65ArmBackend(EffectorBackend):
         self._stamp_final_action_target(command, qpos_target, source=command_source)
 
         if self.arm is not None and self.config.background_streaming_enabled:
-            with self._send_lock:
+            target_admission_started = time.perf_counter()
+            target_admission_mode = str(
+                self.config.background_streaming_target_admission_mode
+            )
+            effective_target_admission_mode = target_admission_mode
+            target_admission_fallback_reason: str | None = None
+            if (
+                target_admission_mode
+                == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+                and command_source in _SERIALIZED_QPOS_INIT_TARGET_SOURCES
+            ):
+                # G-triggered qpos initialization publishes a slow, ordered
+                # reference trajectory. Do not let a new reference supersede
+                # an SDK call already in flight: the conservative preemption
+                # recovery must reset planner velocity to zero because the
+                # physical application time is unknown, which turns repeated
+                # preemptions into a perceptible stop-start vibration.
+                effective_target_admission_mode = (
+                    RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+                )
+                target_admission_fallback_reason = (
+                    "qpos_init_requires_serialized_velocity_continuity"
+                )
+            elif (
+                target_admission_mode
+                == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+                and not isinstance(
+                    self._stream_planner,
+                    AccelerationLimitedJointTrajectoryPlanner,
+                )
+            ):
+                # Linear and sample-aligned admission both mutate cached
+                # multi-tick plans at publication time. Keep them on the old
+                # serialized contract until they have the acceleration
+                # planner's explicit accepted-qcmd rebase operation.
+                effective_target_admission_mode = (
+                    RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+                )
+                target_admission_fallback_reason = str(
+                    f"{self._stream_planner_mode}_planner_requires_"
+                    "synchronous_activation"
+                )
+            send_lock_context = (
+                self._send_lock
+                if effective_target_admission_mode
+                == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+                else nullcontext()
+            )
+            send_lock_wait_started = time.perf_counter()
+            with send_lock_context:
+                send_lock_acquired = time.perf_counter()
                 with self._state_lock:
                     if self._closed:
                         raise RuntimeError(f"{self.name} is closed; refusing command dispatch.")
@@ -3554,6 +3920,89 @@ class RM65ArmBackend(EffectorBackend):
                     self._last_target_qpos = qpos_target.copy()
                     self._last_command = command.copy()
                     self._last_command_timestamp = command_start_time
+            target_admission_completed = time.perf_counter()
+            target_admission_timing = {
+                "requested_mode": target_admission_mode,
+                "mode": effective_target_admission_mode,
+                "fallback_reason": target_admission_fallback_reason,
+                "total_ms": max(
+                    0.0,
+                    (target_admission_completed - target_admission_started) * 1000.0,
+                ),
+                "send_lock_wait_ms": (
+                    max(
+                        0.0,
+                        (send_lock_acquired - send_lock_wait_started) * 1000.0,
+                    )
+                    if effective_target_admission_mode
+                    == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+                    else 0.0
+                ),
+                "transport_target_sequence": int(transport_target_sequence),
+                "sample_aligned_bucket_held": bool(sample_aligned_bucket_held),
+            }
+            post_admission_metadata_started = time.perf_counter()
+            singularity_timing = _metadata_mapping(
+                _metadata_mapping(command.metadata.get("singularity_metadata")).get(
+                    "target_singularity_analysis_timing"
+                )
+            )
+            command_phase_timing = {
+                "entry_state_lock_wait_ms": max(
+                    0.0,
+                    (entry_state_lock_acquired - entry_state_lock_wait_started)
+                    * 1000.0,
+                ),
+                "entry_state_snapshot_ms": max(
+                    0.0,
+                    (entry_state_snapshot_completed - entry_state_lock_acquired)
+                    * 1000.0,
+                ),
+                "max_joint_step_setup_ms": max(
+                    0.0,
+                    (max_joint_step_completed - entry_state_snapshot_completed)
+                    * 1000.0,
+                ),
+                "pre_singularity_ms": max(
+                    0.0,
+                    (pre_singularity_completed - max_joint_step_completed) * 1000.0,
+                ),
+                "singularity_protection_ms": max(
+                    0.0,
+                    (singularity_completed - pre_singularity_completed) * 1000.0,
+                ),
+                "singularity_analysis_lock_wait_ms": float(
+                    singularity_timing.get("lock_wait_ms", 0.0) or 0.0
+                ),
+                "singularity_analysis_sdk_call_ms": float(
+                    singularity_timing.get("sdk_call_ms", 0.0) or 0.0
+                ),
+                "post_singularity_and_target_admission_ms": max(
+                    0.0,
+                    (target_admission_completed - singularity_completed) * 1000.0,
+                ),
+                "target_admission_ms": float(target_admission_timing["total_ms"]),
+                "total_through_target_admission_ms": max(
+                    0.0,
+                    (target_admission_completed - command_phase_started) * 1000.0,
+                ),
+            }
+            command.metadata["rm65_background_target_admission_timing"] = dict(
+                target_admission_timing
+            )
+            command.metadata["rm65_background_command_phase_timing"] = dict(
+                command_phase_timing
+            )
+            post_admission_metadata_completed = time.perf_counter()
+            final_state_lock_wait_started = time.perf_counter()
+            with self._state_lock:
+                final_state_lock_acquired = time.perf_counter()
+                self._last_background_target_admission_timing = dict(
+                    target_admission_timing
+                )
+                self._last_command = command.copy()
+            final_state_snapshot_completed = time.perf_counter()
+            quick_stop_metadata_started = time.perf_counter()
             if trajectory_policy is not None and trajectory_policy.quick_stop:
                 # The executable action/reference must describe the exact
                 # frozen qpos, not the rejected collision/singularity target.
@@ -3564,6 +4013,8 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 with self._state_lock:
                     self._last_command = command.copy()
+            quick_stop_metadata_completed = time.perf_counter()
+            singularity_trace_started = time.perf_counter()
             self._emit_singularity_transition_trace(
                 target_sequence=transport_target_sequence,
                 monotonic_time=transport_target_monotonic,
@@ -3574,6 +4025,50 @@ class RM65ArmBackend(EffectorBackend):
                     if isinstance(command.metadata, Mapping)
                     else {}
                 ),
+            )
+            singularity_trace_completed = time.perf_counter()
+            command_phase_timing.update(
+                {
+                    "post_admission_metadata_ms": max(
+                        0.0,
+                        (
+                            post_admission_metadata_completed
+                            - post_admission_metadata_started
+                        )
+                        * 1000.0,
+                    ),
+                    "final_state_lock_wait_ms": max(
+                        0.0,
+                        (final_state_lock_acquired - final_state_lock_wait_started)
+                        * 1000.0,
+                    ),
+                    "final_state_snapshot_ms": max(
+                        0.0,
+                        (final_state_snapshot_completed - final_state_lock_acquired)
+                        * 1000.0,
+                    ),
+                    "quick_stop_metadata_ms": max(
+                        0.0,
+                        (
+                            quick_stop_metadata_completed
+                            - quick_stop_metadata_started
+                        )
+                        * 1000.0,
+                    ),
+                    "singularity_transition_trace_ms": max(
+                        0.0,
+                        (singularity_trace_completed - singularity_trace_started)
+                        * 1000.0,
+                    ),
+                    "total_send_command_ms": max(
+                        0.0,
+                        (singularity_trace_completed - command_phase_started)
+                        * 1000.0,
+                    ),
+                }
+            )
+            command.metadata["rm65_background_command_phase_timing"] = dict(
+                command_phase_timing
             )
             return CommandDispatchReceipt(
                 effector_name=self.name,
@@ -3589,6 +4084,8 @@ class RM65ArmBackend(EffectorBackend):
                     "trajectory_policy_mode": self._stream_planner_policy_mode,
                     "trajectory_policy_speed_scale": self._stream_planner_policy_speed_scale,
                     "trajectory_policy_reason": self._stream_planner_policy_reason,
+                    "target_admission_timing": dict(target_admission_timing),
+                    "command_phase_timing": dict(command_phase_timing),
                 },
             )
 
@@ -4025,6 +4522,18 @@ class RM65ArmBackend(EffectorBackend):
         return {
             "enabled": bool(self.config.background_streaming_enabled),
             "hz": target_hz,
+            "target_admission_mode": str(
+                self.config.background_streaming_target_admission_mode
+            ),
+            "last_target_admission_timing": dict(
+                self._last_background_target_admission_timing
+            ),
+            "inflight_target_preemption_count": int(
+                self._stream_inflight_target_preemption_count
+            ),
+            "last_inflight_target_preemption": dict(
+                self._stream_last_inflight_target_preemption
+            ),
             "warning_threshold_hz": target_hz * warning_ratio,
             "warning_ratio": warning_ratio,
             "thread_alive": thread_alive,
@@ -4193,7 +4702,22 @@ class RM65ArmBackend(EffectorBackend):
                     source="background_target_stale",
                 )
             else:
+                anchor = self._command_anchor_qpos_locked()
                 self._clear_stream_target_locked()
+                if isinstance(
+                    self._stream_planner,
+                    SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                ):
+                    if anchor is None:
+                        anchor = np.zeros(6, dtype=float)
+                    # No qcmd is emitted while a target is stale.  Reconcile
+                    # the planner with that command-space hold so the next
+                    # source cannot resume from nonzero qd/qdd that were never
+                    # physically dispatched.
+                    self._reset_stream_planner_locked(
+                        anchor,
+                        monotonic_time=now,
+                    )
             return True
 
     def _record_background_stream_send(
@@ -4243,11 +4767,17 @@ class RM65ArmBackend(EffectorBackend):
                     "low_rate_count": int(self._stream_low_rate_count),
                 }
                 now_for_print = time.monotonic()
-                if now_for_print - self._stream_last_warning_print_time >= 1.0:
-                    print(
-                        f"WARNING: {self.name} RM65 background CANFD stream low rate "
+                if (
+                    now_for_print - self._stream_last_warning_print_time
+                    >= _BACKGROUND_STREAM_WARNING_PRINT_INTERVAL_SEC
+                ):
+                    _console_log_event(
+                        "CANFD",
+                        f"WARNING: {self.name} stream low rate "
                         f"actual={actual_hz:.1f}Hz target={target_hz:.1f}Hz "
-                        f"threshold={warning_threshold_hz:.1f}Hz"
+                        f"threshold={warning_threshold_hz:.1f}Hz; "
+                        f"suppressed repeats for "
+                        f"{_BACKGROUND_STREAM_WARNING_PRINT_INTERVAL_SEC:.0f}s",
                     )
                     self._stream_last_warning_print_time = now_for_print
             else:
@@ -4652,14 +5182,28 @@ class RM65ArmBackend(EffectorBackend):
                                 self._last_send_result_text = send_text
                                 if accepted:
                                     if trajectory_proposal is not None:
-                                        self._stream_planner.commit(
-                                            trajectory_proposal,
-                                            accepted_monotonic_time=call_finished,
-                                            accepted_q_command=next_qpos,
-                                            allow_bounded_accepted_adjustment=bool(
-                                                follow_smoothing_applied
-                                            ),
+                                        target_superseded_during_sdk = bool(
+                                            target_sequence is not None
+                                            and self._stream_target_sequence
+                                            != target_sequence
                                         )
+                                        if target_superseded_during_sdk:
+                                            self._rebase_acceleration_planner_after_inflight_target_preemption_locked(
+                                                accepted_qpos=next_qpos,
+                                                completed_monotonic_time=call_finished,
+                                                completed_target_sequence=int(
+                                                    target_sequence
+                                                ),
+                                            )
+                                        else:
+                                            self._stream_planner.commit(
+                                                trajectory_proposal,
+                                                accepted_monotonic_time=call_finished,
+                                                accepted_q_command=next_qpos,
+                                                allow_bounded_accepted_adjustment=bool(
+                                                    follow_smoothing_applied
+                                                ),
+                                            )
                                     accepted_sequence = self._record_command_accepted_locked(
                                         next_qpos,
                                         timestamp=time.time(),
@@ -5139,6 +5683,15 @@ class RM65ArmBackend(EffectorBackend):
                 include_derived_pose=bool(include_derived_pose),
                 include_timing_percentiles=bool(include_timing_percentiles),
             )
+        refresh_wall_started = time.perf_counter()
+        refresh_cpu_started = time.thread_time()
+        lock_wait_wall_sec = 0.0
+        lock_wait_cpu_sec = 0.0
+        sdk_call_wall_sec = 0.0
+        sdk_call_cpu_sec = 0.0
+        parse_validation_wall_sec = 0.0
+        parse_validation_cpu_sec = 0.0
+        retry_sleep_wall_sec = 0.0
         retry_count = max(
             1,
             int(
@@ -5162,27 +5715,63 @@ class RM65ArmBackend(EffectorBackend):
         parsed_text = ""
         qpos_from_joint_now = None
         for attempt in range(retry_count):
+            lock_wait_started = time.perf_counter()
+            lock_wait_cpu_started = time.thread_time()
             try:
                 with self._hardware_read_lock:
-                    raw_result, joint_now, pose_now, arm_err, sys_err = (
-                        self.arm.Get_Current_Arm_State()
+                    lock_acquired = time.perf_counter()
+                    lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
+                    lock_wait_cpu_sec += max(
+                        0.0,
+                        time.thread_time() - lock_wait_cpu_started,
                     )
+                    sdk_call_started = time.perf_counter()
+                    sdk_call_cpu_started = time.thread_time()
+                    try:
+                        raw_result, joint_now, pose_now, arm_err, sys_err = (
+                            self.arm.Get_Current_Arm_State()
+                        )
+                    finally:
+                        sdk_call_wall_sec += max(
+                            0.0,
+                            time.perf_counter() - sdk_call_started,
+                        )
+                        sdk_call_cpu_sec += max(
+                            0.0,
+                            time.thread_time() - sdk_call_cpu_started,
+                        )
             except Exception as exc:
                 raw_result = f"EXCEPTION: {exc}"
                 joint_now = None
                 pose_now = None
                 arm_err = None
                 sys_err = None
+            parse_validation_started = time.perf_counter()
+            parse_validation_cpu_started = time.thread_time()
             parsed_code, parsed_text = _parse_rm65_result(raw_result)
             qpos_from_joint_now = _joint_now_to_qpos(joint_now)
-            if _state_result_is_usable(
+            usable_attempt = _state_result_is_usable(
                 parsed_code,
                 joint_now=joint_now,
                 pose_now=pose_now,
-            ):
+            )
+            parse_validation_wall_sec += max(
+                0.0,
+                time.perf_counter() - parse_validation_started,
+            )
+            parse_validation_cpu_sec += max(
+                0.0,
+                time.thread_time() - parse_validation_cpu_started,
+            )
+            if usable_attempt:
                 break
             if attempt + 1 < retry_count:
+                retry_sleep_started = time.perf_counter()
                 time.sleep(retry_delay_sec)
+                retry_sleep_wall_sec += max(
+                    0.0,
+                    time.perf_counter() - retry_sleep_started,
+                )
         refresh_timestamp = time.time()
         refresh_monotonic = time.monotonic()
         usable_result = _state_result_is_usable(
@@ -5193,11 +5782,30 @@ class RM65ArmBackend(EffectorBackend):
         measurement_success = bool(
             usable_result and qpos_from_joint_now is not None
         )
+        refresh_phase_timing = {
+            "total_wall_ms": max(
+                0.0,
+                (time.perf_counter() - refresh_wall_started) * 1000.0,
+            ),
+            "total_thread_cpu_ms": max(
+                0.0,
+                (time.thread_time() - refresh_cpu_started) * 1000.0,
+            ),
+            "hardware_read_lock_wait_wall_ms": lock_wait_wall_sec * 1000.0,
+            "hardware_read_lock_wait_thread_cpu_ms": lock_wait_cpu_sec * 1000.0,
+            "sdk_call_wall_ms": sdk_call_wall_sec * 1000.0,
+            "sdk_call_thread_cpu_ms": sdk_call_cpu_sec * 1000.0,
+            "parse_validation_wall_ms": parse_validation_wall_sec * 1000.0,
+            "parse_validation_thread_cpu_ms": parse_validation_cpu_sec * 1000.0,
+            "retry_sleep_wall_ms": retry_sleep_wall_sec * 1000.0,
+            "attempt_count": float(attempt + 1),
+        }
         with self._state_lock:
             self._hardware_read_sequence += 1
             self._last_hardware_read_time = refresh_timestamp
             self._last_hardware_read_monotonic = refresh_monotonic
             self._last_hardware_read_success = measurement_success
+            self._last_hardware_read_phase_timing = dict(refresh_phase_timing)
             self._last_hardware_result_code = parsed_code
             self._last_hardware_result_text = parsed_text
             self._last_hardware_arm_err = None if arm_err is None else int(arm_err)
@@ -5225,6 +5833,15 @@ class RM65ArmBackend(EffectorBackend):
         if self.arm is None:
             raise RuntimeError(f"{self.name} RM65 force read requires a hardware connection")
         started_monotonic = time.monotonic()
+        read_wall_started = time.perf_counter()
+        read_cpu_started = time.thread_time()
+        pacing_wait_requested_sec = 0.0
+        pacing_wait_wall_sec = 0.0
+        pacing_wait_cpu_sec = 0.0
+        lock_wait_wall_sec = 0.0
+        lock_wait_cpu_sec = 0.0
+        sdk_call_wall_sec = 0.0
+        sdk_call_cpu_sec = 0.0
         # The vendor SDK requires at least 50 ms between *actual* repeated
         # Get_Force_Data calls.  Pacing only the monitor loop is insufficient:
         # an intervening qpos read can shift one force call later and make the
@@ -5232,7 +5849,15 @@ class RM65ArmBackend(EffectorBackend):
         # the serialized SDK boundary while leaving the lock free during the
         # wait so qpos feedback can continue.
         while True:
+            lock_wait_started = time.perf_counter()
+            lock_wait_cpu_started = time.thread_time()
             with self._hardware_read_lock:
+                lock_acquired = time.perf_counter()
+                lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
+                lock_wait_cpu_sec += max(
+                    0.0,
+                    time.thread_time() - lock_wait_cpu_started,
+                )
                 query_now = time.monotonic()
                 previous_query = self._last_force_query_monotonic
                 wait_sec = (
@@ -5242,9 +5867,34 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 if wait_sec <= 0.0:
                     self._last_force_query_monotonic = query_now
-                    result = self.arm.Get_Force_Data()
+                    sdk_call_started = time.perf_counter()
+                    sdk_call_cpu_started = time.thread_time()
+                    try:
+                        result = self.arm.Get_Force_Data()
+                    finally:
+                        sdk_call_wall_sec += max(
+                            0.0,
+                            time.perf_counter() - sdk_call_started,
+                        )
+                        sdk_call_cpu_sec += max(
+                            0.0,
+                            time.thread_time() - sdk_call_cpu_started,
+                        )
                     break
+            pacing_wait_requested_sec += max(0.0, wait_sec)
+            pacing_wait_started = time.perf_counter()
+            pacing_wait_cpu_started = time.thread_time()
             time.sleep(wait_sec)
+            pacing_wait_wall_sec += max(
+                0.0,
+                time.perf_counter() - pacing_wait_started,
+            )
+            pacing_wait_cpu_sec += max(
+                0.0,
+                time.thread_time() - pacing_wait_cpu_started,
+            )
+        validation_wall_started = time.perf_counter()
+        validation_cpu_started = time.thread_time()
         if not isinstance(result, (tuple, list)) or len(result) != 5:
             raise RuntimeError(
                 f"{self.name} Get_Force_Data returned an invalid result shape"
@@ -5273,11 +5923,39 @@ class RM65ArmBackend(EffectorBackend):
                     f"{self.name} {source} force must contain 6 finite values"
                 )
             sources[source] = vector.copy()
+        validation_wall_sec = max(
+            0.0,
+            time.perf_counter() - validation_wall_started,
+        )
+        validation_cpu_sec = max(
+            0.0,
+            time.thread_time() - validation_cpu_started,
+        )
+        read_phase_timing = {
+            "total_wall_ms": max(
+                0.0,
+                (time.perf_counter() - read_wall_started) * 1000.0,
+            ),
+            "total_thread_cpu_ms": max(
+                0.0,
+                (time.thread_time() - read_cpu_started) * 1000.0,
+            ),
+            "pacing_wait_requested_ms": pacing_wait_requested_sec * 1000.0,
+            "pacing_wait_wall_ms": pacing_wait_wall_sec * 1000.0,
+            "pacing_wait_thread_cpu_ms": pacing_wait_cpu_sec * 1000.0,
+            "hardware_read_lock_wait_wall_ms": lock_wait_wall_sec * 1000.0,
+            "hardware_read_lock_wait_thread_cpu_ms": lock_wait_cpu_sec * 1000.0,
+            "sdk_call_wall_ms": sdk_call_wall_sec * 1000.0,
+            "sdk_call_thread_cpu_ms": sdk_call_cpu_sec * 1000.0,
+            "validation_wall_ms": validation_wall_sec * 1000.0,
+            "validation_thread_cpu_ms": validation_cpu_sec * 1000.0,
+        }
         return {
             "sources": sources,
             "monotonic_time_sec": time.monotonic(),
             "wall_time_sec": time.time(),
             "read_elapsed_sec": time.monotonic() - started_monotonic,
+            "read_phase_timing": read_phase_timing,
             "result_code": code,
             "result_text": result_text,
         }
@@ -5317,6 +5995,9 @@ class RM65ArmBackend(EffectorBackend):
             hardware_read_time = self._last_hardware_read_time
             hardware_read_monotonic = self._last_hardware_read_monotonic
             hardware_read_success = self._last_hardware_read_success
+            hardware_read_phase_timing = dict(
+                self._last_hardware_read_phase_timing
+            )
             hardware_read_sequence = int(self._hardware_read_sequence)
             hardware_refresh_time = self._last_hardware_refresh_time
             measured_timestamp = self._measured_timestamp
@@ -5397,6 +6078,7 @@ class RM65ArmBackend(EffectorBackend):
             "hardware_read_timestamp_monotonic": hardware_read_monotonic,
             "hardware_read_sequence": hardware_read_sequence,
             "hardware_read_success": hardware_read_success,
+            "hardware_read_phase_timing": hardware_read_phase_timing,
             "hardware_result_code": hardware_result_code,
             "hardware_result_text": hardware_result_text,
             "hardware_arm_err": hardware_arm_err,

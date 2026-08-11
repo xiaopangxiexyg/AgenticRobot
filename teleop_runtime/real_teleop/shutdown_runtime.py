@@ -77,6 +77,7 @@ def shutdown_real_teleop_runtime(
     ik_debug_log_recorder = runtime_state.get("ik_debug_log_recorder")
     recording_active = runtime_state.get("recording_active")
     stop_recording = runtime_state.get("stop_recording")
+    idle_tactile_compression = runtime_state.get("idle_tactile_compression")
 
     _arm_control_mode_arg = support["_arm_control_mode_arg"]
     _attach_actuator_command_trace_sink = support[
@@ -113,6 +114,13 @@ def shutdown_real_teleop_runtime(
         )
     if startup_progress is not None:
         shutdown_steps.append(("startup_progress", startup_progress.close))
+    if idle_tactile_compression is not None:
+        # Revoke maintenance before any recorder/camera/device teardown.  The
+        # controller joins the child and publishes its filesystem barrier
+        # before returning.
+        shutdown_steps.append(
+            ("idle_tactile_compression", idle_tactile_compression.close)
+        )
     if position_force_guard_monitor is not None:
         shutdown_steps.append(
             ("position_force_guard_monitor", position_force_guard_monitor.close)

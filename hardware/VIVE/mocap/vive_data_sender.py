@@ -14,6 +14,7 @@ import importlib.util
 import json
 import math
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -1304,10 +1305,18 @@ def load_triad_openvr(module_path: Path | None = None) -> Any:
         )
 
     module = importlib.util.module_from_spec(spec)
+    module_name = spec.name
+    had_previous = module_name in sys.modules
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
     print(f"[Info] loading triad_openvr from: {resolved_path}")
     try:
         spec.loader.exec_module(module)
     except ModuleNotFoundError as exc:
+        if had_previous:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
         if module_path is None:
             print(
                 f"[Warn] external triad_openvr dependency '{exc.name}' is unavailable; "
@@ -1319,6 +1328,12 @@ def load_triad_openvr(module_path: Path | None = None) -> Any:
             f"[Error] failed to import '{missing}' from {resolved_path}. "
             "Install the VIVE sender dependencies in this Python environment, then retry."
         ) from exc
+    except BaseException:
+        if had_previous:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+        raise
     return module
 
 

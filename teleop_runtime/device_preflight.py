@@ -681,7 +681,22 @@ def configure_realsense_interactive(
     valid.update(serials)
     by_index = {str(item.get("index")): str(item.get("serial")) for item in discovered}
     if assume_yes:
-        selected = dict(zip(configs.keys(), serials))
+        selected = {}
+        for key, config in configs.items():
+            configured_serial = str(config.serial)
+            if configured_serial not in serials:
+                raise DevicePreflightError(
+                    "Non-interactive RealSense assignment refuses to infer "
+                    "physical camera roles from discovery order: "
+                    f"camera {str(key)!r} expects serial {configured_serial!r}. "
+                    "Run interactively to assign an explicitly verified serial."
+                )
+            if configured_serial in used:
+                raise DevicePreflightError(
+                    f"RealSense serial {configured_serial} was assigned more than once."
+                )
+            used.add(configured_serial)
+            selected[str(key)] = configured_serial
     else:
         selected = {}
         for key, config in configs.items():

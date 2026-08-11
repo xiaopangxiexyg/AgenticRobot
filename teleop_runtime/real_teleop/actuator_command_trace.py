@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-ACTUATOR_COMMAND_TRACE_SCHEMA = "dexteleop.rm65_actuator_command_trace.v3"
+ACTUATOR_COMMAND_TRACE_SCHEMA = "dexteleop.rm65_actuator_command_trace.v4"
 ACTUATOR_COMMAND_TRACE_DATA_NAME = "command_trace.npz"
 ACTUATOR_COMMAND_TRACE_MANIFEST_NAME = "manifest.json"
 DEFAULT_ACTUATOR_TRACE_ROOT = Path("teleop_records/actuator_identification")
@@ -93,6 +93,7 @@ _VIVE_SOURCE_DTYPE = np.dtype(
         ("control_monotonic_time_ns", "<i8"),
         ("present_mask", "u1"),
         ("valid_mask", "u1"),
+        ("velocity_valid_mask", "u1"),
         ("channel_seq", "<i8", (2,)),
         ("channel_timestamp_ns", "<i8", (2,)),
         ("receiver_timestamp_ns", "<i8", (2,)),
@@ -105,8 +106,13 @@ _VIVE_SOURCE_DTYPE = np.dtype(
         ("capture_estimate_uncertainty_sec", "<f8", (2,)),
         ("clock_sync_offset_sec", "<f8", (2,)),
         ("pose_vive_world", "<f8", (2, 4, 4)),
+        ("linear_velocity_m_s", "<f8", (2, 3)),
+        ("angular_velocity_rad_s", "<f8", (2, 3)),
         ("tracker_name", "S64", (2,)),
         ("tracker_role", "S32", (2,)),
+        ("velocity_frame_name", "S32", (2,)),
+        ("velocity_source", "S64", (2,)),
+        ("velocity_error", "S128", (2,)),
         ("teleop_state", "S24"),
         ("motion_hold_mode", "S32"),
     ],
@@ -578,6 +584,7 @@ class ActuatorCommandTraceRecorder:
             row["control_monotonic_time_ns"] = int(control_monotonic_time_ns)
             row["present_mask"] = 0
             row["valid_mask"] = 0
+            row["velocity_valid_mask"] = 0
             for field_name in (
                 "channel_seq",
                 "channel_timestamp_ns",
@@ -594,10 +601,15 @@ class ActuatorCommandTraceRecorder:
                 "capture_estimate_uncertainty_sec",
                 "clock_sync_offset_sec",
                 "pose_vive_world",
+                "linear_velocity_m_s",
+                "angular_velocity_rad_s",
             ):
                 row[field_name].fill(np.nan)
             row["tracker_name"].fill(b"")
             row["tracker_role"].fill(b"")
+            row["velocity_frame_name"].fill(b"")
+            row["velocity_source"].fill(b"")
+            row["velocity_error"].fill(b"")
             for side_index, channel_name in enumerate(
                 ("left_wrist_pose", "right_wrist_pose")
             ):
@@ -650,11 +662,37 @@ class ActuatorCommandTraceRecorder:
                         np.nan if value is None else float(value)
                     )
                 row["pose_vive_world"][side_index] = pose
+                linear_velocity = metadata.get("linear_velocity_m_s")
+                angular_velocity = metadata.get("angular_velocity_rad_s")
+                velocity_vectors_valid = False
+                if linear_velocity is not None and angular_velocity is not None:
+                    linear_array = np.asarray(linear_velocity, dtype=float)
+                    angular_array = np.asarray(angular_velocity, dtype=float)
+                    velocity_vectors_valid = bool(
+                        linear_array.shape == (3,)
+                        and angular_array.shape == (3,)
+                        and np.all(np.isfinite(linear_array))
+                        and np.all(np.isfinite(angular_array))
+                    )
+                    if velocity_vectors_valid:
+                        row["linear_velocity_m_s"][side_index] = linear_array
+                        row["angular_velocity_rad_s"][side_index] = angular_array
+                if bool(metadata.get("velocity_valid", False)) and velocity_vectors_valid:
+                    row["velocity_valid_mask"] |= 1 << side_index
                 row["tracker_name"][side_index] = str(
                     metadata.get("tracker_name") or ""
                 ).encode("utf-8")
                 row["tracker_role"][side_index] = str(
                     metadata.get("tracker_role") or ""
+                ).encode("utf-8")
+                row["velocity_frame_name"][side_index] = str(
+                    metadata.get("velocity_frame_name") or ""
+                ).encode("utf-8")
+                row["velocity_source"][side_index] = str(
+                    metadata.get("velocity_source") or ""
+                ).encode("utf-8")
+                row["velocity_error"][side_index] = str(
+                    metadata.get("velocity_error") or ""
                 ).encode("utf-8")
             row["teleop_state"] = str(teleop_state).encode("utf-8")
             row["motion_hold_mode"] = str(motion_hold_mode).encode("utf-8")

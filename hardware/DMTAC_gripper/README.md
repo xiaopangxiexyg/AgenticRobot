@@ -164,8 +164,11 @@ python run_gripper.py configure-usb --scan-only \
 不做触觉去噪/时间平滑，以便排查延迟；窗口底部会显示 `read=...ms render=...ms display=...ms loop=...ms`，
 每个传感器标题区显示 `fid_age=...ms df=...ms force=...ms`，其中 `df` 是
 `getDistributeForce()` getter 耗时。
-开始可视化后会自动记录读数到
-`teleop_records/dmtac_tactile_debug/<timestamp>_tactile_gui/`：`metadata.json` 保存本次配置，
+开始可视化后默认仍会自动记录读数到
+`teleop_records/dmtac_tactile_debug/<timestamp>_tactile_gui/`；显式传入
+`--tactile-gui-artifact-layout runtime-artifacts-v1` 时改写到
+`runtime_artifacts/runs/dmtac_tactile_gui/<date>/<timestamp>_tactile_gui/`，而
+`--tactile-gui-record-dir` 始终优先。`metadata.json` 保存本次配置与实际存储选择，
 `frames.jsonl` 逐帧保存 fid、getter 耗时和力场摘要；默认不写完整 20x30 网格，以免文件 IO 拖慢下一帧。
 
 ```text
@@ -579,6 +582,13 @@ TactileConfig(fields=("all",))
 | `examples/minimal_gripper_tactile_loop.py` | 低速夹爪动作 + 触觉读取 |
 | `examples/visualize_distributed_force.py` | 实时可视化 `distributed_force` XY |
 | `examples/calibrate_tactile_base_frames.py` | 直接连接真实传感器并生成固定 base-frame 校准 |
+| `examples/inspect_dmtac_offline_api.py` | 只反射 SDK 符号和签名，不构建设备或调用 SDK 函数 |
+
+从仓库根目录执行离线 SDK 接口检查：
+
+```bash
+python hardware/DMTAC_gripper/examples/inspect_dmtac_offline_api.py
+```
 
 ## 安全
 

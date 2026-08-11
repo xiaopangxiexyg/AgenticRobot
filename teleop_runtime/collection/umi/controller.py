@@ -13,21 +13,13 @@ from typing import Iterable, Mapping, MutableMapping
 
 import numpy as np
 
-from control_station.umi.control_availability import (
-    UmiControlState,
-    active_controls as umi_active_controls,
-)
-from control_station.umi.input_mapping import (
-    UmiOperatorEvent,
-    foot_pad_test_batch_active,
-    merge_operator_events,
-)
 from robot_motion.runtime.contracts import TeleopObservation, merge_teleop_commands
 
 from ...operator_ui_ports import OperatorUiPort
 from ...real_teleop.gui_tracker_status import raw_tracker_pose_state_from_channels
 from ..operator_labels import OperatorLabelStateMachine
 from ..episode_curation import EpisodeCurationSession, load_task_variant_profile
+from .application_ports import UmiOperatorEventTuple, UmiOperatorPolicyPort
 from .calibration import UmiCalibrationBinding
 from .components import UmiComponents
 from .config import UmiCollectionConfig
@@ -54,6 +46,7 @@ class UmiCollectionController:
         components: UmiComponents,
         recorder: UmiDatasetRecorder,
         ui: OperatorUiPort,
+        operator_policy: UmiOperatorPolicyPort,
         labels: OperatorLabelStateMachine,
         snapshot_assembler: UmiSnapshotAssembler,
         last_commands: MutableMapping[str, float] | None = None,
@@ -63,6 +56,7 @@ class UmiCollectionController:
         self.components = components
         self.recorder = recorder
         self.ui = ui
+        self.operator_policy = operator_policy
         self.labels = labels
         self.snapshot_assembler = snapshot_assembler
         self.should_quit = False
@@ -175,17 +169,45 @@ class UmiCollectionController:
             and self.plus_curation.pending_episode_index is not None
             and self.plus_curation.status not in {"saving"}
         )
-        return umi_active_controls(
-            UmiControlState(
-                calibration_expired=bool(self._calibration_expired),
-                recording=recording,
-                collection_blocked=bool(self._startup_collection_blockers()),
-                plus_save_available=plus_save,
-                plus_save_in_flight=self._plus_curation_save_in_flight(),
-                foot_pad_online=self._foot_pad_online(),
-                foot_pad_test_active=bool(self._foot_pad_test_active),
-            )
+        return self.operator_policy.active_controls(
+            calibration_expired=bool(self._calibration_expired),
+            recording=recording,
+            collection_blocked=bool(self._startup_collection_blockers()),
+            plus_save_available=plus_save,
+            plus_save_in_flight=self._plus_curation_save_in_flight(),
+            foot_pad_online=self._foot_pad_online(),
+            foot_pad_test_active=bool(self._foot_pad_test_active),
+            dataset_reconfiguration_available=(
+                self._dataset_reconfiguration_blocker() == ""
+            ),
+            episode_deletion_available=(
+                self._episode_deletion_blocker() == ""
+            ),
         )
+
+    def _dataset_reconfiguration_blocker(self) -> str:
+        """Explain why this recorder cannot be rebound by the shared GUI.
+
+        A provisional native shadow owns a store rooted at the dataset chosen
+        during assembly.  Rebinding only the legacy writer would split one
+        logical Episode across two roots, so fail closed until the application
+        can rebuild the complete recorder/store pair.
+        """
+
+        plus_blocker = self.plus_curation.persisted_binding_lock_reason()
+        if plus_blocker:
+            return plus_blocker
+        if getattr(self.recorder, "v25p_sidecar_store", None) is not None:
+            return "当前 UMI v2.5-p sidecar 已绑定启动时的数据集；本次运行不能切换根目录。"
+        if getattr(self.recorder, "v25p_native_shadow", None) is not None:
+            return "当前 UMI native shadow 已绑定启动时的数据集；本次运行不能切换根目录。"
+        return ""
+
+    def _episode_deletion_blocker(self) -> str:
+        plus_blocker = self.plus_curation.persisted_binding_lock_reason()
+        if plus_blocker:
+            return plus_blocker
+        return ""
 
     def _startup_collection_blockers(self) -> tuple[str, ...]:
         ignored_cameras = set(getattr(self.config, "ignored_camera_keys", ()) or ())
@@ -408,7 +430,7 @@ class UmiCollectionController:
             "countdown": countdown,
         }
 
-    def _events(self) -> list[UmiOperatorEvent]:
+    def _events(self) -> list[UmiOperatorEventTuple]:
         now = time.time()
         web_events = list(self.ui.consume_events())
         foot_pad_events: list[str] = []
@@ -424,7 +446,7 @@ class UmiCollectionController:
                     pedal_count=self._foot_pad_count(),
                 )
         events = list(
-            merge_operator_events(
+            self.operator_policy.merge_operator_events(
                 web_events,
                 foot_pad_events,
                 timestamp=now,
@@ -489,6 +511,16 @@ class UmiCollectionController:
             ignored_camera_keys=tuple(str(item) for item in ignored_cameras),
             ignored_tactile_keys=tuple(str(item) for item in ignored_tactile),
         )
+        current_root = Path(self.config.dataset_root).expanduser().resolve()
+        next_root = Path(next_config.dataset_root).expanduser().resolve()
+        reconfiguration_requested = bool(
+            next_root != current_root
+            or next_config.capture_modality_contract
+            != self.config.capture_modality_contract
+        )
+        blocker = self._dataset_reconfiguration_blocker()
+        if blocker and reconfiguration_requested:
+            raise RuntimeError(blocker)
         reconfigure = getattr(self.recorder, "reconfigure_config", None)
         if callable(reconfigure):
             reconfigure(next_config)
@@ -509,7 +541,7 @@ class UmiCollectionController:
         # Treat pedal edges sampled in the same cycle as a test start/stop as
         # diagnostics too.  This prevents a browser click racing the input
         # poll from turning one edge into a real annotation.
-        foot_pad_test_batch = foot_pad_test_batch_active(
+        foot_pad_test_batch = self.operator_policy.foot_pad_test_batch_active(
             event_batch,
             test_already_active=bool(self._foot_pad_test_active),
         )
@@ -595,6 +627,13 @@ class UmiCollectionController:
             elif event.startswith("episode_delete:"):
                 try:
                     episode_index = int(event.split(":", 1)[1])
+                    deletion_blocker = self._episode_deletion_blocker()
+                    if deletion_blocker:
+                        self._event_status = "error"
+                        self._event_message = (
+                            f"删除 episode {episode_index} 失败：{deletion_blocker}"
+                        )
+                        continue
                     if self._plus_curation_save_in_flight():
                         self._event_status = "error"
                         self._event_message = (
@@ -674,48 +713,74 @@ class UmiCollectionController:
                             "cannot start: " + ", ".join(self.last_rejection)
                         )
                         continue
-                    self.calibration.require_valid(self.config)
-                    readiness = self.snapshot_assembler.assemble(
-                        episode_index=-1,
-                        frame_index=0,
-                        timestamp=time.time(),
-                    )
-                    if isinstance(readiness, SnapshotRejection):
-                        self.last_rejection = readiness.reasons
-                        self._event_status = "ready"
-                        self._event_message = (
-                            "cannot start: " + ", ".join(readiness.reasons)
+                    try:
+                        self.calibration.require_valid(self.config)
+                        readiness = self.snapshot_assembler.assemble(
+                            episode_index=-1,
+                            frame_index=0,
+                            timestamp=time.time(),
                         )
+                        if isinstance(readiness, SnapshotRejection):
+                            self.last_rejection = readiness.reasons
+                            self._event_status = "ready"
+                            self._event_message = (
+                                "cannot start: " + ", ".join(readiness.reasons)
+                            )
+                            continue
+                        self.labels.reset(source="episode_start", timestamp=timestamp)
+                        episode_index = self.recorder.start_episode(
+                            {
+                                "embodiment": "umi_dual_wrist",
+                                "embodiment_has_arm": False,
+                                "calibration_sha256": self.calibration.sha256,
+                                "tcp_extrinsic_by_side": {
+                                    side: {
+                                        "T_tcp_to_tracker": self.calibration.T_tcp_to_tracker_by_side[
+                                            side
+                                        ].tolist(),
+                                        "status": self.config.side(side).tcp_extrinsic_status,
+                                        "tcp_profile": self.config.side(side).tcp_profile,
+                                        "hand_eye_result_path": (
+                                            None
+                                            if side not in self.calibration.by_side
+                                            else str(self.calibration.by_side[side].path)
+                                        ),
+                                        "hand_eye_result_sha256": (
+                                            None
+                                            if side not in self.calibration.by_side
+                                            else self.calibration.by_side[side].sha256
+                                        ),
+                                    }
+                                    for side in SIDES
+                                },
+                            }
+                        )
+                    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                        self.last_rejection = (
+                            f"episode_start_failed:{type(exc).__name__}",
+                        )
+                        self._event_status = "error"
+                        self._event_message = (
+                            "UMI episode 启动失败，未进入数采："
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        append_message = getattr(self.ui, "append_message", None)
+                        if callable(append_message):
+                            append_message("Dataset", self._event_message)
                         continue
-                    self.labels.reset(source="episode_start", timestamp=timestamp)
-                    episode_index = self.recorder.start_episode(
-                        {
-                            "embodiment": "umi_dual_wrist",
-                            "embodiment_has_arm": False,
-                            "calibration_sha256": self.calibration.sha256,
-                            "tcp_extrinsic_by_side": {
-                                side: {
-                                    "T_tcp_to_tracker": self.calibration.T_tcp_to_tracker_by_side[
-                                        side
-                                    ].tolist(),
-                                    "status": self.config.side(side).tcp_extrinsic_status,
-                                    "tcp_profile": self.config.side(side).tcp_profile,
-                                    "hand_eye_result_path": (
-                                        None
-                                        if side not in self.calibration.by_side
-                                        else str(self.calibration.by_side[side].path)
-                                    ),
-                                    "hand_eye_result_sha256": (
-                                        None
-                                        if side not in self.calibration.by_side
-                                        else self.calibration.by_side[side].sha256
-                                    ),
-                                }
-                                for side in SIDES
-                            },
-                        }
-                    )
-                    self._begin_plus_episode(int(episode_index))
+                    try:
+                        self._begin_plus_episode(int(episode_index))
+                    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                        # Plus is an optional post-episode overlay.  An
+                        # in-memory review-state failure must never abandon an
+                        # already-open raw UMI episode.
+                        append_message = getattr(self.ui, "append_message", None)
+                        if callable(append_message):
+                            append_message(
+                                "Plus",
+                                "Plus episode 状态初始化失败；原始数采继续："
+                                f"{type(exc).__name__}: {exc}",
+                            )
                     self._next_sample_at = time.perf_counter()
                     self.last_rejection = ()
                     self._event_status = "recording"
@@ -730,10 +795,24 @@ class UmiCollectionController:
                         episode_event_message=self._event_message,
                         active_controls=["q"],
                     )
-                    stopped_episode_index = self.recorder.stop_episode(
-                        reason=event,
-                        discard=event == "episode_cancel",
-                    )
+                    try:
+                        stopped_episode_index = self.recorder.stop_episode(
+                            reason=event,
+                            discard=event == "episode_cancel",
+                        )
+                    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                        self._event_status = "error"
+                        self._event_message = (
+                            "UMI episode 封存失败；录制身份保持打开，可重试停止："
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        self.last_rejection = (
+                            f"episode_finalize_failed:{type(exc).__name__}",
+                        )
+                        append_message = getattr(self.ui, "append_message", None)
+                        if callable(append_message):
+                            append_message("Dataset", self._event_message)
+                        continue
                     if (
                         stopped_episode_index is not None
                         and str(self.recorder.last_outcome) == "saved"
@@ -939,6 +1018,10 @@ class UmiCollectionController:
             dataset_base_root=str(dataset_root),
             dataset_root=str(dataset_root),
             dataset_modality_contract=self.config.capture_modality_contract.to_dict(),
+            dataset_configuration_blocked_reason=(
+                self._dataset_reconfiguration_blocker()
+            ),
+            episode_deletion_blocked_reason=self._episode_deletion_blocker(),
             hardware_status=self.components.hardware_status(),
             collection_task_id=self.config.task_id,
             collection_task_name=self.config.task_description,
@@ -1168,20 +1251,44 @@ class UmiCollectionController:
                     self.calibration.require_valid(self.config)
                 except RuntimeError as exc:
                     if self.recorder.recording:
-                        stopped_episode_index = self.recorder.stop_episode(reason="calibration_expired")
-                        if (
-                            stopped_episode_index is not None
-                            and str(self.recorder.last_outcome) == "saved"
-                        ):
-                            self._mark_plus_pending(int(stopped_episode_index))
+                        try:
+                            stopped_episode_index = self.recorder.stop_episode(
+                                reason="calibration_expired"
+                            )
+                        except (OSError, TypeError, ValueError, RuntimeError) as stop_exc:
+                            stopped_episode_index = None
+                            self._event_message = (
+                                "UMI 标定已过期，自动封存失败；"
+                                "请在界面重试停止 episode："
+                                f"{type(stop_exc).__name__}: {stop_exc}"
+                            )
+                        else:
+                            if (
+                                stopped_episode_index is not None
+                                and str(self.recorder.last_outcome) == "saved"
+                            ):
+                                self._mark_plus_pending(int(stopped_episode_index))
                     self._calibration_expired = True
                     self._event_status = "error"
-                    self._event_message = (
-                        "UMI 标定已过期；当前 episode 已安全结束。"
-                        "请点击界面中的“重新标定左右 UMI”。"
-                    )
+                    if not self._event_message.startswith("UMI 标定已过期，自动封存失败"):
+                        self._event_message = (
+                            "UMI 标定已过期；当前 episode 已安全结束。"
+                            "请点击界面中的“重新标定左右 UMI”。"
+                        )
                     self.last_rejection = ("calibration_expired", str(exc))
             if self._calibration_expired:
+                # The expired-state availability policy intentionally keeps
+                # idle dataset rebinding and pending Plus sidecar submission
+                # available.  Process those admitted events before waiting for
+                # recalibration; otherwise the GUI would acknowledge and then
+                # silently discard them.
+                self._handle_events(
+                    events,
+                    gripper_ready=False,
+                    gripper_reason=self._event_message,
+                )
+                if self.should_quit:
+                    break
                 if wall_now - last_publish >= 0.2:
                     self._publish(
                         wall_now,

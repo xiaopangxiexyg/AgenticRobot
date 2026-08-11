@@ -14,8 +14,15 @@ def _session_record_root_dir(args: argparse.Namespace) -> Path | None:
     if cached:
         return Path(cached)
     session_record_root = str(getattr(args, "session_record_root", "") or "").strip()
+    canonical_session_dir = str(
+        getattr(args, "_runtime_artifact_session_dir", "") or ""
+    ).strip()
     if not session_record_root:
-        return None
+        if not canonical_session_dir:
+            return None
+        root_dir = Path(canonical_session_dir).expanduser()
+        setattr(args, "_session_record_root_dir", str(root_dir))
+        return root_dir
     stamp = str(getattr(args, "_session_record_stamp", "") or "").strip()
     if not stamp:
         stamp = time.strftime("%Y%m%d_%H%M%S")

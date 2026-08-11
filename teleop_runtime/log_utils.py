@@ -23,6 +23,13 @@ _TAG_COLORS = {
     "VALIDATE": "\033[92m",
     "SAVE": "\033[92m",
     "CALIBRATION": "\033[96m",
+    "DEPLOY": "\033[96m",
+    "INIT": "\033[92m",
+    "POLICY": "\033[95m",
+    "STATUS": "\033[94m",
+    "SAFETY": "\033[91m",
+    "COLLISION": "\033[93m",
+    "CANFD": "\033[93m",
 }
 DEFAULT_LOG_HEARTBEAT_SEC = 2
 
@@ -40,6 +47,11 @@ def _message_color(message: str) -> str | None:
         for word in ("REJECTED", "FAILED", "ERROR", "CANNOT", "MISSING", "TIMEOUT")
     ):
         return "\033[91m"
+    if any(
+        word in upper
+        for word in ("WARNING", "STALE", "LOW RATE", "BLOCKED")
+    ):
+        return "\033[93m"
     if any(
         word in upper
         for word in ("ACCEPTED", "READY", "UPDATED", "WRITTEN", "CONTINUING", "LOADED")
@@ -73,6 +85,7 @@ class ChangeGate:
     def __init__(self) -> None:
         self._values: dict[str, Any] = {}
         self._last_emit_times: dict[str, float] = {}
+        self._pending_changes: set[str] = set()
 
     def should_emit(
         self,
@@ -81,17 +94,38 @@ class ChangeGate:
         *,
         now: float | None = None,
         heartbeat_sec: float | None = None,
+        min_interval_sec: float | None = None,
     ) -> bool:
         current_time = time.time() if now is None else float(now)
         previous = self._values.get(key, _MISSING)
-        if previous is _MISSING or previous != value:
+        changed = previous is _MISSING or previous != value
+        if changed:
             self._values[key] = value
+        if previous is _MISSING:
             self._last_emit_times[key] = current_time
+            self._pending_changes.discard(key)
             return True
+        minimum = (
+            None
+            if min_interval_sec is None
+            else max(0.0, float(min_interval_sec))
+        )
+        if changed:
+            if minimum is None or minimum <= 0.0:
+                self._last_emit_times[key] = current_time
+                self._pending_changes.discard(key)
+                return True
+            self._pending_changes.add(key)
+        last_emit = self._last_emit_times.get(key, current_time)
+        if key in self._pending_changes:
+            if minimum is None or current_time - last_emit >= minimum:
+                self._last_emit_times[key] = current_time
+                self._pending_changes.discard(key)
+                return True
         if heartbeat_sec is not None:
-            last_emit = self._last_emit_times.get(key, current_time)
             if current_time - last_emit >= heartbeat_sec:
                 self._last_emit_times[key] = current_time
+                self._pending_changes.discard(key)
                 return True
         return False
 

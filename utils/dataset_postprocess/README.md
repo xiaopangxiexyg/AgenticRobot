@@ -15,6 +15,201 @@ DexTeleop dataset 后处理工具集合。默认以 dry-run / 写新目录为主
 conda activate dexteleop310
 ```
 
+### 混合触觉数据的一体化入口（推荐）
+
+`tactile-maintain` 是面向既有数据集的状态感知入口。默认只生成 JSON 计划，不写数据；它会从
+`episodes.jsonl`、每个 tactile manifest、当前 inventory 和 storage receipt 判断数据集属于：
+
+- 全 raw；
+- raw 与 zstd/lz4 混合；
+- 已全部压缩；
+- `payload-only` 或 `whole-prefix` 已验证迁出；
+- 非法部分缺失、未知编码或未完成事务。
+
+目标为 `compressed-hot` 时，只无损压缩仍为 raw 的 stream，已经是 zstd/lz4 的 stream 保持原样。
+重复执行会得到 `target_satisfied=true` 的空操作：
+
+```bash
+python -m utils.dataset_postprocess \
+  tactile-maintain DATASET_ROOT \
+  --target compressed-hot
+```
+
+确认计划后显式应用：
+
+```bash
+python -m utils.dataset_postprocess \
+  tactile-maintain DATASET_ROOT \
+  --target compressed-hot \
+  --apply
+```
+
+目标为 `detached` 时，默认先把剩余 raw stream 无损压缩，再调用可续传、可恢复的 whole-prefix
+managed move。迁出/放回涉及 reader 边界，因此 apply 必须确认没有活跃 reader：
+
+```bash
+python -m utils.dataset_postprocess \
+  tactile-maintain DATASET_ROOT \
+  --target detached \
+  --cold-root COLD_ROOT
+
+python -m utils.dataset_postprocess \
+  tactile-maintain DATASET_ROOT \
+  --target detached \
+  --cold-root COLD_ROOT \
+  --apply \
+  --confirm-no-active-readers
+```
+
+将已迁出的数据恢复为 hot、自包含状态：
+
+```bash
+python -m utils.dataset_postprocess \
+  tactile-maintain DATASET_ROOT \
+  --target hot \
+  --cold-root COLD_ROOT \
+  --apply \
+  --confirm-no-active-readers
+```
+
+如果迁出时保留了 raw，再以 `--target compressed-hot --cold-root COLD_ROOT` 应用，工具会先完成
+verified rehydrate，再只压缩剩余 raw。每一步继续使用原有 recompression/storage receipt；组合入口
+没有第二套进度文件。进程在“压缩后、迁出前”或“装回后、压缩前”中断时，重复同一目标命令会根据
+实际 manifest/receipt 从剩余步骤继续。
+
+`--no-compress-before-detach` 是只迁出、不先压缩的显式回退开关。已处于目标状态时不要求 cold root；
+detached 数据需要装回或继续压缩时必须显式给出 cold root。任何未知/部分缺失状态都会 fail closed，
+不会被当成合法 detached。这个入口只处理 external tactile；没有 external tactile 引用的数据集返回
+`NO_EXTERNAL_TACTILE` 空操作。
+
+### 触觉模态冷存储（默认只读）
+
+触觉拆出/放回使用现有 entrypoint，不手工移动 `tactile/`。第一次命令只生成 proposal：
+
+若目标是把整个 `tactile/` 当成一个模块迁走，推荐使用托管 move。第一次不带
+`--apply` 只做严格只读计划：
+
+```bash
+python -m utils.dataset_postprocess modality-move DATASET_ROOT \
+  --cold-root COLD_ROOT \
+  --modality tactile
+```
+
+确认 hot/cold 路径、不同 `st_dev`、容量和 `ready=true` 后，单次执行：
+
+```bash
+python -m utils.dataset_postprocess modality-move DATASET_ROOT \
+  --cold-root COLD_ROOT \
+  --modality tactile \
+  --apply \
+  --confirm-no-active-readers
+```
+
+这是安全的 rsync 类 move，不是 shell `mv`：冷端 partial tree 由 dataset fingerprint 和
+inventory hash 唯一绑定；完整文件按 SHA-256 复用，未完成文件先逐字节验证已有前缀再从断点
+续传。SIGINT、进程异常或主机重启发生在 cold export 阶段时，hot `tactile/` 保持不动；再次
+执行同一条 apply 命令即可继续。只有独立 cold inode、完整 hash、标准 tactile reader restore
+drill 和 receipt 全部成功后，才原子退役 hot `tactile/`。原有 `modality-detach` 的显式
+plan-hash/fingerprint 两阶段接口继续保留，作为更严格的审核和完整回退路径。
+
+如果中断发生在热端退役事务中，重复 apply 会先恢复 journal，再重新规划；如果退役 receipt
+已经持久化但原调用方没有收到结果，重复 apply 会返回同一个已验证结果，不会创建第二次迁移。
+清理事务 quarantine 前会重新核对 receipt/inventory，并重新验证冷端所有 hash 和 tactile
+reader；冷盘未挂载、路径不符或任一字节变化时会 fail closed，并保留 quarantine 和 journal，
+不得为了“解除卡住”而手工删除这些目录。
+
+既有的标准 v2.3 数据集不要求预先存在 modality inventory：dry-run 会只读构建临时 inventory，
+apply 才会发布 sidecar 并执行迁移。由旧格式转换产生、与其他数据集共享 inode 的 hardlink
+数据会在 planning/admission 阶段明确拒绝；不能把另一个路径名当作独立备份，也不要直接 unlink
+其中任意一份。应先选择 canonical 数据集，或另行完成带独立备份 receipt 的 hardlink 拆分。
+
+新采集和既有标准 v2.3 数据都沿用同一物理布局，不重写 Parquet 或 Episode catalog：
+
+```text
+DATASET_ROOT/
+  data/                     # 数值帧；保留 tactile 相对引用
+  videos/
+  meta/
+    episodes.jsonl          # 保留 tactile_paths 捕获事实
+    modality_artifacts/     # inventory、receipt、事务 journal
+  tactile/                  # 全部触觉 manifest 与 payload 的唯一前缀
+```
+
+`whole-prefix` 成功拆出后，hot root 中整个 `tactile/` 不存在；inventory 和 durable receipt
+留在 `meta/modality_artifacts/`，所以纯视觉视图能够区分“已验证冷存储”和“误删”。放回后恢复为上面的
+标准、自包含 v2.3 布局。RealTeleop 与 UMI writer 的回归测试会拒绝把触觉 artifact 写到其他前缀。
+事务实现由 `collection_runtime.modality_storage` 拥有；本 CLI 仅负责 proposal、确认和展示结果。
+
+新采集可显式启用 `--tactile-artifact-integrity`。writer 会在写 payload 时增量计算 stored-byte
+SHA-256，并在每个 Episode 封口后自动写入 immutable inventory；因此不需要再单独执行“生成 hash”
+步骤。旧数据或未启用参数的数据仍由 proposal 走兼容的全量扫描。无论 hash 来自采集期还是离线扫描，
+apply 都不会跳过 cold-copy 校验、restore drill 和退役前全量复核。
+采集期参数应从新数据集 Episode 0 开始启用；已有未封存 tactile 历史的数据集不会在采集中自动
+回填 manifest，而是在 writer 创建前拒绝该参数，避免每次封口重复扫描全部历史 payload。
+
+```bash
+python -m utils.dataset_postprocess modality-detach DATASET_ROOT \
+  --cold-root COLD_ROOT \
+  --modality tactile
+
+python -m utils.dataset_postprocess modality-status DATASET_ROOT
+```
+
+兼容默认是 `--detach-scope payload-only`：hot 端保留 manifest。若需要让整个 `tactile/`
+成为可拆装模块，proposal 和 apply 都显式使用：
+
+```bash
+python -m utils.dataset_postprocess modality-detach DATASET_ROOT \
+  --cold-root COLD_ROOT \
+  --modality tactile \
+  --detach-scope whole-prefix
+```
+
+proposal 通过后，apply 必须同时回填输出的 `plan_hash`、dataset fingerprint，并人工确认没有
+OpenPI、训练脚本或其他 reader 正在读取数据集：
+
+```bash
+python -m utils.dataset_postprocess modality-detach DATASET_ROOT \
+  --cold-root COLD_ROOT \
+  --modality tactile \
+  --detach-scope whole-prefix \
+  --apply \
+  --plan-hash PLAN_HASH \
+  --confirm-dataset-fingerprint DATASET_FINGERPRINT \
+  --confirm-no-active-readers
+```
+
+production apply 强制 hot/cold 位于不同 `st_dev`。它先完成独立 inode shadow export 和逐
+manifest restore drill，最后才以 journal + quarantine 原子退役。`payload-only` 保留 hot
+manifest；`whole-prefix` 原子退役完整 `tactile/`。detached root 不能继续正式数采，纯视觉训练
+必须走 inventory + durable retirement receipt 驱动的 core-only admission。
+RealTeleop、UMI 及共享 headless writer 都会在任何新写入前拒绝 detached/partial/pending-transaction
+数据集；工具不会自动创建一个新的 hot `tactile/` 与旧 cold 内容混装。
+
+放回也先 dry-run，再使用相同三项确认：
+
+```bash
+python -m utils.dataset_postprocess modality-rehydrate DATASET_ROOT \
+  --cold-root COLD_ROOT \
+  --inventory-hash INVENTORY_HASH
+```
+
+确认 proposal 后再执行：
+
+```bash
+python -m utils.dataset_postprocess modality-rehydrate DATASET_ROOT \
+  --cold-root COLD_ROOT \
+  --inventory-hash INVENTORY_HASH \
+  --apply \
+  --plan-hash PLAN_HASH \
+  --confirm-dataset-fingerprint DATASET_FINGERPRINT \
+  --confirm-no-active-readers
+```
+
+工具会在 hot 文件系统构造完整 staging tree，通过标准触觉 reader 和完整 v2.3 validation 后才
+原子交换；cold 副本不会自动删除。当前实现已通过离线与 actual-v2.3 fixture，但在独立冷盘小型
+canary 完成前不得直接用于大规模真实数据。
+
 ## 推荐汇总 Pipeline
 
 大批量数据建议按下面顺序处理。结构变换步骤写到新目录；末尾的 tactile compact

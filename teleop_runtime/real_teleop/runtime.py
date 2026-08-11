@@ -12,130 +12,68 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
+from ..operator_ui_ports import RealTeleopInputBatchPrioritizer
 from . import control_loop as _control_loop
+from .artifact_context import materialize_real_teleop_artifact_context
 from .control_loop import (
     RealTeleopControlLoopContext,
     run_real_teleop_control_loop,
 )
 from .device_retry_runtime import build_device_retry_runtime
+from .diagnostic_setup import (
+    initialize_control_debug_runtime_metadata,
+    setup_actuator_command_trace,
+    setup_control_debug_runtime,
+)
 from .episode_recording_runtime import build_episode_recording_runtime
 from .foot_pad_controls import (
     apply_live_foot_pad_topology,
     foot_pad_progress_topology_guidance,
+    initialize_startup_foot_pad_input,
 )
 from .gripper_warmup_runtime import build_gripper_warmup_probe_runtime
 from .position_episode_debug import build_position_episode_debug_runtime
-from .progress_adapter import (
-    build_real_teleop_startup_progress_ui_payload,
-    select_real_teleop_managed_progress_profile,
+from .position_admittance_shadow import (
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
+    POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG,
+    POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
+    install_position_admittance_active,
+    install_position_admittance_shadow,
+    position_admittance_active_apply_sides,
+    position_admittance_active_config,
+    position_admittance_shadow_config,
+    position_rotational_admittance_config,
+    validate_position_admittance_active_authority,
 )
+from .progress_contracts import ProgressApplicationPort
 from .recording_admission import (
     recording_auto_stop_reason as _recording_auto_stop_reason,
     recording_warmup_status as _recording_warmup_status,
 )
 from .shutdown_runtime import shutdown_real_teleop_runtime
+from .startup_runtime import (
+    StartupCleanupRegistry as _StartupCleanupRegistry,
+    activate_startup_cleanup as _activate_startup_cleanup,
+    cleanup_active_startup,
+    deactivate_startup_cleanup as _deactivate_startup_cleanup,
+    register_component_startup_cleanup as _register_component_startup_cleanup,
+)
+from .startup_progress_runtime import RealTeleopStartupProgressRuntime
+from .startup_device_runtime import StartupDeviceRuntime
+from .startup_admission import (
+    assemble_startup_components,
+    configure_startup_cameras,
+    initialize_startup_ui,
+    prepare_startup_dataset_recorder,
+)
+from .tactile_idle_compression import (
+    RealTeleopIdleTactileCompression,
+)
 from .visualization_runtime import build_visualization_runtime
-
-
-_ACTIVE_STARTUP_CLEANUP: "_StartupCleanupRegistry | None" = None
-
-
-class _StartupCleanupRegistry:
-    """Best-effort cleanup for the portion before the main startup ``try``.
-
-    The historical runtime enters its full shutdown ``finally`` only after the
-    initial diagnostics/input objects have been created.  Ctrl+C can arrive in
-    that short preamble, so keep a small LIFO registry until ownership is
-    transferred to the normal runtime shutdown path.
-    """
-
-    def __init__(self) -> None:
-        self._steps: list[tuple[str, Any]] = []
-        self._active = True
-
-    def add(self, label: str, callback: Any) -> None:
-        if self._active and callable(callback):
-            self._steps.append((str(label), callback))
-
-    def disarm(self) -> None:
-        global _ACTIVE_STARTUP_CLEANUP
-        self._active = False
-        if _ACTIVE_STARTUP_CLEANUP is self:
-            _ACTIVE_STARTUP_CLEANUP = None
-        self._steps.clear()
-
-    def close(self) -> None:
-        global _ACTIVE_STARTUP_CLEANUP
-        if not self._active:
-            return
-        self._active = False
-        if _ACTIVE_STARTUP_CLEANUP is self:
-            _ACTIVE_STARTUP_CLEANUP = None
-        failures: list[str] = []
-        for label, callback in reversed(self._steps):
-            try:
-                callback()
-            except BaseException as exc:  # noqa: BLE001 - never mask Ctrl+C.
-                failures.append(f"{label}: {type(exc).__name__}: {exc}")
-        self._steps.clear()
-        if failures:
-            logger = globals().get("_log")
-            if callable(logger):
-                logger(
-                    "Shutdown",
-                    "startup Ctrl+C cleanup completed with recoverable failures: "
-                    + "; ".join(failures),
-                )
-
-
-def _activate_startup_cleanup() -> _StartupCleanupRegistry:
-    global _ACTIVE_STARTUP_CLEANUP
-    if _ACTIVE_STARTUP_CLEANUP is not None:
-        _ACTIVE_STARTUP_CLEANUP.close()
-    registry = _StartupCleanupRegistry()
-    _ACTIVE_STARTUP_CLEANUP = registry
-    return registry
-
-
-def _deactivate_startup_cleanup() -> None:
-    registry = _ACTIVE_STARTUP_CLEANUP
-    if registry is not None:
-        registry.disarm()
-
-
-def cleanup_active_startup() -> None:
-    """Close resources created before normal runtime shutdown takes ownership."""
-
-    registry = _ACTIVE_STARTUP_CLEANUP
-    if registry is not None:
-        registry.close()
-
-
-def _register_component_startup_cleanup(
-    registry: _StartupCleanupRegistry,
-    components: Any,
-) -> None:
-    """Register only idempotent component close hooks for early cancellation."""
-
-    for side in ("right", "left"):
-        state_backend = getattr(components, f"{side}_state_backend", None)
-        if state_backend is not None:
-            registry.add(f"{side}_state_backend", state_backend.close)
-        hand_backend = getattr(components, f"{side}_hand_backend", None)
-        if hand_backend is not None:
-            registry.add(f"{side}_hand_backend", hand_backend.close)
-    executor = getattr(components, "arm_state_read_executor", None)
-    if executor is not None:
-        registry.add(
-            "arm_state_read_executor",
-            lambda executor=executor: executor.shutdown(wait=True),
-        )
-    session = getattr(components, "session", None)
-    if session is not None:
-        registry.add("teleop_session", session.close)
-
 
 _REQUIRED_SUPPORT_NAMES = (
     "ActionDebugLogRecorder",
@@ -364,147 +302,187 @@ def bind_legacy_support(namespace: Mapping[str, Any]) -> None:
     _control_loop.bind_legacy_support(namespace)
 
 
-def run_real_teleop(args: argparse.Namespace) -> None:
-    startup_cleanup = _activate_startup_cleanup()
+def _position_admittance_runtime_event_payload(
+    *,
+    requested_mode: str,
+    enabled: bool,
+    active_sides: tuple[str, ...] | list[str],
+    coupled_pre_ik_target_filter_available: bool,
+    reason: str | None = None,
+    snapshot: Mapping[str, object] | None = None,
+    endpoint_excursion_guard: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Build one bounded startup receipt without changing control state."""
+
+    payload = dict(snapshot or {})
+    payload.update(
+        {
+            "runtime_schema": "teleop_runtime.position_admittance_startup/v1",
+            "enabled": bool(enabled),
+            "requested_mode": str(requested_mode),
+            "active_sides": [str(side) for side in active_sides],
+            "coupled_pre_ik_target_filter_available": bool(
+                coupled_pre_ik_target_filter_available
+            ),
+        }
+    )
+    if reason is not None:
+        payload["reason"] = str(reason)
+    if endpoint_excursion_guard is not None:
+        payload["endpoint_excursion_guard"] = dict(endpoint_excursion_guard)
+    return payload
+
+
+def run_real_teleop(
+    args: argparse.Namespace,
+    *,
+    progress_application: ProgressApplicationPort | None = None,
+    input_batch_prioritizer: RealTeleopInputBatchPrioritizer | None = None,
+) -> None:
+    position_admittance_rotation_active = bool(
+        getattr(args, "position_admittance_rotation_active", False)
+    )
+    position_admittance_combined_active = bool(
+        getattr(args, "position_admittance_combined_active", False)
+    )
+    if position_admittance_rotation_active and not bool(
+        getattr(args, "position_admittance_active", False)
+    ):
+        raise RuntimeError(
+            "rotation admittance Active requires position admittance Active"
+        )
+    if position_admittance_combined_active and not (
+        position_admittance_rotation_active
+        and bool(getattr(args, "position_admittance_active", False))
+    ):
+        raise RuntimeError(
+            "combined translation and rotation admittance Active requires "
+            "both position and rotation admittance Active"
+        )
+    if bool(getattr(args, "position_admittance_shadow", False)):
+        try:
+            position_admittance_shadow_config(args)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "position admittance shadow preflight failed: " + str(exc)
+            ) from exc
+    if bool(getattr(args, "position_admittance_rotation_shadow", False)):
+        if not bool(getattr(args, "position_admittance_shadow", False)):
+            raise RuntimeError(
+                "rotation admittance shadow requires position admittance shadow"
+            )
+        if bool(getattr(args, "position_admittance_active", False)):
+            raise RuntimeError(
+                "rotation admittance shadow cannot authorize position Active"
+            )
+        try:
+            position_rotational_admittance_config(
+                args,
+                profile=str(args.position_admittance_rotation_shadow_profile),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "rotation admittance shadow preflight failed: " + str(exc)
+            ) from exc
+    if bool(getattr(args, "position_admittance_active", False)):
+        # Defense in depth for direct Namespace callers that bypass the
+        # canonical CLI resolver.  Validate the same final Active envelope
+        # before UI, devices, or arms start; the canonical installer repeats
+        # this check immediately before attaching the pre-IK modifier.
+        try:
+            maximum_tool_excursion = float(
+                getattr(
+                    args,
+                    "position_admittance_active_max_tool_excursion_m",
+                    POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
+                )
+            )
+            rotation_config = None
+            maximum_tool_rotation_excursion_deg = None
+            if position_admittance_rotation_active:
+                rotation_profile = str(
+                    getattr(
+                        args,
+                        "position_admittance_rotation_active_profile",
+                        POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
+                    )
+                )
+                rotation_config = position_rotational_admittance_config(
+                    args,
+                    profile=rotation_profile,
+                )
+                maximum_tool_rotation_excursion_deg = float(
+                    getattr(
+                        args,
+                        "position_admittance_active_max_tool_rotation_excursion_deg",
+                        POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG,
+                    )
+                )
+            validate_position_admittance_active_authority(
+                position_admittance_active_config(args),
+                active_envelope=str(
+                    getattr(args, "position_admittance_active_envelope", "cautious")
+                ),
+                rotational_config=rotation_config,
+                combined_translation_rotation_active=(
+                    position_admittance_combined_active
+                ),
+                endpoint_policy=str(
+                    getattr(
+                        args,
+                        "position_admittance_active_endpoint_policy",
+                        POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+                    )
+                ),
+                apply_sides=position_admittance_active_apply_sides(
+                    str(getattr(args, "position_admittance_active_side", ""))
+                ),
+                max_tool_excursion_m=maximum_tool_excursion,
+                max_tool_rotation_excursion_deg=(
+                    maximum_tool_rotation_excursion_deg
+                ),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "active position admittance preflight failed: " + str(exc)
+            ) from exc
+    materialize_real_teleop_artifact_context(args)
+    startup_cleanup = _activate_startup_cleanup(logger=_log)
     capability_admission = (
         str(getattr(args, "hardware_admission_mode", "strict")) == "capability"
     )
-    control_ui = (
-        CalibrationWebUi(
-            open_browser=True,
-            resizable_sidebars=bool(
-                getattr(args, "gui_resizable_sidebars", True)
-            ),
-            input_activity_indicators=bool(
-                getattr(args, "gui_input_activity_indicators", True)
-            ),
-        )
-        if bool(getattr(args, "gui_requested", False))
-        else None
-    )
-    if control_ui is not None:
-        startup_cleanup.add("web_ui", control_ui.close)
-    startup_progress: GuiStartupProgress | None = None
-    if control_ui is not None:
-        control_ui.publish(
-            stage="设备连接中",
-            control_hint="正在尝试连接全部配置设备；失败设备不会阻止进入 GUI。",
-            active_controls=["q"],
-        )
-        control_ui.start()
-        startup_progress = GuiStartupProgress(control_ui)
-        startup_cleanup.add("startup_progress", startup_progress.close)
-        startup_progress.start()
-    foot_pad_input = None
-    foot_pad_requested = (
-        str(getattr(args, "special_arm_control_mode", ""))
-        == SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
-    )
-    args.foot_pad_requested = bool(foot_pad_requested)
-    args.foot_pad_startup_error = ""
-    if foot_pad_requested:
-        if startup_progress is not None:
-            startup_progress.begin(
-                "foot_pad",
-                label="脚踏输入",
-                message="正在查找虚拟脚踏设备",
-                requirement="optional_input",
-            )
-        foot_pad_candidate = None
-        try:
-            foot_pad_candidate = FootPadSpecialArmInput.open_online()
-            live_count = int(
-                getattr(foot_pad_candidate, "foot_pad_count", 0) or 0
-            )
-            live_mode = apply_live_foot_pad_topology(args, live_count)
-            foot_pad_input = foot_pad_candidate
-            _log(
-                "FootPad",
-                "live virtual keyboard topology resolved: "
-                f"count={live_count} mode={live_mode}",
-            )
-            topology_guidance = foot_pad_progress_topology_guidance(
-                live_count,
-                progress_enabled=bool(
-                    getattr(args, "collection_progress_profile", None) is not None
-                    or getattr(args, "collection_progress_gui", False)
-                ),
-            )
-            if topology_guidance:
-                _log("FootPad", topology_guidance)
-                if control_ui is not None:
-                    control_ui.append_message("FootPad", topology_guidance)
-        except (FootPadUnavailableError, OSError, RuntimeError, ValueError) as exc:
-            if foot_pad_candidate is not None:
-                try:
-                    foot_pad_candidate.close()
-                except Exception:
-                    pass
-            args.foot_pad_startup_error = f"{type(exc).__name__}: {exc}"
-            foot_pad_input = FootPadSpecialArmInput.waiting_for_service()
-            startup_cleanup.add("foot_pad", foot_pad_input.close)
-            if startup_progress is not None:
-                startup_progress.fail(
-                    "foot_pad",
-                    args.foot_pad_startup_error,
-                    message="未就绪；点击“重连失败设备”后才会重新扫描",
-                )
-            _log(
-                "FootPad",
-                "foot-pad input is unavailable; GUI/keyboard special-arm controls "
-                "remain available; press 'retry failed devices' in the GUI to "
-                "scan for the virtual keyboard again: "
-                f"{exc}",
-            )
-        else:
-            startup_cleanup.add("foot_pad", foot_pad_input.close)
-            if startup_progress is not None:
-                startup_progress.succeed("foot_pad", message="脚踏输入已连接")
-    init_restored, init_restore_message = _restore_init_arm_after_foot_pad_fallback(
+    startup_ui = initialize_startup_ui(
         args,
-        live_foot_pad_count=(
-            None
-            if foot_pad_input is None
-            or not bool(getattr(foot_pad_input, "is_online", False))
-            else int(getattr(foot_pad_input, "foot_pad_count", 0) or 0)
-        ),
+        startup_cleanup=startup_cleanup,
+        ui_type=CalibrationWebUi,
+        progress_type=GuiStartupProgress,
     )
-    if init_restore_message:
-        _log("InitArm", init_restore_message)
-        if control_ui is not None:
-            control_ui.append_message("InitArm", init_restore_message)
-    tactile_visualizer = None
-    if startup_progress is not None:
-        startup_progress.begin(
-            "runtime.components",
-            label="遥操运行时组件",
-            message="正在构建机械臂、夹爪与 tracker 组件",
-            requirement="runtime_core",
-        )
-    if bool(args.visualize_tactile) and not bool(args.skip_renderer):
-        tactile_visualizer = _build_tactile_visualizer(args, _active_sides_from_args(args))
-        if tactile_visualizer is not None:
-            startup_cleanup.add("tactile_visualizer", tactile_visualizer.close)
-    try:
-        components = _build_components(args)
-    except Exception as exc:
-        if startup_progress is not None:
-            startup_progress.fail(
-                "runtime.components",
-                f"{type(exc).__name__}: {exc}",
-                message="运行时组件构建失败",
-            )
-            startup_progress.close()
-        if tactile_visualizer is not None:
-            tactile_visualizer.close()
-        raise
-    else:
-        if startup_progress is not None:
-            startup_progress.succeed(
-                "runtime.components",
-                message="运行时组件已构建，尚未启动设备",
-            )
-        _register_component_startup_cleanup(startup_cleanup, components)
+    control_ui = startup_ui.control_ui
+    startup_progress = startup_ui.progress
+    foot_pad_input = initialize_startup_foot_pad_input(
+        args,
+        foot_pad_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        input_type=FootPadSpecialArmInput,
+        unavailable_error_type=FootPadUnavailableError,
+        startup_cleanup=startup_cleanup,
+        startup_progress=startup_progress,
+        control_ui=control_ui,
+        apply_live_topology=apply_live_foot_pad_topology,
+        topology_guidance=foot_pad_progress_topology_guidance,
+        restore_init_after_fallback=_restore_init_arm_after_foot_pad_fallback,
+        log=_log,
+    )
+    startup_component_assembly = assemble_startup_components(
+        args,
+        startup_cleanup=startup_cleanup,
+        startup_progress=startup_progress,
+        active_sides_from_args=_active_sides_from_args,
+        build_tactile_visualizer=_build_tactile_visualizer,
+        build_components=_build_components,
+        register_component_cleanup=_register_component_startup_cleanup,
+    )
+    components = startup_component_assembly.components
+    tactile_visualizer = startup_component_assembly.tactile_visualizer
     init_controller_available = (
         getattr(components, "init_arm_controller", None) is not None
     )
@@ -527,61 +505,23 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             "已请求机械臂归位功能，但 Init controller 未构建；"
             f"reason={str(getattr(args, 'init_arm_disabled_reason', '') or 'unknown')}。",
         )
-    if startup_progress is not None:
-        startup_progress.begin(
-            "camera.config",
-            label="相机配置",
-            message="正在解析相机注册表与预览配置",
-            requirement="required_for_collection",
-        )
-    try:
-        camera_sources = _build_camera_sources(args)
-        for camera_key, source in camera_sources.items():
-            startup_cleanup.add(f"camera[{camera_key}]", source.close)
-        try:
-            preview_camera_sources = _select_preview_camera_sources(
-                camera_sources,
-                str(getattr(args, "vis_cam_key", "") or ""),
-            )
-        except ValueError:
-            if bool(getattr(args, "vis_cam", False)):
-                raise
-            _log(
-                "Camera",
-                f"preview camera key {getattr(args, 'vis_cam_key', '')!r} is unavailable; preview disabled.",
-            )
-            preview_camera_sources = {}
-    except Exception as exc:
-        if startup_progress is not None:
-            startup_progress.fail(
-                "camera.config",
-                f"{type(exc).__name__}: {exc}",
-                message="相机配置加载失败",
-            )
-        if not capability_admission:
-            if tactile_visualizer is not None:
-                tactile_visualizer.close()
-            if startup_progress is not None:
-                startup_progress.close()
-            raise
-        args.camera_startup_error = f"{type(exc).__name__}: {exc}"
-        camera_sources = {}
-        preview_camera_sources = {}
-        _log(
-            "Camera",
-            "WARNING: camera configuration/startup was isolated from GUI and arm controls: "
-            f"{args.camera_startup_error}",
-        )
-        if control_ui is not None:
-            control_ui.append_message("Camera", args.camera_startup_error)
-    else:
-        if startup_progress is not None:
-            startup_progress.succeed(
-                "camera.config",
-                message=f"已加载 {len(camera_sources)} 个相机配置",
-            )
-    setattr(args, "camera_visualization_available", bool(preview_camera_sources))
-    setattr(args, "configured_camera_keys", tuple(sorted(camera_sources)))
+    startup_camera_configuration = configure_startup_cameras(
+        args,
+        startup_cleanup=startup_cleanup,
+        startup_progress=startup_progress,
+        control_ui=control_ui,
+        capability_admission=capability_admission,
+        build_sources=_build_camera_sources,
+        select_preview_sources=_select_preview_camera_sources,
+        strict_failure_cleanup=(
+            tactile_visualizer.close
+            if tactile_visualizer is not None
+            else lambda: None
+        ),
+        log=_log,
+    )
+    camera_sources = startup_camera_configuration.sources
+    preview_camera_sources = startup_camera_configuration.preview_sources
     setattr(args, "tactile_solving_available", _tactile_solving_available(args, components))
     setattr(args, "tactile_solving_active", _tactile_solving_active(args, components))
     setattr(args, "tactile_visualization_available", _tactile_visualization_available(args, components))
@@ -617,7 +557,13 @@ def run_real_teleop(args: argparse.Namespace) -> None:
     pose_snapshot_recorder = (
         None
         if bool(getattr(args, "no_debug_disk_write", False))
-        else _fix_arm_pose_snapshot_recorder(components)
+        else _fix_arm_pose_snapshot_recorder(
+            components,
+            root_dir=(
+                getattr(args, "_runtime_artifact_fix_arm_snapshot_root", "")
+                or None
+            ),
+        )
     )
     clutch_input = RealTeleopControlInput(
         terminal=TerminalClutchInput(components.keyboard_source),
@@ -627,6 +573,15 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         pose_snapshot_recorder=pose_snapshot_recorder,
         foot_pad_input=foot_pad_input,
     )
+    if (progress_application is None) != (input_batch_prioritizer is None):
+        raise RuntimeError(
+            "RealTeleop application ports must be injected together."
+        )
+    if progress_application is not None and input_batch_prioritizer is not None:
+        clutch_input.bind_application_ports(
+            progress_application=progress_application,
+            input_batch_prioritizer=input_batch_prioritizer,
+        )
     startup_cleanup.add("clutch_input", clutch_input.close)
     debug_episode_recording_enabled = _debug_episode_recording_enabled(args)
     episode_recorder = EpisodeRecorder(
@@ -634,164 +589,36 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         config=EpisodeRecorderConfig(enabled=debug_episode_recording_enabled),
     )
     startup_cleanup.add("episode_recorder", episode_recorder.close)
-    control_debug_requested = bool(args.control_debug_config.enabled)
-    _merge_control_debug_runtime_metadata(
+    initialize_control_debug_runtime_metadata(
         args,
-        attached=False,
-        session_sidecar_requested=control_debug_requested,
-        session_sidecar_attached=False,
-        session_sidecar_error=None,
-        session_sidecar_output_dir=None,
-        session_sidecar_attached_wall_time=None,
-        session_sidecar_attached_monotonic_time=None,
-        episode_sidecar_requested=bool(
-            control_debug_requested
-            and bool(getattr(args, "control_debug_episode_sidecar", True))
-            and not bool(getattr(args, "no_collection", False))
-        ),
-        episode_sidecar_attached=False,
-        episode_sidecar_error=None,
-        episode_sidecar_output_dir=None,
-        episode_sidecar_episode_index=None,
-        episode_sidecar_attached_wall_time=None,
-        episode_sidecar_attached_monotonic_time=None,
-        episode_sidecars=False,
+        merge_runtime_metadata=_merge_control_debug_runtime_metadata,
     )
-    dataset_recorder = None
-    if not bool(getattr(args, "no_collection", False)):
-        if startup_progress is not None:
-            startup_progress.begin(
-                "dataset.writer.prepare",
-                label="数采 writer 配置",
-                message="正在校验数据集路径、模态声明与 writer 配置",
-                requirement="required_for_collection",
-            )
-        try:
-            dataset_recorder = RealTeleopDatasetRecorder(
-                args=args,
-                components=components,
-                camera_sources=camera_sources,
-            )
-            startup_cleanup.add("dataset_recorder", dataset_recorder.close)
-        except (OSError, RuntimeError, ValueError) as exc:
-            if startup_progress is not None:
-                startup_progress.fail(
-                    "dataset.writer.prepare",
-                    f"{type(exc).__name__}: {exc}",
-                    message="writer 配置校验失败",
-                )
-            if not capability_admission:
-                if startup_progress is not None:
-                    startup_progress.close()
-                raise
-            args.dataset_startup_error = f"{type(exc).__name__}: {exc}"
-            _log(
-                "Dataset",
-                "WARNING: dataset writer construction was isolated from GUI and arm controls: "
-                f"{args.dataset_startup_error}",
-            )
-            if control_ui is not None:
-                control_ui.append_message("Dataset", args.dataset_startup_error)
-        else:
-            if startup_progress is not None:
-                startup_progress.succeed(
-                    "dataset.writer.prepare",
-                    message="writer 配置已就绪，尚未启动子进程",
-                )
+    idle_tactile_compression: RealTeleopIdleTactileCompression | None = None
+    dataset_recorder = prepare_startup_dataset_recorder(
+        args,
+        components=components,
+        camera_sources=camera_sources,
+        startup_cleanup=startup_cleanup,
+        startup_progress=startup_progress,
+        control_ui=control_ui,
+        capability_admission=capability_admission,
+        recorder_type=RealTeleopDatasetRecorder,
+        log=_log,
+    )
 
-    startup_progress_ui_signature: tuple[object, ...] | None = None
-    startup_progress_ui_error_signature: tuple[object, ...] | None = None
     # Profile selection is configuration-only: it does not start an Episode,
     # move an arm, or mutate the dataset binding.  Make the selector available
     # as soon as the idle recorder/UI exist instead of making it depend on a
     # later startup/Home milestone.  The payload still disables it for a
     # locked dataset or when the managed catalog has no selectable profile.
-    startup_progress_profile_selection_ready = True
-
-    def publish_startup_progress_ui_state(*, force: bool = False) -> None:
-        """Expose profile selection before runtime Home/control-loop startup."""
-
-        nonlocal startup_progress_ui_error_signature
-        nonlocal startup_progress_ui_signature
-        if control_ui is None:
-            return
-        recorder_profile = (
-            None
-            if dataset_recorder is None
-            else getattr(dataset_recorder, "progress_profile", None)
-        )
-        requested_profile = getattr(args, "collection_progress_profile", None)
-        signature = (
-            bool(getattr(args, "collection_progress_gui", False)),
-            bool(startup_progress_profile_selection_ready),
-            str(getattr(args, "collection_task_id", "") or ""),
-            str(Path(args.dataset_root).expanduser().resolve()),
-            id(dataset_recorder),
-            str(
-                getattr(
-                    recorder_profile,
-                    "semantic_content_hash",
-                    "",
-                )
-            ),
-            str(
-                getattr(
-                    requested_profile,
-                    "semantic_content_hash",
-                    "",
-                )
-            ),
-            bool(
-                False
-                if dataset_recorder is None
-                else getattr(
-                    dataset_recorder,
-                    "progress_profile_selection_locked",
-                    False,
-                )
-            ),
-            str(
-                getattr(
-                    args,
-                    "collection_progress_arm_control_mode",
-                    "profile",
-                )
-            ),
-        )
-        if not force and signature == startup_progress_ui_signature:
-            return
-        try:
-            payload = build_real_teleop_startup_progress_ui_payload(
-                args=args,
-                dataset_recorder=dataset_recorder,
-                profile_selection_enabled=(
-                    startup_progress_profile_selection_ready
-                ),
-            )
-            clutch_input.publish_progress_ui_state(payload)
-            startup_progress_ui_signature = signature
-            startup_progress_ui_error_signature = None
-        except Exception as exc:  # noqa: BLE001 - UI remains observational.
-            failure_signature = (
-                *signature,
-                type(exc).__qualname__,
-                str(exc),
-            )
-            startup_progress_ui_signature = signature
-            if failure_signature != startup_progress_ui_error_signature:
-                _log(
-                    "Progress",
-                    "启动阶段长程进度 GUI 状态发布失败；原遥操 GUI 保持可用："
-                    f"{type(exc).__name__}: {exc}",
-                )
-                control_ui.append_message(
-                    "Progress",
-                    "长程进度面板初始化失败："
-                    f"{type(exc).__name__}: {exc}",
-                )
-                startup_progress_ui_error_signature = failure_signature
-
-    publish_startup_progress_ui_state(force=True)
+    startup_progress_runtime = RealTeleopStartupProgressRuntime(
+        args=args,
+        control_input=clutch_input,
+        control_ui=control_ui,
+        dataset_recorder=lambda: dataset_recorder,
+        log=_log,
+    )
+    startup_progress_runtime.publish(force=True)
     if control_ui is not None:
         control_ui.publish(
             dataset_modality_contract=(
@@ -849,167 +676,45 @@ def run_real_teleop(args: argparse.Namespace) -> None:
     position_debug_close_threads: list[threading.Thread] = []
     actuator_trace_recorder: ActuatorCommandTraceRecorder | None = None
     actuator_trace_session_dir: Path | None = None
-    if bool(args.control_debug_config.enabled):
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            position_debug_session_dir = (
-                _expand_cli_path(args.control_debug_config.root)
-                / f"{timestamp}_vive_rm65_real_teleop"
-            )
-            position_debug_session_recorder = _new_position_debug_recorder(
-                args,
-                output_dir=position_debug_session_dir,
-                thread_name="position-debug-session-writer",
-                components=components,
-                recorder_scope="session",
-            )
-            startup_cleanup.add(
-                "position_debug_session_recorder",
-                lambda recorder=position_debug_session_recorder: recorder.close(
-                    timeout_sec=1.0
-                ),
-            )
-            position_audit_fanout = PositionAuditFanout((position_debug_session_recorder,))
-            _attach_position_audit_sink(components, position_audit_fanout)
-            attached_wall_time = time.time()
-            attached_monotonic_time = time.monotonic()
-            update_control_debug_runtime_metadata(
-                attached=True,
-                session_output_dir=str(position_debug_session_dir),
-                session_sidecar_attached=True,
-                session_sidecar_error=None,
-                session_sidecar_output_dir=str(position_debug_session_dir),
-                session_sidecar_attached_wall_time=attached_wall_time,
-                session_sidecar_attached_monotonic_time=attached_monotonic_time,
-            )
-            _log(
-                "ControlDebug",
-                f"async audit attached output={position_debug_session_dir} "
-                f"mode={args.control_debug_config.level}",
-            )
-        except Exception as exc:  # noqa: BLE001 - diagnostics must not alter control behavior.
-            cleanup_errors: list[str] = []
-            if position_debug_session_recorder is not None:
-                try:
-                    position_debug_session_recorder.close(timeout_sec=1.0)
-                except Exception as cleanup_exc:  # noqa: BLE001
-                    cleanup_errors.append(
-                        f"recorder_close:{type(cleanup_exc).__name__}: {cleanup_exc}"
-                    )
-            position_debug_session_recorder = None
-            position_audit_fanout = None
-            try:
-                _attach_position_audit_sink(components, None)
-            except Exception as cleanup_exc:  # noqa: BLE001
-                cleanup_errors.append(
-                    f"sink_detach:{type(cleanup_exc).__name__}: {cleanup_exc}"
-                )
-            setup_error = f"{type(exc).__name__}: {exc}"
-            if cleanup_errors:
-                setup_error += "; cleanup=" + "; ".join(cleanup_errors)
-            update_control_debug_runtime_metadata(
-                attached=False,
-                error=setup_error,
-                session_sidecar_attached=False,
-                session_sidecar_error=setup_error,
-                session_sidecar_output_dir=(
-                    None
-                    if position_debug_session_dir is None
-                    else str(position_debug_session_dir)
-                ),
-                session_sidecar_attached_wall_time=None,
-                session_sidecar_attached_monotonic_time=None,
-            )
-            _log(
-                "ControlDebug",
-                f"WARNING: async audit setup failed and was isolated: {type(exc).__name__}: {exc}",
-            )
-    if bool(getattr(args, "actuator_trace", False)):
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            actuator_trace_session_dir = (
-                _expand_cli_path(args.actuator_trace_root)
-                / f"{timestamp}_vive_rm65_actuator_trace"
-            )
-            actuator_trace_recorder = _new_actuator_command_trace_recorder(
-                args,
-                components=components,
-                output_dir=actuator_trace_session_dir,
-            )
-            startup_cleanup.add("actuator_trace_recorder", actuator_trace_recorder.close)
-            attached_count = _attach_actuator_command_trace_sink(
-                components,
-                actuator_trace_recorder.record_command,
-            )
-            if attached_count != len(components.active_sides):
-                raise RuntimeError(
-                    "actuator trace did not attach to every active command backend: "
-                    f"attached={attached_count} active={len(components.active_sides)}"
-                )
-            singularity_attached_count = 0
-            if bool(getattr(args, "actuator_singularity_trace", True)):
-                singularity_attached_count = _attach_singularity_transition_trace_sink(
-                    components,
-                    actuator_trace_recorder.record_singularity_transition,
-                )
-                if singularity_attached_count != len(components.active_sides):
-                    raise RuntimeError(
-                        "singularity transition trace did not attach to every active "
-                        "command backend: "
-                        f"attached={singularity_attached_count} "
-                        f"active={len(components.active_sides)}"
-                    )
-            ik_shadow_attached_count = _attach_ik_shadow_trace_sink(
-                components,
-                actuator_trace_recorder.record_ik_shadow,
-            )
-            _log(
-                "ActuatorTrace",
-                "preallocated fixed-field capture attached "
-                f"output={actuator_trace_session_dir} "
-                f"capacity_per_side={actuator_trace_recorder.config.capacity_per_side} "
-                f"singularity_trace={bool(singularity_attached_count)} "
-                f"ik_shadow_trace={bool(ik_shadow_attached_count)} "
-                "vive_source_trace=true "
-                "hot_path_disk_write=false",
-            )
-        except Exception as exc:  # noqa: BLE001 - diagnostics must not alter control behavior.
-            cleanup_errors: list[str] = []
-            try:
-                _attach_actuator_command_trace_sink(components, None)
-            except Exception as cleanup_exc:  # noqa: BLE001
-                cleanup_errors.append(
-                    f"sink_detach:{type(cleanup_exc).__name__}: {cleanup_exc}"
-                )
-            try:
-                _attach_singularity_transition_trace_sink(components, None)
-            except Exception as cleanup_exc:  # noqa: BLE001
-                cleanup_errors.append(
-                    "singularity_sink_detach:"
-                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-                )
-            try:
-                _attach_ik_shadow_trace_sink(components, None)
-            except Exception as cleanup_exc:  # noqa: BLE001
-                cleanup_errors.append(
-                    "ik_shadow_sink_detach:"
-                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-                )
-            if actuator_trace_recorder is not None:
-                try:
-                    actuator_trace_recorder.close()
-                except Exception as cleanup_exc:  # noqa: BLE001
-                    cleanup_errors.append(
-                        f"recorder_close:{type(cleanup_exc).__name__}: {cleanup_exc}"
-                    )
-            actuator_trace_recorder = None
-            detail = f"{type(exc).__name__}: {exc}"
-            if cleanup_errors:
-                detail += "; cleanup=" + "; ".join(cleanup_errors)
-            _log(
-                "ActuatorTrace",
-                f"WARNING: setup failed and was isolated: {detail}",
-            )
+    control_debug_setup = setup_control_debug_runtime(
+        args,
+        components=components,
+        startup_cleanup=startup_cleanup,
+        timestamp=(
+            datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            if bool(args.control_debug_config.enabled)
+            else ""
+        ),
+        expand_cli_path=_expand_cli_path,
+        new_recorder=_new_position_debug_recorder,
+        audit_fanout_type=PositionAuditFanout,
+        attach_position_sink=_attach_position_audit_sink,
+        update_runtime_metadata=update_control_debug_runtime_metadata,
+        wall_time=time.time,
+        monotonic_time=time.monotonic,
+        log=_log,
+    )
+    position_audit_fanout = control_debug_setup.audit_fanout
+    position_debug_session_recorder = control_debug_setup.recorder
+    position_debug_session_dir = control_debug_setup.session_dir
+    actuator_trace_setup = setup_actuator_command_trace(
+        args,
+        components=components,
+        startup_cleanup=startup_cleanup,
+        timestamp=(
+            datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            if bool(getattr(args, "actuator_trace", False))
+            else ""
+        ),
+        expand_cli_path=_expand_cli_path,
+        new_recorder=_new_actuator_command_trace_recorder,
+        attach_command_sink=_attach_actuator_command_trace_sink,
+        attach_singularity_sink=_attach_singularity_transition_trace_sink,
+        attach_ik_shadow_sink=_attach_ik_shadow_trace_sink,
+        log=_log,
+    )
+    actuator_trace_recorder = actuator_trace_setup.recorder
+    actuator_trace_session_dir = actuator_trace_setup.session_dir
     clutch_input.start()
     if startup_progress is not None:
         startup_progress.succeed(
@@ -1018,63 +723,18 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         )
     startup_device_errors: dict[str, str] = {}
     position_force_guard_monitor: PositionForceGuardMonitor | None = None
-
-    def startup_device_label(key: str) -> str:
-        return {
-            "arm.left.qpos": "左臂状态反馈",
-            "arm.right.qpos": "右臂状态反馈",
-            "arm.force_guard": "双臂位控受力急停",
-            "hand.left": "左手 / 左夹爪",
-            "hand.right": "右手 / 右夹爪",
-            "rig.session": "遥操核心 Rig",
-            "human_shadow": "Human shadow 前端",
-            "vive.clock_sync": "VIVE 时钟同步",
-            "dataset.writer": "数采 writer 子进程",
-        }.get(str(key), str(key))
-
-    def startup_device_requirement(key: str) -> str:
-        if key.startswith("arm.") or key == "rig.session":
-            return "motion_safety"
-        if key.startswith("camera.") or key.startswith("dataset."):
-            return "required_for_collection"
-        return "feature_dependent"
-
-    def start_device(label: str, backend: Any | None) -> bool:
-        if backend is None:
-            return False
-        if startup_progress is not None:
-            startup_progress.begin(
-                label,
-                label=startup_device_label(label),
-                message="正在调用设备 backend.start()",
-                requirement=startup_device_requirement(label),
-            )
-        try:
-            backend.start()
-            if isinstance(backend, DMTacGripperBackend) and not backend.is_ready():
-                try:
-                    state = backend.get_state(include_tactile_arrays=False)
-                except TypeError:
-                    state = backend.get_state()
-                raise RuntimeError(
-                    str(state.get("telemetry_error") or "DMTAC backend is not ready")
-                )
-            if startup_progress is not None:
-                startup_progress.succeed(label)
-            return True
-        except Exception as exc:  # noqa: BLE001 - capability admission records device failure.
-            detail = f"{type(exc).__name__}: {exc}"
-            if startup_progress is not None:
-                startup_progress.fail(label, detail)
-            if not capability_admission:
-                if startup_progress is not None:
-                    startup_progress.close()
-                raise
-            startup_device_errors[str(label)] = detail
-            _log("Device", f"WARNING: {label} unavailable: {detail}")
-            if control_ui is not None:
-                control_ui.append_message("Device", f"{label} 连接失败：{detail}")
-            return False
+    position_admittance_shadow = None
+    startup_device_runtime = StartupDeviceRuntime(
+        capability_admission=capability_admission,
+        startup_progress=startup_progress,
+        startup_device_errors=startup_device_errors,
+        control_ui=control_ui,
+        dmtac_gripper_backend_type=DMTacGripperBackend,
+        log=_log,
+    )
+    startup_device_label = startup_device_runtime.label
+    startup_device_requirement = startup_device_runtime.requirement
+    start_device = startup_device_runtime.start
 
     try:
         # From this point on the complete runtime shutdown ``finally`` owns
@@ -1449,9 +1109,9 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         if getattr(args, "dmtac_startup_error", ""):
             startup_device_errors["dmtac.assignment"] = str(args.dmtac_startup_error)
         if getattr(args, "angle_trigger_startup_error", ""):
-            startup_device_errors["angle_trigger"] = str(
-                args.angle_trigger_startup_error
-            )
+            startup_device_errors["angle_trigger"] = str(args.angle_trigger_startup_error)
+        if getattr(args, "q6_startup_error", ""):
+            startup_device_errors["gripper.input"] = str(args.q6_startup_error)
         if getattr(args, "camera_startup_error", ""):
             startup_device_errors["camera.config"] = str(args.camera_startup_error)
         if getattr(args, "dataset_startup_error", ""):
@@ -1463,11 +1123,62 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         if startup_progress is not None:
             startup_progress.close()
 
+        if bool(getattr(args, "idle_tactile_compression", False)):
+            idle_tactile_compression = RealTeleopIdleTactileCompression(
+                enabled=True
+            )
+            _log(
+                "TactileCompression",
+                "idle lossless compression enabled; admission requires Hold/pre-Home "
+                "and no active/countdown/finalizing formal episode",
+            )
+
+        def tick_idle_tactile_compression(
+            *,
+            episode_countdown_active: bool = False,
+        ) -> None:
+            if idle_tactile_compression is None:
+                return
+            idle_tactile_compression.tick_runtime(
+                dataset_recorder=dataset_recorder,
+                teleop_started=bool(
+                    getattr(clutch_input, "_teleop_started", False)
+                ),
+                hold_active=bool(clutch_input.hold_active()),
+                episode_countdown_active=bool(episode_countdown_active),
+                startup_and_devices_ready=True,
+                log=_log,
+            )
+
+        def begin_idle_tactile_quiesce(reason: str) -> None:
+            if idle_tactile_compression is not None:
+                idle_tactile_compression.begin_latency_sensitive_transition(
+                    reason=reason
+                )
+
+        def require_idle_tactile_quiesced(reason: str) -> None:
+            if idle_tactile_compression is None:
+                return
+            idle_tactile_compression.require_safe_transition(
+                reason=reason,
+                dataset_root=(
+                    None
+                    if dataset_recorder is None
+                    else getattr(dataset_recorder, "dataset_root", None)
+                ),
+                integrity_enabled=bool(
+                    getattr(args, "tactile_artifact_integrity", False)
+                ),
+                log=_log,
+                timeout_sec=2.0,
+            )
+
         def current_dataset_recorder() -> object | None:
             return dataset_recorder
 
         def set_current_dataset_recorder(value: object | None) -> None:
             nonlocal dataset_recorder
+            require_idle_tactile_quiesced("dataset_recorder_rebind")
             dataset_recorder = value
 
         def current_foot_pad_input() -> object | None:
@@ -1478,11 +1189,16 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             foot_pad_input = value
 
         def publish_retry_camera_status() -> None:
-            clutch_input.publish_camera_status(
+            # A manual reconnect changes live camera health, so the startup
+            # self-check snapshot must be replaced as well as the camera cards.
+            # Do not recursively poll operator input from inside the retry
+            # request handler.
+            _run_camera_startup_self_check(
                 camera_sources=camera_sources,
+                clutch_input=clutch_input,
                 preview_camera_sources=preview_camera_sources,
                 camera_previewer=camera_previewer,
-                force=True,
+                poll_input=False,
             )
 
         device_retry_runtime = build_device_retry_runtime(
@@ -1521,6 +1237,11 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             device_retry_runtime.sync_foot_pad_runtime_status
         )
         retry_failed_devices = device_retry_runtime.retry_failed_devices
+        # Startup progress and the steady-state hardware list are separate UI
+        # projections.  Publish once even when both arm qpos reads succeed so
+        # isolated Q6/input failures are visible before the operator presses
+        # the manual retry button.
+        publish_runtime_hardware_status()
 
         def set_current_visualization_state(
             previewer: object | None,
@@ -1576,48 +1297,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             """Service optional UI requests while runtime Home is still armed."""
 
             handle_startup_visualization_requests_base(now)
-            selections = (
-                clutch_input.consume_progress_profile_selection_intents()
-            )
-            arm_mode_selections = (
-                clutch_input.consume_progress_arm_control_mode_selection_intents()
-            )
-            for selection in arm_mode_selections:
-                args.collection_progress_arm_control_mode = selection.mode
-                if control_ui is not None:
-                    control_ui.append_message(
-                        "Progress",
-                        f"已选择长程进度臂控制模式：{selection.mode}。",
-                    )
-                publish_startup_progress_ui_state(force=True)
-            for selection in selections:
-                try:
-                    selected = (
-                        select_real_teleop_managed_progress_profile(
-                            args=args,
-                            dataset_recorder=dataset_recorder,
-                            profile_id=selection.profile_id,
-                        )
-                    )
-                    if control_ui is not None:
-                        control_ui.append_message(
-                            "Progress",
-                            "已选择长程进度 profile："
-                            f"{selected.profile_id}@"
-                            f"{selected.profile_version}；"
-                            "首个 Episode 启动时将按完整 hash 锁定到数据集。",
-                        )
-                except Exception as exc:  # noqa: BLE001 - selection is configuration only.
-                    message = (
-                        "长程进度 profile 选择失败，原配置保持不变："
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    _log("Progress", message, now=now)
-                    if control_ui is not None:
-                        control_ui.append_message("Progress", message)
-                finally:
-                    publish_startup_progress_ui_state(force=True)
-            publish_startup_progress_ui_state()
+            startup_progress_runtime.handle_pending_selections(now=now)
 
         update_startup_visualizations = (
             visualization_runtime.update_startup_visualizations
@@ -1955,8 +1635,16 @@ def run_real_teleop(args: argparse.Namespace) -> None:
             console_writer=debug_timing_console_writer,
         )
         ik_debug_profile_base_enabled = bool(debug_timing_modules.ik_profile)
-        ik_debug_log_recorder = IkDebugLogRecorder()
+        ik_debug_log_recorder = IkDebugLogRecorder(
+            root_dir=(
+                getattr(args, "_runtime_artifact_ik_debug_root", "") or None
+            )
+        )
         debug_timing_log_recorder = DebugTimingLogRecorder(
+            root_dir=(
+                getattr(args, "_runtime_artifact_debug_timing_root", "")
+                or None
+            ),
             heartbeat_sec=max(0.1, float(getattr(args, "debug_timing_report_interval_sec", 1.0))),
             sample_hz=float(getattr(args, "debug_timing_log_sample_hz", 0.0)),
         )
@@ -2160,7 +1848,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 _log("DebugAction", f"standalone log disabled: {type(exc).__name__}: {exc}")
         else:
             action_debug_path = None
-        publish_startup_progress_ui_state(force=True)
+        startup_progress_runtime.publish(force=True)
         startup_home_captured = False
         startup_home_qpos_snapshot: dict[str, np.ndarray] = {}
         manual_startup_request = _manual_calibration_confirmation_required(args, components)
@@ -2169,6 +1857,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
         def update_startup_runtime_status() -> None:
             nonlocal last_startup_camera_status_at
             sync_foot_pad_runtime_status()
+            tick_idle_tactile_compression()
             now = time.time()
             if now - last_startup_camera_status_at < 0.2:
                 return
@@ -2195,6 +1884,12 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                     visualization_request_handler=handle_startup_visualization_requests,
                     visualization_update_handler=update_startup_visualizations,
                     runtime_status_update_handler=update_startup_runtime_status,
+                    begin_home_transition_handler=lambda: (
+                        begin_idle_tactile_quiesce("startup_runtime_home")
+                    ),
+                    require_home_transition_ready_handler=lambda: (
+                        require_idle_tactile_quiesced("startup_runtime_home")
+                    ),
                 )
                 if requested is None:
                     return
@@ -2220,6 +1915,10 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 manual_startup_request = True
                 continue
             try:
+                # Automatic/non-interactive startup does not pass through the
+                # GUI's two-second Home delay, so retain the same fail-closed
+                # barrier immediately before sampling.
+                require_idle_tactile_quiesced("startup_runtime_home")
                 startup_home_qpos_snapshot = _runtime_home_calibration(
                     components,
                     arm_mode="real",
@@ -2271,6 +1970,199 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 else None
             ),
         )
+        position_admittance_active = bool(
+            getattr(args, "position_admittance_active", False)
+        )
+        position_admittance_shadow_requested = bool(
+            getattr(args, "position_admittance_shadow", False)
+        )
+        if position_admittance_shadow_requested or position_admittance_active:
+            admittance_mode = (
+                "combined_active"
+                if position_admittance_combined_active
+                else "rotation_active"
+                if position_admittance_rotation_active
+                else "active"
+                if position_admittance_active
+                else "rotation_shadow"
+                if bool(
+                    getattr(args, "position_admittance_rotation_shadow", False)
+                )
+                else "shadow"
+            )
+            admittance_error: str | None = None
+            if _arm_control_mode_arg(args) != "position":
+                admittance_error = "position admittance requires position arm control"
+            elif position_force_guard_monitor is None:
+                admittance_error = "the position force guard monitor is unavailable"
+            elif str(getattr(args, "position_force_guard_source", "tool")) != "tool":
+                admittance_error = (
+                    "position admittance currently requires "
+                    "--position-force-guard-source tool"
+                )
+            elif components.dual_arm_retargeter is None:
+                admittance_error = "the coupled pre-IK target filter is unavailable"
+            if admittance_error is None:
+                def position_admittance_side_activity(side: str) -> tuple[bool, str]:
+                    if clutch_input.hold_active():
+                        return False, "operator_hold"
+                    init_controller = components.init_arm_controller
+                    if init_controller is not None and bool(init_controller.active):
+                        return False, "init_arm_active"
+                    fix_controller = components.fix_arm_controller
+                    fixed_sides = set(
+                        getattr(fix_controller, "fixed_sides", ()) or ()
+                    )
+                    if side in fixed_sides:
+                        return False, "fixed_side"
+                    if not bool(getattr(clutch_input, "_teleop_started", False)):
+                        return False, "teleop_not_started"
+                    return True, "running_live_side"
+
+                try:
+                    installer = (
+                        install_position_admittance_active
+                        if position_admittance_active
+                        else install_position_admittance_shadow
+                    )
+                    installer_kwargs: dict[str, object] = {}
+                    if position_admittance_active:
+                        installer_kwargs["apply_sides"] = (
+                            position_admittance_active_apply_sides(
+                                str(args.position_admittance_active_side)
+                            )
+                        )
+                        installer_kwargs["active_envelope"] = str(
+                            args.position_admittance_active_envelope
+                        )
+                        installer_kwargs["endpoint_policy"] = str(
+                            getattr(
+                                args,
+                                "position_admittance_active_endpoint_policy",
+                                POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+                            )
+                        )
+                        if position_admittance_rotation_active:
+                            installer_kwargs["rotational_config"] = (
+                                position_rotational_admittance_config(
+                                    args,
+                                    profile=str(
+                                        args.position_admittance_rotation_active_profile
+                                    ),
+                                )
+                            )
+                            installer_kwargs[
+                                "combined_translation_rotation_active"
+                            ] = position_admittance_combined_active
+                    elif bool(
+                        getattr(
+                            args,
+                            "position_admittance_rotation_shadow",
+                            False,
+                        )
+                    ):
+                        installer_kwargs["rotational_config"] = (
+                            position_rotational_admittance_config(
+                                args,
+                                profile=str(
+                                    args.position_admittance_rotation_shadow_profile
+                                ),
+                            )
+                        )
+                    admittance_config = (
+                        position_admittance_active_config(args)
+                        if position_admittance_active
+                        else position_admittance_shadow_config(args)
+                    )
+                    if bool(
+                        getattr(
+                            args,
+                            "position_admittance_rotation_shadow",
+                            False,
+                        )
+                    ):
+                        admittance_config = replace(
+                            admittance_config,
+                            enabled_axes=(False, False, False),
+                        )
+                    position_admittance_shadow = installer(
+                        retargeter=components.dual_arm_retargeter,
+                        monitor=position_force_guard_monitor,
+                        active_sides=components.active_sides,
+                        config=admittance_config,
+                        side_activity=position_admittance_side_activity,
+                        **installer_kwargs,
+                    )
+                except Exception as exc:  # noqa: BLE001 - active mode fails closed below.
+                    admittance_error = f"{type(exc).__name__}: {exc}"
+            if admittance_error is not None:
+                position_admittance_shadow = None
+                if action_debug_log_recorder.active:
+                    action_debug_log_recorder.write_event(
+                        "position_admittance_disabled",
+                        _position_admittance_runtime_event_payload(
+                            requested_mode=admittance_mode,
+                            enabled=False,
+                            active_sides=list(components.active_sides),
+                            coupled_pre_ik_target_filter_available=(
+                                components.dual_arm_retargeter is not None
+                            ),
+                            reason=admittance_error,
+                            endpoint_excursion_guard=(
+                                None
+                                if components.position_admittance_endpoint_guard is None
+                                else components.position_admittance_endpoint_guard.snapshot()
+                            ),
+                        ),
+                        now=time.time(),
+                    )
+                if position_admittance_active:
+                    raise RuntimeError(
+                        "active position admittance failed to arm: "
+                        + admittance_error
+                    )
+                _log(
+                    "PositionAdmittanceShadow",
+                    "disabled without changing control: " + admittance_error,
+                )
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "PositionAdmittanceShadow",
+                        "位控柔顺 shadow 未能启用；现有位控目标保持不变。\n"
+                        + admittance_error,
+                    )
+            else:
+                assert position_admittance_shadow is not None
+                admittance_snapshot = position_admittance_shadow.snapshot()
+                endpoint_excursion_guard_snapshot = (
+                    None
+                    if components.position_admittance_endpoint_guard is None
+                    else components.position_admittance_endpoint_guard.snapshot()
+                )
+                _log(
+                    "PositionAdmittance",
+                    f"ready mode={admittance_mode} "
+                    f"shadow_only={str(not position_admittance_active).lower()} "
+                    f"applied_to_target={str(position_admittance_active).lower()} "
+                    "wrench_owner=position_force_guard poll_hz="
+                    f"{position_force_guard_monitor.config.poll_hz:g} "
+                    f"config={admittance_snapshot['config']}",
+                )
+                if action_debug_log_recorder.active:
+                    action_debug_log_recorder.write_event(
+                        "position_admittance_config",
+                        _position_admittance_runtime_event_payload(
+                            requested_mode=admittance_mode,
+                            enabled=True,
+                            active_sides=list(components.active_sides),
+                            coupled_pre_ik_target_filter_available=True,
+                            snapshot=admittance_snapshot,
+                            endpoint_excursion_guard=(
+                                endpoint_excursion_guard_snapshot
+                            ),
+                        ),
+                        now=time.time(),
+                    )
         clutch_input.consume_episode_start_request()
         clutch_input.consume_episode_stop_request()
 
@@ -2492,6 +2384,9 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 gripper_warmup_probe_running=gripper_warmup_probe_running,
                 ik_debug_log_recorder=ik_debug_log_recorder,
                 ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
+                idle_tactile_compression_tick=tick_idle_tactile_compression,
+                begin_idle_tactile_quiesce=begin_idle_tactile_quiesce,
+                require_idle_tactile_quiesced=require_idle_tactile_quiesced,
                 main_loop_watchdog=main_loop_watchdog,
                 open_camera_preview=open_camera_preview,
                 open_tactile_preview=open_tactile_preview,
@@ -2502,6 +2397,7 @@ def run_real_teleop(args: argparse.Namespace) -> None:
                 pose_snapshot_recorder=pose_snapshot_recorder,
                 position_audit_fanout=position_audit_fanout,
                 position_force_guard_monitor=position_force_guard_monitor,
+                position_admittance_shadow=position_admittance_shadow,
                 preview_camera_sources=preview_camera_sources,
                 publish_collection_frequency_warning=(
                     publish_collection_frequency_warning

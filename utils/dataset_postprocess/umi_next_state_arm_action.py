@@ -16,6 +16,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from collection_runtime.artifact_integrity import digest_stored_file
+from collection_runtime.modality_inventory import publish_tracked_modality_inventory
+from dataset_interface.modality_artifacts import PAYLOAD_HASH_PREFER_SEALED
+
 from .tactile_recompress import _ZstdCodec, _active_collection_processes
 
 
@@ -449,6 +453,14 @@ def _trim_tactile_manifest(
             else:
                 raise ValueError(f"unsupported tactile compression {compression!r}")
         spec["frame_count"] = keep
+        sealed = digest_stored_file(path)
+        spec.update(
+            {
+                "stored_size_bytes": int(sealed.size_bytes),
+                "stored_sha256": sealed.sha256,
+                "stored_hash_profile": sealed.profile,
+            }
+        )
         updated_streams[str(sensor_key)] = spec
     manifest["frame_count"] = keep
     manifest["frames"] = list(manifest.get("frames") or ())[:keep]
@@ -731,6 +743,13 @@ def migrate_umi_arm_action_to_next_observation(
         if stats:
             _write_jsonl(stage / "meta" / "episodes_stats.jsonl", updated_stats)
         _write_json(stage / "meta" / "umi_arm_action_alignment.json", history_record)
+
+        # The staged tactile graph was copy-on-write replaced above.  Preserve
+        # an opted-in dataset's immutable revision chain before swapping roots.
+        publish_tracked_modality_inventory(
+            stage,
+            payload_hash_mode=PAYLOAD_HASH_PREFER_SEALED,
+        )
 
         # A second full preflight cannot be used because it intentionally rejects
         # already-aligned datasets. Verify the global count and all staged files first.

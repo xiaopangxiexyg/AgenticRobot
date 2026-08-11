@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import json
+from pathlib import Path
 import sys
 import time
 
@@ -52,6 +53,20 @@ def _parse_dev_id(text: str):
 
 def _print_json(data) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+
+def _tactile_gui_artifact_layout_default() -> str:
+    """Use the repository switch when available, preserving standalone use."""
+
+    project_root = Path(__file__).resolve().parents[3]
+    if (project_root / "runtime_artifact_paths.py").is_file():
+        project_root_text = str(project_root)
+        if project_root_text not in sys.path:
+            sys.path.insert(0, project_root_text)
+        from runtime_artifact_paths import configured_runtime_artifact_layout
+
+        return configured_runtime_artifact_layout()
+    return "legacy"
 
 
 def _add_hidden_alias(
@@ -867,6 +882,7 @@ def _run_configure_usb(args) -> None:
                 normal_vector_ref=float(args.tactile_gui_vector_ref),
                 record_readings=not bool(args.tactile_gui_no_record),
                 record_dir=args.tactile_gui_record_dir or None,
+                artifact_layout=str(args.tactile_gui_artifact_layout),
                 record_every_n=max(1, int(args.tactile_gui_record_every_n)),
                 record_grid=bool(args.tactile_gui_record_grid)
                 and not bool(args.tactile_gui_record_summary_only),
@@ -1151,7 +1167,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--tactile-gui-record-dir",
         default="",
-        help="Directory for tactile GUI debug records. Defaults under teleop_records.",
+        help=(
+            "Exact directory for tactile GUI debug records. When supplied it "
+            "overrides --tactile-gui-artifact-layout."
+        ),
+    )
+    p.add_argument(
+        "--tactile-gui-artifact-layout",
+        choices=("legacy", "runtime-artifacts-v1"),
+        default=_tactile_gui_artifact_layout_default(),
+        help=(
+            "Managed debug-record layout when --tactile-gui-record-dir is "
+            "omitted. Standalone use defaults to legacy; inside DexTeleop, "
+            "local_paths.json can coordinate the canonical cutover."
+        ),
     )
     p.add_argument(
         "--tactile-gui-record-every-n",

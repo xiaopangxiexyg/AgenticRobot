@@ -41,3 +41,32 @@ Historical names retain lazy media reads for reproducibility.
 Do not resume an unsuffixed checkpoint with a corrected config. Start a new
 experiment/checkpoint directory so the config identity and artifact receipt
 remain unambiguous.
+
+Wrist-bearing corrected configs must be launched through:
+
+```bash
+PYTHONPATH=/home/user/zc/DexTeleop:/home/user/zc/openpi/src \
+/home/user/zc/openpi/.venv/bin/python \
+  -m deployments.openpi.corrected_train --dry-run --sample-check -- \
+  0712-wrist-cube-corrected-v1 --exp-name NEW_EXPERIMENT
+```
+
+The wrapper audits each dataset source by its recorded RealSense serial and
+sets `DEXTELEOP_CAMERA_ROLE_REGISTRY` for all dataset workers. Remove only the
+wrapper's `--dry-run` after reviewing the audit. Running an unsuffixed config
+directly remains the historical-semantics rollback.
+
+## Writing front-only default: state-dropout-v2 B1
+
+New writing front-only h16 runs default to the versioned B1 configs:
+
+- relative: `writing-phase1-grap-pen-front-only-h16-relative-task-ready-state-dropout-v2`;
+- absolute: `writing-phase1-grap-pen-front-only-h16-absolute-task-ready-state-dropout-v2`.
+
+B1 keeps normalized whole-state dropout at 10% and adds 15% independent
+per-side arm-pose dropout. Gripper dropout and all state-noise values remain
+unchanged. Both configs keep `num_workers=4` and `shared_worker_v1`.
+
+The corresponding `...-task-ready-v1` configs are frozen rollback identities
+for existing checkpoints. Do not resume a v1 checkpoint with a v2 config;
+start a new experiment instead.

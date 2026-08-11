@@ -64,6 +64,12 @@ def build_device_retry_runtime(
             return "required_for_collection"
         if key.startswith("dataset."):
             return "required_for_collection"
+        if key == "gripper.input":
+            return (
+                "required_for_collection"
+                if bool(getattr(args, "q6_config_required", False))
+                else "optional_input"
+            )
         return "feature_dependent"
 
 
@@ -87,6 +93,17 @@ def build_device_retry_runtime(
                 "requirement": "optional_input",
                 "error": detail,
             }
+        if key == "gripper.input" and not bool(
+            getattr(args, "q6_config_required", False)
+        ):
+            return {
+                "online": False,
+                "health": "waiting",
+                "status_level": "warn",
+                "status_label": "Q6 未就绪（可选回退）",
+                "requirement": "optional_input",
+                "error": detail,
+            }
         return {
             "online": False,
             "health": "error",
@@ -103,6 +120,10 @@ def build_device_retry_runtime(
         for key, detail in startup_device_errors.items():
             # Foot-pad is an operator convenience and never a data modality.
             if key == "foot_pad":
+                continue
+            if key == "gripper.input" and not bool(
+                getattr(args, "q6_config_required", False)
+            ):
                 continue
             # The writer is rebuilt/revalidated on episode start.  Its
             # current startup error must not prevent that recovery attempt.
@@ -255,7 +276,9 @@ def build_device_retry_runtime(
                 if promoted:
                     clutch_input._gripper_control_enabled = False
                     startup_device_errors.pop("angle_trigger", None)
+                    startup_device_errors.pop("gripper.input", None)
                     args.angle_trigger_startup_error = ""
+                    args.q6_startup_error = ""
                     clutch_input.publish_gripper_status(force=True)
             _log("GripperInput", q6_message)
             if control_ui is not None:
@@ -415,6 +438,12 @@ def build_device_retry_runtime(
                                 else "脚踏板已重连；“脚踏板安全测试”已恢复。"
                             )
                         )
+                elif key == "gripper.input":
+                    # The reconnect/promotion attempt above is the sole owner
+                    # of this logical input resource.  Keep its failed status
+                    # visible without also claiming that a process restart is
+                    # required.
+                    continue
                 elif key in {
                     "dmtac.assignment",
                     "camera.config",

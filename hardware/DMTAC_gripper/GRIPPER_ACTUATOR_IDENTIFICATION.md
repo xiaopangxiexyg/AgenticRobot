@@ -187,8 +187,21 @@ contact protocol每个trial只保留一次必要的Enter：夹爪自动张开后
 默认输出目录：
 
 ```text
-logs/gripper_actuator_identification/<timestamp>_<side>_<protocol>/
+teleop_records/gripper_actuator_identification/<timestamp>_<side>_<protocol>/
 ```
+
+原有`logs/gripper_actuator_identification/`已随整个`logs`目录归档到
+`legacy/logs/gripper_actuator_identification/`，仅作为历史记录和异常恢复journal的扫描来源；
+新运行不再默认写入该归档目录。若要把一次新采集显式写入统一运行产物布局，给`run`增加：
+
+```text
+--artifact-layout runtime-artifacts-v1
+```
+
+此时目录为
+`runtime_artifacts/runs/dmtac_gripper_actuator/<YYYY-MM-DD>/<timestamp>_<side>_<protocol>/`。
+若同时提供`--output-root <path>`，该精确路径始终优先。工具只写一个目标，但开始运动前会跨旧目录、
+统一布局的所有日期分区及显式目录检查未恢复journal，不能通过切换输出目录绕过恢复要求。
 
 包含：
 
@@ -220,10 +233,13 @@ logs/gripper_actuator_identification/<timestamp>_<side>_<protocol>/
 
 ```bash
 python hardware/DMTAC_gripper/examples/identify_gripper_actuator.py restore \
-  --journal logs/gripper_actuator_identification/<run>/gripper_settings.recovery.json \
+  --journal teleop_records/gripper_actuator_identification/<run>/gripper_settings.recovery.json \
   --apply \
   --confirmation-token RESTORE_GRIPPER_SETTINGS
 ```
+
+若要恢复迁移前遗留的未完成journal，可把`--journal`精确指向
+`legacy/logs/gripper_actuator_identification/<run>/gripper_settings.recovery.json`；普通新运行不会写入该归档树。
 
 恢复命令会发送停止并恢复配置寄存器，但不会移动或张开夹爪。必须看到
 `RESTORED verified=true`，再运行只读`inspect`核对。若物体仍被机械夹持，不要用手强拉；断开夹爪
@@ -353,8 +369,15 @@ artifact仍会保留，但总manifest标记失败，不会把不完整结果当�
 `runtime-equivalent`、50 Hz状态读取和55°C温度上限。数据默认保存到：
 
 ```text
-logs/gripper_position_suite/dmtac_bimanual_position_<timestamp>/
+teleop_records/gripper_position_suite/dmtac_bimanual_position_<timestamp>/
 ```
+
+原有`logs/gripper_position_suite/`随整个`logs`目录归档到`legacy/logs/gripper_position_suite/`，
+预检仍会只读扫描其中的历史恢复journal。显式增加
+`--artifact-layout runtime-artifacts-v1`后，新套件写入
+`runtime_artifacts/runs/dmtac_gripper_position_suite/<YYYY-MM-DD>/dmtac_bimanual_position_<timestamp>/`；
+`--output-root <path>`仍具有最高优先级。套件预检会同时扫描独立采集器与套件的新旧根目录，避免遗漏
+此前未恢复的夹爪设置journal。
 
 其中`runs/<side>/<phase>/`保留每个原始trace、summary、recovery和manifest，
 `analysis/dmtac_gripper_position_fit.json`是自动拟合结果。`fast_preemption`只作为后续中途反向模型证据，
@@ -370,7 +393,7 @@ logs/gripper_position_suite/dmtac_bimanual_position_<timestamp>/
 ```bash
 python scripts/identify_bimanual_gripper_position.py run \
   --config latest \
-  --resume-suite logs/gripper_position_suite/dmtac_bimanual_position_<timestamp> \
+  --resume-suite teleop_records/gripper_position_suite/dmtac_bimanual_position_<timestamp> \
   --apply \
   --confirmation-token BIMANUAL_GRIPPER_POSITION_SUITE
 ```

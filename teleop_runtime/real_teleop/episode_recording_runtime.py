@@ -313,7 +313,19 @@ def build_episode_recording_runtime(
                 if control_ui is not None:
                     control_ui.append_message("Dataset", message)
                 return False
-            clutch_input.begin_plus_curation_episode(int(episode_index))
+            try:
+                clutch_input.begin_plus_curation_episode(int(episode_index))
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                # Plus is deliberately subordinate to raw collection.  The
+                # dataset episode is already open at this point and must keep
+                # recording even if optional review state cannot initialize.
+                message = (
+                    "Plus episode 状态初始化失败；正式原始数采继续："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("Plus", message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Plus", message)
             if int(episode_index) != planned_episode_index:
                 mismatch = (
                     "dataset episode index changed after audit attachment: "
@@ -373,6 +385,7 @@ def build_episode_recording_runtime(
         nonlocal episode_start_countdown_deadline, episode_start_countdown_reason
         nonlocal episode_start_warmup_ready_since, episode_start_warmup_last_message
         nonlocal dataset_recorder
+        preparation_started_at = time.perf_counter()
         refresh_runtime_views()
         if recording_active():
             return False
@@ -485,8 +498,25 @@ def build_episode_recording_runtime(
                 )
                 return False
         clutch_input._restore_gripper_task_policy_for_collection()
+        countdown_started_at = time.time()
+        preparation_elapsed_sec = max(
+            0.0,
+            time.perf_counter() - preparation_started_at,
+        )
+        if preparation_elapsed_sec >= 0.05:
+            _log(
+                "DatasetTiming",
+                "recording countdown preparation delayed the control plane "
+                f"elapsed={preparation_elapsed_sec * 1000.0:.1f}ms; "
+                "the next control frame will refresh its causal timestamp",
+                now=countdown_started_at,
+            )
         countdown_sec = float(DEFAULT_EPISODE_START_COUNTDOWN_SEC)
-        episode_start_countdown_deadline = float(now) + countdown_sec
+        # The countdown begins only after synchronous preparation has
+        # completed.  Using the request timestamp here silently shortened the
+        # operator countdown by however long writer/filesystem preparation
+        # took.
+        episode_start_countdown_deadline = countdown_started_at + countdown_sec
         episode_start_countdown_reason = str(start_reason)
         episode_start_warmup_ready_since = None
         episode_start_warmup_last_message = None
@@ -496,7 +526,11 @@ def build_episode_recording_runtime(
             "两者都完成后开始写入。"
         )
         clutch_input.set_episode_start_countdown_state(remaining_sec=countdown_sec, message=message)
-        _log("Dataset", f"recording warmup/countdown started delay={countdown_sec:.1f}s reason={start_reason}", now=now)
+        _log(
+            "Dataset",
+            f"recording warmup/countdown started delay={countdown_sec:.1f}s reason={start_reason}",
+            now=countdown_started_at,
+        )
         if control_ui is not None:
             control_ui.append_message("Dataset", message)
         return True

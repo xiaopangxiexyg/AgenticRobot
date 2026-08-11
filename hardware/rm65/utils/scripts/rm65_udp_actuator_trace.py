@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import copy
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,6 +37,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Iterable, Mapping, Protocol
@@ -51,9 +52,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from project_paths import teleop_records_root
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    ArtifactWriteResolution,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
+
 
 TRACE_SCHEMA = "rm65_udp_actuator_feedback_v1"
 JOURNAL_SCHEMA = "rm65_udp_push_recovery_v1"
+ARTIFACT_KIND = "rm65_udp_actuator_trace"
 CUSTOM_CONFIG_FIELDS = (
     "joint_speed",
     "lift_state",
@@ -64,6 +76,67 @@ CUSTOM_CONFIG_FIELDS = (
     "plus_base",
     "plus_state",
 )
+
+
+def legacy_output_root() -> Path:
+    return teleop_records_root() / "actuator_feedback"
+
+
+def canonical_output_family_root() -> Path:
+    return RuntimeArtifactLayout.configured().run_family_dir(kind=ARTIFACT_KIND)
+
+
+def canonical_output_root(*, date_partition: str | None = None) -> Path:
+    partition = date_partition or datetime.now().astimezone().date().isoformat()
+    return RuntimeArtifactLayout.configured().run_partition_dir(
+        kind=ARTIFACT_KIND,
+        date_partition=partition,
+    )
+
+
+def resolve_output_root(
+    args: argparse.Namespace,
+    *,
+    date_partition: str | None = None,
+) -> ArtifactWriteResolution:
+    """Resolve one output parent without creating or contacting anything."""
+
+    return resolve_artifact_write_path(
+        explicit_path=getattr(args, "output_root", None),
+        artifact_layout=getattr(args, "artifact_layout", None),
+        legacy_path=legacy_output_root(),
+        canonical_path=canonical_output_root(date_partition=date_partition),
+    )
+
+
+def recovery_journal_roots(*additional_roots: Path) -> tuple[Path, ...]:
+    roots = (legacy_output_root(), canonical_output_family_root(), *additional_roots)
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.expanduser().resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def _process_lock_root() -> Path:
+    return (
+        Path(tempfile.gettempdir())
+        / f"dexteleop-{os.getuid()}"
+        / "runtime_locks"
+        / ARTIFACT_KIND
+    )
+
+
+def _capture_lock_roots(selected_root: Path) -> tuple[Path, ...]:
+    selected = selected_root.expanduser().resolve()
+    roots = [_process_lock_root(), selected]
+    legacy = legacy_output_root().resolve()
+    if legacy == selected or legacy.exists():
+        roots.append(legacy)
+    return tuple(sorted(set(roots), key=str))
 
 
 class PushConfigClient(Protocol):
@@ -80,6 +153,36 @@ class ArmSpec:
     arm_ip: str
     local_ip: str
     push_port: int
+
+
+@dataclass(frozen=True)
+class CaptureArtifactPaths:
+    output_parent: Path
+    run_directory: Path
+    trace_path: Path
+    journal_path: Path
+
+
+def allocate_capture_artifact_paths(
+    resolution: ArtifactWriteResolution,
+    *,
+    timestamp: str,
+) -> CaptureArtifactPaths:
+    """Allocate paths only; canonical captures are one movable run directory."""
+
+    output_parent = resolution.path.expanduser().resolve()
+    basename = f"rm65_udp_actuator_trace_{timestamp}"
+    run_directory = (
+        output_parent / basename
+        if resolution.source == "canonical"
+        else output_parent
+    )
+    return CaptureArtifactPaths(
+        output_parent=output_parent,
+        run_directory=run_directory,
+        trace_path=run_directory / f"{basename}.jsonl",
+        journal_path=run_directory / f"{basename}.recovery.json",
+    )
 
 
 class RestoreError(RuntimeError):
@@ -338,8 +441,19 @@ def restore_journal(path: Path, *, actor: str) -> None:
     _atomic_write_json(path, journal)
 
 
-def recover_unfinished_journals(root: Path) -> None:
-    for path in sorted(root.glob("*.recovery.json")):
+def recovery_journal_paths(roots: Iterable[Path]) -> tuple[Path, ...]:
+    paths = {
+        path.resolve()
+        for root in roots
+        if root.exists()
+        for path in root.glob("**/*.recovery.json")
+        if path.is_file()
+    }
+    return tuple(sorted(paths))
+
+
+def recover_unfinished_journals(roots: Iterable[Path]) -> None:
+    for path in recovery_journal_paths(roots):
         journal = _load_json(path)
         if journal.get("schema") != JOURNAL_SCHEMA:
             continue
@@ -603,6 +717,16 @@ def exclusive_capture_lock(root: Path):
         yield
 
 
+@contextmanager
+def exclusive_capture_locks(roots: Iterable[Path]):
+    """Acquire one cross-layout lock plus any active legacy root lock."""
+
+    with ExitStack() as stack:
+        for root in sorted({path.resolve() for path in roots}, key=str):
+            stack.enter_context(exclusive_capture_lock(root))
+        yield
+
+
 def _build_specs(args: argparse.Namespace) -> list[ArmSpec]:
     return [
         ArmSpec("left", args.left_arm_ip, args.left_local_ip, args.push_port),
@@ -617,6 +741,7 @@ def _prepare_journal(
     original_by_side: Mapping[str, Mapping[str, Any]],
     target_by_side: Mapping[str, Mapping[str, Any]],
     trace_path: Path,
+    artifact_storage: Mapping[str, Any],
 ) -> dict[str, Any]:
     journal = {
         "schema": JOURNAL_SCHEMA,
@@ -624,6 +749,7 @@ def _prepare_journal(
         "created_wall_time": time.time(),
         "creator_pid": os.getpid(),
         "trace_path": str(trace_path.resolve()),
+        "artifact_storage": dict(artifact_storage),
         "arms": [
             {
                 "side": spec.side,
@@ -709,13 +835,26 @@ def capture(args: argparse.Namespace) -> int:
     if not 10.0 <= args.duration_sec <= 600.0:
         raise RuntimeError("--duration-sec must be within [10, 600]")
 
-    root = args.output_root.resolve()
-    with exclusive_capture_lock(root):
-        recover_unfinished_journals(root)
+    output_resolution = resolve_output_root(args)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    artifacts = allocate_capture_artifact_paths(
+        output_resolution,
+        timestamp=timestamp,
+    )
+    artifact_storage = {
+        "requested_layout": getattr(args, "artifact_layout", None),
+        "selection_source": output_resolution.source,
+        "resolved_layout": output_resolution.layout_name,
+        "resolved_output_parent": str(artifacts.output_parent),
+        "resolved_run_directory": str(artifacts.run_directory),
+    }
+    with exclusive_capture_locks(_capture_lock_roots(artifacts.output_parent)):
+        recover_unfinished_journals(
+            recovery_journal_roots(artifacts.output_parent)
+        )
         specs = _build_specs(args)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        trace_path = root / f"rm65_udp_actuator_trace_{timestamp}.jsonl"
-        journal_path = root / f"rm65_udp_actuator_trace_{timestamp}.recovery.json"
+        trace_path = artifacts.trace_path
+        journal_path = artifacts.journal_path
 
         writer = UdpTraceWriter(trace_path, queue_size=args.queue_size)
         original_by_side = {spec.side: query_config(spec.arm_ip) for spec in specs}
@@ -746,6 +885,7 @@ def capture(args: argparse.Namespace) -> int:
                 original_by_side=original_by_side,
                 target_by_side=target_by_side,
                 trace_path=trace_path,
+                artifact_storage=artifact_storage,
             )
         except Exception:
             for receiver in receivers:
@@ -798,6 +938,7 @@ def capture(args: argparse.Namespace) -> int:
                     "cycle_ms": args.cycle_ms,
                     "duration_sec": args.duration_sec,
                     "trace_format": str(args.trace_format),
+                    "artifact_storage": artifact_storage,
                     "arms": [
                         {
                             "side": spec.side,
@@ -1000,7 +1141,24 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("teleop_records/actuator_feedback"),
+        default=None,
+        help=(
+            "Exact output parent. When provided it overrides --artifact-layout; "
+            "otherwise the validated local managed-layout default is used."
+        ),
+    )
+    capture_parser.add_argument(
+        "--artifact-layout",
+        choices=(
+            LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ),
+        default=configured_runtime_artifact_layout(),
+        help=(
+            "Select the managed output layout when --output-root is omitted. "
+            "The repository default is legacy; local_paths.json can coordinate "
+            "a project-wide canonical cutover."
+        ),
     )
     capture_parser.add_argument("--queue-size", type=int, default=65536)
     capture_parser.add_argument(

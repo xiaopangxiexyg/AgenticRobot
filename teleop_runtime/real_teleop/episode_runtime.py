@@ -80,6 +80,11 @@ def _episode_root_dir(
     episode_root = str(getattr(args, "episode_root", "") or "").strip()
     if episode_root:
         return _expand_cli_path(episode_root)
+    canonical_trajectory_root = str(
+        getattr(args, "_runtime_artifact_trajectory_root", "") or ""
+    ).strip()
+    if canonical_trajectory_root:
+        return Path(canonical_trajectory_root).expanduser()
     if components.session.recorder is not None:
         return Path(components.session.recorder.root_dir) / "trajectories"
     session_record_root = _session_record_root_dir(args)
@@ -90,12 +95,16 @@ def _episode_root_dir(
 
 def _fix_arm_pose_snapshot_recorder(
     components: RealTeleopComponents,
+    *,
+    root_dir: str | Path | None = None,
 ) -> FixArmPoseSnapshotRecorder | None:
     if getattr(components, "fix_arm_controller", None) is None:
         return None
-    session_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if root_dir is None:
+        session_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        root_dir = teleop_records_root() / "fix_arm_pose_snapshots" / session_name
     return FixArmPoseSnapshotRecorder(
-        teleop_records_root() / "fix_arm_pose_snapshots" / session_name
+        Path(root_dir).expanduser()
     )
 
 

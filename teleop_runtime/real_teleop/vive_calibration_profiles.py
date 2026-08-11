@@ -6,36 +6,28 @@ import argparse
 import json
 import os
 import re
-from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from project_paths import calibration_profiles_dir
+
 from ..calibration import TeleopCalibration
 from .components import RealTeleopComponents
-
-
-_REQUIRED_SUPPORT_NAMES = (
-    "DEFAULT_CALIBRATION_PROFILE_DIR",
-    "_apply_workspace_config",
-    "_apply_workspace_overrides",
-    "_arm_workspace_config_path",
-    "_movement_multiple_value",
-    "_tracker_source_side_for_logical_side",
-    "datetime",
+from .movement import movement_multiple_value as _movement_multiple_value
+from .side_mapping import (
+    tracker_source_side_for_logical_side as _tracker_source_side_for_logical_side,
+)
+from .workspace import (
+    apply_workspace_config as _apply_workspace_config,
+    apply_workspace_overrides as _apply_workspace_overrides,
+    arm_workspace_config_path as _arm_workspace_config_path,
 )
 
 
-def bind_legacy_support(namespace: Mapping[str, Any]) -> None:
-    missing = [name for name in _REQUIRED_SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "VIVE calibration profile support is incomplete: " + ", ".join(missing)
-        )
-    module_globals = globals()
-    for name in _REQUIRED_SUPPORT_NAMES:
-        module_globals[name] = namespace[name]
+DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
 
 
 def _calibration_profile_latest_sort_key(path: Path) -> tuple[int, str, float, str]:
@@ -49,12 +41,20 @@ def _calibration_profile_latest_sort_key(path: Path) -> tuple[int, str, float, s
     )
 
 
-def _latest_vive_calibration_profile_path() -> Path | None:
-    if not DEFAULT_CALIBRATION_PROFILE_DIR.exists():
+def _latest_vive_calibration_profile_path(
+    *,
+    profile_dir: Path | None = None,
+) -> Path | None:
+    resolved_profile_dir = (
+        DEFAULT_CALIBRATION_PROFILE_DIR
+        if profile_dir is None
+        else Path(profile_dir)
+    )
+    if not resolved_profile_dir.exists():
         return None
     candidates: list[Path] = []
     seen: set[Path] = set()
-    for path in DEFAULT_CALIBRATION_PROFILE_DIR.glob("*.json"):
+    for path in resolved_profile_dir.glob("*.json"):
         resolved = path.resolve()
         if resolved in seen or not path.is_file():
             continue
@@ -65,17 +65,28 @@ def _latest_vive_calibration_profile_path() -> Path | None:
     return max(candidates, key=_calibration_profile_latest_sort_key)
 
 
-def _gui_vive_calibration_load_path(args: argparse.Namespace) -> Path:
+def _gui_vive_calibration_load_path(
+    args: argparse.Namespace,
+    *,
+    profile_dir: Path | None = None,
+) -> Path:
     explicit = str(getattr(args, "load_profile", "") or "").strip()
     if explicit:
         return Path(os.path.expandvars(explicit)).expanduser()
     last_saved = str(getattr(args, "gui_last_vive_calibration_profile", "") or "").strip()
     if last_saved:
         return Path(os.path.expandvars(last_saved)).expanduser()
-    latest = _latest_vive_calibration_profile_path()
+    resolved_profile_dir = (
+        DEFAULT_CALIBRATION_PROFILE_DIR
+        if profile_dir is None
+        else Path(profile_dir)
+    )
+    latest = _latest_vive_calibration_profile_path(
+        profile_dir=resolved_profile_dir,
+    )
     if latest is None:
         raise FileNotFoundError(
-            f"No VIVE calibration profile found in {DEFAULT_CALIBRATION_PROFILE_DIR}"
+            f"No VIVE calibration profile found in {resolved_profile_dir}"
         )
     return latest
 
@@ -117,12 +128,19 @@ def _calibration_profile_payload_without_workspace(
 def _save_gui_vive_calibration_profile(
     args: argparse.Namespace,
     components: RealTeleopComponents,
+    *,
+    profile_dir: Path | None = None,
 ) -> Path:
     calibration = components.session.calibration
     if calibration is None:
         raise RuntimeError("No active calibration is attached to the teleop session.")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = DEFAULT_CALIBRATION_PROFILE_DIR / f"{timestamp}_vive_rm65_real_teleop.json"
+    resolved_profile_dir = (
+        DEFAULT_CALIBRATION_PROFILE_DIR
+        if profile_dir is None
+        else Path(profile_dir)
+    )
+    output_path = resolved_profile_dir / f"{timestamp}_vive_rm65_real_teleop.json"
     profile = TeleopCalibration.from_dict(calibration.to_dict())
     runtime_home_was_available = _runtime_home_was_available(profile)
     profile.clear_home_state()
@@ -158,8 +176,13 @@ def _save_gui_vive_calibration_profile(
 def _load_gui_vive_calibration_profile(
     args: argparse.Namespace,
     components: RealTeleopComponents,
+    *,
+    profile_dir: Path | None = None,
 ) -> Path:
-    path = _gui_vive_calibration_load_path(args)
+    path = _gui_vive_calibration_load_path(
+        args,
+        profile_dir=profile_dir,
+    )
     loaded = TeleopCalibration.load_json(path)
     current = components.session.calibration
     if current is None:
@@ -230,6 +253,4 @@ __all__ = [
     "_load_gui_vive_calibration_profile",
     "_runtime_home_was_available",
     "_save_gui_vive_calibration_profile",
-    "bind_legacy_support",
 ]
-

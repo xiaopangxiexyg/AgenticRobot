@@ -19,8 +19,8 @@ from .pose_adapter import as_rigid_transform
 from .topology import CAMERA_KEYS, SIDES
 
 
-DEFAULT_LEFT_WRIST_CAMERA_SERIAL = "261122273924"
-DEFAULT_RIGHT_WRIST_CAMERA_SERIAL = "260522278055"
+DEFAULT_LEFT_WRIST_CAMERA_SERIAL = "260522278055"
+DEFAULT_RIGHT_WRIST_CAMERA_SERIAL = "261122273924"
 
 
 def _mapping(value: Any, *, name: str) -> Mapping[str, Any]:
@@ -182,6 +182,7 @@ class UmiCollectionConfig:
     ignored_tactile_keys: tuple[str, ...] = ()
     hardware_admission_mode: str = "capability"
     tactile_compression: str = "none"
+    tactile_artifact_integrity: bool = False
     dmtac_tactile_read_hz: float = 15.0
     dmtac_gripper_command_hz: float = 20.0
     dmtac_gripper_telemetry_hz: float = 20.0
@@ -279,6 +280,11 @@ class UmiCollectionConfig:
             )
         if self.tactile_compression not in {"none", "lz4", "zstd"}:
             raise ValueError("tactile_compression must be one of: none, lz4, zstd")
+        object.__setattr__(
+            self,
+            "tactile_artifact_integrity",
+            bool(self.tactile_artifact_integrity),
+        )
         if float(self.dmtac_tactile_read_hz) <= 0.0:
             raise ValueError("dmtac_tactile_read_hz must be positive")
         if float(self.dmtac_gripper_command_hz) <= 0.0:
@@ -429,6 +435,9 @@ class UmiCollectionConfig:
                 payload.get("hardware_admission_mode", "capability")
             ),
             tactile_compression=str(payload.get("tactile_compression", "none")),
+            tactile_artifact_integrity=bool(
+                payload.get("tactile_artifact_integrity", False)
+            ),
             dmtac_tactile_read_hz=float(payload.get("dmtac_tactile_read_hz", 15.0)),
             dmtac_gripper_command_hz=float(
                 payload.get("dmtac_gripper_command_hz", 20.0)

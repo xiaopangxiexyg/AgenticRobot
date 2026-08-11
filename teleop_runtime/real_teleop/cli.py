@@ -14,6 +14,11 @@ from dataset_contracts.v25p_native_storage import (
     V25P_NATIVE_STORAGE_LAYOUTS_V1,
     V25P_RECORD_CJSON_LAYOUT_V1,
 )
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    configured_runtime_artifact_layout,
+)
 
 from robot_motion.position_control import (
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
@@ -21,6 +26,8 @@ from robot_motion.position_control import (
     DEFAULT_POSITION_VELOCITY_RAMP_SEC,
     POSITION_COMMAND_PLANNER_CHOICES,
     POSITION_COMMAND_PLANNER_LINEAR,
+    ROTATIONAL_ADMITTANCE_PROFILE_BALANCED_5DEG,
+    ROTATIONAL_ADMITTANCE_PROFILE_CHOICES,
 )
 from robot_motion.rm65 import (
     IK_STEP_MODE_CHOICES,
@@ -57,7 +64,10 @@ from ..position_control import (
     DEFAULT_CONTROL_DEBUG_QUEUE_SIZE,
     DEFAULT_CONTROL_DEBUG_ROOT,
 )
-from ..sources.camera import REALSENSE_STARTUP_WARMUP_POLICIES
+from ..sources.camera import (
+    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+    REALSENSE_STARTUP_WARMUP_POLICIES,
+)
 from ..sources.pose import DEFAULT_VIVE_CLOCK_SYNC_PORT
 from .actuator_command_trace import (
     DEFAULT_ACTUATOR_TRACE_MAX_DURATION_SEC,
@@ -95,6 +105,19 @@ from .hand_cli import (
 )
 from .movement import MOVEMENT_MULTIPLE_DEFAULT
 from .position_force_guard import POSITION_FORCE_SOURCES
+from .position_admittance_shadow import (
+    POSITION_ADMITTANCE_ACCEPTED_FILTER_TAU_SEC,
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE,
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+    POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
+    POSITION_ADMITTANCE_ACTIVE_ENVELOPE_CHOICES,
+    POSITION_ADMITTANCE_ACTIVE_ENDPOINT_POLICY_CHOICES,
+    POSITION_ADMITTANCE_ACTIVE_SIDE_CHOICES,
+    POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG,
+    POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
+    POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE_CHOICES,
+    POSITION_ADMITTANCE_RESPONSE_WEIGHT_DEFAULT,
+)
 from .progress_adapter import load_real_teleop_progress_profile
 from .wrist_depth_freshness import (
     DEFAULT_WRIST_DEPTH_MAX_M,
@@ -313,14 +336,16 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--camera-startup-warmup-policy",
         choices=REALSENSE_STARTUP_WARMUP_POLICIES,
-        default="legacy",
+        default=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
         help=(
             "RealSense post-pipeline startup warmup. legacy preserves the "
             "historical synchronous N-frame wait and reset retry; "
-            "bounded_first_frame waits for one valid frame within the configured "
-            "startup_frame_grace_sec, then relies on the unchanged global "
-            "multi-frame camera self-check. Pipeline negotiation remains serial. "
-            "Default: legacy (atomic rollback)."
+            "bounded_first_frame waits for one valid frame within each configured "
+            "startup_frame_grace_sec attempt, using short cancellable SDK waits; "
+            "one failed pipeline is cleanly reopened once before admission fails, "
+            "then the unchanged global multi-frame camera self-check runs. "
+            "Pipeline negotiation remains serial and no USB reset is implied. "
+            "Default: bounded_first_frame; select legacy for atomic rollback."
         ),
     )
     parser.add_argument(
@@ -628,13 +653,13 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--position-force-guard-max-force-n",
         type=_positive_float,
-        default=15.0,
+        default=30.0,
         help="Position-mode bimanual emergency-stop threshold for force-vector norm.",
     )
     parser.add_argument(
         "--position-force-guard-max-torque-nm",
         type=_positive_float,
-        default=2.0,
+        default=5.0,
         help="Position-mode bimanual emergency-stop threshold for torque-vector norm.",
     )
     parser.add_argument(
@@ -661,7 +686,7 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--position-force-guard-stale-sec",
         type=_positive_float,
-        default=0.25,
+        default=0.4,
         help="Maximum age of the latest valid force sample before fail-closed stop.",
     )
     parser.add_argument(
@@ -672,6 +697,295 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
             "Startup deadline for one valid force sample from every active arm; "
             "failure stops both arms and aborts arming."
         ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Observe a bounded translation-only Cartesian admittance overlay "
+            "from the existing position force-guard samples without changing "
+            "any pre-IK target, qref, or command. Default off."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-shadow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Observe a bounded SO(3) rotational admittance response from the "
+            "same tared tool wrench. Requires --position-admittance-shadow and "
+            "disables the translation shadow axes so the receipt is isolated. "
+            "It never changes a target, qref, or hardware command. Default off."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-shadow-profile",
+        choices=ROTATIONAL_ADMITTANCE_PROFILE_CHOICES,
+        default=ROTATIONAL_ADMITTANCE_PROFILE_BALANCED_5DEG,
+        help=(
+            "Named rotation-shadow response profile. balanced-5deg is the "
+            "saved-wrench MuJoCo candidate; this option has no Active authority."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-active",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply a bounded Cartesian admittance overlay to copied pre-IK "
+            "targets. Translation is the default; the separate rotation-active "
+            "flag selects the isolated cautious rotational envelope. This is "
+            "an explicit, default-off research mode; IK, collision, qref "
+            "dynamics, and the independent position force guard remain authoritative."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-active",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply one admitted rotational admittance envelope to the explicitly "
+            "selected Active side authority. Cautious rotation remains isolated by default; the "
+            "bounded 5-degree profiles require explicit combined normal-parity "
+            "authority. All ordinary IK, collision, qref, endpoint, and "
+            "force-stop gates remain active. Default off."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-combined-active",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Explicitly authorize translation and rotation admittance together "
+            "on the selected Active side authority. The exact envelope/profile pair is "
+            "validated by the production installer. Requires both Active flags; "
+            "without this flag, cautious rotation retains its established "
+            "translation-disabled behavior. Default off."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-active-profile",
+        choices=POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE_CHOICES,
+        default=POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
+        help=(
+            "Named production rotation Active profile. cautious-3deg is the "
+            "default; balanced-5deg and rotation-emphasis-5deg are admitted "
+            "only with combined normal-parity translation."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-active-side",
+        choices=POSITION_ADMITTANCE_ACTIVE_SIDE_CHOICES,
+        default=None,
+        help=(
+            "Explicit side authority for the active overlay. left/right preserve "
+            "the staged single-side paths; both is admitted only for the exact "
+            "formal_teleop combined normal-parity translation/rotation profile. "
+            "Required with --position-admittance-active; shadow observes both sides."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-active-envelope",
+        choices=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_CHOICES,
+        default=POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE,
+        help=(
+            "Explicit production Active envelope. cautious remains the default; "
+            "half_normal enables the audited 40 mm / 30 mm/s staged test; "
+            "normal_parity is restricted to an admitted combined 5-degree "
+            "rotation Active profile."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-active-endpoint-policy",
+        choices=POSITION_ADMITTANCE_ACTIVE_ENDPOINT_POLICY_CHOICES,
+        default=POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+        help=(
+            "Final tool endpoint policy for Active admittance. runtime_home_hold "
+            "keeps the temporary test envelope around runtime Home. formal_teleop "
+            "removes only that Home-relative test envelope and retains the ordinary "
+            "formal teleop workspace, collision, joint, dynamics, force-stop, and "
+            "bounded-modifier safety. formal_teleop is admitted only for exact "
+            "combined normal-parity translation and 5-degree rotation."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-active-max-tool-excursion-m",
+        type=_positive_float,
+        default=POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
+        help=(
+            "Maximum final calibrated tool-TCP qref distance from runtime Home "
+            "when the endpoint policy is runtime_home_hold. A larger candidate "
+            "holds the last safe qref and requests the ordinary GUI Hold/Home flow."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-active-max-tool-rotation-excursion-deg",
+        type=_positive_float,
+        default=(
+            POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG
+        ),
+        help=(
+            "Maximum final calibrated tool-TCP qref rotation from runtime Home "
+            "during rotation Active when the endpoint policy is runtime_home_hold. "
+            "A larger candidate holds the last safe qref and requests the ordinary "
+            "GUI Hold/Home flow."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-axes",
+        type=str,
+        default="xyz",
+        help="Translation axes used by shadow/active admittance; non-empty subset of xyz.",
+    )
+    parser.add_argument(
+        "--position-admittance-response-model",
+        choices=("second_order", "profile_compliance"),
+        default="second_order",
+        help=(
+            "Response law for the default-off shadow/active modifier. "
+            "second_order preserves the initial research implementation; "
+            "profile_compliance reproduces the established filtered "
+            "compliance-target and passive-return semantics."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-translation-response-weight",
+        type=_positive_float,
+        default=POSITION_ADMITTANCE_RESPONSE_WEIGHT_DEFAULT,
+        help=(
+            "Translation compliance multiplier relative to the accepted 250 N/m "
+            "profile. 1.0 preserves accepted behavior; 2.0 doubles the "
+            "unconstrained offset for the same force. Final offset, velocity, "
+            "slew, IK, collision, and force-stop limits are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-response-weight",
+        type=_positive_float,
+        default=POSITION_ADMITTANCE_RESPONSE_WEIGHT_DEFAULT,
+        help=(
+            "Rotation compliance multiplier relative to the selected accepted "
+            "profile. 1.0 preserves accepted behavior; larger values emphasize "
+            "rotation without changing the profile's final rotation/slew bounds."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-mass-kg",
+        type=_positive_float,
+        default=2.0,
+        help="Isotropic virtual translation mass used by shadow/active admittance.",
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-damping-n-s-m",
+        type=_non_negative_float,
+        default=50.0,
+        help=(
+            "Isotropic physical damping used only by the second_order research "
+            "model. It is intentionally inactive in the accepted "
+            "profile_compliance path; use the translation/rotation filter tau "
+            "options for that path's effective input damping."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-stiffness-n-m",
+        type=_non_negative_float,
+        default=250.0,
+        help=(
+            "Isotropic virtual translation stiffness. The 250 N/m default "
+            "matches the established DMTAC_M 0.004 m/N compliance scale."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-deadband-n",
+        type=_non_negative_float,
+        default=0.45,
+        help="Per-axis force deadband for shadow/active admittance.",
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-filter-tau-sec",
+        "--position-admittance-translation-filter-tau-sec",
+        dest="position_admittance_shadow_filter_tau_sec",
+        type=_non_negative_float,
+        default=0.022,
+        help=(
+            "Translation force-input damping/filter time constant; the production-"
+            "neutral option name is an alias for the historical shadow name. "
+            "Larger values are smoother and slower. For exact DMTAC_M 0.9-at-40-Hz "
+            "pole parity use approximately 0.010857362 s."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-filter-tau-sec",
+        type=_non_negative_float,
+        default=POSITION_ADMITTANCE_ACCEPTED_FILTER_TAU_SEC,
+        help=(
+            "Rotation torque-input damping/filter time constant. Larger values "
+            "are smoother and slower; the default preserves the accepted profile."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-max-offset-m",
+        type=_positive_float,
+        default=0.005,
+        help="Per-axis translation-offset limit (hypothetical in shadow mode).",
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-max-velocity-m-s",
+        type=_positive_float,
+        default=0.01,
+        help="Per-axis offset-velocity limit (hypothetical in shadow mode).",
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-max-return-velocity-m-s",
+        type=_positive_float,
+        default=0.01,
+        help=(
+            "Passive return velocity limit for profile_compliance. It is "
+            "independent from the active offset-velocity limit."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-max-slew-m-s",
+        type=_positive_float,
+        default=0.01,
+        help="60 Hz output-slew limit (hypothetical in shadow mode).",
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-return-deadband-n",
+        type=_non_negative_float,
+        default=0.45,
+        help=(
+            "Filtered-force activity threshold that pauses passive return in "
+            "profile_compliance mode."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-return-rate-s",
+        type=_non_negative_float,
+        default=1.0,
+        help="Passive zero-force offset return rate for profile_compliance.",
+    )
+    parser.add_argument(
+        "--position-admittance-response-reference-hz",
+        type=_positive_float,
+        default=40.0,
+        help=(
+            "Reference rate whose discrete passive-return dynamics are "
+            "preserved when wrench samples arrive at another rate."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-stale-sec",
+        type=_positive_float,
+        default=0.15,
+        help="Admittance freshness limit; does not replace the force guard.",
+    )
+    parser.add_argument(
+        "--position-admittance-shadow-max-force-dt-sec",
+        type=_positive_float,
+        default=0.15,
+        help="Maximum new-wrench integration interval used by the admittance state.",
     )
     parser.add_argument(
         "--strict-tool-profile",
@@ -1030,6 +1344,16 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--status-change-min-sec",
+        type=_non_negative_float,
+        default=1.0,
+        help=(
+            "Minimum interval between change-driven [RealTeleop] diagnostic lines "
+            "(default: 1.0). State-machine, fault, collision, Hold, and device-health "
+            "changes bypass this coalescing interval. Use 0 for legacy every-change output."
+        ),
+    )
+    parser.add_argument(
         "--debug-orientation-console",
         action="store_true",
         help=(
@@ -1092,8 +1416,9 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Record only post-SDK RM65 qcmd/result/timestamps into preallocated memory, then "
-            "write once after command workers stop. Intended for low-disturbance actuator "
+            "Record post-SDK RM65 qcmd/result/timestamps, 60 Hz IK shadow, and pre-filter "
+            "VIVE pose/OpenVR velocity metadata into preallocated memory, then write once "
+            "after command workers stop. Intended for low-disturbance actuator and source "
             "identification; do not combine with --control-debug summary/full."
         ),
     )
@@ -1146,7 +1471,10 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         "--debug-timing-light-log",
         dest="debug_timing_log",
         action="store_true",
-        help="Write sampled real-loop timing JSONL frames under teleop_records/debug_timing.",
+        help=(
+            "Write sampled real-loop timing JSONL frames under the selected artifact "
+            "layout (legacy: teleop_records/debug_timing)."
+        ),
     )
     parser.add_argument(
         "--no-debug-timing-auto-log",
@@ -1685,13 +2013,25 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--artifact-layout",
+        choices=(
+            LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ),
+        default=configured_runtime_artifact_layout(),
+        help=(
+            "Select the default storage layout for optional runtime/debug artifacts. "
+            "Formal collection datasets are never redirected; explicit per-sink roots win."
+        ),
+    )
+    parser.add_argument(
         "--record",
         dest="no_record",
         action="store_false",
         help=(
             "Enable legacy debug session JSONL recording. This writes raw_inputs/faults/"
             "state_transitions/calibration under --session-record-root when provided, or "
-            "teleop_records/<timestamp> otherwise."
+            "the selected artifact layout otherwise."
         ),
     )
     parser.add_argument(
@@ -1807,9 +2147,10 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Render the optional Control Station long-horizon progress panel. "
-            "A managed LINEAR profile can be selected in the GUI before the "
+            "A blank, unbound dataset defaults to the managed four-stage "
+            "writing profile, which can be changed in the GUI before the "
             "first Episode; --collection-progress-profile remains an optional "
-            "initial/CLI selection. Default off; disabling it preserves the "
+            "explicit override. Default off; disabling it preserves the "
             "existing RealTeleop collection GUI and A/B/C semantics exactly."
         ),
     )
@@ -1877,7 +2218,8 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Optional base directory for legacy debug JSONL session output when --record is set. "
-            "Session JSONL is written to <session-record-root>/<timestamp>_vive_rm65_real_teleop."
+            "Session JSONL is written to <session-record-root>/<timestamp>_vive_rm65_real_teleop; "
+            "when omitted, --artifact-layout selects the default."
         ),
     )
     parser.add_argument(
@@ -2048,6 +2390,27 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Compression for external tactile streams. none is the default and writes "
             "raw .bin streams; use lz4 or zstd for lossless chunk compression."
+        ),
+    )
+    parser.add_argument(
+        "--idle-tactile-compression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Losslessly recompress raw tactile streams only while RealTeleop is in "
+            "startup-wait/Hold with no active, countdown, or finalizing Episode. "
+            "The worker is quiesced before runtime Home. Default off; "
+            "--no-idle-tactile-compression is the rollback path."
+        ),
+    )
+    parser.add_argument(
+        "--tactile-artifact-integrity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Incrementally hash exact external tactile bytes in the collection writer "
+            "and publish a detachable-modality inventory after every sealed Episode. "
+            "Default off; --no-tactile-artifact-integrity is the rollback path."
         ),
     )
     parser.add_argument(

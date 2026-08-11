@@ -5,6 +5,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from collection_runtime.tactile_postprocess import (
+    TACTILE_MAINTENANCE_TARGETS,
+    TACTILE_TARGET_COMPRESSED_HOT,
+    apply_tactile_postprocess,
+    plan_tactile_postprocess,
+)
 from dataset_interface.validation import validate_v23_dataset
 
 from .causal_align import causal_align_dataset, plan_causal_align
@@ -13,6 +19,17 @@ from .fault_nan_tail import detect_fault_nan_tail
 from .force_collision_labels import label_force_collisions, plan_force_collision_labels
 from .hardlink_dedupe import apply_hardlink_dedupe, plan_hardlink_dedupe
 from .io import episode_records, parquet_path_for_record, read_parquet_rows
+from .modality_storage import (
+    DEFAULT_MIN_FREE_BYTES as DEFAULT_MODALITY_STORAGE_MIN_FREE_BYTES,
+    detach_modality,
+    export_modality,
+    modality_storage_status,
+    move_modality,
+    plan_modality_detach,
+    plan_modality_export,
+    plan_modality_rehydrate,
+    rehydrate_modality,
+)
 from .split_episodes import plan_episode_split, split_episodes
 from .stutter_segments import (
     clean_stutters,
@@ -42,6 +59,7 @@ from .v22_to_v23_desk import (
     plan_v22_to_v23_desk_conversion,
 )
 from .workspace_near_boundary import migrate_umi_workspace_near_boundary
+from .writing_stage1_pilot import configure_parser as configure_writing_stage1_pilot
 
 
 def _print_json(payload: Any) -> None:
@@ -231,6 +249,154 @@ def _cmd_validate_v23(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _cmd_modality_status(args: argparse.Namespace) -> int:
+    _print_json(
+        modality_storage_status(
+            args.dataset_root,
+            inventory_hash=_optional_path(args.inventory_hash),
+        )
+    )
+    return 0
+
+
+def _cmd_modality_detach(args: argparse.Namespace) -> int:
+    min_free_bytes = int(float(args.min_free_gb) * 1024**3)
+    if bool(args.apply):
+        if (
+            not args.plan_hash
+            or not args.confirm_dataset_fingerprint
+            or not args.confirm_no_active_readers
+        ):
+            raise ValueError(
+                "--plan-hash, --confirm-dataset-fingerprint, and "
+                "--confirm-no-active-readers are required with --apply"
+            )
+        result: Any = detach_modality(
+            args.dataset_root,
+            args.cold_root,
+            expected_plan_hash=str(args.plan_hash),
+            confirm_dataset_fingerprint=str(args.confirm_dataset_fingerprint),
+            detachment_scope=str(args.detach_scope),
+            min_free_bytes=min_free_bytes,
+            source_storage_id=str(args.source_storage_id),
+            target_storage_id=str(args.target_storage_id),
+            confirm_no_active_readers=bool(args.confirm_no_active_readers),
+            allow_legacy_hardlinked_source=bool(
+                args.allow_legacy_hardlinked_source
+            ),
+            legacy_scan_payload_hashes=bool(args.legacy_scan_payload_hashes),
+        )
+    else:
+        result = plan_modality_detach(
+            args.dataset_root,
+            args.cold_root,
+            detachment_scope=str(args.detach_scope),
+            min_free_bytes=min_free_bytes,
+            allow_legacy_hardlinked_source=bool(
+                args.allow_legacy_hardlinked_source
+            ),
+            legacy_scan_payload_hashes=bool(args.legacy_scan_payload_hashes),
+        )
+    _print_json(result.to_dict())
+    return 0
+
+
+def _cmd_modality_export(args: argparse.Namespace) -> int:
+    min_free_bytes = int(float(args.min_free_gb) * 1024**3)
+    if bool(args.apply):
+        if (
+            not args.plan_hash
+            or not args.confirm_dataset_fingerprint
+            or not args.confirm_no_active_readers
+        ):
+            raise ValueError(
+                "--plan-hash, --confirm-dataset-fingerprint, and "
+                "--confirm-no-active-readers are required with --apply"
+            )
+        result: Any = export_modality(
+            args.dataset_root,
+            args.cold_root,
+            expected_plan_hash=str(args.plan_hash),
+            confirm_dataset_fingerprint=str(args.confirm_dataset_fingerprint),
+            min_free_bytes=min_free_bytes,
+            source_storage_id=str(args.source_storage_id),
+            target_storage_id=str(args.target_storage_id),
+            confirm_no_active_readers=True,
+            allow_legacy_source=bool(args.allow_legacy_source),
+            legacy_scan_payload_hashes=bool(args.legacy_scan_payload_hashes),
+        )
+    else:
+        result = plan_modality_export(
+            args.dataset_root,
+            args.cold_root,
+            min_free_bytes=min_free_bytes,
+            allow_legacy_source=bool(args.allow_legacy_source),
+            legacy_scan_payload_hashes=bool(args.legacy_scan_payload_hashes),
+        )
+    _print_json(result.to_dict())
+    return 0
+
+
+def _cmd_modality_move(args: argparse.Namespace) -> int:
+    min_free_bytes = int(float(args.min_free_gb) * 1024**3)
+    if bool(args.apply):
+        if not args.confirm_no_active_readers:
+            raise ValueError(
+                "--confirm-no-active-readers is required with --apply"
+            )
+        result: Any = move_modality(
+            args.dataset_root,
+            args.cold_root,
+            min_free_bytes=min_free_bytes,
+            source_storage_id=str(args.source_storage_id),
+            target_storage_id=str(args.target_storage_id),
+            confirm_no_active_readers=True,
+        )
+    else:
+        result = plan_modality_detach(
+            args.dataset_root,
+            args.cold_root,
+            detachment_scope="whole-prefix",
+            min_free_bytes=min_free_bytes,
+        )
+    _print_json(result.to_dict())
+    return 0
+
+
+def _cmd_modality_rehydrate(args: argparse.Namespace) -> int:
+    min_free_bytes = int(float(args.min_free_gb) * 1024**3)
+    if bool(args.apply):
+        if (
+            not args.plan_hash
+            or not args.confirm_dataset_fingerprint
+            or not args.confirm_no_active_readers
+        ):
+            raise ValueError(
+                "--plan-hash, --confirm-dataset-fingerprint, and "
+                "--confirm-no-active-readers are required with --apply"
+            )
+        result: Any = rehydrate_modality(
+            args.dataset_root,
+            args.cold_root,
+            str(args.inventory_hash),
+            expected_plan_hash=str(args.plan_hash),
+            confirm_dataset_fingerprint=str(args.confirm_dataset_fingerprint),
+            min_free_bytes=min_free_bytes,
+            source_storage_id=str(args.source_storage_id),
+            target_storage_id=str(args.target_storage_id),
+            confirm_no_active_readers=bool(args.confirm_no_active_readers),
+        )
+    else:
+        result = plan_modality_rehydrate(
+            args.dataset_root,
+            args.cold_root,
+            str(args.inventory_hash),
+            min_free_bytes=min_free_bytes,
+        )
+    _print_json(result.to_dict())
+    return 0
+
+
 def _cmd_v22_to_v23_desk(args: argparse.Namespace) -> int:
     kwargs = {"target_layout_path": args.target_layout_json}
     if bool(args.apply_v22_desk_conversion):
@@ -295,6 +461,29 @@ def _cmd_tactile_recompress_zstd(args: argparse.Namespace) -> int:
             min_free_bytes=min_free_bytes,
         )
         _print_json(plan.to_dict())
+    return 0
+
+
+def _cmd_tactile_maintain(args: argparse.Namespace) -> int:
+    min_free_bytes = int(float(args.min_free_gb) * 1024**3)
+    kwargs = {
+        "target": str(args.target),
+        "cold_root": _optional_path(args.cold_root),
+        "min_free_bytes": min_free_bytes,
+        "compress_before_detach": bool(args.compress_before_detach),
+    }
+    if bool(args.apply):
+        outcome: Any = apply_tactile_postprocess(
+            args.dataset_root,
+            level=int(args.level),
+            chunk_frames=int(args.chunk_frames),
+            backend=str(args.backend),
+            confirm_no_active_readers=bool(args.confirm_no_active_readers),
+            **kwargs,
+        )
+    else:
+        outcome = plan_tactile_postprocess(args.dataset_root, **kwargs)
+    _print_json(outcome.to_dict())
     return 0
 
 
@@ -566,6 +755,197 @@ def build_parser() -> argparse.ArgumentParser:
     validate_v23.add_argument("--max-errors", type=int, default=200)
     validate_v23.set_defaults(func=_cmd_validate_v23)
 
+    modality_status = subparsers.add_parser(
+        "modality-status",
+        help="Read-only detachable-modality availability and receipt status.",
+    )
+    modality_status.add_argument("dataset_root")
+    modality_status.add_argument("--modality", choices=("tactile",), default="tactile")
+    modality_status.add_argument("--inventory-hash", default="")
+    modality_status.set_defaults(func=_cmd_modality_status)
+
+    modality_export = subparsers.add_parser(
+        "modality-export",
+        help=(
+            "Plan or copy and verify tactile artifacts on independent cold "
+            "storage while preserving every hot source file."
+        ),
+    )
+    modality_export.add_argument("dataset_root")
+    modality_export.add_argument("--cold-root", required=True)
+    modality_export.add_argument("--modality", choices=("tactile",), default="tactile")
+    modality_export.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MODALITY_STORAGE_MIN_FREE_BYTES / 1024**3,
+    )
+    modality_export.add_argument("--source-storage-id", default="hot.local")
+    modality_export.add_argument("--target-storage-id", default="cold.archive")
+    modality_export.add_argument(
+        "--allow-legacy-source",
+        action="store_true",
+        help=(
+            "Allow legacy dataset metadata only for source-preserving export; "
+            "the tactile graph still requires exact inventory/hash and reader checks."
+        ),
+    )
+    modality_export.add_argument(
+        "--legacy-scan-payload-hashes",
+        action="store_true",
+        help=(
+            "Break-glass legacy export mode: hash actual payload bytes instead "
+            "of trusting stale sealed hashes. Requires --allow-legacy-source."
+        ),
+    )
+    modality_export.add_argument("--plan-hash", default="")
+    modality_export.add_argument("--confirm-dataset-fingerprint", default="")
+    modality_export.add_argument(
+        "--confirm-no-active-readers",
+        action="store_true",
+        help=(
+            "Required with --apply until all external readers participate in a "
+            "shared dataset lease."
+        ),
+    )
+    modality_export.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Copy and verify the frozen proposal without retiring or renaming "
+            "any hot artifact. Without this flag the command is read-only."
+        ),
+    )
+    modality_export.set_defaults(func=_cmd_modality_export)
+
+    modality_detach = subparsers.add_parser(
+        "modality-detach",
+        help=(
+            "Plan or transactionally export, restore-drill, and retire tactile "
+            "payloads. Apply requires a distinct filesystem and frozen confirmations."
+        ),
+    )
+    modality_detach.add_argument("dataset_root")
+    modality_detach.add_argument("--cold-root", required=True)
+    modality_detach.add_argument("--modality", choices=("tactile",), default="tactile")
+    modality_detach.add_argument(
+        "--detach-scope",
+        choices=("payload-only", "whole-prefix"),
+        default="payload-only",
+        help=(
+            "Retain hot manifests (payload-only, compatibility default) or "
+            "transactionally detach the complete tactile/ tree (whole-prefix)."
+        ),
+    )
+    modality_detach.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MODALITY_STORAGE_MIN_FREE_BYTES / 1024**3,
+    )
+    modality_detach.add_argument("--source-storage-id", default="hot.local")
+    modality_detach.add_argument("--target-storage-id", default="cold.archive")
+    modality_detach.add_argument("--plan-hash", default="")
+    modality_detach.add_argument("--confirm-dataset-fingerprint", default="")
+    modality_detach.add_argument(
+        "--confirm-no-active-readers",
+        action="store_true",
+        help=(
+            "Required with --apply until all external readers participate in a "
+            "shared dataset lease."
+        ),
+    )
+    modality_detach.add_argument(
+        "--allow-legacy-hardlinked-source",
+        action="store_true",
+        help=(
+            "Break-glass support for historical datasets whose tactile paths "
+            "share inodes. The default remains fail-closed; apply still requires "
+            "an independent verified cold copy and restore drill before unlinking "
+            "only this dataset's paths."
+        ),
+    )
+    modality_detach.add_argument(
+        "--legacy-scan-payload-hashes",
+        action="store_true",
+        help=(
+            "Break-glass legacy detach mode: hash actual payload bytes instead "
+            "of trusting stale sealed hashes. Requires "
+            "--allow-legacy-hardlinked-source."
+        ),
+    )
+    modality_detach.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply exactly the preceding proposal; otherwise this command is read-only.",
+    )
+    modality_detach.set_defaults(func=_cmd_modality_detach)
+
+    modality_move = subparsers.add_parser(
+        "modality-move",
+        help=(
+            "Safely move the complete tactile/ module to cold storage with a "
+            "resumable, verified transfer. Re-run the same command after interruption."
+        ),
+    )
+    modality_move.add_argument("dataset_root")
+    modality_move.add_argument("--cold-root", required=True)
+    modality_move.add_argument("--modality", choices=("tactile",), default="tactile")
+    modality_move.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MODALITY_STORAGE_MIN_FREE_BYTES / 1024**3,
+    )
+    modality_move.add_argument("--source-storage-id", default="hot.local")
+    modality_move.add_argument("--target-storage-id", default="cold.archive")
+    modality_move.add_argument(
+        "--confirm-no-active-readers",
+        action="store_true",
+        help="Required with --apply; confirms the dataset is not being read.",
+    )
+    modality_move.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Execute a freshly frozen whole-prefix plan. Without this flag the "
+            "command remains a read-only proposal."
+        ),
+    )
+    modality_move.set_defaults(func=_cmd_modality_move)
+
+    modality_rehydrate = subparsers.add_parser(
+        "modality-rehydrate",
+        help=(
+            "Plan or transactionally rebuild a complete hot tactile tree from a "
+            "verified cold inventory."
+        ),
+    )
+    modality_rehydrate.add_argument("dataset_root")
+    modality_rehydrate.add_argument("--cold-root", required=True)
+    modality_rehydrate.add_argument("--modality", choices=("tactile",), default="tactile")
+    modality_rehydrate.add_argument("--inventory-hash", required=True)
+    modality_rehydrate.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MODALITY_STORAGE_MIN_FREE_BYTES / 1024**3,
+    )
+    modality_rehydrate.add_argument("--source-storage-id", default="cold.archive")
+    modality_rehydrate.add_argument("--target-storage-id", default="hot.local")
+    modality_rehydrate.add_argument("--plan-hash", default="")
+    modality_rehydrate.add_argument("--confirm-dataset-fingerprint", default="")
+    modality_rehydrate.add_argument(
+        "--confirm-no-active-readers",
+        action="store_true",
+        help=(
+            "Required with --apply until all external readers participate in a "
+            "shared dataset lease."
+        ),
+    )
+    modality_rehydrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply exactly the preceding proposal; otherwise this command is read-only.",
+    )
+    modality_rehydrate.set_defaults(func=_cmd_modality_rehydrate)
+
     workspace_shift = subparsers.add_parser(
         "umi-workspace-near-boundary-shift",
         help=(
@@ -657,6 +1037,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tactile_zstd.set_defaults(func=_cmd_tactile_recompress_zstd)
 
+    tactile_maintain = subparsers.add_parser(
+        "tactile-maintain",
+        help=(
+            "State-aware dry-run/apply interface for mixed raw, compressed, "
+            "and detached tactile datasets."
+        ),
+    )
+    tactile_maintain.add_argument("dataset_root")
+    tactile_maintain.add_argument(
+        "--target",
+        choices=TACTILE_MAINTENANCE_TARGETS,
+        default=TACTILE_TARGET_COMPRESSED_HOT,
+        help=(
+            "Desired physical state: hot keeps existing encodings, compressed-hot "
+            "losslessly converts only raw streams, detached compresses raw streams "
+            "then safely moves the whole tactile prefix."
+        ),
+    )
+    tactile_maintain.add_argument(
+        "--cold-root",
+        default="",
+        help="Required when the target needs detach or rehydrate.",
+    )
+    tactile_maintain.add_argument("--level", type=int, default=1)
+    tactile_maintain.add_argument("--chunk-frames", type=int, default=8)
+    tactile_maintain.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_BYTES / 1024**3,
+    )
+    tactile_maintain.add_argument(
+        "--backend", choices=("auto", "python", "cli"), default="auto"
+    )
+    tactile_maintain.add_argument(
+        "--compress-before-detach",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Losslessly compress remaining raw streams before whole-prefix detach.",
+    )
+    tactile_maintain.add_argument(
+        "--confirm-no-active-readers",
+        action="store_true",
+        help="Required when apply performs detach or rehydrate.",
+    )
+    tactile_maintain.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the planned target; without this flag the command is read-only.",
+    )
+    tactile_maintain.set_defaults(func=_cmd_tactile_maintain)
+
     tactile_compact = subparsers.add_parser(
         "tactile-compact",
         help=(
@@ -711,6 +1142,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required with --apply; source/reference files are never replaced.",
     )
     hardlink_dedupe.set_defaults(func=_cmd_hardlink_dedupe)
+
+    writing_stage1_pilot = subparsers.add_parser(
+        "writing-stage1-pilot",
+        help=(
+            "Preflight or publish the dataset-local 7.23/7.24 v2.3 "
+            "writing-stage1 annotation pilot."
+        ),
+    )
+    configure_writing_stage1_pilot(writing_stage1_pilot)
     return parser
 
 

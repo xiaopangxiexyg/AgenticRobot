@@ -32,10 +32,21 @@ from dataset_contracts.layout import episode_id_from_index
 from dataset_contracts.policy_artifact import policy_artifact_from_metadata
 from dataset_contracts.pose_frames import load_pose_frame_contract
 from dataset_contracts.pose_training import POSE_TRAINING_ORIGIN_NATIVE_V23
-from dataset_contracts.v22 import DEXTELEOP_DATASET_SCHEMA_V22, policy_io_layout_from_metadata
+from dataset_contracts.v22 import (
+    DEXTELEOP_DATASET_SCHEMA_V22,
+    policy_io_layout_from_metadata,
+)
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from deployments.client import load_policy_artifact
 from project_paths import repo_path
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    ArtifactWriteResolution,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
 from robot_motion.rm65.assets import require_asset_path
 from robot_motion.action import (
     ActionComponentCatalog,
@@ -64,9 +75,13 @@ from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
     build_deployment_observation,
 )
-from robot_motion.deploy.observation_view import default_deploy_policy_observation_contract
+from robot_motion.deploy.observation_view import (
+    default_deploy_policy_observation_contract,
+)
 from robot_motion.deploy.next_step import sync_queue_preserves_same_chunk_successor
-from robot_motion.deploy.pose_adapter import convert_policy_absolute_vector_to_runtime_raw
+from robot_motion.deploy.pose_adapter import (
+    convert_policy_absolute_vector_to_runtime_raw,
+)
 from robot_motion.deploy.runtime import (
     PolicyDeployRuntime,
     PolicyDeployRuntimeConfig,
@@ -104,18 +119,34 @@ from robot_motion.rm65 import (
     RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
     RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
+    RM65_QREF_ACCELERATION_COMFORT_75_V1,
+    RM65_QREF_ACCELERATION_HARD_V1,
+    RM65_QREF_ACCELERATION_PROFILE_CHOICES,
     build_rm65_pose_lift_ik_tuning,
     resolve_rm65_pose_lift_profile,
+    resolve_rm65_qref_acceleration_profile,
 )
 from robot_motion.position_control import (
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
     DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
     DEFAULT_POSITION_VELOCITY_RAMP_SEC,
+    POSITION_PLAN_SPLICE_DYNAMICS_OFF,
+    POSITION_PLAN_SPLICE_DYNAMICS_PROFILE_CHOICES,
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_CHOICES,
+    PositionSourcePlanCut,
+    PositionStreamStartAcquisitionConfig,
+    resolve_position_plan_splice_dynamics_config,
 )
-from robot_motion.pose_frame_profiles import default_rm65_workspace_near_boundary_runtime_pose_frame_contract
-from robot_motion.runtime import TeleopCommand
+from robot_motion.pose_frame_profiles import (
+    default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
+)
+from robot_motion.runtime import (
+    TeleopCommand,
+    available_cpu_ids,
+    cpu_thread_sibling_ids,
+    exclude_cpu_ids_from_current_process,
+)
 from robot_motion.runtime.causal_history import CausalSnapshotHistory
 from robot_motion.runtime_gate import IKActionChunkGate
 
@@ -123,6 +154,8 @@ from ..backends.arms import (
     DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
     RM65ArmBackend,
     RM65ArmBackendConfig,
+    RM65_BACKGROUND_TARGET_ADMISSION_CHOICES,
+    RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
     RM65ImpedanceArmBackend,
     RM65ImpedanceArmBackendConfig,
 )
@@ -132,6 +165,7 @@ from ..action.replay_proposal import (
     replay_adapter_debug_payload,
 )
 from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
+from .position_plan_cut import DeploymentPositionPlanCutDetector
 from .rtc_frontend import RtcPolicyShadowConfig, RtcPolicyShadowFrontend
 from .rtc_debug import (
     RTC_DEBUG_LEVEL_OFF,
@@ -186,8 +220,12 @@ from ..defaults import (
 from ..execution_mode_contract import validate_dataset_arm_control_mode
 from ..hand_mapping import parse_tactile_regions
 from ..interfaces import EffectorBackend
+from ..log_utils import ChangeGate, log_event as console_log_event
 from ..position_control import (
     ARM_EXECUTION_PROFILE_CHOICES,
+    CONTINUOUS_WAYPOINT_WORKER_ISOLATION_CHOICES,
+    CONTINUOUS_WAYPOINT_WORKER_PROCESS,
+    CONTINUOUS_WAYPOINT_WORKER_THREAD,
     POSITION_15_60_120HZ_PROFILE_NAME,
     PositionDeployExecutor,
     PositionDeployExecutorConfig,
@@ -201,16 +239,32 @@ from ..position_control import (
     resolve_real_arm_execution_config,
 )
 from ..sources.camera import (
+    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+    REALSENSE_STARTUP_WARMUP_POLICIES,
     RealSenseRGBCameraConfig,
     RealSenseRGBSource,
     load_realsense_camera_config_map,
 )
+from ..real_teleop.camera_runtime import (
+    CAMERA_START_STAGGER_SEC as REAL_TELEOP_CAMERA_START_STAGGER_SEC,
+    CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES,
+    CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
+    CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC,
+    CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
+    CameraStartupFreshnessGate,
+    _start_camera_sources_best_effort as _start_real_teleop_camera_sources_best_effort,
+    apply_real_teleop_camera_startup_defaults,
+)
+from ..real_teleop.status_payloads import _build_camera_status
 from ..tactile_visualizer import (
     TactileUVVisualizer,
     TactileVisualizerConfig,
     tactile_by_side_from_hand_states,
 )
 from .dispatch import (
+    POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
+    POSITION_REFERENCE_DISPATCH_AUDIT_POST,
+    dispatch_position_reference_command,
     dispatch_teleop_command,
     require_arm_backends_ready_for_position_dispatch,
 )
@@ -226,6 +280,13 @@ from .impedance_force_guard import (
     ImpedanceForceGuardFault,
     ImpedanceForceGuardMonitor,
     bimanual_emergency_stop,
+)
+from ..real_teleop.position_force_guard import (
+    POSITION_FORCE_SOURCES,
+    PositionForceGuardFault,
+    PositionForceGuardMonitor,
+    PositionForceGuardTripped,
+    position_force_guard_config,
 )
 from deployments.client.policy import load_policy
 from deployments.client.rtc_executor import (
@@ -246,9 +307,7 @@ from .safety_shadow import evaluate_policy_legacy_aligned_safety
 from .startup_init import StartupInitializer, resolve_startup_init_action
 
 
-DEFAULT_CAMERA_CONFIG_PATH = (
-    DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
-)
+DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 # Deployment runs the vision policy at roughly 15 Hz on the RM65 profile.  A
 # 100 ms observation gate leaves only one half-frame of jitter budget at that
 # rate, so keep a deployment-specific margin without changing collection's
@@ -276,7 +335,10 @@ DEPLOY_ARM_STEP_DT_STALL_RESET_SEC = 0.25
 DEPLOY_MAX_ARM_JOINT_STEP_RAD = float(np.deg2rad(6.0))
 RM65_ARM_CONTROL_MODE_POSITION = "position"
 RM65_ARM_CONTROL_MODE_IMPEDANCE = "impedance"
-RM65_ARM_CONTROL_MODES = (RM65_ARM_CONTROL_MODE_POSITION, RM65_ARM_CONTROL_MODE_IMPEDANCE)
+RM65_ARM_CONTROL_MODES = (
+    RM65_ARM_CONTROL_MODE_POSITION,
+    RM65_ARM_CONTROL_MODE_IMPEDANCE,
+)
 
 
 @dataclass(frozen=True)
@@ -290,7 +352,9 @@ class _PreparedActionExecution:
 
 
 def normalize_rm65_arm_control_mode(value: object) -> str:
-    text = str(value or RM65_ARM_CONTROL_MODE_POSITION).strip().lower().replace("-", "_")
+    text = (
+        str(value or RM65_ARM_CONTROL_MODE_POSITION).strip().lower().replace("-", "_")
+    )
     aliases = {
         "pos": RM65_ARM_CONTROL_MODE_POSITION,
         "movej": RM65_ARM_CONTROL_MODE_POSITION,
@@ -302,7 +366,9 @@ def normalize_rm65_arm_control_mode(value: object) -> str:
     }
     mode = aliases.get(text, text)
     if mode not in RM65_ARM_CONTROL_MODES:
-        raise ValueError(f"Unsupported RM65 arm control mode {value!r}; expected one of {RM65_ARM_CONTROL_MODES}.")
+        raise ValueError(
+            f"Unsupported RM65 arm control mode {value!r}; expected one of {RM65_ARM_CONTROL_MODES}."
+        )
     return mode
 
 
@@ -310,7 +376,10 @@ def effective_arm_control_hz(args: argparse.Namespace) -> float:
     value = getattr(args, "arm_control_hz", None)
     if value is not None:
         return float(value)
-    if normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None)) == RM65_ARM_CONTROL_MODE_IMPEDANCE:
+    if (
+        normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
+        == RM65_ARM_CONTROL_MODE_IMPEDANCE
+    ):
         return float(DEFAULT_RM65_ARM_CONTROL_HZ)
     return float(DEFAULT_RM65_POSITION_ARM_CONTROL_HZ)
 
@@ -325,11 +394,30 @@ def effective_position_reference_hz(args: argparse.Namespace) -> float:
     )
 
 
+def _resolve_position_reference_and_command_hz(
+    args: argparse.Namespace,
+    *,
+    backend_control_hz: float,
+) -> tuple[float, float]:
+    """Keep planner-reference and downstream CANFD clocks distinct."""
+
+    reference_hz = effective_position_reference_hz(args)
+    command_hz = (
+        float(backend_control_hz)
+        if effective_arm_canfd_follow(args)
+        else float(reference_hz)
+    )
+    return float(reference_hz), float(command_hz)
+
+
 def effective_arm_canfd_follow(args: argparse.Namespace) -> bool:
     value = getattr(args, "arm_canfd_follow", None)
     if value is not None:
         return bool(value)
-    return normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None)) == RM65_ARM_CONTROL_MODE_POSITION
+    return (
+        normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
+        == RM65_ARM_CONTROL_MODE_POSITION
+    )
 
 
 class NonBlockingKeyboard:
@@ -380,6 +468,112 @@ _DEBUG_REDACT_KEYS = {
     "secret",
 }
 
+DEPLOY_DEBUG_PAYLOAD_COMPACT = "compact"
+DEPLOY_DEBUG_PAYLOAD_FULL = "full"
+DEPLOY_DEBUG_PAYLOAD_MODES = (
+    DEPLOY_DEBUG_PAYLOAD_COMPACT,
+    DEPLOY_DEBUG_PAYLOAD_FULL,
+)
+
+_DEBUG_EFFECTOR_METADATA_KEYS = (
+    "source",
+    "action_source",
+    "deploy_source",
+    "policy_name",
+    "action_space",
+    "action_timestamp",
+    "action_pose_source",
+    "position_reference_sequence",
+    "position_reference_scheduled_monotonic_time",
+    "position_reference_query_monotonic_time",
+    "position_reference_emitted_monotonic_time",
+    "position_reference_emitted_timestamp",
+    "position_reference_wall_time",
+    "position_reference_hz",
+    "position_command_hz",
+    "position_transport_target_sequence",
+    "position_transport_target_source",
+    "position_transport_target_monotonic_time",
+    "position_transport_target_wall_time",
+    "position_transport_planner",
+    "position_collision_status",
+    "position_collision_distance_m",
+    "position_collision_hold",
+    "position_collision_certification_status",
+    "position_collision_time_budget_exceeded",
+    "position_collision_modification_reasons",
+    "position_collision_pair_count",
+    "position_collision_planner",
+    "position_collision_planner_sequence",
+    "position_collision_scene_profile",
+    "position_collision_geometry_model",
+    "position_endpoint_collision_checked",
+    "position_endpoint_collision_passed",
+    "position_collision_frame_total_ms",
+    "position_collision_horizon_plan_ms",
+    "position_collision_precompute_submit_ms",
+    "position_collision_selection_ms",
+    "position_collision_solve_ms",
+    "position_collision_validation_ms",
+    "position_collision_endpoint_fk_ms",
+    "position_collision_shadow_metadata_ms",
+    "position_trajectory_policy_mode",
+    "position_trajectory_policy_reasons",
+    "position_trajectory_policy_speed_scale",
+    "position_trajectory_policy_quick_stop",
+    "position_lookahead_available_at_emit",
+    "position_lookahead_used",
+    "position_causal",
+    "position_causal_delay_periods",
+    "position_causal_output_lag_sec",
+    "position_interpolation_alpha",
+    "position_interpolation_alpha_by_modality",
+    "position_parent_source_indices",
+    "position_parent_source_indices_by_modality",
+    "position_parent_source_timestamps_by_modality",
+    "backend_final_action_source",
+    "backend_final_target_qpos",
+    "solver_output_qpos",
+    "rm65_background_target_admission_timing",
+    "rm65_background_command_phase_timing",
+    "target_pose_available",
+    "target_pose_base",
+    "target_pose_controlled_frame",
+    "target_pose_tcp_base",
+    "singularity_metadata",
+)
+
+_DEBUG_LAST_COMMAND_METADATA_KEYS = (
+    "source",
+    "action_source",
+    "deploy_source",
+    "position_reference_sequence",
+    "position_reference_scheduled_monotonic_time",
+    "position_reference_emitted_monotonic_time",
+    "position_reference_hz",
+    "position_command_hz",
+    "position_transport_target_sequence",
+    "position_transport_target_source",
+    "position_transport_planner",
+    "position_collision_status",
+    "position_collision_distance_m",
+    "position_collision_hold",
+    "position_collision_certification_status",
+    "position_collision_time_budget_exceeded",
+    "position_collision_frame_total_ms",
+    "position_collision_horizon_plan_ms",
+    "position_collision_solve_ms",
+    "position_collision_validation_ms",
+    "position_trajectory_policy_mode",
+    "position_trajectory_policy_reasons",
+    "position_trajectory_policy_speed_scale",
+    "position_trajectory_policy_quick_stop",
+    "backend_final_action_source",
+    "backend_final_target_qpos",
+    "rm65_background_target_admission_timing",
+    "rm65_background_command_phase_timing",
+)
+
 
 def _debug_redact(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -394,6 +588,285 @@ def _debug_redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_debug_redact(item) for item in value]
     return value
+
+
+def _debug_compact_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_items: int = 32,
+) -> Any:
+    """Bound passive debug values before they reach JSON serialization.
+
+    Deployment debug runs beside a deadline-sensitive Python reference worker.
+    Keeping bounds here avoids repeatedly walking artifact-sized policy metadata
+    while retaining the scalar timing and identity fields used for diagnosis.
+    """
+
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        if value.size <= 64:
+            return value.copy()
+        return {
+            "omitted": True,
+            "reason": "compact_deploy_debug_array",
+            "shape": tuple(int(item) for item in value.shape),
+            "dtype": str(value.dtype),
+            "size": int(value.size),
+        }
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, str):
+        if len(value) <= 512:
+            return value
+        return value[:512] + f"<... {len(value) - 512} chars omitted>"
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Mapping):
+        if depth >= 3:
+            return {
+                "omitted": True,
+                "reason": "compact_deploy_debug_depth",
+                "type": "mapping",
+                "size": int(len(value)),
+            }
+        items = list(value.items())
+        payload = {
+            str(key): _debug_compact_value(
+                item,
+                depth=depth + 1,
+                max_items=max_items,
+            )
+            for key, item in items[:max_items]
+        }
+        if len(items) > max_items:
+            payload["_debug_omitted_item_count"] = int(len(items) - max_items)
+        return payload
+    if isinstance(value, (list, tuple)):
+        if depth >= 3:
+            return {
+                "omitted": True,
+                "reason": "compact_deploy_debug_depth",
+                "type": "sequence",
+                "size": int(len(value)),
+            }
+        payload = [
+            _debug_compact_value(
+                item,
+                depth=depth + 1,
+                max_items=max_items,
+            )
+            for item in list(value)[:max_items]
+        ]
+        if len(value) > max_items:
+            payload.append(
+                {"_debug_omitted_item_count": int(len(value) - max_items)}
+            )
+        return payload
+    return str(value)
+
+
+def _debug_remote_policy_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    server = value.get("server")
+    server_identity: dict[str, Any] = {}
+    if isinstance(server, Mapping):
+        for key in (
+            "protocol_version",
+            "deploy_schema_version",
+            "model_id",
+            "normalization_hash",
+            "policy_io_layout_hash",
+            "pose_action_chunk_contract_hash",
+            "pose_frame_contract_hashes",
+        ):
+            if key in server:
+                server_identity[key] = _debug_compact_value(server.get(key))
+    payload = {
+        key: _debug_compact_value(value.get(key), max_items=32)
+        for key in (
+            "action_key",
+            "action_discrete_key",
+            "server_summary",
+            "validation_warnings",
+            "response_keys",
+            "server_timing",
+            "policy_timing",
+        )
+        if key in value
+    }
+    if server_identity:
+        payload["server_identity"] = server_identity
+    payload["_debug_omitted_server_detail"] = bool(isinstance(server, Mapping))
+    return payload
+
+
+def _debug_metadata_summary(
+    metadata: Any,
+    *,
+    full_payload: bool,
+    selected_keys: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(metadata, Mapping):
+        return {}
+    if full_payload:
+        return dict(metadata)
+
+    keys = (
+        tuple(str(key) for key in metadata)
+        if selected_keys is None
+        else selected_keys
+    )
+    payload: dict[str, Any] = {}
+    for key in keys:
+        if key not in metadata:
+            continue
+        if key == "remote_policy":
+            payload[key] = _debug_remote_policy_summary(metadata.get(key))
+        else:
+            payload[key] = _debug_compact_value(metadata.get(key), max_items=32)
+
+    omitted = [str(key) for key in metadata if str(key) not in payload]
+    if omitted:
+        payload["_debug_omitted_metadata"] = {
+            "count": int(len(omitted)),
+            "keys": omitted[:32],
+        }
+    return payload
+
+
+def _debug_background_streaming_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    keys = (
+        "enabled",
+        "healthy",
+        "health_reasons",
+        "thread_alive",
+        "target_active",
+        "target_sequence",
+        "target_age_sec",
+        "target_stale",
+        "fault",
+        "fault_count",
+        "actual_hz",
+        "last_call_ms",
+        "last_deadline_lag_ms",
+        "last_send_dt_sec",
+        "deadline_miss_count",
+        "low_rate_count",
+        "target_admission_mode",
+        "last_target_admission_timing",
+        "inflight_target_preemption_count",
+        "last_inflight_target_preemption",
+    )
+    return {
+        key: _debug_compact_value(value.get(key), max_items=16)
+        for key in keys
+        if key in value
+    }
+
+
+def _debug_backend_dispatch_by_effector_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload: dict[str, Any] = {}
+    for effector_name, raw_item in value.items():
+        if not isinstance(raw_item, Mapping):
+            continue
+        keys = (
+            "accepted",
+            "rewritten",
+            "backend_ready",
+            "operation",
+            "status",
+            "result_code",
+            "singularity_gate_status",
+            "dispatch_timing",
+            "target_admission_timing",
+            "command_phase_timing",
+            "expected_qpos",
+            "requested_qpos",
+            "final_qpos",
+            "backend_final_target_qpos",
+        )
+        item = {
+            key: _debug_compact_value(raw_item.get(key), max_items=16)
+            for key in keys
+            if key in raw_item
+        }
+        if "background_streaming" in raw_item:
+            item["background_streaming"] = _debug_background_streaming_summary(
+                raw_item.get("background_streaming")
+            )
+        payload[str(effector_name)] = item
+    return payload
+
+
+def _debug_backend_group_health_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload = {
+        key: _debug_compact_value(value.get(key), max_items=16)
+        for key in ("ready", "require_background_target", "required_sides", "timing")
+        if key in value
+    }
+    raw_sides = value.get("sides")
+    if isinstance(raw_sides, Mapping):
+        payload["sides"] = {}
+        for side, raw_item in raw_sides.items():
+            if not isinstance(raw_item, Mapping):
+                continue
+            payload["sides"][str(side)] = {
+                key: _debug_compact_value(raw_item.get(key), max_items=16)
+                for key in (
+                    "ready",
+                    "reasons",
+                    "backend_ready",
+                    "state_error",
+                    "hardware_ready",
+                    "emergency_stopped",
+                    "send_result_code",
+                    "warnings",
+                    "timing",
+                )
+                if key in raw_item
+            }
+    return payload
+
+
+def _debug_position_executor_event_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    compact = dict(payload)
+    collision_debug = compact.get("position_collision_debug")
+    if isinstance(collision_debug, Mapping):
+        compact["position_collision_debug"] = {
+            "omitted": True,
+            "reason": "compact_deploy_debug_redundant_detail",
+            "available_keys": tuple(str(key) for key in collision_debug),
+            "q_ik_raw_by_side": _debug_compact_value(
+                collision_debug.get("q_ik_raw_by_side"),
+                max_items=16,
+            ),
+            "q_ref_by_side": _debug_compact_value(
+                collision_debug.get("q_ref_by_side"),
+                max_items=16,
+            ),
+        }
+    if "position_arm_backend_dispatch_by_effector" in compact:
+        compact["position_arm_backend_dispatch_by_effector"] = (
+            _debug_backend_dispatch_by_effector_summary(
+                compact.get("position_arm_backend_dispatch_by_effector")
+            )
+        )
+    if "position_arm_backend_group_health" in compact:
+        compact["position_arm_backend_group_health"] = (
+            _debug_backend_group_health_summary(
+                compact.get("position_arm_backend_group_health")
+            )
+        )
+    return compact
 
 
 def _debug_args_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -484,7 +957,9 @@ def _debug_hand_by_side_from_vector(
     return hands
 
 
-def _debug_arm_joint_targets(action: Any, active_sides: tuple[str, ...]) -> dict[str, np.ndarray]:
+def _debug_arm_joint_targets(
+    action: Any, active_sides: tuple[str, ...]
+) -> dict[str, np.ndarray]:
     targets = getattr(action, "arm_joint_targets", {}) or {}
     if not isinstance(targets, Mapping):
         return {}
@@ -496,14 +971,24 @@ def _debug_arm_joint_targets(action: Any, active_sides: tuple[str, ...]) -> dict
     return resolved
 
 
-def _debug_action_summary(action: Any, active_sides: tuple[str, ...]) -> dict[str, Any] | None:
+def _debug_action_summary(
+    action: Any,
+    active_sides: tuple[str, ...],
+    *,
+    full_payload: bool = False,
+) -> dict[str, Any] | None:
     vector = _debug_action_vector(action)
     if vector is None:
         return None
     metadata = getattr(action, "metadata", {})
     return {
-        "source": str(metadata.get("source", "")) if isinstance(metadata, Mapping) else "",
-        "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+        "source": (
+            str(metadata.get("source", "")) if isinstance(metadata, Mapping) else ""
+        ),
+        "metadata": _debug_metadata_summary(
+            metadata,
+            full_payload=full_payload,
+        ),
         "vector": vector,
         "arm_pose_by_side": _debug_pose_by_side_from_vector(vector, active_sides),
         "arm_joint_targets_by_side": _debug_arm_joint_targets(action, active_sides),
@@ -551,14 +1036,19 @@ def _debug_pose_delta_by_side(
     return deltas
 
 
-def _debug_command_arm_pose_by_side(command: Any, active_sides: tuple[str, ...]) -> dict[str, np.ndarray]:
+def _debug_command_arm_pose_by_side(
+    command: Any, active_sides: tuple[str, ...]
+) -> dict[str, np.ndarray]:
     if command is None:
         return {}
     commands = getattr(command, "commands", {}) or {}
     poses: dict[str, np.ndarray] = {}
     for side in active_sides:
         effector_command = commands.get(f"{side}_arm")
-        if effector_command is None or getattr(effector_command, "command_type", "") != "cartesian_pose":
+        if (
+            effector_command is None
+            or getattr(effector_command, "command_type", "") != "cartesian_pose"
+        ):
             continue
         metadata = getattr(effector_command, "metadata", {}) or {}
         pose = None
@@ -573,7 +1063,12 @@ def _debug_command_arm_pose_by_side(command: Any, active_sides: tuple[str, ...])
     return poses
 
 
-def _debug_command_summary(command: Any, active_sides: tuple[str, ...]) -> dict[str, Any] | None:
+def _debug_command_summary(
+    command: Any,
+    active_sides: tuple[str, ...],
+    *,
+    full_payload: bool = False,
+) -> dict[str, Any] | None:
     if command is None:
         return None
     commands = getattr(command, "commands", {}) or {}
@@ -585,7 +1080,13 @@ def _debug_command_summary(command: Any, active_sides: tuple[str, ...]) -> dict[
             "side": getattr(effector_command, "side", None),
             "frame_name": getattr(effector_command, "frame_name", None),
             "value": getattr(effector_command, "value", None),
-            "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+            "metadata": _debug_metadata_summary(
+                metadata,
+                full_payload=full_payload,
+                selected_keys=(
+                    None if full_payload else _DEBUG_EFFECTOR_METADATA_KEYS
+                ),
+            ),
         }
         if item["command_type"] == "cartesian_pose":
             item["target_xyzquat"] = _debug_xyzquat(
@@ -594,17 +1095,26 @@ def _debug_command_summary(command: Any, active_sides: tuple[str, ...]) -> dict[
                 else None
             )
             if item["target_xyzquat"] is None:
-                item["target_xyzquat"] = _debug_xyzquat(getattr(effector_command, "value", None))
+                item["target_xyzquat"] = _debug_xyzquat(
+                    getattr(effector_command, "value", None)
+                )
         command_payload[str(effector_name)] = item
     return {
         "timestamp": getattr(command, "timestamp", None),
-        "metadata": dict(getattr(command, "metadata", {}) or {}),
+        "metadata": _debug_metadata_summary(
+            getattr(command, "metadata", {}) or {},
+            full_payload=full_payload,
+        ),
         "commands": command_payload,
         "arm_pose_by_side": _debug_command_arm_pose_by_side(command, active_sides),
     }
 
 
-def _debug_arm_state_summary(states: Mapping[str, Mapping[str, Any]] | None) -> dict[str, Any]:
+def _debug_arm_state_summary(
+    states: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    full_payload: bool = False,
+) -> dict[str, Any]:
     if not states:
         return {}
     keys = (
@@ -616,6 +1126,7 @@ def _debug_arm_state_summary(states: Mapping[str, Mapping[str, Any]] | None) -> 
         "last_command_timestamp",
         "hardware_pose_6d",
         "hardware_refresh_time",
+        "hardware_read_phase_timing",
         "hardware_result_code",
         "hardware_result_text",
         "hardware_arm_err",
@@ -639,6 +1150,23 @@ def _debug_arm_state_summary(states: Mapping[str, Mapping[str, Any]] | None) -> 
     payload: dict[str, Any] = {}
     for side, state in states.items():
         side_payload = {key: state.get(key) for key in keys if key in state}
+        if not full_payload:
+            last_command = side_payload.get("last_command")
+            if isinstance(last_command, Mapping):
+                last_command_payload = dict(last_command)
+                last_command_payload["metadata"] = _debug_metadata_summary(
+                    last_command.get("metadata", {}),
+                    full_payload=False,
+                    selected_keys=_DEBUG_LAST_COMMAND_METADATA_KEYS,
+                )
+                last_command_payload.pop("execution_work_item", None)
+                side_payload["last_command"] = last_command_payload
+            for key in ("ik_metadata", "singularity_metadata"):
+                if key in side_payload:
+                    side_payload[key] = _debug_compact_value(
+                        side_payload[key],
+                        max_items=32,
+                    )
         pose = _debug_xyzquat(side_payload.get("current_tcp_pose"))
         if pose is not None:
             side_payload["current_tcp_xyzquat"] = pose
@@ -646,7 +1174,9 @@ def _debug_arm_state_summary(states: Mapping[str, Mapping[str, Any]] | None) -> 
     return payload
 
 
-def _debug_state_pose_by_side(states: Mapping[str, Mapping[str, Any]] | None) -> dict[str, np.ndarray]:
+def _debug_state_pose_by_side(
+    states: Mapping[str, Mapping[str, Any]] | None
+) -> dict[str, np.ndarray]:
     poses: dict[str, np.ndarray] = {}
     if not states:
         return poses
@@ -657,7 +1187,9 @@ def _debug_state_pose_by_side(states: Mapping[str, Mapping[str, Any]] | None) ->
     return poses
 
 
-def _debug_backend_arm_states(backends: Mapping[str, EffectorBackend]) -> dict[str, dict[str, Any]]:
+def _debug_backend_arm_states(
+    backends: Mapping[str, EffectorBackend]
+) -> dict[str, dict[str, Any]]:
     states: dict[str, dict[str, Any]] = {}
     for side, backend in backends.items():
         try:
@@ -676,7 +1208,9 @@ def _debug_backend_limits(
     for side, backend in backends.items():
         get_effective_step = getattr(backend, "get_effective_max_joint_step", None)
         try:
-            effective_step = get_effective_step(now=now) if callable(get_effective_step) else None
+            effective_step = (
+                get_effective_step(now=now) if callable(get_effective_step) else None
+            )
         except Exception as exc:  # noqa: BLE001
             effective_step = None
             error = f"{type(exc).__name__}: {exc}"
@@ -687,11 +1221,18 @@ def _debug_backend_limits(
             "control_dt_sec": float(config.control_dt),
             "max_angvel_rad_s": tuple(float(value) for value in config.max_angvel),
             "effective_max_joint_step_rad": effective_step,
-            "background_streaming_enabled": bool(getattr(config, "background_streaming_enabled", False)),
+            "background_streaming_enabled": bool(
+                getattr(config, "background_streaming_enabled", False)
+            ),
             "background_streaming_hz": (
                 None
                 if getattr(config, "background_streaming_hz", None) is None
                 else float(getattr(config, "background_streaming_hz"))
+            ),
+            "background_streaming_target_admission_mode": getattr(
+                config,
+                "background_streaming_target_admission_mode",
+                None,
             ),
             "canfd_follow": getattr(config, "canfd_follow", None),
             "observation_only": bool(getattr(config, "observation_only", False)),
@@ -701,6 +1242,32 @@ def _debug_backend_limits(
     return limits
 
 
+def canonical_deployment_debug_root(*, now: float | None = None) -> Path:
+    timestamp_time = time.time() if now is None else float(now)
+    local_time = time.localtime(timestamp_time)
+    date_partition = time.strftime("%Y-%m-%d", local_time)
+    stamp = time.strftime("%Y%m%d_%H%M%S", local_time)
+    millis = int((timestamp_time % 1.0) * 1000.0)
+    return RuntimeArtifactLayout.configured().run_dir(
+        kind="policy_deploy",
+        date_partition=date_partition,
+        run_id=f"deploy_{stamp}_{millis:03d}",
+    )
+
+
+def resolve_deployment_debug_root(
+    args: argparse.Namespace,
+    *,
+    now: float | None = None,
+) -> ArtifactWriteResolution:
+    return resolve_artifact_write_path(
+        explicit_path=getattr(args, "debug_dir", None),
+        artifact_layout=getattr(args, "artifact_layout", None),
+        legacy_path=repo_path("teleop_records", "deployment_debug"),
+        canonical_path=canonical_deployment_debug_root(now=now),
+    )
+
+
 class DeploymentDebugLogger:
     def __init__(
         self,
@@ -708,11 +1275,19 @@ class DeploymentDebugLogger:
         enabled: bool,
         root_dir: Path | None,
         active_sides: tuple[str, ...],
+        payload_mode: str = DEPLOY_DEBUG_PAYLOAD_COMPACT,
         flush_every_events: int = 1,
         flush_interval_sec: float = 0.0,
     ):
         self.enabled = bool(enabled)
         self.active_sides = tuple(active_sides)
+        self.payload_mode = str(payload_mode).strip().lower()
+        if self.payload_mode not in DEPLOY_DEBUG_PAYLOAD_MODES:
+            raise ValueError(
+                "payload_mode must be one of "
+                f"{DEPLOY_DEBUG_PAYLOAD_MODES}, got {payload_mode!r}."
+            )
+        self.full_payload = self.payload_mode == DEPLOY_DEBUG_PAYLOAD_FULL
         self.path: Path | None = None
         self._handle: Any = None
         self._lock = threading.RLock()
@@ -730,7 +1305,11 @@ class DeploymentDebugLogger:
         self._last_flush_at = time.monotonic()
         if not self.enabled:
             return
-        debug_root = root_dir if root_dir is not None else repo_path("teleop_records", "deployment_debug")
+        debug_root = (
+            root_dir
+            if root_dir is not None
+            else repo_path("teleop_records", "deployment_debug")
+        )
         debug_root = Path(debug_root).expanduser()
         if not debug_root.is_absolute():
             debug_root = repo_path(debug_root)
@@ -739,7 +1318,9 @@ class DeploymentDebugLogger:
         millis = int((time.time() % 1.0) * 1000.0)
         self.path = debug_root / f"deploy_debug_{stamp}_{millis:03d}.jsonl"
         self._handle = self.path.open("a", encoding="utf-8")
-        print(f"[DeployDebug] writing action/pose debug JSONL to {self.path}", flush=True)
+        print(
+            f"[DeployDebug] writing action/pose debug JSONL to {self.path}", flush=True
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -753,36 +1334,58 @@ class DeploymentDebugLogger:
         with self._lock:
             if not self.enabled or self._handle is None:
                 return
+            event_name = str(event)
+            event_payload = dict(payload)
+            if (
+                not self.full_payload
+                and event_name.startswith("position_executor_")
+            ):
+                event_payload = _debug_position_executor_event_summary(event_payload)
             record = {
-                "event": str(event),
+                "event": event_name,
                 "wall_time": time.time(),
-                **dict(payload),
+                "debug_payload_mode": self.payload_mode,
+                **event_payload,
             }
             try:
-                self._handle.write(
-                    json.dumps(
+                try:
+                    encoded = json.dumps(
                         to_serializable(record),
                         ensure_ascii=True,
                         separators=(",", ":"),
                     )
-                    + "\n"
-                )
+                except Exception as serialization_exc:  # noqa: BLE001
+                    # One newly added passive field must not disable every
+                    # subsequent record.  Preserve a compact failure event and
+                    # continue; actual file I/O failures below remain terminal
+                    # for this observational sink.
+                    encoded = json.dumps(
+                        {
+                            "event": "debug_serialization_error",
+                            "wall_time": time.time(),
+                            "source_event": str(event),
+                            "error_type": type(serialization_exc).__name__,
+                            "error": str(serialization_exc),
+                        },
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    )
+                self._handle.write(encoded + "\n")
                 self._pending_flush_events += 1
                 now = time.monotonic()
-                if (
-                    self._pending_flush_events >= self._flush_every_events
-                    or (
-                        self._flush_interval_sec > 0.0
-                        and now - self._last_flush_at
-                        >= self._flush_interval_sec
-                    )
+                if self._pending_flush_events >= self._flush_every_events or (
+                    self._flush_interval_sec > 0.0
+                    and now - self._last_flush_at >= self._flush_interval_sec
                 ):
                     self._handle.flush()
                     self._pending_flush_events = 0
                     self._last_flush_at = now
             except Exception as exc:  # noqa: BLE001
                 if not self._write_failed:
-                    print(f"[DeployDebug] disabled after write failure: {type(exc).__name__}: {exc}", flush=True)
+                    print(
+                        f"[DeployDebug] disabled after write failure: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                 self._write_failed = True
                 self.enabled = False
 
@@ -809,6 +1412,7 @@ class DeploymentDebugLogger:
             {
                 "args": _debug_args_payload(args),
                 "policy_name": getattr(policy, "name", ""),
+                "debug_payload_mode": self.payload_mode,
                 "policy_metadata": _debug_redact(getattr(policy, "metadata", {})),
                 "active_sides": tuple(active_sides),
                 "arms_enabled": bool(args.arms_enabled),
@@ -826,14 +1430,20 @@ class DeploymentDebugLogger:
                     else None
                 ),
                 "safety_limits": {
-                    "arm_workspace_min": tuple(float(value) for value in args.arm_workspace_min),
-                    "arm_workspace_max": tuple(float(value) for value in args.arm_workspace_max),
+                    "arm_workspace_min": tuple(
+                        float(value) for value in args.arm_workspace_min
+                    ),
+                    "arm_workspace_max": tuple(
+                        float(value) for value in args.arm_workspace_max
+                    ),
                     "max_arm_xyz_step_m": float(args.max_arm_xyz_step_m),
                     "max_arm_rot_step_deg": float(args.max_arm_rot_step_deg),
                     "max_arm_joint_step_rad": float(args.max_arm_joint_step_rad),
                     "max_hand_step": float(args.max_hand_step),
                 },
-                "backend_limits_by_side": _debug_backend_limits(arm_backends, now=time.time()),
+                "backend_limits_by_side": _debug_backend_limits(
+                    arm_backends, now=time.time()
+                ),
             },
         )
 
@@ -876,10 +1486,17 @@ class DeploymentDebugLogger:
                 "ik_recovery_diagnostics": (
                     {}
                     if ik_recovery_diagnostics is None
-                    else {str(side): dict(value) for side, value in ik_recovery_diagnostics.items()}
+                    else {
+                        str(side): dict(value)
+                        for side, value in ik_recovery_diagnostics.items()
+                    }
                 ),
                 "actions": [
-                    _debug_action_summary(action, self.active_sides)
+                    _debug_action_summary(
+                        action,
+                        self.active_sides,
+                        full_payload=self.full_payload,
+                    )
                     for action in actions
                 ],
             },
@@ -925,19 +1542,44 @@ class DeploymentDebugLogger:
         faults: list[str],
         dispatch_error: BaseException | None,
         execution: _PreparedActionExecution | None = None,
+        phase_timing: Mapping[str, Any] | None = None,
     ) -> None:
         if not self.enabled:
             return
-        raw_summary = _debug_action_summary(raw_action, self.active_sides)
-        filtered_summary = _debug_action_summary(getattr(canonical_action, "action", None), self.active_sides)
-        command_summary = _debug_command_summary(getattr(canonical_action, "command", None), self.active_sides)
-        raw_pose = {} if raw_summary is None else raw_summary.get("arm_pose_by_side", {})
-        filtered_pose = {} if filtered_summary is None else filtered_summary.get("arm_pose_by_side", {})
-        command_pose = {} if command_summary is None else command_summary.get("arm_pose_by_side", {})
+        raw_summary = _debug_action_summary(
+            raw_action,
+            self.active_sides,
+            full_payload=self.full_payload,
+        )
+        filtered_summary = _debug_action_summary(
+            getattr(canonical_action, "action", None),
+            self.active_sides,
+            full_payload=self.full_payload,
+        )
+        command_summary = _debug_command_summary(
+            getattr(canonical_action, "command", None),
+            self.active_sides,
+            full_payload=self.full_payload,
+        )
+        raw_pose = (
+            {} if raw_summary is None else raw_summary.get("arm_pose_by_side", {})
+        )
+        filtered_pose = (
+            {}
+            if filtered_summary is None
+            else filtered_summary.get("arm_pose_by_side", {})
+        )
+        command_pose = (
+            {}
+            if command_summary is None
+            else command_summary.get("arm_pose_by_side", {})
+        )
         pre_tcp_pose = _debug_state_pose_by_side(pre_arm_states)
         post_tcp_pose = _debug_state_pose_by_side(post_arm_states)
         command = getattr(canonical_action, "command", None)
-        command_count = len(getattr(command, "commands", {}) or {}) if command is not None else 0
+        command_count = (
+            len(getattr(command, "commands", {}) or {}) if command is not None else 0
+        )
         dispatch_attempted = (
             bool(execution.dispatch_attempted)
             if execution is not None
@@ -952,7 +1594,9 @@ class DeploymentDebugLogger:
                 "send_actions": bool(send_actions),
                 "dispatch_attempted": bool(dispatch_attempted),
                 "dispatch_completed": bool(
-                    execution.dispatch_completed if execution is not None else dispatch_attempted
+                    execution.dispatch_completed
+                    if execution is not None
+                    else dispatch_attempted and dispatch_error is None
                 ),
                 "dispatch_asynchronous": bool(
                     execution.asynchronous if execution is not None else False
@@ -968,22 +1612,48 @@ class DeploymentDebugLogger:
                 "dispatch_error": (
                     None
                     if dispatch_error is None
-                    else {"type": type(dispatch_error).__name__, "message": str(dispatch_error)}
+                    else {
+                        "type": type(dispatch_error).__name__,
+                        "message": str(dispatch_error),
+                    }
                 ),
                 "queue_len_before_pop": int(queue_len_before_pop),
                 "queue_len_after_pop": int(queue_len_after_pop),
                 "faults": list(faults),
+                "phase_timing": _debug_compact_value(
+                    {} if phase_timing is None else phase_timing,
+                    max_items=32,
+                ),
                 "raw_action": raw_summary,
                 "filtered_action": filtered_summary,
                 "command": command_summary,
-                "canonical_metadata": getattr(canonical_action, "metadata", {}),
-                "raw_to_filtered_pose_delta": _debug_pose_delta_by_side(raw_pose, filtered_pose),
-                "filtered_to_command_pose_delta": _debug_pose_delta_by_side(filtered_pose, command_pose),
-                "command_to_pre_tcp_delta": _debug_pose_delta_by_side(command_pose, pre_tcp_pose),
-                "command_to_post_tcp_delta": _debug_pose_delta_by_side(command_pose, post_tcp_pose),
-                "pre_arm_state_by_side": _debug_arm_state_summary(pre_arm_states),
-                "post_arm_state_by_side": _debug_arm_state_summary(post_arm_states),
-                "backend_limits_by_side": _debug_backend_limits(arm_backends, now=time.time()),
+                "canonical_metadata": _debug_metadata_summary(
+                    getattr(canonical_action, "metadata", {}),
+                    full_payload=self.full_payload,
+                ),
+                "raw_to_filtered_pose_delta": _debug_pose_delta_by_side(
+                    raw_pose, filtered_pose
+                ),
+                "filtered_to_command_pose_delta": _debug_pose_delta_by_side(
+                    filtered_pose, command_pose
+                ),
+                "command_to_pre_tcp_delta": _debug_pose_delta_by_side(
+                    command_pose, pre_tcp_pose
+                ),
+                "command_to_post_tcp_delta": _debug_pose_delta_by_side(
+                    command_pose, post_tcp_pose
+                ),
+                "pre_arm_state_by_side": _debug_arm_state_summary(
+                    pre_arm_states,
+                    full_payload=self.full_payload,
+                ),
+                "post_arm_state_by_side": _debug_arm_state_summary(
+                    post_arm_states,
+                    full_payload=self.full_payload,
+                ),
+                "backend_limits_by_side": _debug_backend_limits(
+                    arm_backends, now=time.time()
+                ),
             },
         )
 
@@ -1048,9 +1718,7 @@ class ArmStateReader:
                             measurement_sequence = state.get(
                                 "hardware_measurement_sequence"
                             )
-                            measurement_valid = state.get(
-                                "hardware_measurement_valid"
-                            )
+                            measurement_valid = state.get("hardware_measurement_valid")
                             read_success = state.get("hardware_read_success")
                             sequence_valid = (
                                 measurement_sequence is None
@@ -1083,7 +1751,10 @@ class ArmStateReader:
                         state["current_tcp_pose"] = compute_pose()
                         state["tcp_pose_source"] = "current_qpos_fk"
                 except Exception as exc:  # noqa: BLE001
-                    state.setdefault("pose_error", f"compute_tcp_pose_failed:{type(exc).__name__}:{exc}")
+                    state.setdefault(
+                        "pose_error",
+                        f"compute_tcp_pose_failed:{type(exc).__name__}:{exc}",
+                    )
             source_timestamp = state.get(
                 "hardware_measurement_timestamp",
                 state.get("hardware_refresh_time"),
@@ -1165,14 +1836,22 @@ def _parse_active_sides(value: str | list[str] | tuple[str, ...]) -> tuple[str, 
             if part.strip()
         ]
     else:
-        parts = [part.strip().lower() for part in str(value).replace(",", " ").split() if part.strip()]
+        parts = [
+            part.strip().lower()
+            for part in str(value).replace(",", " ").split()
+            if part.strip()
+        ]
     if not parts:
-        raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
+        raise argparse.ArgumentTypeError(
+            "active-sides must be one of: left, right, both"
+        )
     if parts == ["both"]:
         return ("left", "right")
     invalid = sorted(set(parts) - set(ALL_SIDES))
     if invalid:
-        raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
+        raise argparse.ArgumentTypeError(
+            "active-sides must be one of: left, right, both"
+        )
     return tuple(side for side in ALL_SIDES if side in set(parts))
 
 
@@ -1190,7 +1869,11 @@ def _parse_end_effector_sides(
             if part.strip()
         ]
     else:
-        parts = [part.strip().lower() for part in str(value).replace(",", " ").split() if part.strip()]
+        parts = [
+            part.strip().lower()
+            for part in str(value).replace(",", " ").split()
+            if part.strip()
+        ]
     if not parts or parts == ["active"]:
         return tuple(active_sides) if hands_enabled else ()
     if parts == ["none"]:
@@ -1217,7 +1900,9 @@ def _parse_end_effector_sides(
 def _parse_float_tuple(text: str, *, length: int, name: str) -> tuple[float, ...]:
     parts = [part.strip() for part in str(text).split(",") if part.strip()]
     if len(parts) != int(length):
-        raise argparse.ArgumentTypeError(f"{name} must contain {length} comma-separated floats")
+        raise argparse.ArgumentTypeError(
+            f"{name} must contain {length} comma-separated floats"
+        )
     try:
         values = tuple(float(part) for part in parts)
     except ValueError as exc:
@@ -1232,7 +1917,9 @@ def _non_negative_float(text: str) -> float:
     return value
 
 
-def _parse_vector3(value: str | list[str] | tuple[object, ...]) -> tuple[float, float, float]:
+def _parse_vector3(
+    value: str | list[str] | tuple[object, ...]
+) -> tuple[float, float, float]:
     if isinstance(value, (list, tuple)):
         parts = [
             part.strip()
@@ -1243,7 +1930,9 @@ def _parse_vector3(value: str | list[str] | tuple[object, ...]) -> tuple[float, 
         text = " ".join(parts)
     else:
         text = str(value)
-        parts = [part.strip() for part in text.replace(",", " ").split() if part.strip()]
+        parts = [
+            part.strip() for part in text.replace(",", " ").split() if part.strip()
+        ]
     if len(parts) != 3:
         raise argparse.ArgumentTypeError("vector3 must contain 3 floats")
     try:
@@ -1270,14 +1959,20 @@ def _parse_arm_max_angvel(text: str) -> tuple[float, ...]:
             raise argparse.ArgumentTypeError("arm max angvel must be positive")
         return (float(values[0]),) * 6
     if len(values) != 6 or any(value <= 0.0 for value in values):
-        raise argparse.ArgumentTypeError("arm max angvel must contain 1 or 6 positive floats")
+        raise argparse.ArgumentTypeError(
+            "arm max angvel must contain 1 or 6 positive floats"
+        )
     return tuple(float(value) for value in values)
 
 
 def _hand_backend_mode(args: argparse.Namespace) -> str:
-    mode = str(getattr(args, "hand_backend", HAND_BACKEND_INSPIRE) or HAND_BACKEND_INSPIRE)
+    mode = str(
+        getattr(args, "hand_backend", HAND_BACKEND_INSPIRE) or HAND_BACKEND_INSPIRE
+    )
     if mode not in HAND_BACKEND_CHOICES:
-        raise ValueError(f"Unsupported hand backend {mode!r}; expected one of {HAND_BACKEND_CHOICES}.")
+        raise ValueError(
+            f"Unsupported hand backend {mode!r}; expected one of {HAND_BACKEND_CHOICES}."
+        )
     return mode
 
 
@@ -1323,7 +2018,9 @@ def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
     if selected is not None:
         gripper = selected.get("gripper")
         if gripper is not None and not isinstance(gripper, Mapping):
-            raise ValueError(f"Profile {path} selected task field 'gripper' must be an object.")
+            raise ValueError(
+                f"Profile {path} selected task field 'gripper' must be an object."
+            )
         merged = dict(base_gripper) if isinstance(base_gripper, Mapping) else {}
         merged.update(dict(gripper) if isinstance(gripper, Mapping) else dict(selected))
         return merged
@@ -1359,7 +2056,10 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "telemetry_hz": ("telemetry_hz",),
         "telemetry_command_grace_s": ("telemetry_command_grace_s",),
         "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
-        "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
+        "tactile_compute_profile": (
+            "tactile_compute_profile",
+            "dmtac_tactile_compute_profile",
+        ),
     }
     for key, aliases in profile_keys.items():
         value = _profile_value(profile, *aliases)
@@ -1391,11 +2091,11 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
-    policy["telemetry_command_grace_s"] = float(
-        policy["telemetry_command_grace_s"]
-    )
+    policy["telemetry_command_grace_s"] = float(policy["telemetry_command_grace_s"])
     if policy.get("tactile_fields") is not None:
-        policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
+        policy["tactile_fields"] = normalize_dmtac_tactile_fields(
+            policy["tactile_fields"]
+        )
     if policy.get("tactile_compute_profile") is not None:
         policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
     if int(policy["output_dim"]) != 0:
@@ -1496,15 +2196,21 @@ def _dmtac_backend_configs(
         try:
             assignment = load_dmtac_hardware_assignment(
                 str(getattr(args, "dmtac_config", "latest") or "latest"),
-                validate_current_usb=bool(getattr(args, "dmtac_validate_current_usb", True)),
+                validate_current_usb=bool(
+                    getattr(args, "dmtac_validate_current_usb", True)
+                ),
                 allow_missing=bool(getattr(args, "dmtac_allow_missing", False)),
-                assume_yes_for_extra=bool(getattr(args, "dmtac_assume_yes_for_extra", True)),
+                assume_yes_for_extra=bool(
+                    getattr(args, "dmtac_assume_yes_for_extra", True)
+                ),
             )
             configs.update(
                 dmtac_backend_configs_from_assignment(
                     assignment,
                     active_sides=dmtac_sides,
-                    tactile_backend=str(getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"),
+                    tactile_backend=str(
+                        getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"
+                    ),
                     speed=float(policy["speed"]),
                     torque=float(policy["torque"]),
                     max_action=float(policy["max_action"]),
@@ -1515,7 +2221,10 @@ def _dmtac_backend_configs(
                 raise RuntimeError(
                     f"Failed to load DMTAC hardware assignment {getattr(args, 'dmtac_config', 'latest')!r}: {exc}"
                 ) from exc
-            print(f"[DMTAC] WARNING: could not load DMTAC hardware assignment: {exc}", flush=True)
+            print(
+                f"[DMTAC] WARNING: could not load DMTAC hardware assignment: {exc}",
+                flush=True,
+            )
 
     for side in dmtac_sides:
         manual = manual_dmtac_backend_config_for_side(args, side, policy)
@@ -1728,6 +2437,147 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Acceleration-to-jerk ramp used by the official all-IK governor.",
     )
     parser.add_argument(
+        "--position-qref-acceleration-profile",
+        choices=RM65_QREF_ACCELERATION_PROFILE_CHOICES,
+        default=RM65_QREF_ACCELERATION_COMFORT_75_V1,
+        help=(
+            "Deploy-only accepted-qref acceleration envelope (default: "
+            "comfort_75_v1 for the official all-IK governor). hard_v1 is the "
+            "exact rollback; comfort profiles scale the 60 Hz all-IK governor "
+            "qdd and derived jerk limits while leaving the 120 Hz backend hard "
+            "limits and all live-human teleoperation defaults unchanged. "
+            "An implicit non-official backend fallback retains hard_v1."
+        ),
+    )
+    parser.add_argument(
+        "--position-all-ik-batched-solver-tolerance",
+        type=_positive_float,
+        default=1e-6,
+        help=(
+            "OSQP tolerance for the reusable official all-IK horizon workspace. "
+            "The default matches its hard-certificate scale; pass 1e-4 for "
+            "the former faster implementation as an explicit rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuous-waypoint-profile",
+        choices=("async_c2", "formal_third_order"),
+        default="formal_third_order",
+        help=(
+            "Source-cut execution profile for formal dual-arm position deploy. "
+            "formal_third_order is the production default after real-runtime "
+            "deadline evidence showed that the bounded async C2 worker can "
+            "contend with the authoritative 60 Hz reference loop. async_c2 "
+            "remains an explicit, atomically reversible research profile and "
+            "falls back by complete source cut when its candidate is unavailable; "
+            "it requires --debug."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuous-waypoint-shadow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Compute and debug-log a non-authoritative continuous C2 waypoint "
+            "candidate beside the official all-IK governor. This default-off "
+            "shadow never changes qcmd, collision admission, safety, or dispatch "
+            "and requires --debug. Use with --position-continuous-waypoint-profile "
+            "formal_third_order for a shadow-only comparison."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuous-waypoint-experimental-admission",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Compatibility/research switch selecting a synchronously built C2 path "
+            "for a complete 15 Hz source cut after whole-cut sampled collision "
+            "admission. Default off; requires --debug."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuous-waypoint-async-precompute",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Compatibility/research switch that adds bounded precompute to the "
+            "experimental admission switch. The 120 Hz owner never waits and consumes "
+            "only an exact epoch/source/anchor match; otherwise the whole cut "
+            "falls back to the formal governor. The isolated async C2 experiment "
+            "is selected by --position-continuous-waypoint-profile async_c2 and "
+            "requires --debug."
+        ),
+    )
+    parser.add_argument(
+        "--position-reference-worker-cpu",
+        type=_non_negative_int,
+        default=None,
+        help=(
+            "Default-off native CPU pin for the authoritative position-reference "
+            "worker. It may be used alone for formal_third_order A/B soaks. "
+            "When async_c2 is selected it must be paired with a distinct "
+            "--position-continuous-waypoint-worker-cpu."
+        ),
+    )
+    parser.add_argument(
+        "--position-cyclic-gc-guard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run one generation-2 cyclic collection immediately before the first "
+            "position stream is queued, then suppress automatic cyclic GC until "
+            "the position executor closes. This prevents a process-wide GIL pause "
+            "from starving the authoritative reference worker; ordinary reference "
+            "counting remains active. Use --no-position-cyclic-gc-guard for the "
+            "exact rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuous-waypoint-worker-cpu",
+        type=_non_negative_int,
+        default=None,
+        help=(
+            "Default-off native CPU pin for the async C2 proposal worker. It "
+            "must be paired with a distinct --position-reference-worker-cpu. "
+            "Removing both options is the atomic affinity rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuous-waypoint-worker-isolation",
+        choices=CONTINUOUS_WAYPOINT_WORKER_ISOLATION_CHOICES,
+        default=CONTINUOUS_WAYPOINT_WORKER_THREAD,
+        help=(
+            "Default-off C2 proposal-worker isolation. 'thread' preserves the "
+            "existing rollback path; 'process' spawn-isolates C2 construction "
+            "and proposal collision checks from the authoritative reference "
+            "thread. Process isolation remains dry-run research only."
+        ),
+    )
+    parser.add_argument(
+        "--position-worker-cpu-reservation",
+        action="store_true",
+        help=(
+            "Default-off process-local reservation for the authoritative reference "
+            "worker, and for the C2 worker when process-isolated async_c2 is selected. "
+            "After workers start, remove their CPUs and in-mask SMT siblings from "
+            "every other native thread in this deployment client while leaving the "
+            "reference worker pinned. This does not isolate other processes; launch "
+            "the OpenPI server with matching --exclude-cpu options. Omit this option for the "
+            "atomic rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuous-waypoint-no-debug-deadline-soak",
+        action="store_true",
+        help=(
+            "Narrow dry-run-only exception to the async_c2 --debug requirement. "
+            "It is accepted only for a bounded, auto-started, no-init-qpos "
+            "deadline soak with distinct reference/C2 worker CPUs and never "
+            "permits --send-actions. Omit this option for every ordinary or "
+            "hardware deployment."
+        ),
+    )
+    parser.add_argument(
         "--pose-lift-profile",
         choices=RM65_POSE_LIFT_PROFILE_CHOICES,
         default=RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
@@ -1756,6 +2606,30 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--position-background-target-admission",
+        choices=RM65_BACKGROUND_TARGET_ADMISSION_CHOICES,
+        default=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+        help=(
+            "How a new position reference is admitted while the background RM65 "
+            "worker may be inside a CANFD SDK call. latest_nonblocking publishes "
+            "the newest validated target under the backend state lock without "
+            "waiting for that SDK call; synchronous_lock restores the former "
+            "serialized behavior as an explicit rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-reference-dispatch-audit-mode",
+        choices=POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
+        default=POSITION_REFERENCE_DISPATCH_AUDIT_POST,
+        help=(
+            "Synchronous backend evidence collected on each authoritative 60 Hz "
+            "qref. post (default) relies on fail-closed RM65 send_command admission "
+            "and one dual-arm post-dispatch health snapshot. full restores the "
+            "former pre/per-effector/post diagnostic audit and is the explicit "
+            "rollback when diagnosing backend state transitions."
+        ),
+    )
+    parser.add_argument(
         "--position-chunk-lookahead",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1763,6 +2637,61 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "Use the already-predicted next action inside one policy chunk for "
             "zero-period causal 15->reference interpolation (default: enabled). "
             "Disable to restore the compatibility one-action-period delayed path."
+        ),
+    )
+    parser.add_argument(
+        "--position-plan-splice-governor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Classify policy/RTC source-plan cuts and apply robot_motion "
+            "Hold-restart versus live-splice dynamic-state semantics "
+            "(default: enabled). Use --no-position-plan-splice-governor "
+            "together with --no-position-stream-start-acquisition for the "
+            "pre-splice rollback path."
+        ),
+    )
+    parser.add_argument(
+        "--position-plan-splice-dynamics-profile",
+        choices=POSITION_PLAN_SPLICE_DYNAMICS_PROFILE_CHOICES,
+        default=POSITION_PLAN_SPLICE_DYNAMICS_OFF,
+        help=(
+            "Default-off post-Hold chunk-boundary dynamics tuning. "
+            "conservative_v1 adds a bounded jerk-delta continuity cost only "
+            "to the first acknowledged-Hold restart horizon; off is the exact "
+            "current-behavior rollback."
+        ),
+    )
+    parser.add_argument(
+        "--position-stream-start-acquisition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Insert bounded measured-anchor SE(3) source samples before a "
+            "discontinuous first policy Pose while preserving later source "
+            "spacing (default: enabled for synchronous and RTC emissions). "
+            "Requires --position-plan-splice-governor."
+        ),
+    )
+    parser.add_argument(
+        "--position-stream-start-max-translation-step-m",
+        type=_positive_float,
+        default=0.005,
+        help="Maximum translation per synthetic 15 Hz stream-start source interval.",
+    )
+    parser.add_argument(
+        "--position-stream-start-max-rotation-step-deg",
+        type=_positive_float,
+        default=0.5,
+        help="Maximum rotation per synthetic 15 Hz stream-start source interval.",
+    )
+    parser.add_argument(
+        "--position-stream-start-max-source-intervals",
+        type=_positive_int,
+        default=16,
+        help=(
+            "Fail-closed bound on synthetic stream-start source intervals "
+            "(default: 16)."
         ),
     )
     parser.add_argument(
@@ -1815,9 +2744,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--position-ik-solve-min-iterations",
         type=_positive_int,
         default=2,
-        help=(
-            "Position-only coupled IK hard minimum iterations (default 2)."
-        ),
+        help=("Position-only coupled IK hard minimum iterations (default 2)."),
     )
     parser.add_argument(
         "--position-ik-damping",
@@ -1878,6 +2805,79 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=_positive_float,
         default=3.0,
         help="Tare duration before enabling impedance force control in deployment.",
+    )
+    parser.add_argument(
+        "--position-force-guard",
+        dest="position_force_guard",
+        action="store_true",
+        help=(
+            "Require the latched RM65 force/torque emergency-stop monitor for "
+            "real position deployment. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-position-force-guard",
+        dest="position_force_guard",
+        action="store_false",
+        help=(
+            "Disable the real-position RM65 force emergency-stop monitor. "
+            "Unsafe; intended only for explicit diagnostics."
+        ),
+    )
+    parser.set_defaults(position_force_guard=True)
+    parser.add_argument(
+        "--position-force-guard-source",
+        choices=POSITION_FORCE_SOURCES,
+        default="tool",
+        help="RM65 force source used by the position emergency-stop monitor.",
+    )
+    parser.add_argument(
+        "--position-force-guard-max-force-n",
+        type=_positive_float,
+        default=30.0,
+        help="Position-deploy bimanual emergency-stop threshold for force-vector norm.",
+    )
+    parser.add_argument(
+        "--position-force-guard-max-torque-nm",
+        type=_positive_float,
+        default=5.0,
+        help="Position-deploy bimanual emergency-stop threshold for torque-vector norm.",
+    )
+    parser.add_argument(
+        "--position-force-guard-hz",
+        type=_positive_float,
+        default=20.0,
+        help=(
+            "Per-arm RM65 force polling rate. Must be <=20 Hz because the SDK "
+            "requires at least 50 ms between repeated force queries."
+        ),
+    )
+    parser.add_argument(
+        "--position-force-guard-consecutive-samples",
+        type=_positive_int,
+        default=1,
+        help="Consecutive over-limit samples required before the latched bimanual stop.",
+    )
+    parser.add_argument(
+        "--position-force-guard-max-read-errors",
+        type=_positive_int,
+        default=3,
+        help="Consecutive RM65 force-read errors allowed before fail-closed bimanual stop.",
+    )
+    parser.add_argument(
+        "--position-force-guard-stale-sec",
+        type=_positive_float,
+        default=0.4,
+        help="Maximum valid force-sample age before fail-closed bimanual stop.",
+    )
+    parser.add_argument(
+        "--position-force-guard-startup-timeout-sec",
+        type=_positive_float,
+        default=2.0,
+        help=(
+            "Startup deadline for one valid force sample from every active arm; "
+            "failure stops both arms and aborts arming."
+        ),
     )
     parser.add_argument(
         "--strict-tool-profile",
@@ -1958,7 +2958,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Compatibility alias for --action-queue-policy append.",
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0)
-    parser.add_argument("--status-sec", type=_positive_float, default=1.0)
+    parser.add_argument(
+        "--status-sec",
+        type=_positive_float,
+        default=3.0,
+        help=(
+            "Periodic deployment status heartbeat in seconds (default: 3). "
+            "Safety and lifecycle transitions are still printed immediately."
+        ),
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -1972,6 +2980,28 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="Directory for --debug JSONL logs. Relative paths resolve under the DexTeleop repo.",
+    )
+    parser.add_argument(
+        "--debug-payload-mode",
+        choices=DEPLOY_DEBUG_PAYLOAD_MODES,
+        default=DEPLOY_DEBUG_PAYLOAD_COMPACT,
+        help=(
+            "Payload detail for --debug. compact is bounded for live deployment; "
+            "full restores the historical unbounded metadata payload for offline diagnosis."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-layout",
+        choices=(
+            LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+            RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+        ),
+        default=configured_runtime_artifact_layout(),
+        help=(
+            "Select the managed --debug output layout when --debug-dir is omitted. "
+            "The repository default is legacy; local_paths.json can coordinate "
+            "a project-wide canonical cutover."
+        ),
     )
     parser.add_argument(
         "--rtc-debug-level",
@@ -2050,7 +3080,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=_parse_arm_max_angvel,
         default=(4.5, 4.5, 4.5, 6.0, 6.0, 8.0),
     )
-    parser.add_argument("--deploy-fixed-init-qpos-tolerance", type=_positive_float, default=0.1)
+    parser.add_argument(
+        "--deploy-fixed-init-qpos-tolerance", type=_positive_float, default=0.1
+    )
     parser.add_argument(
         "--policy-qpos-init-dataset",
         type=Path,
@@ -2145,6 +3177,59 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=policy_qpos_defaults.qpos_reached_tolerance_rad,
     )
     parser.add_argument(
+        "--policy-qpos-init-hands",
+        action=argparse.BooleanOptionalAction,
+        default=policy_qpos_defaults.initialize_hands,
+        help=(
+            "Initialize enabled end effectors from the same recorded frame after "
+            "the arm qpos target is reached. Use --no-policy-qpos-init-hands as "
+            "an explicit rollback to the former arm-only behavior."
+        ),
+    )
+    parser.add_argument(
+        "--policy-qpos-init-hand-tolerance",
+        type=_positive_float,
+        default=policy_qpos_defaults.hand_reached_tolerance,
+        help=(
+            "Maximum normalized measured hand-target error before startup release "
+            "for end effectors whose command and measured state share one domain. "
+            "DM-Tac uses its separate tolerance and measured-progress recovery."
+        ),
+    )
+    parser.add_argument(
+        "--policy-qpos-init-dmtac-tolerance",
+        type=_positive_float,
+        default=policy_qpos_defaults.dmtac_hand_reached_tolerance,
+        help=(
+            "Maximum normalized DM-Tac measured-target error before qpos-init "
+            "release. Default matches the existing real-teleop warmup probe."
+        ),
+    )
+    parser.add_argument(
+        "--policy-qpos-init-hand-progress-timeout-sec",
+        type=_positive_float,
+        default=policy_qpos_defaults.hand_progress_timeout_sec,
+        help=(
+            "Maximum time without significant DM-Tac measured progress before "
+            "one bounded reconnect and force-resend."
+        ),
+    )
+    parser.add_argument(
+        "--policy-qpos-init-hand-progress-epsilon",
+        type=_positive_float,
+        default=policy_qpos_defaults.hand_progress_epsilon,
+        help="Minimum normalized DM-Tac error reduction counted as progress.",
+    )
+    parser.add_argument(
+        "--policy-qpos-init-hand-reconnect-attempts",
+        type=_non_negative_int,
+        default=policy_qpos_defaults.hand_reconnect_attempts,
+        help=(
+            "Bounded DM-Tac reconnect/force-resend attempts during dataset-frame "
+            "initialization. Zero disables automatic recovery and fails closed."
+        ),
+    )
+    parser.add_argument(
         "--start-init_qpos",
         "--start-init-qpos",
         dest="start_init_qpos",
@@ -2154,9 +3239,30 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "current qpos without a dataset-frame policy qpos init."
         ),
     )
+    parser.add_argument(
+        "--no-init-qpos",
+        "--no--init-qpos",
+        dest="no_init_qpos",
+        action="store_true",
+        help=(
+            "Explicit safety override: suppress profile- or CLI-provided dataset-frame "
+            "policy qpos initialization and allow real arm policy execution to start "
+            "from the current qpos. With --init-source current, the redundant Cartesian "
+            "startup motion is treated as already satisfied; manual deployments still "
+            "require A ready confirmation. The legacy --no--init-qpos spelling is "
+            "accepted for command-handoff compatibility."
+        ),
+    )
     parser.add_argument("--require-ready-observation", action="store_true")
-    parser.add_argument("--pause-on-policy-error", dest="pause_on_policy_error", action="store_true", default=True)
-    parser.add_argument("--no-pause-on-policy-error", dest="pause_on_policy_error", action="store_false")
+    parser.add_argument(
+        "--pause-on-policy-error",
+        dest="pause_on_policy_error",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-pause-on-policy-error", dest="pause_on_policy_error", action="store_false"
+    )
     parser.add_argument("--send-actions", action="store_true")
     parser.add_argument(
         "--allow-missing-v22-end-effectors",
@@ -2184,7 +3290,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-arm-connect-failure", action="store_true")
     parser.add_argument("--allow-hand-connect-failure", action="store_true")
 
-    parser.add_argument("--enable-arms", dest="arms_enabled", action="store_true", default=True)
+    parser.add_argument(
+        "--enable-arms", dest="arms_enabled", action="store_true", default=True
+    )
     parser.add_argument("--no-arms", dest="arms_enabled", action="store_false")
     parser.add_argument("--left-arm-ip", type=str, default="")
     parser.add_argument("--right-arm-ip", type=str, default="")
@@ -2317,8 +3425,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--arm-state-refresh-hz", type=float, default=10.0)
-    parser.add_argument("--rm65-hardware-read-retries", type=_non_negative_int, default=1)
-    parser.add_argument("--rm65-hardware-read-retry-delay-sec", type=float, default=0.02)
+    parser.add_argument(
+        "--rm65-hardware-read-retries", type=_non_negative_int, default=1
+    )
+    parser.add_argument(
+        "--rm65-hardware-read-retry-delay-sec", type=float, default=0.02
+    )
     parser.add_argument("--left-initial-qpos", type=_parse_qpos6, default=None)
     parser.add_argument("--right-initial-qpos", type=_parse_qpos6, default=None)
     parser.add_argument(
@@ -2334,7 +3446,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Arm workspace maximum xyz. Accepts either three values or --arm-workspace-max=x,y,z.",
     )
     parser.add_argument("--max-arm-xyz-step-m", type=_non_negative_float, default=0.1)
-    parser.add_argument("--max-arm-rot-step-deg", type=_non_negative_float, default=15.0)
+    parser.add_argument(
+        "--max-arm-rot-step-deg", type=_non_negative_float, default=15.0
+    )
     parser.add_argument(
         "--max-arm-joint-step-rad",
         type=_non_negative_float,
@@ -2345,7 +3459,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
-    parser.add_argument("--enable-hands", dest="hands_enabled", action="store_true", default=None)
+    parser.add_argument(
+        "--enable-hands", dest="hands_enabled", action="store_true", default=None
+    )
     parser.add_argument("--no-hands", dest="hands_enabled", action="store_false")
     parser.add_argument(
         "--hand-backend",
@@ -2370,7 +3486,14 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hand-modbus-port", type=int, default=6000)
     parser.add_argument("--hand-send-threshold", type=float, default=0.002)
     parser.add_argument("--hand-telemetry-hz", type=_positive_float, default=20.0)
-    parser.add_argument("--hand-tactile-regions", "--tactile-regions", "--tactile-region", dest="hand_tactile_regions", type=str, default="all")
+    parser.add_argument(
+        "--hand-tactile-regions",
+        "--tactile-regions",
+        "--tactile-region",
+        dest="hand_tactile_regions",
+        type=str,
+        default="all",
+    )
     parser.add_argument(
         "--inspire-hand-max-force",
         "--inspire-tac-max-fingertip-force",
@@ -2397,7 +3520,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     add_dmtac_assignment_arguments(parser, assignment_includes_tactile=True)
     parser.add_argument("--dmtac-tactile-backend", type=str, default="cpu")
     parser.add_argument("--dmtac-tactile-timeout-ms", type=_positive_int, default=None)
-    parser.add_argument("--dmtac-tactile-wait-for-new", action="store_true", default=None)
+    parser.add_argument(
+        "--dmtac-tactile-wait-for-new", action="store_true", default=None
+    )
     parser.add_argument("--dmtac-tactile-sequential-read", action="store_true")
     parser.add_argument(
         "--dmtac-tactile-fields",
@@ -2415,16 +3540,30 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         choices=("dist-only", "legacy", "requested", "shear-depth"),
         default=None,
     )
-    parser.add_argument("--dmtac-with-tactile", dest="dmtac_tactile", action="store_true", default=None)
-    parser.add_argument("--dmtac-no-tactile", dest="dmtac_tactile", action="store_false")
+    parser.add_argument(
+        "--dmtac-with-tactile", dest="dmtac_tactile", action="store_true", default=None
+    )
+    parser.add_argument(
+        "--dmtac-no-tactile", dest="dmtac_tactile", action="store_false"
+    )
     parser.add_argument(
         "--gripper-task-profile",
         type=str,
         default="",
         help="JSON profile with top-level gripper defaults and/or tasks.<name>.gripper overrides.",
     )
-    parser.add_argument("--task-id", type=str, default="", help="Task id used to select gripper task profile entries.")
-    parser.add_argument("--task-name", type=str, default="", help="Task name used to select gripper task profile entries.")
+    parser.add_argument(
+        "--task-id",
+        type=str,
+        default="",
+        help="Task id used to select gripper task profile entries.",
+    )
+    parser.add_argument(
+        "--task-name",
+        type=str,
+        default="",
+        help="Task name used to select gripper task profile entries.",
+    )
     parser.add_argument(
         "--gripper-task",
         type=str,
@@ -2442,18 +3581,29 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--gripper-max-action", type=float, default=None)
     parser.add_argument("--gripper-send-threshold", type=float, default=None)
-    parser.add_argument("--gripper-continuous", dest="gripper_continuous_grasp", action="store_true", default=None)
-    parser.add_argument("--gripper-no-continuous", dest="gripper_continuous_grasp", action="store_false")
+    parser.add_argument(
+        "--gripper-continuous",
+        dest="gripper_continuous_grasp",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--gripper-no-continuous", dest="gripper_continuous_grasp", action="store_false"
+    )
     parser.add_argument("--gripper-command-hz", type=_positive_float, default=None)
     parser.add_argument("--gripper-telemetry-hz", type=_positive_float, default=None)
-    parser.add_argument(
-        "--gripper-telemetry-command-grace-s", type=float, default=None
-    )
+    parser.add_argument("--gripper-telemetry-command-grace-s", type=float, default=None)
 
-    parser.add_argument("--camera-mode", choices=["none", "single", "multi"], default="none")
-    parser.add_argument("--camera-config", type=Path, default=DEFAULT_CAMERA_CONFIG_PATH)
+    parser.add_argument(
+        "--camera-mode", choices=["none", "single", "multi"], default="none"
+    )
+    parser.add_argument(
+        "--camera-config", type=Path, default=DEFAULT_CAMERA_CONFIG_PATH
+    )
     parser.add_argument("--camera-key", type=str, default="front")
-    parser.add_argument("--camera-serial", "--camera-id", dest="camera_serial", type=str, default="")
+    parser.add_argument(
+        "--camera-serial", "--camera-id", dest="camera_serial", type=str, default=""
+    )
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=720)
     parser.add_argument("--camera-fps", type=int, default=30)
@@ -2480,6 +3630,21 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
     parser.add_argument(
+        "--camera-color-format",
+        choices=("bgr8", "rgb8", "yuyv", "uyvy", "y8", "rgba8", "bgra8"),
+        default="bgr8",
+        help=(
+            "Native RealSense color transport. The default matches formal "
+            "real-teleop collection startup."
+        ),
+    )
+    parser.add_argument(
+        "--camera-startup-warmup-policy",
+        choices=REALSENSE_STARTUP_WARMUP_POLICIES,
+        default=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+        help=("RealSense warmup policy shared with formal real-teleop collection."),
+    )
+    parser.add_argument(
         "--camera-startup-hardware-reset",
         action="store_true",
         help=(
@@ -2490,10 +3655,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--camera-start-stagger-sec",
         type=float,
-        default=0.0,
+        default=REAL_TELEOP_CAMERA_START_STAGGER_SEC,
         help=(
-            "Delay between sequential RealSense starts. Camera-config insertion order "
-            "is preserved; the default 0 keeps the existing deploy behavior."
+            "Delay between sequential RealSense starts. The default matches formal "
+            "real-teleop collection; metadata.startup_priority owns hardware order."
         ),
     )
     parser.add_argument("--require-camera-frame", action="store_true")
@@ -2519,11 +3684,7 @@ def _hands_enabled(args: argparse.Namespace) -> bool:
         for side in ALL_SIDES
     ):
         return True
-    return bool(
-        args.left_hand_ip
-        or args.right_hand_ip
-        or args.visualize_tactile
-    )
+    return bool(args.left_hand_ip or args.right_hand_ip or args.visualize_tactile)
 
 
 def _position_deploy_ik_tuning(args: argparse.Namespace):
@@ -2543,20 +3704,170 @@ def validate_args(
     args: argparse.Namespace,
     *,
     raw_argv: tuple[str, ...] | list[str] = (),
+    policy_artifact_has_arm_hold_output: bool = False,
 ) -> tuple[str, ...]:
+    if not isinstance(policy_artifact_has_arm_hold_output, bool):
+        raise TypeError("policy_artifact_has_arm_hold_output must be a bool.")
     active_sides = _parse_active_sides(args.active_sides)
     args.active_sides = active_sides
+    no_init_qpos = bool(getattr(args, "no_init_qpos", False))
+    if no_init_qpos and (
+        args.deploy_fixed_init_dataset or args.deploy_fixed_init_parquet
+    ):
+        raise ValueError(
+            "--no-init-qpos cannot be combined with the explicit legacy "
+            "--deploy-fixed-init-* trajectory."
+        )
+    if no_init_qpos:
+        # Deployment profiles are expanded before the delegated runtime parses
+        # its arguments.  Clear their dataset-frame qpos-init inputs before any
+        # mode-specific validation so one explicit trailing override works for
+        # every current and future profile.  Keep the remaining startup/current-
+        # pose and ready-confirm gates intact.
+        args.policy_qpos_init_suppressed = bool(
+            args.policy_qpos_init_dataset or args.policy_qpos_init_parquet
+        )
+        args.policy_qpos_init_dataset = None
+        args.policy_qpos_init_parquet = None
+    else:
+        args.policy_qpos_init_suppressed = False
+    if bool(getattr(args, "position_force_guard", False)):
+        # Resolve the complete config before any backend or device is created.
+        # In particular, RM65 force polling above 20 Hz must fail at CLI
+        # validation rather than after a real-arm connection is opened.
+        position_force_guard_config(args)
+    rtc_profile_id = str(getattr(args, "rtc_profile", "off")).strip()
+    rtc_profile_enabled = rtc_profile_id != "off"
+    if bool(args.position_stream_start_acquisition) and not bool(
+        args.position_plan_splice_governor
+    ):
+        raise ValueError(
+            "--position-stream-start-acquisition requires "
+            "--position-plan-splice-governor."
+        )
+    arm_hold_output_enabled = bool(policy_artifact_has_arm_hold_output)
+    if rtc_profile_enabled or arm_hold_output_enabled:
+        # Neither timed RTC emissions nor arm-hold-resolved actions expose an
+        # already-resolved same-chunk successor.  Resolve this compatibility
+        # constraint before choosing the path-lift backend/profile so the
+        # effective configuration cannot claim official lookahead or async C2.
+        args.position_chunk_lookahead = False
     pose_lift_profile = resolve_rm65_pose_lift_profile(args.pose_lift_profile)
     path_lift_backend = str(args.position_path_lift_backend)
+    plan_splice_dynamics_config = resolve_position_plan_splice_dynamics_config(
+        args.position_plan_splice_dynamics_profile
+    )
+    (
+        args.position_qref_acceleration_scale_resolved,
+        args.position_qref_max_acceleration_rad_s2_resolved,
+    ) = resolve_rm65_qref_acceleration_profile(
+        args.position_qref_acceleration_profile,
+        hard_max_acceleration_rad_s2=args.position_max_acceleration_rad_s2,
+    )
+    qref_acceleration_profile_is_comfort = not math.isclose(
+        float(args.position_qref_acceleration_scale_resolved),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+    qref_acceleration_profile_explicit = bool(
+        _argument_was_supplied(
+            list(raw_argv),
+            "--position-qref-acceleration-profile",
+        )
+        or str(args.position_qref_acceleration_profile)
+        != RM65_QREF_ACCELERATION_COMFORT_75_V1
+    )
+    plan_splice_dynamics_enabled = any(
+        weight > 0.0
+        for weight in (
+            plan_splice_dynamics_config.hold_restart_initial_jerk_delta_regularization,
+            plan_splice_dynamics_config.hold_restart_jerk_delta_regularization,
+        )
+    )
+    if plan_splice_dynamics_enabled and not bool(args.position_plan_splice_governor):
+        raise ValueError(
+            "non-off --position-plan-splice-dynamics-profile requires "
+            "--position-plan-splice-governor."
+        )
+    if (
+        plan_splice_dynamics_enabled
+        and path_lift_backend != OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+    ):
+        raise ValueError(
+            "non-off --position-plan-splice-dynamics-profile requires the "
+            "official source all-IK governor backend."
+        )
     if bool(args.send_actions) and not pose_lift_profile.hardware_dispatch_allowed:
         raise ValueError(
             f"pose-lift profile {pose_lift_profile.name!r} forbids hardware "
             "dispatch; select a profile with hardware_dispatch_allowed=true."
         )
     if int(args.position_all_ik_lookahead_source_steps) < 2:
+        raise ValueError("--position-all-ik-lookahead-source-steps must be >= 2.")
+    if float(args.position_all_ik_batched_solver_tolerance) > 1e-4:
+        raise ValueError("--position-all-ik-batched-solver-tolerance must be <= 1e-4.")
+    continuous_waypoint_research = bool(
+        str(args.position_continuous_waypoint_profile).strip() == "async_c2"
+        or args.position_continuous_waypoint_shadow
+        or args.position_continuous_waypoint_experimental_admission
+        or args.position_continuous_waypoint_async_precompute
+    )
+    no_debug_deadline_soak = bool(
+        args.position_continuous_waypoint_no_debug_deadline_soak
+    )
+    if no_debug_deadline_soak:
+        soak_violations: list[str] = []
+        if bool(args.debug):
+            soak_violations.append("--debug must be omitted")
+        if str(args.position_continuous_waypoint_profile).strip() != "async_c2":
+            soak_violations.append(
+                "--position-continuous-waypoint-profile must be async_c2"
+            )
+        if bool(args.send_actions):
+            soak_violations.append("--send-actions is forbidden")
+        if not (0 < int(args.max_steps) <= 900):
+            soak_violations.append("--max-steps must be in [1, 900]")
+        if args.position_reference_worker_cpu is None:
+            soak_violations.append("--position-reference-worker-cpu is required")
+        if args.position_continuous_waypoint_worker_cpu is None:
+            soak_violations.append(
+                "--position-continuous-waypoint-worker-cpu is required"
+            )
+        if not no_init_qpos:
+            soak_violations.append("--no-init-qpos is required")
+        if not math.isclose(
+            float(args.init_time_s),
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            soak_violations.append("--init-time-s 0 is required")
+        if not bool(args.auto_start):
+            soak_violations.append("--auto-start is required")
+        if bool(args.wait_for_ready_confirm):
+            soak_violations.append("--no-wait-for-ready-confirm is required")
+        if soak_violations:
+            raise ValueError(
+                "--position-continuous-waypoint-no-debug-deadline-soak is "
+                "restricted to the isolated bounded dry-run contract: "
+                + "; ".join(soak_violations)
+            )
+    if bool(args.position_continuous_waypoint_async_precompute) and not bool(
+        args.position_continuous_waypoint_experimental_admission
+    ):
         raise ValueError(
-            "--position-all-ik-lookahead-source-steps must be >= 2."
+            "--position-continuous-waypoint-async-precompute requires "
+            "--position-continuous-waypoint-experimental-admission."
         )
+    if continuous_waypoint_research:
+        if not bool(args.debug) and not no_debug_deadline_soak:
+            raise ValueError(
+                "continuous waypoint research switch requires --debug so its "
+                "bounded observational results are persisted; the only "
+                "exception is the explicit bounded no-debug deadline-soak "
+                "contract."
+            )
     if path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND:
         if active_sides != ("left", "right"):
             if _argument_was_supplied(
@@ -2583,9 +3894,8 @@ def validate_args(
                 )
             args.position_path_lift_backend = PINK_POSE_LIFT_BACKEND
             path_lift_backend = PINK_POSE_LIFT_BACKEND
-        if (
-            path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
-            and not bool(args.position_collision_check)
+        if path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND and not bool(
+            args.position_collision_check
         ):
             if _argument_was_supplied(
                 list(raw_argv),
@@ -2596,11 +3906,167 @@ def validate_args(
                     "--position-collision-check."
                 )
             args.position_path_lift_backend = PINK_POSE_LIFT_BACKEND
-    observation_firewall_mode = str(
-        getattr(args, "policy_observation_firewall_mode", "strict")
-    ).strip().lower()
-    rtc_profile_id = str(getattr(args, "rtc_profile", "off")).strip()
-    rtc_profile_enabled = rtc_profile_id != "off"
+            path_lift_backend = PINK_POSE_LIFT_BACKEND
+    if qref_acceleration_profile_is_comfort and (
+        path_lift_backend != OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+        or str(args.arm_control_mode) != RM65_ARM_CONTROL_MODE_POSITION
+    ):
+        if qref_acceleration_profile_explicit:
+            raise ValueError(
+                "non-hard --position-qref-acceleration-profile requires the "
+                "effective official source all-IK governor backend."
+            )
+        args.position_qref_acceleration_profile = RM65_QREF_ACCELERATION_HARD_V1
+        (
+            args.position_qref_acceleration_scale_resolved,
+            args.position_qref_max_acceleration_rad_s2_resolved,
+        ) = resolve_rm65_qref_acceleration_profile(
+            args.position_qref_acceleration_profile,
+            hard_max_acceleration_rad_s2=(args.position_max_acceleration_rad_s2),
+        )
+    official_governor_effective = bool(
+        path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+        and str(args.arm_control_mode) == RM65_ARM_CONTROL_MODE_POSITION
+    )
+    continuous_waypoint_profile = str(args.position_continuous_waypoint_profile).strip()
+    continuous_waypoint_profile_explicit = _argument_was_supplied(
+        list(raw_argv),
+        "--position-continuous-waypoint-profile",
+    )
+    if (
+        continuous_waypoint_profile == "async_c2"
+        and continuous_waypoint_profile_explicit
+        and not official_governor_effective
+    ):
+        raise ValueError(
+            "--position-continuous-waypoint-profile async_c2 requires the "
+            "effective official source all-IK governor, dual arms, chunk "
+            "lookahead, and position collision checking."
+        )
+    if continuous_waypoint_research and not official_governor_effective:
+        raise ValueError(
+            "continuous waypoint research switches cannot follow an automatic "
+            "fallback away from the official source all-IK governor."
+        )
+    production_async_c2 = bool(
+        continuous_waypoint_profile == "async_c2" and official_governor_effective
+    )
+    args.position_continuous_waypoint_profile_effective = (
+        "async_c2" if production_async_c2 else "formal_third_order"
+    )
+    # Keep the original research booleans as compatibility inputs, then expose
+    # their effective values to the existing narrow factory/wiring surface.
+    args.position_continuous_waypoint_shadow = bool(
+        production_async_c2 or args.position_continuous_waypoint_shadow
+    )
+    args.position_continuous_waypoint_experimental_admission = bool(
+        production_async_c2 or args.position_continuous_waypoint_experimental_admission
+    )
+    args.position_continuous_waypoint_async_precompute = bool(
+        production_async_c2 or args.position_continuous_waypoint_async_precompute
+    )
+    continuous_worker_isolation = (
+        str(args.position_continuous_waypoint_worker_isolation).strip().lower()
+    )
+    if continuous_worker_isolation != CONTINUOUS_WAYPOINT_WORKER_THREAD and not bool(
+        args.position_continuous_waypoint_async_precompute
+    ):
+        raise ValueError(
+            "--position-continuous-waypoint-worker-isolation process requires "
+            "async_c2 precompute"
+        )
+    reference_worker_cpu = args.position_reference_worker_cpu
+    continuous_worker_cpu = args.position_continuous_waypoint_worker_cpu
+    if continuous_worker_cpu is not None and reference_worker_cpu is None:
+        raise ValueError(
+            "--position-continuous-waypoint-worker-cpu requires "
+            "--position-reference-worker-cpu"
+        )
+    if bool(args.position_continuous_waypoint_async_precompute) and (
+        (reference_worker_cpu is None) != (continuous_worker_cpu is None)
+    ):
+        raise ValueError(
+            "async_c2 CPU isolation requires both "
+            "--position-reference-worker-cpu and "
+            "--position-continuous-waypoint-worker-cpu"
+        )
+    args.position_worker_cpu_affinity_allowed = None
+    if reference_worker_cpu is not None:
+        if continuous_worker_cpu is not None and not bool(
+            args.position_continuous_waypoint_async_precompute
+        ):
+            raise ValueError(
+                "--position-continuous-waypoint-worker-cpu requires async_c2 "
+                "precompute"
+            )
+        if continuous_worker_cpu is not None and int(reference_worker_cpu) == int(
+            continuous_worker_cpu
+        ):
+            raise ValueError(
+                "position reference and continuous C2 workers require distinct CPUs"
+            )
+        allowed_cpus = available_cpu_ids()
+        missing_cpus = sorted(
+            (
+                {int(reference_worker_cpu)}
+                if continuous_worker_cpu is None
+                else {
+                    int(reference_worker_cpu),
+                    int(continuous_worker_cpu),
+                }
+            ).difference(allowed_cpus)
+        )
+        if missing_cpus:
+            raise ValueError(
+                "requested position worker CPUs are outside this process affinity "
+                f"mask: missing={missing_cpus} allowed={list(allowed_cpus)}"
+            )
+        args.position_worker_cpu_affinity_allowed = allowed_cpus
+    args.position_worker_cpu_reservation_cpu_ids = ()
+    if bool(args.position_worker_cpu_reservation):
+        reservation_violations: list[str] = []
+        if reference_worker_cpu is None:
+            reservation_violations.append("--position-reference-worker-cpu is required")
+        if bool(args.position_continuous_waypoint_async_precompute):
+            if continuous_worker_cpu is None:
+                reservation_violations.append(
+                    "--position-continuous-waypoint-worker-cpu is required"
+                )
+            if continuous_worker_isolation != CONTINUOUS_WAYPOINT_WORKER_PROCESS:
+                reservation_violations.append(
+                    "--position-continuous-waypoint-worker-isolation process is required"
+                )
+        if reservation_violations:
+            raise ValueError(
+                "--position-worker-cpu-reservation requirements are not met: "
+                + "; ".join(reservation_violations)
+            )
+        assert args.position_worker_cpu_affinity_allowed is not None
+        reservation_cpu_ids: set[int] = set()
+        for worker_cpu in (reference_worker_cpu, continuous_worker_cpu):
+            if worker_cpu is None:
+                continue
+            reservation_cpu_ids.update(
+                int(cpu)
+                for cpu in cpu_thread_sibling_ids(int(worker_cpu))
+                if int(cpu) in args.position_worker_cpu_affinity_allowed
+            )
+        args.position_worker_cpu_reservation_cpu_ids = tuple(
+            sorted(reservation_cpu_ids)
+        )
+    if bool(args.send_actions) and bool(
+        args.position_continuous_waypoint_experimental_admission
+    ):
+        raise ValueError(
+            "continuous C2 waypoint admission is not authorized for real "
+            "hardware dispatch: the 2026-08-08 full-runtime trace exceeded "
+            "the authoritative 60 Hz deadline. Use formal_third_order for "
+            "--send-actions; re-authorize C2 only after isolated real-executor "
+            "deadline soak passes."
+        )
+    observation_firewall_mode = (
+        str(getattr(args, "policy_observation_firewall_mode", "strict")).strip().lower()
+    )
     rtc_real_shadow = bool(getattr(args, "rtc_real_shadow", False))
     requested_rtc_debug_level = getattr(args, "rtc_debug_level", None)
     if requested_rtc_debug_level is None:
@@ -2639,18 +4105,26 @@ def validate_args(
         if args.debug_replay_dataset or args.debug_replay_parquet:
             raise ValueError("RTC profiles do not modify or consume debug replay.")
         if args.action_hz_dataset or args.action_hz_parquet:
-            raise ValueError("RTC profiles do not consume replay/reference rate inputs.")
+            raise ValueError(
+                "RTC profiles do not consume replay/reference rate inputs."
+            )
         if bool(args.append_action_chunks) or str(args.action_queue_policy) == "append":
-            raise ValueError("RTC profiles use timed mutable-future merge, not queue append.")
+            raise ValueError(
+                "RTC profiles use timed mutable-future merge, not queue append."
+            )
         if rtc_profile_id == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1:
             if str(args.policy_spec or "hold").strip().lower() not in {
                 "",
                 "hold",
                 "builtin:hold",
             }:
-                raise ValueError("RTC-3c is restricted to the builtin hold virtual policy.")
+                raise ValueError(
+                    "RTC-3c is restricted to the builtin hold virtual policy."
+                )
             if args.policy_artifact_json is not None:
-                raise ValueError("RTC-3c virtual shadow does not bind a model artifact yet.")
+                raise ValueError(
+                    "RTC-3c virtual shadow does not bind a model artifact yet."
+                )
             if parse_policy_kwargs(args.policy_kwargs_json):
                 raise ValueError("RTC-3c builtin hold policy accepts no policy kwargs.")
         elif args.policy_artifact_json is None:
@@ -2731,22 +4205,31 @@ def validate_args(
             "formal real shadow requires the M4B durable trace gate."
         )
     raw_tokens_list = [str(value) for value in raw_argv]
-    if not any(
-        token in ("--arm-canfd-follow", "--no-arm-canfd-follow")
-        for token in raw_tokens_list
-    ) and getattr(args, "arm_canfd_follow", None) is False:
+    if (
+        not any(
+            token in ("--arm-canfd-follow", "--no-arm-canfd-follow")
+            for token in raw_tokens_list
+        )
+        and getattr(args, "arm_canfd_follow", None) is False
+    ):
         raw_tokens_list.append("--no-arm-canfd-follow")
-    if not any(
-        token == "--position-ik-solve-min-iterations"
-        or token.startswith("--position-ik-solve-min-iterations=")
-        for token in raw_tokens_list
-    ) and int(args.position_ik_solve_min_iterations) != 2:
+    if (
+        not any(
+            token == "--position-ik-solve-min-iterations"
+            or token.startswith("--position-ik-solve-min-iterations=")
+            for token in raw_tokens_list
+        )
+        and int(args.position_ik_solve_min_iterations) != 2
+    ):
         raw_tokens_list.append("--position-ik-solve-min-iterations")
-    if not any(
-        token == "--position-ik-solve-max-iterations"
-        or token.startswith("--position-ik-solve-max-iterations=")
-        for token in raw_tokens_list
-    ) and int(args.position_ik_solve_max_iterations) != 4:
+    if (
+        not any(
+            token == "--position-ik-solve-max-iterations"
+            or token.startswith("--position-ik-solve-max-iterations=")
+            for token in raw_tokens_list
+        )
+        and int(args.position_ik_solve_max_iterations) != 4
+    ):
         raw_tokens_list.append("--position-ik-solve-max-iterations")
     raw_tokens = tuple(raw_tokens_list)
     requested_profile = getattr(args, "arm_execution_profile", None)
@@ -2755,22 +4238,16 @@ def validate_args(
         and str(getattr(args, "arm_control_mode", "")).strip()
         == RM65_ARM_CONTROL_MODE_POSITION
     )
-    if (
-        requested_profile in (None, "")
-        and position_requested
-    ):
+    if requested_profile in (None, "") and position_requested:
         # Deployment defaults to the clock contract already validated by the
         # current position teleop. Explicit rate flags remain profile
         # overrides through resolve_real_arm_execution_config().
         args.arm_execution_profile = POSITION_15_60_120HZ_PROFILE_NAME
-    explicit_compatibility_arm_profile = (
-        any(
-            token == "--arm-execution-profile"
-            or token.startswith("--arm-execution-profile=")
-            for token in raw_tokens
-        )
-        and requested_profile not in (None, "", POSITION_15_60_120HZ_PROFILE_NAME)
-    )
+    explicit_compatibility_arm_profile = any(
+        token == "--arm-execution-profile"
+        or token.startswith("--arm-execution-profile=")
+        for token in raw_tokens
+    ) and requested_profile not in (None, "", POSITION_15_60_120HZ_PROFILE_NAME)
     if explicit_compatibility_arm_profile:
         args.position_control_profile_resolved = LEGACY_POSITION_CONTROL_PROFILE_NAME
         args.position_control_profile_metadata = {
@@ -2779,10 +4256,7 @@ def validate_args(
             "reason": f"explicit_arm_execution_profile:{requested_profile}",
         }
     else:
-        if (
-            str(args.position_control_profile)
-            == LEGACY_POSITION_CONTROL_PROFILE_NAME
-        ):
+        if str(args.position_control_profile) == LEGACY_POSITION_CONTROL_PROFILE_NAME:
             if not any(
                 token == "--position-ik-solve-max-iterations"
                 or token.startswith("--position-ik-solve-max-iterations=")
@@ -2790,7 +4264,8 @@ def validate_args(
             ):
                 args.position_ik_solve_max_iterations = 2
             if not any(
-                token in (
+                token
+                in (
                     "--position-ik-adaptive-iterations",
                     "--no-position-ik-adaptive-iterations",
                 )
@@ -2848,20 +4323,16 @@ def validate_args(
                 "RTC-3c position cadence is fixed at 60 Hz reference / "
                 "120 Hz command."
             )
-    if (
-        args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION
-        and float(args.arm_control_hz) < float(args.position_reference_hz)
-    ):
+    if args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION and float(
+        args.arm_control_hz
+    ) < float(args.position_reference_hz):
         raise ValueError(
             "--arm-control-hz must be >= --position-reference-hz in position mode "
             "so every reference can be represented by the command stream."
         )
-    position_collision_enabled = bool(
-        getattr(args, "position_collision_check", True)
-    )
-    if (
-        float(args.position_collision_distance_epsilon_m)
-        > float(args.position_collision_min_distance_m)
+    position_collision_enabled = bool(getattr(args, "position_collision_check", True))
+    if float(args.position_collision_distance_epsilon_m) > float(
+        args.position_collision_min_distance_m
     ):
         raise ValueError(
             "--position-collision-distance-epsilon-m must not exceed "
@@ -2903,14 +4374,22 @@ def validate_args(
     if args.init_dataset and args.init_parquet:
         raise ValueError("Use only one of --init-dataset or --init-parquet.")
     if args.deploy_fixed_init_dataset and args.deploy_fixed_init_parquet:
-        raise ValueError("Use only one of --deploy-fixed-init-dataset or --deploy-fixed-init-parquet.")
+        raise ValueError(
+            "Use only one of --deploy-fixed-init-dataset or --deploy-fixed-init-parquet."
+        )
     if args.policy_qpos_init_dataset and args.policy_qpos_init_parquet:
-        raise ValueError("Use only one of --policy-qpos-init-dataset or --policy-qpos-init-parquet.")
+        raise ValueError(
+            "Use only one of --policy-qpos-init-dataset or --policy-qpos-init-parquet."
+        )
     if args.deploy_fixed_init_dataset or args.deploy_fixed_init_parquet:
         if args.policy_qpos_init_dataset or args.policy_qpos_init_parquet:
-            raise ValueError("Use only one of --deploy-fixed-init-* or --policy-qpos-init-*.")
+            raise ValueError(
+                "Use only one of --deploy-fixed-init-* or --policy-qpos-init-*."
+            )
         if active_sides != ("right",):
-            raise ValueError("--deploy-fixed-init-* is currently right-arm/right-hand only; use --active-sides right.")
+            raise ValueError(
+                "--deploy-fixed-init-* is currently right-arm/right-hand only; use --active-sides right."
+            )
         if not bool(args.arms_enabled):
             raise ValueError("--deploy-fixed-init-* requires arms to be enabled.")
     if args.policy_qpos_init_dataset or args.policy_qpos_init_parquet:
@@ -2927,11 +4406,13 @@ def validate_args(
         and bool(args.arms_enabled)
         and not has_dataset_qpos_start
         and not bool(args.start_init_qpos)
+        and not no_init_qpos
     ):
         raise ValueError(
             "Real arm policy execution requires dataset-frame qpos initialization "
             "(--policy-qpos-init-dataset or --policy-qpos-init-parquet). "
-            "To intentionally start from the current qpos, pass --start-init_qpos."
+            "To intentionally start from the current qpos, pass --no-init-qpos "
+            "(--start-init_qpos remains supported when no profile injects qpos init)."
         )
     if (
         raw_argv
@@ -2972,34 +4453,60 @@ def validate_args(
             "A single active arm has no authoritative passive-arm qpos/TCP, so the "
             "dual-arm model must fail closed rather than guess it."
         )
-    if args.debug_replay_end_index is not None and int(args.debug_replay_end_index) <= int(args.debug_replay_start_index):
-        raise ValueError("--debug-replay-end-index must be greater than --debug-replay-start-index.")
-    action_hz_start = args.debug_replay_start_index if args.action_hz_start_index is None else args.action_hz_start_index
-    action_hz_end = args.debug_replay_end_index if args.action_hz_end_index is None else args.action_hz_end_index
+    if args.debug_replay_end_index is not None and int(
+        args.debug_replay_end_index
+    ) <= int(args.debug_replay_start_index):
+        raise ValueError(
+            "--debug-replay-end-index must be greater than --debug-replay-start-index."
+        )
+    action_hz_start = (
+        args.debug_replay_start_index
+        if args.action_hz_start_index is None
+        else args.action_hz_start_index
+    )
+    action_hz_end = (
+        args.debug_replay_end_index
+        if args.action_hz_end_index is None
+        else args.action_hz_end_index
+    )
     if action_hz_end is not None and int(action_hz_end) <= int(action_hz_start):
-        raise ValueError("--action-hz-end-index must be greater than --action-hz-start-index.")
+        raise ValueError(
+            "--action-hz-end-index must be greater than --action-hz-start-index."
+        )
     if args.debug_replay_dataset and args.debug_replay_parquet:
-        raise ValueError("Use only one of --debug-replay-dataset or --debug-replay-parquet.")
+        raise ValueError(
+            "Use only one of --debug-replay-dataset or --debug-replay-parquet."
+        )
     if args.action_hz_dataset and args.action_hz_parquet:
         raise ValueError("Use only one of --action-hz-dataset or --action-hz-parquet.")
-    if (args.debug_replay_dataset or args.debug_replay_parquet) and str(args.policy_spec or "hold").strip().lower() not in {"", "hold", "builtin:hold"}:
-        raise ValueError("--debug-replay-* replaces --policy; omit --policy in replay mode.")
+    if (args.debug_replay_dataset or args.debug_replay_parquet) and str(
+        args.policy_spec or "hold"
+    ).strip().lower() not in {"", "hold", "builtin:hold"}:
+        raise ValueError(
+            "--debug-replay-* replaces --policy; omit --policy in replay mode."
+        )
     parse_tactile_regions(args.hand_tactile_regions)
     if bool(args.send_actions) and bool(args.arms_enabled):
         for side in active_sides:
             if not getattr(args, f"{side}_arm_ip"):
-                raise ValueError(f"--send-actions requires --{side}-arm-ip for active side '{side}'.")
+                raise ValueError(
+                    f"--send-actions requires --{side}-arm-ip for active side '{side}'."
+                )
     if bool(args.send_actions) and hands_enabled:
         for side in end_effector_sides:
             if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_INSPIRE:
                 if not getattr(args, f"{side}_hand_ip"):
-                    raise ValueError(f"--send-actions with hands requires --{side}-hand-ip.")
+                    raise ValueError(
+                        f"--send-actions with hands requires --{side}-hand-ip."
+                    )
     if bool(args.visualize_tactile):
         if any(
             _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
             for side in end_effector_sides
         ):
-            raise ValueError("--visualize-tactile currently supports InspireTac UV tactile, not DMTAC gripper tactile.")
+            raise ValueError(
+                "--visualize-tactile currently supports InspireTac UV tactile, not DMTAC gripper tactile."
+            )
         if not hands_enabled:
             raise ValueError("--visualize-tactile requires hands to be enabled.")
         for side in end_effector_sides:
@@ -3007,9 +4514,13 @@ def validate_args(
                 raise ValueError(f"--visualize-tactile requires --{side}-hand-ip.")
     if args.camera_mode in {"single", "multi"}:
         if args.camera_mode == "multi" and args.camera_serial:
-            raise ValueError("--camera-mode multi uses --camera-config; omit --camera-serial.")
+            raise ValueError(
+                "--camera-mode multi uses --camera-config; omit --camera-serial."
+            )
         if not args.camera_serial and not Path(args.camera_config).exists():
-            raise ValueError(f"--camera-mode {args.camera_mode} requires an existing --camera-config.")
+            raise ValueError(
+                f"--camera-mode {args.camera_mode} requires an existing --camera-config."
+            )
         if int(args.camera_width) <= 0 or int(args.camera_height) <= 0:
             raise ValueError("--camera-width/--camera-height must be positive.")
         if int(args.camera_fps) <= 0:
@@ -3025,7 +4536,9 @@ def validate_args(
         if float(args.camera_start_stagger_sec) < 0.0:
             raise ValueError("--camera-start-stagger-sec must be >= 0.")
     elif bool(args.vis_cam):
-        raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
+        raise ValueError(
+            "--vis_cam requires --camera-mode single or --camera-mode multi."
+        )
     return active_sides
 
 
@@ -3043,7 +4556,9 @@ def _runtime_action_keyframe_period_sec(args: argparse.Namespace) -> float:
     return 1.0 / 15.0
 
 
-def _action_hz_reference(args: argparse.Namespace) -> tuple[Path | None, Path | None, int, int, int | None]:
+def _action_hz_reference(
+    args: argparse.Namespace,
+) -> tuple[Path | None, Path | None, int, int, int | None]:
     dataset = args.action_hz_dataset or args.debug_replay_dataset
     parquet = args.action_hz_parquet or args.debug_replay_parquet
     episode = (
@@ -3064,7 +4579,9 @@ def _action_hz_reference(args: argparse.Namespace) -> tuple[Path | None, Path | 
     return dataset, parquet, episode, start_index, end_index
 
 
-def resolve_effective_action_hz(args: argparse.Namespace, policy: Any | None = None) -> tuple[float, dict[str, Any]]:
+def resolve_effective_action_hz(
+    args: argparse.Namespace, policy: Any | None = None
+) -> tuple[float, dict[str, Any]]:
     explicit = float(args.action_hz)
     if explicit > 0.0:
         return explicit, {"source": "cli.action_hz", "hz": explicit}
@@ -3101,7 +4618,9 @@ def resolve_effective_action_hz(args: argparse.Namespace, policy: Any | None = N
     return default_hz, {"source": "cli.hz", "hz": default_hz}
 
 
-def resolve_effective_policy_hz(args: argparse.Namespace, *, action_hz: float, action_hz_source: str) -> tuple[float, str]:
+def resolve_effective_policy_hz(
+    args: argparse.Namespace, *, action_hz: float, action_hz_source: str
+) -> tuple[float, str]:
     if args.policy_hz is not None:
         return float(args.policy_hz), "cli.policy_hz"
     return float(action_hz), "action_hz"
@@ -3118,7 +4637,9 @@ def resolve_arm_step_dt_max_scale(
         return float(explicit), False
     target_hz = float(action_hz or 0.0)
     if target_hz <= 0.0:
-        target_hz = float(getattr(args, "hz", DEFAULT_TELEOP_SAMPLE_HZ) or DEFAULT_TELEOP_SAMPLE_HZ)
+        target_hz = float(
+            getattr(args, "hz", DEFAULT_TELEOP_SAMPLE_HZ) or DEFAULT_TELEOP_SAMPLE_HZ
+        )
     target_hz = max(1e-6, target_hz)
     required_scale = 1.1 * max(1e-6, float(control_hz)) / target_hz
     return max(DEPLOY_ARM_STEP_DT_MAX_SCALE, required_scale), True
@@ -3149,7 +4670,9 @@ def deploy_arm_command_step_dt_sec(
     if not bool(getattr(args, "arm_step_dt_scaling", True)):
         return base_dt
     action_dt = 1.0 / max(1e-6, float(action_hz))
-    max_scale = float(getattr(args, "arm_step_dt_max_scale", DEPLOY_ARM_STEP_DT_MAX_SCALE))
+    max_scale = float(
+        getattr(args, "arm_step_dt_max_scale", DEPLOY_ARM_STEP_DT_MAX_SCALE)
+    )
     return float(np.clip(action_dt, base_dt, base_dt * max_scale))
 
 
@@ -3159,7 +4682,9 @@ def deploy_arm_backend_control_dt_sec(
     control_hz: float,
     action_hz: float | None,
 ) -> float:
-    arm_control_mode = normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
+    arm_control_mode = normalize_rm65_arm_control_mode(
+        getattr(args, "arm_control_mode", None)
+    )
     if arm_control_mode != RM65_ARM_CONTROL_MODE_POSITION:
         return 1.0 / max(1e-6, float(control_hz))
     del action_hz
@@ -3215,7 +4740,9 @@ def annotate_deploy_arm_command_limits(
         effector_command.metadata["max_joint_step_rad"] = max_joint_step.copy()
         effector_command.metadata["deploy_max_joint_step_rad"] = max_joint_step.copy()
         effector_command.metadata["deploy_action_step_dt_sec"] = float(step_dt)
-        effector_command.metadata["deploy_backend_control_dt_sec"] = float(backend_control_dt)
+        effector_command.metadata["deploy_backend_control_dt_sec"] = float(
+            backend_control_dt
+        )
         effector_command.metadata["deploy_arm_step_dt_scaling"] = bool(
             getattr(args, "arm_step_dt_scaling", True)
         )
@@ -3264,7 +4791,9 @@ def _dispatch_position_discrete_command_checked(
         side = str(effector_command.side or "")
         backend = hand_backends.get(side)
         if backend is None:
-            raise KeyError(f"Deploy backend missing for discrete effector {effector_name!r}.")
+            raise KeyError(
+                f"Deploy backend missing for discrete effector {effector_name!r}."
+            )
         started = time.monotonic()
         try:
             result = backend.send_command(effector_command)
@@ -3384,6 +4913,101 @@ def request_policy_inference_soft_hold(
     return receipts
 
 
+def _defer_position_action_after_synchronous_prediction(
+    *,
+    prediction_accepted: bool,
+    position_executor_enabled: bool,
+) -> bool:
+    """Keep a newly predicted position chunk for the next observation cut.
+
+    Legacy policy inference is synchronous.  A slow inference therefore ages
+    the observation that was used to request it, even though the model output
+    itself remains valid.  The first position command must not reuse that
+    frozen observation as the authoritative collision-planner reset state.
+    Deferring consumption by one control-loop iteration lets the frontend
+    acquire a fresh dual-arm measurement without weakening collision-reset
+    freshness or changing the queued action chunk.
+    """
+
+    return bool(prediction_accepted and position_executor_enabled)
+
+
+def _prepare_position_plan_cut_for_action_step(
+    detector: DeploymentPositionPlanCutDetector,
+    action_step: Any,
+    *,
+    rtc_enabled: bool,
+    policy_node_id: str,
+    hold_generation: int,
+    detected_at: float,
+):
+    """Build the mandatory typed cut from the owning source cursor.
+
+    RTC owns a committed timed emission.  The synchronous compatibility path
+    instead owns a shared queue cursor and its attached chunk metadata.  Its
+    optional passive emission must not become motion authority.
+    """
+
+    detector.observe_hold_generation(int(hold_generation))
+    if rtc_enabled:
+        emission = getattr(action_step, "emission", None)
+        if emission is None:
+            raise RuntimeError(
+                "RTC position action is missing its committed emission lineage; "
+                "motion submission is blocked before the executor."
+            )
+        return detector.prepare(
+            emission,
+            detected_at=detected_at,
+        )
+    raw_action = getattr(action_step, "raw_action", None)
+    if raw_action is None:
+        raise RuntimeError(
+            "Synchronous position action is missing its queue-owned source "
+            "lineage; motion submission is blocked before the executor."
+        )
+    return detector.prepare_synchronous_action(
+        raw_action,
+        policy_node_id=policy_node_id,
+        detected_at=detected_at,
+    )
+
+
+def _hold_active_position_stream_for_synchronous_chunk_gap(
+    position_executor: PositionDeployExecutor | None,
+) -> bool:
+    """End an exhausted synchronous chunk without faulting its executor.
+
+    The legacy OpenPI client performs inference synchronously.  With a full
+    chunk execution policy, the position stream can therefore be active while
+    the policy queue has just become empty.  Waiting for inference inside that
+    active stream would trip the executor's missing-keyframe watchdog.  Clear
+    the stream first so the arms enter the existing bounded Hold path; the next
+    chunk must then establish a fresh collision reset before it can move.
+    """
+
+    if position_executor is None:
+        return False
+    tail_status = position_executor.source_tail_drain_status()
+    if bool(tail_status.get("required")) and not bool(tail_status.get("drained")):
+        return False
+    if not bool(position_executor.snapshot().get("active")):
+        return False
+    position_executor.clear()
+    return True
+
+
+def _position_source_tail_pending_before_synchronous_chunk_gap(
+    position_executor: PositionDeployExecutor | None,
+) -> bool:
+    """Keep the upper chunk boundary open until motion emitted its tail."""
+
+    if position_executor is None:
+        return False
+    status = position_executor.source_tail_drain_status()
+    return bool(status.get("required")) and not bool(status.get("drained"))
+
+
 def emergency_stop_deploy_arm_backends(
     arm_backends: Mapping[str, EffectorBackend],
     *,
@@ -3399,6 +5023,34 @@ def emergency_stop_deploy_arm_backends(
         )
 
 
+def emergency_stop_position_deploy_on_keyboard_interrupt(
+    args: argparse.Namespace,
+    *,
+    send_actions: bool,
+    arm_backends: Mapping[str, EffectorBackend],
+) -> bool:
+    """Request Arm_Stop for an active real-position deployment.
+
+    Returns False for dry-run, arm-disabled, non-position, or backend-free
+    processes so Ctrl+C retains its ordinary resource-cleanup behavior there.
+    Any incomplete real-arm acknowledgement is intentionally propagated.
+    """
+
+    if not (
+        bool(send_actions)
+        and bool(getattr(args, "arms_enabled", False))
+        and normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
+        == RM65_ARM_CONTROL_MODE_POSITION
+        and arm_backends
+    ):
+        return False
+    emergency_stop_deploy_arm_backends(
+        arm_backends,
+        reason="keyboard_interrupt",
+    )
+    return True
+
+
 def build_arm_backends(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
@@ -3409,14 +5061,18 @@ def build_arm_backends(
     if not bool(args.arms_enabled):
         return {}
     arm_urdf_path = str(args.arm_urdf_path or require_asset_path("rm65_arm.urdf"))
-    control_hz = effective_arm_control_hz(args) if control_hz is None else float(control_hz)
+    control_hz = (
+        effective_arm_control_hz(args) if control_hz is None else float(control_hz)
+    )
     control_dt = 1.0 / float(control_hz)
     backend_control_dt = deploy_arm_backend_control_dt_sec(
         args,
         control_hz=float(control_hz),
         action_hz=action_hz,
     )
-    arm_control_mode = normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
+    arm_control_mode = normalize_rm65_arm_control_mode(
+        getattr(args, "arm_control_mode", None)
+    )
     worker_binding = getattr(args, "_rm65_legacy_worker_binding", None)
     if worker_binding is not None:
         if not isinstance(worker_binding, RM65LegacyWorkerExecutionBinding):
@@ -3426,9 +5082,7 @@ def build_arm_backends(
                 "RM65 arms-only worker binding requires coupled left/right sides"
             )
         if arm_control_mode != RM65_ARM_CONTROL_MODE_POSITION:
-            raise ValueError(
-                "RM65 arms-only worker binding excludes impedance control"
-            )
+            raise ValueError("RM65 arms-only worker binding excludes impedance control")
     command_input_hz = (
         effective_position_reference_hz(args)
         if arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION
@@ -3442,7 +5096,9 @@ def build_arm_backends(
     arm_canfd_follow = effective_arm_canfd_follow(args)
     observation_only = bool(getattr(args, "rtc_real_shadow", False))
     if observation_only and bool(getattr(args, "send_actions", False)):
-        raise ValueError("rtc real shadow backend construction requires send_actions=False")
+        raise ValueError(
+            "rtc real shadow backend construction requires send_actions=False"
+        )
     if observation_only:
         # A read-only shadow must not accidentally inherit a force/CANFD
         # execution setting from the checked-in lab profile.
@@ -3458,20 +5114,20 @@ def build_arm_backends(
                     connect_hardware=bool(arm_ip),
                     observation_only=observation_only,
                     tool_profile=getattr(args, f"{side}_tool_profile", "") or None,
-                    strict_tool_profile=bool(getattr(args, "strict_tool_profile", True)),
+                    strict_tool_profile=bool(
+                        getattr(args, "strict_tool_profile", True)
+                    ),
                     impedance_mode="pose",
                     force_tare_sec=float(getattr(args, "force_tare_sec", 3.0)),
                     control_dt=control_dt,
-                    action_hz=(
-                        None
-                        if action_hz is None
-                        else float(action_hz)
-                    ),
+                    action_hz=(None if action_hz is None else float(action_hz)),
                     max_angvel=tuple(float(value) for value in args.arm_max_angvel),
                     actual_send_dt_alpha=float(args.arm_step_dt_alpha),
                     actual_send_dt_min_scale=1.0,
                     actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
-                    actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
+                    actual_send_dt_stall_reset_sec=float(
+                        args.arm_step_dt_stall_reset_sec
+                    ),
                     debug_timing=bool(getattr(args, "debug", False)),
                     # Force-policy deployment follows the impedance-only
                     # safety envelope.  The position branch below keeps its
@@ -3524,38 +5180,48 @@ def build_arm_backends(
                 observation_only=observation_only,
                 control_dt=backend_control_dt,
                 max_angvel=tuple(float(value) for value in args.arm_max_angvel),
-                singularity_qpos_init_slowdown=float(args.singularity_qpos_init_slowdown),
+                singularity_qpos_init_slowdown=float(
+                    args.singularity_qpos_init_slowdown
+                ),
                 dry_run_fast=not bool(arm_ip),
                 hardware_read_retries=int(args.rm65_hardware_read_retries),
-                hardware_read_retry_delay_sec=float(args.rm65_hardware_read_retry_delay_sec),
+                hardware_read_retry_delay_sec=float(
+                    args.rm65_hardware_read_retry_delay_sec
+                ),
                 initial_qpos=getattr(args, f"{side}_initial_qpos"),
                 tool_profile=getattr(args, f"{side}_tool_profile", "") or None,
                 ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
-                use_actual_send_dt_scaling=bool(getattr(args, "arm_step_dt_scaling", True)),
+                use_actual_send_dt_scaling=bool(
+                    getattr(args, "arm_step_dt_scaling", True)
+                ),
                 actual_send_dt_alpha=float(args.arm_step_dt_alpha),
                 actual_send_dt_min_scale=1.0,
                 actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
                 actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
                 background_streaming_enabled=bool(arm_ip) and bool(arm_canfd_follow),
                 background_streaming_hz=float(control_hz),
+                background_streaming_target_admission_mode=str(
+                    getattr(
+                        args,
+                        "position_background_target_admission",
+                        RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+                    )
+                ),
                 position_command_planner=str(args.position_command_planner),
                 position_velocity_ramp_sec=float(args.position_velocity_ramp_sec),
                 position_target_velocity_filter_tau_sec=float(
                     args.position_target_velocity_filter_tau_sec
                 ),
                 position_max_acceleration_rad_s2=tuple(
-                    float(value)
-                    for value in args.position_max_acceleration_rad_s2
+                    float(value) for value in args.position_max_acceleration_rad_s2
                 ),
-                position_max_command_step_deg=float(
-                    args.position_max_command_step_deg
-                ),
-                position_degraded_speed_scale=float(
-                    args.position_degraded_speed_scale
-                ),
+                position_max_command_step_deg=float(args.position_max_command_step_deg),
+                position_degraded_speed_scale=float(args.position_degraded_speed_scale),
                 arm_follow_qpos_alpha=float(args.arm_follow_qpos_alpha),
                 canfd_follow=bool(arm_canfd_follow),
-                canfd_trajectory_mode=int(getattr(args, "arm_canfd_trajectory_mode", 0)),
+                canfd_trajectory_mode=int(
+                    getattr(args, "arm_canfd_trajectory_mode", 0)
+                ),
                 canfd_radio=int(getattr(args, "arm_canfd_radio", 0)),
             ),
             **binding_kwargs,
@@ -3563,15 +5229,17 @@ def build_arm_backends(
     return backends
 
 
-def build_hand_backends(args: argparse.Namespace, active_sides: tuple[str, ...]) -> dict[str, EffectorBackend]:
+def build_hand_backends(
+    args: argparse.Namespace, active_sides: tuple[str, ...]
+) -> dict[str, EffectorBackend]:
     if not active_sides or not _hands_enabled(args):
         return {}
     configs = _dmtac_backend_configs(args, active_sides)
     backends: dict[str, EffectorBackend] = {
-            side: DMTacGripperBackend(config)
-            for side, config in configs.items()
-            if side in active_sides
-            and _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+        side: DMTacGripperBackend(config)
+        for side, config in configs.items()
+        if side in active_sides
+        and _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
     }
 
     tactile_regions = parse_tactile_regions(args.hand_tactile_regions)
@@ -3639,7 +5307,10 @@ def resolve_policy_camera_input_keys(
                 f"artifact requires {list(selected_keys)}."
             )
         selected_key = selected_keys[0]
-        if _argument_was_supplied(raw_argv, "--camera-key") and args.camera_key != selected_key:
+        if (
+            _argument_was_supplied(raw_argv, "--camera-key")
+            and args.camera_key != selected_key
+        ):
             raise ValueError(
                 "--camera-key disagrees with policy artifact camera input: "
                 f"expected {selected_key!r}, got {args.camera_key!r}."
@@ -3663,15 +5334,20 @@ def build_camera_sources(
     if args.camera_mode == "none":
         return {}
     if selected_camera_keys == ():
-        raise ValueError("A policy artifact without camera inputs requires --camera-mode none.")
+        raise ValueError(
+            "A policy artifact without camera inputs requires --camera-mode none."
+        )
     if args.camera_serial:
         if args.camera_mode != "single":
-            raise ValueError("--camera-serial can only be used with --camera-mode single.")
+            raise ValueError(
+                "--camera-serial can only be used with --camera-mode single."
+            )
         config = RealSenseRGBCameraConfig(
             serial=str(args.camera_serial),
             width=int(args.camera_width),
             height=int(args.camera_height),
             fps=int(args.camera_fps),
+            color_format=str(getattr(args, "camera_color_format", "bgr8")),
             camera_key=str(args.camera_key),
             keep_last=int(args.camera_keep_last),
             color_space=str(args.camera_color_space),
@@ -3681,9 +5357,19 @@ def build_camera_sources(
             startup_hardware_reset=bool(
                 getattr(args, "camera_startup_hardware_reset", False)
             ),
+            startup_warmup_policy=str(
+                getattr(
+                    args,
+                    "camera_startup_warmup_policy",
+                    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+                )
+            ),
             metadata={"source": "teleop_runtime_deploy_cli"},
         )
-        if selected_camera_keys is not None and config.camera_key not in selected_camera_keys:
+        if (
+            selected_camera_keys is not None
+            and config.camera_key not in selected_camera_keys
+        ):
             raise ValueError(
                 f"--camera-key {config.camera_key!r} is not selected by policy artifact "
                 f"{list(selected_camera_keys)}."
@@ -3691,7 +5377,9 @@ def build_camera_sources(
         return {config.camera_key: RealSenseRGBSource(config)}
     camera_configs = load_realsense_camera_config_map(Path(args.camera_config))
     if selected_camera_keys is not None:
-        missing_keys = tuple(key for key in selected_camera_keys if key not in camera_configs)
+        missing_keys = tuple(
+            key for key in selected_camera_keys if key not in camera_configs
+        )
         if missing_keys:
             raise ValueError(
                 "--camera-config does not provide policy artifact camera inputs: "
@@ -3701,6 +5389,22 @@ def build_camera_sources(
         camera_configs = {
             key: config for key, config in camera_configs.items() if key in selected
         }
+    real_camera_configs = {
+        key: config
+        for key, config in camera_configs.items()
+        if isinstance(config, RealSenseRGBCameraConfig)
+    }
+    apply_real_teleop_camera_startup_defaults(
+        real_camera_configs,
+        color_format=str(getattr(args, "camera_color_format", "bgr8")),
+        warmup_policy=str(
+            getattr(
+                args,
+                "camera_startup_warmup_policy",
+                REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+            )
+        ),
+    )
     # Config files historically omitted keep_last, which left deployment with
     # the source default of two frames even though --camera-keep-last already
     # defaulted to four for the single-camera CLI path.  Apply the deployment
@@ -3716,7 +5420,9 @@ def build_camera_sources(
         for config in camera_configs.values():
             config.startup_hardware_reset = True
     if args.camera_mode == "single" and len(camera_configs) != 1:
-        raise ValueError(f"--camera-mode single expects exactly one camera config, got {len(camera_configs)}.")
+        raise ValueError(
+            f"--camera-mode single expects exactly one camera config, got {len(camera_configs)}."
+        )
     if args.camera_mode == "multi" and not camera_configs:
         raise ValueError("--camera-mode multi requires at least one camera config.")
     return {key: RealSenseRGBSource(config) for key, config in camera_configs.items()}
@@ -3725,38 +5431,81 @@ def build_camera_sources(
 def start_camera_sources(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
-    stagger_sec: float = 0.0,
+    stagger_sec: float = REAL_TELEOP_CAMERA_START_STAGGER_SEC,
 ) -> None:
-    """Start selected cameras serially in config order, with optional staggering."""
+    """Use the formal real-teleop collection camera startup lifecycle."""
 
-    delay_sec = float(stagger_sec)
-    if delay_sec < 0.0:
-        raise ValueError("camera start stagger_sec must be >= 0.")
-    for index, (camera_key, camera_source) in enumerate(camera_sources.items()):
-        if index > 0 and delay_sec > 0.0:
+    errors = _start_real_teleop_camera_sources_best_effort(
+        camera_sources,
+        stagger_sec=float(stagger_sec),
+    )
+    if errors:
+        detail = "; ".join(
+            f"{camera_key}={errors[camera_key]}" for camera_key in sorted(errors)
+        )
+        raise RuntimeError(
+            "RealSense startup failed after the formal real-teleop deferred "
+            f"retry lifecycle: {detail}"
+        )
+
+
+def run_camera_startup_self_check(
+    camera_sources: Mapping[str, RealSenseRGBSource],
+    *,
+    duration_sec: float = CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
+    interval_sec: float = CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
+) -> None:
+    """Run the formal collection consecutive-fresh-frame admission headlessly."""
+
+    if not camera_sources:
+        return
+    started_at = time.time()
+    duration_sec = max(0.0, float(duration_sec))
+    interval_sec = max(0.01, float(interval_sec))
+    freshness_gate = CameraStartupFreshnessGate(
+        tuple(str(camera_key) for camera_key in camera_sources)
+    )
+    final_status: Mapping[str, object] = {}
+    while True:
+        now = time.time()
+        final_status = _build_camera_status(camera_sources, now=now)
+        if freshness_gate.update(final_status):
             print(
-                f"[Camera] waiting {delay_sec:.2f}s before starting camera {camera_key}",
+                "[CameraSelfCheck] formal real-teleop admission passed: "
+                f"cameras={sorted(camera_sources)} "
+                f"consecutive={CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES} "
+                f"max_age_sec={CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC:.3f}",
                 flush=True,
             )
-            time.sleep(delay_sec)
-        config = camera_source.config
-        print(
-            "[Camera] starting "
-            f"camera={camera_key} serial={config.serial} "
-            f"startup_hardware_reset={bool(config.startup_hardware_reset)}",
-            flush=True,
-        )
-        camera_source.start()
+            return
+        elapsed_sec = now - started_at
+        if elapsed_sec >= duration_sec:
+            status_detail = "; ".join(
+                f"{camera_key}={final_status.get(camera_key)}"
+                for camera_key in sorted(camera_sources)
+            )
+            raise RuntimeError(
+                "RealSense formal real-teleop startup self-check failed: "
+                f"elapsed={elapsed_sec:.3f}s "
+                f"streaks={freshness_gate.fresh_frame_streaks}; {status_detail}"
+            )
+        sleep_sec = min(interval_sec, max(0.0, duration_sec - elapsed_sec))
+        if sleep_sec > 0.0:
+            time.sleep(sleep_sec)
 
 
-def select_preview_camera_sources(camera_sources: dict[str, RealSenseRGBSource], requested_key: str) -> dict[str, RealSenseRGBSource]:
+def select_preview_camera_sources(
+    camera_sources: dict[str, RealSenseRGBSource], requested_key: str
+) -> dict[str, RealSenseRGBSource]:
     if not camera_sources:
         return {}
     key = str(requested_key or "").strip()
     if key:
         if key not in camera_sources:
             available = ", ".join(sorted(camera_sources))
-            raise ValueError(f"--vis-cam-key {key!r} not found. Available camera keys: {available}")
+            raise ValueError(
+                f"--vis-cam-key {key!r} not found. Available camera keys: {available}"
+            )
         return {key: camera_sources[key]}
     selected_key = "front" if "front" in camera_sources else sorted(camera_sources)[0]
     return {selected_key: camera_sources[selected_key]}
@@ -3769,12 +5518,18 @@ def compact_log_value(value: object, *, max_chars: int = 90) -> str:
     return text[: max(0, max_chars - 3)] + "..."
 
 
-def camera_status_text(camera_sources: dict[str, RealSenseRGBSource], camera_previewer: CameraPreviewer | None) -> str:
+def camera_status_text(
+    camera_sources: dict[str, RealSenseRGBSource],
+    camera_previewer: CameraPreviewer | None,
+) -> str:
     if not camera_sources:
         return "camera=off"
     bits: list[str] = []
     if camera_previewer is not None and camera_previewer.disabled_reason:
-        bits.append("preview=disabled:" + compact_log_value(camera_previewer.disabled_reason, max_chars=80))
+        bits.append(
+            "preview=disabled:"
+            + compact_log_value(camera_previewer.disabled_reason, max_chars=80)
+        )
     for camera_key, camera_source in sorted(camera_sources.items()):
         try:
             info = camera_source.device_info()
@@ -3784,7 +5539,9 @@ def camera_status_text(camera_sources: dict[str, RealSenseRGBSource], camera_pre
         frame_count = int(info.get("frame_count", 0) or 0)
         last_error = info.get("last_error")
         if last_error:
-            bits.append(f"{camera_key}=frames:{frame_count},err:{compact_log_value(last_error, max_chars=70)}")
+            bits.append(
+                f"{camera_key}=frames:{frame_count},err:{compact_log_value(last_error, max_chars=70)}"
+            )
         else:
             bits.append(f"{camera_key}=frames:{frame_count}")
     return "camera=" + ";".join(bits)
@@ -3835,16 +5592,24 @@ def print_controls(
         print("  ready_confirm=on(A/a required after startup init)")
     if fixed_init_enabled:
         print("  fixed_init=on(H first-frame qpos, H execute T, then startup init)")
-        print("Controls: H=pause policy or fixed-init step, g=start after fixed-init, r=manual safety re-arm, A=confirm, q=quit")
+        print(
+            "Controls: H=pause policy or fixed-init step, g=start after fixed-init, r=manual safety re-arm, A=confirm, q=quit"
+        )
     elif policy_qpos_init_enabled:
         print("  policy_qpos_init=on(g moves to dataset frame qpos, then startup init)")
-        print("Controls: g=start qpos init / resume, r=manual safety re-arm, A=confirm ready, h=pause+clear queue, q=quit")
+        print(
+            "Controls: g=start qpos init / resume, r=manual safety re-arm, A=confirm ready, h=pause+clear queue, q=quit"
+        )
     else:
-        print("Controls: g=start/resume, r=manual safety re-arm, A=confirm ready/start policy, h=pause+clear queue, q=quit")
+        print(
+            "Controls: g=start/resume, r=manual safety re-arm, A=confirm ready/start policy, h=pause+clear queue, q=quit"
+        )
     print("=" * 60 + "\n")
 
 
-def _resolve_action_queue_policy(args: argparse.Namespace, *, debug_replay: bool) -> str:
+def _resolve_action_queue_policy(
+    args: argparse.Namespace, *, debug_replay: bool
+) -> str:
     """Compatibility wrapper for the shared queue-policy resolver."""
 
     return resolve_action_queue_policy(
@@ -4065,9 +5830,7 @@ def _policy_observation_contract(
         )
         binding_id = f"artifact={artifact_hash}"
     elif effective_layout is not None:
-        binding_id = (
-            f"layout={effective_layout.layout_hash};model=unversioned"
-        )
+        binding_id = f"layout={effective_layout.layout_hash};model=unversioned"
     else:
         binding_id = f"policy={getattr(policy, 'name', 'unknown')}"
     return default_deploy_policy_observation_contract(
@@ -4075,6 +5838,109 @@ def _policy_observation_contract(
         last_action_pose_mode=str(pose_mode),
         compatibility_hand_state_keys=tuple(sorted(hand_state_keys)),
     )
+
+
+def _reset_startup_initializer(
+    startup_initializer: StartupInitializer,
+    *,
+    current_pose_start_allowed: bool,
+) -> bool:
+    """Reset startup init without inventing motion for an allowed current start.
+
+    ``init-source=current`` resolves its target from the same live observation
+    that supplies its start action.  When the caller has explicitly admitted a
+    current-qpos start, replaying that no-op through the Cartesian position
+    stream is both redundant and semantically wrong: it creates a new motion
+    stream without a source-plan cut.  Keep non-current startup targets intact.
+    """
+
+    startup_initializer.reset()
+    current_startup_satisfied = (
+        bool(current_pose_start_allowed)
+        and startup_initializer.enabled
+        and str(startup_initializer.source).strip().lower() == "current"
+    )
+    if current_startup_satisfied:
+        startup_initializer.mark_complete()
+    return current_startup_satisfied
+
+
+def _finish_policy_qpos_init_reference_cut(
+    startup_initializer: StartupInitializer,
+) -> tuple[np.ndarray, bool]:
+    """Cut dataset-frame pose history before live Cartesian execution.
+
+    The caller suppresses action generation for the qpos-init completion loop.
+    An all-NaN ``last_action`` then makes the freshly sampled observation in
+    the next loop the safety/reference anchor. A ``current`` startup init is a
+    no-op after qpos init, so it is completed without submitting that same pose
+    through IK for another initialization interval.
+    """
+
+    last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
+    current_startup_satisfied = _reset_startup_initializer(
+        startup_initializer,
+        current_pose_start_allowed=True,
+    )
+    return last_action, current_startup_satisfied
+
+
+def _announce_policy_qpos_init_complete(
+    *,
+    wait_for_ready_confirm: bool,
+    now: float,
+) -> None:
+    """Print a high-salience boundary between initialization and policy motion."""
+
+    console_log_event(
+        "Init",
+        "READY: G INITIALIZATION COMPLETE - arms and end effectors reached "
+        "the dataset start state.",
+        now=now,
+    )
+    if wait_for_ready_confirm:
+        console_log_event(
+            "Policy",
+            "WAIT: PRESS A to start policy inference/execution.",
+            now=now,
+        )
+    else:
+        console_log_event(
+            "Policy",
+            "READY: policy inference/execution released automatically.",
+            now=now,
+        )
+
+
+def _begin_policy_qpos_init_with_force_guard(
+    controller: DeployPolicyQposInitController,
+    *,
+    monitor: PositionForceGuardMonitor | None,
+    arm_backends: Mapping[str, EffectorBackend],
+    now: float,
+) -> str:
+    """Plan qpos init without admitting motion while force reads are blocked."""
+
+    if monitor is None:
+        return controller.begin(arm_backends=arm_backends, now=now)
+    token = monitor.suspend_stale_watchdog_for_non_motion()
+    print(
+        "[PositionForceGuard] stale watchdog paused for non-motion qpos-init "
+        f"planning token={token}; force limits/read errors remain active.",
+        flush=True,
+    )
+    try:
+        message = controller.begin(arm_backends=arm_backends, now=now)
+    finally:
+        snapshot = monitor.resume_stale_watchdog_after_non_motion(token)
+        print(
+            "[PositionForceGuard] qpos-init planning window closed; fresh "
+            "post-plan samples received for sides="
+            f"{sorted(snapshot.get('last_reading_by_side', {}))}; stale "
+            "watchdog re-armed before motion.",
+            flush=True,
+        )
+    return message
 
 
 def main(
@@ -4102,13 +5968,9 @@ def main(
         RtcPolicyEmissionPublisher,
     ):
         raise TypeError(
-            "rtc_emission_publisher must be an "
-            "RtcPolicyEmissionPublisher or None."
+            "rtc_emission_publisher must be an " "RtcPolicyEmissionPublisher or None."
         )
-    if (
-        rtc_emission_fanout is not None
-        and rtc_emission_publisher is not None
-    ):
+    if rtc_emission_fanout is not None and rtc_emission_publisher is not None:
         raise ValueError(
             "Use rtc_emission_publisher or the compatibility "
             "rtc_emission_fanout, not both."
@@ -4129,7 +5991,10 @@ def main(
     kwargs_artifact = policy_kwargs.get("policy_artifact")
     if kwargs_artifact is not None:
         kwargs_contract = policy_artifact_from_metadata(kwargs_artifact)
-        if policy_artifact is not None and kwargs_contract.to_dict() != policy_artifact.to_dict():
+        if (
+            policy_artifact is not None
+            and kwargs_contract.to_dict() != policy_artifact.to_dict()
+        ):
             raise ValueError(
                 "--policy-kwargs-json policy_artifact disagrees with --policy-artifact-json."
             )
@@ -4139,7 +6004,9 @@ def main(
         policy_artifact,
         raw_argv=raw_argv,
     )
-    if debug_replay and str(args.debug_replay_output_pose_mode) != str(args.policy_action_pose_mode):
+    if debug_replay and str(args.debug_replay_output_pose_mode) != str(
+        args.policy_action_pose_mode
+    ):
         raise ValueError(
             "debug replay output pose mode must match policy action pose mode: "
             f"{args.debug_replay_output_pose_mode!r} != {args.policy_action_pose_mode!r}"
@@ -4154,20 +6021,26 @@ def main(
             token == "--end-effector-sides" or token.startswith("--end-effector-sides=")
             for token in raw_argv
         ):
-            args.end_effector_sides = "none" if not layout_sides else " ".join(layout_sides)
+            args.end_effector_sides = (
+                "none" if not layout_sides else " ".join(layout_sides)
+            )
         if args.hands_enabled is None:
             args.hands_enabled = bool(layout_sides)
-        if (
-            policy_artifact.arm_hold_output is not None
-            and str(args.rtc_profile)
-            not in {"off", RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1}
-        ):
+        if policy_artifact.arm_hold_output is not None and str(
+            args.rtc_profile
+        ) not in {"off", RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1}:
             raise ValueError(
                 "arm-hold action semantics support sync deployment and "
                 "raw-RTC final-chunk shadow only; model continuation and "
                 "virtual RTC profiles remain fail closed."
             )
-    active_sides = validate_args(args, raw_argv=raw_argv)
+    active_sides = validate_args(
+        args,
+        raw_argv=raw_argv,
+        policy_artifact_has_arm_hold_output=bool(
+            policy_artifact is not None and policy_artifact.arm_hold_output is not None
+        ),
+    )
     if rtc_step_fanout is not None and str(args.rtc_profile) != (
         RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
     ):
@@ -4209,14 +6082,14 @@ def main(
         if policy_artifact is not None:
             policy_kwargs["policy_artifact"] = policy_artifact.to_dict()
         policy = load_policy(args.policy_spec, kwargs=policy_kwargs)
-    deploy_layout = None if policy_artifact is None else policy_artifact.policy_io_layout
+    deploy_layout = (
+        None if policy_artifact is None else policy_artifact.policy_io_layout
+    )
     if deploy_layout is None and debug_replay:
         dataset_info = policy.metadata.get("dataset_info")
-        if (
-            isinstance(dataset_info, Mapping)
-            and str(dataset_info.get("dexteleop_dataset_schema") or "")
-            in {DEXTELEOP_DATASET_SCHEMA_V22, DEXTELEOP_DATASET_SCHEMA_V23}
-        ):
+        if isinstance(dataset_info, Mapping) and str(
+            dataset_info.get("dexteleop_dataset_schema") or ""
+        ) in {DEXTELEOP_DATASET_SCHEMA_V22, DEXTELEOP_DATASET_SCHEMA_V23}:
             deploy_layout = policy_io_layout_from_metadata(
                 dataset_info,
                 allow_legacy_v21=False,
@@ -4274,13 +6147,13 @@ def main(
             ),
             action_keyframe_period_sec=_runtime_action_keyframe_period_sec(args),
             arm_hold_output=(
-                None
-                if policy_artifact is None
-                else policy_artifact.arm_hold_output
+                None if policy_artifact is None else policy_artifact.arm_hold_output
             ),
         )
     )
-    policy.metadata["resolved_deploy_session_contract"] = deploy_session_contract.to_dict()
+    policy.metadata["resolved_deploy_session_contract"] = (
+        deploy_session_contract.to_dict()
+    )
     policy.metadata["policy_observation_firewall"] = (
         policy_deploy_runtime.observation_firewall_manifest()
     )
@@ -4290,7 +6163,10 @@ def main(
     policy.metadata["action_chunk_execution_steps"] = (
         policy_deploy_runtime.config.action_chunk_execution_steps
     )
-    if runtime_pose_frame_contract_source == "default_rm65_dual_arm_workspace_near_boundary_v1":
+    if (
+        runtime_pose_frame_contract_source
+        == "default_rm65_dual_arm_workspace_near_boundary_v1"
+    ):
         print(
             "[Deploy] runtime pose frame default: dual RM65 calibrated URDF "
             "workspace_near_boundary_frame.",
@@ -4346,23 +6222,12 @@ def main(
     replay_proposal_shadow_adapter: DatasetReplayProposalShadowAdapter | None = None
     if str(args.action_arbiter_mode) == ARBITER_SHADOW_MODE_SHADOW:
         shadow_effectors = tuple(
-            [
-                f"{side}_arm"
-                for side in active_sides
-                if bool(args.arms_enabled)
-            ]
-            + [
-                f"{side}_hand"
-                for side in end_effector_sides
-                if hands_enabled
-            ]
+            [f"{side}_arm" for side in active_sides if bool(args.arms_enabled)]
+            + [f"{side}_hand" for side in end_effector_sides if hands_enabled]
         )
         runtime_session_id = f"deploy-shadow-{uuid.uuid4()}"
         shadow_catalog = ActionComponentCatalog(
-            catalog_id=(
-                "deploy-shadow:"
-                f"{'-'.join(shadow_effectors)}:v1"
-            ),
+            catalog_id=("deploy-shadow:" f"{'-'.join(shadow_effectors)}:v1"),
             action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
             components=tuple(
                 ActionComponentSpec(
@@ -4392,9 +6257,7 @@ def main(
                 control_domain_id="deploy-control-0",
                 embodiment_instance_id="rm65-bimanual-0",
                 producer_id=(
-                    f"replay:{policy.name}"
-                    if debug_replay
-                    else f"policy:{policy.name}"
+                    f"replay:{policy.name}" if debug_replay else f"policy:{policy.name}"
                 ),
                 active_effectors=shadow_effectors,
                 action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
@@ -4442,7 +6305,8 @@ def main(
                         dataset_metadata=dataset_info,
                         target_frame_contract_hash=(
                             None
-                            if deploy_session_contract.runtime_pose_frame_contract is None
+                            if deploy_session_contract.runtime_pose_frame_contract
+                            is None
                             else deploy_session_contract.runtime_pose_frame_contract.contract_hash
                         ),
                     )
@@ -4499,7 +6363,11 @@ def main(
         if bool(args.vis_cam) and camera_sources
         else {}
     )
-    camera_previewer = CameraPreviewer(CameraPreviewConfig()) if bool(args.vis_cam) and preview_camera_sources else None
+    camera_previewer = (
+        CameraPreviewer(CameraPreviewConfig())
+        if bool(args.vis_cam) and preview_camera_sources
+        else None
+    )
     visualizer = (
         TactileUVVisualizer(
             TactileVisualizerConfig(
@@ -4523,8 +6391,12 @@ def main(
             max_arm_rot_step_deg=float(args.max_arm_rot_step_deg),
             max_arm_joint_step_rad=float(args.max_arm_joint_step_rad),
             max_hand_step=float(args.max_hand_step),
-            arm_joint_lower_rad=tuple(float(value) for value in RM65_ABSOLUTE_Q_MIN_RAD),
-            arm_joint_upper_rad=tuple(float(value) for value in RM65_ABSOLUTE_Q_MAX_RAD),
+            arm_joint_lower_rad=tuple(
+                float(value) for value in RM65_ABSOLUTE_Q_MIN_RAD
+            ),
+            arm_joint_upper_rad=tuple(
+                float(value) for value in RM65_ABSOLUTE_Q_MAX_RAD
+            ),
         )
     )
     canonical_action_pipeline = CanonicalDeployActionPipeline(
@@ -4639,10 +6511,7 @@ def main(
             worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
             observe_bundle=observe_rtc_transport_exchange,
         )
-    elif (
-        str(args.rtc_profile)
-        == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
-    ):
+    elif str(args.rtc_profile) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
         if rtc_model_adapter_factory is None:
             raise ValueError(
                 "model-RTC flow-inpaint requires a model-package adapter "
@@ -4680,7 +6549,9 @@ def main(
         if rtc_frontend is None:
             raise RuntimeError("RTC emission publisher has no RTC frontend.")
         rtc_emission_publisher.bind_frontend(rtc_frontend)
-    ik_action_gate = IKActionChunkGate(stable_frames_required=int(args.ik_recovery_stable_frames))
+    ik_action_gate = IKActionChunkGate(
+        stable_frames_required=int(args.ik_recovery_stable_frames)
+    )
     startup_initializer = StartupInitializer(
         duration_s=float(args.init_time_s),
         source=startup_init_source,
@@ -4691,13 +6562,27 @@ def main(
         arm_position_tolerance_m=float(args.init_arm_position_tolerance_m),
         arm_rotation_tolerance_deg=float(args.init_arm_rotation_tolerance_deg),
     )
-    startup_initializer.reset()
+    current_pose_start_override = bool(args.no_init_qpos or args.start_init_qpos)
+    current_startup_satisfied_by_override = _reset_startup_initializer(
+        startup_initializer,
+        current_pose_start_allowed=current_pose_start_override,
+    )
+    if current_startup_satisfied_by_override:
+        current_pose_override_name = (
+            "--no-init-qpos" if bool(args.no_init_qpos) else "--start-init_qpos"
+        )
+        print(
+            f"[StartupInit] source=current already satisfied by {current_pose_override_name}; "
+            "press A to confirm ready and start policy execution."
+        )
     fixed_init_controller = (
         None
         if fixed_init_plan is None
         else DeployFixedInitController(
             fixed_init_plan,
-            arm_max_angvel=tuple(float(value) for value in args.deploy_fixed_init_arm_max_angvel),
+            arm_max_angvel=tuple(
+                float(value) for value in args.deploy_fixed_init_arm_max_angvel
+            ),
             qpos_tolerance=float(args.deploy_fixed_init_qpos_tolerance),
         )
     )
@@ -4707,18 +6592,41 @@ def main(
         else DeployPolicyQposInitController(
             policy_qpos_init_plan,
             active_sides=active_sides,
+            hand_action_specs_by_side=hand_action_specs,
             settings=DeployPolicyQposInitSettings(
                 qpos_reached_tolerance_rad=float(args.policy_qpos_init_qpos_tolerance),
                 move_to_start_timeout_s=float(args.policy_qpos_init_timeout_s),
                 qpos_init_dt_sec=float(args.policy_qpos_init_dt_sec),
-                qpos_init_joint_velocity_profile=str(args.policy_qpos_init_joint_velocity_profile),
+                qpos_init_joint_velocity_profile=str(
+                    args.policy_qpos_init_joint_velocity_profile
+                ),
                 qpos_init_max_angvel_rad_s=args.policy_qpos_init_arm_max_angvel,
-                qpos_init_max_steps_per_side=int(args.policy_qpos_init_max_steps_per_side),
+                qpos_init_max_steps_per_side=int(
+                    args.policy_qpos_init_max_steps_per_side
+                ),
                 qpos_init_collision_check=bool(args.policy_qpos_init_collision_check),
-                qpos_init_collision_scene_profile=str(args.policy_qpos_init_collision_scene_profile),
+                qpos_init_collision_scene_profile=str(
+                    args.policy_qpos_init_collision_scene_profile
+                ),
                 qpos_init_branch_search=bool(args.policy_qpos_init_branch_search),
-                qpos_init_branch_search_max_branches=int(args.policy_qpos_init_branch_search_max_branches),
+                qpos_init_branch_search_max_branches=int(
+                    args.policy_qpos_init_branch_search_max_branches
+                ),
                 qpos_init_branch_neutral_qpos_path=args.policy_qpos_init_branch_neutral_qpos_path,
+                initialize_hands=bool(args.policy_qpos_init_hands),
+                hand_reached_tolerance=float(args.policy_qpos_init_hand_tolerance),
+                dmtac_hand_reached_tolerance=float(
+                    args.policy_qpos_init_dmtac_tolerance
+                ),
+                hand_progress_timeout_sec=float(
+                    args.policy_qpos_init_hand_progress_timeout_sec
+                ),
+                hand_progress_epsilon=float(
+                    args.policy_qpos_init_hand_progress_epsilon
+                ),
+                hand_reconnect_attempts=int(
+                    args.policy_qpos_init_hand_reconnect_attempts
+                ),
             ),
         )
     )
@@ -4740,14 +6648,35 @@ def main(
     loop_rate = LoopRate()
     last_status_at = 0.0
     last_fault_text: str | None = None
+    collision_reset_console_gate = ChangeGate()
     started_at = time.time()
+    debug_storage_resolution = (
+        resolve_deployment_debug_root(args, now=started_at)
+        if bool(args.debug)
+        else None
+    )
     debug_logger = DeploymentDebugLogger(
         enabled=bool(args.debug),
-        root_dir=args.debug_dir,
+        root_dir=(
+            None if debug_storage_resolution is None else debug_storage_resolution.path
+        ),
         active_sides=active_sides,
+        payload_mode=str(args.debug_payload_mode),
         flush_every_events=16,
         flush_interval_sec=0.25,
     )
+    if debug_storage_resolution is not None:
+        debug_logger.log_event(
+            "artifact_storage",
+            {
+                "requested_layout": getattr(args, "artifact_layout", None),
+                "selection_source": debug_storage_resolution.source,
+                "resolved_layout": debug_storage_resolution.layout_name,
+                "resolved_output_root": str(
+                    debug_storage_resolution.path.expanduser().resolve()
+                ),
+            },
+        )
     if rtc_frontend is not None:
         rtc_debug_observer = RtcDebugEventObserver(
             level=str(getattr(args, "_rtc_debug_level", RTC_DEBUG_LEVEL_OFF)),
@@ -4777,18 +6706,14 @@ def main(
             rtc_debug_observer.offer(
                 "rtc_source_binding_activated",
                 {
-                    "schema": (
-                        "dexteleop_rtc_source_binding_activation_debug_v1"
-                    ),
+                    "schema": ("dexteleop_rtc_source_binding_activation_debug_v1"),
                     "source_binding_hash": (
                         rtc_emission_publisher.active_binding.semantic_content_hash
                     ),
                     "source_descriptor_hash": (
                         rtc_emission_publisher.active_binding.descriptor_hash
                     ),
-                    "producer_id": (
-                        rtc_emission_publisher.active_binding.producer_id
-                    ),
+                    "producer_id": (rtc_emission_publisher.active_binding.producer_id),
                     "producer_epoch": (
                         rtc_emission_publisher.active_binding.producer_epoch
                     ),
@@ -4799,6 +6724,11 @@ def main(
                 },
             )
     position_deploy_executor: PositionDeployExecutor | None = None
+    position_plan_cut_detector = (
+        DeploymentPositionPlanCutDetector()
+        if bool(args.position_plan_splice_governor)
+        else None
+    )
     if (
         bool(args.arms_enabled)
         and normalize_rm65_arm_control_mode(args.arm_control_mode)
@@ -4808,16 +6738,14 @@ def main(
             args.position_collision_check and active_sides == ("left", "right")
         )
         position_path_lift_backend = str(args.position_path_lift_backend)
-        position_reference_hz = effective_position_reference_hz(args)
-        position_command_hz = (
-            float(backend_control_hz)
-            if effective_arm_canfd_follow(args)
-            else float(position_reference_hz)
+        (
+            position_reference_hz,
+            position_command_hz,
+        ) = _resolve_position_reference_and_command_hz(
+            args,
+            backend_control_hz=float(backend_control_hz),
         )
-        if (
-            position_path_lift_backend
-            == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
-        ):
+        if position_path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND:
             if not math.isclose(
                 float(effective_action_hz),
                 15.0,
@@ -4838,9 +6766,10 @@ def main(
                     "the promoted official all-IK governor contract requires "
                     "the 120Hz RM65 command stream."
                 )
-            # Unlike the former Pink path, the governor itself owns the 120Hz
-            # qcmd cut.  The executor must therefore run at the command rate.
-            position_reference_hz = float(position_command_hz)
+            # The official governor owns the certified qref cut, while the
+            # already-existing CANFD backend owns the downstream 120 Hz qcmd
+            # stream. Keep those clocks separate so the planner runs at the
+            # declared 60 Hz reference rate rather than overrunning at 120 Hz.
         arm_only_pipeline = CanonicalDeployActionPipeline(
             safety_filter=safety_filter,
             active_sides=active_sides,
@@ -4856,27 +6785,12 @@ def main(
                 control_hz=float(backend_control_hz),
                 action_hz=float(position_reference_hz),
             )
-            require_arm_backends_ready_for_position_dispatch(
-                arm_backends,
-                require_background_target=False,
-                stage="pre_arm_reference_queue",
-                required_sides=active_sides,
-            )
-            dispatch_result = dispatch_teleop_command(
+            return dispatch_position_reference_command(
                 command,
                 arm_backends=arm_backends,
-                hand_backends={},
-                collect_backend_evidence=True,
+                required_sides=active_sides,
+                audit_mode=str(args.position_reference_dispatch_audit_mode),
             )
-            dispatch_result["arm_backend_health"] = (
-                require_arm_backends_ready_for_position_dispatch(
-                    arm_backends,
-                    require_background_target=True,
-                    stage="post_arm_reference_queue",
-                    required_sides=active_sides,
-                )
-            )
-            return dispatch_result
 
         def dispatch_position_discrete(command: TeleopCommand) -> Mapping[str, Any]:
             # Recheck after the arm target was queued and immediately before
@@ -4913,6 +6827,32 @@ def main(
                     send_actions
                 ),
                 chunk_lookahead_enabled=bool(args.position_chunk_lookahead),
+                plan_splice_governor_enabled=bool(args.position_plan_splice_governor),
+                plan_splice_clock_rebase_enabled=bool(
+                    args.position_plan_splice_governor
+                ),
+                stream_start_acquisition=(
+                    PositionStreamStartAcquisitionConfig(
+                        enabled=bool(args.position_stream_start_acquisition),
+                        max_translation_step_m=float(
+                            args.position_stream_start_max_translation_step_m
+                        ),
+                        max_rotation_step_rad=math.radians(
+                            float(args.position_stream_start_max_rotation_step_deg)
+                        ),
+                        max_source_intervals=int(
+                            args.position_stream_start_max_source_intervals
+                        ),
+                    )
+                ),
+                max_reference_tick_skip_burst=(
+                    1
+                    if position_path_lift_backend
+                    == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND
+                    else None
+                ),
+                reference_worker_cpu=args.position_reference_worker_cpu,
+                cyclic_gc_guard_enabled=bool(args.position_cyclic_gc_guard),
             ),
             canonical_pipeline=arm_only_pipeline,
             dispatch_callback=(dispatch_position_reference if send_actions else None),
@@ -4935,16 +6875,36 @@ def main(
                         lambda: build_official_all_ik_governor_from_started_backends(
                             arm_backends,
                             source_hz=float(effective_action_hz),
-                            command_hz=float(position_command_hz),
+                            command_hz=float(position_reference_hz),
                             lookahead_source_steps=int(
                                 args.position_all_ik_lookahead_source_steps
                             ),
-                            jerk_ramp_sec=float(
-                                args.position_all_ik_jerk_ramp_sec
+                            jerk_ramp_sec=float(args.position_all_ik_jerk_ramp_sec),
+                            batched_solver_tolerance=float(
+                                args.position_all_ik_batched_solver_tolerance
                             ),
-                            scene_profile=str(
-                                args.position_collision_scene_profile
+                            continuous_waypoint_shadow_enabled=bool(
+                                args.position_continuous_waypoint_shadow
+                                or args.position_continuous_waypoint_experimental_admission
                             ),
+                            continuous_waypoint_admission_enabled=bool(
+                                args.position_continuous_waypoint_experimental_admission
+                            ),
+                            continuous_waypoint_async_precompute_enabled=bool(
+                                args.position_continuous_waypoint_async_precompute
+                            ),
+                            continuous_waypoint_worker_cpu=(
+                                args.position_continuous_waypoint_worker_cpu
+                            ),
+                            continuous_waypoint_worker_isolation=str(
+                                args.position_continuous_waypoint_worker_isolation
+                            ),
+                            plan_splice_dynamics_config=(
+                                resolve_position_plan_splice_dynamics_config(
+                                    args.position_plan_splice_dynamics_profile
+                                )
+                            ),
+                            scene_profile=str(args.position_collision_scene_profile),
                             collision_min_distance_m=float(
                                 args.position_collision_min_distance_m
                             ),
@@ -4961,11 +6921,9 @@ def main(
                             ),
                             max_joint_acceleration_rad_s2=tuple(
                                 float(value)
-                                for value in args.position_max_acceleration_rad_s2
+                                for value in args.position_qref_max_acceleration_rad_s2_resolved
                             ),
-                            debug_profile=bool(
-                                args.position_collision_debug_profile
-                            ),
+                            debug_profile=bool(args.position_collision_debug_profile),
                         )
                     )
                     if position_path_lift_backend
@@ -5012,9 +6970,7 @@ def main(
                                 args.position_ik_iteration_reserve_ms
                             ),
                             pose_lift_profile=str(args.pose_lift_profile),
-                            debug_profile=bool(
-                                args.position_collision_debug_profile
-                            ),
+                            debug_profile=bool(args.position_collision_debug_profile),
                             ik_tuning=_position_deploy_ik_tuning(args),
                         )
                     )
@@ -5046,6 +7002,10 @@ def main(
         lookahead_observation: Any | None = None,
         second_lookahead_canonical_action: Any | None = None,
         second_lookahead_observation: Any | None = None,
+        third_lookahead_canonical_action: Any | None = None,
+        third_lookahead_observation: Any | None = None,
+        source_plan_cut: PositionSourcePlanCut | None = None,
+        phase_timing: dict[str, Any] | None = None,
     ) -> _PreparedActionExecution:
         command = getattr(canonical_action, "command", None)
         if command is None or not command.commands:
@@ -5056,12 +7016,18 @@ def main(
                 dispatch_completed=False,
             )
         if position_deploy_executor is None:
+            direct_dispatch_started = time.monotonic()
             if send_actions:
                 dispatch_teleop_command(
                     command,
                     arm_backends=arm_backends,
                     hand_backends=hand_backends,
                 )
+            if phase_timing is not None:
+                phase_timing["direct_dispatch_ms"] = max(
+                    0.0,
+                    time.monotonic() - direct_dispatch_started,
+                ) * 1000.0
             return _PreparedActionExecution(
                 accepted=True,
                 mode="direct" if send_actions else "dry_run",
@@ -5078,6 +7044,7 @@ def main(
                 kind="hand",
             )
         if arm_command is not None:
+            position_submit_started = time.monotonic()
             try:
                 source_index = position_deploy_executor.submit(
                     canonical_action.filtered,
@@ -5097,6 +7064,13 @@ def main(
                         else second_lookahead_canonical_action.filtered
                     ),
                     second_lookahead_observation=second_lookahead_observation,
+                    third_lookahead_filtered=(
+                        None
+                        if third_lookahead_canonical_action is None
+                        else third_lookahead_canonical_action.filtered
+                    ),
+                    third_lookahead_observation=third_lookahead_observation,
+                    source_plan_cut=source_plan_cut,
                 )
             except PositionDeployExecutorFault:
                 fault_stage = str(
@@ -5114,9 +7088,17 @@ def main(
                         dispatch_completed=False,
                     )
                 raise
+            finally:
+                if phase_timing is not None:
+                    phase_timing["position_submit_ms"] = max(
+                        0.0,
+                        time.monotonic() - position_submit_started,
+                    ) * 1000.0
             return _PreparedActionExecution(
                 accepted=True,
-                mode=("position_async_queue" if send_actions else "position_dry_run_queue"),
+                mode=(
+                    "position_async_queue" if send_actions else "position_dry_run_queue"
+                ),
                 dispatch_attempted=False,
                 dispatch_completed=False,
                 asynchronous=True,
@@ -5162,7 +7144,9 @@ def main(
     ) -> None:
         """Turn a blocked 15 Hz canonical action into a real hold boundary."""
 
-        canonical_faults = tuple(str(item) for item in getattr(canonical_action, "faults", ()))
+        canonical_faults = tuple(
+            str(item) for item in getattr(canonical_action, "faults", ())
+        )
         if not canonical_faults:
             return
         if position_deploy_executor is not None:
@@ -5189,6 +7173,14 @@ def main(
     )
     impedance_force_control_enabled = False
     impedance_force_guard_monitor: ImpedanceForceGuardMonitor | None = None
+    position_force_guard_monitor: PositionForceGuardMonitor | None = None
+    position_force_guard_required = bool(
+        send_actions
+        and bool(args.arms_enabled)
+        and bool(args.position_force_guard)
+        and normalize_rm65_arm_control_mode(args.arm_control_mode)
+        == RM65_ARM_CONTROL_MODE_POSITION
+    )
 
     if impedance_force_control_is_deferred:
         guard_readers: dict[str, Callable[[], Mapping[str, Any]]] = {}
@@ -5204,10 +7196,7 @@ def main(
         def impedance_force_guard_stop(
             fault: ImpedanceForceGuardFault,
         ) -> None:
-            reason = (
-                f"impedance_force_guard:{fault.reason}:"
-                f"{fault.side or 'all'}"
-            )
+            reason = f"impedance_force_guard:{fault.reason}:" f"{fault.side or 'all'}"
             print(
                 "[ImpedanceForceGuard] TRIPPED; requesting concurrent bimanual "
                 f"Arm_Stop: {fault.message}",
@@ -5236,6 +7225,45 @@ def main(
             set_callback = getattr(backend, "set_force_hard_stop_callback")
             set_callback(impedance_force_guard_monitor.notify_backend_hard_stop)
 
+    if position_force_guard_required:
+        position_guard_readers: dict[str, Callable[[], Mapping[str, Any]]] = {}
+        for side, backend in arm_backends.items():
+            reader = getattr(backend, "read_force_data", None)
+            if not callable(reader):
+                raise RuntimeError(
+                    f"{side} position backend does not expose read_force_data"
+                )
+            position_guard_readers[str(side)] = reader
+
+        def position_force_guard_stop(
+            fault: PositionForceGuardFault,
+        ) -> None:
+            reason = f"position_force_guard:{fault.reason}:{fault.side or 'all'}"
+            print(
+                "[PositionForceGuard] TRIPPED; requesting concurrent bimanual "
+                f"Arm_Stop: {fault.message}",
+                flush=True,
+            )
+            try:
+                emergency_stop_deploy_arm_backends(
+                    arm_backends,
+                    reason=reason,
+                )
+            except Exception as exc:
+                print(
+                    "[PositionForceGuard] CRITICAL: bimanual Arm_Stop "
+                    f"acknowledgement failed: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
+
+        position_force_guard_monitor = PositionForceGuardMonitor(
+            readers_by_side=position_guard_readers,
+            emergency_stop=position_force_guard_stop,
+            config=position_force_guard_config(args),
+        )
+
     def enable_deferred_impedance_force_control(*, trigger: str) -> None:
         """Start impedance output only at an explicit policy/init start boundary."""
 
@@ -5262,8 +7290,7 @@ def main(
     def hold_rtc_if_eligible(*, now: float, reason: str) -> None:
         if (
             rtc_frontend is not None
-            and rtc_frontend.state.lifecycle_state
-            == POLICY_ASYNC_PRODUCER_ELIGIBLE
+            and rtc_frontend.state.lifecycle_state == POLICY_ASYNC_PRODUCER_ELIGIBLE
         ):
             transition = rtc_frontend.hold(now=now, reason=reason)
             debug_logger.log_event(
@@ -5283,10 +7310,7 @@ def main(
     def rearm_rtc_if_needed(*, now: float, reason: str) -> bool:
         if rtc_frontend is None:
             return True
-        if (
-            rtc_frontend.state.lifecycle_state
-            == POLICY_ASYNC_PRODUCER_ELIGIBLE
-        ):
+        if rtc_frontend.state.lifecycle_state == POLICY_ASYNC_PRODUCER_ELIGIBLE:
             return True
         try:
             transition = rtc_frontend.rearm(now=now, reason=reason)
@@ -5298,13 +7322,12 @@ def main(
             {
                 "target": "ELIGIBLE",
                 "reason": reason,
-                "producer_transition_hash": (
-                    transition.receipt.semantic_content_hash
-                ),
+                "producer_transition_hash": (transition.receipt.semantic_content_hash),
             },
         )
         return True
 
+    keyboard_interrupt_stop_error: str | None = None
     try:
         print(
             "[Deploy] policy="
@@ -5347,6 +7370,34 @@ def main(
                 f"delay={'0_action_period' if executor_config.chunk_lookahead_enabled else '1_action_period'} "
                 f"interpolation={'linear_source_qref' if official_governor_active else 'xyz_linear+shortest_slerp'} "
                 f"temporal_smoothing={'third_order_jerk_horizon' if official_governor_active else 'off'} "
+                "plan_splice_dynamics="
+                f"{args.position_plan_splice_dynamics_profile} "
+                "qref_acceleration_profile="
+                f"{args.position_qref_acceleration_profile} "
+                "qref_qdd_scale="
+                f"{float(args.position_qref_acceleration_scale_resolved):g} "
+                "qcmd_qdd_envelope=hard_execution_profile "
+                "batched_solver_tolerance="
+                f"{float(args.position_all_ik_batched_solver_tolerance):g} "
+                "continuous_waypoint_shadow="
+                f"{'on(candidate_path)' if bool(args.position_continuous_waypoint_shadow) else 'off'} "
+                "continuous_waypoint_profile="
+                f"{str(args.position_continuous_waypoint_profile_effective)} "
+                "continuous_waypoint_experimental_admission="
+                f"{'on(source_cut_atomic)' if bool(args.position_continuous_waypoint_experimental_admission) else 'off'} "
+                "continuous_waypoint_async_precompute="
+                f"{'on(bounded_next_cut)' if bool(args.position_continuous_waypoint_async_precompute) else 'off'} "
+                "worker_cpu_affinity="
+                f"reference:{args.position_reference_worker_cpu},"
+                f"c2:{args.position_continuous_waypoint_worker_cpu} "
+                "cyclic_gc_guard="
+                f"{'on(first_submit_to_close)' if executor_config.cyclic_gc_guard_enabled else 'off'} "
+                "c2_worker_isolation="
+                f"{args.position_continuous_waypoint_worker_isolation} "
+                "client_cpu_reservation="
+                f"{'on(process_local)' if bool(args.position_worker_cpu_reservation) else 'off'} "
+                "reference_dispatch_audit="
+                f"{args.position_reference_dispatch_audit_mode} "
                 f"collision_reference={'on' if executor_config.collision_required else 'off(dry-run)'} "
                 f"collision_scope={'selected_scene_endpoint+sampled_interval' if official_governor_active else 'selected_scene_endpoint_only'} "
                 "segment_reference_to_command_certified=false "
@@ -5382,17 +7433,29 @@ def main(
                 f"targets={policy_qpos_init_plan.target_sources_by_side} "
                 f"after=startup_init:{startup_init_source}"
             )
-        elif bool(args.start_init_qpos) and bool(args.send_actions) and bool(args.arms_enabled):
+        elif (
+            (bool(args.start_init_qpos) or bool(args.no_init_qpos))
+            and bool(args.send_actions)
+            and bool(args.arms_enabled)
+        ):
+            override_name = (
+                "--no-init-qpos" if bool(args.no_init_qpos) else "--start-init_qpos"
+            )
+            suppressed_suffix = (
+                " Profile/CLI dataset-frame qpos-init inputs were suppressed."
+                if bool(getattr(args, "policy_qpos_init_suppressed", False))
+                else ""
+            )
             print(
-                "[Deploy] start_init_qpos override enabled: "
-                "real arm policy execution may start from current qpos without dataset-frame qpos init."
+                f"[Deploy] {override_name} override enabled: "
+                "real arm policy execution may start from current qpos without "
+                "dataset-frame qpos init." + suppressed_suffix
             )
         if not send_actions:
-            print("[Deploy] dry-run: actions are filtered and logged but not sent to hardware.")
-        if (
-            send_actions
-            and hands_enabled
-        ):
+            print(
+                "[Deploy] dry-run: actions are filtered and logged but not sent to hardware."
+            )
+        if send_actions and hands_enabled:
             missing_hand_sides = [
                 side
                 for side in end_effector_sides
@@ -5422,10 +7485,86 @@ def main(
         for side, backend in arm_backends.items():
             backend.start()
             if not backend.is_ready() and not bool(args.allow_arm_connect_failure):
-                raise RuntimeError(f"{side} arm backend is not ready: {backend.get_state()}")
+                raise RuntimeError(
+                    f"{side} arm backend is not ready: {backend.get_state()}"
+                )
         if position_deploy_executor is not None:
             position_deploy_executor.prepare_collision_planner()
             position_deploy_executor.start()
+            if args.position_reference_worker_cpu is not None:
+                affinity = position_deploy_executor.snapshot().get(
+                    "reference_worker_affinity_receipt"
+                )
+                if args.position_continuous_waypoint_worker_cpu is None:
+                    print(
+                        "[PositionCPU] READY: reference worker affinity "
+                        f"verified cpu={args.position_reference_worker_cpu}; "
+                        "C2 worker is disabled for this formal A/B run.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[PositionCPU] READY: reference worker affinity verified "
+                        f"cpu={args.position_reference_worker_cpu}; "
+                        "C2 worker affinity is verified by its planner startup "
+                        f"receipt cpu={args.position_continuous_waypoint_worker_cpu} "
+                        "isolation="
+                        f"{args.position_continuous_waypoint_worker_isolation}.",
+                        flush=True,
+                    )
+                if not isinstance(affinity, Mapping) or not bool(
+                    affinity.get("applied", False)
+                ):
+                    raise RuntimeError(
+                        "position reference worker affinity receipt is missing "
+                        "after successful startup"
+                    )
+                if bool(args.position_worker_cpu_reservation):
+                    reference_native_thread_id = affinity.get("native_thread_id")
+                    if isinstance(reference_native_thread_id, bool) or not isinstance(
+                        reference_native_thread_id, int
+                    ):
+                        raise RuntimeError(
+                            "position reference worker affinity receipt lacks "
+                            "a native thread id for CPU reservation"
+                        )
+                    reservation = exclude_cpu_ids_from_current_process(
+                        args.position_worker_cpu_reservation_cpu_ids,
+                        role="position_deploy_client_ordinary_threads",
+                        exempt_native_thread_ids=(int(reference_native_thread_id),),
+                    )
+                    print(
+                        "[PositionCPU] READY: deployment-client ordinary "
+                        "threads exclude reserved CPUs "
+                        f"{reservation['excluded_cpu_ids']}; reference_tid="
+                        f"{reference_native_thread_id} remains pinned; mode="
+                        + (
+                            "async_c2_process"
+                            if args.position_continuous_waypoint_worker_cpu is not None
+                            else "formal_reference_only"
+                        )
+                        + "; migrated_native_threads="
+                        f"{reservation['native_threads_migrated']}.",
+                        flush=True,
+                    )
+                if bool(args.position_continuous_waypoint_no_debug_deadline_soak):
+                    print(
+                        "[PositionCPU] SOAK: bounded no-debug dry-run exception "
+                        f"active max_steps={int(args.max_steps)}; hardware "
+                        "dispatch remains forbidden.",
+                        flush=True,
+                    )
+        if position_force_guard_monitor is not None:
+            guard_snapshot = position_force_guard_monitor.start(
+                arm_stale_watchdog=False,
+            )
+            print(
+                "[PositionForceGuard] force limits armed; stale watchdog "
+                "deferred until camera startup completes "
+                f"config={guard_snapshot.get('config', {})} "
+                f"sides={sorted(guard_snapshot.get('last_reading_by_side', {}))}",
+                flush=True,
+            )
         if impedance_force_control_is_deferred:
             warmed_sides = warm_start_impedance_force_control_backends(arm_backends)
             if warmed_sides:
@@ -5437,7 +7576,9 @@ def main(
         for side, backend in hand_backends.items():
             backend.start()
             if not backend.is_ready() and not bool(args.allow_hand_connect_failure):
-                raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
+                raise RuntimeError(
+                    f"{side} hand backend is not ready: {backend.get_state()}"
+                )
         if hand_state_poller is not None:
             hand_state_poller.start()
         if camera_sources:
@@ -5450,11 +7591,22 @@ def main(
                 if camera_previewer.ensure_available():
                     print("[Camera] --vis_cam display preflight ok.")
                 else:
-                    print(f"[Camera] preview disabled: {camera_previewer.disabled_reason}")
+                    print(
+                        f"[Camera] preview disabled: {camera_previewer.disabled_reason}"
+                    )
         start_camera_sources(
             camera_sources,
             stagger_sec=float(args.camera_start_stagger_sec),
         )
+        run_camera_startup_self_check(camera_sources)
+        if position_force_guard_monitor is not None:
+            guard_snapshot = position_force_guard_monitor.arm_stale_watchdog()
+            print(
+                "[PositionForceGuard] armed fail_closed=true latched=true "
+                "stop_scope=bimanual "
+                f"config={guard_snapshot.get('config', {})}",
+                flush=True,
+            )
         if rtc_frontend is not None:
             rtc_frontend.start()
             if str(args.rtc_profile) == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
@@ -5469,10 +7621,7 @@ def main(
                     ),
                     flush=True,
                 )
-            elif (
-                str(args.rtc_profile)
-                == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
-            ):
+            elif str(args.rtc_profile) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
                 print(
                     "[model-RTC] conditioned OpenPI shadow active: "
                     "send_actions=false, position_lookahead=false, "
@@ -5498,21 +7647,43 @@ def main(
             policy_qpos_init_enabled=policy_qpos_init_controller is not None,
         )
         if policy_qpos_init_controller is not None and bool(args.auto_start):
-            enable_deferred_impedance_force_control(trigger="auto_start_policy_qpos_init")
-            message = policy_qpos_init_controller.begin(
-                arm_backends=arm_backends,
-                now=time.time(),
+            enable_deferred_impedance_force_control(
+                trigger="auto_start_policy_qpos_init"
             )
+            try:
+                message = _begin_policy_qpos_init_with_force_guard(
+                    policy_qpos_init_controller,
+                    monitor=position_force_guard_monitor,
+                    arm_backends=arm_backends,
+                    now=time.time(),
+                )
+            except PositionForceGuardTripped as exc:
+                policy_active = False
+                message = (
+                    "[PolicyQposInit] automatic planning completed without "
+                    "motion, but fresh post-plan force samples were not "
+                    "admitted; motion remains blocked: " + exc.fault.message
+                )
             if message:
                 print(message)
         elif bool(args.auto_start) and fixed_init_controller is None:
             enable_deferred_impedance_force_control(trigger="auto_start")
 
+        position_force_guard_fault_handled = False
         with NonBlockingKeyboard() as keyboard:
             while True:
                 loop_started_at = time.time()
                 control_loop_started_at = time.monotonic()
+                pre_action_executor_started_at = control_loop_started_at
                 position_safety_fault_latched = False
+                position_force_guard_fault = (
+                    None
+                    if position_force_guard_monitor is None
+                    else position_force_guard_monitor.fault
+                )
+                position_force_guard_fault_latched = (
+                    position_force_guard_fault is not None
+                )
                 impedance_force_guard_fault = (
                     None
                     if impedance_force_guard_monitor is None
@@ -5533,6 +7704,21 @@ def main(
                             position_safety_fault_latched = True
                         else:
                             position_deploy_executor.raise_if_fault()
+                pre_action_executor_completed_at = time.monotonic()
+                if position_force_guard_fault_latched:
+                    policy_active = False
+                    policy_deploy_runtime.clear_action_queue()
+                    hold_rtc_if_eligible(
+                        now=control_loop_started_at,
+                        reason="position_force_guard_latched",
+                    )
+                    if not position_force_guard_fault_handled:
+                        if position_deploy_executor is not None:
+                            # Arm_Stop is already latched by the monitor. Clear
+                            # queued reference work without re-enabling motion;
+                            # RM65 hold_motion is a no-op under that latch.
+                            position_deploy_executor.clear()
+                        position_force_guard_fault_handled = True
                 if impedance_force_guard_fault_latched:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
@@ -5548,21 +7734,34 @@ def main(
                     key = preview_keys[0]
                 key = None if key is None else key.lower()
                 rearm_requested = bool(key == "r")
-                if (
+                if rearm_requested and position_force_guard_fault_latched:
+                    policy_active = False
+                    policy_deploy_runtime.clear_action_queue()
+                    print(
+                        "[Deploy] r ignored: position force emergency stop is "
+                        "latched; restart and perform a fresh qpos init."
+                    )
+                elif (
                     rearm_requested
                     and not position_safety_fault_latched
                     and not impedance_force_guard_fault_latched
                 ):
-                    print("[Deploy] r ignored: no manually re-armable safety fault is latched.")
+                    print(
+                        "[Deploy] r ignored: no manually re-armable safety fault is latched."
+                    )
                 elif rearm_requested:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
                 elif key == "g":
-                    if position_safety_fault_latched or impedance_force_guard_fault_latched:
+                    if (
+                        position_safety_fault_latched
+                        or position_force_guard_fault_latched
+                        or impedance_force_guard_fault_latched
+                    ):
                         policy_active = False
                         print(
-                            "[Deploy] g ignored: a safety fault is latched; press r only after "
-                            "fresh in-domain measured feedback is available."
+                            "[Deploy] g ignored: a safety fault is latched; position-force "
+                            "trips require restart, other safety faults require manual re-arm."
                         )
                         continue
                     if position_deploy_executor is not None:
@@ -5576,18 +7775,42 @@ def main(
                         continue
                     policy.reset()
                     policy_deploy_runtime.clear_action_queue()
-                    startup_initializer.reset()
+                    _reset_startup_initializer(
+                        startup_initializer,
+                        current_pose_start_allowed=current_pose_start_override,
+                    )
                     policy_deploy_runtime.reset_prediction_schedule()
                     ready_confirmed = not wait_for_ready_confirm
-                    if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
-                        print("[Deploy] ignore g: complete fixed-init H -> H before starting policy.")
-                    elif policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
-                        policy_active = False
-                        enable_deferred_impedance_force_control(trigger="g_policy_qpos_init")
-                        message = policy_qpos_init_controller.begin(
-                            arm_backends=arm_backends,
-                            now=loop_started_at,
+                    if (
+                        fixed_init_controller is not None
+                        and fixed_init_controller.blocks_policy
+                    ):
+                        print(
+                            "[Deploy] ignore g: complete fixed-init H -> H before starting policy."
                         )
+                    elif (
+                        policy_qpos_init_controller is not None
+                        and policy_qpos_init_controller.blocks_policy
+                    ):
+                        policy_active = False
+                        enable_deferred_impedance_force_control(
+                            trigger="g_policy_qpos_init"
+                        )
+                        try:
+                            message = _begin_policy_qpos_init_with_force_guard(
+                                policy_qpos_init_controller,
+                                monitor=position_force_guard_monitor,
+                                arm_backends=arm_backends,
+                                now=loop_started_at,
+                            )
+                        except PositionForceGuardTripped as exc:
+                            policy_active = False
+                            message = (
+                                "[PolicyQposInit] planning completed without "
+                                "motion, but fresh post-plan force samples were "
+                                "not admitted; motion remains blocked: "
+                                + exc.fault.message
+                            )
                         if message:
                             print(message)
                     else:
@@ -5595,16 +7818,32 @@ def main(
                         policy_active = True
                         print("[Deploy] policy active")
                 elif key == "a":
-                    if impedance_force_guard_fault_latched:
+                    if position_force_guard_fault_latched:
+                        policy_active = False
+                        print(
+                            "[Deploy] ready confirm ignored: position force emergency "
+                            "stop is latched; restart and perform a fresh qpos init."
+                        )
+                    elif impedance_force_guard_fault_latched:
                         policy_active = False
                         print(
                             "[Deploy] ready confirm ignored: impedance force guard is "
                             "latched; complete manual re-arm with r."
                         )
-                    elif fixed_init_controller is not None and fixed_init_controller.blocks_policy:
-                        print("[Deploy] ready confirm ignored: complete fixed-init H -> H first.")
-                    elif policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
-                        print("[Deploy] ready confirm ignored: complete policy qpos init first (press g).")
+                    elif (
+                        fixed_init_controller is not None
+                        and fixed_init_controller.blocks_policy
+                    ):
+                        print(
+                            "[Deploy] ready confirm ignored: complete fixed-init H -> H first."
+                        )
+                    elif (
+                        policy_qpos_init_controller is not None
+                        and policy_qpos_init_controller.blocks_policy
+                    ):
+                        print(
+                            "[Deploy] ready confirm ignored: complete policy qpos init first (press g)."
+                        )
                     else:
                         if not rearm_rtc_if_needed(
                             now=control_loop_started_at,
@@ -5614,14 +7853,25 @@ def main(
                             continue
                         if not policy_active:
                             policy_active = True
-                        enable_deferred_impedance_force_control(trigger="A_policy_or_ready_confirm")
-                        if startup_initializer.enabled and not startup_initializer.completed:
-                            print("[Deploy] ready confirm ignored: startup init is not complete yet.")
+                        enable_deferred_impedance_force_control(
+                            trigger="A_policy_or_ready_confirm"
+                        )
+                        if (
+                            startup_initializer.enabled
+                            and not startup_initializer.completed
+                        ):
+                            print(
+                                "[Deploy] ready confirm ignored: startup init is not complete yet."
+                            )
                         else:
                             ready_confirmed = True
                             policy_deploy_runtime.clear_action_queue()
                             policy_deploy_runtime.reset_prediction_schedule()
-                            print("[Deploy] ready confirmed; policy inference/execution may start.")
+                            console_log_event(
+                                "Policy",
+                                "READY: policy inference/execution may start.",
+                                now=loop_started_at,
+                            )
                 elif key == "h":
                     hold_rtc_if_eligible(
                         now=control_loop_started_at,
@@ -5643,15 +7893,26 @@ def main(
                         )
                         if message:
                             print(message)
-                    elif policy_qpos_init_controller is not None and policy_qpos_init_controller.running:
+                    elif (
+                        policy_qpos_init_controller is not None
+                        and policy_qpos_init_controller.running
+                    ):
                         policy_active = False
                         print("[PolicyQposInit] ignore h while qpos init is running.")
                     else:
                         policy_active = False
                         print("[Deploy] policy paused")
-                elif key == "x" and fixed_init_controller is not None and fixed_init_controller.running:
+                elif (
+                    key == "x"
+                    and fixed_init_controller is not None
+                    and fixed_init_controller.running
+                ):
                     print("[FixedInit] ignore x while fixed trajectory is running.")
-                elif key == "x" and policy_qpos_init_controller is not None and policy_qpos_init_controller.running:
+                elif (
+                    key == "x"
+                    and policy_qpos_init_controller is not None
+                    and policy_qpos_init_controller.running
+                ):
                     print("[PolicyQposInit] ignore x while qpos init is running.")
                 elif key == "q":
                     if position_deploy_executor is not None:
@@ -5659,7 +7920,11 @@ def main(
                     print("\n[Deploy] quitting policy deployment loop\n")
                     break
 
+                pre_action_operator_completed_at = time.monotonic()
+                arm_snapshot_cpu_started = time.thread_time()
                 arm_states = arm_reader.snapshot(loop_started_at)
+                arm_snapshot_cpu_completed = time.thread_time()
+                pre_action_arm_snapshot_completed_at = time.monotonic()
                 ik_gate_event = ik_action_gate.update(arm_states)
                 if ik_action_gate.blocks_action_output:
                     policy_deploy_runtime.clear_action_queue()
@@ -5675,6 +7940,7 @@ def main(
                     history_poller=hand_state_poller,
                     timestamp=loop_started_at,
                 )
+                pre_action_hand_snapshot_completed_at = time.monotonic()
                 control_hz = loop_rate.tick(loop_started_at)
                 observation = build_deployment_observation(
                     active_sides=active_sides,
@@ -5701,7 +7967,8 @@ def main(
                         "policy_absolute_frame": deploy_session_contract.policy_absolute_frame,
                         "runtime_pose_frame_contract_hash": (
                             None
-                            if deploy_session_contract.runtime_pose_frame_contract is None
+                            if deploy_session_contract.runtime_pose_frame_contract
+                            is None
                             else deploy_session_contract.runtime_pose_frame_contract.contract_hash
                         ),
                         "hand_action_specs_by_side": hand_action_specs,
@@ -5711,7 +7978,19 @@ def main(
                         },
                     },
                 )
+                pre_action_observation_completed_at = time.monotonic()
                 faults = list(observation.faults)
+                if position_force_guard_fault_latched:
+                    policy_active = False
+                    policy_deploy_runtime.clear_action_queue()
+                    guard_reason = (
+                        "unknown"
+                        if position_force_guard_fault is None
+                        else position_force_guard_fault.reason
+                    )
+                    faults.append(
+                        "position_force_guard_restart_required:" + guard_reason
+                    )
                 if impedance_force_guard_fault_latched:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
@@ -5725,8 +8004,7 @@ def main(
                         else impedance_force_guard_fault.reason
                     )
                     faults.append(
-                        "impedance_force_guard_manual_rearm_required:"
-                        + guard_reason
+                        "impedance_force_guard_manual_rearm_required:" + guard_reason
                     )
                     if rearm_requested and impedance_force_guard_monitor is not None:
                         try:
@@ -5747,7 +8025,9 @@ def main(
                                     raise RuntimeError(
                                         f"{side} has no qpos for manual impedance re-arm"
                                     )
-                                measured_at = state.get("hardware_measurement_timestamp")
+                                measured_at = state.get(
+                                    "hardware_measurement_timestamp"
+                                )
                                 if measured_at is not None:
                                     measured_age = loop_started_at - float(measured_at)
                                     if measured_age > 0.5:
@@ -5768,7 +8048,9 @@ def main(
                                 start=False
                             )
                             impedance_force_control_enabled = False
-                        except Exception as exc:  # noqa: BLE001 - keep the latch on failure.
+                        except (
+                            Exception
+                        ) as exc:  # noqa: BLE001 - keep the latch on failure.
                             try:
                                 emergency_stop_deploy_arm_backends(
                                     arm_backends,
@@ -5788,7 +8070,10 @@ def main(
                             impedance_force_guard_fault = None
                             impedance_force_guard_fault_latched = False
                             policy.reset()
-                            startup_initializer.reset()
+                            _reset_startup_initializer(
+                                startup_initializer,
+                                current_pose_start_allowed=current_pose_start_override,
+                            )
                             policy_deploy_runtime.clear_action_queue()
                             policy_deploy_runtime.reset_prediction_schedule()
                             ready_confirmed = not wait_for_ready_confirm
@@ -5810,7 +8095,9 @@ def main(
                     if rearm_requested and position_deploy_executor is not None:
                         try:
                             position_deploy_executor.manual_rearm(observation)
-                        except Exception as exc:  # noqa: BLE001 - operator-facing re-arm gate.
+                        except (
+                            Exception
+                        ) as exc:  # noqa: BLE001 - operator-facing re-arm gate.
                             print(
                                 "[Deploy] manual re-arm rejected; re-home is required if feedback is "
                                 f"unavailable/out of domain: {type(exc).__name__}: {exc}"
@@ -5818,19 +8105,46 @@ def main(
                         else:
                             last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
                             policy.reset()
-                            startup_initializer.reset()
+                            _reset_startup_initializer(
+                                startup_initializer,
+                                current_pose_start_allowed=current_pose_start_override,
+                            )
                             policy_deploy_runtime.reset_prediction_schedule()
                             ready_confirmed = not wait_for_ready_confirm
                             faults.append("position_safety_rearmed_press_g_to_resume")
-                            print("[Deploy] safety fault re-armed; press g to begin a fresh policy stream.")
+                            print(
+                                "[Deploy] safety fault re-armed; press g to begin a fresh policy stream."
+                            )
                 if loop_started_at - started_at < float(args.startup_warmup_sec):
                     faults.append("startup_warmup")
 
                 if visualizer is not None:
-                    visualizer.update(tactile_by_side_from_hand_states(active_sides, hand_states))
+                    visualizer.update(
+                        tactile_by_side_from_hand_states(active_sides, hand_states)
+                    )
+
+                live_position_force_guard_fault = (
+                    None
+                    if position_force_guard_monitor is None
+                    else position_force_guard_monitor.fault
+                )
+                if live_position_force_guard_fault is not None:
+                    position_force_guard_fault = live_position_force_guard_fault
+                    position_force_guard_fault_latched = True
+                    policy_active = False
+                    policy_deploy_runtime.clear_action_queue()
+                    force_fault_label = (
+                        "position_force_guard_restart_required:"
+                        + live_position_force_guard_fault.reason
+                    )
+                    if force_fault_label not in faults:
+                        faults.append(force_fault_label)
 
                 fixed_completed_this_step = False
-                if fixed_init_controller is not None:
+                if (
+                    fixed_init_controller is not None
+                    and not position_force_guard_fault_latched
+                ):
                     fixed_result = fixed_init_controller.step(
                         now=loop_started_at,
                         send_actions=send_actions,
@@ -5838,43 +8152,78 @@ def main(
                         hand_backends=hand_backends,
                     )
                     if fixed_result.last_action is not None:
-                        last_action = fixed_result.last_action.astype(np.float32, copy=True)
+                        last_action = fixed_result.last_action.astype(
+                            np.float32, copy=True
+                        )
                     if fixed_result.message:
                         print(fixed_result.message)
                     if fixed_result.completed:
                         policy.reset()
                         policy_deploy_runtime.clear_action_queue()
-                        startup_initializer.reset()
+                        _reset_startup_initializer(
+                            startup_initializer,
+                            current_pose_start_allowed=current_pose_start_override,
+                        )
                         policy_deploy_runtime.reset_prediction_schedule()
                         ready_confirmed = not wait_for_ready_confirm
                         if bool(args.auto_start):
                             policy_active = True
-                            print("[Deploy] fixed-init complete; policy auto-start released.")
+                            print(
+                                "[Deploy] fixed-init complete; policy auto-start released."
+                            )
                         else:
                             policy_active = False
-                            print("[Deploy] fixed-init complete; press g to run startup init/policy.")
+                            print(
+                                "[Deploy] fixed-init complete; press g to run startup init/policy."
+                            )
                         fixed_completed_this_step = True
 
                 policy_qpos_completed_this_step = False
-                if policy_qpos_init_controller is not None:
+                if (
+                    policy_qpos_init_controller is not None
+                    and not position_force_guard_fault_latched
+                ):
                     policy_qpos_result = policy_qpos_init_controller.step(
                         now=loop_started_at,
                         send_actions=send_actions,
                         arm_backends=arm_backends,
+                        hand_backends=hand_backends,
                     )
                     if policy_qpos_result.last_action is not None:
-                        last_action = policy_qpos_result.last_action.astype(np.float32, copy=True)
-                    if policy_qpos_result.message:
+                        last_action = policy_qpos_result.last_action.astype(
+                            np.float32,
+                            copy=True,
+                        )
+                    if policy_qpos_result.message and not policy_qpos_result.completed:
                         print(policy_qpos_result.message)
                     if policy_qpos_result.completed:
                         policy.reset()
                         policy_deploy_runtime.clear_action_queue()
-                        startup_initializer.reset()
+                        if not policy_qpos_result.requires_fresh_observation:
+                            raise RuntimeError(
+                                "policy qpos init completion is missing its "
+                                "fresh-observation reference cut"
+                            )
+                        (
+                            last_action,
+                            current_startup_satisfied,
+                        ) = _finish_policy_qpos_init_reference_cut(startup_initializer)
                         policy_deploy_runtime.reset_prediction_schedule()
                         ready_confirmed = not wait_for_ready_confirm
                         policy_active = True
                         policy_qpos_completed_this_step = True
-                        print("[Deploy] policy qpos init complete; startup init/policy released.")
+                        _announce_policy_qpos_init_complete(
+                            wait_for_ready_confirm=wait_for_ready_confirm,
+                            now=loop_started_at,
+                        )
+                        last_status_at = loop_started_at
+                        if current_startup_satisfied:
+                            console_log_event(
+                                "Init",
+                                "READY: init-source=current already satisfied; "
+                                "no redundant Cartesian startup command will run.",
+                                now=loop_started_at,
+                            )
 
                 live_impedance_force_guard_fault = (
                     None
@@ -5888,9 +8237,14 @@ def main(
                     policy_deploy_runtime.clear_action_queue()
                 if impedance_force_guard_fault_latched:
                     policy_active = False
+                if position_force_guard_fault_latched:
+                    policy_active = False
                 if policy_active:
                     position_action_submitted_this_loop = False
-                    can_run_policy = not (bool(args.require_ready_observation) and faults)
+                    defer_position_action_until_fresh_cut = False
+                    can_run_policy = not (
+                        bool(args.require_ready_observation) and faults
+                    )
                     if _debug_replay_execution_exhausted(
                         policy,
                         queued_actions=policy_deploy_runtime.action_queue_length(),
@@ -5900,15 +8254,26 @@ def main(
                         can_run_policy = False
                     if policy_qpos_completed_this_step:
                         can_run_policy = False
-                    if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
+                    if (
+                        fixed_init_controller is not None
+                        and fixed_init_controller.blocks_policy
+                    ):
                         can_run_policy = False
-                    if policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
+                    if (
+                        policy_qpos_init_controller is not None
+                        and policy_qpos_init_controller.blocks_policy
+                    ):
                         can_run_policy = False
-                    if startup_initializer.enabled and not startup_initializer.completed:
+                    if (
+                        startup_initializer.enabled
+                        and not startup_initializer.completed
+                    ):
                         if can_run_policy:
-                            init_action, init_faults, init_ready = startup_initializer.next_action(
-                                observation,
-                                now=loop_started_at,
+                            init_action, init_faults, init_ready = (
+                                startup_initializer.next_action(
+                                    observation,
+                                    now=loop_started_at,
+                                )
                             )
                             faults.extend(init_faults)
                             if init_action is not None:
@@ -5930,7 +8295,10 @@ def main(
                                     startup_initializer.update_resolved_target_action(
                                         canonical_action.action.vector
                                     )
-                                if canonical_action.command is not None and canonical_action.command.commands:
+                                if (
+                                    canonical_action.command is not None
+                                    and canonical_action.command.commands
+                                ):
                                     execution = execute_prepared_action(
                                         canonical_action,
                                         observation,
@@ -5940,11 +8308,20 @@ def main(
                                         position_action_submitted_this_loop = (
                                             position_deploy_executor is not None
                                         )
-                                        last_action = canonical_action.action.vector.astype(np.float32, copy=True)
+                                        last_action = (
+                                            canonical_action.action.vector.astype(
+                                                np.float32, copy=True
+                                            )
+                                        )
                                 if init_ready and not canonical_action.faults:
                                     startup_initializer.mark_complete()
-                                    if startup_initializer.source in {"replay:first_frame", "policy:first_frame"}:
-                                        skipped = _skip_startup_replay_frames(policy, count=1)
+                                    if startup_initializer.source in {
+                                        "replay:first_frame",
+                                        "policy:first_frame",
+                                    }:
+                                        skipped = _skip_startup_replay_frames(
+                                            policy, count=1
+                                        )
                                         if skipped:
                                             print(
                                                 "[StartupInit] replay startup target consumed; "
@@ -5957,8 +8334,53 @@ def main(
                                             "[StartupInit] ready; press A to start policy inference/execution."
                                         )
                         can_run_policy = False
-                    if can_run_policy and wait_for_ready_confirm and not ready_confirmed:
+                    if (
+                        can_run_policy
+                        and wait_for_ready_confirm
+                        and not ready_confirmed
+                    ):
                         can_run_policy = False
+                    if (
+                        rtc_frontend is None
+                        and position_deploy_executor is not None
+                        and can_run_policy
+                        and policy_deploy_runtime.action_queue_length() == 0
+                        and _position_source_tail_pending_before_synchronous_chunk_gap(
+                            position_deploy_executor
+                        )
+                    ):
+                        # The motion layer shifted this non-RTC chunk to begin
+                        # after planner preparation. Keep the deployment-owned
+                        # chunk boundary open until its final staged source
+                        # timestamp has actually been emitted; otherwise the
+                        # next clear/Hold would truncate the shifted tail.
+                        can_run_policy = False
+                    if (
+                        rtc_frontend is None
+                        and position_deploy_executor is not None
+                        and can_run_policy
+                        and policy_deploy_runtime.action_queue_length() == 0
+                        and _hold_active_position_stream_for_synchronous_chunk_gap(
+                            position_deploy_executor
+                        )
+                    ):
+                        if position_plan_cut_detector is not None:
+                            position_plan_cut_detector.mark_hold_acknowledged()
+                        console_log_event(
+                            "Policy",
+                            "WAIT: action chunk exhausted; position stream entered "
+                            "Hold before synchronous inference.",
+                            now=loop_started_at,
+                        )
+                        debug_logger.log_event(
+                            "position_chunk_gap_hold",
+                            {
+                                "schema": "dexteleop_position_chunk_gap_hold_v1",
+                                "reason": "synchronous_inference_with_empty_action_queue",
+                                "queue_len": 0,
+                                "observation_step_index": int(observation.step_index),
+                            },
+                        )
                     if (
                         rtc_frontend is None
                         and can_run_policy
@@ -5992,6 +8414,14 @@ def main(
                         queue_len_before_update = prediction.queue_len_before
                         if prediction.accepted:
                             ik_action_gate.mark_policy_output_accepted()
+                            defer_position_action_until_fresh_cut = (
+                                _defer_position_action_after_synchronous_prediction(
+                                    prediction_accepted=True,
+                                    position_executor_enabled=(
+                                        position_deploy_executor is not None
+                                    ),
+                                )
+                            )
                             debug_logger.log_policy_chunk(
                                 timestamp=loop_started_at,
                                 step_index=step_index,
@@ -6007,8 +8437,26 @@ def main(
                                 ik_recovery_statuses=ik_action_gate.last_statuses,
                                 ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
                             )
+                            if defer_position_action_until_fresh_cut:
+                                debug_logger.log_event(
+                                    "policy_chunk_execution_deferred",
+                                    {
+                                        "schema": (
+                                            "dexteleop_policy_chunk_execution_deferred_v1"
+                                        ),
+                                        "reason": (
+                                            "fresh_post_inference_observation_cut_required"
+                                        ),
+                                        "queue_len": int(prediction.queue_len_after),
+                                        "observation_step_index": int(
+                                            observation.step_index
+                                        ),
+                                    },
+                                )
                         elif prediction.discarded_by_gate:
-                            print("[Deploy] IK recovery active; discarded predicted action chunk.")
+                            print(
+                                "[Deploy] IK recovery active; discarded predicted action chunk."
+                            )
                             debug_logger.log_policy_chunk(
                                 timestamp=loop_started_at,
                                 step_index=step_index,
@@ -6070,29 +8518,130 @@ def main(
                     # lease in the backend before the next 40 Hz tick; the
                     # explicit option above keeps a rollback to legacy
                     # target continuation available for controlled debugging.
+                    collision_reset_waiting = False
+                    if (
+                        position_deploy_executor is not None
+                        and can_run_policy
+                        and not defer_position_action_until_fresh_cut
+                        and policy_deploy_runtime.action_queue_length() > 0
+                    ):
+                        collision_reset_preflight = (
+                            position_deploy_executor.collision_reset_preflight(
+                                observation,
+                                timestamp_monotonic=control_loop_started_at,
+                            )
+                        )
+                        if bool(collision_reset_preflight.get("required")):
+                            collision_reset_waiting = not bool(
+                                collision_reset_preflight.get("ready")
+                            )
+                            preflight_state = (
+                                "waiting:"
+                                + str(
+                                    collision_reset_preflight.get("reason") or "unknown"
+                                )
+                                if collision_reset_waiting
+                                else "ready"
+                            )
+                            if collision_reset_console_gate.should_emit(
+                                "first_collision_reset",
+                                preflight_state,
+                                now=loop_started_at,
+                                heartbeat_sec=5.0,
+                                min_interval_sec=1.0,
+                            ):
+                                if collision_reset_waiting:
+                                    console_log_event(
+                                        "Collision",
+                                        "WAIT: queued policy action retained until fresh "
+                                        "dual-arm collision-reset state is available; "
+                                        + str(collision_reset_preflight.get("reason")),
+                                        now=loop_started_at,
+                                    )
+                                else:
+                                    console_log_event(
+                                        "Collision",
+                                        "READY: fresh dual-arm collision-reset state admitted.",
+                                        now=loop_started_at,
+                                    )
+                                debug_logger.log_event(
+                                    "collision_reset_preflight",
+                                    dict(collision_reset_preflight),
+                                )
                     allow_policy_output = (
-                        can_run_policy and not ik_action_gate.blocks_action_output
+                        can_run_policy
+                        and not ik_action_gate.blocks_action_output
+                        and not defer_position_action_until_fresh_cut
+                        and not collision_reset_waiting
                     )
                     if policy_arbiter_shadow is not None:
                         shadow_gate_status = (
                             "fault"
                             if position_safety_fault_latched
-                            else "ready"
-                            if allow_policy_output
-                            else "hold"
+                            else "ready" if allow_policy_output else "hold"
                         )
                         policy_arbiter_shadow.update_execution_gate(
                             shadow_gate_status,
                             reason=(
                                 "legacy_output_eligible"
                                 if shadow_gate_status == "ready"
-                                else "legacy_safety_fault_latched"
-                                if shadow_gate_status == "fault"
-                                else "legacy_output_not_eligible"
+                                else (
+                                    "legacy_safety_fault_latched"
+                                    if shadow_gate_status == "fault"
+                                    else "legacy_output_not_eligible"
+                                )
                             ),
                             produced_at=control_loop_started_at,
                         )
+                    action_phase_timing: dict[str, Any] = {
+                        "executor_debug_and_fault_ms": max(
+                            0.0,
+                            pre_action_executor_completed_at
+                            - pre_action_executor_started_at,
+                        )
+                        * 1000.0,
+                        "operator_and_lifecycle_ms": max(
+                            0.0,
+                            pre_action_operator_completed_at
+                            - pre_action_executor_completed_at,
+                        )
+                        * 1000.0,
+                        "arm_snapshot_ms": max(
+                            0.0,
+                            pre_action_arm_snapshot_completed_at
+                            - pre_action_operator_completed_at,
+                        )
+                        * 1000.0,
+                        "arm_snapshot_thread_cpu_ms": max(
+                            0.0,
+                            arm_snapshot_cpu_completed - arm_snapshot_cpu_started,
+                        )
+                        * 1000.0,
+                        "ik_gate_and_hand_snapshot_ms": max(
+                            0.0,
+                            pre_action_hand_snapshot_completed_at
+                            - pre_action_arm_snapshot_completed_at,
+                        )
+                        * 1000.0,
+                        "observation_build_ms": max(
+                            0.0,
+                            pre_action_observation_completed_at
+                            - pre_action_hand_snapshot_completed_at,
+                        )
+                        * 1000.0,
+                    }
                     if rtc_frontend is None:
+                        primary_prepare_started = time.monotonic()
+                        primary_prepare_cpu_started = time.thread_time()
+                        action_phase_timing["post_observation_policy_and_gate_ms"] = max(
+                            0.0,
+                            primary_prepare_started
+                            - pre_action_observation_completed_at,
+                        ) * 1000.0
+                        action_phase_timing["before_primary_prepare_ms"] = max(
+                            0.0,
+                            primary_prepare_started - control_loop_started_at,
+                        ) * 1000.0
                         action_step = policy_deploy_runtime.prepare_next_action(
                             observation,
                             preparer=canonical_action_pipeline,
@@ -6105,6 +8654,19 @@ def main(
                                 )
                             ),
                         )
+                        primary_prepare_completed = time.monotonic()
+                        primary_prepare_cpu_completed = time.thread_time()
+                        action_phase_timing["prepare_next_action_ms"] = max(
+                            0.0,
+                            primary_prepare_completed - primary_prepare_started,
+                        ) * 1000.0
+                        action_phase_timing[
+                            "prepare_next_action_thread_cpu_ms"
+                        ] = max(
+                            0.0,
+                            primary_prepare_cpu_completed
+                            - primary_prepare_cpu_started,
+                        ) * 1000.0
                     else:
                         rtc_step = rtc_frontend.step(
                             observation,
@@ -6114,10 +8676,7 @@ def main(
                         if rtc_step_fanout is not None:
                             rtc_step_fanout.put_nowait(rtc_step)
                         emission = rtc_step.emission_result.emission
-                        if (
-                            rtc_emission_publisher is not None
-                            and emission is not None
-                        ):
+                        if rtc_emission_publisher is not None and emission is not None:
                             publication_receipt = (
                                 rtc_emission_publisher.publish_committed_emission(
                                     emission,
@@ -6127,9 +8686,7 @@ def main(
                             )
                             if (
                                 rtc_debug_observer is not None
-                                and rtc_debug_observer.accepts(
-                                    RTC_DEBUG_LEVEL_SUMMARY
-                                )
+                                and rtc_debug_observer.accepts(RTC_DEBUG_LEVEL_SUMMARY)
                             ):
                                 rtc_debug_observer.offer(
                                     "rtc_emission_publication",
@@ -6161,14 +8718,31 @@ def main(
                                     "accepted producer commit evidence."
                                 )
                             rtc_emission_fanout.put_nowait(emission)
-                        action_step = (
-                            policy_deploy_runtime.prepare_emission_result(
-                                rtc_step.emission_result,
-                                observation,
-                                preparer=canonical_action_pipeline,
-                                policy_name=policy.name,
-                            )
+                        primary_prepare_started = time.monotonic()
+                        primary_prepare_cpu_started = time.thread_time()
+                        action_phase_timing["before_primary_prepare_ms"] = max(
+                            0.0,
+                            primary_prepare_started - control_loop_started_at,
+                        ) * 1000.0
+                        action_step = policy_deploy_runtime.prepare_emission_result(
+                            rtc_step.emission_result,
+                            observation,
+                            preparer=canonical_action_pipeline,
+                            policy_name=policy.name,
                         )
+                        primary_prepare_completed = time.monotonic()
+                        primary_prepare_cpu_completed = time.thread_time()
+                        action_phase_timing["prepare_emission_result_ms"] = max(
+                            0.0,
+                            primary_prepare_completed - primary_prepare_started,
+                        ) * 1000.0
+                        action_phase_timing[
+                            "prepare_emission_result_thread_cpu_ms"
+                        ] = max(
+                            0.0,
+                            primary_prepare_cpu_completed
+                            - primary_prepare_cpu_started,
+                        ) * 1000.0
                         if rtc_debug_observer is not None:
                             summary_worthy = bool(
                                 rtc_step.completion is not None
@@ -6194,8 +8768,7 @@ def main(
                             and not rtc_step.result_transition.receipt.accepted
                         ):
                             faults.extend(
-                                "rtc_result_rejected:"
-                                f"{reason}"
+                                "rtc_result_rejected:" f"{reason}"
                                 for reason in (
                                     rtc_step.result_transition.receipt.reasons
                                 )
@@ -6221,13 +8794,11 @@ def main(
                                     and action_step.raw_action is not None
                                 ):
                                     try:
-                                        replay_adapter_result = (
-                                            replay_proposal_shadow_adapter.adapt_emission(
-                                                action_step.emission,
-                                                raw_action_metadata=(
-                                                    action_step.raw_action.metadata
-                                                ),
-                                            )
+                                        replay_adapter_result = replay_proposal_shadow_adapter.adapt_emission(
+                                            action_step.emission,
+                                            raw_action_metadata=(
+                                                action_step.raw_action.metadata
+                                            ),
                                         )
                                         debug_logger.log_event(
                                             "replay_proposal_adapter",
@@ -6235,17 +8806,16 @@ def main(
                                                 replay_adapter_result
                                             ),
                                         )
-                                        if replay_adapter_result.proposal_draft is not None:
-                                            arbiter_shadow_step = (
-                                                policy_arbiter_shadow.evaluate_proposal_draft(
-                                                    replay_adapter_result.proposal_draft,
-                                                    source_event_id=(
-                                                        replay_adapter_result
-                                                        .source_adapter_receipt
-                                                        .representation_trace_id
-                                                    ),
-                                                    emission=action_step.emission,
-                                                )
+                                        if (
+                                            replay_adapter_result.proposal_draft
+                                            is not None
+                                        ):
+                                            arbiter_shadow_step = policy_arbiter_shadow.evaluate_proposal_draft(
+                                                replay_adapter_result.proposal_draft,
+                                                source_event_id=(
+                                                    replay_adapter_result.source_adapter_receipt.representation_trace_id
+                                                ),
+                                                emission=action_step.emission,
                                             )
                                         else:
                                             arbiter_shadow_step = policy_arbiter_shadow.status(
@@ -6305,8 +8875,35 @@ def main(
                     raw_second_lookahead_action = (
                         action_step.raw_second_lookahead_action
                     )
+                    raw_third_lookahead_action = action_step.raw_third_lookahead_action
                     queue_len_after_pop = action_step.queue_len_after
                     if raw_action is not None:
+                        if action_step.emission is None:
+                            emission_error = action_step.emission_error
+                            debug_logger.log_event(
+                                "policy_action_emission_unavailable",
+                                {
+                                    "schema": (
+                                        "dexteleop_policy_action_emission_unavailable_v1"
+                                    ),
+                                    "non_authoritative": True,
+                                    "motion_lineage_source": (
+                                        "normalized_action_chunk_metadata"
+                                        if rtc_frontend is None
+                                        else "blocked_missing_rtc_emission"
+                                    ),
+                                    "error_type": (
+                                        None
+                                        if emission_error is None
+                                        else type(emission_error).__name__
+                                    ),
+                                    "error": (
+                                        None
+                                        if emission_error is None
+                                        else str(emission_error)
+                                    ),
+                                },
+                            )
                         canonical_action = action_step.prepared_action
                         if (
                             not debug_replay
@@ -6351,6 +8948,8 @@ def main(
                         lookahead_observation = None
                         second_lookahead_canonical_action = None
                         second_lookahead_observation = None
+                        third_lookahead_canonical_action = None
+                        third_lookahead_observation = None
                         if (
                             position_deploy_executor is not None
                             and bool(args.position_chunk_lookahead)
@@ -6368,11 +8967,16 @@ def main(
                                     copy=True,
                                 ),
                             )
+                            lookahead_prepare_started = time.monotonic()
                             prepared_lookahead = canonical_action_pipeline.prepare(
                                 raw_lookahead_action,
                                 lookahead_observation,
                                 policy_name=policy.name,
                             )
+                            action_phase_timing["lookahead_prepare_1_ms"] = max(
+                                0.0,
+                                time.monotonic() - lookahead_prepare_started,
+                            ) * 1000.0
                             if not prepared_lookahead.faults:
                                 lookahead_canonical_action = prepared_lookahead
                                 if (
@@ -6389,6 +8993,7 @@ def main(
                                             )
                                         ),
                                     )
+                                    lookahead_prepare_started = time.monotonic()
                                     prepared_second_lookahead = (
                                         canonical_action_pipeline.prepare(
                                             raw_second_lookahead_action,
@@ -6396,10 +9001,48 @@ def main(
                                             policy_name=policy.name,
                                         )
                                     )
+                                    action_phase_timing["lookahead_prepare_2_ms"] = max(
+                                        0.0,
+                                        time.monotonic() - lookahead_prepare_started,
+                                    ) * 1000.0
                                     if not prepared_second_lookahead.faults:
                                         second_lookahead_canonical_action = (
                                             prepared_second_lookahead
                                         )
+                                        if (
+                                            bool(
+                                                args.position_continuous_waypoint_async_precompute
+                                            )
+                                            and raw_third_lookahead_action is not None
+                                        ):
+                                            third_lookahead_observation = replace(
+                                                observation,
+                                                last_action=(
+                                                    prepared_second_lookahead.action.vector.astype(
+                                                        np.float32,
+                                                        copy=True,
+                                                    )
+                                                ),
+                                            )
+                                            lookahead_prepare_started = time.monotonic()
+                                            prepared_third_lookahead = (
+                                                canonical_action_pipeline.prepare(
+                                                    raw_third_lookahead_action,
+                                                    third_lookahead_observation,
+                                                    policy_name=policy.name,
+                                                )
+                                            )
+                                            action_phase_timing[
+                                                "lookahead_prepare_3_ms"
+                                            ] = max(
+                                                0.0,
+                                                time.monotonic()
+                                                - lookahead_prepare_started,
+                                            ) * 1000.0
+                                            if not prepared_third_lookahead.faults:
+                                                third_lookahead_canonical_action = (
+                                                    prepared_third_lookahead
+                                                )
                         faults.extend(canonical_action.faults)
                         latch_canonical_safety_fault(
                             canonical_action,
@@ -6422,8 +9065,7 @@ def main(
                                     "target": "FAULT",
                                     "reason": "canonical_safety_fault",
                                     "producer_transition_hash": (
-                                        rtc_fault.producer_transition.receipt
-                                        .semantic_content_hash
+                                        rtc_fault.producer_transition.receipt.semantic_content_hash
                                     ),
                                     "worker_stop_hash": (
                                         rtc_fault.worker_stop_receipt.semantic_content_hash
@@ -6433,6 +9075,7 @@ def main(
                             policy_active = False
                         dispatch_error: BaseException | None = None
                         execution: _PreparedActionExecution | None = None
+                        plan_cut_proposal = None
                         post_arm_states: dict[str, dict[str, Any]] | None = None
                         if position_deploy_executor is None:
                             annotate_deploy_arm_command_limits(
@@ -6443,7 +9086,35 @@ def main(
                                 action_hz=float(effective_action_hz),
                             )
                         try:
-                            if canonical_action.command is not None and canonical_action.command.commands:
+                            if (
+                                canonical_action.command is not None
+                                and canonical_action.command.commands
+                            ):
+                                if (
+                                    position_plan_cut_detector is not None
+                                    and position_deploy_executor is not None
+                                ):
+                                    plan_cut_prepare_started = time.monotonic()
+                                    plan_cut_proposal = _prepare_position_plan_cut_for_action_step(
+                                        position_plan_cut_detector,
+                                        action_step,
+                                        rtc_enabled=rtc_frontend is not None,
+                                        policy_node_id=(
+                                            policy_deploy_runtime.config.policy_node_id
+                                        ),
+                                        hold_generation=int(
+                                            position_deploy_executor.snapshot().get(
+                                                "clear_count",
+                                                0,
+                                            )
+                                        ),
+                                        detected_at=control_loop_started_at,
+                                    )
+                                    action_phase_timing["plan_cut_prepare_ms"] = max(
+                                        0.0,
+                                        time.monotonic() - plan_cut_prepare_started,
+                                    ) * 1000.0
+                                execute_prepared_started = time.monotonic()
                                 execution = execute_prepared_action(
                                     canonical_action,
                                     observation,
@@ -6458,15 +9129,53 @@ def main(
                                     second_lookahead_observation=(
                                         second_lookahead_observation
                                     ),
+                                    third_lookahead_canonical_action=(
+                                        third_lookahead_canonical_action
+                                    ),
+                                    third_lookahead_observation=(
+                                        third_lookahead_observation
+                                    ),
+                                    source_plan_cut=(
+                                        None
+                                        if plan_cut_proposal is None
+                                        else plan_cut_proposal.cut
+                                    ),
+                                    phase_timing=action_phase_timing,
                                 )
+                                action_phase_timing["execute_prepared_action_ms"] = max(
+                                    0.0,
+                                    time.monotonic() - execute_prepared_started,
+                                ) * 1000.0
+                                if plan_cut_proposal is not None:
+                                    if execution.accepted:
+                                        position_plan_cut_detector.commit(
+                                            plan_cut_proposal
+                                        )
+                                    else:
+                                        position_plan_cut_detector.reject(
+                                            plan_cut_proposal
+                                        )
+                                    plan_cut_proposal = None
                                 if execution.accepted:
                                     position_action_submitted_this_loop = (
                                         position_deploy_executor is not None
                                     )
-                                    last_action = canonical_action.action.vector.astype(np.float32, copy=True)
+                                    last_action = canonical_action.action.vector.astype(
+                                        np.float32, copy=True
+                                    )
                             if debug_logger.enabled:
-                                post_arm_states = _debug_backend_arm_states(arm_backends)
+                                post_state_started = time.monotonic()
+                                post_arm_states = _debug_backend_arm_states(
+                                    arm_backends
+                                )
+                                action_phase_timing["post_arm_state_snapshot_ms"] = max(
+                                    0.0,
+                                    time.monotonic() - post_state_started,
+                                ) * 1000.0
                         except Exception as exc:  # noqa: BLE001
+                            if plan_cut_proposal is not None:
+                                position_plan_cut_detector.reject(plan_cut_proposal)
+                                plan_cut_proposal = None
                             dispatch_error = exc
                             if (
                                 policy_arbiter_shadow is not None
@@ -6486,7 +9195,18 @@ def main(
                                     legacy_shadow_event.to_debug_payload(),
                                 )
                             if debug_logger.enabled:
-                                post_arm_states = _debug_backend_arm_states(arm_backends)
+                                post_state_started = time.monotonic()
+                                post_arm_states = _debug_backend_arm_states(
+                                    arm_backends
+                                )
+                                action_phase_timing["post_arm_state_snapshot_ms"] = max(
+                                    0.0,
+                                    time.monotonic() - post_state_started,
+                                ) * 1000.0
+                                action_phase_timing["loop_before_debug_ms"] = max(
+                                    0.0,
+                                    time.monotonic() - control_loop_started_at,
+                                ) * 1000.0
                                 debug_logger.log_action_step(
                                     timestamp=loop_started_at,
                                     step_index=step_index,
@@ -6502,6 +9222,7 @@ def main(
                                     faults=faults,
                                     dispatch_error=dispatch_error,
                                     execution=execution,
+                                    phase_timing=action_phase_timing,
                                 )
                             raise
                         if (
@@ -6521,6 +9242,10 @@ def main(
                                 "legacy_execution_observation",
                                 legacy_shadow_event.to_debug_payload(),
                             )
+                        action_phase_timing["loop_before_debug_ms"] = max(
+                            0.0,
+                            time.monotonic() - control_loop_started_at,
+                        ) * 1000.0
                         debug_logger.log_action_step(
                             timestamp=loop_started_at,
                             step_index=step_index,
@@ -6536,6 +9261,7 @@ def main(
                             faults=faults,
                             dispatch_error=dispatch_error,
                             execution=execution,
+                            phase_timing=action_phase_timing,
                         )
 
                     if (
@@ -6554,7 +9280,15 @@ def main(
 
                 fault_text = _compact_faults(faults)
                 if fault_text != last_fault_text:
-                    print(f"[State] faults={fault_text}")
+                    console_log_event(
+                        "Safety",
+                        (
+                            "READY: faults=none"
+                            if fault_text == "none"
+                            else f"ERROR: faults={fault_text}"
+                        ),
+                        now=loop_started_at,
+                    )
                     last_fault_text = fault_text
 
                 if loop_started_at - last_status_at >= float(args.status_sec):
@@ -6593,49 +9327,99 @@ def main(
                             )
                         except (TypeError, ValueError):
                             collision_distance_text = "invalid"
-                        position_executor_status = (
-                            "position_refs="
-                            f"{position_snapshot.get('reference_count', 0)} "
-                            f"position_queue={position_snapshot.get('queue_depth', 0)} "
-                            f"position_missed={position_snapshot.get('missed_reference_ticks', 0)} "
-                            f"position_hand="
-                            f"{position_snapshot.get('discrete_dispatch_count', 0)}/"
-                            f"{position_snapshot.get('discrete_dispatch_attempt_count', 0)} "
-                            f"position_hand_skip="
-                            f"{position_snapshot.get('discrete_skipped_count', 0) + position_snapshot.get('discrete_backend_skipped_count', 0)} "
-                            f"position_debug_drop="
-                            f"{position_snapshot.get('debug_event_drop_count', 0)} "
-                            f"position_collision="
-                            f"{last_collision.get('position_collision_status', 'pending')} "
-                            f"position_collision_d_m={collision_distance_text} "
-                            f"position_collision_counts="
-                            f"{position_snapshot.get('collision_tracking_count', 0)}/"
-                            f"{position_snapshot.get('collision_limited_count', 0)}/"
-                            f"{position_snapshot.get('collision_backoff_count', 0)}/"
-                            f"{position_snapshot.get('collision_hold_count', 0)} "
-                            f"position_collision_endpoint="
-                            f"{int(bool(position_snapshot.get('endpoint_collision_certified')))} "
-                            "position_collision_segment=0 "
-                            f"position_collision_reset={collision_reset_status}"
+                        reference_count = int(
+                            position_snapshot.get("reference_count", 0)
                         )
+                        queue_depth = int(position_snapshot.get("queue_depth", 0))
+                        missed_ticks = int(
+                            position_snapshot.get("missed_reference_ticks", 0)
+                        )
+                        collision_status = str(
+                            last_collision.get(
+                                "position_collision_status",
+                                "pending",
+                            )
+                        )
+                        position_status_parts = [
+                            "position="
+                            f"refs:{reference_count}/queue:{queue_depth}"
+                            f"/missed:{missed_ticks}",
+                            "collision="
+                            f"{collision_status}/d:{collision_distance_text}"
+                            f"/reset:{collision_reset_status}",
+                        ]
+                        hand_attempts = int(
+                            position_snapshot.get(
+                                "discrete_dispatch_attempt_count",
+                                0,
+                            )
+                        )
+                        hand_dispatches = int(
+                            position_snapshot.get("discrete_dispatch_count", 0)
+                        )
+                        hand_skips = int(
+                            position_snapshot.get("discrete_skipped_count", 0)
+                        ) + int(
+                            position_snapshot.get(
+                                "discrete_backend_skipped_count",
+                                0,
+                            )
+                        )
+                        if hand_attempts or hand_dispatches or hand_skips:
+                            position_status_parts.append(
+                                "hands="
+                                f"{hand_dispatches}/{hand_attempts}"
+                                f"/skip:{hand_skips}"
+                            )
+                        debug_drops = int(
+                            position_snapshot.get("debug_event_drop_count", 0)
+                        )
+                        if debug_drops:
+                            position_status_parts.append(f"debug_drop={debug_drops}")
+                        position_executor_status = " ".join(position_status_parts)
                     status_parts = [
                         text
                         for text in (
-                            fixed_init_controller.status_text if fixed_init_controller is not None else "",
+                            (
+                                fixed_init_controller.status_text
+                                if fixed_init_controller is not None
+                                else ""
+                            ),
                             (
                                 policy_qpos_init_controller.status_text
                                 if policy_qpos_init_controller is not None
                                 else ""
                             ),
                             startup_initializer.status_text,
-                            "ready=wait:A" if (
-                                wait_for_ready_confirm
-                                and policy_active
-                                and startup_initializer.completed
-                                and not ready_confirmed
-                            ) else "",
+                            (
+                                "ready=wait:A"
+                                if (
+                                    wait_for_ready_confirm
+                                    and policy_active
+                                    and startup_initializer.completed
+                                    and not ready_confirmed
+                                )
+                                else ""
+                            ),
                             policy_status,
                             ik_action_gate.status_text(),
+                            (
+                                "position_force_guard=latched:"
+                                + str(
+                                    position_force_guard_fault.reason
+                                    if position_force_guard_fault is not None
+                                    else "unknown"
+                                )
+                                if position_force_guard_fault_latched
+                                else (
+                                    "position_force_guard=armed"
+                                    if (
+                                        position_force_guard_monitor is not None
+                                        and position_force_guard_monitor.motion_ready
+                                    )
+                                    else ""
+                                )
+                            ),
                             (
                                 "impedance_guard=latched:"
                                 + str(
@@ -6668,15 +9452,16 @@ def main(
                         if text
                     ]
                     suffix = f" {' '.join(status_parts)}" if status_parts else ""
-                    print(
-                        "[Status] "
+                    console_log_event(
+                        "Status",
                         f"step={step_index} hz={control_hz:.2f} "
                         f"policy={'active' if policy_active else 'paused'} "
                         f"send={'on' if send_actions else 'dry-run'} "
                         f"queue={pending_action_count} "
                         f"state_valid={int(np.sum(observation.state_valid))}/{observation.state_valid.size} "
                         f"{camera_status_text(camera_sources, camera_previewer)}"
-                        f"{suffix}"
+                        f"{suffix}",
+                        now=loop_started_at,
                     )
                     last_status_at = loop_started_at
 
@@ -6685,8 +9470,13 @@ def main(
                     break
                 loop_target_hz = float(effective_action_hz)
                 if fixed_init_controller is not None and fixed_init_controller.running:
-                    loop_target_hz = max(loop_target_hz, float(fixed_init_controller.plan.action_hz))
-                if policy_qpos_init_controller is not None and policy_qpos_init_controller.running:
+                    loop_target_hz = max(
+                        loop_target_hz, float(fixed_init_controller.plan.action_hz)
+                    )
+                if (
+                    policy_qpos_init_controller is not None
+                    and policy_qpos_init_controller.running
+                ):
                     loop_target_hz = max(
                         loop_target_hz,
                         1.0 / max(0.001, float(args.policy_qpos_init_dt_sec)),
@@ -6695,10 +9485,36 @@ def main(
                 if sleep_time > 0.0:
                     time.sleep(sleep_time)
     except KeyboardInterrupt:
-        print("\n[Deploy] keyboard interrupt; stopping\n")
+        print("\n[Deploy] keyboard interrupt; requesting stop\n", flush=True)
+        try:
+            position_stop_requested = (
+                emergency_stop_position_deploy_on_keyboard_interrupt(
+                    args,
+                    send_actions=send_actions,
+                    arm_backends=arm_backends,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup still must run.
+            keyboard_interrupt_stop_error = f"{type(exc).__name__}: {exc}"
+            print(
+                "[Deploy] CRITICAL: Ctrl+C bimanual Arm_Stop was not fully "
+                f"acknowledged: {keyboard_interrupt_stop_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            if position_stop_requested:
+                print(
+                    "[Deploy] Ctrl+C bimanual Arm_Stop acknowledged.",
+                    flush=True,
+                )
     finally:
         position_workers_stopped = True
         cleanup_errors: list[str] = []
+        if keyboard_interrupt_stop_error is not None:
+            cleanup_errors.append(
+                "keyboard_interrupt_emergency_stop: " + keyboard_interrupt_stop_error
+            )
 
         def close_resource(label: str, resource: Any) -> None:
             try:
@@ -6708,7 +9524,11 @@ def main(
                 cleanup_errors.append(error)
                 debug_logger.log_event(
                     "cleanup_error",
-                    {"resource": str(label), "error_type": type(exc).__name__, "error": str(exc)},
+                    {
+                        "resource": str(label),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
                 )
                 print(f"[DeployCleanup] {error}", file=sys.stderr)
 
@@ -6748,7 +9568,9 @@ def main(
         if position_deploy_executor is not None:
             try:
                 position_deploy_executor.close()
-            except Exception as exc:  # noqa: BLE001 - inspect worker liveness before backend close.
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 - inspect worker liveness before backend close.
                 close_snapshot = position_deploy_executor.snapshot()
                 position_workers_stopped = not bool(
                     close_snapshot.get("reference_worker_alive")
@@ -6758,9 +9580,7 @@ def main(
                     f"[PositionDeploy] close/hold error: {type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
-                cleanup_errors.append(
-                    f"position_executor: {type(exc).__name__}: {exc}"
-                )
+                cleanup_errors.append(f"position_executor: {type(exc).__name__}: {exc}")
                 debug_logger.log_event(
                     "position_executor_close_error",
                     {
@@ -6775,6 +9595,12 @@ def main(
                 "position_executor_final_snapshot",
                 position_deploy_executor.snapshot(),
             )
+        if position_force_guard_monitor is not None:
+            debug_logger.log_event(
+                "position_force_guard_final_snapshot",
+                position_force_guard_monitor.snapshot(),
+            )
+            close_resource("position_force_guard", position_force_guard_monitor)
         if impedance_force_guard_monitor is not None:
             close_resource("impedance_force_guard", impedance_force_guard_monitor)
         if fixed_init_controller is not None:

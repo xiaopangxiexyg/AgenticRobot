@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from robot_motion.deploy.normalization import (
+from dataset_contracts.normalization import (
     NormalizationContract,
     NormalizationContractError,
     NormalizationDomainSpec,

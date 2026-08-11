@@ -21,6 +21,12 @@ FIX_ARM_FAULT_CODES = frozenset(
     }
 )
 
+# A profile-driven arm handoff may use the latest tracker sample as an atomic
+# zero-delta rebase when a stillness-qualified passive Home is unavailable.
+# Keep this substantially tighter than the ordinary 0.5 s Home freshness
+# bound: a moving hand must not turn an older sample into queued catch-up.
+PROFILE_TRANSITION_FRESH_REBASE_MAX_AGE_SEC = 0.075
+
 
 def normalize_fix_arm_side(side: str) -> str:
     normalized = str(side or "").strip().lower()
@@ -222,6 +228,7 @@ class FixArmCommandController:
         side: str,
         *,
         now: float,
+        allow_fresh_rebase: bool = False,
     ) -> dict[str, object]:
         normalized = normalize_fix_arm_side(side)
         cache = self._passive_home_cache[normalized]
@@ -230,15 +237,43 @@ class FixArmCommandController:
             if cache.pose is None or cache.source_timestamp <= 0.0
             else max(0.0, float(now) - float(cache.source_timestamp))
         )
-        ready = bool(age_sec is not None and age_sec <= 0.5)
+        stable_ready = bool(age_sec is not None and age_sec <= 0.5)
+        latest_timestamp = cache.stability.last_timestamp
+        latest_age_sec = (
+            None
+            if cache.stability.last_pose is None or latest_timestamp is None
+            else float(now) - float(latest_timestamp)
+        )
+        fresh_rebase_ready = bool(
+            latest_age_sec is not None
+            and -0.05 <= latest_age_sec <= PROFILE_TRANSITION_FRESH_REBASE_MAX_AGE_SEC
+        )
+        ready = bool(stable_ready or (allow_fresh_rebase and fresh_rebase_ready))
+        quality = (
+            "stable"
+            if stable_ready
+            else (
+                "fresh_rebase"
+                if allow_fresh_rebase and fresh_rebase_ready
+                else "unavailable"
+            )
+        )
         return {
             "side": normalized,
             "ready": ready,
+            "stable_ready": stable_ready,
+            "fresh_rebase_ready": fresh_rebase_ready,
+            "quality": quality,
             "age_sec": age_sec,
+            "latest_age_sec": latest_age_sec,
             "reason": (
                 "stable_home_cache_ready"
-                if ready
-                else str(cache.unavailable_reason)
+                if stable_ready
+                else (
+                    "fresh_tracker_rebase_ready"
+                    if allow_fresh_rebase and fresh_rebase_ready
+                    else str(cache.unavailable_reason)
+                )
             ),
         }
 
@@ -369,6 +404,7 @@ class FixArmCommandController:
         now: float,
         timeout_sec: float = 1.0,
         min_samples: int = 1,
+        allow_fresh_home_rebase: bool = False,
     ) -> FixArmTransition:
         """Prepare one atomic two-pedal Fix transition.
 
@@ -491,26 +527,48 @@ class FixArmCommandController:
             self._post_recalibration_fixed_side = target
             self._two_pedal_transition_pending = True
             cache = self._passive_home_cache.get(current)
-            cache_status = self.passive_home_cache_status(current, now=now)
-            if (
+            cache_status = self.passive_home_cache_status(
+                current,
+                now=now,
+                allow_fresh_rebase=allow_fresh_home_rebase,
+            )
+            seed_pose: np.ndarray | None = None
+            seed_timestamp: float | None = None
+            seed_quality = str(cache_status["quality"])
+            if cache is not None and bool(cache_status["stable_ready"]):
+                seed_pose = None if cache.pose is None else cache.pose.copy()
+                seed_timestamp = float(cache.source_timestamp)
+            elif (
                 cache is not None
-                and cache.pose is not None
-                and 0.0 <= float(now) - float(cache.source_timestamp) <= 0.5
+                and allow_fresh_home_rebase
+                and bool(cache_status["fresh_rebase_ready"])
+                and cache.stability.last_pose is not None
+                and cache.stability.last_timestamp is not None
             ):
-                self._recalibration.samples = [cache.pose.copy()]
-                # The passive cache has already passed the stillness dwell.
-                # Carry its stability state into the active capture so the
-                # transition can commit on the next fresh sample instead of
-                # waiting for a duplicate dwell window.
-                self._recalibration.stability.prime_from_stable_sample(
-                    cache.pose,
-                    source_timestamp=float(cache.source_timestamp),
-                    reason="stable_home_cache_reused",
-                )
+                seed_pose = cache.stability.last_pose.copy()
+                seed_timestamp = float(cache.stability.last_timestamp)
+            if seed_pose is not None and seed_timestamp is not None:
+                self._recalibration.samples = [seed_pose]
+                if seed_quality == "stable":
+                    # The passive cache has already passed the stillness dwell.
+                    # Carry that state into the active capture rather than
+                    # waiting through a duplicate dwell window.
+                    self._recalibration.stability.prime_from_stable_sample(
+                        seed_pose,
+                        source_timestamp=seed_timestamp,
+                        reason="stable_home_cache_reused",
+                    )
+                else:
+                    # This is an instantaneous rebase, not a claim that the
+                    # hand passed the ordinary stillness contract.  The sample
+                    # is consumed immediately by the atomic progress handoff.
+                    self._recalibration.stability.reason = (
+                        "fresh_tracker_rebase_reused"
+                    )
             target_text = target or "live"
             if self._recalibration.samples:
                 self._status_message = (
-                    f"fresh stable {current} Home cache ready; "
+                    f"fresh {seed_quality} {current} Home cache ready; "
                     f"committing atomic switch to {target_text}"
                 )
             else:

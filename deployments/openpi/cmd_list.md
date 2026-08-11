@@ -1,12 +1,29 @@
-# OpenPI Policy → DexTeleop 部署命令
+# OpenPI Policy → DexTeleop 部署与训练命令
 
-本文档汇总远端 `/home/user/zc/openpi` 当前可用于 DexTeleop 的 policy、可选
-checkpoint step、OpenPI server、契约检查、无动作 dry-run 和真实 RM65 阻抗/力控
-部署命令。
+本文档是远端 `/home/user/zc/openpi` policy 接入
+`/home/user/zc/DexTeleop` 的自包含运行手册。内容覆盖 checkpoint 选择、OpenPI server、
+契约检查、no-action 检查、真实 RM65 部署，以及历史训练入口。
 
-本文档只记录命令，没有启动训练、OpenPI server、相机、机械臂或夹爪。
+本文档中的命令仅供操作者按节执行；本次整理没有启动训练、OpenPI server、相机、
+机械臂或夹爪。
 
-## 1. 使用规则
+## 1. 使用规则与路线
+
+### 1.1 按 policy 类型选择路线
+
+| 类型 | 使用章节 | 允许的入口 |
+| --- | --- | --- |
+| 普通 artifact-backed policy | 第 2～8 节 | 第 4 节选择变量；依次做 server dry-run、contract check、server、no-action，最后才是 L5 |
+| prepared writing stage1 | 第 9 节 | checkpoint 与 stage1 training profile 必须同时绑定 |
+| prepared writing stage2 | 第 10 节 | checkpoint 与 stage2 training profile 必须同时绑定；连续任务使用 `--no-init-qpos` |
+| trained model-RTC | 第 11 节 | 仅 conditioned no-action shadow；当前没有动作部署入口 |
+| 老 v1 registry policy | 第 12 节 | legacy registry；不属于 v2 artifact contract |
+| 训练与恢复参考 | 第 13～15 节 | 只在明确要训练时使用，不是部署前置步骤 |
+
+不要把不同路线的 server/client 参数混合。例如 prepared policy 不能改用通用
+`--config`，RTC shadow 不能复制 `--send-actions`。
+
+### 1.2 通用规则
 
 - `POLICY_STEP` 必须对应 checkpoint 目录中实际存在的数字 step，不能任意填写。
 - artifact-backed policy 使用 `deployments.openpi.server`：它根据 checkpoint 下的
@@ -15,13 +32,18 @@ checkpoint step、OpenPI server、契约检查、无动作 dry-run 和真实 RM6
   `checkpoint_step` 是可选 provenance，不作为默认部署门槛。
 - server 与 DexTeleop client 可以在同一台机器上运行。跨机器时，client 的
   `SERVER_IP` 不能使用 `127.0.0.1`，应改成 server 的可路由 IP。
-- 先执行 contract check 和 no-action dry-run，再考虑 `--send-actions`。
+- 先执行 contract check 和 no-action，再考虑 `--send-actions`。
 - `--deployment-profile rm65_bimanual_dmtac` 使用当前已检查的双臂 DMTAC、
   `impedance_40hz` 和 RealSense 多相机链路；它不会自动打开 `--send-actions`。
+- no-action 不等于无硬件：凡是连接真实 observation/backend 的命令，都可能打开相机、
+  DMTAC 和 RM65 backend；只有明确写着 contract/config check 的命令才是不连接设备。
+- `--no-init-qpos` 只跳过初始化轨迹，不会跳过 ready、碰撞、力限、观测新鲜度或
+  dispatch 安全门，也不会延续前一个 client 的 action queue、model history 或 chunk。
 
-## 2. 当前 policy 清单
+## 2. 当前可部署 policy 与 checkpoint
 
-检查时间：2026-07-28。以下是当前远端已经有有效 checkpoint 的 policy。
+基础清单检查时间：2026-08-06；writing stage2 行于 2026-08-08 单独完成远端只读复核。
+以下是已经有有效 checkpoint 的 policy。
 
 | Policy/config | 数据与动作语义 | 相机 | 可选 checkpoint step | 部署方式 |
 | --- | --- | --- | --- | --- |
@@ -32,6 +54,8 @@ checkpoint step、OpenPI server、契约检查、无动作 dry-run 和真实 RM6
 | `0712-wrist-cube` | v2.2，legacy absolute，16D / 16D，h50 | left/right wrist | `30000, 60000, 90000, 92599` | artifact wrapper / registry |
 | `0712-cube` | v2.2，legacy absolute，16D / 16D，h50 | front + left/right wrist | `11768` | artifact wrapper / registry |
 | `writing-phase1-grap-pen-h16-relative` | v2.3，relative，32D / 16D，h16 | front + left/right wrist | `30000, 60000, 90000, 120000, 150000` | artifact wrapper |
+| `writing-stage1-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第一阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v2` 实验） | checkpoint-bound prepared wrapper |
+| `writing-stage2-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第二阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v1` 实验） | checkpoint-bound prepared wrapper |
 | `dual_rm65_dmgripper` | 老 v1，26D action，h50 | front + left/right wrist | registry 固定 `99999` | legacy registry |
 
 对应的推荐 checkpoint 路径如下：
@@ -44,6 +68,8 @@ checkpoint step、OpenPI server、契约检查、无动作 dry-run 和真实 RM6
 /home/user/zc/openpi/checkpoints/0712-wrist-cube/0712-wrist-cube-wrist-only/<STEP>
 /home/user/zc/openpi/checkpoints/0712-cube/0712-cube/<STEP>
 /home/user/zc/openpi/checkpoints/writing-phase1-grap-pen-h16-relative/writing-phase1-grap-pen-h16-relative/<STEP>
+/home/user/zc/openpi/checkpoints/writing-stage1-0804-0805-front-h16-absolute-prepared-v1/writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2/<STEP>
+/home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1/writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1/<STEP>
 ```
 
 当前没有有效 checkpoint、因此暂不可部署的配置：
@@ -54,7 +80,7 @@ checkpoint step、OpenPI server、契约检查、无动作 dry-run 和真实 RM6
 - `writing-phase1-grap-pen-h16-absolute`：writing absolute h16 配置，暂无 checkpoint。
 - `dual_rm65_dmgripper_v22_masked`：registry 指向的 checkpoint 当前不存在，不能部署。
 
-## 3. 环境变量
+## 3. 公共环境变量
 
 先在 server/client 终端分别设置基础变量。若两端是同一台机器，可以使用下面默认值。
 
@@ -69,9 +95,10 @@ export LEFT_ARM_IP=192.168.101.21
 export RIGHT_ARM_IP=192.168.1.20
 ```
 
-## 4. 选择 policy 和 checkpoint step
+## 4. Policy 与 checkpoint step 选择
 
-每次只执行下面一个 policy 选择块，然后执行第 5～8 节的通用命令。
+每次只执行下面一个 policy 选择块。普通 artifact policy 随后执行第 5～8 节；checkpoint-bound
+prepared policy 不能使用通用 `--config` 路径，stage1 按第 9 节、stage2 按第 10 节执行。
 
 ### 4.1 cube 4:1，v2.3 relative h16
 
@@ -183,29 +210,36 @@ export OPENPI_ARTIFACT="$OPENPI_CKPT/policy_artifact.json"
 
 可将 `POLICY_STEP` 改为 `30000`、`60000`、`90000` 或 `120000`。
 
+### 4.8 writing stage2（0804/0805），front + absolute h16
+
+```bash
+export OPENPI_CONFIG=writing-stage2-0804-0805-front-h16-absolute-prepared-v1
+export OPENPI_MODEL=writing-stage2-0804-0805-front-h16-absolute-prepared-v1
+export OPENPI_ACTION_HORIZON=16
+export OPENPI_CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1
+export OPENPI_EXPERIMENT=writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1
+export POLICY_STEP=150000
+export OPENPI_TRAINING_PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage2_0804_0805_front_h16_absolute_v1.json
+export OPENPI_CKPT="$OPENPI_CHECKPOINT_ROOT/$OPENPI_EXPERIMENT/$POLICY_STEP"
+export OPENPI_ARTIFACT="$OPENPI_CKPT/policy_artifact.json"
+```
+
+远端只读复核时间为 2026-08-08：五个数字 checkpoint 均存在；最终 `150000` 目录及
+`policy_artifact.json` 生成于 2026-08-07 09:21。可将 `POLICY_STEP` 改为 `30000`、
+`60000`、`90000` 或 `120000`，但每个 step 都必须继续使用同一个 prepared training
+profile 生成 checkpoint-bound deployment binding。
+
+不要把本选择块的 `OPENPI_CONFIG` 传给第 5 节通用 `--config` server 命令；stage2 必须直接
+使用第 10 节同时绑定 `--checkpoint-dir` 和 `--prepared-training-profile` 的命令。
+
 ## 5. artifact-backed policy：启动 OpenPI server
 
 必须先在 server 终端执行第 4 节的一个选择块。
 
-### 5.1 只生成临时 registry，不启动 server
+server/config 的无硬件 preflight 不在各运行章节重复。统一检查样例与不同 policy
+路线需要替换的绑定参数见第 6 节。
 
-```bash
-cd "$DEXTELEOP_ROOT"
-export PYTHONPATH="$DEXTELEOP_ROOT"
-export JAX_PLATFORMS=cuda
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
-
-/home/user/zc/openpi/.venv/bin/python -m deployments.openpi.server \
-  --checkpoint-dir "$OPENPI_CKPT" \
-  --openpi-root "$OPENPI_ROOT" \
-  --config "$OPENPI_CONFIG" \
-  --action-horizon "$OPENPI_ACTION_HORIZON" \
-  --host 0.0.0.0 \
-  --port "$OPENPI_PORT" \
-  --dry-run
-```
-
-### 5.2 正式启动 server
+### 5.1 正式启动 server
 
 ```bash
 cd "$DEXTELEOP_ROOT"
@@ -233,9 +267,10 @@ metadata 至少应满足所选 artifact 的协议要求：deploy schema、action
 state/action dimension、camera slots、layout 和 pose mode。server 的 `model_id` 与
 `checkpoint_step` 默认允许变化；需要逐实例审计时再使用第 6 节的 strict 选项。
 
-## 6. artifact contract check（无 server、无相机、无硬件）
+## 6. 统一无硬件检查样例
 
-在 client 终端重新执行第 4 节对应的选择块，然后运行：
+全篇只保留本节这一组无 server、无相机、无机器人检查样例。普通 artifact policy 在
+client 终端重新执行第 4 节对应的选择块，然后运行：
 
 ```bash
 cd "$DEXTELEOP_ROOT"
@@ -248,23 +283,29 @@ export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
 
 该检查会校验 artifact、pose action mode、layout hash、camera mapping 和 state/action
 protocol，不连接 websocket、相机、夹爪或机械臂。它不会把 checkpoint step 当作协议
-门槛；失败时不能用
-关闭校验或手动伪造 metadata 的方式绕过。
+门槛；失败时不能关闭校验或手动伪造 metadata。
 
-默认不会用 `model_id`/`checkpoint_step` 阻塞上游模型切换。如果需要审计某个精确
-模型实例，再显式增加：
+其他路线复用同一个检查入口，只替换 binding 参数，不再重复整条命令：
 
-```bash
-  --strict-model-identity \
-  --model "$OPENPI_MODEL" \
-  --checkpoint-step "$POLICY_STEP"
-```
+| 路线 | 用于替换 `--policy-artifact-json ...` 的参数 |
+| --- | --- |
+| prepared stage1/stage2 | 对应的 `--checkpoint-dir` 与 `--prepared-training-profile` |
+| model-RTC | prepared 两项，再加 `--model-rtc-profile` 和 `--rtc-profile` |
 
-## 7. DexTeleop no-action dry-run
+需要 server 侧 preflight 时，复用对应章节的正式 server 命令并添加一个退出型开关：
+`--dry-run` 用于生成/显示临时 artifact 和 registry；prepared 路线还可改用
+`--prepared-config-check-only` 在真实 OpenPI registry 中临时构造并校验派生 config。
+两者都不加载模型、不监听端口，也不创建设备 backend；一次只使用一个。
 
-该命令会连接 OpenPI server 并读取实时相机/手部观测，执行推理、归一化、动作过滤和
-力控部署链路，但不添加 `--send-actions`，因此不会向机械臂或夹爪下发动作。它仍可能
-打开相机、DMTAC 和 RM65 backend，现场执行前必须确认硬件范围。
+默认不会用 `model_id`/`checkpoint_step` 阻塞上游模型切换。需要审计精确模型实例时，
+在同一命令中增加 `--strict-model-identity`、`--model "$OPENPI_MODEL"` 和
+`--checkpoint-step "$POLICY_STEP"`。
+
+## 7. 统一 no-action 样例
+
+全篇只保留本节这一条 no-action 样例。它会连接 OpenPI server 并读取实时相机/手部观测，
+执行推理、归一化、动作过滤和力控部署链路，但不添加 `--send-actions`，因此不会向机械臂
+或夹爪下发动作。它仍可能打开相机、DMTAC 和 RM65 backend，现场执行前必须确认硬件范围。
 
 ```bash
 cd "$DEXTELEOP_ROOT"
@@ -289,6 +330,12 @@ export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
 
 若选用不同任务或 checkpoint，应先人工确认 `OPENPI_QPOS_DATASET` 的 episode/frame
 是可安全到达的初始化姿态；`0/0` 只是命令示例。
+
+其他运行路线不再重复 no-action 命令：复制该路线的正式 client 命令，删除
+`--send-actions`，并添加 `--max-steps 100`。checkpoint/profile、控制分支、相机和
+`--no-init-qpos` 等路线特有参数保持不变；position force guard 参数可以保留，也可在
+只验证 observation/transport 时整组移除。缺少 `--send-actions` 才是“不下发动作”的
+权威条件，`--max-steps 100` 只限制检查长度。
 
 ## 8. DexTeleop 真实阻抗/力控部署（L5）
 
@@ -317,11 +364,309 @@ export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
   --debug
 ```
 
-该 profile 使用当前部署专用的 `impedance_40hz` 链路。不要改成 position 分支，也
-不要额外添加 `--start-init_qpos`，除非重新完成安全审查。手动启动时仍须遵循当前
-运行时的 ready/qpos-init/策略放行流程。
+该 profile 使用当前部署专用的 `impedance_40hz` 链路。默认保持 dataset-frame qpos-init；
+只有连续任务明确需要从当前 qpos 接管、并重新完成当前姿态和 policy 首帧安全审查时，才使用
+`--no-init-qpos` 显式覆盖。手动启动时仍须遵循当前运行时的 ready/策略放行流程。
 
-## 9. 老 v1 policy：`dual_rm65_dmgripper`
+## 9. Prepared writing stage1：checkpoint-bound 部署
+
+该模型不能用 `--config` 手填一个同名 OpenPI config。server 与 client 都必须同时给出
+checkpoint 和训练 profile；wrapper 会生成一次性 deployment artifact，并把以下内容绑定为
+同一单元：checkpoint 原始 artifact、训练 profile、派生 config、asset id、front-only camera
+slots、absolute/h16 action contract，以及该 checkpoint 中实际 `norm_stats.json` 的字节 hash。
+任一项漂移都会在模型或硬件创建前失败。临时 artifact/registry 只写入 `/tmp`，不修改
+checkpoint、OpenPI 正式 registry、数据集或任何遥操配置。
+
+本路线仍须先完成第 6 节无硬件检查，但不在这里重复命令。将样例中的 artifact 参数替换为
+本节正式命令所列的 stage1 `--checkpoint-dir` 和 `--prepared-training-profile`；server 侧
+preflight 也直接复用同一组绑定。
+
+正式运行时至少使用两个终端：
+
+1. **终端 A（OpenPI 环境）**执行下面的完整 server 命令；它会持续占用该终端。
+2. **终端 B（DexTeleop 环境）**用于 health/metadata 检查，以及之后的 client。
+3. client 退出或需要重启时不必重启终端 A；更换 checkpoint/profile 时则必须先停止并
+   重新启动 server，不能在同一 server 进程里混用绑定。
+
+终端 A：启动 OpenPI server，持续提供 OpenPI h16 chunk。`--host` 的值必须是裸地址
+`0.0.0.0`，不能写成 URL 或 Markdown 链接。
+
+运行命令只包含环境激活、必要的 CUDA/JAX 环境变量和直接的 `python -m` 调用；不要再包
+子 Shell、`set -euo pipefail`、`exec` 或路径变量。`Ctrl+C` 正常关闭 server 时，prepared
+runtime 会完成清理并以 130 退出，不打印 Python traceback。
+
+```bash
+cd /home/user/zc/DexTeleop
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+
+python -m deployments.openpi.server \
+  --checkpoint-dir /home/user/zc/openpi/checkpoints/writing-stage1-0804-0805-front-h16-absolute-prepared-v1/writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2/150000 \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+终端 B 先按第 7 节规则，从下方正式 client 命令派生 100-step no-action：删除
+`--send-actions`，添加 `--max-steps 100`。该检查会连接 server、front 相机和状态 backend，
+但不会下发动作。
+
+no-action 通过并退出后，仍在终端 B 执行下面的完整命令进入带 `--send-actions` 的正式
+位控流程。此命令会连接真实设备并允许机器人运动，只能在完成现场安全检查、急停可用且
+工作空间无人员/障碍后执行。启动后先按 `g` 执行 dataset-frame qpos-init，人工确认 ready
+和实际姿态，再按 `A` 放行 policy。
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate dexteleop310
+
+python -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir /home/user/zc/openpi/checkpoints/writing-stage1-0804-0805-front-h16-absolute-prepared-v1/writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2/150000 \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage \
+  --policy-qpos-init-episode 0 \
+  --policy-qpos-init-frame 0 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-collision-check \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --send-actions \
+  --debug
+```
+
+client 显式覆盖快捷 profile 中的执行分支为 `position_15_60_120hz`，最终解析为 15 Hz
+policy/action、60 Hz pose-reference/双臂 IK、120 Hz CANFD qcmd，以及
+`rm65_bimanual_position_v1` 正式 position control profile。60 Hz accepted-qref 默认并在
+本命令中显式封印为 `comfort_75_v1`；精确回退只需将该参数改为 `hard_v1`，不会改变
+120 Hz qcmd 的 hard execution envelope，也不会改变遥操默认值。DMTAC tool TCP 和 gripper
+配置继续复用既有已审核参数；artifact 会把三相机配置裁剪为仅创建 `front`。qpos-init 使用
+严格 cohort 中的 0804 Episode 0/frame 0。命令未启用 RTC，也没有设置
+`--action-chunk-execution-steps`，因此每次完整消费 server 返回的 h16 chunk。
+RealSense 启动严格复用正式真机遥操数采链路：`bgr8`、`bounded_first_frame`、按
+`metadata.startup_priority` 串行启动、默认 0.5 秒错峰；首轮无首帧时冷却 1 秒后只关闭并
+重开失败 pipeline 一次，不做 USB hardware reset。全部 pipeline 启动后还必须通过与数采
+相同的连续 3 个新帧、帧龄不超过 0.1 秒的 startup self-check，失败会在 policy 循环前终止。
+100-step 上限只保留在 no-action 检查中；正式位控命令不设置 `--max-steps`，不会把等待
+`g`、qpos-init 和等待 `A` 的循环计数误当成 policy 执行寿命。chunk 边界允许短暂间断，
+队列仍保持 `replace + min_queue=0` 的既有语义。正式位控显式启用独立 20 Hz RM65 tool-frame
+受力监控；超力、连续读错或 stale 会锁存并发双臂 `Arm_Stop`，且必须重启并重新 qpos-init。
+在真实位控进程中按 Ctrl+C 也会先明确请求双臂 `Arm_Stop`，确认回执后再完成其余资源清理。
+
+本节正式 position client 命令及其按第 7 节派生的 no-action 版本默认启用 plan-cut splice governor 和首个 stream 的
+measured-anchor acquisition，无需额外增加参数。首个 policy Pose 与初始化后的实测 Pose
+不连续时，robot motion 会按每个 15 Hz source 间隔最多 5 mm、0.5° 插入有界 SE(3)
+接近段；后续 source 时间间距保持不变。该首段处理与同步 chunk、RTC emission 共用同一
+typed stream-start cut，且不改变碰撞检查边界。需要原子回退到启用前行为时，同时追加：
+
+```bash
+--no-position-plan-splice-governor \
+  --no-position-stream-start-acquisition
+```
+
+只关闭 stream-start acquisition、保留普通 chunk splice 时，可以仅追加
+`--no-position-stream-start-acquisition`。
+
+### 9.1 连续任务从当前 qpos 接管（显式覆盖）
+
+当上一个任务已经把机器人留在下一个任务可接受的起始姿态，且不希望重新执行
+dataset-frame qpos 初始化轨迹时，可在第 9 节 client 命令末尾追加规范参数
+`--no-init-qpos`。兼容拼写 `--no--init-qpos` 也会被接受，但新命令统一使用前者。
+
+该参数在共享 runtime 参数解析完成后生效，因此会覆盖任意 deployment profile 或同一命令中
+注入的 `--policy-qpos-init-dataset` / `--policy-qpos-init-parquet`；不需要删除 profile，也不会
+创建 qpos-init controller。此时：
+
+- 不加 `--auto-start` 时，`g` 只表示 start/resume，会直接进入当前姿态下的 startup/policy
+  流程，不执行 dataset-frame qpos 轨迹。
+- `rm65_bimanual_dmtac` 仍保留 `init-source=current` 和 ready confirm；当前姿态 startup
+  检查完成后仍需按 `A`。`--no-init-qpos` 不会自动关闭这些门。
+- `--auto-start`、`--no-wait-for-ready-confirm` 是独立开关，不由 `--no-init-qpos` 隐式启用。
+- 碰撞检查、position force guard、observation freshness、IK/reference 和 dispatch 安全边界均不变。
+- 该参数只解决“跳过任务间 qpos 初始化轨迹”；它不会保留或拼接上一个 client 的 action queue、
+  model history 或未执行 chunk，也不构成跨 checkpoint/profile 的无缝轨迹 handoff。
+
+这是 L5 当前姿态接管 override。使用前必须确认当前双臂 qpos、TCP、夹爪状态、工作空间和新
+policy 首个 chunk 都处于允许范围；absolute policy 还必须确认当前状态属于其训练/部署起始分布。
+
+## 10. Prepared writing stage2：checkpoint-bound 部署
+
+本节用于已经完整训练的旧 stage2：`writing.remove_brush_cap_and_return_cap`。远端
+`dex-remote` 在 2026-08-08 的只读复核确认实验目录包含 `30000`、`60000`、`90000`、
+`120000`、`150000` 五个数字 checkpoint；最终 `150000` 及其 238 KiB
+`policy_artifact.json` 的时间为 2026-08-07 09:21。artifact 声明 v2.3、front-only、
+absolute h16、32D state / 16D action 和 checkpoint step 150000。
+
+该模型与 stage1 一样必须使用 checkpoint-bound prepared wrapper。server 与 client 都要同时
+给出 checkpoint 和 stage2 training profile，不能手填 `--config` 绕过 prepared dataset、
+normalization 和 artifact binding。
+
+本路线仍须先完成第 6 节无硬件检查，但不在这里重复命令。将样例中的 artifact 参数替换为
+本节正式命令所列的 stage2 `--checkpoint-dir` 和 `--prepared-training-profile`；server 侧
+preflight 也直接复用同一组绑定。
+
+这三项检查已于 2026-08-08 在 `dex-remote` 实际通过：prepared binding hash 为
+`sha256:09952950eb62b5683074563c3de052dcda1981f8540a343d6bb460d78fb133ef`，checkpoint
+内 norm-stats hash 为
+`sha256:117e32c01836794c08e30a1d3f7ee78f6805c7ee6d9c3d7db395e0905a58e000`，client
+contract-check 返回 `ok=true`。检查未加载模型、未监听端口，也未创建相机或机器人 backend。
+
+stage1 server 不能与 stage2 server 在同一个 `8078` 端口并存。由现有 server owner 正常按
+Ctrl+C 停止 stage1 server，确认端口和显存释放后，在终端 A 启动 stage2 server：
+
+```bash
+cd /home/user/zc/DexTeleop
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+
+python -m deployments.openpi.server \
+  --checkpoint-dir /home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1/writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1/150000 \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage2_0804_0805_front_h16_absolute_v1.json \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+终端 B 先检查 stage2 loaded-instance health 和 metadata：
+
+```bash
+curl --fail --silent http://127.0.0.1:8078/healthz
+curl --fail --silent http://127.0.0.1:8078/metadata | python -m json.tool
+```
+
+然后按第 7 节规则，从下方正式 client 命令派生 100-step no-action：删除
+`--send-actions`，添加 `--max-steps 100`，其余参数包括 `--no-init-qpos` 保持不变。该检查会
+连接真实 front 相机、双臂状态和 DMTAC，但不会构造 qpos-init controller，也不会下发动作。
+
+no-action、server metadata 和现场安全检查全部通过后，才可执行下面的 L5 stage2 真机命令。
+它从 stage1 留下的当前 qpos 接管，不回到任意数据集帧；启动后按 `g` 直接进入
+current-pose startup，完成后仍需按 `A` 放行 policy：
+
+```bash
+cd /home/user/zc/DexTeleop
+export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+
+"$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir /home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1/writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1/150000 \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage2_0804_0805_front_h16_absolute_v1.json \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  --no-init-qpos \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --send-actions \
+  --debug
+```
+
+`--no-init-qpos` 只跳过 qpos 初始化轨迹，不保留 stage1 client 的 action queue、model history 或
+未执行 chunk。stage1 client 退出和 stage2 client 启动之间也不是无间断 command handoff；position
+executor 会从 stage2 首个实测 cut 重新建立权威参考。默认启用的 stream-start measured-anchor
+acquisition 和 plan-cut splice governor 会对首个 absolute Pose 接近段施加既有 5 mm / 0.5° 每
+source interval 上限，但这不证明当前状态属于 stage2 训练分布。操作者必须另外确认 stage1 结束
+状态、stage2 首个 chunk、夹爪和笔帽状态均匹配后，才能按 `A`。
+
+## 11. Trained model-RTC：conditioned no-action shadow
+
+本节只用于 trained model-RTC 的 conditioned no-action shadow，不是正式动作部署命令。
+当前训练进程没有完成 150000 step；可验证的最新完整 checkpoint 是 30000。因此下面的
+checkpoint 只能用于实现、时序和协议检查，不能当作最终训练结果。
+
+trained model-RTC 必须同时绑定 prepared training profile、model-RTC training profile、
+checkpoint artifact、training-run manifest、checkpoint receipt、immutable prepared dataset
+binding 和 continuation contract。server 还必须显式传入 `--enable-rtc-continuation`；省略该
+开关时仍保持普通 OpenPI 推理语义。client 侧 RTC profile 强制 `send_actions=false`，不得加入
+`--send-actions`。
+
+该模型和第 9 节的非 RTC prepared server 都需要大显存，不能在当前单卡上并行加载。启动本节
+server 前，先由现有 server 的 owner 正常停止旧进程，并确认 `8078` 未监听且 GPU 显存已经
+释放；不要由另一个终端强制结束不属于自己的进程。
+
+本路线仍须先完成第 6 节无硬件检查，但不在这里重复命令。client contract check 复用本节
+正式 server 命令中的 `--checkpoint-dir`、`--prepared-training-profile` 和
+`--model-rtc-profile`，并增加 `--rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1`。
+server 侧 preflight 还必须保留 `--enable-rtc-continuation`。
+
+终端 A：在确认旧 server 已停止、GPU 显存足够后启动 conditioned server：
+
+```bash
+cd /home/user/zc/DexTeleop
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+
+python -m deployments.openpi.server \
+  --checkpoint-dir /home/user/zc/openpi/checkpoints/writing-stage1-0804-0806-front-h16-absolute-prepared-model-rtc-v1/writing-stage1-0804-0806-front-h16-absolute-model-rtc-b1-nw4-v1/30000 \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_0804_0806_front_h16_absolute_v1.json \
+  --model-rtc-profile /home/user/zc/DexTeleop/deployments/openpi/configs/model_rtc/writing_stage1_0804_0806_front_h16_absolute_prepared_model_rtc_v1.json \
+  --openpi-root /home/user/zc/openpi \
+  --enable-rtc-continuation \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+终端 B：先检查 loaded-instance health 和 metadata；两项都通过后才进入 observation shadow：
+
+```bash
+curl --fail --silent http://127.0.0.1:8078/healthz
+curl --fail --silent http://127.0.0.1:8078/metadata | python -m json.tool
+```
+
+终端 B 的 100-step observation/transport shadow 也复用第 7 节唯一 no-action 样例，按上段
+替换三项 checkpoint/profile binding，并增加 `--rtc-profile
+model_rtc_flow_inpaint_shadow_15_30_60_120_v1`、`--rtc-real-shadow`、
+`--rtc-debug-level summary` 和 `--debug-dir
+/home/user/zc/DexTeleop/logs/openpi_model_rtc_shadow`；删除普通样例中的 qpos-init 参数。
+该流程会读取真实双臂、手和 front 相机 observation，并向 server 发 conditioned inference
+请求，但不创建动作下发 authority。需要逐 tick 排查时才把 `summary` 改为 `trace`。
+
+`--rtc-real-shadow` 是进入真实 observation 边界的显式开关：它移除 qpos-init authority，
+禁止 `--send-actions`，并保持 position lookahead disabled。当前没有 trained model-RTC 的动作
+部署入口；不得把第 9 节的 `--send-actions` 参数复制到本节。
+
+## 12. Legacy v1：`dual_rm65_dmgripper`
 
 该 checkpoint 没有 `policy_artifact.json`，不能使用第 6 节 artifact contract check，
 也不能用 `POLICY_STEP` 切换 step。当前 registry 固定使用 `99999`：
@@ -338,7 +683,9 @@ uv run scripts/serve_dexteleop_policy.py \
   --port 8078
 ```
 
-老 v1 client dry-run（不发送动作）：
+老 v1 仍须使用第 7 节唯一 no-action 样例：将 artifact 参数替换为
+`--model dual_rm65_dmgripper_latest`。完成独立的旧 registry/26D contract 检查和现场安全
+确认后，真实下发命令为：
 
 ```bash
 cd /home/user/zc/DexTeleop
@@ -353,14 +700,17 @@ export OPENPI_PORT=8078
   --deployment-profile rm65_bimanual_dmtac \
   --left-arm-ip "$LEFT_ARM_IP" \
   --right-arm-ip "$RIGHT_ARM_IP" \
-  --max-steps 100 \
+  --send-actions \
   --debug
 ```
 
-老 v1 真实下发只允许在完成独立的旧 registry/26D contract 检查后，给上一个命令
-追加 `--send-actions`；它不属于当前 v2 artifact 兼容链路。
+该命令不属于当前 v2 artifact 兼容链路。要派生 legacy no-action，只删除
+`--send-actions` 并添加 `--max-steps 100`，不要把 v2 artifact 参数复制进来。
 
-## 10. 暂无 checkpoint 的配置：训练命令
+## 13. 训练参考：当前暂无 checkpoint 的配置
+
+本节保留的是 OpenPI 历史整数据集入口，不会按 prepared Skill 区间裁剪。训练
+0804/0805 writing 子任务1应使用第 14 节，不能直接复用本节的 writing 命令。
 
 下面命令只用于以后生成 checkpoint，不会自动产生可部署 artifact。首次使用配置时
 先计算该配置自己的 stats；h16、h50、v2.2 和 v2.3 的 stats 不要混用。
@@ -447,7 +797,92 @@ uv run scripts/train.py dual_rm65_dmgripper_front \
   --exp-name=dual_rm65_dmgripper_front
 ```
 
-## 11. 训练恢复规则
+## 14. 训练参考：0804/0805 writing stage1 prepared 矩阵
+
+四个 profile 使用同一套严格 cohort：602 条成功且非异常 Episode（0804 为 344，
+0805 为 258）。远端审计确认全部 602 条都具备 front、left wrist 和 right wrist，
+因此 front/full 的 Episode 集合一致；两日期按有效窗口自然合并，不做数据源等权
+重复采样。
+
+| 组合 | Profile | OpenPI base | 默认实验名 |
+| --- | --- | --- | --- |
+| front + absolute | `writing_stage1_0804_0805_front_h16_absolute_v1.json` | front task-ready state-dropout-v2 | `writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2` |
+| front + relative | `writing_stage1_0804_0805_front_h16_relative_v1.json` | front task-ready state-dropout-v2 | `writing-stage1-0804-0805-front-h16-relative-b1-nw4-meta-v2` |
+| full + absolute | `writing_stage1_0804_0805_full_h16_absolute_v1.json` | full corrected-v1 | `writing-stage1-0804-0805-full-h16-absolute-nw4-meta-v2` |
+| full + relative | `writing_stage1_0804_0805_full_h16_relative_v1.json` | full corrected-v1 | `writing-stage1-0804-0805-full-h16-relative-nw4-meta-v2` |
+
+四个 profile 都是 π0.5 LoRA、h16、batch size 1、4 workers、150k steps，并显式
+复用 state-dropout-v2：10% whole-state dropout 和 15% 独立 arm-pose dropout。
+front 使用 100% procedural 背景；full 使用 corrected-v1 的 10% original、40%
+real-image、50% procedural 三视角背景增强。
+
+先设置公共变量：
+
+```bash
+cd /home/user/zc/DexTeleop
+export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
+export PROFILE_ROOT=deployments/openpi/configs/training
+```
+
+每次只选择下面一组：
+
+```bash
+# front + absolute
+export PROFILE=$PROFILE_ROOT/writing_stage1_0804_0805_front_h16_absolute_v1.json
+export EXP=writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2
+```
+
+```bash
+# front + relative
+export PROFILE=$PROFILE_ROOT/writing_stage1_0804_0805_front_h16_relative_v1.json
+export EXP=writing-stage1-0804-0805-front-h16-relative-b1-nw4-meta-v2
+```
+
+```bash
+# full（三视角）+ absolute
+export PROFILE=$PROFILE_ROOT/writing_stage1_0804_0805_full_h16_absolute_v1.json
+export EXP=writing-stage1-0804-0805-full-h16-absolute-nw4-meta-v2
+```
+
+```bash
+# full（三视角）+ relative
+export PROFILE=$PROFILE_ROOT/writing_stage1_0804_0805_full_h16_relative_v1.json
+export EXP=writing-stage1-0804-0805-full-h16-relative-nw4-meta-v2
+```
+
+对选中的 profile 依次执行：
+
+```bash
+# 1. 只读审计 eligibility；不写 prepared view
+$OPENPI_PYTHON -m deployments.openpi.training.prepared_skill_launch \
+  audit --profile "$PROFILE" --no-motion
+
+# 2. 生成/复用 immutable prepared view 和 OpenPI binding
+$OPENPI_PYTHON -m deployments.openpi.training.prepared_skill_launch \
+  prepare --profile "$PROFILE" --no-motion
+
+# 3. 无图像、无模型 sample-check；prepare 已完成完整源文件校验
+$OPENPI_PYTHON -m deployments.openpi.training.prepared_skill_launch \
+  sample-check --profile "$PROFILE" \
+  --skip-source-file-verification --no-motion
+
+# 4. 每个 profile 首次训练前分别生成 norm-stats
+# 43860 个有效窗口可被 batch size 204 整除，不遗漏尾部样本
+$OPENPI_PYTHON -m deployments.openpi.training.prepared_skill_launch \
+  norm-stats --profile "$PROFILE" \
+  --stats-batch-size 204 --stats-num-workers 0 \
+  --skip-source-file-verification --no-motion
+
+# 5. 正式训练；重新执行完整源文件校验
+CUDA_VISIBLE_DEVICES=0 $OPENPI_PYTHON \
+  -m deployments.openpi.training.prepared_skill_launch \
+  train --profile "$PROFILE" --exp-name "$EXP" --no-motion
+```
+
+不要并行运行四组 norm-stats 或训练。不同 profile 使用独立 OpenPI config、asset id、
+workspace 和 checkpoint 目录；relative 不得复用 absolute 的 norm-stats。
+
+## 15. 训练恢复规则
 
 只有当对应 `--exp-name` 目录下已经有有效数字 checkpoint 时才加 `--resume`：
 
@@ -460,3 +895,87 @@ uv run scripts/train.py <config-name> \
 如果目录只有 `wandb/`、stats 或临时文件而没有数字 checkpoint，不要直接使用
 `--resume`；使用新的 `--exp-name`，避免覆盖并行工作。训练 checkpoint 生成后，按
 第 2 节把该 step 加入可部署清单，再执行第 4～8 节。
+
+第 14 节的 prepared 子任务训练必须通过同一 launcher 恢复：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $OPENPI_PYTHON \
+  -m deployments.openpi.training.prepared_skill_launch \
+  train --profile "$PROFILE" --exp-name "$EXP" --resume --no-motion
+```
+
+## 16. 0804–0806 writing 四阶段联合 prompt 训练
+
+该方案只训练一个 π0.5 LoRA 模型。四个子任务继续使用同一个父 `task_id`，但每个
+合法动作窗口由 immutable binding 覆盖为各自的英文 prompt。不要复用原四个独立
+stage checkpoint，也不要复用它们的 norm stats。
+
+当前 binding 同时保留两类计数：prepared 标注窗口为
+71,818 / 53,911 / 96,649 / 78,048；经过 OpenPI 的 `RUNNING`、有限值和
+pose-quality 行级过滤后，实际训练窗口为
+64,999 / 51,459 / 79,078 / 8,995。训练按 stage 等权采样，每个 epoch 从每个
+stage 无放回选择 8,995 个窗口，共 35,980 个；下一 epoch 用固定 seed 轮换较大
+stage 的子集。600,000 steps 等价于每个 stage 约 150,000 次样本暴露。
+
+先设置公共变量：
+
+```bash
+cd /home/user/zc/DexTeleop
+export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
+export PROFILE=deployments/openpi/configs/training/writing_multistage_prompt_0804_0806_front_h16_absolute_v1.json
+```
+
+首次训练前依次执行检查和该联合配置自己的 norm stats：
+
+```bash
+# 1. 只读重审四个 stage 的 eligibility 和固定 child binding
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  audit --profile "$PROFILE"
+
+# 2. 生成或复用联合 immutable binding；不启动训练
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  prepare --profile "$PROFILE"
+
+# 3. 不加载图像、不推理、不训练；验证四条 prompt 和平衡索引
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  sample-check --profile "$PROFILE"
+
+# 4. 35,980 可被 batch size 20 整除，不丢弃尾部样本
+CUDA_VISIBLE_DEVICES=0 "$OPENPI_PYTHON" -u \
+  -m deployments.openpi.training.prepared_skill_launch \
+  norm-stats --profile "$PROFILE" \
+  --stats-batch-size 20 --stats-num-workers 0 \
+  --skip-source-file-verification
+```
+
+首次训练使用下面的前台交互命令。它不会后台化、不会 `exec` 替换 shell，也不经过
+管道；终端保持正常交互，按 `S` 保存并继续，按一次 `Ctrl+C` 保存并退出：
+
+```bash
+cd /home/user/zc/DexTeleop
+export CUDA_VISIBLE_DEVICES=0
+export WANDB_MODE=offline
+export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
+export PROFILE=deployments/openpi/configs/training/writing_multistage_prompt_0804_0806_front_h16_absolute_v1.json
+
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  train --profile "$PROFILE"
+```
+
+只有默认实验目录已经存在正整数 step checkpoint 时，才使用同一 profile 恢复：
+
+```bash
+cd /home/user/zc/DexTeleop
+export CUDA_VISIBLE_DEVICES=0
+export WANDB_MODE=offline
+export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
+export PROFILE=deployments/openpi/configs/training/writing_multistage_prompt_0804_0806_front_h16_absolute_v1.json
+
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  train --profile "$PROFILE" --resume
+```
+
+默认实验名是
+`writing-multistage-prompt-0804-0806-front-h16-absolute-b1-nw4-v1`。不要给首次
+训练添加 `--resume`；launcher 会拒绝不存在或没有正整数 step 的 checkpoint 目录，
+不会从一个空目录伪恢复。

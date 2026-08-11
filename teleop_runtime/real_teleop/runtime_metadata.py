@@ -4,9 +4,24 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from dataclasses import asdict
 
 from ..position_control import RealArmExecutionConfig
 from .control_profile import arm_control_mode
+from .position_admittance_shadow import (
+    POSITION_ADMITTANCE_ACCEPTED_FILTER_TAU_SEC,
+    POSITION_ADMITTANCE_ACCEPTED_TRANSLATION_STIFFNESS_N_M,
+    POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA,
+    POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG,
+    POSITION_ADMITTANCE_ROTATION_ACTIVE_QPOS_FAST_PATH_ALPHA,
+    POSITION_ADMITTANCE_ROTATION_RELEASE_QPOS_FAST_PATH_ALPHA,
+    POSITION_ADMITTANCE_ROTATION_RELEASE_QPOS_RAMP_SEC,
+    position_admittance_active_config,
+    position_admittance_rotation_response_weight,
+    position_admittance_shadow_config,
+    position_admittance_translation_response_weight,
+    position_rotational_admittance_config,
+)
 
 
 def arm_execution_profile_metadata(args: argparse.Namespace) -> dict[str, object]:
@@ -20,10 +35,153 @@ def arm_execution_profile_metadata(args: argparse.Namespace) -> dict[str, object
     return metadata
 
 
+def position_admittance_response_metadata(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    """Describe the effective pre-IK response, including inactive parameters."""
+
+    active = bool(getattr(args, "position_admittance_active", False))
+    shadow = bool(getattr(args, "position_admittance_shadow", False))
+    enabled = active or shadow
+    rotation_active = bool(
+        getattr(args, "position_admittance_rotation_active", False)
+    )
+    rotation_shadow = bool(
+        getattr(args, "position_admittance_rotation_shadow", False)
+    )
+    translation_weight = position_admittance_translation_response_weight(args)
+    rotation_weight = position_admittance_rotation_response_weight(args)
+
+    translation_config = None
+    if enabled:
+        translation_config = (
+            position_admittance_active_config(args)
+            if active
+            else position_admittance_shadow_config(args)
+        )
+    rotational_config = None
+    rotation_profile = None
+    if rotation_active or rotation_shadow:
+        rotation_profile = str(
+            getattr(
+                args,
+                (
+                    "position_admittance_rotation_active_profile"
+                    if rotation_active
+                    else "position_admittance_rotation_shadow_profile"
+                ),
+            )
+        )
+        rotational_config = position_rotational_admittance_config(
+            args,
+            profile=rotation_profile,
+        )
+
+    translation_effective_compliance = None
+    translation_effective_weight = None
+    translation_physical_damping_applied = None
+    if translation_config is not None:
+        if translation_config.response_model == "profile_compliance":
+            translation_effective_weight = (
+                POSITION_ADMITTANCE_ACCEPTED_TRANSLATION_STIFFNESS_N_M
+                / float(translation_config.stiffness_n_m[0])
+            )
+            translation_effective_compliance = [
+                1.0 / float(value) for value in translation_config.stiffness_n_m
+            ]
+            translation_physical_damping_applied = False
+        else:
+            translation_physical_damping_applied = True
+    rotation_effective_compliance = (
+        None
+        if rotational_config is None
+        else [
+            1.0 / float(value)
+            for value in rotational_config.stiffness_nm_rad
+        ]
+    )
+
+    return {
+        "schema_version": "teleop.position_admittance_response/v1",
+        "enabled": enabled,
+        "mode": "active" if active else "shadow" if shadow else "disabled",
+        "modifier_stage": "pre_ik_target",
+        "ik_logic_modified": False,
+        "weight_semantics": (
+            "accepted_relative_compliance_multiplier_before_unchanged_hard_bounds"
+        ),
+        "translation": {
+            "response_weight": translation_weight,
+            "effective_response_weight": translation_effective_weight,
+            "declared_weight_matches_effective": (
+                None
+                if translation_effective_weight is None
+                else abs(translation_weight - translation_effective_weight)
+                <= 1e-12
+            ),
+            "accepted_stiffness_n_m": (
+                POSITION_ADMITTANCE_ACCEPTED_TRANSLATION_STIFFNESS_N_M
+            ),
+            "base_stiffness_input_n_m": float(
+                getattr(
+                    args,
+                    "position_admittance_shadow_stiffness_n_m",
+                    POSITION_ADMITTANCE_ACCEPTED_TRANSLATION_STIFFNESS_N_M,
+                )
+            ),
+            "effective_compliance_m_n": translation_effective_compliance,
+            "input_filter_tau_sec": (
+                None
+                if translation_config is None
+                else float(translation_config.force_filter_tau_sec)
+            ),
+            "physical_damping_n_s_m_applied": (
+                translation_physical_damping_applied
+            ),
+            "declared_physical_damping_n_s_m": (
+                None
+                if translation_config is None
+                else list(translation_config.damping_n_s_m)
+            ),
+            "effective_config": (
+                None if translation_config is None else asdict(translation_config)
+            ),
+        },
+        "rotation": {
+            "enabled": rotation_active or rotation_shadow,
+            "profile": rotation_profile,
+            "response_weight": rotation_weight,
+            "accepted_filter_tau_sec": POSITION_ADMITTANCE_ACCEPTED_FILTER_TAU_SEC,
+            "effective_compliance_rad_nm": rotation_effective_compliance,
+            "input_filter_tau_sec": (
+                None
+                if rotational_config is None
+                else float(rotational_config.torque_filter_tau_sec)
+            ),
+            "physical_damping_term_applied": False,
+            "effective_config": (
+                None if rotational_config is None else asdict(rotational_config)
+            ),
+        },
+        "unchanged_authoritative_boundaries": [
+            "final_modifier_offset_and_slew_envelope",
+            "shared_60hz_ik",
+            "collision_admission",
+            "joint_and_dynamics_admission",
+            "position_force_guard",
+        ],
+    }
+
+
 def position_ik_iteration_metadata(args: argparse.Namespace) -> dict[str, object]:
     """Return position-only IK tuning settings for audit/config metadata."""
     position_mode = arm_control_mode(args) == "position"
     return {
+        "position_admittance_response": (
+            position_admittance_response_metadata(args)
+            if position_mode
+            else None
+        ),
         "position_ik_step_mode": (
             str(getattr(args, "position_ik_step_mode", "legacy_iterative"))
             if position_mode
@@ -173,6 +331,84 @@ def position_ik_iteration_metadata(args: argparse.Namespace) -> dict[str, object
                     0.0,
                 )
             )
+            if position_mode
+            else None
+        ),
+        "position_admittance_active_qpos_fast_path": (
+            bool(getattr(args, "position_admittance_active", False))
+            if position_mode
+            else None
+        ),
+        "position_admittance_active_envelope": (
+            str(getattr(args, "position_admittance_active_envelope", "cautious"))
+            if position_mode
+            else None
+        ),
+        "position_admittance_active_max_tool_excursion_m": (
+            float(
+                getattr(
+                    args,
+                    "position_admittance_active_max_tool_excursion_m",
+                    0.08,
+                )
+            )
+            if position_mode
+            else None
+        ),
+        "position_admittance_rotation_active": (
+            bool(getattr(args, "position_admittance_rotation_active", False))
+            if position_mode
+            else None
+        ),
+        "position_admittance_combined_active": (
+            bool(getattr(args, "position_admittance_combined_active", False))
+            if position_mode
+            else None
+        ),
+        "position_admittance_rotation_active_profile": (
+            str(
+                getattr(
+                    args,
+                    "position_admittance_rotation_active_profile",
+                    "cautious-3deg",
+                )
+            )
+            if position_mode
+            else None
+        ),
+        "position_admittance_active_max_tool_rotation_excursion_deg": (
+            float(
+                getattr(
+                    args,
+                    "position_admittance_active_max_tool_rotation_excursion_deg",
+                    3.5,
+                )
+            )
+            if position_mode
+            else None
+        ),
+        "position_admittance_active_qpos_fast_path_alpha": (
+            float(POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA)
+            if position_mode
+            else None
+        ),
+        "position_admittance_rotation_active_qpos_fast_path_alpha": (
+            float(POSITION_ADMITTANCE_ROTATION_ACTIVE_QPOS_FAST_PATH_ALPHA)
+            if position_mode
+            else None
+        ),
+        "position_admittance_rotation_release_qpos_fast_path_alpha": (
+            float(POSITION_ADMITTANCE_ROTATION_RELEASE_QPOS_FAST_PATH_ALPHA)
+            if position_mode
+            else None
+        ),
+        "position_admittance_rotation_release_qpos_ramp_sec": (
+            float(POSITION_ADMITTANCE_ROTATION_RELEASE_QPOS_RAMP_SEC)
+            if position_mode
+            else None
+        ),
+        "position_admittance_active_qpos_micro_reversal_hold_deg": (
+            float(POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG)
             if position_mode
             else None
         ),
@@ -433,5 +669,6 @@ def position_ik_iteration_metadata(args: argparse.Namespace) -> dict[str, object
 
 __all__ = [
     "arm_execution_profile_metadata",
+    "position_admittance_response_metadata",
     "position_ik_iteration_metadata",
 ]

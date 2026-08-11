@@ -75,13 +75,13 @@ python -m utils.hand_eye \
 ```bash
 python -m utils.hand_eye \
   --arm left \
-  --left-camera serial:261122273924 \
+  --left-camera serial:260522278055 \
   --right-camera serial:213222079798 \
   --target aruco \
   --marker-length-m 0.10
 ```
 
-显式 `--camera 0` 或 `--camera-serial 261122273924` 会优先于 `--left-camera/--right-camera`。`--left-camera` 和 `--right-camera` 支持 `index:0`、`serial:261122273924`、短数字 `0`、或直接写完整 serial。
+显式 `--camera 0` 或 `--camera-serial 260522278055` 会优先于 `--left-camera/--right-camera`。`--left-camera` 和 `--right-camera` 支持 `index:0`、`serial:260522278055`、短数字 `0`、或直接写完整 serial。
 
 默认就是高精度采集配置：
 

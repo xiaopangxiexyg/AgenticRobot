@@ -12,6 +12,7 @@ from ..retargeters import DualArmCollisionAwareRetargeter, ScalarToGripperRetarg
 from ..special_tasks.fix_arm import FixArmCommandController
 from ..special_tasks.init_arm import InitArmCommandController
 from .fix_arm_collision_guard import fixed_arm_final_collision_fault
+from .position_admittance_shadow import PositionAdmittanceEndpointExcursionGuard
 from .temporary_dual_arm_safety import TemporaryDualArmSafetyLimiter
 
 def _compose_real_command_filter(
@@ -19,11 +20,15 @@ def _compose_real_command_filter(
     temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None,
     fix_arm_controller: FixArmCommandController | None,
     init_arm_controller: InitArmCommandController | None,
+    position_admittance_endpoint_guard: (
+        PositionAdmittanceEndpointExcursionGuard | None
+    ) = None,
 ):
     if (
         temporary_safety_limiter is None
         and fix_arm_controller is None
         and init_arm_controller is None
+        and position_admittance_endpoint_guard is None
     ):
         return None
 
@@ -39,6 +44,13 @@ def _compose_real_command_filter(
             fix_arm_controller is not None or init_arm_controller is not None
         ):
             temporary_safety_limiter.sync_from_command(filtered)
+        if position_admittance_endpoint_guard is not None:
+            filtered = position_admittance_endpoint_guard.filter_command(
+                filtered,
+                now=now,
+            )
+            if temporary_safety_limiter is not None:
+                temporary_safety_limiter.sync_from_command(filtered)
         return filtered
 
     return filter_command
@@ -59,12 +71,14 @@ def _compose_real_command_guard(
             if fault is not None:
                 return fault
         if fix_arm_controller is not None:
-            return fixed_arm_final_collision_fault(
+            fault = fixed_arm_final_collision_fault(
                 command,
                 fix_arm_controller=fix_arm_controller,
                 dual_arm_retargeter=dual_arm_retargeter,
                 now=now,
             )
+            if fault is not None:
+                return fault
         return None
 
     return guard
@@ -143,6 +157,9 @@ def _filter_manual_real_command(
         temporary_safety_limiter=components.temporary_safety_limiter,
         fix_arm_controller=components.fix_arm_controller,
         init_arm_controller=getattr(components, "init_arm_controller", None),
+        position_admittance_endpoint_guard=(
+            components.position_admittance_endpoint_guard
+        ),
     )
     if filter_command is None:
         return command

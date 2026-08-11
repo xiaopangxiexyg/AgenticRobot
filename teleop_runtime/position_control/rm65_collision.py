@@ -6,13 +6,18 @@ from typing import Any
 import numpy as np
 
 from robot_motion.pose import pose6_to_matrix
+from robot_motion.position_control import PositionPlanSpliceDynamicsConfig
 from robot_motion.rm65.position_collision import (
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
     RM65PositionPlannerProtocol,
 )
 
-from .official_all_ik_governor import RM65OfficialAllIKGovernorPlanner
+from .official_all_ik_governor import (
+    CONTINUOUS_WAYPOINT_WORKER_PROCESS,
+    RM65ContinuousWaypointProcessSpec,
+    RM65OfficialAllIKGovernorPlanner,
+)
 
 
 def _six_positive(values: Sequence[float], *, name: str) -> tuple[float, ...]:
@@ -149,6 +154,13 @@ def build_official_all_ik_governor_from_started_backends(
     command_hz: float,
     lookahead_source_steps: int,
     jerk_ramp_sec: float,
+    batched_solver_tolerance: float = 1e-6,
+    continuous_waypoint_shadow_enabled: bool = False,
+    continuous_waypoint_admission_enabled: bool = False,
+    continuous_waypoint_async_precompute_enabled: bool = False,
+    continuous_waypoint_worker_cpu: int | None = None,
+    continuous_waypoint_worker_isolation: str = "thread",
+    plan_splice_dynamics_config: PositionPlanSpliceDynamicsConfig | None = None,
     scene_profile: str,
     collision_min_distance_m: float,
     collision_distance_epsilon_m: float,
@@ -161,25 +173,49 @@ def build_official_all_ik_governor_from_started_backends(
     endpoint_to_tool = endpoint_to_tool_transforms_from_started_backends(
         arm_backends
     )
-    collision_planner = RM65PositionCollisionPlanner(
-        RM65PositionCollisionPlannerConfig(
-            reference_hz=float(command_hz),
-            scene_profile=str(scene_profile),
-            collision_min_distance_m=float(collision_min_distance_m),
-            collision_distance_epsilon_m=float(collision_distance_epsilon_m),
-            max_joint_velocity_rad_s=_six_positive(
-                max_joint_velocity_rad_s,
-                name="max_joint_velocity_rad_s",
-            ),
-            max_joint_acceleration_rad_s2=_six_positive(
-                max_joint_acceleration_rad_s2,
-                name="max_joint_acceleration_rad_s2",
-            ),
-            solve_max_iterations=1,
-            solve_min_iterations=1,
-            debug_profile=bool(debug_profile),
+    planner_config = RM65PositionCollisionPlannerConfig(
+        reference_hz=float(command_hz),
+        scene_profile=str(scene_profile),
+        collision_min_distance_m=float(collision_min_distance_m),
+        collision_distance_epsilon_m=float(collision_distance_epsilon_m),
+        max_joint_velocity_rad_s=_six_positive(
+            max_joint_velocity_rad_s,
+            name="max_joint_velocity_rad_s",
         ),
+        max_joint_acceleration_rad_s2=_six_positive(
+            max_joint_acceleration_rad_s2,
+            name="max_joint_acceleration_rad_s2",
+        ),
+        solve_max_iterations=1,
+        solve_min_iterations=1,
+        debug_profile=bool(debug_profile),
+    )
+    collision_planner = RM65PositionCollisionPlanner(
+        planner_config,
         endpoint_to_tool_by_side=endpoint_to_tool,
+    )
+    worker_isolation = str(continuous_waypoint_worker_isolation).strip().lower()
+    precompute_collision_planner = (
+        RM65PositionCollisionPlanner(
+            planner_config,
+            endpoint_to_tool_by_side=endpoint_to_tool,
+        )
+        if (
+            bool(continuous_waypoint_async_precompute_enabled)
+            and worker_isolation != CONTINUOUS_WAYPOINT_WORKER_PROCESS
+        )
+        else None
+    )
+    process_spec = (
+        RM65ContinuousWaypointProcessSpec(
+            collision_planner_config=planner_config,
+            endpoint_to_tool_by_side=endpoint_to_tool,
+        )
+        if (
+            bool(continuous_waypoint_async_precompute_enabled)
+            and worker_isolation == CONTINUOUS_WAYPOINT_WORKER_PROCESS
+        )
+        else None
     )
     if int(collision_planner.collision_pair_count) <= 0:
         raise RuntimeError(
@@ -187,11 +223,28 @@ def build_official_all_ik_governor_from_started_backends(
         )
     return RM65OfficialAllIKGovernorPlanner(
         collision_planner,
+        continuous_waypoint_precompute_collision_planner=(
+            precompute_collision_planner
+        ),
         endpoint_to_tool_by_side=endpoint_to_tool,
         source_hz=float(source_hz),
         command_hz=float(command_hz),
         lookahead_source_steps=int(lookahead_source_steps),
         jerk_ramp_sec=float(jerk_ramp_sec),
+        batched_solver_tolerance=float(batched_solver_tolerance),
+        continuous_waypoint_shadow_enabled=bool(
+            continuous_waypoint_shadow_enabled
+        ),
+        continuous_waypoint_admission_enabled=bool(
+            continuous_waypoint_admission_enabled
+        ),
+        continuous_waypoint_async_precompute_enabled=bool(
+            continuous_waypoint_async_precompute_enabled
+        ),
+        continuous_waypoint_worker_cpu=continuous_waypoint_worker_cpu,
+        continuous_waypoint_worker_isolation=worker_isolation,
+        continuous_waypoint_process_spec=process_spec,
+        plan_splice_dynamics_config=plan_splice_dynamics_config,
         max_velocity_rad_s=max_joint_velocity_rad_s,
         max_acceleration_rad_s2=max_joint_acceleration_rad_s2,
     )

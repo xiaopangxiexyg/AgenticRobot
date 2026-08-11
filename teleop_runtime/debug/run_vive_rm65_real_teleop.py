@@ -600,16 +600,11 @@ from ..real_teleop.workspace import (
 from ..real_teleop import cli_runtime_config as _cli_runtime_config
 
 
-def _refresh_cli_runtime_config_support() -> None:
-    _cli_runtime_config.bind_legacy_support(globals())
-
-
 def _apply_default_q6_ports(
     args: argparse.Namespace,
     *,
     parser: argparse.ArgumentParser | None = None,
 ) -> None:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._apply_default_q6_ports(args, parser=parser)
 
 
@@ -619,7 +614,6 @@ def _run_gui_device_preflight(
     active_sides: tuple[str, ...],
     parser: argparse.ArgumentParser,
 ) -> None:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._run_gui_device_preflight(
         args,
         active_sides=active_sides,
@@ -631,12 +625,10 @@ def _resolve_gripper_input_source(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
 ) -> None:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._resolve_gripper_input_source(args, active_sides)
 
 
 def _argv_has_option(raw_argv: Sequence[str], option: str) -> bool:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._argv_has_option(raw_argv, option)
 
 
@@ -645,7 +637,6 @@ def _apply_real_loop_timing_defaults(
     *,
     raw_argv: Sequence[str],
 ) -> None:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._apply_real_loop_timing_defaults(
         args,
         raw_argv=raw_argv,
@@ -656,7 +647,6 @@ def _source_arm_ip_fields_for_active_sides(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
 ) -> dict[str, str]:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._source_arm_ip_fields_for_active_sides(
         args,
         active_sides,
@@ -668,7 +658,6 @@ def _apply_default_arm_ips(
     *,
     active_sides: tuple[str, ...],
 ) -> None:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._apply_default_arm_ips(
         args,
         active_sides=active_sides,
@@ -680,7 +669,6 @@ def _save_explicit_arm_ips_latest(
     *,
     raw_argv: Sequence[str],
 ) -> None:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._save_explicit_arm_ips_latest(
         args,
         raw_argv=raw_argv,
@@ -691,7 +679,6 @@ def _validate_required_arm_ips(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
 ) -> None:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._validate_required_arm_ips(args, active_sides)
 
 
@@ -699,7 +686,6 @@ def _dmtac_backend_configs(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
 ) -> dict[str, DMTacGripperBackendConfig]:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._dmtac_backend_configs(args, active_sides)
 
 
@@ -784,7 +770,6 @@ from ..real_teleop.cli_resolution import (
 
 
 def parse_args() -> argparse.Namespace:
-    _refresh_cli_runtime_config_support()
     _bind_cli_resolution_support(globals())
     return parse_real_teleop_args()
 
@@ -839,7 +824,6 @@ def _discover_runtime_q6_ports(
     args: argparse.Namespace,
     active_sides: Sequence[str],
 ) -> dict[str, str]:
-    _refresh_cli_runtime_config_support()
     return _cli_runtime_config._discover_runtime_q6_ports(args, active_sides)
 
 
@@ -986,38 +970,42 @@ from ..real_teleop.vive_calibration_profiles import (
     _load_gui_vive_calibration_profile as _load_gui_vive_calibration_profile_impl,
     _runtime_home_was_available,
     _save_gui_vive_calibration_profile as _save_gui_vive_calibration_profile_impl,
-    bind_legacy_support as _bind_vive_calibration_profile_support,
 )
 
 
-def _refresh_vive_calibration_profile_support() -> None:
-    _bind_vive_calibration_profile_support(globals())
-
-
 def _latest_vive_calibration_profile_path() -> Path | None:
-    _refresh_vive_calibration_profile_support()
-    return _latest_vive_calibration_profile_path_impl()
+    return _latest_vive_calibration_profile_path_impl(
+        profile_dir=DEFAULT_CALIBRATION_PROFILE_DIR,
+    )
 
 
 def _gui_vive_calibration_load_path(args: argparse.Namespace) -> Path:
-    _refresh_vive_calibration_profile_support()
-    return _gui_vive_calibration_load_path_impl(args)
+    return _gui_vive_calibration_load_path_impl(
+        args,
+        profile_dir=DEFAULT_CALIBRATION_PROFILE_DIR,
+    )
 
 
 def _save_gui_vive_calibration_profile(
     args: argparse.Namespace,
     components: RealTeleopComponents,
 ) -> Path:
-    _refresh_vive_calibration_profile_support()
-    return _save_gui_vive_calibration_profile_impl(args, components)
+    return _save_gui_vive_calibration_profile_impl(
+        args,
+        components,
+        profile_dir=DEFAULT_CALIBRATION_PROFILE_DIR,
+    )
 
 
 def _load_gui_vive_calibration_profile(
     args: argparse.Namespace,
     components: RealTeleopComponents,
 ) -> Path:
-    _refresh_vive_calibration_profile_support()
-    return _load_gui_vive_calibration_profile_impl(args, components)
+    return _load_gui_vive_calibration_profile_impl(
+        args,
+        components,
+        profile_dir=DEFAULT_CALIBRATION_PROFILE_DIR,
+    )
 
 
 from ..real_teleop.vive_calibration_runtime import (
@@ -1455,6 +1443,10 @@ from control_station.real_teleop.control_availability import (
     vive_calibration_controls as _gui_vive_calibration_controls,
     visualization_controls as _gui_visualization_controls,
 )
+from control_station.real_teleop.input_mapping import prioritize_input_batch
+from control_station.real_teleop_application import (
+    build_real_teleop_progress_application,
+)
 
 
 # Batch 7 compatibility imports: these modules contain pure value/state
@@ -1521,9 +1513,9 @@ from ..real_teleop.debug_ik_payload import (
     _teleop_command_metadata_debug,
 )
 
-# GUI batch 2: the coordinator body lives in ``teleop_runtime.gui``.  The
-# explicit support binding below keeps legacy imports and monkeypatch points
-# stable while this entrypoint retains runtime assembly and control-loop code.
+# GUI batch 2: the coordinator body lives in ``teleop_runtime.gui``.  Status
+# projections import shared read-only formatting from its runtime-health owner;
+# this entrypoint retains compatibility re-exports and runtime assembly.
 from ..real_teleop.status_payloads import (
     _IK_RED_WARNING_LABELS,
     _IK_RED_WARNING_SINGULARITY_GATE_CODES,
@@ -1565,10 +1557,7 @@ from ..real_teleop.status_payloads import (
     _with_expected_wrist_depth_camera_statuses,
     _wrist_depth_requested,
     WRIST_DEPTH_CAMERA_KEYS,
-    bind_legacy_support as _bind_status_payload_support,
 )
-
-_bind_status_payload_support(globals())
 
 from ..real_teleop.debug_timing_payload import (
     _channels_log_payload,
@@ -1577,10 +1566,7 @@ from ..real_teleop.debug_timing_payload import (
     _latency_items_log_payload,
     _latency_log_payload,
     _phase_timings_log_payload,
-    bind_legacy_support as _bind_debug_timing_payload_support,
 )
-
-_bind_debug_timing_payload_support(globals())
 
 from ..real_teleop.debug_log_frames import (
     _backend_timing_log_payload,
@@ -1588,20 +1574,14 @@ from ..real_teleop.debug_log_frames import (
     _build_ik_debug_log_frame,
     _camera_status_log_payload,
     _command_for_side,
-    bind_legacy_support as _bind_debug_log_frame_support,
 )
-
-_bind_debug_log_frame_support(globals())
 
 from ..real_teleop.action_debug_payload import (
     _action_debug_active_sides,
     _action_debug_backend_snapshot_from_state,
     _action_debug_jitter_focus,
     _build_action_debug_metadata,
-    bind_legacy_support as _bind_action_debug_payload_support,
 )
-
-_bind_action_debug_payload_support(globals())
 
 from ..real_teleop.operator_control_runtime import (
     RealTeleopControlInput,
@@ -1724,13 +1704,13 @@ from ..real_teleop.startup_runtime import (
     _update_init_arm_arrival_from_hardware,
     _wait_for_real_teleop_start_request,
     bind_legacy_support as _bind_startup_runtime_support,
+    cleanup_active_startup,
 )
 
 _bind_startup_runtime_support(globals())
 
 from ..real_teleop.runtime import (
     bind_legacy_support as _bind_real_teleop_runtime_support,
-    cleanup_active_startup,
     run_real_teleop,
 )
 
@@ -1739,7 +1719,11 @@ def main() -> None:
     try:
         args = parse_args()
         _bind_real_teleop_runtime_support(globals())
-        run_real_teleop(args)
+        run_real_teleop(
+            args,
+            progress_application=build_real_teleop_progress_application(args),
+            input_batch_prioritizer=prioritize_input_batch,
+        )
     except KeyboardInterrupt:
         # Keep Ctrl+C a normal operator action.  The runtime's regular
         # ``finally`` handles the post-startup path; this fallback covers the

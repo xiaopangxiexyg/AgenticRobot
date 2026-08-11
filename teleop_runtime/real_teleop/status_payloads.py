@@ -2,17 +2,14 @@
 
 The functions in this module accept snapshots, mappings, or already-read
 runtime objects and return presentation payloads.  They must not start devices,
-refresh hardware, send commands, or publish to a UI.  The legacy entrypoint
-binds the one remaining formatting helper explicitly so old threshold and
-monkeypatch behavior stays visible at the compatibility boundary.
+refresh hardware, send commands, or publish to a UI.  Shared read-only backend
+formatting is imported from its runtime-health owner.
 """
-
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-import inspect
 import time
 
 import numpy as np
@@ -21,53 +18,12 @@ from ..collection.camera_preview import CameraPreviewer
 from ..collection.sample_assembler import (
     _build_pose_quality_metadata as _collection_build_pose_quality_metadata,
 )
+from ..sources.camera import RealSenseRGBSource
+from .runtime_health import _command_backend_status_text
 from .wrist_depth_freshness import (
     WRIST_DEPTH_CAMERA_KEYS,
     WristDepthFreshnessMonitor,
 )
-from ..sources.camera import RealSenseRGBSource
-
-
-_SUPPORT_NAMES = ("_command_backend_status_text",)
-
-
-class _LegacyFunctionProxy:
-    """Resolve legacy helpers dynamically so compatibility patches remain live."""
-
-    __slots__ = ("_namespace", "_name")
-
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(f"recursive status payload support proxy: {self._name}")
-        return target(*args, **kwargs)  # type: ignore[operator]
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
-
-
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    """Bind the minimal legacy formatting support used by this module."""
-
-    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "status payload support is incomplete: " + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _SUPPORT_NAMES
-        }
-    )
 
 
 def _json_safe_value(value: object) -> object:
@@ -1147,7 +1103,6 @@ def _ik_timing_status_text(payload: Mapping[str, object] | None) -> str:
     )
 
 __all__ = [
-    "bind_legacy_support",
     "_IK_RED_WARNING_LABELS",
     "_IK_RED_WARNING_SINGULARITY_GATE_CODES",
     "_IK_RED_WARNING_STATUS_CODES",

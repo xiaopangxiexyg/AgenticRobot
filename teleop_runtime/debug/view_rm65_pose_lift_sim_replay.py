@@ -9,8 +9,10 @@ research chain: source-rate official all-solution IK, collision-safe causal
 branch selection, linear joint reference, and a 120 Hz third-order horizon
 governor.
 
-MuJoCo is a trajectory viewer here.  It does not solve IK again, project the
-planner output, open a device, or dispatch a real command.
+MuJoCo is a trajectory viewer here.  It can also display caller-supplied
+normalized gripper close references on the scene's gripper proxy.  It does not
+solve IK again, project the planner output, open a device, or dispatch a real
+command.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import argparse
 import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -142,6 +144,7 @@ class PoseLiftSimFrame:
     modification_reasons: tuple[str, ...]
     pose_lift_reason: str
     collision_distance_m: float | None
+    gripper_close_by_name: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -156,6 +159,9 @@ class PoseLiftSimTrajectory:
     status_counts: Mapping[str, int]
     hold_count: int
     pose_lift_applied_count: int
+    initial_gripper_close_by_name: Mapping[str, float] = field(
+        default_factory=dict
+    )
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -171,6 +177,16 @@ class PoseLiftSimTrajectory:
             "status_counts": dict(self.status_counts),
             "hold_count": int(self.hold_count),
             "pose_lift_applied_count": int(self.pose_lift_applied_count),
+            "gripper_reference_count": int(
+                sum(bool(frame.gripper_close_by_name) for frame in self.frames)
+            ),
+            "gripper_names": sorted(
+                {
+                    str(name)
+                    for frame in self.frames
+                    for name in frame.gripper_close_by_name
+                }
+            ),
         }
 
 
@@ -1028,6 +1044,9 @@ def write_trace_jsonl(
                     "profile": trajectory.profile_name,
                     "source_episode_index": trajectory.source_episode_index,
                     "qpos_by_side": trajectory.initial_qpos_by_side,
+                    "gripper_close_by_name": (
+                        trajectory.initial_gripper_close_by_name
+                    ),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1050,6 +1069,7 @@ def write_trace_jsonl(
                         "modification_reasons": frame.modification_reasons,
                         "pose_lift_reason": frame.pose_lift_reason,
                         "collision_distance_m": frame.collision_distance_m,
+                        "gripper_close_by_name": frame.gripper_close_by_name,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -1080,7 +1100,7 @@ def view_trajectories(
     # Imports stay lazy so --help, --list-episodes, and offline trace generation
     # do not require MuJoCo/GLFW or create a GUI resource.
     from sim.contracts import SceneSpec
-    from sim.mujoco.controllers import QposController
+    from sim.mujoco.controllers import GripperController, QposController
     from sim.mujoco.scene import MujocoScene
     from sim.mujoco.viewer import passive_viewer_handle
 
@@ -1096,6 +1116,7 @@ def view_trajectories(
     if missing:
         raise RuntimeError(f"MuJoCo view URDF is missing arm specs: {missing}")
     controller = QposController(scene, collision_mode="raw")
+    gripper_controller = GripperController(scene, collision_mode="raw")
     with passive_viewer_handle(
         scene,
         show_left_ui=not bool(args.hide_left_ui),
@@ -1109,6 +1130,19 @@ def view_trajectories(
                     break
                 scene.reset_data()
                 controller.apply(trajectory.initial_qpos_by_side)
+                if trajectory.initial_gripper_close_by_name:
+                    missing_grippers = sorted(
+                        set(trajectory.initial_gripper_close_by_name)
+                        - set(scene.gripper_specs)
+                    )
+                    if missing_grippers:
+                        raise RuntimeError(
+                            "MuJoCo view URDF is missing gripper specs: "
+                            f"{missing_grippers}"
+                        )
+                    gripper_controller.apply(
+                        trajectory.initial_gripper_close_by_name
+                    )
                 viewer_handle.sync()
                 comparison_label = (
                     "B_CURRENT_BETTER_OFFICIAL_ALL_IK_GOVERNOR"
@@ -1139,6 +1173,8 @@ def view_trajectories(
                         keep_running = False
                         break
                     controller.apply(frame.qpos_by_side)
+                    if frame.gripper_close_by_name:
+                        gripper_controller.apply(frame.gripper_close_by_name)
                     viewer_handle.sync()
                     if not bool(args.no_sleep):
                         dt = max(0.0, frame.timestamp - previous_timestamp)

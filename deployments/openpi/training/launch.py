@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any, Mapping
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -38,11 +39,22 @@ from dataset_interface.model_continuation import (
 from dataset_interface.model_continuation_training import (
     model_continuation_training_source_binding,
 )
-from deployments.client import load_policy_artifact
+from dataset_interface.camera_semantics import (
+    DatasetCameraSemanticResolver,
+    load_camera_role_binding,
+)
+from deployments.policy_artifact import load_policy_artifact
+from deployments.openpi.camera_semantics import (
+    LEGACY_SWAPPED_WRIST_CAMERA_SEMANTICS_V1,
+    camera_input_routing_hash,
+    policy_artifact_base_hash,
+    validate_legacy_swapped_wrist_route,
+)
 
 from .adapter import (
     OpenPIModelRtcDataConfigFactory,
     OpenPIModelRtcTrainingTransform,
+    OpenPICameraSemanticTransform,
     OpenPIOverlayCheckpointWeightLoader,
     build_openpi_model_rtc_training_manifest,
 )
@@ -53,6 +65,16 @@ MODEL_CONTINUATION_TRAINING_RUN_METADATA_KEY_V1 = (
 )
 MODEL_CONTINUATION_TRAINING_RUN_HASH_METADATA_KEY_V1 = (
     "model_continuation_training_run_hash"
+)
+CAMERA_SEMANTIC_TRAINING_AUDIT_METADATA_KEY_V1 = (
+    "camera_semantic_training_audit"
+)
+CAMERA_SEMANTIC_TRAINING_AUDIT_HASH_METADATA_KEY_V1 = (
+    "camera_semantic_training_audit_hash"
+)
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_CAMERA_ROLE_REGISTRY = (
+    _PROJECT_ROOT / "robot_motion/configs/rm65_camera_registry.json"
 )
 
 
@@ -105,6 +127,7 @@ def _train_config_hash(
     artifact_template: PolicyArtifactContract,
     sampling_spec: ModelContinuationTrainingSamplingSpec,
     source_binding_hash: str,
+    camera_semantic_audit_hash: str | None,
     overrides: Mapping[str, Any],
 ) -> str:
     payload = {
@@ -127,6 +150,7 @@ def _train_config_hash(
         "artifact_template_model_id": artifact_template.model_id,
         "sampling_spec_hash": sampling_spec.semantic_content_hash,
         "source_binding_hash": source_binding_hash,
+        "camera_semantic_audit_hash": camera_semantic_audit_hash,
         "overrides": _stable_value(dict(overrides)),
     }
     return "sha256:" + canonical_content_hash(
@@ -174,7 +198,18 @@ def _openpi_train_main() -> tuple[Any, Path]:
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load OpenPI train module: {train_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module_name = spec.name
+    had_previous = module_name in sys.modules
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if had_previous:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+        raise
     main = getattr(module, "main", None)
     if not callable(main):
         raise TypeError("OpenPI scripts/train.py does not expose main(config).")
@@ -191,6 +226,41 @@ def _run_openpi_train(config: Any) -> None:
         train_main(config)
     finally:
         os.chdir(caller_cwd)
+
+
+def _validate_checkpoint_camera_compatibility(
+    base_artifact: PolicyArtifactContract,
+    artifact_template: PolicyArtifactContract,
+) -> None:
+    base_camera = base_artifact.camera_input
+    target_camera = artifact_template.camera_input
+    if base_camera is None or target_camera is None:
+        if base_camera is not target_camera:
+            raise ValueError(
+                "Base checkpoint and trained artifact camera contracts differ."
+            )
+        return
+    if base_camera.to_dict() == target_camera.to_dict():
+        return
+    camera_semantics = str(
+        artifact_template.metadata.get("camera_semantics") or ""
+    ).strip()
+    route_hash = str(
+        artifact_template.metadata.get("camera_input_routing_hash") or ""
+    ).strip()
+    base_hash = str(
+        artifact_template.metadata.get("base_policy_artifact_hash") or ""
+    ).strip()
+    if (
+        camera_semantics != LEGACY_SWAPPED_WRIST_CAMERA_SEMANTICS_V1
+        or route_hash != camera_input_routing_hash(target_camera)
+        or base_hash != policy_artifact_base_hash(base_artifact)
+    ):
+        raise ValueError(
+            "Base checkpoint and trained artifact camera contracts differ "
+            "without an explicit checkpoint-compatible semantic route."
+        )
+    validate_legacy_swapped_wrist_route(base_camera, target_camera)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -216,6 +286,23 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument("--source-id", default=None)
+    parser.add_argument(
+        "--camera-role-registry",
+        type=Path,
+        default=_DEFAULT_CAMERA_ROLE_REGISTRY,
+        help=(
+            "Shared camera registry whose wrist serials define canonical "
+            "physical roles. Read only; defaults to the DexTeleop RM65 registry."
+        ),
+    )
+    parser.add_argument(
+        "--disable-camera-semantic-resolution",
+        action="store_true",
+        help=(
+            "Explicit rollback: do not resolve stored wrist keys by serial. "
+            "Unsafe for mixed historical/corrected wrist datasets."
+        ),
+    )
     parser.add_argument("--output-config-name", required=True)
     parser.add_argument("--exp-name", required=True)
     parser.add_argument("--num-train-steps", type=int, default=None)
@@ -297,15 +384,10 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         raise ValueError(
             "Base checkpoint and trained artifact layouts differ."
         )
-    if (
-        base_artifact.camera_input is not None
-        and artifact_template.camera_input is not None
-        and base_artifact.camera_input.to_dict()
-        != artifact_template.camera_input.to_dict()
-    ):
-        raise ValueError(
-            "Base checkpoint and trained artifact camera contracts differ."
-        )
+    _validate_checkpoint_camera_compatibility(
+        base_artifact,
+        artifact_template,
+    )
     sampling_spec = ModelContinuationTrainingSamplingSpec.from_dict(
         _json_object(args.sampling_spec_json)
     )
@@ -342,6 +424,39 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         raise ValueError(
             "Training dataset root is not declared by the artifact template."
         )
+
+    camera_transform = None
+    camera_semantic_audit = None
+    camera_semantic_audit_hash = None
+    if (
+        not bool(args.disable_camera_semantic_resolution)
+        and artifact_template.camera_input is not None
+    ):
+        binding = load_camera_role_binding(args.camera_role_registry)
+        expected_binding_hash = str(
+            artifact_template.metadata.get("camera_role_binding_hash") or ""
+        ).strip()
+        if expected_binding_hash and expected_binding_hash != binding.contract_hash:
+            raise ValueError(
+                "Artifact camera_role_binding_hash differs from the selected "
+                "camera role registry."
+            )
+        if set(artifact_template.camera_input.source_keys).intersection(
+            binding.canonical_roles
+        ):
+            semantic_resolver = DatasetCameraSemanticResolver(
+                requested_source_root,
+                binding,
+            )
+            camera_transform = OpenPICameraSemanticTransform(
+                artifact=artifact_template,
+                resolver=semantic_resolver,
+            )
+            camera_semantic_audit = semantic_resolver.audit_summary()
+            camera_semantic_audit_hash = canonical_content_hash(
+                camera_semantic_audit,
+                domain="dexteleop.openpi.camera_semantic_training_audit.v1",
+            )
 
     overrides = {
         "num_train_steps": (
@@ -385,6 +500,7 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         artifact_template=artifact_template,
         sampling_spec=sampling_spec,
         source_binding_hash=source_binding.semantic_content_hash,
+        camera_semantic_audit_hash=camera_semantic_audit_hash,
         overrides=overrides,
     )
     manifest = build_openpi_model_rtc_training_manifest(
@@ -409,6 +525,13 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
     policy_metadata[
         MODEL_CONTINUATION_TRAINING_RUN_HASH_METADATA_KEY_V1
     ] = manifest.semantic_content_hash
+    if camera_semantic_audit is not None:
+        policy_metadata[CAMERA_SEMANTIC_TRAINING_AUDIT_METADATA_KEY_V1] = (
+            camera_semantic_audit
+        )
+        policy_metadata[
+            CAMERA_SEMANTIC_TRAINING_AUDIT_HASH_METADATA_KEY_V1
+        ] = camera_semantic_audit_hash
     params_path = base_checkpoint_dir / "params"
     config = dataclasses.replace(
         base,
@@ -417,6 +540,7 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         data=OpenPIModelRtcDataConfigFactory(
             base_factory=base.data,
             transform=transform,
+            camera_transform=camera_transform,
         ),
         weight_loader=OpenPIOverlayCheckpointWeightLoader(
             base_loader=base.weight_loader,
@@ -441,6 +565,9 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         "source_binding_hash": source_binding.semantic_content_hash,
         "training_run_manifest_hash": manifest.semantic_content_hash,
         "train_config_hash": train_config_hash,
+        "camera_semantic_resolution_enabled": camera_transform is not None,
+        "camera_semantic_audit_hash": camera_semantic_audit_hash,
+        "camera_semantic_audit": camera_semantic_audit,
         "action_pose_mode": "absolute",
         "action_horizon": int(base.model.action_horizon),
         "ordinary_openpi_config_registry_modified": False,

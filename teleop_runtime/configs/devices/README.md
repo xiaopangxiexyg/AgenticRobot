@@ -5,6 +5,25 @@ This directory owns workstation-side camera transport assignments. The
 `right_wrist`) to RealSense serials and requested stream profiles used by
 teleop, collection, and policy deployment.
 
+The current RM65 physical wrist binding is authoritative and must not be
+inferred from USB enumeration order:
+
+```text
+left_wrist  -> RealSense 260522278055
+right_wrist -> RealSense 261122273924
+```
+
+Logical camera roles are also independent of hardware startup order.  The
+optional numeric `metadata.startup_priority` is lifecycle-only: lower values
+start first, while a missing value preserves JSON declaration order.  The
+current station starts `front`, then serial `261122273924`, then serial
+`260522278055`, matching the order recorded by the stable August 4/5 captures.
+
+An already running process keeps the configuration it loaded at startup. The
+corrected binding applies after the next complete collection/deployment
+restart. Historical datasets remain immutable; training resolves their stored
+wrist keys from each dataset's recorded RealSense serial.
+
 `realsense_front.json` is retained as the single-front station variant for
 explicit callers; it is not the multi-camera default.
 

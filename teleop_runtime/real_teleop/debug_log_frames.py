@@ -8,140 +8,45 @@ device, dispatch a command, publish a UI update, or mutate runtime state.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-import inspect
 
 from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
 from robot_motion.runtime import TeleopCommand
 
 from ..collection.camera_preview import CameraPreviewer
-from .status_payloads import _build_camera_status as _default_build_camera_status
 from ..sources.camera import RealSenseRGBSource
-from .arm_state_sync import _state_qpos as _default_state_qpos
+from .arm_state_sync import _state_qpos
 from .components import RealTeleopComponents
 from .debug_ik_payload import (
-    _backend_compact_debug_payload as _default_backend_compact_debug_payload,
-    _backend_debug_payload as _default_backend_debug_payload,
-    _backend_ik_metadata_compact_debug as _default_backend_ik_metadata_compact_debug,
-    _command_compact_debug_payload as _default_command_compact_debug_payload,
-    _command_debug_payload as _default_command_debug_payload,
-    _impedance_record_compact_debug as _default_impedance_record_compact_debug,
-    _observation_pose_compact_debug as _default_observation_pose_compact_debug,
-    _observation_pose_debug as _default_observation_pose_debug,
-    _teleop_command_metadata_compact_debug as _default_teleop_command_metadata_compact_debug,
-    _teleop_command_metadata_debug as _default_teleop_command_metadata_debug,
+    _backend_compact_debug_payload,
+    _backend_debug_payload,
+    _backend_ik_metadata_compact_debug,
+    _command_compact_debug_payload,
+    _command_debug_payload,
+    _impedance_record_compact_debug,
+    _observation_pose_compact_debug,
+    _observation_pose_debug,
+    _teleop_command_metadata_compact_debug,
+    _teleop_command_metadata_debug,
 )
 from .debug_payload_primitives import (
-    _compact_debug_value as _default_compact_debug_value,
-    _qpos_compact_debug as _default_qpos_compact_debug,
-    _qpos_debug as _default_qpos_debug,
+    _compact_debug_value,
+    _qpos_compact_debug,
+    _qpos_debug,
 )
-from .debug_recorders import state_value as _default_state_value
+from .debug_recorders import state_value as _state_value
 from .debug_timing_payload import (
-    _channels_log_payload as _default_channels_log_payload,
-    _fault_signature as _default_fault_signature,
-    _faults_log_payload as _default_faults_log_payload,
-    _latency_log_payload as _default_latency_log_payload,
-    _phase_timings_log_payload as _default_phase_timings_log_payload,
+    _channels_log_payload,
+    _fault_signature,
+    _faults_log_payload,
+    _latency_log_payload,
+    _phase_timings_log_payload,
 )
 from .gui_special_arm_status import (
-    fix_arm_debug_state as _default_fix_arm_debug_state,
-    init_arm_debug_state as _default_init_arm_debug_state,
+    fix_arm_debug_state as _fix_arm_debug_state,
+    init_arm_debug_state as _init_arm_debug_state,
 )
-from .runtime_health import _short_status_text as _default_short_status_text
-
-
-_backend_compact_debug_payload = _default_backend_compact_debug_payload
-_backend_debug_payload = _default_backend_debug_payload
-_backend_ik_metadata_compact_debug = _default_backend_ik_metadata_compact_debug
-_build_camera_status = _default_build_camera_status
-_channels_log_payload = _default_channels_log_payload
-_command_compact_debug_payload = _default_command_compact_debug_payload
-_command_debug_payload = _default_command_debug_payload
-_compact_debug_value = _default_compact_debug_value
-_fault_signature = _default_fault_signature
-_faults_log_payload = _default_faults_log_payload
-_fix_arm_debug_state = _default_fix_arm_debug_state
-_impedance_record_compact_debug = _default_impedance_record_compact_debug
-_init_arm_debug_state = _default_init_arm_debug_state
-_latency_log_payload = _default_latency_log_payload
-_observation_pose_compact_debug = _default_observation_pose_compact_debug
-_observation_pose_debug = _default_observation_pose_debug
-_phase_timings_log_payload = _default_phase_timings_log_payload
-_qpos_compact_debug = _default_qpos_compact_debug
-_qpos_debug = _default_qpos_debug
-_short_status_text = _default_short_status_text
-_state_qpos = _default_state_qpos
-_state_value = _default_state_value
-_teleop_command_metadata_compact_debug = (
-    _default_teleop_command_metadata_compact_debug
-)
-_teleop_command_metadata_debug = _default_teleop_command_metadata_debug
-
-_SUPPORT_NAMES = (
-    "_backend_compact_debug_payload",
-    "_backend_debug_payload",
-    "_backend_ik_metadata_compact_debug",
-    "_build_camera_status",
-    "_channels_log_payload",
-    "_command_compact_debug_payload",
-    "_command_debug_payload",
-    "_compact_debug_value",
-    "_fault_signature",
-    "_faults_log_payload",
-    "_fix_arm_debug_state",
-    "_impedance_record_compact_debug",
-    "_init_arm_debug_state",
-    "_latency_log_payload",
-    "_observation_pose_compact_debug",
-    "_observation_pose_debug",
-    "_phase_timings_log_payload",
-    "_qpos_compact_debug",
-    "_qpos_debug",
-    "_short_status_text",
-    "_state_qpos",
-    "_state_value",
-    "_teleop_command_metadata_compact_debug",
-    "_teleop_command_metadata_debug",
-)
-
-
-class _LegacyFunctionProxy:
-    """Resolve a historical entrypoint-level patch point at call time."""
-
-    __slots__ = ("_namespace", "_name")
-
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(f"recursive debug-log-frame support proxy: {self._name}")
-        return target(*args, **kwargs)  # type: ignore[operator]
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
-
-
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    """Keep the former entrypoint globals live as compatibility patch points."""
-
-    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "debug-log-frame support is incomplete: " + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _SUPPORT_NAMES
-        }
-    )
+from .runtime_health import _short_status_text
+from .status_payloads import _build_camera_status
 
 
 def _command_for_side(active_command: TeleopCommand | None, side: str):
@@ -426,7 +331,6 @@ def _build_debug_timing_log_frame(
 
 
 __all__ = [
-    "bind_legacy_support",
     "_command_for_side",
     "_build_ik_debug_log_frame",
     "_camera_status_log_payload",

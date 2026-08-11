@@ -6,6 +6,7 @@ the concrete browser transport and satisfies these protocols structurally.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, Protocol
 
 
@@ -26,4 +27,33 @@ class OperatorUiPort(Protocol):
     def append_message(self, tag: str, message: str) -> None: ...
 
 
-__all__ = ["OperatorUiPort"]
+class OperatorInputBatchView(Protocol):
+    """Prioritized application input returned to the lower runtime."""
+
+    events: tuple[str, ...]
+
+    @property
+    def terminal_quit_requested(self) -> bool: ...
+
+    @property
+    def suppress_foot_pad_events(self) -> bool: ...
+
+
+class RealTeleopInputBatchPrioritizer(Protocol):
+    """Application-owned precedence policy consumed by RealTeleop."""
+
+    def __call__(
+        self,
+        events: Iterable[str],
+        *,
+        terminal_quit_requested: bool,
+        teleop_started: bool,
+        two_pedal_mode_active: bool,
+    ) -> OperatorInputBatchView: ...
+
+
+__all__ = [
+    "OperatorInputBatchView",
+    "OperatorUiPort",
+    "RealTeleopInputBatchPrioritizer",
+]
