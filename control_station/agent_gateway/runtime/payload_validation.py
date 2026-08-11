@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .skill_catalog import SkillExecutionRoute, SkillRouteManifest
+from ..protocol.skill_catalog import SkillExecutionRoute, SkillRouteManifest
 
 PayloadValidator = Callable[[Mapping[str, Any]], None]
 ContextualResultPayloadValidator = Callable[

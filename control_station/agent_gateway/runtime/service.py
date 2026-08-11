@@ -17,19 +17,20 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .access_policy import (
-    AgentSkillAccessPolicy,
-    SkillAccessDecision,
-    SkillExecutionGrant,
-    assess_skill_request_access,
-)
-from .contracts import (
+from ..protocol.contracts import (
     AgentObservationSnapshot,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
     AgentOwnOperationQuery,
     AgentSkillOperation,
     AgentSkillRequest,
+)
+from ..protocol.skill_catalog import SkillRouteManifest
+from .access_policy import (
+    AgentSkillAccessPolicy,
+    SkillAccessDecision,
+    SkillExecutionGrant,
+    assess_skill_request_access,
 )
 from .executor_registry import SkillExecutorRegistry
 from .operation_port import (
@@ -46,7 +47,6 @@ from .operation_store import (
     OperationStoreOutcome,
 )
 from .payload_validation import AgentSkillPayloadValidatorRegistry
-from .skill_catalog import SkillRouteManifest
 
 
 def _required_text(value: object, *, field_name: str) -> str:

@@ -15,7 +15,6 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-
 AGENT_STATION_CONTROL_FINGERPRINT_HASH_DOMAIN_V1 = (
     "dexteleop.agent_gateway.station_control_fingerprint.v1"
 )

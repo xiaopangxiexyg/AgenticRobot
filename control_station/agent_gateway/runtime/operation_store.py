@@ -16,8 +16,8 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from ..protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from .access_policy import SkillAccessDecision
-from .contracts import AgentSkillOperation, AgentSkillRequest
 
 AGENT_GATEWAY_OPERATION_ID_HASH_DOMAIN_V1 = (
     "dexteleop.agent_gateway.operation_id.v1"

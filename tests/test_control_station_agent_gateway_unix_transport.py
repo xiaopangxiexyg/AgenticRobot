@@ -5,7 +5,6 @@ import os
 import socket
 import stat
 import struct
-import sys
 import threading
 import time
 import uuid
@@ -14,7 +13,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import control_station.agent_gateway.unix_transport as unix_transport
 from control_station.agent_gateway import (
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
     AgentGatewayUnixJsonServer,
@@ -22,7 +20,7 @@ from control_station.agent_gateway import (
     AgentGatewayUnixPeerCredentials,
     BoundAgentGatewayWireAdapter,
 )
-
+from control_station.agent_gateway.transport import unix_transport
 
 _PREFIX = struct.Struct(">I")
 
@@ -224,17 +222,17 @@ def test_server_cleans_its_bound_inode_when_permission_setup_fails(
     assert not os.path.lexists(path)
 
 
+@pytest.mark.integration
+@pytest.mark.optional
 def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity() -> None:
-    rpent_root = (
-        Path(__file__).resolve().parents[2] / "HierachicalVLA" / "RPent"
+    transport_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.unix_transport",
+        reason="paired RPent integration wheel is not installed",
     )
-    if not (rpent_root / "robots" / "dexteleop" / "unix_client.py").is_file():
-        pytest.skip("Live RPent checkout is unavailable for the optional loopback.")
-    sys.path.insert(0, str(rpent_root))
-    from robots.dexteleop.unix_client import (
-        DexTeleopGatewayTransportError,
-        UnixDexTeleopGatewayClient,
+    DexTeleopGatewayTransportError = (
+        transport_module.DexTeleopGatewayTransportError
     )
+    UnixDexTeleopGatewayClient = transport_module.UnixDexTeleopGatewayClient
 
     path = _socket_path("live-client")
     facade = _FakeBoundFacade("rpent:local")

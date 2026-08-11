@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contracts import AgentSkillRequest
+from ..protocol.contracts import AgentSkillRequest
+from ..protocol.skill_catalog import SkillRouteManifest, SkillRouteManifestEntry
 from .operation_port import AgentSkillExecutionPort
-from .skill_catalog import SkillRouteManifest, SkillRouteManifestEntry
 
 
 def _required(value: object, *, field_name: str) -> str:

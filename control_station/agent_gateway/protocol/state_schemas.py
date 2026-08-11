@@ -26,7 +26,6 @@ from .skill_catalog import (
     agent_skill_schema_document_hash,
 )
 
-
 TCP_POSE_STATE_SKILL_ID_V1 = "state.read_tcp_pose"
 TCP_POSE_HISTORY_STATE_SKILL_ID_V1 = "state.read_tcp_pose_history"
 

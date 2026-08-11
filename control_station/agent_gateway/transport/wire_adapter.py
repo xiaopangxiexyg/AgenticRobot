@@ -12,20 +12,20 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .access_policy import SkillExecutionGrant
-from .contracts import (
+from ..protocol.contracts import (
     AgentSkillRequest,
     agent_own_domain_hold_request_from_json,
     agent_own_operation_cancel_request_from_json,
     agent_own_operation_query_from_json,
     agent_skill_request_from_json,
 )
-from .service import (
+from ..protocol.skill_catalog import AgentSkillSchemaCatalog, SkillDefinitionCatalog
+from ..runtime.access_policy import SkillExecutionGrant
+from ..runtime.service import (
     AgentGatewayObservationOutcome,
     AgentGatewayOperationOutcome,
     AgentGatewayService,
 )
-from .skill_catalog import AgentSkillSchemaCatalog, SkillDefinitionCatalog
 
 
 def _required(value: object, *, field_name: str) -> str:

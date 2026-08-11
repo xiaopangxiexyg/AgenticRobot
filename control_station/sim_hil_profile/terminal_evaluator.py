@@ -17,18 +17,16 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
-from dataset_contracts.canonical_encoding import canonical_content_hash
-
-from control_station.agent_gateway.contracts import (
+from control_station.agent_gateway.protocol.contracts import (
     AgentSkillOperation,
     AgentSkillRequest,
 )
-from control_station.agent_gateway.evaluation_contracts import (
+from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillAggregateEvaluationReceipt,
     SkillEvaluationPlan,
     SkillEvaluationReceipt,
 )
-from control_station.agent_gateway.skill_catalog import SkillExecutionRoute
+from control_station.agent_gateway.protocol.skill_catalog import SkillExecutionRoute
 from control_station.agent_gateway.task_schemas import (
     CUBE_LIFT_AGGREGATION_POLICY_HASH_V1,
     CUBE_LIFT_AGGREGATION_POLICY_ID_V1,
@@ -41,7 +39,7 @@ from control_station.agent_gateway.task_schemas import (
     validate_cube_lift_sim_route_v1,
     validate_cube_lift_task_evaluation_v1,
 )
-
+from dataset_contracts.canonical_encoding import canonical_content_hash
 
 CUBE_LIFT_LOWER_HOLD_PROOF_HASH_DOMAIN_V1 = (
     "dexteleop.sim_hil.cube_lift_lower_hold_proof.v1"

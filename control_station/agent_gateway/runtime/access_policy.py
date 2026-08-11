@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .contracts import (
+from ..protocol.contracts import (
     AGENT_SKILL_ACCESS_DECISION_HASH_DOMAIN_V1,
     AGENT_SKILL_ACCESS_POLICY_HASH_DOMAIN_V1,
     AGENT_SKILL_EXECUTION_GRANT_HASH_DOMAIN_V1,
@@ -26,19 +26,18 @@ from .contracts import (
     _required,
     _unique_sorted,
 )
-from .skill_catalog import (
+from ..protocol.skill_catalog import (
     AGENT_SKILL_CONTROL_EFFECT_CLASSES_V1,
     AGENT_SKILL_MODES_V1,
     AGENT_SKILL_PRIVILEGE_TIERS_V1,
     MAX_AGENT_SKILL_TIMEOUT_MS_V1,
+    SkillExecutionRoute,
     SkillRouteManifest,
     SkillRouteManifestEntry,
-    SkillExecutionRoute,
     validate_route_id,
     validate_skill_id,
     validate_version,
 )
-
 
 AGENT_SKILL_GRANT_REQUIRED_TIERS_V1 = (
     "t2_real_motion",

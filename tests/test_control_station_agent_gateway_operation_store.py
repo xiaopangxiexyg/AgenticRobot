@@ -2,22 +2,22 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from control_station.agent_gateway.access_policy import (
-    AgentSkillAccessPolicy,
-    assess_skill_request_access,
-)
-from control_station.agent_gateway.contracts import (
+from control_station.agent_gateway.protocol.contracts import (
     AgentSkillRequest,
 )
-from control_station.agent_gateway.operation_store import (
-    BoundedInMemoryAgentSkillOperationStore,
-)
-from control_station.agent_gateway.skill_catalog import (
+from control_station.agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
     SkillParameterProfileRef,
     SkillRouteManifest,
     SkillRouteManifestEntry,
+)
+from control_station.agent_gateway.runtime.access_policy import (
+    AgentSkillAccessPolicy,
+    assess_skill_request_access,
+)
+from control_station.agent_gateway.runtime.operation_store import (
+    BoundedInMemoryAgentSkillOperationStore,
 )
 
 

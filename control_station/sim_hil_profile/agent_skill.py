@@ -14,15 +14,15 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from dataset_contracts.canonical_encoding import canonical_content_hash
-
-from control_station.agent_gateway.contracts import (
+from control_station.agent_gateway.protocol.contracts import (
     AgentSkillOperation,
     AgentSkillRequest,
 )
-from control_station.agent_gateway.evaluation_contracts import SkillEvaluationPlan
-from control_station.agent_gateway.skill_catalog import SkillExecutionRoute
-from control_station.agent_gateway.station_operation_worker import (
+from control_station.agent_gateway.protocol.evaluation_contracts import (
+    SkillEvaluationPlan,
+)
+from control_station.agent_gateway.protocol.skill_catalog import SkillExecutionRoute
+from control_station.agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
     StationLifecycleEvaluationCompletion,
@@ -33,6 +33,7 @@ from control_station.agent_gateway.task_schemas import (
     CubeLiftTerminalEvaluatorConfig,
     validate_cube_lift_sim_route_v1,
 )
+from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .execution_evidence import (
     CubeLiftExecutionEvidenceCollector,
@@ -44,7 +45,6 @@ from .terminal_evaluator import (
     MujocoCubeLiftTerminalHoldSampler,
     cube_lift_lower_hold_proof_from_transition,
 )
-
 
 CUBE_LIFT_CANDIDATE_OBSERVATION_HASH_DOMAIN_V1 = (
     "dexteleop.sim_hil.cube_lift_candidate_observation.v1"

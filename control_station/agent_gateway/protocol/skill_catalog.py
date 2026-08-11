@@ -22,7 +22,6 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-
 AGENT_SKILL_PROTOCOL_VERSION_V1 = "dexteleop.agent_skill.v1"
 
 AGENT_SKILL_TARGET_KINDS_V1 = ("null", "real", "sim")

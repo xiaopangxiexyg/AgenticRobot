@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import threading
 import time
 import uuid
@@ -490,9 +489,26 @@ def test_application_passive_cut_is_no_start_no_step_and_uses_existing_owner() -
     assert calls == {"scene": 2, "gate": 1}
 
 
+@pytest.mark.integration
+@pytest.mark.optional
 def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
     monkeypatch,
 ) -> None:
+    toolkit_module = pytest.importorskip(
+        "rpent_dexteleop.toolkit",
+        reason="paired RPent integration wheel is not installed",
+    )
+    DEX_CONTROL_TOOL_CANCEL_OWN_OPERATION = (
+        toolkit_module.DEX_CONTROL_TOOL_CANCEL_OWN_OPERATION
+    )
+    DEX_CONTROL_TOOL_GET_OWN_OPERATION = (
+        toolkit_module.DEX_CONTROL_TOOL_GET_OWN_OPERATION
+    )
+    DEX_CONTROL_TOOL_REQUEST_HOLD_OWN_DOMAIN = (
+        toolkit_module.DEX_CONTROL_TOOL_REQUEST_HOLD_OWN_DOMAIN
+    )
+    DexTeleopToolExposurePolicy = toolkit_module.DexTeleopToolExposurePolicy
+    DexTeleopToolkit = toolkit_module.DexTeleopToolkit
     application = _application()
     now = {"value": 20.0}
     application.runtime.clock = lambda: now["value"]
@@ -551,20 +567,6 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
         "own_operation_status_v1",
     }
 
-    rpent_root = (
-        Path(__file__).resolve().parents[2] / "HierachicalVLA" / "RPent"
-    )
-    if not (rpent_root / "robots" / "dexteleop" / "toolkit.py").is_file():
-        pytest.skip("Live RPent checkout is unavailable for the optional loopback.")
-    sys.path.insert(0, str(rpent_root))
-    from robots.dexteleop.toolkit import (
-        DEX_CONTROL_TOOL_CANCEL_OWN_OPERATION,
-        DEX_CONTROL_TOOL_GET_OWN_OPERATION,
-        DEX_CONTROL_TOOL_REQUEST_HOLD_OWN_DOMAIN,
-        DexTeleopToolExposurePolicy,
-        DexTeleopToolkit,
-    )
-
     control_tools = frozenset(
         {
             DEX_CONTROL_TOOL_CANCEL_OWN_OPERATION,
@@ -612,9 +614,21 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
         facade.submit_skill_request(forged)
 
 
+@pytest.mark.integration
+@pytest.mark.optional
 def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
     monkeypatch,
 ) -> None:
+    toolkit_module = pytest.importorskip(
+        "rpent_dexteleop.toolkit",
+        reason="paired RPent integration wheel is not installed",
+    )
+    transport_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.unix_transport",
+        reason="paired RPent integration wheel is not installed",
+    )
+    DexTeleopToolkit = toolkit_module.DexTeleopToolkit
+    UnixDexTeleopGatewayClient = transport_module.UnixDexTeleopGatewayClient
     application = _application()
     now = {"value": 25.0}
     application.runtime.clock = lambda: now["value"]
@@ -692,19 +706,6 @@ def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
     client = None
     operation_id = None
     try:
-        rpent_root = (
-            Path(__file__).resolve().parents[2] / "HierachicalVLA" / "RPent"
-        )
-        if not (
-            rpent_root / "robots" / "dexteleop" / "unix_client.py"
-        ).is_file():
-            pytest.skip(
-                "Live RPent checkout is unavailable for the optional UDS loopback."
-            )
-        sys.path.insert(0, str(rpent_root))
-        from robots.dexteleop.toolkit import DexTeleopToolkit
-        from robots.dexteleop.unix_client import UnixDexTeleopGatewayClient
-
         client = UnixDexTeleopGatewayClient(
             socket_path=socket_path,
             client_id="rpent:b3",
@@ -903,9 +904,16 @@ def test_exact_gateway_session_launches_one_fail_closed_station_worker(
     assert session.close().accepted
 
 
+@pytest.mark.integration
+@pytest.mark.optional
 def test_session_repeats_passive_tcp_pose_reads_without_consuming_motion_worker(
     monkeypatch,
 ) -> None:
+    toolkit_module = pytest.importorskip(
+        "rpent_dexteleop.toolkit",
+        reason="paired RPent integration wheel is not installed",
+    )
+    DexTeleopToolkit = toolkit_module.DexTeleopToolkit
     application = _application()
     now = {"value": 40.0}
     application.runtime.clock = lambda: now["value"]
@@ -984,12 +992,6 @@ def test_session_repeats_passive_tcp_pose_reads_without_consuming_motion_worker(
         clock=application.runtime.clock,
     )
     facade = session.wire_adapter(authenticated_client_id="rpent:b3")
-
-    rpent_root = Path(__file__).resolve().parents[2] / "HierachicalVLA" / "RPent"
-    if not (rpent_root / "robots" / "dexteleop" / "toolkit.py").is_file():
-        pytest.skip("Live RPent checkout is unavailable for the optional loopback.")
-    sys.path.insert(0, str(rpent_root))
-    from robots.dexteleop.toolkit import DexTeleopToolkit
 
     request_ids = iter(("request:state:1", "request:state:2"))
     toolkit = DexTeleopToolkit(

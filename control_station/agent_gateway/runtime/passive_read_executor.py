@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .contracts import AgentSkillOperation, AgentSkillRequest
+from ..protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from .operation_port import AgentGatewayAuthoritativePortReceipt
 
 PASSIVE_READ_EXECUTION_RECEIPT_HASH_DOMAIN_V1 = (

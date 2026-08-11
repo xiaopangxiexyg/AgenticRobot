@@ -51,7 +51,6 @@ from .skill_catalog import (
     validate_version,
 )
 
-
 AGENT_SKILL_PROTOCOL_VERSION_V1 = "dexteleop.agent_skill.v1"
 AGENT_SKILL_SCHEMA_SNAPSHOT_V1 = "dexteleop_agent_skill_schema_snapshot_v1"
 

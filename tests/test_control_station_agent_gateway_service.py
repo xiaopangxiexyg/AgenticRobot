@@ -6,47 +6,47 @@ from dataclasses import replace
 
 import pytest
 
-from control_station.agent_gateway.access_policy import (
-    AgentSkillAccessPolicy,
-    issue_skill_execution_grant,
-)
-from control_station.agent_gateway.contracts import (
+from control_station.agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
     AgentOwnOperationQuery,
     AgentSkillRequest,
 )
-from control_station.agent_gateway.executor_registry import (
-    SkillExecutorBinding,
-    SkillExecutorRegistry,
-)
-from control_station.agent_gateway.operation_port import (
-    AgentGatewayAuthoritativePortReceipt,
-    DeterministicNoIoAgentSkillOperationPort,
-    NullAgentSkillOperationPort,
-)
-from control_station.agent_gateway.operation_store import (
-    BoundedInMemoryAgentSkillOperationStore,
-)
-from control_station.agent_gateway.passive_read_executor import (
-    PassiveReadResult,
-    PassiveReadSkillExecutor,
-)
-from control_station.agent_gateway.payload_validation import (
-    AgentSkillPayloadValidatorRegistry,
-    AgentSkillPayloadValidatorSet,
-)
-from control_station.agent_gateway.service import (
-    AgentGatewayService,
-    NoIoAgentGatewayService,
-)
-from control_station.agent_gateway.skill_catalog import (
+from control_station.agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
     SkillParameterProfileRef,
     SkillRouteManifest,
     SkillRouteManifestEntry,
+)
+from control_station.agent_gateway.runtime.access_policy import (
+    AgentSkillAccessPolicy,
+    issue_skill_execution_grant,
+)
+from control_station.agent_gateway.runtime.executor_registry import (
+    SkillExecutorBinding,
+    SkillExecutorRegistry,
+)
+from control_station.agent_gateway.runtime.operation_port import (
+    AgentGatewayAuthoritativePortReceipt,
+    DeterministicNoIoAgentSkillOperationPort,
+    NullAgentSkillOperationPort,
+)
+from control_station.agent_gateway.runtime.operation_store import (
+    BoundedInMemoryAgentSkillOperationStore,
+)
+from control_station.agent_gateway.runtime.passive_read_executor import (
+    PassiveReadResult,
+    PassiveReadSkillExecutor,
+)
+from control_station.agent_gateway.runtime.payload_validation import (
+    AgentSkillPayloadValidatorRegistry,
+    AgentSkillPayloadValidatorSet,
+)
+from control_station.agent_gateway.runtime.service import (
+    AgentGatewayService,
+    NoIoAgentGatewayService,
 )
 
 

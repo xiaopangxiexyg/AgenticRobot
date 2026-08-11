@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import ast
-import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -261,7 +260,6 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
         assert session.history_recorder.capture_once() is not None
         state["time"] = 11.0
         state["pose"][0] = 0.2
-        facade = session.wire_adapter(authenticated_client_id="rpent:history-fixture")
         parameters = {
             "component_ids": ["right_arm"],
             "reference_frame_id": "right_arm_base",
@@ -269,13 +267,66 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
             "history_window_ms": 5_000,
             "max_samples": 4,
         }
-        rpent_root = Path(__file__).resolve().parents[2] / "HierachicalVLA" / "RPent"
-        sys.path.insert(0, str(rpent_root))
-        from robots.dexteleop.toolkit import (
-            DexTeleopToolExposurePolicy,
-            DexTeleopToolkit,
+        history_read = session.history_provider.read(
+            active_operation_id="operation:tcp-pose-history:lower:1",
+            parameters=parameters,
         )
+        result = history_read.execution_result
+        assert result is not None and result["sample_count"] == 2
+        assert [
+            sample["pose_by_component"]["right_arm"][0] for sample in result["samples"]
+        ] == pytest.approx([0.1, 0.2])
+        assert len(history_read.evidence_refs) == 3
+        assert not application.started
+        session.close()
+        assert store.closed
 
+
+@pytest.mark.integration
+@pytest.mark.optional
+def test_installed_rpent_toolkit_reads_exactly_bound_history(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    toolkit_module = pytest.importorskip(
+        "rpent_dexteleop.toolkit",
+        reason="paired RPent integration wheel is not installed",
+    )
+    DexTeleopToolExposurePolicy = toolkit_module.DexTeleopToolExposurePolicy
+    DexTeleopToolkit = toolkit_module.DexTeleopToolkit
+    application, state = _build_application(monkeypatch)
+    profile = _history_profile()
+    bundle = build_mujoco_agent_tcp_pose_contract_bundle(
+        application=application,
+        history_profile=profile,
+    )
+
+    with SQLitePlanningHistoryStore(
+        root=(tmp_path / "paired-planning-history").resolve(),
+        binding=bundle.history_source_binding,
+        limits=profile.store_limits,
+    ) as store:
+        session = assemble_mujoco_agent_tcp_pose_gateway_session(
+            application=application,
+            contract_bundle=bundle,
+            allowed_client_ids=("rpent:history-fixture",),
+            planning_history_store=store,
+            owns_planning_history_store=True,
+        )
+        assert session.history_recorder is not None
+        assert session.history_recorder.capture_once() is not None
+        state["time"] = 11.0
+        state["pose"][0] = 0.2
+        facade = session.wire_adapter(
+            authenticated_client_id="rpent:history-fixture"
+        )
+        parameters = {
+            "component_ids": ["right_arm"],
+            "reference_frame_id": "right_arm_base",
+            "controlled_frame_id": "tool_tcp",
+            "history_window_ms": 5_000,
+            "max_samples": 4,
+        }
         toolkit = DexTeleopToolkit(
             client=SimpleNamespace(
                 get_skill_definition_catalog=facade.get_skill_definition_catalog,

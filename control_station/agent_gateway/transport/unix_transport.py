@@ -27,7 +27,6 @@ from typing import Any
 
 from .wire_adapter import BoundAgentGatewayWireAdapter
 
-
 AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1 = "dexteleop.agent_gateway.unix_json.v1"
 AGENT_GATEWAY_UNIX_JSON_METHODS_V1 = frozenset(
     {

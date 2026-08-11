@@ -4,15 +4,7 @@ The package itself starts no simulator, device, transport, or motion.  Concrete
 application leaves may bind the authoritative worker port explicitly.
 """
 
-from .access_policy import (
-    AGENT_SKILL_GRANT_REQUIRED_TIERS_V1,
-    AgentSkillAccessPolicy,
-    SkillAccessDecision,
-    SkillExecutionGrant,
-    assess_skill_request_access,
-    issue_skill_execution_grant,
-)
-from .contracts import (
+from .protocol.contracts import (
     AGENT_CONTROL_REASON_CODES_V1,
     AGENT_OWN_DOMAIN_HOLD_REQUEST_HASH_DOMAIN_V1,
     AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1,
@@ -38,29 +30,14 @@ from .contracts import (
     AgentOwnOperationQuery,
     AgentSkillOperation,
     AgentSkillRequest,
-    agent_skill_request_from_json,
     agent_own_domain_hold_request_from_json,
     agent_own_operation_cancel_request_from_json,
     agent_own_operation_query_from_json,
+    agent_skill_request_from_json,
     agent_skill_schema_snapshot_document,
     agent_skill_schema_snapshot_json,
 )
-from .operation_port import (
-    AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1,
-    AGENT_GATEWAY_PORT_OPERATION_KINDS_V1,
-    AGENT_GATEWAY_PORT_RECEIPT_HASH_DOMAIN_V1,
-    AgentGatewayAuthoritativePortReceipt,
-    AgentGatewayNoIoPortReceipt,
-    AgentDomainControlPort,
-    AgentSkillExecutionPort,
-    AgentSkillOperationPort,
-    AgentSkillOperationPortReceipt,
-    DeterministicNoIoAgentSkillOperationPort,
-    NoIoAgentSkillOperationPort,
-    NullAgentSkillOperationPort,
-)
-from .executor_registry import SkillExecutorBinding, SkillExecutorRegistry
-from .evaluation_contracts import (
+from .protocol.evaluation_contracts import (
     AGENT_SKILL_AGGREGATE_VERDICTS_V1,
     AGENT_SKILL_EVALUATION_VERDICTS_V1,
     AGENT_SKILL_EVALUATOR_KINDS_V1,
@@ -71,26 +48,7 @@ from .evaluation_contracts import (
     SkillEvaluatorSpec,
     assess_evaluation_receipts,
 )
-from .operation_store import (
-    AGENT_GATEWAY_CONTROL_KINDS_V1,
-    AGENT_GATEWAY_OPERATION_ID_HASH_DOMAIN_V1,
-    BoundedInMemoryAgentSkillOperationStore,
-    OperationStoreOutcome,
-)
-from .payload_validation import (
-    AgentSkillPayloadValidatorRegistry,
-    AgentSkillPayloadValidatorSet,
-    ContextualResultPayloadValidator,
-    PayloadValidator,
-)
-from .passive_read_executor import (
-    PASSIVE_READ_EXECUTION_RECEIPT_HASH_DOMAIN_V1,
-    PassiveReadExecutionReceipt,
-    PassiveReadLaunchReceipt,
-    PassiveReadResult,
-    PassiveReadSkillExecutor,
-)
-from .motion_schemas import (
+from .protocol.motion_schemas import (
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
     REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
@@ -101,7 +59,26 @@ from .motion_schemas import (
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
 )
-from .state_schemas import (
+from .protocol.skill_catalog import (
+    AGENT_SKILL_CONTROL_EFFECT_CLASSES_V1,
+    AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_POLICIES_V1,
+    AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V1,
+    AGENT_SKILL_INTENDED_TARGET_KINDS_V1,
+    AGENT_SKILL_KINDS_V1,
+    AgentSkillSchemaCatalog,
+    AgentSkillSchemaEntry,
+    CrossTargetDeploymentReviewRef,
+    SkillDefinition,
+    SkillDefinitionCatalog,
+    SkillDeploymentBindingRef,
+    SkillExecutionRoute,
+    SkillParameterProfileRef,
+    SkillRouteManifest,
+    SkillRouteManifestEntry,
+    agent_skill_schema_document_hash,
+    validate_skill_route_catalog_closure,
+)
+from .protocol.state_schemas import (
     AGENT_STATE_HISTORY_SLICE_HASH_DOMAIN_V1,
     AGENT_STATE_SCHEMA_KINDS_V1,
     TCP_POSE_HISTORY_STATE_SKILL_ID_V1,
@@ -115,6 +92,76 @@ from .state_schemas import (
     validate_agent_state_parameters_v1,
     validate_agent_state_result_v1,
     validate_agent_state_route_schema_v1,
+)
+from .runtime.access_policy import (
+    AGENT_SKILL_GRANT_REQUIRED_TIERS_V1,
+    AgentSkillAccessPolicy,
+    SkillAccessDecision,
+    SkillExecutionGrant,
+    assess_skill_request_access,
+    issue_skill_execution_grant,
+)
+from .runtime.executor_registry import SkillExecutorBinding, SkillExecutorRegistry
+from .runtime.operation_port import (
+    AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1,
+    AGENT_GATEWAY_PORT_OPERATION_KINDS_V1,
+    AGENT_GATEWAY_PORT_RECEIPT_HASH_DOMAIN_V1,
+    AgentDomainControlPort,
+    AgentGatewayAuthoritativePortReceipt,
+    AgentGatewayNoIoPortReceipt,
+    AgentSkillExecutionPort,
+    AgentSkillOperationPort,
+    AgentSkillOperationPortReceipt,
+    DeterministicNoIoAgentSkillOperationPort,
+    NoIoAgentSkillOperationPort,
+    NullAgentSkillOperationPort,
+)
+from .runtime.operation_store import (
+    AGENT_GATEWAY_CONTROL_KINDS_V1,
+    AGENT_GATEWAY_OPERATION_ID_HASH_DOMAIN_V1,
+    BoundedInMemoryAgentSkillOperationStore,
+    OperationStoreOutcome,
+)
+from .runtime.passive_read_executor import (
+    PASSIVE_READ_EXECUTION_RECEIPT_HASH_DOMAIN_V1,
+    PassiveReadExecutionReceipt,
+    PassiveReadLaunchReceipt,
+    PassiveReadResult,
+    PassiveReadSkillExecutor,
+)
+from .runtime.payload_validation import (
+    AgentSkillPayloadValidatorRegistry,
+    AgentSkillPayloadValidatorSet,
+    ContextualResultPayloadValidator,
+    PayloadValidator,
+)
+from .runtime.reusable_station_executor import (
+    ReusableStationAgentSkillOperationExecutor,
+    StationOperationLifecycleFactory,
+)
+from .runtime.service import (
+    AgentGatewayControlPlaneOutcome,
+    AgentGatewayObservationOutcome,
+    AgentGatewayOperationOutcome,
+    AgentGatewayService,
+    AgentGatewaySubmission,
+    NoIoAgentGatewayService,
+)
+from .runtime.station_operation_worker import (
+    STATION_OPERATION_WORKER_STATES_V1,
+    BoundedStationAgentSkillOperationWorker,
+    StationLifecycleActivationEvidence,
+    StationLifecycleControlEvidence,
+    StationLifecycleEvaluationCompletion,
+    StationLifecycleExecutionCompletion,
+    StationOperationLaunchReceipt,
+    StationOperationWorkerBinding,
+    StationSkillOperationLifecycle,
+)
+from .runtime.station_revision import (
+    AGENT_STATION_CONTROL_FINGERPRINT_HASH_DOMAIN_V1,
+    AgentStationRevisionObservation,
+    AgentStationRevisionTracker,
 )
 from .task_schemas import (
     CUBE_LIFT_AGGREGATION_POLICY_HASH_V1,
@@ -142,55 +189,7 @@ from .task_schemas import (
     validate_cube_lift_sim_route_v1,
     validate_cube_lift_task_evaluation_v1,
 )
-from .skill_catalog import (
-    AGENT_SKILL_CONTROL_EFFECT_CLASSES_V1,
-    AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_POLICIES_V1,
-    AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V1,
-    AGENT_SKILL_INTENDED_TARGET_KINDS_V1,
-    AGENT_SKILL_KINDS_V1,
-    AgentSkillSchemaCatalog,
-    AgentSkillSchemaEntry,
-    CrossTargetDeploymentReviewRef,
-    SkillDefinition,
-    SkillDefinitionCatalog,
-    SkillDeploymentBindingRef,
-    SkillExecutionRoute,
-    SkillParameterProfileRef,
-    SkillRouteManifest,
-    SkillRouteManifestEntry,
-    agent_skill_schema_document_hash,
-    validate_skill_route_catalog_closure,
-)
-from .service import (
-    AgentGatewayControlPlaneOutcome,
-    AgentGatewayObservationOutcome,
-    AgentGatewayOperationOutcome,
-    AgentGatewayService,
-    AgentGatewaySubmission,
-    NoIoAgentGatewayService,
-)
-from .station_operation_worker import (
-    STATION_OPERATION_WORKER_STATES_V1,
-    BoundedStationAgentSkillOperationWorker,
-    StationLifecycleActivationEvidence,
-    StationLifecycleControlEvidence,
-    StationLifecycleEvaluationCompletion,
-    StationLifecycleExecutionCompletion,
-    StationOperationLaunchReceipt,
-    StationOperationWorkerBinding,
-    StationSkillOperationLifecycle,
-)
-from .reusable_station_executor import (
-    ReusableStationAgentSkillOperationExecutor,
-    StationOperationLifecycleFactory,
-)
-from .station_revision import (
-    AGENT_STATION_CONTROL_FINGERPRINT_HASH_DOMAIN_V1,
-    AgentStationRevisionObservation,
-    AgentStationRevisionTracker,
-)
-from .wire_adapter import BoundAgentGatewayWireAdapter
-from .unix_transport import (
+from .transport.unix_transport import (
     AGENT_GATEWAY_UNIX_JSON_METHODS_V1,
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
     DEFAULT_AGENT_GATEWAY_UNIX_MAX_FRAME_BYTES,
@@ -202,7 +201,7 @@ from .unix_transport import (
     AgentGatewayUnixPeerCredentials,
     AgentGatewayUnixProtocolError,
 )
-
+from .transport.wire_adapter import BoundAgentGatewayWireAdapter
 
 __all__ = [
     "AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1",

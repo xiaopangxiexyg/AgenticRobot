@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -382,9 +381,9 @@ def test_graph_factory_rejects_non_dedicated_target_config_before_scene_load() -
         )
 
 
-def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
+def _build_no_model_contract_bundle_fixture(
     monkeypatch,
-) -> None:
+):
     _profile, action_schema = _profile_and_schema()
     observation_plan = SimpleNamespace(
         enabled=True,
@@ -506,6 +505,15 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
         application=application
     )
+    return application, runtime, direct, bundle, captured_manifest_args
+
+
+def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
+    monkeypatch,
+) -> None:
+    application, _runtime, _direct, bundle, captured_manifest_args = (
+        _build_no_model_contract_bundle_fixture(monkeypatch)
+    )
     motion_entry = bundle.route_manifest.route(
         "motion.move_tcp_to_pose",
         "1",
@@ -582,13 +590,42 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     )
     assert motion_application.closed
 
-    rpent_root = (
-        Path(__file__).resolve().parents[2] / "HierachicalVLA" / "RPent"
+
+@pytest.mark.integration
+@pytest.mark.optional
+def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
+    monkeypatch,
+) -> None:
+    client_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.client",
+        reason="paired RPent integration wheel is not installed",
     )
-    assert (rpent_root / "robots" / "dexteleop" / "toolkit.py").is_file()
-    sys.path.insert(0, str(rpent_root))
-    from robots.dexteleop.client import InMemoryDexTeleopGatewayClient
-    from robots.dexteleop.toolkit import DexTeleopToolkit
+    toolkit_module = pytest.importorskip(
+        "rpent_dexteleop.toolkit",
+        reason="paired RPent integration wheel is not installed",
+    )
+    InMemoryDexTeleopGatewayClient = (
+        client_module.InMemoryDexTeleopGatewayClient
+    )
+    DexTeleopToolkit = toolkit_module.DexTeleopToolkit
+    _application, runtime, direct, bundle, _captured_manifest_args = (
+        _build_no_model_contract_bundle_fixture(monkeypatch)
+    )
+    motion_entry = bundle.route_manifest.route(
+        "motion.move_tcp_to_pose",
+        "1",
+    )
+    parameters = {
+        "pose_targets_by_component": {
+            "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
+        },
+        "reference_frame_id": "right_arm_base",
+        "reference_frame_spec_hash": "frame-spec:right-arm-base",
+        "controlled_frame_id": "tool_tcp",
+        "frame_graph_hash": "frame-graph:fixture",
+        "tool_config_hash": "tool-config:fixture",
+        "calibration_hash": "calibration:agent-motion-bundle-fixture",
+    }
 
     source_slot = bundle.station_manifest.source_slots[0]
     snapshot = AgentObservationSnapshot(

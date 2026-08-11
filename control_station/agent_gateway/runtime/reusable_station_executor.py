@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, Protocol
 
-from .contracts import AgentSkillOperation, AgentSkillRequest
+from ..protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from .operation_port import AgentGatewayAuthoritativePortReceipt
 from .station_operation_worker import (
     BoundedStationAgentSkillOperationWorker,

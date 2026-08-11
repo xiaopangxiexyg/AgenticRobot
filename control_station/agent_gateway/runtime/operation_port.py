@@ -16,7 +16,7 @@ from typing import Protocol, runtime_checkable
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .contracts import AgentSkillOperation, AgentSkillRequest
+from ..protocol.contracts import AgentSkillOperation, AgentSkillRequest
 
 AGENT_GATEWAY_PORT_RECEIPT_HASH_DOMAIN_V1 = (
     "dexteleop.agent_gateway.no_io_port_receipt.v1"

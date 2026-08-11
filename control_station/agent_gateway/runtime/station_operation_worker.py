@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
-from .contracts import (
+from ..protocol.contracts import (
     AGENT_SKILL_EVALUATION_STATUSES_V1,
     AGENT_SKILL_TASK_OUTCOMES_V1,
     AgentSkillOperation,

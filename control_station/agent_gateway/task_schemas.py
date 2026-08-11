@@ -15,12 +15,11 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .evaluation_contracts import (
+from .protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
 )
-from .payload_validation import AgentSkillPayloadValidatorSet
-from .skill_catalog import (
+from .protocol.skill_catalog import (
     AgentSkillSchemaEntry,
     SkillDefinition,
     SkillDeploymentBindingRef,
@@ -28,7 +27,7 @@ from .skill_catalog import (
     SkillParameterProfileRef,
     agent_skill_schema_document_hash,
 )
-
+from .runtime.payload_validation import AgentSkillPayloadValidatorSet
 
 CUBE_LIFT_SKILL_ID_V1 = "task.cube_lift"
 CUBE_LIFT_SIM_ROUTE_ID_V1 = "sim.mujoco.cube_lift.policy_only"

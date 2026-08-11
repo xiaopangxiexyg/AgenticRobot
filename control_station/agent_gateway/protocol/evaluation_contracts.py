@@ -23,7 +23,6 @@ from .skill_catalog import (
     validate_version,
 )
 
-
 AGENT_SKILL_EVALUATOR_KINDS_V1 = (
     "environment",
     "external",
