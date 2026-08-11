@@ -13,10 +13,24 @@ from sim.contracts import SceneSpec
 from robot_motion.replay.control_schedule import (
     DEFAULT_POSITION_QPOS_CONTROL_HZ,
     DEFAULT_REPLAY_REFERENCE_HZ,
+    REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC,
+    REPLAY_QPOS_EXECUTION_MODES,
     ReplayControlAction,
     ReplayControlTick,
     iter_position_qpos_control_ticks,
+    normalize_replay_qpos_execution_mode,
     validate_replay_rate,
+)
+from robot_motion.position_control import (
+    JointHorizonLimits,
+    OFFLINE_WAYPOINT_TIMING_MODES,
+    OfflineWaypointTrajectoryInfeasibleError,
+)
+from robot_motion.rm65 import (
+    RM65_ABSOLUTE_Q_MAX_RAD,
+    RM65_ABSOLUTE_Q_MIN_RAD,
+    RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
+    RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
 )
 
 from ..config import default_camera_registry_path
@@ -143,6 +157,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Final position-command rate. --command-hz is an alias; --control-hz "
             "remains for compatibility."
         ),
+    )
+    parser.add_argument(
+        "--qpos-execution-mode",
+        choices=REPLAY_QPOS_EXECUTION_MODES,
+        default="legacy_linear",
+        help=(
+            "QPOS replay interpolation. legacy_linear preserves the existing "
+            "action->reference->command path. continuous_quintic is an "
+            "offline-only, exact-waypoint C2 trajectory with a continuous "
+            "RM65 q/v/a/jerk certificate."
+        ),
+    )
+    parser.add_argument(
+        "--qpos-continuous-jerk-ramp-sec",
+        type=float,
+        default=0.05,
+        help=(
+            "continuous_quintic jerk limit is RM65 max acceleration divided "
+            "by this positive ramp time. Ignored by legacy_linear."
+        ),
+    )
+    parser.add_argument(
+        "--qpos-continuous-timing-mode",
+        choices=OFFLINE_WAYPOINT_TIMING_MODES,
+        default="strict_fixed_timing",
+        help=(
+            "strict_fixed_timing rejects an infeasible recorded cadence; "
+            "safe_retime_global preserves every qpos waypoint and uniformly "
+            "slows playback until the continuous certificate passes."
+        ),
+    )
+    parser.add_argument(
+        "--qpos-continuous-max-time-scale",
+        type=float,
+        default=4.0,
+        help="Maximum slowdown permitted by safe_retime_global.",
     )
     parser.add_argument(
         "--no-final-control-settle",
@@ -712,6 +762,9 @@ def _write_replay_metadata(
         "urdf_path": args.urdf,
         "mode": args.mode,
         "qpos_source": args.qpos_source,
+        "qpos_execution_mode": args.qpos_execution_mode,
+        "qpos_continuous_timing_mode": args.qpos_continuous_timing_mode,
+        "qpos_continuous_max_time_scale": args.qpos_continuous_max_time_scale,
         "total_rows": total_rows,
         "selected_rows": selected_rows,
         "planned_reference_frames": planned_reference_frames,
@@ -735,6 +788,7 @@ def _write_replay_metadata(
                 "fixed_rate_first_tick_at_or_after_final_settle_deadline"
             ),
             "reference_command_tie_break": "accept_reference_before_command_emit",
+            "qpos_execution_mode": args.qpos_execution_mode,
         },
         "speed": args.speed,
         "inactive_sources": inactive_sources,
@@ -787,6 +841,17 @@ def run(args: argparse.Namespace) -> None:
     )
     reference_hz = validate_replay_rate(float(args.reference_hz), name="reference_hz")
     control_hz = validate_replay_rate(float(args.control_hz), name="control_hz")
+    qpos_execution_mode = normalize_replay_qpos_execution_mode(
+        args.qpos_execution_mode
+    )
+    jerk_ramp_sec = float(args.qpos_continuous_jerk_ramp_sec)
+    if not np.isfinite(jerk_ramp_sec) or jerk_ramp_sec <= 0.0:
+        raise SystemExit("--qpos-continuous-jerk-ramp-sec must be finite and positive.")
+    max_time_scale = float(args.qpos_continuous_max_time_scale)
+    if not np.isfinite(max_time_scale) or max_time_scale < 1.0:
+        raise SystemExit(
+            "--qpos-continuous-max-time-scale must be finite and at least 1.0."
+        )
     sim_timestep_sec = float(args.dt) if float(args.dt) > 0.0 else 1.0 / control_hz
     if not np.isfinite(sim_timestep_sec) or sim_timestep_sec <= 0.0:
         raise SystemExit("--dt must be finite and positive, or 0 to use 1 / --control-hz.")
@@ -942,12 +1007,46 @@ def run(args: argparse.Namespace) -> None:
                 )
         gripper_samples.append(gripper_sample)
 
-    control_ticks = iter_position_qpos_control_ticks(
-        control_actions,
-        reference_hz=reference_hz,
-        control_hz=control_hz,
-        include_final_settle=not bool(args.no_final_control_settle),
-    )
+    continuous_limits = None
+    if qpos_execution_mode == REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC:
+        side_count = len(active_sides)
+        acceleration = np.tile(
+            np.asarray(RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2, dtype=float),
+            side_count,
+        )
+        continuous_limits = JointHorizonLimits(
+            min_position_rad=np.tile(
+                np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float),
+                side_count,
+            ),
+            max_position_rad=np.tile(
+                np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float),
+                side_count,
+            ),
+            max_velocity_rad_s=np.tile(
+                np.asarray(RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S, dtype=float),
+                side_count,
+            ),
+            max_acceleration_rad_s2=acceleration,
+            max_jerk_rad_s3=acceleration / jerk_ramp_sec,
+        )
+    try:
+        control_ticks = iter_position_qpos_control_ticks(
+            control_actions,
+            reference_hz=reference_hz,
+            control_hz=control_hz,
+            include_final_settle=not bool(args.no_final_control_settle),
+            execution_mode=qpos_execution_mode,
+            continuous_limits=continuous_limits,
+            continuous_timing_mode=args.qpos_continuous_timing_mode,
+            continuous_max_time_scale=max_time_scale,
+        )
+    except OfflineWaypointTrajectoryInfeasibleError as exc:
+        raise SystemExit(
+            "continuous qpos replay rejected the fixed source timing: "
+            f"{exc}. Use legacy_linear for the unchanged baseline; do not "
+            "send an uncertified trajectory to hardware."
+        ) from exc
     # Reference indices are contiguous. Some references can be accepted and
     # preempted between command ticks when users choose reference_hz >
     # control_hz, so counting only indices visible on emitted ticks would
@@ -970,6 +1069,10 @@ def run(args: argparse.Namespace) -> None:
                 "reference_hz": reference_hz,
                 "control_hz": control_hz,
                 "command_hz": control_hz,
+                "qpos_execution_mode": qpos_execution_mode,
+                "qpos_continuous_jerk_ramp_sec": jerk_ramp_sec,
+                "qpos_continuous_timing_mode": args.qpos_continuous_timing_mode,
+                "qpos_continuous_max_time_scale": max_time_scale,
                 "sim_timestep_sec": sim_timestep_sec,
                 "planned_reference_frames": planned_reference_frames,
                 "planned_control_ticks": len(control_ticks),

@@ -23,6 +23,7 @@ from control_composition.lifecycle.session import (
 from .contracts import StationOperationResult
 from .publication_barrier import (
     StationPublicationBarrier,
+    StationPublicationBarrierObserverPort,
     StationPublicationBarrierSnapshot,
 )
 
@@ -65,21 +66,16 @@ class CompositionSessionController(CompositionSessionRegistry):
         self.publication_barrier = StationPublicationBarrier(
             source_slot_id=self.composer_source_slot_id
         )
-        self._barrier_observer: Callable[..., object] | None = None
-        self._observed_barrier_keys: set[tuple[str, str]] = set()
+        self._barrier_observer_port = StationPublicationBarrierObserverPort(
+            suppress_callback_errors=False
+        )
 
     def bind_publication_barrier_observer(
         self,
         observer: Callable[..., object],
     ) -> None:
-        if not callable(observer):
-            raise TypeError("Publication barrier observer must be callable.")
         with self._lock:
-            if self._barrier_observer is not None:
-                raise RuntimeError(
-                    "Publication barrier observer is already bound."
-                )
-            self._barrier_observer = observer
+            self._barrier_observer_port.bind(observer)
 
     def observe_publication_barrier(
         self,
@@ -95,20 +91,12 @@ class CompositionSessionController(CompositionSessionRegistry):
             )
         if snapshot.source_slot_id != self.composer_source_slot_id:
             raise ValueError("Publication barrier source slot mismatch.")
-        observer = self._barrier_observer
-        if observer is None:
-            return
-        key = (snapshot.semantic_content_hash, str(causal_station_fact_id))
-        with self._lock:
-            if key in self._observed_barrier_keys:
-                return
-            observer(
-                snapshot,
-                causal_station_fact_id=causal_station_fact_id,
-                occurred_at=occurred_at,
-                clock_domain_id=clock_domain_id,
-            )
-            self._observed_barrier_keys.add(key)
+        self._barrier_observer_port.observe(
+            snapshot,
+            causal_station_fact_id=causal_station_fact_id,
+            occurred_at=occurred_at,
+            clock_domain_id=clock_domain_id,
+        )
 
     def disable_publication(
         self,

@@ -19,6 +19,8 @@ class UmiControlState:
     plus_save_in_flight: bool = False
     foot_pad_online: bool = False
     foot_pad_test_active: bool = False
+    dataset_reconfiguration_available: bool = True
+    episode_deletion_available: bool = True
 
 
 def active_controls(state: UmiControlState) -> list[str]:
@@ -27,17 +29,24 @@ def active_controls(state: UmiControlState) -> list[str]:
     if not isinstance(state, UmiControlState):
         raise TypeError("state must be a UmiControlState.")
     if state.calibration_expired:
-        controls = ["q", "task_select", "umi_recalibrate", "angle_recalibrate"]
+        if state.recording:
+            return ["q", "episode_stop"]
+        controls = ["q", "umi_recalibrate", "angle_recalibrate"]
+        if state.dataset_reconfiguration_available:
+            controls.append("task_select")
         if state.plus_save_available:
             controls.append("plus_curation_save")
         return controls
 
     controls: list[str] = []
     if not state.recording:
-        controls.append("task_select")
+        if state.dataset_reconfiguration_available:
+            controls.append("task_select")
         if not state.collection_blocked:
             controls.append("episode_start")
-        controls.extend(["episode_delete", "device_retry"])
+        if state.episode_deletion_available:
+            controls.append("episode_delete")
+        controls.append("device_retry")
     else:
         controls.append("episode_stop")
     controls.append("q")

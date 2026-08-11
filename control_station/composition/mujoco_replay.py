@@ -11,7 +11,6 @@ the source adapter.  Real targets and production entrypoints remain excluded.
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -48,6 +47,7 @@ from ..contracts import (
 )
 from ..publication_barrier import (
     StationPublicationBarrier,
+    StationPublicationBarrierObserverPort,
     StationPublicationBarrierSnapshot,
 )
 from ..runtime import ControlStationRuntime, StationOperationExecution
@@ -568,10 +568,9 @@ class ScopedMujocoReplayStationComposition:
         self.publication_barrier = StationPublicationBarrier(
             source_slot_id=self.source_adapter.subject_id
         )
-        self._barrier_transition_observer: Callable[..., object] | None = None
-        self._barrier_observer_failure_count = 0
-        self._barrier_observer_lock = threading.RLock()
-        self._observed_barrier_transition_keys: set[tuple[str, str]] = set()
+        self._barrier_observer_port = StationPublicationBarrierObserverPort(
+            suppress_callback_errors=True
+        )
 
     @property
     def station(self) -> ControlStationRuntime:
@@ -608,13 +607,9 @@ class ScopedMujocoReplayStationComposition:
         }
 
     def bind_publication_barrier_observer(self, observer: Callable[..., object]) -> None:
-        if not callable(observer):
-            raise TypeError("publication barrier observer must be callable.")
-        if self._barrier_transition_observer is not None:
-            raise RuntimeError("Publication barrier observer is already bound.")
         if self._station.state.state_revision != 0:
             raise RuntimeError("Publication barrier observer must bind before use.")
-        self._barrier_transition_observer = observer
+        self._barrier_observer_port.bind(observer)
 
     def _observe_barrier_transition(
         self,
@@ -624,23 +619,12 @@ class ScopedMujocoReplayStationComposition:
         occurred_at: float,
         clock_domain_id: str,
     ) -> None:
-        observer = self._barrier_transition_observer
-        if observer is None:
-            return
-        key = (snapshot.semantic_content_hash, str(causal_station_fact_id))
-        with self._barrier_observer_lock:
-            if key in self._observed_barrier_transition_keys:
-                return
-            try:
-                observer(
-                    snapshot,
-                    causal_station_fact_id=causal_station_fact_id,
-                    occurred_at=occurred_at,
-                    clock_domain_id=clock_domain_id,
-                )
-                self._observed_barrier_transition_keys.add(key)
-            except Exception:
-                self._barrier_observer_failure_count += 1
+        self._barrier_observer_port.observe(
+            snapshot,
+            causal_station_fact_id=causal_station_fact_id,
+            occurred_at=occurred_at,
+            clock_domain_id=clock_domain_id,
+        )
 
     def prepare_pending_operation(self, transition: ControlStationTransition) -> None:
         if transition.receipt.status != "operation_requested":

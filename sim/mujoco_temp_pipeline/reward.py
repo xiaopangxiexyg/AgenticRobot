@@ -15,6 +15,8 @@ def shape_rewards(
     raw_rewards: np.ndarray,
     config: RewardShapingConfig,
     safety_projection_alpha: np.ndarray | None = None,
+    safety_intervention: np.ndarray | None = None,
+    safety_collision_category: np.ndarray | None = None,
     resting_cube_z_m: np.ndarray | float | None = None,
     lift_delta_m: float = 0.08,
     success: np.ndarray | None = None,
@@ -28,6 +30,7 @@ def shape_rewards(
     outer_contact_score: np.ndarray | None = None,
     previous_inner_contact_score: np.ndarray | None = None,
     previous_bilateral_inner_contact_score: np.ndarray | None = None,
+    task_action: np.ndarray | None = None,
     accepted_action: np.ndarray | None = None,
     approach_action: np.ndarray | None = None,
     time_limit: np.ndarray | None = None,
@@ -47,14 +50,19 @@ def shape_rewards(
     current_state = CubeLiftRewardState.from_flat(current)
     previous_state.validate_batch(raw.shape[0])
     current_state.validate_batch(raw.shape[0])
-    if accepted_action is None:
+    if task_action is not None and accepted_action is not None:
+        raise ValueError("Pass task_action or legacy accepted_action, not both.")
+    selected_task_action = (
+        task_action if task_action is not None else accepted_action
+    )
+    if selected_task_action is None:
         accepted = current_state.last_action
     else:
-        accepted = np.asarray(accepted_action, dtype=np.float32)
+        accepted = np.asarray(selected_task_action, dtype=np.float32)
         if accepted.shape != (raw.shape[0], 7):
-            raise ValueError("accepted_action must have shape (N, 7).")
+            raise ValueError("task_action must have shape (N, 7).")
         if not np.all(np.isfinite(accepted)):
-            raise ValueError("accepted_action must be finite.")
+            raise ValueError("task_action must be finite.")
     if approach_action is None:
         scripted_approach = np.zeros((raw.shape[0], 7), dtype=np.float32)
     else:
@@ -546,7 +554,41 @@ def shape_rewards(
         if projection_alpha.shape != raw.shape:
             raise ValueError("safety_projection_alpha must match the reward batch.")
         projection_alpha = np.clip(projection_alpha, 0.0, 1.0)
+    if safety_intervention is None:
+        intervened = np.zeros_like(raw)
+    else:
+        intervened = np.asarray(
+            safety_intervention, dtype=np.float32
+        ).reshape(-1)
+        if intervened.shape != raw.shape:
+            raise ValueError("safety_intervention must match the reward batch.")
+        intervened = np.clip(intervened, 0.0, 1.0)
     safety_term = -config.safety_projection_penalty * (1.0 - projection_alpha)
+    safety_intervention_term = (
+        -config.safety_intervention_penalty * intervened
+    )
+    if safety_collision_category is None:
+        category_penalty = np.zeros_like(raw)
+    else:
+        categories = np.asarray(
+            safety_collision_category, dtype=object
+        ).reshape(-1)
+        if categories.shape != raw.shape:
+            raise ValueError(
+                "safety_collision_category must match the reward batch."
+            )
+        category_penalty = np.asarray(
+            [
+                config.safety_collision_category_penalties.get(
+                    str(category), 0.0
+                )
+                if category is not None
+                else 0.0
+                for category in categories
+            ],
+            dtype=np.float32,
+        )
+    safety_collision_category_term = -category_penalty * intervened
     shaped = (
         reach_term
         + reach_progress_term
@@ -577,8 +619,15 @@ def shape_rewards(
         + failure_termination_term
         + unsafe_termination_term
         + safety_term
+        + safety_intervention_term
+        + safety_collision_category_term
         if config.enabled
-        else raw + safety_term
+        else (
+            raw
+            + safety_term
+            + safety_intervention_term
+            + safety_collision_category_term
+        )
     )
     return shaped.astype(np.float32), {
         "distance_m": current_distance.astype(np.float32),
@@ -650,6 +699,12 @@ def shape_rewards(
         "failure_termination_term": failure_termination_term.astype(np.float32),
         "unsafe_termination_term": unsafe_termination_term.astype(np.float32),
         "safety_projection_term": safety_term.astype(np.float32),
+        "safety_intervention_term": safety_intervention_term.astype(
+            np.float32
+        ),
+        "safety_collision_category_term": (
+            safety_collision_category_term.astype(np.float32)
+        ),
     }
 
 

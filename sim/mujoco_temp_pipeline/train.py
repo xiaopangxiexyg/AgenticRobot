@@ -14,14 +14,25 @@ import numpy as np
 import torch
 
 from .checkpoint import (
+    build_warm_start_exploration_schedule,
     build_policy_from_checkpoint,
     check_task_config_compatibility,
     expand_cube_pose_policy_state,
-    file_sha256,
     save_checkpoint,
+    task_config_sha256,
+    transfer_actor_state,
+    transfer_policy_action_components,
     scale_pose_action_head_for_doubled_step,
 )
-from .config import PPOConfig, RewardShapingConfig
+from .bootstrap import (
+    collect_goal_delta_bootstrap_dataset,
+    fit_goal_delta_actor_bootstrap,
+)
+from .config import (
+    GoalDeltaActorBootstrapConfig,
+    PPOConfig,
+    RewardShapingConfig,
+)
 from .normalization import RunningMeanStd
 from .ppo import PPOSmokeTrainer
 from .records import RunRecorder
@@ -53,17 +64,33 @@ def initialize_policy_weights(
         checkpoint,
         device=trainer.device,
     )
+    critic_topology_changed = (
+        (
+            restored.critic_observation_dim,
+            restored.separate_critic_backbone,
+        )
+        != (
+            trainer.policy.critic_observation_dim,
+            trainer.policy.separate_critic_backbone,
+        )
+    )
     compatibility = check_task_config_compatibility(
         payload,
         task_config_path,
         allow_mismatch=True,
         allow_cube_pose_observation_expansion=True,
+        allow_policy_action_component_transfer=True,
+        allow_policy_action_transform_transfer=True,
+        allow_task_action_conditioning_transfer=True,
+    )
+    action_component_transfer = compatibility.get(
+        "policy_action_component_transfer"
     )
     if (
         restored.environment_action_dim != trainer.policy.environment_action_dim
         or restored.active_action_indices
         != trainer.policy.active_action_indices
-    ):
+    ) and not isinstance(action_component_transfer, Mapping):
         raise ValueError(
             "Warm-start checkpoint policy action mapping is incompatible: "
             f"checkpoint={restored.active_action_indices}/"
@@ -71,7 +98,43 @@ def initialize_policy_weights(
             f"runtime={trainer.policy.active_action_indices}/"
             f"{trainer.policy.environment_action_dim}. Start a fresh checkpoint."
         )
-    if bool(compatibility.get("cube_pose_observation_expansion", False)):
+    if bool(compatibility.get("cube_pose_observation_expansion", False)) and isinstance(
+        action_component_transfer, Mapping
+    ):
+        raise ValueError(
+            "A warm start cannot expand observations and remap action "
+            "components in the same transfer. Use one explicit stage at a time."
+        )
+    if isinstance(action_component_transfer, Mapping):
+        shared = transfer_policy_action_components(
+            restored,
+            trainer.policy,
+            source_components=tuple(
+                str(value)
+                for value in action_component_transfer[
+                    "checkpoint_components"
+                ]
+            ),
+            target_components=tuple(
+                str(value)
+                for value in action_component_transfer["runtime_components"]
+            ),
+        )
+        if normalizer.mean.shape != (trainer.observation_dim,):
+            raise ValueError(
+                "Action component transfer requires an unchanged observation "
+                f"shape; checkpoint={normalizer.mean.shape}, "
+                f"runtime={(trainer.observation_dim,)}."
+            )
+        trainer.observation_normalizer = normalizer
+        action_component_transfer = {
+            **dict(action_component_transfer),
+            "transferred_components": shared,
+        }
+        compatibility["policy_action_component_transfer"] = (
+            action_component_transfer
+        )
+    elif bool(compatibility.get("cube_pose_observation_expansion", False)):
         # Preserve the learned 28-D actor while adding the seven new cube-pose
         # inputs.  The new first-layer columns are zeroed, and the arm output
         # head is made conservative because v5 doubles the physical pose step.
@@ -94,15 +157,91 @@ def initialize_policy_weights(
         expanded_normalizer.clip = normalizer.clip
         trainer.observation_normalizer = expanded_normalizer
     else:
-        trainer.policy.load_state_dict(restored.state_dict())
+        if critic_topology_changed:
+            transfer_actor_state(restored, trainer.policy)
+        else:
+            trainer.policy.load_state_dict(restored.state_dict())
         trainer.observation_normalizer = normalizer
+    exploration_schedule: dict[str, object] | None = None
+    checkpoint_metadata = payload.get("task_metadata")
+    checkpoint_learning = (
+        checkpoint_metadata.get("learning_contract")
+        if isinstance(checkpoint_metadata, Mapping)
+        else None
+    )
+    source_components = (
+        tuple(
+            str(value)
+            for value in checkpoint_learning.get(
+                "policy_action_components",
+                (),
+            )
+        )
+        if isinstance(checkpoint_learning, Mapping)
+        else ()
+    )
+    target_components = tuple(
+        trainer.task_config.resolved_policy_action_components
+    )
+    if (
+        len(source_components) == restored.action_dim
+        and len(target_components) == trainer.action_dim
+        and any(component in source_components for component in target_components)
+    ):
+        initial_log_std, final_log_std = (
+            build_warm_start_exploration_schedule(
+                source_log_std=(
+                    restored.log_std.detach().cpu().numpy()
+                ),
+                source_components=source_components,
+                target_components=target_components,
+                configured_initial_log_std=(
+                    trainer.config.initial_log_std
+                ),
+                configured_final_log_std=trainer.config.final_log_std,
+                new_action_log_std_cap=(
+                    trainer.config.warm_start_new_action_log_std_cap
+                ),
+            )
+        )
+        exploration_schedule = trainer.configure_exploration_schedule(
+            initial_log_std,
+            final_log_std,
+            source="checkpoint_named_components",
+        )
     if bool(compatibility.get("task_config_mismatch", False)):
         # Keep the actor as a warm start, but do not reuse value estimates
         # from a different transition/reward contract.
         trainer.policy.reset_critic()
+    elif (
+        trainer.critic_observation_normalizer is not None
+        and not critic_topology_changed
+    ):
+        critic_normalizer_state = payload.get(
+            "critic_observation_normalizer"
+        )
+        if not isinstance(critic_normalizer_state, Mapping):
+            raise ValueError(
+                "Privileged-critic warm start is missing its independent "
+                "critic observation normalizer."
+            )
+        critic_normalizer = RunningMeanStd.from_state(
+            critic_normalizer_state
+        )
+        if critic_normalizer.mean.shape != (
+            trainer.critic_observation_dim,
+        ):
+            raise ValueError(
+                "Critic observation normalizer shape does not match runtime: "
+                f"checkpoint={critic_normalizer.mean.shape}, "
+                f"runtime={(trainer.critic_observation_dim,)}."
+            )
+        trainer.critic_observation_normalizer = critic_normalizer
     return {
         "path": str(Path(checkpoint).resolve()),
         "source_global_step": int(payload.get("global_step", 0)),
+        "critic_topology_changed": critic_topology_changed,
+        "exploration_schedule": exploration_schedule,
         **compatibility,
     }
 
@@ -173,6 +312,17 @@ def format_training_progress(
             f" rgbstd={_format_metric(record.get('wrist_rgb_std'), decimals=1)}"
             f" rgbok={_format_metric(100.0 * float(record.get('wrist_rgb_health_rate', 0.0) or 0.0), decimals=1, suffix='%')}"
         )
+    action_health = ""
+    if record.get("action_conditioning_scale_mean") is not None:
+        action_health = (
+            " act="
+            f"{_format_metric(record.get('policy_action_abs_mean'))}"
+            " sat="
+            f"{_format_metric(100.0 * float(record.get('policy_action_saturation_rate', 0.0) or 0.0), decimals=1, suffix='%')}"
+            " ascale="
+            f"{_format_metric(record.get('action_conditioning_scale_mean'))}"
+            " "
+        )
     return (
         f"[train] steps={step:,}/{total:,} ({progress:5.1f}%) "
         f"u={int(record.get('update', 0)):04d} "
@@ -187,6 +337,7 @@ def format_training_progress(
         f"close={_format_metric(record.get('reward_gripper_close_mean'))} "
         f"contact={_format_metric(100.0 * float(record.get('reward_bilateral_contact_mean', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"lift={_format_metric(record.get('reward_lift_fraction_mean'))} "
+        f"{action_health}"
         f"proj={_format_metric(100.0 * float(record.get('safety_projection_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"reject={_format_metric(100.0 * float(record.get('safety_rejection_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"clr={int(record.get('clearance_violation_count', 0))} "
@@ -200,6 +351,10 @@ def format_training_progress(
         f"std={_format_metric(record.get('policy_std_mean'))} "
         f"loss={_format_metric(record.get('policy_loss'), decimals=3)} "
         f"v={_format_metric(record.get('value_loss'), decimals=3)} "
+        f"vclip={_format_metric(100.0 * float(record.get('value_clip_fraction', 0.0) or 0.0), decimals=1, suffix='%')} "
+        f"ev={_format_metric(record.get('explained_variance'), decimals=3)} "
+        f"grad={_format_metric(record.get('actor_grad_norm'), decimals=2)}/"
+        f"{_format_metric(record.get('critic_grad_norm'), decimals=2)} "
         f"kl={_format_metric(record.get('approx_kl'), decimals=2, scientific=True)} "
         f"stop={_format_metric(100.0 * float(record.get('ppo_early_stop_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"ckpt={checkpoint}"
@@ -263,10 +418,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "without restoring optimizer state or training counters."
         ),
     )
+    parser.add_argument(
+        "--goal-delta-bootstrap-transitions",
+        type=int,
+        default=0,
+        help=(
+            "Optionally initialize the xyz actor from its deployable "
+            "reach-target-delta feature before PPO. Zero (default) keeps "
+            "random PPO initialization."
+        ),
+    )
+    parser.add_argument(
+        "--goal-delta-bootstrap-epochs",
+        type=int,
+        default=80,
+    )
+    parser.add_argument(
+        "--goal-delta-bootstrap-minibatch-size",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        "--goal-delta-bootstrap-learning-rate",
+        type=float,
+        default=1e-3,
+    )
+    parser.add_argument(
+        "--goal-delta-bootstrap-target-mse",
+        type=float,
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--goal-delta-bootstrap-lift-step-m",
+        type=float,
+        default=0.004,
+        help=(
+            "Actor-visible Pick teacher z increment after measured closure; "
+            "ignored by Reach and Contact bootstrap profiles."
+        ),
+    )
+    parser.add_argument(
+        "--goal-delta-bootstrap-pick-close-distance-m",
+        type=float,
+        default=0.035,
+        help="Pick teacher distance for beginning and then maintaining closure.",
+    )
     parser.add_argument("--record-root", type=Path, default=DEFAULT_RECORD_ROOT)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--total-timesteps", type=int, default=200_000)
-    parser.add_argument("--num-envs", type=int, default=16)
+    parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--rollout-steps", type=int, default=128)
     parser.add_argument("--update-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=512)
@@ -289,19 +489,65 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Bound normalized advantages for numerical robustness.",
     )
+    parser.add_argument(
+        "--value-clip-coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Optionally clip value updates around rollout predictions; zero "
+            "preserves the validated shared-backbone baseline."
+        ),
+    )
+    parser.add_argument(
+        "--actor-reference-mse-coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Optionally anchor PPO's deterministic actor output to the "
+            "post-initialization actor using deployable observations only."
+        ),
+    )
     parser.add_argument("--initial-log-std", type=float, default=-0.5)
     parser.add_argument("--final-log-std", type=float, default=-2.5)
     parser.add_argument("--std-anneal-fraction", type=float, default=0.75)
     parser.add_argument(
+        "--warm-start-new-action-log-std-cap",
+        type=float,
+        default=-1.5,
+        help=(
+            "Maximum initial log std for action components added by a named "
+            "checkpoint transfer; shared components retain checkpoint std."
+        ),
+    )
+    parser.add_argument(
         "--effective-action-for-ppo",
         action="store_true",
         help=(
-            "For safety/post-contact-modified transitions, recompute PPO's "
-            "old log-probability on the compact action that was actually "
-            "accepted by the simulator."
+            "Deprecated and rejected: projected/executed actions cannot "
+            "replace PPO's sampled latent action."
         ),
     )
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument(
+        "--critic-observation-mode",
+        choices=("actor", "privileged_training_state"),
+        default="actor",
+        help=(
+            "Use the deployable actor observation for the critic (default), "
+            "or opt in to a separate simulator-only 31-D training critic."
+        ),
+    )
+    parser.add_argument(
+        "--critic-backbone-mode",
+        choices=("separate", "shared_actor"),
+        default="shared_actor",
+        help=(
+            "Share the actor representation for same-observation training "
+            "(default), or isolate value gradients with an independent "
+            "critic encoder. Privileged critic input always selects the "
+            "independent encoder."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--start-method", default="spawn", choices=("spawn", "forkserver"))
@@ -350,58 +596,172 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         target_kl=args.target_kl,
         max_log_ratio=args.max_log_ratio,
         advantage_clip=args.advantage_clip,
+        value_clip_coef=args.value_clip_coef,
+        actor_reference_mse_coef=args.actor_reference_mse_coef,
         initial_log_std=args.initial_log_std,
         final_log_std=args.final_log_std,
         std_anneal_fraction=args.std_anneal_fraction,
+        warm_start_new_action_log_std_cap=(
+            args.warm_start_new_action_log_std_cap
+        ),
         effective_action_for_ppo=args.effective_action_for_ppo,
         hidden_dim=args.hidden_dim,
+        critic_observation_mode=args.critic_observation_mode,
+        critic_backbone_mode=args.critic_backbone_mode,
         seed=args.seed,
         checkpoint_interval=args.checkpoint_interval,
         start_method=args.start_method,
         device=args.device,
     )
+    bootstrap_config = GoalDeltaActorBootstrapConfig(
+        transitions=args.goal_delta_bootstrap_transitions,
+        epochs=args.goal_delta_bootstrap_epochs,
+        minibatch_size=args.goal_delta_bootstrap_minibatch_size,
+        learning_rate=args.goal_delta_bootstrap_learning_rate,
+        target_mse=args.goal_delta_bootstrap_target_mse,
+        lift_step_m=args.goal_delta_bootstrap_lift_step_m,
+        pick_close_distance_m=(
+            args.goal_delta_bootstrap_pick_close_distance_m
+        ),
+    )
     task_config = CubeLiftTaskConfig.load(args.task_config)
     reward_values = dict(task_config.reward_shaping)
     reward_values["enabled"] = not args.no_reward_shaping
     reward_config = RewardShapingConfig.from_dict(reward_values)
+    model_cache_dir = (
+        None
+        if args.model_cache_dir is None
+        else str(args.model_cache_dir)
+    )
+    bootstrap_dataset = (
+        collect_goal_delta_bootstrap_dataset(
+            bootstrap_config,
+            task_config_path=str(args.task_config),
+            num_envs=ppo_config.num_envs,
+            seed=ppo_config.seed,
+            start_method=ppo_config.start_method,
+            model_cache_dir=model_cache_dir,
+        )
+        if bootstrap_config.enabled
+        else None
+    )
     trainer = PPOSmokeTrainer(
         ppo_config,
         reward_config,
         task_config_path=str(args.task_config),
-        model_cache_dir=(
-            None if args.model_cache_dir is None else str(args.model_cache_dir)
-        ),
+        model_cache_dir=model_cache_dir,
         require_wrist_rgb_health=bool(args.require_rgb_health),
     )
-    initialization = (
-        None
-        if args.init_checkpoint is None
-        else initialize_policy_weights(
-            trainer,
-            args.init_checkpoint,
-            task_config_path=args.task_config,
+    try:
+        checkpoint_initialization = (
+            None
+            if args.init_checkpoint is None
+            else initialize_policy_weights(
+                trainer,
+                args.init_checkpoint,
+                task_config_path=args.task_config,
+            )
         )
-    )
+        if bootstrap_dataset is not None:
+            (
+                trainer.observation_normalizer,
+                bootstrap_initialization,
+            ) = fit_goal_delta_actor_bootstrap(
+                trainer.policy,
+                bootstrap_dataset,
+                bootstrap_config,
+                device=trainer.device,
+            )
+            if checkpoint_initialization is None:
+                policy_initialization: dict[str, object] = {
+                    "type": "goal_delta_actor_bootstrap",
+                    **bootstrap_initialization,
+                }
+            else:
+                policy_initialization = {
+                    "type": (
+                        "checkpoint_warm_start_then_goal_delta_actor_bootstrap"
+                    ),
+                    "checkpoint_warm_start": checkpoint_initialization,
+                    "goal_delta_actor_bootstrap": bootstrap_initialization,
+                }
+        elif checkpoint_initialization is not None:
+            policy_initialization = {
+                "type": "checkpoint_warm_start",
+                **checkpoint_initialization,
+            }
+        else:
+            policy_initialization = {"type": "random"}
+        if float(ppo_config.actor_reference_mse_coef) > 0.0:
+            if policy_initialization["type"] == "random":
+                raise ValueError(
+                    "actor_reference_mse_coef requires an initialization "
+                    "checkpoint or goal-delta bootstrap."
+                )
+            actor_reference = trainer.capture_actor_reference(
+                source=str(policy_initialization["type"]),
+            )
+        else:
+            actor_reference = {
+                "enabled": False,
+                "source": None,
+                "mse_coefficient": 0.0,
+                "uses_privileged_observation": False,
+            }
+    except BaseException:
+        # Initialization failures happen before the main training finally
+        # block. Close vector workers here so a bad bootstrap/checkpoint cannot
+        # strand process-local MuJoCo models in host memory.
+        trainer.close()
+        raise
+    learning_metadata = build_learning_metadata(trainer.task_config)
     recorder = RunRecorder(
         args.record_root,
         run_name=args.run_name,
         config={
             "schema_version": "dexteleop.sim.mujoco_temp_ppo_run.v1",
             "ppo": ppo_config.to_dict(),
+            "goal_delta_actor_bootstrap": bootstrap_config.to_dict(),
             "reward_shaping": reward_config.to_dict(),
             "task_config": str(Path(args.task_config).resolve()),
-            "task_config_sha256": file_sha256(args.task_config),
+            "task_config_sha256": task_config_sha256(args.task_config),
             "task_metadata": trainer.task_config.to_metadata(),
-            "learning_contract": build_learning_metadata(trainer.task_config),
+            "learning_contract": learning_metadata,
             "policy_action_mapping": {
                 "policy_action_dim": trainer.action_dim,
                 "environment_action_dim": trainer.environment_action_dim,
                 "active_action_indices": list(
                     trainer.active_action_indices
                 ),
+                "policy_action_components": list(
+                    trainer.policy_action_transform.policy_components
+                ),
+                "task_action_components": list(
+                    trainer.policy_action_transform.task_components
+                ),
+                "transform_id": trainer.policy_action_transform.transform_id,
+                "transform_hash": (
+                    trainer.policy_action_transform.semantic_content_hash
+                ),
+            },
+            "exploration_schedule": trainer.exploration_schedule_metadata,
+            "actor_reference": actor_reference,
+            "observation_ownership": {
+                "task_observation_dim": trainer.task_observation_dim,
+                "actor_observation_dim": trainer.observation_dim,
+                "actor_observation_fields": list(
+                    trainer.learning_model_input_binding.input_fields
+                ),
+                "actor_uses_privileged": bool(
+                    learning_metadata["actor_uses_privileged"]
+                ),
+                "critic_observation_mode": trainer.critic_observation_mode,
+                "critic_observation_dim": trainer.critic_observation_dim,
+                "critic_backbone_mode": trainer.critic_backbone_mode,
             },
             "checkpoint_target": str(Path(args.checkpoint).resolve()),
-            "initialization_checkpoint": initialization,
+            "initialization_checkpoint": checkpoint_initialization,
+            "policy_initialization": policy_initialization,
             "model_cache_dir": (
                 None if args.model_cache_dir is None else str(Path(args.model_cache_dir).resolve())
             ),
@@ -425,6 +785,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     "task": trainer.task_config.name,
                     "policy_class": trainer.task_config.policy_class,
                     "observation_dim": trainer.observation_dim,
+                    "task_observation_dim": trainer.task_observation_dim,
+                    "critic_observation_mode": trainer.critic_observation_mode,
+                    "critic_observation_dim": trainer.critic_observation_dim,
+                    "critic_backbone_mode": trainer.critic_backbone_mode,
                     "policy_action_dim": trainer.action_dim,
                     "environment_action_dim": trainer.environment_action_dim,
                     "active_action_indices": list(
@@ -504,13 +868,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "policy_log_std_mean": float(
                     trainer.policy.log_std.detach().mean().cpu()
                 ),
+                "policy_log_std_by_component": (
+                    trainer.policy.log_std.detach().cpu().numpy().astype(float).tolist()
+                ),
                 "policy_action_dim": trainer.action_dim,
                 "environment_action_dim": trainer.environment_action_dim,
+                **rollout.action_diagnostics,
                 "learning_rate": float(trainer.optimizer.param_groups[0]["lr"]),
                 "safety_projection_rate": rollout.safety_projection_rate,
                 "safety_rejection_rate": rollout.safety_rejection_rate,
                 "safety_recovery_rate": rollout.safety_recovery_rate,
                 "safety_projection_alpha_mean": rollout.safety_projection_alpha_mean,
+                **{
+                    f"safety_collision_{category}_rate": rate
+                    for category, rate in (
+                        rollout.safety_collision_category_rates.items()
+                    )
+                },
+                "downstream_action_modified_rate": (
+                    rollout.effective_action_override_rate
+                ),
+                "task_to_admitted_action_delta_mean": (
+                    rollout.effective_action_delta_mean
+                ),
                 "effective_action_override_rate": (
                     rollout.effective_action_override_rate
                 ),
@@ -523,6 +903,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ),
                 "scripted_pregrasp_action_modified_rate": (
                     rollout.scripted_pregrasp_action_modified_rate
+                ),
+                "scripted_contact_action_modified_rate": (
+                    rollout.scripted_contact_action_modified_rate
                 ),
                 "safety_minimum_distance_m": rollout.safety_minimum_distance_m,
                 "hard_penetration_count": rollout.hard_penetration_count,
@@ -557,22 +940,30 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     policy=trainer.policy,
                     optimizer=trainer.optimizer,
                     observation_normalizer=trainer.observation_normalizer,
+                    critic_observation_normalizer=(
+                        trainer.critic_observation_normalizer
+                    ),
                     ppo_config=ppo_config,
                     reward_config=reward_config,
                     global_step=trainer.global_step,
                     update=trainer.update_index,
                     task_config_path=args.task_config,
+                    policy_initialization=policy_initialization,
                 )
                 save_checkpoint(
                     recorder.checkpoint_directory / f"step_{trainer.global_step:09d}.pt",
                     policy=trainer.policy,
                     optimizer=trainer.optimizer,
                     observation_normalizer=trainer.observation_normalizer,
+                    critic_observation_normalizer=(
+                        trainer.critic_observation_normalizer
+                    ),
                     ppo_config=ppo_config,
                     reward_config=reward_config,
                     global_step=trainer.global_step,
                     update=trainer.update_index,
                     task_config_path=args.task_config,
+                    policy_initialization=policy_initialization,
                 )
                 while next_checkpoint <= trainer.global_step:
                     next_checkpoint += ppo_config.checkpoint_interval
@@ -602,22 +993,30 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             policy=trainer.policy,
             optimizer=trainer.optimizer,
             observation_normalizer=trainer.observation_normalizer,
+            critic_observation_normalizer=(
+                trainer.critic_observation_normalizer
+            ),
             ppo_config=ppo_config,
             reward_config=reward_config,
             global_step=trainer.global_step,
             update=trainer.update_index,
             task_config_path=args.task_config,
+            policy_initialization=policy_initialization,
         )
         run_checkpoint = save_checkpoint(
             recorder.checkpoint_directory / f"step_{trainer.global_step:09d}_final.pt",
             policy=trainer.policy,
             optimizer=trainer.optimizer,
             observation_normalizer=trainer.observation_normalizer,
+            critic_observation_normalizer=(
+                trainer.critic_observation_normalizer
+            ),
             ppo_config=ppo_config,
             reward_config=reward_config,
             global_step=trainer.global_step,
             update=trainer.update_index,
             task_config_path=args.task_config,
+            policy_initialization=policy_initialization,
         )
         elapsed = time.monotonic() - started
         summary = {
@@ -637,6 +1036,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "torch_cuda_version": torch.version.cuda,
             "cuda_available": torch.cuda.is_available(),
             "reward_shaping": reward_config.enabled,
+            "task_observation_dim": trainer.task_observation_dim,
+            "actor_observation_dim": trainer.observation_dim,
+            "critic_observation_mode": trainer.critic_observation_mode,
+            "critic_observation_dim": trainer.critic_observation_dim,
+            "policy_initialization": policy_initialization,
+            "actor_reference": actor_reference,
         }
         recorder.finish(summary)
         return summary

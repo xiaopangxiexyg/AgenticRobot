@@ -1,5 +1,9 @@
 """UMI-specific Control Station application policy."""
 
+from .application_policy import (
+    DEFAULT_STATION_UMI_OPERATOR_POLICY,
+    StationUmiOperatorPolicy,
+)
 from .control_availability import UmiControlState, active_controls
 from .input_mapping import (
     UmiOperatorEvent,
@@ -8,6 +12,8 @@ from .input_mapping import (
 )
 
 __all__ = [
+    "DEFAULT_STATION_UMI_OPERATOR_POLICY",
+    "StationUmiOperatorPolicy",
     "UmiControlState",
     "UmiOperatorEvent",
     "active_controls",

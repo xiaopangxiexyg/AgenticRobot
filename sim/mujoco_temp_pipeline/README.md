@@ -5,6 +5,22 @@ Cube-Lift fast/vector environment. It is not the long-term model architecture.
 Execution backends, actuator profiles, timing and task physics live under
 `sim/mujoco`; this package only supplies temporary PPO/checkpoint tooling.
 
+The policy and simulator action spaces are deliberately separate:
+
+```text
+PPO latent action (1D / 3D / 4D / 7D)
+  -> task-owned deterministic component mapping
+  -> complete normalized pose action [xyz, rotvec, gripper] (7D)
+  -> task phase conditioning
+  -> pose IK and collision-safety admission
+  -> actuator/contact response
+```
+
+PPO always stores the sampled latent value and its original log probability.
+Conditioned, admitted, and measured actions are diagnostics/reward inputs only;
+`--effective-action-for-ppo` is retained as a rejected migration flag because
+rewriting an on-policy sample after safety projection is not valid PPO.
+
 The task already controls only the right arm and right gripper: physical-policy
 configs use a 7-D pose action containing three normalized right-TCP translation
 increments, three base-frame rotation-vector increments, and one right-gripper
@@ -28,6 +44,265 @@ response. Normal v2 selects a separately hashed Cube-Lift contact variant that
 changes only simulator friction after the settled reset; the tuple is not
 hardware force identification. Simulator-only dense-reward features are passed
 through a separate training channel and never enter the normal observation.
+Task observations and actor inputs are also separate contracts. An explicit
+`policy_observation_fields` allowlist may omit object pose or RGB even when the
+environment carries those fields for diagnostics and ablation comparisons.
+
+The default critic consumes the same deployable observation and shares the
+actor representation. Matched Reach probes learned materially faster with this
+sample-efficient topology than with two independent encoders. The established
+unclipped value update remains the default; optional
+`--value-clip-coef 0.2` experiments are recorded with their actual clip rate
+and explained variance, but did not improve consistently across matched CPU
+Reach probes. An independent same-observation critic remains available as an
+isolation ablation via `--critic-backbone-mode separate`; its actor and critic
+gradient norms are clipped independently.
+
+The optional `--critic-observation-mode privileged_training_state` instead
+feeds an automatically separate critic a 31-D simulator-state input. It never
+changes the actor input, actor backbone, or deployment inference path;
+checkpoints record both normalizers independently. This is asymmetric training
+assistance, not a runtime requirement.
+
+## Task suite
+
+New profiles compose from versioned physical baselines while retaining a
+dependency-aware hash. They are intended to be learned and evaluated in this
+order:
+
+| Profile | Objective | PPO latent | Public task output | Reset |
+| --- | --- | --- | --- | --- |
+| `rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json` | fixed-spawn reach baseline | xyz (3D) | pose+gripper (7D) | home; proprio actor |
+| `rm65_right_cube_reach_pose_xyz_v1.json` | randomized reach | xyz (3D) | pose+gripper (7D) | home; proprio+object-estimator actor |
+| `rm65_right_cube_reach_goal_delta_xyz_v2.json` | randomized reach, deployable goal-relative ablation | xyz (3D) | pose+gripper (7D) | home; proprio+base-frame target delta actor |
+| `rm65_right_cube_reach_goal_delta_progress_xyz_v3.json` | randomized reach, progress-only reward | xyz (3D) | pose+gripper (7D) | home; proprio+base-frame target delta actor |
+| `rm65_right_cube_reach_goal_delta_overhead_progress_xyz_v4.json` | experimental overhead-guided reach with coarse-to-fine TCP steps | xyz (3D) | pose+gripper (7D), full xyz far / 0.35 scale at target | home; proprio+smooth overhead target delta actor |
+| `rm65_right_cube_reach_safe_hover_goal_delta_xyz_v1.json` | collision-aware 10 cm hover reach | xyz (3D) | pose+gripper (7D) | home; five clear steps required for success |
+| `rm65_right_cube_reach_safe_pregrasp_goal_delta_xyz_v1.json` | collision-aware 4 cm pre-grasp reach | xyz (3D) | pose+gripper (7D) | home; five clear steps required for success |
+| `rm65_right_cube_contact_acquire_fixed_pose_xyz_gripper_proprio_v1.json` | fixed-spawn contact baseline | xyz+gripper (4D) | pose+gripper (7D) | open pre-grasp; proprio actor |
+| `rm65_right_cube_contact_acquire_pose_xyz_gripper_v1.json` | randomized contact acquisition | xyz+gripper (4D) | pose+gripper (7D) | open pre-grasp; proprio+object-estimator actor |
+| `rm65_right_cube_contact_acquire_goal_delta_overhead_xyz_gripper_v2.json` | Reach-v4-compatible randomized contact bridge | xyz+gripper (4D) | pose+gripper (7D), coarse-to-fine xyz / independent gripper | open pre-grasp; proprio+smooth target-delta actor |
+| `rm65_right_cube_contact_acquire_goal_delta_overhead_xyz_gripper_v3.json` | lower-projection randomized contact bridge | xyz+gripper (4D) | pose+gripper (7D), close-phase xy=0.1 / z=0.025 | open pre-grasp; proprio+smooth target-delta actor |
+| `rm65_right_cube_contact_quality_goal_delta_xyz_gripper_v1.json` | inner-surface bilateral-contact acquisition | xyz+gripper (4D) | pose+gripper (7D) | pre-grasp; outer contact cannot substitute for grasp |
+| `rm65_right_cube_contact_descend_close_pose_z_gripper_v1.json` | centered descend and close | z+gripper (2D) | pose+gripper (7D) | open pre-grasp; proprio actor |
+| `rm65_right_cube_lift_short_pose_z_proprio_v1.json` | short 2 cm lift | z (1D) | pose+gripper (7D) | physical contact; proprio actor |
+| `rm65_right_cube_lift_short_positive_z_proprio_v2.json` | short 2 cm lift without a zero-action shortcut | z (1D) | pose+gripper (7D), negative z admitted as hold | physical contact; proprio actor |
+| `rm65_right_cube_lift_hold_pose_z_v1.json` | lift and hold an established grasp | z (1D) | pose+gripper (7D) | physical contact; proprio actor |
+| `rm65_right_cube_pick_pose_xyz_gripper_v1.json` | fixed-spawn full-pick integration | xyz+gripper (4D) | pose+gripper (7D) | open pre-grasp; proprio actor |
+| `rm65_right_cube_pick_pose_xyz_gripper_estimator_v1.json` | fixed-spawn estimator-input ablation | xyz+gripper (4D) | pose+gripper (7D) | open pre-grasp; proprio+object-estimator actor |
+| `rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json` | randomized end-to-end 3 cm pick from home | xyz+gripper (4D) | direct pose+gripper (7D) | home, about 38 cm from cube; proprio+target-delta actor |
+| `rm65_right_cube_pick_goal_delta_xyz_gripper_v3.json` | collision/contact-quality constrained 3 cm pick | xyz+gripper (4D) | direct pose+gripper (7D) | home; three clear steps plus inner-contact quality |
+| `rm65_right_tall_block_pick_goal_delta_xyz_gripper_v1.json` | 30x30x50 mm clearance curriculum | xyz+gripper (4D) | direct pose+gripper (7D) | home; separate hashed physical contract |
+
+The estimator profiles receive a simulator ground-truth proxy under an
+explicit source contract. This represents the external estimator interface,
+not privileged-policy permission or deployability proof. Every stage has a
+proprio-only fixed-scene baseline; randomized object placement is rejected at
+config load time unless the actor explicitly binds RGB, object pose, or a
+derived target delta. The goal-delta Reach profile converts estimated object
+pose plus measured-qpos RM65 forward kinematics into the same right-base frame
+used by xyz pose actions. Its 3-D feature is real-computable and non-privileged,
+and the Sim-HIL adapter reconstructs the same feature from the MuJoCo object
+pose and measured TCP pose before emitting the public absolute-pose action.
+The real-robot external estimator/FK source and its calibration are not wired
+or proven by this simulation adapter.
+The progress-only v3 Reach profile removes the old per-step absolute proximity
+reward. A stationary policy therefore receives no dense reach return; only
+measured reduction in target distance and terminal success are positive. This
+avoids making a long hover at 7--8 cm competitive with reaching the target.
+The experimental v4 profile retains that reward and final success target, but
+changes the actor-visible delta to a smooth geometric approach target. Far from
+the cube it aims 12 cm above the cube; inside an 8 cm horizontal radius it
+smoothly descends to the final 3 cm target. The feature uses only the external
+object position and measured TCP/base pose, so it is available to the normal
+actor and Sim-HIL without a collision oracle or simulator reward state. Its
+task-owned latent decoder keeps the full normalized xyz range outside an 8 cm
+target-delta radius, then smoothly reduces the multiplier to 0.35 at zero
+distance. At the inherited 12 mm TCP scale this means up to 12 mm per axis far
+from the target and 4.2 mm per axis at zero distance. Rotation and gripper
+remain zero. The decoder is observation-conditioned and checkpoint-hashed; it
+replaces the rejected fixed global action cap so long-range motion is not
+slowed unconditionally. The bootstrap teacher inverts the same decoder before
+supervising the PPO latent action. This profile is a bounded collision-avoidance
+candidate, not evidence that Reach or grasping is solved.
+Training records and evaluation JSON report latent-action absolute mean and
+saturation rate (`|a| >= 0.95`) separately from the public 7-D task-action
+absolute mean. They
+also report the distance-conditioned scale mean/minimum and the fraction of
+steps where it is below one. These are diagnostics only: PPO log-probabilities
+remain attached to the sampled latent action.
+The Contact v2/v3 bridge preserves Reach v4's actor observation and dynamic xyz
+decoder contracts, then adds one independently decoded gripper latent. This
+allows a named-component warm start to reuse the deployable backbone and xyz
+actor-head rows while leaving the new gripper row fresh and resetting the
+critic. Contact success, reward, and the open-pregrasp reset remain task-owned;
+no contact or collision signal is added to the actor input.
+Inside 3.5 cm of the actor-visible target (or after measured close reaches
+0.1), its task-owned decoder applies an additional 0.1 multiplier to xyz while
+leaving gripper unchanged. A frozen 16-seed feasibility sweep selected this
+point: 0.0 correction lost most grasps, while full correction succeeded only
+by repeatedly asking the table-collision projector to truncate motion. The
+0.1 setting retained 16/16 scripted success with no hard penetration and the
+lowest projection/rejection rates among the successful isotropic settings.
+Contact v3 keeps that 0.1 lateral correction but reduces close-phase z to
+0.025. In the frozen 16-seed axis sweep it retained 16/16 success while
+reducing projection/rejection from 38.4%/16.9% to 24.4%/9.6%; setting z to
+zero failed 14/16, so v3 preserves a small vertical correction instead of
+masking the axis entirely. The actor still outputs the same xyz-plus-gripper
+latent and the public action remains the real-aligned 7-D pose delta.
+A frozen seed-101 v3 adaptation (4096 PPO steps, actor-only warm start from the
+v2 checkpoint, separate non-privileged critic, learning rate 1e-4) retained
+32/32 deterministic successes on evaluation seeds starting at 20000, with no
+hard penetration or clearance failure. Projection/rejection were 25.1%/10.7%
+versus v2's 37.0%/15.5%; mean episode length increased from 37.4 to 68.4 steps.
+The 128-step v3 smoke had lower 21.7%/8.4% rates but took 71.7 steps, so the
+longer PPO adaptation traded some safety margin for speed. It is reported as a
+training-objective limitation, not handled by post-hoc checkpoint selection.
+LiftShort v1 maps latent z from `[-1, 1]` to `[0, 1]`; consequently, a zero
+actor output commands a 0.5 upward step and makes the curriculum artificially
+easy. LiftShort v2 keeps the public 7-D pose contract but maps zero to hold and
+clips only negative executed z at the task boundary. Its physical gate proves
+that zero fails while positive z succeeds. A fixed grid exposed a sharp
+feasibility threshold: z<=0.2 was 0/4 and z>=0.3 was 4/4. With the generic std
+anneal from 0.607 to 0.082, a frozen 4096-step run collapsed to 2/53 training
+successes and 0/8 deterministic evaluation successes. Holding std at 0.607
+instead produced 15/54 training successes and 8/8 deterministic evaluation
+successes in 21 steps, with no hard penetration. Projection/rejection remained
+42.9%/19.0%, so this is a fixed-spawn post-contact curriculum rather than a
+solved lift task. Randomized estimator-input variants were not added: even a
+constant z=1 policy failed some 2--4 mm jitter cases, and a 6 mm case failed
+the scripted-contact reset itself.
+The goal-delta Pick v2 profile closes the previous randomized end-to-end task
+defect. The old actor-visible target was 30 mm above cube center while the
+physically validated closed-grasp target was 22 mm, so PPO was asked to imitate
+an 8 mm-inconsistent goal. The task now uses the 22 mm target everywhere,
+removes observation-conditioned action scaling, starts from home about 38 cm
+from the cube, randomizes cube xy by 6 mm and yaw by 0.15 rad, and requires a
+3 cm lift with bilateral contact. A single actor-visible settling rule holds
+one cycle when the previous public gripper action was close, then lifts by
+4 mm while retaining xy centering. The vector teacher and independent physical
+oracle both passed the frozen eight-seed feasibility sweep. This is MuJoCo
+task evidence, not real grasp-physics or estimator calibration evidence.
+
+### Collision-aware success and curriculum
+
+Object contact is not treated as a generic collision. The safety policy admits
+the intended finger/object and object/table contacts, while arm self-collision
+and robot/table contact remain forbidden and are handled by the canonical pose
+admission projector. The new success constraints are task-owned and default
+off, preserving existing profiles and checkpoints:
+
+- `success_min_safety_clear_policy_steps` requires a consecutive tail of public
+  actions that needed no collision modification. An accepted monotonic recovery
+  from an already marginal state is recorded separately and does not count as a
+  fresh intervention;
+- `success_min_bilateral_inner_contact_score` requires contact on both named
+  inner finger surfaces, and `success_max_outer_contact_score` prevents an
+  outside/side collision from satisfying the grasp predicate;
+- `safety_intervention_penalty` is an optional fixed training cost per action
+  modified by admission, in addition to the existing projection-fraction cost.
+  It does not replace hard collision projection.
+
+The intended non-privileged curriculum is safe hover at 10 cm, safe pre-grasp
+at 4 cm, bilateral inner-contact acquisition, constrained Pick v3, then the
+same Pick objective on the taller block. All stages keep the actor on deployable
+proprioception plus target delta and keep PPO latent xyz or xyz+gripper separate
+from the real-aligned public 7-D pose action. Simulator contact labels are used
+only for reward, success, diagnostics, and an optional teacher; they are not
+required actor observations.
+
+The frozen v2 Pick checkpoint exposes why success alone is insufficient. On 16
+seed-20000 cube episodes it reached 15/16, but 55.2% of actions were modified,
+23.9% were fully rejected, and one hard penetration occurred. Blocking pairs
+were dominated by link2/link4 self-collision and multiple arm, flange, base,
+and finger contacts with the table. A 4096-step reward-only continuation under
+the stricter v3 task regressed to 11/16 with three hard penetrations, so it was
+rejected and did not replace the validated checkpoint.
+
+The taller-block profile is a curriculum rather than a claim that collision is
+solved. The unchanged cube checkpoint achieved 16/16 with no hard penetration
+on its 16-episode seed-20000 evaluation, but still required projection on 52.1%
+of actions. Across four scripted-oracle seeds, the taller block kept 4/4 grasp
+success and reduced mean intervention rate from 56.4% for the cube to 43.7%;
+the remaining self/table interventions must still be learned away.
+When `--init-checkpoint` crosses two of these profiles, only actor-head rows
+with the same named latent component are transferred; new rows stay freshly
+initialized and the critic head is reset. Shared components retain the source
+checkpoint's exploration standard deviation instead of being widened back to
+the fresh-run default. A new component starts at no more than
+`--warm-start-new-action-log-std-cap` (default log std -1.5) and anneals
+independently; this prevents a mature xyz policy and a new gripper dimension
+from being forced through the same broad first-rollout noise. Observation and
+public 7-D action contracts must still match exactly.
+
+### Optional non-privileged Reach/Pick initialization
+
+Goal-relative Reach can be seed-sensitive when a randomly initialized PPO
+actor never discovers the correct near-target direction. An optional,
+default-off actor bootstrap converts the actor-visible base-frame target delta
+to the same xyz latent action for a bounded number of simulated transitions,
+fits only the actor, resets the critic, and then starts ordinary PPO. It does
+not read `training_reward_state`, does not initialize the critic, and does not
+replace the sampled latent actions used by PPO likelihood accounting. Pick may
+use the simulator post-contact phase only inside this optional teacher to label
+lift samples. That phase is never appended to the 31-D actor observation, and
+both evaluation and deployment run without it.
+
+```bash
+python -m sim.mujoco_temp_pipeline.train \
+  --task-config sim/configs/tasks/rm65_right_cube_reach_goal_delta_overhead_progress_xyz_v4.json \
+  --goal-delta-bootstrap-transitions 4096 \
+  --goal-delta-bootstrap-epochs 80 \
+  --critic-backbone-mode separate \
+  --num-envs 2 \
+  --rollout-steps 128 \
+  --minibatch-size 256 \
+  --total-timesteps 25088 \
+  --run-name reach_goal_delta_overhead_progress_bootstrap \
+  --checkpoint /tmp/reach_goal_delta_overhead_progress_bootstrap.pt \
+  --device cpu
+```
+
+For the randomized Pick profile, the validated bounded CPU command is:
+
+```bash
+python -m sim.mujoco_temp_pipeline.train \
+  --task-config sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json \
+  --init-checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_contact_goal_delta_overhead_xyz_gripper_v3_s101.pt \
+  --goal-delta-bootstrap-transitions 4096 \
+  --goal-delta-bootstrap-epochs 120 \
+  --goal-delta-bootstrap-lift-step-m 0.004 \
+  --critic-observation-mode actor \
+  --critic-backbone-mode separate \
+  --num-envs 4 \
+  --rollout-steps 128 \
+  --minibatch-size 256 \
+  --total-timesteps 512 \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_pick_goal_delta_xyz_gripper_v2_s211_bootstrap.pt \
+  --device cpu
+```
+
+The frozen seed-20000 evaluation produced 29/32 deterministic successes, no
+hard penetration, and no clearance violation. An unanchored 8192-step PPO
+continuation regressed to 20/32 with five hard penetrations. The optional
+`--actor-reference-mse-coef` freezes the post-initialization actor and penalizes
+deterministic latent-action drift using the same deployable observations. It is
+default-off and does not make the actor or critic privileged. A coefficient-2
+8192-step ablation retained 28/32 but still did not beat the bootstrap
+checkpoint, so the bootstrap checkpoint remains the current validated model.
+
+Bootstrap collection records its own success, safety-projection, rejection,
+and penetration rates in both `run_config.json` and the checkpoint. A
+successful teacher is only an initialization feasibility check: high safety
+projection still means the PPO/task path needs further collision-aware
+optimization. A Contact curriculum may explicitly combine `--init-checkpoint`
+with goal-delta bootstrap. The recorded initialization receipt then names the
+ordered protocol (checkpoint transfer first, actor-only bootstrap second), so
+the deployable actor provenance remains unambiguous; the critic is reset and
+never initialized from teacher or privileged state.
+For this initialized actor, a separate non-privileged critic is recommended:
+it prevents the initially large value loss from rewriting the actor features.
+This does not change the shared-actor default for fresh PPO runs.
 
 ## Environment
 
@@ -42,6 +317,13 @@ import torch
 print(torch.__version__, torch.version.cuda, torch.cuda.is_available())
 PY
 ```
+
+MuJoCo vector workers keep process-local models, so host memory grows with
+`--num-envs`; GPU availability does not remove that host-RAM cost. Training and
+evaluation now default to four workers. On a memory-pressured workstation use
+two, run only one train/evaluate command at a time, and check `free -h` before
+launching. Do not parallelize multiple evaluation seeds on the same host when
+swap is already active.
 
 ## Short smoke training
 
@@ -60,7 +342,7 @@ python -m sim.mujoco_temp_pipeline.train \
 
 ```bash
 python -m sim.mujoco_temp_pipeline.train \
-  --num-envs 16 \
+  --num-envs 4 \
   --rollout-steps 128 \
   --total-timesteps 200000 \
   --run-name cube_lift_normal_v2 \
@@ -78,7 +360,7 @@ the first physical milestone is a 70 mm bilateral-contact lift. For a full run:
 ```bash
 python -m sim.mujoco_temp_pipeline.train \
   --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json \
-  --num-envs 16 \
+  --num-envs 4 \
   --rollout-steps 128 \
   --total-timesteps 2000000 \
   --run-name cube_lift_normal_v2 \
@@ -118,7 +400,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.train \
   --run-name cube_lift_contact_curriculum_v2 \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_contact_curriculum_v2.pt \
   --total-timesteps 200000 \
-  --num-envs 8 \
+  --num-envs 4 \
   --rollout-steps 128 \
   --device auto
 ```
@@ -135,7 +417,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.train \
   --run-name cube_lift_normal_v2_from_contact \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v2_from_contact.pt \
   --total-timesteps 2000000 \
-  --num-envs 8 \
+  --num-envs 4 \
   --rollout-steps 128 \
   --device auto
 ```
@@ -159,7 +441,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.train \
   --run-name cube_lift_privileged_expert_rgb_v2 \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_privileged_expert_rgb_v2.pt \
   --total-timesteps 2000000 \
-  --num-envs 16 \
+  --num-envs 4 \
   --device auto
 ```
 
@@ -270,7 +552,7 @@ single HTML file back to the debug machine.
 python -m sim.mujoco_temp_pipeline.evaluate \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/latest.pt \
   --episodes 32 \
-  --num-envs 8
+  --num-envs 4
 ```
 
 For an explicit normal checkpoint:
@@ -280,7 +562,19 @@ python -m sim.mujoco_temp_pipeline.evaluate \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v2.pt \
   --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json \
   --episodes 32 \
-  --num-envs 8 \
+  --num-envs 4 \
+  --device cpu
+```
+
+For the current randomized Pick checkpoint:
+
+```bash
+python -m sim.mujoco_temp_pipeline.evaluate \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_pick_goal_delta_xyz_gripper_v2_s211_bootstrap.pt \
+  --task-config sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json \
+  --episodes 32 \
+  --num-envs 4 \
+  --seed 20000 \
   --device cpu
 ```
 
@@ -293,7 +587,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_rgb_v2.pt \
   --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json \
   --episodes 32 \
-  --num-envs 8 \
+  --num-envs 4 \
   --device auto
 ```
 
@@ -304,7 +598,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_rgb_v3.pt \
   --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v3.json \
   --episodes 32 \
-  --num-envs 8 \
+  --num-envs 4 \
   --device auto
 ```
 
@@ -315,7 +609,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_rgb_v4.pt \
   --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json \
   --episodes 32 \
-  --num-envs 8 \
+  --num-envs 4 \
   --device auto
 ```
 
@@ -328,6 +622,18 @@ viewer command is:
 python -m sim.mujoco_temp_pipeline.play \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v2.pt \
   --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json \
+  --episodes 3 \
+  --device cpu \
+  --print-safety-events
+```
+
+To inspect the current randomized Pick checkpoint visually:
+
+```bash
+python -m sim.mujoco_temp_pipeline.play \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_pick_goal_delta_xyz_gripper_v2_s211_bootstrap.pt \
+  --task-config sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json \
+  --seed 20000 \
   --episodes 3 \
   --device cpu \
   --print-safety-events
@@ -383,7 +689,7 @@ run a quantitative headless check first:
 python -m sim.mujoco_temp_pipeline.evaluate \
   --checkpoint sim/mujoco_temp_pipeline/checkpoints/latest.pt \
   --episodes 8 \
-  --num-envs 8 \
+  --num-envs 4 \
   --device cpu \
   --allow-task-config-mismatch
 ```

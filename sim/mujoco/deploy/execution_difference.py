@@ -410,8 +410,8 @@ def project_mujoco_execution_reference_sample(
     available_at: float,
     side_to_component_id: Mapping[str, str],
     component_schema_hash: str,
-    observation_binding_id: str,
-    observation_plan_hash: str,
+    observation_binding_id: str | None,
+    observation_plan_hash: str | None,
     selected_component_ids: tuple[str, ...] | None = None,
 ) -> ExecutionReferenceFrameObservation:
     """Project the exact active qref at one downstream measurement cut."""
@@ -562,8 +562,8 @@ def project_mujoco_immediate_execution_reference_sample(
     available_at: float,
     side_to_component_id: Mapping[str, str],
     component_schema_hash: str,
-    observation_binding_id: str,
-    observation_plan_hash: str,
+    observation_binding_id: str | None,
+    observation_plan_hash: str | None,
     selected_component_ids: tuple[str, ...],
 ) -> ExecutionReferenceFrameObservation:
     """Project the exact active immediate qref reported by the execution Rig."""

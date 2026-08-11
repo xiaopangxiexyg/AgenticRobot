@@ -1,10 +1,11 @@
 """Temporary-PPO contributor adapter for MuJoCo Sim-HIL.
 
-The temporary CubeLift PPO checkpoint is not a generic deploy policy: it emits
-seven normalized values (right TCP xyz/rotvec increments plus a gripper
-increment) and was trained against a 28-value task-local observation.  This
-module keeps those semantics in the temporary pipeline while exposing the
-shared ``PolicyActionEmission`` seam consumed by ``control_station``.
+The temporary CubeLift PPO checkpoint is not a generic deploy policy: its
+latent output can control a task-selected subset such as xyz or z-only.  The
+task-owned transform expands that latent sample into seven normalized values
+(right TCP xyz/rotvec increments plus a gripper increment) before this module
+exposes the shared ``PolicyActionEmission`` seam consumed by
+``control_station``.
 
 It intentionally owns no MuJoCo execution, canonical safety, IK, authority, or
 dispatch.  The only MuJoCo access here is read-only observation/pose anchoring
@@ -29,8 +30,17 @@ from robot_motion.deploy import (
     PolicyActionEmission,
     PolicyDeployRuntime,
     PolicyDeployRuntimeConfig,
+    PolicyExecutionFeedback,
+    PolicyExecutionFeedbackApplication,
 )
 from robot_motion.deploy.action_adapter import DeployRobotActionAdapter
+from robot_motion.deploy.source_projection import (
+    POLICY_SOURCE_ACTION_PROJECTION_METADATA_KEY,
+    POLICY_SOURCE_ACTION_SEQUENTIAL_TARGET_DELTA,
+    POLICY_SOURCE_ANCHOR_PREVIOUS_POLICY_TARGET,
+    PolicySourceActionProjection,
+)
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.deploy.observation import DeploymentObservation
 from robot_motion.deploy.observation_view import PolicyObservationView
 from robot_motion.deploy.schema import (
@@ -47,10 +57,17 @@ from sim.mujoco.tasks.cube_lift.action_conditioning import (
     CubeLiftActionConditioner,
     CubeLiftFingerContactObserver,
 )
+from sim.mujoco.tasks.cube_lift.learning import (
+    build_learning_metadata,
+    build_policy_action_transform,
+    encode_policy_observation,
+)
+from sim.mujoco.tasks.cube_lift.reach_guidance import build_reach_guidance
 from sim.mujoco.tasks.cube_lift.spec import (
     CubeLiftActionSpec,
     CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION,
     CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION,
+    CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION,
     CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION,
 )
 
@@ -95,6 +112,7 @@ def validate_temp_ppo_hil_profile(
     supported_layout_dims = {
         CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION: 28,
         CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION: 35,
+        CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION: 38,
     }
     expected_observation_dim = supported_layout_dims.get(
         task_config.observation_layout
@@ -112,17 +130,23 @@ def validate_temp_ppo_hil_profile(
             "Temporary PPO task dimensions do not match its declared "
             "observation layout."
         )
+    action_transform = build_policy_action_transform(task_config)
+    learning_metadata = build_learning_metadata(task_config)
     if (
-        int(policy.observation_dim) != expected_observation_dim
-        or int(policy.action_dim) != 7
+        int(policy.observation_dim) != int(learning_metadata["model_input_dim"])
+        or int(policy.action_dim) != action_transform.policy_dim
     ):
         raise ValueError(
             "Selected PPO checkpoint dimensions do not match the task "
             "observation layout."
         )
-    if int(policy.environment_action_dim) != 7:
+    if (
+        int(policy.environment_action_dim) != action_transform.task_dim
+        or tuple(policy.active_action_indices) != action_transform.task_indices
+    ):
         raise ValueError(
-            "Temporary PPO checkpoint environment action dim must be 7."
+            "Temporary PPO checkpoint does not match the task-owned "
+            "latent-to-pose action transform."
         )
 
 
@@ -130,12 +154,15 @@ class TempPPOHILObservationAdapter:
     """Project the shared MuJoCo observation into a supported task-local state.
 
     The shared deployment observation remains 38-D so it can pass the common
-    observation firewall.  The task-local 28-D or 35-D PPO state is stored in
-    its prefix and the predictor explicitly consumes that prefix.  Target-error
-    fields are zeroed because reconstructing the old CubeLift internal qpos
-    target before composition would introduce the forbidden second IK owner.
-    Motion deltas advance only on policy-cadence samples, not on every faster
-    Control Station composition tick.
+    observation firewall.  The task-local 28-D, 35-D, or 38-D PPO state is
+    stored in its prefix and the predictor explicitly consumes that prefix.
+    Target-error fields are zeroed because reconstructing the old CubeLift
+    internal qpos target before composition would introduce the forbidden
+    second IK owner.  The optional reach delta is reconstructed from the
+    externally observable object pose and the measured TCP pose in the same
+    right-arm-base frame used by the public pose action.  Motion deltas advance
+    only on policy-cadence samples, not on every faster Control Station
+    composition tick.
     """
 
     def __init__(
@@ -150,6 +177,22 @@ class TempPPOHILObservationAdapter:
         self._previous_qpos: np.ndarray | None = None
         self._previous_close: float | None = None
         self._last_compact_action = np.zeros(7, dtype=np.float32)
+        self._endpoint_to_tool: np.ndarray | None = None
+        if (
+            task_config.observation_layout
+            == CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION
+        ):
+            from robot_motion.rm65 import (
+                endpoint_to_tool_transform,
+                load_rm65_tool_profile,
+            )
+
+            self._endpoint_to_tool = endpoint_to_tool_transform(
+                load_rm65_tool_profile(
+                    task_config.right_tool_profile_path,
+                    side="right",
+                )
+            )
 
     @property
     def last_compact_action(self) -> np.ndarray:
@@ -204,10 +247,11 @@ class TempPPOHILObservationAdapter:
         # 14:20 and 20 are the historical target-error fields.  They remain
         # explicit zero fallbacks until a post-composition target is available.
         compact_state[21:28] = self._last_compact_action
-        if (
-            self.task_config.observation_layout
-            == CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION
-        ):
+        cube_pose: np.ndarray | None = None
+        if self.task_config.observation_layout in {
+            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION,
+        }:
             cube_pose = np.asarray(
                 self.scene.freejoint_qpos(
                     self.task_config.object_freejoint_name
@@ -217,6 +261,41 @@ class TempPPOHILObservationAdapter:
             if cube_pose.shape != (7,) or not np.all(np.isfinite(cube_pose)):
                 raise ValueError("MuJoCo cube freejoint pose is not finite 7-D.")
             compact_state[28:35] = cube_pose
+        if (
+            self.task_config.observation_layout
+            == CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION
+        ):
+            if cube_pose is None or self._endpoint_to_tool is None:
+                raise RuntimeError("Reach-delta observation dependencies are unavailable.")
+            base_pose = np.asarray(
+                self.scene.body_pose(_arm_base_body_name(self.scene, "right")),
+                dtype=float,
+            ).reshape(4, 4)
+            endpoint_pose = np.asarray(
+                self.scene.body_pose(
+                    self.scene.arm_specs["right"].controlled_body
+                ),
+                dtype=float,
+            ).reshape(4, 4)
+            if not np.all(np.isfinite(base_pose)) or not np.all(
+                np.isfinite(endpoint_pose)
+            ):
+                raise ValueError("MuJoCo right-arm-base/TCP poses are not finite.")
+            tool_pose = endpoint_pose @ self._endpoint_to_tool
+            compact_state[35:38] = build_reach_guidance(
+                cube_pose[:3],
+                tool_pose[:3, 3],
+                base_pose[:3, :3],
+                target_height_offset_m=(
+                    self.task_config.reach_target_height_offset_m
+                ),
+                guidance_height_offset_m=(
+                    self.task_config.reach_guidance_height_offset_m
+                ),
+                guidance_xy_blend_radius_m=(
+                    self.task_config.reach_guidance_xy_blend_radius_m
+                ),
+            ).delta_in_base
         if commit_policy_history:
             self._previous_qpos = measured_qpos.copy()
             self._previous_close = measured_close
@@ -253,10 +332,15 @@ class TempPPOHILObservationAdapter:
                 "right_target_error": np.zeros(6, dtype=np.float32),
                 "right_gripper_target_error": 0.0,
                 **(
+                    {"cube_pose": compact_state[28:35].copy()}
+                    if compact_dim in {35, 38}
+                    else {}
+                ),
+                **(
                     {
-                        "cube_pose": compact_state[28:35].copy(),
+                        "reach_target_delta": compact_state[35:38].copy(),
                     }
-                    if compact_dim == 35
+                    if compact_dim == 38
                     else {}
                 ),
             }
@@ -273,10 +357,19 @@ class TempPPOHILObservationAdapter:
 class _TempPPOModel:
     """Strict model-facing wrapper around the temporary ActorCritic."""
 
-    def __init__(self, policy: Any, normalizer: Any, *, observation_dim: int) -> None:
+    def __init__(
+        self,
+        policy: Any,
+        normalizer: Any,
+        action_transform: Any,
+        *,
+        task_config: CubeLiftTaskConfig,
+    ) -> None:
         self.policy = policy
         self.normalizer = normalizer
-        self.observation_dim = int(observation_dim)
+        self.action_transform = action_transform
+        self.task_config = task_config
+        self.task_observation_dim = int(task_config.observation_dim)
         self.device = next(policy.parameters()).device
 
     def predict(self, observation: PolicyObservationView) -> np.ndarray:
@@ -285,13 +378,23 @@ class _TempPPOModel:
         state = np.asarray(observation.model_input()["state"], dtype=np.float32).reshape(-1)
         if state.shape != (38,):
             raise ValueError(f"Shared observation state must be 38-D, got {state.shape}.")
-        compact_state = state[: self.observation_dim]
-        normalized = self.normalizer.normalize(compact_state)
+        compact_state = state[: self.task_observation_dim]
+        actor_state = encode_policy_observation(
+            self.task_config,
+            compact_state,
+        )
+        normalized = self.normalizer.normalize(actor_state)
         tensor = torch.as_tensor(normalized, dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            action, _, _ = self.policy.act(tensor.unsqueeze(0), deterministic=True)
-            action = self.policy.expand_action(action)
-        values = action[0].detach().cpu().numpy().astype(np.float32, copy=False)
+            action, _ = self.policy.predict_action(
+                tensor.unsqueeze(0),
+                deterministic=True,
+            )
+        latent = action.detach().cpu().numpy().astype(np.float32, copy=False)
+        values = self.action_transform.transform(
+            latent,
+            observation=compact_state[None, :],
+        )[0]
         if values.shape != (7,) or not np.all(np.isfinite(values)):
             raise ValueError("Temporary PPO returned a non-finite 7-D action.")
         return values.copy()
@@ -353,11 +456,17 @@ class _TempPPOAbsolutePoseDecoder:
         )
         self._target_pose_arm_base: np.ndarray | None = None
         self._target_gripper_close: float | None = None
+        self._target_generation = 0
 
     def reset(self) -> None:
         self._action_conditioner.reset()
         self._target_pose_arm_base = None
         self._target_gripper_close = None
+        self._target_generation = 0
+
+    @property
+    def target_generation(self) -> int:
+        return int(self._target_generation)
 
     def _current_tool_pose_arm_base(self) -> np.ndarray:
         base = self.scene.body_pose(_arm_base_body_name(self.scene, "right"))
@@ -421,6 +530,8 @@ class _TempPPOAbsolutePoseDecoder:
             self._target_gripper_close = float(
                 np.clip(measured_close, 0.0, self.task_config.right_gripper_max_close)
             )
+        source_anchor_pose = self._target_pose_arm_base.copy()
+        source_anchor_gripper = float(self._target_gripper_close)
         target = self._target_pose_arm_base.copy()
         target[:3, 3] += values[:3] * np.asarray(
             self.task_config.right_tcp_delta_m, dtype=float
@@ -450,6 +561,24 @@ class _TempPPOAbsolutePoseDecoder:
         )
         self._right_hand_spec.validate_vector(hand_qpos)
         vector[ACTION_HAND_SLICES["right"]] = hand_qpos
+        projection = PolicySourceActionProjection(
+            source_semantics=POLICY_SOURCE_ACTION_SEQUENTIAL_TARGET_DELTA,
+            source_pose_mode="relative",
+            source_action_schema_id=self.task_config.action_layout,
+            source_action_by_channel={"task_action": requested_values},
+            conditioned_action_by_channel={"task_action": values},
+            decoded_absolute_action_hash=canonical_content_hash(
+                {"vector": vector, "arm_joint_targets": {}},
+                domain="dexteleop.policy_decoded_absolute_action.v1",
+            ),
+            anchor_policy=POLICY_SOURCE_ANCHOR_PREVIOUS_POLICY_TARGET,
+            anchor_value_by_component={
+                "right_arm": pose_matrix_to_xyzquat(source_anchor_pose),
+                "right_gripper": (source_anchor_gripper,),
+            },
+            target_generation=self._target_generation,
+        )
+        self._target_generation += 1
         arm_spec = ArmActionSpec.tool_tcp(
             "right", reference_frame="right_arm_base"
         )
@@ -462,19 +591,28 @@ class _TempPPOAbsolutePoseDecoder:
             "hand_action_specs_by_side": {
                 "right": self._right_hand_spec.to_metadata()
             },
-            "pose_action_source_mode": "absolute",
+            "pose_action_source_mode": "relative",
             "pose_action_mode": "absolute",
             "pose_action_source_absolute_frame": "right_arm_base",
             "pose_action_output_absolute_frame": "runtime_raw",
-            "pose_anchor_policy": "maintained_absolute_target_from_measured_tcp",
+            "pose_anchor_policy": POLICY_SOURCE_ANCHOR_PREVIOUS_POLICY_TARGET,
             "pose_anchor_sides": ("right",),
+            POLICY_SOURCE_ACTION_PROJECTION_METADATA_KEY: projection.to_dict(),
             "temp_ppo_hil_profile": TEMP_PPO_HIL_POLICY_ID_V1,
             "unused_action_components": (),
             "policy_hand_control": "right_gripper_delta_to_absolute_qpos_v1",
             "right_gripper_target_close": self._target_gripper_close,
             "action_protocol": "robot_action_v1",
             "policy_action_layout": CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION,
+            "policy_latent_action_layout": self.task_config.policy_action_layout,
+            "policy_latent_action_components": (
+                self.task_config.resolved_policy_action_components
+            ),
+            "task_action_components": self.task_config.action_components,
             "observation_target_error_source": "measured_qpos_zero_fallback_v1",
+            "task_requested_action": requested_values.copy(),
+            "task_conditioned_action": values.copy(),
+            # Compatibility aliases for existing Sim-HIL log consumers.
             "policy_requested_action": requested_values.copy(),
             "policy_conditioned_action": values.copy(),
             "scripted_pregrasp_action_modified": (
@@ -688,7 +826,8 @@ class TempPPOHILPolicySource:
         self._model = _TempPPOModel(
             self.policy,
             self.normalizer,
-            observation_dim=int(self.task_config.observation_dim),
+            build_policy_action_transform(self.task_config),
+            task_config=self.task_config,
         )
         self._preparer = _TempPPOActionPreparer(
             DeployRobotActionAdapter(
@@ -700,6 +839,10 @@ class TempPPOHILPolicySource:
         self._started = False
         self._last_emission: PolicyActionEmission | None = None
         self._last_prediction_result: Any | None = None
+        self._last_execution_feedback: PolicyExecutionFeedback | None = None
+        self._last_feedback_application: (
+            PolicyExecutionFeedbackApplication | None
+        ) = None
         self._last_error: str | None = None
 
     def _validate_profile(self) -> None:
@@ -750,12 +893,54 @@ class TempPPOHILPolicySource:
         self.runtime.reset_prediction_schedule()
         self._last_emission = None
         self._last_prediction_result = None
+        self._last_execution_feedback = None
+        self._last_feedback_application = None
         self._last_error = None
 
     def close(self) -> None:
         self._started = False
         self.runtime.clear_action_queue()
         self._last_emission = None
+
+    def observe_execution_feedback(
+        self,
+        feedback: PolicyExecutionFeedback,
+    ) -> PolicyExecutionFeedbackApplication:
+        """Record exact downstream evidence without changing policy state.
+
+        Sequential-delta anchoring remains ``previous_policy_target``.  A
+        future profile may explicitly opt into downstream-reference rebase,
+        but doing that implicitly would silently change policy semantics.
+        """
+
+        if not isinstance(feedback, PolicyExecutionFeedback):
+            raise TypeError("feedback must be PolicyExecutionFeedback.")
+        generation = self.decoder.target_generation
+        last = self._last_emission
+        if (
+            last is None
+            or feedback.policy_emission_id != last.emission_id
+            or feedback.policy_emission_hash != last.semantic_content_hash
+        ):
+            decision = "ignored_stale_or_foreign_emission"
+            reason = "feedback does not bind the source's latest emission"
+        else:
+            decision = "recorded_no_state_mutation"
+            reason = (
+                "sequential target anchor is policy-owned; downstream facts "
+                "are passive evidence"
+            )
+            self._last_execution_feedback = feedback
+        application = PolicyExecutionFeedbackApplication(
+            feedback_id=feedback.feedback_id,
+            feedback_hash=feedback.semantic_content_hash,
+            decision=decision,
+            reason=reason,
+            target_generation_before=generation,
+            target_generation_after=self.decoder.target_generation,
+        )
+        self._last_feedback_application = application
+        return application
 
     def step(
         self,
@@ -840,6 +1025,20 @@ class TempPPOHILPolicySource:
             "queue_length": self.runtime.action_queue_length(),
             "last_emission_age_sec": age,
             "last_inference_duration_sec": inference_duration,
+            "last_execution_feedback_id": (
+                None
+                if self._last_execution_feedback is None
+                else self._last_execution_feedback.feedback_id
+            ),
+            "last_feedback_application": (
+                None
+                if self._last_feedback_application is None
+                else {
+                    "receipt_id": self._last_feedback_application.receipt_id,
+                    "decision": self._last_feedback_application.decision,
+                    "reason": self._last_feedback_application.reason,
+                }
+            ),
             "last_error": self._last_error,
             "unused_action_components": [],
             "policy_hand_control": "right_gripper_delta_to_absolute_qpos_v1",

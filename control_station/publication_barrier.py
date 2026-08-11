@@ -34,6 +34,64 @@ class StationPublicationBarrierSnapshot:
     semantic_content_hash: str
 
 
+class StationPublicationBarrierObserverPort:
+    """Deduplicate and deliver passive publication-barrier observations.
+
+    The port owns no barrier state and cannot enable or disable publication.
+    Callers keep responsibility for deciding when a transition is observed and
+    whether observer failures are diagnostic-only or operation-fatal.
+    """
+
+    def __init__(self, *, suppress_callback_errors: bool) -> None:
+        self._suppress_callback_errors = bool(suppress_callback_errors)
+        self._lock = threading.RLock()
+        self._observer: Callable[..., object] | None = None
+        self._observed_keys: set[tuple[str, str]] = set()
+        self._failure_count = 0
+
+    @property
+    def failure_count(self) -> int:
+        with self._lock:
+            return self._failure_count
+
+    def bind(self, observer: Callable[..., object]) -> None:
+        if not callable(observer):
+            raise TypeError("Publication barrier observer must be callable.")
+        with self._lock:
+            if self._observer is not None:
+                raise RuntimeError("Publication barrier observer is already bound.")
+            self._observer = observer
+
+    def observe(
+        self,
+        snapshot: StationPublicationBarrierSnapshot,
+        *,
+        causal_station_fact_id: str,
+        occurred_at: float,
+        clock_domain_id: str,
+    ) -> None:
+        if not isinstance(snapshot, StationPublicationBarrierSnapshot):
+            raise TypeError("snapshot must be a StationPublicationBarrierSnapshot.")
+        key = (snapshot.semantic_content_hash, str(causal_station_fact_id))
+        with self._lock:
+            observer = self._observer
+            if observer is None or key in self._observed_keys:
+                return
+            try:
+                observer(
+                    snapshot,
+                    causal_station_fact_id=causal_station_fact_id,
+                    occurred_at=occurred_at,
+                    clock_domain_id=clock_domain_id,
+                )
+            except Exception:
+                if not self._suppress_callback_errors:
+                    raise
+                self._failure_count += 1
+                return
+            self._observed_keys.add(key)
+
+
 class StationPublicationBarrier:
     """Linearize a persistent source authority lease against publication."""
 
@@ -179,5 +237,6 @@ class StationPublicationBarrier:
 __all__ = [
     "STATION_PUBLICATION_BARRIER_HASH_DOMAIN_V1",
     "StationPublicationBarrier",
+    "StationPublicationBarrierObserverPort",
     "StationPublicationBarrierSnapshot",
 ]

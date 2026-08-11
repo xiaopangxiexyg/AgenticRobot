@@ -17,9 +17,13 @@ from ...grasp_contact import extract_gripper_contact_scores
 from ...scene import MujocoCameraRenderer, MujocoScene
 from .config import (
     CONTACT_LATCH_DEBUG_GRASP_MODE,
+    CONTACT_TASK_OBJECTIVE,
+    LIFT_TASK_OBJECTIVE,
     NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
+    NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2,
     NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
     NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1,
+    REACH_TASK_OBJECTIVE,
     CubeLiftTaskConfig,
     SCRIPTED_CONTACT_LOST_REASON,
 )
@@ -28,6 +32,7 @@ from .contacts import classify_cube_contact_position
 from .action_conditioning import CubeLiftActionConditioner
 from .grasp_latch import ContactGraspLatch
 from .pose_action import CubeLiftPoseActionController
+from .reach_guidance import ReachGuidance, build_reach_guidance
 
 
 InfoMode = Literal["compact", "terminal"]
@@ -207,6 +212,7 @@ class CubeLiftKernel:
         self._bounds_lower = np.asarray(self.config.out_of_bounds_xyz_lower_m, dtype=np.float64)
         self._bounds_upper = np.asarray(self.config.out_of_bounds_xyz_upper_m, dtype=np.float64)
         self._spawn_qpos = np.asarray(self.config.cube_spawn_qpos, dtype=np.float64)
+        self._episode_spawn_qpos = self._spawn_qpos.copy()
         self._zero_cube_qvel = np.zeros(6, dtype=np.float64)
 
         self._right_target = self._right_home.copy()
@@ -215,6 +221,9 @@ class CubeLiftKernel:
             dtype=np.float64,
         )
         self._last_action = np.zeros(7, dtype=np.float32)
+        self._last_requested_action = np.zeros(7, dtype=np.float32)
+        self._last_conditioned_action = np.zeros(7, dtype=np.float32)
+        self._last_admitted_action = np.zeros(7, dtype=np.float32)
         self._observation_buffer = np.empty(self.observation_dim, dtype=np.float32)
         self._training_reward_state_buffer = np.empty(31, dtype=np.float32)
         self._previous_observation_right_qpos: np.ndarray | None = None
@@ -245,6 +254,7 @@ class CubeLiftKernel:
         self._next_policy_time: float | None = None
         self._episode_steps = 0
         self._success_hold_ticks = 0
+        self._safety_clear_policy_steps = 0
         self._termination_reason: str | None = None
         self._resting_center_z = float("nan")
         self.last_physics_ticks = 0
@@ -318,16 +328,24 @@ class CubeLiftKernel:
         return self._physics_tick / self.config.physics_hz
 
     def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, Any]]:
-        # RNG is reserved now so adding randomization does not change the API.
+        # The vector executor supplies deterministic per-env/per-episode seeds.
         self._rng = np.random.default_rng(seed)
+        self._episode_spawn_qpos = np.asarray(
+            self.config.sample_cube_spawn_qpos(self._rng),
+            dtype=np.float64,
+        )
         self._right_target[:] = self._right_home
         self._gripper_close[:] = (
             self.config.initial_gripper_close_by_name[self._gripper_names[0]],
             self.config.initial_gripper_close_by_name[self._gripper_names[1]],
         )
         self._last_action.fill(0.0)
+        self._last_requested_action.fill(0.0)
+        self._last_conditioned_action.fill(0.0)
+        self._last_admitted_action.fill(0.0)
         self._episode_steps = 0
         self._success_hold_ticks = 0
+        self._safety_clear_policy_steps = 0
         self._termination_reason = None
         self._last_safety_result = None
         self._last_active_collision_check = None
@@ -353,6 +371,7 @@ class CubeLiftKernel:
             self.use_settled_snapshot
             and self._settled_snapshot is not None
             and not self.config.scripted_contact_reset
+            and not self.config.randomizes_cube_spawn
         ):
             self._restore_settled_snapshot()
             self._start_actuated_rig()
@@ -365,17 +384,20 @@ class CubeLiftKernel:
             # looks valid at reset but cannot reliably lift. Re-run the cold
             # settle for this curriculum instead of exposing that false state.
             self.scene.reset_data()
-            if self.config.scripted_contact_reset and self.config.uses_pose_action:
+            if self.config.uses_pose_action:
                 # RM65CanonicalIK construction seeds internal coupled-planner
-                # state from the scene before its first explicit reset. Build
-                # that state from the same qpos0 snapshot on every scripted
-                # reset; reusing a planner previously exercised at contact
-                # changes the next reset's otherwise identical IK trajectory.
+                # state before its first explicit reset. Rebuild it for every
+                # cold pose-action reset, not only scripted-contact curricula:
+                # a planner previously exercised by another randomized episode
+                # otherwise changes the next episode's IK trajectory despite
+                # identical simulator state and seed.
                 self._pose_action_controller = CubeLiftPoseActionController(
                     self.scene,
                     self.config,
                 )
-            self.data.qpos[self._cube_qpos_addr : self._cube_qpos_addr + 7] = self._spawn_qpos
+            self.data.qpos[self._cube_qpos_addr : self._cube_qpos_addr + 7] = (
+                self._episode_spawn_qpos
+            )
             self.data.qvel[self._cube_dof_addr : self._cube_dof_addr + 6] = self._zero_cube_qvel
             self._physics_tick = 0
             self._next_command_time = 1.0 / self.config.command_hz
@@ -419,7 +441,7 @@ class CubeLiftKernel:
                     "CubeLift fast reset did not produce a valid settled scene: "
                     f"{self._termination_reason}."
                 )
-            if self.use_settled_snapshot:
+            if self.use_settled_snapshot and not self.config.randomizes_cube_spawn:
                 self._capture_settled_snapshot()
 
         for geom_id, _original, override in self._post_settle_geom_friction:
@@ -493,8 +515,12 @@ class CubeLiftKernel:
         # expose a fresh episode clock/action history at the reached pose.
         self._episode_steps = 0
         self._success_hold_ticks = 0
+        self._safety_clear_policy_steps = 0
         self._termination_reason = None
         self._last_action.fill(0.0)
+        self._last_requested_action.fill(0.0)
+        self._last_conditioned_action.fill(0.0)
+        self._last_admitted_action.fill(0.0)
         self._last_accepted_action.fill(0.0)
         self._last_safety_result = None
         self._last_active_collision_check = None
@@ -596,8 +622,12 @@ class CubeLiftKernel:
         # The scripted motion is reset preparation, not policy experience.
         self._episode_steps = 0
         self._success_hold_ticks = 0
+        self._safety_clear_policy_steps = 0
         self._termination_reason = None
         self._last_action.fill(0.0)
+        self._last_requested_action.fill(0.0)
+        self._last_conditioned_action.fill(0.0)
+        self._last_admitted_action.fill(0.0)
         self._last_accepted_action.fill(0.0)
         self._last_safety_result = None
         self._last_active_collision_check = None
@@ -644,6 +674,7 @@ class CubeLiftKernel:
             raise ValueError("CubeLift action must be a finite 7-D vector.")
         if np.any(values < -1.0) or np.any(values > 1.0):
             raise ValueError("CubeLift action values must lie in [-1, 1].")
+        self._last_requested_action[:] = values
         previous_measured_close = self._measured_gripper_close(1)
         left_contact, right_contact = self._cube_finger_contacts()
         conditioning = self._action_conditioner.condition(
@@ -659,6 +690,7 @@ class CubeLiftKernel:
             ),
         )
         values = conditioning.values
+        self._last_conditioned_action[:] = values
         self._scripted_contact_action_modified = (
             conditioning.scripted_contact_modified
         )
@@ -812,6 +844,14 @@ class CubeLiftKernel:
             # this retains only the reset-validated target; arm projection and
             # the active hard-contact oracle remain authoritative.
             self._gripper_close[:] = requested_gripper_close
+        safety_intervention = bool(
+            self._last_safety_result is not None
+            and self._last_safety_result.modified
+        )
+        if safety_intervention:
+            self._safety_clear_policy_steps = 0
+        else:
+            self._safety_clear_policy_steps += 1
         if self._pose_action_controller is not None:
             # ``last_action`` is policy lineage in pose coordinates.  It must
             # not silently become a qpos delta merely because the downstream
@@ -899,10 +939,7 @@ class CubeLiftKernel:
         terminated = self._termination_reason is not None
         truncated = not terminated and self._episode_steps >= self.config.max_episode_steps
         success = self._termination_reason == self.config.success_termination_reason
-        cube_z = float(self.data.qpos[self._cube_qpos_addr + 2])
-        progress = float(
-            np.clip((cube_z - self._resting_center_z) / self.config.lift_delta_m, 0.0, 1.0)
-        )
+        progress = self._objective_progress()
         reward = progress - self.config.reward.action_penalty * float(
             np.mean(np.square(values, dtype=np.float32))
         )
@@ -917,6 +954,7 @@ class CubeLiftKernel:
                 terminated = True
                 truncated = False
         accepted_action = np.zeros(7, dtype=np.float32)
+        admitted_action = np.zeros(7, dtype=np.float32)
         if self._pose_action_controller is not None:
             pose_step = self._last_pose_action_step
             if (
@@ -934,12 +972,21 @@ class CubeLiftKernel:
                     -1.0,
                     1.0,
                 )
+                admitted_action[:6] = accepted_action[:6]
         else:
             accepted_action[:6] = np.clip(
                 (self._right_target - previous_right_target) / self._right_delta,
                 -1.0,
                 1.0,
             ).astype(np.float32)
+            admitted_action[:6] = accepted_action[:6]
+        if abs(self.config.right_gripper_delta) > 1e-12:
+            admitted_action[6] = np.clip(
+                (self._gripper_close[1] - previous_right_close)
+                / self.config.right_gripper_delta,
+                -1.0,
+                1.0,
+            )
         measured_close = self._measured_gripper_close(1)
         if abs(self.config.right_gripper_delta) > 1e-12:
             accepted_action[6] = np.clip(
@@ -948,6 +995,7 @@ class CubeLiftKernel:
                 -1.0,
                 1.0,
             )
+        self._last_admitted_action[:] = admitted_action
         self._last_accepted_action[:] = accepted_action
         terminal = terminated or truncated
         return CubeLiftKernelStep(
@@ -1202,14 +1250,47 @@ class CubeLiftKernel:
             return True
         if not check_success:
             return False
-        above_target = float(cube_position[2]) >= (
-            self._resting_center_z + self.config.lift_delta_m
-        )
-        bilateral_contact = True
-        if self.config.success_requires_bilateral_contact:
+        objective_satisfied = False
+        if self.config.task_objective == REACH_TASK_OBJECTIVE:
+            objective_satisfied = (
+                self._reach_distance_m()
+                <= self.config.reach_success_distance_m
+            )
+        elif self.config.task_objective == CONTACT_TASK_OBJECTIVE:
             left_contact, right_contact = self._cube_finger_contacts()
-            bilateral_contact = left_contact and right_contact
-        if above_target and bilateral_contact and not self._cube_touches_table():
+            contact_score = self._contact_success_score()
+            objective_satisfied = bool(
+                left_contact
+                and right_contact
+                and contact_score >= self.config.contact_success_min_score
+                and self._measured_gripper_close(1)
+                >= self.config.contact_success_min_measured_close
+                and self._success_contact_quality_satisfied()
+            )
+        elif self.config.task_objective == LIFT_TASK_OBJECTIVE:
+            above_target = float(cube_position[2]) >= (
+                self._resting_center_z + self.config.lift_delta_m
+            )
+            bilateral_contact = True
+            if self.config.success_requires_bilateral_contact:
+                left_contact, right_contact = self._cube_finger_contacts()
+                bilateral_contact = left_contact and right_contact
+            objective_satisfied = bool(
+                above_target
+                and bilateral_contact
+                and not self._cube_touches_table()
+                and self._success_contact_quality_satisfied()
+            )
+        else:  # Configuration validation makes this unreachable.
+            raise RuntimeError(
+                f"Unsupported CubeLift task objective {self.config.task_objective!r}."
+            )
+        objective_satisfied = bool(
+            objective_satisfied
+            and self._safety_clear_policy_steps
+            >= self.config.success_min_safety_clear_policy_steps
+        )
+        if objective_satisfied:
             self._success_hold_ticks += 1
         else:
             self._success_hold_ticks = 0
@@ -1217,6 +1298,84 @@ class CubeLiftKernel:
             self._termination_reason = self.config.success_termination_reason
             return True
         return False
+
+    def _reach_distance_m(self) -> float:
+        state = self._training_reward_state()
+        error = state[20:23].astype(np.float64, copy=True)
+        error[2] += self.config.reach_target_height_offset_m
+        return float(np.linalg.norm(error))
+
+    def _reach_guidance(self) -> ReachGuidance:
+        """Return actor guidance without simulator-only collision features."""
+
+        state = self._training_reward_state()
+        cube_position = state[7:10].astype(np.float64, copy=False)
+        grasp_position = cube_position - state[20:23]
+        base_rotation = self.scene.body_pose(
+            f"{self.config.controlled_side}_arm_base_link"
+        )[:3, :3]
+        return build_reach_guidance(
+            cube_position,
+            grasp_position,
+            base_rotation,
+            target_height_offset_m=(
+                self.config.reach_target_height_offset_m
+            ),
+            guidance_height_offset_m=(
+                self.config.reach_guidance_height_offset_m
+            ),
+            guidance_xy_blend_radius_m=(
+                self.config.reach_guidance_xy_blend_radius_m
+            ),
+        )
+
+    def _contact_success_score(self) -> float:
+        if not self.config.gripper_contact_surface_specs:
+            left_contact, right_contact = self._cube_finger_contacts()
+            return 1.0 if left_contact and right_contact else 0.0
+        return float(
+            self._gripper_contact_scores()[
+                "gripper_bilateral_inner_contact_score"
+            ]
+        )
+
+    def _success_contact_quality_satisfied(self) -> bool:
+        if not self.config.gripper_contact_surface_specs:
+            return True
+        scores = self._gripper_contact_scores()
+        return bool(
+            float(scores["gripper_bilateral_inner_contact_score"])
+            >= self.config.success_min_bilateral_inner_contact_score
+            and float(scores["gripper_outer_contact_score"])
+            <= self.config.success_max_outer_contact_score
+        )
+
+    def _objective_progress(self) -> float:
+        if self.config.task_objective == REACH_TASK_OBJECTIVE:
+            distance = self._reach_distance_m()
+            return float(
+                np.exp(
+                    -distance
+                    / max(self.config.reach_target_height_offset_m, 1e-6)
+                )
+            )
+        if self.config.task_objective == CONTACT_TASK_OBJECTIVE:
+            close_fraction = np.clip(
+                self._measured_gripper_close(1)
+                / max(self.config.contact_success_min_measured_close, 1e-6),
+                0.0,
+                1.0,
+            )
+            return float(self._contact_success_score() * close_fraction)
+        cube_z = float(self.data.qpos[self._cube_qpos_addr + 2])
+        return float(
+            np.clip(
+                (cube_z - self._resting_center_z)
+                / self.config.lift_delta_m,
+                0.0,
+                1.0,
+            )
+        )
 
     def _observation(self) -> np.ndarray:
         privileged = self._training_reward_state()
@@ -1227,6 +1386,7 @@ class CubeLiftKernel:
                 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1,
                 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2,
                 NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
+                NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2,
             }:
                 measured_qpos = privileged[0:6].astype(np.float64, copy=False)
                 measured_close = float(privileged[6])
@@ -1254,13 +1414,25 @@ class CubeLiftKernel:
                 self._previous_observation_right_close = measured_close
                 if (
                     self.config.normal_proprio_profile
-                    == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1
+                    in {
+                        NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
+                        NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2,
+                    }
                 ):
                     # Keep the cube pose in the existing privileged-state
                     # convention: world-frame free-joint position followed by
                     # MuJoCo's wxyz quaternion.  It is appended after the
                     # established 28-D proprioceptive contract.
                     out[28:35] = privileged[7:14]
+                if (
+                    self.config.normal_proprio_profile
+                    == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2
+                ):
+                    # This is a deployable derived feature, not privileged
+                    # simulator state: real input can compute the same vector
+                    # from an external object pose and measured-qpos FK.  Use
+                    # the same controlled-arm base frame as the public action.
+                    out[35:38] = self._reach_guidance().delta_in_base
             else:
                 out[7:14] = privileged[23:30]
                 out[14] = privileged[30]
@@ -1350,13 +1522,29 @@ class CubeLiftKernel:
                 self._cube_finger_contact_orientation()
             )
         generic_gripper_contact = self._gripper_contact_scores()
+        reach_guidance = (
+            self._reach_guidance()
+            if self.config.reach_target_delta_observation_source
+            else None
+        )
         compact: dict[str, Any] = {
             "reset": bool(reset),
             "episode_step": self._episode_steps,
             "physics_ticks": self.last_physics_ticks,
             "command_ticks": self.last_command_ticks,
             "success_hold_physics_ticks": self._success_hold_ticks,
+            "safety_clear_policy_steps": self._safety_clear_policy_steps,
+            "success_min_safety_clear_policy_steps": (
+                self.config.success_min_safety_clear_policy_steps
+            ),
+            "success_contact_quality_satisfied": (
+                self._success_contact_quality_satisfied()
+            ),
             "termination_reason": self._termination_reason,
+            "task_objective": self.config.task_objective,
+            "objective_progress": self._objective_progress(),
+            "reach_distance_m": self._reach_distance_m(),
+            "contact_success_score": self._contact_success_score(),
             "policy_class": self.config.policy_class,
             "observation_mode": self.config.observation_mode,
             "observation_layout": self.config.observation_layout,
@@ -1370,6 +1558,13 @@ class CubeLiftKernel:
             "wrist_rgb_spatial_pool_size": self.config.wrist_rgb_spatial_pool_size,
             "action_layout": self.config.action_layout,
             "pose_control_frame": self.config.pose_control_frame,
+            "policy_action_layout": self.config.policy_action_layout,
+            "policy_action_components": (
+                self.config.resolved_policy_action_components
+            ),
+            "task_action_components": self.config.action_components,
+            "cube_spawn_qpos": self._episode_spawn_qpos.astype(float).tolist(),
+            "cube_spawn_randomized": self.config.randomizes_cube_spawn,
             "grasp_latched": bool(
                 self._grasp_latch is not None and self._grasp_latch.active
             ),
@@ -1455,7 +1650,22 @@ class CubeLiftKernel:
             "post_contact_phase_action_modified": (
                 self._post_contact_phase_action_modified
             ),
-            "requested_action": self._last_action.astype(float).tolist(),
+            "action_lineage_version": "cube_lift_action_lineage.v2",
+            # The kernel receives the complete task action. PPO's compact
+            # latent sample is recorded by the trainer/checkpoint boundary.
+            "task_requested_action": self._last_requested_action.astype(
+                float
+            ).tolist(),
+            "task_conditioned_action": self._last_conditioned_action.astype(
+                float
+            ).tolist(),
+            "admitted_action": self._last_admitted_action.astype(float).tolist(),
+            # Compatibility aliases. ``requested_action`` historically meant
+            # the conditioned task action, while ``accepted_action`` mixed
+            # admitted arm motion with measured gripper response.
+            "requested_action": self._last_conditioned_action.astype(
+                float
+            ).tolist(),
             "accepted_action": self._last_accepted_action.astype(float).tolist(),
             # This is intentionally a diagnostic/reward-only teacher signal;
             # it is never appended to normal or privileged policy input.
@@ -1484,6 +1694,10 @@ class CubeLiftKernel:
                 self._last_safety_result is not None
                 and self._last_safety_result.modified
             ),
+            "safety_intervention": bool(
+                self._last_safety_result is not None
+                and self._last_safety_result.modified
+            ),
             "safety_recovery": bool(
                 self._last_safety_result is not None
                 and self._last_safety_result.status == "recovered"
@@ -1492,6 +1706,11 @@ class CubeLiftKernel:
                 1.0
                 if self._last_safety_result is None
                 else self._last_safety_result.projection_alpha
+            ),
+            "safety_projection_fraction": float(
+                0.0
+                if self._last_safety_result is None
+                else 1.0 - self._last_safety_result.projection_alpha
             ),
             "safety_minimum_distance_m": float(
                 float("inf")
@@ -1519,6 +1738,22 @@ class CubeLiftKernel:
                 )
                 else self._last_safety_result.blocking_check.body2_name
             ),
+            "safety_blocking_pair_class": (
+                None
+                if (
+                    self._last_safety_result is None
+                    or self._last_safety_result.blocking_check is None
+                )
+                else self._last_safety_result.blocking_check.pair_class
+            ),
+            "safety_blocking_category": (
+                None
+                if (
+                    self._last_safety_result is None
+                    or self._last_safety_result.blocking_check is None
+                )
+                else self._last_safety_result.blocking_check.collision_category
+            ),
             "safety_blocking_distance_m": (
                 None
                 if (
@@ -1528,6 +1763,23 @@ class CubeLiftKernel:
                 else self._last_safety_result.blocking_check.minimum_distance_m
             ),
         }
+        if reach_guidance is not None:
+            compact.update(
+                {
+                    "reach_guidance_enabled": (
+                        self.config.reach_guidance_enabled
+                    ),
+                    "reach_guidance_distance_m": float(
+                        np.linalg.norm(reach_guidance.delta_in_base)
+                    ),
+                    "reach_guidance_overhead_blend": (
+                        reach_guidance.overhead_blend
+                    ),
+                    "reach_guidance_target_height_offset_m": (
+                        reach_guidance.target_height_offset_m
+                    ),
+                }
+            )
         if self.config.wrist_rgb_enabled:
             compact.update(self._last_wrist_rgb_health)
         if self.include_training_reward_state:

@@ -1,0 +1,7 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_lift_short_pose_z_proprio_v1.json",
+  "name": "rm65_right_cube_lift_short_positive_z_proprio_v2",
+  "scripted_contact_action_scale": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+  "scripted_contact_action_bias": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "scripted_contact_nonnegative_lift_action": true
+}

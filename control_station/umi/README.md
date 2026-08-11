@@ -1,14 +1,15 @@
 # UMI Control Station boundary
 
-This package owns UMI presentation policy, operator-intent mapping, view
-models, and application workflow coordination. It must not read VIVE/Q6/angle
-trigger/camera devices, dispatch gripper commands, own calibration validity,
-or start/finalize an episode. Those operations remain behind typed UMI and
-collection runtime ports.
+This package owns UMI presentation policy, operator-intent mapping, and view
+models. It must not read VIVE/Q6/angle-trigger/camera devices, dispatch gripper
+commands, own calibration validity, or start/finalize an episode. Those
+operations remain behind typed UMI and collection-runtime ports.
 
-The current controller import is an explicit migration seam used only to
-consume pure control-availability policy. Boundary tests prevent that reverse
-dependency from spreading while the UMI coordinator is extracted.
+The sibling `control_station/umi_application.py` is the concrete application
+leaf that binds those ports to the Web UI. Lower UMI modules depend only on the
+operator-policy protocol declared in `teleop_runtime`; they do not import this
+package. The historic `teleop_runtime.collection.umi.app` path is a thin
+compatibility import for the existing command and callers.
 
 UMI uses the same `control_station.web.calibration_web_ui` transport as
 RealTeleop. UMI-specific control availability and event mapping stay in this

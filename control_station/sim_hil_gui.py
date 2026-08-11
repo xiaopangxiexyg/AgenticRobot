@@ -16,11 +16,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
+from .sim_hil_human_deflection_view import (
+    HUMAN_DEFLECTION_VIEW_CSS,
+    HUMAN_DEFLECTION_VIEW_HTML,
+    HUMAN_DEFLECTION_VIEW_JS,
+)
+from .sim_hil_profile.status import SIM_HIL_STATUS_SCHEMA_V1
+
 
 StatusProvider = Callable[[], dict[str, Any]]
 LiveStatusProvider = Callable[[], dict[str, Any]]
 IntentSubmitter = Callable[[Mapping[str, Any]], dict[str, object]]
-SIM_HIL_STATUS_SCHEMA_V1 = "dexteleop.control_station.sim_hil_status.v1"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
@@ -63,8 +69,20 @@ _HTML = """<!doctype html>
     .live-meta { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
     .live-error { overflow: hidden; color: var(--red); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
     .live-error.inactive { color: var(--muted); }
+__SIM_HIL_HUMAN_DEFLECTION_CSS__
     .operation-panel { margin-bottom: 22px; padding: 17px; border: 1px solid rgba(115,183,255,.32); border-radius: 16px; background: linear-gradient(145deg, rgba(20,34,57,.97), rgba(17,24,39,.96)); box-shadow: var(--shadow); }
     .operation-panel[hidden] { display: none; }
+    .operator-guidance { margin: 14px 0; padding: 16px; border: 1px solid rgba(115,183,255,.38); border-radius: 14px; background: rgba(11,19,33,.72); }
+    .operator-guidance.ready { border-color: rgba(105,211,154,.48); }
+    .operator-guidance.warning { border-color: rgba(243,189,98,.48); }
+    .operator-guidance.error { border-color: rgba(255,126,138,.58); }
+    .operator-guidance-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+    .operator-guidance h2 { margin-bottom: 4px; font-size: 18px; }
+    .operator-guidance .controls { margin-top: 10px; }
+    .operator-blockers { margin: 10px 0 0; padding-left: 20px; color: #ffd6da; }
+    .operator-blockers[hidden], .operator-notices[hidden], .operator-error[hidden] { display: none; }
+    .operator-notices { margin-top: 9px; color: var(--muted); font-size: 12px; }
+    button.primary { border-color: rgba(115,183,255,.62); background: #17304f; font-weight: 750; }
     .readonly-hint { margin: 0 0 18px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 11px; color: var(--muted); background: rgba(17,24,39,.72); }
     .readonly-hint[hidden] { display: none; }
     .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin: 22px 2px 10px; }
@@ -108,6 +126,7 @@ _HTML = """<!doctype html>
     .acceptance-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
     .mode-card { padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: rgba(10,15,28,.45); }
     .mode-card h3 { margin: 0 0 5px; font-size: 13px; }
+    .mode-card p { min-height: 36px; margin-bottom: 7px; font-size: 12px; }
     .mode-state { margin-bottom: 9px; color: var(--muted); font-size: 12px; }
     .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
     button, input { border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: #10192a; font: inherit; }
@@ -119,6 +138,9 @@ _HTML = """<!doctype html>
     input.profile-name { width: min(260px, 100%); }
     .intent-message { min-height: 20px; margin-top: 9px; color: var(--muted); font-size: 12px; }
     .subtle { color: var(--muted); }
+    .diagnostics-panel { margin-top: 18px; padding: 0; }
+    .diagnostics-panel > summary { padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(17,24,39,.72); font-weight: 700; }
+    .diagnostics-panel[open] > summary { margin-bottom: 12px; }
     details { margin-top: 14px; }
     summary { cursor: pointer; color: var(--blue); }
     pre { max-height: 420px; margin: 12px 0 0; padding: 14px; overflow: auto; border: 1px solid var(--line); border-radius: 12px; color: #c9d7ea; background: #080c15; white-space: pre-wrap; }
@@ -135,7 +157,7 @@ _HTML = """<!doctype html>
       <div>
         <div class="kicker">控制台 / 仿真在环</div>
         <h1>仿真在环控制与 VIVE 标定</h1>
-        <p>先在本页确认或标定 VIVE；只有实时输入与已保存坐标配置均就绪后才构造 MuJoCo。PPO 与人类输入仅作为动作来源。</p>
+        <p id="page-summary">本页按准备、启动、运行和收尾四个阶段组织操作；PPO 与人类输入仅作为动作来源。</p>
       </div>
       <div id="badge" class="badge hold">加载中</div>
     </header>
@@ -165,9 +187,28 @@ _HTML = """<!doctype html>
         <div id="gripper-meta" class="live-meta">—</div>
       </div>
     </section>
+__SIM_HIL_HUMAN_DEFLECTION_HTML__
     <section id="acceptance-card" class="operation-panel" hidden>
       <div class="card-head"><h2>操作区 · Sim-HIL 正式控制</h2><span id="acceptance-label" class="label">—</span></div>
-      <p>启动一次运行会话后，可随时切换纯遥操、纯 PPO 和比例融合。VIVE 配置阶段独占接收器；运行时构造后由 Sim-HIL 持有唯一接收器。</p>
+      <p id="acceptance-description">正在读取所选控制方案。</p>
+      <section id="operator-guidance" class="operator-guidance warning" hidden>
+        <div class="operator-guidance-head">
+          <div>
+            <h2 id="operator-headline">正在检查运行状态</h2>
+            <p id="operator-detail">—</p>
+          </div>
+          <span id="operator-phase" class="setup-state">—</span>
+        </div>
+        <ul id="operator-blockers" class="operator-blockers" hidden></ul>
+        <div id="operator-notices" class="operator-notices" hidden></div>
+        <div class="controls">
+          <button id="operator-primary-action" class="primary" hidden>下一步</button>
+        </div>
+        <details id="operator-error" class="operator-error" hidden>
+          <summary>查看原始错误</summary>
+          <pre id="operator-raw-error">—</pre>
+        </details>
+      </section>
       <div id="vive-setup-panel" class="setup-panel">
         <div class="setup-head">
           <div>
@@ -202,11 +243,11 @@ _HTML = """<!doctype html>
         </div>
       </div>
       <div id="control-modes" class="acceptance-grid"></div>
-      <div class="controls">
+      <div id="fixed-alpha-controls" class="controls">
         <label>人类输入混合 α <input id="blend-alpha" type="number" min="0.01" max="0.99" step="0.05" value="0.50"></label>
         <span class="subtle">α 仅用于比例融合；模式可按任意顺序反复切换。</span>
       </div>
-      <div class="controls">
+      <div id="blend-failure-controls" class="controls">
         <label>融合目标不可执行时
           <select id="blend-failure-fallback">
             <option value="hold">静止</option>
@@ -214,10 +255,13 @@ _HTML = """<!doctype html>
             <option value="policy">切换到策略</option>
           </select>
         </label>
+        <label>连续失败切换延迟（秒）
+          <input id="blend-failure-grace" type="number" min="0" step="0.05" value="0.00">
+        </label>
         <button id="apply-blend-failure-fallback">应用回退源</button>
-        <span id="blend-failure-fallback-status" class="subtle">默认静止；只在比例融合目标无法解析时触发。</span>
+        <span id="blend-failure-fallback-status" class="subtle">静止始终立即生效；该窗口只延迟切换到人类或策略。</span>
       </div>
-      <div class="controls">
+      <div id="human-timeout-controls" class="controls">
         <label>人类输入超时回退
           <select id="human-timeout-fallback">
             <option value="hold">静止</option>
@@ -226,6 +270,24 @@ _HTML = """<!doctype html>
         </label>
         <button id="apply-human-timeout-fallback">应用输入回退</button>
         <span id="human-timeout-fallback-status" class="subtle">默认静止；超过 5 秒无新的人类输出时触发。</span>
+      </div>
+      <div id="allocation-controls" class="setup-panel" hidden>
+        <div class="setup-head">
+          <div>
+            <h2>策略 / 人类动态分配</h2>
+            <p>自动模式根据输入证据分配；手动模式由当前方案声明。重新定基只清除 human residual，不改变分配模式。</p>
+          </div>
+          <span id="allocation-mode-status" class="setup-state">—</span>
+        </div>
+        <div class="controls">
+          <button id="start-allocation-runtime">启动动态分配运行会话</button>
+          <button id="allocation-automatic">自动分配</button>
+          <button id="allocation-base-only">仅策略基线</button>
+          <button id="allocation-relative-overlay">人类相对修正</button>
+          <button id="allocation-absolute-overlay-owner" hidden>人类绝对接管</button>
+          <button id="allocation-rebase-and-clear">重新定基并清除修正</button>
+        </div>
+        <div id="allocation-operation-status" class="subtle">等待 Runtime 启动。</div>
       </div>
       <div id="runtime-controls" class="setup-panel">
         <div class="setup-head">
@@ -239,16 +301,18 @@ _HTML = """<!doctype html>
           <button id="hold-runtime">保持输出</button>
           <button id="rearm-runtime">恢复运行</button>
           <button id="capture-runtime-home">采集当前 Runtime Home</button>
-          <button id="rebuild-runtime">结束当前仿真并返回准备页</button>
+          <button id="rebuild-runtime" class="danger">结束当前仿真并返回准备页</button>
           <button id="cancel-operation" class="danger">中断启动 / 等待</button>
-          <button id="finalize-capture">结束回合并封存</button>
+          <button id="finalize-capture" class="danger">结束回合并封存</button>
           <button id="stop-runtime" class="danger">退出控制</button>
         </div>
       </div>
       <div id="intent-message" class="intent-message"></div>
     </section>
-    <div class="section-heading"><h2>状态与执行信息</h2><span class="label">只读 · 回执 / 来源链 / 诊断</span></div>
-    <section class="grid">
+    <details id="operator-diagnostics" class="diagnostics-panel">
+      <summary>高级诊断与回执信息（只读）</summary>
+      <div class="section-heading"><h2>状态与执行信息</h2><span class="label">回执 / 来源链 / 诊断</span></div>
+      <section class="grid">
       <article class="card">
         <div class="card-head"><h2>配置</h2><span id="sampled" class="label">—</span></div>
         <dl id="profile-rows"></dl>
@@ -283,7 +347,8 @@ _HTML = """<!doctype html>
           <pre id="raw-status">—</pre>
         </details>
       </article>
-    </section>
+      </section>
+    </details>
   </main>
   <script>
     const controlToken = __SIM_HIL_CONTROL_TOKEN_JSON__;
@@ -439,6 +504,9 @@ _HTML = """<!doctype html>
         target.append(dt, dd);
       }
     }
+    function explainDisabled(button, reason) {
+      button.title = button.disabled && reason ? String(reason) : '';
+    }
     function renderChecks(readiness) {
       const target = $('checks');
       target.replaceChildren();
@@ -476,6 +544,69 @@ _HTML = """<!doctype html>
       ppo_only: '纯 PPO',
       proportional_blend: '比例融合',
     };
+    const controlModeDescriptions = {
+      human_teleop: '仅使用人类 pose / 末端 qpos；启动前必须接纳 Human 输入。',
+      ppo_only: '仅使用策略动作；可在 VIVE 尚未就绪时独立启动。',
+      proportional_blend: '按固定 α 融合人类与策略，不使用动态分配规则。',
+    };
+    const allocationModeNames = {
+      automatic: '自动分配',
+      base_only: '仅策略基线',
+      relative_overlay: '人类相对修正',
+      absolute_overlay_owner: '人类绝对接管',
+    };
+    const allocationSignalNames = {
+      allocation_automatic: '切换到自动分配',
+      allocation_base_only: '切换到仅策略基线',
+      allocation_relative_overlay: '切换到人类相对修正',
+      allocation_absolute_overlay_owner: '切换到人类绝对接管',
+      residual_rebase_and_clear: '重新定基并清除修正',
+    };
+    const operatorPhaseNames = {
+      setup_required: '需要准备', calibrating: '正在标定',
+      ready_to_start: '可以启动', operation_pending: '操作中',
+      running: '运行中', held: '保持', faulted: '故障',
+      restart_required: '需要重建', episode_ended: '回合已结束',
+      closing: '正在退出',
+    };
+    function renderOperatorGuidance(value) {
+      const guidance = value.operator_guidance || {};
+      const panel = $('operator-guidance');
+      if (!guidance.phase) {
+        panel.hidden = true;
+        return;
+      }
+      panel.hidden = false;
+      panel.className = `operator-guidance ${guidance.severity || 'warning'}`;
+      $('operator-headline').textContent = text(guidance.headline);
+      $('operator-detail').textContent = text(guidance.detail);
+      $('operator-phase').textContent =
+        operatorPhaseNames[guidance.phase] || uiValue(guidance.phase);
+      $('operator-phase').className = `setup-state ${
+        guidance.severity === 'ready' ? 'ready' : ''
+      }`;
+
+      const blockers = $('operator-blockers');
+      blockers.replaceChildren();
+      for (const blocker of guidance.blockers || []) {
+        const item = document.createElement('li');
+        item.textContent = text(blocker.message || blocker.code);
+        blockers.append(item);
+      }
+      blockers.hidden = blockers.childElementCount === 0;
+      const notices = guidance.notices || [];
+      $('operator-notices').textContent = notices.join(' · ');
+      $('operator-notices').hidden = notices.length === 0;
+
+      const action = guidance.recommended_action || null;
+      const actionButton = $('operator-primary-action');
+      actionButton.hidden = !action;
+      actionButton.disabled = !action;
+      actionButton.textContent = action ? text(action.label) : '下一步';
+      const rawError = guidance.raw_error;
+      $('operator-error').hidden = !rawError;
+      $('operator-raw-error').textContent = rawError ? String(rawError) : '—';
+    }
     function renderAcceptance(value) {
       const acceptance = value.acceptance;
       const card = $('acceptance-card');
@@ -488,6 +619,7 @@ _HTML = """<!doctype html>
       }
       card.hidden = false;
       captureCard.hidden = false;
+      renderOperatorGuidance(value);
       const setup = acceptance.setup || {};
       const calibration = setup.calibration || {};
       const executionTarget = value.execution_target;
@@ -510,6 +642,9 @@ _HTML = """<!doctype html>
       const acceptanceBusy = intentPending
         || Number(acceptance.pending_intent_count || 0) > 0
         || Boolean(acceptance.active_intent_id);
+      const busyReason = acceptanceBusy
+        ? '当前已有操作正在执行；请等待完成或使用“中断当前操作”。'
+        : '';
       const calibrationAvailable = Boolean(setup.calibration);
       const deferredHumanSetup = Boolean(
         runtimeConstructed
@@ -605,6 +740,12 @@ _HTML = """<!doctype html>
       $('begin-vive-calibration').disabled = acceptanceBusy
         || !calibrationAvailable || workflowActive
         || !Boolean(inputPreflight.ready);
+      explainDisabled(
+        $('begin-vive-calibration'),
+        busyReason || (!calibrationAvailable
+          ? '当前配置不提供 VIVE 标定。'
+          : workflowActive ? '标定已经开始。' : '先等待有效 VIVE 输入。'),
+      );
       $('capture-vive-calibration').disabled = acceptanceBusy || !canCapture;
       $('reset-vive-calibration').disabled = acceptanceBusy
         || !workflowActive || !canCapture;
@@ -616,6 +757,32 @@ _HTML = """<!doctype html>
       const target = $('control-modes');
       target.replaceChildren();
       const runtimeStarted = Boolean(value.started);
+      // The acceptance controller owns which typed start intent is legal.
+      // Do not infer that capability from a runtime/bootstrap profile label:
+      // those projections can change independently while the application is
+      // being constructed or while a cached status is served.
+      const allocationProfile = Boolean(
+        acceptance.allocation_runtime_enabled
+      );
+      const selectedControlProfile = String(
+        value.control_profile_id || 'fixed_alpha_compatibility'
+      );
+      const allocationSupportsAbsolute = selectedControlProfile.includes(
+        'scheme_b'
+      );
+      $('page-summary').textContent = allocationProfile
+        ? '动态分配以策略基线启动；VIVE 与夹爪只在首次进入 Human 模式时接入。'
+        : '可选择纯 PPO、纯遥操或固定比例融合；纯 PPO 不要求 VIVE 先就绪。';
+      $('acceptance-description').textContent = allocationProfile
+        ? (allocationSupportsAbsolute
+          ? '可在策略基线、自动分配、人类相对修正和人类绝对接管之间切换。'
+          : '可在策略基线、自动分配和人类相对修正之间切换；当前方案不提供绝对接管。')
+        : '启动后可切换纯遥操、纯 PPO 和比例融合；切换到 Human 相关模式时才接纳 VIVE。';
+      target.hidden = allocationProfile;
+      $('fixed-alpha-controls').hidden = allocationProfile;
+      $('blend-failure-controls').hidden = allocationProfile;
+      $('human-timeout-controls').hidden = allocationProfile;
+      $('allocation-controls').hidden = !allocationProfile;
       const reportedMixMode = ((value.composition || {}).mix || {}).mode;
       const blendFallback = value.blend_failure_fallback || {};
       const fallbackMode = {
@@ -632,45 +799,150 @@ _HTML = """<!doctype html>
           : null
       );
       const episodeEnded = Boolean(value.episode_ended);
-      for (const modeId of Object.keys(controlModeNames)) {
-        const modeLaunchReady = modeId === 'ppo_only'
-          ? policyRuntimeLaunchReady
-          : humanRuntimeLaunchReady;
-        const modeCard = document.createElement('div');
-        modeCard.className = 'mode-card';
-        const title = document.createElement('h3');
-        title.textContent = controlModeNames[modeId];
-        const state = document.createElement('div');
-        state.className = 'mode-state';
-        state.textContent = activeMode === modeId
-          ? '当前模式'
-          : runtimeStarted ? '可随时切换' : '可作为启动模式';
-        const button = document.createElement('button');
-        button.textContent = !modeLaunchReady
-          ? (modeId === 'ppo_only'
-            ? '策略运行时尚未就绪'
-            : '等待 VIVE / 坐标配置')
-          : activeMode === modeId
-          ? '当前模式'
-          : runtimeStarted
-          ? '切换到此模式'
-          : '以此模式启动';
-        button.disabled = acceptanceBusy
-          || episodeEnded
-          || activeMode === modeId
-          || !modeLaunchReady;
-        button.addEventListener('click', () => {
-          const alpha = modeId === 'proportional_blend'
-            ? Number($('blend-alpha').value) : null;
-          submitIntent(
-            runtimeStarted ? 'set_control_mode' : 'start_runtime',
-            modeId,
-            alpha,
+      if (!allocationProfile) {
+        for (const modeId of Object.keys(controlModeNames)) {
+          const modeLaunchReady = modeId === 'ppo_only'
+            ? policyRuntimeLaunchReady
+            : humanRuntimeLaunchReady;
+          const modeCard = document.createElement('div');
+          modeCard.className = 'mode-card';
+          const title = document.createElement('h3');
+          title.textContent = controlModeNames[modeId];
+          const description = document.createElement('p');
+          description.textContent = controlModeDescriptions[modeId];
+          const state = document.createElement('div');
+          state.className = 'mode-state';
+          state.textContent = activeMode === modeId
+            ? '当前模式'
+            : runtimeStarted ? '可随时切换' : '可作为启动模式';
+          const button = document.createElement('button');
+          button.textContent = !modeLaunchReady
+            ? (modeId === 'ppo_only'
+              ? '策略运行时尚未就绪'
+              : '等待 VIVE / 坐标配置')
+            : activeMode === modeId
+            ? '当前模式'
+            : runtimeStarted
+            ? '切换到此模式'
+            : '以此模式启动';
+          button.disabled = acceptanceBusy
+            || episodeEnded
+            || activeMode === modeId
+            || !modeLaunchReady;
+          explainDisabled(
+            button,
+            busyReason || (episodeEnded
+              ? '当前回合已经结束。'
+              : activeMode === modeId
+              ? '这已经是当前模式。'
+              : 'Human 相关模式需要有效 VIVE 输入与已保存坐标配置。'),
           );
-        });
-        modeCard.append(title, state, button);
-        target.append(modeCard);
+          button.addEventListener('click', () => {
+            const alpha = modeId === 'proportional_blend'
+              ? Number($('blend-alpha').value) : null;
+            submitIntent(
+              runtimeStarted ? 'set_control_mode' : 'start_runtime',
+              modeId,
+              alpha,
+            );
+          });
+          modeCard.append(title, description, state, button);
+          target.append(modeCard);
+        }
       }
+      const allocationOperations = ((value.composition || {})
+        .allocation_operations || {});
+      const allocationMode = allocationOperations.allocation_override_mode
+        || 'automatic';
+      const effectiveAllocationModes = (((value.composition || {}).last_cycle
+        || {}).composition_step || {}).allocation?.selected_mode_by_component || {};
+      const effectiveAllocationModeSet = new Set(
+        Object.values(effectiveAllocationModes)
+      );
+      const effectiveAllocationLabel = effectiveAllocationModeSet.size === 1
+        ? (allocationModeNames[[...effectiveAllocationModeSet][0]]
+          || [...effectiveAllocationModeSet][0])
+        : effectiveAllocationModeSet.size > 1
+        ? '按 component 分配'
+        : '等待首个正式周期';
+      const supportedAllocationSignals = new Set(
+        allocationOperations.supported_signals || []
+      );
+      const allocationUnavailable = acceptanceBusy
+        || !runtimeStarted || Boolean(value.held) || episodeEnded;
+      $('start-allocation-runtime').hidden = runtimeStarted;
+      $('start-allocation-runtime').textContent = '以策略基线启动动态分配';
+      $('start-allocation-runtime').disabled = acceptanceBusy
+        || !allocationProfile || runtimeStarted || episodeEnded
+        || !policyRuntimeLaunchReady;
+      const guidanceBlockers = (value.operator_guidance?.blockers || [])
+        .map(item => item.message || item.code).join('；');
+      explainDisabled(
+        $('start-allocation-runtime'),
+        busyReason || (episodeEnded
+          ? '当前回合已经结束。'
+          : runtimeStarted ? '运行会话已经启动。'
+          : guidanceBlockers || '启动条件尚未满足。'),
+      );
+      for (const [buttonId, modeId, signalName] of [
+        ['allocation-automatic', 'automatic', 'allocation_automatic'],
+        ['allocation-base-only', 'base_only', 'allocation_base_only'],
+        ['allocation-relative-overlay', 'relative_overlay', 'allocation_relative_overlay'],
+        ['allocation-absolute-overlay-owner', 'absolute_overlay_owner', 'allocation_absolute_overlay_owner'],
+      ]) {
+        const button = $(buttonId);
+        if (modeId === 'absolute_overlay_owner') {
+          button.hidden = !supportedAllocationSignals.has(signalName);
+        }
+        const modeNeedsHuman = modeId !== 'base_only';
+        const waitingForHuman = modeNeedsHuman
+          && deferredHumanSetup && !humanRuntimeLaunchReady;
+        // Automatic may already be the profile default while Human is still
+        // deferred.  Keep it clickable once Human becomes ready so that the
+        // same intent performs the typed attachment before reasserting auto.
+        const currentModeIsActionableAttachment = modeId === 'automatic'
+          && deferredHumanSetup && humanRuntimeLaunchReady;
+        button.disabled = allocationUnavailable || waitingForHuman
+          || (allocationMode === modeId && !currentModeIsActionableAttachment);
+        explainDisabled(
+          button,
+          busyReason || (!runtimeStarted
+            ? '先启动动态分配运行会话。'
+            : value.held ? '输出保持期间不能切换分配模式。'
+            : episodeEnded ? '当前回合已经结束。'
+            : waitingForHuman
+            ? '等待新鲜 VIVE 输入和有效坐标配置；策略基线可继续运行。'
+            : '这已经是当前模式。'),
+        );
+      }
+      const rebaseWaitingForHuman = deferredHumanSetup
+        && !humanRuntimeLaunchReady;
+      $('allocation-rebase-and-clear').disabled = allocationUnavailable
+        || rebaseWaitingForHuman;
+      explainDisabled(
+        $('allocation-rebase-and-clear'),
+        busyReason || (!runtimeStarted
+          ? '先启动动态分配运行会话。'
+          : value.held ? '先恢复运行，再请求重新定基。'
+          : rebaseWaitingForHuman
+          ? '等待 Human 输入与坐标配置就绪。'
+          : '当前回合已经结束。'),
+      );
+      $('allocation-mode-status').textContent = allocationProfile
+        ? (runtimeStarted
+          ? `分配规则：${allocationModeNames[allocationMode] || allocationMode}`
+            + ` · 本周期实际选择：${effectiveAllocationLabel}`
+          : '尚未启动 · 可先使用策略基线')
+        : '—';
+      $('allocation-operation-status').textContent = !runtimeStarted
+        ? '等待 Runtime 启动。'
+        : allocationOperations.last_operation_signal
+        ? `最近操作：${allocationSignalNames[
+            allocationOperations.last_operation_signal
+          ] || allocationOperations.last_operation_signal} · revision ${text(
+            allocationOperations.allocation_override_revision
+          )}`
+        : '尚未进行手动分配或 rebase。';
       const swapButton = $('swap-vive-sources');
       swapButton.disabled = acceptanceBusy
         || workflowActive
@@ -684,10 +956,17 @@ _HTML = """<!doctype html>
         ? '已交换左右来源；当前映射已更新'
         : '只交换左右来源映射，不检查来源状态';
       const fallbackSelector = $('blend-failure-fallback');
+      const blendFailureGraceInput = $('blend-failure-grace');
       if (document.activeElement !== fallbackSelector) {
         fallbackSelector.value = blendFallback.selected_source || 'hold';
       }
+      if (document.activeElement !== blendFailureGraceInput) {
+        blendFailureGraceInput.value = Number(
+          blendFallback.grace_sec ?? 0
+        ).toFixed(2);
+      }
       fallbackSelector.disabled = acceptanceBusy || !runtimeStarted;
+      blendFailureGraceInput.disabled = acceptanceBusy || !runtimeStarted;
       $('apply-blend-failure-fallback').disabled =
         acceptanceBusy || !runtimeStarted;
       const fallbackActivation = blendFallback.last_activation || {};
@@ -696,9 +975,17 @@ _HTML = """<!doctype html>
           ? `已因融合目标不可执行而锁存到${
               blendFallback.latched_source === 'human' ? '人类' : '策略'
             }；重新选择比例融合可解除。`
+          : fallbackActivation.status === 'grace_active'
+          ? `融合目标仍由下游立即保持；连续失败 ${Number(
+              fallbackActivation.failure_elapsed_sec || 0
+            ).toFixed(2)} / ${Number(blendFallback.grace_sec || 0).toFixed(2)} 秒后才切换来源。`
           : fallbackActivation.status === 'hold_selected'
           ? '最近一次融合目标不可执行，已保持静止。'
-          : '只在比例融合目标无法解析时触发。';
+          : fallbackSelector.value === 'hold'
+          ? '静止在首次不可执行时立即生效；切换延迟不适用于静止。'
+          : `连续不可执行达到 ${Number(
+              blendFallback.grace_sec || 0
+            ).toFixed(2)} 秒后切换来源；每个失败周期仍立即保持。`;
       const humanTimeoutFallback = value.human_timeout_fallback || {};
       const humanTimeoutSelector = $('human-timeout-fallback');
       if (document.activeElement !== humanTimeoutSelector) {
@@ -716,10 +1003,27 @@ _HTML = """<!doctype html>
           ? `人类输入超过 ${timeoutSec} 秒未更新，已保持静止。`
           : `超过 ${timeoutSec} 秒无新的人类输出时触发；默认静止。`;
       $('hold-runtime').disabled = acceptanceBusy || !value.started || value.held;
+      explainDisabled(
+        $('hold-runtime'),
+        busyReason || (!value.started ? '运行会话尚未启动。' : '输出已经保持。'),
+      );
       $('rearm-runtime').disabled = acceptanceBusy || !value.started || !value.held
         || value.episode_ended;
+      explainDisabled(
+        $('rearm-runtime'),
+        busyReason || (!value.started
+          ? '运行会话尚未启动。'
+          : value.episode_ended ? '已结束的回合不能恢复。' : '当前正在运行。'),
+      );
       $('capture-runtime-home').disabled = acceptanceBusy || !value.started
         || !value.held || value.episode_ended || deferredHumanSetup;
+      explainDisabled(
+        $('capture-runtime-home'),
+        busyReason || (!value.started
+          ? '运行会话尚未启动。'
+          : !value.held ? '必须先保持输出。'
+          : deferredHumanSetup ? 'Human 输入尚未接入。' : '当前回合已经结束。'),
+      );
       const runtimeHeld = Boolean(value.held);
       const runtimeAvailable = runtimeConstructed && !value.episode_ended;
       $('runtime-control-state').textContent = !runtimeConstructed
@@ -743,9 +1047,19 @@ _HTML = """<!doctype html>
       const captureWriter = capture.writer || {};
       $('finalize-capture').disabled = acceptanceBusy || !value.started
         || value.episode_ended || capture.status !== 'recording';
+      explainDisabled(
+        $('finalize-capture'),
+        busyReason || (!value.started
+          ? '运行会话尚未启动。'
+          : value.episode_ended ? '当前回合已经结束。' : '记录链路不在 recording 状态。'),
+      );
       $('stop-runtime').disabled = Boolean(acceptance.shutdown_requested);
       $('acceptance-label').textContent = acceptance.last_error
         ? '故障'
+        : allocationProfile && runtimeStarted
+        ? `当前：${allocationModeNames[allocationMode] || allocationMode}`
+        : allocationProfile
+        ? '动态分配待启动'
         : activeMode
         ? `当前：${controlModeNames[activeMode] || uiValue(activeMode)}`
         : policyRuntimeLaunchReady
@@ -760,7 +1074,10 @@ _HTML = """<!doctype html>
         ['存储目录', capture.session_root], ['说明', capture.message],
       ]);
       if (acceptance.last_error) {
-        $('intent-message').textContent = uiValue(acceptance.last_error);
+        const guidance = value.operator_guidance || {};
+        $('intent-message').textContent = guidance.headline
+          ? `${guidance.headline}；原始错误见上方或高级诊断。`
+          : uiValue(acceptance.last_error);
       } else if (acceptance.last_result) {
         const result = acceptance.last_result;
         const resultValue = result.message || result.status || result.intent_kind;
@@ -774,6 +1091,8 @@ _HTML = """<!doctype html>
       humanAlpha = null,
       profileName = null,
       fallbackSource = null,
+      allocationMode = null,
+      blendFailureGraceSec = null,
     ) {
       const outOfBand = ['cancel_operation', 'stop_runtime'].includes(intentKind);
       if (!latestStatus || (intentPending && !outOfBand)) return;
@@ -789,6 +1108,10 @@ _HTML = """<!doctype html>
       if (humanAlpha !== null) payload.human_alpha = humanAlpha;
       if (profileName !== null) payload.profile_name = profileName;
       if (fallbackSource !== null) payload.fallback_source = fallbackSource;
+      if (allocationMode !== null) payload.allocation_mode = allocationMode;
+      if (blendFailureGraceSec !== null) {
+        payload.blend_failure_grace_sec = blendFailureGraceSec;
+      }
       if (!outOfBand) intentPending = true;
       $('intent-message').textContent = '提交中…';
       let acceptedIntentId = null;
@@ -834,6 +1157,37 @@ _HTML = """<!doctype html>
         if (!acceptedIntentId) await refresh();
       }
     }
+    const lifecycleConfirmations = {
+      rebuild_runtime: '这会结束当前 MuJoCo 仿真；未封存记录会被明确中止。确认继续吗？',
+      finalize_capture: '这会结束当前回合并封存记录，之后不能恢复本回合。确认继续吗？',
+      stop_runtime: '这会保持输出并退出当前控制进程。确认继续吗？',
+    };
+    function confirmLifecycleIntent(intentKind) {
+      const message = lifecycleConfirmations[intentKind];
+      return !message || window.confirm(message);
+    }
+    function submitLifecycleIntent(intentKind) {
+      if (!confirmLifecycleIntent(intentKind)) return;
+      submitIntent(intentKind);
+    }
+    $('operator-primary-action').addEventListener('click', () => {
+      const action = latestStatus?.operator_guidance?.recommended_action;
+      if (!action) return;
+      if (action.interaction === 'focus') {
+        const target = $(action.target_id);
+        if (!target) return;
+        if (target.tagName === 'DETAILS') target.open = true;
+        target.scrollIntoView({behavior: 'smooth', block: 'start'});
+        return;
+      }
+      if (action.interaction !== 'intent') return;
+      if (!confirmLifecycleIntent(action.intent_kind)) return;
+      submitIntent(
+        action.intent_kind,
+        action.control_mode || null,
+        action.human_alpha ?? null,
+      );
+    });
     $('swap-vive-sources').addEventListener(
       'click',
       () => submitIntent('swap_vive_sources'),
@@ -871,6 +1225,8 @@ _HTML = """<!doctype html>
         null,
         null,
         $('blend-failure-fallback').value,
+        null,
+        Number($('blend-failure-grace').value),
       ),
     );
     $('apply-human-timeout-fallback').addEventListener(
@@ -883,6 +1239,27 @@ _HTML = """<!doctype html>
         $('human-timeout-fallback').value,
       ),
     );
+    $('start-allocation-runtime').addEventListener(
+      'click',
+      () => submitIntent('start_allocation_runtime'),
+    );
+    for (const [buttonId, allocationMode] of [
+      ['allocation-automatic', 'automatic'],
+      ['allocation-base-only', 'base_only'],
+      ['allocation-relative-overlay', 'relative_overlay'],
+      ['allocation-absolute-overlay-owner', 'absolute_overlay_owner'],
+    ]) {
+      $(buttonId).addEventListener(
+        'click',
+        () => submitIntent(
+          'set_allocation_mode', null, null, null, null, allocationMode
+        ),
+      );
+    }
+    $('allocation-rebase-and-clear').addEventListener(
+      'click',
+      () => submitIntent('request_residual_rebase_and_clear'),
+    );
     $('hold-runtime').addEventListener('click', () => submitIntent('hold'));
     $('rearm-runtime').addEventListener('click', () => submitIntent('rearm'));
     $('capture-runtime-home').addEventListener(
@@ -891,14 +1268,20 @@ _HTML = """<!doctype html>
     );
     $('rebuild-runtime').addEventListener(
       'click',
-      () => submitIntent('rebuild_runtime'),
+      () => submitLifecycleIntent('rebuild_runtime'),
     );
     $('cancel-operation').addEventListener(
       'click',
       () => submitIntent('cancel_operation'),
     );
-    $('finalize-capture').addEventListener('click', () => submitIntent('finalize_capture'));
-    $('stop-runtime').addEventListener('click', () => submitIntent('stop_runtime'));
+    $('finalize-capture').addEventListener(
+      'click',
+      () => submitLifecycleIntent('finalize_capture'),
+    );
+    $('stop-runtime').addEventListener(
+      'click',
+      () => submitLifecycleIntent('stop_runtime'),
+    );
     function renderViveReceiver(viveReceiver) {
       viveReceiver = viveReceiver || {};
       const receiverState = viveReceiver.status || 'unavailable';
@@ -949,11 +1332,13 @@ _HTML = """<!doctype html>
         ].join(' · ');
         const errorNode = $(`vive-${side}-error`);
         errorNode.className = inactive ? 'live-error inactive' : 'live-error';
-        errorNode.textContent = tracker.sender_error ? `错误：${tracker.sender_error}` : '';
+        errorNode.textContent = tracker.sender_error
+          ? `${inactive ? '未选用来源' : '错误'}：${tracker.sender_error}` : '';
       }
       renderViveTracker('left');
       renderViveTracker('right');
     }
+__SIM_HIL_HUMAN_DEFLECTION_JS__
     function render(value) {
       latestStatus = value;
       $('error').className = 'error';
@@ -969,12 +1354,22 @@ _HTML = """<!doctype html>
       );
       const ready = Boolean(value.started && readiness.ready && gate.status === 'ready');
       const badge = $('badge');
-      badge.textContent = restartRequired
-        ? uiValue('RESTART REQUIRED')
-        : value.started ? (ready ? uiValue('READY') : uiValue('HOLD'))
-        : viveSetupOnly ? uiValue('VIVE SETUP')
-        : starting ? uiValue('STARTING') : uiValue('STOPPED');
-      badge.className = `badge ${restartRequired ? 'error' : ready ? 'ready' : 'hold'}`;
+      const guidance = value.operator_guidance || {};
+      if (guidance.phase) {
+        badge.textContent = operatorPhaseNames[guidance.phase]
+          || uiValue(guidance.phase);
+        badge.className = `badge ${
+          guidance.severity === 'error'
+            ? 'error' : guidance.severity === 'ready' ? 'ready' : 'hold'
+        }`;
+      } else {
+        badge.textContent = restartRequired
+          ? uiValue('RESTART REQUIRED')
+          : starting ? uiValue('STARTING')
+          : value.started ? (ready ? uiValue('READY') : uiValue('HOLD'))
+          : viveSetupOnly ? uiValue('VIVE SETUP') : uiValue('STOPPED');
+        badge.className = `badge ${restartRequired ? 'error' : ready ? 'ready' : 'hold'}`;
+      }
       $('sampled').textContent = `t=${text(value.sampled_at)}`;
       const binding = value.calibration || {};
       const contracts = value.contracts || {};
@@ -1023,6 +1418,7 @@ _HTML = """<!doctype html>
         ['last error', policy.last_error],
       ]);
       const human = value.human || {};
+      renderHumanDeflection(human.relative_deflection || {});
       const humanEmission = human.last_emission || {};
       const bindingStatus = human.binding || {};
       const safety = human.session_safety || {};
@@ -1049,6 +1445,10 @@ _HTML = """<!doctype html>
         `人类目标 ${text(gripperHuman.normalized_close)}`,
         `执行目标 ${text(gripperExecution.accepted_close)}`,
         `仿真测量 ${text(gripperExecution.measured_close)}`,
+        gripperInputChannel.read_error
+          ? `输入错误 ${text(gripperInputChannel.read_error)}` : null,
+        gripperInputChannel.reader_error_count !== undefined
+          ? `累计读取错误 ${text(gripperInputChannel.reader_error_count)}` : null,
         gripperDevice.endpoint ? `端点 ${text(gripperDevice.endpoint)}` : null,
         gripperDevice.fallback_reason
           ? `回退 ${uiValue(gripperDevice.fallback_reason)}` : null,
@@ -1057,6 +1457,10 @@ _HTML = """<!doctype html>
         sourceConfig.vive_source_role_by_output_channel || {};
       rows($('human-rows'), [
         ['session', human.session_state], ['source started', human.source_started],
+        ['observed sequence', human.last_observed_emission_sequence],
+        ['source rejection', human.last_rejection_reason],
+        ['last step valid', (human.last_step || {}).emission_valid],
+        ['last step rejection', (human.last_step || {}).rejection_reason],
         ['last emission', humanEmission.emission_id],
         ['emission hash', humanEmission.semantic_content_hash],
         ['age', human.last_emission_age_sec], ['rig absent', bindingStatus.rig_absent],
@@ -1186,6 +1590,21 @@ _HTML = """<!doctype html>
 </body>
 </html>
 """
+
+_HTML = (
+    _HTML.replace(
+        "__SIM_HIL_HUMAN_DEFLECTION_CSS__",
+        HUMAN_DEFLECTION_VIEW_CSS,
+    )
+    .replace(
+        "__SIM_HIL_HUMAN_DEFLECTION_HTML__",
+        HUMAN_DEFLECTION_VIEW_HTML,
+    )
+    .replace(
+        "__SIM_HIL_HUMAN_DEFLECTION_JS__",
+        HUMAN_DEFLECTION_VIEW_JS,
+    )
+)
 
 
 class SimHILStatusServer:

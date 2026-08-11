@@ -1,0 +1,12 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_reach_goal_delta_overhead_progress_xyz_v4.json",
+  "name": "rm65_right_cube_reach_safe_hover_goal_delta_xyz_v1",
+  "reach_target_height_offset_m": 0.10,
+  "reach_success_distance_m": 0.025,
+  "success_min_safety_clear_policy_steps": 5,
+  "reward_shaping": {
+    "grasp_height_offset_m": 0.10,
+    "safety_projection_penalty": 1.5,
+    "safety_intervention_penalty": 0.25
+  }
+}

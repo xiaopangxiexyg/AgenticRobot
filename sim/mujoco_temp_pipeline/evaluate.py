@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
@@ -11,8 +12,16 @@ import numpy as np
 import torch
 
 from sim.mujoco.runtime import CubeLiftVectorExecutor
-from sim.mujoco.tasks.cube_lift.config import is_cube_lift_success_reason
+from sim.mujoco.tasks.cube_lift.config import (
+    CubeLiftTaskConfig,
+    is_cube_lift_success_reason,
+)
+from sim.mujoco.tasks.cube_lift.learning import (
+    build_policy_action_transform,
+    encode_policy_observation,
+)
 
+from .action_diagnostics import ActionDiagnostics
 from .checkpoint import build_policy_from_checkpoint, check_task_config_compatibility
 from .policy import resolve_device
 from .train import DEFAULT_CHECKPOINT, DEFAULT_TASK_CONFIG
@@ -37,7 +46,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
     parser.add_argument("--episodes", type=int, default=32)
-    parser.add_argument("--num-envs", type=int, default=8)
+    parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=10_000)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--start-method", choices=("spawn", "forkserver"), default="spawn")
@@ -89,6 +98,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.task_config,
         allow_mismatch=getattr(args, "allow_task_config_mismatch", False),
     )
+    task_config = CubeLiftTaskConfig.load(args.task_config)
+    action_transform = build_policy_action_transform(task_config)
+    if (
+        policy.action_dim != action_transform.policy_dim
+        or policy.environment_action_dim != action_transform.task_dim
+        or tuple(policy.active_action_indices) != action_transform.task_indices
+    ):
+        raise ValueError(
+            "Checkpoint policy action dimensions do not match the task-owned "
+            "latent-to-pose transform."
+        )
     env = CubeLiftVectorExecutor(
         args.num_envs,
         config_path=args.task_config,
@@ -123,6 +143,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     projected_actions = 0
     rejected_actions = 0
     evaluated_actions = 0
+    blocking_body_pairs: Counter[str] = Counter()
+    blocking_categories: Counter[str] = Counter()
+    blocking_category_projection_fraction_sum: Counter[str] = Counter()
+    blocking_category_rejections: Counter[str] = Counter()
+    phase_blocking_categories: Counter[str] = Counter()
+    phase_actions: Counter[str] = Counter()
+    phase_projected_actions: Counter[str] = Counter()
     minimum_safety_distance = float("inf")
     hard_penetrations = 0
     clearance_violations = 0
@@ -131,13 +158,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     tracking_error_max = 0.0
     gripper_tracking_error_sum = 0.0
     gripper_tracking_error_max = 0.0
+    action_diagnostics = ActionDiagnostics()
     try:
         observation, _infos = env.reset()
         max_steps = args.episodes * 600
         for _ in range(max_steps):
+            actor_observation = encode_policy_observation(
+                task_config,
+                observation,
+            )
             with torch.no_grad():
-                action, _log_prob, _value = policy.act(
-                    torch.as_tensor(normalizer.normalize(observation), device=device),
+                action, _log_prob = policy.predict_action(
+                    torch.as_tensor(
+                        normalizer.normalize(actor_observation),
+                        device=device,
+                    ),
                     deterministic=not args.stochastic,
                 )
                 if policy.action_dim == 1:
@@ -147,12 +182,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         -1.0,
                         1.0,
                     )
-                environment_action = policy.expand_action(action)
+                latent_action = action.cpu().numpy().astype(
+                    np.float32, copy=False
+                )
+                action_scale = action_transform.action_scale(observation)
+                environment_action = action_transform.transform(
+                    latent_action,
+                    observation=observation,
+                )
+                action_diagnostics.update(
+                    latent_action,
+                    environment_action,
+                    action_scale,
+                )
             observation, reward, terminated, truncated, infos = env.step(
-                environment_action.cpu().numpy().astype(np.float32, copy=False)
+                environment_action
             )
             evaluated_actions += args.num_envs
-            for info in infos:
+            done = np.logical_or(terminated, truncated)
+            transition_infos = tuple(
+                info.get("final_info", info) if done[env_id] else info
+                for env_id, info in enumerate(infos)
+            )
+            for info in transition_infos:
                 tracking_error_sum += float(info.get("arm_tracking_error_rad_mean", 0.0))
                 tracking_error_max = max(
                     tracking_error_max,
@@ -166,10 +218,46 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 gripper_tracking_error_max = max(
                     gripper_tracking_error_max, gripper_error
                 )
-                projected_actions += int(info.get("safety_modified", False))
+                safety_modified = bool(info.get("safety_modified", False))
+                projected_actions += int(safety_modified)
                 rejected_actions += int(
                     float(info.get("safety_projection_alpha", 1.0)) <= 1e-8
                 )
+                if bool(info.get("post_contact_phase_active", False)):
+                    phase = "post_contact"
+                elif float(
+                    info.get("gripper_bilateral_inner_contact_score", 0.0)
+                ) >= 0.5:
+                    phase = "bilateral_inner_contact"
+                else:
+                    phase = "pre_contact"
+                phase_actions[phase] += 1
+                phase_projected_actions[phase] += int(safety_modified)
+                if safety_modified:
+                    body1 = info.get("safety_blocking_body1")
+                    body2 = info.get("safety_blocking_body2")
+                    pair = " <-> ".join(
+                        sorted(
+                            (
+                                "<unknown>" if body1 is None else str(body1),
+                                "<unknown>" if body2 is None else str(body2),
+                            )
+                        )
+                    )
+                    blocking_body_pairs[pair] += 1
+                    category = str(
+                        info.get("safety_blocking_category") or "unknown"
+                    )
+                    blocking_categories[category] += 1
+                    blocking_category_projection_fraction_sum[category] += (
+                        1.0
+                        - float(info.get("safety_projection_alpha", 1.0))
+                    )
+                    blocking_category_rejections[category] += int(
+                        float(info.get("safety_projection_alpha", 1.0))
+                        <= 1e-8
+                    )
+                    phase_blocking_categories[f"{phase}: {category}"] += 1
                 distance = float(info.get("safety_minimum_distance_m", float("inf")))
                 if np.isfinite(distance):
                     minimum_safety_distance = min(minimum_safety_distance, distance)
@@ -185,14 +273,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
             returns += reward
             lengths += 1
-            done = np.logical_or(terminated, truncated)
             for env_id in np.flatnonzero(done):
                 if completed_by_env[env_id] < target_episodes_per_env:
                     episode_return = float(returns[env_id])
                     episode_length = int(lengths[env_id])
                     success = int(
                         is_cube_lift_success_reason(
-                            infos[env_id].get("termination_reason")
+                            transition_infos[env_id].get("termination_reason")
                         )
                     )
                     completed_returns.append(episode_return)
@@ -219,6 +306,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         **compatibility,
         "checkpoint": str(args.checkpoint),
         "checkpoint_global_step": int(payload["global_step"]),
+        "evaluation_seed": int(args.seed),
+        "task_objective": task_config.task_objective,
+        "task_config_semantic_sha256": task_config.source_sha256,
+        "cube_spawn_xy_jitter_m": list(
+            task_config.cube_spawn_xy_jitter_m
+        ),
+        "cube_spawn_yaw_jitter_rad": (
+            task_config.cube_spawn_yaw_jitter_rad
+        ),
         "episodes": args.episodes,
         "successes": successes,
         "success_rate": successes / args.episodes,
@@ -226,6 +322,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "policy_action_dim": policy.action_dim,
         "environment_action_dim": policy.environment_action_dim,
         "active_action_indices": list(policy.active_action_indices),
+        "policy_action_components": list(action_transform.policy_components),
+        "policy_action_transform_id": action_transform.transform_id,
+        "policy_action_transform_hash": action_transform.semantic_content_hash,
+        "task_action_layout": task_config.action_layout,
+        **action_diagnostics.summary(),
         "action_offset_results": [
             {
                 "action_offset": offset,
@@ -249,6 +350,38 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "episode_length_mean": float(np.mean(completed_lengths)),
         "projected_action_rate": projected_actions / max(evaluated_actions, 1),
         "fully_rejected_action_rate": rejected_actions / max(evaluated_actions, 1),
+        "projected_action_count": projected_actions,
+        "fully_rejected_action_count": rejected_actions,
+        "projected_action_rate_by_phase": {
+            phase: phase_projected_actions[phase] / max(count, 1)
+            for phase, count in sorted(phase_actions.items())
+        },
+        "action_count_by_phase": dict(sorted(phase_actions.items())),
+        "safety_blocking_body_pair_counts": dict(
+            sorted(
+                blocking_body_pairs.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ),
+        "safety_blocking_category_counts": dict(
+            sorted(blocking_categories.items())
+        ),
+        "safety_blocking_category_action_rates": {
+            category: count / max(evaluated_actions, 1)
+            for category, count in sorted(blocking_categories.items())
+        },
+        "safety_blocking_category_projection_fraction_mean": {
+            category: blocking_category_projection_fraction_sum[category]
+            / max(count, 1)
+            for category, count in sorted(blocking_categories.items())
+        },
+        "safety_blocking_category_rejection_rates": {
+            category: blocking_category_rejections[category] / max(count, 1)
+            for category, count in sorted(blocking_categories.items())
+        },
+        "safety_blocking_phase_category_counts": dict(
+            sorted(phase_blocking_categories.items())
+        ),
         "minimum_robot_environment_distance_m": (
             None if not np.isfinite(minimum_safety_distance) else minimum_safety_distance
         ),

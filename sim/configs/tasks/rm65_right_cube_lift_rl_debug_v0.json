@@ -3,7 +3,7 @@
   "name": "rm65_right_cube_lift_rl_debug_v0",
   "policy_class": "legacy_debug",
   "base_contract_path": "sim/configs/rm65_bimanual_physics_v1.json",
-  "base_contract_sha256": "baa5efcd490f27b0d2e261ac2e5c91181a0618de75596017a05714a02333a0df",
+  "base_contract_sha256": "c3d4703b460905d130e59885661a7b037585b98e898ab9fdd59b01457aa5eae5",
   "execution_mode": "kinematic_direct_qpos_debug",
   "robot_dynamics": "not_simulated",
   "grasp_mode": "contact_latch_debug",

@@ -10,9 +10,19 @@ sim snapshot / real deployment snapshot
         -> named causal ObservationContract fields
         -> ModelInputBinding (same order, dtype, image layout, normalization)
         -> policy model
-        -> PolicyActionBinding (same frame, mode, and dimension)
-        -> sim actuator / real execution adapter
+        -> PolicyActionBinding (latent model output)
+        -> PolicyActionTransform (task-owned, deterministic)
+        -> complete real-aligned task action binding
+        -> IK / canonical safety / sim or real execution adapter
 ```
+
+The PPO latent action, complete task action, and admitted/executed action are
+separate values. PPO stores only the sampled latent value and its original log
+probability. Task conditioning, IK, safety projection, actuator dynamics, and
+contact are downstream transition dynamics; their outputs must not be inverted
+to manufacture a replacement PPO sample. A transform may reduce a policy to
+xyz, xyz+gripper, or z-only while the public Cube-Lift boundary stays on the
+seven-value right-TCP pose/gripper layout used by the real-aligned decoder.
 
 `ObservationRole.ACTOR` is the normal deployable-policy allowlist.  Privileged
 and reward-only fields can be present in an expert/critic snapshot, but a
@@ -26,10 +36,10 @@ terms; fixed indices are no longer scattered through the reward calculation.
 
 The selected first fixture is now available at
 `sim.mujoco.tasks.cube_lift.learning`: it names the existing normal/expert
-state and wrist-RGB slices, declares the seven-dimensional relative action,
-and provides a lossless flat-vector projection for parity tests.  It is not
-used to alter PPO tensor values; its identities are checked at PPO startup and
-recorded in temporary-PPO run/checkpoint metadata.  The normal v4 fixture is
+state and wrist-RGB slices, declares both latent and complete task actions,
+and provides a lossless flat-vector projection for parity tests. Its
+identities are checked at PPO startup and recorded in temporary-PPO
+run/checkpoint metadata. The normal v4 fixture is
 the long-term policy contract: it uses only measured state and wrist RGB and
 does not expose `episode_progress`.  v3 remains loadable as a versioned
 compatibility profile.
@@ -47,3 +57,9 @@ deployment adapter to reconstruct simulator reset-relative time.  A future
 real adapter still has to provide the measured-state and camera source
 semantics declared by the v4 fields; the manifest check is necessary but does
 not replace calibration or paired sim/real validation.
+
+Randomized task profiles that append object pose split it into an explicit
+`object_pose` field. Their current source is named
+`sim_ground_truth_proxy_for_external_object_pose_estimator.v1`; this is a
+simulation oracle standing in for a required real estimator, not evidence
+that the real observation adapter exists or has been calibrated.

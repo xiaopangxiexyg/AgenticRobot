@@ -1,0 +1,32 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json",
+  "name": "rm65_right_cube_pick_pose_xyz_gripper_v1",
+  "task_objective": "lift",
+  "object_pose_observation_source": "sim_ground_truth_proxy_for_external_object_pose_estimator.v1",
+  "policy_observation_fields": ["proprio"],
+  "policy_action_components": [
+    "right_tcp_delta_x",
+    "right_tcp_delta_y",
+    "right_tcp_delta_z",
+    "right_gripper_delta"
+  ],
+  "policy_action_scale": [0.2, 0.2, 1.0, 1.0],
+  "policy_action_bias": [0.0, 0.0, 0.0, 0.0],
+  "right_tcp_delta_m": [0.01, 0.01, 0.01],
+  "post_contact_phase_enabled": false,
+  "post_contact_action_scale": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  "post_contact_action_bias": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "post_contact_nonnegative_lift_action": false,
+  "cube_spawn_xy_jitter_m": [0.0, 0.0],
+  "cube_spawn_yaw_jitter_rad": 0.0,
+  "max_episode_steps": 300,
+  "success_hold_physics_ticks": 100,
+  "success_requires_bilateral_contact": true,
+  "reward_shaping": {
+    "gripper_reward_scale": 0.35,
+    "gripper_progress_scale": 4.0,
+    "gripper_command_reward_scale": 0.08,
+    "gripper_reward_requires_contact": false,
+    "grasp_acquire_requires_contact": true
+  }
+}

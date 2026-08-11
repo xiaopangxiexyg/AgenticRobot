@@ -20,12 +20,18 @@ from control_composition.eligibility import (
 )
 from control_composition.composition import (
     CompositionContextDraft,
+    CompositionInputBatchDraft,
     CompositionInputDraft,
     CompositionSpec,
     FormalCompositionStrategy,
     CompositionStrategyControl,
 )
 from control_composition.observability import SourceDifferenceSpec
+from control_composition.residual_anchor_lifecycle import (
+    ResidualAnchorLifecycleAdmissionReceipt,
+    ResidualAnchorLifecycleDraft,
+    ResidualAnchorLifecycleSpec,
+)
 from control_composition.retention import TimeWindowRetentionSpec
 from control_composition.runtime import (
     CompositeProposalSubmission,
@@ -84,6 +90,8 @@ from robot_motion.action import (
     TargetExecutionRequest,
     TargetExecutionStatusSnapshot,
     TargetExecutionSubmissionReceipt,
+    TARGET_ADMISSION_SUPPORT_EXPIRED,
+    TARGET_SUBMISSION_INSUFFICIENT_SUPPORT_MARGIN,
     admit_component_execution_target,
     build_target_execution_completion_receipt,
     build_target_execution_status_snapshot,
@@ -111,6 +119,7 @@ from robot_motion.replay.control_trace import (
     project_replay_source_frame_emission,
 )
 from robot_motion.runtime.identity import ClockDomainDescriptor
+from robot_motion.runtime import CommandDispatchReceipt
 from robot_motion.runtime.control_admission import (
     ControlAdmissionCoordinator,
     ControlCut,
@@ -128,6 +137,7 @@ from ..adapters import MujocoPositionExecutionRig
 from .measurement import (
     MujocoQposMeasurement,
     build_mujoco_backend_measurement,
+    build_mujoco_qpos_measurement_from_execution_cut,
     capture_mujoco_qpos_measurement,
 )
 from .execution_difference import (
@@ -135,6 +145,13 @@ from .execution_difference import (
     project_mujoco_execution_measurement_observation,
     project_mujoco_execution_reference_sample,
 )
+from .execution_pose_observation import (
+    MUJOCO_FK_POSE_MEASUREMENT_STAGE_ID,
+    MUJOCO_FK_POSE_REFERENCE_STAGE_ID,
+    project_mujoco_fk_pose_measurement_observation,
+    project_mujoco_fk_pose_reference_observation,
+)
+from .pose_kinematics import MujocoPoseObservationProjector
 from .observation import MujocoPolicyObservationAdapter
 from .reference_receiver import MujocoScheduledQposReferenceReceiver
 from .pose_resolution import (
@@ -258,6 +275,50 @@ class MujocoComponentExecutionBinding:
 
 
 @dataclass(frozen=True)
+class MujocoDirectComponentProposalSource:
+    """Fixed identity for one native ``ComponentAction`` proposal source.
+
+    The caller of :meth:`MujocoDeployRuntime.submit_component_action` cannot
+    select or override this identity.  The first supported direct source is an
+    Agent Skill; adding another source kind requires another explicit runtime
+    profile instead of reusing policy lineage fields.
+    """
+
+    producer_id: str
+    producer_epoch: int = 1
+    authority_priority: int = 10
+    producer_kind: str = "agent_skill"
+    control_mode: str = "agent_skill"
+
+    def __post_init__(self) -> None:
+        for name in ("producer_id", "producer_kind", "control_mode"):
+            value = str(getattr(self, name)).strip()
+            if not value:
+                raise ValueError(f"{name} must be non-empty.")
+            object.__setattr__(self, name, value)
+        if self.producer_kind != "agent_skill":
+            raise ValueError(
+                "Direct component proposal source currently supports only "
+                "producer_kind='agent_skill'."
+            )
+        if self.control_mode != "agent_skill":
+            raise ValueError(
+                "Agent Skill component proposals require control_mode='agent_skill'."
+            )
+        if (
+            isinstance(self.producer_epoch, bool)
+            or not isinstance(self.producer_epoch, int)
+            or self.producer_epoch < 0
+        ):
+            raise ValueError("producer_epoch must be a non-negative integer.")
+        if (
+            isinstance(self.authority_priority, bool)
+            or not isinstance(self.authority_priority, int)
+        ):
+            raise TypeError("authority_priority must be an integer.")
+
+
+@dataclass(frozen=True)
 class MujocoDeployConfig:
     runtime_session_id: str = "mujoco-deploy-session"
     control_domain_id: str = "mujoco-env-0"
@@ -310,9 +371,9 @@ class MujocoDeployConfig:
     # Default-off formal gate for composer-owned compound motion.  The typed
     # profile binds exact composition semantics and an all-required scope; it
     # is intentionally independent from any model/checkpoint identity.
-    compound_composer_authority_profile: (
-        ConservativeCompoundAuthorityProfile | None
-    ) = None
+    compound_composer_authority_profile: ConservativeCompoundAuthorityProfile | None = (
+        None
+    )
     # Development migration gate for the component-keyed target handoff.
     # Only the scoped Sim-HIL profile enables it until other target owners
     # migrate from the RobotAction-v1 execution-target carrier.
@@ -324,6 +385,15 @@ class MujocoDeployConfig:
     # The receiver still owns the deadline; this only places the segment start
     # far enough after the decision tick for an upstream application profile.
     scheduled_activation_margin_sec: float | None = None
+    # Optional target-owner processing budget.  It only prevents work from
+    # starting when too little target lifetime remains; it does not extend the
+    # target, alter source TTL, or act as a safety verdict.
+    target_admission_margin_sec: float | None = None
+    # Optional fixed-identity ingress for native ComponentAction sources.  It
+    # is independent of policy/composer/replay identities and defaults off.
+    direct_component_proposal_source: (
+        MujocoDirectComponentProposalSource | None
+    ) = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -367,6 +437,24 @@ class MujocoDeployConfig:
                 "execution_observation_plan must be an "
                 "ExecutionObservationPlan or None."
             )
+        direct_source = self.direct_component_proposal_source
+        if direct_source is not None and not isinstance(
+            direct_source,
+            MujocoDirectComponentProposalSource,
+        ):
+            raise TypeError(
+                "direct_component_proposal_source must be a "
+                "MujocoDirectComponentProposalSource or None."
+            )
+        if direct_source is not None and direct_source.producer_id in {
+            self.producer_id,
+            self.composer_producer_id,
+            self.replay_producer_id,
+        }:
+            raise ValueError(
+                "Direct component proposal producer ID must be distinct from "
+                "policy, composer, and replay producer IDs."
+            )
         if self.scheduled_activation_margin_sec is not None:
             margin = float(self.scheduled_activation_margin_sec)
             if not math.isfinite(margin) or margin <= 0.0:
@@ -379,11 +467,24 @@ class MujocoDeployConfig:
                 "scheduled_activation_margin_sec",
                 margin,
             )
+        if self.target_admission_margin_sec is not None:
+            target_margin = float(self.target_admission_margin_sec)
+            if not math.isfinite(target_margin) or target_margin <= 0.0:
+                raise ValueError(
+                    "target_admission_margin_sec must be finite and positive "
+                    "when supplied."
+                )
+            object.__setattr__(
+                self,
+                "target_admission_margin_sec",
+                target_margin,
+            )
         if not any(
             (
                 self.enable_primary_policy_authority,
                 self.enable_composer_authority,
                 self.enable_replay_authority,
+                direct_source is not None,
             )
         ):
             raise ValueError("At least one MuJoCo proposal authority must be enabled.")
@@ -393,6 +494,7 @@ class MujocoDeployConfig:
         }:
             raise ValueError("Unsupported MuJoCo reference activation profile.")
         if self.initial_control_mode not in {
+            "agent_skill",
             "human",
             "policy",
             "replay",
@@ -402,13 +504,35 @@ class MujocoDeployConfig:
             "fault",
         }:
             raise ValueError("Unsupported initial_control_mode.")
-        if self.pose_frame_contract_hash is not None and not str(
-            self.pose_frame_contract_hash
-        ).strip():
+        enabled_producer_ids = [
+            *(
+                (self.producer_id,)
+                if self.enable_primary_policy_authority
+                else ()
+            ),
+            *(
+                (self.composer_producer_id,)
+                if self.enable_composer_authority
+                else ()
+            ),
+            *(
+                (self.replay_producer_id,)
+                if self.enable_replay_authority
+                else ()
+            ),
+            *((direct_source.producer_id,) if direct_source is not None else ()),
+        ]
+        if len(enabled_producer_ids) != len(set(enabled_producer_ids)):
+            raise ValueError(
+                "Enabled MuJoCo proposal authorities require distinct producer IDs."
+            )
+        if (
+            self.pose_frame_contract_hash is not None
+            and not str(self.pose_frame_contract_hash).strip()
+        ):
             raise ValueError("pose_frame_contract_hash must be non-empty when set.")
         allowed = tuple(
-            str(value).strip()
-            for value in self.authority_takeover_allowed_producers
+            str(value).strip() for value in self.authority_takeover_allowed_producers
         )
         if any(not value for value in allowed) or len(set(allowed)) != len(allowed):
             raise ValueError(
@@ -452,12 +576,9 @@ class MujocoDeployConfig:
                 "composition_information_plan must be a "
                 "CompositionInformationPlan or None."
             )
-        if (
-            self.compound_composer_authority_profile is not None
-            and not isinstance(
-                self.compound_composer_authority_profile,
-                ConservativeCompoundAuthorityProfile,
-            )
+        if self.compound_composer_authority_profile is not None and not isinstance(
+            self.compound_composer_authority_profile,
+            ConservativeCompoundAuthorityProfile,
         ):
             raise TypeError(
                 "compound_composer_authority_profile must be a "
@@ -484,6 +605,7 @@ class _MujocoTargetExecutionSubmissionPort:
         target_handler_id: str,
         component_target_capability: ComponentTargetCapabilitySpec,
         activation_mode: str,
+        minimum_support_margin_sec: float | None,
         clock: Callable[[], float],
     ) -> None:
         self._target_handler_id = str(target_handler_id).strip()
@@ -504,6 +626,17 @@ class _MujocoTargetExecutionSubmissionPort:
             raise ValueError("activation_mode must be 'required' or 'omitted'.")
         self._component_target_capability = component_target_capability
         self._activation_mode = mode
+        margin = (
+            None
+            if minimum_support_margin_sec is None
+            else float(minimum_support_margin_sec)
+        )
+        if margin is not None and (not math.isfinite(margin) or margin <= 0.0):
+            raise ValueError(
+                "minimum_support_margin_sec must be finite and positive "
+                "when supplied."
+            )
+        self._minimum_support_margin_sec = margin
         self._clock = clock
 
     @property
@@ -534,8 +667,7 @@ class _MujocoTargetExecutionSubmissionPort:
         adaptation = request.adaptation_result.request
         capability = self.component_target_capability
         if (
-            adaptation.component_target_capability_id
-            != capability.capability_id
+            adaptation.component_target_capability_id != capability.capability_id
             or adaptation.component_target_capability_hash
             != capability.semantic_content_hash
         ):
@@ -546,6 +678,19 @@ class _MujocoTargetExecutionSubmissionPort:
                 rejection_code="target_capability_mismatch",
             )
         received_at = max(float(self._clock()), request.submitted_at)
+        if (
+            self._minimum_support_margin_sec is not None
+            and request.supported_until - received_at
+            < self._minimum_support_margin_sec
+        ):
+            return build_target_execution_submission_receipt(
+                request,
+                received_at=received_at,
+                accepted_for_processing=False,
+                rejection_code=(
+                    TARGET_SUBMISSION_INSUFFICIENT_SUPPORT_MARGIN
+                ),
+            )
         return build_target_execution_submission_receipt(
             request,
             received_at=received_at,
@@ -607,16 +752,16 @@ class MujocoPolicyActionChunkSubmission:
                 "executed_chunk_size must be positive and no larger than source_chunk_size."
             )
         if len(receipts) != executed_chunk_size:
-            raise ValueError(
-                "receipts length must match executed_chunk_size."
-            )
+            raise ValueError("receipts length must match executed_chunk_size.")
         object.__setattr__(self, "chunk_id", chunk_id)
         object.__setattr__(self, "source_chunk_size", source_chunk_size)
         object.__setattr__(self, "executed_chunk_size", executed_chunk_size)
         object.__setattr__(
             self,
             "action_chunk_execution_steps",
-            ActionChunkExecutionPolicy(self.action_chunk_execution_steps).execution_steps,
+            ActionChunkExecutionPolicy(
+                self.action_chunk_execution_steps
+            ).execution_steps,
         )
         object.__setattr__(self, "receipts", receipts)
 
@@ -639,8 +784,7 @@ class MujocoPolicyEmissionSubmission:
     @property
     def accepted(self) -> bool:
         return bool(
-            self.proposal_admission is not None
-            and self.proposal_admission.accepted
+            self.proposal_admission is not None and self.proposal_admission.accepted
         )
 
 
@@ -774,21 +918,25 @@ class MujocoDeployRuntime:
         pose_resolver: MujocoCoupledPoseToQposResolver | None = None,
         shared_safety=None,
         composition_strategy: FormalCompositionStrategy | None = None,
-        composition_strategy_control_factory: Callable[
-            [
-                ControlAdmissionCoordinator,
-                ProducerEpochRegistry,
-                float,
-            ],
-            CompositionStrategyControl,
-        ]
-        | None = None,
-        composition_input_action_schema_by_role: Mapping[
-            str, ComponentActionSchema
-        ]
-        | None = None,
+        composition_strategy_control_factory: (
+            Callable[
+                [
+                    ControlAdmissionCoordinator,
+                    ProducerEpochRegistry,
+                    float,
+                ],
+                CompositionStrategyControl,
+            ]
+            | None
+        ) = None,
+        composition_input_action_schema_by_role: (
+            Mapping[str, ComponentActionSchema] | None
+        ) = None,
         component_execution_binding: MujocoComponentExecutionBinding | None = None,
         execution_observation_sink: ExecutionObservationSink | None = None,
+        execution_pose_observation_projector: (
+            MujocoPoseObservationProjector | None
+        ) = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.rig = rig
@@ -798,6 +946,17 @@ class MujocoDeployRuntime:
         self._pose_execution_enabled = pose_resolver is not None
         self._explicit_shared_safety = shared_safety is not None
         self._execution_observation_sink = execution_observation_sink
+        if execution_pose_observation_projector is not None and not isinstance(
+            execution_pose_observation_projector,
+            MujocoPoseObservationProjector,
+        ):
+            raise TypeError(
+                "execution_pose_observation_projector must be a "
+                "MujocoPoseObservationProjector or None."
+            )
+        self._execution_pose_observation_projector = (
+            execution_pose_observation_projector
+        )
         observation_plan = config.execution_observation_plan
         observation_enabled = bool(
             observation_plan is not None and observation_plan.enabled
@@ -832,9 +991,7 @@ class MujocoDeployRuntime:
                 "MujocoComponentExecutionBinding or None."
             )
         self.component_execution_binding = component_execution_binding
-        self._compound_hand_specs = dict(
-            config.compound_hand_action_specs_by_side
-        )
+        self._compound_hand_specs = dict(config.compound_hand_action_specs_by_side)
         self._compound_execution_enabled = bool(self._compound_hand_specs)
         self._compound_composer_authority_profile = (
             config.compound_composer_authority_profile
@@ -884,12 +1041,8 @@ class MujocoDeployRuntime:
                     "Compound DM-Tac execution requires a configured MuJoCo "
                     "gripper actuation profile."
                 )
-            configured_gripper_sides = set(
-                gripper_profile.side_by_gripper.values()
-            )
-            if not set(self._compound_hand_specs).issubset(
-                configured_gripper_sides
-            ):
+            configured_gripper_sides = set(gripper_profile.side_by_gripper.values())
+            if not set(self._compound_hand_specs).issubset(configured_gripper_sides):
                 raise ValueError(
                     "Compound hand specs must be a non-empty subset of "
                     "configured MuJoCo gripper sides."
@@ -917,8 +1070,7 @@ class MujocoDeployRuntime:
                 )
             profile = self._compound_composer_authority_profile
             if (
-                strategy_spec.composition_spec_hash
-                != profile.composition_spec_hash
+                strategy_spec.composition_spec_hash != profile.composition_spec_hash
                 or strategy_spec.semantic_content_hash
                 != profile.formal_strategy_spec_hash
                 or component_rule_set.semantic_content_hash
@@ -949,9 +1101,11 @@ class MujocoDeployRuntime:
         self.catalog = (
             component_execution_binding.execution_catalog
             if component_execution_binding is not None
-            else _bimanual_pose_catalog(hand_sides)
-            if self._pose_execution_enabled
-            else _bimanual_qpos_catalog(hand_sides)
+            else (
+                _bimanual_pose_catalog(hand_sides)
+                if self._pose_execution_enabled
+                else _bimanual_qpos_catalog(hand_sides)
+            )
         )
         pose_input_arm_specs = None
         if self._pose_execution_enabled:
@@ -988,13 +1142,12 @@ class MujocoDeployRuntime:
                 arm_action_specs_by_side=pose_input_arm_specs,
                 hand_action_specs_by_side=self._compound_hand_specs,
             )
-        self.reference_action_schema_hash = (
-            _bimanual_qpos_catalog(hand_sides).semantic_content_hash
-        )
+        self.reference_action_schema_hash = _bimanual_qpos_catalog(
+            hand_sides
+        ).semantic_content_hash
         self._component_dependencies_by_group = {
             group: tuple(
-                item.component_id
-                for item in self.catalog.components_for_group(group)
+                item.component_id for item in self.catalog.components_for_group(group)
             )
             for group in self.catalog.selection_group_ids
         }
@@ -1028,9 +1181,11 @@ class MujocoDeployRuntime:
             acceptance_evidence_id=(
                 "mujoco-coupled-pose-dmtac-compound-contract-tests-v1"
                 if self._compound_execution_enabled
-                else "mujoco-coupled-pose-ik-contract-tests-v1"
-                if self._pose_execution_enabled
-                else "mujoco-deploy-contract-tests-v1"
+                else (
+                    "mujoco-coupled-pose-ik-contract-tests-v1"
+                    if self._pose_execution_enabled
+                    else "mujoco-deploy-contract-tests-v1"
+                )
             ),
             decision_runtime_budget_sec=0.005,
             ik_runtime_budget_sec=1.0 / 60.0,
@@ -1089,11 +1244,15 @@ class MujocoDeployRuntime:
                 units_convention_id=(
                     "component_payload_schema_bound_v1"
                     if component_execution_binding is not None
-                    else "si_m_rad_xyzw_plus_normalized_hand_v1"
-                    if self._compound_execution_enabled
-                    else "si_m_rad_xyzw_v1"
-                    if self._pose_execution_enabled
-                    else "si_rad_joint_order_v1"
+                    else (
+                        "si_m_rad_xyzw_plus_normalized_hand_v1"
+                        if self._compound_execution_enabled
+                        else (
+                            "si_m_rad_xyzw_v1"
+                            if self._pose_execution_enabled
+                            else "si_rad_joint_order_v1"
+                        )
+                    )
                 ),
                 supported_transform_hash_by_source_frame=(
                     {}
@@ -1110,9 +1269,7 @@ class MujocoDeployRuntime:
         )
         self.component_target_capability: ComponentTargetCapabilitySpec = (
             build_robot_action_v1_target_capability(
-                capability_id=(
-                    f"mujoco-component-target:{config.control_domain_id}"
-                ),
+                capability_id=(f"mujoco-component-target:{config.control_domain_id}"),
                 action_schema=self.action_schema,
                 handler_contract_id=(
                     component_execution_binding.handler_contract_id
@@ -1129,20 +1286,19 @@ class MujocoDeployRuntime:
                 ),
             )
         )
-        target_handler_id = (
-            f"mujoco-pose-target-handler:{config.control_domain_id}"
-        )
+        target_handler_id = f"mujoco-pose-target-handler:{config.control_domain_id}"
         self.target_execution_port = (
             _MujocoTargetExecutionSubmissionPort(
                 target_handler_id=target_handler_id,
-                component_target_capability=(
-                    self.component_target_capability
-                ),
+                component_target_capability=(self.component_target_capability),
                 activation_mode=(
                     "required"
                     if config.reference_activation_profile_id
                     == SCHEDULED_REFERENCE_SEGMENT_SIM_V1
                     else "omitted"
+                ),
+                minimum_support_margin_sec=(
+                    config.target_admission_margin_sec
                 ),
                 clock=clock,
             )
@@ -1157,9 +1313,7 @@ class MujocoDeployRuntime:
                 ),
                 component_target_capability=self.component_target_capability,
                 output_source="action_arbiter",
-                adapter_contract_id=(
-                    component_execution_binding.handler_contract_id
-                ),
+                adapter_contract_id=(component_execution_binding.handler_contract_id),
                 adapter_contract_hash=(
                     component_execution_binding.handler_contract_hash
                 ),
@@ -1181,9 +1335,7 @@ class MujocoDeployRuntime:
         self._execution_observation_capability: (
             ExecutionObservationCapabilitySpec | None
         ) = None
-        self._execution_observation_binding: (
-            ExecutionObservationBinding | None
-        ) = None
+        self._execution_observation_binding: ExecutionObservationBinding | None = None
         if observation_enabled:
             arm_components = tuple(
                 self._execution_observation_side_to_component_id.values()
@@ -1193,45 +1345,82 @@ class MujocoDeployRuntime:
                     "MuJoCo observation capability requires at least one "
                     "public arm component."
                 )
-            self._execution_observation_capability = (
-                ExecutionObservationCapabilitySpec(
-                    capability_id=(
-                        f"mujoco-qpos-observation:{config.control_domain_id}"
-                    ),
-                    target_handler_id=target_handler_id,
-                    clock_domain_id=config.clock_domain_id,
-                    supported_reference_modes=(
-                        "off",
-                        "decimated_frames",
-                        "full_frames",
-                    ),
-                    supported_measurement_modes=(
-                        "off",
-                        "decimated_frames",
-                        "full_frames",
-                    ),
-                    representation_by_component={
-                        component_id: "joint_position"
-                        for component_id in arm_components
-                    },
-                    schema_hash_by_component={
-                        component_id: self.reference_action_schema_hash
-                        for component_id in arm_components
-                    },
-                    reference_stage_id=(
-                        "mujoco.active_qref_at_measurement"
-                    ),
-                    measurement_stage_id="mujoco.measured_qpos",
-                )
-            )
             assert observation_plan is not None
-            self._execution_observation_binding = (
-                bind_execution_observation_plan(
-                    observation_plan,
-                    self._execution_observation_capability,
-                    bound_at=float(self.clock()),
-                )
+            required_representations = set(
+                observation_plan.required_representation_by_component.values()
             )
+            if not required_representations or required_representations == {
+                "joint_position"
+            }:
+                self._execution_observation_representation = "joint_position"
+                capability_components = arm_components
+                representation_by_component = {
+                    component_id: "joint_position"
+                    for component_id in capability_components
+                }
+                schema_hash_by_component = {
+                    component_id: self.reference_action_schema_hash
+                    for component_id in capability_components
+                }
+                reference_stage_id = "mujoco.active_qref_at_measurement"
+                measurement_stage_id = "mujoco.measured_qpos"
+                capability_name = "mujoco-qpos-observation"
+            elif required_representations == {"cartesian_pose"}:
+                projector = self._execution_pose_observation_projector
+                if projector is None:
+                    raise ValueError(
+                        "Cartesian-pose execution observations require a "
+                        "downstream MuJoCo FK projector."
+                    )
+                missing_pose_components = sorted(
+                    set(observation_plan.component_ids) - set(projector.component_ids)
+                )
+                if missing_pose_components:
+                    raise ValueError(
+                        "MuJoCo FK projector does not cover requested pose "
+                        f"components: {missing_pose_components!r}."
+                    )
+                self._execution_observation_representation = "cartesian_pose"
+                capability_components = projector.component_ids
+                representation_by_component = {
+                    component_id: "cartesian_pose"
+                    for component_id in capability_components
+                }
+                schema_hash_by_component = dict(projector.schema_hash_by_component)
+                reference_stage_id = MUJOCO_FK_POSE_REFERENCE_STAGE_ID
+                measurement_stage_id = MUJOCO_FK_POSE_MEASUREMENT_STAGE_ID
+                capability_name = "mujoco-fk-pose-observation"
+            else:
+                raise ValueError(
+                    "One MuJoCo execution observation plan cannot mix or "
+                    "request unsupported component representations."
+                )
+            self._execution_observation_capability = ExecutionObservationCapabilitySpec(
+                capability_id=(f"{capability_name}:{config.control_domain_id}"),
+                target_handler_id=target_handler_id,
+                clock_domain_id=config.clock_domain_id,
+                supported_reference_modes=(
+                    "off",
+                    "decimated_frames",
+                    "full_frames",
+                ),
+                supported_measurement_modes=(
+                    "off",
+                    "decimated_frames",
+                    "full_frames",
+                ),
+                representation_by_component=representation_by_component,
+                schema_hash_by_component=schema_hash_by_component,
+                reference_stage_id=reference_stage_id,
+                measurement_stage_id=measurement_stage_id,
+            )
+            self._execution_observation_binding = bind_execution_observation_plan(
+                observation_plan,
+                self._execution_observation_capability,
+                bound_at=float(self.clock()),
+            )
+        else:
+            self._execution_observation_representation = "off"
         self._execution_observation_last_published_at = {
             "reference": None,
             "measurement": None,
@@ -1253,22 +1442,19 @@ class MujocoDeployRuntime:
         ] = {}
         target_lead_time_sec = 0.0
         schedule_spec_id = f"mujoco-{config.decision_hz:g}hz-v1"
-        if (
-            config.reference_activation_profile_id
-            == SCHEDULED_REFERENCE_SEGMENT_SIM_V1
-        ):
+        if config.reference_activation_profile_id == SCHEDULED_REFERENCE_SEGMENT_SIM_V1:
             minimum_activation_margin_sec = max(
                 1.0 / timing.reference_hz,
-                0.0
-                if config.scheduled_activation_margin_sec is None
-                else config.scheduled_activation_margin_sec,
+                (
+                    0.0
+                    if config.scheduled_activation_margin_sec is None
+                    else config.scheduled_activation_margin_sec
+                ),
             )
             target_lead_time_sec = (
                 1.0 / config.decision_hz + minimum_activation_margin_sec
             )
-            schedule_spec_id = (
-                f"mujoco-{config.decision_hz:g}hz-scheduled-segment-v1"
-            )
+            schedule_spec_id = f"mujoco-{config.decision_hz:g}hz-scheduled-segment-v1"
         decision_schedule = DecisionScheduleSpec(
             spec_id=schedule_spec_id,
             decision_hz=config.decision_hz,
@@ -1276,6 +1462,18 @@ class MujocoDeployRuntime:
             max_target_lateness_sec=max(
                 0.02,
                 1.0 / config.decision_hz,
+            ),
+            late_tick_policy=(
+                "skip_to_next_legal_reference_tick"
+                if config.reference_activation_profile_id
+                == SCHEDULED_REFERENCE_SEGMENT_SIM_V1
+                else "preserve_grid"
+            ),
+            required_start_margin_sec=(
+                minimum_activation_margin_sec
+                if config.reference_activation_profile_id
+                == SCHEDULED_REFERENCE_SEGMENT_SIM_V1
+                else 0.0
             ),
         )
         if config.reference_activation_profile_id == IMMEDIATE_QREF_SIM_V1:
@@ -1290,9 +1488,7 @@ class MujocoDeployRuntime:
                 build_scheduled_reference_segment_activation_spec(
                     decision_schedule,
                     self.execution_capability,
-                    minimum_activation_margin_sec=(
-                        minimum_activation_margin_sec
-                    ),
+                    minimum_activation_margin_sec=(minimum_activation_margin_sec),
                     activation_margin_evidence_id=(
                         "mujoco-configured-producer-admission-margin-v1"
                         if config.scheduled_activation_margin_sec is not None
@@ -1312,6 +1508,9 @@ class MujocoDeployRuntime:
             priority[config.replay_producer_id] = 20
         if config.enable_composer_authority:
             priority[config.composer_producer_id] = 15
+        direct_source = config.direct_component_proposal_source
+        if direct_source is not None:
+            priority[direct_source.producer_id] = direct_source.authority_priority
         self.core = AuthoritativeControlRuntime(
             AuthoritativeControlConfig(
                 runtime_session_id=config.runtime_session_id,
@@ -1329,14 +1528,12 @@ class MujocoDeployRuntime:
                 authority_policy=AuthorityPolicySpec(
                     policy_id=config.authority_policy_id,
                     priority_by_group={
-                        group: priority
-                        for group in self.catalog.selection_group_ids
+                        group: priority for group in self.catalog.selection_group_ids
                     },
                     fallback_by_group={
                         group: (
                             "hold"
-                            if self._compound_composer_authority_profile
-                            is not None
+                            if self._compound_composer_authority_profile is not None
                             else "no_action"
                         )
                         for group in self.catalog.selection_group_ids
@@ -1353,9 +1550,7 @@ class MujocoDeployRuntime:
                     ),
                 ),
                 execution_capability=self.execution_capability,
-                component_target_capability=(
-                    self.component_target_capability
-                ),
+                component_target_capability=(self.component_target_capability),
                 target_runtime_contract_hash=(
                     self.target_runtime_action_contract.semantic_content_hash
                 ),
@@ -1401,17 +1596,15 @@ class MujocoDeployRuntime:
                 "clock": clock,
             }
             if self._pose_execution_enabled:
-                self.reference_receiver = (
-                    MujocoScheduledResolvedQposReferenceReceiver(
-                        rig,
-                        pose_action_schema_hash=self.catalog.semantic_content_hash,
-                        compound_activation_callback=(
-                            self.core.activate_pending_execution_segments
-                            if self._compound_execution_enabled
-                            else None
-                        ),
-                        **receiver_args,
-                    )
+                self.reference_receiver = MujocoScheduledResolvedQposReferenceReceiver(
+                    rig,
+                    pose_action_schema_hash=self.catalog.semantic_content_hash,
+                    compound_activation_callback=(
+                        self.core.activate_pending_execution_segments
+                        if self._compound_execution_enabled
+                        else None
+                    ),
+                    **receiver_args,
                 )
             else:
                 self.reference_receiver = MujocoScheduledQposReferenceReceiver(
@@ -1429,12 +1622,10 @@ class MujocoDeployRuntime:
                     "A composition strategy control factory requires a "
                     "formal composition strategy."
                 )
-            composition_strategy_control = (
-                composition_strategy_control_factory(
-                    self.core.coordinator,
-                    self.core.producer_epochs,
-                    float(clock()),
-                )
+            composition_strategy_control = composition_strategy_control_factory(
+                self.core.coordinator,
+                self.core.producer_epochs,
+                float(clock()),
             )
             if not isinstance(
                 composition_strategy_control,
@@ -1452,9 +1643,7 @@ class MujocoDeployRuntime:
             coordinator=self.core.coordinator,
             producer_epochs=self.core.producer_epochs,
             action_schema=self.action_schema,
-            input_action_schema_by_role=(
-                composition_input_action_schema_by_role
-            ),
+            input_action_schema_by_role=(composition_input_action_schema_by_role),
             event_emitter=self._composition_trace_emitter,
             proposal_admitter=self.core.admit_proposal,
             context_retention_spec=TimeWindowRetentionSpec(
@@ -1494,9 +1683,7 @@ class MujocoDeployRuntime:
             | AuthoritativeTargetDispatchContext
             | None
         ) = None
-        self._last_compound_dispatch_manifest: (
-            CompoundDispatchManifest | None
-        ) = None
+        self._last_compound_dispatch_manifest: CompoundDispatchManifest | None = None
         self._projected_reference_fact_ids: set[str] = set()
         # Lower reference/execution adapters expose append-only diagnostic
         # histories.  Trace publication must consume only each newly appended
@@ -1509,6 +1696,7 @@ class MujocoDeployRuntime:
         self._immediate_target_by_reference_sequence = {}
         self._projected_policy_emission_ids: set[str] = set()
         self._next_proposal_sequence = 0
+        self._next_direct_component_proposal_sequence = 0
         self._next_replay_proposal_sequence = 0
         self._next_composite_proposal_sequence = 0
         self._composition_promotion_envelope_by_evaluation_id: dict[
@@ -1529,8 +1717,7 @@ class MujocoDeployRuntime:
         self,
         command,
         context: (
-            AuthoritativeCommandDispatchContext
-            | AuthoritativeTargetDispatchContext
+            AuthoritativeCommandDispatchContext | AuthoritativeTargetDispatchContext
         ),
     ):
         """Forward a permitted command through its configured target handoff.
@@ -1549,17 +1736,14 @@ class MujocoDeployRuntime:
                     resolution,
                     context,
                     resolved_at=float(self.clock()),
-                    output_target_schema_hash=(
-                        self.reference_action_schema_hash
-                    ),
+                    output_target_schema_hash=(self.reference_action_schema_hash),
                     component_id_by_output_effector=(
                         None
                         if self.component_execution_binding is None
                         else {
                             effector: component_id
                             for component_id, effector in (
-                                self.component_execution_binding
-                                .output_effector_by_component.items()
+                                self.component_execution_binding.output_effector_by_component.items()
                             )
                         }
                     ),
@@ -1567,8 +1751,7 @@ class MujocoDeployRuntime:
                         ()
                         if self.component_execution_binding is None
                         else (
-                            self.component_execution_binding
-                            .support_only_output_effectors
+                            self.component_execution_binding.support_only_output_effectors
                         )
                     ),
                 )
@@ -1597,20 +1780,50 @@ class MujocoDeployRuntime:
                         resolution=resolution,
                     )
                 admitted_at = max(float(self.clock()), target.resolved_at)
+                target_is_live = admitted_at < target.supported_until
                 admission = admit_component_execution_target(
                     target,
-                    receiver_id=(
-                        "mujoco-immediate-component-qpos-reference-receiver"
-                    ),
-                    admission_sequence=(
-                        self._next_immediate_target_admission_sequence
-                    ),
+                    receiver_id=("mujoco-immediate-component-qpos-reference-receiver"),
+                    admission_sequence=(self._next_immediate_target_admission_sequence),
                     admitted_at=admitted_at,
                     available_at=admitted_at,
-                    accepted=True,
-                    admission_token=f"mujoco-immediate-qref:{target.target_id}",
+                    accepted=target_is_live,
+                    rejection_code=(
+                        None
+                        if target_is_live
+                        else TARGET_ADMISSION_SUPPORT_EXPIRED
+                    ),
+                    admission_token=(
+                        f"mujoco-immediate-qref:{target.target_id}"
+                        if target_is_live
+                        else None
+                    ),
                 )
                 self._next_immediate_target_admission_sequence += 1
+                self._immediate_component_targets.append(target)
+                self._immediate_component_target_admissions.append(admission)
+                if not admission.accepted:
+                    return TargetExecutionDispatchResult(
+                        completion_receipt=completion,
+                        target=target,
+                        target_admission=admission,
+                        dispatch_receipts={
+                            name: CommandDispatchReceipt(
+                                effector_name=name,
+                                accepted=False,
+                                operation=(
+                                    "mujoco_immediate_target_admission"
+                                ),
+                                status=TARGET_ADMISSION_SUPPORT_EXPIRED,
+                                timestamp=admitted_at,
+                                result_text=(
+                                    "Target support expired before immediate "
+                                    "qref admission."
+                                ),
+                            )
+                            for name in command.commands
+                        },
+                    )
                 receipts = self.core.dispatcher(command)
                 reference_sequences = {
                     int(receipt.metadata["reference_sequence"])
@@ -1622,8 +1835,6 @@ class MujocoDeployRuntime:
                         "Immediate qref dispatch did not return one reference sequence."
                     )
                 reference_sequence = reference_sequences.pop()
-                self._immediate_component_targets.append(target)
-                self._immediate_component_target_admissions.append(admission)
                 # Execution exposes only the currently active immediate qref.
                 # Keep the same bounded latest-value semantics for its lookup;
                 # durable history already lives in ControlTrace facts.
@@ -1676,9 +1887,7 @@ class MujocoDeployRuntime:
     def last_dispatch_context(
         self,
     ) -> (
-        AuthoritativeCommandDispatchContext
-        | AuthoritativeTargetDispatchContext
-        | None
+        AuthoritativeCommandDispatchContext | AuthoritativeTargetDispatchContext | None
     ):
         return self._last_dispatch_context
 
@@ -1694,9 +1903,7 @@ class MujocoDeployRuntime:
                 reason=cancellation.cancellation_id,
                 effective_at=float(self.clock()),
             )
-        self.rig.hold_motion(
-            f"{cancellation.reason}:{cancellation.cancellation_id}"
-        )
+        self.rig.hold_motion(f"{cancellation.reason}:{cancellation.cancellation_id}")
         return {"software_queue": True}
 
     @property
@@ -1725,19 +1932,13 @@ class MujocoDeployRuntime:
     def execution_observation_watermarks(
         self,
     ) -> Mapping[str, ExecutionObservationWatermark]:
-        return MappingProxyType(
-            dict(self._execution_observation_watermark_by_stream)
-        )
+        return MappingProxyType(dict(self._execution_observation_watermark_by_stream))
 
     def _execution_observation_mode(self, stream: str) -> str:
         plan = self.config.execution_observation_plan
         if plan is None:
             return "off"
-        return (
-            plan.reference_mode
-            if stream == "reference"
-            else plan.measurement_mode
-        )
+        return plan.reference_mode if stream == "reference" else plan.measurement_mode
 
     def _execution_observation_publish_due(
         self,
@@ -1765,9 +1966,7 @@ class MujocoDeployRuntime:
         self,
         stream: str,
         observation: (
-            ExecutionReferenceFrameObservation
-            | ExecutionMeasurementObservation
-            | None
+            ExecutionReferenceFrameObservation | ExecutionMeasurementObservation | None
         ),
         *,
         processed_through: float,
@@ -1790,9 +1989,7 @@ class MujocoDeployRuntime:
             )
             self._execution_observation_latest_sequence[stream] += 1
             try:
-                data_accepted = bool(
-                    sink.publish_execution_observation(observation)
-                )
+                data_accepted = bool(sink.publish_execution_observation(observation))
             except Exception:  # noqa: BLE001 - observation failure is passive evidence.
                 data_accepted = False
             if data_accepted:
@@ -1803,9 +2000,7 @@ class MujocoDeployRuntime:
             else:
                 self._execution_observation_dropped_count[stream] += 1
         available_at = max(float(self.clock()), float(processed_through))
-        stream_has_drops = (
-            self._execution_observation_dropped_count[stream] > 0
-        )
+        stream_has_drops = self._execution_observation_dropped_count[stream] > 0
         watermark = ExecutionObservationWatermark(
             observation_binding_id=binding.binding_id,
             observation_plan_hash=binding.plan_hash,
@@ -1815,25 +2010,22 @@ class MujocoDeployRuntime:
             emitted_count=self._execution_observation_emitted_count[stream],
             dropped_count=self._execution_observation_dropped_count[stream],
             status=(
-                "healthy"
-                if data_accepted and not stream_has_drops
-                else "violated"
+                "healthy" if data_accepted and not stream_has_drops else "violated"
             ),
             reason=(
                 "observation_stream_has_drops"
                 if data_accepted and stream_has_drops
-                else
-                reason
-                if data_accepted or observation is None
-                else "observation_sink_rejected"
+                else (
+                    reason
+                    if data_accepted or observation is None
+                    else "observation_sink_rejected"
+                )
             ),
             available_at=available_at,
             clock_domain_id=binding.clock_domain_id,
         )
         try:
-            watermark_accepted = bool(
-                sink.publish_execution_observation(watermark)
-            )
+            watermark_accepted = bool(sink.publish_execution_observation(watermark))
         except Exception:
             watermark_accepted = False
         if not watermark_accepted:
@@ -1844,9 +2036,7 @@ class MujocoDeployRuntime:
                 observation_plan_hash=binding.plan_hash,
                 stream=stream,
                 processed_through=float(processed_through),
-                latest_sequence=(
-                    self._execution_observation_latest_sequence[stream]
-                ),
+                latest_sequence=(self._execution_observation_latest_sequence[stream]),
                 emitted_count=self._execution_observation_emitted_count[stream],
                 dropped_count=self._execution_observation_dropped_count[stream],
                 status="violated",
@@ -1857,18 +2047,22 @@ class MujocoDeployRuntime:
         elif observation is None:
             # A no-frame watermark closes one intentionally selected cut, such
             # as "no active reference", and therefore advances decimation.
-            self._execution_observation_last_published_at[stream] = (
-                processed_through
-            )
+            self._execution_observation_last_published_at[stream] = processed_through
         self._execution_observation_watermark_by_stream[stream] = watermark
 
     def _active_mujoco_reference_at(
         self,
         sampled_at: float,
+        *,
+        active_reference_snapshot: Mapping[str, object] | None = None,
     ):
         receiver = self.reference_receiver
         if receiver is None:
-            active = self.rig.capture_active_reference()
+            active = (
+                self.rig.capture_active_reference()
+                if active_reference_snapshot is None
+                else active_reference_snapshot
+            )
             if active is None:
                 return None
             lineage = self._immediate_target_by_reference_sequence.get(
@@ -1883,17 +2077,21 @@ class MujocoDeployRuntime:
         ):
             return None
         terminal_at_by_segment = {
-            item.reference_segment_id: item.effective_at
-            for item in receiver.terminals
+            item.reference_segment_id: item.effective_at for item in receiver.terminals
         }
+        active_sequence = (
+            None
+            if active_reference_snapshot is None
+            else int(active_reference_snapshot["sequence"])
+        )
         activations = tuple(
             item
             for item in self.rig.reference_activation_observations
             if (
-                item.activated_at_worker_time <= sampled_at + 1e-12
+                (active_sequence is None or item.reference_sequence == active_sequence)
+                and item.activated_at_worker_time <= sampled_at + 1e-12
                 and (
-                    item.reference_segment_id
-                    not in terminal_at_by_segment
+                    item.reference_segment_id not in terminal_at_by_segment
                     or sampled_at + 1e-12
                     < terminal_at_by_segment[item.reference_segment_id]
                 )
@@ -1952,17 +2150,45 @@ class MujocoDeployRuntime:
         plan = self.config.execution_observation_plan
         if binding is None or plan is None:
             return
-        sampled_at = float(self.clock())
+        pose_projector = (
+            self._execution_pose_observation_projector
+            if self._execution_observation_representation == "cartesian_pose"
+            else None
+        )
+        execution_state_cut = None
+        active_reference_snapshot = None
+        if pose_projector is not None:
+            execution_state_cut = self.rig.capture_execution_state_cut(
+                sources=tuple(self._execution_observation_side_to_component_id)
+            )
+            sampled_at = execution_state_cut.sampled_at
+            if execution_state_cut.active_reference_sequence is not None:
+                active_reference_snapshot = {
+                    "sequence": execution_state_cut.active_reference_sequence,
+                    "qref_by_side": execution_state_cut.active_qref_by_source,
+                }
+        else:
+            sampled_at = float(self.clock())
         measurement = None
         if plan.measurement_mode != "off":
-            measurement = capture_mujoco_qpos_measurement(
-                self.rig,
-                sides=tuple(self._execution_observation_side_to_component_id),
-                clock_domain_id=self.config.clock_domain_id,
-                measured_at=sampled_at,
-                clock=self.clock,
+            measurement = (
+                build_mujoco_qpos_measurement_from_execution_cut(
+                    execution_state_cut,
+                    clock_domain_id=self.config.clock_domain_id,
+                )
+                if execution_state_cut is not None
+                else capture_mujoco_qpos_measurement(
+                    self.rig,
+                    sides=tuple(self._execution_observation_side_to_component_id),
+                    clock_domain_id=self.config.clock_domain_id,
+                    measured_at=sampled_at,
+                    clock=self.clock,
+                )
             )
-        active_reference = self._active_mujoco_reference_at(sampled_at)
+        active_reference = self._active_mujoco_reference_at(
+            sampled_at,
+            active_reference_snapshot=active_reference_snapshot,
+        )
         reference_due = self._execution_observation_publish_due(
             "reference",
             observed_at=sampled_at,
@@ -1982,29 +2208,56 @@ class MujocoDeployRuntime:
                             side_to_component_id=(
                                 self._execution_observation_side_to_component_id
                             ),
-                            component_schema_hash=(
-                                self.reference_action_schema_hash
+                            component_schema_hash=(self.reference_action_schema_hash),
+                            observation_binding_id=(
+                                None
+                                if pose_projector is not None
+                                else binding.binding_id
                             ),
-                            observation_binding_id=binding.binding_id,
-                            observation_plan_hash=binding.plan_hash,
+                            observation_plan_hash=(
+                                None
+                                if pose_projector is not None
+                                else binding.plan_hash
+                            ),
                             selected_component_ids=binding.component_ids,
                         )
                     )
                 else:
+                    reference_observation = project_mujoco_execution_reference_sample(
+                        segment=first,
+                        admission=admission,
+                        activation=activation,
+                        sampled_at=sampled_at,
+                        available_at=max(float(self.clock()), sampled_at),
+                        side_to_component_id=(
+                            self._execution_observation_side_to_component_id
+                        ),
+                        component_schema_hash=self.reference_action_schema_hash,
+                        observation_binding_id=(
+                            None if pose_projector is not None else binding.binding_id
+                        ),
+                        observation_plan_hash=(
+                            None if pose_projector is not None else binding.plan_hash
+                        ),
+                        selected_component_ids=binding.component_ids,
+                    )
+                if pose_projector is not None:
+                    assert execution_state_cut is not None
                     reference_observation = (
-                        project_mujoco_execution_reference_sample(
-                            segment=first,
-                            admission=admission,
-                            activation=activation,
-                            sampled_at=sampled_at,
-                            available_at=max(float(self.clock()), sampled_at),
-                            side_to_component_id=(
-                                self._execution_observation_side_to_component_id
+                        project_mujoco_fk_pose_reference_observation(
+                            reference_observation,
+                            projector=pose_projector,
+                            model_qpos=execution_state_cut.model_qpos,
+                            qpos_by_source=(
+                                execution_state_cut.active_qref_by_source or {}
                             ),
-                            component_schema_hash=self.reference_action_schema_hash,
+                            component_ids=binding.component_ids,
+                            projected_at=max(
+                                float(self.clock()),
+                                reference_observation.available_at,
+                            ),
                             observation_binding_id=binding.binding_id,
                             observation_plan_hash=binding.plan_hash,
-                            selected_component_ids=binding.component_ids,
                         )
                     )
                 self._publish_execution_observation(
@@ -2014,9 +2267,7 @@ class MujocoDeployRuntime:
                     reason="selected_reference_sample_published",
                 )
             else:
-                reference_expected = self._target_reference_expected_at(
-                    sampled_at
-                )
+                reference_expected = self._target_reference_expected_at(sampled_at)
                 self._publish_execution_observation(
                     "reference",
                     None,
@@ -2033,20 +2284,37 @@ class MujocoDeployRuntime:
             observed_at=sampled_at,
         )
         if measurement is not None and measurement_due:
-            measurement_observation = (
-                project_mujoco_execution_measurement_observation(
-                    measurement,
-                    control_domain_id=self.config.control_domain_id,
-                    side_to_component_id=(
-                        self._execution_observation_side_to_component_id
-                    ),
-                    component_schema_hash=self.reference_action_schema_hash,
-                    available_at=max(float(self.clock()), sampled_at),
-                    observation_binding_id=binding.binding_id,
-                    observation_plan_hash=binding.plan_hash,
-                    selected_component_ids=binding.component_ids,
-                )
+            measurement_observation = project_mujoco_execution_measurement_observation(
+                measurement,
+                control_domain_id=self.config.control_domain_id,
+                side_to_component_id=(self._execution_observation_side_to_component_id),
+                component_schema_hash=self.reference_action_schema_hash,
+                available_at=max(float(self.clock()), sampled_at),
+                observation_binding_id=(
+                    None if pose_projector is not None else binding.binding_id
+                ),
+                observation_plan_hash=(
+                    None if pose_projector is not None else binding.plan_hash
+                ),
+                selected_component_ids=binding.component_ids,
             )
+            if pose_projector is not None:
+                assert execution_state_cut is not None
+                measurement_observation = (
+                    project_mujoco_fk_pose_measurement_observation(
+                        measurement_observation,
+                        projector=pose_projector,
+                        model_qpos=execution_state_cut.model_qpos,
+                        qpos_by_source=(execution_state_cut.measured_qpos_by_source),
+                        component_ids=binding.component_ids,
+                        projected_at=max(
+                            float(self.clock()),
+                            measurement_observation.available_at,
+                        ),
+                        observation_binding_id=binding.binding_id,
+                        observation_plan_hash=binding.plan_hash,
+                    )
+                )
             self._publish_execution_observation(
                 "measurement",
                 measurement_observation,
@@ -2147,16 +2415,14 @@ class MujocoDeployRuntime:
         ):
             for candidate in reversed(receiver.component_target_admissions):
                 if (
-                    candidate.target_execution_request_id
-                    == request.request_id
+                    candidate.target_execution_request_id == request.request_id
                     and candidate.available_at <= timestamp
                 ):
                     admission = candidate
                     break
             for candidate in reversed(receiver.component_target_activations):
                 if (
-                    candidate.target_execution_request_id
-                    == request.request_id
+                    candidate.target_execution_request_id == request.request_id
                     and candidate.available_at <= timestamp
                 ):
                     activation = candidate
@@ -2209,6 +2475,13 @@ class MujocoDeployRuntime:
                 producer_id=self.config.composer_producer_id,
                 producer_epoch=self.config.producer_epoch,
                 reason="mujoco composer authority startup",
+            )
+        direct_source = self.config.direct_component_proposal_source
+        if direct_source is not None:
+            self.core.activate_producer(
+                producer_id=direct_source.producer_id,
+                producer_epoch=direct_source.producer_epoch,
+                reason="mujoco direct component proposal source startup",
             )
         self._started = True
 
@@ -2295,6 +2568,84 @@ class MujocoDeployRuntime:
             self._next_proposal_sequence += 1
         return receipt
 
+    def submit_component_action(
+        self,
+        action: ComponentAction,
+        *,
+        source_event_id: str,
+        produced_at: float | None = None,
+        target_effective_at: float | None = None,
+        observation_cut_id: str | None = None,
+        context_ids: tuple[str, ...] = (),
+    ) -> ProposalAdmissionReceipt:
+        """Admit one native action from the configured direct source.
+
+        The source identity, kind, epoch and authority priority are immutable
+        runtime configuration.  This method only admits a proposal; the
+        existing authoritative decision, safety, target adaptation, coupled
+        IK, reference and dispatch chain remains the sole execution owner.
+        """
+
+        if not self._started:
+            raise RuntimeError("MujocoDeployRuntime.start() is required.")
+        source = self.config.direct_component_proposal_source
+        if source is None:
+            raise RuntimeError(
+                "This MuJoCo runtime has no direct component proposal source."
+            )
+        if not isinstance(action, ComponentAction):
+            raise TypeError("action must be a ComponentAction.")
+        if action.action_schema.semantic_content_hash != (
+            self.action_schema.semantic_content_hash
+        ):
+            raise ValueError(
+                "Direct component action does not match the runtime schema."
+            )
+        if action.component_coverage != self.action_schema.component_ids:
+            raise ValueError(
+                "Direct component action must exactly cover its runtime profile."
+            )
+        event_id = str(source_event_id).strip()
+        if not event_id:
+            raise ValueError("source_event_id must be non-empty.")
+        normalized_context_ids = tuple(str(value).strip() for value in context_ids)
+        if any(not value for value in normalized_context_ids):
+            raise ValueError("context_ids must contain non-empty strings.")
+        produced = float(self.clock() if produced_at is None else produced_at)
+        target = float(
+            produced if target_effective_at is None else target_effective_at
+        )
+        sequence = self._next_direct_component_proposal_sequence
+        draft = ActionProposalDraft(
+            runtime_session_id=self.config.runtime_session_id,
+            control_domain_id=self.config.control_domain_id,
+            embodiment_instance_id=self.config.embodiment_instance_id,
+            producer_kind=source.producer_kind,
+            producer_id=source.producer_id,
+            producer_epoch=source.producer_epoch,
+            sequence=sequence,
+            action=action,
+            produced_at=produced,
+            produced_clock_domain_id=self.config.clock_domain_id,
+            effective_from=target,
+            effective_until=target + self.config.proposal_horizon_sec,
+            target_effective_at=target,
+            effective_clock_domain_id=self.config.clock_domain_id,
+            authority_priority=source.authority_priority,
+            observation_cut_id=observation_cut_id,
+            context_ids=normalized_context_ids,
+            audit_metadata={
+                "direct_component_source_event_id": event_id,
+            },
+        )
+        receipt = self.core.admit_proposal(
+            draft,
+            source_event_id=event_id,
+        )
+        if receipt.accepted:
+            self._next_direct_component_proposal_sequence += 1
+        return receipt
+
     def submit_policy_action_emission(
         self,
         emission: PolicyActionEmission,
@@ -2326,7 +2677,9 @@ class MujocoDeployRuntime:
             <= emission.target_effective_at
             < emission.effective_until
         ):
-            raise ValueError("Policy emission target is outside its effective interval.")
+            raise ValueError(
+                "Policy emission target is outside its effective interval."
+            )
 
         action = emission.pre_safety_robot_action
         validation = emission.source_validation
@@ -2531,17 +2884,22 @@ class MujocoDeployRuntime:
             raise RuntimeError("Replay authority is not enabled for this sim runtime.")
         source_config = source.config
         if source_config.producer_id != self.config.replay_producer_id:
-            raise ValueError("Replay producer does not match the sim authority profile.")
+            raise ValueError(
+                "Replay producer does not match the sim authority profile."
+            )
         if (
             source_config.runtime_session_id != self.config.runtime_session_id
             or source_config.control_domain_id != self.config.control_domain_id
-            or source_config.embodiment_instance_id != self.config.embodiment_instance_id
+            or source_config.embodiment_instance_id
+            != self.config.embodiment_instance_id
         ):
             raise ValueError("Replay proposal source belongs to another sim target.")
         if source_config.target_runtime_contract.semantic_content_hash != (
             self.target_runtime_action_contract.semantic_content_hash
         ):
-            raise ValueError("Replay source is not assessed against this exact sim target.")
+            raise ValueError(
+                "Replay source is not assessed against this exact sim target."
+            )
         produced = float(self.clock() if produced_at is None else produced_at)
         target = float(produced if target_effective_at is None else target_effective_at)
         source_emission = create_replay_source_frame_emission(
@@ -2599,17 +2957,22 @@ class MujocoDeployRuntime:
             raise TypeError("emission must be a ReplaySourceFrameEmission.")
         source_config = source.config
         if source_config.producer_id != self.config.replay_producer_id:
-            raise ValueError("Replay producer does not match the sim authority profile.")
+            raise ValueError(
+                "Replay producer does not match the sim authority profile."
+            )
         if (
             source_config.runtime_session_id != self.config.runtime_session_id
             or source_config.control_domain_id != self.config.control_domain_id
-            or source_config.embodiment_instance_id != self.config.embodiment_instance_id
+            or source_config.embodiment_instance_id
+            != self.config.embodiment_instance_id
         ):
             raise ValueError("Replay proposal source belongs to another sim target.")
         if source_config.target_runtime_contract.semantic_content_hash != (
             self.target_runtime_action_contract.semantic_content_hash
         ):
-            raise ValueError("Replay source is not assessed against this exact sim target.")
+            raise ValueError(
+                "Replay source is not assessed against this exact sim target."
+            )
         if emission.clock_domain_id != self.config.clock_domain_id:
             raise ValueError(
                 "Replay source-frame and sim runtime require one explicit clock domain."
@@ -2696,9 +3059,11 @@ class MujocoDeployRuntime:
     ) -> ObservationBundle:
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        node_id = self.config.policy_node_id if policy_node_id is None else str(
-            policy_node_id
-        ).strip()
+        node_id = (
+            self.config.policy_node_id
+            if policy_node_id is None
+            else str(policy_node_id).strip()
+        )
         if not node_id:
             raise ValueError("policy_node_id must be non-empty.")
         adapter = self._observation_adapter_by_node.get(node_id)
@@ -2721,6 +3086,17 @@ class MujocoDeployRuntime:
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
         return self.policy_topology.admit_composition_context(draft)
+
+    def resolve_composition_context(self, context_id: str):
+        """Resolve one admitted context for exact publisher reconciliation.
+
+        This is a read-only receiver port.  It does not capture a cut, advance
+        retention, or reinterpret a duplicate admission.
+        """
+
+        if not self._started:
+            raise RuntimeError("MujocoDeployRuntime.start() is required.")
+        return self.policy_topology.contexts.record_by_id(context_id)
 
     def capture_composition_context_snapshot(
         self,
@@ -2748,6 +3124,21 @@ class MujocoDeployRuntime:
             activation_scope=activation_scope,
         )
 
+    def submit_composition_inputs(
+        self,
+        batch: CompositionInputBatchDraft,
+        *,
+        activation_scope: CompositionActivationScope | None = None,
+    ):
+        """Atomically admit one same-source multi-role composition batch."""
+
+        if not self._started:
+            raise RuntimeError("MujocoDeployRuntime.start() is required.")
+        return self.policy_topology.admit_composition_inputs(
+            batch,
+            activation_scope=activation_scope,
+        )
+
     def submit_composition_source_eligibility(
         self,
         draft: CompositionSourceEligibilityDraft,
@@ -2755,6 +3146,23 @@ class MujocoDeployRuntime:
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
         return self.policy_topology.admit_source_eligibility(draft)
+
+    def submit_residual_anchor_lifecycle(
+        self,
+        draft: ResidualAnchorLifecycleDraft,
+        *,
+        spec: ResidualAnchorLifecycleSpec,
+        activation_scope: CompositionActivationScope,
+    ) -> ResidualAnchorLifecycleAdmissionReceipt:
+        """Forward one anchor lifecycle fact to the shared receiver store."""
+
+        if not self._started:
+            raise RuntimeError("MujocoDeployRuntime.start() is required.")
+        return self.policy_topology.admit_residual_anchor_lifecycle(
+            draft,
+            spec=spec,
+            activation_scope=activation_scope,
+        )
 
     def evaluate_composition_shadow(
         self,
@@ -2767,6 +3175,7 @@ class MujocoDeployRuntime:
         source_difference_spec: SourceDifferenceSpec | None = None,
         activation_scope: CompositionActivationScope | None = None,
         source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+        residual_anchor_lifecycle_scope_id: str | None = None,
     ):
         """Evaluate a composition cut without proposal, authority, or dispatch."""
 
@@ -2782,16 +3191,17 @@ class MujocoDeployRuntime:
                 source_difference_spec=source_difference_spec,
                 activation_scope=activation_scope,
                 source_eligibility_spec=source_eligibility_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
             )
         else:
             if (
                 spec.semantic_content_hash
-                != self.composition_strategy_control.latest_revision
-                .composition_spec.semantic_content_hash
+                != self.composition_strategy_control.latest_revision.composition_spec.semantic_content_hash
             ):
                 raise ValueError(
-                    "Hot composition evaluation requested another "
-                    "CompositionSpec."
+                    "Hot composition evaluation requested another " "CompositionSpec."
                 )
             submission = self.policy_topology.evaluate_hot_composition(
                 target_effective_at=target_effective_at,
@@ -2801,6 +3211,9 @@ class MujocoDeployRuntime:
                 source_difference_spec=source_difference_spec,
                 activation_scope=activation_scope,
                 source_eligibility_spec=source_eligibility_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
             )
         if submission.proposal_admission is not None:
             raise RuntimeError("Shadow composition unexpectedly admitted a proposal.")
@@ -2816,32 +3229,39 @@ class MujocoDeployRuntime:
         source_difference_spec: SourceDifferenceSpec | None = None,
         component_coverage: tuple[str, ...] | None = None,
         selection_groups: tuple[str, ...] | None = None,
+        residual_anchor_lifecycle_scope_id: str | None = None,
     ):
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
         if not self.config.enable_composer_authority:
-            raise RuntimeError("Composer authority is not enabled for this sim runtime.")
+            raise RuntimeError(
+                "Composer authority is not enabled for this sim runtime."
+            )
         if self.composition_strategy_control is None:
             evaluation = self.policy_topology.evaluate_composition(
                 spec=spec,
                 target_effective_at=target_effective_at,
                 required_context_channels=required_context_channels,
                 source_difference_spec=source_difference_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
             )
         else:
             if (
                 spec.semantic_content_hash
-                != self.composition_strategy_control.latest_revision
-                .composition_spec.semantic_content_hash
+                != self.composition_strategy_control.latest_revision.composition_spec.semantic_content_hash
             ):
                 raise ValueError(
-                    "Hot composition submission requested another "
-                    "CompositionSpec."
+                    "Hot composition submission requested another " "CompositionSpec."
                 )
             evaluation = self.policy_topology.evaluate_hot_composition(
                 target_effective_at=target_effective_at,
                 required_context_channels=required_context_channels,
                 source_difference_spec=source_difference_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
             )
         if (
             evaluation.composition_evaluation.output_status != "ready"
@@ -2862,21 +3282,29 @@ class MujocoDeployRuntime:
         selection_groups: tuple[str, ...] | None,
         action: RobotAction,
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        if not isinstance(action, ComponentAction):
+            raise TypeError("Composed candidate must be a ComponentAction.")
+        catalog_by_component = self.catalog.component_by_id
         if component_coverage is None and selection_groups is None:
             if self._compound_composer_authority_profile is None:
-                coverage = ("left_arm", "right_arm")
-                groups = ("arms",)
+                # The ordinary composer profile follows the exact typed
+                # candidate instead of assuming a bimanual-arm topology.
+                # Catalog and coupled-group validation below still reject an
+                # unknown or partial physical ownership scope.
+                coverage = action.component_coverage
+                groups = tuple(
+                    dict.fromkeys(
+                        catalog_by_component[component].selection_group_id
+                        for component in coverage
+                        if component in catalog_by_component
+                    )
+                )
             else:
-                coverage = (
-                    self._compound_composer_authority_profile.component_coverage
-                )
-                groups = (
-                    self._compound_composer_authority_profile.selection_groups
-                )
+                coverage = self._compound_composer_authority_profile.component_coverage
+                groups = self._compound_composer_authority_profile.selection_groups
         elif component_coverage is None or selection_groups is None:
             raise ValueError(
-                "component_coverage and selection_groups must be provided "
-                "together."
+                "component_coverage and selection_groups must be provided " "together."
             )
         else:
             coverage = tuple(str(value).strip() for value in component_coverage)
@@ -2891,11 +3319,8 @@ class MujocoDeployRuntime:
             raise ValueError(
                 "Composition promotion scope must be non-empty and unique."
             )
-        catalog_by_component = self.catalog.component_by_id
         unknown_components = tuple(
-            component
-            for component in coverage
-            if component not in catalog_by_component
+            component for component in coverage if component not in catalog_by_component
         )
         if unknown_components:
             raise ValueError(
@@ -2926,27 +3351,21 @@ class MujocoDeployRuntime:
             members = self.catalog.components_for_group(group)
             if members and members[0].coupled:
                 covered_members = {
-                    component for component in coverage
-                    if catalog_by_component[component].selection_group_id
-                    == group
+                    component
+                    for component in coverage
+                    if catalog_by_component[component].selection_group_id == group
                 }
-                required_members = {
-                    component.component_id for component in members
-                }
+                required_members = {component.component_id for component in members}
                 if covered_members != required_members:
                     raise ValueError(
                         "Composition promotion cannot partially cover coupled "
                         f"selection group {group!r}."
                     )
-        if not isinstance(action, ComponentAction):
-            raise TypeError("Composed candidate must be a ComponentAction.")
         if (
             action.action_schema.semantic_content_hash
             != self.action_schema.semantic_content_hash
         ):
-            raise ValueError(
-                "Composed action uses another runtime action schema."
-            )
+            raise ValueError("Composed action uses another runtime action schema.")
         action_coverage = action.component_coverage
         if coverage != action_coverage:
             raise ValueError(
@@ -2954,10 +3373,8 @@ class MujocoDeployRuntime:
                 "action components."
             )
         if self._compound_composer_authority_profile is not None and (
-            coverage
-            != self._compound_composer_authority_profile.component_coverage
-            or groups
-            != self._compound_composer_authority_profile.selection_groups
+            coverage != self._compound_composer_authority_profile.component_coverage
+            or groups != self._compound_composer_authority_profile.selection_groups
         ):
             raise ValueError(
                 "Conservative compound composer authority requires the exact "
@@ -2978,15 +3395,12 @@ class MujocoDeployRuntime:
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
         if not self.config.enable_composer_authority:
-            raise RuntimeError("Composer authority is not enabled for this sim runtime.")
-        action = evaluation.composition_evaluation.composed_candidate
-        if (
-            evaluation.composition_evaluation.output_status != "ready"
-            or action is None
-        ):
-            raise ValueError(
-                "Only a ready composition evaluation may be promoted."
+            raise RuntimeError(
+                "Composer authority is not enabled for this sim runtime."
             )
+        action = evaluation.composition_evaluation.composed_candidate
+        if evaluation.composition_evaluation.output_status != "ready" or action is None:
+            raise ValueError("Only a ready composition evaluation may be promoted.")
         coverage, groups = self._validate_composition_promotion_scope(
             component_coverage=component_coverage,
             selection_groups=selection_groups,
@@ -2996,28 +3410,19 @@ class MujocoDeployRuntime:
             evaluation.composition_evaluation.composition_supported_until
         )
         if composition_supported_until is None:
-            raise ValueError(
-                "Ready composition evaluation has no support deadline."
+            raise ValueError("Ready composition evaluation has no support deadline.")
+        requested_until = evaluation.input_snapshot.target_effective_at + (
+            1.0 / self.config.decision_hz
+            if (
+                self._compound_composer_authority_profile is not None
+                and self.config.reference_activation_profile_id
+                == SCHEDULED_REFERENCE_SEGMENT_SIM_V1
             )
-        requested_until = (
-            evaluation.input_snapshot.target_effective_at
-            + (
-                1.0 / self.config.decision_hz
-                if (
-                    self._compound_composer_authority_profile is not None
-                    and self.config.reference_activation_profile_id
-                    == SCHEDULED_REFERENCE_SEGMENT_SIM_V1
-                )
-                else self.config.proposal_horizon_sec
-            )
+            else self.config.proposal_horizon_sec
         )
-        evaluation_id = (
-            evaluation.composition_evaluation.composition_evaluation_id
-        )
-        cached_envelope = (
-            self._composition_promotion_envelope_by_evaluation_id.get(
-                evaluation_id
-            )
+        evaluation_id = evaluation.composition_evaluation.composition_evaluation_id
+        cached_envelope = self._composition_promotion_envelope_by_evaluation_id.get(
+            evaluation_id
         )
         if cached_envelope is None:
             promotion_sequence = self._next_composite_proposal_sequence
@@ -3044,17 +3449,14 @@ class MujocoDeployRuntime:
         if (
             submission.proposal_admission is not None
             and submission.proposal_admission.accepted
-            and submission.proposal_admission
-            is not evaluation.proposal_admission
+            and submission.proposal_admission is not evaluation.proposal_admission
         ):
             proposal = submission.proposal_admission.proposal
             if (
                 proposal is not None
                 and proposal.sequence == self._next_composite_proposal_sequence
             ):
-                self._composition_promotion_envelope_by_evaluation_id[
-                    evaluation_id
-                ] = (
+                self._composition_promotion_envelope_by_evaluation_id[evaluation_id] = (
                     promotion_sequence,
                     promotion_until,
                     promotion_policy_node_id,
@@ -3148,9 +3550,7 @@ class MujocoDeployRuntime:
                 self._projected_reference_fact_ids.update(
                     fact.fact_id for fact in pending
                 )
-            self._reference_trace_cursor_by_stream.update(
-                next_cursor_by_stream
-            )
+            self._reference_trace_cursor_by_stream.update(next_cursor_by_stream)
             return
         facts.extend(
             project_reference_receiver_validation(context, item)
@@ -3270,17 +3670,11 @@ class MujocoDeployRuntime:
             if fact.fact_id not in self._projected_reference_fact_ids
         )
         if not pending:
-            self._reference_trace_cursor_by_stream.update(
-                next_cursor_by_stream
-            )
+            self._reference_trace_cursor_by_stream.update(next_cursor_by_stream)
             return
         self.core.record_external_facts(pending)
-        self._projected_reference_fact_ids.update(
-            fact.fact_id for fact in pending
-        )
-        self._reference_trace_cursor_by_stream.update(
-            next_cursor_by_stream
-        )
+        self._projected_reference_fact_ids.update(fact.fact_id for fact in pending)
+        self._reference_trace_cursor_by_stream.update(next_cursor_by_stream)
 
     def set_execution_gate(
         self,
@@ -3336,10 +3730,11 @@ class MujocoDeployRuntime:
 
 
 __all__ = [
-    "build_mujoco_pose_action_schema",
     "MujocoComponentExecutionBinding",
     "MujocoDeployConfig",
     "MujocoDeployRuntime",
+    "MujocoDirectComponentProposalSource",
     "MujocoPolicyActionChunkSubmission",
     "MujocoReplaySubmission",
+    "build_mujoco_pose_action_schema",
 ]

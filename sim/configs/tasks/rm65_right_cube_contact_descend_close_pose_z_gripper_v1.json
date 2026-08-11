@@ -1,0 +1,53 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json",
+  "name": "rm65_right_cube_contact_descend_close_pose_z_gripper_v1",
+  "task_objective": "contact",
+  "object_pose_observation_source": "sim_ground_truth_proxy_for_external_object_pose_estimator.v1",
+  "policy_observation_fields": ["proprio"],
+  "policy_action_components": [
+    "right_tcp_delta_z",
+    "right_gripper_delta"
+  ],
+  "cube_spawn_xy_jitter_m": [0.0, 0.0],
+  "cube_spawn_yaw_jitter_rad": 0.0,
+  "post_contact_phase_enabled": false,
+  "post_contact_action_scale": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  "post_contact_action_bias": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "post_contact_nonnegative_lift_action": false,
+  "contact_success_min_measured_close": 0.55,
+  "contact_success_min_score": 0.5,
+  "max_episode_steps": 120,
+  "success_hold_physics_ticks": 40,
+  "success_requires_bilateral_contact": true,
+  "reward": {
+    "success_bonus": 15.0,
+    "action_penalty": 0.003
+  },
+  "reward_shaping": {
+    "reach_reward_scale": 0.1,
+    "reach_progress_scale": 3.0,
+    "grasp_region_reward_scale": 0.05,
+    "grasp_region_progress_scale": 3.0,
+    "gripper_reward_scale": 0.35,
+    "gripper_progress_scale": 4.0,
+    "gripper_command_reward_scale": 0.08,
+    "gripper_reward_requires_contact": false,
+    "grasp_acquire_bonus": 2.0,
+    "grasp_acquire_requires_contact": true,
+    "bilateral_contact_acquire_bonus": 5.0,
+    "bilateral_contact_missing_penalty": 0.02,
+    "top_bottom_contact_penalty": 2.0,
+    "inner_contact_reward_scale": 1.0,
+    "bilateral_inner_contact_reward_scale": 2.0,
+    "outer_contact_penalty": 2.0,
+    "center_proximity_penalty": 8.0,
+    "lift_reward_scale": 0.0,
+    "lift_progress_scale": 0.0,
+    "success_bonus": 30.0,
+    "action_penalty": 0.003,
+    "safety_projection_penalty": 1.5,
+    "time_limit_penalty": 2.0,
+    "failure_termination_penalty": 10.0,
+    "unsafe_termination_penalty": 20.0
+  }
+}

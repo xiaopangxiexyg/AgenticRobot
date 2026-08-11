@@ -20,6 +20,19 @@ from robot_motion.position_control.trajectory import (
     DEFAULT_POSITION_VELOCITY_RAMP_SEC,
     JointTrajectoryLimits,
     JointTrajectoryProposal,
+    POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+    normalize_position_command_planner,
+)
+from robot_motion.position_control.horizon_governor import JointHorizonLimits
+from robot_motion.position_control.sample_aligned_trajectory import (
+    SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET,
+    SampleAlignedJerkLimitedJointTrajectoryPlanner,
+    normalize_sample_aligned_source_latch_mode,
+)
+from robot_motion.rm65.constants import (
+    RM65_ABSOLUTE_Q_MAX_RAD,
+    RM65_ABSOLUTE_Q_MIN_RAD,
 )
 from robot_motion.rm65.defaults import (
     RM65_POSITION_TRACKING_FOLLOW_ALPHA,
@@ -47,6 +60,7 @@ from .reference_lineage import (
     build_mujoco_planner_command_frame_observation,
     build_mujoco_reference_target_activation_observation,
 )
+from .execution_cut import MujocoExecutionStateCut
 
 
 _SIDES = ("left", "right")
@@ -80,6 +94,16 @@ class MujocoPositionExecutionConfig:
     )
     degraded_speed_scale: float = DEFAULT_POSITION_DEGRADED_SPEED_SCALE
     follow_qpos_alpha: float = RM65_POSITION_TRACKING_FOLLOW_ALPHA
+    position_command_planner: str = POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+    sample_aligned_source_hz: float = 15.0
+    sample_aligned_source_latch_mode: str = (
+        SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET
+    )
+    sample_aligned_horizon_source_steps: int = 2
+    sample_aligned_safety_horizon_source_steps: int | None = None
+    sample_aligned_scale_degraded_target: bool = True
+    sample_aligned_jerk_regularization: float = 1e-9
+    sample_aligned_jerk_delta_regularization: float = 0.0
     # Physical RM65 + DM-Tac execution is the simulation default. Callers that
     # intentionally need the legacy prescribed-qpos path must pass both fields
     # as ``None`` explicitly; absence is no longer an implicit debug switch.
@@ -133,6 +157,94 @@ class MujocoPositionExecutionConfig:
             raise ValueError("follow_qpos_alpha must be in (0, 1].")
         object.__setattr__(self, "degraded_speed_scale", degraded)
         object.__setattr__(self, "follow_qpos_alpha", follow)
+        planner = normalize_position_command_planner(self.position_command_planner)
+        if planner not in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }:
+            raise ValueError(
+                "MuJoCo position execution requires an acceleration/jerk-limited planner."
+            )
+        object.__setattr__(self, "position_command_planner", planner)
+        source_hz = float(self.sample_aligned_source_hz)
+        source_latch_mode = normalize_sample_aligned_source_latch_mode(
+            self.sample_aligned_source_latch_mode
+        )
+        horizon_source_steps = int(self.sample_aligned_horizon_source_steps)
+        for name in (
+            "sample_aligned_jerk_regularization",
+            "sample_aligned_jerk_delta_regularization",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative.")
+            object.__setattr__(self, name, value)
+        if planner == POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED:
+            ratio = float(self.timing.command_hz) / source_hz
+            if (
+                not math.isfinite(source_hz)
+                or source_hz <= 0.0
+                or not math.isclose(ratio, round(ratio), rel_tol=0.0, abs_tol=1e-9)
+            ):
+                raise ValueError(
+                    "sample-aligned MuJoCo execution requires command_hz/source_hz "
+                    "to be a positive integer ratio."
+                )
+            if (
+                isinstance(self.sample_aligned_horizon_source_steps, bool)
+                or horizon_source_steps != self.sample_aligned_horizon_source_steps
+                or horizon_source_steps < 2
+            ):
+                raise ValueError(
+                    "sample_aligned_horizon_source_steps must be an integer >= 2."
+                )
+            safety_horizon_source_steps = (
+                None
+                if self.sample_aligned_safety_horizon_source_steps is None
+                else int(self.sample_aligned_safety_horizon_source_steps)
+            )
+            if safety_horizon_source_steps is not None and (
+                isinstance(
+                    self.sample_aligned_safety_horizon_source_steps,
+                    bool,
+                )
+                or safety_horizon_source_steps
+                != self.sample_aligned_safety_horizon_source_steps
+                or safety_horizon_source_steps <= horizon_source_steps
+            ):
+                raise ValueError(
+                    "sample_aligned_safety_horizon_source_steps must be an "
+                    "integer greater than sample_aligned_horizon_source_steps."
+                )
+            if not math.isclose(follow, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "sample-aligned MuJoCo execution requires follow_qpos_alpha=1."
+                )
+        object.__setattr__(self, "sample_aligned_source_hz", source_hz)
+        object.__setattr__(
+            self,
+            "sample_aligned_source_latch_mode",
+            source_latch_mode,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_horizon_source_steps",
+            horizon_source_steps,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_safety_horizon_source_steps",
+            (
+                None
+                if self.sample_aligned_safety_horizon_source_steps is None
+                else int(self.sample_aligned_safety_horizon_source_steps)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_scale_degraded_target",
+            bool(self.sample_aligned_scale_degraded_target),
+        )
         if self.actuation_profile is not None:
             if not isinstance(self.actuation_profile, PositionActuationProfile):
                 raise TypeError(
@@ -218,7 +330,11 @@ class MujocoPositionExecutionRig(Rig):
         self._planner_command_frame_observations: list[
             MujocoPlannerCommandFrameObservation
         ] = []
-        self._planners: dict[str, AccelerationLimitedJointTrajectoryPlanner] = {}
+        self._planners: dict[
+            str,
+            AccelerationLimitedJointTrajectoryPlanner
+            | SampleAlignedJerkLimitedJointTrajectoryPlanner,
+        ] = {}
         if config.actuation_profile is None:
             self._execution = DirectQposDebugController(
                 scene,
@@ -253,39 +369,125 @@ class MujocoPositionExecutionRig(Rig):
     def name(self) -> str:
         return "mujoco_position_execution_rig"
 
+    def _new_planner(
+        self,
+    ) -> (
+        AccelerationLimitedJointTrajectoryPlanner
+        | SampleAlignedJerkLimitedJointTrajectoryPlanner
+    ):
+        max_step = np.full(
+            6,
+            np.deg2rad(float(self.config.max_command_step_deg)),
+            dtype=float,
+        )
+        if (
+            self.config.position_command_planner
+            == POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+        ):
+            max_acceleration = np.asarray(
+                self.config.max_acceleration_rad_s2,
+                dtype=float,
+            )
+            effective_velocity = np.minimum(
+                np.asarray(self.config.max_velocity_rad_s, dtype=float),
+                max_step * float(self.config.timing.command_hz),
+            )
+            return SampleAlignedJerkLimitedJointTrajectoryPlanner(
+                JointHorizonLimits(
+                    min_position_rad=np.asarray(
+                        RM65_ABSOLUTE_Q_MIN_RAD,
+                        dtype=float,
+                    ),
+                    max_position_rad=np.asarray(
+                        RM65_ABSOLUTE_Q_MAX_RAD,
+                        dtype=float,
+                    ),
+                    max_velocity_rad_s=effective_velocity,
+                    max_acceleration_rad_s2=max_acceleration,
+                    max_jerk_rad_s3=(
+                        max_acceleration / float(self.config.velocity_ramp_sec)
+                    ),
+                ),
+                source_hz=float(self.config.sample_aligned_source_hz),
+                command_hz=float(self.config.timing.command_hz),
+                source_latch_mode=(
+                    self.config.sample_aligned_source_latch_mode
+                ),
+                horizon_source_steps=int(
+                    self.config.sample_aligned_horizon_source_steps
+                ),
+                safety_horizon_source_steps=(
+                    self.config.sample_aligned_safety_horizon_source_steps
+                ),
+                scale_degraded_target=bool(
+                    self.config.sample_aligned_scale_degraded_target
+                ),
+                jerk_regularization=float(
+                    self.config.sample_aligned_jerk_regularization
+                ),
+                jerk_delta_regularization=float(
+                    self.config.sample_aligned_jerk_delta_regularization
+                ),
+                reference_mode="linear_hold",
+            )
+        return AccelerationLimitedJointTrajectoryPlanner(
+            JointTrajectoryLimits(
+                max_velocity_rad_s=self.config.max_velocity_rad_s,
+                max_acceleration_rad_s2=self.config.max_acceleration_rad_s2,
+                max_command_step_rad=max_step,
+            ),
+            velocity_ramp_sec=self.config.velocity_ramp_sec,
+            target_velocity_filter_tau_sec=(
+                self.config.target_velocity_filter_tau_sec
+            ),
+            reference_period_sec=1.0 / self.config.timing.reference_hz,
+            monotonic_clock=self._clock,
+        )
+
+    def _reset_and_prime_planner(
+        self,
+        planner: (
+            AccelerationLimitedJointTrajectoryPlanner
+            | SampleAlignedJerkLimitedJointTrajectoryPlanner
+        ),
+        qpos: np.ndarray,
+        *,
+        monotonic_time: float,
+    ) -> None:
+        planner.reset(qpos, monotonic_time=monotonic_time)
+        if isinstance(planner, SampleAlignedJerkLimitedJointTrajectoryPlanner):
+            admission = planner.prepare_target(
+                qpos,
+                source_timestamp=(
+                    monotonic_time
+                    - 1.0 / float(self.config.sample_aligned_source_hz)
+                ),
+                speed_scale=1.0,
+                mode="tracking",
+                reason="mujoco_position_execution_start",
+            )
+            planner.activate_target(admission, sequence=0)
+            return
+        planner.accept_target(
+            qpos,
+            sequence=0,
+            published_monotonic_time=(
+                monotonic_time - 1.0 / self.config.timing.reference_hz
+            ),
+            monotonic_time=monotonic_time,
+        )
+
     def start(self) -> None:
         with self._lock:
             if self._started:
                 return
             self._clock_origin = float(self._clock())
-            max_step = np.full(
-                6,
-                np.deg2rad(float(self.config.max_command_step_deg)),
-                dtype=float,
-            )
             for side in self.config.active_sides:
-                planner = AccelerationLimitedJointTrajectoryPlanner(
-                    JointTrajectoryLimits(
-                        max_velocity_rad_s=self.config.max_velocity_rad_s,
-                        max_acceleration_rad_s2=self.config.max_acceleration_rad_s2,
-                        max_command_step_rad=max_step,
-                    ),
-                    velocity_ramp_sec=self.config.velocity_ramp_sec,
-                    target_velocity_filter_tau_sec=(
-                        self.config.target_velocity_filter_tau_sec
-                    ),
-                    reference_period_sec=1.0 / self.config.timing.reference_hz,
-                    monotonic_clock=self._clock,
-                )
+                planner = self._new_planner()
                 initial = self._accepted_qcmd_by_side[side]
-                planner.reset(initial, monotonic_time=self._clock_origin)
-                # A target is required before the first 120 Hz proposal.
-                planner.accept_target(
+                self._reset_and_prime_planner(
+                    planner,
                     initial,
-                    sequence=0,
-                    published_monotonic_time=(
-                        self._clock_origin - 1.0 / self.config.timing.reference_hz
-                    ),
                     monotonic_time=self._clock_origin,
                 )
                 self._planners[side] = planner
@@ -404,7 +606,7 @@ class MujocoPositionExecutionRig(Rig):
             raise ValueError(
                 "position execution requires one atomic qref for every active arm: "
                 f"expected={sorted(expected)} present={sorted(present)}"
-            )
+        )
         qref_by_side: dict[str, np.ndarray] = {}
         metadata_by_side: dict[str, Mapping[str, object]] = {}
         for side in self.config.active_sides:
@@ -669,6 +871,72 @@ class MujocoPositionExecutionRig(Rig):
                 },
             }
 
+    def capture_execution_state_cut(
+        self,
+        *,
+        sources: Sequence[str] | None = None,
+    ) -> MujocoExecutionStateCut:
+        """Capture measured qpos, active qref and model qpos under one lock.
+
+        This is a passive observation seam.  In particular it does not call
+        ``mj_forward``, alter live ``MjData``, or advance the execution worker.
+        """
+
+        requested = (
+            self.config.active_sides
+            if sources is None
+            else tuple(str(value).strip() for value in sources)
+        )
+        if (
+            not requested
+            or any(not value for value in requested)
+            or len(requested) != len(set(requested))
+            or not set(requested).issubset(self.config.active_sides)
+        ):
+            raise ValueError(
+                "sources must be a unique non-empty subset of active_sides."
+            )
+        with self._lock:
+            if not self._started:
+                raise RuntimeError(
+                    "MujocoPositionExecutionRig.start() is required."
+                )
+            reference = self._last_reference
+            active_qref = (
+                None
+                if reference is None
+                else {
+                    source: reference.qref_by_side[source].copy()
+                    for source in requested
+                }
+            )
+            return MujocoExecutionStateCut(
+                sampled_at=float(self._clock()),
+                measured_qpos_by_source={
+                    source: self.scene.get_arm_qpos(source)
+                    for source in requested
+                },
+                model_qpos=np.asarray(self.scene.data.qpos, dtype=float).copy(),
+                physics_tick=self._worker_physics_ticks,
+                active_reference_sequence=(
+                    None if reference is None else reference.sequence
+                ),
+                active_qref_by_source=active_qref,
+                active_reference_segment_id=(
+                    None
+                    if reference is None
+                    else reference.reference_segment_id
+                ),
+                active_execution_fence_sequence=(
+                    None if reference is None else reference.execution_epoch
+                ),
+                active_group_segment_generation=(
+                    None
+                    if reference is None
+                    else reference.group_segment_generation
+                ),
+            )
+
     def step_physics(self) -> None:
         """Advance one deterministic physics tick; used by tests and offline replay."""
 
@@ -760,13 +1028,9 @@ class MujocoPositionExecutionRig(Rig):
                     for side in self.config.active_sides
                 }
                 for side, planner in self._planners.items():
-                    planner.reset(actual[side], monotonic_time=planner_now)
-                    planner.accept_target(
+                    self._reset_and_prime_planner(
+                        planner,
                         actual[side],
-                        sequence=0,
-                        published_monotonic_time=(
-                            planner_now - 1.0 / self.config.timing.reference_hz
-                        ),
                         monotonic_time=planner_now,
                     )
                 self._accepted_qcmd_by_side = {
@@ -819,6 +1083,8 @@ class MujocoPositionExecutionRig(Rig):
             generation_activation_id = None
         self._pending_reference = None
         self._hold_reason = None
+        sample_aligned_new_bucket: bool | None = None
+        activated_qref_by_side: dict[str, np.ndarray] = {}
         for side in self.config.active_sides:
             metadata = reference.metadata_by_side[side]
             policy = classify_position_trajectory_policy(
@@ -833,6 +1099,39 @@ class MujocoPositionExecutionRig(Rig):
                     monotonic_time=planner_now,
                     reason=policy.reason,
                 )
+                activated_qref_by_side[side] = self._accepted_qcmd_by_side[
+                    side
+                ].copy()
+            elif isinstance(
+                planner,
+                SampleAlignedJerkLimitedJointTrajectoryPlanner,
+            ):
+                admission = planner.prepare_target(
+                    reference.qref_by_side[side],
+                    source_timestamp=reference.published_monotonic_time,
+                    speed_scale=policy.speed_scale,
+                    mode=policy.mode,
+                    reason=policy.reason,
+                )
+                if sample_aligned_new_bucket is None:
+                    sample_aligned_new_bucket = bool(
+                        admission.new_source_bucket
+                    )
+                elif sample_aligned_new_bucket != bool(
+                    admission.new_source_bucket
+                ):
+                    raise RuntimeError(
+                        "bimanual sample-aligned source buckets diverged."
+                    )
+                if admission.new_source_bucket:
+                    planner.activate_target(
+                        admission,
+                        sequence=reference.sequence,
+                    )
+                activated_qref_by_side[side] = np.asarray(
+                    admission.admitted_qpos,
+                    dtype=float,
+                ).copy()
             else:
                 published = min(reference.published_monotonic_time, planner_now)
                 planner.accept_target(
@@ -844,6 +1143,7 @@ class MujocoPositionExecutionRig(Rig):
                     mode=policy.mode,
                     reason=policy.reason,
                 )
+                activated_qref_by_side[side] = reference.qref_by_side[side].copy()
         if reference.gripper_close_by_name:
             if self._gripper_execution is None:
                 raise RuntimeError(
@@ -851,6 +1151,20 @@ class MujocoPositionExecutionRig(Rig):
                 )
             self._gripper_execution.queue_close_targets(
                 reference.gripper_close_by_name
+            )
+        if sample_aligned_new_bucket is False:
+            return
+        if sample_aligned_new_bucket is True:
+            reference = _QueuedReference(
+                sequence=reference.sequence,
+                published_monotonic_time=reference.published_monotonic_time,
+                activate_at=reference.activate_at,
+                reference_segment_id=reference.reference_segment_id,
+                execution_epoch=reference.execution_epoch,
+                group_segment_generation=reference.group_segment_generation,
+                qref_by_side=activated_qref_by_side,
+                metadata_by_side=reference.metadata_by_side,
+                gripper_close_by_name=reference.gripper_close_by_name,
             )
         self._last_reference = reference
         if (

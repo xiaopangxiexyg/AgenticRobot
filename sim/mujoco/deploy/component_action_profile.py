@@ -47,12 +47,13 @@ def _unique_mapping(
     *,
     key_name: str,
     value_name: str,
+    allow_empty: bool = False,
 ) -> Mapping[str, str]:
     normalized = {
         _required(key, name=key_name): _required(value, name=value_name)
         for key, value in dict(values).items()
     }
-    if not normalized:
+    if not normalized and not allow_empty:
         raise ValueError(f"{key_name} mapping must not be empty.")
     if len(normalized.values()) != len(set(normalized.values())):
         raise ValueError(f"{value_name} values must be unique.")
@@ -86,6 +87,7 @@ class MujocoComponentTargetProfile:
             self.gripper_name_by_component,
             key_name="gripper component id",
             value_name="MuJoCo gripper name",
+            allow_empty=True,
         )
         if set(arms) & set(grippers):
             raise ValueError("One component cannot route to both an arm and a gripper.")
@@ -620,7 +622,7 @@ def build_mujoco_component_execution_binding(
     )
 
 
-def build_mujoco_pose_qpos_component_target_profile(
+def _build_mujoco_pose_component_target_profile(
     scene: Any,
     *,
     profile_id: str,
@@ -629,8 +631,9 @@ def build_mujoco_pose_qpos_component_target_profile(
     arm_reference_frame_by_component: Mapping[str, str] | None = None,
     arm_controlled_frame_by_component: Mapping[str, str] | None = None,
     selection_group_by_component: Mapping[str, str] | None = None,
+    require_gripper: bool,
 ) -> MujocoComponentTargetProfile:
-    """Build one arbitrary-cardinality pose+qpos target profile from a scene.
+    """Build the shared arm-pose plus optional gripper-qpos profile body.
 
     Arm values are absolute ``xyz + quat_xyzw`` tool poses.  Gripper values are
     the actual MuJoCo joint positions in the scene-declared joint order; a
@@ -656,7 +659,7 @@ def build_mujoco_pose_qpos_component_target_profile(
     }
     if not arms:
         raise ValueError("A pose+qpos target profile requires at least one arm.")
-    if not grippers:
+    if require_gripper and not grippers:
         raise ValueError("A pose+qpos target profile requires at least one gripper.")
     if set(arms) & set(grippers):
         raise ValueError("Arm and gripper component ids must be disjoint.")
@@ -787,7 +790,9 @@ def build_mujoco_pose_qpos_component_target_profile(
         semantic_parameters={
             "target_profile_id": profile,
             "canonical_arm_representation": "cartesian_pose",
-            "canonical_end_effector_representation": "physical_joint_qpos",
+            "canonical_end_effector_representation": (
+                "physical_joint_qpos" if grippers else "none"
+            ),
             "source_model_device_independent": True,
         },
     )
@@ -796,6 +801,58 @@ def build_mujoco_pose_qpos_component_target_profile(
         action_schema=action_schema,
         arm_side_by_component=arms,
         gripper_name_by_component=grippers,
+    )
+
+
+def build_mujoco_pose_component_target_profile(
+    scene: Any,
+    *,
+    profile_id: str,
+    arm_side_by_component: Mapping[str, str],
+    arm_reference_frame_by_component: Mapping[str, str] | None = None,
+    arm_controlled_frame_by_component: Mapping[str, str] | None = None,
+    selection_group_by_component: Mapping[str, str] | None = None,
+) -> MujocoComponentTargetProfile:
+    """Build an arms-only absolute tool-pose target profile.
+
+    This is the narrow ingress used by generic Agent motion.  It deliberately
+    exposes no hand or gripper component; a coupled solver may still receive a
+    measured support-arm pose through the target-private materializer.
+    """
+
+    return _build_mujoco_pose_component_target_profile(
+        scene,
+        profile_id=profile_id,
+        arm_side_by_component=arm_side_by_component,
+        gripper_name_by_component={},
+        arm_reference_frame_by_component=arm_reference_frame_by_component,
+        arm_controlled_frame_by_component=arm_controlled_frame_by_component,
+        selection_group_by_component=selection_group_by_component,
+        require_gripper=False,
+    )
+
+
+def build_mujoco_pose_qpos_component_target_profile(
+    scene: Any,
+    *,
+    profile_id: str,
+    arm_side_by_component: Mapping[str, str],
+    gripper_name_by_component: Mapping[str, str],
+    arm_reference_frame_by_component: Mapping[str, str] | None = None,
+    arm_controlled_frame_by_component: Mapping[str, str] | None = None,
+    selection_group_by_component: Mapping[str, str] | None = None,
+) -> MujocoComponentTargetProfile:
+    """Build one arbitrary-cardinality pose+qpos target profile from a scene."""
+
+    return _build_mujoco_pose_component_target_profile(
+        scene,
+        profile_id=profile_id,
+        arm_side_by_component=arm_side_by_component,
+        gripper_name_by_component=gripper_name_by_component,
+        arm_reference_frame_by_component=arm_reference_frame_by_component,
+        arm_controlled_frame_by_component=arm_controlled_frame_by_component,
+        selection_group_by_component=selection_group_by_component,
+        require_gripper=True,
     )
 
 
@@ -822,10 +879,11 @@ def build_rm65_right_cube_lift_component_target_profile(
 
 
 __all__ = [
-    "MujocoComponentTargetProfile",
     "MujocoComponentActionRobotActionV1Materializer",
+    "MujocoComponentTargetProfile",
     "MujocoRobotActionV1ComponentIngressAdapter",
     "build_mujoco_component_execution_binding",
+    "build_mujoco_pose_component_target_profile",
     "build_mujoco_pose_qpos_component_target_profile",
     "build_rm65_right_cube_lift_component_target_profile",
 ]

@@ -15,6 +15,24 @@ CUBE_LIFT_QPOS_ACTION_LAYOUT_VERSION = "right_qpos_delta6_right_gripper_delta1.v
 CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION = (
     "right_tcp_delta_xyz3_rotvec3_right_gripper_delta1.v1"
 )
+CUBE_LIFT_QPOS_ACTION_COMPONENTS = (
+    "right_qpos_delta_0",
+    "right_qpos_delta_1",
+    "right_qpos_delta_2",
+    "right_qpos_delta_3",
+    "right_qpos_delta_4",
+    "right_qpos_delta_5",
+    "right_gripper_delta",
+)
+CUBE_LIFT_POSE_ACTION_COMPONENTS = (
+    "right_tcp_delta_x",
+    "right_tcp_delta_y",
+    "right_tcp_delta_z",
+    "right_tcp_rotvec_x",
+    "right_tcp_rotvec_y",
+    "right_tcp_rotvec_z",
+    "right_gripper_delta",
+)
 CUBE_LIFT_ACTION_LAYOUT_VERSION = CUBE_LIFT_QPOS_ACTION_LAYOUT_VERSION
 CUBE_LIFT_PRIVILEGED_OBSERVATION_LAYOUT_VERSION = (
     "right_qpos6_right_close1_cube_pose7_cube_velocity6_"
@@ -52,6 +70,11 @@ CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION = (
 CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION = (
     "right_qpos6_right_close1_right_qpos_delta6_right_close_delta1_"
     "right_target_error6_right_gripper_target_error1_last_action7_cube_pose7.v1"
+)
+CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION = (
+    "right_qpos6_right_close1_right_qpos_delta6_right_close_delta1_"
+    "right_target_error6_right_gripper_target_error1_last_action7_cube_pose7_"
+    "tcp_to_reach_target_base_xyz3.v2"
 )
 CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_48_OBSERVATION_LAYOUT_VERSION = (
     "right_qpos6_right_close1_right_qpos_delta6_right_close_delta1_"
@@ -162,6 +185,13 @@ NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_FIELDS = (
     "cube_quat_z",
 )
 
+NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_FIELDS = (
+    *NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_FIELDS,
+    "tcp_to_reach_target_base_x_m",
+    "tcp_to_reach_target_base_y_m",
+    "tcp_to_reach_target_base_z_m",
+)
+
 
 def require_gymnasium():
     """Import Gymnasium lazily so config/physics utilities remain lightweight."""
@@ -211,6 +241,14 @@ class CubeLiftActionSpec:
     def gym_space(self):
         _gymnasium, spaces = require_gymnasium()
         return spaces.Box(low=-1.0, high=1.0, shape=(self.dim,), dtype=self.dtype)
+
+    @property
+    def components(self) -> tuple[str, ...]:
+        return (
+            CUBE_LIFT_POSE_ACTION_COMPONENTS
+            if self.layout_version == CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION
+            else CUBE_LIFT_QPOS_ACTION_COMPONENTS
+        )
 
 
 @dataclass(frozen=True)
@@ -265,6 +303,7 @@ class CubeLiftObservationSpec:
             CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION: NORMAL_MOTION_TRACKING_OBSERVATION_FIELDS,
             CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION: NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_FIELDS,
             CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION: NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_FIELDS,
+            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION: NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_FIELDS,
             CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_48_OBSERVATION_LAYOUT_VERSION: NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_FIELDS,
         }
         if self.layout_version not in supported:
@@ -278,6 +317,7 @@ class CubeLiftObservationSpec:
             CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_48_OBSERVATION_LAYOUT_VERSION,
         }:
             object.__setattr__(self, "field_names", expected_fields)
@@ -337,7 +377,9 @@ class CubeLiftObservationSpec:
 
 __all__ = [
     "CUBE_LIFT_ACTION_LAYOUT_VERSION",
+    "CUBE_LIFT_POSE_ACTION_COMPONENTS",
     "CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION",
+    "CUBE_LIFT_QPOS_ACTION_COMPONENTS",
     "CUBE_LIFT_QPOS_ACTION_LAYOUT_VERSION",
     "CUBE_LIFT_OBSERVATION_LAYOUT_VERSION",
     "CUBE_LIFT_NORMAL_OBSERVATION_LAYOUT_VERSION",
@@ -347,6 +389,7 @@ __all__ = [
     "CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION",
     "CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION",
     "CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION",
+    "CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION",
     "CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_48_OBSERVATION_LAYOUT_VERSION",
     "CUBE_LIFT_PRIVILEGED_OBSERVATION_LAYOUT_VERSION",
     "CUBE_LIFT_PRIVILEGED_RGB_OBSERVATION_LAYOUT_VERSION",
@@ -356,6 +399,7 @@ __all__ = [
     "NORMAL_MOTION_TRACKING_OBSERVATION_FIELDS",
     "NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_FIELDS",
     "NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_FIELDS",
+    "NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_FIELDS",
     "CubeLiftActionSpec",
     "CubeLiftObservationSpec",
     "require_gymnasium",

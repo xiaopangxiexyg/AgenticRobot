@@ -2078,7 +2078,7 @@ __RESIZABLE_SIDEBAR_DIVIDER__
     xhr.open("GET", "/choose-directory?initial=" + encodeURIComponent(input.value || ""), true);
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== 4) return;
-      button.disabled = false;
+      button.disabled = !legacyActiveControls.task_select;
       if (xhr.status !== 200) {
         setText("sendStatus", "选择文件夹失败: HTTP " + xhr.status);
         return;
@@ -2680,7 +2680,12 @@ async function chooseDatasetDirectory() {
   } finally {
     datasetChooseRootButtonEl.textContent = originalText || "选择文件夹";
     const latestEpisodeStatus = String(latestState.episode_event_status || "");
-    datasetChooseRootButtonEl.disabled = Boolean(latestState.episode_recording) || latestEpisodeStatus === "preparing" || latestEpisodeStatus === "finalizing";
+    datasetChooseRootButtonEl.disabled = (
+      Boolean(latestState.episode_recording)
+      || latestEpisodeStatus === "preparing"
+      || latestEpisodeStatus === "finalizing"
+      || !activeControls.has("task_select")
+    );
   }
 }
 
@@ -4300,7 +4305,14 @@ function renderTaskForm(state, recording) {
   // UMI keeps task semantics in its validated runtime config, while allowing
   // the idle dataset root to be selected for the next episode.
   const runtimeConfigured = String(state.ui_mode || "") === "umi_collection";
-  const pathLocked = Boolean(recording || preparing || finalizing);
+  const datasetConfigurationAvailable = activeControls.has("task_select");
+  const pathLocked = Boolean(
+    recording
+    || preparing
+    || finalizing
+    || datasetConfigurationSubmissionPending
+    || !datasetConfigurationAvailable
+  );
   const taskLocked = Boolean(pathLocked || runtimeConfigured);
   const selectedType = normalizeTaskType(
     taskTypeOverride
@@ -4386,9 +4398,14 @@ function renderTaskForm(state, recording) {
           : "应用配置 / 切换新数据集";
   }
   if (datasetConfigurationStatusEl) {
-    if (pathLocked) {
+    if (recording || preparing || finalizing) {
       datasetConfigurationStatusEl.textContent = (
         "当前 Episode 正在录制、暂停、准备或保存；停止并完成封口后才能切换数据集。"
+      );
+    } else if (!datasetConfigurationAvailable) {
+      datasetConfigurationStatusEl.textContent = String(
+        state.dataset_configuration_blocked_reason
+        || "当前运行阶段或数据合同不允许切换数据集。"
       );
     } else if (datasetConfigurationSubmissionPending) {
       datasetConfigurationStatusEl.textContent = "正在等待后端应用配置...";
@@ -5372,7 +5389,8 @@ _FALLBACK_SCRIPT = r"""
     if (deleteButton) deleteButton.disabled = !deleteAllowed;
     var runtimeConfigured = String(state.ui_mode || "") === "umi_collection";
     if (umiCalibrationSection) umiCalibrationSection.hidden = !runtimeConfigured;
-    var pathLocked = recording || preparing || finalizing;
+    var datasetConfigurationAvailable = Boolean(fallbackActiveControls.task_select);
+    var pathLocked = recording || preparing || finalizing || !datasetConfigurationAvailable;
     var locked = pathLocked || runtimeConfigured;
     var pathFields = ["datasetBaseRootInput", "datasetChooseRootButton"];
     for (var pathIndex = 0; pathIndex < pathFields.length; pathIndex += 1) {
@@ -6871,12 +6889,21 @@ class CalibrationWebUi:
                 "episode_start",
                 "episode_delete",
                 "device_retry",
+                "task_select",
             }:
+                # Dataset rebind, Episode mutation, and device rebuild share
+                # one pending application-mutation slot.  The next runtime
+                # state publication re-enables whichever controls are legal.
                 self._state.active_controls = [
                     control
                     for control in self._state.active_controls
                     if str(control)
-                    not in {"episode_start", "episode_delete", "device_retry"}
+                    not in {
+                        "episode_start",
+                        "episode_delete",
+                        "device_retry",
+                        "task_select",
+                    }
                 ]
             if accepted and event_control in {
                 "progress_advance",

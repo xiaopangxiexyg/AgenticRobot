@@ -1,0 +1,8 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_lift_hold_pose_z_v1.json",
+  "name": "rm65_right_cube_lift_short_pose_z_proprio_v1",
+  "policy_observation_fields": ["proprio"],
+  "lift_delta_m": 0.02,
+  "max_episode_steps": 90,
+  "success_hold_physics_ticks": 60
+}

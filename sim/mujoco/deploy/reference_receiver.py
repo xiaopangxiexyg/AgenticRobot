@@ -23,6 +23,7 @@ from robot_motion.action import (
     GroupGenerationActivation,
     PendingGroupGenerationReservation,
     ReferenceActivationSpec,
+    SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1,
     ReferenceSegment,
     ReferenceSegmentAdmissionReceipt,
     ReferenceSegmentTerminal,
@@ -255,7 +256,7 @@ class MujocoScheduledQposReferenceReceiver:
                     if relation_rejection is not None
                     else None
                     if before_start
-                    else "admission_deadline_missed_before_start"
+                    else SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1
                 ),
             )
             self._admissions.append(admission)

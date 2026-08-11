@@ -1,0 +1,5 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_contact_acquire_goal_delta_overhead_xyz_gripper_v2.json",
+  "name": "rm65_right_cube_contact_acquire_goal_delta_overhead_xyz_gripper_v3",
+  "contact_close_z_translation_scale": 0.025
+}

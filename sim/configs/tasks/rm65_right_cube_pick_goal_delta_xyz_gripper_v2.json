@@ -1,0 +1,40 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_contact_acquire_goal_delta_overhead_xyz_gripper_v3.json",
+  "name": "rm65_right_cube_pick_goal_delta_xyz_gripper_v2",
+  "task_objective": "lift",
+  "scripted_pregrasp_reset": false,
+  "reach_target_height_offset_m": 0.022,
+  "reach_guidance_height_offset_m": 0.0,
+  "reach_guidance_xy_blend_radius_m": 0.0,
+  "reach_action_min_scale": 1.0,
+  "reach_action_slow_radius_m": 0.0,
+  "contact_close_translation_scale": 1.0,
+  "contact_close_z_translation_scale": null,
+  "contact_close_distance_m": 0.0,
+  "contact_close_keep_measured_close": 1.0,
+  "post_contact_phase_enabled": true,
+  "post_contact_phase_activation_steps": 5,
+  "post_contact_phase_min_measured_close": 0.59,
+  "post_contact_phase_loss_grace_steps": 300,
+  "post_contact_action_scale": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  "post_contact_action_bias": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "post_contact_nonnegative_lift_action": false,
+  "max_episode_steps": 300,
+  "lift_delta_m": 0.03,
+  "success_hold_physics_ticks": 100,
+  "success_requires_bilateral_contact": true,
+  "reward": {
+    "success_bonus": 5.0,
+    "action_penalty": 0.003
+  },
+  "reward_shaping": {
+    "lift_reward_scale": 6.0,
+    "lift_progress_scale": 80.0,
+    "success_bonus": 60.0,
+    "action_penalty": 0.003,
+    "safety_projection_penalty": 1.5,
+    "time_limit_penalty": 2.0,
+    "failure_termination_penalty": 12.0,
+    "unsafe_termination_penalty": 20.0
+  }
+}

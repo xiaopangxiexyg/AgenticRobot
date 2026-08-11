@@ -101,6 +101,7 @@ _IMPLEMENTED_INTENTS = frozenset(
         "request_motion_authority",
         "release_motion_authority",
         "request_human_takeover",
+        "request_residual_rebase_and_clear",
         "start_composition_session",
         "rearm_composition_session",
         "stop_composition_session",
@@ -519,6 +520,11 @@ def _rejected_transition(
         state_revision_after=state.state_revision,
         manifest_hash=state.manifest_hash,
         resulting_state_hash=state.semantic_content_hash,
+        intent_hash=(
+            intent.semantic_content_hash
+            if intent.intent_kind == "request_residual_rebase_and_clear"
+            else None
+        ),
     )
     return ControlStationTransition(intent, state, state, receipt)
 
@@ -576,6 +582,11 @@ def _accepted_transition(
         state_revision_after=next_state.state_revision,
         manifest_hash=state.manifest_hash,
         resulting_state_hash=next_state.semantic_content_hash,
+        intent_hash=(
+            intent.semantic_content_hash
+            if intent.intent_kind == "request_residual_rebase_and_clear"
+            else None
+        ),
     )
     return ControlStationTransition(intent, state, next_state, receipt)
 
@@ -806,6 +817,48 @@ def apply_station_intent(
             pending_operations=pending_operations,
             lease=lease,
             status="operation_requested",
+        )
+
+    if kind == "request_residual_rebase_and_clear":
+        composer_slot_id = intent.subject_id
+        anchor_binding_id = intent.resource_binding_id
+        if (
+            composer_slot_id is None
+            or anchor_binding_id is None
+            or intent.operation_spec_id is None
+        ):
+            return _rejected_transition(
+                state,
+                intent,
+                status="residual_rebase_binding_incomplete",
+            )
+        if composer_slot_id not in source_states:
+            return _rejected_transition(
+                state,
+                intent,
+                status="residual_rebase_composer_unknown",
+            )
+        composer_slot = manifest.source_slot(composer_slot_id)
+        if (
+            composer_slot.source_kind != "composite"
+            or source_states[composer_slot_id] != "active"
+        ):
+            return _rejected_transition(
+                state,
+                intent,
+                status="residual_rebase_requires_active_composer",
+            )
+        if state.lifecycle_state != "running":
+            return _rejected_transition(
+                state,
+                intent,
+                status="residual_rebase_requires_running_session",
+            )
+        return _accepted_transition(
+            state,
+            intent,
+            lease=lease,
+            status="residual_rebase_intent_accepted",
         )
 
     if kind in {

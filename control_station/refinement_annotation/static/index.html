@@ -24,6 +24,15 @@
   <div id="connection-status" class="connection-status hidden" role="alert">
     标注服务连接已断开：页面已进入只读状态，不会接受新的本地标注。请确认程序仍在运行。
   </div>
+  <div id="operation-progress" class="operation-progress hidden" role="status" aria-live="polite">
+    <div class="operation-progress-heading">
+      <span id="operation-progress-label">正在处理</span>
+      <span id="operation-progress-percent">0%</span>
+    </div>
+    <div class="operation-progress-track" aria-hidden="true">
+      <div id="operation-progress-fill" class="operation-progress-fill"></div>
+    </div>
+  </div>
 
   <section id="workspace-launcher" class="launcher-shell">
     <div class="launcher-card panel">
@@ -31,7 +40,8 @@
         <div class="eyebrow">OPEN ANNOTATION WORKSPACE</div>
         <h2>选择数据集与标注身份</h2>
         <p>
-          这里只会读取正式采集与 Progress 均已封存、且带阶段 profile 的 Episode。
+          这里只会读取 Progress 已封存且带阶段 profile 的 Episode；历史数据必须通过
+          RETROSPECTIVE_MIGRATED semantic workspace 显式接入。
           这不表示二次阶段标注已经完成。确认后才会取得该数据集的唯一标注 writer lock。
         </p>
       </div>
@@ -126,6 +136,7 @@
         >↑</button>
         <strong id="collapsed-episode-number" class="collapsed-episode-number">—</strong>
         <small id="collapsed-episode-position" class="collapsed-episode-position">0 / 0</small>
+        <small id="collapsed-episode-status" class="collapsed-episode-status">—</small>
         <button
           id="next-episode-collapsed"
           class="secondary compact collapsed-nav-button"
@@ -149,6 +160,7 @@
             <div>
               <span class="section-index">02</span>
               <h2 id="episode-title">视频核验</h2>
+              <p id="episode-semantics" class="panel-note"></p>
             </div>
             <div class="camera-tabs" id="camera-tabs"></div>
           </div>
@@ -189,7 +201,10 @@
                 <span><i class="legend-failure"></i>失败阶段</span>
                 <span><i class="legend-fixed"></i>原始 Failure</span>
                 <span><i class="legend-trigger"></i>failure_trigger</span>
+                <span><i class="legend-recoverable"></i>可恢复失误</span>
                 <span><i class="legend-abnormal"></i>异常区间</span>
+                <span><i class="legend-pause"></i>暂停 / Attempt 间隔</span>
+                <span><i class="legend-unexplained"></i>待解释缺口</span>
               </div>
               <button id="delete-selected" class="danger compact" disabled>
                 删除所选阶段
@@ -206,9 +221,59 @@
             class="timeline-track failure-trigger-track"
             aria-label="failure_trigger 时间轴"
           ></div>
+          <div
+            id="recoverable-failure-track"
+            class="timeline-track recoverable-failure-track"
+            aria-label="可恢复失误时间轴"
+          ></div>
+          <p id="timeline-warning" class="timeline-warning hidden"></p>
+          <div
+            id="capture-end-step-editor"
+            class="capture-end-step-editor hidden"
+            aria-label="采集结束子任务选择"
+          ></div>
+          <div
+            id="failed-attempt-editors"
+            class="failed-attempt-editors"
+            aria-label="失败 Attempt 子阶段选择"
+          ></div>
           <div id="stage-descriptions" class="stage-descriptions"></div>
+          <div class="recoverable-failure-card">
+            <div>
+              <h3>中间失误后恢复（分析附加信息）</h3>
+              <p>
+                依次取“失误发生”和“恢复正常”两个样本；系统自动绑定两点共同所在的
+                SUCCESS 子阶段。若跨越白色阶段边界会拒绝添加，请先调整边界。该信息
+                不会改写 Failure、Retry、阶段结果或默认训练排除。多个区间之间需保留
+                至少一个明确正常样本；已有区间可定位或安全重标。
+              </p>
+            </div>
+            <div class="tool-row">
+              <button id="mark-recoverable-start" class="secondary compact" type="button">
+                取当前为失误发生
+              </button>
+              <button id="mark-recoverable-end" class="secondary compact" type="button">
+                取当前为恢复正常并添加
+              </button>
+              <button
+                id="cancel-recoverable-capture"
+                class="secondary compact hidden"
+                type="button"
+              >
+                取消本次取点
+              </button>
+              <input
+                id="recoverable-failure-note"
+                type="text"
+                placeholder="可选：简要说明失误与恢复"
+              >
+              <span id="recoverable-failure-pending" role="status" aria-live="polite">
+                尚未取点
+              </span>
+            </div>
+            <div id="recoverable-failure-list" class="compact-list"></div>
+          </div>
           <div class="edit-actions">
-            <button id="split-failure" class="secondary">在当前画面前完成上一阶段</button>
             <button id="toggle-tail-outcome" class="secondary">末段改为失败</button>
           </div>
           <p class="hint">
@@ -217,8 +282,12 @@
             相反顺序恢复。拖动白色阶段边界会实时定位视频。
             红色 Failure 刻度来自第一次采集，不能移动。每个采集 Failure 下方都有一个
             failure_trigger 时间轴；可拖动白色触发柄，但只能在失败阶段起点到原始 Failure
-            样本之间移动。长 Hold 只在显示轴压缩为 1 秒。“末段改为成功/失败”只修正
-            最后一个 Attempt 的末段草稿，仍需点击“封存标注”写入新版本。
+            样本之间移动。失败 Attempt 请先在其卡片中选择“失败发生于”哪个子阶段；系统
+            会按 profile 自动生成此前成功阶段，并同步重排同一子任务的后续 Retry。长 Hold
+            只在显示轴压缩为 1 秒。若原始数采在非最终子任务直接结束，可在“采集结束位置”
+            选择最后正常完成的子任务；系统只新增后标注投影，不改写原始 MANUAL_STOP，
+            并按所选子任务重新生成可拖动的子阶段。“末段改为成功/失败”只修正
+            最后一个 Attempt 的末段编辑，仍需点击“封存标注”写入新版本。
           </p>
         </section>
 
@@ -279,7 +348,7 @@
 
         <section class="commit-panel panel">
           <div>
-            <h2>保存与封存</h2>
+            <h2>校验与封存</h2>
             <p id="coverage-preview">提交时将执行严格顺序、Failure 归属与训练排除校验。</p>
             <div id="sealed-reedit-controls" class="sealed-reedit-controls hidden">
               <label>
@@ -296,7 +365,6 @@
             </div>
           </div>
           <div class="commit-actions">
-            <button id="save-draft" class="secondary">保存草稿</button>
             <button id="commit-annotations" class="primary">校验并封存标注</button>
           </div>
         </section>
@@ -347,6 +415,38 @@
         <button id="dataset-browser-cancel" class="secondary" type="button">取消</button>
         <button id="dataset-browser-select" class="primary" type="button">
           选择当前目录
+        </button>
+      </div>
+    </section>
+  </div>
+
+  <div
+    id="draft-warning-modal"
+    class="modal hidden"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="draft-warning-title"
+  >
+    <section class="draft-warning-card panel">
+      <div class="modal-heading">
+        <div>
+          <div class="eyebrow">UNSEALED CHANGES</div>
+          <h2 id="draft-warning-title">当前 Episode 有未封存修改</h2>
+        </div>
+      </div>
+      <p>
+        当前修改还没有发布为不可变标注版本。若直接离开，内存中的修改将丢失。
+        请先选择如何处理后再继续<span id="draft-warning-target">切换</span>。
+      </p>
+      <div class="modal-actions draft-warning-actions">
+        <button id="draft-warning-cancel" class="secondary" type="button">
+          取消切换
+        </button>
+        <button id="draft-warning-discard" class="danger" type="button">
+          放弃修改并切换
+        </button>
+        <button id="draft-warning-save" class="primary" type="button">
+          校验封存并切换
         </button>
       </div>
     </section>

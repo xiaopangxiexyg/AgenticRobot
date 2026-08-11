@@ -12,7 +12,14 @@ import numpy as np
 import torch
 
 from sim.mujoco.tasks.cube_lift import CubeLiftEnv
-from sim.mujoco.tasks.cube_lift.config import is_cube_lift_success_reason
+from sim.mujoco.tasks.cube_lift.config import (
+    CubeLiftTaskConfig,
+    is_cube_lift_success_reason,
+)
+from sim.mujoco.tasks.cube_lift.learning import (
+    build_policy_action_transform,
+    encode_policy_observation,
+)
 
 from .checkpoint import build_policy_from_checkpoint, check_task_config_compatibility
 from .policy import resolve_device
@@ -56,6 +63,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.task_config,
         allow_mismatch=getattr(args, "allow_task_config_mismatch", False),
     )
+    task_config = CubeLiftTaskConfig.load(args.task_config)
+    action_transform = build_policy_action_transform(task_config)
+    if (
+        policy.action_dim != action_transform.policy_dim
+        or policy.environment_action_dim != action_transform.task_dim
+        or tuple(policy.active_action_indices) != action_transform.task_indices
+    ):
+        raise ValueError(
+            "Checkpoint policy action dimensions do not match the task-owned "
+            "latent-to-pose transform."
+        )
     if compatibility["task_config_mismatch"]:
         print(
             "warning: legacy checkpoint/task mismatch enabled; "
@@ -102,16 +120,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 frame_started = time.monotonic()
                 if args.duration > 0.0 and frame_started - started >= args.duration:
                     break
+                actor_observation = encode_policy_observation(
+                    task_config,
+                    observation,
+                )
                 with torch.no_grad():
-                    action, _log_prob, _value = policy.act(
+                    action, _log_prob = policy.predict_action(
                         torch.as_tensor(
-                            normalizer.normalize(observation), device=device
+                            normalizer.normalize(actor_observation), device=device
                         ).unsqueeze(0),
                         deterministic=True,
                     )
-                    environment_action = policy.expand_action(action)
+                    environment_action = action_transform.transform(
+                        action.cpu().numpy().astype(np.float32, copy=False),
+                        observation=np.asarray(observation)[None, :],
+                    )
                 observation, reward, terminated, truncated, info = env.step(
-                    environment_action.squeeze(0).cpu().numpy()
+                    environment_action.squeeze(0)
                 )
                 total_raw_reward += reward
                 policy_steps += 1

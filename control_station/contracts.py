@@ -13,6 +13,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 
 
 CONTROL_STATION_SOURCE_KINDS_V1 = (
+    "agent_skill",
     "human",
     "replay",
     "policy",
@@ -45,6 +46,7 @@ CONTROL_STATION_INTENT_KINDS_V1 = (
     "request_motion_authority",
     "release_motion_authority",
     "request_human_takeover",
+    "request_residual_rebase_and_clear",
     "start_composition_session",
     "rearm_composition_session",
     "stop_composition_session",
@@ -527,27 +529,31 @@ class StationIntentAdmissionReceipt:
     state_revision_after: int
     manifest_hash: str
     resulting_state_hash: str
+    intent_hash: str | None = None
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "intent_id": self.intent_id,
+            "runtime_session_id": self.runtime_session_id,
+            "control_domain_id": self.control_domain_id,
+            "client_id": self.client_id,
+            "client_sequence": self.client_sequence,
+            "intent_kind": self.intent_kind,
+            "available_at": self.available_at,
+            "available_clock_domain_id": self.available_clock_domain_id,
+            "admission_sequence": self.admission_sequence,
+            "accepted": self.accepted,
+            "status": self.status,
+            "state_revision_before": self.state_revision_before,
+            "state_revision_after": self.state_revision_after,
+            "manifest_hash": self.manifest_hash,
+            "resulting_state_hash": self.resulting_state_hash,
+        }
+        if self.intent_hash is not None:
+            payload["intent_hash"] = self.intent_hash
         return canonical_content_hash(
-            {
-                "intent_id": self.intent_id,
-                "runtime_session_id": self.runtime_session_id,
-                "control_domain_id": self.control_domain_id,
-                "client_id": self.client_id,
-                "client_sequence": self.client_sequence,
-                "intent_kind": self.intent_kind,
-                "available_at": self.available_at,
-                "available_clock_domain_id": self.available_clock_domain_id,
-                "admission_sequence": self.admission_sequence,
-                "accepted": self.accepted,
-                "status": self.status,
-                "state_revision_before": self.state_revision_before,
-                "state_revision_after": self.state_revision_after,
-                "manifest_hash": self.manifest_hash,
-                "resulting_state_hash": self.resulting_state_hash,
-            },
+            payload,
             domain=STATION_INTENT_RECEIPT_HASH_DOMAIN_V1,
         )
 

@@ -42,6 +42,7 @@ class GuiControlState:
     hold_active: bool = False
     episode_recording_available: bool = False
     episode_delete_available: bool = True
+    dataset_reconfiguration_available: bool = True
     episode_recording_active: bool = False
     recording_paused: bool = False
     episode_countdown_active: bool = False
@@ -139,7 +140,9 @@ def movement_multiple_controls(
 def collection_task_controls(state: GuiControlState) -> list[str]:
     if episode_busy(state):
         return []
-    controls = ["task_select"]
+    controls: list[str] = []
+    if state.dataset_reconfiguration_available:
+        controls.append("task_select")
     if state.episode_recording_available:
         controls.append("round_trip_toggle")
     return controls

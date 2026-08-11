@@ -1,0 +1,10 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json",
+  "name": "rm65_right_cube_pick_goal_delta_xyz_gripper_v3",
+  "success_min_safety_clear_policy_steps": 3,
+  "success_min_bilateral_inner_contact_score": 0.5,
+  "success_max_outer_contact_score": 0.25,
+  "reward_shaping": {
+    "safety_intervention_penalty": 0.25
+  }
+}

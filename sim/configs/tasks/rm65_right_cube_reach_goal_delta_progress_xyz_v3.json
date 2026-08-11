@@ -1,0 +1,18 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_reach_goal_delta_xyz_v2.json",
+  "name": "rm65_right_cube_reach_goal_delta_progress_xyz_v3",
+  "reward_shaping": {
+    "staged_grasp": false,
+    "reach_reward_scale": 0.0,
+    "reach_progress_scale": 20.0,
+    "grasp_region_reward_scale": 0.0,
+    "grasp_region_progress_scale": 0.0,
+    "approach_alignment_reward_scale": 0.0,
+    "success_bonus": 20.0,
+    "action_penalty": 0.002,
+    "safety_projection_penalty": 1.0,
+    "time_limit_penalty": 2.0,
+    "failure_termination_penalty": 8.0,
+    "unsafe_termination_penalty": 15.0
+  }
+}

@@ -4,16 +4,25 @@ const state = {
   episodes: [],
   detail: null,
   draft: null,
+  savedDraftSnapshot: null,
   selectedEpisode: null,
   selectedCamera: null,
   selectedOccurrenceId: null,
   abnormalStart: null,
+  recoverableFailureStart: null,
+  recoverableFailureStartOccurrenceId: null,
+  recoverableFailureEditingId: null,
   dragging: null,
   busy: false,
   workspaceConfigured: false,
   workspace: null,
   serverOnline: true,
   episodeRefreshInFlight: false,
+  episodeRevision: null,
+  episodeRenderLimit: 200,
+  episodeScanInProgress: false,
+  lastEpisodeRefreshError: null,
+  workspaceGeneration: 0,
   privilegedBaseline: null,
   timelineMap: null,
   numericSampleTimestamps: null,
@@ -31,9 +40,22 @@ const state = {
   sealedReeditBaseline: null,
   sealedReeditSourceId: null,
   episodePanelCollapsed: false,
+  activeOperationId: null,
+  operationProgressKind: null,
 };
 
+let pendingDraftTransition = null;
+let activeVideoLoadCleanup = null;
+let episodeSummaryObserver = null;
+let episodeSummaryFlushTimer = 0;
+const pendingEpisodeSummaryIds = new Set();
+const inFlightEpisodeSummaryIds = new Set();
+const episodeSummaryRefreshedAt = new Map();
+
 const EPISODE_REFRESH_INTERVAL_MS = 4000;
+const EPISODE_RENDER_BATCH_SIZE = 200;
+const EPISODE_SUMMARY_BATCH_SIZE = 32;
+const EPISODE_SUMMARY_REFRESH_MS = 15000;
 const EPISODE_PANEL_STORAGE_KEY =
   "dexteleop.annotation.episode_panel_collapsed";
 const DISPLAY_GAP_THRESHOLD_SEC = 1.0;
@@ -74,6 +96,13 @@ function cancelPendingSeek() {
   }
   state.pendingSeekFrame = 0;
   state.pendingSeekTimestamp = null;
+}
+
+function clearVideoLoadListeners() {
+  if (!activeVideoLoadCleanup) return;
+  const cleanup = activeVideoLoadCleanup;
+  activeVideoLoadCleanup = null;
+  cleanup();
 }
 
 function flushPendingSeek() {
@@ -130,6 +159,109 @@ async function requestJson(url, options = {}) {
   return payload;
 }
 
+function renderOperationProgress({kind, message, percent = null}) {
+  const root = $("operation-progress");
+  const fill = $("operation-progress-fill");
+  const numeric = Number(percent);
+  const determinate = Number.isFinite(numeric);
+  state.operationProgressKind = kind;
+  $("operation-progress-label").textContent = message;
+  $("operation-progress-percent").textContent = determinate
+    ? `${Math.round(clamp(numeric, 0, 100))}%`
+    : "处理中";
+  fill.classList.toggle("indeterminate", !determinate);
+  fill.style.width = determinate
+    ? `${clamp(numeric, 0, 100)}%`
+    : "38%";
+  root.classList.remove("hidden");
+}
+
+function hideOperationProgress(expectedKind = null) {
+  if (
+    expectedKind
+    && state.operationProgressKind !== expectedKind
+  ) return;
+  $("operation-progress").classList.add("hidden");
+  state.operationProgressKind = null;
+}
+
+function newOperationId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `operation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function pollOperationProgress(operationId) {
+  while (state.activeOperationId === operationId) {
+    try {
+      const payload = await requestJson(
+        `/api/operation-progress?id=${encodeURIComponent(operationId)}`,
+      );
+      const progress = payload.progress;
+      if (progress && state.activeOperationId === operationId) {
+        renderOperationProgress({
+          kind: progress.kind,
+          message: progress.message,
+          percent: progress.percent,
+        });
+        if (!progress.active) return;
+      }
+    } catch (_error) {
+      // The main request remains authoritative. A transient polling failure
+      // must not turn a successful annotation operation into a UI error.
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+  }
+}
+
+async function requestJsonWithProgress(
+  url,
+  options,
+  {kind, message, completeMessage},
+) {
+  const operationId = newOperationId();
+  state.activeOperationId = operationId;
+  renderOperationProgress({kind, message, percent: 0});
+  void pollOperationProgress(operationId);
+  try {
+    const headers = {
+      ...(options?.headers || {}),
+      "X-Annotation-Operation": operationId,
+    };
+    const payload = await requestJson(url, {...(options || {}), headers});
+    if (state.activeOperationId === operationId) {
+      renderOperationProgress({
+        kind,
+        message: completeMessage,
+        percent: 100,
+      });
+    }
+    return payload;
+  } finally {
+    if (state.activeOperationId === operationId) {
+      state.activeOperationId = null;
+      window.setTimeout(() => hideOperationProgress(kind), 450);
+    }
+  }
+}
+
+function renderCatalogScanProgress(payload) {
+  if (state.activeOperationId) return;
+  if (!payload.refreshing) {
+    hideOperationProgress("CATALOG_SCAN");
+    return;
+  }
+  const completed = Number(payload.refresh_progress?.completed);
+  const total = Number(payload.refresh_progress?.total);
+  const determinate = Number.isFinite(total) && total > 0;
+  renderOperationProgress({
+    kind: "CATALOG_SCAN",
+    message: determinate
+      ? `正在扫描可标注 Episode（${completed}/${total}）`
+      : "正在读取 Episode 目录",
+    percent: determinate ? completed / total * 100 : null,
+  });
+}
+
 function rememberedValues(key) {
   try {
     const values = JSON.parse(window.localStorage.getItem(key) || "[]");
@@ -171,6 +303,72 @@ function storeBoolean(key, value) {
   }
 }
 
+function canonicalDraftValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalDraftValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalDraftValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+function draftsEqual(left, right) {
+  return JSON.stringify(canonicalDraftValue(left))
+    === JSON.stringify(canonicalDraftValue(right));
+}
+
+function setSavedDraftSnapshot(draft) {
+  state.savedDraftSnapshot = draft ? structuredClone(draft) : null;
+}
+
+function hasUnsavedDraftChanges() {
+  if (!state.detail || !state.draft) return false;
+  if (!state.savedDraftSnapshot) return true;
+  return !draftsEqual(state.draft, state.savedDraftSnapshot);
+}
+
+function settleDraftTransition(decision) {
+  if (!pendingDraftTransition) return;
+  const pending = pendingDraftTransition;
+  pendingDraftTransition = null;
+  $("draft-warning-modal").classList.add("hidden");
+  pending.resolve(decision);
+}
+
+function askDraftTransition(targetLabel) {
+  if (!hasUnsavedDraftChanges()) return Promise.resolve("proceed");
+  if (pendingDraftTransition) return Promise.resolve("cancel");
+  return new Promise((resolve) => {
+    pendingDraftTransition = {resolve};
+    $("draft-warning-target").textContent = targetLabel;
+    $("draft-warning-modal").classList.remove("hidden");
+    $("draft-warning-save").focus();
+  });
+}
+
+async function ensureAnnotationsSealedBeforeTransition(targetLabel) {
+  const decision = await askDraftTransition(targetLabel);
+  if (decision === "proceed" || decision === "discard") return true;
+  if (decision !== "seal") return false;
+  try {
+    const report = await publishCurrentAnnotations();
+    showToast(
+      report.draft_cache_warning
+        ? `标注已封存，但工作缓存更新失败：${report.draft_cache_warning}`
+        : "当前修改已校验并封存，继续切换。",
+      report.draft_cache_warning ? "error" : "info",
+      report.draft_cache_warning ? 9000 : 4200,
+    );
+    return true;
+  } catch (error) {
+    showToast(`封存失败，已取消切换：${error.message}`, "error", 8000);
+    return false;
+  }
+}
+
 function selectedEpisodeListIndex() {
   return state.episodes.findIndex(
     (value) => value.episode_uuid === state.selectedEpisode,
@@ -190,6 +388,20 @@ function updateEpisodeNavigation() {
   $("collapsed-episode-number").title = hasSelection
     ? state.episodes[index].episode_uuid
     : "尚未选择 Episode";
+  const selected = hasSelection ? state.episodes[index] : null;
+  const status = $("collapsed-episode-status");
+  const labels = [];
+  if (selected?.whole_episode_abnormal) labels.push("整条异常");
+  if (selected?.review_state === "PENDING") labels.push("待复核");
+  else if (selected?.review_state === "COMPLETED") labels.push("已复核");
+  status.textContent = labels.join(" / ") || "—";
+  status.className = [
+    "collapsed-episode-status",
+    selected?.whole_episode_abnormal ? "abnormal" : "",
+    selected?.review_state === "PENDING" ? "review" : "",
+    selected?.review_state === "COMPLETED" ? "review-complete" : "",
+  ].filter(Boolean).join(" ");
+  status.title = labels.join("；") || "当前 Episode 无整条异常或复核状态";
   for (const id of ["previous-episode", "previous-episode-collapsed"]) {
     $(id).disabled = !hasSelection || index <= 0;
   }
@@ -315,7 +527,9 @@ async function openWorkspace() {
     await loadEpisodes();
     $("launcher-status").classList.remove("error");
     showToast(
-      `工作区已打开，可标注 ${payload.workspace.eligible_episode_count} 个 Episode。`,
+      payload.workspace.episode_scan_in_progress
+        ? "工作区已打开，正在后台扫描可标注 Episode。"
+        : `工作区已打开，可标注 ${payload.workspace.eligible_episode_count} 个 Episode。`,
       "info",
       5000,
     );
@@ -324,6 +538,7 @@ async function openWorkspace() {
     $("launcher-status").classList.add("error");
   } finally {
     state.busy = false;
+    updateTimelinePointCaptureState();
     $("open-workspace").disabled = false;
   }
 }
@@ -417,17 +632,30 @@ function openDatasetBrowser(purpose = "launcher") {
 }
 
 function resetAnnotationStateForWorkspace() {
+  state.workspaceGeneration += 1;
   cancelPendingSeek();
   cancelVideoPrefetch();
+  clearVideoLoadListeners();
   video.pause();
   video.removeAttribute("src");
   video.load();
   state.episodes = [];
+  state.episodeRevision = null;
+  state.episodeRenderLimit = EPISODE_RENDER_BATCH_SIZE;
+  state.episodeScanInProgress = false;
+  state.lastEpisodeRefreshError = null;
+  pendingEpisodeSummaryIds.clear();
+  inFlightEpisodeSummaryIds.clear();
+  episodeSummaryRefreshedAt.clear();
+  if (episodeSummaryObserver) episodeSummaryObserver.disconnect();
   state.detail = null;
   state.draft = null;
+  setSavedDraftSnapshot(null);
   state.selectedEpisode = null;
   state.selectedCamera = null;
   state.selectedOccurrenceId = null;
+  state.abnormalStart = null;
+  clearRecoverableFailureCapture({clearNote: true});
   state.timelineMap = null;
   state.numericSampleTimestamps = null;
   state.loadedMediaKey = null;
@@ -444,6 +672,7 @@ async function switchWorkspace(datasetRoot) {
   state.busy = true;
   $("change-dataset-root").disabled = true;
   try {
+    if (!await ensureAnnotationsSealedBeforeTransition("切换数据集")) return;
     const payload = await requestJson("/api/switch-workspace", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -458,15 +687,18 @@ async function switchWorkspace(datasetRoot) {
     showConfiguredWorkspace(payload.workspace);
     await loadEpisodes();
     showToast(
-      `已切换数据集，可标注 ${payload.workspace.eligible_episode_count} 个 Episode。`,
+      payload.workspace.episode_scan_in_progress
+        ? "已切换数据集，正在后台扫描可标注 Episode。"
+        : `已切换数据集，可标注 ${payload.workspace.eligible_episode_count} 个 Episode。`,
       "info",
       5000,
     );
   } catch (error) {
     showToast(`切换数据集失败：${error.message}`, "error", 8000);
-    $("change-dataset-root").disabled = false;
   } finally {
     state.busy = false;
+    updateTimelinePointCaptureState();
+    $("change-dataset-root").disabled = false;
   }
 }
 
@@ -485,9 +717,6 @@ function selectDatasetBrowserPath() {
     closeDatasetBrowser();
     return;
   }
-  if (!window.confirm(
-    "切换数据集会离开当前 Episode；未保存的草稿不会自动带到新目录。确认切换吗？",
-  )) return;
   closeDatasetBrowser();
   void switchWorkspace(selected);
 }
@@ -656,6 +885,108 @@ function currentTimelineTime() {
   return timestampAtVideoRatio(video.currentTime / duration);
 }
 
+function clearRecoverableFailureCapture({clearNote = false} = {}) {
+  state.recoverableFailureStart = null;
+  state.recoverableFailureStartOccurrenceId = null;
+  state.recoverableFailureEditingId = null;
+  if (clearNote) {
+    const note = $("recoverable-failure-note");
+    if (note) note.value = "";
+  }
+}
+
+function currentTimelineSamplePoint() {
+  const timestamps = sampleTimestamps();
+  if (!timestamps.length) return null;
+  const sampleIndex = nearestSampleIndex(currentTimelineTime());
+  return {
+    sampleIndex,
+    timestamp: timestamps[sampleIndex],
+  };
+}
+
+function successOccurrenceOwningSample(timestamp) {
+  return sortedOccurrences().find((value) =>
+    value.outcome === "SUCCESS"
+    && value.start_at <= timestamp
+    && timestamp < value.end_at
+  ) || null;
+}
+
+function recoverableFailureConflict(
+  onsetSampleIndex,
+  recoveredSampleIndex,
+  {excludingAnnotationId = null} = {},
+) {
+  return recoverableFailures().find((event) =>
+    event.annotation_id !== excludingAnnotationId
+    && onsetSampleIndex <= Number(event.recovered_sample_index)
+    && Number(event.onset_sample_index) <= recoveredSampleIndex
+  ) || null;
+}
+
+function recoverableFailureAmbiguityIds() {
+  const result = new Set();
+  const byOccurrence = new Map();
+  for (const event of recoverableFailures()) {
+    const key = event.stage_occurrence_annotation_id;
+    if (!byOccurrence.has(key)) byOccurrence.set(key, []);
+    byOccurrence.get(key).push(event);
+  }
+  for (const values of byOccurrence.values()) {
+    for (let index = 1; index < values.length; index += 1) {
+      const previous = values[index - 1];
+      const current = values[index];
+      if (
+        Number(current.onset_sample_index)
+        <= Number(previous.recovered_sample_index)
+      ) {
+        result.add(previous.annotation_id);
+        result.add(current.annotation_id);
+      }
+    }
+  }
+  return result;
+}
+
+function timelinePointCaptureReady() {
+  return Boolean(
+    state.detail
+    && state.loadedMediaKey
+    && !state.videoLoading
+    && video.readyState >= HTMLMediaElement.HAVE_METADATA
+    && Number.isFinite(video.duration)
+    && video.duration > 0
+  );
+}
+
+function updateTimelinePointCaptureState() {
+  const ready = timelinePointCaptureReady();
+  const disabled = state.busy || !ready;
+  const recoverableStart = $("mark-recoverable-start");
+  const recoverableEnd = $("mark-recoverable-end");
+  recoverableStart.disabled = disabled;
+  recoverableEnd.disabled = disabled || state.recoverableFailureStart === null;
+  recoverableStart.title = ready ? "" : "请先加载视频并等待时间轴就绪";
+  recoverableEnd.title = !ready
+    ? "请先加载视频并等待时间轴就绪"
+    : state.recoverableFailureStart === null
+      ? "请先记录失误发生样本"
+      : "";
+  for (const id of ["mark-abnormal-start", "mark-abnormal-end"]) {
+    const button = $(id);
+    button.disabled = disabled;
+    button.title = ready ? "" : "请先加载视频并等待时间轴就绪";
+  }
+  $("cancel-recoverable-capture").disabled = state.busy;
+}
+
+function requireTimelinePointCaptureReady() {
+  if (timelinePointCaptureReady()) return true;
+  showToast("请先加载视频并等待时间轴就绪后再取点。", "warning");
+  return false;
+}
+
 function seekTimeline(timestamp) {
   if (!state.detail) return;
   if (
@@ -684,8 +1015,64 @@ function sortedOccurrences() {
   );
 }
 
+function annotationAttempts() {
+  const raw = state.detail?.attempts || [];
+  const editor = state.detail?.capture_end_step_editor;
+  const captureEnd = state.draft?.capture_end_step;
+  if (!editor || !captureEnd) return raw;
+  const sourceIndex = raw.findIndex(
+    (value) => value.attempt_id === captureEnd.source_attempt_id,
+  );
+  const selectedIndex = (editor.options || []).findIndex(
+    (value) => value.progress_step_id === captureEnd.end_progress_step_id,
+  );
+  const sourceStepIndex = (editor.options || []).findIndex(
+    (value) => value.progress_step_id === editor.source_progress_step_id,
+  );
+  if (sourceIndex < 0 || selectedIndex < 0 || sourceStepIndex < 0) return raw;
+  let anchorIndex = sourceIndex;
+  let projectedOptions;
+  if (selectedIndex <= sourceStepIndex) {
+    anchorIndex = -1;
+    for (let index = sourceIndex; index >= 0; index -= 1) {
+      if (raw[index].progress_step_id === captureEnd.end_progress_step_id) {
+        anchorIndex = index;
+        break;
+      }
+    }
+    if (anchorIndex < 0) return raw;
+    projectedOptions = [editor.options[selectedIndex]];
+  } else {
+    projectedOptions = editor.options.slice(sourceStepIndex, selectedIndex + 1);
+  }
+  const anchor = raw[anchorIndex];
+  const projected = [];
+  for (const option of projectedOptions) {
+    const attemptId = option.progress_step_id === anchor.progress_step_id
+      ? anchor.attempt_id
+      : `${anchor.attempt_id}:capture-end-step:${option.progress_step_id}`;
+    const values = sortedOccurrences().filter(
+      (value) => value.coarse_attempt_id === attemptId,
+    );
+    if (!values.length) return raw;
+    projected.push({
+      ...anchor,
+      attempt_id: attemptId,
+      progress_step_id: option.progress_step_id,
+      progress_step_display_name: option.display_name,
+      start_at: Math.min(...values.map((value) => Number(value.start_at))),
+      end_at: Math.max(...values.map((value) => Number(value.end_at))),
+      outcome: values.at(-1).outcome,
+      failure_fact_id: null,
+      failure_reported_at: null,
+      annotation_projected_from_capture_end: true,
+    });
+  }
+  return [...raw.slice(0, anchorIndex), ...projected];
+}
+
 function attemptsById() {
-  return new Map((state.detail?.attempts || []).map((value) => [value.attempt_id, value]));
+  return new Map(annotationAttempts().map((value) => [value.attempt_id, value]));
 }
 
 function effectiveProgressBoundary(transition) {
@@ -697,7 +1084,7 @@ function effectiveProgressBoundary(transition) {
 
 function effectiveAttemptBounds() {
   const bounds = new Map(
-    (state.detail?.attempts || []).map((attempt) => [
+    annotationAttempts().map((attempt) => [
       attempt.attempt_id,
       {
         start_at: Number(attempt.start_at),
@@ -780,7 +1167,7 @@ function restoreOriginalCoarseBoundaries() {
 }
 
 function editableTailOutcome() {
-  const attempts = state.detail?.attempts || [];
+  const attempts = annotationAttempts();
   const attempt = attempts.at(-1);
   if (!state.draft || !attempt || attempt.failure_fact_id) return null;
   const attemptEnd = Number(attempt.end_at);
@@ -803,6 +1190,14 @@ function failureTriggers() {
   return [...(state.draft?.failure_triggers || [])].sort((a, b) =>
     Number(a.upper_bound_at) - Number(b.upper_bound_at)
     || String(a.source_failure_fact_id).localeCompare(String(b.source_failure_fact_id))
+  );
+}
+
+function recoverableFailures() {
+  return [...(state.draft?.recoverable_failures || [])].sort((a, b) =>
+    Number(a.onset_sample_index) - Number(b.onset_sample_index)
+    || Number(a.recovered_sample_index) - Number(b.recovered_sample_index)
+    || String(a.annotation_id).localeCompare(String(b.annotation_id))
   );
 }
 
@@ -920,6 +1315,101 @@ function occurrenceOverlapsAbnormal(occurrence) {
   );
 }
 
+function occurrenceReferenceIssues() {
+  const attempts = attemptsById();
+  const issues = [];
+  for (const value of state.draft?.occurrences || []) {
+    const attempt = attempts.get(value.coarse_attempt_id);
+    const start = Number(value.start_at);
+    const end = Number(value.end_at);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      issues.push(`${value.annotation_id || "未知 occurrence"} 的时间范围无效`);
+      continue;
+    }
+    if (!attempt) {
+      issues.push(`${value.annotation_id || "未知 occurrence"} 引用了未知 Attempt`);
+      continue;
+    }
+    if (!stagesForStep(attempt.progress_step_id).some(
+      (stage) => stage.stage_id === value.stage_id,
+    )) {
+      issues.push(`${value.annotation_id || "未知 occurrence"} 的 stage 不属于其 Attempt`);
+    }
+  }
+  return issues;
+}
+
+function timelineCoverageGaps() {
+  if (!state.detail) return [];
+  const episodeStart = Number(state.detail.start_timestamp);
+  const episodeEnd = Number(state.detail.end_timestamp);
+  const intervals = sortedOccurrences()
+    .map((value) => ({
+      start: clamp(Number(value.start_at), episodeStart, episodeEnd),
+      end: clamp(Number(value.end_at), episodeStart, episodeEnd),
+    }))
+    .filter((value) => (
+      Number.isFinite(value.start)
+      && Number.isFinite(value.end)
+      && value.end > value.start
+    ));
+  const merged = [];
+  for (const interval of intervals) {
+    const previous = merged.at(-1);
+    if (previous && interval.start <= previous.end + 1e-9) {
+      previous.end = Math.max(previous.end, interval.end);
+    } else {
+      merged.push({...interval});
+    }
+  }
+  const rawGaps = [];
+  let cursor = episodeStart;
+  for (const interval of merged) {
+    if (interval.start > cursor + 1e-9) {
+      rawGaps.push({start: cursor, end: interval.start});
+    }
+    cursor = Math.max(cursor, interval.end);
+  }
+  if (cursor < episodeEnd - 1e-9) {
+    rawGaps.push({start: cursor, end: episodeEnd});
+  }
+
+  const attempts = Array.from(effectiveAttemptBounds().values());
+  const abnormal = state.draft?.abnormal_intervals || [];
+  const classified = [];
+  for (const gap of rawGaps) {
+    const boundaries = [gap.start, gap.end];
+    for (const interval of [...attempts, ...abnormal]) {
+      const start = Number(interval.start_at);
+      const end = Number(interval.end_at);
+      if (start > gap.start && start < gap.end) boundaries.push(start);
+      if (end > gap.start && end < gap.end) boundaries.push(end);
+    }
+    boundaries.sort((left, right) => left - right);
+    for (let index = 1; index < boundaries.length; index += 1) {
+      const start = boundaries[index - 1];
+      const end = boundaries[index];
+      if (end <= start + 1e-9) continue;
+      const midpoint = (start + end) / 2;
+      const isAbnormal = abnormal.some(
+        (value) => Number(value.start_at) <= midpoint && midpoint < Number(value.end_at),
+      );
+      const insideAttempt = attempts.some(
+        (value) => (
+          Number(value.start_at) <= midpoint
+          && (value.end_at === null || midpoint < Number(value.end_at))
+        ),
+      );
+      classified.push({
+        start,
+        end,
+        kind: isAbnormal ? "abnormal" : insideAttempt ? "unexplained" : "attempt-pause",
+      });
+    }
+  }
+  return classified;
+}
+
 function normalizeOrderedOccurrences() {
   const values = sortedOccurrences();
   const byAttempt = new Map();
@@ -929,7 +1419,7 @@ function normalizeOrderedOccurrences() {
   }
 
   const retained = [];
-  for (const attempt of state.detail.attempts || []) {
+  for (const attempt of annotationAttempts()) {
     const attemptValues = (byAttempt.get(attempt.attempt_id) || []).sort((a, b) =>
       a.start_at - b.start_at
       || a.end_at - b.end_at
@@ -946,7 +1436,15 @@ function normalizeOrderedOccurrences() {
       retained.push(value);
     }
   }
-  state.draft.occurrences = retained;
+  const retainedIds = new Set(retained.map((value) => value.annotation_id));
+  const unresolved = values.filter(
+    (value) => !retainedIds.has(value.annotation_id),
+  );
+  state.draft.occurrences = [...retained, ...unresolved].sort((a, b) =>
+    Number(a.start_at) - Number(b.start_at)
+    || Number(a.end_at) - Number(b.end_at)
+    || String(a.annotation_id).localeCompare(String(b.annotation_id))
+  );
   if (
     state.selectedOccurrenceId
     && !retained.some(
@@ -957,6 +1455,278 @@ function normalizeOrderedOccurrences() {
   }
 }
 
+function failedAttemptEditorModels() {
+  const expectedByStep = new Map(
+    (state.detail?.progress_steps || []).map((step) => [step.progress_step_id, 0]),
+  );
+  const entryStage = stageById(state.detail?.entry_stage_id);
+  if (entryStage) {
+    expectedByStep.set(
+      entryStage.progress_step_id,
+      Math.max(0, Number(entryStage.ordinal || 1) - 1),
+    );
+  }
+  const grouped = new Map();
+  for (const occurrence of sortedOccurrences()) {
+    if (!grouped.has(occurrence.coarse_attempt_id)) {
+      grouped.set(occurrence.coarse_attempt_id, []);
+    }
+    grouped.get(occurrence.coarse_attempt_id).push(occurrence);
+  }
+
+  const models = [];
+  for (const attempt of annotationAttempts()) {
+    const stages = stagesForStep(attempt.progress_step_id);
+    let expected = expectedByStep.get(attempt.progress_step_id) || 0;
+    const entryIndex = clamp(expected, 0, Math.max(0, stages.length - 1));
+    const values = grouped.get(attempt.attempt_id) || [];
+    const failure = values.find(
+      (value) =>
+        value.outcome === "FAILURE"
+        && value.source_failure_fact_id === attempt.failure_fact_id,
+    );
+    if (attempt.outcome === "FAILURE" && attempt.failure_fact_id) {
+      models.push({
+        attempt,
+        stages,
+        entryIndex,
+        failure,
+        values,
+      });
+    }
+    for (const occurrence of values) {
+      const index = stages.findIndex(
+        (stage) => stage.stage_id === occurrence.stage_id,
+      );
+      if (index < 0) continue;
+      if (occurrence.outcome === "SUCCESS") {
+        expected = index + 1;
+      } else if (occurrence.outcome === "FAILURE") {
+        expected = index;
+        break;
+      }
+    }
+    expectedByStep.set(attempt.progress_step_id, expected);
+  }
+  return models;
+}
+
+async function reflowFailedAttemptStage(model, failedStageId, select) {
+  if (!state.draft || !state.detail || state.busy) return;
+  const currentStageId = model.failure?.stage_id || "";
+  if (failedStageId === currentStageId) return;
+  const attempts = annotationAttempts();
+  const attemptIndex = attempts.findIndex(
+    (value) => value.attempt_id === model.attempt.attempt_id,
+  );
+  const affectedAttemptIds = new Set();
+  for (const attempt of attempts.slice(attemptIndex)) {
+    if (attempt.progress_step_id !== model.attempt.progress_step_id) break;
+    affectedAttemptIds.add(attempt.attempt_id);
+  }
+  const affectedOccurrences = sortedOccurrences().filter(
+    (value) => affectedAttemptIds.has(value.coarse_attempt_id),
+  );
+  if (
+    affectedOccurrences.length > 1
+    && !window.confirm(
+      "更改失败阶段会按 profile 重新生成当前 Attempt 及同一子任务的后续 Retry 阶段块；这些 Attempt 中已手动调整的子阶段边界将被重新均分。原始 Failure、视频和样本不会改变。是否继续？",
+    )
+  ) {
+    select.value = currentStageId;
+    return;
+  }
+
+  state.busy = true;
+  select.disabled = true;
+  try {
+    const payload = await requestJson(
+      `/api/reflow-failed-stage/${encodeURIComponent(state.detail.episode_uuid)}`,
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          draft: state.draft,
+          attempt_id: model.attempt.attempt_id,
+          failed_stage_id: failedStageId,
+        }),
+      },
+    );
+    state.draft = payload.draft;
+    state.deletionHistory = [];
+    state.selectedOccurrenceId = null;
+    state.abnormalStart = null;
+    clearRecoverableFailureCapture({clearNote: true});
+    state.privilegedBaseline = null;
+    renderTimeline();
+    renderRecoverableFailureTools();
+    renderPrivilegedTools();
+    updateEditButtonState();
+    const selectedStage = stageById(failedStageId);
+    showToast(
+      `失败阶段已设为“${selectedStage?.display_name || failedStageId}”，并重排 ${payload.changed_attempt_ids.length} 个 Attempt；请继续拖动白色边界精调。`,
+      "info",
+      6500,
+    );
+  } catch (error) {
+    select.value = currentStageId;
+    showToast(`失败阶段调整失败：${error.message}`, "error", 8500);
+  } finally {
+    state.busy = false;
+    updateTimelinePointCaptureState();
+    select.disabled = false;
+  }
+}
+
+function renderFailedAttemptEditors() {
+  const root = $("failed-attempt-editors");
+  root.replaceChildren();
+  for (const model of failedAttemptEditorModels()) {
+    if (!model.stages.length) continue;
+    const card = element("div", "failed-attempt-editor");
+    const summary = element("div", "");
+    const entry = model.stages[model.entryIndex];
+    summary.appendChild(
+      element(
+        "strong",
+        "",
+        `${model.attempt.progress_step_display_name} · 失败 Attempt`,
+      ),
+    );
+    summary.appendChild(
+      element(
+        "small",
+        "",
+        `本次从“${entry?.display_name || "未知"}”开始；原始 Failure ${formatTime(Number(model.attempt.failure_reported_at) - state.detail.start_timestamp)}，只读。`,
+      ),
+    );
+    const label = element("label", "", "失败发生于");
+    const select = element("select", "");
+    for (const stage of model.stages.slice(model.entryIndex)) {
+      const option = document.createElement("option");
+      option.value = stage.stage_id;
+      option.textContent = `${stage.ordinal}. ${stage.display_name}`;
+      select.appendChild(option);
+    }
+    select.value = model.failure?.stage_id || entry?.stage_id || "";
+    select.addEventListener("change", () => {
+      void reflowFailedAttemptStage(model, select.value, select);
+    });
+    label.appendChild(select);
+    card.appendChild(summary);
+    card.appendChild(label);
+    root.appendChild(card);
+  }
+  root.classList.toggle("hidden", !root.childElementCount);
+}
+
+async function reflowCaptureEndStep(editor, endProgressStepId, select) {
+  if (!state.draft || !state.detail || state.busy || !endProgressStepId) return;
+  const current = state.draft.capture_end_step?.end_progress_step_id || "";
+  if (endProgressStepId === current) return;
+  if (
+    sortedOccurrences().length > 0
+    && !window.confirm(
+      "更改采集结束子任务会按 profile 重新生成最后一段的子阶段，并重新均分这些子阶段的初始边界；原始 MANUAL_STOP、视频、样本和此前已确认的采集 Failure 不会改变。是否继续？",
+    )
+  ) {
+    select.value = current;
+    return;
+  }
+  state.busy = true;
+  select.disabled = true;
+  try {
+    const payload = await requestJson(
+      `/api/reflow-capture-end-step/${encodeURIComponent(state.detail.episode_uuid)}`,
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          draft: state.draft,
+          end_progress_step_id: endProgressStepId,
+        }),
+      },
+    );
+    state.draft = payload.draft;
+    state.deletionHistory = [];
+    state.selectedOccurrenceId = null;
+    state.abnormalStart = null;
+    clearRecoverableFailureCapture({clearNote: true});
+    state.privilegedBaseline = null;
+    renderEditor();
+    const selected = (editor.options || []).find(
+      (value) => value.progress_step_id === endProgressStepId,
+    );
+    showToast(
+      `采集结束位置已设为“${selected?.display_name || endProgressStepId}”；该子任务默认正常完成，请拖动白色边界精调其子阶段。`,
+      "info",
+      6500,
+    );
+  } catch (error) {
+    select.value = current;
+    showToast(`采集结束子任务调整失败：${error.message}`, "error", 8500);
+  } finally {
+    state.busy = false;
+    updateTimelinePointCaptureState();
+  }
+}
+
+function renderCaptureEndStepEditor() {
+  const root = $("capture-end-step-editor");
+  root.replaceChildren();
+  const editor = state.detail?.capture_end_step_editor;
+  if (!editor) {
+    root.classList.add("hidden");
+    return;
+  }
+  const summary = element("div", "");
+  summary.appendChild(element("strong", "", "采集结束位置"));
+  summary.appendChild(
+    element(
+      "small",
+      "",
+      `原始 ${editor.termination_cause} / ${editor.source_attempt_outcome} 保持只读；这里只补充后标注的子任务结束解释。`,
+    ),
+  );
+  const label = element("label", "", "结束于子任务");
+  const select = element("select", "");
+  const current = state.draft?.capture_end_step?.end_progress_step_id || "";
+  if (!current) {
+    const legacy = document.createElement("option");
+    legacy.value = "";
+    legacy.textContent = "旧标注：尚未声明结束子任务";
+    select.appendChild(legacy);
+  }
+  for (const option of editor.options || []) {
+    const node = document.createElement("option");
+    node.value = option.progress_step_id;
+    node.textContent = `${option.ordinal}. ${option.display_name}`;
+    node.disabled = option.selectable === false;
+    if (option.disabled_reason) node.title = option.disabled_reason;
+    select.appendChild(node);
+  }
+  select.value = current;
+  select.addEventListener("change", () => {
+    void reflowCaptureEndStep(editor, select.value, select);
+  });
+  label.appendChild(select);
+  root.append(summary, label);
+  root.classList.remove("hidden");
+}
+
+function occurrenceAtTimelineTime(timestamp) {
+  const values = sortedOccurrences();
+  const occurrence = values.find(
+    (value) => value.start_at <= timestamp && timestamp < value.end_at,
+  );
+  if (occurrence) return occurrence;
+  const finalOccurrence = values.at(-1);
+  return (
+    finalOccurrence
+    && Math.abs(timestamp - finalOccurrence.end_at) <= 1e-9
+  ) ? finalOccurrence : null;
+}
+
 function updatePlayhead(timestamp = currentTimelineTime()) {
   if (!state.detail) return;
   const left = `${timelineRatio(timestamp) * 100}%`;
@@ -964,6 +1734,7 @@ function updatePlayhead(timestamp = currentTimelineTime()) {
     $("coarse-track"),
     $("stage-track"),
     $("failure-trigger-track"),
+    $("recoverable-failure-track"),
   ]) {
     let playhead = track.querySelector(".playhead");
     if (!playhead) {
@@ -973,9 +1744,7 @@ function updatePlayhead(timestamp = currentTimelineTime()) {
     playhead.style.left = left;
   }
   $("video-timecode").textContent = formatTime(timestamp - state.detail.start_timestamp);
-  const occurrence = sortedOccurrences().find(
-    (value) => value.start_at <= timestamp && timestamp <= value.end_at,
-  );
+  const occurrence = occurrenceAtTimelineTime(timestamp);
   if (!occurrence) {
     $("video-context").textContent = "未标注区间";
     return;
@@ -985,19 +1754,48 @@ function updatePlayhead(timestamp = currentTimelineTime()) {
     `${stage?.display_name || occurrence.stage_id} · ${occurrenceOutcomeLabel(occurrence.outcome)}`;
 }
 
-async function loadEpisodes({silent = false} = {}) {
+async function loadEpisodes({silent = false, force = false} = {}) {
   if (state.episodeRefreshInFlight || !state.workspaceConfigured) return;
   state.episodeRefreshInFlight = true;
   const previousIds = new Set(
     state.episodes.map((value) => value.episode_uuid),
   );
   try {
-    const payload = await requestJson("/api/episodes");
+    const query = force ? "?refresh=1" : "?stale_ok=1";
+    const payload = await requestJson(`/api/episodes${query}`);
     setServerOnline(true);
-    state.episodes = payload.episodes;
+    state.episodeScanInProgress = Boolean(payload.refreshing);
+    renderCatalogScanProgress(payload);
+    if (payload.refresh_error && payload.refresh_error !== state.lastEpisodeRefreshError) {
+      state.lastEpisodeRefreshError = payload.refresh_error;
+      showToast(`Episode 扫描失败：${payload.refresh_error}`, "error", 9000);
+    } else if (!payload.refresh_error) {
+      state.lastEpisodeRefreshError = null;
+    }
+    const nextRevision = Number(payload.revision);
+    const revisionKnown = Number.isFinite(nextRevision);
+    const episodesChanged = !revisionKnown
+      || state.episodeRevision !== nextRevision;
+    if (episodesChanged) {
+      state.episodes = payload.episodes;
+      state.episodeRevision = revisionKnown ? nextRevision : null;
+      const selectedIndex = state.episodes.findIndex(
+        (value) => value.episode_uuid === state.selectedEpisode,
+      );
+      state.episodeRenderLimit = Math.max(
+        state.episodeRenderLimit,
+        EPISODE_RENDER_BATCH_SIZE,
+        selectedIndex + 1,
+      );
+    }
     $("dataset-root").textContent = payload.dataset_root;
     $("episode-count").textContent = String(payload.episodes.length);
-    renderEpisodeList();
+    if (episodesChanged) renderEpisodeList();
+    else if (state.episodes.slice(0, state.episodeRenderLimit).some((item) => (
+      item.episode_uuid !== state.selectedEpisode
+      && Date.now() - (episodeSummaryRefreshedAt.get(item.episode_uuid) || 0)
+        >= EPISODE_SUMMARY_REFRESH_MS
+    ))) renderEpisodeList();
     if (
       state.selectedEpisode
       && !payload.episodes.some((value) => value.episode_uuid === state.selectedEpisode)
@@ -1005,6 +1803,8 @@ async function loadEpisodes({silent = false} = {}) {
       state.selectedEpisode = null;
       state.detail = null;
       state.draft = null;
+      state.abnormalStart = null;
+      clearRecoverableFailureCapture({clearNote: true});
       renderEditor();
     }
     updateEpisodeNavigation();
@@ -1039,31 +1839,126 @@ function startEpisodePolling() {
   }, EPISODE_REFRESH_INTERVAL_MS);
 }
 
+function queueEpisodeSummary(episodeUuid) {
+  if (inFlightEpisodeSummaryIds.has(episodeUuid)) return;
+  pendingEpisodeSummaryIds.add(episodeUuid);
+  if (episodeSummaryFlushTimer) return;
+  episodeSummaryFlushTimer = window.setTimeout(
+    flushEpisodeSummaryQueue,
+    40,
+  );
+}
+
+async function flushEpisodeSummaryQueue() {
+  episodeSummaryFlushTimer = 0;
+  const workspaceGeneration = state.workspaceGeneration;
+  const episodeUuids = Array.from(pendingEpisodeSummaryIds).slice(
+    0,
+    EPISODE_SUMMARY_BATCH_SIZE,
+  );
+  if (!episodeUuids.length || !state.workspaceConfigured) return;
+  for (const episodeUuid of episodeUuids) {
+    pendingEpisodeSummaryIds.delete(episodeUuid);
+    inFlightEpisodeSummaryIds.add(episodeUuid);
+  }
+  try {
+    const payload = await requestJson("/api/episode-summaries", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({episode_uuids: episodeUuids}),
+    });
+    if (workspaceGeneration !== state.workspaceGeneration) return;
+    const byId = new Map(
+      payload.summaries.map((value) => [value.episode_uuid, value]),
+    );
+    const errorsById = new Map(
+      payload.errors.map((value) => [value.episode_uuid, value.error]),
+    );
+    state.episodes = state.episodes.map((item) => (
+      byId.has(item.episode_uuid)
+        ? {
+            ...item,
+            ...byId.get(item.episode_uuid),
+            annotation_summary_error: null,
+          }
+        : errorsById.has(item.episode_uuid)
+          ? {
+              ...item,
+              annotation_summary_error: errorsById.get(item.episode_uuid),
+            }
+          : item
+    ));
+    const refreshedAt = Date.now();
+    for (const episodeUuid of byId.keys()) {
+      episodeSummaryRefreshedAt.set(episodeUuid, refreshedAt);
+    }
+    if (payload.errors.length) {
+      showToast(
+        `有 ${payload.errors.length} 个 Episode 的标注摘要暂时无法读取。`,
+        "error",
+        7000,
+      );
+    }
+    renderEpisodeList();
+  } catch (error) {
+    if (workspaceGeneration === state.workspaceGeneration) {
+      showToast(`读取可见 Episode 标注摘要失败：${error.message}`, "error", 7000);
+    }
+  } finally {
+    for (const episodeUuid of episodeUuids) {
+      inFlightEpisodeSummaryIds.delete(episodeUuid);
+    }
+    if (pendingEpisodeSummaryIds.size && !episodeSummaryFlushTimer) {
+      episodeSummaryFlushTimer = window.setTimeout(
+        flushEpisodeSummaryQueue,
+        40,
+      );
+    }
+  }
+}
+
 function renderEpisodeList() {
   const root = $("episode-list");
   root.replaceChildren();
+  if (episodeSummaryObserver) episodeSummaryObserver.disconnect();
+  episodeSummaryObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      episodeSummaryObserver.unobserve(entry.target);
+      queueEpisodeSummary(entry.target.dataset.episodeUuid);
+    }
+  }, {root, rootMargin: "160px"});
   if (!state.episodes.length) {
     root.appendChild(
       element(
         "p",
         "panel-note",
-        "没有同时满足“正式采集已发布、Progress 已封存、阶段 profile 完整”的可标注 Episode。",
+        state.episodeScanInProgress
+          ? "正在后台扫描可标注 Episode；页面保持可响应。"
+          : "没有满足“Progress/migration 已封存、阶段 profile 完整、外部源已显式授权”的可标注 Episode。",
       ),
     );
     updateEpisodeNavigation();
     return;
   }
-  for (const item of state.episodes) {
+  const renderedEpisodes = state.episodes.slice(0, state.episodeRenderLimit);
+  for (const item of renderedEpisodes) {
     const button = element(
       "button",
       `episode-item${item.episode_uuid === state.selectedEpisode ? " active" : ""}`,
     );
     button.type = "button";
     button.title = item.episode_uuid;
+    button.dataset.episodeUuid = item.episode_uuid;
     button.appendChild(element("strong", "", `#${item.episode_index} · ${formatTime(item.duration_sec)}`));
     const badges = element("div", "episode-badges");
     badges.appendChild(element("span", "badge", `${item.frame_count} 帧`));
-    if (item.has_draft) badges.appendChild(element("span", "badge draft", "草稿"));
+    if (item.resolution_kind === "RETROSPECTIVE_MIGRATED") {
+      badges.appendChild(element("span", "badge", "历史迁移"));
+    }
+    if (item.source_batch_id) {
+      badges.appendChild(element("span", "badge", item.source_batch_id));
+    }
     if (item.annotation_set_count) {
       badges.appendChild(
         element(
@@ -1073,33 +1968,93 @@ function renderEpisodeList() {
         ),
       );
     }
-    if (item.needs_second_review) {
+    if (item.annotation_summary_error) {
+      const badge = element("span", "badge summary-error", "状态读取失败");
+      badge.title = item.annotation_summary_error;
+      badges.appendChild(badge);
+    } else if (!item.annotation_summary_loaded) {
+      badges.appendChild(element("span", "badge loading", "状态读取中"));
+    }
+    if (item.whole_episode_abnormal) {
+      badges.appendChild(
+        element(
+          "span",
+          "badge abnormal",
+          `整条异常${item.whole_episode_abnormal_reason ? ` · ${item.whole_episode_abnormal_reason}` : ""}`,
+        ),
+      );
+    }
+    if (item.review_state === "PENDING" || item.needs_second_review) {
       badges.appendChild(element("span", "badge review", "待二次复核"));
     }
-    if (item.latest_annotation_mode === "SECOND_REVIEW") {
-      badges.appendChild(element("span", "badge sealed", "已二次复核"));
+    if (
+      item.review_state === "COMPLETED"
+      || (
+        item.review_state == null
+        && item.latest_annotation_mode === "SECOND_REVIEW"
+        && !item.needs_second_review
+      )
+    ) {
+      badges.appendChild(element("span", "badge review-complete", "二次复核完成"));
     }
     button.appendChild(badges);
     button.addEventListener("click", () => selectEpisode(item.episode_uuid));
     root.appendChild(button);
+    const refreshedAt = episodeSummaryRefreshedAt.get(item.episode_uuid) || 0;
+    if (
+      item.episode_uuid !== state.selectedEpisode
+      && (
+        !item.annotation_summary_loaded
+        || Date.now() - refreshedAt >= EPISODE_SUMMARY_REFRESH_MS
+      )
+    ) {
+      episodeSummaryObserver.observe(button);
+    }
+  }
+  if (renderedEpisodes.length < state.episodes.length) {
+    const remaining = state.episodes.length - renderedEpisodes.length;
+    const loadMore = element(
+      "button",
+      "episode-item",
+      `加载后续 ${Math.min(EPISODE_RENDER_BATCH_SIZE, remaining)} 条`,
+    );
+    loadMore.type = "button";
+    loadMore.addEventListener("click", () => {
+      state.episodeRenderLimit += EPISODE_RENDER_BATCH_SIZE;
+      renderEpisodeList();
+    });
+    root.appendChild(loadMore);
   }
   updateEpisodeNavigation();
 }
 
 async function selectEpisode(episodeUuid) {
-  if (state.busy) return;
+  if (state.busy || episodeUuid === state.selectedEpisode) return;
   state.busy = true;
   try {
-    const payload = await requestJson(`/api/episode/${encodeURIComponent(episodeUuid)}`);
+    if (!await ensureAnnotationsSealedBeforeTransition("切换 Episode")) return;
+    const payload = await requestJsonWithProgress(
+      `/api/episode/${encodeURIComponent(episodeUuid)}`,
+      {},
+      {
+        kind: "OPEN_EPISODE",
+        message: "正在打开 Episode",
+        completeMessage: "Episode 已打开",
+      },
+    );
     cancelPendingSeek();
     cancelVideoPrefetch();
     video.pause();
     state.selectedEpisode = episodeUuid;
     state.detail = payload.episode;
     state.draft = structuredClone(payload.episode.draft);
+    setSavedDraftSnapshot(
+      payload.episode.draft_requires_seal ? null : state.draft,
+    );
     state.selectedCamera = payload.episode.default_camera_key;
     state.selectedOccurrenceId = null;
     state.abnormalStart = null;
+    clearRecoverableFailureCapture({clearNote: true});
     state.privilegedBaseline = null;
     state.timelineMap = null;
     state.numericSampleTimestamps = null;
@@ -1111,20 +2066,49 @@ async function selectEpisode(episodeUuid) {
     );
     state.sealedReeditBaseline = null;
     state.sealedReeditSourceId = null;
+    const selectedIndex = state.episodes.findIndex(
+      (value) => value.episode_uuid === episodeUuid,
+    );
+    if (selectedIndex >= 0) {
+      state.episodes[selectedIndex] = {
+        ...state.episodes[selectedIndex],
+        annotation_set_count: payload.episode.annotation_set_count,
+        needs_second_review: payload.episode.needs_second_review,
+        review_state: payload.episode.review_state,
+        latest_annotation_mode: payload.episode.latest_annotation_mode,
+        whole_episode_abnormal: payload.episode.whole_episode_abnormal,
+        whole_episode_abnormal_reason:
+          payload.episode.whole_episode_abnormal_reason,
+        annotation_summary_loaded: true,
+        annotation_summary_error: null,
+      };
+      state.episodeRenderLimit = Math.max(
+        state.episodeRenderLimit,
+        selectedIndex + 1,
+      );
+      episodeSummaryRefreshedAt.set(episodeUuid, Date.now());
+    }
     buildTimelineMap();
     renderEpisodeList();
     renderEditor();
     if (payload.episode.review_label_auto_cleared) {
       showToast(
-        "已进入二次复核草稿并自动清除“需要二次复核”标签；重新封存后才会解除已发布版本的整条训练排除。",
+        "已进入二次复核编辑并自动清除“需要二次复核”标签；重新封存后才会解除已发布版本的整条训练排除。",
         "info",
         8000,
+      );
+    } else if (payload.episode.draft_requires_seal) {
+      showToast(
+        "检测到尚未封存的兼容草稿；切换 Episode 或数据集前必须封存或明确放弃。",
+        "info",
+        7000,
       );
     }
   } catch (error) {
     showToast(error.message, "error", 6000);
   } finally {
     state.busy = false;
+    updateTimelinePointCaptureState();
     updateEpisodeNavigation();
   }
 }
@@ -1135,6 +2119,15 @@ function renderEditor() {
   $("editor-content").classList.toggle("hidden", !available);
   if (!available) return;
   $("episode-title").textContent = `Episode #${state.detail.episode_index} · 视频核验`;
+  const fullTask = state.detail.full_task_outcome === "NOT_APPLICABLE"
+    ? "FULL TASK N/A"
+    : `FULL TASK ${state.detail.full_task_outcome || "—"}`;
+  $("episode-semantics").textContent = [
+    state.detail.resolution_kind,
+    state.detail.recording_scope,
+    fullTask,
+    state.detail.source_batch_id,
+  ].filter(Boolean).join(" · ");
   $("privileged-toggle").checked = Boolean(state.draft.privileged_tools_enabled);
   $("privileged-tools").classList.toggle(
     "hidden",
@@ -1142,6 +2135,8 @@ function renderEditor() {
   );
   renderCameraTabs();
   renderTimeline();
+  renderCaptureEndStepEditor();
+  renderRecoverableFailureTools();
   renderReviewControls();
   renderPrivilegedTools();
   renderSealedReeditControls();
@@ -1200,6 +2195,7 @@ function scheduleNextEpisodeWarmup() {
 }
 
 function showVideoLoadPrompt() {
+  clearVideoLoadListeners();
   state.loadedMediaKey = null;
   state.loadingMediaKey = null;
   state.videoLoading = false;
@@ -1209,6 +2205,7 @@ function showVideoLoadPrompt() {
   $("load-video").classList.remove("hidden");
   $("play-toggle").disabled = true;
   $("video-scrubber").disabled = true;
+  updateTimelinePointCaptureState();
 }
 
 function renderCameraTabs(preserveTimestamp = null, {forceLoad = false} = {}) {
@@ -1245,6 +2242,7 @@ function renderCameraTabs(preserveTimestamp = null, {forceLoad = false} = {}) {
 function loadSelectedVideo(preserveTimestamp) {
   if (!state.detail) return;
   cancelPendingSeek();
+  clearVideoLoadListeners();
   const source = state.detail.media_urls[state.selectedCamera];
   const mediaKey = mediaKeyForEpisode(state.detail, state.selectedCamera);
   if (!source || !mediaKey) return;
@@ -1254,38 +2252,48 @@ function loadSelectedVideo(preserveTimestamp) {
   $("load-video").classList.add("hidden");
   $("play-toggle").disabled = true;
   $("video-scrubber").disabled = true;
+  updateTimelinePointCaptureState();
   video.preload = "auto";
   video.dataset.episode = state.detail.episode_uuid;
-  video.addEventListener(
-    "loadedmetadata",
-    () => {
-      if (state.loadedMediaKey !== mediaKey) return;
-      state.videoLoading = false;
-      state.loadingMediaKey = null;
-      $("play-toggle").disabled = false;
-      $("video-scrubber").disabled = false;
-      seekTimeline(preserveTimestamp);
-      scheduleNextEpisodeWarmup();
-    },
-    {once: true},
-  );
-  video.addEventListener(
-    "error",
-    () => {
-      if (state.loadedMediaKey !== mediaKey) return;
-      state.loadedMediaKey = null;
-      state.loadingMediaKey = null;
-      state.videoLoading = false;
-      $("play-toggle").disabled = true;
-      $("video-scrubber").disabled = true;
-      const code = video.error?.code;
-      const detail = code === 4
-        ? "浏览器不支持该视频编码；服务端应自动准备 H.264 兼容缓存。"
-        : "请检查视频文件和标注服务日志。";
-      showToast(`视频无法加载：${detail}`, "error", 9000);
-    },
-    {once: true},
-  );
+  const cleanup = () => {
+    video.removeEventListener("loadedmetadata", onLoadedMetadata);
+    video.removeEventListener("error", onError);
+  };
+  const finishLoad = () => {
+    if (activeVideoLoadCleanup === cleanup) {
+      activeVideoLoadCleanup = null;
+    }
+    cleanup();
+  };
+  const onLoadedMetadata = () => {
+    finishLoad();
+    if (state.loadedMediaKey !== mediaKey) return;
+    state.videoLoading = false;
+    state.loadingMediaKey = null;
+    $("play-toggle").disabled = false;
+    $("video-scrubber").disabled = false;
+    seekTimeline(preserveTimestamp);
+    updateTimelinePointCaptureState();
+    scheduleNextEpisodeWarmup();
+  };
+  const onError = () => {
+    finishLoad();
+    if (state.loadedMediaKey !== mediaKey) return;
+    state.loadedMediaKey = null;
+    state.loadingMediaKey = null;
+    state.videoLoading = false;
+    $("play-toggle").disabled = true;
+    $("video-scrubber").disabled = true;
+    updateTimelinePointCaptureState();
+    const code = video.error?.code;
+    const detail = code === 4
+      ? "浏览器不支持该视频编码；服务端应自动准备 H.264 兼容缓存。"
+      : "请检查视频文件和标注服务日志。";
+    showToast(`视频无法加载：${detail}`, "error", 9000);
+  };
+  activeVideoLoadCleanup = cleanup;
+  video.addEventListener("loadedmetadata", onLoadedMetadata);
+  video.addEventListener("error", onError);
   video.src = source;
   video.load();
 }
@@ -1298,20 +2306,21 @@ function setPosition(node, startAt, endAt) {
 }
 
 function renderTimeline() {
-  normalizeOrderedOccurrences();
   synchronizeFailureTriggerWindows();
   const coarse = $("coarse-track");
   const stages = $("stage-track");
   const triggerTrack = $("failure-trigger-track");
+  const recoverableTrack = $("recoverable-failure-track");
   coarse.replaceChildren();
   stages.replaceChildren();
   triggerTrack.replaceChildren();
+  recoverableTrack.replaceChildren();
   const stepMap = stepsById();
   const end = state.detail.end_timestamp;
   const attemptBounds = effectiveAttemptBounds();
 
   for (const gap of state.timelineMap?.compressedGaps || []) {
-    for (const track of [coarse, stages, triggerTrack]) {
+    for (const track of [coarse, stages, triggerTrack, recoverableTrack]) {
       const marker = element("div", "compressed-gap");
       setPosition(marker, gap.realStart, gap.realEnd);
       marker.title =
@@ -1320,7 +2329,7 @@ function renderTimeline() {
     }
   }
 
-  for (const attempt of state.detail.attempts) {
+  for (const attempt of annotationAttempts()) {
     const bounds = attemptBounds.get(attempt.attempt_id) || attempt;
     const block = element(
       "div",
@@ -1444,12 +2453,45 @@ function renderTimeline() {
     stages.appendChild(block);
   }
 
+  const coverageGaps = timelineCoverageGaps();
+  for (const gap of coverageGaps) {
+    if (gap.kind === "abnormal") continue;
+    const block = element("div", `timeline-gap ${gap.kind}`);
+    setPosition(block, gap.start, gap.end);
+    block.title = gap.kind === "attempt-pause"
+      ? `暂停 / Attempt 间隔 · ${formatTime(gap.end - gap.start)}`
+      : `阶段标注未解释的时间缺口 · ${formatTime(gap.end - gap.start)}`;
+    stages.appendChild(block);
+  }
+
   for (const abnormal of state.draft.abnormal_intervals || []) {
     const block = element("div", "abnormal-block");
     setPosition(block, abnormal.start_at, abnormal.end_at);
     block.title = `${abnormal.reason_code}${abnormal.note ? ` · ${abnormal.note}` : ""}`;
     stages.appendChild(block);
   }
+
+  const referenceIssues = occurrenceReferenceIssues();
+  const unexplainedGaps = coverageGaps.filter(
+    (value) => value.kind === "unexplained",
+  );
+  const warning = $("timeline-warning");
+  const warningParts = [];
+  if (unexplainedGaps.length) {
+    warningParts.push(
+      `${unexplainedGaps.length} 处阶段时间缺口不属于异常区间或 Attempt 暂停`,
+    );
+  }
+  if (referenceIssues.length) {
+    warningParts.push(`${referenceIssues.length} 条阶段引用无效`);
+    warning.title = referenceIssues.join("；");
+  } else {
+    warning.title = "";
+  }
+  warning.textContent = warningParts.length
+    ? `时间轴需要复核：${warningParts.join("；")}。`
+    : "";
+  warning.classList.toggle("hidden", !warningParts.length);
 
   for (const trigger of failureTriggers()) {
     const window = element(
@@ -1523,6 +2565,22 @@ function renderTimeline() {
     triggerTrack.appendChild(handle);
   }
 
+  for (const event of recoverableFailures()) {
+    const stage = stageById(event.stage_id);
+    const block = element(
+      "div",
+      "recoverable-failure-block",
+      stage?.display_name || event.stage_id,
+    );
+    setPosition(block, event.onset_at, event.recovered_at);
+    block.title =
+      `可恢复失误 · ${stage?.display_name || event.stage_id}`
+      + ` · ${formatTime(event.onset_at - state.detail.start_timestamp)}`
+      + ` – ${formatTime(event.recovered_at - state.detail.start_timestamp)}`
+      + `${event.note ? ` · ${event.note}` : ""}`;
+    recoverableTrack.appendChild(block);
+  }
+
   for (let index = 1; index < values.length; index += 1) {
     const left = values[index - 1];
     const right = values[index];
@@ -1582,6 +2640,7 @@ function renderTimeline() {
   coarse.appendChild(coarsePlayhead);
   stages.appendChild(stagePlayhead);
   triggerTrack.appendChild(triggerPlayhead);
+  renderFailedAttemptEditors();
   renderStageDescriptions();
   updatePlayhead();
   updateEditButtonState();
@@ -1612,47 +2671,6 @@ function renderStageDescriptions() {
       root.appendChild(card);
     }
   }
-}
-
-function splitFailureAtCursor() {
-  const timestamp = currentTimelineTime();
-  const values = sortedOccurrences();
-  const failure = values.find(
-    (value) =>
-      value.outcome === "FAILURE"
-      && value.start_at < timestamp
-      && timestamp < value.end_at,
-  );
-  if (!failure) {
-    showToast("请先把视频定位到要拆分的失败阶段内部。", "warning");
-    return;
-  }
-  const stages = stagesForStep(failure.progress_step_id);
-  const index = stages.findIndex((value) => value.stage_id === failure.stage_id);
-  if (index < 0 || index + 1 >= stages.length) {
-    showToast("该失败已经位于此子任务最后一个阶段，不能再向后拆分。", "warning");
-    return;
-  }
-  clearDeletionHistory();
-  const success = {
-    annotation_id: `draft:${crypto.randomUUID()}`,
-    coarse_attempt_id: failure.coarse_attempt_id,
-    progress_step_id: failure.progress_step_id,
-    stage_id: failure.stage_id,
-    occurrence_index_in_attempt: failure.occurrence_index_in_attempt,
-    start_at: failure.start_at,
-    end_at: timestamp,
-    outcome: "SUCCESS",
-    confidence: 1.0,
-    source_failure_fact_id: null,
-  };
-  failure.start_at = timestamp;
-  failure.stage_id = stages[index + 1].stage_id;
-  state.draft.occurrences.push(success);
-  normalizeOrderedOccurrences();
-  renderTimeline();
-  updateEditButtonState();
-  showToast("已保留原始 Failure，并将其归属到下一个阶段。", "info");
 }
 
 function occurrenceDeletionPosition(value) {
@@ -1847,7 +2865,7 @@ function undoLastDeletion() {
     || Math.abs(target.end_at - entry.targetEndAfter) > 1e-7
   ) {
     showToast(
-      "删除后的目标阶段已被其他编辑改变，不能猜测性回退；可重新打开 Episode 恢复已保存草稿。",
+      "删除后的目标阶段已被其他编辑改变，不能猜测性回退；可重新打开 Episode 恢复最近一次封存版本。",
       "warning",
       6500,
     );
@@ -1881,7 +2899,7 @@ function toggleTailOutcome() {
   renderTimeline();
   updateEditButtonState();
   showToast(
-    `末段已在当前草稿中改为${tail.occurrence.outcome === "FAILURE" ? "失败" : "成功"}；点击“封存标注”后写入新版本。`,
+    `末段已在当前编辑中改为${tail.occurrence.outcome === "FAILURE" ? "失败" : "成功"}；点击“封存标注”后写入新版本。`,
     "info",
     5000,
   );
@@ -1944,7 +2962,7 @@ async function reopenSealedAnnotation() {
   const annotationSetId = $("sealed-annotation-set").value;
   if (!annotationSetId) return;
   if (!window.confirm(
-    `将所选封存版本 ${annotationSetId} 加载为新的可编辑草稿。旧封存版本不会被覆盖；保存草稿后会替换当前 mutable draft，继续吗？`,
+    `将所选封存版本 ${annotationSetId} 加载为新的可编辑版本。旧封存版本不会被覆盖；只有再次校验并封存才会发布新版本，继续吗？`,
   )) {
     return;
   }
@@ -1968,13 +2986,14 @@ async function reopenSealedAnnotation() {
     );
     state.selectedOccurrenceId = null;
     state.abnormalStart = null;
+    clearRecoverableFailureCapture({clearNote: true});
     state.privilegedBaseline = null;
     renderEditor();
     seekTimeline(timestamp);
     showToast(
       payload.review_label_auto_cleared
-        ? "封存版本已加载为二次复核草稿，并自动清除待复核标签；再次封存后才会解除整条训练排除。"
-        : "封存版本已只读加载为新草稿；只有点击保存草稿或再次封存时才会写入，新封存会生成独立版本。",
+        ? "封存版本已加载为二次复核编辑，并自动清除待复核标签；再次封存后才会解除整条训练排除。"
+        : "封存版本已加载为新的页面编辑；只有再次校验并封存才会写入，新封存会生成独立版本。",
       "info",
       7200,
     );
@@ -1982,6 +3001,7 @@ async function reopenSealedAnnotation() {
     showToast(`重新编辑失败：${error.message}`, "error", 8000);
   } finally {
     state.busy = false;
+    updateTimelinePointCaptureState();
   }
 }
 
@@ -1996,10 +3016,166 @@ function cancelReopenSealedAnnotation() {
   state.sealedReeditSourceId = null;
   state.selectedOccurrenceId = null;
   state.abnormalStart = null;
+  clearRecoverableFailureCapture({clearNote: true});
   state.privilegedBaseline = null;
   renderEditor();
   seekTimeline(timestamp);
-  showToast("已取消本次重新编辑，并恢复进入前的页面草稿。", "info");
+  showToast("已取消本次重新编辑，并恢复进入前的页面状态。", "info");
+}
+
+async function reconcileAbnormalDraft() {
+  const payload = await requestJson(
+    `/api/reconcile-abnormal-intervals/${encodeURIComponent(state.detail.episode_uuid)}`,
+    {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({draft: state.draft}),
+    },
+  );
+  state.draft = payload.draft;
+  state.deletionHistory = structuredClone(
+    state.draft.deletion_history || [],
+  );
+  state.selectedOccurrenceId = null;
+}
+
+function locateRecoverableFailure(event, timestamp = event.onset_at) {
+  if (!requireTimelinePointCaptureReady()) return;
+  seekTimeline(timestamp);
+  showToast(
+    `已定位到可恢复失误的样本 ${nearestSampleIndex(timestamp)}。`,
+    "info",
+    2600,
+  );
+}
+
+function beginRecoverableFailureReannotation(event) {
+  if (state.busy || !requireTimelinePointCaptureReady()) return;
+  state.recoverableFailureEditingId = event.annotation_id;
+  state.recoverableFailureStart = null;
+  state.recoverableFailureStartOccurrenceId = null;
+  $("recoverable-failure-note").value = event.note || "";
+  seekTimeline(event.onset_at);
+  renderRecoverableFailureTools();
+  showToast(
+    "原区间会保留到新起止点通过校验；请先定位并重新记录失误发生样本。",
+    "info",
+    6000,
+  );
+}
+
+function cancelRecoverableFailureCapture() {
+  const wasEditing = Boolean(state.recoverableFailureEditingId);
+  clearRecoverableFailureCapture({clearNote: true});
+  renderRecoverableFailureTools();
+  showToast(
+    wasEditing ? "已取消重标，原可恢复失误区间保持不变。" : "已取消本次取点。",
+    "info",
+    3200,
+  );
+}
+
+function renderRecoverableFailureTools() {
+  const root = $("recoverable-failure-list");
+  root.replaceChildren();
+  const ambiguityIds = recoverableFailureAmbiguityIds();
+  for (const event of recoverableFailures()) {
+    const stage = stageById(event.stage_id);
+    const row = element(
+      "div",
+      `compact-item${
+        event.annotation_id === state.recoverableFailureEditingId
+          ? " recoverable-editing"
+          : ""
+      }${ambiguityIds.has(event.annotation_id) ? " recoverable-ambiguous" : ""}`,
+    );
+    row.appendChild(element(
+      "span",
+      "compact-item-label",
+      `${stage?.display_name || event.stage_id} · `
+      + `样本 ${event.onset_sample_index}–${event.recovered_sample_index} · `
+      + `${formatTime(event.onset_at - state.detail.start_timestamp)} – `
+      + `${formatTime(event.recovered_at - state.detail.start_timestamp)}`
+      + `${event.note ? ` · ${event.note}` : ""}`
+      + `${ambiguityIds.has(event.annotation_id) ? " · 需重标" : ""}`,
+    ));
+    const actions = element("span", "compact-item-actions");
+    const locateStart = element("button", "secondary compact", "定位起点");
+    locateStart.type = "button";
+    locateStart.addEventListener(
+      "click",
+      () => locateRecoverableFailure(event, event.onset_at),
+    );
+    const locateEnd = element("button", "secondary compact", "定位恢复");
+    locateEnd.type = "button";
+    locateEnd.addEventListener(
+      "click",
+      () => locateRecoverableFailure(event, event.recovered_at),
+    );
+    const reannotate = element("button", "secondary compact", "重标");
+    reannotate.type = "button";
+    reannotate.addEventListener(
+      "click",
+      () => beginRecoverableFailureReannotation(event),
+    );
+    const remove = element("button", "secondary compact", "移除");
+    remove.type = "button";
+    remove.addEventListener("click", () => {
+      if (state.busy) return;
+      if (state.recoverableFailureEditingId === event.annotation_id) {
+        clearRecoverableFailureCapture({clearNote: true});
+      }
+      state.draft.recoverable_failures = (
+        state.draft.recoverable_failures || []
+      ).filter((value) => value.annotation_id !== event.annotation_id);
+      renderTimeline();
+      renderRecoverableFailureTools();
+      updateEditButtonState();
+    });
+    actions.append(locateStart, locateEnd, reannotate, remove);
+    row.appendChild(actions);
+    root.appendChild(row);
+  }
+  const editing = recoverableFailures().find(
+    (event) => event.annotation_id === state.recoverableFailureEditingId,
+  );
+  if (state.recoverableFailureEditingId && !editing) {
+    clearRecoverableFailureCapture({clearNote: true});
+  }
+  const startOccurrence = sortedOccurrences().find(
+    (value) => (
+      value.annotation_id === state.recoverableFailureStartOccurrenceId
+    ),
+  );
+  const startStage = startOccurrence
+    ? stageById(startOccurrence.stage_id)
+    : null;
+  const pending = $("recoverable-failure-pending");
+  if (state.recoverableFailureStart !== null) {
+    pending.textContent = `${editing ? "重标" : "新增"} · `
+      + `失误样本 ${nearestSampleIndex(state.recoverableFailureStart)} · `
+      + `${startStage?.display_name || startOccurrence?.stage_id || "未知阶段"} · `
+      + formatTime(
+        state.recoverableFailureStart - state.detail.start_timestamp,
+      );
+  } else if (editing) {
+    pending.textContent = "正在重标；原区间仍保留，请先取新的失误发生样本。";
+  } else if (ambiguityIds.size) {
+    pending.textContent = "检测到历史区间重叠或共用边界样本；请使用“重标”逐项消除歧义后再封存。";
+  } else {
+    pending.textContent = "尚未取点";
+  }
+  $("mark-recoverable-start").textContent = state.recoverableFailureStart === null
+    ? editing ? "重标：取失误发生" : "取当前为失误发生"
+    : "重新取失误发生";
+  $("mark-recoverable-end").textContent = editing
+    ? "取恢复正常并替换"
+    : "取当前为恢复正常并添加";
+  $("cancel-recoverable-capture").classList.toggle(
+    "hidden",
+    !editing && state.recoverableFailureStart === null,
+  );
+  updateTimelinePointCaptureState();
 }
 
 function renderPrivilegedTools() {
@@ -2015,12 +3191,29 @@ function renderPrivilegedTools() {
     );
     const remove = element("button", "secondary compact", "移除");
     remove.type = "button";
-    remove.addEventListener("click", () => {
-      state.draft.abnormal_intervals = state.draft.abnormal_intervals.filter(
-        (value) => value.annotation_id !== abnormal.annotation_id,
-      );
-      renderTimeline();
-      renderPrivilegedTools();
+    remove.addEventListener("click", async () => {
+      if (state.busy) return;
+      const baseline = structuredClone(state.draft);
+      state.busy = true;
+      remove.disabled = true;
+      try {
+        state.draft.abnormal_intervals = state.draft.abnormal_intervals.filter(
+          (value) => value.annotation_id !== abnormal.annotation_id,
+        );
+        await reconcileAbnormalDraft();
+        renderTimeline();
+        renderPrivilegedTools();
+        updateEditButtonState();
+        showToast("异常区间已移除，相关阶段片段已立即恢复。", "info");
+      } catch (error) {
+        state.draft = baseline;
+        showToast(`移除异常区间失败：${error.message}`, "error", 8000);
+        renderTimeline();
+        renderPrivilegedTools();
+      } finally {
+        state.busy = false;
+        updateTimelinePointCaptureState();
+      }
     });
     row.appendChild(remove);
     abnormalRoot.appendChild(row);
@@ -2081,84 +3274,144 @@ function renderPrivilegedTools() {
 
 function renderReviewControls() {
   const request = state.draft?.episode_review_request || null;
+  const sealedPending = Boolean(
+    state.detail?.review_state === "PENDING"
+    && state.detail?.annotation_mode !== "SECOND_REVIEW"
+  );
   const card = $("toggle-review-request").closest(".review-request-card");
   card.classList.toggle("pending", Boolean(request));
   $("review-request-note").value = request?.note || "";
-  $("toggle-review-request").textContent = request
+  const toggle = $("toggle-review-request");
+  toggle.textContent = request
     ? "取消二次复核标签"
     : "标记需要二次复核";
-  $("review-request-status").textContent = request
-    ? "当前草稿封存后将整条排除；二次复核模式重新封存后恢复正常。"
+  toggle.disabled = sealedPending && Boolean(request);
+  toggle.title = toggle.disabled
+    ? "该标签来自已封存版本，只能由二次复核封存解除"
+    : "";
+  $("review-request-status").textContent = sealedPending
+    ? request
+      ? "该待复核标签来自已封存版本；普通标注不能解除，需进入二次复核模式并封存。"
+      : "已封存版本仍要求二次复核；当前草稿缺少标签，普通模式封存将被拒绝。"
+    : request
+    ? "当前编辑封存后将整条排除；二次复核模式重新封存后恢复正常。"
     : state.detail?.annotation_mode === "SECOND_REVIEW"
-      ? "当前是二次复核草稿；封存后生成 SECOND_REVIEW 版本。"
+      ? "当前是二次复核编辑；封存后生成 SECOND_REVIEW 版本。"
       : "标记后整条 Episode 默认不进入训练，直到二次复核版本封存。";
 }
 
-async function saveDraft() {
-  if (!state.draft || state.busy) return;
-  state.busy = true;
-  try {
-    state.draft.draft_revision = Number(state.draft.draft_revision || 0) + 1;
-    const payload = await requestJson(
-      `/api/draft/${encodeURIComponent(state.detail.episode_uuid)}`,
-      {
-        method: "PUT",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(state.draft),
-      },
-    );
-    state.draft = payload.draft;
-    showToast("草稿已原子保存。", "info");
-    await loadEpisodes();
-  } catch (error) {
-    showToast(error.message, "error", 7000);
-  } finally {
-    state.busy = false;
+async function publishCurrentAnnotations() {
+  if (!state.draft || !state.detail) {
+    throw new Error("当前没有可封存的 Episode 标注。");
   }
+  const payload = await requestJsonWithProgress(
+    `/api/commit/${encodeURIComponent(state.detail.episode_uuid)}`,
+    {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(state.draft),
+    },
+    {
+      kind: "COMMIT_ANNOTATION",
+      message: "正在校验并封存标注",
+      completeMessage: "标注已封存",
+    },
+  );
+  const report = payload.report;
+  state.draft = report.draft;
+  setSavedDraftSnapshot(state.draft);
+  state.sealedReeditBaseline = null;
+  state.sealedReeditSourceId = null;
+  state.detail.annotation_sets = [
+    {
+      annotation_set_id: report.annotation_set_id,
+      annotator_id: report.annotator_id,
+      annotation_mode: report.annotation_mode,
+      created_at: report.created_at,
+      manifest_hash: report.manifest_hash,
+      annotation_count: state.draft.occurrences.length,
+      needs_second_review: Boolean(state.draft.episode_review_request),
+    },
+    ...(state.detail.annotation_sets || []),
+  ];
+  state.detail.annotation_set_count = state.detail.annotation_sets.length;
+  state.detail.needs_second_review = Boolean(
+    state.draft.episode_review_request,
+  );
+  state.detail.review_state = state.detail.needs_second_review
+    ? "PENDING"
+    : report.annotation_mode === "SECOND_REVIEW"
+      ? "COMPLETED"
+      : "NONE";
+  state.detail.latest_annotation_mode = report.annotation_mode;
+  state.detail.whole_episode_abnormal = Boolean(
+    state.draft.episode_abnormal,
+  );
+  state.detail.whole_episode_abnormal_reason =
+    state.draft.episode_abnormal?.reason_code || null;
+  const episodeIndex = state.episodes.findIndex(
+    (value) => value.episode_uuid === state.detail.episode_uuid,
+  );
+  if (episodeIndex >= 0) {
+    state.episodes[episodeIndex] = {
+      ...state.episodes[episodeIndex],
+      annotation_set_count: state.detail.annotation_set_count,
+      needs_second_review: state.detail.needs_second_review,
+      review_state: state.detail.review_state,
+      latest_annotation_mode: state.detail.latest_annotation_mode,
+      whole_episode_abnormal: state.detail.whole_episode_abnormal,
+      whole_episode_abnormal_reason:
+        state.detail.whole_episode_abnormal_reason,
+      annotation_summary_loaded: true,
+      annotation_summary_error: null,
+    };
+    episodeSummaryRefreshedAt.set(state.detail.episode_uuid, Date.now());
+  }
+  state.detail.draft_persistence_state = "SEALED_SNAPSHOT";
+  state.detail.draft_requires_seal = false;
+  renderSealedReeditControls();
+  $("coverage-preview").textContent =
+    `已封存 ${report.annotation_set_id} · coverage=${report.coverage_status} · 排除区间 ${report.exclusion_count}`;
+  await loadEpisodes();
+  return report;
 }
 
 async function commitAnnotations() {
   if (!state.draft || state.busy) return;
   state.busy = true;
   try {
-    const payload = await requestJson(
-      `/api/commit/${encodeURIComponent(state.detail.episode_uuid)}`,
-      {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(state.draft),
-      },
+    const report = await publishCurrentAnnotations();
+    showToast(
+      report.draft_cache_warning
+        ? `不可变标注已发布，但工作缓存更新失败：${report.draft_cache_warning}`
+        : "标注校验通过，已发布不可变 annotation set。",
+      report.draft_cache_warning ? "error" : "info",
+      report.draft_cache_warning ? 9000 : 5000,
     );
-    const report = payload.report;
-    state.draft = report.draft;
-    state.sealedReeditBaseline = null;
-    state.sealedReeditSourceId = null;
-    state.detail.annotation_sets = [
-      {
-        annotation_set_id: report.annotation_set_id,
-        annotator_id: report.annotator_id,
-        annotation_mode: report.annotation_mode,
-        created_at: report.created_at,
-        manifest_hash: report.manifest_hash,
-        annotation_count: state.draft.occurrences.length,
-        needs_second_review: Boolean(state.draft.episode_review_request),
-      },
-      ...(state.detail.annotation_sets || []),
-    ];
-    state.detail.annotation_set_count = state.detail.annotation_sets.length;
-    renderSealedReeditControls();
-    $("coverage-preview").textContent =
-      `已封存 ${report.annotation_set_id} · coverage=${report.coverage_status} · 排除区间 ${report.exclusion_count}`;
-    showToast("标注校验通过，已发布不可变 annotation set。", "info", 5000);
-    await loadEpisodes();
   } catch (error) {
     showToast(`封存失败：${error.message}`, "error", 9000);
   } finally {
     state.busy = false;
+    updateTimelinePointCaptureState();
   }
 }
 
-$("refresh-episodes").addEventListener("click", loadEpisodes);
+$("refresh-episodes").addEventListener(
+  "click",
+  () => loadEpisodes({force: true}),
+);
+$("draft-warning-save").addEventListener(
+  "click",
+  () => settleDraftTransition("seal"),
+);
+$("draft-warning-discard").addEventListener(
+  "click",
+  () => settleDraftTransition("discard"),
+);
+$("draft-warning-cancel").addEventListener(
+  "click",
+  () => settleDraftTransition("cancel"),
+);
 $("collapse-episode-panel").addEventListener(
   "click",
   () => setEpisodePanelCollapsed(true),
@@ -2204,7 +3457,12 @@ $("dataset-browser-select").addEventListener(
 $("dataset-browser-cancel").addEventListener("click", closeDatasetBrowser);
 $("dataset-browser-cancel-top").addEventListener("click", closeDatasetBrowser);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeDatasetBrowser();
+  if (event.key !== "Escape") return;
+  if (pendingDraftTransition) {
+    settleDraftTransition("cancel");
+    return;
+  }
+  closeDatasetBrowser();
 });
 $("launcher-annotator-id").addEventListener("keydown", (event) => {
   if (event.key === "Enter") openWorkspace();
@@ -2238,16 +3496,160 @@ $("video-scrubber").addEventListener("input", (event) => {
   scheduleSeek(timestampAtVideoRatio(Number(event.target.value) / 1000));
 });
 $("video-scrubber").addEventListener("change", flushPendingSeek);
-$("split-failure").addEventListener("click", splitFailureAtCursor);
 $("delete-selected").addEventListener("click", deleteSelectedOccurrence);
 $("undo-delete").addEventListener("click", undoLastDeletion);
 $("toggle-tail-outcome").addEventListener("click", toggleTailOutcome);
-$("save-draft").addEventListener("click", saveDraft);
 $("commit-annotations").addEventListener("click", commitAnnotations);
 $("reopen-sealed").addEventListener("click", reopenSealedAnnotation);
 $("cancel-reopen-sealed").addEventListener(
   "click",
   cancelReopenSealedAnnotation,
+);
+
+$("mark-recoverable-start").addEventListener("click", () => {
+  if (!state.draft || state.busy) return;
+  if (!requireTimelinePointCaptureReady()) return;
+  const point = currentTimelineSamplePoint();
+  const occurrence = point
+    ? successOccurrenceOwningSample(point.timestamp)
+    : null;
+  if (!point || !occurrence) {
+    showToast(
+      "失误发生样本必须位于一个 SUCCESS 子阶段内；请移动到紫色轨迹实际发生失误的位置。",
+      "warning",
+      6500,
+    );
+    return;
+  }
+  state.recoverableFailureStart = point.timestamp;
+  state.recoverableFailureStartOccurrenceId = occurrence.annotation_id;
+  seekTimeline(point.timestamp);
+  renderRecoverableFailureTools();
+  const stage = stageById(occurrence.stage_id);
+  showToast(
+    `已吸附到样本 ${point.sampleIndex}，属于“${
+      stage?.display_name || occurrence.stage_id
+    }”；请定位到恢复正常样本。`,
+    "info",
+    5200,
+  );
+});
+$("mark-recoverable-end").addEventListener("click", async () => {
+  if (!state.draft || !state.detail || state.busy) return;
+  if (!requireTimelinePointCaptureReady()) return;
+  const recoveredPoint = currentTimelineSamplePoint();
+  if (!recoveredPoint) return;
+  if (state.recoverableFailureStart === null) {
+    showToast("请先记录失误发生样本。", "warning");
+    return;
+  }
+  const onsetSampleIndex = nearestSampleIndex(
+    state.recoverableFailureStart,
+  );
+  if (recoveredPoint.sampleIndex <= onsetSampleIndex) {
+    showToast("恢复正常样本必须晚于失误发生样本。", "warning");
+    return;
+  }
+  const startOccurrence = successOccurrenceOwningSample(
+    state.recoverableFailureStart,
+  );
+  const recoveredOccurrence = successOccurrenceOwningSample(
+    recoveredPoint.timestamp,
+  );
+  if (
+    !startOccurrence
+    || startOccurrence.annotation_id
+      !== state.recoverableFailureStartOccurrenceId
+  ) {
+    state.recoverableFailureStart = null;
+    state.recoverableFailureStartOccurrenceId = null;
+    renderRecoverableFailureTools();
+    showToast(
+      "取点后阶段边界已经变化，请重新记录失误发生样本。原重标区间仍保持不变。",
+      "warning",
+      7000,
+    );
+    return;
+  }
+  if (
+    !recoveredOccurrence
+    || recoveredOccurrence.annotation_id !== startOccurrence.annotation_id
+  ) {
+    showToast(
+      "失误发生和恢复正常必须位于同一个 SUCCESS 子阶段；不能跨越白色阶段边界。",
+      "warning",
+      7000,
+    );
+    return;
+  }
+  const conflict = recoverableFailureConflict(
+    onsetSampleIndex,
+    recoveredPoint.sampleIndex,
+    {excludingAnnotationId: state.recoverableFailureEditingId},
+  );
+  if (conflict) {
+    showToast(
+      "该区间与已有可恢复失误重叠或共用边界样本；请保留至少一个明确正常样本。",
+      "warning",
+      7000,
+    );
+    return;
+  }
+  const editingId = state.recoverableFailureEditingId;
+  const requestDraft = editingId
+    ? {
+        ...structuredClone(state.draft),
+        recoverable_failures: state.draft.recoverable_failures.filter(
+          (event) => event.annotation_id !== editingId,
+        ),
+      }
+    : state.draft;
+  state.busy = true;
+  updateTimelinePointCaptureState();
+  try {
+    const payload = await requestJson(
+      `/api/recoverable-failure/${encodeURIComponent(state.detail.episode_uuid)}`,
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          draft: requestDraft,
+          onset_at: state.recoverableFailureStart,
+          recovered_at: recoveredPoint.timestamp,
+          note: $("recoverable-failure-note").value.trim() || null,
+        }),
+      },
+    );
+    state.draft = payload.draft;
+    clearRecoverableFailureCapture({clearNote: true});
+    renderTimeline();
+    renderRecoverableFailureTools();
+    updateEditButtonState();
+    const added = payload.recoverable_failure;
+    const stage = added ? stageById(added.stage_id) : null;
+    showToast(
+      `可恢复失误已${editingId ? "安全替换并" : ""}绑定到“${
+        stage?.display_name || added?.stage_id || "当前子阶段"
+      }”的样本 ${added?.onset_sample_index}–${
+        added?.recovered_sample_index
+      }；随下次封存保存。`,
+      "info",
+      6500,
+    );
+  } catch (error) {
+    showToast(
+      `无法${editingId ? "重标" : "添加"}可恢复失误：${error.message}`,
+      "error",
+      8500,
+    );
+  } finally {
+    state.busy = false;
+    updateTimelinePointCaptureState();
+  }
+});
+$("cancel-recoverable-capture").addEventListener(
+  "click",
+  cancelRecoverableFailureCapture,
 );
 
 $("toggle-review-request").addEventListener("click", () => {
@@ -2269,7 +3671,11 @@ $("review-request-note").addEventListener("input", () => {
   }
 });
 
-$("privileged-toggle").addEventListener("change", (event) => {
+$("privileged-toggle").addEventListener("change", async (event) => {
+  if (state.busy) {
+    event.target.checked = Boolean(state.draft?.privileged_tools_enabled);
+    return;
+  }
   clearDeletionHistory();
   const enabled = Boolean(event.target.checked);
   if (enabled) {
@@ -2284,7 +3690,7 @@ $("privileged-toggle").addEventListener("change", (event) => {
     if (
       hasSpecial
       && !window.confirm(
-        "关闭特殊工具会撤销本次启用后产生的异常/边界修正，并恢复启用前阶段草稿，是否继续？",
+        "关闭特殊工具会撤销本次启用后产生的异常/边界修正，并恢复启用前阶段状态，是否继续？",
       )
     ) {
       event.target.checked = true;
@@ -2307,9 +3713,30 @@ $("privileged-toggle").addEventListener("change", (event) => {
       // pre-enable snapshot. New abnormal edits are non-destructive, so
       // clear special fields and explicitly restore every coarse boundary in
       // the editable occurrences before leaving privileged mode.
+      const baseline = structuredClone(state.draft);
       state.draft.abnormal_intervals = [];
       restoreOriginalCoarseBoundaries();
       state.draft.episode_abnormal = null;
+      state.draft.privileged_tools_enabled = false;
+      state.busy = true;
+      try {
+        await reconcileAbnormalDraft();
+      } catch (error) {
+        state.draft = baseline;
+        event.target.checked = true;
+        state.busy = false;
+        updateTimelinePointCaptureState();
+        showToast(
+          `关闭特殊修正工具失败，页面修改已恢复：${error.message}`,
+          "error",
+          8500,
+        );
+        renderTimeline();
+        renderPrivilegedTools();
+        return;
+      }
+      state.busy = false;
+      updateTimelinePointCaptureState();
     }
     state.draft.privileged_tools_enabled = false;
     state.privilegedBaseline = null;
@@ -2318,12 +3745,14 @@ $("privileged-toggle").addEventListener("change", (event) => {
   state.selectedOccurrenceId = null;
   renderTimeline();
   renderPrivilegedTools();
+  updateEditButtonState();
 });
 $("mark-abnormal-start").addEventListener("click", () => {
   if (!state.draft?.privileged_tools_enabled) {
     showToast("请先启用特殊修正工具。", "warning");
     return;
   }
+  if (!requireTimelinePointCaptureReady()) return;
   state.abnormalStart = currentTimelineTime();
   renderPrivilegedTools();
 });
@@ -2333,6 +3762,7 @@ $("mark-abnormal-end").addEventListener("click", () => {
     state.abnormalStart = null;
     return;
   }
+  if (!requireTimelinePointCaptureReady()) return;
   const end = currentTimelineTime();
   if (state.abnormalStart === null || end <= state.abnormalStart) {
     showToast("异常区间终点必须晚于起点。", "warning");

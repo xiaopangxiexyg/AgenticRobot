@@ -29,6 +29,7 @@
   let requestPending = false;
   let pendingSignature = "";
   let pendingTimer = null;
+  let renderedDatasetRoot = "";
 
   function addStyle() {
     if (document.getElementById("realTeleopProgressStyle")) return;
@@ -454,6 +455,10 @@
       ? progress.arm_control_modes.map(String)
       : [];
     const priorProfileSelection = String(profileSelect.value || "");
+    const currentDatasetRoot = String(
+      (state && (state.dataset_root || state.dataset_base_root)) || "",
+    );
+    const datasetChanged = currentDatasetRoot !== renderedDatasetRoot;
     profileSelect.replaceChildren();
     for (const item of profiles) {
       const option = document.createElement("option");
@@ -467,10 +472,16 @@
       profileSelect.appendChild(option);
     }
     const selectedProfileId = String(progress.profile_id || "");
-    // Keep the operator's local draft while polling. The backend profile can
-    // legitimately lag behind until the queued selection intent is consumed.
+    // Keep the operator's local draft while polling one dataset. A dataset
+    // switch must instead adopt the target dataset's canonical binding;
+    // otherwise a locked target can misleadingly display the previous
+    // dataset's profile forever.
     if (
-      profiles.some((item) => String(item.profile_id) === priorProfileSelection)
+      !datasetChanged
+      && !Boolean(progress.profile_selection_locked)
+      && profiles.some(
+        (item) => String(item.profile_id) === priorProfileSelection,
+      )
     ) {
       profileSelect.value = priorProfileSelection;
     } else if (
@@ -478,6 +489,7 @@
     ) {
       profileSelect.value = selectedProfileId;
     }
+    renderedDatasetRoot = currentDatasetRoot;
     const priorSelection = String(nextSelect.value || "");
     nextSelect.replaceChildren();
     for (const item of nextSteps) {

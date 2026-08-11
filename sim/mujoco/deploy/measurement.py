@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from sim.mujoco.adapters.execution_cut import MujocoExecutionStateCut
 
 
 MUJOCO_BACKEND_MEASUREMENT_VERSION = "dexteleop.sim.mujoco.measurement.v1"
@@ -52,9 +53,9 @@ def _qpos_by_side(values: object, *, field_name: str) -> dict[str, list[float]]:
         if not side or side in result:
             raise ValueError(f"{field_name} contains an invalid side {side!r}.")
         qpos = np.asarray(raw_qpos, dtype=float).reshape(-1)
-        if qpos.size != 6 or not np.all(np.isfinite(qpos)):
+        if qpos.size == 0 or not np.all(np.isfinite(qpos)):
             raise ValueError(
-                f"{field_name}[{side!r}] must contain six finite qpos values."
+                f"{field_name}[{side!r}] must contain finite qpos values."
             )
         result[side] = [float(value) for value in qpos]
     return result
@@ -178,6 +179,44 @@ def capture_mujoco_qpos_measurement(
     )
 
 
+def build_mujoco_qpos_measurement_from_execution_cut(
+    cut: MujocoExecutionStateCut,
+    *,
+    clock_domain_id: str,
+) -> MujocoQposMeasurement:
+    """Project the measurement half of one atomic execution-state cut."""
+
+    if not isinstance(cut, MujocoExecutionStateCut):
+        raise TypeError("cut must be a MujocoExecutionStateCut.")
+    clock_domain = str(clock_domain_id).strip()
+    if not clock_domain:
+        raise ValueError("clock_domain_id must be non-empty.")
+    measured = {
+        source: [float(value) for value in qpos]
+        for source, qpos in cut.measured_qpos_by_source.items()
+    }
+    payload = {
+        "qpos_by_side": measured,
+        "measured_at": cut.sampled_at,
+        "clock_domain_id": clock_domain,
+        "physics_tick": cut.physics_tick,
+    }
+    content_hash = canonical_content_hash(
+        payload,
+        domain=MUJOCO_QPOS_MEASUREMENT_HASH_DOMAIN_V1,
+    )
+    return MujocoQposMeasurement(
+        measurement_id=f"mujoco-qpos-measurement:{content_hash}",
+        qpos_by_side={
+            source: tuple(values) for source, values in measured.items()
+        },
+        measured_at=cut.sampled_at,
+        clock_domain_id=clock_domain,
+        physics_tick=cut.physics_tick,
+        semantic_content_hash=content_hash,
+    )
+
+
 def build_mujoco_backend_measurement(
     rig: Any,
     *,
@@ -284,5 +323,6 @@ __all__ = [
     "MUJOCO_QPOS_MEASUREMENT_HASH_DOMAIN_V1",
     "MujocoQposMeasurement",
     "build_mujoco_backend_measurement",
+    "build_mujoco_qpos_measurement_from_execution_cut",
     "capture_mujoco_qpos_measurement",
 ]

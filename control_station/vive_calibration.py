@@ -29,6 +29,7 @@ from teleop_runtime.sources.pose import VivePoseSource
 from teleop_runtime.transforms import as_pose_matrix
 
 from .vive_calibration_profiles import (
+    LATEST_VIVE_COORDINATE_PROFILE,
     VIVE_COORDINATE_PROFILE_KIND,
     coordinate_profile_view,
     list_coordinate_profiles,
@@ -205,6 +206,10 @@ class ViveCoordinateCalibrationConfig:
     virtual_desk_post_yaw_deg: float = 180.0
     input_ready_max_age_sec: float = _INPUT_READY_MAX_AGE_SEC
     profile_dir: Path | None = None
+    # Optional read-only startup selection. ``latest`` resolves the newest
+    # valid coordinate profile; absence of any valid latest profile preserves
+    # the first-time calibration flow.
+    initial_profile: str | Path | None = None
 
     def __post_init__(self) -> None:
         self.active_sides = normalize_active_sides(self.active_sides)
@@ -248,6 +253,11 @@ class ViveCoordinateCalibrationConfig:
             if self.profile_dir is None
             else Path(self.profile_dir)
         )
+        if self.initial_profile is not None:
+            initial_profile = str(self.initial_profile).strip()
+            if not initial_profile:
+                raise ValueError("initial_profile must be non-empty when supplied.")
+            self.initial_profile = Path(initial_profile).expanduser()
 
 
 class ViveCoordinateCalibrationController:
@@ -278,6 +288,21 @@ class ViveCoordinateCalibrationController:
         self._profiles_revision = 0
         self._ui_state: dict[str, Any] = {}
         self._shutdown_requested = False
+        initial_profile = self.config.initial_profile
+        if initial_profile is not None:
+            try:
+                self._load_profile(str(initial_profile))
+            except FileNotFoundError:
+                if str(initial_profile).strip().lower() != (
+                    LATEST_VIVE_COORDINATE_PROFILE
+                ):
+                    raise
+                # A first-time user has nothing to load yet. Keep the empty
+                # draft available for calibration instead of making setup or
+                # policy-only startup fail.
+                self._message = (
+                    "未找到有效的 VIVE 坐标 profile；可开始首次标定。"
+                )
 
     @property
     def source(self) -> object:
@@ -293,6 +318,15 @@ class ViveCoordinateCalibrationController:
             if not self._last_saved_profile_path:
                 return None
             return Path(self._last_saved_profile_path)
+
+    @property
+    def current_profile_path(self) -> Path | None:
+        """Resolved profile currently shown by this setup controller."""
+
+        with self._lock:
+            if not self._current_profile_path:
+                return None
+            return Path(self._current_profile_path)
 
     @property
     def shutdown_requested(self) -> bool:

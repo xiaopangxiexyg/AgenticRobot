@@ -12,6 +12,7 @@ from .contracts import (
     ObservationFieldSpec,
     ObservationRole,
     PolicyActionBinding,
+    PolicyActionTransform,
 )
 from .model_io import EncodedModelInput, encode_model_input
 from .manifest import (
@@ -35,6 +36,7 @@ __all__ = [
     "ObservationFieldSpec",
     "ObservationRole",
     "PolicyActionBinding",
+    "PolicyActionTransform",
     "EncodedModelInput",
     "encode_model_input",
     "MODEL_MANIFEST_VERSION",

@@ -65,6 +65,30 @@ GUI-selectable application assemblies should become declarative
 `control_station/profiles/`; they may import multiple lower packages but may
 not recreate their queues, workers, cursors, epochs, safety, or dispatch.
 
+The default-off Sim-HIL application keeps
+`control_station.sim_hil` as its stable CLI/facade. Its internal
+`control_station/sim_hil_profile/` package is split by application concern:
+`config.py` validates profile selection without constructing resources,
+`human.py` binds lower-owned passive VIVE/gripper producers to the selected
+component contract, `factory.py` assembles the concrete MuJoCo graph once,
+`application.py` owns the core lifecycle, `application_human.py` owns the
+human-attachment/runtime-Home sub-lifecycle, and `application_status.py` plus
+`status.py` contain read-only GUI projection. `validation.py` is intentionally
+limited to small profile-local scalar/text validation. `control_cycle.py`
+defines the typed application seam between one selected composition profile
+and the lower-owned execution result. `allocation_control_cycle.py` provides
+the separate activation-scoped port for allocation-aware publication. Its
+profile-owned binding must supply the exact roles, anchor, source admission and
+allocation basis; the port does not infer them. The fixed-alpha profile remains
+an exact compatibility adapter over the existing cycle and does not inherit
+the allocation port's lifecycle. Activation priming is an explicit port
+capability: the compatibility port retains application-owned legacy priming,
+while the allocation port activates its scoped binding first and then primes
+only through that binding's injected source publisher.
+The CLI runner remains in the stable facade; none of these modules owns device
+workers, composition algorithms, canonical safety, IK, dispatch, or dataset
+persistence.
+
 The boundary tests keep current migration debt explicit: dataset projection is
 confined to `control_trace.py`, the existing
 `composition/mujoco_pose_composer.py` profile, and the default-off
@@ -114,6 +138,21 @@ Do not create one composition module per checkpoint, teleop device, robot arm,
 or task configuration when the typed source/target seam is unchanged. Prefer
 data-driven manifests and capability hashes. Introduce a new module only when
 it owns a genuinely different lifecycle, authority boundary, or protocol.
+
+### Future-trajectory display ports
+
+Station trajectory-preview ports are backend-neutral, default-off, read-only
+demand gates. The intent port may derive a source-intent view from one already
+published `ComponentActionTrajectory`. The corrected port accepts one
+lower-owned `TrajectoryCorrectedPreviewSnapshot`; the supplier remains
+responsible for its coherent non-closing composition cut. Neither port admits
+inputs, advances a source cursor, publishes proposals, or sends actions.
+
+Freshness evidence is fetched only when the selected profile declares a
+`TrajectoryPreviewFreshnessSpec`. This keeps observation/modality acquisition
+demand-driven. The assessment annotates display age only and cannot change the
+producer-locked/speculative class or turn a conditional preview into an
+executable Reference.
 
 ## Mainline mixed-action representation
 
@@ -360,6 +399,206 @@ sim only: no GUI, device start, replay cursor, policy/RTC source, real binding,
 or production entrypoint is added, and no physical deadman/retarget evidence is
 claimed.
 
+The development-only MuJoCo timed-trajectory publisher reuses this same
+session barrier; it does not define another pause/end state machine. It is
+constructed per activation, publishes only an already-produced exact target,
+and cannot cross a barrier generation change. Current-action-only policy
+sources remain on the ordinary per-cut path. An application may bind a real
+timed source later, but its request supplier must be a nonblocking mailbox read;
+model workers, device workers, and chunk cursors stay outside the barrier and
+outside the publisher.
+
+Allocation-context publication has a separate backend-neutral, default-off
+Station port. `StationAllocationPublicationPort` binds one
+`AllocationPublicationRuntime` to the active typed composition-session barrier
+and moves only the potentially blocking `CompositionContext` admission onto a
+single application-owned worker. The control-facing call performs a lazy,
+bounded read of one already-produced `AllocationPublicationBasis`; while one
+exact attempt is pending, the reusable runtime retains only its latest newer
+basis. Unknown admission outcomes stop rather than spin and require an
+explicit exact-retry request.
+
+Closing the port invalidates the allocation activation before joining the
+worker, so a late receipt cannot commit reducer state. With the profile off it
+does not create a worker or evaluate the basis supplier. The port has no
+device/model/cursor, authority, safety, action publication, target, reference,
+dispatch, or dataset ownership. Its latest status remains available to UI
+observers after the bounded event cache is drained for trace projection.
+
+`MujocoAllocationShadowController` is the concrete default-off D3 binding. It
+connects that port to an already-started MuJoCo composition topology, evaluates
+only through `evaluate_composition_shadow()`, and verifies that input and
+allocation context snapshots share the exact same `ControlCut`. Pending
+candidates are invisible; only a receiver-admitted context may select a mode.
+The optional corrected-horizon view additionally verifies each allocation
+context against the MuJoCo store before exposing it. The cycle is always
+non-authoritative/non-promotable and has no proposal, target, Reference, IK,
+physics-step, or dispatch method.
+
+`MujocoAllocationProposalPublicationController` is the separate default-off
+D4 gate. It never promotes a D3 shadow result: while the same typed Station
+composition-session barrier is held, it captures a new receiver `ControlCut`,
+performs one formal allocation-aware evaluation, and submits only that exact
+ready evaluation through the existing MuJoCo composer proposal port. A missing
+or expired context returns typed `no_action`; it does not manufacture HOLD or
+fallback. The controller does not call `runtime.step()`, so an accepted
+proposal is still neither authoritative nor executed and cannot by itself
+create a target, Reference, IK result, physics command, or dispatch receipt.
+Component coverage and selection groups are derived and validated from the
+typed action/catalog; the Station gate does not assume two arms or one action
+representation. Exclusive takeover remains a different typed lifecycle.
+
+The first executable allocation profile, Scheme A, is deliberately
+relative-only. Its component policies cap automatic selection at
+`relative_overlay`, and its proposal allowlist contains exactly `base_only`
+plus `relative_overlay`; it therefore does not manufacture an absolute
+candidate and later block it. Scheme B is a separate explicit profile that
+allows all three modes and enables the reusable target-transition continuity
+policy. Both profiles assemble the same derived-input, allocation-context,
+composition, proposal, and lower-cycle ports. The existing fixed-alpha public
+factory and numeric behavior are unchanged.
+
+Scheme B corrects only the composition-target seam. Entering absolute mode
+aligns the current raw human target to the previous composed target and retains
+that alignment while human deltas continue; leaving a mode begins at the
+previous composed target and decays the seam correction over the profile-owned
+target-time interval. Formal evaluation only prepares the correction; the
+continuity state advances after that exact proposal admission is accepted, so a
+rejected or expired evaluation cannot alter the next target baseline. The
+evaluation records the prepared state/identity and correction receipt in
+`strategy_result_data`. This is not a
+claim that an execution Reference or measured command is continuous: target
+resolution, planner interpolation, limits, IK, canonical safety, and dispatch
+remain lower-owned. Read-only projected trajectory preview does not advance the
+stateful continuity reducer and remains advisory/raw at this boundary.
+
+Allocation publication outcomes have a compact generic
+`allocation_publication_outcome` ControlTrace projection. Ordinary context
+admission/context/evaluation facts remain the owners of full payloads. Atomic
+human absolute/residual batch admission is also projected as actual-data
+lineage without duplicating action vectors. The public factory selects this
+path only for an explicit `policy_human_allocation_scheme_a` or
+`policy_human_allocation_scheme_b` profile; the default remains fixed-alpha
+compatibility.
+
+The default-off MuJoCo policy/human allocation input profile now binds one
+already-produced human sample to fixed `human_absolute` and `human_residual`
+roles and admits them as one batch. It does not poll a device or infer topology;
+component schemas, thresholds, normalization, custom metric providers, and role
+names are profile inputs. Only accepted receiver stamps enter the reusable
+time-window evidence builder. The explicit Scheme-A and Scheme-B Sim-HIL
+profiles wire this adapter to the existing passive VIVE plus gripper source;
+the adapter itself remains device-, topology-, and model-neutral.
+
+Requesting a new anchor is now a target-fenced transaction. The Station input
+controller admits `pending` before mutating its source adapter, advances the
+allocation generation fence, and then waits for the first fresh complete
+sample. That sample produces one atomic absolute plus identity-residual input
+batch; only its accepted batch may publish the exact `ready` receipt. Rejected
+batch or ready admission is retried exactly before a later sample is consumed.
+At the declared boundary, missing/pending lifecycle yields typed `no_action`;
+Station does not reinterpret it as HOLD or own the lower execution response.
+
+Lifecycle, allocation context, and selected inputs are not sequential Station
+objects. They are independently receiver-admitted facts captured under one
+immutable cut by `control_composition`. Thus the protocol adds admission work
+only when an anchor changes, not one extra control-period delay. Old-generation
+allocation attempts are fenced, and their late receipts remain observable but
+cannot commit reducer state.
+
+The allocation-aware Sim-HIL cycle now also has a thin MuJoCo binding. A
+profile callback publishes already-configured policy/human inputs and an
+optional allocation basis; the existing D2 worker admits context asynchronously,
+the D4 gate captures a later exact cut and may admit a proposal, and the binding
+then calls the one lower `runtime.step()`. A `no_action` proposal status still
+calls that lower step so existing proposal persistence and execution-gate
+semantics decide the physical response. Source publication carries an explicit
+post-admission receiver `observed_at`; basis, proposal and lower execution are
+never evaluated against the earlier pre-poll timestamp.
+
+The application distinguishes compatibility-owned and control-cycle-owned
+activation priming. The fixed-alpha path preserves its original
+prime-before-port-activation order. The allocation path creates the exact
+activation-local binding first, resets/steps the required policy source, and
+waits within the existing application timeout for one genuinely new human
+emission after the activation barrier. It passes that immutable emission into
+the binding's source-prime operation without publishing a proposal or running
+a lower cycle; it never substitutes `last_emission`. A cycle cannot run until
+that prime succeeds; re-arm must create and prime a fresh binding. Profiles
+using allocation also reject the legacy fixed-alpha GUI control explicitly. A
+cached device pose cannot cross the activation barrier. Allocation shutdown is
+likewise explicit: the application closes the passive human source, while the
+fixed-alpha compatibility composition retains its historical source-close
+ownership.
+
+`MujocoPolicyHumanAllocationSession` now supplies the application-facing
+start/HOLD/rearm/close seam without constructing a source or target. Every
+source readiness field is required for this first profile. Start and rearm
+activate fresh receiver producer epochs and create a new
+`CompositionActivationScope`; the shared publication barrier opens only after
+an injected upper Station operation-result provider acknowledges the exact
+profile, activation, preflight, producer receipts, and (for rearm) lower READY
+gate evidence. Operation completion must be receiver-causal: its admission
+time cannot precede those same-clock facts. Activation recording is an
+injected required observer, so this session does not add a new dependency on
+dataset projection or choose a v2.4 persistence implementation.
+
+This session remains default-off. The public CLI selects Scheme A with
+`--control-profile policy_human_allocation_scheme_a` or Scheme B with
+`--control-profile policy_human_allocation_scheme_b`; omitting the option keeps
+the fixed-alpha compatibility profile. Numeric allocation thresholds, evidence
+window, TTL, dwell, and Scheme-B target handoff duration remain explicit
+profile/integration inputs rather than generic defaults.
+
+`StationCompositionSessionOperationPort` is the backend-neutral upper
+completion seam for that lifecycle. One instance binds one already-admitted
+Station start/rearm/stop request and completes it through
+`ControlStationRuntime.finalize_pending_operation()`; it never admits a result
+directly or creates another pending-operation state machine. Successful lower
+evidence must expose its operation kind, complete evidence references, and the
+latest causal readiness time in the Station receiver clock. Cross-clock
+evidence requires a separate conversion receipt instead of timestamp guessing.
+If lower preparation fails before such evidence exists, the same port can
+resolve the pending request with a typed failed result. A Station HOLD, fault,
+stop, or competing transition supersedes the request and the port cannot revive
+it.
+
+Sim-HIL profile selection treats `{application session lifecycle,
+control-cycle port}` as one atomic application profile. This prevents a new
+cycle implementation from accidentally inheriting fixed-alpha
+start/HOLD/rearm/close behavior. Profile builders are lazy: registration is
+resource-free and only the selected builder is invoked. The built-in/default
+selection remains `fixed_alpha_compatibility`; explicit Scheme-A or Scheme-B
+selection builds its session and cycle port as one bundle. Programmatic integrations may
+inject another binding, but it must supply both the session and cycle port with
+a matching declared cycle kind. Allocation thresholds, source/anchor wiring, and
+Station intent source remain explicit profile data rather than hidden generic
+defaults.
+
+Pause and episode-end use two-phase worker teardown. The control-cycle port
+first fences the activation and invalidates pending allocation work without
+waiting for the worker, so the application can immediately request the one
+lower-owned HOLD. Terminal application cleanup joins all retired bindings only
+after that HOLD boundary. A fence error is reported, but it does not suppress
+the lower HOLD attempt.
+
+Residual `rebase-and-clear` has a separate default-off Station port. The
+central reducer accepts the typed operator intent only for an active composite
+source in a running application session. Its admission receipt binds the exact
+intent hash, not only the sequence-derived intent ID. The thin
+`StationResidualRebaseController` then checks that receipt, the selected
+composer slot, profile ID, and current active-anchor binding before invoking a
+lazy command supplier and entering the backend-neutral rebase reducer. With
+the profile off, the supplier is not evaluated.
+
+The reusable port does not read a button, poll a tracker, request HOLD, or
+publish/dispatch an action. In either explicit allocation application, a GUI intent
+is translated by the thin Station adapter into the barrier-bound anchor request;
+the next fresh complete VIVE/gripper emission atomically supplies the new pose
+and qpos anchor receipt. Downstream execution still decides what typed
+`no_action` means physically while rebase is pending. Deploy, replay, teleop,
+and real-robot execution paths are not changed by this binding.
+
 The current default-off `python -m control_station sim-hil --enable` application
 profile is the operational Station leaf for the temporary PPO plus one passive
 VIVE tracker and one selected right gripper input (Q6 first, calibrated angle
@@ -367,8 +606,10 @@ trigger fallback). Its native composition schema is
 `right_arm: cartesian_pose` plus `right_gripper: physical_joint_qpos`; the old
 `RobotAction` is materialized only inside the current coupled MuJoCo execution
 edge. The selected topology is an application profile, while the lower source,
-component schema, and target binding remain cardinality-driven. The ordinary
-`--gui` remains a read-only status surface showing readiness, source freshness,
+component schema, and target binding remain cardinality-driven. The
+operator commands, including the explicit single-arm allocation angle-trigger
+profile, are maintained in [`docs/HIL/README.md`](../docs/HIL/README.md).
+The ordinary `--gui` remains a read-only status surface showing readiness, source freshness,
 composition input/proposal receipts, activation hashes, and execution
 receipts. The explicit `--control-gui --enable` profile additionally exposes
 a loopback-only typed control endpoint. Browser requests enter a bounded
@@ -391,14 +632,27 @@ it closes the current MuJoCo episode and restores the VIVE setup owner. Neither
 operation commands a physical robot to home. A composition failure is shown
 separately from later input diagnostics, so the operator can diagnose the
 first fault before choosing Home capture, re-arm, or a whole-runtime rebuild.
+With an explicit allocation profile the same page replaces fixed-alpha controls
+with typed `Auto allocation`, `Policy baseline`, `Human relative correction`,
+and `Rebase and clear residual` operations. Scheme B additionally exposes
+`Human absolute takeover`; Scheme A neither advertises nor accepts that button.
+Its dedicated allocation start
+intent starts from the policy baseline and carries no fixed-alpha control mode
+or weight. Human devices and coordinate-profile readiness are deferred until
+the first Auto/relative/absolute/rebase operation that consumes Human input.
+Until then the admitted composition contains only the real policy input; the
+optional allocation context is absent and the strategy records an explicit
+`base_only` selection rather than synthesizing Human data.
 
 The control page starts before a MuJoCo target or policy runtime is
 constructed. One setup controller owns the VIVE receiver and projects live
 input plus the selected saved coordinate profile into the same page. The
 operator may start/cancel/retry coordinate calibration there; an unsaved
-calibration is never used for execution. Human-only and proportional launch
-require a finite/fresh selected VIVE channel plus a valid coordinate profile.
-PPO-only launch does not consume or wait for either fact: Station reserves the
+calibration is never used for execution. Human-only and proportional launch in
+the fixed-alpha compatibility profile require a finite/fresh selected VIVE
+channel plus a valid coordinate profile. PPO-only launch, and policy-baseline
+launch in either allocation profile, do not consume or wait for either fact:
+Station reserves the
 typed human component port without constructing a device source, starts the
 policy/target/viewer path, and keeps the setup receiver available only for an
 optional later Human attachment. A setup-receiver bind/start failure remains
@@ -532,6 +786,19 @@ visited. `SimHILAcceptanceTraceCapture` remains the internal capture adapter:
 it binds the lower-owned `EpisodeTraceRecorderSink`, records both immediate
 source/composed differences and lower reference/measurement differences,
 establishes HOLD/cancellation at episode end, then seal/commits the trace.
+The policy-source port is representation-neutral: absolute policies,
+observation-relative chunks, and sequential-delta policies all enter through
+the same canonical `PolicyActionEmission` boundary. A profile may inject any
+source implementing that port; Station does not inspect its checkpoint or
+model encoding.
+
+After a cycle, Station may project passive `policy_execution_feedback`. It
+matches the policy input selected by composition through its exact source fact,
+then accepts Reference/Measurement values only when their receipt chain contains
+the same downstream target-admission receipt. The record distinguishes an
+unchanged policy output from an output composed with human/other sources.
+Feedback consumption is optional and defaults to recording only; it never
+reruns IK/interpolation/safety or silently rebases a relative policy target.
 Runtime termination stays outside episode membership. This is ControlTrace-core
 capture, not a replacement for collection-runtime camera/tactile/native-stream
 writers. `--acceptance-gui` remains only a CLI compatibility alias for

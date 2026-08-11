@@ -70,6 +70,23 @@ shared-safety, resolver, one-shot dispatch permit, position rig, receipt, and
 measurement lineage. The ActionArbiter is capped at 60 Hz; reference, command,
 and physics clocks remain independent.
 
+Execution observations remain default-off. A plan may retain the historical
+`joint_position` active-qref/measured-qpos stream or explicitly require
+`cartesian_pose`. The latter is produced by the MuJoCo owner as
+`FK(active qref)` and `FK(measured qpos)` using a private `MjData` scratch
+buffer. The Rig captures qref, measured qpos, model qpos, and sample time under
+one owner lock; FK never writes the live simulator. Pose schema/frame identity,
+the raw qpos observation, and the model/kinematics contract stay in lineage.
+
+The optional trajectory-residual publication fixture is likewise default-off.
+Its Control Station adapter may admit one future composed proposal, but it does
+not call the MuJoCo control loop. The existing runtime remains the only owner
+that selects the proposal at its effective time, resolves the component target,
+activates qref, steps physics, and publishes the resulting FK pose observations.
+Consequently publication success is not reported as target execution, and no
+Reference/Measurement exists until the lower loop has actually processed the
+proposal.
+
 This scoped M5.5a/b path has no `teleop_runtime` dependency and does not copy
 `run_policy.py`. In addition to deterministic single-policy tests, an explicitly
 enabled canonical replay source may become sim authority only when its source

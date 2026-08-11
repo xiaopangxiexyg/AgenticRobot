@@ -39,6 +39,9 @@ class CollisionProjectionResult:
                     "blocking_body1": blocking["body1"],
                     "blocking_body2": blocking["body2"],
                     "blocking_pair_class": blocking["pair_class"],
+                    "blocking_collision_category": blocking[
+                        "collision_category"
+                    ],
                 }
             )
         return values

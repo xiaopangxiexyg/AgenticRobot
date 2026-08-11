@@ -20,6 +20,7 @@ LEARNING_CONTRACT_VERSION = "dexteleop.learning_contract.v1"
 _OBSERVATION_CONTRACT_HASH_DOMAIN = "dexteleop.learning.observation_contract.v1"
 _MODEL_INPUT_BINDING_HASH_DOMAIN = "dexteleop.learning.model_input_binding.v1"
 _ACTION_BINDING_HASH_DOMAIN = "dexteleop.learning.action_binding.v1"
+_ACTION_TRANSFORM_HASH_DOMAIN = "dexteleop.learning.action_transform.v1"
 
 
 class ObservationRole(str, Enum):
@@ -307,6 +308,188 @@ class PolicyActionBinding:
         )
 
 
+@dataclass(frozen=True)
+class PolicyActionTransform:
+    """Deterministic model-output to task-action mapping.
+
+    PPO owns the normalized values described by ``policy_components``.  The
+    task owns this transform and always emits the complete normalized action
+    described by ``task_components``.  Safety projection and plant response
+    are deliberately downstream and must never be inverted through this
+    object to manufacture a replacement PPO sample.
+    """
+
+    transform_id: str
+    policy_action_binding_hash: str
+    task_action_binding_hash: str
+    policy_components: tuple[str, ...]
+    task_components: tuple[str, ...]
+    task_defaults: tuple[float, ...]
+    policy_scales: tuple[float, ...] = ()
+    policy_biases: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        transform_id = str(self.transform_id).strip()
+        policy_hash = str(self.policy_action_binding_hash).strip()
+        task_hash = str(self.task_action_binding_hash).strip()
+        if not transform_id or not policy_hash or not task_hash:
+            raise ValueError(
+                "PolicyActionTransform identity and binding hashes are required"
+            )
+        policy_components = tuple(
+            str(component).strip() for component in self.policy_components
+        )
+        task_components = tuple(
+            str(component).strip() for component in self.task_components
+        )
+        if not policy_components or any(not value for value in policy_components):
+            raise ValueError("policy_components must be non-empty")
+        if not task_components or any(not value for value in task_components):
+            raise ValueError("task_components must be non-empty")
+        if len(policy_components) != len(set(policy_components)):
+            raise ValueError("policy_components must be unique")
+        if len(task_components) != len(set(task_components)):
+            raise ValueError("task_components must be unique")
+        unknown = tuple(
+            component
+            for component in policy_components
+            if component not in task_components
+        )
+        if unknown:
+            raise ValueError(
+                f"Policy action components are absent from the task action: {unknown}"
+            )
+        defaults = tuple(float(value) for value in self.task_defaults)
+        if len(defaults) != len(task_components):
+            raise ValueError(
+                "task_defaults must contain one value per task action component"
+            )
+        import math
+
+        if any(not math.isfinite(value) or abs(value) > 1.0 for value in defaults):
+            raise ValueError("task_defaults must be finite normalized values in [-1, 1]")
+        scales = (
+            (1.0,) * len(policy_components)
+            if not self.policy_scales
+            else tuple(float(value) for value in self.policy_scales)
+        )
+        biases = (
+            (0.0,) * len(policy_components)
+            if not self.policy_biases
+            else tuple(float(value) for value in self.policy_biases)
+        )
+        if len(scales) != len(policy_components) or len(biases) != len(
+            policy_components
+        ):
+            raise ValueError(
+                "policy_scales and policy_biases must match policy_components"
+            )
+        if any(
+            not math.isfinite(scale) or not 0.0 < scale <= 1.0
+            for scale in scales
+        ):
+            raise ValueError("policy_scales must be finite values in (0, 1]")
+        if any(
+            not math.isfinite(bias) or abs(bias) + scale > 1.0
+            for scale, bias in zip(scales, biases)
+        ):
+            raise ValueError(
+                "policy_biases plus policy_scales must keep mapped values in [-1, 1]"
+            )
+        object.__setattr__(self, "transform_id", transform_id)
+        object.__setattr__(self, "policy_action_binding_hash", policy_hash)
+        object.__setattr__(self, "task_action_binding_hash", task_hash)
+        object.__setattr__(self, "policy_components", policy_components)
+        object.__setattr__(self, "task_components", task_components)
+        object.__setattr__(self, "task_defaults", defaults)
+        object.__setattr__(self, "policy_scales", scales)
+        object.__setattr__(self, "policy_biases", biases)
+
+    @property
+    def policy_dim(self) -> int:
+        return len(self.policy_components)
+
+    @property
+    def task_dim(self) -> int:
+        return len(self.task_components)
+
+    @property
+    def task_indices(self) -> tuple[int, ...]:
+        return tuple(
+            self.task_components.index(component)
+            for component in self.policy_components
+        )
+
+    def validate_bindings(
+        self,
+        policy_binding: PolicyActionBinding,
+        task_binding: PolicyActionBinding,
+    ) -> None:
+        """Fail closed when either side of the declared transform drifts."""
+
+        if policy_binding.semantic_content_hash != self.policy_action_binding_hash:
+            raise ValueError("Policy action binding does not match action transform")
+        if task_binding.semantic_content_hash != self.task_action_binding_hash:
+            raise ValueError("Task action binding does not match action transform")
+        if policy_binding.output_dim != self.policy_dim:
+            raise ValueError("Policy action binding dimension does not match transform")
+        if task_binding.output_dim != self.task_dim:
+            raise ValueError("Task action binding dimension does not match transform")
+
+    def transform(self, values: Any) -> "Any":
+        """Map one or a batch of normalized latent actions to full task actions."""
+
+        import numpy as np
+
+        policy_values = np.asarray(values, dtype=np.float32)
+        if policy_values.ndim == 0 or policy_values.shape[-1] != self.policy_dim:
+            raise ValueError(
+                "Policy action must end in "
+                f"{self.policy_dim} values; got {policy_values.shape}"
+            )
+        if not np.all(np.isfinite(policy_values)):
+            raise ValueError("Policy action must be finite")
+        if np.any(policy_values < -1.0) or np.any(policy_values > 1.0):
+            raise ValueError("Policy action values must lie in [-1, 1]")
+        output = np.broadcast_to(
+            np.asarray(self.task_defaults, dtype=np.float32),
+            (*policy_values.shape[:-1], self.task_dim),
+        ).copy()
+        mapped = (
+            policy_values
+            * np.asarray(self.policy_scales, dtype=np.float32)
+            + np.asarray(self.policy_biases, dtype=np.float32)
+        )
+        output[..., list(self.task_indices)] = mapped
+        return output
+
+    def semantic_payload(self) -> dict[str, Any]:
+        payload = {
+            "transform_id": self.transform_id,
+            "policy_action_binding_hash": self.policy_action_binding_hash,
+            "task_action_binding_hash": self.task_action_binding_hash,
+            "policy_components": self.policy_components,
+            "task_components": self.task_components,
+            "task_defaults": self.task_defaults,
+        }
+        if self.policy_scales != (1.0,) * self.policy_dim or self.policy_biases != (
+            0.0,
+        ) * self.policy_dim:
+            payload["policy_scales"] = self.policy_scales
+            payload["policy_biases"] = self.policy_biases
+        return payload
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "version": LEARNING_CONTRACT_VERSION,
+                **self.semantic_payload(),
+            },
+            domain=_ACTION_TRANSFORM_HASH_DOMAIN,
+        )
+
+
 __all__ = [
     "LEARNING_CONTRACT_VERSION",
     "ModelInputBinding",
@@ -314,4 +497,5 @@ __all__ = [
     "ObservationFieldSpec",
     "ObservationRole",
     "PolicyActionBinding",
+    "PolicyActionTransform",
 ]

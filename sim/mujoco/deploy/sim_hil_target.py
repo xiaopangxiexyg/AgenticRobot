@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from project_paths import resolve_path
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
@@ -82,6 +83,10 @@ class MujocoSimHILTargetConfig:
     target_admission_margin_sec: float = 0.05
     execution_observation_plan: ExecutionObservationPlan | None = None
     exposed_pose_sides: tuple[str, ...] = ("left", "right")
+    # Generic Agent motion must not inherit task-specific scripted reset
+    # trajectories. Existing CubeLift Sim-HIL profiles retain their behavior.
+    allow_scripted_task_reset: bool = True
+    agent_skill_producer_id: str = "control-station-agent-skill"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_config_path", Path(self.task_config_path).expanduser())
@@ -94,9 +99,12 @@ class MujocoSimHILTargetConfig:
             "policy_node_id",
             "clock_domain_id",
             "position_control_profile_name",
+            "agent_skill_producer_id",
         ):
             if not str(getattr(self, name)).strip():
                 raise ValueError(f"{name} must be non-empty.")
+        if not isinstance(self.allow_scripted_task_reset, bool):
+            raise TypeError("allow_scripted_task_reset must be a bool.")
         if self.compose_target_hz is not None:
             compose_target_hz = float(self.compose_target_hz)
             if not np.isfinite(compose_target_hz) or compose_target_hz <= 0.0:
@@ -166,6 +174,18 @@ class MujocoSimHILPreparedTarget:
     task_initialization_info: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class MujocoAgentSkillMotionTarget:
+    """No-model, arms-only target bound to the shared MuJoCo executor."""
+
+    task_config: Any
+    scene: Any
+    runtime: Any
+    target_frame_profile: TargetFrameProfile
+    tool_frame_profile: ToolFrameProfile
+    task_initialization_info: Mapping[str, object]
+
+
 def prepare_mujoco_sim_hil_target(
     config: MujocoSimHILTargetConfig,
 ) -> MujocoSimHILPreparedTarget:
@@ -183,6 +203,16 @@ def prepare_mujoco_sim_hil_target(
 
     task_config = CubeLiftTaskConfig.load(config.task_config_path)
     contract = task_config.base_contract()
+    if (
+        not config.allow_scripted_task_reset
+        and (
+            bool(task_config.scripted_pregrasp_reset)
+            or bool(task_config.scripted_contact_reset)
+        )
+    ):
+        raise ValueError(
+            "Generic Agent motion forbids task-specific scripted reset motion."
+        )
     try:
         position_profile: PositionControlProfile = _POSITION_CONTROL_PROFILES_BY_NAME[
             str(config.position_control_profile_name).strip()
@@ -271,6 +301,9 @@ def prepare_mujoco_sim_hil_target(
         task_initialization_info = {
             "owner": "sim.mujoco.tasks.cube_lift.CubeLiftKernel.reset",
             "seed": 0,
+            "resting_center_z_m": float(
+                reset_info["resting_center_z_m"]
+            ),
             "scripted_pregrasp_reset": bool(
                 reset_info.get("scripted_pregrasp_reset", False)
             ),
@@ -539,7 +572,15 @@ def build_mujoco_sim_hil_target(
             compound_composer_authority_profile=contracts.authority_profile,
             initial_control_mode="policy",
             enable_component_execution_handoff=True,
+            target_admission_margin_sec=(
+                config.target_admission_margin_sec
+            ),
             enable_composition_source_eligibility=True,
+            composition_information_plan=getattr(
+                contracts,
+                "information_plan",
+                None,
+            ),
             execution_observation_plan=config.execution_observation_plan,
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(ik),
@@ -551,6 +592,21 @@ def build_mujoco_sim_hil_target(
         ),
         component_execution_binding=component_execution_binding,
         execution_observation_sink=execution_observation_sink,
+        execution_pose_observation_projector=(
+            build_mujoco_sim_hil_pose_observation_projector(
+                prepared,
+                component_execution_binding,
+            )
+            if (
+                config.execution_observation_plan is not None
+                and set(
+                    config.execution_observation_plan
+                    .required_representation_by_component.values()
+                )
+                == {"cartesian_pose"}
+            )
+            else None
+        ),
         trace_sink=trace_sink,
     )
     return MujocoSimHILTarget(
@@ -561,6 +617,268 @@ def build_mujoco_sim_hil_target(
         target_frame_profile=target_frame_profile,
         tool_frame_profile=tool_frame_profile,
         task_initialization_info=prepared.task_initialization_info,
+    )
+
+
+def build_mujoco_agent_skill_motion_target(
+    *,
+    config: MujocoSimHILTargetConfig,
+    component_execution_binding: Any,
+    prepared_target: MujocoSimHILPreparedTarget | None = None,
+    execution_observation_sink: ExecutionObservationSink | None = None,
+    trace_sink: Callable[[Any], None] | None = None,
+) -> MujocoAgentSkillMotionTarget:
+    """Build the first no-model, right-arm Agent Skill execution target.
+
+    The direct source only emits the runtime's exact ``ComponentAction``.
+    Canonical safety, coupled IK, reference generation and dispatch remain in
+    :class:`MujocoDeployRuntime`; this builder installs no second controller.
+    """
+
+    if not isinstance(config, MujocoSimHILTargetConfig):
+        raise TypeError("config must be a MujocoSimHILTargetConfig.")
+    if config.allow_scripted_task_reset:
+        raise ValueError(
+            "Agent Skill motion target requires allow_scripted_task_reset=False."
+        )
+    prepared = (
+        prepare_mujoco_sim_hil_target(config)
+        if prepared_target is None
+        else prepared_target
+    )
+    if (
+        not isinstance(prepared, MujocoSimHILPreparedTarget)
+        or prepared.config != config
+    ):
+        raise ValueError("prepared_target belongs to another target config.")
+    action_schema = getattr(component_execution_binding, "action_schema", None)
+    materializer = getattr(component_execution_binding, "materializer", None)
+    profile = getattr(materializer, "profile", None)
+    if (
+        tuple(getattr(action_schema, "component_ids", ())) != ("right_arm",)
+        or dict(getattr(profile, "arm_side_by_component", {}))
+        != {"right_arm": "right"}
+        or dict(getattr(profile, "gripper_name_by_component", {}))
+    ):
+        raise ValueError(
+            "The first Agent motion target requires one right_arm pose "
+            "component and no hand/gripper component."
+        )
+
+    from robot_motion.action import (
+        CanonicalKeyframeSafetyProfile,
+        IMMEDIATE_QREF_SIM_V1,
+        apply_canonical_keyframe_safety,
+    )
+    from robot_motion.position_control import PositionKeyframeSafetyConfig
+    from robot_motion.rm65 import RM65PositionCollisionPlannerConfig
+    from sim.mujoco.adapters import (
+        MujocoPositionExecutionConfig,
+        MujocoPositionExecutionRig,
+    )
+    from sim.mujoco.ik import RM65CanonicalIK
+    from .pose_resolution import MujocoCoupledPoseToQposResolver
+    from .runtime import (
+        MujocoDeployConfig,
+        MujocoDeployRuntime,
+        MujocoDirectComponentProposalSource,
+    )
+
+    rig = MujocoPositionExecutionRig(
+        prepared.scene,
+        MujocoPositionExecutionConfig(
+            timing=prepared.timing,
+            active_sides=("left", "right"),
+            actuation_profile=prepared.arm_profile,
+            # The generic profile has no hand action surface.
+            gripper_actuation_profile=None,
+            realtime_worker=config.realtime_worker,
+            follow_qpos_alpha=1.0,
+        ),
+    )
+    safety_profile = CanonicalKeyframeSafetyProfile(
+        profile_id="control-station-mujoco-agent-skill-arms-safety-v1",
+        limits=PositionKeyframeSafetyConfig(workspace_enabled=True),
+        hand_limits_by_side={},
+    )
+
+    def shared_safety(action: Any, input_id: str) -> Any:
+        anchor = rig.capture_scene(
+            lambda captured_scene: capture_mujoco_sim_hil_safety_anchor(
+                captured_scene,
+                prepared.task_config,
+                {},
+                now=time.monotonic(),
+            )
+        )
+        return apply_canonical_keyframe_safety(
+            action,
+            input_action_id=input_id,
+            anchor=anchor,
+            profile=safety_profile,
+        )
+
+    ik = RM65CanonicalIK.from_tool_profiles(
+        prepared.scene,
+        {
+            "left": prepared.task_config.left_tool_profile_path,
+            "right": prepared.task_config.right_tool_profile_path,
+        },
+        planner_config=RM65PositionCollisionPlannerConfig(
+            reference_hz=prepared.compose_target_hz,
+            solve_time_budget_ms=(
+                1000.0 / float(prepared.position_profile.rates.ik_hz)
+            ),
+        ),
+    )
+    support_horizon_sec = max(0.25, 1.0 / prepared.compose_target_hz)
+    runtime = MujocoDeployRuntime(
+        rig,
+        MujocoDeployConfig(
+            runtime_session_id=config.runtime_session_id,
+            control_domain_id=config.control_domain_id,
+            embodiment_instance_id=config.embodiment_instance_id,
+            producer_id=config.producer_id,
+            composer_producer_id=config.composer_producer_id,
+            enable_primary_policy_authority=False,
+            enable_composer_authority=False,
+            enable_replay_authority=False,
+            producer_epoch=1,
+            policy_node_id=config.policy_node_id,
+            decision_hz=prepared.compose_target_hz,
+            reference_activation_profile_id=IMMEDIATE_QREF_SIM_V1,
+            selected_segment_max_lifetime_sec=support_horizon_sec,
+            proposal_horizon_sec=support_horizon_sec,
+            clock_domain_id=config.clock_domain_id,
+            pose_frame_contract_hash="mujoco-agent-skill-rm65-arm-base-v1",
+            initial_control_mode="agent_skill",
+            enable_component_execution_handoff=True,
+            target_admission_margin_sec=(
+                config.target_admission_margin_sec
+            ),
+            execution_observation_plan=config.execution_observation_plan,
+            direct_component_proposal_source=(
+                MujocoDirectComponentProposalSource(
+                    producer_id=config.agent_skill_producer_id,
+                    producer_epoch=1,
+                    authority_priority=10,
+                )
+            ),
+        ),
+        pose_resolver=MujocoCoupledPoseToQposResolver(ik),
+        shared_safety=shared_safety,
+        component_execution_binding=component_execution_binding,
+        execution_observation_sink=execution_observation_sink,
+        execution_pose_observation_projector=(
+            build_mujoco_sim_hil_pose_observation_projector(
+                prepared,
+                component_execution_binding,
+            )
+            if config.execution_observation_plan is not None
+            else None
+        ),
+        trace_sink=trace_sink,
+    )
+    return MujocoAgentSkillMotionTarget(
+        task_config=prepared.task_config,
+        scene=prepared.scene,
+        runtime=runtime,
+        target_frame_profile=prepared.target_frame_profile,
+        tool_frame_profile=prepared.tool_frame_profile,
+        task_initialization_info=prepared.task_initialization_info,
+    )
+
+
+def build_mujoco_sim_hil_pose_observation_projector(
+    prepared_target: MujocoSimHILPreparedTarget,
+    component_execution_binding: Any,
+) -> Any:
+    """Bind the active component profile to private-MjData FK observation."""
+
+    if not isinstance(prepared_target, MujocoSimHILPreparedTarget):
+        raise TypeError(
+            "prepared_target must be a MujocoSimHILPreparedTarget."
+        )
+    materializer = getattr(component_execution_binding, "materializer", None)
+    profile = getattr(materializer, "profile", None)
+    arm_side_by_component = getattr(profile, "arm_side_by_component", None)
+    action_schema = getattr(component_execution_binding, "action_schema", None)
+    if not isinstance(arm_side_by_component, Mapping) or action_schema is None:
+        raise TypeError(
+            "Component execution binding must expose its MuJoCo arm profile."
+        )
+    from .pose_kinematics import (
+        build_mujoco_pose_observation_projector,
+    )
+
+    scene = prepared_target.scene
+    task_config = prepared_target.task_config
+    tool_profile_path_by_source = {
+        "left": task_config.left_tool_profile_path,
+        "right": task_config.right_tool_profile_path,
+    }
+    endpoint_to_controlled_by_component = {}
+    reference_body_by_component = {}
+    endpoint_body_by_component = {}
+    joint_names_by_source = {}
+    for component_id, raw_source in arm_side_by_component.items():
+        source = str(raw_source)
+        payload_schema = action_schema.payload_schema_by_component[component_id]
+        if payload_schema.controlled_frame != "tool_tcp":
+            raise ValueError(
+                "The current Sim-HIL FK profile requires tool_tcp arm outputs; "
+                "another controlled frame must provide its own explicit offset."
+            )
+        tool_profile = load_rm65_tool_profile(
+            tool_profile_path_by_source[source],
+            side=source,
+        )
+        endpoint_to_controlled_by_component[component_id] = (
+            endpoint_to_tool_transform(tool_profile)
+        )
+        reference_body_by_component[component_id] = _arm_base_body_name(
+            scene,
+            source,
+        )
+        endpoint_body_by_component[component_id] = (
+            scene.arm_specs[source].controlled_body
+        )
+        joint_names_by_source[source] = tuple(
+            scene.arm_specs[source].joint_names
+        )
+
+    model_contract_hash = canonical_content_hash(
+        {
+            "target_frame_profile_hash": (
+                prepared_target.target_frame_profile.semantic_content_hash
+            ),
+            "tool_frame_profile_hash": (
+                prepared_target.tool_frame_profile.semantic_content_hash
+            ),
+            "action_schema_hash": action_schema.semantic_content_hash,
+            "scene_profile_name": scene.conversion.scene_profile_name,
+            "model_nq": int(scene.model.nq),
+            "model_nv": int(scene.model.nv),
+        },
+        domain="dexteleop.sim.mujoco.sim_hil_fk_model_contract.development",
+    )
+    return build_mujoco_pose_observation_projector(
+        scene,
+        action_schema=action_schema,
+        qpos_source_by_component={
+            str(component_id): str(source)
+            for component_id, source in arm_side_by_component.items()
+        },
+        joint_names_by_source=joint_names_by_source,
+        reference_body_by_component=reference_body_by_component,
+        endpoint_body_by_component=endpoint_body_by_component,
+        endpoint_to_controlled_by_component=(
+            endpoint_to_controlled_by_component
+        ),
+        model_contract_id=(
+            f"mujoco-sim-hil-fk:{scene.conversion.scene_profile_name}"
+        ),
+        model_contract_hash=model_contract_hash,
     )
 
 
@@ -750,10 +1068,13 @@ def capture_mujoco_sim_hil_safety_anchor(
 
 
 __all__ = [
+    "MujocoAgentSkillMotionTarget",
+    "MujocoSimHILPreparedTarget",
     "MujocoSimHILTarget",
     "MujocoSimHILTargetConfig",
-    "MujocoSimHILPreparedTarget",
+    "build_mujoco_agent_skill_motion_target",
     "build_mujoco_sim_hil_coordinate_profiles",
+    "build_mujoco_sim_hil_pose_observation_projector",
     "build_mujoco_sim_hil_target",
     "capture_mujoco_sim_hil_safety_anchor",
     "capture_mujoco_sim_hil_tool_tcp_pose_by_side",

@@ -1,0 +1,7 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_reach_pose_xyz_v1.json",
+  "name": "rm65_right_cube_reach_goal_delta_xyz_v2",
+  "normal_proprio_profile": "qpos_close_motion_tracking_no_episode_clock_cube_pose_reach_delta.v2",
+  "reach_target_delta_observation_source": "derived_from_external_object_pose_and_rm65_measured_qpos_fk_in_right_base.v1",
+  "policy_observation_fields": ["proprio", "reach_target_delta"]
+}

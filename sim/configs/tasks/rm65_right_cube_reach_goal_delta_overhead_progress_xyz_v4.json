@@ -1,0 +1,9 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_reach_goal_delta_progress_xyz_v3.json",
+  "name": "rm65_right_cube_reach_goal_delta_overhead_progress_xyz_v4",
+  "reach_target_delta_observation_source": "derived_from_external_object_pose_and_rm65_measured_qpos_fk_with_smooth_overhead_guidance_in_right_base.v1",
+  "reach_guidance_height_offset_m": 0.12,
+  "reach_guidance_xy_blend_radius_m": 0.08,
+  "reach_action_min_scale": 0.35,
+  "reach_action_slow_radius_m": 0.08
+}

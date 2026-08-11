@@ -1,0 +1,7 @@
+{
+  "extends": "sim/configs/tasks/rm65_right_cube_contact_acquire_pose_xyz_gripper_v1.json",
+  "name": "rm65_right_cube_contact_acquire_fixed_pose_xyz_gripper_proprio_v1",
+  "policy_observation_fields": ["proprio"],
+  "cube_spawn_xy_jitter_m": [0.0, 0.0],
+  "cube_spawn_yaw_jitter_rad": 0.0
+}

@@ -48,6 +48,9 @@ MUJOCO_POLICY_HUMAN_RESIDUAL_SOURCE_BINDING_HASH_DOMAIN_DEVELOPMENT = (
 MUJOCO_POLICY_HUMAN_RESIDUAL_STEP_HASH_DOMAIN_DEVELOPMENT = (
     "dexteleop.mujoco_policy_human_residual_step.development"
 )
+MUJOCO_POLICY_HUMAN_ALLOCATION_DERIVATION_HASH_DOMAIN_DEVELOPMENT = (
+    "dexteleop.mujoco_policy_human_allocation_derivation.development"
+)
 
 
 def _required(value: object, *, name: str) -> str:
@@ -72,6 +75,7 @@ class MujocoPolicyHumanResidualProfileConfig:
     profile_id: str = MUJOCO_POLICY_HUMAN_RESIDUAL_PROFILE_ID_DEVELOPMENT
     baseline_role: str = "policy"
     residual_role: str = "human_residual"
+    absolute_overlay_role: str = "human_absolute"
     require_residual_role: bool = True
 
     def __post_init__(self) -> None:
@@ -79,14 +83,24 @@ class MujocoPolicyHumanResidualProfileConfig:
             raise TypeError("enabled must be bool.")
         if not isinstance(self.require_residual_role, bool):
             raise TypeError("require_residual_role must be bool.")
-        for name in ("profile_id", "baseline_role", "residual_role"):
+        for name in (
+            "profile_id",
+            "baseline_role",
+            "residual_role",
+            "absolute_overlay_role",
+        ):
             object.__setattr__(
                 self,
                 name,
                 _required(getattr(self, name), name=name),
             )
-        if self.baseline_role == self.residual_role:
-            raise ValueError("baseline_role and residual_role must differ.")
+        roles = (
+            self.baseline_role,
+            self.residual_role,
+            self.absolute_overlay_role,
+        )
+        if len(set(roles)) != len(roles):
+            raise ValueError("Baseline/residual/absolute roles must differ.")
 
 
 @dataclass(frozen=True)
@@ -105,7 +119,11 @@ class MujocoPolicyHumanResidualProfileStep:
 
     def __post_init__(self) -> None:
         status = _required(self.status, name="status")
-        if status not in {"anchor_captured", "relative_action_ready"}:
+        if status not in {
+            "anchor_captured",
+            "anchor_captured_relative_action_ready",
+            "relative_action_ready",
+        }:
             raise ValueError("Unsupported residual profile step status.")
         text = {
             name: _required(getattr(self, name), name=name)
@@ -137,7 +155,10 @@ class MujocoPolicyHumanResidualProfileStep:
             raise ValueError(
                 "Anchor capture must not also publish a relative action."
             )
-        if status == "relative_action_ready" and not isinstance(
+        if status in {
+            "anchor_captured_relative_action_ready",
+            "relative_action_ready",
+        } and not isinstance(
             self.relative_result,
             HumanComponentResidualResult,
         ):
@@ -187,6 +208,79 @@ class MujocoPolicyHumanResidualProfileStep:
         """Generic Station transform-port view of this profile-local step."""
 
         return self.relative_action
+
+
+@dataclass(frozen=True)
+class MujocoPolicyHumanAllocationDerivation:
+    """Two fixed role views derived from one exact human source sample."""
+
+    profile_step: MujocoPolicyHumanResidualProfileStep
+    absolute_action: ComponentAction
+    absolute_overlay_role: str
+    residual_role: str
+    action_by_role: Mapping[str, ComponentAction] = field(init=False)
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.profile_step,
+            MujocoPolicyHumanResidualProfileStep,
+        ):
+            raise TypeError("profile_step must be a typed residual profile step.")
+        if not isinstance(self.absolute_action, ComponentAction):
+            raise TypeError("absolute_action must be a ComponentAction.")
+        absolute_role = _required(
+            self.absolute_overlay_role,
+            name="absolute_overlay_role",
+        )
+        residual_role = _required(self.residual_role, name="residual_role")
+        if absolute_role == residual_role:
+            raise ValueError("Absolute and residual roles must differ.")
+        if self.profile_step.status == "anchor_captured":
+            actions: dict[str, ComponentAction] = {}
+        else:
+            relative = self.profile_step.relative_action
+            if relative is None:
+                raise ValueError("Ready allocation derivation lacks residual action.")
+            actions = {
+                absolute_role: self.absolute_action,
+                residual_role: relative,
+            }
+        payload = {
+            "profile_step_hash": self.profile_step.semantic_content_hash,
+            "source_action_id": self.profile_step.source_action_id,
+            "source_action_hash": self.profile_step.source_action_hash,
+            "absolute_action_hash": self.absolute_action.semantic_content_hash,
+            "action_hash_by_role": {
+                role: action.semantic_content_hash
+                for role, action in sorted(actions.items())
+            },
+        }
+        object.__setattr__(self, "absolute_overlay_role", absolute_role)
+        object.__setattr__(self, "residual_role", residual_role)
+        object.__setattr__(
+            self,
+            "action_by_role",
+            MappingProxyType(dict(sorted(actions.items()))),
+        )
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=(
+                    MUJOCO_POLICY_HUMAN_ALLOCATION_DERIVATION_HASH_DOMAIN_DEVELOPMENT
+                ),
+            ),
+        )
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.action_by_role)
+
+    @property
+    def captured_anchor(self) -> bool:
+        return self.profile_step.status.startswith("anchor_captured")
 
 
 class MujocoPolicyHumanResidualInputAdapter:
@@ -260,14 +354,36 @@ class MujocoPolicyHumanResidualInputAdapter:
             raise RuntimeError(
                 "policy-baseline/human-residual profile is default-off."
             )
+        request = self.prepare_anchor_request(
+            activation_scope,
+            requested_at=requested_at,
+        )
+        self.commit_anchor_request(request)
+        return request
+
+    def prepare_anchor_request(
+        self,
+        activation_scope: CompositionActivationScope,
+        *,
+        requested_at: float,
+    ) -> ResidualAnchorRequest:
+        """Build the next request without changing the active adapter state."""
+
+        if not self.config.enabled:
+            raise RuntimeError(
+                "policy-baseline/human-residual profile is default-off."
+            )
         with self._lock:
             previous = self._request
-            generation = (
-                0
-                if previous is None
-                else previous.request_generation + 1
-            )
-            request = ResidualAnchorRequest.for_activation(
+            if previous is not None and (
+                previous.composition_activation_id
+                != activation_scope.activation_id
+                or previous.composition_activation_hash
+                != activation_scope.semantic_content_hash
+            ):
+                previous = None
+            generation = 0 if previous is None else previous.request_generation + 1
+            return ResidualAnchorRequest.for_activation(
                 activation_scope,
                 request_generation=generation,
                 source_role=self.config.residual_role,
@@ -283,9 +399,43 @@ class MujocoPolicyHumanResidualInputAdapter:
                 requested_at=requested_at,
                 previous_request=previous,
             )
+
+    def commit_anchor_request(self, request: ResidualAnchorRequest) -> None:
+        """Activate one previously prepared request after external admission."""
+
+        if not isinstance(request, ResidualAnchorRequest):
+            raise TypeError("request must be ResidualAnchorRequest.")
+        with self._lock:
+            current = self._request
+            same_activation = bool(
+                current is not None
+                and current.composition_activation_id
+                == request.composition_activation_id
+                and current.composition_activation_hash
+                == request.composition_activation_hash
+            )
+            if same_activation:
+                assert current is not None
+                if (
+                    request.request_generation
+                    != current.request_generation + 1
+                    or request.previous_request_id != current.request_id
+                    or request.previous_request_hash
+                    != current.semantic_content_hash
+                ):
+                    raise ValueError(
+                        "Prepared residual anchor request is no longer the next "
+                        "generation."
+                    )
+            elif request.request_generation != 0 or (
+                request.previous_request_id is not None
+                or request.previous_request_hash is not None
+            ):
+                raise ValueError(
+                    "A new composition activation must start anchor generation zero."
+                )
             self._request = request
             self._anchor = None
-            return request
 
     def process_absolute_action(
         self,
@@ -328,8 +478,18 @@ class MujocoPolicyHumanResidualInputAdapter:
                     captured_at=observed,
                 )
                 self._anchor = anchor
+                result = self.adapter.adapt(
+                    absolute_action,
+                    anchor=anchor,
+                    source_action_id=source_action_id,
+                    source_action_hash=source_action_hash,
+                    measured_at=measured_at,
+                    measured_clock_domain_id=measured_clock_domain_id,
+                    adapted_at=observed,
+                    adapted_clock_domain_id=observed_clock,
+                )
                 return MujocoPolicyHumanResidualProfileStep(
-                    status="anchor_captured",
+                    status="anchor_captured_relative_action_ready",
                     source_action_id=source_action_id,
                     source_action_hash=source_action_hash,
                     anchor_request_id=request.request_id,
@@ -338,7 +498,7 @@ class MujocoPolicyHumanResidualInputAdapter:
                     anchor_receipt_hash=(
                         anchor.receipt.semantic_content_hash
                     ),
-                    relative_result=None,
+                    relative_result=result,
                     occurred_at=observed,
                     clock_domain_id=observed_clock,
                 )
@@ -392,6 +552,37 @@ class MujocoPolicyHumanResidualInputAdapter:
             observed_clock_domain_id=observed_clock_domain_id,
         )
 
+    def derive_allocation_actions(
+        self,
+        absolute_action: ComponentAction,
+        *,
+        source_action_id: str,
+        source_action_hash: str,
+        source_available_at: float,
+        measured_at: float,
+        measured_clock_domain_id: str,
+        observed_at: float,
+        observed_clock_domain_id: str,
+    ) -> MujocoPolicyHumanAllocationDerivation:
+        """Derive fixed absolute/residual roles without runtime role switching."""
+
+        step = self.process_absolute_action(
+            absolute_action,
+            source_action_id=source_action_id,
+            source_action_hash=source_action_hash,
+            source_available_at=source_available_at,
+            measured_at=measured_at,
+            measured_clock_domain_id=measured_clock_domain_id,
+            observed_at=observed_at,
+            observed_clock_domain_id=observed_clock_domain_id,
+        )
+        return MujocoPolicyHumanAllocationDerivation(
+            profile_step=step,
+            absolute_action=absolute_action,
+            absolute_overlay_role=self.config.absolute_overlay_role,
+            residual_role=self.config.residual_role,
+        )
+
 
 @dataclass(frozen=True)
 class MujocoPolicyHumanResidualProfileBundle:
@@ -423,6 +614,73 @@ class MujocoPolicyHumanResidualProfileBundle:
                 ),
             }
         )
+
+
+@dataclass(frozen=True)
+class MujocoPolicyHumanResidualInputContracts:
+    """Residual input transform only, without authority or safety contracts."""
+
+    config: MujocoPolicyHumanResidualProfileConfig
+    relative_action_schema: ComponentActionSchema
+    residual_adapter: HumanComponentResidualAdapter = field(
+        repr=False,
+        compare=False,
+    )
+    input_adapter: MujocoPolicyHumanResidualInputAdapter = field(
+        repr=False,
+        compare=False,
+    )
+
+
+def build_mujoco_policy_human_residual_input_contracts(
+    *,
+    absolute_action_schema: ComponentActionSchema,
+    frame_graph: CoordinateFrameGraph,
+    concrete_reference_frame_by_component: Mapping[str, str],
+    concrete_controlled_frame_by_component: Mapping[str, str],
+    source_binding_id: str,
+    source_binding_hash: str,
+    config: MujocoPolicyHumanResidualProfileConfig,
+    pose_translation_gain_by_component: Mapping[str, object] | None = None,
+    joint_gain_by_component: Mapping[str, object] | None = None,
+) -> MujocoPolicyHumanResidualInputContracts:
+    """Build only canonical absolute-to-relative input transformation."""
+
+    if not isinstance(config, MujocoPolicyHumanResidualProfileConfig):
+        raise TypeError("config must be MujocoPolicyHumanResidualProfileConfig.")
+    relative_schema = build_relative_delta_action_schema(
+        absolute_action_schema,
+        schema_id=f"{config.profile_id}.human-residual-action",
+        schema_version="development",
+        catalog_id=f"{config.profile_id}.human-residual-components",
+    )
+    residual_adapter = HumanComponentResidualAdapter(
+        absolute_action_schema=absolute_action_schema,
+        relative_action_schema=relative_schema,
+        source_binding_id=source_binding_id,
+        source_binding_hash=source_binding_hash,
+        frame_graph=frame_graph,
+        concrete_reference_frame_by_component=(
+            concrete_reference_frame_by_component
+        ),
+        concrete_controlled_frame_by_component=(
+            concrete_controlled_frame_by_component
+        ),
+        pose_translation_gain_by_component=(
+            pose_translation_gain_by_component
+        ),
+        joint_gain_by_component=joint_gain_by_component,
+    )
+    input_adapter = MujocoPolicyHumanResidualInputAdapter(
+        config=config,
+        adapter=residual_adapter,
+    )
+    return MujocoPolicyHumanResidualInputContracts(
+        config=config,
+        relative_action_schema=relative_schema,
+        residual_adapter=residual_adapter,
+        input_adapter=input_adapter,
+    )
 
 
 def build_mujoco_policy_human_residual_source_binding_hash(
@@ -473,12 +731,24 @@ def build_mujoco_policy_human_residual_profile(
     """Build the concrete profile without enabling or starting any runtime."""
 
     profile = config or MujocoPolicyHumanResidualProfileConfig()
-    relative_schema = build_relative_delta_action_schema(
-        absolute_action_schema,
-        schema_id=f"{profile.profile_id}.human-residual-action",
-        schema_version="development",
-        catalog_id=f"{profile.profile_id}.human-residual-components",
+    input_contracts = build_mujoco_policy_human_residual_input_contracts(
+        absolute_action_schema=absolute_action_schema,
+        frame_graph=frame_graph,
+        concrete_reference_frame_by_component=(
+            concrete_reference_frame_by_component
+        ),
+        concrete_controlled_frame_by_component=(
+            concrete_controlled_frame_by_component
+        ),
+        source_binding_id=source_binding_id,
+        source_binding_hash=source_binding_hash,
+        config=profile,
+        pose_translation_gain_by_component=(
+            pose_translation_gain_by_component
+        ),
+        joint_gain_by_component=joint_gain_by_component,
     )
+    relative_schema = input_contracts.relative_action_schema
     required_roles = (
         (profile.baseline_role, profile.residual_role)
         if profile.require_residual_role
@@ -545,44 +815,27 @@ def build_mujoco_policy_human_residual_profile(
         authority_profile=authority_profile,
         authority_gate_spec=gate,
     )
-    residual_adapter = HumanComponentResidualAdapter(
-        absolute_action_schema=absolute_action_schema,
-        relative_action_schema=relative_schema,
-        source_binding_id=source_binding_id,
-        source_binding_hash=source_binding_hash,
-        frame_graph=frame_graph,
-        concrete_reference_frame_by_component=(
-            concrete_reference_frame_by_component
-        ),
-        concrete_controlled_frame_by_component=(
-            concrete_controlled_frame_by_component
-        ),
-        pose_translation_gain_by_component=(
-            pose_translation_gain_by_component
-        ),
-        joint_gain_by_component=joint_gain_by_component,
-    )
-    input_adapter = MujocoPolicyHumanResidualInputAdapter(
-        config=profile,
-        adapter=residual_adapter,
-    )
     return MujocoPolicyHumanResidualProfileBundle(
         config=profile,
         relative_contracts=relative_contracts,
         sim_hil_contracts=sim_contracts,
-        residual_adapter=residual_adapter,
-        input_adapter=input_adapter,
+        residual_adapter=input_contracts.residual_adapter,
+        input_adapter=input_contracts.input_adapter,
     )
 
 
 __all__ = [
+    "MUJOCO_POLICY_HUMAN_ALLOCATION_DERIVATION_HASH_DOMAIN_DEVELOPMENT",
     "MUJOCO_POLICY_HUMAN_RESIDUAL_PROFILE_ID_DEVELOPMENT",
     "MUJOCO_POLICY_HUMAN_RESIDUAL_SOURCE_BINDING_HASH_DOMAIN_DEVELOPMENT",
     "MUJOCO_POLICY_HUMAN_RESIDUAL_STEP_HASH_DOMAIN_DEVELOPMENT",
     "MujocoPolicyHumanResidualInputAdapter",
+    "MujocoPolicyHumanResidualInputContracts",
+    "MujocoPolicyHumanAllocationDerivation",
     "MujocoPolicyHumanResidualProfileBundle",
     "MujocoPolicyHumanResidualProfileConfig",
     "MujocoPolicyHumanResidualProfileStep",
     "build_mujoco_policy_human_residual_profile",
+    "build_mujoco_policy_human_residual_input_contracts",
     "build_mujoco_policy_human_residual_source_binding_hash",
 ]

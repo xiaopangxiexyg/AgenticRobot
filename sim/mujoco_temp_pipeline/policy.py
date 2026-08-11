@@ -35,6 +35,8 @@ class ActorCritic(nn.Module):
         proprio_dim: int | None = None,
         image_shape: Sequence[int] | None = None,
         image_pool_size: int = 1,
+        critic_observation_dim: int | None = None,
+        separate_critic_backbone: bool = False,
         environment_action_dim: int | None = None,
         active_action_indices: Sequence[int] | None = None,
         trainable_log_std: bool = True,
@@ -44,6 +46,15 @@ class ActorCritic(nn.Module):
         self.observation_dim = int(observation_dim)
         self.action_dim = int(action_dim)
         self.hidden_dim = int(hidden_dim)
+        self.critic_observation_dim = (
+            self.observation_dim
+            if critic_observation_dim is None
+            else int(critic_observation_dim)
+        )
+        self.separate_critic_backbone = bool(
+            separate_critic_backbone
+            or self.critic_observation_dim != self.observation_dim
+        )
         self.environment_action_dim = (
             self.action_dim
             if environment_action_dim is None
@@ -54,8 +65,15 @@ class ActorCritic(nn.Module):
             if active_action_indices is None
             else tuple(int(value) for value in active_action_indices)
         )
-        if self.action_dim <= 0 or self.environment_action_dim <= 0:
-            raise ValueError("Policy and environment action dimensions must be positive.")
+        if (
+            self.action_dim <= 0
+            or self.environment_action_dim <= 0
+            or self.critic_observation_dim <= 0
+        ):
+            raise ValueError(
+                "Policy, critic observation, and environment action dimensions "
+                "must be positive."
+            )
         if len(self.active_action_indices) != self.action_dim:
             raise ValueError(
                 "active_action_indices length must match the policy action dimension."
@@ -128,6 +146,20 @@ class ActorCritic(nn.Module):
                 nn.Linear(self.hidden_dim, self.hidden_dim),
                 nn.Tanh(),
             )
+        # Same-observation actor/critic training shares this representation by
+        # default for sample efficiency and checkpoint compatibility. A
+        # different critic observation (the optional privileged training
+        # state), or an explicit isolation ablation, uses a separate encoder.
+        self.critic_backbone = (
+            None
+            if not self.separate_critic_backbone
+            else nn.Sequential(
+                nn.Linear(self.critic_observation_dim, self.hidden_dim),
+                nn.Tanh(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.Tanh(),
+            )
+        )
         self.actor_mean = nn.Linear(self.hidden_dim, self.action_dim)
         self.critic = nn.Linear(self.hidden_dim, 1)
         self.log_std = nn.Parameter(
@@ -151,6 +183,11 @@ class ActorCritic(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def _features(self, observation: torch.Tensor) -> torch.Tensor:
+        """Compatibility alias for deployable actor features."""
+
+        return self._actor_features(observation)
+
+    def _actor_features(self, observation: torch.Tensor) -> torch.Tensor:
         if observation.shape[-1] != self.observation_dim:
             raise ValueError(
                 f"Expected observation dim {self.observation_dim}, got {observation.shape}."
@@ -167,13 +204,48 @@ class ActorCritic(nn.Module):
         features = self.backbone(combined)
         return features.reshape(*leading_shape, self.hidden_dim)
 
-    def _distribution_and_value(
-        self, observation: torch.Tensor
-    ) -> tuple[Normal, torch.Tensor]:
-        features = self._features(observation)
+    def _critic_features(
+        self,
+        actor_features: torch.Tensor,
+        actor_observation: torch.Tensor,
+        critic_observation: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.critic_backbone is None:
+            return actor_features
+        if critic_observation is None:
+            if self.critic_observation_dim != self.observation_dim:
+                raise ValueError(
+                    "This policy uses an asymmetric critic; privileged critic "
+                    "observation is required only for value evaluation/training."
+                )
+            critic_observation = actor_observation
+        if critic_observation.shape[-1] != self.critic_observation_dim:
+            raise ValueError(
+                "Expected critic observation dim "
+                f"{self.critic_observation_dim}, got {critic_observation.shape}."
+            )
+        return self.critic_backbone(critic_observation)
+
+    def _distribution(self, observation: torch.Tensor) -> Normal:
+        features = self._actor_features(observation)
         mean = self.actor_mean(features)
         std = torch.exp(torch.clamp(self.log_std, -5.0, 1.0)).expand_as(mean)
-        return Normal(mean, std), self.critic(features).squeeze(-1)
+        return Normal(mean, std)
+
+    def _distribution_and_value(
+        self,
+        observation: torch.Tensor,
+        critic_observation: torch.Tensor | None = None,
+    ) -> tuple[Normal, torch.Tensor]:
+        actor_features = self._actor_features(observation)
+        mean = self.actor_mean(actor_features)
+        std = torch.exp(torch.clamp(self.log_std, -5.0, 1.0)).expand_as(mean)
+        critic_features = self._critic_features(
+            actor_features,
+            observation,
+            critic_observation,
+        )
+        return Normal(mean, std), self.critic(critic_features).squeeze(-1)
 
     @staticmethod
     def _squashed_log_prob(
@@ -189,15 +261,33 @@ class ActorCritic(nn.Module):
         observation: torch.Tensor,
         *,
         deterministic: bool = False,
+        critic_observation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        distribution, value = self._distribution_and_value(observation)
+        distribution, value = self._distribution_and_value(
+            observation,
+            critic_observation,
+        )
         pre_tanh = distribution.mean if deterministic else distribution.rsample()
         action = torch.tanh(pre_tanh)
         log_prob = self._squashed_log_prob(distribution, pre_tanh, action)
         return action, log_prob, value
 
+    def predict_action(
+        self,
+        observation: torch.Tensor,
+        *,
+        deterministic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the deployable actor without constructing a critic input."""
+
+        distribution = self._distribution(observation)
+        pre_tanh = distribution.mean if deterministic else distribution.rsample()
+        action = torch.tanh(pre_tanh)
+        log_prob = self._squashed_log_prob(distribution, pre_tanh, action)
+        return action, log_prob
+
     def expand_action(self, action: torch.Tensor) -> torch.Tensor:
-        """Expand compact learned actions into the environment's public layout."""
+        """Compatibility helper; task runtimes should use their named transform."""
 
         if action.shape[-1] != self.action_dim:
             raise ValueError(
@@ -216,12 +306,44 @@ class ActorCritic(nn.Module):
         expanded[..., list(self.active_action_indices)] = action
         return expanded
 
+    def actor_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return the deployable actor parameter group without duplicates."""
+
+        modules: tuple[nn.Module | None, ...] = (
+            self.proprio_encoder,
+            self.image_encoder,
+            self.backbone,
+            self.actor_mean,
+        )
+        parameters = [
+            parameter
+            for module in modules
+            if module is not None
+            for parameter in module.parameters()
+        ]
+        parameters.append(self.log_std)
+        return tuple(parameter for parameter in parameters if parameter.requires_grad)
+
+    def critic_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return parameters owned exclusively by a separate critic."""
+
+        if self.critic_backbone is None:
+            return tuple(self.critic.parameters())
+        return tuple(self.critic_backbone.parameters()) + tuple(
+            self.critic.parameters()
+        )
+
     def evaluate_actions(
         self,
         observation: torch.Tensor,
         action: torch.Tensor,
+        *,
+        critic_observation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        distribution, value = self._distribution_and_value(observation)
+        distribution, value = self._distribution_and_value(
+            observation,
+            critic_observation,
+        )
         bounded = torch.clamp(action, -1.0 + LOG_PROB_EPS, 1.0 - LOG_PROB_EPS)
         pre_tanh = torch.atanh(bounded)
         log_prob = self._squashed_log_prob(distribution, pre_tanh, bounded)
@@ -230,9 +352,19 @@ class ActorCritic(nn.Module):
         entropy = distribution.entropy().sum(dim=-1)
         return log_prob, entropy, value
 
-    def value(self, observation: torch.Tensor) -> torch.Tensor:
-        _distribution, value = self._distribution_and_value(observation)
-        return value
+    def value(
+        self,
+        observation: torch.Tensor,
+        *,
+        critic_observation: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        actor_features = self._actor_features(observation)
+        critic_features = self._critic_features(
+            actor_features,
+            observation,
+            critic_observation,
+        )
+        return self.critic(critic_features).squeeze(-1)
 
     def reset_critic(self) -> None:
         """Reset only the value head after a task-contract change.
@@ -244,6 +376,8 @@ class ActorCritic(nn.Module):
         checkpoint before the new task has been fit.
         """
 
+        if self.critic_backbone is not None:
+            self.critic_backbone.apply(self._initialize_layer)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.zeros_(self.critic.bias)
 

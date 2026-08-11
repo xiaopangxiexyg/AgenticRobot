@@ -45,10 +45,25 @@ SIM_HIL_HUMAN_TIMEOUT_FALLBACKS_V1 = (
     "hold",
     "policy",
 )
+SIM_HIL_ALLOCATION_MODES_DEVELOPMENT = (
+    "automatic",
+    "base_only",
+    "relative_overlay",
+    "absolute_overlay_owner",
+)
 SIM_HIL_ACCEPTANCE_TRACE_RUNTIME_CAPACITY_V1 = 524_288
+STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1 = (
+    "dexteleop.station_control_trace_terminal_receipt.v1"
+)
+STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1 = (
+    "dexteleop.station_control_trace_finalization.v1"
+)
 SIM_HIL_ACCEPTANCE_INTENT_KINDS_V1 = (
     "start_runtime",
+    "start_allocation_runtime",
     "set_control_mode",
+    "set_allocation_mode",
+    "request_residual_rebase_and_clear",
     "set_blend_failure_fallback",
     "set_human_timeout_fallback",
     "start_stage",
@@ -102,8 +117,10 @@ class SimHILAcceptanceIntent:
     intent_kind: str
     stage_id: str | None = None
     control_mode: str | None = None
+    allocation_mode: str | None = None
     human_alpha: float | None = None
     fallback_source: str | None = None
+    blend_failure_grace_sec: float | None = None
     profile_name: str | None = None
     reason: str = "operator_request"
 
@@ -122,6 +139,7 @@ class SimHILAcceptanceIntent:
             raise ValueError(f"Unsupported acceptance intent: {intent_kind}.")
         stage_id = _optional(self.stage_id)
         control_mode = _optional(self.control_mode)
+        allocation_mode = _optional(self.allocation_mode)
         if intent_kind in {"start_stage", "confirm_stage"}:
             if stage_id not in SIM_HIL_ACCEPTANCE_STAGES_V1:
                 raise ValueError(
@@ -140,6 +158,16 @@ class SimHILAcceptanceIntent:
         elif control_mode is not None:
             raise ValueError(
                 f"{intent_kind} must not carry control_mode."
+            )
+        if intent_kind == "set_allocation_mode":
+            if allocation_mode not in SIM_HIL_ALLOCATION_MODES_DEVELOPMENT:
+                raise ValueError(
+                    "set_allocation_mode requires automatic, base_only, "
+                    "relative_overlay, or absolute_overlay_owner."
+                )
+        elif allocation_mode is not None:
+            raise ValueError(
+                f"{intent_kind} must not carry allocation_mode."
             )
         alpha = self.human_alpha
         if alpha is not None:
@@ -183,6 +211,24 @@ class SimHILAcceptanceIntent:
                 "fallback_source is only valid for "
                 "a fallback-selection intent."
             )
+        blend_failure_grace = self.blend_failure_grace_sec
+        if blend_failure_grace is not None:
+            blend_failure_grace = float(blend_failure_grace)
+            if (
+                not math.isfinite(blend_failure_grace)
+                or blend_failure_grace < 0.0
+            ):
+                raise ValueError(
+                    "blend_failure_grace_sec must be finite and non-negative."
+                )
+        if (
+            intent_kind != "set_blend_failure_fallback"
+            and blend_failure_grace is not None
+        ):
+            raise ValueError(
+                "blend_failure_grace_sec is only valid for "
+                "set_blend_failure_fallback."
+            )
         profile_name = _optional(self.profile_name)
         if intent_kind == "save_vive_calibration_profile":
             pass
@@ -196,8 +242,14 @@ class SimHILAcceptanceIntent:
         object.__setattr__(self, "intent_kind", intent_kind)
         object.__setattr__(self, "stage_id", stage_id)
         object.__setattr__(self, "control_mode", control_mode)
+        object.__setattr__(self, "allocation_mode", allocation_mode)
         object.__setattr__(self, "human_alpha", alpha)
         object.__setattr__(self, "fallback_source", fallback_source)
+        object.__setattr__(
+            self,
+            "blend_failure_grace_sec",
+            blend_failure_grace,
+        )
         object.__setattr__(self, "profile_name", profile_name)
         object.__setattr__(
             self,
@@ -207,20 +259,29 @@ class SimHILAcceptanceIntent:
 
     @property
     def intent_id(self) -> str:
+        payload = {
+            "schema": SIM_HIL_ACCEPTANCE_INTENT_SCHEMA_V1,
+            "client_id": self.client_id,
+            "client_sequence": self.client_sequence,
+            "expected_revision": self.expected_revision,
+            "intent_kind": self.intent_kind,
+            "stage_id": self.stage_id,
+            "control_mode": self.control_mode,
+            "human_alpha": self.human_alpha,
+            "fallback_source": self.fallback_source,
+            "profile_name": self.profile_name,
+            "reason": self.reason,
+        }
+        # Keep existing fixed-alpha intent identities byte-for-byte stable.
+        # The development allocation field enters the identity only when used.
+        if self.allocation_mode is not None:
+            payload["allocation_mode"] = self.allocation_mode
+        if self.blend_failure_grace_sec is not None:
+            payload["blend_failure_grace_sec"] = (
+                self.blend_failure_grace_sec
+            )
         return "sim-hil-acceptance-intent:" + canonical_content_hash(
-            {
-                "schema": SIM_HIL_ACCEPTANCE_INTENT_SCHEMA_V1,
-                "client_id": self.client_id,
-                "client_sequence": self.client_sequence,
-                "expected_revision": self.expected_revision,
-                "intent_kind": self.intent_kind,
-                "stage_id": self.stage_id,
-                "control_mode": self.control_mode,
-                "human_alpha": self.human_alpha,
-                "fallback_source": self.fallback_source,
-                "profile_name": self.profile_name,
-                "reason": self.reason,
-            },
+            payload,
             domain=SIM_HIL_ACCEPTANCE_INTENT_HASH_DOMAIN_V1,
         )
 
@@ -239,8 +300,10 @@ def sim_hil_acceptance_intent_from_json(
         "intent_kind",
         "stage_id",
         "control_mode",
+        "allocation_mode",
         "human_alpha",
         "fallback_source",
+        "blend_failure_grace_sec",
         "profile_name",
         "reason",
     }
@@ -263,8 +326,10 @@ def sim_hil_acceptance_intent_from_json(
         intent_kind=payload["intent_kind"],
         stage_id=payload.get("stage_id"),
         control_mode=payload.get("control_mode"),
+        allocation_mode=payload.get("allocation_mode"),
         human_alpha=payload.get("human_alpha"),
         fallback_source=payload.get("fallback_source"),
+        blend_failure_grace_sec=payload.get("blend_failure_grace_sec"),
         profile_name=payload.get("profile_name"),
         reason=payload.get("reason", "operator_request"),
     )
@@ -288,8 +353,121 @@ class SimHILAcceptanceSubmissionReceipt:
         }
 
 
-class SimHILAcceptanceTraceCapture:
-    """Concrete binding to the lower-owned ControlTrace episode lifecycle."""
+@dataclass(frozen=True)
+class StationControlTraceFinalizationReceipt:
+    """Durable lower-owned references after episode commit and runtime close.
+
+    The runtime terminal must be admitted after the formal episode is unbound:
+    the episode seal intentionally excludes ``runtime_trace_terminal`` from its
+    range.  This receipt therefore joins, but never fabricates, the committed
+    episode metadata and the later durable terminal record.
+    """
+
+    trace_session_id: str
+    runtime_session_id: str
+    control_domain_id: str
+    episode_uuid: str
+    terminal_fact_id: str
+    terminal_fact_hash: str
+    terminal_journal_sequence: int
+    terminal_record_integrity_hash: str
+    trace_seal_hash: str
+    trace_commit_hash: str
+    trace_commit_relative_path: str
+    trace_terminal_receipt_ref: str = ""
+    trace_commit_receipt_ref: str = ""
+    semantic_content_hash: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "trace_session_id",
+            "runtime_session_id",
+            "control_domain_id",
+            "episode_uuid",
+            "terminal_fact_id",
+            "terminal_fact_hash",
+            "terminal_record_integrity_hash",
+            "trace_seal_hash",
+            "trace_commit_hash",
+            "trace_commit_relative_path",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), name=field_name),
+            )
+        sequence = int(self.terminal_journal_sequence)
+        if (
+            isinstance(self.terminal_journal_sequence, bool)
+            or sequence <= 0
+            or sequence != self.terminal_journal_sequence
+        ):
+            raise ValueError("terminal_journal_sequence must be a positive integer.")
+        object.__setattr__(self, "terminal_journal_sequence", sequence)
+        terminal_payload = {
+            "trace_session_id": self.trace_session_id,
+            "runtime_session_id": self.runtime_session_id,
+            "control_domain_id": self.control_domain_id,
+            "terminal_fact_id": self.terminal_fact_id,
+            "terminal_fact_hash": self.terminal_fact_hash,
+            "terminal_journal_sequence": sequence,
+            "terminal_record_integrity_hash": (
+                self.terminal_record_integrity_hash
+            ),
+        }
+        terminal_ref = (
+            "control-trace-terminal-durable:"
+            + canonical_content_hash(
+                terminal_payload,
+                domain=(
+                    STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1
+                ),
+            )
+        )
+        commit_ref = f"control-trace-capture-commit:{self.trace_commit_hash}"
+        payload = {
+            **terminal_payload,
+            "episode_uuid": self.episode_uuid,
+            "trace_seal_hash": self.trace_seal_hash,
+            "trace_commit_hash": self.trace_commit_hash,
+            "trace_commit_relative_path": self.trace_commit_relative_path,
+            "trace_terminal_receipt_ref": terminal_ref,
+            "trace_commit_receipt_ref": commit_ref,
+        }
+        object.__setattr__(self, "trace_terminal_receipt_ref", terminal_ref)
+        object.__setattr__(self, "trace_commit_receipt_ref", commit_ref)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1,
+            ),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "trace_session_id": self.trace_session_id,
+            "runtime_session_id": self.runtime_session_id,
+            "control_domain_id": self.control_domain_id,
+            "episode_uuid": self.episode_uuid,
+            "terminal_fact_id": self.terminal_fact_id,
+            "terminal_fact_hash": self.terminal_fact_hash,
+            "terminal_journal_sequence": self.terminal_journal_sequence,
+            "terminal_record_integrity_hash": (
+                self.terminal_record_integrity_hash
+            ),
+            "trace_seal_hash": self.trace_seal_hash,
+            "trace_commit_hash": self.trace_commit_hash,
+            "trace_commit_relative_path": self.trace_commit_relative_path,
+            "trace_terminal_receipt_ref": self.trace_terminal_receipt_ref,
+            "trace_commit_receipt_ref": self.trace_commit_receipt_ref,
+            "semantic_content_hash": self.semantic_content_hash,
+        }
+
+
+class StationControlTraceEpisodeSessionCapture:
+    """Concrete binding to one lower-owned durable ControlTrace session."""
 
     def __init__(
         self,
@@ -300,6 +478,15 @@ class SimHILAcceptanceTraceCapture:
         runtime_capacity: int = (
             SIM_HIL_ACCEPTANCE_TRACE_RUNTIME_CAPACITY_V1
         ),
+        runtime_session_id: str = "control-station-sim-hil-ppo-session",
+        control_domain_id: str = "mujoco-sim-hil",
+        trace_requirement_profile_id: str = (
+            "deployable_sim_immediate_component_policy_human_composer_v1"
+        ),
+        clock_domain_id: str = "mujoco.sim_hil.monotonic",
+        capture_purpose: str = "sim_hil_acceptance",
+        legacy_episode_index: int = 0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -307,6 +494,37 @@ class SimHILAcceptanceTraceCapture:
         self._runtime_capacity = int(runtime_capacity)
         if self._runtime_capacity <= 0:
             raise ValueError("runtime_capacity must be positive.")
+        self._runtime_session_id = _required(
+            runtime_session_id,
+            name="runtime_session_id",
+        )
+        self._control_domain_id = _required(
+            control_domain_id,
+            name="control_domain_id",
+        )
+        self._trace_requirement_profile_id = _required(
+            trace_requirement_profile_id,
+            name="trace_requirement_profile_id",
+        )
+        self._clock_domain_id = _required(
+            clock_domain_id,
+            name="clock_domain_id",
+        )
+        self._capture_purpose = _required(
+            capture_purpose,
+            name="capture_purpose",
+        )
+        episode_index = int(legacy_episode_index)
+        if (
+            isinstance(legacy_episode_index, bool)
+            or episode_index < 0
+            or episode_index != legacy_episode_index
+        ):
+            raise ValueError("legacy_episode_index must be a non-negative integer.")
+        if not callable(clock):
+            raise TypeError("clock must be callable.")
+        self._legacy_episode_index = episode_index
+        self._clock = clock
         self._lock = threading.RLock()
         self._open_session(trace_session_id=trace_session_id)
 
@@ -331,21 +549,27 @@ class SimHILAcceptanceTraceCapture:
         session_id = (
             str(trace_session_id).strip()
             if trace_session_id is not None
-            else "sim-hil-acceptance-" + uuid.uuid4().hex
+            else self._capture_purpose.replace("_", "-") + "-" + uuid.uuid4().hex
         )
         if not session_id:
             raise ValueError("trace_session_id must be non-empty.")
-        profile = TRACE_REQUIREMENT_PROFILES_V1[
-            "deployable_sim_immediate_component_policy_human_composer_v1"
-        ]
+        try:
+            profile = TRACE_REQUIREMENT_PROFILES_V1[
+                self._trace_requirement_profile_id
+            ]
+        except KeyError as error:
+            raise ValueError(
+                "Unknown ControlTrace requirement profile: "
+                f"{self._trace_requirement_profile_id!r}."
+            ) from error
         self.trace_runtime = ControlTraceRuntime(
             RuntimeTraceSession(
                 trace_session_id=session_id,
-                runtime_session_id="control-station-sim-hil-ppo-session",
-                control_domain_id="mujoco-sim-hil",
+                runtime_session_id=self._runtime_session_id,
+                control_domain_id=self._control_domain_id,
                 profile_id=profile.profile_id,
-                started_at=time.monotonic(),
-                clock_domain_id="mujoco.sim_hil.monotonic",
+                started_at=float(self._clock()),
+                clock_domain_id=self._clock_domain_id,
             ),
             profile=profile,
             capacity=self._runtime_capacity,
@@ -377,7 +601,7 @@ class SimHILAcceptanceTraceCapture:
         self.spool_worker = ControlTraceSpoolWorker(
             self.durable_sink,
             poll_interval_sec=0.01,
-            thread_name=f"sim-hil-trace-{session_id}",
+            thread_name=f"station-trace-{session_id}",
         )
         self.spool_worker.start()
         self._dependency_sequences: tuple[int, ...] = ()
@@ -392,6 +616,9 @@ class SimHILAcceptanceTraceCapture:
         )
         self._prepared: Any | None = None
         self._final_report: Any | None = None
+        self._runtime_finalization: (
+            StationControlTraceFinalizationReceipt | None
+        ) = None
         self._admission_failure: str | None = None
         self._closed = False
 
@@ -412,7 +639,7 @@ class SimHILAcceptanceTraceCapture:
         receipt = self.trace_runtime.issue(fact)
         if not receipt.accepted:
             failure = (
-                "Sim-HIL acceptance trace admission failed: "
+                "Station ControlTrace admission failed: "
                 f"{receipt.rejection_code}:{receipt.message}"
             )
             with self._lock:
@@ -428,9 +655,9 @@ class SimHILAcceptanceTraceCapture:
             if self._prepared is not None:
                 return self.status()
             if self._final_report is not None:
-                raise RuntimeError("Acceptance capture was already finalized.")
+                raise RuntimeError("ControlTrace episode was already finalized.")
             prepared = self.recorder.prepare_episode(
-                legacy_episode_index=0,
+                legacy_episode_index=self._legacy_episode_index,
                 prepared_at=float(now),
             )
             # Publish the subordinate preparation before binding so every
@@ -467,7 +694,7 @@ class SimHILAcceptanceTraceCapture:
                         self.recorder.release_episode(
                             prepared,
                             unbound_at=float(now),
-                            reason="sim_hil_acceptance_bind_failed",
+                            reason=f"{self._capture_purpose}_bind_failed",
                         )
                     else:
                         cancel_prepared = getattr(
@@ -500,11 +727,11 @@ class SimHILAcceptanceTraceCapture:
         with self._lock:
             prepared = self._prepared
             if prepared is None:
-                raise RuntimeError("Acceptance capture is not prepared.")
+                raise RuntimeError("ControlTrace episode is not prepared.")
             released = self.recorder.release_episode(
                 prepared,
                 unbound_at=float(now),
-                reason="sim_hil_acceptance_finalize",
+                reason=f"{self._capture_purpose}_finalize",
             )
             finalized = self.recorder.legacy_finalize_completed(
                 released,
@@ -515,10 +742,88 @@ class SimHILAcceptanceTraceCapture:
             self._final_report = finalized
             if finalized.capture_commit_status != "committed":
                 raise RuntimeError(
-                    "Acceptance ControlTrace did not commit: "
+                    "ControlTrace episode did not commit: "
                     f"{finalized.message}"
                 )
             return self.status()
+
+    def complete_runtime(self) -> StationControlTraceFinalizationReceipt:
+        """Join one durable commit with the later durable terminal fact.
+
+        The owning application must already be closed so its lower runtime has
+        emitted exactly one ``runtime_trace_terminal`` outside the episode.
+        """
+
+        with self._lock:
+            if self._runtime_finalization is not None:
+                return self._runtime_finalization
+            if self._prepared is not None:
+                raise RuntimeError(
+                    "Runtime finalization requires the episode to be unbound."
+                )
+            finalized = self._final_report
+            if finalized is None or finalized.capture_commit_status != "committed":
+                raise RuntimeError(
+                    "Runtime finalization requires a durable episode commit."
+                )
+            commit = finalized.capture_commit_candidate
+            publish_receipt = finalized.capture_commit_publish_receipt
+            if commit is None or publish_receipt is None:
+                raise RuntimeError("Committed trace is missing its commit receipt.")
+            if (
+                not bool(publish_receipt.durable)
+                or publish_receipt.semantic_content_hash
+                != commit.semantic_content_hash
+                or publish_receipt.episode_uuid != finalized.episode_uuid
+            ):
+                raise RuntimeError("ControlTrace commit publication receipt mismatch.")
+            flush_report = self.spool_worker.flush_once()
+            if flush_report.failure_code is not None:
+                raise RuntimeError(
+                    "ControlTrace terminal persistence failed: "
+                    f"{flush_report.failure_code}."
+                )
+            terminal_entries = tuple(
+                entry
+                for entry in self.trace_runtime.journal_entries()
+                if entry.fact.event_type == "runtime_trace_terminal"
+            )
+            if len(terminal_entries) != 1:
+                raise RuntimeError(
+                    "Runtime finalization requires exactly one terminal fact."
+                )
+            terminal_entry = terminal_entries[0]
+            if terminal_entry.episode_membership is not None:
+                raise RuntimeError(
+                    "Runtime terminal fact must be outside the formal episode."
+                )
+            snapshot = self.trace_runtime.snapshot()
+            if terminal_entry.journal_sequence not in snapshot.durable_sequences:
+                raise RuntimeError("Runtime terminal fact is not durable.")
+            records = {
+                record.journal_sequence: record
+                for record in self.trace_runtime.records()
+            }
+            terminal_record = records.get(terminal_entry.journal_sequence)
+            if terminal_record is None:
+                raise RuntimeError("Runtime terminal record is missing.")
+            receipt = StationControlTraceFinalizationReceipt(
+                trace_session_id=self.trace_runtime.session.trace_session_id,
+                runtime_session_id=self.trace_runtime.session.runtime_session_id,
+                control_domain_id=self.trace_runtime.session.control_domain_id,
+                episode_uuid=finalized.episode_uuid,
+                terminal_fact_id=terminal_entry.fact.fact_id,
+                terminal_fact_hash=terminal_entry.fact.semantic_content_hash,
+                terminal_journal_sequence=terminal_entry.journal_sequence,
+                terminal_record_integrity_hash=(
+                    terminal_record.record_integrity_hash
+                ),
+                trace_seal_hash=commit.trace_seal_hash,
+                trace_commit_hash=commit.semantic_content_hash,
+                trace_commit_relative_path=publish_receipt.relative_path,
+            )
+            self._runtime_finalization = receipt
+            return receipt
 
     def abort(self, *, now: float) -> None:
         with self._lock:
@@ -535,7 +840,7 @@ class SimHILAcceptanceTraceCapture:
                 self.recorder.release_episode(
                     prepared,
                     unbound_at=float(now),
-                    reason="sim_hil_acceptance_aborted",
+                    reason=f"{self._capture_purpose}_aborted",
                 )
             except RuntimeError as error:
                 # A bind can fail after ``prepare_episode`` but before the
@@ -594,6 +899,15 @@ class SimHILAcceptanceTraceCapture:
                 "trace_session_id": (
                     self.trace_runtime.session.trace_session_id
                 ),
+                "runtime_session_id": (
+                    self.trace_runtime.session.runtime_session_id
+                ),
+                "control_domain_id": (
+                    self.trace_runtime.session.control_domain_id
+                ),
+                "trace_requirement_profile_id": (
+                    self.trace_runtime.session.profile_id
+                ),
                 "session_root": str(self.session_root),
                 "episode_uuid": (
                     prepared.episode_uuid
@@ -609,6 +923,11 @@ class SimHILAcceptanceTraceCapture:
                     else finalized.capture_commit_status
                 ),
                 "message": message,
+                "runtime_finalization": (
+                    None
+                    if self._runtime_finalization is None
+                    else self._runtime_finalization.to_wire()
+                ),
                 "dependency_count": len(self._dependency_sequences),
                 "writer": {
                     "thread_alive": writer.thread_alive,
@@ -647,10 +966,19 @@ class SimHILAcceptanceTraceCapture:
             self._closed = True
 
 
+# Backward-compatible public name for the interactive acceptance controller.
+# New Agent Skill code uses the generic Station-owned name above and supplies
+# the exact fresh runtime/control-domain identity from its deployment binding.
+SimHILAcceptanceTraceCapture = StationControlTraceEpisodeSessionCapture
+
+
 class SimHILAcceptanceController:
     """Interactive Sim-HIL state owned by the Station control thread.
 
-    ``start_runtime`` constructs one formal session.  Afterwards
+    ``start_runtime`` constructs one fixed-alpha formal session.  The distinct
+    ``start_allocation_runtime`` intent constructs an allocation-aware session
+    without pretending that its initial state is a proportional blend.
+    Afterwards
     ``set_control_mode`` may select human-only, policy-only, or proportional
     blend in any order and any number of times.  The older staged intents
     remain temporarily accepted for migration but are not used by the formal
@@ -668,6 +996,7 @@ class SimHILAcceptanceController:
         vive_setup_controller: Any | None = None,
         vive_setup_factory: Callable[[str], Any] | None = None,
         coordinate_profile_path: str | Path | None = None,
+        allocation_runtime_enabled: bool = False,
     ) -> None:
         capacity = int(queue_capacity)
         if capacity <= 0:
@@ -690,10 +1019,23 @@ class SimHILAcceptanceController:
         self.application_factory = application_factory
         self._vive_setup_controller = vive_setup_controller
         self._vive_setup_factory = vive_setup_factory
-        self._coordinate_profile_path = (
+        requested_coordinate_profile_path = (
             None
             if coordinate_profile_path is None
             else Path(coordinate_profile_path).expanduser()
+        )
+        loaded_coordinate_profile_path = (
+            None
+            if vive_setup_controller is None
+            else getattr(vive_setup_controller, "current_profile_path", None)
+        )
+        # Freeze a symbolic ``latest`` selection to the exact validated file
+        # already loaded by the setup controller. GUI status and later runtime
+        # construction must not resolve two different files.
+        self._coordinate_profile_path = (
+            Path(loaded_coordinate_profile_path).expanduser()
+            if loaded_coordinate_profile_path is not None
+            else requested_coordinate_profile_path
         )
         self._selected_vive_source_role = "left_wrist"
         self._setup_phase = (
@@ -704,6 +1046,7 @@ class SimHILAcceptanceController:
         self._cancel_requested = threading.Event()
         self.trace_capture = trace_capture
         self.device_check_timeout_sec = timeout
+        self.allocation_runtime_enabled = bool(allocation_runtime_enabled)
         self.queue_capacity = capacity
         self._queue: deque[SimHILAcceptanceIntent] = deque()
         self._revision = 0
@@ -843,7 +1186,9 @@ class SimHILAcceptanceController:
         source = getattr(setup, "source", None)
         from types import SimpleNamespace
 
-        from control_station.sim_hil import _vive_receiver_status
+        from control_station.sim_hil_profile.status import (
+            _vive_receiver_status,
+        )
 
         return {
             "schema": "dexteleop.control_station.sim_hil_vive_status.v1",
@@ -1007,10 +1352,15 @@ class SimHILAcceptanceController:
         self,
         *,
         initial_human_alpha: float = 1.0,
+        human_required: bool | None = None,
     ) -> Any:
         setup_status = self._setup_snapshot()
-        human_required = float(initial_human_alpha) > 1e-12
-        if human_required and not bool(
+        requires_human = (
+            float(initial_human_alpha) > 1e-12
+            if human_required is None
+            else bool(human_required)
+        )
+        if requires_human and not bool(
             setup_status.get("runtime_launch_ready", False)
         ):
             raise RuntimeError(
@@ -1076,7 +1426,7 @@ class SimHILAcceptanceController:
                 )
         with self._lock:
             self._setup_phase = "vive_handoff"
-        if human_required:
+        if requires_human:
             try:
                 setup.close()
             except BaseException:
@@ -1089,7 +1439,7 @@ class SimHILAcceptanceController:
         with self._lock:
             self.application = application
             self._coordinate_profile_path = profile_path
-            if human_required:
+            if requires_human:
                 self._vive_setup_controller = None
                 self._setup_phase = "runtime_constructed"
             else:
@@ -1196,6 +1546,11 @@ class SimHILAcceptanceController:
         control_mode: str,
         human_alpha: float | None,
     ) -> dict[str, object]:
+        if self.allocation_runtime_enabled:
+            raise RuntimeError(
+                "Allocation-aware Sim-HIL does not accept fixed-alpha control "
+                "modes; use set_allocation_mode."
+            )
         application = self._require_application()
         application_status = application.status()
         if not bool(application_status.get("started", False)):
@@ -1445,11 +1800,54 @@ class SimHILAcceptanceController:
         self,
         intent: SimHILAcceptanceIntent,
     ) -> dict[str, object]:
+        if self.allocation_runtime_enabled:
+            raise RuntimeError(
+                "The selected allocation profile requires "
+                "start_allocation_runtime."
+            )
         control_mode = str(intent.control_mode)
         initial_alpha = self._control_mode_alpha(
             control_mode,
             requested_alpha=intent.human_alpha,
         )
+        return self._start_application_runtime(
+            intent,
+            initial_human_alpha=initial_alpha,
+            human_required=initial_alpha > 1e-12,
+            control_mode=control_mode,
+        )
+
+    def _start_allocation_runtime(
+        self,
+        intent: SimHILAcceptanceIntent,
+    ) -> dict[str, object]:
+        """Start an allocation profile without publishing fixed-alpha state."""
+
+        if not self.allocation_runtime_enabled:
+            raise RuntimeError(
+                "start_allocation_runtime requires an allocation-aware "
+                "application profile."
+            )
+        return self._start_application_runtime(
+            intent,
+            # Allocation profiles ignore this fixed-alpha compatibility
+            # field.  Zero selects deferred human construction only; the
+            # allocation context remains profile-owned and starts from the
+            # policy baseline while Human is absent.
+            initial_human_alpha=0.0,
+            human_required=False,
+            control_mode=None,
+        )
+
+    def _start_application_runtime(
+        self,
+        intent: SimHILAcceptanceIntent,
+        *,
+        initial_human_alpha: float,
+        human_required: bool,
+        control_mode: str | None,
+    ) -> dict[str, object]:
+        initial_alpha = float(initial_human_alpha)
         existing = self.current_application
         if existing is not None and bool(
             getattr(existing, "started", False)
@@ -1460,9 +1858,10 @@ class SimHILAcceptanceController:
             if existing is not None
             else self._construct_application_after_vive_setup(
                 initial_human_alpha=initial_alpha,
+                human_required=human_required,
             )
         )
-        if initial_alpha > 1e-12:
+        if human_required:
             if self.application_factory is None:
                 passive_input = (
                     application.run_human_input_acceptance_check(
@@ -1503,7 +1902,7 @@ class SimHILAcceptanceController:
         )
         if self.trace_capture is not None:
             self.trace_capture.prepare(now=application.clock())
-        if existing is None:
+        if existing is None and control_mode is not None:
             # Production constructs the composition contract with the selected
             # alpha. Startup readiness and first activation therefore use the
             # requested mode without a redundant post-start parameter update.
@@ -1517,13 +1916,20 @@ class SimHILAcceptanceController:
                 self._active_control_mode = control_mode
                 self._active_human_alpha = initial_alpha
                 self._control_mode_change_count += 1
-        else:
+        elif existing is not None and control_mode is not None:
             # Direct application injection is retained for lightweight tests
             # and compatibility callers whose contract already exists.
             mode = self._select_control_mode(
                 control_mode=control_mode,
                 human_alpha=intent.human_alpha,
             )
+        else:
+            mode = {
+                "control_profile_start": "allocation",
+                "human_input_required": bool(human_required),
+                "human_input_deferred": not bool(human_required),
+                "initial_allocation_mode": "automatic",
+            }
         with self._lock:
             self._formal_runtime_started = True
         return {
@@ -1825,7 +2231,10 @@ class SimHILAcceptanceController:
     ) -> dict[str, object]:
         if intent.intent_kind in {
             "start_runtime",
+            "start_allocation_runtime",
             "set_control_mode",
+            "set_allocation_mode",
+            "request_residual_rebase_and_clear",
             "start_stage",
             "confirm_stage",
             "rearm",
@@ -1877,6 +2286,8 @@ class SimHILAcceptanceController:
             }
         if intent.intent_kind == "start_runtime":
             return self._start_runtime(intent)
+        if intent.intent_kind == "start_allocation_runtime":
+            return self._start_allocation_runtime(intent)
         if intent.intent_kind == "set_control_mode":
             mode = self._select_control_mode(
                 control_mode=str(intent.control_mode),
@@ -1887,6 +2298,105 @@ class SimHILAcceptanceController:
                 "status": "mode_selected",
                 **mode,
             }
+        if intent.intent_kind in {
+            "set_allocation_mode",
+            "request_residual_rebase_and_clear",
+        }:
+            from control_station.composition.mujoco_policy_human_allocation_operations import (
+                MUJOCO_ALLOCATION_SIGNAL_ABSOLUTE_OVERLAY_OWNER,
+                MUJOCO_ALLOCATION_SIGNAL_AUTOMATIC,
+                MUJOCO_ALLOCATION_SIGNAL_BASE_ONLY,
+                MUJOCO_ALLOCATION_SIGNAL_REBASE_AND_CLEAR,
+                MUJOCO_ALLOCATION_SIGNAL_RELATIVE_OVERLAY,
+            )
+
+            application = self._require_application()
+            requested_mode = (
+                None
+                if intent.intent_kind == "request_residual_rebase_and_clear"
+                else str(intent.allocation_mode)
+            )
+            needs_human = (
+                intent.intent_kind == "request_residual_rebase_and_clear"
+                or requested_mode != "base_only"
+            )
+            human_preparation = None
+            automatically_held = False
+            if needs_human:
+                human_preparation, automatically_held = (
+                    self._prepare_human_mode(
+                        application,
+                        # Runtime Home belongs to the device/target binding,
+                        # not to every allocation-mode click.  First attach
+                        # captures it because none exists; later mode changes
+                        # retain the established Home.
+                        recapture_runtime_home=False,
+                    )
+                )
+            signal_name = (
+                MUJOCO_ALLOCATION_SIGNAL_REBASE_AND_CLEAR
+                if intent.intent_kind == "request_residual_rebase_and_clear"
+                else {
+                    "automatic": MUJOCO_ALLOCATION_SIGNAL_AUTOMATIC,
+                    "base_only": MUJOCO_ALLOCATION_SIGNAL_BASE_ONLY,
+                    "relative_overlay": (
+                        MUJOCO_ALLOCATION_SIGNAL_RELATIVE_OVERLAY
+                    ),
+                    "absolute_overlay_owner": (
+                        MUJOCO_ALLOCATION_SIGNAL_ABSOLUTE_OVERLAY_OWNER
+                    ),
+                }[str(intent.allocation_mode)]
+            )
+            try:
+                receipt = application.submit_allocation_button_operation(
+                    signal_name=signal_name,
+                    event_id=intent.intent_id,
+                    source_fact_id=intent.intent_id,
+                    source_fact_hash=intent.intent_id.rsplit(":", 1)[-1],
+                    occurred_at=time.monotonic(),
+                )
+                if automatically_held:
+                    application.rearm(
+                        cancel_requested=self._cancellation_requested,
+                    )
+            except BaseException:
+                if automatically_held:
+                    try:
+                        application.rearm(
+                            cancel_requested=self._cancellation_requested,
+                        )
+                    except BaseException:
+                        pass
+                raise
+            override_receipt = getattr(receipt, "override_receipt", None)
+            anchor_request = getattr(receipt, "anchor_request", None)
+            return {
+                "intent_kind": intent.intent_kind,
+                "status": (
+                    "residual_rebase_requested"
+                    if anchor_request is not None
+                    else "allocation_mode_selected"
+                ),
+                "signal_name": signal_name,
+                "allocation_mode": intent.allocation_mode,
+                "operation_receipt_id": getattr(receipt, "receipt_id", None),
+                "operation_receipt_hash": getattr(
+                    receipt,
+                    "semantic_content_hash",
+                    None,
+                ),
+                "allocation_override_receipt_id": getattr(
+                    override_receipt,
+                    "receipt_id",
+                    None,
+                ),
+                "anchor_request_id": getattr(
+                    anchor_request,
+                    "request_id",
+                    None,
+                ),
+                "human_preparation": human_preparation,
+            }
         if intent.intent_kind == "set_blend_failure_fallback":
             application = self._require_application()
             if not bool(application.status().get("started", False)):
@@ -1895,7 +2405,8 @@ class SimHILAcceptanceController:
                     "failure fallback."
                 )
             receipt = application.set_blend_failure_fallback(
-                str(intent.fallback_source)
+                str(intent.fallback_source),
+                grace_sec=intent.blend_failure_grace_sec,
             )
             return {
                 "intent_kind": intent.intent_kind,
@@ -2081,7 +2592,10 @@ class SimHILAcceptanceController:
         except Exception as error:
             capture_reset_error: BaseException | None = None
             startup_intent = bool(
-                intent.intent_kind == "start_runtime"
+                intent.intent_kind in {
+                    "start_runtime",
+                    "start_allocation_runtime",
+                }
                 or (
                     intent.intent_kind == "start_stage"
                     and intent.stage_id == "human_teleop"
@@ -2189,8 +2703,10 @@ class SimHILAcceptanceController:
                 "schema": SIM_HIL_ACCEPTANCE_STATUS_SCHEMA_V1,
                 "revision": self._revision,
                 "active_stage_id": self._active_stage_id,
-                "available_control_modes": list(
-                    SIM_HIL_CONTROL_MODES_V1
+                "available_control_modes": (
+                    []
+                    if self.allocation_runtime_enabled
+                    else list(SIM_HIL_CONTROL_MODES_V1)
                 ),
                 "available_blend_failure_fallbacks": list(
                     SIM_HIL_BLEND_FAILURE_FALLBACKS_V1
@@ -2204,6 +2720,9 @@ class SimHILAcceptanceController:
                     self._control_mode_change_count
                 ),
                 "formal_runtime_started": self._formal_runtime_started,
+                "allocation_runtime_enabled": (
+                    self.allocation_runtime_enabled
+                ),
                 "active_intent_id": self._active_intent_id,
                 "pending_intent_count": len(self._queue),
                 "completed_stage_ids": list(self._completed),
@@ -2305,15 +2824,20 @@ class SimHILAcceptanceController:
 
 
 __all__ = [
+    "SIM_HIL_ALLOCATION_MODES_DEVELOPMENT",
     "SIM_HIL_ACCEPTANCE_INTENT_KINDS_V1",
     "SIM_HIL_ACCEPTANCE_INTENT_SCHEMA_V1",
     "SIM_HIL_ACCEPTANCE_STAGES_V1",
     "SIM_HIL_ACCEPTANCE_STATUS_SCHEMA_V1",
     "SIM_HIL_CONTROL_MODES_V1",
     "SIM_HIL_HUMAN_TIMEOUT_FALLBACKS_V1",
+    "STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1",
+    "STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1",
     "SimHILAcceptanceController",
     "SimHILAcceptanceIntent",
     "SimHILAcceptanceSubmissionReceipt",
     "SimHILAcceptanceTraceCapture",
+    "StationControlTraceEpisodeSessionCapture",
+    "StationControlTraceFinalizationReceipt",
     "sim_hil_acceptance_intent_from_json",
 ]

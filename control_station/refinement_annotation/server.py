@@ -11,12 +11,18 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
+import os
 from pathlib import Path
 import re
 import threading
-from typing import Any
+import time
+from typing import Any, Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
+
+from collection_runtime.progress.stage_annotation_store import (
+    StageAnnotationStoreError,
+)
 
 from .application import (
     RefinementAnnotationApplication,
@@ -35,11 +41,79 @@ _STATIC_ROUTES = {
 _LOCAL_BIND_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _MAX_JSON_BODY_BYTES = 4 * 1024 * 1024
 _RANGE_PATTERN = re.compile(r"^bytes=(\d*)-(\d*)$")
+_OPERATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _CLIENT_DISCONNECT_ERRORS = (
     BrokenPipeError,
     ConnectionResetError,
     ConnectionAbortedError,
 )
+
+
+class _OperationProgressRegistry:
+    """Small in-memory registry for live browser operation progress."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values: dict[str, dict[str, Any]] = {}
+
+    def begin(self, operation_id: str, *, kind: str, message: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._values[operation_id] = {
+                "operation_id": operation_id,
+                "kind": kind,
+                "percent": 0,
+                "message": message,
+                "active": True,
+                "error": None,
+                "started_at": now,
+                "updated_at": now,
+            }
+            if len(self._values) > 64:
+                oldest = min(
+                    self._values,
+                    key=lambda key: self._values[key]["updated_at"],
+                )
+                if oldest != operation_id:
+                    self._values.pop(oldest, None)
+
+    def update(self, operation_id: str, percent: int, message: str) -> None:
+        with self._lock:
+            value = self._values.get(operation_id)
+            if value is None or not value["active"]:
+                return
+            value["percent"] = max(0, min(99, int(percent)))
+            value["message"] = str(message)
+            value["updated_at"] = time.time()
+
+    def finish(self, operation_id: str, message: str) -> None:
+        with self._lock:
+            value = self._values.get(operation_id)
+            if value is None:
+                return
+            value.update(
+                percent=100,
+                message=str(message),
+                active=False,
+                updated_at=time.time(),
+            )
+
+    def fail(self, operation_id: str, error: str) -> None:
+        with self._lock:
+            value = self._values.get(operation_id)
+            if value is None:
+                return
+            value.update(
+                message="操作失败",
+                active=False,
+                error=str(error),
+                updated_at=time.time(),
+            )
+
+    def snapshot(self, operation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            value = self._values.get(operation_id)
+            return None if value is None else dict(value)
 
 
 class _AnnotationHttpServer(ThreadingHTTPServer):
@@ -53,9 +127,11 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
         dataset_root: str | Path | None,
         annotator_id: str,
         second_review: bool,
+        allowed_source_roots: Sequence[str | Path],
     ) -> None:
         self._application_lock = threading.RLock()
         self._media_cache = BrowserMediaCache()
+        self._operation_progress = _OperationProgressRegistry()
         self._annotation_application: (
             RefinementAnnotationApplication | None
         ) = None
@@ -66,6 +142,10 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
         )
         self._suggested_annotator_id = str(annotator_id).strip()
         self._suggested_second_review = bool(second_review)
+        self._allowed_source_roots = tuple(
+            Path(value).expanduser().resolve()
+            for value in allowed_source_roots
+        )
         super().__init__(server_address, handler_class)
         try:
             if self._suggested_dataset_root and self._suggested_annotator_id:
@@ -152,11 +232,15 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
         self,
         application: RefinementAnnotationApplication,
     ) -> dict[str, Any]:
+        episode_snapshot = application.list_episodes(
+            wait_for_refresh=False,
+            include_annotation_summaries=False,
+        )
         return {
             **self.workspace_payload(),
-            "eligible_episode_count": len(
-                application.list_episodes()["episodes"]
-            ),
+            "eligible_episode_count": len(episode_snapshot["episodes"]),
+            "episode_scan_in_progress": episode_snapshot["refreshing"],
+            "episode_scan_error": episode_snapshot["refresh_error"],
         }
 
     def open_workspace(
@@ -192,6 +276,8 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                 candidate,
                 annotator_id=annotator_text,
                 second_review=bool(second_review),
+                allowed_source_roots=self._allowed_source_roots,
+                defer_initial_refresh=True,
             )
             self._annotation_application = application
             self._suggested_dataset_root = str(candidate)
@@ -220,6 +306,8 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                     candidate,
                     annotator_id=annotator_text,
                     second_review=bool(second_review),
+                    allowed_source_roots=self._allowed_source_roots,
+                    defer_initial_refresh=True,
                 )
                 self._annotation_application = application
             elif (
@@ -245,6 +333,8 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                     candidate,
                     annotator_id=annotator_text,
                     second_review=bool(second_review),
+                    allowed_source_roots=self._allowed_source_roots,
+                    defer_initial_refresh=True,
                 )
                 old_application = current
                 self._annotation_application = application
@@ -279,30 +369,30 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
             raise RefinementAnnotationApplicationError(
                 f"目录不存在或不是文件夹：{candidate}"
             )
+        directories: list[dict[str, str]] = []
         try:
-            entries = sorted(
-                candidate.iterdir(),
-                key=lambda value: value.name.casefold(),
-            )
+            with os.scandir(candidate) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_dir(follow_symlinks=True):
+                            continue
+                    except OSError:
+                        # One inaccessible child must not hide the other usable
+                        # directories in the picker.
+                        continue
+                    directories.append(
+                        {
+                            "name": entry.name,
+                            # Resolve only the selected directory later. Avoid
+                            # one remote canonicalization round trip per child.
+                            "path": os.path.abspath(entry.path),
+                        }
+                    )
+            directories.sort(key=lambda value: value["name"].casefold())
         except OSError as exc:
             raise RefinementAnnotationApplicationError(
                 f"无法读取目录：{candidate} ({exc})"
             ) from exc
-        directories: list[dict[str, str]] = []
-        for entry in entries:
-            try:
-                if not entry.is_dir():
-                    continue
-                directories.append(
-                    {
-                        "name": entry.name,
-                        "path": str(entry.resolve()),
-                    }
-                )
-            except OSError:
-                # One inaccessible child must not hide the other usable
-                # directories in the picker.
-                continue
         parent = None if candidate.parent == candidate else str(candidate.parent)
         return {
             "current": str(candidate),
@@ -312,6 +402,36 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
 
     def resolve_browser_media(self, source: Path) -> Path:
         return self._media_cache.resolve(source)
+
+    def begin_operation(
+        self,
+        operation_id: str,
+        *,
+        kind: str,
+        message: str,
+    ) -> None:
+        self._operation_progress.begin(
+            operation_id,
+            kind=kind,
+            message=message,
+        )
+
+    def update_operation(
+        self,
+        operation_id: str,
+        percent: int,
+        message: str,
+    ) -> None:
+        self._operation_progress.update(operation_id, percent, message)
+
+    def finish_operation(self, operation_id: str, message: str) -> None:
+        self._operation_progress.finish(operation_id, message)
+
+    def fail_operation(self, operation_id: str, error: str) -> None:
+        self._operation_progress.fail(operation_id, error)
+
+    def operation_progress(self, operation_id: str) -> dict[str, Any] | None:
+        return self._operation_progress.snapshot(operation_id)
 
     def close_media_cache(self) -> None:
         self._media_cache.close()
@@ -430,6 +550,16 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
             raise RefinementAnnotationApplicationError(
                 "Cross-origin mutation requests are rejected."
             )
+
+    def _operation_id(self) -> str | None:
+        value = str(self.headers.get("X-Annotation-Operation", "")).strip()
+        if not value:
+            return None
+        if _OPERATION_ID_PATTERN.fullmatch(value) is None:
+            raise RefinementAnnotationApplicationError(
+                "Invalid annotation operation identity."
+            )
+        return value
 
     @staticmethod
     def _api_identity(path: str, prefix: str) -> str | None:
@@ -557,6 +687,7 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
             BrowserMediaError,
             OSError,
             RefinementAnnotationApplicationError,
+            StageAnnotationStoreError,
             ValueError,
         ) as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
@@ -591,28 +722,95 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            if path == "/api/episodes":
+            if path == "/api/operation-progress":
+                query = parse_qs(
+                    urlsplit(self.path).query,
+                    keep_blank_values=True,
+                )
+                operation_id = query.get("id", [""])[0].strip()
+                if _OPERATION_ID_PATTERN.fullmatch(operation_id) is None:
+                    raise RefinementAnnotationApplicationError(
+                        "A valid operation progress identity is required."
+                    )
+                progress = self.server.operation_progress(operation_id)
                 self._send_json(
                     HTTPStatus.OK,
-                    {"ok": True, **self.application.list_episodes()},
+                    {"ok": True, "progress": progress},
                 )
                 return
-            episode_uuid = self._api_identity(path, "/api/episode/")
-            if episode_uuid is not None:
+            if path == "/api/episodes":
+                query = parse_qs(
+                    urlsplit(self.path).query,
+                    keep_blank_values=True,
+                )
+                stale_ok = query.get("stale_ok", ["0"])[0] in {
+                    "1",
+                    "true",
+                    "yes",
+                }
+                force_refresh = query.get("refresh", ["0"])[0] in {
+                    "1",
+                    "true",
+                    "yes",
+                }
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
-                        "episode": self.application.episode_detail(
-                            episode_uuid
+                        **self.application.list_episodes(
+                            wait_for_refresh=not stale_ok or force_refresh,
+                            force_refresh=force_refresh,
+                            include_annotation_summaries=False,
                         ),
                     },
+                )
+                return
+            episode_uuid = self._api_identity(path, "/api/episode/")
+            if episode_uuid is not None:
+                operation_id = self._operation_id()
+                if operation_id is not None:
+                    self.server.begin_operation(
+                        operation_id,
+                        kind="OPEN_EPISODE",
+                        message="正在打开 Episode",
+                    )
+                try:
+                    if operation_id is None:
+                        episode = self.application.episode_detail(episode_uuid)
+                    else:
+                        episode = self.application.episode_detail(
+                            episode_uuid,
+                            progress_callback=lambda percent, message: (
+                                self.server.update_operation(
+                                    operation_id,
+                                    percent,
+                                    message,
+                                )
+                            ),
+                        )
+                except Exception as exc:
+                    if operation_id is not None:
+                        self.server.fail_operation(operation_id, str(exc))
+                    raise
+                if operation_id is not None:
+                    self.server.finish_operation(
+                        operation_id,
+                        "Episode 已打开",
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "episode": episode},
                 )
                 return
             self._send_error_json(HTTPStatus.NOT_FOUND, "Unknown route.")
         except _CLIENT_DISCONNECT_ERRORS:
             return
-        except (OSError, RefinementAnnotationApplicationError, ValueError) as exc:
+        except (
+            OSError,
+            RefinementAnnotationApplicationError,
+            StageAnnotationStoreError,
+            ValueError,
+        ) as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
 
     def do_HEAD(self) -> None:  # noqa: N802
@@ -629,11 +827,40 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
             draft = self._read_json()
             saved = self.application.save_draft(episode_uuid, draft)
             self._send_json(HTTPStatus.OK, {"ok": True, "draft": saved})
-        except (OSError, RefinementAnnotationApplicationError, ValueError) as exc:
+        except (
+            OSError,
+            RefinementAnnotationApplicationError,
+            StageAnnotationStoreError,
+            ValueError,
+        ) as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        if path == "/api/episode-summaries":
+            try:
+                self._require_same_origin()
+                request = self._read_json()
+                episode_uuids = request.get("episode_uuids", ())
+                if not isinstance(episode_uuids, list):
+                    raise RefinementAnnotationApplicationError(
+                        "episode_uuids must be a JSON list."
+                    )
+                payload = self.application.episode_annotation_summaries(
+                    episode_uuids
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, **payload},
+                )
+            except (
+                OSError,
+                RefinementAnnotationApplicationError,
+                StageAnnotationStoreError,
+                ValueError,
+            ) as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if path == "/api/switch-workspace":
             try:
                 self._require_same_origin()
@@ -692,6 +919,100 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
             except (
                 OSError,
                 RefinementAnnotationApplicationError,
+                StageAnnotationStoreError,
+                ValueError,
+            ) as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        reflow_episode_uuid = self._api_identity(
+            path,
+            "/api/reflow-failed-stage/",
+        )
+        capture_end_episode_uuid = self._api_identity(
+            path,
+            "/api/reflow-capture-end-step/",
+        )
+        if capture_end_episode_uuid is not None:
+            try:
+                self._require_same_origin()
+                request = self._read_json()
+                result = self.application.reflow_capture_end_step(
+                    capture_end_episode_uuid,
+                    request.get("draft", {}),
+                    end_progress_step_id=request.get(
+                        "end_progress_step_id",
+                        "",
+                    ),
+                )
+                self._send_json(HTTPStatus.OK, {"ok": True, **result})
+            except (
+                OSError,
+                RefinementAnnotationApplicationError,
+                StageAnnotationStoreError,
+                ValueError,
+            ) as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if reflow_episode_uuid is not None:
+            try:
+                self._require_same_origin()
+                request = self._read_json()
+                result = self.application.reflow_failed_attempt_stage(
+                    reflow_episode_uuid,
+                    request.get("draft", {}),
+                    attempt_id=request.get("attempt_id", ""),
+                    failed_stage_id=request.get("failed_stage_id", ""),
+                )
+                self._send_json(HTTPStatus.OK, {"ok": True, **result})
+            except (
+                OSError,
+                RefinementAnnotationApplicationError,
+                StageAnnotationStoreError,
+                ValueError,
+            ) as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        recoverable_episode_uuid = self._api_identity(
+            path,
+            "/api/recoverable-failure/",
+        )
+        if recoverable_episode_uuid is not None:
+            try:
+                self._require_same_origin()
+                request = self._read_json()
+                result = self.application.add_recoverable_failure(
+                    recoverable_episode_uuid,
+                    request.get("draft", {}),
+                    onset_at=request.get("onset_at"),
+                    recovered_at=request.get("recovered_at"),
+                    note=request.get("note"),
+                )
+                self._send_json(HTTPStatus.OK, {"ok": True, **result})
+            except (
+                OSError,
+                RefinementAnnotationApplicationError,
+                StageAnnotationStoreError,
+                ValueError,
+            ) as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        reconcile_episode_uuid = self._api_identity(
+            path,
+            "/api/reconcile-abnormal-intervals/",
+        )
+        if reconcile_episode_uuid is not None:
+            try:
+                self._require_same_origin()
+                request = self._read_json()
+                result = self.application.reconcile_abnormal_intervals(
+                    reconcile_episode_uuid,
+                    request.get("draft", {}),
+                )
+                self._send_json(HTTPStatus.OK, {"ok": True, **result})
+            except (
+                OSError,
+                RefinementAnnotationApplicationError,
+                StageAnnotationStoreError,
                 ValueError,
             ) as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
@@ -703,9 +1024,44 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
         try:
             self._require_same_origin()
             draft = self._read_json()
-            report = self.application.commit(episode_uuid, draft)
+            operation_id = self._operation_id()
+            if operation_id is not None:
+                self.server.begin_operation(
+                    operation_id,
+                    kind="COMMIT_ANNOTATION",
+                    message="正在校验标注",
+                )
+            try:
+                if operation_id is None:
+                    report = self.application.commit(episode_uuid, draft)
+                else:
+                    report = self.application.commit(
+                        episode_uuid,
+                        draft,
+                        progress_callback=lambda percent, message: (
+                            self.server.update_operation(
+                                operation_id,
+                                percent,
+                                message,
+                            )
+                        ),
+                    )
+            except Exception as exc:
+                if operation_id is not None:
+                    self.server.fail_operation(operation_id, str(exc))
+                raise
+            if operation_id is not None:
+                self.server.finish_operation(
+                    operation_id,
+                    "标注已封存",
+                )
             self._send_json(HTTPStatus.OK, {"ok": True, "report": report})
-        except (OSError, RefinementAnnotationApplicationError, ValueError) as exc:
+        except (
+            OSError,
+            RefinementAnnotationApplicationError,
+            StageAnnotationStoreError,
+            ValueError,
+        ) as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
 
     def do_DELETE(self) -> None:  # noqa: N802
@@ -716,7 +1072,7 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
 
 
 class RefinementAnnotationGui:
-    """Own the loopback server thread and one dataset annotation lock."""
+    """Own the loopback server thread and one Episode-scoped editor."""
 
     def __init__(
         self,
@@ -724,6 +1080,7 @@ class RefinementAnnotationGui:
         *,
         annotator_id: str = "",
         second_review: bool = False,
+        allowed_source_roots: Sequence[str | Path] = (),
         host: str = "127.0.0.1",
         port: int = 0,
         open_browser: bool = True,
@@ -743,6 +1100,7 @@ class RefinementAnnotationGui:
             dataset_root=dataset_root,
             annotator_id=annotator_id,
             second_review=second_review,
+            allowed_source_roots=allowed_source_roots,
         )
         bound_host, bound_port = self.server.server_address[:2]
         visible_host = (

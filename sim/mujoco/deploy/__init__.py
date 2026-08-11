@@ -13,7 +13,19 @@ from .deployment_observation import (
 from .measurement import (
     MUJOCO_QPOS_MEASUREMENT_HASH_DOMAIN_V1,
     MujocoQposMeasurement,
+    build_mujoco_qpos_measurement_from_execution_cut,
     capture_mujoco_qpos_measurement,
+)
+from .execution_pose_observation import (
+    MUJOCO_FK_POSE_MEASUREMENT_STAGE_ID,
+    MUJOCO_FK_POSE_REFERENCE_STAGE_ID,
+    project_mujoco_fk_pose_measurement_observation,
+    project_mujoco_fk_pose_reference_observation,
+)
+from .pose_kinematics import (
+    MujocoPoseKinematicsBinding,
+    MujocoPoseObservationProjector,
+    build_mujoco_pose_observation_projector,
 )
 from .execution_difference import (
     MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID,
@@ -32,6 +44,7 @@ from .component_action_profile import (
     MujocoComponentTargetProfile,
     MujocoRobotActionV1ComponentIngressAdapter,
     build_mujoco_component_execution_binding,
+    build_mujoco_pose_component_target_profile,
     build_mujoco_pose_qpos_component_target_profile,
     build_rm65_right_cube_lift_component_target_profile,
 )
@@ -43,10 +56,13 @@ from .pose_resolution import (
     build_mujoco_pose_qpos_execution_target,
 )
 from .sim_hil_target import (
+    MujocoAgentSkillMotionTarget,
     MujocoSimHILPreparedTarget,
     MujocoSimHILTarget,
     MujocoSimHILTargetConfig,
+    build_mujoco_agent_skill_motion_target,
     build_mujoco_sim_hil_coordinate_profiles,
+    build_mujoco_sim_hil_pose_observation_projector,
     build_mujoco_sim_hil_target,
     capture_mujoco_sim_hil_safety_anchor,
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
@@ -70,6 +86,7 @@ from .runtime import (
     MujocoComponentExecutionBinding,
     MujocoDeployConfig,
     MujocoDeployRuntime,
+    MujocoDirectComponentProposalSource,
     MujocoPolicyActionChunkSubmission,
     MujocoPolicyEmissionSubmission,
     MujocoReplaySubmission,
@@ -89,6 +106,7 @@ __all__ = [
     "MujocoDeployConfig",
     "MujocoComponentExecutionBinding",
     "MujocoDeployRuntime",
+    "MujocoDirectComponentProposalSource",
     "MujocoPolicyActionChunkSubmission",
     "MujocoPolicyEmissionSubmission",
     "MujocoReplaySubmission",
@@ -97,7 +115,15 @@ __all__ = [
     "MujocoDeploymentObservationConfig",
     "MUJOCO_QPOS_MEASUREMENT_HASH_DOMAIN_V1",
     "MujocoQposMeasurement",
+    "build_mujoco_qpos_measurement_from_execution_cut",
     "capture_mujoco_qpos_measurement",
+    "MUJOCO_FK_POSE_MEASUREMENT_STAGE_ID",
+    "MUJOCO_FK_POSE_REFERENCE_STAGE_ID",
+    "MujocoPoseKinematicsBinding",
+    "MujocoPoseObservationProjector",
+    "build_mujoco_pose_observation_projector",
+    "project_mujoco_fk_pose_measurement_observation",
+    "project_mujoco_fk_pose_reference_observation",
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID",
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH",
     "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID",
@@ -116,9 +142,11 @@ __all__ = [
     "POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1",
     "build_mujoco_pose_qpos_execution_target",
     "MujocoSimHILTarget",
+    "MujocoAgentSkillMotionTarget",
     "MujocoSimHILTargetConfig",
     "MujocoSimHILPreparedTarget",
     "build_mujoco_sim_hil_coordinate_profiles",
+    "build_mujoco_sim_hil_pose_observation_projector",
     "build_mujoco_sim_hil_target",
     "capture_mujoco_sim_hil_safety_anchor",
     "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
@@ -144,6 +172,8 @@ __all__ = [
     "MujocoComponentActionRobotActionV1Materializer",
     "MujocoRobotActionV1ComponentIngressAdapter",
     "build_mujoco_component_execution_binding",
+    "build_mujoco_agent_skill_motion_target",
+    "build_mujoco_pose_component_target_profile",
     "build_mujoco_pose_qpos_component_target_profile",
     "build_rm65_right_cube_lift_component_target_profile",
 ]

@@ -26,6 +26,7 @@ from robot_motion.action import (
     ReferenceSegmentAdmissionReceipt,
     ReferenceSegmentTerminal,
     ResolvedExecutionTarget,
+    SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1,
     SafetyAnchorCommitEvidence,
     TargetExecutionCompletionReceipt,
     TargetExecutionDispatchResult,
@@ -259,7 +260,7 @@ class MujocoScheduledResolvedQposReferenceReceiver(
                 if not validation.accepted
                 else relation_rejection
                 if relation_rejection is not None
-                else "admission_deadline_missed_before_start"
+                else SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1
             )
             target_sequence = self._take_sequence()
             target_admission = admit_component_execution_target(
@@ -588,7 +589,7 @@ class MujocoScheduledResolvedQposReferenceReceiver(
                 if not validation.accepted
                 else relation_rejection
                 if relation_rejection is not None
-                else "admission_deadline_missed_before_start"
+                else SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1
             )
             target_admission = admit_resolved_execution_target(
                 target,
