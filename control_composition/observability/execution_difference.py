@@ -11,6 +11,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
+import numpy as np
+from scipy.spatial.transform import Rotation
+
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action.execution_observation import (
     ExecutionFactReference,
@@ -116,6 +119,52 @@ def _observation_receipts(
     for value in values:
         unique.setdefault(value.semantic_content_hash, value)
     return tuple(unique.values())
+
+
+def _cartesian_pose_residual(
+    reference_values: Sequence[float],
+    measurement_values: Sequence[float],
+    *,
+    schema_hash: str,
+) -> Mapping[str, object]:
+    reference = np.asarray(reference_values, dtype=float).reshape(-1)
+    measured = np.asarray(measurement_values, dtype=float).reshape(-1)
+    if (
+        reference.shape != (7,)
+        or measured.shape != (7,)
+        or not np.all(np.isfinite(reference))
+        or not np.all(np.isfinite(measured))
+    ):
+        raise ValueError("Cartesian pose observations must contain finite xyzquat7.")
+    reference_quaternion = reference[3:7]
+    measured_quaternion = measured[3:7]
+    reference_norm = float(np.linalg.norm(reference_quaternion))
+    measured_norm = float(np.linalg.norm(measured_quaternion))
+    if reference_norm <= 1e-12 or measured_norm <= 1e-12:
+        raise ValueError("Cartesian pose quaternion norm must be positive.")
+    reference_quaternion = reference_quaternion / reference_norm
+    measured_quaternion = measured_quaternion / measured_norm
+    translation = measured[:3] - reference[:3]
+    relative_rotation = (
+        Rotation.from_quat(reference_quaternion).inv()
+        * Rotation.from_quat(measured_quaternion)
+    )
+    rotation_vector = relative_rotation.as_rotvec()
+    return {
+        "metric": "cartesian_pose_residual",
+        "translation_signed_m": tuple(float(value) for value in translation),
+        "translation_l2_m": float(np.linalg.norm(translation)),
+        "translation_linf_m": float(np.max(np.abs(translation))),
+        "rotation_vector_rad": tuple(
+            float(value) for value in rotation_vector
+        ),
+        "rotation_angle_rad": float(np.linalg.norm(rotation_vector)),
+        "rotation_vector_frame": "reference_pose_local",
+        "reference": tuple(float(value) for value in reference),
+        "measured": tuple(float(value) for value in measured),
+        "representation": "cartesian_pose",
+        "schema_hash": schema_hash,
+    }
 
 
 @dataclass(frozen=True)
@@ -386,17 +435,6 @@ def associate_measurement_to_reference(
                 reason=f"representation_mismatch:{component_id}",
                 reference=reference,
             )
-        if reference_representation != "joint_position":
-            return _association_without_reference(
-                measurement,
-                selection_group_id=selection_group,
-                status="incomparable",
-                reason=(
-                    f"unsupported_metric:{component_id}:"
-                    f"{reference_representation}"
-                ),
-                reference=reference,
-            )
         if (
             reference.schema_hash_by_component[component_id]
             != measurement.schema_hash_by_component[component_id]
@@ -418,21 +456,57 @@ def associate_measurement_to_reference(
                 reason=f"dimension_mismatch:{component_id}",
                 reference=reference,
             )
-        signed = tuple(
-            measured - expected
-            for expected, measured in zip(reference_values, measurement_values)
-        )
-        component_difference[component_id] = {
-            "metric": "joint_position_vector_residual",
-            "dimension": len(signed),
-            "signed": signed,
-            "l2": math.sqrt(sum(value * value for value in signed)),
-            "linf": max(abs(value) for value in signed),
-            "reference": reference_values,
-            "measured": measurement_values,
-            "representation": reference_representation,
-            "schema_hash": reference.schema_hash_by_component[component_id],
-        }
+        if reference_representation == "joint_position":
+            signed = tuple(
+                measured - expected
+                for expected, measured in zip(
+                    reference_values,
+                    measurement_values,
+                )
+            )
+            component_difference[component_id] = {
+                "metric": "joint_position_vector_residual",
+                "dimension": len(signed),
+                "signed": signed,
+                "l2": math.sqrt(sum(value * value for value in signed)),
+                "linf": max(abs(value) for value in signed),
+                "reference": reference_values,
+                "measured": measurement_values,
+                "representation": reference_representation,
+                "schema_hash": reference.schema_hash_by_component[
+                    component_id
+                ],
+            }
+        elif reference_representation == "cartesian_pose":
+            try:
+                component_difference[component_id] = (
+                    _cartesian_pose_residual(
+                        reference_values,
+                        measurement_values,
+                        schema_hash=reference.schema_hash_by_component[
+                            component_id
+                        ],
+                    )
+                )
+            except ValueError:
+                return _association_without_reference(
+                    measurement,
+                    selection_group_id=selection_group,
+                    status="incomparable",
+                    reason=f"invalid_cartesian_pose:{component_id}",
+                    reference=reference,
+                )
+        else:
+            return _association_without_reference(
+                measurement,
+                selection_group_id=selection_group,
+                status="incomparable",
+                reason=(
+                    f"unsupported_metric:{component_id}:"
+                    f"{reference_representation}"
+                ),
+                reference=reference,
+            )
 
     return MeasurementReferenceAssociation(
         status="available",

@@ -1,5 +1,13 @@
 # robot_motion.deploy
 
+`project_timed_policy_plan_to_component_trajectory()` is a pure, optional
+adapter from one immutable `TimedPolicyActionPlanSnapshot` to the generic
+`robot_motion.action.ComponentActionTrajectory` carrier. The caller supplies
+the artifact/profile-bound action representation projector. The adapter does
+not read or advance a queue/cursor, merge a result, commit a producer prefix,
+emit an action, or grant execution authority. `producer_committed_through` is
+preserved only as `source_immutable_through` lineage.
+
 `robot_motion.deploy` holds sim/real-neutral runtime glue for motion-control
 deployment. Model-server client code lives under `deployments.client`.
 Real-only hardware adapters stay under `teleop_runtime`; sim-only adapters stay
@@ -18,6 +26,9 @@ ObservationSource -> Policy -> optional action semantics
 - `action_semantics.py`: typed action-aligned prediction sidecars.
 - `arm_hold.py`: target-neutral, per-side hold state machine and immutable
   resolution receipts. It owns no device or dispatch authority.
+- `arm_hold_history.py`: optional, model-neutral previous-resolution context
+  with explicit binding/epoch and bounded sequence admission. It owns no model
+  input encoding, target preparation, execution acknowledgement, or trace.
 - `policy_worker.py`: bounded model-neutral RTC inference carrier; no plan,
   safety, target or dispatch ownership. Stop dispatches an optional executor
   cancellation hook in isolation and reports cancellation separately from
@@ -53,6 +64,20 @@ Raw-RTC freezes that snapshot in a versioned
 Relative chunks are expanded once with the original request anchor before
 timed-plan admission; absolute chunks use explicit no-anchor semantics. The
 context is client-local causal evidence, not a model-server input.
+
+`PolicySourceActionProjection` records the representation used before the
+canonical absolute emission. It deliberately distinguishes:
+
+- `absolute_target`: already absolute, with no anchor;
+- `observation_relative_chunk`: every keyframe uses one immutable measured-TCP
+  anchor captured at the observation cut;
+- `sequential_target_delta`: each delta uses the previous policy target and an
+  explicit target generation.
+
+All three paths must produce an absolute `PolicyActionEmission` before entering
+composition. `policy_action_projection` preserves the raw/conditioned source
+channels, anchor, and decoded-action hash in ControlTrace; it does not grant
+authority or add safety/IK behavior.
 
 Model-family packages should accept this config and return decoded
 `NormalizedAction` chunks. They must not infer a transform from a field name
@@ -130,6 +155,17 @@ no new command.
 Thresholds and consecutive-step counts are artifact fields, not runtime
 defaults. `reset_prediction_schedule()` also releases latched semantic state at
 the existing init/re-arm lifecycle boundary.
+
+Resolved history is separately default-off. A caller may inject one typed
+`ArmHoldResolvedHistoryBinding` when constructing `PolicyDeployRuntime`; the
+binding must match the artifact arm-hold contract at construction time. The
+synchronous path advances history immediately after `resolver.resolve()` has
+committed, while raw-RTC advances it through `commit_staged_arm_hold()` only
+after formal producer emission admission. `arm_hold_resolved_history_snapshot()`
+returns immutable context for a later model adapter, and semantic reset rotates
+the epoch back to explicit unavailable bootstrap. This receipt means only that
+the authoritative resolver transition committed. It is not evidence that a
+target was accepted or hardware motion executed.
 
 The default-off raw-RTC final-chunk path supports the same sidecar without
 changing the continuous action dimension. Capability, request, and response

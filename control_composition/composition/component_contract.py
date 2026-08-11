@@ -28,6 +28,9 @@ HAND_ACTION_SPEC_HASH_DOMAIN_V1 = "dexteleop.hand_action_spec.semantic.v1"
 COMPONENT_MISSING_BEHAVIORS_V1 = frozenset(
     {"no_action", "invalid", "renormalize_available", "use_baseline"}
 )
+ALLOCATION_CONTEXT_MISSING_BEHAVIORS_DEVELOPMENT = frozenset(
+    {"no_action", "use_baseline"}
+)
 COMPONENT_SEMANTIC_PARAMETER_KEYS_V1 = frozenset(
     {
         "component_rule_set",
@@ -40,6 +43,12 @@ COMPONENT_SEMANTIC_PARAMETER_KEYS_V1 = frozenset(
         "max_translation_disagreement_m",
         "max_rotation_disagreement_rad",
         "value_contract_hash",
+        "allocation_spec_hash",
+        "allocation_context_channel",
+        "context_missing_behavior",
+        "base_absolute_role",
+        "relative_overlay_role",
+        "absolute_overlay_role",
     }
 )
 
@@ -105,6 +114,16 @@ def _relative_missing_behavior(value: object) -> str:
     if behavior == "renormalize_available":
         raise ValueError(
             "renormalize_available is not valid for relative-overlay rules."
+        )
+    return behavior
+
+
+def _allocation_missing_behavior(value: object) -> str:
+    behavior = _missing_behavior(value)
+    if behavior not in {"no_action", "invalid"}:
+        raise ValueError(
+            "Allocation-selected rules support only no_action or invalid "
+            "for a missing selected input."
         )
     return behavior
 
@@ -387,11 +406,242 @@ class RelativeQposComponentCompositionRule:
         }
 
 
+@dataclass(frozen=True)
+class AllocatedPoseComponentCompositionRule:
+    """Select base, relative overlay, or absolute overlay for one pose.
+
+    The selected mode comes from one typed allocation decision context.  Even
+    ``absolute_overlay_owner`` remains a composition choice; it does not change
+    the runtime authority owner.
+    """
+
+    component_id: str
+    base_absolute_role: str
+    relative_overlay_role: str
+    absolute_overlay_role: str
+    allocation_spec_hash: str
+    allocation_context_channel: str
+    missing_behavior: str = "no_action"
+    context_missing_behavior: str = "no_action"
+
+    def __post_init__(self) -> None:
+        component_id = _required(self.component_id, field_name="component_id")
+        roles = (
+            _required(
+                self.base_absolute_role,
+                field_name="base_absolute_role",
+            ),
+            _required(
+                self.relative_overlay_role,
+                field_name="relative_overlay_role",
+            ),
+            _required(
+                self.absolute_overlay_role,
+                field_name="absolute_overlay_role",
+            ),
+        )
+        if len(set(roles)) != 3:
+            raise ValueError("Allocated composition roles must be distinct.")
+        object.__setattr__(self, "component_id", component_id)
+        object.__setattr__(self, "base_absolute_role", roles[0])
+        object.__setattr__(self, "relative_overlay_role", roles[1])
+        object.__setattr__(self, "absolute_overlay_role", roles[2])
+        object.__setattr__(
+            self,
+            "allocation_spec_hash",
+            _required(
+                self.allocation_spec_hash,
+                field_name="allocation_spec_hash",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "allocation_context_channel",
+            _required(
+                self.allocation_context_channel,
+                field_name="allocation_context_channel",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "missing_behavior",
+            _allocation_missing_behavior(self.missing_behavior),
+        )
+        context_missing = _required(
+            self.context_missing_behavior,
+            field_name="context_missing_behavior",
+        )
+        if context_missing not in ALLOCATION_CONTEXT_MISSING_BEHAVIORS_DEVELOPMENT:
+            raise ValueError("Unsupported allocation context missing behavior.")
+        object.__setattr__(
+            self,
+            "context_missing_behavior",
+            context_missing,
+        )
+
+    @property
+    def representation(self) -> str:
+        return "pose"
+
+    @property
+    def contributing_roles(self) -> tuple[str, ...]:
+        return (
+            self.base_absolute_role,
+            self.relative_overlay_role,
+            self.absolute_overlay_role,
+        )
+
+    def semantic_payload(self) -> dict[str, Any]:
+        return {
+            "component_id": self.component_id,
+            "representation": self.representation,
+            "composition": "allocation_selected_pose_v1",
+            "base_absolute_role": self.base_absolute_role,
+            "relative_overlay_role": self.relative_overlay_role,
+            "absolute_overlay_role": self.absolute_overlay_role,
+            "allocation_spec_hash": self.allocation_spec_hash,
+            "allocation_context_channel": self.allocation_context_channel,
+            "missing_behavior": self.missing_behavior,
+            **(
+                {}
+                if self.context_missing_behavior == "no_action"
+                else {"context_missing_behavior": self.context_missing_behavior}
+            ),
+            "relative_translation_application": "reference_frame_additive",
+            "relative_rotation_application": (
+                "baseline_local_right_multiply"
+            ),
+            "authority_semantics": (
+                "composer_stays_authoritative_soft_selection"
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class AllocatedQposComponentCompositionRule:
+    """Select base, relative overlay, or absolute overlay for one qpos."""
+
+    component_id: str
+    base_absolute_role: str
+    relative_overlay_role: str
+    absolute_overlay_role: str
+    baseline_value_contract_hash: str
+    delta_value_contract_hash: str
+    allocation_spec_hash: str
+    allocation_context_channel: str
+    missing_behavior: str = "no_action"
+    context_missing_behavior: str = "no_action"
+
+    def __post_init__(self) -> None:
+        pose_shape = AllocatedPoseComponentCompositionRule(
+            component_id=self.component_id,
+            base_absolute_role=self.base_absolute_role,
+            relative_overlay_role=self.relative_overlay_role,
+            absolute_overlay_role=self.absolute_overlay_role,
+            allocation_spec_hash=self.allocation_spec_hash,
+            allocation_context_channel=self.allocation_context_channel,
+            missing_behavior=self.missing_behavior,
+            context_missing_behavior=self.context_missing_behavior,
+        )
+        object.__setattr__(self, "component_id", pose_shape.component_id)
+        object.__setattr__(
+            self,
+            "base_absolute_role",
+            pose_shape.base_absolute_role,
+        )
+        object.__setattr__(
+            self,
+            "relative_overlay_role",
+            pose_shape.relative_overlay_role,
+        )
+        object.__setattr__(
+            self,
+            "absolute_overlay_role",
+            pose_shape.absolute_overlay_role,
+        )
+        object.__setattr__(
+            self,
+            "baseline_value_contract_hash",
+            _required(
+                self.baseline_value_contract_hash,
+                field_name="baseline_value_contract_hash",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "delta_value_contract_hash",
+            _required(
+                self.delta_value_contract_hash,
+                field_name="delta_value_contract_hash",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "allocation_spec_hash",
+            pose_shape.allocation_spec_hash,
+        )
+        object.__setattr__(
+            self,
+            "allocation_context_channel",
+            pose_shape.allocation_context_channel,
+        )
+        object.__setattr__(
+            self,
+            "missing_behavior",
+            pose_shape.missing_behavior,
+        )
+        object.__setattr__(
+            self,
+            "context_missing_behavior",
+            pose_shape.context_missing_behavior,
+        )
+
+    @property
+    def representation(self) -> str:
+        return "qpos"
+
+    @property
+    def contributing_roles(self) -> tuple[str, ...]:
+        return (
+            self.base_absolute_role,
+            self.relative_overlay_role,
+            self.absolute_overlay_role,
+        )
+
+    def semantic_payload(self) -> dict[str, Any]:
+        return {
+            "component_id": self.component_id,
+            "representation": self.representation,
+            "composition": "allocation_selected_qpos_v1",
+            "base_absolute_role": self.base_absolute_role,
+            "relative_overlay_role": self.relative_overlay_role,
+            "absolute_overlay_role": self.absolute_overlay_role,
+            "baseline_value_contract_hash": (
+                self.baseline_value_contract_hash
+            ),
+            "delta_value_contract_hash": self.delta_value_contract_hash,
+            "allocation_spec_hash": self.allocation_spec_hash,
+            "allocation_context_channel": self.allocation_context_channel,
+            "missing_behavior": self.missing_behavior,
+            **(
+                {}
+                if self.context_missing_behavior == "no_action"
+                else {"context_missing_behavior": self.context_missing_behavior}
+            ),
+            "relative_application": "elementwise_additive",
+            "authority_semantics": (
+                "composer_stays_authoritative_soft_selection"
+            ),
+        }
+
+
 ComponentCompositionRule = (
     PoseComponentCompositionRule
     | QposComponentCompositionRule
     | RelativePoseComponentCompositionRule
     | RelativeQposComponentCompositionRule
+    | AllocatedPoseComponentCompositionRule
+    | AllocatedQposComponentCompositionRule
 )
 
 
@@ -418,6 +668,8 @@ class ComponentCompositionRuleSet:
                     QposComponentCompositionRule,
                     RelativePoseComponentCompositionRule,
                     RelativeQposComponentCompositionRule,
+                    AllocatedPoseComponentCompositionRule,
+                    AllocatedQposComponentCompositionRule,
                 ),
             )
             for rule in rules
@@ -526,6 +778,8 @@ __all__ = [
     "HAND_ACTION_SPEC_HASH_DOMAIN_V1",
     "ComponentCompositionRule",
     "ComponentCompositionRuleSet",
+    "AllocatedPoseComponentCompositionRule",
+    "AllocatedQposComponentCompositionRule",
     "FormalComponentCompositionBinding",
     "PoseComponentCompositionRule",
     "QposComponentCompositionRule",

@@ -17,8 +17,31 @@ from scipy.spatial.transform import Rotation
 from robot_motion.action.hand_spec import HandActionSpec
 from robot_motion.action.component_action import ComponentAction
 
+from control_composition.allocation.contracts import (
+    COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
+    CompositionAllocationSpec,
+)
+from control_composition.allocation.context import (
+    selected_allocation_modes_from_context,
+)
+from control_composition.allocation.continuity import (
+    AllocationTransitionContinuityRuntime,
+)
+from control_composition.allocation.continuity_contracts import (
+    AllocationTransitionContinuityPolicy,
+)
+from control_composition.activation import CompositionActivationScope
+from control_composition.residual_anchor_lifecycle import (
+    ResidualAnchorLifecycleSpec,
+)
+from control_composition.allocation.strategy import (
+    evaluate_allocated_component_rule,
+)
+
 from .component_contract import (
     FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2,
+    AllocatedPoseComponentCompositionRule,
+    AllocatedQposComponentCompositionRule,
     ComponentCompositionRuleSet,
     PoseComponentCompositionRule,
     QposComponentCompositionRule,
@@ -26,7 +49,13 @@ from .component_contract import (
     RelativeQposComponentCompositionRule,
     hand_action_spec_semantic_hash,
 )
-from .core import CompositionInputRecord, CompositionSpec
+from .core import CompositionEvaluation, CompositionInputRecord, CompositionSpec
+from .component_operations import (
+    component_record_available,
+    record_matches_declared_schema,
+    relative_pose_component_value,
+    relative_qpos_component_value,
+)
 from .formal_strategy import (
     CompositionStrategyDecision,
     FormalCompositionStrategyInput,
@@ -58,23 +87,6 @@ def _positive_weights(
         for role, weight in weight_by_role.items()
         if float(weight) > 0.0
     }
-
-
-def _component_available(
-    record: CompositionInputRecord,
-    *,
-    component_id: str,
-    representation: str,
-) -> bool:
-    action = record.action
-    if component_id not in action.values_by_component:
-        return False
-    family = action.action_schema.payload_schema_by_component[
-        component_id
-    ].representation_family
-    return family == (
-        "cartesian_pose" if representation == "pose" else "joint_position"
-    )
 
 
 def _fuse_pose_values(
@@ -152,7 +164,7 @@ def _selected_records_and_weights(
         if (
             role in positive
             and role in selected
-            and _component_available(
+            and component_record_available(
                 selected[role],
                 component_id=rule.component_id,
                 representation=rule.representation,
@@ -173,109 +185,6 @@ def _selected_records_and_weights(
     return available, MappingProxyType(normalized), missing
 
 
-def _record_matches_declared_schema(
-    strategy_input: FormalCompositionStrategyInput,
-    record: CompositionInputRecord,
-) -> bool:
-    expected = (
-        strategy_input.input_snapshot.input_action_schema_hash_by_role.get(
-            record.input_role,
-            strategy_input.input_snapshot.action_schema_hash,
-        )
-    )
-    return record.action.action_schema.semantic_content_hash == expected
-
-
-def _relative_pose_value(
-    baseline: CompositionInputRecord,
-    delta: CompositionInputRecord,
-    *,
-    component_id: str,
-) -> np.ndarray:
-    baseline_schema = (
-        baseline.action.action_schema.payload_schema_by_component[component_id]
-    )
-    delta_schema = (
-        delta.action.action_schema.payload_schema_by_component[component_id]
-    )
-    if (
-        baseline_schema.representation_family != "cartesian_pose"
-        or delta_schema.representation_family != "cartesian_pose"
-        or baseline_schema.value_semantics != "absolute_target"
-        or delta_schema.value_semantics != "relative_delta"
-    ):
-        raise ValueError("relative_pose_semantics_mismatch")
-    if (
-        baseline_schema.reference_frame != delta_schema.reference_frame
-        or baseline_schema.controlled_frame != delta_schema.controlled_frame
-    ):
-        raise ValueError("relative_pose_frame_mismatch")
-    baseline_value = np.asarray(
-        baseline.action.value(component_id).values,
-        dtype=np.float64,
-    )
-    delta_value = np.asarray(
-        delta.action.value(component_id).values,
-        dtype=np.float64,
-    )
-    translation = baseline_value[:3] + delta_value[:3]
-    quaternion = (
-        Rotation.from_quat(baseline_value[3:7])
-        * Rotation.from_quat(delta_value[3:7])
-    ).as_quat()
-    if float(np.dot(quaternion, baseline_value[3:7])) < 0.0:
-        quaternion = -quaternion
-    return np.concatenate((translation, quaternion)).astype(
-        baseline_schema.dtype
-    )
-
-
-def _relative_qpos_value(
-    baseline: CompositionInputRecord,
-    delta: CompositionInputRecord,
-    *,
-    rule: RelativeQposComponentCompositionRule,
-) -> np.ndarray:
-    baseline_schema = (
-        baseline.action.action_schema.payload_schema_by_component[
-            rule.component_id
-        ]
-    )
-    delta_schema = delta.action.action_schema.payload_schema_by_component[
-        rule.component_id
-    ]
-    if (
-        baseline_schema.representation_family != "joint_position"
-        or delta_schema.representation_family != "joint_position"
-        or baseline_schema.value_semantics != "absolute_target"
-        or delta_schema.value_semantics != "relative_delta"
-    ):
-        raise ValueError("relative_qpos_semantics_mismatch")
-    if (
-        baseline_schema.semantic_content_hash
-        != rule.baseline_value_contract_hash
-        or delta_schema.semantic_content_hash
-        != rule.delta_value_contract_hash
-    ):
-        raise ValueError("relative_qpos_value_contract_mismatch")
-    if (
-        baseline_schema.shape != delta_schema.shape
-        or baseline_schema.coordinate_names != delta_schema.coordinate_names
-        or baseline_schema.units != delta_schema.units
-    ):
-        raise ValueError("relative_qpos_layout_mismatch")
-    return (
-        np.asarray(
-            baseline.action.value(rule.component_id).values,
-            dtype=np.float64,
-        )
-        + np.asarray(
-            delta.action.value(rule.component_id).values,
-            dtype=np.float64,
-        )
-    ).astype(baseline_schema.dtype)
-
-
 class FormalComponentCompositionStrategyV2:
     """Minimal deterministic evaluator for one typed component rule set.
 
@@ -291,6 +200,15 @@ class FormalComponentCompositionStrategyV2:
         composition_spec: CompositionSpec,
         component_rule_set: ComponentCompositionRuleSet,
         qpos_value_spec_by_component: Mapping[str, HandActionSpec] | None = None,
+        allocation_spec_by_hash: (
+            Mapping[str, CompositionAllocationSpec] | None
+        ) = None,
+        residual_anchor_lifecycle_spec: (
+            ResidualAnchorLifecycleSpec | None
+        ) = None,
+        allocation_transition_continuity_policy_by_spec_hash: (
+            Mapping[str, AllocationTransitionContinuityPolicy] | None
+        ) = None,
     ) -> None:
         if not isinstance(strategy_spec, FormalCompositionStrategySpec):
             raise TypeError(
@@ -386,15 +304,231 @@ class FormalComponentCompositionStrategyV2:
                     "another value contract."
                 )
 
+        allocation_specs = dict(allocation_spec_by_hash or {})
+        for spec_hash, allocation_spec in allocation_specs.items():
+            if not isinstance(allocation_spec, CompositionAllocationSpec):
+                raise TypeError(
+                    "allocation_spec_by_hash values must be "
+                    "CompositionAllocationSpec."
+                )
+            if spec_hash != allocation_spec.semantic_content_hash:
+                raise ValueError("Allocation spec mapping key/hash mismatch.")
+        allocated_rules = tuple(
+            rule
+            for rule in component_rule_set.rules
+            if isinstance(
+                rule,
+                (
+                    AllocatedPoseComponentCompositionRule,
+                    AllocatedQposComponentCompositionRule,
+                ),
+            )
+        )
+        if allocated_rules:
+            if not isinstance(
+                residual_anchor_lifecycle_spec,
+                ResidualAnchorLifecycleSpec,
+            ):
+                raise TypeError(
+                    "Allocated component strategy requires a residual anchor "
+                    "lifecycle spec."
+                )
+            if (
+                strategy_spec.required_residual_anchor_lifecycle_spec_hash
+                != residual_anchor_lifecycle_spec.semantic_content_hash
+            ):
+                raise ValueError(
+                    "Allocated strategy and residual anchor lifecycle spec differ."
+                )
+        elif residual_anchor_lifecycle_spec is not None:
+            raise ValueError(
+                "A non-allocated strategy must not bind residual anchor lifecycle."
+            )
+        for rule in allocated_rules:
+            allocation_spec = allocation_specs.get(rule.allocation_spec_hash)
+            if allocation_spec is None:
+                raise ValueError(
+                    "Allocated component rule requires its typed allocation spec."
+                )
+            if (
+                rule.base_absolute_role != allocation_spec.base_absolute_role
+                or rule.relative_overlay_role
+                != allocation_spec.relative_overlay_role
+                or rule.absolute_overlay_role
+                != allocation_spec.absolute_overlay_role
+                or rule.component_id not in allocation_spec.component_ids
+            ):
+                raise ValueError(
+                    "Allocated component rule disagrees with allocation spec."
+                )
+            if rule.allocation_context_channel not in (
+                strategy_spec.context_channels
+            ):
+                raise ValueError(
+                    "Allocated component rule requires its context channel in "
+                    "FormalCompositionStrategySpec."
+                )
+            if rule.base_absolute_role not in (
+                composition_spec.depends_on_roles_by_role.get(
+                    rule.relative_overlay_role,
+                    (),
+                )
+            ):
+                raise ValueError(
+                    "Allocated relative role must depend on its absolute base."
+                )
+            if not composition_spec.input_action_schema_hash_by_role:
+                raise ValueError(
+                    "Allocated rules require role-specific input action schemas."
+                )
+        for allocation_hash in {
+            rule.allocation_spec_hash for rule in allocated_rules
+        }:
+            allocation_spec = allocation_specs[allocation_hash]
+            bound_rules = tuple(
+                rule
+                for rule in allocated_rules
+                if rule.allocation_spec_hash == allocation_hash
+            )
+            if tuple(rule.component_id for rule in bound_rules) != (
+                allocation_spec.component_ids
+            ):
+                raise ValueError(
+                    "Allocated rules must cover their allocation spec components "
+                    "in declared order."
+                )
+            if len(
+                {rule.allocation_context_channel for rule in bound_rules}
+            ) != 1:
+                raise ValueError(
+                    "One allocation spec must use one context channel."
+                )
+        continuity_policies = dict(
+            allocation_transition_continuity_policy_by_spec_hash or {}
+        )
+        for allocation_hash, allocation_spec in allocation_specs.items():
+            policy = continuity_policies.get(allocation_hash)
+            required_hash = allocation_spec.transition_continuity_policy_hash
+            if required_hash is None:
+                if policy is not None:
+                    raise ValueError(
+                        "Allocation strategy supplied undeclared continuity."
+                    )
+                continue
+            if not isinstance(policy, AllocationTransitionContinuityPolicy):
+                raise TypeError(
+                    "Continuity-enabled allocation requires its typed policy."
+                )
+            if (
+                policy.semantic_content_hash != required_hash
+                or policy.component_ids != allocation_spec.component_ids
+            ):
+                raise ValueError(
+                    "Allocation continuity policy differs from its spec."
+                )
+        if set(continuity_policies) - set(allocation_specs):
+            raise ValueError("Continuity policy references an unknown allocation spec.")
+
         self._spec = strategy_spec
         self.composition_spec = composition_spec
         self.component_rule_set = component_rule_set
         self.qpos_value_spec_by_component = MappingProxyType(qpos_specs)
+        self.allocation_spec_by_hash = MappingProxyType(allocation_specs)
+        self.residual_anchor_lifecycle_spec = residual_anchor_lifecycle_spec
+        self.allocation_transition_continuity_runtime_by_spec_hash = (
+            MappingProxyType(
+                {
+                    spec_hash: AllocationTransitionContinuityRuntime(policy)
+                    for spec_hash, policy in continuity_policies.items()
+                }
+            )
+        )
         self.supported_strategy_modes = FORMAL_COMPONENT_STRATEGY_MODES_V1
 
     @property
     def spec(self) -> FormalCompositionStrategySpec:
         return self._spec
+
+    def activate_allocation_transition_continuity(
+        self,
+        activation_scope: CompositionActivationScope,
+    ) -> None:
+        """Reset opt-in target-seam state for one exact composition activation."""
+
+        if not isinstance(activation_scope, CompositionActivationScope):
+            raise TypeError("activation_scope must be typed.")
+        for runtime in (
+            self.allocation_transition_continuity_runtime_by_spec_hash.values()
+        ):
+            runtime.activate(
+                composition_activation_id=activation_scope.activation_id,
+                composition_activation_hash=activation_scope.semantic_content_hash,
+            )
+
+    def _continuity_publication_binding(
+        self,
+        evaluation: CompositionEvaluation,
+    ) -> tuple[AllocationTransitionContinuityRuntime, str] | None:
+        if not isinstance(evaluation, CompositionEvaluation):
+            raise TypeError("evaluation must be a CompositionEvaluation.")
+        receipt = evaluation.strategy_result_data.get(
+            "allocation_transition_continuity"
+        )
+        runtimes = tuple(
+            self.allocation_transition_continuity_runtime_by_spec_hash.values()
+        )
+        if receipt is None:
+            if runtimes and evaluation.output_status == "ready":
+                raise ValueError(
+                    "Continuity-enabled ready evaluation has no preparation receipt."
+                )
+            return None
+        if not isinstance(receipt, Mapping):
+            raise TypeError("Continuity preparation receipt must be a mapping.")
+        policy_hash = str(receipt.get("policy_hash", "")).strip()
+        receipt_hash = str(receipt.get("receipt_hash", "")).strip()
+        if not policy_hash or not receipt_hash:
+            raise ValueError("Continuity preparation receipt identity is incomplete.")
+        runtime = next(
+            (
+                item
+                for item in runtimes
+                if item.policy.semantic_content_hash == policy_hash
+            ),
+            None,
+        )
+        if runtime is None:
+            raise ValueError("Continuity receipt names an unknown policy.")
+        if (
+            receipt.get("composition_activation_id")
+            != evaluation.composition_activation_id
+            or receipt.get("composition_activation_hash")
+            != evaluation.composition_activation_hash
+        ):
+            raise ValueError("Continuity receipt belongs to another activation.")
+        return runtime, receipt_hash
+
+    def validate_publication_transaction(
+        self,
+        evaluation: CompositionEvaluation,
+    ) -> None:
+        """Validate prepared target state before an external proposal is admitted."""
+
+        binding = self._continuity_publication_binding(evaluation)
+        if binding is not None:
+            runtime, receipt_hash = binding
+            runtime.validate_prepared(receipt_hash=receipt_hash)
+
+    def commit_publication_transaction(
+        self,
+        evaluation: CompositionEvaluation,
+    ) -> None:
+        """Advance target continuity after exact proposal admission succeeds."""
+
+        binding = self._continuity_publication_binding(evaluation)
+        if binding is not None:
+            runtime, receipt_hash = binding
+            runtime.commit_prepared(receipt_hash=receipt_hash)
 
     def decide(
         self,
@@ -415,6 +549,44 @@ class FormalComponentCompositionStrategyV2:
             composition_spec=self.composition_spec,
             component_rule_set=self.component_rule_set,
             strategy_mode=FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
+            apply_transition_continuity=True,
+        )
+
+    def decide_projected(
+        self,
+        strategy_input: object,
+    ) -> CompositionStrategyDecision:
+        """Evaluate an explicit non-admitted projection with the same rules.
+
+        The projection carrier intentionally lives in another identity domain
+        and cannot enter formal result promotion.  Structural validation here
+        is kept local to avoid making the production formal strategy protocol
+        depend on a trajectory or preview package.
+        """
+
+        if getattr(strategy_input, "promotable", None) is not False:
+            raise TypeError(
+                "Projected strategy input must explicitly be non-promotable."
+            )
+        if getattr(strategy_input, "strategy_spec", None) != self.spec:
+            raise ValueError("Projected strategy input uses another strategy spec.")
+        composition_spec = getattr(strategy_input, "composition_spec", None)
+        if not isinstance(composition_spec, CompositionSpec) or (
+            composition_spec.semantic_content_hash
+            != self.composition_spec.semantic_content_hash
+        ):
+            raise ValueError(
+                "Projected strategy input uses another CompositionSpec."
+            )
+        input_snapshot = getattr(strategy_input, "input_snapshot", None)
+        if getattr(input_snapshot, "promotable", None) is not False:
+            raise TypeError("Projected input snapshot must be non-promotable.")
+        return self._decide(
+            strategy_input,
+            composition_spec=self.composition_spec,
+            component_rule_set=self.component_rule_set,
+            strategy_mode=FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
+            apply_transition_continuity=False,
         )
 
     def decide_with_control(
@@ -461,11 +633,13 @@ class FormalComponentCompositionStrategyV2:
                     (
                         RelativePoseComponentCompositionRule,
                         RelativeQposComponentCompositionRule,
+                        AllocatedPoseComponentCompositionRule,
+                        AllocatedQposComponentCompositionRule,
                     ),
                 ):
                     raise ValueError(
-                        "Alpha hot-control is not defined for relative-overlay "
-                        "rules."
+                        "Alpha hot-control is not defined for relative or "
+                        "allocation-selected rules."
                     )
                 value = float(alpha[rule.component_id])
                 effective_rules.append(
@@ -484,6 +658,7 @@ class FormalComponentCompositionStrategyV2:
             component_rule_set=rules,
             strategy_mode=revision.strategy_mode,
             discrete_tie_role=discrete_tie_role,
+            apply_transition_continuity=True,
         )
 
     def _decide(
@@ -494,6 +669,7 @@ class FormalComponentCompositionStrategyV2:
         component_rule_set: ComponentCompositionRuleSet,
         strategy_mode: str,
         discrete_tie_role: str | None = None,
+        apply_transition_continuity: bool,
     ) -> CompositionStrategyDecision:
         selected_by_role = (
             strategy_input.input_snapshot.selected_input_by_role
@@ -512,9 +688,58 @@ class FormalComponentCompositionStrategyV2:
 
         output_values: dict[str, np.ndarray] = {}
         renormalized_components: list[str] = []
+        used_context_ids: set[str] = set()
+        allocated_mode_by_component: dict[str, str] = {}
         output_action_schema = None
 
         for rule in component_rule_set.rules:
+            if isinstance(
+                rule,
+                (
+                    AllocatedPoseComponentCompositionRule,
+                    AllocatedQposComponentCompositionRule,
+                ),
+            ):
+                allocation_spec = self.allocation_spec_by_hash[
+                    rule.allocation_spec_hash
+                ]
+                allocated = evaluate_allocated_component_rule(
+                    strategy_input,
+                    rule=rule,
+                    allocation_component_ids=allocation_spec.component_ids,
+                )
+                if allocated.used_context_id is not None:
+                    used_context_ids.add(allocated.used_context_id)
+                if allocated.output_status != "ready":
+                    return CompositionStrategyDecision(
+                        output_status=allocated.output_status,
+                        reason=(
+                            f"allocated_component:{rule.component_id}:"
+                            f"{allocated.reason}"
+                        ),
+                        composed_candidate=None,
+                        used_context_ids=tuple(sorted(used_context_ids)),
+                    )
+                assert allocated.value is not None
+                assert allocated.output_action_schema is not None
+                assert allocated.selected_mode is not None
+                allocated_mode_by_component[rule.component_id] = (
+                    allocated.selected_mode
+                )
+                if output_action_schema is None:
+                    output_action_schema = allocated.output_action_schema
+                elif (
+                    output_action_schema.semantic_content_hash
+                    != allocated.output_action_schema.semantic_content_hash
+                ):
+                    return CompositionStrategyDecision(
+                        output_status="invalid",
+                        reason="allocated_output_schema_mismatch",
+                        composed_candidate=None,
+                        used_context_ids=tuple(sorted(used_context_ids)),
+                    )
+                output_values[rule.component_id] = allocated.value
+                continue
             if isinstance(
                 rule,
                 (
@@ -537,7 +762,7 @@ class FormalComponentCompositionStrategyV2:
                         ),
                         composed_candidate=None,
                     )
-                if not _component_available(
+                if not component_record_available(
                     baseline,
                     component_id=rule.component_id,
                     representation=rule.representation,
@@ -550,7 +775,7 @@ class FormalComponentCompositionStrategyV2:
                         ),
                         composed_candidate=None,
                     )
-                if not _record_matches_declared_schema(
+                if not record_matches_declared_schema(
                     strategy_input,
                     baseline,
                 ):
@@ -585,7 +810,7 @@ class FormalComponentCompositionStrategyV2:
                         reason="relative_output_schema_mismatch",
                         composed_candidate=None,
                     )
-                if delta is None or not _component_available(
+                if delta is None or not component_record_available(
                     delta,
                     component_id=rule.component_id,
                     representation=rule.representation,
@@ -604,7 +829,7 @@ class FormalComponentCompositionStrategyV2:
                         copy=True,
                     )
                     continue
-                if not _record_matches_declared_schema(
+                if not record_matches_declared_schema(
                     strategy_input,
                     delta,
                 ):
@@ -622,7 +847,7 @@ class FormalComponentCompositionStrategyV2:
                         RelativePoseComponentCompositionRule,
                     ):
                         output_values[rule.component_id] = (
-                            _relative_pose_value(
+                            relative_pose_component_value(
                                 baseline,
                                 delta,
                                 component_id=rule.component_id,
@@ -630,10 +855,16 @@ class FormalComponentCompositionStrategyV2:
                         )
                     else:
                         output_values[rule.component_id] = (
-                            _relative_qpos_value(
+                            relative_qpos_component_value(
                                 baseline,
                                 delta,
-                                rule=rule,
+                                component_id=rule.component_id,
+                                baseline_value_contract_hash=(
+                                    rule.baseline_value_contract_hash
+                                ),
+                                delta_value_contract_hash=(
+                                    rule.delta_value_contract_hash
+                                ),
                             )
                         )
                 except (KeyError, TypeError, ValueError) as exc:
@@ -668,7 +899,7 @@ class FormalComponentCompositionStrategyV2:
             if missing:
                 renormalized_components.append(rule.component_id)
             if any(
-                not _record_matches_declared_schema(strategy_input, record)
+                not record_matches_declared_schema(strategy_input, record)
                 for record in records
             ):
                 return CompositionStrategyDecision(
@@ -760,6 +991,134 @@ class FormalComponentCompositionStrategyV2:
             action_schema=output_action_schema,
             values_by_component=output_values,
         )
+        result_data = (
+            {}
+            if not allocated_mode_by_component
+            else {
+                "allocation_selected_mode_by_component": dict(
+                    allocated_mode_by_component
+                )
+            }
+        )
+        continuity_spec_hashes = tuple(
+            dict.fromkeys(
+                rule.allocation_spec_hash
+                for rule in component_rule_set.rules
+                if isinstance(
+                    rule,
+                    (
+                        AllocatedPoseComponentCompositionRule,
+                        AllocatedQposComponentCompositionRule,
+                    ),
+                )
+                and rule.allocation_spec_hash
+                in self.allocation_transition_continuity_runtime_by_spec_hash
+            )
+        )
+        if apply_transition_continuity and continuity_spec_hashes:
+            if len(continuity_spec_hashes) != 1:
+                return CompositionStrategyDecision(
+                    output_status="invalid",
+                    reason="multiple_allocation_continuity_specs_unsupported",
+                    composed_candidate=None,
+                    used_context_ids=tuple(sorted(used_context_ids)),
+                )
+            allocation_spec = self.allocation_spec_by_hash[
+                continuity_spec_hashes[0]
+            ]
+            context_snapshot = strategy_input.context_snapshot
+            context = (
+                None
+                if context_snapshot is None
+                else context_snapshot.selected_context_by_channel.get(
+                    next(
+                        rule.allocation_context_channel
+                        for rule in component_rule_set.rules
+                        if isinstance(
+                            rule,
+                            (
+                                AllocatedPoseComponentCompositionRule,
+                                AllocatedQposComponentCompositionRule,
+                            ),
+                        )
+                        and rule.allocation_spec_hash == continuity_spec_hashes[0]
+                    )
+                )
+            )
+            baseline = selected_by_role.get(allocation_spec.base_absolute_role)
+            activation_id = strategy_input.input_snapshot.expected_activation_id
+            activation_hash = strategy_input.input_snapshot.expected_activation_hash
+            if baseline is None or (
+                activation_id is None or activation_hash is None
+            ):
+                return CompositionStrategyDecision(
+                    output_status="invalid",
+                    reason="allocation_continuity_basis_missing",
+                    composed_candidate=None,
+                    used_context_ids=tuple(sorted(used_context_ids)),
+                )
+            try:
+                allocation_rules = tuple(
+                    rule
+                    for rule in component_rule_set.rules
+                    if isinstance(
+                        rule,
+                        (
+                            AllocatedPoseComponentCompositionRule,
+                            AllocatedQposComponentCompositionRule,
+                        ),
+                    )
+                    and rule.allocation_spec_hash == continuity_spec_hashes[0]
+                )
+                if context is None or context.availability != "available":
+                    if any(
+                        rule.context_missing_behavior != "use_baseline"
+                        for rule in allocation_rules
+                    ):
+                        raise ValueError("allocation_continuity_context_missing")
+                    modes = {
+                        component_id: COMPOSITION_ALLOCATION_MODE_BASE_ONLY
+                        for component_id in allocation_spec.component_ids
+                    }
+                else:
+                    modes = selected_allocation_modes_from_context(
+                        context,
+                        expected_allocation_spec_hash=(
+                            allocation_spec.semantic_content_hash
+                        ),
+                        expected_component_ids=allocation_spec.component_ids,
+                        target_effective_at=(
+                            strategy_input.input_snapshot.target_effective_at
+                        ),
+                        expected_composition_activation_id=activation_id,
+                        expected_composition_activation_hash=activation_hash,
+                    )
+                continuity = self.allocation_transition_continuity_runtime_by_spec_hash[
+                    continuity_spec_hashes[0]
+                ].prepare(
+                    raw_candidate=action,
+                    baseline_candidate=baseline.action,
+                    selected_mode_by_component=modes,
+                    target_effective_at=(
+                        strategy_input.input_snapshot.target_effective_at
+                    ),
+                    invocation_id=strategy_input.strategy_input_id,
+                    invocation_hash=strategy_input.semantic_content_hash,
+                )
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                return CompositionStrategyDecision(
+                    output_status="invalid",
+                    reason=f"allocation_continuity_invalid:{exc}",
+                    composed_candidate=None,
+                    used_context_ids=tuple(sorted(used_context_ids)),
+                )
+            action = continuity.output
+            result_data = {
+                **result_data,
+                "allocation_transition_continuity": (
+                    continuity.receipt.semantic_payload()
+                )
+            }
         reason = (
             "formal_component_composition_renormalized:"
             + ",".join(renormalized_components)
@@ -768,10 +1127,14 @@ class FormalComponentCompositionStrategyV2:
         )
         if strategy_mode != FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1:
             reason += f":{strategy_mode}"
+        if result_data:
+            reason += ":allocation_transition_continuity"
         return CompositionStrategyDecision(
             output_status="ready",
             reason=reason,
             composed_candidate=action,
+            used_context_ids=tuple(sorted(used_context_ids)),
+            result_data=result_data,
         )
 
 

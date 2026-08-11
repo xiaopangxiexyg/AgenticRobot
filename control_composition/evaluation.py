@@ -38,6 +38,7 @@ from .observability import (
     SourceDifferenceObservation,
     SourceDifferenceSpec,
 )
+from .residual_anchor_lifecycle import ResidualAnchorLifecycleSnapshot
 
 
 def _required(value: object, *, name: str) -> str:
@@ -94,6 +95,9 @@ class CompositionEvaluationRecord:
     pre_mix_policy_input: CompositionPreMixPolicyInput | None = None
     pre_mix_policy_decision: CompositionPreMixPolicyDecision | None = None
     pre_mix_policy_elapsed_sec: float | None = None
+    residual_anchor_lifecycle_snapshot: (
+        ResidualAnchorLifecycleSnapshot | None
+    ) = None
 
     def __post_init__(self) -> None:
         if self.information_plan is not None and not isinstance(
@@ -153,7 +157,7 @@ class CompositionEvaluationRecord:
             raise ValueError("required_context_channels must be unique.")
         if (
             self.information_plan is not None
-            and channels != self.information_plan.required_context_channels
+            and channels != self.information_plan.context_channels
         ):
             raise ValueError(
                 "Evaluation channels do not match CompositionInformationPlan."
@@ -285,6 +289,30 @@ class CompositionEvaluationRecord:
         elif self.composition_evaluation.strategy_id is not None:
             raise ValueError(
                 "Formal composition evaluation requires strategy evaluation lineage."
+            )
+        lifecycle = self.residual_anchor_lifecycle_snapshot
+        strategy_lifecycle = (
+            None
+            if self.strategy_input is None
+            else self.strategy_input.residual_anchor_lifecycle_snapshot
+        )
+        if lifecycle is None:
+            if strategy_lifecycle is not None:
+                raise ValueError(
+                    "Residual anchor lifecycle evaluation lineage is missing."
+                )
+        elif (
+            not isinstance(lifecycle, ResidualAnchorLifecycleSnapshot)
+            or strategy_lifecycle != lifecycle
+            or lifecycle.control_domain_id != self.control_cut.control_domain_id
+            or lifecycle.cutoff_at != self.control_cut.cutoff_at
+            or lifecycle.cutoff_admission_sequence
+            != self.control_cut.cutoff_admission_sequence
+            or lifecycle.target_effective_at
+            != self.input_snapshot.target_effective_at
+        ):
+            raise ValueError(
+                "Residual anchor lifecycle snapshot does not share the cut."
             )
         control_binding = self.strategy_control_binding
         if control_binding is not None:

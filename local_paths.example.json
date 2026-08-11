@@ -1,6 +1,8 @@
 {
-  "dataset_root": "datasets",
+  "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection",
   "teleop_records_root": "teleop_records",
-  "real_robot_dataset_root": "../real_robot_dataset/datasets",
+  "runtime_artifacts_root": "runtime_artifacts",
+  "runtime_artifact_layout": "legacy",
+  "real_robot_dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection",
   "concat_video_input_dir": "../real_robot_dataset/datasets/2026-04-27_chips_changed/videos/observation.images.front/chunk-000"
 }

@@ -15,6 +15,7 @@ from robot_motion.action.proposal import (
 )
 
 from .runtime import PolicyActionEmission
+from .source_projection import policy_source_projection_from_metadata
 
 
 ROBOT_ACTION_RECORD_HASH_DOMAIN_V1 = "dexteleop.robot_action_record.v1"
@@ -104,7 +105,7 @@ def project_policy_action_emission(
     control_domain_id: str,
     embodiment_instance_id: str,
     clock_domain_id: str,
-) -> tuple[ControlTraceFact, ControlTraceFact]:
+) -> tuple[ControlTraceFact, ...]:
     """Project an emission and its independent source-validation fact."""
 
     payload = policy_action_emission_payload(emission)
@@ -140,10 +141,60 @@ def project_policy_action_emission(
         },
         **common,
     )
-    return emission_fact, validation_fact
+    projection_fact = project_policy_action_projection(
+        emission,
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        embodiment_instance_id=embodiment_instance_id,
+        clock_domain_id=clock_domain_id,
+    )
+    return (
+        (emission_fact, validation_fact)
+        if projection_fact is None
+        else (emission_fact, validation_fact, projection_fact)
+    )
+
+
+def project_policy_action_projection(
+    emission: PolicyActionEmission,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    embodiment_instance_id: str,
+    clock_domain_id: str,
+) -> ControlTraceFact | None:
+    """Record source values and anchor semantics without copying model internals."""
+
+    if not isinstance(emission, PolicyActionEmission):
+        raise TypeError("emission must be a PolicyActionEmission.")
+    decoded = emission.decoded_absolute_action
+    if decoded is None:
+        return None
+    projection = policy_source_projection_from_metadata(decoded.metadata)
+    if projection is None:
+        return None
+    fact_id = f"policy-action-projection:{emission.emission_id}"
+    return ControlTraceFact.create(
+        fact_id=fact_id,
+        event_type="policy_action_projection",
+        runtime_session_id=str(runtime_session_id),
+        control_domain_id=str(control_domain_id),
+        embodiment_instance_id=str(embodiment_instance_id),
+        occurred_at=float(emission.emitted_at),
+        clock_domain_id=str(clock_domain_id),
+        payload={
+            "emission_id": emission.emission_id,
+            "emission_hash": emission.semantic_content_hash,
+            "policy_node_id": emission.policy_node_id,
+            "inference_id": emission.inference_id,
+            "policy_output_id": emission.policy_output_id,
+            "projection": projection.to_dict(),
+        },
+    )
 
 
 __all__ = [
     "policy_action_emission_payload",
     "project_policy_action_emission",
+    "project_policy_action_projection",
 ]

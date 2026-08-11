@@ -21,6 +21,13 @@ class ControlAdmissionStore(Protocol[T]):
         ...
 
 
+class ControlAdmissionBatchStore(Protocol[T]):
+    def _insert_admitted_batch(self, records: tuple[T, ...]) -> None:
+        """Atomically insert a prebuilt record batch or raise without mutation."""
+
+        ...
+
+
 @dataclass(frozen=True)
 class ControlCut:
     runtime_session_id: str
@@ -105,6 +112,38 @@ class ControlAdmissionCoordinator:
             self._committed_high_watermark = sequence
             return record
 
+    def commit_batch(
+        self,
+        *,
+        store: ControlAdmissionBatchStore[T],
+        count: int,
+        build: Callable[[float, tuple[int, ...]], tuple[T, ...]],
+    ) -> tuple[T, ...]:
+        """Stamp and atomically publish one non-empty fact batch.
+
+        Every record shares the same receiver ``available_at``. Admission
+        sequences remain globally unique and consecutive, while cut capture
+        cannot observe a strict subset because the high-water mark advances
+        only after the store accepts the complete batch under this lock.
+        """
+
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("Control admission batch count must be positive.")
+        with self._lock:
+            first = self._committed_high_watermark + 1
+            sequences = tuple(range(first, first + count))
+            available_at = float(self._clock())
+            if not math.isfinite(available_at):
+                raise ValueError("Receiver monotonic clock returned a non-finite value.")
+            records = tuple(build(available_at, sequences))
+            if len(records) != count:
+                raise ValueError(
+                    "Control admission batch builder returned another record count."
+                )
+            store._insert_admitted_batch(records)
+            self._committed_high_watermark = sequences[-1]
+            return records
+
     def capture_cut(
         self,
         *,
@@ -141,6 +180,7 @@ def admitted_at_or_before(record: Any, cut: ControlCut) -> bool:
 
 __all__ = [
     "ControlAdmissionCoordinator",
+    "ControlAdmissionBatchStore",
     "ControlAdmissionStore",
     "ControlCut",
     "ControlCutCapture",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 from dataset_contracts.progress_profile import (
@@ -12,6 +12,7 @@ from dataset_contracts.progress_profile import (
 from dataset_contracts.progress_stage_annotations import (
     StageAnnotationBundleV1,
     StageOccurrenceAnnotationV1,
+    capture_end_projected_attempt_id,
 )
 from dataset_contracts.progress_stages import (
     ProgressStageEntryBindingV1,
@@ -24,6 +25,10 @@ from .progress_samples import project_progress_timeline_to_samples
 from .progress_timeline import (
     ResolvedProgressAttempt,
     ResolvedProgressTimeline,
+)
+from .retrospective_progress import (
+    ResolvedRetrospectiveAttempt,
+    ResolvedRetrospectiveProgressWindow,
 )
 from .sample_axis import (
     EpisodeSampleAxis,
@@ -82,7 +87,7 @@ class StageTrainingIndex:
 
 @dataclass(frozen=True)
 class _EffectiveAttempt:
-    source: ResolvedProgressAttempt
+    source: ResolvedProgressAttempt | ResolvedRetrospectiveAttempt
     start_at: float
     end_at: float | None
 
@@ -118,7 +123,9 @@ def _timestamp_is_covered_by_abnormal(
 
 def _effective_attempts(
     *,
-    timeline: ResolvedProgressTimeline,
+    progress_profile: TaskProgressProfileV1,
+    progress_binding: ProgressEpisodeBindingV1,
+    timeline: ResolvedProgressTimeline | ResolvedRetrospectiveProgressWindow,
     annotations: StageAnnotationBundleV1,
 ) -> tuple[_EffectiveAttempt, ...]:
     starts = {item.attempt_id: item.start_at for item in timeline.attempts}
@@ -164,7 +171,141 @@ def _effective_attempts(
             raise ProgressStageResolutionError(
                 "Corrected coarse boundaries move Attempt time backwards."
             )
-    return effective
+    capture_end = annotations.capture_end_step
+    if capture_end is None:
+        return effective
+    if not isinstance(timeline, ResolvedProgressTimeline):
+        raise ProgressStageResolutionError(
+            "A capture-end Step annotation requires capture-time Progress facts."
+        )
+    if progress_profile.topology_kind != "LINEAR":
+        raise ProgressStageResolutionError(
+            "A capture-end Step annotation currently requires a LINEAR profile."
+        )
+    if (
+        not effective
+        or timeline.terminal_fact_id is None
+        or capture_end.source_terminal_fact_id != timeline.terminal_fact_id
+        or capture_end.clock_domain_id != timeline.clock_domain_id
+    ):
+        raise ProgressStageResolutionError(
+            "Capture-end Step annotation does not bind the terminal fact or clock."
+        )
+    source = effective[-1]
+    if (
+        capture_end.source_attempt_id != source.source.attempt_id
+        or source.end_at is None
+        or source.source.failure_fact_id is not None
+        or source.source.outcome
+        not in {"ABORTED", "TRUNCATED_AT_CAPTURE_END", "UNKNOWN"}
+        or timeline.termination_cause
+        not in {"MANUAL_STOP", "ABORTED", "UNKNOWN", "WINDOW_COMPLETED"}
+    ):
+        raise ProgressStageResolutionError(
+            "Capture-end Step annotation requires the final non-failure Attempt "
+            "of an ambiguous or normal window stop."
+        )
+    step_ids = tuple(step.progress_step_id for step in progress_profile.steps)
+    try:
+        source_index = step_ids.index(source.source.progress_step_id)
+        end_index = step_ids.index(capture_end.end_progress_step_id)
+    except ValueError as exc:
+        raise ProgressStageResolutionError(
+            "Capture-end Step annotation references a foreign Progress Step."
+        ) from exc
+    try:
+        entry_index = step_ids.index(progress_binding.entry_step_id)
+    except ValueError as exc:
+        raise ProgressStageResolutionError(
+            "Capture-end Step annotation has a foreign Episode entry Step."
+        ) from exc
+    if end_index < entry_index:
+        raise ProgressStageResolutionError(
+            "Capture-end Step cannot move before the Episode entry Step."
+        )
+    if end_index <= source_index:
+        anchor_index = next(
+            (
+                index
+                for index in range(len(effective) - 1, -1, -1)
+                if effective[index].source.progress_step_id
+                == capture_end.end_progress_step_id
+            ),
+            None,
+        )
+        if anchor_index is None:
+            raise ProgressStageResolutionError(
+                "The selected earlier capture-end Step has no source Attempt."
+            )
+        anchor = effective[anchor_index]
+        selected_step_ids = (capture_end.end_progress_step_id,)
+    else:
+        anchor_index = len(effective) - 1
+        anchor = source
+        selected_step_ids = step_ids[source_index : end_index + 1]
+    if any(
+        attempt.source.failure_fact_id is not None
+        for attempt in effective[anchor_index:]
+    ):
+        raise ProgressStageResolutionError(
+            "Capture-end Step projection cannot discard a captured Failure "
+            "Attempt."
+        )
+    projected: list[_EffectiveAttempt] = []
+    previous_end: float | None = None
+    for step_id in selected_step_ids:
+        attempt_id = capture_end_projected_attempt_id(
+            source_attempt_id=anchor.source.attempt_id,
+            source_progress_step_id=anchor.source.progress_step_id,
+            progress_step_id=step_id,
+        )
+        values = tuple(
+            occurrence
+            for occurrence in annotations.occurrences
+            if occurrence.coarse_attempt_id == attempt_id
+        )
+        if not values or any(
+            occurrence.progress_step_id != step_id for occurrence in values
+        ):
+            raise ProgressStageResolutionError(
+                "Every projected capture-end Progress Step requires its own "
+                "fine-stage occurrences."
+            )
+        start_at = min(value.start_at for value in values)
+        end_at = max(value.end_at for value in values)
+        if previous_end is None:
+            if not _close(start_at, anchor.start_at):
+                raise ProgressStageResolutionError(
+                    "Capture-end Step projection must start at the source "
+                    "Attempt boundary."
+                )
+        elif not _close(start_at, previous_end):
+            raise ProgressStageResolutionError(
+                "Projected capture-end Progress Steps must be contiguous."
+            )
+        projected.append(
+            _EffectiveAttempt(
+                source=replace(
+                    anchor.source,
+                    attempt_id=attempt_id,
+                    progress_step_id=step_id,
+                    start_at=start_at,
+                    end_at=end_at,
+                    outcome="SUCCESS",
+                    failure_fact_id=None,
+                    failure_reported_at=None,
+                    failure_timing_semantics=None,
+                ),
+                start_at=start_at,
+                end_at=end_at,
+            )
+        )
+        previous_end = end_at
+    if previous_end is None or not _close(previous_end, source.end_at):
+        raise ProgressStageResolutionError(
+            "Capture-end Step projection must end at the source Attempt boundary."
+        )
+    return effective[:anchor_index] + tuple(projected)
 
 
 def _entry_stage_id(
@@ -173,7 +314,7 @@ def _entry_stage_id(
     progress_binding: ProgressEpisodeBindingV1,
     stage_profile: TaskStageProfileV1,
     stage_entry_binding: ProgressStageEntryBindingV1 | None,
-    timeline: ResolvedProgressTimeline,
+    timeline: ResolvedProgressTimeline | ResolvedRetrospectiveProgressWindow,
 ) -> str:
     stages = stage_profile.stages_for_step(progress_binding.entry_step_id)
     if not stages:
@@ -203,7 +344,7 @@ def _validate_occurrence_basics(
     occurrence: StageOccurrenceAnnotationV1,
     attempt: _EffectiveAttempt,
     stage_profile: TaskStageProfileV1,
-    timeline: ResolvedProgressTimeline,
+    timeline: ResolvedProgressTimeline | ResolvedRetrospectiveProgressWindow,
     abnormal_intervals: tuple[object, ...],
 ) -> None:
     if occurrence.clock_domain_id != timeline.clock_domain_id:
@@ -335,7 +476,7 @@ def resolve_stage_training_index(
     progress_binding: ProgressEpisodeBindingV1,
     stage_profile: TaskStageProfileV1,
     stage_entry_binding: ProgressStageEntryBindingV1 | None,
-    timeline: ResolvedProgressTimeline,
+    timeline: ResolvedProgressTimeline | ResolvedRetrospectiveProgressWindow,
     annotations: StageAnnotationBundleV1,
     sample_axis: EpisodeSampleAxis,
 ) -> StageTrainingIndex:
@@ -370,6 +511,8 @@ def resolve_stage_training_index(
         timeline=timeline,
     )
     attempts = _effective_attempts(
+        progress_profile=progress_profile,
+        progress_binding=progress_binding,
         timeline=timeline,
         annotations=annotations,
     )
@@ -446,8 +589,14 @@ def resolve_stage_training_index(
         annotations.episode_abnormal is not None
         or annotations.episode_review_request is not None
     )
+    effective_attempt_ids = frozenset(
+        item.source.attempt_id for item in attempts
+    )
     transitioned_attempt_ids = frozenset(
-        item.from_attempt_id for item in timeline.transitions
+        item.from_attempt_id
+        for item in timeline.transitions
+        if item.from_attempt_id in effective_attempt_ids
+        and item.to_attempt_id in effective_attempt_ids
     )
     final_attempt_id = attempts[-1].source.attempt_id if attempts else None
 

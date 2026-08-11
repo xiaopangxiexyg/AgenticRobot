@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
@@ -14,6 +15,9 @@ COMPOSITION_ACTIVATION_BINDING_HASH_DOMAIN_V2 = (
 )
 COMPOSITION_SOURCE_ELIGIBILITY_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.composition_source_eligibility_binding.v1"
+)
+COMPOSITION_INPUT_SEMANTIC_BINDING_HASH_DOMAIN_DEVELOPMENT = (
+    "dexteleop.composition_input_semantic_binding.development"
 )
 
 
@@ -112,6 +116,80 @@ class CompositionSourceEligibilityBinding:
 
 
 @dataclass(frozen=True)
+class CompositionInputSemanticBinding:
+    """Record non-debug semantic identities carried by one admitted input.
+
+    Bindings stay separate from the established composition-input trace record,
+    while the input's own semantic hash still commits to them.
+    """
+
+    composition_input_id: str
+    composition_input_hash: str
+    binding_id_by_kind: Mapping[str, str]
+    binding_hash_by_kind: Mapping[str, str]
+    semantic_content_hash: str = ""
+
+    def __post_init__(self) -> None:
+        binding_ids = {
+            _required(kind, name="binding_kind"): _required(
+                value,
+                name="binding_id",
+            )
+            for kind, value in dict(self.binding_id_by_kind).items()
+        }
+        binding_hashes = {
+            _required(kind, name="binding_kind"): _required(
+                value,
+                name="binding_hash",
+            )
+            for kind, value in dict(self.binding_hash_by_kind).items()
+        }
+        if not binding_ids:
+            raise ValueError("Composition input semantic binding must be non-empty.")
+        if set(binding_ids) != set(binding_hashes):
+            raise ValueError("Composition input semantic binding kinds must match.")
+        payload = {
+            "composition_input_id": _required(
+                self.composition_input_id,
+                name="composition_input_id",
+            ),
+            "composition_input_hash": _required(
+                self.composition_input_hash,
+                name="composition_input_hash",
+            ),
+            "binding_id_by_kind": dict(sorted(binding_ids.items())),
+            "binding_hash_by_kind": dict(sorted(binding_hashes.items())),
+        }
+        digest = canonical_content_hash(
+            payload,
+            domain=COMPOSITION_INPUT_SEMANTIC_BINDING_HASH_DOMAIN_DEVELOPMENT,
+        )
+        if self.semantic_content_hash and self.semantic_content_hash != digest:
+            raise ValueError("Composition input semantic binding hash mismatch.")
+        object.__setattr__(self, "composition_input_id", payload["composition_input_id"])
+        object.__setattr__(
+            self,
+            "composition_input_hash",
+            payload["composition_input_hash"],
+        )
+        object.__setattr__(
+            self,
+            "binding_id_by_kind",
+            MappingProxyType(payload["binding_id_by_kind"]),
+        )
+        object.__setattr__(
+            self,
+            "binding_hash_by_kind",
+            MappingProxyType(payload["binding_hash_by_kind"]),
+        )
+        object.__setattr__(self, "semantic_content_hash", digest)
+
+    @property
+    def binding_id(self) -> str:
+        return f"composition-input-semantic-binding:{self.semantic_content_hash}"
+
+
+@dataclass(frozen=True)
 class CompositionDomainEvent:
     """One immutable domain occurrence, before any recording projection."""
 
@@ -135,8 +213,10 @@ class CompositionDomainEvent:
 
 __all__ = [
     "COMPOSITION_ACTIVATION_BINDING_HASH_DOMAIN_V2",
+    "COMPOSITION_INPUT_SEMANTIC_BINDING_HASH_DOMAIN_DEVELOPMENT",
     "COMPOSITION_SOURCE_ELIGIBILITY_BINDING_HASH_DOMAIN_V1",
     "CompositionActivationBinding",
     "CompositionDomainEvent",
+    "CompositionInputSemanticBinding",
     "CompositionSourceEligibilityBinding",
 ]

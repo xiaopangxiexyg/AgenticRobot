@@ -1,139 +1,90 @@
+"""Shared motion APIs with dependency-local lazy exports."""
+
 from __future__ import annotations
 
-from .composite_provider import CompositeKinematicsProvider
-from .diagnostics import (
-    FaultEvent,
-    FaultSeverity,
-    RateTracker,
-    TeleopRunState,
-    TeleopStateMachine,
-)
-from .ik_resolver import IKSafetyResolver
-from .joint_limits import (
-    JointLimitStep,
-    JointRateLimiter,
-    JointVelocityLimitProfile,
-    limit_joint_step,
-    load_joint_velocity_limit_profiles,
-    plan_limited_joint_path,
-)
-from .pinocchio_provider import PinocchioIKProvider
-from .profiles import IKSafetyProfile, load_ik_safety_profiles
-from .relative_action import (
-    ACTION_POSE_MODES,
-    ACTION_POSE_MODE_ABSOLUTE,
-    ACTION_POSE_MODE_RELATIVE,
-    DEFAULT_ARM_POSE_SLICES,
-    PoseChunkErrorMetrics,
-    RelativeActionError,
-    absolute_pose,
-    compare_pose_chunks,
-    convert_action_and_last_action_chunk,
-    convert_arm_pose_chunk,
-    convert_last_action_chunk,
-    normalize_action_pose_mode,
-    pose_matrix_to_xyzquat,
-    relative_pose,
-    xyzquat_to_pose_matrix,
-)
-from .seed_expansion import (
-    SeedExpansionProfile,
-    SeedExpansionResult,
-    SeedPerturbation,
-    expand_seed_qpos,
-    load_seed_expansion_profiles,
-)
-from .runtime import (
-    BackendDispatchError,
-    BimanualRig,
-    CommandDispatchReceipt,
-    CompositeRig,
-    EffectorBackend,
-    EffectorCommand,
-    MotionCommand,
-    MotionObservation,
-    ObservationChannel,
-    ObservationSource,
-    Retargeter,
-    Rig,
-    RigDispatchError,
-    TeleopCommand,
-    TeleopObservation,
-    latest_channel_timestamp,
-    merge_teleop_commands,
-)
-from .safety import MotionSafetyConfig, SafetyMonitor, SafetyViolation, TeleopSafetyConfig
-from .types import (
-    IKCandidate,
-    IKResolveRequest,
-    IKResolveResult,
-    IKResolveStatus,
-    PoseTolerance,
-    SingularityReport,
-)
+from importlib import import_module
+from typing import Any
 
-__all__ = [
-    "IKCandidate",
-    "IKResolveRequest",
-    "IKResolveResult",
-    "IKResolveStatus",
-    "IKSafetyProfile",
-    "IKSafetyResolver",
-    "BimanualRig",
-    "ACTION_POSE_MODES",
-    "ACTION_POSE_MODE_ABSOLUTE",
-    "ACTION_POSE_MODE_RELATIVE",
-    "BackendDispatchError",
-    "CommandDispatchReceipt",
-    "CompositeKinematicsProvider",
-    "CompositeRig",
-    "DEFAULT_ARM_POSE_SLICES",
-    "EffectorBackend",
-    "EffectorCommand",
-    "FaultEvent",
-    "FaultSeverity",
-    "JointLimitStep",
-    "JointRateLimiter",
-    "JointVelocityLimitProfile",
-    "MotionCommand",
-    "MotionObservation",
-    "MotionSafetyConfig",
-    "ObservationChannel",
-    "ObservationSource",
-    "PoseTolerance",
-    "PoseChunkErrorMetrics",
-    "PinocchioIKProvider",
-    "RateTracker",
-    "RelativeActionError",
-    "Retargeter",
-    "Rig",
-    "RigDispatchError",
-    "SeedExpansionProfile",
-    "SeedExpansionResult",
-    "SeedPerturbation",
-    "SafetyMonitor",
-    "SafetyViolation",
-    "SingularityReport",
-    "TeleopCommand",
-    "TeleopObservation",
-    "TeleopRunState",
-    "TeleopStateMachine",
-    "TeleopSafetyConfig",
-    "expand_seed_qpos",
-    "absolute_pose",
-    "compare_pose_chunks",
-    "convert_action_and_last_action_chunk",
-    "convert_arm_pose_chunk",
-    "convert_last_action_chunk",
-    "latest_channel_timestamp",
-    "limit_joint_step",
-    "load_ik_safety_profiles",
-    "load_joint_velocity_limit_profiles",
-    "load_seed_expansion_profiles",
-    "merge_teleop_commands",
-    "normalize_action_pose_mode",
-    "pose_matrix_to_xyzquat",
-    "plan_limited_joint_path",
-    "relative_pose",
-    "xyzquat_to_pose_matrix",
-]
+
+_EXPORTS: dict[str, str] = {
+    "CompositeKinematicsProvider": ".composite_provider",
+    "FaultEvent": ".diagnostics",
+    "FaultSeverity": ".diagnostics",
+    "RateTracker": ".diagnostics",
+    "TeleopRunState": ".diagnostics",
+    "TeleopStateMachine": ".diagnostics",
+    "IKSafetyResolver": ".ik_resolver",
+    "JointLimitStep": ".joint_limits",
+    "JointRateLimiter": ".joint_limits",
+    "JointVelocityLimitProfile": ".joint_limits",
+    "limit_joint_step": ".joint_limits",
+    "load_joint_velocity_limit_profiles": ".joint_limits",
+    "plan_limited_joint_path": ".joint_limits",
+    "PinocchioIKProvider": ".pinocchio_provider",
+    "IKSafetyProfile": ".profiles",
+    "load_ik_safety_profiles": ".profiles",
+    "ACTION_POSE_MODES": ".relative_action",
+    "ACTION_POSE_MODE_ABSOLUTE": ".relative_action",
+    "ACTION_POSE_MODE_RELATIVE": ".relative_action",
+    "DEFAULT_ARM_POSE_SLICES": ".relative_action",
+    "PoseChunkErrorMetrics": ".relative_action",
+    "RelativeActionError": ".relative_action",
+    "absolute_pose": ".relative_action",
+    "compare_pose_chunks": ".relative_action",
+    "convert_action_and_last_action_chunk": ".relative_action",
+    "convert_arm_pose_chunk": ".relative_action",
+    "convert_last_action_chunk": ".relative_action",
+    "normalize_action_pose_mode": ".relative_action",
+    "pose_matrix_to_xyzquat": ".relative_action",
+    "relative_pose": ".relative_action",
+    "xyzquat_to_pose_matrix": ".relative_action",
+    "SeedExpansionProfile": ".seed_expansion",
+    "SeedExpansionResult": ".seed_expansion",
+    "SeedPerturbation": ".seed_expansion",
+    "expand_seed_qpos": ".seed_expansion",
+    "load_seed_expansion_profiles": ".seed_expansion",
+    "BackendDispatchError": ".runtime",
+    "BimanualRig": ".runtime",
+    "CommandDispatchReceipt": ".runtime",
+    "CompositeRig": ".runtime",
+    "EffectorBackend": ".runtime",
+    "EffectorCommand": ".runtime",
+    "MotionCommand": ".runtime",
+    "MotionObservation": ".runtime",
+    "ObservationChannel": ".runtime",
+    "ObservationSource": ".runtime",
+    "Retargeter": ".runtime",
+    "Rig": ".runtime",
+    "RigDispatchError": ".runtime",
+    "TeleopCommand": ".runtime",
+    "TeleopObservation": ".runtime",
+    "latest_channel_timestamp": ".runtime",
+    "merge_teleop_commands": ".runtime",
+    "MotionSafetyConfig": ".safety",
+    "SafetyMonitor": ".safety",
+    "SafetyViolation": ".safety",
+    "TeleopSafetyConfig": ".safety",
+    "IKCandidate": ".types",
+    "IKResolveRequest": ".types",
+    "IKResolveResult": ".types",
+    "IKResolveStatus": ".types",
+    "PoseTolerance": ".types",
+    "SingularityReport": ".types",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    module = import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted((*globals(), *_EXPORTS))
+
+
+__all__ = sorted(_EXPORTS)

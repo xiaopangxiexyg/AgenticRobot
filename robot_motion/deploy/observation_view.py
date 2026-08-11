@@ -223,6 +223,7 @@ class PolicyObservationView:
     payload: Mapping[str, Any]
     compatibility_payload: Mapping[str, Any] = field(default_factory=dict)
     compatibility_adapter_id: str = POLICY_OBSERVATION_COMPATIBILITY_ADAPTER_V1
+    compatibility_hand_state_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.contract_id).strip() or not str(self.contract_hash).strip():
@@ -268,6 +269,20 @@ class PolicyObservationView:
                     str(key): deep_freeze(value)
                     for key, value in self.compatibility_payload.items()
                 }
+            ),
+        )
+        object.__setattr__(
+            self,
+            "compatibility_hand_state_keys",
+            tuple(
+                sorted(
+                    dict.fromkeys(
+                        (
+                            *DEFAULT_COMPATIBILITY_HAND_STATE_KEYS_V1,
+                            *self.compatibility_hand_state_keys,
+                        )
+                    )
+                )
             ),
         )
         if self.compatibility_adapter_id != POLICY_OBSERVATION_COMPATIBILITY_ADAPTER_V1:
@@ -543,10 +558,7 @@ def compare_policy_observation_view(
             ),
             "compatibility.hand_states": _sanitize_state_mapping(
                 legacy_observation.hand_states,
-                allowed_keys=set(
-                    view.compatibility_payload.get("hand_states", {}).keys()
-                )
-                | DEFAULT_COMPATIBILITY_HAND_STATE_KEYS_V1,
+                allowed_keys=set(view.compatibility_hand_state_keys),
             ),
             "compatibility.public_metadata": _public_metadata(legacy_observation),
         }
@@ -614,6 +626,7 @@ def build_policy_observation_view(
         payload=projected,
         compatibility_payload=compatibility_payload,
         compatibility_adapter_id=contract.compatibility_adapter_id,
+        compatibility_hand_state_keys=contract.compatibility_hand_state_keys,
     )
 
 

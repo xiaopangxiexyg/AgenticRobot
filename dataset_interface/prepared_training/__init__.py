@@ -9,6 +9,11 @@ from .models import (
     PreparedTrainingViewError,
 )
 from .reader import load_prepared_training_view
+from .skill_selection import (
+    PreparedSkillEligibilityExclusion,
+    PreparedSkillEligibilityReport,
+    select_strict_successful_skill_episodes,
+)
 
 __all__ = [
     "LoadedPreparedTrainingView",
@@ -16,6 +21,9 @@ __all__ = [
     "PreparedSourceDataset",
     "PreparedTrainingViewBuildResult",
     "PreparedTrainingViewError",
+    "PreparedSkillEligibilityExclusion",
+    "PreparedSkillEligibilityReport",
     "build_prepared_training_view",
     "load_prepared_training_view",
+    "select_strict_successful_skill_episodes",
 ]

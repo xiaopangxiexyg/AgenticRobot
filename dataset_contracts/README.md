@@ -76,6 +76,12 @@ privileged coarse-boundary overrides, whole-Episode abnormal exclusion, and one
 sealed annotation-set binding/bundle/manifest. These are pure facts: they do
 not select an annotation set, operate a GUI, or persist a training index.
 
+`dataset_contracts.retrospective_progress` binds a post-capture Progress window
+to immutable legacy Episode artifacts without pretending it was captured
+causally. `retrospective_campaign` records one dataset-local eligible set,
+selected annotation batch, migration identity, and publication receipt. A
+pilot campaign is annotation-process QA metadata, not a dataset split.
+
 `PoseTrainingDataContract` distinguishes three pose-training origins: native
 v2.3 canonical desk, legacy v2.2 raw-identity compatibility, and v2.2 rows
 physically migrated to canonical desk. The migrated origin uses an explicit
@@ -129,6 +135,12 @@ command emission, independent source-adapter receipt, source validation, and typ
 episode membership transitions; runtime dataclass or audit-field additions cannot
 silently change persisted projections. Journal-issued, sink-accepted, and
 sink-durable evidence remain separate.
+The additive `component_action_trajectory` source record preserves one complete
+immutable component-keyed plan, including every target interval and action
+value. It is an actual-data fact emitted once by the source owner, not a
+per-control-cut debug snapshot and not evidence of proposal, target, reference,
+or dispatch admission. Existing non-trajectory profiles classify it as
+optional; a future timed-trajectory capture profile must require it explicitly.
 The in-memory runtime alone has a zero durable high-water mark. M4B.2 adds
 per-episode range/dependency seals and an additive capture commit contract;
 the human source-specific formal profile has a scoped runtime fixture, while
@@ -368,6 +380,13 @@ source base/episode hashes, an explicit source binding, and only the bounded
 curation fields `disposition`, `reason_code`, and optional task-profile
 `variant_id`.
 
+New annotation manifests declare the append-stable base-fingerprint algorithm
+`dexteleop.plus.source_dataset_base_fingerprint.v2`. It hashes stable dataset
+metadata while excluding the episode/frame counters rewritten at every seal;
+exact episode membership remains bound by the separate episode-manifest hash.
+This lets one external annotation set accept successive Episodes from the same
+live dataset without weakening the per-Episode locator.
+
 `dataset_interface.EpisodeCurationReader` treats a missing overlay as normal,
 so existing v2.3 datasets and explicit v2.4 compatibility views remain
 readable without migration. The overlay root is external and source data is
@@ -378,3 +397,6 @@ do not create Plus files or alter the raw writer, row schema, or episode
 lifecycle. The GUI-side review draft is reset per pending episode, and a
 save request must match that episode's opaque pending token. Native v2.4 capture membership remains an explicit adapter boundary
 and is never inferred from a directory name.
+Once an external Plus record is durable, the live GUI disables source-root
+switching and in-place episode deletion/reindexing; use a copy-on-write derived
+dataset if those source identities must change.

@@ -17,6 +17,7 @@ from control_composition.activation import CompositionActivationScope
 from control_composition.events import (
     CompositionActivationBinding,
     CompositionDomainEvent,
+    CompositionInputSemanticBinding,
     CompositionSourceEligibilityBinding,
 )
 from control_composition.information import (
@@ -30,6 +31,7 @@ from control_composition.eligibility import (
     CompositionSourceEligibilitySnapshot,
     CompositionSourceEligibilitySpec,
     CompositionSourceEligibilityStore,
+    project_composition_source_eligibility,
 )
 from control_composition.evaluation import (
     CompositionDiagnostic,
@@ -43,6 +45,8 @@ from control_composition.ports import (
 from robot_motion.action.component_action import ComponentActionSchema
 from control_composition.composition import (
     CompositionInputAdmissionReceipt,
+    CompositionInputBatchAdmissionReceipt,
+    CompositionInputBatchDraft,
     CompositionInputDraft,
     CompositionInputSnapshot,
     CompositionInputStore,
@@ -52,6 +56,7 @@ from control_composition.composition import (
     DeterministicComposer,
     FormalCompositionStrategy,
     FormalCompositionStrategyInput,
+    FormalCompositionPublicationTransaction,
     FormalCompositionStrategyResultBinding,
     FormalCompositionStrategySpec,
     build_blocked_composition_evaluation,
@@ -60,6 +65,7 @@ from control_composition.composition import (
     build_formal_strategy_result_binding,
     CompositionContextAdmissionReceipt,
     CompositionContextDraft,
+    CompositionContextRecord,
     CompositionContextSnapshot,
     CompositionContextStore,
     CompositionPreMixPolicy,
@@ -72,6 +78,8 @@ from control_composition.composition import (
     CompositionStrategyControlBinding,
     CompositionStrategyRevisionAdmissionReceipt,
     CompositionStrategyRevisionDraft,
+    project_composition_contexts,
+    project_composition_inputs,
 )
 from robot_motion.action.proposal import ProposalAdmissionReceipt
 from control_composition.composition.component_contract import (
@@ -88,11 +96,21 @@ from control_composition.observability import (
 from robot_motion.runtime.control_admission import (
     ControlAdmissionCoordinator,
     ControlCut,
+    ControlCutCapture,
 )
 from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
 from robot_motion.runtime.identity import RuntimeFactIdentity
 
 from control_composition.retention import TimeWindowRetentionSpec
+from control_composition.residual_anchor_lifecycle import (
+    ResidualAnchorLifecycleAdmissionReceipt,
+    ResidualAnchorLifecycleDraft,
+    ResidualAnchorLifecycleSnapshot,
+    ResidualAnchorLifecycleSpec,
+    ResidualAnchorLifecycleStore,
+    capture_residual_anchor_lifecycle_snapshot,
+    project_residual_anchor_lifecycle,
+)
 
 
 @dataclass(frozen=True)
@@ -105,6 +123,9 @@ class CompositeProposalSubmission:
     source_difference_error: str | None = None
     evaluation_record: CompositionEvaluationRecord | None = None
     source_eligibility_snapshot: CompositionSourceEligibilitySnapshot | None = None
+    residual_anchor_lifecycle_snapshot: (
+        ResidualAnchorLifecycleSnapshot | None
+    ) = None
 
     @property
     def diagnostics(self) -> tuple[CompositionDiagnostic, ...]:
@@ -222,9 +243,9 @@ class ControlCompositionRuntime:
             declared_channels = (
                 ()
                 if information_plan is None
-                else information_plan.required_context_channels
+                else information_plan.context_channels
             )
-            if strategy_spec.required_context_channels != declared_channels:
+            if strategy_spec.context_channels != declared_channels:
                 raise ValueError(
                     "Formal strategy channels must match the runtime "
                     "CompositionInformationPlan."
@@ -338,6 +359,11 @@ class ControlCompositionRuntime:
             action_schema=action_schema,
             input_action_schema_by_role=self.input_action_schema_by_role,
         )
+        self.residual_anchor_lifecycle = ResidualAnchorLifecycleStore(
+            runtime_session_id=runtime_session_id,
+            coordinator=coordinator,
+            producer_epochs=producer_epochs,
+        )
         self.source_eligibility = (
             None
             if source_eligibility_retention_spec is None
@@ -362,6 +388,7 @@ class ControlCompositionRuntime:
         self._emitted_formal_component_binding_hashes: set[str] = set()
         self._emitted_strategy_revision_hashes: set[str] = set()
         self._emitted_dynamic_parameter_contract_hashes: set[str] = set()
+        self._emitted_residual_anchor_lifecycle_spec_hashes: set[str] = set()
         self._information_plan_emitted = False
         self._temporal_selection_spec_emitted = False
         self._proposal_admission_by_composition_evaluation_id: dict[
@@ -387,6 +414,56 @@ class ControlCompositionRuntime:
         """Return the immutable runtime-bound demand plan, if configured."""
 
         return self._information_plan
+
+    def capture_non_closing_projection_cut(
+        self,
+        *,
+        cutoff_at: float | None = None,
+        include_composition_inputs: bool = False,
+        include_contexts: bool = True,
+        include_source_eligibility: bool = True,
+        include_residual_anchor_lifecycle: bool = False,
+    ) -> ControlCutCapture:
+        """Freeze read-only store projections without closing a target window.
+
+        This is the supported observer/preview seam.  It captures one control
+        cut and immutable record tuples while holding the same snapshot lock as
+        formal evaluation, but never calls a store ``capture_snapshot()`` or
+        advances retention watermarks.
+        """
+
+        projectors = {"producer_epochs": self.producer_epochs.snapshot}
+        if include_composition_inputs:
+            projectors["composition_inputs"] = (
+                lambda cut: project_composition_inputs(
+                    self.composition_inputs,
+                    cut,
+                )
+            )
+        if include_contexts:
+            projectors["contexts"] = lambda cut: project_composition_contexts(
+                self.contexts,
+                cut,
+            )
+        if include_source_eligibility and self.source_eligibility is not None:
+            projectors["source_eligibility"] = (
+                lambda cut: project_composition_source_eligibility(
+                    self.source_eligibility,
+                    cut,
+                )
+            )
+        if include_residual_anchor_lifecycle:
+            projectors["residual_anchor_lifecycle"] = (
+                lambda cut: project_residual_anchor_lifecycle(
+                    self.residual_anchor_lifecycle,
+                    cut,
+                )
+            )
+        with self._evaluation_snapshot_lock:
+            return self.coordinator.capture_cut(
+                cutoff_at=cutoff_at,
+                projectors=projectors,
+            )
 
     def admit_strategy_revision(
         self,
@@ -663,6 +740,14 @@ class ControlCompositionRuntime:
         self._emit_with_information_plan(*events)
         return receipt
 
+    def retained_composition_context_by_id(
+        self,
+        context_id: str,
+    ) -> CompositionContextRecord | None:
+        """Resolve a retained fact for exact producer retry reconciliation."""
+
+        return self.contexts.record_by_id(context_id)
+
     def capture_composition_context_snapshot(
         self,
         *,
@@ -699,14 +784,34 @@ class ControlCompositionRuntime:
             draft,
             activation_scope=activation_scope,
         )
-        events = [
-            CompositionDomainEvent(
-                event_kind="composition_input_admission",
-                subject=receipt,
-                occurred_at=float(self.clock()),
+        self._emit_composition_input_receipts((receipt,))
+        return receipt
+
+    def _emit_composition_input_receipts(
+        self,
+        receipts: tuple[CompositionInputAdmissionReceipt, ...],
+        *,
+        batch_receipt: CompositionInputBatchAdmissionReceipt | None = None,
+    ) -> None:
+        events: list[CompositionDomainEvent] = []
+        if batch_receipt is not None:
+            events.append(
+                CompositionDomainEvent(
+                    event_kind="composition_input_batch_admission",
+                    subject=batch_receipt,
+                    occurred_at=float(self.clock()),
+                )
             )
-        ]
-        if receipt.composition_input is not None:
+        for receipt in receipts:
+            events.append(
+                CompositionDomainEvent(
+                    event_kind="composition_input_admission",
+                    subject=receipt,
+                    occurred_at=float(self.clock()),
+                )
+            )
+            if receipt.composition_input is None:
+                continue
             input_record = receipt.composition_input
             events.append(
                 CompositionDomainEvent(
@@ -719,6 +824,27 @@ class ControlCompositionRuntime:
                     occurred_at=input_record.available_at,
                 )
             )
+            if input_record.semantic_binding_id_by_kind:
+                events.append(
+                    CompositionDomainEvent(
+                        event_kind="composition_input_semantic_binding",
+                        subject=CompositionInputSemanticBinding(
+                            composition_input_id=(
+                                input_record.composition_input_id
+                            ),
+                            composition_input_hash=(
+                                input_record.semantic_content_hash
+                            ),
+                            binding_id_by_kind=(
+                                input_record.semantic_binding_id_by_kind
+                            ),
+                            binding_hash_by_kind=(
+                                input_record.semantic_binding_hash_by_kind
+                            ),
+                        ),
+                        occurred_at=input_record.available_at,
+                    )
+                )
             if input_record.composition_activation_id is not None:
                 events.append(
                     CompositionDomainEvent(
@@ -736,6 +862,73 @@ class ControlCompositionRuntime:
                     )
                 )
         self._emit_with_information_plan(*events)
+
+    def admit_composition_inputs(
+        self,
+        batch: CompositionInputBatchDraft,
+        *,
+        activation_scope: CompositionActivationScope | None = None,
+    ) -> CompositionInputBatchAdmissionReceipt:
+        """Admit one same-source multi-role batch without partial visibility."""
+
+        receipt = self.composition_inputs.admit_batch(
+            batch,
+            activation_scope=activation_scope,
+        )
+        self._emit_composition_input_receipts(
+            receipt.input_receipts,
+            batch_receipt=receipt,
+        )
+        return receipt
+
+    def admit_residual_anchor_lifecycle(
+        self,
+        draft: ResidualAnchorLifecycleDraft,
+        *,
+        spec: ResidualAnchorLifecycleSpec,
+        activation_scope: CompositionActivationScope,
+    ) -> ResidualAnchorLifecycleAdmissionReceipt:
+        """Admit one low-rate anchor pending/ready fact on this receiver."""
+
+        receipt = self.residual_anchor_lifecycle.admit(
+            draft,
+            spec=spec,
+            activation_scope=activation_scope,
+        )
+        events: list[CompositionDomainEvent] = []
+        with self._event_spec_lock:
+            emit_spec = (
+                spec.semantic_content_hash
+                not in self._emitted_residual_anchor_lifecycle_spec_hashes
+            )
+            if emit_spec:
+                events.append(
+                    CompositionDomainEvent(
+                        event_kind="residual_anchor_lifecycle_spec",
+                        subject=spec,
+                        occurred_at=float(self.clock()),
+                    )
+                )
+            events.append(
+                CompositionDomainEvent(
+                    event_kind="residual_anchor_lifecycle_admission",
+                    subject=receipt,
+                    occurred_at=float(self.clock()),
+                )
+            )
+            if receipt.lifecycle_record is not None:
+                events.append(
+                    CompositionDomainEvent(
+                        event_kind="residual_anchor_lifecycle",
+                        subject=receipt.lifecycle_record,
+                        occurred_at=receipt.lifecycle_record.available_at,
+                    )
+                )
+            self._emit_with_information_plan(*events)
+            if emit_spec:
+                self._emitted_residual_anchor_lifecycle_spec_hashes.add(
+                    spec.semantic_content_hash
+                )
         return receipt
 
     def admit_source_eligibility(
@@ -787,6 +980,7 @@ class ControlCompositionRuntime:
         source_difference_spec: SourceDifferenceSpec | None = None,
         activation_scope: CompositionActivationScope | None = None,
         source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+        residual_anchor_lifecycle_scope_id: str | None = None,
     ) -> CompositeProposalSubmission:
         evaluation = self.evaluate_composition(
             spec=spec,
@@ -796,6 +990,9 @@ class ControlCompositionRuntime:
             source_difference_spec=source_difference_spec,
             activation_scope=activation_scope,
             source_eligibility_spec=source_eligibility_spec,
+            residual_anchor_lifecycle_scope_id=(
+                residual_anchor_lifecycle_scope_id
+            ),
         )
         if (
             evaluation.composition_evaluation.output_status != "ready"
@@ -889,14 +1086,21 @@ class ControlCompositionRuntime:
                         "publication envelope."
                     )
                 return CompositeProposalSubmission(
-                    evaluation.input_snapshot,
-                    result,
-                    receipt,
-                    evaluation.context_snapshot,
-                    evaluation.source_difference_observation,
-                    evaluation.source_difference_error,
-                    evaluation.evaluation_record,
-                    evaluation.source_eligibility_snapshot,
+                    input_snapshot=evaluation.input_snapshot,
+                    composition_evaluation=result,
+                    proposal_admission=receipt,
+                    context_snapshot=evaluation.context_snapshot,
+                    source_difference_observation=(
+                        evaluation.source_difference_observation
+                    ),
+                    source_difference_error=evaluation.source_difference_error,
+                    evaluation_record=evaluation.evaluation_record,
+                    source_eligibility_snapshot=(
+                        evaluation.source_eligibility_snapshot
+                    ),
+                    residual_anchor_lifecycle_snapshot=(
+                        evaluation.residual_anchor_lifecycle_snapshot
+                    ),
                 )
             last_target = self._accepted_publication_target_by_scope.get(
                 publication_scope
@@ -909,6 +1113,16 @@ class ControlCompositionRuntime:
                     "Production composition targets must increase strictly "
                     "within one producer activation."
                 )
+            publication_transaction = (
+                self.composition_strategy
+                if isinstance(
+                    self.composition_strategy,
+                    FormalCompositionPublicationTransaction,
+                )
+                else None
+            )
+            if publication_transaction is not None:
+                publication_transaction.validate_publication_transaction(result)
             produced_at = float(self.clock())
             if (
                 result.composition_supported_until is None
@@ -943,6 +1157,8 @@ class ControlCompositionRuntime:
                 source_event_id=result.composition_evaluation_id,
             )
             if receipt.accepted:
+                if publication_transaction is not None:
+                    publication_transaction.commit_publication_transaction(result)
                 self._proposal_admission_by_composition_evaluation_id[
                     result.composition_evaluation_id
                 ] = (
@@ -957,14 +1173,21 @@ class ControlCompositionRuntime:
                     publication_scope
                 ] = result.target_effective_at
             return CompositeProposalSubmission(
-                evaluation.input_snapshot,
-                result,
-                receipt,
-                evaluation.context_snapshot,
-                evaluation.source_difference_observation,
-                evaluation.source_difference_error,
-                evaluation.evaluation_record,
-                evaluation.source_eligibility_snapshot,
+                input_snapshot=evaluation.input_snapshot,
+                composition_evaluation=result,
+                proposal_admission=receipt,
+                context_snapshot=evaluation.context_snapshot,
+                source_difference_observation=(
+                    evaluation.source_difference_observation
+                ),
+                source_difference_error=evaluation.source_difference_error,
+                evaluation_record=evaluation.evaluation_record,
+                source_eligibility_snapshot=(
+                    evaluation.source_eligibility_snapshot
+                ),
+                residual_anchor_lifecycle_snapshot=(
+                    evaluation.residual_anchor_lifecycle_snapshot
+                ),
             )
 
     def evaluate_hot_composition(
@@ -977,6 +1200,7 @@ class ControlCompositionRuntime:
         source_difference_spec: SourceDifferenceSpec | None = None,
         activation_scope: CompositionActivationScope | None = None,
         source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+        residual_anchor_lifecycle_scope_id: str | None = None,
     ) -> CompositeProposalSubmission:
         """Evaluate one cut using its exact admitted revision and parameters."""
 
@@ -1003,6 +1227,9 @@ class ControlCompositionRuntime:
             source_difference_spec=source_difference_spec,
             activation_scope=activation_scope,
             source_eligibility_spec=source_eligibility_spec,
+            residual_anchor_lifecycle_scope_id=(
+                residual_anchor_lifecycle_scope_id
+            ),
             _strategy_control_binding=binding,
         )
 
@@ -1017,6 +1244,7 @@ class ControlCompositionRuntime:
         source_difference_spec: SourceDifferenceSpec | None = None,
         activation_scope: CompositionActivationScope | None = None,
         source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+        residual_anchor_lifecycle_scope_id: str | None = None,
         _strategy_control_binding: CompositionStrategyControlBinding | None = None,
     ) -> CompositeProposalSubmission:
         """Evaluate and observe one composition cut without publishing a proposal."""
@@ -1076,7 +1304,7 @@ class ControlCompositionRuntime:
                 )
         requested_context_channels = tuple(required_context_channels)
         if self.information_plan is not None:
-            declared_channels = self.information_plan.required_context_channels
+            declared_channels = self.information_plan.context_channels
             if (
                 requested_context_channels
                 and requested_context_channels != declared_channels
@@ -1107,6 +1335,7 @@ class ControlCompositionRuntime:
         formal_component_binding: (
             FormalComponentCompositionBinding | None
         ) = None
+        residual_anchor_lifecycle_spec: ResidualAnchorLifecycleSpec | None = None
         if strategy is not None:
             strategy_spec = (
                 strategy.spec
@@ -1114,13 +1343,53 @@ class ControlCompositionRuntime:
                 else _strategy_control_binding.revision.strategy_spec
             )
             active_strategy_spec = strategy_spec
+            declared_lifecycle_hash = (
+                strategy_spec.required_residual_anchor_lifecycle_spec_hash
+            )
+            candidate_lifecycle_spec = getattr(
+                strategy,
+                "residual_anchor_lifecycle_spec",
+                None,
+            )
+            if declared_lifecycle_hash is not None:
+                if not isinstance(
+                    candidate_lifecycle_spec,
+                    ResidualAnchorLifecycleSpec,
+                ):
+                    raise ValueError(
+                        "Formal strategy declares residual anchor lifecycle but "
+                        "does not expose its typed spec."
+                    )
+                if (
+                    candidate_lifecycle_spec.semantic_content_hash
+                    != declared_lifecycle_hash
+                ):
+                    raise ValueError(
+                        "Formal strategy exposes another residual anchor "
+                        "lifecycle spec."
+                    )
+                if activation_scope is None:
+                    raise ValueError(
+                        "Residual anchor lifecycle evaluation requires an "
+                        "activation scope."
+                    )
+                if not str(residual_anchor_lifecycle_scope_id or "").strip():
+                    raise ValueError(
+                        "Residual anchor lifecycle evaluation requires its "
+                        "lifecycle scope ID."
+                    )
+                residual_anchor_lifecycle_spec = candidate_lifecycle_spec
+            elif candidate_lifecycle_spec is not None:
+                raise ValueError(
+                    "Formal strategy exposes undeclared residual anchor lifecycle."
+                )
             if strategy_spec.composition_spec_hash != spec.semantic_content_hash:
                 raise ValueError(
                     "Formal strategy is bound to another CompositionSpec."
                 )
             if (
                 requested_context_channels
-                != strategy_spec.required_context_channels
+                != strategy_spec.context_channels
             ):
                 raise ValueError(
                     "Formal strategy context channels do not match evaluation."
@@ -1260,12 +1529,36 @@ class ControlCompositionRuntime:
                 )
             else:
                 self.contexts.advance_closed_target(target_effective_at)
+            residual_anchor_lifecycle_snapshot: (
+                ResidualAnchorLifecycleSnapshot | None
+            ) = None
+            if residual_anchor_lifecycle_spec is not None:
+                assert activation_scope is not None
+                residual_anchor_lifecycle_snapshot = (
+                    capture_residual_anchor_lifecycle_snapshot(
+                        self.residual_anchor_lifecycle,
+                        cut,
+                        producer_epochs=epoch_snapshot,
+                        spec=residual_anchor_lifecycle_spec,
+                        activation_scope=activation_scope,
+                        lifecycle_scope_id=str(
+                            residual_anchor_lifecycle_scope_id
+                        ),
+                        target_effective_at=target_effective_at,
+                    )
+                )
         blocked_reason: str | None = None
         blocked_result_status = "no_action"
         if context_snapshot is not None:
-            if context_snapshot.missing_channels:
+            missing_required_channels = tuple(
+                channel
+                for channel in context_snapshot.missing_channels
+                if self.information_plan is None
+                or channel in self.information_plan.required_context_channels
+            )
+            if missing_required_channels:
                 blocked_reason = "missing_context:" + ",".join(
-                    context_snapshot.missing_channels
+                    missing_required_channels
                 )
             else:
                 mismatches: list[str] = []
@@ -1276,6 +1569,8 @@ class ControlCompositionRuntime:
                     ):
                         if requirement.binding_mode != (
                             "selected_input_ancestor"
+                        ) or requirement.channel not in (
+                            context_snapshot.selected_context_id_by_channel
                         ):
                             continue
                         context_id = (
@@ -1476,6 +1771,9 @@ class ControlCompositionRuntime:
                 input_snapshot=input_snapshot,
                 context_snapshot=context_snapshot,
                 information_plan=self.information_plan,
+                residual_anchor_lifecycle_snapshot=(
+                    residual_anchor_lifecycle_snapshot
+                ),
                 strategy_control_binding_id=(
                     None
                     if _strategy_control_binding is None
@@ -1646,6 +1944,14 @@ class ControlCompositionRuntime:
                 )
             )
         if strategy_input is not None:
+            if residual_anchor_lifecycle_snapshot is not None:
+                events.append(
+                    CompositionDomainEvent(
+                        event_kind="residual_anchor_lifecycle_snapshot",
+                        subject=residual_anchor_lifecycle_snapshot,
+                        occurred_at=residual_anchor_lifecycle_snapshot.cutoff_at,
+                    )
+                )
             events.append(
                 CompositionDomainEvent(
                     event_kind=(
@@ -1965,6 +2271,9 @@ class ControlCompositionRuntime:
             context_snapshot=context_snapshot,
             source_eligibility_spec=source_eligibility_spec,
             source_eligibility_snapshot=source_eligibility_snapshot,
+            residual_anchor_lifecycle_snapshot=(
+                residual_anchor_lifecycle_snapshot
+            ),
             strategy_spec=active_strategy_spec,
             strategy_input=strategy_input,
             strategy_result_binding=strategy_result_binding,
@@ -1991,6 +2300,9 @@ class ControlCompositionRuntime:
             source_difference_error=difference_error,
             evaluation_record=evaluation_record,
             source_eligibility_snapshot=source_eligibility_snapshot,
+            residual_anchor_lifecycle_snapshot=(
+                residual_anchor_lifecycle_snapshot
+            ),
         )
 
 

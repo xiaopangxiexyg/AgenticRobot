@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from robot_motion.action import RobotAction
@@ -100,6 +101,8 @@ def build_composition_input_draft(
     policy_output_id: str | None = None,
     source_fact_ids: tuple[str, ...] = (),
     source_fact_hashes: tuple[str, ...] = (),
+    semantic_binding_id_by_kind: Mapping[str, str] | None = None,
+    semantic_binding_hash_by_kind: Mapping[str, str] | None = None,
     composition_activation_id: str | None = None,
     composition_activation_hash: str | None = None,
     audit_metadata: Mapping[str, Any] | None = None,
@@ -148,6 +151,28 @@ def build_composition_input_draft(
     )
     if len(normalized_source_ids) != len(normalized_source_hashes):
         raise ValueError("source_fact_ids and source_fact_hashes must have equal length.")
+    binding_ids = {
+        _required(kind, name="semantic_binding_kind"): _required(
+            binding_id,
+            name="semantic_binding_id",
+        )
+        for kind, binding_id in dict(
+            semantic_binding_id_by_kind or {}
+        ).items()
+    }
+    binding_hashes = {
+        _required(kind, name="semantic_binding_kind"): _required(
+            binding_hash,
+            name="semantic_binding_hash",
+        )
+        for kind, binding_hash in dict(
+            semantic_binding_hash_by_kind or {}
+        ).items()
+    }
+    if set(binding_ids) != set(binding_hashes):
+        raise ValueError(
+            "semantic binding id/hash maps must have identical kinds."
+        )
     activation_id = (
         None
         if composition_activation_id is None
@@ -195,6 +220,12 @@ def build_composition_input_draft(
         policy_output_id=policy_id,
         source_fact_ids=normalized_source_ids,
         source_fact_hashes=normalized_source_hashes,
+        semantic_binding_id_by_kind=MappingProxyType(
+            dict(sorted(binding_ids.items()))
+        ),
+        semantic_binding_hash_by_kind=MappingProxyType(
+            dict(sorted(binding_hashes.items()))
+        ),
         composition_activation_id=activation_id,
         composition_activation_hash=activation_hash,
         authority_candidate=False,

@@ -11,6 +11,11 @@ from robot_motion.position_control.interpolation import (
     DEFAULT_POSITION_REFERENCE_HZ,
     JointCommandInterpolator,
 )
+from robot_motion.position_control.horizon_governor import JointHorizonLimits
+from robot_motion.position_control.offline_waypoint_trajectory import (
+    OFFLINE_WAYPOINT_TIMING_STRICT,
+    build_offline_quintic_waypoint_trajectory,
+)
 from robot_motion.position_control.resampling import (
     TimestampedMotionTarget,
     build_uniform_time_grid,
@@ -23,6 +28,13 @@ DEFAULT_REPLAY_ACTION_HZ = 15.0
 DEFAULT_REPLAY_REFERENCE_HZ = DEFAULT_POSITION_REFERENCE_HZ
 DEFAULT_POSITION_QPOS_CONTROL_HZ = DEFAULT_POSITION_COMMAND_HZ
 _TIME_EPSILON_SEC = 1e-12
+
+REPLAY_QPOS_EXECUTION_LEGACY_LINEAR = "legacy_linear"
+REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC = "continuous_quintic"
+REPLAY_QPOS_EXECUTION_MODES = (
+    REPLAY_QPOS_EXECUTION_LEGACY_LINEAR,
+    REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC,
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,24 @@ class ReplayControlTick:
 
 def validate_replay_rate(value: float, *, name: str) -> float:
     return validate_resample_rate(value, name=name)
+
+
+def normalize_replay_qpos_execution_mode(value: str | None) -> str:
+    mode = str(value or REPLAY_QPOS_EXECUTION_LEGACY_LINEAR).strip().lower()
+    aliases = {
+        "legacy": REPLAY_QPOS_EXECUTION_LEGACY_LINEAR,
+        "linear": REPLAY_QPOS_EXECUTION_LEGACY_LINEAR,
+        "continuous": REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC,
+        "quintic": REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC,
+        "c2": REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC,
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in REPLAY_QPOS_EXECUTION_MODES:
+        raise ValueError(
+            "qpos execution mode must be one of "
+            f"{REPLAY_QPOS_EXECUTION_MODES}, got {value!r}."
+        )
+    return mode
 
 
 def position_qpos_segment_duration(
@@ -246,6 +276,10 @@ def iter_position_qpos_control_ticks(
     control_hz: float = DEFAULT_POSITION_QPOS_CONTROL_HZ,
     segment_duration_sec: float | None = None,
     include_final_settle: bool = True,
+    execution_mode: str = REPLAY_QPOS_EXECUTION_LEGACY_LINEAR,
+    continuous_limits: JointHorizonLimits | None = None,
+    continuous_timing_mode: str = OFFLINE_WAYPOINT_TIMING_STRICT,
+    continuous_max_time_scale: float = 4.0,
 ) -> list[ReplayControlTick]:
     """Build the offline action -> reference -> command path.
 
@@ -256,6 +290,28 @@ def iter_position_qpos_control_ticks(
     ``segment_duration_sec``). No unobserved theoretical point is used as a
     segment anchor, and no integer frequency ratio is assumed.
     """
+
+    mode = normalize_replay_qpos_execution_mode(execution_mode)
+    if mode == REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC:
+        if segment_duration_sec is not None:
+            raise ValueError(
+                "segment_duration_sec is a legacy-linear option and cannot be "
+                "combined with continuous_quintic."
+            )
+        if continuous_limits is None:
+            raise ValueError(
+                "continuous_quintic requires continuous_limits for a hard "
+                "q/v/a/jerk certificate."
+            )
+        return _iter_continuous_position_qpos_control_ticks(
+            actions,
+            reference_hz=reference_hz,
+            control_hz=control_hz,
+            include_final_settle=include_final_settle,
+            limits=continuous_limits,
+            timing_mode=continuous_timing_mode,
+            max_time_scale=continuous_max_time_scale,
+        )
 
     reference_rate = validate_replay_rate(reference_hz, name="reference_hz")
     control_rate = validate_replay_rate(control_hz, name="control_hz")
@@ -372,6 +428,198 @@ def iter_position_qpos_control_ticks(
     return ticks
 
 
+def _iter_continuous_position_qpos_control_ticks(
+    actions: Sequence[ReplayControlAction],
+    *,
+    reference_hz: float,
+    control_hz: float,
+    include_final_settle: bool,
+    limits: JointHorizonLimits,
+    timing_mode: str,
+    max_time_scale: float,
+) -> list[ReplayControlTick]:
+    """Build one exact-waypoint C2 trajectory on the command clock.
+
+    ``reference_hz`` remains in the public replay contract and determines the
+    optional final hold duration.  It does not create a second interpolation
+    owner in this mode.
+    """
+
+    action_list = _normalize_actions(actions)
+    reference_rate = validate_replay_rate(reference_hz, name="reference_hz")
+    control_rate = validate_replay_rate(control_hz, name="control_hz")
+    sides = tuple(sorted(action_list[0].qpos_by_side))
+    if not sides:
+        raise ValueError("continuous qpos replay requires at least one side.")
+    for action in action_list:
+        if tuple(sorted(action.qpos_by_side)) != sides:
+            raise ValueError(
+                "continuous qpos replay actions must keep a stable side set."
+            )
+    dimension_by_side = {
+        side: int(np.asarray(action_list[0].qpos_by_side[side]).size)
+        for side in sides
+    }
+    total_dimension = sum(dimension_by_side.values())
+    if limits.dimension != total_dimension:
+        raise ValueError(
+            "continuous_limits dimension does not match replay qpos sides: "
+            f"limits={limits.dimension}, qpos={total_dimension}."
+        )
+
+    waypoint_times = np.asarray(
+        [action.relative_time_sec for action in action_list],
+        dtype=float,
+    )
+    waypoint_q = np.asarray(
+        [
+            np.concatenate(
+                [
+                    np.asarray(action.qpos_by_side[side], dtype=float)
+                    for side in sides
+                ]
+            )
+            for action in action_list
+        ],
+        dtype=float,
+    )
+    trajectory = build_offline_quintic_waypoint_trajectory(
+        waypoint_times,
+        waypoint_q,
+        command_hz=control_rate,
+        limits=limits,
+        timing_mode=timing_mode,
+        max_time_scale=max_time_scale,
+        terminal_hold_sec=(1.0 / reference_rate if include_final_settle else 0.0),
+    )
+    execution_waypoint_times = trajectory.waypoint_timestamps
+    final_deadline = float(execution_waypoint_times[-1])
+    if include_final_settle:
+        final_deadline += 1.0 / reference_rate
+
+    side_slices: dict[str, slice] = {}
+    offset = 0
+    for side in sides:
+        next_offset = offset + dimension_by_side[side]
+        side_slices[side] = slice(offset, next_offset)
+        offset = next_offset
+
+    ticks: list[ReplayControlTick] = []
+    for control_index, timestamp in enumerate(trajectory.timestamps):
+        active_position = int(
+            np.clip(
+                np.searchsorted(
+                    execution_waypoint_times,
+                    timestamp,
+                    side="right",
+                )
+                - 1,
+                0,
+                len(action_list) - 1,
+            )
+        )
+        next_position = min(active_position + 1, len(action_list) - 1)
+        active = action_list[active_position]
+        successor = action_list[next_position]
+        interval_duration = float(
+            execution_waypoint_times[next_position]
+            - execution_waypoint_times[active_position]
+        )
+        alpha = (
+            0.0
+            if next_position == active_position or interval_duration <= 0.0
+            else float(
+                np.clip(
+                    (
+                        timestamp
+                        - execution_waypoint_times[active_position]
+                    )
+                    / interval_duration,
+                    0.0,
+                    1.0,
+                )
+            )
+        )
+        qpos_by_side = {
+            side: np.asarray(
+                trajectory.q_rad[control_index, side_slices[side]],
+                dtype=float,
+            ).copy()
+            for side in sides
+        }
+        target_qpos_by_side = {
+            side: np.asarray(successor.qpos_by_side[side], dtype=float).copy()
+            for side in sides
+        }
+        metadata = dict(active.metadata or {})
+        metadata.update(
+            {
+                "position_control_pipeline": (
+                    "action_waypoints_to_continuous_command"
+                ),
+                "reference_hz": float(reference_rate),
+                "control_hz": float(control_rate),
+                "command_hz": float(control_rate),
+                "command_planner": trajectory.metadata["planner"],
+                "command_resampling_mode": (
+                    REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC
+                ),
+                "command_segment_anchor": "global_timestamped_waypoints",
+                "continuous_qpos_hard_limit_certificate": dict(
+                    trajectory.metadata["continuous_hard_limit_certificate"]
+                ),
+                "continuous_qd_rad_s": trajectory.qd_rad_s[
+                    control_index
+                ].tolist(),
+                "continuous_qdd_rad_s2": trajectory.qdd_rad_s2[
+                    control_index
+                ].tolist(),
+                "continuous_jerk_rad_s3": trajectory.jerk_rad_s3[
+                    control_index
+                ].tolist(),
+                "continuous_internal_knot_zero_velocity_required": False,
+                "continuous_timing_mode": trajectory.metadata["timing_mode"],
+                "continuous_time_scale": trajectory.metadata["time_scale"],
+                "continuous_retimed": trajectory.metadata["retimed"],
+                "continuous_source_duration_sec": trajectory.metadata[
+                    "source_duration_sec"
+                ],
+                "continuous_execution_duration_sec": trajectory.metadata[
+                    "execution_duration_sec"
+                ],
+                "reference_action_interpolation_alpha": alpha,
+                "final_deadline_sec": float(final_deadline),
+                "include_final_settle": bool(include_final_settle),
+            }
+        )
+        ticks.append(
+            ReplayControlTick(
+                control_index=int(control_index),
+                action_index=int(active.action_index),
+                action_frame_index=int(active.frame_index),
+                relative_time_sec=float(timestamp),
+                action_relative_time_sec=float(active.relative_time_sec),
+                reference_index=int(active_position),
+                reference_relative_time_sec=float(timestamp),
+                reference_action_interpolation_alpha=alpha,
+                segment_elapsed_sec=max(
+                    0.0,
+                    float(timestamp)
+                    - float(execution_waypoint_times[active_position]),
+                ),
+                segment_duration_sec=max(0.0, interval_duration),
+                interpolation_alpha=alpha,
+                qpos_by_side=qpos_by_side,
+                target_qpos_by_side=target_qpos_by_side,
+                reference_qpos_by_side={
+                    side: value.copy() for side, value in qpos_by_side.items()
+                },
+                metadata=metadata,
+            )
+        )
+    return ticks
+
+
 __all__ = [
     "DEFAULT_POSITION_QPOS_CONTROL_HZ",
     "DEFAULT_REPLAY_ACTION_HZ",
@@ -379,7 +627,11 @@ __all__ = [
     "ReplayControlAction",
     "ReplayControlReference",
     "ReplayControlTick",
+    "REPLAY_QPOS_EXECUTION_CONTINUOUS_QUINTIC",
+    "REPLAY_QPOS_EXECUTION_LEGACY_LINEAR",
+    "REPLAY_QPOS_EXECUTION_MODES",
     "iter_position_qpos_control_ticks",
+    "normalize_replay_qpos_execution_mode",
     "position_qpos_segment_duration",
     "resample_position_qpos_references",
     "validate_replay_rate",

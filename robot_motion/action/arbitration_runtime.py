@@ -18,6 +18,10 @@ DECISION_SCHEDULE_HASH_DOMAIN_V1 = "dexteleop.decision_schedule.v1"
 DECISION_TICK_HASH_DOMAIN_V1 = "dexteleop.decision_schedule_tick.v1"
 ARBITRATION_PUBLICATION_HASH_DOMAIN_V1 = "dexteleop.arbitration_publication.v1"
 
+LATE_TICK_POLICIES_V1 = frozenset(
+    {"preserve_grid", "skip_to_next_legal_reference_tick"}
+)
+
 
 @dataclass(frozen=True)
 class DecisionScheduleSpec:
@@ -33,6 +37,11 @@ class DecisionScheduleSpec:
     trigger_coalescing_policy: str = "latest"
     decision_runtime_budget_sec: float = 0.005
     max_pending_trigger_evidence: int = 4096
+    # Scheduled-reference profiles may discard a fixed-grid tick whose START
+    # is already behind the observation/publication time.  The default keeps
+    # the historical semantics for immediate targets and unbound schedules.
+    late_tick_policy: str = "preserve_grid"
+    required_start_margin_sec: float = 0.0
 
     def __post_init__(self) -> None:
         if not str(self.spec_id).strip():
@@ -62,6 +71,31 @@ class DecisionScheduleSpec:
             raise ValueError("Decision schedule v1 only supports latest trigger coalescing.")
         if int(self.max_pending_trigger_evidence) <= 0:
             raise ValueError("max_pending_trigger_evidence must be positive.")
+        if self.late_tick_policy not in LATE_TICK_POLICIES_V1:
+            raise ValueError(
+                "late_tick_policy must be preserve_grid or "
+                "skip_to_next_legal_reference_tick."
+            )
+        margin = float(self.required_start_margin_sec)
+        if not math.isfinite(margin) or margin < 0.0:
+            raise ValueError(
+                "required_start_margin_sec must be finite and non-negative."
+            )
+        object.__setattr__(self, "required_start_margin_sec", margin)
+        if self.late_tick_policy == "skip_to_next_legal_reference_tick":
+            if margin <= 0.0:
+                raise ValueError(
+                    "strict late-tick recovery requires a positive START margin."
+                )
+            if self.target_lead_time_sec + 1e-12 < self.period_sec + margin:
+                raise ValueError(
+                    "strict late-tick recovery requires target lead to cover "
+                    "one decision period plus the START margin."
+                )
+        elif margin > 0.0:
+            raise ValueError(
+                "required_start_margin_sec requires strict late-tick recovery."
+            )
 
     @property
     def period_sec(self) -> float:
@@ -69,22 +103,36 @@ class DecisionScheduleSpec:
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "policy_id": PRODUCTION_DECISION_RATE_POLICY_V1,
+            "spec_id": self.spec_id,
+            "schedule_mode": self.schedule_mode,
+            "decision_hz": self.decision_hz,
+            "cutoff_lag_sec": self.cutoff_lag_sec,
+            "target_lead_time_sec": self.target_lead_time_sec,
+            "publication_deadline_offset_sec": self.publication_deadline_offset_sec,
+            "max_target_lateness_sec": self.max_target_lateness_sec,
+            "late_decision_policy": self.late_decision_policy,
+            "missed_tick_policy": self.missed_tick_policy,
+            "trigger_coalescing_policy": self.trigger_coalescing_policy,
+            "decision_runtime_budget_sec": self.decision_runtime_budget_sec,
+            "max_pending_trigger_evidence": self.max_pending_trigger_evidence,
+        }
+        # Preserve hashes for legacy/default schedules.  Strict scheduled
+        # profiles are deliberately distinguished because their legal tick set
+        # is different.
+        if (
+            self.late_tick_policy != "preserve_grid"
+            or self.required_start_margin_sec > 0.0
+        ):
+            payload.update(
+                {
+                    "late_tick_policy": self.late_tick_policy,
+                    "required_start_margin_sec": self.required_start_margin_sec,
+                }
+            )
         return canonical_content_hash(
-            {
-                "policy_id": PRODUCTION_DECISION_RATE_POLICY_V1,
-                "spec_id": self.spec_id,
-                "schedule_mode": self.schedule_mode,
-                "decision_hz": self.decision_hz,
-                "cutoff_lag_sec": self.cutoff_lag_sec,
-                "target_lead_time_sec": self.target_lead_time_sec,
-                "publication_deadline_offset_sec": self.publication_deadline_offset_sec,
-                "max_target_lateness_sec": self.max_target_lateness_sec,
-                "late_decision_policy": self.late_decision_policy,
-                "missed_tick_policy": self.missed_tick_policy,
-                "trigger_coalescing_policy": self.trigger_coalescing_policy,
-                "decision_runtime_budget_sec": self.decision_runtime_budget_sec,
-                "max_pending_trigger_evidence": self.max_pending_trigger_evidence,
-            },
+            payload,
             domain=DECISION_SCHEDULE_HASH_DOMAIN_V1,
         )
 
@@ -105,6 +153,14 @@ class DecisionScheduleTick:
     trigger_evidence_truncated: bool
     schedule_spec_hash: str
     semantic_content_hash: str
+    late_tick_policy: str = "preserve_grid"
+    skipped_late_tick_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.late_tick_policy not in LATE_TICK_POLICIES_V1:
+            raise ValueError("Unsupported late-tick policy.")
+        if int(self.skipped_late_tick_count) < 0:
+            raise ValueError("skipped_late_tick_count must be non-negative.")
 
 
 class DecisionScheduler:
@@ -157,6 +213,7 @@ class DecisionScheduler:
         if not self.due(timestamp):
             return None
         scheduled_at = timestamp
+        skipped_late_tick_count = 0
         if (
             self._next_due_at is not None
             and self.spec.target_lead_time_sec > 0.0
@@ -164,10 +221,24 @@ class DecisionScheduler:
             scheduled_at = self._next_due_at
             lateness = max(0.0, timestamp - scheduled_at)
             missed_periods = int(
-                math.floor(lateness / self.spec.period_sec)
+                math.floor((lateness + 1e-12) / self.spec.period_sec)
             )
             if missed_periods:
                 scheduled_at += missed_periods * self.spec.period_sec
+                skipped_late_tick_count += missed_periods
+        if (
+            self.spec.late_tick_policy
+            == "skip_to_next_legal_reference_tick"
+        ):
+            # A scheduled reference segment starts one decision period before
+            # its target END.  Equality is already too late for a receiver
+            # whose admission deadline is strictly before START.
+            start_offset = (
+                self.spec.target_lead_time_sec - self.spec.period_sec
+            )
+            while timestamp + 1e-12 >= scheduled_at + start_offset:
+                scheduled_at += self.spec.period_sec
+                skipped_late_tick_count += 1
         triggers = tuple(self._pending_triggers)
         self._pending_triggers.clear()
         trigger_count = self._pending_trigger_count
@@ -188,10 +259,24 @@ class DecisionScheduler:
             "trigger_evidence_truncated": trigger_count > len(triggers),
             "schedule_spec_hash": self.spec.semantic_content_hash,
         }
+        if self.spec.late_tick_policy != "preserve_grid":
+            payload.update(
+                {
+                    "late_tick_policy": self.spec.late_tick_policy,
+                    "skipped_late_tick_count": skipped_late_tick_count,
+                }
+            )
         semantic_hash = canonical_content_hash(payload, domain=DECISION_TICK_HASH_DOMAIN_V1)
+        tick_payload = dict(payload)
+        tick_payload["late_tick_policy"] = self.spec.late_tick_policy
+        tick_payload["skipped_late_tick_count"] = (
+            skipped_late_tick_count
+            if self.spec.late_tick_policy != "preserve_grid"
+            else 0
+        )
         tick = DecisionScheduleTick(
             schedule_tick_id=f"decision-tick:{semantic_hash}",
-            **payload,
+            **tick_payload,
             semantic_content_hash=semantic_hash,
         )
         self._tick_index += 1
@@ -495,4 +580,5 @@ __all__ = [
     "DecisionScheduleSpec",
     "DecisionScheduleTick",
     "DecisionScheduler",
+    "LATE_TICK_POLICIES_V1",
 ]

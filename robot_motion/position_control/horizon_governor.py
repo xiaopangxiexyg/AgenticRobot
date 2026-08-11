@@ -27,6 +27,11 @@ _POSITION_NUMERIC_TOLERANCE_RAD = 1e-7
 _POSITION_CONSTRAINT_INTERIOR_RAD = 1e-6
 _POSITION_CONSTRAINT_MIN_INTERIOR_RAD = 1e-7
 _SOLVER_CERTIFICATE_TOLERANCE_RAD = 1e-6
+# A certified OSQP result may still carry a microradian-scale position residue.
+# Normalize only that numerical residue before the plan leaves this shared
+# layer; larger violations remain hard failures.
+_POSITION_OUTPUT_INTERIOR_RAD = 1e-7
+_POSITION_OUTPUT_MAX_PROJECTION_RAD = 2e-6
 
 
 def _vector(value: Sequence[float] | np.ndarray, *, name: str) -> np.ndarray:
@@ -142,6 +147,90 @@ class JointHorizonPlan:
     @property
     def q_control_cut_rad(self) -> np.ndarray:
         return self.q_path_rad[1 : self.commit_count + 1]
+
+
+def _normalize_joint_horizon_position_roundoff(
+    plan: JointHorizonPlan,
+    *,
+    limits: JointHorizonLimits,
+) -> JointHorizonPlan:
+    """Project certified position residue and preserve discrete dynamics.
+
+    Row zero is an already-realized anchor and is intentionally left intact.
+    When a future row is moved, velocity and acceleration are reconstructed
+    from the corrected position path so the returned plan still satisfies the
+    semi-implicit integration contract used by the QP and 120 Hz executor.
+    """
+
+    q_path = np.asarray(plan.q_path_rad, dtype=float).copy()
+    if q_path.shape[1] != limits.dimension:
+        raise ValueError("joint horizon plan dimension does not match limits.")
+    lower = np.asarray(limits.min_position_rad, dtype=float)
+    upper = np.asarray(limits.max_position_rad, dtype=float)
+    safe_lower = lower + _POSITION_OUTPUT_INTERIOR_RAD
+    safe_upper = upper - _POSITION_OUTPUT_INTERIOR_RAD
+    if np.any(safe_upper <= safe_lower):
+        raise RuntimeError(
+            "joint horizon position envelope is narrower than the output interior."
+        )
+
+    projected = q_path.copy()
+    projected[1:] = np.clip(projected[1:], safe_lower, safe_upper)
+    correction = projected - q_path
+    max_correction = float(np.max(np.abs(correction)))
+    if max_correction <= 0.0:
+        return plan
+    if max_correction > _POSITION_OUTPUT_MAX_PROJECTION_RAD:
+        raise RuntimeError(
+            "joint horizon position output exceeds numeric projection budget: "
+            f"correction={max_correction:.9g}rad > "
+            f"{_POSITION_OUTPUT_MAX_PROJECTION_RAD:.9g}rad"
+        )
+
+    qd_path = np.asarray(plan.qd_path_rad_s, dtype=float).copy()
+    qdd_path = np.asarray(plan.qdd_path_rad_s2, dtype=float).copy()
+    qd_before = qd_path.copy()
+    qdd_before = qdd_path.copy()
+    qd_path[1:] = np.diff(projected, axis=0) / plan.dt_sec
+    qdd_path[1:] = np.diff(qd_path, axis=0) / plan.dt_sec
+    jerk_path = np.diff(qdd_path, axis=0) / plan.dt_sec
+    tolerance = _SOLVER_CERTIFICATE_TOLERANCE_RAD
+    if (
+        np.any(np.abs(qd_path[1:]) > limits.max_velocity_rad_s + tolerance)
+        or np.any(
+            np.abs(qdd_path[1:])
+            > limits.max_acceleration_rad_s2 + tolerance
+        )
+        or np.any(
+            np.abs(jerk_path) > limits.max_jerk_rad_s3 + tolerance
+        )
+    ):
+        raise RuntimeError(
+            "joint horizon numeric position projection would violate the "
+            "certified velocity, acceleration, or jerk envelope."
+        )
+
+    return JointHorizonPlan(
+        q_path_rad=projected,
+        qd_path_rad_s=qd_path,
+        qdd_path_rad_s2=qdd_path,
+        commit_count=plan.commit_count,
+        dt_sec=plan.dt_sec,
+        metadata={
+            **dict(plan.metadata),
+            "position_output_roundoff_projected": True,
+            "position_output_projection_count": int(np.count_nonzero(correction)),
+            "position_output_max_projection_rad": max_correction,
+            "position_output_interior_rad": _POSITION_OUTPUT_INTERIOR_RAD,
+            "position_output_dynamics_reconstructed": True,
+            "position_output_max_velocity_reconstruction_rad_s": float(
+                np.max(np.abs(qd_path - qd_before))
+            ),
+            "position_output_max_acceleration_reconstruction_rad_s2": float(
+                np.max(np.abs(qdd_path - qdd_before))
+            ),
+        },
+    )
 
 
 def plan_jerk_limited_joint_horizon(
@@ -455,7 +544,7 @@ def plan_jerk_limited_joint_horizon(
                 "upper_position_interior_rad": upper_position_interior,
             }
         )
-    return JointHorizonPlan(
+    return _normalize_joint_horizon_position_roundoff(JointHorizonPlan(
         q_path_rad=q_path,
         qd_path_rad_s=qd_path,
         qdd_path_rad_s2=qdd_path,
@@ -472,7 +561,7 @@ def plan_jerk_limited_joint_horizon(
             ),
             "solver_receipts": tuple(receipts),
         },
-    )
+    ), limits=limits)
 
 
 def plan_jerk_limited_joint_horizon_batched(
@@ -747,7 +836,7 @@ def plan_jerk_limited_joint_horizon_batched(
                 "upper_position_interior_rad": problem["upper_interior"],
             }
         )
-    return JointHorizonPlan(
+    return _normalize_joint_horizon_position_roundoff(JointHorizonPlan(
         q_path_rad=q_path,
         qd_path_rad_s=qd_path,
         qdd_path_rad_s2=qdd_path,
@@ -762,7 +851,7 @@ def plan_jerk_limited_joint_horizon_batched(
             "position_constraint_interior_rad": _POSITION_CONSTRAINT_INTERIOR_RAD,
             "solver_receipts": tuple(receipts),
         },
-    )
+    ), limits=limits)
 
 
 class JointHorizonBatchedWorkspace:
@@ -781,10 +870,19 @@ class JointHorizonBatchedWorkspace:
         limits: JointHorizonLimits,
         dt_sec: float,
         horizon_transitions: int,
+        tracking_horizon_transitions: int | None = None,
+        tail_tracking_weight: float = 0.0,
+        position_constraint_interior_rad: float = (
+            _POSITION_CONSTRAINT_INTERIOR_RAD
+        ),
+        position_constraint_min_interior_rad: float = (
+            _POSITION_CONSTRAINT_MIN_INTERIOR_RAD
+        ),
         bound_guard: float = 0.999,
         solver_tolerance: float = 1e-7,
         jerk_regularization: float = 1e-9,
         jerk_delta_regularization: float = 0.0,
+        initial_jerk_delta_regularization: float = 0.0,
         terminal_velocity_regularization: float = 0.0,
         terminal_acceleration_regularization: float = 0.0,
     ) -> None:
@@ -796,6 +894,7 @@ class JointHorizonBatchedWorkspace:
         regularization = {
             "jerk": float(jerk_regularization),
             "jerk_delta": float(jerk_delta_regularization),
+            "initial_jerk_delta": float(initial_jerk_delta_regularization),
             "terminal_velocity": float(terminal_velocity_regularization),
             "terminal_acceleration": float(
                 terminal_acceleration_regularization
@@ -808,6 +907,43 @@ class JointHorizonBatchedWorkspace:
             or transitions < 1
         ):
             raise ValueError("horizon_transitions must be a positive integer.")
+        tracking_transitions = (
+            transitions
+            if tracking_horizon_transitions is None
+            else int(tracking_horizon_transitions)
+        )
+        if (
+            isinstance(tracking_horizon_transitions, bool)
+            or tracking_transitions < 1
+            or tracking_transitions > transitions
+            or (
+                tracking_horizon_transitions is not None
+                and tracking_transitions != tracking_horizon_transitions
+            )
+        ):
+            raise ValueError(
+                "tracking_horizon_transitions must be an integer in "
+                "[1, horizon_transitions]."
+            )
+        tail_weight = float(tail_tracking_weight)
+        if (
+            not math.isfinite(tail_weight)
+            or tail_weight < 0.0
+            or tail_weight > 1.0
+        ):
+            raise ValueError("tail_tracking_weight must be finite and in [0, 1].")
+        position_interior = float(position_constraint_interior_rad)
+        position_min_interior = float(position_constraint_min_interior_rad)
+        if (
+            not math.isfinite(position_interior)
+            or not math.isfinite(position_min_interior)
+            or position_min_interior <= 0.0
+            or position_interior < position_min_interior
+        ):
+            raise ValueError(
+                "position constraint interiors must be finite with "
+                "0 < minimum <= maximum."
+            )
         if not math.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt_sec must be finite and positive.")
         if not math.isfinite(guard) or not 0.0 < guard <= 1.0:
@@ -823,6 +959,10 @@ class JointHorizonBatchedWorkspace:
         self.limits = limits
         self.dt_sec = dt
         self.horizon_transitions = transitions
+        self.tracking_horizon_transitions = tracking_transitions
+        self.tail_tracking_weight = tail_weight
+        self.position_constraint_interior_rad = position_interior
+        self.position_constraint_min_interior_rad = position_min_interior
         self.bound_guard = guard
         self.solver_tolerance = solver_eps
         self._regularization = MappingProxyType(regularization)
@@ -876,11 +1016,21 @@ class JointHorizonBatchedWorkspace:
                 velocity_response + braking_ratio * acceleration_response
             )
             position_response_rad = q_scale * position_response
+            tracking_weights = np.full(
+                transitions,
+                tail_weight,
+                dtype=float,
+            )
+            tracking_weights[:tracking_transitions] = 1.0
             terminal_velocity_response = velocity_response[-1]
             terminal_acceleration_response = acceleration_response[-1]
             smoothness_quadratic = (
                 regularization["jerk"] * np.eye(transitions)
                 + regularization["jerk_delta"] * jerk_delta_quadratic
+                + regularization["initial_jerk_delta"]
+                * np.diag(
+                    np.r_[1.0, np.zeros(transitions - 1, dtype=float)]
+                )
                 + regularization["terminal_velocity"]
                 * np.outer(
                     terminal_velocity_response,
@@ -896,9 +1046,10 @@ class JointHorizonBatchedWorkspace:
                 sparse.csc_matrix(
                     2.0
                     * (
-                        position_response_rad.T @ position_response_rad
-                        + smoothness_quadratic
+                        position_response_rad.T
+                        @ (tracking_weights[:, None] * position_response_rad)
                     )
+                    + 2.0 * smoothness_quadratic
                 )
             )
             constraints.append(
@@ -923,6 +1074,7 @@ class JointHorizonBatchedWorkspace:
                     "velocity_response": velocity_response,
                     "viability_response": viability_response,
                     "position_response_rad": position_response_rad,
+                    "tracking_weights": tracking_weights,
                     "integral": integral,
                     "q_velocity_ratio": q_velocity_ratio,
                     "velocity_acceleration_ratio": velocity_acceleration_ratio,
@@ -965,6 +1117,7 @@ class JointHorizonBatchedWorkspace:
         *,
         initial_state: JointHorizonState,
         commit_count: int,
+        previous_jerk_rad_s3: Sequence[float] | np.ndarray | None = None,
     ) -> JointHorizonPlan:
         """Update vectors, warm-start, solve and certify one source cut."""
 
@@ -990,6 +1143,17 @@ class JointHorizonBatchedWorkspace:
             )
         ):
             raise ValueError("initial_state dimension does not match limits.")
+        if previous_jerk_rad_s3 is None:
+            previous_jerk = np.zeros(limits.dimension, dtype=float)
+        else:
+            previous_jerk = np.asarray(previous_jerk_rad_s3, dtype=float)
+            if previous_jerk.shape != (limits.dimension,) or not np.all(
+                np.isfinite(previous_jerk)
+            ):
+                raise ValueError(
+                    "previous_jerk_rad_s3 must be a finite vector matching "
+                    "limits dimension."
+                )
         committed = int(commit_count)
         if (
             isinstance(commit_count, bool)
@@ -1056,9 +1220,9 @@ class JointHorizonBatchedWorkspace:
                 - reference[1:, joint]
             )
             lower_interior = min(
-                _POSITION_CONSTRAINT_INTERIOR_RAD,
+                self.position_constraint_interior_rad,
                 max(
-                    _POSITION_CONSTRAINT_MIN_INTERIOR_RAD,
+                    self.position_constraint_min_interior_rad,
                     float(
                         initial_q[joint]
                         - limits.min_position_rad[joint]
@@ -1067,9 +1231,9 @@ class JointHorizonBatchedWorkspace:
                 ),
             )
             upper_interior = min(
-                _POSITION_CONSTRAINT_INTERIOR_RAD,
+                self.position_constraint_interior_rad,
                 max(
-                    _POSITION_CONSTRAINT_MIN_INTERIOR_RAD,
+                    self.position_constraint_min_interior_rad,
                     float(
                         limits.max_position_rad[joint]
                         - initial_q[joint]
@@ -1081,7 +1245,11 @@ class JointHorizonBatchedWorkspace:
                 2.0
                 * (
                     problem["position_response_rad"].T
-                    @ position_error_bias_rad
+                    @ (problem["tracking_weights"] * position_error_bias_rad)
+                    - self._regularization["initial_jerk_delta"]
+                    * previous_jerk[joint]
+                    / problem["jerk_scale"]
+                    * np.r_[1.0, np.zeros(horizon - 1, dtype=float)]
                     + self._regularization["terminal_velocity"]
                     * problem["terminal_velocity_response"]
                     * velocity_bias[-1]
@@ -1195,9 +1363,20 @@ class JointHorizonBatchedWorkspace:
                 )
             )
             if not certificate_passed:
+                position_below = float(
+                    max(0.0, limits.min_position_rad[joint] - np.min(joint_q))
+                )
+                position_above = float(
+                    max(0.0, np.max(joint_q) - limits.max_position_rad[joint])
+                )
                 raise RuntimeError(
                     "reused batched joint horizon candidate failed "
-                    f"certification for joint {joint + 1}."
+                    f"certification for joint {joint + 1}: "
+                    f"position_below={position_below:.9g}rad; "
+                    f"position_above={position_above:.9g}rad; "
+                    f"max_velocity={float(np.max(np.abs(joint_qd[1:]))):.9g}rad/s; "
+                    f"max_acceleration={float(np.max(np.abs(joint_qdd[1:]))):.9g}rad/s^2; "
+                    f"max_jerk={float(np.max(np.abs(joint_jerk))):.9g}rad/s^3."
                 )
             q_path[:, joint] = joint_q
             qd_path[:, joint] = joint_qd
@@ -1213,7 +1392,7 @@ class JointHorizonBatchedWorkspace:
                     **solve_data[joint],
                 }
             )
-        return JointHorizonPlan(
+        return _normalize_joint_horizon_position_roundoff(JointHorizonPlan(
             q_path_rad=q_path,
             qd_path_rad_s=qd_path,
             qdd_path_rad_s2=qdd_path,
@@ -1224,15 +1403,22 @@ class JointHorizonBatchedWorkspace:
                 "bound_guard": guard,
                 "solver_tolerance": self.solver_tolerance,
                 "horizon_transitions": horizon,
+                "tracking_horizon_transitions": (
+                    self.tracking_horizon_transitions
+                ),
+                "tail_tracking_weight": self.tail_tracking_weight,
                 "jerk_braking_viability": True,
                 "position_constraint_interior_rad": (
-                    _POSITION_CONSTRAINT_INTERIOR_RAD
+                    self.position_constraint_interior_rad
+                ),
+                "position_constraint_min_interior_rad": (
+                    self.position_constraint_min_interior_rad
                 ),
                 "solver_workspace_reused": True,
                 "regularization": dict(self._regularization),
                 "solver_receipts": tuple(receipts),
             },
-        )
+        ), limits=limits)
 
 
 __all__ = [

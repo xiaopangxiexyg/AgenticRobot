@@ -36,6 +36,11 @@ EPISODES_FILE = "episodes.parquet"
 INTERVALS_FILE = "semantic_intervals.parquet"
 ANCHORS_FILE = "semantic_anchors.parquet"
 SOURCE_INVENTORY_FILE = "source_inventory.cjsonl"
+SKILL_INTERVALS_FILE = "skill_intervals.parquet"
+SKILL_PROJECTION_RECEIPTS_FILE = "skill_projection_receipts.cjsonl"
+PREPARED_SKILL_PROJECTION_RECEIPTS_DOMAIN_V1 = (
+    "dexteleop.prepared_training_view.skill_projection_receipts.provisional.v1"
+)
 MANIFEST_FILE = "manifest.cjson"
 DERIVED_FILES = (
     SOURCE_DATASETS_FILE,
@@ -81,6 +86,7 @@ class PreparedTrainingViewBuildResult:
     interval_count: int
     anchor_count: int
     idempotent: bool
+    skill_interval_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +101,8 @@ class LoadedPreparedTrainingView:
     episodes: Any
     semantic_intervals: Any
     semantic_anchors: Any
+    skill_intervals: Any | None = None
+    skill_projection_receipts: tuple[Mapping[str, Any], ...] = ()
 
 
 def arrow_schemas() -> tuple[Any, Any, Any]:
@@ -162,6 +170,31 @@ def arrow_schemas() -> tuple[Any, Any, Any]:
     return episodes, intervals, anchors
 
 
+def skill_interval_arrow_schema() -> Any:
+    try:
+        import pyarrow as pa
+    except ImportError as exc:
+        raise PreparedTrainingViewError(
+            "pyarrow is required to use prepared training views."
+        ) from exc
+    return pa.schema(
+        [
+            ("organized_episode_ordinal", pa.int64()),
+            ("episode_capture_identity_hash", pa.string()),
+            ("skill_id", pa.string()),
+            ("skill_training_contract_hash", pa.string()),
+            ("progress_skill_projection_hash", pa.string()),
+            ("sample_begin", pa.int64()),
+            ("sample_end_exclusive", pa.int64()),
+            ("training_domain", pa.string()),
+            ("source_attempt_id", pa.string()),
+            ("source_stage_ids", pa.list_(pa.string())),
+            ("source_occurrence_ids", pa.list_(pa.string())),
+            ("source_failure_fact_id", pa.string()),
+        ]
+    )
+
+
 __all__ = [
     "ALLOWED_MODALITIES",
     "ANCHORS_FILE",
@@ -177,12 +210,16 @@ __all__ = [
     "PREPARED_TRAINING_VIEW_HASH_DOMAIN_V1",
     "PREPARED_TRAINING_VIEW_MANIFEST_DOMAIN_V1",
     "PREPARED_TRAINING_VIEW_SCHEMA_V1",
+    "PREPARED_SKILL_PROJECTION_RECEIPTS_DOMAIN_V1",
     "PreparedSourceDataset",
     "PreparedTrainingViewBuildResult",
     "PreparedTrainingViewError",
     "SELECTED_EPISODES_FILE",
     "SOURCE_DATASETS_FILE",
     "SOURCE_INVENTORY_FILE",
+    "SKILL_INTERVALS_FILE",
+    "SKILL_PROJECTION_RECEIPTS_FILE",
     "VIEW_RELATIVE_ROOT",
     "arrow_schemas",
+    "skill_interval_arrow_schema",
 ]

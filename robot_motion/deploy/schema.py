@@ -117,7 +117,7 @@ def to_serializable(value: Any) -> Any:
         return value.value
     if is_dataclass(value):
         return {field.name: to_serializable(getattr(value, field.name)) for field in fields(value)}
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {key: to_serializable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [to_serializable(item) for item in value]

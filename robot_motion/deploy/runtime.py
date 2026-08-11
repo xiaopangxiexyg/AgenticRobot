@@ -35,6 +35,12 @@ from .arm_hold import (
     ArmHoldSemanticResolver,
     ArmHoldStagedResolution,
 )
+from .arm_hold_history import (
+    ArmHoldResolvedHistoryBinding,
+    ArmHoldResolvedHistorySnapshot,
+    ArmHoldResolvedHistoryState,
+    build_arm_hold_resolved_history_update,
+)
 from .normalization import (
     NormalizationContractError,
     NormalizationContract,
@@ -647,6 +653,7 @@ class PolicyActionPreparationResult:
     raw_action: NormalizedAction | None = None
     raw_lookahead_action: NormalizedAction | None = None
     raw_second_lookahead_action: NormalizedAction | None = None
+    raw_third_lookahead_action: NormalizedAction | None = None
     prepared_action: Any = None
     emission: PolicyActionEmission | None = None
     emission_error: BaseException | None = None
@@ -666,6 +673,13 @@ class PolicyActionPreparationResult:
         ):
             raise ValueError(
                 "raw_second_lookahead_action requires raw_lookahead_action."
+            )
+        if (
+            self.raw_third_lookahead_action is not None
+            and self.raw_second_lookahead_action is None
+        ):
+            raise ValueError(
+                "raw_third_lookahead_action requires raw_second_lookahead_action."
             )
         signal = self.next_step_execution_signal
         if signal is None:
@@ -738,6 +752,7 @@ class PolicyDeployRuntime:
         config: PolicyDeployRuntimeConfig,
         *,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        arm_hold_history_binding: ArmHoldResolvedHistoryBinding | None = None,
     ):
         if not isinstance(config, PolicyDeployRuntimeConfig):
             raise TypeError("config must be a PolicyDeployRuntimeConfig.")
@@ -770,6 +785,71 @@ class PolicyDeployRuntime:
                 active_sides=config.active_sides,
             )
         )
+        if arm_hold_history_binding is not None and not isinstance(
+            arm_hold_history_binding,
+            ArmHoldResolvedHistoryBinding,
+        ):
+            raise TypeError(
+                "arm_hold_history_binding must be an "
+                "ArmHoldResolvedHistoryBinding or None."
+            )
+        if arm_hold_history_binding is not None:
+            if arm_hold_contract is None:
+                raise ValueError(
+                    "arm_hold_history_binding requires arm_hold_output."
+                )
+            if (
+                arm_hold_history_binding.contract_hash
+                != arm_hold_contract.contract_hash
+            ):
+                raise ValueError(
+                    "arm_hold_history_binding contract does not match "
+                    "arm_hold_output."
+                )
+        self._arm_hold_history_state = (
+            None
+            if arm_hold_history_binding is None
+            else ArmHoldResolvedHistoryState()
+        )
+        if self._arm_hold_history_state is not None:
+            assert arm_hold_history_binding is not None
+            self._arm_hold_history_state.activate(arm_hold_history_binding)
+        self._next_arm_hold_resolution_sequence = 1
+
+    def arm_hold_resolved_history_snapshot(
+        self,
+    ) -> ArmHoldResolvedHistorySnapshot | None:
+        """Return immutable model context, or ``None`` when default-off."""
+
+        if self._arm_hold_history_state is None:
+            return None
+        return self._arm_hold_history_state.snapshot()
+
+    def _advance_arm_hold_resolved_history(
+        self,
+        resolution: ArmHoldResolutionReceipt,
+    ) -> None:
+        state = self._arm_hold_history_state
+        if state is None:
+            return
+        snapshot = state.snapshot()
+        sequence = self._next_arm_hold_resolution_sequence
+        update = build_arm_hold_resolved_history_update(
+            binding=snapshot.binding,
+            resolution_sequence=sequence,
+            resolution_id=(
+                f"{snapshot.binding.binding_id}:epoch:"
+                f"{snapshot.binding.epoch}:resolution:{sequence}"
+            ),
+            resolution=resolution,
+        )
+        receipt = state.advance(update)
+        if not receipt.accepted or not receipt.mutated:
+            raise RuntimeError(
+                "Committed arm-hold resolution was rejected by history state: "
+                f"{receipt.status}."
+            )
+        self._next_arm_hold_resolution_sequence += 1
 
     def action_queue_length(self) -> int:
         """Return the number of decoded actions waiting for execution."""
@@ -873,6 +953,11 @@ class PolicyDeployRuntime:
             if allow_output
             else None
         )
+        third_queued_candidate = (
+            self._action_queue.peek_at(2)
+            if allow_output
+            else None
+        )
         raw_lookahead_action = (
             queued_candidate
             if self._same_chunk_successor(model_raw_action, queued_candidate)
@@ -887,12 +972,22 @@ class PolicyDeployRuntime:
             )
             else None
         )
+        raw_third_lookahead_action = (
+            third_queued_candidate
+            if self._same_chunk_offset(
+                model_raw_action,
+                third_queued_candidate,
+                offset=3,
+            )
+            else None
+        )
         if self._arm_hold_resolver is not None:
             # The successor's semantic transition is intentionally unknown
             # until that keyframe is popped. Exposing its unresolved action to
             # position lookahead would bypass arm-hold resolution.
             raw_lookahead_action = None
             raw_second_lookahead_action = None
+            raw_third_lookahead_action = None
         raw_action = model_raw_action
         arm_hold_resolution = None
         prepared_action = None
@@ -905,6 +1000,7 @@ class PolicyDeployRuntime:
                     raw_action,
                     observation,
                 )
+                self._advance_arm_hold_resolved_history(arm_hold_resolution)
             except Exception as exc:  # noqa: BLE001 - semantic path fails closed.
                 emission_error = exc
                 raw_action = None
@@ -968,6 +1064,7 @@ class PolicyDeployRuntime:
             arm_hold_resolution=arm_hold_resolution,
             raw_lookahead_action=raw_lookahead_action,
             raw_second_lookahead_action=raw_second_lookahead_action,
+            raw_third_lookahead_action=raw_third_lookahead_action,
             next_step_execution_signal=next_step_execution_signal,
             prepared_action=prepared_action,
             emission=emission,
@@ -1526,6 +1623,20 @@ class PolicyDeployRuntime:
 
         if self._arm_hold_resolver is not None:
             self._arm_hold_resolver.reset()
+        history_state = self._arm_hold_history_state
+        if history_state is not None:
+            snapshot = history_state.snapshot()
+            if snapshot.last_resolution_sequence is not None:
+                current = snapshot.binding
+                history_state.activate(
+                    ArmHoldResolvedHistoryBinding(
+                        binding_id=current.binding_id,
+                        epoch=current.epoch + 1,
+                        contract_hash=current.contract_hash,
+                        side_order=current.side_order,
+                    )
+                )
+            self._next_arm_hold_resolution_sequence = 1
 
     def commit_staged_arm_hold(
         self,
@@ -1535,7 +1646,9 @@ class PolicyDeployRuntime:
 
         if self._arm_hold_resolver is None:
             raise RuntimeError("Arm-hold semantics are not configured.")
-        return self._arm_hold_resolver.commit(staged)
+        resolution = self._arm_hold_resolver.commit(staged)
+        self._advance_arm_hold_resolved_history(resolution)
+        return resolution
 
     def discard_staged_arm_hold(
         self,

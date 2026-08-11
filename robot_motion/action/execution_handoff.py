@@ -56,6 +56,19 @@ TARGET_EXECUTION_STATUS_SNAPSHOT_HASH_DOMAIN = (
     "dexteleop.target_execution_status_snapshot.development"
 )
 
+# Receiver-side lifecycle rejections.  These codes describe whether a target
+# can still enter processing/admission; they are not safety verdicts.
+TARGET_SUBMISSION_INSUFFICIENT_SUPPORT_MARGIN = (
+    "insufficient_support_margin"
+)
+TARGET_ADMISSION_SUPPORT_EXPIRED = "target_support_expired_before_admission"
+TRANSIENT_TARGET_LIFECYCLE_REJECTION_CODES = frozenset(
+    {
+        TARGET_SUBMISSION_INSUFFICIENT_SUPPORT_MARGIN,
+        TARGET_ADMISSION_SUPPORT_EXPIRED,
+    }
+)
+
 TARGET_TEMPORAL_SEMANTICS = frozenset({"point_target", "scheduled_interval"})
 TARGET_EXECUTION_COMPLETION_STATUSES = frozenset(
     {"resolved", "rejected", "failed", "cancelled"}
@@ -1738,7 +1751,10 @@ __all__ = [
     "TARGET_ACTIVATION_STATUSES",
     "COMPONENT_EXECUTION_TARGET_ACTIVATION_HASH_DOMAIN",
     "TARGET_PROCESSING_FACT_REFERENCE_HASH_DOMAIN",
+    "TARGET_ADMISSION_SUPPORT_EXPIRED",
+    "TARGET_SUBMISSION_INSUFFICIENT_SUPPORT_MARGIN",
     "TARGET_TEMPORAL_SEMANTICS",
+    "TRANSIENT_TARGET_LIFECYCLE_REJECTION_CODES",
     "ComponentExecutionTarget",
     "ComponentExecutionTargetActivationReceipt",
     "ComponentExecutionTargetAdmissionReceipt",

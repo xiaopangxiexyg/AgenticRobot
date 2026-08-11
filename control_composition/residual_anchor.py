@@ -30,6 +30,7 @@ RESIDUAL_ANCHOR_COMPONENT_BINDING_HASH_DOMAIN_DEVELOPMENT = (
 RESIDUAL_ANCHOR_STATE_HASH_DOMAIN_DEVELOPMENT = (
     "dexteleop.residual_anchor_state.development"
 )
+RESIDUAL_ANCHOR_SEMANTIC_BINDING_KIND = "residual_anchor"
 
 
 def _required(value: object, *, name: str) -> str:
@@ -491,6 +492,7 @@ __all__ = [
     "RESIDUAL_ANCHOR_RECEIPT_HASH_DOMAIN_DEVELOPMENT",
     "RESIDUAL_ANCHOR_REQUEST_HASH_DOMAIN_DEVELOPMENT",
     "RESIDUAL_ANCHOR_STATE_HASH_DOMAIN_DEVELOPMENT",
+    "RESIDUAL_ANCHOR_SEMANTIC_BINDING_KIND",
     "ResidualAnchorComponentBinding",
     "ResidualAnchorReceipt",
     "ResidualAnchorRequest",

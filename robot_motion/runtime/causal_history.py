@@ -13,9 +13,10 @@ import copy
 import math
 import threading
 import time
+from collections.abc import Mapping
 from collections import deque
-from dataclasses import dataclass
-from typing import Any, Mapping
+from dataclasses import dataclass, fields, is_dataclass, replace
+from typing import Any
 
 import numpy as np
 
@@ -180,6 +181,20 @@ def _freeze_record(value: Any) -> Any:
         return [_freeze_record(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_freeze_record(item) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        # Runtime backend states legitimately contain typed records such as an
+        # EffectorCommand.  Those records can in turn carry an immutable
+        # ExecutionWorkItem whose mappings are MappingProxyType instances.
+        # ``copy.deepcopy`` cannot pickle mappingproxy, so recursively rebuild
+        # dataclasses instead of treating the whole object as an opaque leaf.
+        return replace(
+            value,
+            **{
+                item.name: _freeze_record(getattr(value, item.name))
+                for item in fields(value)
+                if item.init
+            },
+        )
     return copy.deepcopy(value)
 
 
@@ -188,7 +203,7 @@ def _copy_record(value: Any, *, copy_arrays: bool) -> Any:
         if copy_arrays:
             return value.copy()
         return value
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {
             key: _copy_record(item, copy_arrays=copy_arrays)
             for key, item in value.items()
@@ -197,4 +212,16 @@ def _copy_record(value: Any, *, copy_arrays: bool) -> Any:
         return [_copy_record(item, copy_arrays=copy_arrays) for item in value]
     if isinstance(value, tuple):
         return tuple(_copy_record(item, copy_arrays=copy_arrays) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return replace(
+            value,
+            **{
+                item.name: _copy_record(
+                    getattr(value, item.name),
+                    copy_arrays=copy_arrays,
+                )
+                for item in fields(value)
+                if item.init
+            },
+        )
     return copy.deepcopy(value)

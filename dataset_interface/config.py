@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Mapping
 
+from dataset_contracts.camera_semantics import CameraRoleBinding
 from utils.random_background import RandomBackgroundAugmentConfig
 
 
@@ -65,6 +66,10 @@ class DatasetInterfaceConfig:
     video: VideoConfig = field(default_factory=VideoConfig)
     augmentation: RandomBackgroundAugmentConfig = field(default_factory=RandomBackgroundAugmentConfig)
     missing_views: MissingViewConfig = field(default_factory=MissingViewConfig)
+    # Optional read-only physical-role resolver. When present, callers request
+    # canonical roles while media/masks are read through the stored dataset key
+    # identified by the recorded RealSense serial.
+    camera_role_binding: CameraRoleBinding | None = None
     # Optional override for the default mixed 10/40/50 real-image pool.
     real_image_root: Path | None = None
     # Prefer a sealed manifest when reproducible image-pool identity matters.

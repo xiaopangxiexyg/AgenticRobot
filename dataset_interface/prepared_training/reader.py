@@ -9,6 +9,11 @@ from dataset_contracts.canonical_encoding import (
     canonical_content_hash,
     canonical_loads,
 )
+from dataset_contracts.progress_skill_projection import (
+    ProgressSkillProjectionV1,
+    SkillProjectionReceiptV1,
+    SkillTrainingContractV1,
+)
 
 from ..episode_curation import source_dataset_base_fingerprint
 from .io import read_cjsonl, sha256_file
@@ -19,6 +24,7 @@ from .models import (
     INTERVALS_FILE,
     MANIFEST_FILE,
     PREPARED_SELECTED_EPISODE_DOMAIN_V1,
+    PREPARED_SKILL_PROJECTION_RECEIPTS_DOMAIN_V1,
     PREPARED_SOURCE_DATASETS_DOMAIN_V1,
     PREPARED_SOURCE_INVENTORY_DOMAIN_V1,
     PREPARED_TRAINING_VIEW_HASH_DOMAIN_V1,
@@ -27,9 +33,12 @@ from .models import (
     SELECTED_EPISODES_FILE,
     SOURCE_DATASETS_FILE,
     SOURCE_INVENTORY_FILE,
+    SKILL_INTERVALS_FILE,
+    SKILL_PROJECTION_RECEIPTS_FILE,
     LoadedPreparedTrainingView,
     PreparedTrainingViewError,
     arrow_schemas,
+    skill_interval_arrow_schema,
 )
 
 
@@ -64,10 +73,15 @@ def _verify_derived_files(
     manifest: Mapping[str, Any],
 ) -> Mapping[str, Mapping[str, Any]]:
     derived = manifest.get("derived_files")
-    if not isinstance(derived, Mapping) or set(derived) != set(DERIVED_FILES):
+    expected = list(DERIVED_FILES)
+    if manifest.get("skill_projection") is not None:
+        expected.extend(
+            (SKILL_INTERVALS_FILE, SKILL_PROJECTION_RECEIPTS_FILE)
+        )
+    if not isinstance(derived, Mapping) or set(derived) != set(expected):
         raise PreparedTrainingViewError("Prepared-view derived file set is invalid.")
     result: dict[str, Mapping[str, Any]] = {}
-    for filename in DERIVED_FILES:
+    for filename in expected:
         metadata = derived[filename]
         path = root / filename
         if not isinstance(metadata, Mapping) or not path.is_file():
@@ -170,6 +184,204 @@ def _load_tables(
             "Prepared-view manifest summary counts are inconsistent."
         )
     return episodes, intervals, anchors
+
+
+def _load_skill_projection(
+    root: Path,
+    derived: Mapping[str, Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+    episodes: Any,
+) -> tuple[Any | None, tuple[Mapping[str, Any], ...]]:
+    capability = manifest.get("skill_projection")
+    if capability is None:
+        return None, ()
+    if not isinstance(capability, Mapping):
+        raise PreparedTrainingViewError(
+            "Prepared-view Skill projection capability is invalid."
+        )
+    progress_hashes = sorted(
+        set(
+            str(value)
+            for value in episodes["progress_profile_hash"].to_pylist()
+        )
+    )
+    stage_hashes = sorted(
+        set(
+            str(value)
+            for value in episodes["stage_profile_hash"].to_pylist()
+            if value is not None
+        )
+    )
+    if (
+        progress_hashes
+        != sorted(
+            str(value)
+            for value in manifest.get("progress_profile_hashes", ())
+        )
+        or stage_hashes
+        != sorted(
+            str(value)
+            for value in manifest.get("stage_profile_hashes", ())
+        )
+        or manifest.get("progress_profile_hash")
+        != (progress_hashes[0] if len(progress_hashes) == 1 else None)
+        or manifest.get("stage_profile_hash")
+        != (stage_hashes[0] if len(stage_hashes) == 1 else None)
+    ):
+        raise PreparedTrainingViewError(
+            "Prepared Skill projection profile hashes and Episode rows differ."
+        )
+    try:
+        skill_payload = capability.get("skill_contract")
+        projection_payloads = capability.get("projections")
+        if not isinstance(skill_payload, Mapping) or not isinstance(
+            projection_payloads,
+            (tuple, list),
+        ):
+            raise ValueError("Skill/projection definitions are missing.")
+        skill = SkillTrainingContractV1.from_payload(skill_payload)
+        projections = tuple(
+            ProgressSkillProjectionV1.from_payload(item)
+            for item in projection_payloads
+        )
+    except (TypeError, ValueError) as exc:
+        raise PreparedTrainingViewError(
+            f"Prepared Skill projection definitions are invalid: {exc}"
+        ) from exc
+    projection_hashes = {
+        projection.semantic_content_hash for projection in projections
+    }
+    if (
+        sorted(projection_hashes)
+        != sorted(
+            str(value)
+            for value in capability.get("projection_hashes", ())
+        )
+        or any(
+            projection.skill_training_contract_hash
+            != skill.semantic_content_hash
+            for projection in projections
+        )
+    ):
+        raise PreparedTrainingViewError(
+            "Prepared Skill projection definitions do not match the manifest."
+        )
+    try:
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(root / SKILL_INTERVALS_FILE)
+    except Exception as exc:
+        raise PreparedTrainingViewError(
+            f"Cannot read prepared Skill interval table: {exc}"
+        ) from exc
+    if not table.schema.equals(
+        skill_interval_arrow_schema(),
+        check_metadata=False,
+    ):
+        raise PreparedTrainingViewError(
+            "Prepared Skill interval table schema mismatch."
+        )
+    expected_count = int(
+        derived[SKILL_INTERVALS_FILE].get("row_count", -1)
+    )
+    if (
+        table.num_rows != expected_count
+        or table.num_rows != int(capability.get("interval_count", -1))
+    ):
+        raise PreparedTrainingViewError(
+            "Prepared Skill interval count is inconsistent."
+        )
+    records = read_cjsonl(
+        root / SKILL_PROJECTION_RECEIPTS_FILE,
+        domain=PREPARED_SKILL_PROJECTION_RECEIPTS_DOMAIN_V1,
+    )
+    if (
+        len(records)
+        != int(
+            derived[SKILL_PROJECTION_RECEIPTS_FILE].get("row_count", -1)
+        )
+        or len(records) != int(capability.get("receipt_count", -1))
+    ):
+        raise PreparedTrainingViewError(
+            "Prepared Skill projection receipt count is inconsistent."
+        )
+    expected_rows: list[dict[str, Any]] = []
+    seen_ordinals: list[int] = []
+    for record in records:
+        ordinal = int(record.get("organized_episode_ordinal", -1))
+        if ordinal < 0 or ordinal >= episodes.num_rows:
+            raise PreparedTrainingViewError(
+                "Prepared Skill projection receipt has an invalid Episode ordinal."
+            )
+        receipt_payload = record.get("receipt")
+        if not isinstance(receipt_payload, Mapping):
+            raise PreparedTrainingViewError(
+                "Prepared Skill projection receipt record is invalid."
+            )
+        try:
+            receipt = SkillProjectionReceiptV1.from_payload(receipt_payload)
+        except (TypeError, ValueError) as exc:
+            raise PreparedTrainingViewError(
+                f"Prepared Skill projection receipt is invalid: {exc}"
+            ) from exc
+        if (
+            receipt.skill_training_contract_hash != skill.semantic_content_hash
+            or receipt.progress_skill_projection_hash not in projection_hashes
+        ):
+            raise PreparedTrainingViewError(
+                "Prepared Skill projection receipt references a foreign "
+                "Skill or projection."
+            )
+        expected_episode_hash = str(
+            episodes["episode_capture_identity_hash"][ordinal].as_py()
+        )
+        if receipt.episode_capture_identity_hash != expected_episode_hash:
+            raise PreparedTrainingViewError(
+                "Prepared Skill projection receipt and Episode row differ."
+            )
+        frame_count = int(episodes["frame_count"][ordinal].as_py())
+        if any(
+            interval.sample_end > frame_count
+            for interval in receipt.intervals
+        ):
+            raise PreparedTrainingViewError(
+                "Prepared Skill projection interval exceeds its Episode axis."
+            )
+        seen_ordinals.append(ordinal)
+        for interval in receipt.intervals:
+            expected_rows.append(
+                {
+                    "organized_episode_ordinal": ordinal,
+                    "episode_capture_identity_hash": expected_episode_hash,
+                    "skill_id": skill.skill_id,
+                    "skill_training_contract_hash": (
+                        skill.semantic_content_hash
+                    ),
+                    "progress_skill_projection_hash": (
+                        receipt.progress_skill_projection_hash
+                    ),
+                    "sample_begin": interval.sample_begin,
+                    "sample_end_exclusive": interval.sample_end,
+                    "training_domain": interval.training_domain,
+                    "source_attempt_id": interval.source_attempt_id,
+                    "source_stage_ids": list(interval.source_stage_ids),
+                    "source_occurrence_ids": list(
+                        interval.source_occurrence_ids
+                    ),
+                    "source_failure_fact_id": (
+                        interval.source_failure_fact_id
+                    ),
+                }
+            )
+    if seen_ordinals != list(range(episodes.num_rows)):
+        raise PreparedTrainingViewError(
+            "Prepared Skill projection requires one ordered receipt per Episode."
+        )
+    if table.to_pylist() != expected_rows:
+        raise PreparedTrainingViewError(
+            "Prepared Skill interval table and projection receipts differ."
+        )
+    return table, records
 
 
 def _verify_selection(episodes: Any, selected: tuple[Mapping[str, Any], ...]) -> None:
@@ -299,6 +511,12 @@ def load_prepared_training_view(
         domain=PREPARED_SOURCE_INVENTORY_DOMAIN_V1,
     )
     episodes, intervals, anchors = _load_tables(root, derived, manifest)
+    skill_intervals, skill_receipts = _load_skill_projection(
+        root,
+        derived,
+        manifest,
+        episodes,
+    )
     _verify_selection(episodes, selected)
     _validate_inventory_locators(inventory, source_paths)
     if verify_source_files:
@@ -314,6 +532,8 @@ def load_prepared_training_view(
         episodes=episodes,
         semantic_intervals=intervals,
         semantic_anchors=anchors,
+        skill_intervals=skill_intervals,
+        skill_projection_receipts=skill_receipts,
     )
 
 

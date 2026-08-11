@@ -19,6 +19,7 @@ from control_composition.activation import CompositionActivationScope
 from control_composition.events import (
     CompositionActivationBinding,
     CompositionDomainEvent,
+    CompositionInputSemanticBinding,
     CompositionSourceEligibilityBinding,
 )
 from control_composition.information import CompositionInformationPlan
@@ -36,6 +37,7 @@ from control_composition.composition import (
     ComponentCompositionRuleSet,
     CompositionAuthorityDisposition,
     CompositionInputAdmissionReceipt,
+    CompositionInputBatchAdmissionReceipt,
     CompositionInputRecord,
     CompositionInputSnapshot,
     CompositionEvaluation,
@@ -324,6 +326,52 @@ def project_composition_input_admission(
     )
 
 
+def project_composition_input_batch_admission(
+    context: AuthoritativeTraceContext,
+    receipt: CompositionInputBatchAdmissionReceipt,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    """Record the all-or-none boundary without duplicating input payloads."""
+
+    if not isinstance(receipt, CompositionInputBatchAdmissionReceipt):
+        raise TypeError(
+            "receipt must be a CompositionInputBatchAdmissionReceipt."
+        )
+    return context.fact(
+        fact_id=f"composition-input-batch-admission:{receipt.batch_id}",
+        event_type="composition_input_batch_admission",
+        occurred_at=float(occurred_at),
+        payload={
+            "batch_id": receipt.batch_id,
+            "batch_semantic_content_hash": (
+                receipt.batch_semantic_content_hash
+            ),
+            "accepted": receipt.accepted,
+            "rejection_code": receipt.rejection_code,
+            "message": receipt.message,
+            "available_at": receipt.available_at,
+            "available_clock_domain_id": (
+                receipt.available_clock_domain_id
+            ),
+            "first_control_admission_sequence": (
+                receipt.first_control_admission_sequence
+            ),
+            "last_control_admission_sequence": (
+                receipt.last_control_admission_sequence
+            ),
+            "input_ids": tuple(
+                item.composition_input_id
+                for item in receipt.input_receipts
+            ),
+            "input_hashes": tuple(
+                item.semantic_content_hash
+                for item in receipt.input_receipts
+            ),
+        },
+    )
+
+
 def project_composition_source_eligibility_spec(
     context: AuthoritativeTraceContext,
     spec: CompositionSourceEligibilitySpec,
@@ -603,6 +651,8 @@ def project_composition_input(
     # established v1 input record remains byte/schema compatible.
     payload.pop("composition_activation_id", None)
     payload.pop("composition_activation_hash", None)
+    payload.pop("semantic_binding_id_by_kind", None)
+    payload.pop("semantic_binding_hash_by_kind", None)
     payload["input_semantic_content_hash"] = record.semantic_content_hash
     return context.fact(
         fact_id=record.composition_input_id,
@@ -636,6 +686,9 @@ def project_formal_composition_strategy_spec(
             "execution_class": "inline_bounded",
             "composition_spec_hash": spec.composition_spec_hash,
             "required_context_channels": spec.required_context_channels,
+            "required_residual_anchor_lifecycle_spec_hash": (
+                spec.required_residual_anchor_lifecycle_spec_hash
+            ),
             "parameter_payload": spec.parameter_payload,
             "maximum_decision_latency_sec": (
                 spec.maximum_decision_latency_sec
@@ -830,6 +883,7 @@ def project_formal_composition_strategy_input(
         )
     context_snapshot = strategy_input.context_snapshot
     information_plan = strategy_input.information_plan
+    lifecycle_snapshot = strategy_input.residual_anchor_lifecycle_snapshot
     return context.fact(
         fact_id=strategy_input.strategy_input_id,
         event_type="formal_composition_strategy_input",
@@ -867,6 +921,16 @@ def project_formal_composition_strategy_input(
                 if information_plan is None
                 else information_plan.semantic_content_hash
             ),
+            "residual_anchor_lifecycle_snapshot_id": (
+                None
+                if lifecycle_snapshot is None
+                else lifecycle_snapshot.lifecycle_snapshot_id
+            ),
+            "residual_anchor_lifecycle_snapshot_hash": (
+                None
+                if lifecycle_snapshot is None
+                else lifecycle_snapshot.semantic_content_hash
+            ),
             "semantic_content_hash": strategy_input.semantic_content_hash,
         },
     )
@@ -882,6 +946,7 @@ def project_hot_composition_strategy_input(
         )
     context_snapshot = strategy_input.context_snapshot
     information_plan = strategy_input.information_plan
+    lifecycle_snapshot = strategy_input.residual_anchor_lifecycle_snapshot
     return context.fact(
         fact_id=strategy_input.strategy_input_id,
         event_type="hot_composition_strategy_input",
@@ -918,6 +983,16 @@ def project_hot_composition_strategy_input(
                 None
                 if information_plan is None
                 else information_plan.semantic_content_hash
+            ),
+            "residual_anchor_lifecycle_snapshot_id": (
+                None
+                if lifecycle_snapshot is None
+                else lifecycle_snapshot.lifecycle_snapshot_id
+            ),
+            "residual_anchor_lifecycle_snapshot_hash": (
+                None
+                if lifecycle_snapshot is None
+                else lifecycle_snapshot.semantic_content_hash
             ),
             "strategy_control_binding_id": (
                 strategy_input.strategy_control_binding_id
@@ -1069,6 +1144,7 @@ def project_composition_evaluation(
         "composition_supported_until": (
             result.composition_supported_until
         ),
+        "strategy_result_data": result.strategy_result_data,
         "semantic_content_hash": result.semantic_content_hash,
     }
     return context.fact(
@@ -1190,6 +1266,31 @@ def project_composition_activation_binding_record(
             "subject_hash": binding.subject_hash,
             "activation_id": binding.activation_id,
             "activation_hash": binding.activation_hash,
+            "semantic_content_hash": binding.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_input_semantic_binding_record(
+    context: AuthoritativeTraceContext,
+    binding: CompositionInputSemanticBinding,
+    *,
+    occurred_at: float,
+) -> ControlTraceFact:
+    if not isinstance(binding, CompositionInputSemanticBinding):
+        raise TypeError(
+            "binding must be a CompositionInputSemanticBinding."
+        )
+    return context.fact(
+        fact_id=binding.binding_id,
+        event_type="composition_input_semantic_binding",
+        occurred_at=float(occurred_at),
+        payload={
+            "binding_id": binding.binding_id,
+            "composition_input_id": binding.composition_input_id,
+            "composition_input_hash": binding.composition_input_hash,
+            "binding_id_by_kind": binding.binding_id_by_kind,
+            "binding_hash_by_kind": binding.binding_hash_by_kind,
             "semantic_content_hash": binding.semantic_content_hash,
         },
     )
@@ -1431,6 +1532,12 @@ def project_composition_domain_event(
             subject,
             occurred_at=event.occurred_at,
         )
+    if kind == "composition_input_batch_admission":
+        return project_composition_input_batch_admission(
+            context,
+            subject,
+            occurred_at=event.occurred_at,
+        )
     if kind == "composition_source_eligibility_spec":
         return project_composition_source_eligibility_spec(
             context,
@@ -1542,6 +1649,12 @@ def project_composition_domain_event(
             subject,
             occurred_at=event.occurred_at,
         )
+    if kind == "composition_input_semantic_binding":
+        return project_composition_input_semantic_binding_record(
+            context,
+            subject,
+            occurred_at=event.occurred_at,
+        )
     if kind == "source_difference_spec":
         return project_source_difference_spec(
             context,
@@ -1550,6 +1663,27 @@ def project_composition_domain_event(
         )
     if kind == "source_difference_observation":
         return project_source_difference_observation(context, subject)
+    if kind.startswith("residual_anchor_lifecycle"):
+        from .residual_anchor_lifecycle_control_trace import (
+            project_residual_anchor_lifecycle_domain_event,
+        )
+
+        return project_residual_anchor_lifecycle_domain_event(context, event)
+    if kind == "allocation_publication_outcome":
+        from .allocation_control_trace import (
+            project_allocation_publication_domain_event,
+        )
+
+        return project_allocation_publication_domain_event(context, event)
+    if kind == "trajectory_composition_shadow_result":
+        from .trajectory_composition_control_trace import (
+            project_trajectory_composition_shadow_domain_event,
+        )
+
+        return project_trajectory_composition_shadow_domain_event(
+            context,
+            event,
+        )
     raise ValueError(f"Unsupported composition domain event kind: {kind}")
 
 
@@ -1618,6 +1752,8 @@ __all__ = [
     "project_composition_authority_disposition",
     "project_composition_input",
     "project_composition_input_admission",
+    "project_composition_input_batch_admission",
+    "project_composition_input_semantic_binding_record",
     "project_composition_input_snapshot",
     "project_composition_temporal_selection_spec",
     "project_composition_evaluation",

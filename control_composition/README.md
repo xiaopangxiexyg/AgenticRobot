@@ -222,6 +222,161 @@ path, preserving its one-current-step draft, sequence, TTL and identity. No
 profile automatically supplies a guarantee. This layer never generates an
 execution Reference, runs safety/IK, reads a chunk queue, or grants authority.
 
+### Optional nominal-trajectory editing
+
+The development-only `control_composition.trajectory` layer can latch one
+backend-neutral `ComponentActionTrajectory` while a residual session is
+active. The canonical trajectory carrier lives in `robot_motion.action`; a
+deploy, replay, or other source owner may project its immutable plan into that
+carrier without transferring queue or cursor ownership.
+
+The reducer exposes pass-through selection, active-base latching, one bounded
+latest shadow candidate, exact lattice-target preparation, and receipt-bound
+emission commitment. Session activation now references one
+`CompositionActivationScope`, `ControlCut`, `ResidualAnchorReceipt`, immutable
+revision-0 `NominalBaseBinding`, and initial publication barrier. The runtime
+state keeps interaction mode and nominal-base lifecycle as separate axes and
+rejects combinations outside the development legality matrix.
+Pass-through trajectories may omit source activation lineage; entering a
+residual session may not. The base binding requires source instance plus
+activation ID/hash, preventing a late result from an earlier re-arm from being
+silently latched.
+
+R3.0 also defines advisory base-transition assessment/revalidation and three
+explicit observation capability levels: HOLD-boundary only, Reference-only,
+and Reference plus Measurement. An assessment binds the active/candidate base,
+the exact residual fact, observation facts, cut, publication basis, future
+switch boundary, and corrected seam. It must be revalidated before the switch;
+a changed residual/candidate/capability, a stale observation, or a publication
+barrier that reaches the boundary rejects that attempt. These are eligibility
+contracts, not motion safety or permission. Ordinary automatic base refresh
+and handback remain disabled.
+
+The separate stateless temporal-warp seam can currently ramp state-valued
+Cartesian translation and arbitrary joint-position residuals; non-identity
+pose rotation is rejected until the full-pose gate. A preparation is not an
+emission, and its commit receipt is not authority, target admission, reference
+activation, or dispatch evidence. Support exhaustion returns typed
+`no_action`; it does not request HOLD or synthesize a lower-owned fallback.
+
+Residual recentering is a separate session-local transaction. The immutable
+session activation keeps its initial anchor, while
+`ActiveResidualAnchorBinding` advances by exactly one revision after an exact
+`ResidualRebaseRequest`/`ResidualAnchorReceipt` pair. Accepting a request
+immediately fences the old anchor at one uncommitted trajectory keyframe.
+Until the fresh receipt arrives, preparation at or after that boundary returns
+typed `no_action`; it does not create HOLD or continue the old correction.
+The receipt must use the same source/schema/component protocol, follow the
+previous request generation, be captured after its barrier and before its
+deadline, and, when declared, match the exact trigger-associated source sample.
+Completion cannot precede capture or rewrite an emitted target.
+
+The current transaction reanchors the exact component set of one residual
+session atomically. It does not partially replace one component's anchor inside
+that session. A future partial-rebase profile would require a component-keyed
+active-anchor binding and publication-basis contract; it must not be simulated
+by mixing receipt generations. Target continuity after the new anchor becomes
+effective remains downstream planner/executor work. No automatic detector,
+device sampling, Reference generation, safety, authority, or dispatch is owned
+by this reducer.
+
+The R3.1a shadow seam connects this preparation to the existing generic
+`CompositionInputStore` and formal strategy without introducing a second
+composer. Contributor role names and producer stamps are caller-bound; neither
+the module nor its tests assume policy/human, arm/hand, MuJoCo, or a particular
+robot topology. In residual-active mode it admits the exact nominal keyframe
+and the temporally sampled residual on one activation/cut, then calls
+`evaluate_composition()` only. It never calls proposal promotion or emission
+commit. Pass-through returns the nominal preview without touching the
+composition store.
+
+The returned preview distinguishes nominal, corrected, latest-shadow, and
+executable views. Executable is always explicitly unavailable in this gate.
+Its compact ControlTrace summary records identities/hashes only; the ordinary
+composition input/evaluation facts retain the actual participating actions, so
+high-rate vectors are not duplicated. The Control Station wrapper is
+default-off, rejects `send_actions=true`, and invokes its evaluation factory
+lazily so an off profile does not fetch model, replay, or device payloads.
+Separately, the source owner may publish one complete
+`component_action_trajectory` actual-data fact when it offers a new immutable
+plan. That fact preserves all keyframe values once; composition and shadow
+summaries continue to reference hashes rather than copying the whole chunk on
+every cut.
+
+R3.1b reuses the same derivation through
+`prepare_trajectory_composition_inputs(admission_mode="publication_candidate")`.
+That function still owns only exact target preparation and ordinary
+`CompositionInputStore` admission. It returns the exact admitted input
+ID/hash for every role so an application adapter can require the later formal
+evaluation to select those same facts. It does not publish a proposal or
+advance the emission barrier. Only an external accepted proposal receipt may
+be passed to `commit_trajectory_target_emission()`; the optional emitted action
+hash is the formally composed candidate, not the nominal keyframe. Target
+resolution, safety, IK, Reference/Measurement generation, and dispatch remain
+downstream-owned.
+
+This layer prepares one due target at a time and does not publish a corrected
+future range. An already emitted target is therefore never revised in place.
+`source_immutable_through`, when present, is producer lineage only and must not
+be displayed as an executable/committed reference prefix. The existing
+absolute weighted and per-cut relative paths remain unchanged, and no
+application profile enables trajectory editing by default.
+
+For source-intent visualization,
+`build_trajectory_intent_preview()` projects every keyframe of one exact
+trajectory revision without touching a queue, cursor, composition store,
+closed-target watermark, proposal, or emission barrier. Each point is labeled
+either `producer_locked_intent` (inside the source's non-rewritable prefix) or
+`speculative_prediction` (replaceable future trend). Neither label claims
+target admission, Reference activation, or execution. Actual downstream
+Reference/Measurement facts remain a separate overlay.
+
+A whole-horizon *corrected* preview uses a separate non-closing projection
+path. `capture_non_closing_projection_cut()` captures producer epochs and the
+currently selected context/eligibility facts plus any strategy-required
+residual-anchor lifecycle facts under one `ControlCut`, without advancing any
+store's closed-target watermark. Source trajectory keyframes, the current
+residual, and optional held roles are then represented as
+`ProjectedCompositionInput`, not as admitted `CompositionInputRecord`. The
+projected carrier deliberately has no receiver admission sequence or
+`composition_input_id`.
+
+`build_trajectory_corrected_preview()` evaluates every source-intent keyframe
+from that one immutable basis. Production and preview share the pure temporal
+selector and formal component arithmetic, but the projected evaluation exposes
+no proposal/submission surface and is always non-authoritative,
+non-promotable, and `execution_guaranteed=False`. Context, input age, source
+lease, and residual support are never extrapolated: once the frozen support
+intersection ends, that target is `unavailable`. A runtime with hot strategy
+control, pre-mix policy, or a strategy without explicit projected evaluation
+support is rejected instead of silently bypassing those semantics.
+
+Preview freshness is an independent display assessment. Producer-locked versus
+speculative describes whether the source may revise a keyframe; fresh, aging,
+stale-displayable, expired, or unknown describes the age of its explicit
+observation basis. `assess_trajectory_intent_preview_freshness()` therefore
+requires typed observation/availability evidence and a compatible clock. It
+never infers observation age from trajectory `created_at`, and missing or
+unmapped evidence remains `unknown` rather than changing source-intent trust.
+
+A current-action-only policy needs no trajectory or model-specific adapter. It
+continues through the existing per-cut composition input path. A one-keyframe
+`ComponentActionTrajectory` is structurally legal, but it proves only that one
+exact lattice target: the reducer does not invent a successor, interpolate a
+future target, or promote its hold interval into a chunk guarantee. Timed
+trajectory editing is selected from the source fact actually supplied, not
+from checkpoint, policy architecture, or model name.
+
+The first MuJoCo publication adapter is activation-local. An enabled instance
+must bind an already-open typed Station composition-session barrier and keeps
+that barrier generation plus operation-result identity. Pause/release closes
+the Station barrier before lower HOLD/cancellation; a later typed re-arm may
+reuse the Station barrier object, but it cannot revive the old trajectory
+state or controller. The application must construct a fresh trajectory
+activation binding. The lazy request supplier is only a bounded read of an
+already-produced fact, never model inference, device polling, or cursor
+advancement.
+
 ### Relative overlay inputs
 
 The formal component strategy supports an explicit stateless
@@ -829,15 +984,18 @@ it does not own reference generation or reconstruct an interpolation timeline.
 For an actual reference comparison, the lower owner must emit the exact
 reference object used by execution (or a lossless immutable projection of it),
 with component identity, target lineage, effective interval, availability and
-clock domain. The first capability supports only same-clock `joint_position`
-residuals. It never uses nearest logical target time, compares cross-clock
-values, treats an unsupported representation as a generic vector, or infers
-authority/cancellation from timestamps. No production caller is enabled merely
-by adding the seam.
+clock domain. The current metric set supports same-clock `joint_position` and
+framed `cartesian_pose` residuals. Pose translation is reported in the declared
+reference frame and rotation as a reference-pose-local rotation vector. It
+never uses nearest logical target time, compares cross-clock values, treats an
+unsupported representation as a generic vector, or infers authority/
+cancellation from timestamps. No production caller is enabled merely by
+adding the seam.
 
 Reference observation is optional and demand-driven. A downstream
 `ExecutionObservationPlan` may request decimated or full-rate reference
-frames, and independently request measurement frames.
+frames, independently request measurement frames, and optionally require the
+exact representation for every selected component.
 `None` or an all-off plan creates no acquisition or publication work. A non-off
 plan must bind in full to an `ExecutionObservationCapabilitySpec` during target
 construction and requires a nonblocking observation sink; unsupported
@@ -856,12 +1014,16 @@ sink does not duplicate those facts.
 
 The owner computes the reference once and fans out the same object; composition
 never receives or executes an interpolation algorithm. MuJoCo uses a
-measurement-coupled point sample of the qref selected by the target owner. This
-avoids retroactively mutating an earlier open interval after supersession while
-still allowing an exact same-clock comparison. Unbound pre-resolver point
-samples remain incomparable. Provenance may carry an algorithm ID/hash, but an
-offline recomputation must be labeled `ReconstructedReference`, never actual
-reference.
+measurement-coupled point sample of the qref selected by the target owner. When
+a pose representation is explicitly bound, the MuJoCo owner derives
+`FK(active qref)` and `FK(measured qpos)` in private model data and publishes
+their raw qpos facts plus the kinematics contract as lineage. This is a
+downstream-owned lossless projection, not composition-side FK or reconstructed
+interpolation. It avoids retroactively mutating an earlier open interval after
+supersession while still allowing an exact same-clock comparison. Unbound
+pre-resolver point samples remain incomparable. Provenance may carry an
+algorithm ID/hash, but an offline recomputation must be labeled
+`ReconstructedReference`, never actual reference.
 
 The two modules return different facts and must not be merged into one record
 or treated as successive schema versions. Visualization and future feedback
@@ -1053,14 +1215,191 @@ predeclared `weighted_component_fusion_v1` and
 strategy implementation/version, context channels, algebra, input/required
 roles, component IDs, representations, and contributing-role topology. It
 does not dynamically load unrelated numerical kernels or acquire new context
-resources. Context-driven per-frame mode selection belongs in a future
-predeclared meta-strategy; arbitrary implementation loading is not a hot
-configuration feature.
+resources. Arbitrary implementation loading is not a hot configuration
+feature. The separate allocation contract below handles predeclared
+context-driven mode selection; it does not overload alpha records or strategy
+revision.
 
 Changing alpha from zero to one changes the realized contributors while the
 composition proposal producer remains the sole downstream authority owner.
 Hot control never performs HOLD, authority release/acquire, canonical safety,
 IK, reference generation, or dispatch.
+
+## Activity-driven source allocation
+
+`control_composition.allocation` is an opt-in, backend-neutral path for the
+common interaction profile:
+
+```text
+quiet near active anchor       -> base_only candidate
+motion or nonzero residual     -> relative_overlay candidate
+large motion/residual evidence -> absolute_overlay_owner candidate
+```
+
+Role names are profile data, not hard-coded human/policy semantics. A
+`CompositionAllocationSpec` predeclares `base_absolute_role`,
+`relative_overlay_role`, `absolute_overlay_role`, and component-keyed threshold
+policies. The allocation reducer consumes bounded-window
+`ComponentSourceActivityObservation` facts and separate anchor-bound
+`ComponentResidualMagnitudeObservation` facts. Motion describes change over a
+bounded window; magnitude describes the latest relative action against the
+identity of its exact `ResidualAnchorReceipt`. Standard providers cover
+Cartesian pose translation/rotation and arbitrary-dimensional
+joint-position/continuous vectors. Every observation carries a provider ID and
+contract hash; a custom provider must declare both explicitly. Normalization
+scales remain profile data.
+
+One admitted source sample may be projected into several fixed roles through
+`CompositionInputBatchDraft`. Such a batch is all-or-none at a receiver cut and
+shares source lineage, timing, activation, and any semantic binding. The
+allocation input path uses this for absolute and residual views of one source;
+allocation never changes that source's role dynamically. `AllocationEvidenceWindow`
+retains accepted pairs by mapped time, not by an arbitrary item capacity, and a
+cut sees a pair only after its final batch admission sequence.
+
+Residual-anchor identity is a formal input semantic binding, not debug
+metadata. It participates in the input hash and is recorded separately as
+`composition_input_semantic_binding`, keeping the established v2.4 base input
+record schema unchanged. Relative and absolute-overlay modes require the
+selected input binding to equal the anchor carried by the admitted allocation
+context. Projected trajectory inputs apply the same rule.
+
+The reducer distinguishes quiet-at-anchor from quiet-at-nonzero-residual, and
+distinguishes both from missing, not-yet-available, or expired evidence.
+Base-to-relative entry may use motion **or** magnitude; returning to base
+requires motion **and** magnitude below their independent exit thresholds plus
+minimum dwell. Multi-component evaluation is atomic and rejects mixed anchor
+receipt generations. Missing/stale evidence returns `no_decision`, preserves
+state, and does not silently become `base_only`.
+
+A ready allocation decision is published through the existing
+`CompositionContextStore`. The reusable `AllocationPublicationRuntime` keeps
+the pure reducer result as a candidate until the exact context receipt is
+accepted. Only then does it commit the saved next reducer state. A terminal
+rejection keeps the old state but consumes the monotonic producer sequence; an
+exception or unknown outcome retains one immutable pending draft for exact
+retry. A generic `duplicate` receipt counts as success only after the retained
+record's producer-side submission hash is proven identical. Ordinary context
+admission continues to reject duplicates.
+
+Each allocation scope permits one pending attempt and one latest coalesced
+evidence basis. Pending never becomes active, never blocks composition from
+using the last admitted context while it remains valid, and never creates a
+backlog of missed evaluations. The attempt binds the source-fact basis cut,
+component-atomic decision, candidate state, producer sequence, and
+`CompositionActivationScope`. Closing that activation permanently invalidates
+the local runtime; a late receipt cannot advance a later activation. The first
+implementation is in-process receipt-driven consistency, not durable
+crash-consistent exactly-once.
+
+The core owns no thread or worker. `offer_basis()` and `resolve_admission()`
+are short state transitions suitable for a control-facing seam. The
+`attempt_admission()` convenience releases the runtime lock around its callback
+but the callback may still block its calling thread; an application therefore
+runs it on a bounded non-control-loop worker, or transports the pending draft
+asynchronously and returns the typed receipt to `resolve_admission()`.
+
+`AllocatedPoseComponentCompositionRule` and
+`AllocatedQposComponentCompositionRule` select the decision on the same formal
+action/context cut after its admission, then either copy the base, apply the
+declared relative delta, or copy the absolute overlay. All three input roles and schemas are
+predeclared at runtime creation; source required/optional behavior continues
+to belong to `CompositionSpec` and eligibility, not the allocator.
+
+Profiles that make `absolute_overlay_owner` promotable may attach an
+`AllocationTransitionContinuityPolicy`. Its activation-scoped reducer is
+component-keyed and target-time driven. On absolute entry it aligns the current
+raw absolute pose/qpos to the previous composed target, keeps that alignment
+while later human deltas arrive, and on a later mode change decays the target
+seam correction over the declared handoff interval. Exact state-before and
+prepared-state-after hashes, invocation identity, selected modes, and
+correction kinds are returned as `strategy_result_data` actual/replay
+information. Preparation does not advance state; only acceptance of that exact
+proposal commits it. Exact duplicate invocations are idempotent and a new
+non-increasing committed target time is rejected.
+Projected trajectory preview intentionally does not mutate this stateful
+reducer and therefore exposes the raw advisory composition view.
+
+`absolute_overlay_owner` is deliberately a **soft composition mode**: the
+composer remains the sole proposal/authority owner. A true exclusive takeover
+still requires the Control Station HOLD/release/rebase/READY lifecycle and is
+not driven frame-by-frame by this reducer. Allocation also owns no canonical
+safety, IK, Reference generation, command smoothing, or dispatch. A future
+learned allocator must publish a bounded-TTL context/advisory asynchronously;
+the inline control loop must not wait for it.
+
+Additional stillness, contact, intent, vision, tactile, or learned classifiers
+remain advisory providers. Their facts need explicit identity, mapped timing,
+TTL, component scope, and lineage. Publishing such a fact cannot itself rebase,
+request HOLD, or change authority. An application may later opt into an
+`automatic_rebase` profile that converts one declared provider fact into the
+same typed rebase transaction.
+
+The generic `control_composition.triggers` layer now supplies the boundary for
+that conversion without enabling a profile. A replaceable provider receives an
+immutable, caller-selected `CompositionTriggerEvaluationBasis`; an input/state
+classifier (for example, large anchor-relative hand motion) returns condition
+evidence, while a button or another already-admitted event returns direct-event
+evidence. A rule maps either source to the same requested operation contract.
+Condition rules emit only on a rising edge and rearm on an explicit inactive
+sample. A device adapter must convert a held button level into uniquely
+identified press/release edges before using the direct-event origin; distinct
+events emit once, and exact duplicates are idempotent.
+Every proposal binds the receiver `ControlCut`, activation, source generation,
+sequence, TTL, component scope, payload contract, and causal facts.
+
+The result is deliberately a non-authoritative
+`CompositionOperationTriggerProposal`. It is not a Station intent, allocation
+context, rebase request, HOLD, authority transition, or action proposal. The
+owning application profile must explicitly bind it to the existing operation
+owner, whose admission receipt and reducer remain canonical. Consequently a
+classifier, button callback, GUI, or device adapter can share one trigger seam
+without gaining a path to mutate composition or execution directly. No GUI,
+device, MuJoCo, replay, deployment, or real-robot caller is wired in this gate.
+
+Clearing a producer-local evidence window is not an immediate rebase fence:
+an older admitted input and allocation context can remain mutually consistent
+until their support expires. The allocation strategy therefore declares a
+`ResidualAnchorLifecycleSpec`, and the runtime selects its receiver-admitted
+`pending`/`ready` record at the same `ControlCut` as actions and allocation
+context. This low-rate stream has no TTL: a record remains valid within its
+activation until a monotonically newer generation supersedes it.
+
+The three facts are parallel inputs to one evaluation, not three serial
+processing stages:
+
+```text
+one receiver cut
+  -> active residual-anchor lifecycle
+  -> selected allocation context
+  -> selected component inputs
+  -> one formal allocation decision
+```
+
+At targets before a rebase boundary, the prior ready receipt remains active.
+At or after the boundary, pending returns typed `no_action`; it is not HOLD.
+Ready may only complete the exact request at the exact pending boundary, and
+selected relative/absolute inputs plus allocation context must bind that same
+receipt. The allocation publication runtime simultaneously fences pending or
+late work from the older generation, so a late accepted context receipt cannot
+commit old reducer state. Initial anchor capture publishes the absolute sample
+and identity residual as one batch before publishing ready.
+
+Frozen corrected-horizon projection carries this same lifecycle projection and
+rebuilds a lifecycle snapshot independently for each future keyframe. It never
+rereads a store, predicts a future receipt, or makes the preview promotable.
+
+The reusable reducer, lifecycle receiver/store, receipt-driven publisher,
+context adapter, and formal rule are implemented and pure-tested. The separate Station rebase port is
+default-off and only binds an already-accepted intent to the pure transaction;
+it does not capture a sample or send an action. A default-off MuJoCo shadow
+binding exercises the ordinary context store and formal same-cut evaluation
+with virtual source facts but cannot admit a proposal. A separate default-off
+Station gate can recapture a formal cut and admit that exact ready result to
+the existing MuJoCo composer proposal port; it does not step the runtime or
+own authority, target/reference generation, safety, IK, or dispatch. No GUI,
+deploy frontend, real-device path, or production profile enables either gate
+by default.
 
 ## Current implementation boundary
 
@@ -1079,6 +1418,15 @@ Implemented and locally contract-tested:
   guidance contracts;
 - complete evaluation return records, domain events, lifecycle,
   handoff, re-arm, proposal promotion, and package dependency firewalls.
+- whole-horizon source-intent preview with locked/speculative trust labels and
+  no execution claim;
+- opt-in component-keyed activity allocation with separate motion and
+  anchor-relative magnitude evidence, explicit metric-provider identity,
+  pose/qpos metrics, hysteresis/dwell/TTL lineage, existing-context admission,
+  and formal base/relative/absolute soft selection;
+- session-local active-anchor revisions with pending-rebase fencing, exact
+  trigger/fresh-sample receipts, deterministic replay, and a default-off thin
+  Station intent port; no application or execution profile is enabled;
 - opt-in formal strategy v2 identity, exact context/information-plan lineage,
   canonical v4 result promotion, strict ControlTrace projection, and a
   deterministic migration adapter without changing the default v1 path.

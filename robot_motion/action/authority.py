@@ -203,6 +203,7 @@ class AuthorityStore:
         if event_type == "mode" and not mode:
             raise ValueError("mode event requires control_mode.")
         if mode is not None and mode not in {
+            "agent_skill",
             "human",
             "policy",
             "replay",

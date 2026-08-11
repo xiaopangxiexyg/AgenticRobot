@@ -1,0 +1,26 @@
+{
+  "schema": "dexteleop.task_progress_profile.v1",
+  "profile_id": "dmtac_bimanual_writing_acquire_present_window_v1",
+  "profile_version": "1",
+  "task_id": "dmtac_bimanual_writing_acquire_present_window",
+  "steps": [
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "semantic_type": "BIMANUAL_ACQUIRE_OBJECT_AND_PRESENT",
+      "display_name": "双臂协同拿取毛笔并送至左手",
+      "ordinal": 1,
+      "arm_control": {
+        "schema": "dexteleop.progress_step_arm_control.v1",
+        "left": "teleop",
+        "right": "teleop",
+        "fixed_scope": "arm_and_end_effector"
+      },
+      "allowed_next_step_ids": []
+    }
+  ],
+  "initial_step_id": "right_acquire_brush",
+  "terminal_step_ids": ["right_acquire_brush"],
+  "topology_kind": "LINEAR",
+  "allow_retry_after_failure": false
+}

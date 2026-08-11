@@ -58,6 +58,9 @@ COMPOSITION_CONTEXT_RECORD_HASH_DOMAIN_V1 = (
 COMPOSITION_CONTEXT_SNAPSHOT_HASH_DOMAIN_V1 = (
     "dexteleop.composition_context_snapshot.v1"
 )
+COMPOSITION_CONTEXT_SUBMISSION_HASH_DOMAIN_DEVELOPMENT = (
+    "dexteleop.composition_context_submission.development"
+)
 
 
 def _required(value: object, *, name: str) -> str:
@@ -600,6 +603,96 @@ def composition_context_semantic_payload(
     }
 
 
+def composition_context_submission_semantic_payload(
+    context: CompositionContextDraft | CompositionContextRecord,
+) -> dict[str, Any]:
+    """Return the producer-side fact content shared by a draft and record.
+
+    Receiver-owned availability and admission stamps are deliberately omitted.
+    This payload is suitable for reconciling an exact retry after admission may
+    have succeeded but its receipt was not observed.  It does not change the
+    ordinary store rule that a duplicate ``admit()`` call is rejected.
+    """
+
+    if isinstance(context, CompositionContextDraft):
+        prepared = _prepare_context(context)
+        draft = prepared.draft
+        return {
+            "context_id": prepared.identity.fact_id,
+            "runtime_session_id": prepared.identity.runtime_session_id,
+            "control_domain_id": prepared.identity.control_domain_id,
+            "producer_id": prepared.identity.producer_id,
+            "producer_epoch": prepared.identity.producer_epoch,
+            "sequence": prepared.identity.sequence,
+            "context_channel": prepared.context_channel,
+            "context_kind": prepared.context_kind,
+            "semantic_payload": prepared.semantic_payload,
+            "produced_at": prepared.produced_at,
+            "produced_clock_domain_id": draft.produced_clock_domain_id,
+            "effective_from": prepared.effective_from,
+            "effective_until": prepared.effective_until,
+            "effective_clock_domain_id": draft.effective_clock_domain_id,
+            "payload_contract_hash": draft.payload_contract_hash,
+            "source_fact_ids": prepared.source_fact_ids,
+            "source_fact_hashes": prepared.source_fact_hashes,
+            "parent_context_ids": prepared.parent_context_ids,
+            "blob_refs": prepared.blob_refs,
+            "availability": prepared.availability,
+            "fault_code": prepared.fault_code,
+            "producer_node_id": draft.producer_node_id,
+            "observation_cut_id": draft.observation_cut_id,
+            "inference_id": draft.inference_id,
+            "policy_output_id": draft.policy_output_id,
+            "producer_artifact_hash": draft.producer_artifact_hash,
+        }
+    if not isinstance(context, CompositionContextRecord):
+        raise TypeError(
+            "context must be CompositionContextDraft or CompositionContextRecord."
+        )
+    return {
+        key: getattr(context, key)
+        for key in (
+            "context_id",
+            "runtime_session_id",
+            "control_domain_id",
+            "producer_id",
+            "producer_epoch",
+            "sequence",
+            "context_channel",
+            "context_kind",
+            "semantic_payload",
+            "produced_at",
+            "produced_clock_domain_id",
+            "effective_from",
+            "effective_until",
+            "effective_clock_domain_id",
+            "payload_contract_hash",
+            "source_fact_ids",
+            "source_fact_hashes",
+            "parent_context_ids",
+            "blob_refs",
+            "availability",
+            "fault_code",
+            "producer_node_id",
+            "observation_cut_id",
+            "inference_id",
+            "policy_output_id",
+            "producer_artifact_hash",
+        )
+    }
+
+
+def composition_context_submission_semantic_hash(
+    context: CompositionContextDraft | CompositionContextRecord,
+) -> str:
+    """Hash exact producer-side submission semantics, excluding receiver stamps."""
+
+    return canonical_content_hash(
+        composition_context_submission_semantic_payload(context),
+        domain=COMPOSITION_CONTEXT_SUBMISSION_HASH_DOMAIN_DEVELOPMENT,
+    )
+
+
 class CompositionContextStore:
     """Receiver-admitted generic context with time-window retention."""
 
@@ -749,6 +842,13 @@ class CompositionContextStore:
                 for record in self._records
                 if admitted_at_or_before(record, cut)
             )
+
+    def record_by_id(self, context_id: str) -> CompositionContextRecord | None:
+        """Return a retained admitted record for exact retry reconciliation."""
+
+        normalized = _required(context_id, name="context_id")
+        with self._lock:
+            return self._by_id.get(normalized)
 
     def capture_snapshot(
         self,
@@ -948,6 +1048,7 @@ __all__ = [
     "COMPOSITION_CONTEXT_KINDS_V1",
     "COMPOSITION_CONTEXT_RECORD_HASH_DOMAIN_V1",
     "COMPOSITION_CONTEXT_SNAPSHOT_HASH_DOMAIN_V1",
+    "COMPOSITION_CONTEXT_SUBMISSION_HASH_DOMAIN_DEVELOPMENT",
     "POSE_MIXING_CONTEXT_KINDS_V1",
     "CompositionContext",
     "CompositionContextAdmissionError",
@@ -960,5 +1061,7 @@ __all__ = [
     "PoseMixingContext",
     "build_composition_context_snapshot",
     "composition_context_semantic_payload",
+    "composition_context_submission_semantic_hash",
+    "composition_context_submission_semantic_payload",
     "project_composition_contexts",
 ]

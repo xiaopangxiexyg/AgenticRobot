@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.pose_frames import PoseFrameContract, PoseFrameContractError
 
 from .actions import NormalizedAction
@@ -27,6 +28,14 @@ from .session_contract import (
     POLICY_ABSOLUTE_FRAME_CANONICAL_DESK,
     POLICY_ABSOLUTE_FRAME_RUNTIME_RAW,
 )
+from .source_projection import (
+    POLICY_SOURCE_ACTION_ABSOLUTE_TARGET,
+    POLICY_SOURCE_ACTION_OBSERVATION_RELATIVE_CHUNK,
+    POLICY_SOURCE_ACTION_PROJECTION_METADATA_KEY,
+    POLICY_SOURCE_ANCHOR_NONE,
+    POLICY_SOURCE_ANCHOR_OBSERVATION_TCP_FIXED_FOR_CHUNK,
+    PolicySourceActionProjection,
+)
 from ..relative_action import (
     ACTION_POSE_MODE_ABSOLUTE,
     ACTION_POSE_MODE_RELATIVE,
@@ -39,6 +48,57 @@ from ..relative_action import (
 
 class PoseDeploymentError(ValueError):
     """Raised when a deployment pose representation cannot be resolved safely."""
+
+
+def _decoded_absolute_action_hash(
+    vector: np.ndarray,
+    arm_joint_targets: Mapping[str, Any],
+) -> str:
+    return canonical_content_hash(
+        {
+            "vector": np.asarray(vector, dtype=np.float32),
+            "arm_joint_targets": {
+                str(side): np.asarray(values, dtype=np.float32)
+                for side, values in arm_joint_targets.items()
+            },
+        },
+        domain="dexteleop.policy_decoded_absolute_action.v1",
+    )
+
+
+def _source_projection_metadata(
+    *,
+    source_semantics: str,
+    source_pose_mode: str,
+    source_vector: np.ndarray,
+    decoded_vector: np.ndarray,
+    arm_joint_targets: Mapping[str, Any],
+    anchor_policy: str,
+    anchors: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    source_array = np.asarray(source_vector, dtype=np.float32).reshape(-1)
+    finite_indices = np.flatnonzero(np.isfinite(source_array)).astype(np.float32)
+    finite_values = source_array[np.isfinite(source_array)]
+    source_channels = {
+        "dense_action_index": finite_indices,
+        "dense_action_value": finite_values,
+    }
+    projection = PolicySourceActionProjection(
+        source_semantics=source_semantics,
+        source_pose_mode=source_pose_mode,
+        source_action_schema_id="legacy_deploy_dense_action26_v1",
+        source_action_by_channel=source_channels,
+        conditioned_action_by_channel=source_channels,
+        decoded_absolute_action_hash=_decoded_absolute_action_hash(
+            decoded_vector,
+            arm_joint_targets,
+        ),
+        anchor_policy=anchor_policy,
+        anchor_value_by_component=anchors,
+    )
+    return {
+        POLICY_SOURCE_ACTION_PROJECTION_METADATA_KEY: projection.to_dict()
+    }
 
 
 def _runtime_pose_contract(
@@ -246,6 +306,17 @@ def convert_normalized_action_chunk_to_absolute(
                     arm_hold_prediction=action.arm_hold_prediction,
                     metadata={
                         **dict(action.metadata),
+                        **_source_projection_metadata(
+                            source_semantics=POLICY_SOURCE_ACTION_ABSOLUTE_TARGET,
+                            source_pose_mode=source,
+                            source_vector=np.asarray(
+                                action.vector, dtype=np.float32
+                            ),
+                            decoded_vector=vector,
+                            arm_joint_targets=action.arm_joint_targets,
+                            anchor_policy=POLICY_SOURCE_ANCHOR_NONE,
+                            anchors={},
+                        ),
                         "pose_action_source_mode": source,
                         "pose_action_mode": "absolute",
                         "pose_action_source_absolute_frame": absolute_frame,
@@ -284,6 +355,21 @@ def convert_normalized_action_chunk_to_absolute(
                 arm_hold_prediction=action.arm_hold_prediction,
                 metadata={
                     **dict(action.metadata),
+                    **_source_projection_metadata(
+                        source_semantics=(
+                            POLICY_SOURCE_ACTION_OBSERVATION_RELATIVE_CHUNK
+                        ),
+                        source_pose_mode=source,
+                        source_vector=np.asarray(
+                            action.vector, dtype=np.float32
+                        ),
+                        decoded_vector=converted[index],
+                        arm_joint_targets=action.arm_joint_targets,
+                        anchor_policy=(
+                            POLICY_SOURCE_ANCHOR_OBSERVATION_TCP_FIXED_FOR_CHUNK
+                        ),
+                        anchors=anchors,
+                    ),
                     "pose_action_source_mode": source,
                     "pose_action_mode": "absolute",
                     "pose_anchor_policy": "current_actual_tcp_fixed_for_chunk",

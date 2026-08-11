@@ -1,0 +1,32 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_bimanual_writing_acquire_present_window_stages_v1",
+  "profile_version": "1",
+  "task_progress_profile_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.approach",
+      "display_name": "双臂协同靠近",
+      "description": "双臂离开起始位，右手靠近带盖毛笔，左臂进入后续取盖协同区域。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.grasp",
+      "display_name": "双臂协同抓取",
+      "description": "右夹爪建立稳定毛笔抓取，左臂允许继续向取盖协同区域运动。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.lift_and_present",
+      "display_name": "双臂协同提起并送笔",
+      "description": "右手提起仍带笔盖的毛笔并送到左手可取盖位置，双臂形成有效协同终态。",
+      "ordinal": 3
+    }
+  ]
+}

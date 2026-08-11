@@ -24,10 +24,12 @@ annotation_store.py
     readers; it is not the current fine-stage GUI store.
 
 stage_annotation_store.py
-    Current ordered-stage annotation persistence: one dataset-wide writer
-    lock, atomic editable drafts and immutable annotation-set seal. The
-    Control Station refinement application coordinates this store through
-    public APIs but the store has no GUI dependency.
+    Current ordered-stage annotation persistence: one shared legacy guard,
+    cross-machine Episode lock directories, atomic editable drafts and
+    immutable annotation-set seal. Distinct Episodes may be edited by upgraded
+    programs on the same SSHFS/NFS-backed dataset. The Control Station
+    refinement application coordinates this store through public APIs but the
+    store has no GUI dependency.
 ```
 
 The two annotation stores are intentionally not merged. They persist different

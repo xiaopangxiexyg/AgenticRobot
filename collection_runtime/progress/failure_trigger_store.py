@@ -29,7 +29,7 @@ class FailureTriggerCommitReport:
 
 
 def failure_trigger_path(annotation_dir: str | Path) -> Path:
-    return Path(annotation_dir).expanduser().resolve() / FAILURE_TRIGGER_RELATIVE_PATH
+    return Path(annotation_dir).expanduser() / FAILURE_TRIGGER_RELATIVE_PATH
 
 
 def commit_failure_trigger_annotation_set(

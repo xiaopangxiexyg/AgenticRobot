@@ -19,6 +19,9 @@ COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V1 = (
 COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V2 = (
     "dexteleop.composition_information_plan.v2"
 )
+COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V3 = (
+    "dexteleop.composition_information_plan.v3"
+)
 CONTEXT_PAYLOAD_ACCESS_MODES_V1 = frozenset(
     {"metadata_only", "inline", "blob_ref"}
 )
@@ -50,6 +53,7 @@ class CompositionContextRequirement:
     maximum_age_sec: float | None = None
     binding_mode: str = "same_cut_global"
     bound_input_roles: tuple[str, ...] = ()
+    required: bool = True
 
     def __post_init__(self) -> None:
         channel = _required(self.channel, name="channel")
@@ -82,6 +86,8 @@ class CompositionContextRequirement:
             raise ValueError(
                 "same_cut_global context must not name bound input roles."
             )
+        if not isinstance(self.required, bool):
+            raise TypeError("required must be a bool.")
         object.__setattr__(self, "channel", channel)
         object.__setattr__(self, "accepted_payload_contract_hashes", hashes)
         object.__setattr__(self, "payload_access", access)
@@ -150,6 +156,7 @@ class CompositionInformationPlan:
                     "maximum_age_sec": item.maximum_age_sec,
                     "binding_mode": item.binding_mode,
                     "bound_input_roles": item.bound_input_roles,
+                    **({} if item.required else {"required": False}),
                 }
                 for item in requirements
             ),
@@ -158,6 +165,11 @@ class CompositionInformationPlan:
         }
         object.__setattr__(self, "plan_id", plan_id)
         object.__setattr__(self, "context_requirements", requirements)
+        hash_domain = (
+            COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V2
+            if all(item.required for item in requirements)
+            else COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V3
+        )
         object.__setattr__(
             self,
             "source_difference_spec_hash",
@@ -169,12 +181,24 @@ class CompositionInformationPlan:
             "semantic_content_hash",
             canonical_content_hash(
                 payload,
-                domain=COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V2,
+                domain=hash_domain,
             ),
         )
 
     @property
     def required_context_channels(self) -> tuple[str, ...]:
+        return tuple(
+            item.channel for item in self.context_requirements if item.required
+        )
+
+    @property
+    def optional_context_channels(self) -> tuple[str, ...]:
+        return tuple(
+            item.channel for item in self.context_requirements if not item.required
+        )
+
+    @property
+    def context_channels(self) -> tuple[str, ...]:
         return tuple(item.channel for item in self.context_requirements)
 
     def requirement_for_channel(
@@ -197,6 +221,7 @@ __all__ = [
     "COMPOSITION_CONTEXT_BINDING_MODES_V1",
     "COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V1",
     "COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V2",
+    "COMPOSITION_INFORMATION_PLAN_HASH_DOMAIN_V3",
     "CONTEXT_PAYLOAD_ACCESS_MODES_V1",
     "CompositionContextRequirement",
     "CompositionInformationPlan",

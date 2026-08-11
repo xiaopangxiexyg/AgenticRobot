@@ -170,6 +170,7 @@ def prepare_episode(
     selector: str | None,
     column_projection: tuple[str, ...],
     modality_selection: tuple[str, ...],
+    camera_selection: tuple[str, ...] | None = None,
 ) -> PreparedEpisode:
     record_hash = source_episode_manifest_hash(
         source.dataset_root,
@@ -180,9 +181,26 @@ def prepare_episode(
             f"Episode {item.episode_index} is absent from episodes.jsonl."
         )
     parquet_hash = sha256_file(item.parquet_path)
+    if "video" in modality_selection:
+        selected_camera_keys = (
+            tuple(sorted(item.video_paths))
+            if camera_selection is None
+            else camera_selection
+        )
+        missing_cameras = tuple(
+            key for key in selected_camera_keys if key not in item.video_paths
+        )
+        if missing_cameras:
+            raise PreparedTrainingViewError(
+                "Prepared Episode is missing selected cameras: "
+                f"episode={item.episode_identity_hash} "
+                f"missing={missing_cameras}."
+            )
+    else:
+        selected_camera_keys = ()
     video_hashes = {
-        key: sha256_file(path)
-        for key, path in sorted(item.video_paths.items())
+        key: sha256_file(item.video_paths[key])
+        for key in selected_camera_keys
     }
     annotation = _select_annotation(item, selector)
     sample_axis = load_episode_sample_axis(item)
@@ -249,11 +267,11 @@ def prepare_episode(
         inventory.extend(
             _inventory_record(
                 source=source,
-                path=path,
+                path=item.video_paths[key],
                 role=f"EPISODE_VIDEO:{key}",
                 known_sha256=video_hashes[key],
             )
-            for key, path in sorted(item.video_paths.items())
+            for key in selected_camera_keys
         )
     for path in sorted(item.progress_episode_dir.iterdir()):
         if path.is_file():

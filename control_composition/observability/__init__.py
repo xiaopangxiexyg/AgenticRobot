@@ -47,6 +47,7 @@ from .execution_difference import (
     MeasurementReferenceAssociation,
     associate_measurement_to_reference,
 )
+from .relative_deflection import project_relative_pose_deflections
 
 __all__ = [
     "SOURCE_DIFFERENCE_OBSERVATION_HASH_DOMAIN_V1",
@@ -86,4 +87,5 @@ __all__ = [
     "MEASUREMENT_REFERENCE_ASSOCIATION_STATUSES",
     "MeasurementReferenceAssociation",
     "associate_measurement_to_reference",
+    "project_relative_pose_deflections",
 ]

@@ -1,0 +1,416 @@
+{
+  "schema": "dexteleop.skill_projection_catalog.authoring.v1",
+  "skills": [
+    {
+      "skill_id": "writing.acquire_brush_grasp_prefix",
+      "skill_version": "1",
+      "semantic_type": "ACQUIRE_OBJECT_GRASP_PREFIX",
+      "controlled_component_ids": ["right_arm", "right_hand"],
+      "entry_predicate_ids": ["brush.available_for_right_hand"],
+      "success_predicate_ids": ["brush.stably_grasped_by_right_hand"],
+      "conditionable_context_ids": [
+        "left_arm.fixed_hold",
+        "left_arm.teleop"
+      ]
+    },
+    {
+      "skill_id": "writing.acquire_brush_to_writing_ready",
+      "skill_version": "1",
+      "semantic_type": "ACQUIRE_OBJECT_TO_WRITING_READY",
+      "controlled_component_ids": ["right_arm", "right_hand"],
+      "entry_predicate_ids": ["brush.available_for_right_hand"],
+      "success_predicate_ids": ["brush.at_writing_ready_pose"],
+      "conditionable_context_ids": ["left_arm.fixed_hold"]
+    },
+    {
+      "skill_id": "writing.acquire_brush_and_present_for_cap_removal",
+      "skill_version": "1",
+      "semantic_type": "ACQUIRE_OBJECT_AND_PRESENT_FOR_CAP_REMOVAL",
+      "controlled_component_ids": ["right_arm", "right_hand"],
+      "entry_predicate_ids": ["brush.available_for_right_hand"],
+      "success_predicate_ids": ["brush.presented_for_left_cap_removal"],
+      "conditionable_context_ids": [
+        "left_arm.fixed_hold",
+        "left_arm.teleop"
+      ]
+    },
+    {
+      "skill_id": "writing.write_with_brush",
+      "skill_version": "1",
+      "semantic_type": "WRITE_WITH_BRUSH",
+      "controlled_component_ids": ["right_arm", "right_hand"],
+      "entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.ready_for_writing"
+      ],
+      "success_predicate_ids": ["writing.requested_content_completed"],
+      "conditionable_context_ids": [
+        "writing_entry.after_cap_removal",
+        "writing_entry.after_ink_dip",
+        "writing_entry.lift_ready"
+      ]
+    },
+    {
+      "skill_id": "writing.return_brush",
+      "skill_version": "1",
+      "semantic_type": "PLACE_OBJECT",
+      "controlled_component_ids": ["right_arm", "right_hand"],
+      "entry_predicate_ids": ["brush.held_by_right_hand"],
+      "success_predicate_ids": ["brush.returned_to_storage"],
+      "conditionable_context_ids": []
+    }
+  ],
+  "projections": [
+    {
+      "projection_id": "writing3.acquire_grasp_prefix",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_grasp_prefix",
+      "source_progress_profile_hash": "ef3efba566b50db0e43cb72b752b1440f6ae26d3e5978dfb27fd97dc08d60044",
+      "source_stage_profile_hash": "5796d352a2e4298cddcebe13c7223dd5d7ea55cf0762e4a7a56f53d69034f99f",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp"
+      ],
+      "projection_kind": "STAGE_SUBSET",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.stably_grasped_by_right_hand"],
+      "conditioned_context_ids": ["left_arm.fixed_hold"]
+    },
+    {
+      "projection_id": "writing4.acquire_grasp_prefix",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_grasp_prefix",
+      "source_progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
+      "source_stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp"
+      ],
+      "projection_kind": "STAGE_SUBSET",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.stably_grasped_by_right_hand"],
+      "conditioned_context_ids": ["left_arm.teleop"]
+    },
+    {
+      "projection_id": "writing5.acquire_grasp_prefix",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_grasp_prefix",
+      "source_progress_profile_hash": "3222716daa948a0939ba735b4d2d1d3ef2946ef6fe0837dedf90c00c438c5da9",
+      "source_stage_profile_hash": "dcdd2596f4c45ee8705399b6a15e561c1ef889dd4caa6226e10710f67e778d27",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp"
+      ],
+      "projection_kind": "STAGE_SUBSET",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.stably_grasped_by_right_hand"],
+      "conditioned_context_ids": ["left_arm.teleop"]
+    },
+    {
+      "projection_id": "writing3.acquire_to_writing_ready",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_to_writing_ready",
+      "source_progress_profile_hash": "ef3efba566b50db0e43cb72b752b1440f6ae26d3e5978dfb27fd97dc08d60044",
+      "source_stage_profile_hash": "5796d352a2e4298cddcebe13c7223dd5d7ea55cf0762e4a7a56f53d69034f99f",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp",
+        "right_acquire_brush.lift_ready"
+      ],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.at_writing_ready_pose"],
+      "conditioned_context_ids": ["left_arm.fixed_hold"]
+    },
+    {
+      "projection_id": "writing4.acquire_and_present",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_and_present_for_cap_removal",
+      "source_progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
+      "source_stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp",
+        "right_acquire_brush.lift_and_present"
+      ],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.presented_for_left_cap_removal"],
+      "conditioned_context_ids": ["left_arm.teleop"]
+    },
+    {
+      "projection_id": "writing5.acquire_and_present",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_and_present_for_cap_removal",
+      "source_progress_profile_hash": "3222716daa948a0939ba735b4d2d1d3ef2946ef6fe0837dedf90c00c438c5da9",
+      "source_stage_profile_hash": "dcdd2596f4c45ee8705399b6a15e561c1ef889dd4caa6226e10710f67e778d27",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp",
+        "right_acquire_brush.lift_and_present"
+      ],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.presented_for_left_cap_removal"],
+      "conditioned_context_ids": ["left_arm.teleop"]
+    },
+    {
+      "projection_id": "writing3.write",
+      "projection_version": "1",
+      "skill_id": "writing.write_with_brush",
+      "source_progress_profile_hash": "ef3efba566b50db0e43cb72b752b1440f6ae26d3e5978dfb27fd97dc08d60044",
+      "source_stage_profile_hash": "5796d352a2e4298cddcebe13c7223dd5d7ea55cf0762e4a7a56f53d69034f99f",
+      "source_progress_step_id": "right_write",
+      "source_stage_ids": ["right_write.write"],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.ready_for_writing"
+      ],
+      "asserted_success_predicate_ids": ["writing.requested_content_completed"],
+      "conditioned_context_ids": ["writing_entry.lift_ready"]
+    },
+    {
+      "projection_id": "writing4.write",
+      "projection_version": "1",
+      "skill_id": "writing.write_with_brush",
+      "source_progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
+      "source_stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b",
+      "source_progress_step_id": "right_write",
+      "source_stage_ids": ["right_write.write"],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.ready_for_writing"
+      ],
+      "asserted_success_predicate_ids": ["writing.requested_content_completed"],
+      "conditioned_context_ids": ["writing_entry.after_cap_removal"]
+    },
+    {
+      "projection_id": "writing5.write",
+      "projection_version": "1",
+      "skill_id": "writing.write_with_brush",
+      "source_progress_profile_hash": "3222716daa948a0939ba735b4d2d1d3ef2946ef6fe0837dedf90c00c438c5da9",
+      "source_stage_profile_hash": "dcdd2596f4c45ee8705399b6a15e561c1ef889dd4caa6226e10710f67e778d27",
+      "source_progress_step_id": "right_write",
+      "source_stage_ids": ["right_write.write"],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.ready_for_writing"
+      ],
+      "asserted_success_predicate_ids": ["writing.requested_content_completed"],
+      "conditioned_context_ids": [
+        "writing_entry.after_cap_removal",
+        "writing_entry.after_ink_dip"
+      ]
+    },
+    {
+      "projection_id": "writing3.return",
+      "projection_version": "1",
+      "skill_id": "writing.return_brush",
+      "source_progress_profile_hash": "ef3efba566b50db0e43cb72b752b1440f6ae26d3e5978dfb27fd97dc08d60044",
+      "source_stage_profile_hash": "5796d352a2e4298cddcebe13c7223dd5d7ea55cf0762e4a7a56f53d69034f99f",
+      "source_progress_step_id": "right_return_brush",
+      "source_stage_ids": [
+        "right_return_brush.align",
+        "right_return_brush.release"
+      ],
+      "projection_kind": "EXACT_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.held_by_right_hand"],
+      "asserted_success_predicate_ids": ["brush.returned_to_storage"],
+      "conditioned_context_ids": []
+    },
+    {
+      "projection_id": "writing4.return",
+      "projection_version": "1",
+      "skill_id": "writing.return_brush",
+      "source_progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
+      "source_stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b",
+      "source_progress_step_id": "right_return_brush",
+      "source_stage_ids": [
+        "right_return_brush.align",
+        "right_return_brush.release"
+      ],
+      "projection_kind": "EXACT_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.held_by_right_hand"],
+      "asserted_success_predicate_ids": ["brush.returned_to_storage"],
+      "conditioned_context_ids": []
+    },
+    {
+      "projection_id": "writing5.return",
+      "projection_version": "1",
+      "skill_id": "writing.return_brush",
+      "source_progress_profile_hash": "3222716daa948a0939ba735b4d2d1d3ef2946ef6fe0837dedf90c00c438c5da9",
+      "source_stage_profile_hash": "dcdd2596f4c45ee8705399b6a15e561c1ef889dd4caa6226e10710f67e778d27",
+      "source_progress_step_id": "right_return_brush",
+      "source_stage_ids": [
+        "right_return_brush.align",
+        "right_return_brush.release"
+      ],
+      "projection_kind": "EXACT_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.held_by_right_hand"],
+      "asserted_success_predicate_ids": ["brush.returned_to_storage"],
+      "conditioned_context_ids": []
+    },
+    {
+      "projection_id": "writing4_legacy.acquire_grasp_prefix",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_grasp_prefix",
+      "source_progress_profile_hash": "76e5ebf9befeaa7f28061092e2c5ebac9d2bc24993606c9fef9fae195c20fd77",
+      "source_stage_profile_hash": "54a627b747eae869ad172c802f4ec41333760c3dd2d17b79a4cc444e844a5839",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp"
+      ],
+      "projection_kind": "STAGE_SUBSET",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.stably_grasped_by_right_hand"],
+      "conditioned_context_ids": ["left_arm.fixed_hold"]
+    },
+    {
+      "projection_id": "writing5_legacy.acquire_grasp_prefix",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_grasp_prefix",
+      "source_progress_profile_hash": "84a7c30c815f5853daf0ffa7ca7692925e1e8540a7cf58aaa02a28193feddaad",
+      "source_stage_profile_hash": "fc273f0b30f8570e2a94bb39bf1d0c60a6c1ed76e863aac76c231932704c6166",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp"
+      ],
+      "projection_kind": "STAGE_SUBSET",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.stably_grasped_by_right_hand"],
+      "conditioned_context_ids": ["left_arm.teleop"]
+    },
+    {
+      "projection_id": "writing4_legacy.acquire_and_present",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_and_present_for_cap_removal",
+      "source_progress_profile_hash": "76e5ebf9befeaa7f28061092e2c5ebac9d2bc24993606c9fef9fae195c20fd77",
+      "source_stage_profile_hash": "54a627b747eae869ad172c802f4ec41333760c3dd2d17b79a4cc444e844a5839",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp",
+        "right_acquire_brush.lift_and_present"
+      ],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.presented_for_left_cap_removal"],
+      "conditioned_context_ids": ["left_arm.fixed_hold"]
+    },
+    {
+      "projection_id": "writing5_legacy.acquire_and_present",
+      "projection_version": "1",
+      "skill_id": "writing.acquire_brush_and_present_for_cap_removal",
+      "source_progress_profile_hash": "84a7c30c815f5853daf0ffa7ca7692925e1e8540a7cf58aaa02a28193feddaad",
+      "source_stage_profile_hash": "fc273f0b30f8570e2a94bb39bf1d0c60a6c1ed76e863aac76c231932704c6166",
+      "source_progress_step_id": "right_acquire_brush",
+      "source_stage_ids": [
+        "right_acquire_brush.approach",
+        "right_acquire_brush.grasp",
+        "right_acquire_brush.lift_and_present"
+      ],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.available_for_right_hand"],
+      "asserted_success_predicate_ids": ["brush.presented_for_left_cap_removal"],
+      "conditioned_context_ids": ["left_arm.teleop"]
+    },
+    {
+      "projection_id": "writing4_legacy.write",
+      "projection_version": "1",
+      "skill_id": "writing.write_with_brush",
+      "source_progress_profile_hash": "76e5ebf9befeaa7f28061092e2c5ebac9d2bc24993606c9fef9fae195c20fd77",
+      "source_stage_profile_hash": "54a627b747eae869ad172c802f4ec41333760c3dd2d17b79a4cc444e844a5839",
+      "source_progress_step_id": "right_write",
+      "source_stage_ids": ["right_write.write"],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.ready_for_writing"
+      ],
+      "asserted_success_predicate_ids": ["writing.requested_content_completed"],
+      "conditioned_context_ids": ["writing_entry.after_cap_removal"]
+    },
+    {
+      "projection_id": "writing5_legacy.write",
+      "projection_version": "1",
+      "skill_id": "writing.write_with_brush",
+      "source_progress_profile_hash": "84a7c30c815f5853daf0ffa7ca7692925e1e8540a7cf58aaa02a28193feddaad",
+      "source_stage_profile_hash": "fc273f0b30f8570e2a94bb39bf1d0c60a6c1ed76e863aac76c231932704c6166",
+      "source_progress_step_id": "right_write",
+      "source_stage_ids": ["right_write.write"],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.ready_for_writing"
+      ],
+      "asserted_success_predicate_ids": ["writing.requested_content_completed"],
+      "conditioned_context_ids": [
+        "writing_entry.after_cap_removal",
+        "writing_entry.after_ink_dip"
+      ]
+    },
+    {
+      "projection_id": "writing4_legacy.return",
+      "projection_version": "1",
+      "skill_id": "writing.return_brush",
+      "source_progress_profile_hash": "76e5ebf9befeaa7f28061092e2c5ebac9d2bc24993606c9fef9fae195c20fd77",
+      "source_stage_profile_hash": "54a627b747eae869ad172c802f4ec41333760c3dd2d17b79a4cc444e844a5839",
+      "source_progress_step_id": "right_return_brush",
+      "source_stage_ids": [
+        "right_return_brush.align",
+        "right_return_brush.release"
+      ],
+      "projection_kind": "EXACT_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.held_by_right_hand"],
+      "asserted_success_predicate_ids": ["brush.returned_to_storage"],
+      "conditioned_context_ids": []
+    },
+    {
+      "projection_id": "writing5_legacy.return",
+      "projection_version": "1",
+      "skill_id": "writing.return_brush",
+      "source_progress_profile_hash": "84a7c30c815f5853daf0ffa7ca7692925e1e8540a7cf58aaa02a28193feddaad",
+      "source_stage_profile_hash": "fc273f0b30f8570e2a94bb39bf1d0c60a6c1ed76e863aac76c231932704c6166",
+      "source_progress_step_id": "right_return_brush",
+      "source_stage_ids": [
+        "right_return_brush.align",
+        "right_return_brush.release"
+      ],
+      "projection_kind": "EXACT_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": ["brush.held_by_right_hand"],
+      "asserted_success_predicate_ids": ["brush.returned_to_storage"],
+      "conditioned_context_ids": []
+    }
+  ]
+}

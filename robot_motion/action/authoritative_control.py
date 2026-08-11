@@ -106,6 +106,7 @@ from .dispatch_context import (
     build_authoritative_target_dispatch_context,
 )
 from .execution_handoff import (
+    TRANSIENT_TARGET_LIFECYCLE_REJECTION_CODES,
     TargetExecutionCompletionReceipt,
     TargetExecutionDispatchResult,
     TargetExecutionPort,
@@ -1566,6 +1567,24 @@ class AuthoritativeControlRuntime:
                 float(self.clock()),
                 float(action_adaptation.receipt.processing_completed_at),
             )
+            if submitted_at >= action_adaptation.request.supported_until:
+                # The target owner never received this candidate, so there is
+                # no submission receipt to fabricate.  Lifecycle expiry is a
+                # current-cycle no-action disposition, not a safety or
+                # execution-gate fault.
+                self._emit(step_facts)
+                return AuthoritativeControlStep(
+                    status=(
+                        "target_support_expired_before_submission_keep_existing"
+                    ),
+                    snapshot=snapshot,
+                    computation=computation,
+                    publication_attempt=publication_attempt,
+                    decision=decision,
+                    directive=directive,
+                    action_adaptation=action_adaptation,
+                    trace_facts=tuple(step_facts),
+                )
             target_execution_request = TargetExecutionRequest(
                 control_domain_id=self.config.control_domain_id,
                 target_handler_id=(
@@ -1607,7 +1626,14 @@ class AuthoritativeControlRuntime:
                 cancellation = None
                 cancellation_receipt = None
                 cancellation_validation = None
-                if compound_profile is not None:
+                transient_lifecycle_rejection = (
+                    target_submission_receipt.rejection_code
+                    in TRANSIENT_TARGET_LIFECYCLE_REJECTION_CODES
+                )
+                if (
+                    compound_profile is not None
+                    and not transient_lifecycle_rejection
+                ):
                     (
                         cancellation,
                         cancellation_receipt,
@@ -1630,6 +1656,9 @@ class AuthoritativeControlRuntime:
                 self._emit(step_facts)
                 return AuthoritativeControlStep(
                     status=(
+                        "target_lifecycle_rejected_keep_existing"
+                        if transient_lifecycle_rejection
+                        else
                         "compound_target_submission_rejected_hold"
                         if cancellation is not None
                         else "target_submission_rejected_keep_existing"
@@ -2267,12 +2296,19 @@ class AuthoritativeControlRuntime:
         backend_accepted = bool(receipts) and set(command.commands).issubset(receipts) and all(
             item.accepted for item in receipts.values()
         )
+        transient_target_lifecycle_rejection = bool(
+            validation.accepted
+            and target_dispatch_result is not None
+            and not target_dispatch_result.target_admission.accepted
+            and target_dispatch_result.target_admission.rejection_code
+            in TRANSIENT_TARGET_LIFECYCLE_REJECTION_CODES
+        )
         cancellation = None
         cancellation_receipt = None
         cancellation_validation = None
         if compound_profile is not None and not (
             validation.accepted and backend_accepted
-        ):
+        ) and not transient_target_lifecycle_rejection:
             failure_sources = tuple(
                 value
                 for value in (
@@ -2330,6 +2366,8 @@ class AuthoritativeControlRuntime:
             status=(
                 "dispatched"
                 if validation.accepted and backend_accepted
+                else "target_lifecycle_rejected_keep_existing"
+                if transient_target_lifecycle_rejection
                 else "compound_downstream_failure_hold"
                 if cancellation is not None
                 else "dispatch_failed"

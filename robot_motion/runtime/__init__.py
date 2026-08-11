@@ -104,6 +104,12 @@ from .worker_drain import (
     acknowledge_worker_epoch_drain,
     aggregate_worker_epoch_drains,
 )
+from .thread_affinity import (
+    available_cpu_ids,
+    bind_current_thread_to_cpu,
+    cpu_thread_sibling_ids,
+    exclude_cpu_ids_from_current_process,
+)
 
 __all__ = [
     "BimanualRig",
@@ -190,7 +196,11 @@ __all__ = [
     "collect_lifecycle_failures",
     "acknowledge_worker_epoch_drain",
     "aggregate_worker_epoch_drains",
+    "available_cpu_ids",
     "assess_dispatch_seam_inventory",
+    "bind_current_thread_to_cpu",
+    "cpu_thread_sibling_ids",
+    "exclude_cpu_ids_from_current_process",
     "copy_runtime_value",
     "latest_channel_timestamp",
     "merge_teleop_commands",

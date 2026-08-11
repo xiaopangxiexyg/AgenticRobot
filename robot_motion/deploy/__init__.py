@@ -28,6 +28,21 @@ from .arm_hold import (
     ArmHoldSideResolution,
     ArmHoldStagedResolution,
 )
+from .arm_hold_history import (
+    ARM_HOLD_HISTORY_ADVANCED,
+    ARM_HOLD_HISTORY_BINDING_MISMATCH,
+    ARM_HOLD_HISTORY_DUPLICATE,
+    ARM_HOLD_HISTORY_SEQUENCE_CONFLICT,
+    ARM_HOLD_HISTORY_SEQUENCE_GAP,
+    ARM_HOLD_HISTORY_STALE_SEQUENCE,
+    ArmHoldResolvedHistoryAdvanceReceipt,
+    ArmHoldResolvedHistoryBinding,
+    ArmHoldResolvedHistoryError,
+    ArmHoldResolvedHistorySnapshot,
+    ArmHoldResolvedHistoryState,
+    ArmHoldResolvedHistoryUpdate,
+    build_arm_hold_resolved_history_update,
+)
 from .chunk import (
     ActionChunkExecutionPolicy,
     normalize_action_chunk_execution_steps,
@@ -69,6 +84,9 @@ from .chunk_plan import (
     mark_policy_action_plan_in_flight,
     merge_policy_chunk_result,
     pop_due_policy_action,
+)
+from .trajectory_adapter import (
+    project_timed_policy_plan_to_component_trajectory,
 )
 from .inference import (
     ASYNC_ALIGNED_CHUNK_MODE_V1,
@@ -181,6 +199,16 @@ from .next_step import (
 from .control_trace import (
     policy_action_emission_payload,
     project_policy_action_emission,
+    project_policy_action_projection,
+)
+from .execution_feedback import (
+    POLICY_EXECUTION_RELATION_COMPOSED,
+    POLICY_EXECUTION_RELATION_EXACT,
+    POLICY_EXECUTION_RELATION_NOT_SELECTED,
+    POLICY_EXECUTION_RELATION_UNKNOWN,
+    PolicyExecutionFeedback,
+    PolicyExecutionFeedbackApplication,
+    project_policy_execution_feedback,
 )
 from .observation import (
     DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
@@ -224,6 +252,17 @@ from .pose_adapter import (
     convert_normalized_action_chunk_to_relative,
     measured_tcp_anchors_by_side,
     prepare_observation_for_policy_pose_mode,
+)
+from .source_projection import (
+    POLICY_SOURCE_ACTION_ABSOLUTE_TARGET,
+    POLICY_SOURCE_ACTION_OBSERVATION_RELATIVE_CHUNK,
+    POLICY_SOURCE_ACTION_PROJECTION_METADATA_KEY,
+    POLICY_SOURCE_ACTION_SEQUENTIAL_TARGET_DELTA,
+    POLICY_SOURCE_ANCHOR_NONE,
+    POLICY_SOURCE_ANCHOR_OBSERVATION_TCP_FIXED_FOR_CHUNK,
+    POLICY_SOURCE_ANCHOR_PREVIOUS_POLICY_TARGET,
+    PolicySourceActionProjection,
+    policy_source_projection_from_metadata,
 )
 from .session_contract import (
     DEPLOY_SCHEMA_V1,
@@ -320,6 +359,7 @@ from .rtc_runtime import (
 )
 
 __all__ = [
+    "project_timed_policy_plan_to_component_trajectory",
     "ACTION_ARM_POSE_SLICES",
     "ACTION_DIM",
     "ACTION_HAND_SLICES",
@@ -357,6 +397,19 @@ __all__ = [
     "ArmHoldSemanticResolver",
     "ArmHoldSideResolution",
     "ArmHoldStagedResolution",
+    "ARM_HOLD_HISTORY_ADVANCED",
+    "ARM_HOLD_HISTORY_BINDING_MISMATCH",
+    "ARM_HOLD_HISTORY_DUPLICATE",
+    "ARM_HOLD_HISTORY_SEQUENCE_CONFLICT",
+    "ARM_HOLD_HISTORY_SEQUENCE_GAP",
+    "ARM_HOLD_HISTORY_STALE_SEQUENCE",
+    "ArmHoldResolvedHistoryAdvanceReceipt",
+    "ArmHoldResolvedHistoryBinding",
+    "ArmHoldResolvedHistoryError",
+    "ArmHoldResolvedHistorySnapshot",
+    "ArmHoldResolvedHistoryState",
+    "ArmHoldResolvedHistoryUpdate",
+    "build_arm_hold_resolved_history_update",
     "ARM_HOLD_RESOLUTION_HASH_DOMAIN_V1",
     "ARM_HOLD_RESOLUTION_RECEIPT_SCHEMA_V1",
     "ARM_HOLD_STATE_HOLD",
@@ -412,6 +465,14 @@ __all__ = [
     "prepare_policy_emission_target_proposal",
     "policy_action_emission_payload",
     "project_policy_action_emission",
+    "project_policy_action_projection",
+    "POLICY_EXECUTION_RELATION_COMPOSED",
+    "POLICY_EXECUTION_RELATION_EXACT",
+    "POLICY_EXECUTION_RELATION_NOT_SELECTED",
+    "POLICY_EXECUTION_RELATION_UNKNOWN",
+    "PolicyExecutionFeedback",
+    "PolicyExecutionFeedbackApplication",
+    "project_policy_execution_feedback",
     "PolicyActionPreparationResult",
     "POLICY_NEXT_STEP_EXECUTION_BASIS_V1",
     "POLICY_NEXT_STEP_EXECUTION_SEMANTICS_V1",
@@ -480,6 +541,15 @@ __all__ = [
     "convert_normalized_action_chunk_to_relative",
     "measured_tcp_anchors_by_side",
     "prepare_observation_for_policy_pose_mode",
+    "POLICY_SOURCE_ACTION_ABSOLUTE_TARGET",
+    "POLICY_SOURCE_ACTION_OBSERVATION_RELATIVE_CHUNK",
+    "POLICY_SOURCE_ACTION_PROJECTION_METADATA_KEY",
+    "POLICY_SOURCE_ACTION_SEQUENTIAL_TARGET_DELTA",
+    "POLICY_SOURCE_ANCHOR_NONE",
+    "POLICY_SOURCE_ANCHOR_OBSERVATION_TCP_FIXED_FOR_CHUNK",
+    "POLICY_SOURCE_ANCHOR_PREVIOUS_POLICY_TARGET",
+    "PolicySourceActionProjection",
+    "policy_source_projection_from_metadata",
     "to_serializable",
     "vector_or_none",
     "V22DeploymentAdapter",

@@ -347,14 +347,17 @@ def _iter_parquet_rows(path: Path) -> Iterable[dict[str, Any]]:
         yield from batch.to_pylist()
 
 
-def validate_v23_dataset(
+def _validate_v23_dataset_impl(
     dataset_root: str | Path,
     *,
     max_errors: int = 200,
+    allowed_missing_tactile_payloads: frozenset[str] = frozenset(),
+    allowed_missing_tactile_manifests: Mapping[str, int] | None = None,
 ) -> V23DatasetValidationReport:
     """Validate a finalized native-v2.3 dataset without modifying it."""
 
     root = Path(dataset_root).expanduser().resolve()
+    missing_tactile_manifests = dict(allowed_missing_tactile_manifests or {})
     report = V23DatasetValidationReport(dataset_root=str(root))
     info_path = root / "meta" / "info.json"
     episodes_path = root / "meta" / "episodes.jsonl"
@@ -447,6 +450,17 @@ def validate_v23_dataset(
             for name, relative in paths.items():
                 artifact = root / str(relative)
                 if not artifact.is_file():
+                    if (
+                        map_key == "tactile_paths"
+                        and str(relative) in missing_tactile_manifests
+                    ):
+                        tactile_manifests[str(relative)] = {
+                            "frame_count": int(
+                                missing_tactile_manifests[str(relative)]
+                            ),
+                            "streams": {},
+                        }
+                        continue
                     report.errors.append(f"{label}:{map_key}.{name} missing: {relative}")
                     continue
                 if map_key in {"tactile_paths", "wrist_depth_mask_paths", "wrist_depth_raw_paths"}:
@@ -463,7 +477,15 @@ def validate_v23_dataset(
                     if isinstance(streams, Mapping):
                         for stream_name, stream in streams.items():
                             if isinstance(stream, Mapping) and stream.get("path"):
-                                if not (root / str(stream["path"])).is_file():
+                                stream_relative = str(stream["path"])
+                                if (
+                                    not (root / stream_relative).is_file()
+                                    and not (
+                                        map_key == "tactile_paths"
+                                        and stream_relative
+                                        in allowed_missing_tactile_payloads
+                                    )
+                                ):
                                     report.errors.append(
                                         f"{label}:{relative} stream {stream_name!r} is missing"
                                     )
@@ -527,4 +549,139 @@ def validate_v23_dataset(
     return report
 
 
-__all__ = ["V23DatasetValidationReport", "validate_v23_dataset"]
+def validate_v23_dataset(
+    dataset_root: str | Path,
+    *,
+    max_errors: int = 200,
+) -> V23DatasetValidationReport:
+    """Validate a physically self-contained native-v2.3 dataset."""
+
+    return _validate_v23_dataset_impl(dataset_root, max_errors=max_errors)
+
+
+def validate_v23_core_dataset(
+    dataset_root: str | Path,
+    *,
+    verified_inventories: Iterable[Any] = (),
+    verified_detachment_scopes: Mapping[str, str] | None = None,
+    max_errors: int = 200,
+) -> V23DatasetValidationReport:
+    """Validate v2.3 core artifacts while honoring verified detached modules.
+
+    Payload-only mode keeps capture-time tactile manifests hot.  Whole-prefix
+    mode may omit the complete tactile tree when the caller has already
+    verified the corresponding storage receipt.  The strict
+    ``validate_v23_dataset`` behavior is unchanged.
+    """
+
+    from dataset_contracts.modality_artifacts import ModalityArtifactInventoryV1
+    from .modality_artifacts import (
+        DETACHED_VERIFIED,
+        DETACHMENT_SCOPES,
+        PAYLOAD_ONLY_DETACH,
+        SELF_CONTAINED,
+        WHOLE_PREFIX_DETACH,
+        resolve_modality_availability,
+        verified_detachment_scope,
+    )
+
+    root = Path(dataset_root).expanduser().resolve()
+    allowed_missing: set[str] = set()
+    allowed_missing_manifests: dict[str, int] = {}
+    seen_modalities: set[str] = set()
+    availability_warnings: list[str] = []
+    scopes = {
+        str(key): str(value or "").strip().lower().replace("-", "_")
+        for key, value in dict(verified_detachment_scopes or {}).items()
+    }
+    for inventory in tuple(verified_inventories):
+        if not isinstance(inventory, ModalityArtifactInventoryV1):
+            report = V23DatasetValidationReport(dataset_root=str(root))
+            report.errors.append("verified inventory has an unsupported type")
+            return report
+        if inventory.modality_key in seen_modalities:
+            report = V23DatasetValidationReport(dataset_root=str(root))
+            report.errors.append(
+                f"duplicate verified inventory for modality {inventory.modality_key!r}"
+            )
+            return report
+        seen_modalities.add(inventory.modality_key)
+        scope = scopes.get(inventory.modality_key, PAYLOAD_ONLY_DETACH)
+        if scope not in DETACHMENT_SCOPES:
+            report = V23DatasetValidationReport(dataset_root=str(root))
+            report.errors.append(
+                f"unsupported detachment scope for {inventory.modality_key!r}: {scope!r}"
+            )
+            return report
+        availability = resolve_modality_availability(
+            root,
+            inventory,
+            detachment_scope=scope,
+        )
+        if availability.status not in {SELF_CONTAINED, DETACHED_VERIFIED}:
+            report = V23DatasetValidationReport(dataset_root=str(root))
+            report.errors.append(
+                "modality inventory is not core-validation eligible: "
+                f"{inventory.modality_key}:{availability.status}:"
+                f"{availability.reason}"
+            )
+            return report
+        if availability.status == DETACHED_VERIFIED:
+            try:
+                evidenced_scope = verified_detachment_scope(
+                    root,
+                    inventory.semantic_content_hash,
+                )
+            except Exception as exc:
+                report = V23DatasetValidationReport(dataset_root=str(root))
+                report.errors.append(
+                    f"invalid modality storage evidence for "
+                    f"{inventory.modality_key!r}: {exc}"
+                )
+                return report
+            if evidenced_scope != scope:
+                report = V23DatasetValidationReport(dataset_root=str(root))
+                report.errors.append(
+                    "detached modality lacks a matching durable retirement receipt: "
+                    f"{inventory.modality_key}:{scope}:{evidenced_scope}"
+                )
+                return report
+            allowed_missing.update(
+                artifact.logical_path
+                for artifact in inventory.artifacts
+                if artifact.role == "payload"
+            )
+            if scope == WHOLE_PREFIX_DETACH:
+                allowed_missing_manifests.update(
+                    {
+                        artifact.logical_path: int(artifact.frame_count or 0)
+                        for artifact in inventory.artifacts
+                        if artifact.role == "manifest"
+                    }
+                )
+            availability_warnings.append(
+                f"{inventory.modality_key} {scope} artifacts are DETACHED_VERIFIED; "
+                "tactile-enabled readers require rehydrate"
+            )
+    unknown_scopes = sorted(set(scopes) - seen_modalities)
+    if unknown_scopes:
+        report = V23DatasetValidationReport(dataset_root=str(root))
+        report.errors.append(
+            f"detachment scopes reference unknown modalities: {unknown_scopes}"
+        )
+        return report
+    report = _validate_v23_dataset_impl(
+        root,
+        max_errors=max_errors,
+        allowed_missing_tactile_payloads=frozenset(allowed_missing),
+        allowed_missing_tactile_manifests=allowed_missing_manifests,
+    )
+    report.warnings.extend(availability_warnings)
+    return report
+
+
+__all__ = [
+    "V23DatasetValidationReport",
+    "validate_v23_core_dataset",
+    "validate_v23_dataset",
+]

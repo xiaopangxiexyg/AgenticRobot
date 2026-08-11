@@ -30,6 +30,9 @@ EPISODE_REVIEW_REQUEST_ANNOTATION_SCHEMA_V1 = (
 PROGRESS_BOUNDARY_OVERRIDE_SCHEMA_V1 = (
     "dexteleop.progress_boundary_override_annotation.v1"
 )
+CAPTURE_END_STEP_ANNOTATION_SCHEMA_V1 = (
+    "dexteleop.capture_end_step_annotation.v1"
+)
 STAGE_ANNOTATION_SET_BINDING_SCHEMA_V1 = (
     "dexteleop.stage_annotation_set_binding.v1"
 )
@@ -77,6 +80,9 @@ _EPISODE_REVIEW_REQUEST_HASH_DOMAIN = (
 )
 _PROGRESS_BOUNDARY_OVERRIDE_HASH_DOMAIN = (
     "dexteleop.progress_boundary_override_annotation.semantic.v1"
+)
+_CAPTURE_END_STEP_HASH_DOMAIN = (
+    "dexteleop.capture_end_step_annotation.semantic.v1"
 )
 _BINDING_HASH_DOMAIN = "dexteleop.stage_annotation_set_binding.semantic.v1"
 _BUNDLE_HASH_DOMAIN = "dexteleop.stage_annotation_bundle.semantic.v1"
@@ -158,6 +164,25 @@ def _verify_declared_hash(
         raise ProgressStageAnnotationContractError(
             f"{name} semantic hash mismatch."
         )
+
+
+def capture_end_projected_attempt_id(
+    *,
+    source_attempt_id: str,
+    source_progress_step_id: str,
+    progress_step_id: str,
+) -> str:
+    """Return the deterministic annotation-only Attempt identity for a Step."""
+
+    source_attempt = _required(source_attempt_id, name="source_attempt_id")
+    source_step = _required(
+        source_progress_step_id,
+        name="source_progress_step_id",
+    )
+    step = _required(progress_step_id, name="progress_step_id")
+    if step == source_step:
+        return source_attempt
+    return f"{source_attempt}:capture-end-step:{step}"
 
 
 @dataclass(frozen=True)
@@ -612,6 +637,93 @@ class ProgressBoundaryOverrideAnnotationV1:
 
 
 @dataclass(frozen=True)
+class CaptureEndStepAnnotationV1:
+    """Post-capture interpretation of an ambiguous final capture stop.
+
+    The referenced terminal fact and source Attempt remain immutable.  This
+    annotation only declares which linear Progress Step contains the final
+    annotated stage occurrence so fine-stage annotation can project a manually
+    stopped capture over the corresponding Step prefix.  The generated draft
+    defaults that tail to SUCCESS; later tail-outcome editing remains explicit.
+    """
+
+    annotation_id: str
+    source_terminal_fact_id: str
+    source_attempt_id: str
+    end_progress_step_id: str
+    clock_domain_id: str
+    semantic_content_hash: str = field(init=False)
+    schema: str = field(
+        default=CAPTURE_END_STEP_ANNOTATION_SCHEMA_V1,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        for name in (
+            "annotation_id",
+            "source_terminal_fact_id",
+            "source_attempt_id",
+            "end_progress_step_id",
+            "clock_domain_id",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _required(getattr(self, name), name=name),
+            )
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                self.to_payload(include_hash=False),
+                domain=_CAPTURE_END_STEP_HASH_DOMAIN,
+            ),
+        )
+
+    def to_payload(self, *, include_hash: bool = True) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema": self.schema,
+            "annotation_id": self.annotation_id,
+            "source_terminal_fact_id": self.source_terminal_fact_id,
+            "source_attempt_id": self.source_attempt_id,
+            "end_progress_step_id": self.end_progress_step_id,
+            "clock_domain_id": self.clock_domain_id,
+        }
+        if include_hash:
+            payload["semantic_content_hash"] = self.semantic_content_hash
+        return payload
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "CaptureEndStepAnnotationV1":
+        if payload.get("schema") != CAPTURE_END_STEP_ANNOTATION_SCHEMA_V1:
+            raise ProgressStageAnnotationContractError(
+                "Unsupported capture-end Step annotation schema."
+            )
+        result = cls(
+            annotation_id=payload.get("annotation_id", ""),
+            source_terminal_fact_id=payload.get(
+                "source_terminal_fact_id",
+                "",
+            ),
+            source_attempt_id=payload.get("source_attempt_id", ""),
+            end_progress_step_id=payload.get(
+                "end_progress_step_id",
+                "",
+            ),
+            clock_domain_id=payload.get("clock_domain_id", ""),
+        )
+        _verify_declared_hash(
+            payload,
+            actual=result.semantic_content_hash,
+            name="capture-end Step annotation",
+        )
+        return result
+
+
+@dataclass(frozen=True)
 class StageAnnotationSetBindingV1:
     annotation_set_id: str
     episode_capture_identity_hash: str
@@ -749,6 +861,7 @@ class StageAnnotationBundleV1:
     progress_boundary_overrides: tuple[
         ProgressBoundaryOverrideAnnotationV1, ...
     ] = ()
+    capture_end_step: CaptureEndStepAnnotationV1 | None = None
     episode_abnormal: EpisodeAbnormalAnnotationV1 | None = None
     episode_review_request: EpisodeReviewRequestAnnotationV1 | None = None
     semantic_content_hash: str = field(init=False)
@@ -778,6 +891,11 @@ class StageAnnotationBundleV1:
             raise TypeError(
                 "progress_boundary_overrides contain an unsupported value."
             )
+        if self.capture_end_step is not None and not isinstance(
+            self.capture_end_step,
+            CaptureEndStepAnnotationV1,
+        ):
+            raise TypeError("capture_end_step has an unsupported value.")
         if self.episode_abnormal is not None and not isinstance(
             self.episode_abnormal,
             EpisodeAbnormalAnnotationV1,
@@ -796,6 +914,11 @@ class StageAnnotationBundleV1:
                 occurrences
                 + intervals
                 + overrides
+                + (
+                    ()
+                    if self.capture_end_step is None
+                    else (self.capture_end_step,)
+                )
                 + (
                     ()
                     if self.episode_abnormal is None
@@ -880,6 +1003,8 @@ class StageAnnotationBundleV1:
             payload["episode_review_request"] = (
                 self.episode_review_request.to_payload()
             )
+        if self.capture_end_step is not None:
+            payload["capture_end_step"] = self.capture_end_step.to_payload()
         if include_hash:
             payload["semantic_content_hash"] = self.semantic_content_hash
         return payload
@@ -895,6 +1020,7 @@ class StageAnnotationBundleV1:
             )
         episode_payload = payload.get("episode_abnormal")
         review_payload = payload.get("episode_review_request")
+        capture_end_payload = payload.get("capture_end_step")
         result = cls(
             occurrences=tuple(
                 StageOccurrenceAnnotationV1.from_payload(item)
@@ -909,6 +1035,13 @@ class StageAnnotationBundleV1:
                 for item in payload.get(
                     "progress_boundary_overrides",
                     (),
+                )
+            ),
+            capture_end_step=(
+                None
+                if capture_end_payload is None
+                else CaptureEndStepAnnotationV1.from_payload(
+                    capture_end_payload
                 )
             ),
             episode_abnormal=(
@@ -1005,6 +1138,7 @@ class StageAnnotationManifestV1:
 __all__ = [
     "ABNORMAL_INTERVAL_ANNOTATION_SCHEMA_V1",
     "ABNORMAL_REASON_CODES_V1",
+    "CAPTURE_END_STEP_ANNOTATION_SCHEMA_V1",
     "EPISODE_ABNORMAL_ANNOTATION_SCHEMA_V1",
     "PROGRESS_BOUNDARY_OVERRIDE_SCHEMA_V1",
     "STAGE_ANNOTATION_BINDING_FILE_DOMAIN_V1",
@@ -1013,6 +1147,7 @@ __all__ = [
     "STAGE_OCCURRENCE_ANNOTATION_SCHEMA_V1",
     "STAGE_OCCURRENCE_OUTCOMES_V1",
     "AbnormalIntervalAnnotationV1",
+    "CaptureEndStepAnnotationV1",
     "EpisodeAbnormalAnnotationV1",
     "ProgressBoundaryOverrideAnnotationV1",
     "ProgressStageAnnotationContractError",
@@ -1020,4 +1155,5 @@ __all__ = [
     "StageAnnotationManifestV1",
     "StageAnnotationSetBindingV1",
     "StageOccurrenceAnnotationV1",
+    "capture_end_projected_attempt_id",
 ]

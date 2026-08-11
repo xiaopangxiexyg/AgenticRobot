@@ -732,6 +732,8 @@ class CompositionStrategyControl:
             != initial.strategy_spec.strategy_version
             or draft.strategy_spec.required_context_channels
             != initial.strategy_spec.required_context_channels
+            or draft.strategy_spec.optional_context_channels
+            != initial.strategy_spec.optional_context_channels
             or draft.composition_spec.algebra
             != initial.composition_spec.algebra
             or draft.composition_spec.input_roles

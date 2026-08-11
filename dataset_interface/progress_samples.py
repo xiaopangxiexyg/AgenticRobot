@@ -9,6 +9,10 @@ from .progress_timeline import (
     ResolvedProgressAttempt,
     ResolvedProgressTimeline,
 )
+from .retrospective_progress import (
+    ResolvedRetrospectiveAttempt,
+    ResolvedRetrospectiveProgressWindow,
+)
 from .sample_axis import EpisodeSampleAxis, SampleAxisError, SampleIndexInterval
 
 
@@ -40,7 +44,7 @@ class ResolvedProgressSampleTimeline:
 
 def _attempt_interval(
     *,
-    attempt: ResolvedProgressAttempt,
+    attempt: ResolvedProgressAttempt | ResolvedRetrospectiveAttempt,
     transitioned_attempt_ids: frozenset[str],
     axis: EpisodeSampleAxis,
 ) -> tuple[SampleIndexInterval, bool]:
@@ -86,7 +90,7 @@ def _pause_interval(
 
 def project_progress_timeline_to_samples(
     *,
-    timeline: ResolvedProgressTimeline,
+    timeline: ResolvedProgressTimeline | ResolvedRetrospectiveProgressWindow,
     sample_axis: EpisodeSampleAxis,
 ) -> ResolvedProgressSampleTimeline:
     """Map Attempt and intentional Pause times without reading stream payloads."""

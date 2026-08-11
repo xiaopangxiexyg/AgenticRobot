@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Any, Mapping
 
 from dataset_contracts.canonical_encoding import canonical_loads
@@ -158,6 +159,57 @@ def _require_expected_hash(
         )
 
 
+class ProgressArtifactReadCache:
+    """Share immutable sealed profile snapshots within one catalog scan.
+
+    Cache keys come from each Episode's own sealed manifest or stage-entry
+    binding, never from editable dataset configuration or catalog metadata.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._progress_profiles: dict[str, TaskProgressProfileV1] = {}
+        self._stage_profiles: dict[str, TaskStageProfileV1] = {}
+
+    def progress_profile(
+        self,
+        path: Path,
+        *,
+        expected_hash: str,
+    ) -> TaskProgressProfileV1:
+        with self._lock:
+            cached = self._progress_profiles.get(expected_hash)
+            if cached is not None:
+                return cached
+            value = _read_profile(path)
+            _require_expected_hash(
+                label="profile hash",
+                expected=expected_hash,
+                actual=value.semantic_content_hash,
+            )
+            self._progress_profiles[expected_hash] = value
+            return value
+
+    def stage_profile(
+        self,
+        path: Path,
+        *,
+        expected_hash: str,
+    ) -> TaskStageProfileV1:
+        with self._lock:
+            cached = self._stage_profiles.get(expected_hash)
+            if cached is not None:
+                return cached
+            value = _read_stage_profile(path)
+            _require_expected_hash(
+                label="task stage profile hash",
+                expected=expected_hash,
+                actual=value.semantic_content_hash,
+            )
+            self._stage_profiles[expected_hash] = value
+            return value
+
+
 def load_dataset_progress_profile(
     dataset_root: str | Path,
     *,
@@ -266,6 +318,7 @@ def load_sealed_progress_episode(
     expected_profile_hash: str | None = None,
     expected_binding_hash: str | None = None,
     expected_manifest_hash: str | None = None,
+    read_cache: ProgressArtifactReadCache | None = None,
 ) -> SealedProgressEpisode:
     """Load one sealed Episode without creating files or opening write handles."""
 
@@ -275,7 +328,20 @@ def load_sealed_progress_episode(
             f"Progress Episode directory does not exist: {resolved_dir}."
         )
     try:
-        profile = _read_profile(resolved_dir / "profile.cjson")
+        manifest = ProgressEpisodeManifestV1.from_payload(
+            _read_canonical_mapping(
+                resolved_dir / "manifest.cjson",
+                domain=PROGRESS_MANIFEST_FILE_DOMAIN_V1,
+            )
+        )
+        profile = (
+            _read_profile(resolved_dir / "profile.cjson")
+            if read_cache is None
+            else read_cache.progress_profile(
+                resolved_dir / "profile.cjson",
+                expected_hash=manifest.task_progress_profile_hash,
+            )
+        )
         binding = ProgressEpisodeBindingV1.from_payload(
             _read_canonical_mapping(
                 resolved_dir / "binding.cjson",
@@ -283,12 +349,6 @@ def load_sealed_progress_episode(
             )
         )
         facts = _read_facts(resolved_dir / "facts.cjsonl")
-        manifest = ProgressEpisodeManifestV1.from_payload(
-            _read_canonical_mapping(
-                resolved_dir / "manifest.cjson",
-                domain=PROGRESS_MANIFEST_FILE_DOMAIN_V1,
-            )
-        )
         timeline = resolve_progress_timeline(
             profile=profile,
             binding=binding,
@@ -298,21 +358,34 @@ def load_sealed_progress_episode(
         )
         stage_path = resolved_dir / "stages.cjson"
         entry_path = resolved_dir / "stage_entry.cjson"
-        if stage_path.exists() != entry_path.exists():
+        stage_exists = stage_path.is_file()
+        entry_exists = entry_path.is_file()
+        if stage_exists != entry_exists:
             raise ProgressArtifactReadError(
                 "Fine-stage progress artifacts are incomplete."
             )
-        stage_profile = (
-            None if not stage_path.exists() else _read_stage_profile(stage_path)
-        )
         stage_entry_binding = (
             None
-            if not entry_path.exists()
+            if not entry_exists
             else ProgressStageEntryBindingV1.from_payload(
                 _read_canonical_mapping(
                     entry_path,
                     domain=(
                         PROGRESS_STAGE_ENTRY_BINDING_FILE_DOMAIN_V1
+                    ),
+                )
+            )
+        )
+        stage_profile = (
+            None
+            if stage_entry_binding is None
+            else (
+                _read_stage_profile(stage_path)
+                if read_cache is None
+                else read_cache.stage_profile(
+                    stage_path,
+                    expected_hash=(
+                        stage_entry_binding.task_stage_profile_hash
                     ),
                 )
             )
@@ -367,6 +440,7 @@ __all__ = [
     "DATASET_PROGRESS_PROFILE_RELATIVE_PATH",
     "DATASET_TASK_STAGE_PROFILE_RELATIVE_PATH",
     "ProgressArtifactReadError",
+    "ProgressArtifactReadCache",
     "SealedProgressEpisode",
     "load_dataset_progress_profile",
     "load_dataset_task_stage_profile",

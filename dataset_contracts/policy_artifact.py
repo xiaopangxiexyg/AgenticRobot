@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from .pose_chunk import POSE_ACTION_CHUNK_METADATA_KEY, PoseActionChunkContract
+from .arm_hold_history import (
+    POLICY_ARM_HOLD_HISTORY_INPUT_HASH_KEY,
+    POLICY_ARM_HOLD_HISTORY_INPUT_METADATA_KEY,
+    PolicyArmHoldHistoryInputContract,
+)
 from .model_continuation import (
     MODEL_CONTINUATION_DATA_HASH_KEY,
     MODEL_CONTINUATION_DATA_METADATA_KEY,
@@ -267,6 +272,9 @@ class PolicyArtifactContract:
     pose_frame_contract_hashes: tuple[str, ...] = ()
     model_continuation: ModelContinuationContract | Mapping[str, Any] | None = None
     arm_hold_output: PolicyArmHoldOutputContract | Mapping[str, Any] | None = None
+    arm_hold_history_input: (
+        PolicyArmHoldHistoryInputContract | Mapping[str, Any] | None
+    ) = None
     state_augmentation: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -341,6 +349,23 @@ class PolicyArtifactContract:
             raise TypeError(
                 "arm_hold_output must be a PolicyArmHoldOutputContract, "
                 "mapping, or None."
+            )
+        arm_hold_history_input = self.arm_hold_history_input
+        if isinstance(arm_hold_history_input, Mapping):
+            arm_hold_history_input = PolicyArmHoldHistoryInputContract.from_dict(
+                arm_hold_history_input
+            )
+        elif arm_hold_history_input is not None and not isinstance(
+            arm_hold_history_input,
+            PolicyArmHoldHistoryInputContract,
+        ):
+            raise TypeError(
+                "arm_hold_history_input must be a "
+                "PolicyArmHoldHistoryInputContract, mapping, or None."
+            )
+        if arm_hold_history_input is not None and arm_hold_output is None:
+            raise DatasetLayoutBindingError(
+                "An arm-hold history input requires an arm-hold output contract."
             )
         if pose_action_chunk is not None and dataset_schema != DEXTELEOP_DATASET_SCHEMA_V23:
             raise DatasetLayoutBindingError(
@@ -439,6 +464,19 @@ class PolicyArtifactContract:
                 "arm-hold output key must not collide with action outputs or "
                 "its contract-hash field."
             )
+        if arm_hold_history_input is not None and arm_hold_history_input.input_key in {
+            self.state_key,
+            self.state_discrete_key,
+            self.action_key,
+            self.action_discrete_key,
+            POLICY_ARM_HOLD_HISTORY_INPUT_METADATA_KEY,
+            POLICY_ARM_HOLD_HISTORY_INPUT_HASH_KEY,
+            POLICY_ARM_HOLD_OUTPUT_HASH_KEY,
+        }:
+            raise DatasetLayoutBindingError(
+                "arm-hold history input key collides with a policy tensor or "
+                "contract field."
+            )
         object.__setattr__(self, "state_input_mode", normalize_state_input_mode(self.state_input_mode))
         object.__setattr__(self, "model_id", _optional_text(self.model_id))
         object.__setattr__(
@@ -455,6 +493,11 @@ class PolicyArtifactContract:
         object.__setattr__(self, "pose_frame_contract_hashes", pose_frame_hashes)
         object.__setattr__(self, "model_continuation", model_continuation)
         object.__setattr__(self, "arm_hold_output", arm_hold_output)
+        object.__setattr__(
+            self,
+            "arm_hold_history_input",
+            arm_hold_history_input,
+        )
         object.__setattr__(self, "state_augmentation", dict(self.state_augmentation))
         object.__setattr__(self, "metadata", dict(self.metadata))
 
@@ -526,6 +569,13 @@ class PolicyArtifactContract:
             )
             payload[POLICY_ARM_HOLD_OUTPUT_HASH_KEY] = (
                 self.arm_hold_output.contract_hash
+            )
+        if self.arm_hold_history_input is not None:
+            payload[POLICY_ARM_HOLD_HISTORY_INPUT_METADATA_KEY] = (
+                self.arm_hold_history_input.to_dict()
+            )
+            payload[POLICY_ARM_HOLD_HISTORY_INPUT_HASH_KEY] = (
+                self.arm_hold_history_input.contract_hash
             )
         return payload
 
@@ -673,6 +723,36 @@ class PolicyArtifactContract:
                 "Policy artifact arm-hold output hash does not match its "
                 "contract."
             )
+        raw_arm_hold_history_input = payload.get(
+            POLICY_ARM_HOLD_HISTORY_INPUT_METADATA_KEY
+        )
+        arm_hold_history_input = (
+            None
+            if raw_arm_hold_history_input is None
+            else PolicyArmHoldHistoryInputContract.from_dict(
+                _mapping(
+                    raw_arm_hold_history_input,
+                    name=POLICY_ARM_HOLD_HISTORY_INPUT_METADATA_KEY,
+                )
+            )
+        )
+        declared_arm_hold_history_hash = payload.get(
+            POLICY_ARM_HOLD_HISTORY_INPUT_HASH_KEY
+        )
+        if arm_hold_history_input is None:
+            if declared_arm_hold_history_hash is not None:
+                raise DatasetLayoutBindingError(
+                    "Policy artifact declares an arm-hold history input hash "
+                    "without its contract."
+                )
+        elif (
+            str(declared_arm_hold_history_hash or "")
+            != arm_hold_history_input.contract_hash
+        ):
+            raise DatasetLayoutBindingError(
+                "Policy artifact arm-hold history input hash does not match "
+                "its contract."
+            )
         return cls(
             policy_io_layout=layout,
             model_id=payload.get("model_id"),
@@ -700,6 +780,7 @@ class PolicyArtifactContract:
             ),
             model_continuation=model_continuation,
             arm_hold_output=arm_hold_output,
+            arm_hold_history_input=arm_hold_history_input,
             state_augmentation=dict(_mapping(payload.get("state_augmentation", {}), name="state_augmentation")),
             metadata=dict(_mapping(payload.get("metadata", {}), name="policy artifact metadata")),
         )
@@ -728,6 +809,7 @@ __all__ = [
     "POLICY_ARTIFACT_METADATA_KEY",
     "POLICY_ARTIFACT_SCHEMA_V1",
     "PolicyArtifactContract",
+    "PolicyArmHoldHistoryInputContract",
     "PolicyArmHoldOutputContract",
     "PolicyCameraInput",
     "PolicyCameraInputContract",

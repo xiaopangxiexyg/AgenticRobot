@@ -10,6 +10,9 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent
 LOCAL_CONFIG_FILENAME = "local_paths.json"
 LOCAL_CONFIG_ENV = "DEX_INSPIRE_LOCAL_CONFIG"
+DEFAULT_FORMAL_COLLECTION_ROOT = Path(
+    "/home/user/zc/datasets/RealmanDMTAC/FormalCollection"
+)
 
 
 def repo_root() -> Path:
@@ -71,11 +74,17 @@ def optional_local_path(key: str) -> Path | None:
 
 
 def default_dataset_root() -> Path:
-    return local_path("dataset_root", "datasets")
+    return local_path("dataset_root", DEFAULT_FORMAL_COLLECTION_ROOT)
 
 
 def teleop_records_root() -> Path:
     return local_path("teleop_records_root", "teleop_records")
+
+
+def runtime_artifacts_root() -> Path:
+    """Return the opt-in canonical runtime-artifact root."""
+
+    return local_path("runtime_artifacts_root", "runtime_artifacts")
 
 
 def teleop_runtime_configs_root() -> Path:
@@ -121,4 +130,4 @@ def initial_alignment_states_dir() -> Path:
 
 
 def real_robot_dataset_root() -> Path:
-    return local_path("real_robot_dataset_root", "datasets")
+    return local_path("real_robot_dataset_root", DEFAULT_FORMAL_COLLECTION_ROOT)

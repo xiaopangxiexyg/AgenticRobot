@@ -82,6 +82,88 @@ def validate_pose_matrix(value: Any, atol: float = 1e-3) -> tuple[bool, str]:
     return True, ""
 
 
+def project_near_rigid_pose(
+    value: Any,
+    *,
+    name: str = "pose",
+    max_orthogonality_error: float = 1e-2,
+    max_determinant_error: float = 1e-2,
+    max_projection_frobenius: float = 1e-2,
+    homogeneous_atol: float = 1e-5,
+) -> tuple[np.ndarray, dict[str, float | bool]]:
+    """Project bounded matrix drift onto SO(3) without accepting bad poses.
+
+    Device pose protocols often encode a rigid rotation as nine floating-point
+    values.  Small transport/backend drift is representational noise, while a
+    reflection or a materially distorted basis is an invalid pose.  This
+    helper distinguishes the two and returns explicit projection diagnostics.
+    """
+
+    pose = np.asarray(value, dtype=float)
+    if pose.shape != (4, 4):
+        raise ValueError(f"{name} must be a 4x4 matrix")
+    if not np.all(np.isfinite(pose)):
+        raise ValueError(f"{name}: Pose contains non-finite values.")
+    if not np.allclose(
+        pose[3],
+        np.array([0.0, 0.0, 0.0, 1.0]),
+        atol=float(homogeneous_atol),
+        rtol=0.0,
+    ):
+        raise ValueError(f"{name}: Pose last row is not [0, 0, 0, 1].")
+    limits = {
+        "max_orthogonality_error": float(max_orthogonality_error),
+        "max_determinant_error": float(max_determinant_error),
+        "max_projection_frobenius": float(max_projection_frobenius),
+    }
+    if any(not np.isfinite(limit) or limit < 0.0 for limit in limits.values()):
+        raise ValueError("Rigid-pose projection limits must be finite and non-negative.")
+
+    raw_rotation = pose[:3, :3]
+    orthogonality_error = float(
+        np.max(np.abs(raw_rotation.T @ raw_rotation - np.eye(3)))
+    )
+    determinant = float(np.linalg.det(raw_rotation))
+    determinant_error = abs(determinant - 1.0)
+    if determinant <= 0.0:
+        raise ValueError(
+            f"{name}: Rotation determinant must be positive, got {determinant:.6g}."
+        )
+    try:
+        u, _singular_values, vt = np.linalg.svd(raw_rotation)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"{name}: Rotation SVD failed: {exc}") from exc
+    projected = u @ vt
+    if float(np.linalg.det(projected)) <= 0.0:
+        u[:, -1] *= -1.0
+        projected = u @ vt
+    projection_frobenius = float(
+        np.linalg.norm(raw_rotation - projected, ord="fro")
+    )
+    if (
+        orthogonality_error > limits["max_orthogonality_error"]
+        or determinant_error > limits["max_determinant_error"]
+        or projection_frobenius > limits["max_projection_frobenius"]
+    ):
+        raise ValueError(
+            f"{name}: Rotation is too far from SO(3) "
+            f"(orth_err={orthogonality_error:.6g}, det={determinant:.6g}, "
+            f"projection_fro={projection_frobenius:.6g})."
+        )
+    normalized = pose.copy()
+    normalized[:3, :3] = projected
+    normalized[3] = np.array([0.0, 0.0, 0.0, 1.0])
+    valid, reason = validate_pose_matrix(normalized, atol=1e-8)
+    if not valid:
+        raise ValueError(f"{name}: {reason}")
+    return normalized, {
+        "rotation_projected": bool(projection_frobenius > 1e-12),
+        "rotation_orthogonality_error": orthogonality_error,
+        "rotation_determinant": determinant,
+        "rotation_projection_frobenius": projection_frobenius,
+    }
+
+
 def invert_pose(value: Any) -> np.ndarray:
     pose = parse_pose_matrix(value)
     out = identity_pose()
@@ -146,6 +228,7 @@ __all__ = [
     "interpolate_pose",
     "invert_pose",
     "parse_pose_matrix",
+    "project_near_rigid_pose",
     "rotation_angle_rad",
     "rotation_is_orthonormal",
     "translation_distance",

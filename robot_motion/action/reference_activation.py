@@ -1,4 +1,13 @@
-"""Pure binding between decision timing and reference receiver semantics."""
+"""Pure binding between decision timing and reference receiver semantics.
+
+For ``scheduled_segment`` profiles, admission is a strict two-owner protocol:
+the action scheduler owns the *candidate tick* and must not publish a tick whose
+START is no longer in the future; the receiver owns the final START deadline
+check.  A late scheduler observation skips the invalid grid point and records
+the next legal fixed-grid tick.  A segment submitted directly after its START
+is rejected with ``reject_and_hold``; neither path backdates or catches up a
+segment, and the control-station layer does not recompute either timestamp.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +24,10 @@ REFERENCE_ACTIVATION_HASH_DOMAIN_V1 = "dexteleop.reference_activation_spec.v1"
 
 IMMEDIATE_QREF_SIM_V1 = "immediate_qref_sim_v1"
 SCHEDULED_REFERENCE_SEGMENT_SIM_V1 = "scheduled_reference_segment_sim_v1"
+SCHEDULED_REFERENCE_LATE_TICK_RECOVERY_V1 = (
+    "skip_to_next_legal_reference_tick"
+)
+SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1 = "reject_and_hold"
 
 REFERENCE_ACTIVATION_MODES_V1 = frozenset(
     {"immediate_target", "scheduled_segment"}
@@ -55,6 +68,7 @@ class ReferenceActivationSpec:
     anchor_commit_policy: str
     replacement_policy: str
     semantic_content_hash: str
+    late_tick_recovery_policy: str = "not_applicable"
 
     def __post_init__(self) -> None:
         for name in (
@@ -69,6 +83,7 @@ class ReferenceActivationSpec:
             "anchor_commit_policy",
             "replacement_policy",
             "semantic_content_hash",
+            "late_tick_recovery_policy",
         ):
             _required_text(getattr(self, name), name=name)
         if self.activation_mode not in REFERENCE_ACTIVATION_MODES_V1:
@@ -94,6 +109,7 @@ class ReferenceActivationSpec:
                 "reference_tick_alignment_policy": "not_applicable",
                 "anchor_commit_policy": "receiver_acceptance",
                 "replacement_policy": "latest_mailbox_target",
+                "late_tick_recovery_policy": "not_applicable",
             }
             if not math.isclose(self.target_lead_time_sec, 0.0, abs_tol=1e-12):
                 raise ValueError("Immediate activation requires zero target lead.")
@@ -107,10 +123,15 @@ class ReferenceActivationSpec:
             expected = {
                 "required_admission_deadline": "before_segment_start",
                 "first_segment_policy": "fresh_measured_rebase_next_reference_tick",
-                "late_admission_policy": "reject_and_hold",
+                "late_admission_policy": (
+                    SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1
+                ),
                 "reference_tick_alignment_policy": "next_reference_tick_strict",
                 "anchor_commit_policy": "endpoint_effective_time",
                 "replacement_policy": "explicit_supersede",
+                "late_tick_recovery_policy": (
+                    SCHEDULED_REFERENCE_LATE_TICK_RECOVERY_V1
+                ),
             }
             minimum_lead = (
                 self.selected_keyframe_period_sec
@@ -169,7 +190,9 @@ def _build_reference_activation_spec(
             else "fresh_measured_rebase_next_reference_tick"
         ),
         "late_admission_policy": (
-            "reject_expired_target" if immediate else "reject_and_hold"
+            "reject_expired_target"
+            if immediate
+            else SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1
         ),
         "reference_tick_alignment_policy": (
             "not_applicable" if immediate else "next_reference_tick_strict"
@@ -179,6 +202,11 @@ def _build_reference_activation_spec(
         ),
         "replacement_policy": (
             "latest_mailbox_target" if immediate else "explicit_supersede"
+        ),
+        "late_tick_recovery_policy": (
+            "not_applicable"
+            if immediate
+            else SCHEDULED_REFERENCE_LATE_TICK_RECOVERY_V1
         ),
     }
     semantic_hash = canonical_content_hash(
@@ -257,6 +285,8 @@ __all__ = [
     "REFERENCE_ACTIVATION_HASH_DOMAIN_V1",
     "REFERENCE_ACTIVATION_MODES_V1",
     "SCHEDULED_REFERENCE_SEGMENT_SIM_V1",
+    "SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1",
+    "SCHEDULED_REFERENCE_LATE_TICK_RECOVERY_V1",
     "ReferenceActivationSpec",
     "build_immediate_qref_activation_spec",
     "build_scheduled_reference_segment_activation_spec",

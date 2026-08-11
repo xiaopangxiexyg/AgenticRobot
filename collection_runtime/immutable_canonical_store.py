@@ -26,6 +26,7 @@ def publish_immutable_canonical(
     payload: Mapping[str, Any],
     *,
     domain: str,
+    sync_parent: bool = True,
 ) -> bool:
     """Publish immutable canonical content; return whether it was idempotent."""
 
@@ -49,7 +50,8 @@ def publish_immutable_canonical(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        fsync_directory(path.parent)
+        if sync_parent:
+            fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
     return False

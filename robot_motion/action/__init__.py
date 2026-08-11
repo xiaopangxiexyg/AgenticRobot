@@ -96,6 +96,16 @@ from .coordinate_binding import (
     bind_action_payload_coordinates,
 )
 from .relative import build_relative_delta_action_schema
+from .trajectory import (
+    COMPONENT_ACTION_TRAJECTORY_HASH_DOMAIN_DEVELOPMENT,
+    COMPONENT_ACTION_TRAJECTORY_KEYFRAME_HASH_DOMAIN_DEVELOPMENT,
+    ComponentActionTrajectory,
+    ComponentActionTrajectoryKeyframe,
+)
+from .trajectory_trace import (
+    component_action_trajectory_payload,
+    project_component_action_trajectory,
+)
 from .adaptation import (
     ACTION_ADAPTATION_RECEIPT_HASH_DOMAIN_V1,
     ACTION_ADAPTATION_REQUEST_HASH_DOMAIN_V1,
@@ -145,6 +155,7 @@ from .arbitration_runtime import (
     DecisionScheduleSpec,
     DecisionScheduleTick,
     DecisionScheduler,
+    LATE_TICK_POLICIES_V1,
 )
 from .arbitration_input import ArbitrationInputSnapshot
 from .arbiter import ActionArbiter, ArbitrationResult
@@ -198,10 +209,13 @@ from .execution_manifest import (
     EXECUTION_PROFILE_EXCLUSION_HASH_DOMAIN_V1,
     HUMAN_MOTION_PROPOSAL_STATUSES_V1,
     M6_CANDIDATE_POLICY_ARM_QPOS_V1,
+    M6_RUNTIME_POLICY_ARM_QPOS_V2,
     ControlExecutionManifest,
+    ControlExecutionManifestIdentity,
     ExecutionProfileExclusion,
     build_control_execution_manifest,
     build_m6_candidate_policy_arm_qpos_manifest,
+    build_m6_runtime_policy_arm_qpos_manifest,
 )
 from .safety_override import (
     SAFETY_CONSTRAINT_BOUND_UNITS_V1,
@@ -248,7 +262,10 @@ from .execution_handoff import (
     TARGET_EXECUTION_STATUS_STAGES,
     TARGET_EXECUTION_SUBMISSION_RECEIPT_HASH_DOMAIN,
     TARGET_PROCESSING_FACT_REFERENCE_HASH_DOMAIN,
+    TARGET_ADMISSION_SUPPORT_EXPIRED,
+    TARGET_SUBMISSION_INSUFFICIENT_SUPPORT_MARGIN,
     TARGET_TEMPORAL_SEMANTICS,
+    TRANSIENT_TARGET_LIFECYCLE_REJECTION_CODES,
     ComponentExecutionTarget,
     ComponentExecutionTargetActivationReceipt,
     ComponentExecutionTargetAdmissionReceipt,
@@ -342,6 +359,8 @@ from .reference_activation import (
     IMMEDIATE_QREF_SIM_V1,
     REFERENCE_ACTIVATION_HASH_DOMAIN_V1,
     REFERENCE_ACTIVATION_MODES_V1,
+    SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1,
+    SCHEDULED_REFERENCE_LATE_TICK_RECOVERY_V1,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
     ReferenceActivationSpec,
     build_immediate_qref_activation_spec,
@@ -400,6 +419,12 @@ from .vector_pipeline import (
 )
 
 __all__ = [
+    "COMPONENT_ACTION_TRAJECTORY_HASH_DOMAIN_DEVELOPMENT",
+    "COMPONENT_ACTION_TRAJECTORY_KEYFRAME_HASH_DOMAIN_DEVELOPMENT",
+    "ComponentActionTrajectory",
+    "ComponentActionTrajectoryKeyframe",
+    "component_action_trajectory_payload",
+    "project_component_action_trajectory",
     "ACTION_COORDINATE_BINDING_HASH_DOMAIN_DEVELOPMENT",
     "ActionExecutionResult",
     "ActionArbiter",
@@ -536,6 +561,8 @@ __all__ = [
     "MAX_PRODUCTION_ARBITER_HZ",
     "MEASUREMENT_OBSERVATION_MODES",
     "M6_CANDIDATE_POLICY_ARM_QPOS_V1",
+    "M6_RUNTIME_POLICY_ARM_QPOS_V2",
+    "ControlExecutionManifestIdentity",
     "MeasuredDivergenceGuardSpec",
     "KEYFRAME_SAFETY_ANCHOR_KINDS_V1",
     "NullCommandDispatcher",
@@ -632,6 +659,7 @@ __all__ = [
     "build_execution_directive",
     "build_control_execution_manifest",
     "build_m6_candidate_policy_arm_qpos_manifest",
+    "build_m6_runtime_policy_arm_qpos_manifest",
     "build_authoritative_command_dispatch_context",
     "build_authoritative_target_dispatch_context",
     "build_action_adaptation_request",
@@ -660,6 +688,8 @@ __all__ = [
     "build_relative_delta_action_schema",
     "build_robot_action_v1_target_capability",
     "build_scheduled_reference_segment_activation_spec",
+    "SCHEDULED_REFERENCE_LATE_ADMISSION_REJECTION_V1",
+    "SCHEDULED_REFERENCE_LATE_TICK_RECOVERY_V1",
     "bind_action_payload_coordinates",
     "bind_execution_observation_plan",
     "execution_target_anchor_commit_evidence",
@@ -670,6 +700,7 @@ __all__ = [
     "DecisionScheduleSpec",
     "DecisionScheduleTick",
     "DecisionScheduler",
+    "LATE_TICK_POLICIES_V1",
     "default_arm_controlled_frame",
     "default_arm_frame",
     "effector_name",
@@ -714,7 +745,10 @@ __all__ = [
     "TARGET_EXECUTION_STATUS_STAGES",
     "TARGET_EXECUTION_SUBMISSION_RECEIPT_HASH_DOMAIN",
     "TARGET_PROCESSING_FACT_REFERENCE_HASH_DOMAIN",
+    "TARGET_ADMISSION_SUPPORT_EXPIRED",
+    "TARGET_SUBMISSION_INSUFFICIENT_SUPPORT_MARGIN",
     "TARGET_TEMPORAL_SEMANTICS",
+    "TRANSIENT_TARGET_LIFECYCLE_REJECTION_CODES",
     "ComponentExecutionTarget",
     "ComponentExecutionTargetActivationReceipt",
     "ComponentExecutionTargetAdmissionReceipt",

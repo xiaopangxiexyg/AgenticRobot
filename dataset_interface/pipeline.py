@@ -7,6 +7,11 @@ from typing import Any, Mapping
 import numpy as np
 
 from .config import DatasetInterfaceConfig, ImageLayout
+from .camera_semantics import (
+    DatasetCameraSemanticResolver,
+    camera_role_registry_from_environment,
+    load_camera_role_binding,
+)
 from .mask_source import FinalMaskSource
 from .metadata import DexTeleopDatasetIndex, InvalidTrainingDataError, TrainingEligibility
 from .missing_views import MissingViewResolver
@@ -45,6 +50,9 @@ class MaskedFramePipeline:
     ):
         self.config = config
         self.index = DexTeleopDatasetIndex(config.dataset_root)
+        self._camera_role_binding = config.camera_role_binding
+        self._camera_role_registry = camera_role_registry_from_environment()
+        self.camera_semantics: DatasetCameraSemanticResolver | None = None
         self.missing_views = (
             MissingViewResolver(self.index, config.missing_views)
             if config.missing_views.enabled
@@ -83,26 +91,69 @@ class MaskedFramePipeline:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def _stored_camera_key(self, episode_index: int, camera_key: str) -> str:
+        key = str(camera_key)
+        binding = self._camera_role_binding
+        if binding is None and self._camera_role_registry is not None:
+            # The environment opt-in is intentionally lazy: front-only
+            # pipelines do not require wrist device metadata or the RM65
+            # registry. Wrist access, however, resolves before any media read.
+            if key not in {"left_wrist", "right_wrist"}:
+                return key
+            binding = load_camera_role_binding(self._camera_role_registry)
+            self._camera_role_binding = binding
+        if binding is None or key not in binding.canonical_roles:
+            return key
+        if self.camera_semantics is None:
+            self.camera_semantics = DatasetCameraSemanticResolver(
+                self.config.dataset_root,
+                binding,
+            )
+        return self.camera_semantics.stored_key_for(episode_index, key)
+
+    def _resolved_camera_semantics(
+        self,
+        episode_index: int,
+        camera_key: str,
+    ) -> Any | None:
+        key = str(camera_key)
+        self._stored_camera_key(episode_index, key)
+        binding = self._camera_role_binding
+        if (
+            self.camera_semantics is None
+            or binding is None
+            or key not in binding.canonical_roles
+        ):
+            return None
+        return self.camera_semantics.resolution_for_episode(episode_index)
+
     def _has_readable_video(self, episode_index: int, camera_key: str) -> bool:
-        if not self.index.has_video(episode_index, camera_key):
+        stored_key = self._stored_camera_key(episode_index, camera_key)
+        if not self.index.has_video(episode_index, stored_key):
             return False
-        return self.index.video_path(episode_index, camera_key).is_file()
+        return self.index.video_path(episode_index, stored_key).is_file()
 
     def read_raw(self, request: FrameRequest) -> tuple[np.ndarray, np.ndarray, Path | None, Path | None]:
         self.require_training_eligibility(request.episode_index, camera_keys=(request.camera_key,))
+        stored_key = self._stored_camera_key(
+            request.episode_index,
+            request.camera_key,
+        )
         if not self._has_readable_video(request.episode_index, request.camera_key):
             if self.missing_views is None:
                 # Preserve the legacy fail-closed error when missing-view
                 # synthesis was not explicitly enabled by the model loader.
-                self.index.video_path(request.episode_index, request.camera_key)
+                self.index.video_path(request.episode_index, stored_key)
                 raise AssertionError("unreachable")
             resolution = self.missing_views.require(request.camera_key)
             image = np.zeros((resolution.height, resolution.width, 3), dtype=np.uint8)
             return image, np.ones(image.shape[:2], dtype=np.uint8), None, None
-        video_path = self.index.video_path(request.episode_index, request.camera_key)
+        video_path = self.index.video_path(request.episode_index, stored_key)
         image = self.videos.read(video_path, request.frame_index)
         if self.missing_views is not None:
             expected = self.missing_views.get(request.camera_key)
+            if expected is None and stored_key != request.camera_key:
+                expected = self.missing_views.get(stored_key)
             if expected is not None and image.shape[:2] != expected.shape:
                 raise ValueError(
                     f"camera {request.camera_key!r} frame resolution {image.shape[1]}x{image.shape[0]} "
@@ -114,7 +165,7 @@ class MaskedFramePipeline:
             return image, np.ones(image.shape[:2], dtype=np.uint8), video_path, None
         mask, manifest = self.masks.read(
             request.episode_index,
-            request.camera_key,
+            stored_key,
             request.frame_index,
         )
         return image, mask, video_path, manifest
@@ -197,6 +248,22 @@ class MaskedFramePipeline:
             ),
             "source_view_missing": source_view_missing,
         }
+        resolution = self._resolved_camera_semantics(
+            request.episode_index,
+            request.camera_key,
+        )
+        if resolution is not None:
+            metadata["camera_semantics"] = {
+                "canonical_role": request.camera_key,
+                "stored_key": resolution.stored_key_for(request.camera_key),
+                "status": resolution.status,
+                "serial": next(
+                    item.serial
+                    for item in resolution.roles
+                    if item.canonical_role == request.camera_key
+                ),
+                "resolution_hash": resolution.semantic_content_hash,
+            }
         if source_view_missing and self.missing_views is not None:
             resolution = self.missing_views.require(request.camera_key)
             metadata["missing_view"] = {
@@ -260,10 +327,11 @@ class MaskedFramePipeline:
         forced_missing_view: bool = False,
     ) -> np.ndarray:
         self.require_training_eligibility(episode_index, camera_keys=(camera_key,))
+        stored_key = self._stored_camera_key(episode_index, camera_key)
         source_view_missing = not self._has_readable_video(episode_index, camera_key)
         if source_view_missing:
             if self.missing_views is None:
-                self.index.video_path(episode_index, camera_key)
+                self.index.video_path(episode_index, stored_key)
                 raise AssertionError("unreachable")
             resolution = self.missing_views.require(camera_key)
             images = np.zeros(
@@ -271,10 +339,12 @@ class MaskedFramePipeline:
                 dtype=np.uint8,
             )
         else:
-            video_path = self.index.video_path(episode_index, camera_key)
+            video_path = self.index.video_path(episode_index, stored_key)
             images = self.videos.read_clip(video_path, start_frame, length, stride)
             if self.missing_views is not None:
                 expected = self.missing_views.get(camera_key)
+                if expected is None and stored_key != camera_key:
+                    expected = self.missing_views.get(stored_key)
                 if expected is not None and images.shape[1:3] != expected.shape:
                     raise ValueError(
                         f"camera {camera_key!r} clip resolution {images.shape[2]}x{images.shape[1]} "
@@ -284,7 +354,13 @@ class MaskedFramePipeline:
         if fixed_mask or source_view_missing:
             masks = np.ones(images.shape[:3], dtype=np.uint8)
         else:
-            masks, _manifest = self.masks.read_clip(episode_index, camera_key, start_frame, length, stride)
+            masks, _manifest = self.masks.read_clip(
+                episode_index,
+                stored_key,
+                start_frame,
+                length,
+                stride,
+            )
         indices = [int(start_frame) + offset * int(stride) for offset in range(int(length))]
         augmented = self.augmenter.apply_batch(
             images,
@@ -356,10 +432,11 @@ class MaskedFramePipeline:
         reasons: list[str] = []
         requested = tuple(dict.fromkeys(str(key) for key in camera_keys))
         for camera_key in requested:
-            if self.index.has_video(episode_index, camera_key):
+            stored_key = self._stored_camera_key(episode_index, camera_key)
+            if self.index.has_video(episode_index, stored_key):
                 eligibility = self.index.training_eligibility(
                     episode_index,
-                    camera_keys=(camera_key,),
+                    camera_keys=(stored_key,),
                 )
                 reasons.extend(eligibility.reasons)
                 if eligibility.reasons or self._has_readable_video(episode_index, camera_key):

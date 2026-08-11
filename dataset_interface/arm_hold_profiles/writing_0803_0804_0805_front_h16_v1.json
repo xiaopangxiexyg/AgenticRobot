@@ -1,0 +1,157 @@
+{
+  "schema": "dexteleop.arm_hold_dataset_profile.provisional.v1",
+  "profile_id": "writing_0803_0804_0805_front_h16_v1",
+  "purpose": "lightweight_hold_label_prediction",
+  "workspace_key": "realman_dmtac_dexteleop_0803_datasets",
+  "sources": [
+    {
+      "source_dataset_id": "writing4_2026_08_03",
+      "relative_dataset_root": "2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_dataset_name": "2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_episode_count": 202,
+      "expected_frame_count": 86667
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_04",
+      "relative_dataset_root": "2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_dataset_name": "2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_episode_count": 355,
+      "expected_frame_count": 142576
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_05",
+      "relative_dataset_root": "2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_dataset_name": "2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "expected_episode_count": 261,
+      "expected_frame_count": 102887
+    }
+  ],
+  "required_contracts": {
+    "dataset_schema": "dexteleop_dataset_v2.3",
+    "layout_hash": "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16",
+    "arm_hold_projection_id": "arm_hold_intent_v1",
+    "arm_hold_projection_hash": "8ff801c71736d28c89b496c3406496bc348cac5aeea14527312d5a21f90c6600",
+    "progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
+    "stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b"
+  },
+  "episode_admission": {
+    "sealed_only": true,
+    "success_policy": "terminal_success_v1",
+    "abnormal_policy": "exclude_episode_if_any_v1",
+    "review_policy": "exclude_episode_review_pending_v1",
+    "annotation_selection_policy": "explicit_or_unique_sealed_v1",
+    "annotation_selection": {
+      "a7290543-3b08-488b-909c-cfbce1123006": "stage-1785840272085-e43e8daf",
+      "e9d1ed12-a5d0-43ba-a63c-c95804348e08": "stage-1785898817316-c18d20dc",
+      "28842dd1-bd4e-4d86-9625-c6b6682c4e2e": "stage-1785907794626-8e3134b8"
+    },
+    "required_modalities": [
+      "numeric",
+      "video"
+    ],
+    "required_columns": [
+      "frame_index",
+      "timestamp",
+      "session_state",
+      "collection.continuity_segment_index",
+      "observation.state",
+      "observation.images.front.video_frame_index",
+      "teleop.arm_mode.schema",
+      "teleop.arm_mode.available",
+      "teleop.arm_mode.left.id",
+      "teleop.arm_mode.left.label",
+      "teleop.arm_mode.left.scope",
+      "teleop.arm_mode.right.id",
+      "teleop.arm_mode.right.label",
+      "teleop.arm_mode.right.scope"
+    ]
+  },
+  "sample_view": {
+    "camera_key": "front",
+    "state_key": "observation.state",
+    "horizon": 16,
+    "tail_policy": "drop",
+    "running_session_state": "RUNNING",
+    "invalid_label_policy": "drop_window_if_any_side_invalid_v1"
+  },
+  "split": {
+    "unit": "episode_capture_identity",
+    "strategy": "source_and_transition_stratified_v1",
+    "train_fraction": 0.8,
+    "validation_fraction": 0.2,
+    "seed_domain": "writing_0803_0804_0805_hold_split_v1",
+    "stratification_keys": [
+      "source_dataset_id",
+      "observed_pair_states",
+      "transition_directions"
+    ],
+    "coverage_constraints": [
+      {
+        "event_kind": "label",
+        "event_key": "left:teleop",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "label",
+        "event_key": "left:fixed_hold",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "label",
+        "event_key": "right:teleop",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "label",
+        "event_key": "right:fixed_hold",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "pair_state",
+        "event_key": "00",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "pair_state",
+        "event_key": "01",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "pair_state",
+        "event_key": "10",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "transition",
+        "event_key": "left:teleop->fixed_hold",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "transition",
+        "event_key": "left:fixed_hold->teleop",
+        "minimum_train_events": 7,
+        "minimum_validation_events": 2
+      },
+      {
+        "event_kind": "transition",
+        "event_key": "right:teleop->fixed_hold",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      },
+      {
+        "event_kind": "transition",
+        "event_key": "right:fixed_hold->teleop",
+        "minimum_train_events": 1,
+        "minimum_validation_events": 1
+      }
+    ]
+  }
+}

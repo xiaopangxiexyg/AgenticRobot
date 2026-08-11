@@ -37,6 +37,7 @@ EXECUTION_PROFILE_EXCLUSION_HASH_DOMAIN_V1 = (
     "dexteleop.execution_profile_exclusion.v1"
 )
 M6_CANDIDATE_POLICY_ARM_QPOS_V1 = "m6_candidate_policy_arm_qpos_v1"
+M6_RUNTIME_POLICY_ARM_QPOS_V2 = "m6_runtime_policy_arm_qpos_v2"
 
 HUMAN_MOTION_PROPOSAL_STATUSES_V1 = frozenset(
     {"authorized", "not_applicable"}
@@ -210,6 +211,42 @@ class ControlExecutionManifest:
         )
 
 
+@dataclass(frozen=True)
+class ControlExecutionManifestIdentity:
+    """Exact identity of one immutable manifest artifact.
+
+    The identity is intentionally smaller than :class:`ControlExecutionManifest`:
+    historical evidence may retain an exact content hash without retaining a
+    reconstructable manifest payload.  Such evidence must compare this identity
+    instead of rebuilding the current default manifest.
+    """
+
+    manifest_id: str
+    manifest_version: str
+    manifest_hash: str
+
+    def __post_init__(self) -> None:
+        for name in ("manifest_id", "manifest_version", "manifest_hash"):
+            object.__setattr__(
+                self,
+                name,
+                _identifier(getattr(self, name), name=name),
+            )
+
+    @classmethod
+    def from_manifest(
+        cls,
+        manifest: ControlExecutionManifest,
+    ) -> "ControlExecutionManifestIdentity":
+        if not isinstance(manifest, ControlExecutionManifest):
+            raise TypeError("manifest must be a ControlExecutionManifest.")
+        return cls(
+            manifest_id=manifest.manifest_id,
+            manifest_version=manifest.manifest_version,
+            manifest_hash=manifest.semantic_content_hash,
+        )
+
+
 def _manifest_payload(
     *,
     manifest_id: str,
@@ -370,7 +407,14 @@ def build_m6_candidate_policy_arm_qpos_manifest(
     capability: ExecutionCapabilityProfile,
     activation: ReferenceActivationSpec,
 ) -> ControlExecutionManifest:
-    """Freeze the first arms-only M6 candidate without authorizing motion."""
+    """Freeze the first arms-only M6 candidate without authorizing motion.
+
+    This historical v1 artifact is backend-independent migration evidence.  It
+    intentionally freezes a candidate adapter profile and must not be
+    published as the exact execution manifest of a concrete runtime instance.
+    Formal runtime capture must use
+    :func:`build_m6_runtime_policy_arm_qpos_manifest` instead.
+    """
 
     if not isinstance(catalog, ActionComponentCatalog):
         raise TypeError("catalog must be an ActionComponentCatalog.")
@@ -468,14 +512,109 @@ def build_m6_candidate_policy_arm_qpos_manifest(
     )
 
 
+def build_m6_runtime_policy_arm_qpos_manifest(
+    *,
+    catalog: ActionComponentCatalog,
+    capability: ExecutionCapabilityProfile,
+    activation: ReferenceActivationSpec,
+    component_target_capability: ComponentTargetCapabilitySpec,
+    target_runtime_action_contract_hash: str,
+) -> ControlExecutionManifest:
+    """Bind the M6 arms-only profile to one exact runtime target capability.
+
+    Unlike the backend-independent v1 candidate artifact, this v2 manifest is
+    suitable for formal capture: its target-capability hash is the exact hash
+    used by runtime action-adaptation requests.  The separately supplied
+    target-runtime contract hash prevents a component catalog hash (an input
+    schema) from being mistaken for the adapter's output contract.
+    """
+
+    if not isinstance(component_target_capability, ComponentTargetCapabilitySpec):
+        raise TypeError(
+            "component_target_capability must be a "
+            "ComponentTargetCapabilitySpec."
+        )
+
+    # Reuse the frozen v1 profile checks without reinterpreting its capability
+    # as a runtime binding.  This produces no authority, state, or trace fact.
+    candidate_profile = build_m6_candidate_policy_arm_qpos_manifest(
+        catalog=catalog,
+        capability=capability,
+        activation=activation,
+    )
+    action_schema = component_target_capability.action_schema
+    if (
+        action_schema.semantic_parameters.get("legacy_component_catalog_hash")
+        != catalog.semantic_content_hash
+    ):
+        raise ValueError(
+            "M6 runtime target capability binds another component catalog."
+        )
+    if any(
+        route.handler_contract_id != ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID
+        or route.handler_contract_hash
+        != ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH
+        for route in component_target_capability.component_routes
+    ) or any(
+        combination.handler_contract_id
+        != ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID
+        or combination.handler_contract_hash
+        != ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH
+        for combination in component_target_capability.resource_combinations
+    ):
+        raise ValueError(
+            "M6 runtime target capability requires the RobotAction v1 adapter "
+            "contract on every route."
+        )
+    expected_output_hash = _identifier(
+        target_runtime_action_contract_hash,
+        name="target_runtime_action_contract_hash",
+    )
+    output_hashes = {
+        route.output_target_schema_hash
+        for route in component_target_capability.component_routes
+    }
+    if output_hashes != {expected_output_hash}:
+        raise ValueError(
+            "M6 runtime target capability does not bind the supplied target "
+            "runtime action contract."
+        )
+
+    return build_control_execution_manifest(
+        manifest_id=M6_RUNTIME_POLICY_ARM_QPOS_V2,
+        manifest_version="v2",
+        action_space=BIMANUAL_QPOS_V1,
+        action_schema=action_schema,
+        component_target_capability=component_target_capability,
+        catalog=catalog,
+        motion_authority_sources=candidate_profile.motion_authority_sources,
+        human_motion_proposal_status=(
+            candidate_profile.human_motion_proposal_status
+        ),
+        safety_control_sources=candidate_profile.safety_control_sources,
+        safety_control_requests=candidate_profile.safety_control_requests,
+        lifecycle_control_sources=candidate_profile.lifecycle_control_sources,
+        lifecycle_control_requests=candidate_profile.lifecycle_control_requests,
+        capability=capability,
+        activation=activation,
+        actual_reference_frame_producer=(
+            candidate_profile.actual_reference_frame_producer
+        ),
+        exclusions=candidate_profile.exclusions,
+    )
+
+
 __all__ = [
     "CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V1",
     "CONTROL_EXECUTION_MANIFEST_HASH_DOMAIN_V2",
     "EXECUTION_PROFILE_EXCLUSION_HASH_DOMAIN_V1",
     "HUMAN_MOTION_PROPOSAL_STATUSES_V1",
     "M6_CANDIDATE_POLICY_ARM_QPOS_V1",
+    "M6_RUNTIME_POLICY_ARM_QPOS_V2",
     "ControlExecutionManifest",
+    "ControlExecutionManifestIdentity",
     "ExecutionProfileExclusion",
     "build_control_execution_manifest",
     "build_m6_candidate_policy_arm_qpos_manifest",
+    "build_m6_runtime_policy_arm_qpos_manifest",
 ]

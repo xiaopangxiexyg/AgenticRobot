@@ -22,6 +22,19 @@ from dataset_contracts.episode_curation import (
 
 SIDECAR_FILENAME = "episode_curation.jsonl"
 MANIFEST_FILENAME = "manifest.json"
+SOURCE_DATASET_BASE_FINGERPRINT_V2 = (
+    "dexteleop.plus.source_dataset_base_fingerprint.v2"
+)
+_APPEND_MUTABLE_INFO_FIELDS = frozenset(
+    {
+        "episode_count",
+        "frame_count",
+        "total_episodes",
+        "total_frames",
+        "total_chunks",
+        "total_videos",
+    }
+)
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -39,11 +52,13 @@ def _json_bytes(value: Any) -> bytes:
 
 
 def source_dataset_base_fingerprint(dataset_root: str | Path) -> str:
-    """Hash immutable source manifests while excluding all Plus directories.
+    """Hash append-stable source metadata while excluding all Plus directories.
 
-    The function only reads ``meta`` files.  It never traverses the dataset,
-    and specifically does not include ``meta/annotations`` or any external
-    annotation root in the fingerprint.
+    LeRobot updates episode/frame counters in ``meta/info.json`` after every
+    seal.  Those counters are deliberately removed from the lineage payload;
+    otherwise the second episode in one live dataset would appear to belong
+    to a different source.  Per-episode membership remains bound separately by
+    ``source_episode_manifest_hash``.
     """
 
     root = Path(dataset_root).expanduser().resolve()
@@ -52,14 +67,40 @@ def source_dataset_base_fingerprint(dataset_root: str | Path) -> str:
         "meta/tasks.jsonl",
         "meta/modality_validity.json",
     )
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
     for relative in relative_files:
         path = root / relative
         if path.is_file():
-            entries.append({"path": relative, "sha256": _sha256_bytes(path.read_bytes())})
+            if relative == "meta/info.json":
+                try:
+                    info = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"invalid dataset info metadata: {path}") from exc
+                if not isinstance(info, dict):
+                    raise ValueError(f"dataset info metadata must be an object: {path}")
+                stable_info = {
+                    str(key): value
+                    for key, value in info.items()
+                    if str(key) not in _APPEND_MUTABLE_INFO_FIELDS
+                }
+                entries.append(
+                    {
+                        "path": relative,
+                        "sha256": _sha256_bytes(_json_bytes(stable_info)),
+                    }
+                )
+            else:
+                entries.append({"path": relative, "sha256": _sha256_bytes(path.read_bytes())})
         else:
             entries.append({"path": relative, "sha256": "missing"})
-    return _sha256_bytes(_json_bytes({"schema": "dexteleop_plus_source_fingerprint_v1", "files": entries}))
+    return _sha256_bytes(
+        _json_bytes(
+            {
+                "schema": SOURCE_DATASET_BASE_FINGERPRINT_V2,
+                "files": entries,
+            }
+        )
+    )
 
 
 def source_episode_manifest_hash(
@@ -179,6 +220,24 @@ class EpisodeCurationReader:
         episode_index: int,
     ) -> EpisodeCurationRecord | None:
         base_fingerprint = source_dataset_base_fingerprint(dataset_root)
+        if self.manifest:
+            manifest_fingerprint = str(
+                self.manifest.get("source_dataset_base_fingerprint", "") or ""
+            )
+            fingerprint_schema = str(
+                self.manifest.get("source_dataset_base_fingerprint_schema", "")
+                or ""
+            )
+            if fingerprint_schema == SOURCE_DATASET_BASE_FINGERPRINT_V2:
+                if manifest_fingerprint != base_fingerprint:
+                    return None
+            elif manifest_fingerprint:
+                # Compatibility for the original provisional v1 algorithm,
+                # whose whole-info hash changed whenever counters advanced.
+                # The explicit annotation root and exact episode-manifest hash
+                # remain required; new sets always use the append-stable v2
+                # algorithm above.
+                base_fingerprint = manifest_fingerprint
         manifest_hash = source_episode_manifest_hash(dataset_root, int(episode_index))
         identity = annotation_episode_id(
             source_dataset_base_fingerprint=base_fingerprint,
@@ -192,6 +251,7 @@ __all__ = [
     "EpisodeCurationReader",
     "MANIFEST_FILENAME",
     "SIDECAR_FILENAME",
+    "SOURCE_DATASET_BASE_FINGERPRINT_V2",
     "source_dataset_base_fingerprint",
     "source_episode_manifest_hash",
 ]

@@ -15,6 +15,10 @@ from dataset_contracts.canonical_encoding import (
 
 from ..episode_curation import source_dataset_base_fingerprint
 from ..progress_annotation_jobs import list_progress_annotation_work_items
+from ..progress_skill_projection import (
+    SkillProjectionCatalog,
+    project_episode_skill_view,
+)
 from ..training_semantics import (
     TRAINING_DOMAIN_FAILURE,
     TRAINING_DOMAIN_NOMINAL,
@@ -36,6 +40,7 @@ from .models import (
     INTERVALS_FILE,
     MANIFEST_FILE,
     PREPARED_SELECTED_EPISODE_DOMAIN_V1,
+    PREPARED_SKILL_PROJECTION_RECEIPTS_DOMAIN_V1,
     PREPARED_SOURCE_DATASETS_DOMAIN_V1,
     PREPARED_SOURCE_INVENTORY_DOMAIN_V1,
     PREPARED_TRAINING_VIEW_HASH_DOMAIN_V1,
@@ -44,11 +49,14 @@ from .models import (
     SELECTED_EPISODES_FILE,
     SOURCE_DATASETS_FILE,
     SOURCE_INVENTORY_FILE,
+    SKILL_INTERVALS_FILE,
+    SKILL_PROJECTION_RECEIPTS_FILE,
     VIEW_RELATIVE_ROOT,
     PreparedSourceDataset,
     PreparedTrainingViewBuildResult,
     PreparedTrainingViewError,
     arrow_schemas,
+    skill_interval_arrow_schema,
 )
 from .reader import load_prepared_training_view
 from .sources import PreparedEpisode, prepare_episode
@@ -58,6 +66,7 @@ def _table_rows(
     episodes: Sequence[PreparedEpisode],
     *,
     modality_selection: tuple[str, ...],
+    camera_selection: tuple[str, ...] | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     episode_rows: list[dict[str, Any]] = []
     interval_rows: list[dict[str, Any]] = []
@@ -66,7 +75,11 @@ def _table_rows(
         item = episode.item
         annotation = episode.annotation
         camera_keys = (
-            list(sorted(item.video_paths))
+            list(
+                sorted(item.video_paths)
+                if camera_selection is None
+                else camera_selection
+            )
             if "video" in modality_selection
             else []
         )
@@ -185,6 +198,7 @@ def _resolve_inputs(
     included: frozenset[str] | None,
     projection: tuple[str, ...],
     modalities: tuple[str, ...],
+    camera_selection: tuple[str, ...] | None,
 ) -> tuple[tuple[PreparedEpisode, ...], list[dict[str, Any]]]:
     prepared: list[PreparedEpisode] = []
     source_rows: list[dict[str, Any]] = []
@@ -213,6 +227,7 @@ def _resolve_inputs(
                     selector=selection.get(item.episode_identity_hash),
                     column_projection=projection,
                     modality_selection=modalities,
+                    camera_selection=camera_selection,
                 )
             )
     if not prepared:
@@ -270,6 +285,110 @@ def _resolve_inputs(
     )
 
 
+def _skill_projection_rows(
+    episodes: Sequence[PreparedEpisode],
+    *,
+    catalog: SkillProjectionCatalog,
+    target_skill_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    skill = catalog.skill_by_id.get(target_skill_id)
+    if skill is None:
+        raise PreparedTrainingViewError(
+            f"Unknown target Skill {target_skill_id!r}."
+        )
+    candidate_projections = catalog.projections_for_skill(target_skill_id)
+    interval_rows: list[dict[str, Any]] = []
+    receipt_rows: list[dict[str, Any]] = []
+    used_projections: dict[str, Any] = {}
+    for ordinal, episode in enumerate(episodes):
+        stage_profile = episode.item.progress.stage_profile
+        if stage_profile is None:
+            raise PreparedTrainingViewError(
+                "Skill projection requires an ordered stage profile."
+            )
+        matches = tuple(
+            projection
+            for projection in candidate_projections
+            if (
+                projection.source_progress_profile_hash
+                == episode.item.progress.profile.semantic_content_hash
+                and projection.source_stage_profile_hash
+                == stage_profile.semantic_content_hash
+            )
+        )
+        if len(matches) != 1:
+            raise PreparedTrainingViewError(
+                "Every selected Episode must resolve exactly one projection "
+                f"for Skill {target_skill_id!r}; episode="
+                f"{episode.item.episode_identity_hash} matches={len(matches)}."
+            )
+        projection = matches[0]
+        annotation_manifest_hash = (
+            None
+            if episode.annotation is None
+            else episode.annotation.manifest.semantic_content_hash
+        )
+        view = project_episode_skill_view(
+            progress_profile=episode.item.progress.profile,
+            stage_profile=stage_profile,
+            skill_contract=skill,
+            projection=projection,
+            semantic_index=episode.semantic_index,
+            source_stage_annotation_manifest_hash=annotation_manifest_hash,
+        )
+        used_projections[projection.semantic_content_hash] = projection
+        receipt_rows.append(
+            {
+                "organized_episode_ordinal": ordinal,
+                "receipt": view.receipt.to_payload(),
+            }
+        )
+        for interval in view.receipt.intervals:
+            interval_rows.append(
+                {
+                    "organized_episode_ordinal": ordinal,
+                    "episode_capture_identity_hash": (
+                        episode.item.episode_identity_hash
+                    ),
+                    "skill_id": skill.skill_id,
+                    "skill_training_contract_hash": (
+                        skill.semantic_content_hash
+                    ),
+                    "progress_skill_projection_hash": (
+                        projection.semantic_content_hash
+                    ),
+                    "sample_begin": interval.sample_begin,
+                    "sample_end_exclusive": interval.sample_end,
+                    "training_domain": interval.training_domain,
+                    "source_attempt_id": interval.source_attempt_id,
+                    "source_stage_ids": list(interval.source_stage_ids),
+                    "source_occurrence_ids": list(
+                        interval.source_occurrence_ids
+                    ),
+                    "source_failure_fact_id": (
+                        interval.source_failure_fact_id
+                    ),
+                }
+            )
+    if not interval_rows:
+        raise PreparedTrainingViewError(
+            "The selected Skill has no annotated eligible intervals."
+        )
+    capability = {
+        "schema": "dexteleop.prepared_skill_projection.provisional.v1",
+        "skill_contract": skill.to_payload(),
+        "projection_hashes": sorted(used_projections),
+        "projections": [
+            used_projections[key].to_payload()
+            for key in sorted(used_projections)
+        ],
+        "interval_count": len(interval_rows),
+        "receipt_count": len(receipt_rows),
+        "implementation_id": "dataset_interface.progress_skill_projection.v1",
+    }
+    return interval_rows, receipt_rows, capability
+
+
 def build_prepared_training_view(
     organized_dataset_root: str | Path,
     sources: Sequence[PreparedSourceDataset],
@@ -277,8 +396,11 @@ def build_prepared_training_view(
     annotation_selection: Mapping[str, str] | None = None,
     include_episode_identities: Iterable[str] | None = None,
     modality_selection: Iterable[str] = ("numeric", "video"),
+    camera_selection: Iterable[str] | None = None,
     column_projection: Iterable[str] = ("timestamp",),
     resolver_policy_id: str = "dataset_interface.training_semantics.v1",
+    skill_projection_catalog: SkillProjectionCatalog | None = None,
+    target_skill_id: str | None = None,
 ) -> PreparedTrainingViewBuildResult:
     """Build one immutable logical view from sealed date-based source roots."""
 
@@ -297,10 +419,41 @@ def build_prepared_training_view(
     if any(not source.dataset_root.is_dir() for source in normalized_sources):
         raise PreparedTrainingViewError("Every source dataset root must exist.")
     modalities = normalized_modalities(modality_selection)
+    cameras = (
+        None
+        if camera_selection is None
+        else tuple(str(value).strip() for value in camera_selection)
+    )
+    if cameras is not None:
+        if not cameras or "" in cameras or len(cameras) != len(set(cameras)):
+            raise PreparedTrainingViewError(
+                "camera_selection must contain unique non-empty camera keys."
+            )
+        if "video" not in modalities:
+            raise PreparedTrainingViewError(
+                "camera_selection requires the video modality."
+            )
     projection = normalized_projection(column_projection)
     policy = str(resolver_policy_id).strip()
     if not policy:
         raise PreparedTrainingViewError("resolver_policy_id must be non-empty.")
+    normalized_target_skill_id = (
+        None if target_skill_id is None else str(target_skill_id).strip()
+    )
+    if (skill_projection_catalog is None) != (
+        normalized_target_skill_id is None
+    ):
+        raise PreparedTrainingViewError(
+            "skill_projection_catalog and target_skill_id must be provided "
+            "together."
+        )
+    if skill_projection_catalog is not None and not isinstance(
+        skill_projection_catalog,
+        SkillProjectionCatalog,
+    ):
+        raise PreparedTrainingViewError(
+            "skill_projection_catalog must be SkillProjectionCatalog."
+        )
     selection = {
         str(key).strip(): str(value).strip()
         for key, value in (annotation_selection or {}).items()
@@ -325,6 +478,7 @@ def build_prepared_training_view(
         included=included,
         projection=projection,
         modalities=modalities,
+        camera_selection=cameras,
     )
 
     progress_hashes = {
@@ -335,7 +489,10 @@ def build_prepared_training_view(
         for episode in episodes
         if episode.item.progress.stage_profile is not None
     }
-    if len(progress_hashes) != 1 or len(stage_hashes) != 1:
+    if (
+        skill_projection_catalog is None
+        and (len(progress_hashes) != 1 or len(stage_hashes) != 1)
+    ):
         raise PreparedTrainingViewError(
             "An organized dataset requires exactly one progress profile and "
             "one stage profile."
@@ -388,7 +545,22 @@ def build_prepared_training_view(
     episode_rows, interval_rows, anchor_rows = _table_rows(
         episodes,
         modality_selection=modalities,
+        camera_selection=cameras,
     )
+    skill_interval_rows: list[dict[str, Any]] = []
+    skill_receipt_rows: list[dict[str, Any]] = []
+    skill_capability: dict[str, Any] | None = None
+    if skill_projection_catalog is not None:
+        assert normalized_target_skill_id is not None
+        (
+            skill_interval_rows,
+            skill_receipt_rows,
+            skill_capability,
+        ) = _skill_projection_rows(
+            episodes,
+            catalog=skill_projection_catalog,
+            target_skill_id=normalized_target_skill_id,
+        )
 
     view_parent = organized_root / VIEW_RELATIVE_ROOT
     view_parent.mkdir(parents=True, exist_ok=True)
@@ -414,6 +586,12 @@ def build_prepared_training_view(
             inventory_rows,
             domain=PREPARED_SOURCE_INVENTORY_DOMAIN_V1,
         )
+        if skill_capability is not None:
+            write_cjsonl(
+                staging / SKILL_PROJECTION_RECEIPTS_FILE,
+                skill_receipt_rows,
+                domain=PREPARED_SKILL_PROJECTION_RECEIPTS_DOMAIN_V1,
+            )
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -435,23 +613,57 @@ def build_prepared_training_view(
             with (staging / filename).open("rb") as handle:
                 os.fsync(handle.fileno())
 
+        if skill_capability is not None:
+            skill_table = pa.Table.from_pylist(
+                skill_interval_rows,
+                schema=skill_interval_arrow_schema(),
+            )
+            pq.write_table(
+                skill_table,
+                staging / SKILL_INTERVALS_FILE,
+                compression="NONE",
+            )
+            with (staging / SKILL_INTERVALS_FILE).open("rb") as handle:
+                os.fsync(handle.fileno())
+
+        derived_filenames = list(DERIVED_FILES)
+        if skill_capability is not None:
+            derived_filenames.extend(
+                (SKILL_INTERVALS_FILE, SKILL_PROJECTION_RECEIPTS_FILE)
+            )
         derived_files = {
             filename: {
                 "sha256": sha256_file(staging / filename),
                 "size_bytes": (staging / filename).stat().st_size,
             }
-            for filename in DERIVED_FILES
+            for filename in derived_filenames
         }
         derived_files[EPISODES_FILE]["row_count"] = len(episode_rows)
         derived_files[INTERVALS_FILE]["row_count"] = len(interval_rows)
         derived_files[ANCHORS_FILE]["row_count"] = len(anchor_rows)
+        if skill_capability is not None:
+            derived_files[SKILL_INTERVALS_FILE]["row_count"] = len(
+                skill_interval_rows
+            )
+            derived_files[SKILL_PROJECTION_RECEIPTS_FILE]["row_count"] = len(
+                skill_receipt_rows
+            )
         manifest_payload: dict[str, Any] = {
             "schema": PREPARED_TRAINING_VIEW_SCHEMA_V1,
             "source_dataset_ids": [row["source_dataset_id"] for row in source_rows],
-            "progress_profile_hash": next(iter(progress_hashes)),
-            "stage_profile_hash": next(iter(stage_hashes)),
+            "progress_profile_hash": (
+                next(iter(progress_hashes))
+                if len(progress_hashes) == 1
+                else None
+            ),
+            "stage_profile_hash": (
+                next(iter(stage_hashes)) if len(stage_hashes) == 1 else None
+            ),
             "resolver_policy_id": policy,
             "modality_selection": list(modalities),
+            "camera_selection": (
+                None if cameras is None else list(cameras)
+            ),
             "column_projection": list(projection),
             "projection_schema": [
                 {"name": name, "type": kind, "nullable": nullable}
@@ -463,6 +675,12 @@ def build_prepared_training_view(
             "derived_files": derived_files,
             "implementation_id": "dataset_interface.prepared_training_view.v1",
         }
+        if skill_capability is not None:
+            manifest_payload["skill_projection"] = skill_capability
+            manifest_payload["progress_profile_hashes"] = sorted(
+                progress_hashes
+            )
+            manifest_payload["stage_profile_hashes"] = sorted(stage_hashes)
         training_view_hash = canonical_content_hash(
             manifest_payload,
             domain=PREPARED_TRAINING_VIEW_HASH_DOMAIN_V1,
@@ -486,6 +704,11 @@ def build_prepared_training_view(
                 interval_count=loaded.semantic_intervals.num_rows,
                 anchor_count=loaded.semantic_anchors.num_rows,
                 idempotent=True,
+                skill_interval_count=(
+                    0
+                    if loaded.skill_intervals is None
+                    else loaded.skill_intervals.num_rows
+                ),
             )
         os.rename(staging, final)
         fsync_directory(view_parent)
@@ -498,6 +721,11 @@ def build_prepared_training_view(
             interval_count=loaded.semantic_intervals.num_rows,
             anchor_count=loaded.semantic_anchors.num_rows,
             idempotent=False,
+            skill_interval_count=(
+                0
+                if loaded.skill_intervals is None
+                else loaded.skill_intervals.num_rows
+            ),
         )
     finally:
         if staging.exists() and staging.name.startswith(".building-"):

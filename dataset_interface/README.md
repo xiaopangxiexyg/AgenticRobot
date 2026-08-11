@@ -26,6 +26,22 @@ objects; this adapter owns only their dataset projection. WAL admission,
 episode membership, seal/commit, native media streams, and the final dataset
 remain in their existing runtime/collection owners.
 
+Receipt-driven allocation publication uses the compact
+`allocation_publication_outcome` projection. It records attempt, decision,
+accepted-context, and committed-state identities without duplicating activity
+windows or action payloads; ordinary composition context/evaluation facts keep
+owning those full records.
+
+Residual-anchor lifecycle is projected as separate spec, admission, record,
+and same-cut snapshot facts. These records preserve request/receipt identity,
+target boundary, receiver availability, generation, and component binding
+lineage, but do not duplicate action vectors; ordinary composition input facts
+remain the action-payload owner. Lifecycle-aware formal strategy spec/input
+records use development record schema v2 and include the required lifecycle
+spec or selected snapshot identity. This is an intentional development
+contract update; consumers of the earlier record shape must be updated rather
+than treating old and new payloads as interchangeable.
+
 Opt-in source eligibility is projected as separate spec, admission, state,
 snapshot, and input-snapshot binding facts. Existing composition input and
 input-snapshot record schemas remain unchanged; the binding preserves exact
@@ -35,8 +51,8 @@ Formal component composition follows the same additive rule. The adapter
 projects one complete `component_composition_rule_set` fact and one
 `formal_component_composition_binding` fact linking the exact
 CompositionSpec, rule set, and FormalCompositionStrategySpec hashes. Existing
-`composition_spec` and `formal_composition_strategy_spec` v1 records retain
-their original field sets and hashes.
+`composition_spec` retains its existing record shape. Formal strategy
+spec/input records use the lifecycle-aware development shape described above.
 
 ## Model continuation derived view
 
@@ -139,6 +155,18 @@ post-annotation correction model. The eventual model may replace a bounded
 retrospective timeline segment, including stage and time boundaries, after
 profile validation.
 
+`dataset_interface.writing_stage1_v23` is the narrow admission adapter for the
+legacy writing campaign. It accepts exactly one v2.3 dataset root and resolves
+only that dataset's `semantic_layers/<layer-id>` path. It does not combine
+dates, choose training views, or weaken camera constraints; those remain work
+for the upper abstract-dataset compiler.
+
+Dataset-local retrospective bindings use `.` relative to the one explicitly
+allowed owning dataset root, so moving the complete dataset does not invalidate
+its semantic layer. `retrospective_campaign_artifacts` admits only Episodes in
+a valid definition/publication-receipt pair; partial campaign writes remain
+invisible and resumable.
+
 `dataset_interface.sample_axis` provides the version-neutral, read-time mapping
 from one Episode clock to its contiguous causal sample indices.
 `EpisodeSampleAxis.from_causal_samples(...)` can consume native causal samples
@@ -200,11 +228,23 @@ persisted dataset schema.
 interpretation during explicit dataset organization, not during live capture.
 It can select sealed Episodes from multiple date-based dataset roots, uses the
 Episode capture identity as the global key, and retains each source
-`episode_index` only as provenance. One organized view requires one exact
+`episode_index` only as provenance. Its default mode requires one exact
 Progress Profile, one exact Stage Profile, and one compatible projected
 Parquet field schema. Multiple annotation sets require an explicit per-Episode
 selection; identical Episode identities are deduplicated only when their raw
 content and selected semantic artifacts are identical.
+
+`dataset_interface.progress_skill_projection` is the explicit exception for
+single-subtask training across task Profiles. A minimal
+`SkillTrainingContractV1` defines the target Skill independently from task
+topology; each `ProgressSkillProjectionV1` binds one exact source Progress and
+Stage profile hash, Step/stage subset, controlled components, predicates, and
+conditioned context to it. The prepared builder enables this mode only when
+both `skill_projection_catalog` and one `target_skill_id` are supplied. It then
+adds `skill_intervals.parquet` and deterministic per-Episode receipts. Failure,
+abnormal, Pause, Attempt, and omitted-stage boundaries remain discontinuities;
+the source datasets are still read-only. Without those two arguments, the
+strict single-Profile behavior and physical file set remain unchanged.
 
 The result is an immutable `derived/training_views/<hash>/` snapshot containing
 an Episode table, semantic interval/anchor tables, explicit source selection,
@@ -233,6 +273,25 @@ result = build_prepared_training_view(
     column_projection=("timestamp", "action", "observation.state"),
 )
 ```
+
+The reviewed writing 3/4/5-step mappings can be selected explicitly:
+
+```python
+from dataset_interface import load_builtin_writing_skill_projection_catalog
+
+result = build_prepared_training_view(
+    "/datasets/organized/writing-skill",
+    sources,
+    skill_projection_catalog=(
+        load_builtin_writing_skill_projection_catalog()
+    ),
+    target_skill_id="writing.write_with_brush",
+)
+```
+
+The writing catalog does not equate `lift_ready` with
+`lift_and_present`: those are separate full acquisition Skills. Only their
+reviewed `approach + grasp` stage prefix is shared.
 
 This call writes only below the organized root. The date roots are opened as
 read-only sources. Callers must use the actual logical column names of their

@@ -65,7 +65,7 @@
       }
     },
     "left_wrist": {
-      "serial": "261122273924",
+      "serial": "260522278055",
       "model": "RealSense D405",
       "stream": "color",
       "profile": {
@@ -105,7 +105,7 @@
       }
     },
     "right_wrist": {
-      "serial": "260522278055",
+      "serial": "261122273924",
       "model": "RealSense D405",
       "stream": "color",
       "profile": {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import InitVar, dataclass, field
+import math
 import time
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -56,6 +57,12 @@ from robot_motion.runtime import EffectorCommand, Retargeter, TeleopCommand, Tel
 from robot_motion.tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
 from robot_motion.transforms import as_pose_matrix, interpolate_pose, invert_pose
 
+from .dual_arm_solver.geometry import (
+    arm_joint_entries,
+    arm_joint_indices,
+    embed_arm_qpos,
+    split_arm_solution,
+)
 from .tool_safety import tcp_safety_warnings
 
 
@@ -74,6 +81,8 @@ IK_STEP_MODE_CHOICES = (
     IK_STEP_MODE_LEGACY_ITERATIVE,
     IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE,
 )
+
+
 JOINT_LIMIT_GUARD_LEGACY = "legacy"
 JOINT_LIMIT_GUARD_BOUNDARY_HOLD = "boundary_hold"
 JOINT_LIMIT_GUARD_FORCED_ESCAPE_LATCHED = "forced_escape_latched"
@@ -601,6 +610,17 @@ class DualArmCollisionAwareRetargeterConfig:
     # healthy.  Keep only that soft eligibility bit alive briefly; joint,
     # null-projection, q5-latch, and admission guards always fail closed.
     output_qpos_normal_fast_path_quality_grace_sec: float = 0.0
+    # Optional endpoint for a nonzero, pre-IK bounded Cartesian admittance
+    # modifier.  It is separate from ordinary tracker smoothing so profiles
+    # can close modifier/qref lag without changing no-force teleoperation.
+    output_qpos_admittance_fast_path_enabled: bool = False
+    output_qpos_admittance_fast_path_alpha: float = 1.0
+    # Default-off, one-tick confirmation for tiny modifier-only qpos direction
+    # reversals.  A reversal is held only when either the previous admitted
+    # step or the proposed step is within this threshold; a persistent reversal
+    # is admitted on the next reference tick.  Zero preserves the historical
+    # Active fast-path behavior.
+    output_qpos_admittance_micro_reversal_hold_deg: float = 0.0
     # When q5 is in the narrow escape band, use the already safety-bounded
     # fast EMA endpoint instead of the normal slow alpha.  This only changes
     # the q5 singular neighborhood; all other joints retain the normal
@@ -956,6 +976,38 @@ class DualArmCollisionAwareRetargeterConfig:
         self.output_qpos_normal_fast_path_quality_grace_sec = (
             normal_fast_quality_grace_sec
         )
+        self.output_qpos_admittance_fast_path_enabled = bool(
+            self.output_qpos_admittance_fast_path_enabled
+        )
+        admittance_fast_alpha = float(
+            self.output_qpos_admittance_fast_path_alpha
+        )
+        if (
+            not np.isfinite(admittance_fast_alpha)
+            or not 0.0 <= admittance_fast_alpha <= 1.0
+        ):
+            raise ValueError(
+                "output_qpos_admittance_fast_path_alpha must be in [0, 1]."
+            )
+        if admittance_fast_alpha < float(self.output_qpos_smoothing_alpha):
+            raise ValueError(
+                "output_qpos_admittance_fast_path_alpha must be >= the slow alpha."
+            )
+        self.output_qpos_admittance_fast_path_alpha = admittance_fast_alpha
+        admittance_reversal_hold_deg = float(
+            self.output_qpos_admittance_micro_reversal_hold_deg
+        )
+        if (
+            not np.isfinite(admittance_reversal_hold_deg)
+            or admittance_reversal_hold_deg < 0.0
+        ):
+            raise ValueError(
+                "output_qpos_admittance_micro_reversal_hold_deg must be "
+                "finite and >= 0."
+            )
+        self.output_qpos_admittance_micro_reversal_hold_deg = (
+            admittance_reversal_hold_deg
+        )
         if self.output_qpos_smoothing_singularity_alpha is not None:
             singularity_alpha = float(self.output_qpos_smoothing_singularity_alpha)
             if not np.isfinite(singularity_alpha) or not 0.0 <= singularity_alpha <= 1.0:
@@ -1295,6 +1347,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._output_qpos_normal_fast_path_last_quality_valid_time: dict[
             str, float | None
         ] = {"left": None, "right": None}
+        self._output_qpos_admittance_pending_reversal_direction = {
+            "left": np.zeros(6, dtype=float),
+            "right": np.zeros(6, dtype=float),
+        }
         self._position_singularity_analyzers: dict[
             str, Callable[[np.ndarray], Mapping[str, object]]
         ] = {}
@@ -1348,6 +1404,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             reset()
         self._last_target_poses = {"left": None, "right": None}
         self._last_output_qpos_smoothing_full_q = None
+        self._reset_output_qpos_admittance_reversal_state()
         self._singularity_escape_direction_latch.clear()
         self._singularity_escape_direction_failures.clear()
         self._singularity_escape_axis_latch.clear()
@@ -1403,6 +1460,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "right": None,
         }
 
+    def _reset_output_qpos_admittance_reversal_state(
+        self,
+        side: str | None = None,
+    ) -> None:
+        sides = (
+            (self._validated_side(side),)
+            if side is not None
+            else ("left", "right")
+        )
+        for resolved_side in sides:
+            self._output_qpos_admittance_pending_reversal_direction[
+                resolved_side
+            ].fill(0.0)
+
     def set_current_qpos_pair(
         self,
         *,
@@ -1444,6 +1515,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             }
             self._set_solver_motion_reference(full_q)
             self._last_output_qpos_smoothing_full_q = None
+            self._reset_output_qpos_admittance_reversal_state()
             self._reset_output_qpos_smoothing_alpha_state()
             self._clear_hold()
         elif (
@@ -1591,6 +1663,34 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         """
 
         solver_targets = self.current_world_targets()
+        return {
+            side: self.tool_tcp_world_target_from_solver_world_target(
+                side=side,
+                solver_world_target=solver_targets[side],
+            )
+            for side in ("left", "right")
+        }
+
+    def tool_tcp_world_targets_for_qpos_pair(
+        self,
+        *,
+        left_qpos: Sequence[float] | np.ndarray,
+        right_qpos: Sequence[float] | np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Return read-only tool-TCP FK for one admitted dual-arm qref pair."""
+
+        left = np.asarray(left_qpos, dtype=float).reshape(-1)
+        right = np.asarray(right_qpos, dtype=float).reshape(-1)
+        if left.shape != (6,) or not np.all(np.isfinite(left)):
+            raise ValueError("left_qpos must contain six finite values.")
+        if right.shape != (6,) or not np.all(np.isfinite(right)):
+            raise ValueError("right_qpos must contain six finite values.")
+        full_q = self._embed_arm_qpos(
+            current_full_q=self.ik_solver.current_q,
+            left_qpos=left,
+            right_qpos=right,
+        )
+        solver_targets = self._solver_world_targets_for_full_q(full_q)
         return {
             side: self.tool_tcp_world_target_from_solver_world_target(
                 side=side,
@@ -2125,6 +2225,14 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "right": right_source_metadata,
             },
         )
+        solve_iteration_mode = (
+            "single_physical_step"
+            if self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            else "adaptive_budget"
+            if bool(self.config.solve_adaptive_iterations_enabled)
+            else "fixed_max"
+        )
         left_source_target_pose_base = (
             None
             if left_source_command_type != "cartesian_pose" or left_source_value is None
@@ -2252,8 +2360,26 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 or rotation_deg > _CURRENT_TARGET_HOLD_ROTATION_DEG
             ):
                 target_already_reached = False
+        current_target_hold_metadata = {
+            "enabled": bool(current_target_hold_enabled),
+            "policy": "shared_ik_unchanged",
+            "translation_threshold_m": float(
+                _CURRENT_TARGET_HOLD_TRANSLATION_M
+            ),
+            "rotation_threshold_deg": float(
+                _CURRENT_TARGET_HOLD_ROTATION_DEG
+            ),
+            "target_already_reached": bool(target_already_reached),
+        }
         if profile is not None:
             profile["current_target_hold_enabled"] = bool(current_target_hold_enabled)
+            profile["current_target_hold_policy"] = "shared_ik_unchanged"
+            profile["current_target_hold_translation_m"] = float(
+                _CURRENT_TARGET_HOLD_TRANSLATION_M
+            )
+            profile["current_target_hold_rotation_deg"] = float(
+                _CURRENT_TARGET_HOLD_ROTATION_DEG
+            )
             profile["target_already_reached"] = bool(target_already_reached)
 
         try:
@@ -2820,14 +2946,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 ),
                 "ik_solve_iterations": int(solve_iteration_count),
                 "ik_solve_step_mode": str(self.config.solve_step_mode),
-                "ik_solve_iteration_mode": (
-                    "single_physical_step"
-                    if self.config.solve_step_mode
-                    == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
-                    else "adaptive_budget"
-                    if bool(self.config.solve_adaptive_iterations_enabled)
-                    else "fixed_max"
-                ),
+                "ik_solve_iteration_mode": solve_iteration_mode,
                 "ik_solve_iteration_max": int(self.config.solve_max_iterations),
                 "ik_solve_iteration_min": int(self.config.solve_min_iterations),
                 "ik_damping": float(self.config.damping),
@@ -2854,6 +2973,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "ik_solve_pose_error": {
                     side: dict(metrics) for side, metrics in solve_pose_error.items()
                 },
+                "ik_current_target_hold": dict(
+                    current_target_hold_metadata
+                ),
                 "ik_jump_gate_status": jump_gate_status,
                 "ik_jump_gate_reason": jump_gate_reason,
                 "ik_jump_gate_release_ready": jump_gate_release_ready,
@@ -2894,14 +3016,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_branch_distance_score_deg": branch_score_deg,
             "ik_solve_iterations": int(solve_iteration_count),
             "ik_solve_step_mode": str(self.config.solve_step_mode),
-            "ik_solve_iteration_mode": (
-                "single_physical_step"
-                if self.config.solve_step_mode
-                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
-                else "adaptive_budget"
-                if bool(self.config.solve_adaptive_iterations_enabled)
-                else "fixed_max"
-            ),
+            "ik_solve_iteration_mode": solve_iteration_mode,
             "ik_solve_iteration_max": int(self.config.solve_max_iterations),
             "ik_solve_iteration_min": int(self.config.solve_min_iterations),
             "ik_damping": float(self.config.damping),
@@ -2942,6 +3057,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 ],
             },
             "ik_solve_pose_error": dict(solve_pose_error.get("left", {})),
+            "ik_current_target_hold": dict(current_target_hold_metadata),
             "ik_jump_gate_status": jump_gate_status,
             "ik_jump_gate_reason": jump_gate_reason,
             "ik_jump_gate_release_ready": jump_gate_release_ready,
@@ -2980,14 +3096,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_branch_distance_score_deg": branch_score_deg,
             "ik_solve_iterations": int(solve_iteration_count),
             "ik_solve_step_mode": str(self.config.solve_step_mode),
-            "ik_solve_iteration_mode": (
-                "single_physical_step"
-                if self.config.solve_step_mode
-                == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
-                else "adaptive_budget"
-                if bool(self.config.solve_adaptive_iterations_enabled)
-                else "fixed_max"
-            ),
+            "ik_solve_iteration_mode": solve_iteration_mode,
             "ik_solve_iteration_max": int(self.config.solve_max_iterations),
             "ik_solve_iteration_min": int(self.config.solve_min_iterations),
             "ik_damping": float(self.config.damping),
@@ -3028,6 +3137,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 ],
             },
             "ik_solve_pose_error": dict(solve_pose_error.get("right", {})),
+            "ik_current_target_hold": dict(current_target_hold_metadata),
             "ik_jump_gate_status": jump_gate_status,
             "ik_jump_gate_reason": jump_gate_reason,
             "ik_jump_gate_release_ready": jump_gate_release_ready,
@@ -3228,7 +3338,66 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "left": as_pose_matrix(maybe_targets["left"]).copy(),
                     "right": as_pose_matrix(maybe_targets["right"]).copy(),
                 }
+                self._apply_target_override_activity_metadata(context)
         return self.build_command_for_context(context, targets=targets)
+
+    def _apply_target_override_activity_metadata(
+        self,
+        context: DualArmTargetContext,
+    ) -> None:
+        """Project optional modifier motion intent into owned command copies."""
+
+        provider = getattr(
+            self.target_override_filter,
+            "target_activity_override_by_side",
+            None,
+        )
+        if not callable(provider):
+            return
+        raw_overrides = provider()
+        if raw_overrides is None:
+            return
+        if not isinstance(raw_overrides, Mapping):
+            raise TypeError(
+                "target activity override provider must return a side mapping"
+            )
+        commands = {
+            "left": context.left_cartesian,
+            "right": context.right_cartesian,
+        }
+        for raw_side, raw_override in raw_overrides.items():
+            side = self._validated_side(str(raw_side))
+            if not isinstance(raw_override, Mapping):
+                raise TypeError(
+                    f"target activity override for {side} must be a mapping"
+                )
+            command = commands[side]
+            if command is None:
+                raise ValueError(
+                    f"target activity override for {side} has no source command"
+                )
+            override = dict(raw_override)
+            hold_weight = float(override.get("hold_weight", 0.0))
+            if (
+                not math.isfinite(hold_weight)
+                or hold_weight < 0.0
+                or hold_weight > 1.0
+            ):
+                raise ValueError(
+                    f"target activity override for {side} has invalid hold_weight"
+                )
+            tracker_intent = command.metadata.get("tracker_motion_intent")
+            if isinstance(tracker_intent, Mapping):
+                # The modifier owns activity/hold authority, but the tracker
+                # remains the source of per-frame motion-window quality used
+                # by the frozen V2 output-smoothing profile.  Dropping these
+                # fields silently forces Balanced from its ordinary 0.55 path
+                # back to the legacy 0.14 endpoint while force is active.
+                for key in ("evidence", "motion_window"):
+                    value = tracker_intent.get(key)
+                    if key not in override and isinstance(value, Mapping):
+                        override[key] = dict(value)
+            command.metadata["pose_action_motion_intent"] = override
 
     def _target_pose_world(
         self,
@@ -3521,6 +3690,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             self._last_solve_iteration_stop_reason = "max_iterations"
         if profile is not None:
             profile["solve_step_mode"] = str(self.config.solve_step_mode)
+            profile["solve_iteration_mode"] = (
+                "single_physical_step"
+                if single_step
+                else "adaptive_budget"
+                if adaptive
+                else "fixed_max"
+            )
             profile["solve_iteration_effective_max"] = int(max_iterations)
             profile["solve_iteration_effective_min"] = int(min_iterations)
             profile["solve_iteration_budget_exhausted"] = bool(
@@ -3549,51 +3725,26 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         left_qpos: np.ndarray,
         right_qpos: np.ndarray,
     ) -> np.ndarray:
-        full_q = np.asarray(current_full_q, dtype=float).copy()
-        if self.profile.solution_layout == "dual_arm_hand" and full_q.shape[0] >= 24:
-            full_q[0:6] = left_qpos
-            full_q[18:24] = right_qpos
-            return full_q
-        if full_q.shape[0] == 14:
-            full_q[1:7] = left_qpos
-            full_q[8:14] = right_qpos
-            return full_q
-        if full_q.shape[0] == 12:
-            full_q[0:6] = left_qpos
-            full_q[6:12] = right_qpos
-            return full_q
-        raise ValueError(
-            f"{self.name} cannot embed arm qpos into solver configuration shape {full_q.shape}."
+        return embed_arm_qpos(
+            solution_layout=self.profile.solution_layout,
+            current_full_q=current_full_q,
+            left_qpos=left_qpos,
+            right_qpos=right_qpos,
+            owner_name=self.name,
         )
 
     def _split_solution(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        qpos = np.asarray(qpos, dtype=float)
-        if self.profile.solution_layout == "dual_arm_hand" and qpos.shape[0] >= 24:
-            return qpos[0:6].copy(), qpos[18:24].copy()
-        if qpos.shape[0] == 14:
-            return qpos[1:7].copy(), qpos[8:14].copy()
-        if qpos.shape[0] == 12:
-            return qpos[0:6].copy(), qpos[6:12].copy()
-        raise ValueError(f"{self.name} received unsupported solver output shape: {qpos.shape}")
+        return split_arm_solution(
+            solution_layout=self.profile.solution_layout,
+            qpos=qpos,
+            owner_name=self.name,
+        )
 
     def _arm_joint_indices(self, vector_size: int) -> dict[str, np.ndarray]:
-        if self.profile.solution_layout == "dual_arm_hand" and vector_size >= 24:
-            return {
-                "left": np.arange(0, 6, dtype=int),
-                "right": np.arange(18, 24, dtype=int),
-            }
-        if vector_size == 14:
-            return {
-                "left": np.arange(1, 7, dtype=int),
-                "right": np.arange(8, 14, dtype=int),
-            }
-        if vector_size == 12:
-            return {
-                "left": np.arange(0, 6, dtype=int),
-                "right": np.arange(6, 12, dtype=int),
-            }
-        raise ValueError(
-            f"{self.name} cannot resolve arm joint indices for vector size {vector_size}."
+        return arm_joint_indices(
+            solution_layout=self.profile.solution_layout,
+            vector_size=vector_size,
+            owner_name=self.name,
         )
 
     def _make_full_joint_acceleration_limit(
@@ -3933,8 +4084,24 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "left": np.asarray(left_qpos, dtype=float).reshape(6),
             "right": np.asarray(right_qpos, dtype=float).reshape(6),
         }
+        previous_admitted_step_by_side = dict(
+            zip(
+                ("left", "right"),
+                self._split_solution(
+                    np.asarray(
+                        self._last_admitted_velocity_full,
+                        dtype=float,
+                    )
+                    * float(self._execution_dt_sec)
+                ),
+            )
+        )
+        admittance_micro_reversal_hold_deg = float(
+            self.config.output_qpos_admittance_micro_reversal_hold_deg
+        )
         singularity_boost_by_side: dict[str, dict[str, object]] = {}
         normal_fast_path_by_side: dict[str, dict[str, object]] = {}
+        admittance_fast_path_by_side: dict[str, dict[str, object]] = {}
         wrist_metadata_sides = self._last_wrist_coaxial_metadata.get("sides", {})
         wrist_metadata_sides = (
             wrist_metadata_sides if isinstance(wrist_metadata_sides, Mapping) else {}
@@ -4057,6 +4224,112 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "alpha_before": before_alpha,
                 "alpha_after": float(alpha_by_side[side]),
             }
+            side_activity = (
+                target_activity.get(side)
+                if isinstance(target_activity, Mapping)
+                else None
+            )
+            side_activity = (
+                side_activity if isinstance(side_activity, Mapping) else {}
+            )
+            modifier_active = bool(
+                str(side_activity.get("source", ""))
+                == "position_admittance_active_modifier"
+                and not bool(side_activity.get("inactive", False))
+                and bool(side_activity.get("modifier_active", True))
+            )
+            rotational_modifier = bool(
+                side_activity.get("modifier_rotation_offset_norm_rad") is not None
+            )
+            # The modifier owns its own offset/slew/stale admission and may be
+            # active while the operator's tracker is intentionally still, so
+            # tracker-speed quality is not an eligibility input here.  Keep
+            # every hard solver guard: tracking admission, ordinary joint
+            # region, inactive null projection, and a clear q5 latch.
+            admittance_fast_eligible = bool(
+                self.config.output_qpos_admittance_fast_path_enabled
+                and modifier_active
+                and singularity_mode_enabled
+                and str(admission_status) == "tracking"
+                and outside_normal_guard
+                and null_projection_inactive
+                and q5_hysteresis_latch_clear
+            )
+            alpha_before_admittance = float(alpha_by_side[side])
+            requested_admittance_alpha = float(
+                self.config.output_qpos_admittance_fast_path_alpha
+            )
+            if (
+                self.config.output_qpos_admittance_fast_path_enabled
+                and modifier_active
+            ):
+                requested_activity_alpha = side_activity.get(
+                    "modifier_qpos_fast_path_alpha"
+                )
+                requested_admittance_alpha = float(
+                    self.config.output_qpos_admittance_fast_path_alpha
+                    if requested_activity_alpha is None
+                    else requested_activity_alpha
+                )
+                if (
+                    not np.isfinite(requested_admittance_alpha)
+                    or requested_admittance_alpha
+                    < float(self.config.output_qpos_smoothing_alpha)
+                    or requested_admittance_alpha
+                    > float(self.config.output_qpos_admittance_fast_path_alpha)
+                    + 1e-12
+                ):
+                    raise ValueError(
+                        "position admittance requested qpos alpha is outside the "
+                        "configured slow-to-fast envelope"
+                    )
+            if admittance_fast_eligible:
+                alpha_by_side[side] = (
+                    requested_admittance_alpha
+                    if rotational_modifier
+                    else max(
+                        alpha_before_admittance,
+                        requested_admittance_alpha,
+                    )
+                )
+                self._output_qpos_smoothing_effective_alpha[side] = float(
+                    alpha_by_side[side]
+                )
+                self._output_qpos_smoothing_update_time[side] = normal_fast_now
+            else:
+                self._reset_output_qpos_admittance_reversal_state(side)
+            admittance_fast_path_by_side[side] = {
+                "enabled": bool(
+                    self.config.output_qpos_admittance_fast_path_enabled
+                ),
+                "eligible": admittance_fast_eligible,
+                "modifier_active": modifier_active,
+                "rotational_modifier": rotational_modifier,
+                "modifier_phase": side_activity.get("modifier_phase"),
+                "requested_alpha": requested_admittance_alpha,
+                "configured_alpha_cap": float(
+                    self.config.output_qpos_admittance_fast_path_alpha
+                ),
+                "tracker_quality_required": False,
+                "micro_reversal_hold_enabled": bool(
+                    admittance_fast_eligible
+                    and admittance_micro_reversal_hold_deg > 0.0
+                ),
+                "micro_reversal_hold_threshold_deg": (
+                    admittance_micro_reversal_hold_deg
+                ),
+                "micro_reversal_held_joint_indices": [],
+                "micro_reversal_pending_joint_indices": [],
+                "hard_solver_guards_satisfied": bool(
+                    singularity_mode_enabled
+                    and str(admission_status) == "tracking"
+                    and outside_normal_guard
+                    and null_projection_inactive
+                    and q5_hysteresis_latch_clear
+                ),
+                "alpha_before": alpha_before_admittance,
+                "alpha_after": float(alpha_by_side[side]),
+            }
             boosted = bool(singularity_mode_enabled and near_band and before_alpha < singularity_alpha)
             if boosted:
                 alpha_by_side[side] = singularity_alpha
@@ -4077,7 +4350,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "alpha_target": singularity_alpha,
             }
         enabled_by_side = {
-            side: bool(self.config.output_command_type == "joint_vector" and alpha < 1.0)
+            side: bool(
+                self.config.output_command_type == "joint_vector"
+                and (
+                    alpha < 1.0
+                    or (
+                        bool(admittance_fast_path_by_side[side]["eligible"])
+                        and admittance_micro_reversal_hold_deg > 0.0
+                    )
+                )
+            )
             for side, alpha in alpha_by_side.items()
         }
         enabled = any(enabled_by_side.values())
@@ -4087,9 +4369,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         metadata["singularity_band_threshold_deg"] = singularity_band_threshold_deg
         metadata["singularity_smoothing"] = singularity_boost_by_side
         metadata["normal_fast_path"] = normal_fast_path_by_side
+        metadata["admittance_fast_path"] = admittance_fast_path_by_side
         if self.config.output_command_type != "joint_vector":
             metadata["reason"] = "non_joint_vector_output"
             self._last_output_qpos_smoothing_full_q = None
+            self._reset_output_qpos_admittance_reversal_state()
             return raw_full_q.copy(), left_qpos.copy(), right_qpos.copy(), metadata
         if not enabled:
             metadata["reason"] = "alpha_one"
@@ -4099,12 +4383,58 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             metadata["initialized"] = bool(smoothing_state_missing)
             previous = np.asarray(previous, dtype=float).reshape(raw_full_q.shape)
             previous_left, previous_right = self._split_solution(previous)
-            smoothed_left = previous_left + alpha_by_side["left"] * (
-                np.asarray(left_qpos, dtype=float).reshape(6) - previous_left
-            )
-            smoothed_right = previous_right + alpha_by_side["right"] * (
-                np.asarray(right_qpos, dtype=float).reshape(6) - previous_right
-            )
+            smoothed_by_side: dict[str, np.ndarray] = {}
+            for side, raw_qpos, previous_qpos in (
+                ("left", left_qpos, previous_left),
+                ("right", right_qpos, previous_right),
+            ):
+                proposed_step = float(alpha_by_side[side]) * (
+                    np.asarray(raw_qpos, dtype=float).reshape(6) - previous_qpos
+                )
+                held_joint_indices: list[int] = []
+                pending = self._output_qpos_admittance_pending_reversal_direction[
+                    side
+                ]
+                if bool(admittance_fast_path_by_side[side]["eligible"]):
+                    threshold_rad = float(
+                        np.deg2rad(admittance_micro_reversal_hold_deg)
+                    )
+                    previous_step = np.asarray(
+                        previous_admitted_step_by_side[side],
+                        dtype=float,
+                    ).reshape(6)
+                    for joint_index in range(6):
+                        proposed = float(proposed_step[joint_index])
+                        proposed_direction = float(np.sign(proposed))
+                        pending_direction = float(pending[joint_index])
+                        if pending_direction != 0.0:
+                            # One repeated sample confirms a real direction
+                            # change.  A return to the prior direction clears
+                            # the pending reversal without ever emitting it.
+                            pending[joint_index] = 0.0
+                            continue
+                        previous_value = float(previous_step[joint_index])
+                        if (
+                            threshold_rad > 0.0
+                            and proposed_direction != 0.0
+                            and previous_value * proposed < 0.0
+                            and min(abs(previous_value), abs(proposed))
+                            <= threshold_rad + 1e-12
+                        ):
+                            proposed_step[joint_index] = 0.0
+                            pending[joint_index] = proposed_direction
+                            held_joint_indices.append(joint_index)
+                else:
+                    pending.fill(0.0)
+                smoothed_by_side[side] = previous_qpos + proposed_step
+                admittance_fast_path_by_side[side][
+                    "micro_reversal_held_joint_indices"
+                ] = held_joint_indices
+                admittance_fast_path_by_side[side][
+                    "micro_reversal_pending_joint_indices"
+                ] = np.flatnonzero(pending).astype(int).tolist()
+            smoothed_left = smoothed_by_side["left"]
+            smoothed_right = smoothed_by_side["right"]
             smoothed_full_q = self._embed_arm_qpos(
                 current_full_q=raw_full_q,
                 left_qpos=smoothed_left,
@@ -4150,6 +4480,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "alpha": alpha_by_side[side],
                 "adaptive": dict(alpha_metadata.get(side, {})),
                 "singularity_smoothing": dict(singularity_boost_by_side[side]),
+                "admittance_fast_path": dict(
+                    admittance_fast_path_by_side[side]
+                ),
                 "stage": "post_ik_pre_action_fk",
                 "raw_target_joint_deg": np.rad2deg(raw_q).astype(float).tolist(),
                 "output_target_joint_deg": np.rad2deg(out_q).astype(float).tolist(),
@@ -6587,6 +6920,57 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 reference_min_distance,
                 boundary_metadata,
             )
+        wrist_q5_boundary_hold_candidate = (
+            None
+            if base_selection is None
+            else self._wrist_q5_entry_boundary_hold_candidate(
+                ordinary_q=base_selection[0],
+                reference_full_q=reference_full,
+                target_activity=target_activity_metadata,
+            )
+        )
+        if wrist_q5_boundary_hold_candidate is not None:
+            # V2's latch-required wrist policy must not convert the first
+            # inward step at the SDK q5 boundary into a full-size synthetic
+            # escape step.  Preserve the already admitted q5 and continue
+            # with the ordinary motion on every other joint.  Returning here
+            # also avoids launching the expensive singularity candidate
+            # expansion for a boundary that was handled directionally.
+            evaluated.clear()
+            collision_safe_evaluated.clear()
+            evaluate_stage(
+                stage="wrist_q5_entry_boundary_hold",
+                candidates=[wrist_q5_boundary_hold_candidate],
+                scales=(1.0,),
+            )
+            wrist_boundary_metadata = selection_metadata(
+                candidates=[wrist_q5_boundary_hold_candidate]
+            )
+            wrist_boundary_selection = choose_from_evaluated(
+                metadata=wrist_boundary_metadata
+            )
+            if wrist_boundary_selection is not None:
+                wrist_boundary_selection[4]["candidate_eval_mode"] = (
+                    "wrist_q5_entry_boundary_hold"
+                )
+                return wrist_boundary_selection
+            wrist_boundary_metadata.update(
+                {
+                    "status": "hold_reference",
+                    "selected": "wrist_q5_entry_boundary_hold_reference",
+                    "selected_source": "wrist_q5_boundary_hold",
+                    "reason": "projected_wrist_boundary_candidate_not_admissible",
+                    "candidate_eval_mode": "wrist_q5_entry_boundary_hold",
+                    "collision_distance_m": reference_min_distance,
+                }
+            )
+            return (
+                reference_full.copy(),
+                "wrist_q5_entry_boundary_hold_reference",
+                0.0,
+                reference_min_distance,
+                wrist_boundary_metadata,
+            )
         limit_escape_pending = bool(limit_escape_active)
         if not limit_escape_pending and limit_escape_required_directions:
             if base_selection is None:
@@ -8639,6 +9023,105 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             },
         )
 
+    def _wrist_q5_entry_boundary_hold_candidate(
+        self,
+        *,
+        ordinary_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        target_activity: Mapping[str, object] | None = None,
+    ) -> _DualArmCandidate | None:
+        """Project only a first inward q5 boundary crossing to zero motion.
+
+        This behavior is intentionally limited to the V2 latch-required
+        wrist policy.  V1 keeps its historical escape behavior as the atomic
+        rollback.  Once the admitted q5 is already inside the boundary, the
+        existing bounded escape remains available; this helper only prevents
+        a safe outside reference from being replaced by a synthetic 4-degree
+        outward pulse when the ordinary solution first requests the coaxial
+        pocket.  Outward motion is never held.
+        """
+
+        enabled = bool(
+            self.config.solve_step_mode
+            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
+            and self.config.wrist_coaxial_continuity_enabled
+            and self.config.wrist_q5_hysteresis_requires_escape_latch
+        )
+        if not enabled:
+            return None
+        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        projected = np.asarray(ordinary_q, dtype=float).reshape(
+            reference.shape
+        ).copy()
+        threshold_deg = max(
+            float(self.config.wrist_singularity_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+            float(self.config.wrist_coaxial_hard_threshold_deg)
+            + float(self.config.wrist_q5_escape_margin_deg),
+        )
+        threshold_rad = float(np.deg2rad(threshold_deg))
+        step_by_side: dict[str, float] = {"left": 0.0, "right": 0.0}
+        if self._full_execution_joint_step is not None:
+            left_step, right_step = self._split_solution(
+                np.asarray(self._full_execution_joint_step, dtype=float)
+            )
+            step_by_side = {
+                "left": abs(float(left_step[4])),
+                "right": abs(float(right_step[4])),
+            }
+        fixed_sides = self._authority_fixed_sides(target_activity)
+        held: dict[str, dict[str, float | str]] = {}
+        for side, _local_index, full_index in self._arm_joint_entries(reference):
+            if side in fixed_sides or int(_local_index) != 4:
+                continue
+            reference_q5 = float(reference[full_index])
+            candidate_q5 = float(projected[full_index])
+            if not np.isfinite(reference_q5) or not np.isfinite(candidate_q5):
+                continue
+            # If the reference is already inside the protected boundary, an
+            # outward escape is still required and the established path owns
+            # that recovery.  This entry guard must never trap an unsafe
+            # startup state in place.
+            if abs(reference_q5) < threshold_rad - 1e-12:
+                continue
+            same_side = bool(reference_q5 * candidate_q5 > 0.0)
+            inward = bool(
+                (same_side and abs(candidate_q5) < abs(reference_q5) - 1e-12)
+                or reference_q5 * candidate_q5 <= 0.0
+            )
+            crossing = bool(reference_q5 * candidate_q5 <= 0.0)
+            crossing_near_boundary = bool(
+                crossing
+                and abs(reference_q5)
+                <= threshold_rad + float(step_by_side.get(side, 0.0)) + 1e-12
+            )
+            enters_boundary = bool(
+                abs(candidate_q5) < threshold_rad or crossing_near_boundary
+            )
+            if not inward or not enters_boundary:
+                continue
+            projected[full_index] = reference_q5
+            held[side] = {
+                "joint": "j5",
+                "reference_q5_deg": float(np.rad2deg(reference_q5)),
+                "ordinary_q5_deg": float(np.rad2deg(candidate_q5)),
+                "threshold_deg": float(threshold_deg),
+                "reason": "inward_entry_or_near_crossing",
+            }
+        if not held:
+            return None
+        return _DualArmCandidate(
+            name="wrist_q5_entry_boundary_hold",
+            qpos=projected,
+            source="wrist_q5_boundary_hold",
+            method="project_inward_wrist_q5_entry",
+            metadata={
+                "wrist_q5_boundary_hold_candidate": True,
+                "held_sides": held,
+                "escape_threshold_deg": float(threshold_deg),
+            },
+        )
+
     def _joint_limit_escape_latch_metadata(
         self,
         latches: Mapping[tuple[str, int], int],
@@ -9423,8 +9906,15 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             )
             return False, output_q, metadata
         limit_escape_candidate = bool(candidate.metadata.get("local_step_limit_escape_candidate", False))
-        boundary_hold_candidate = bool(
+        joint_limit_boundary_hold_candidate = bool(
             candidate.metadata.get("joint_limit_boundary_hold_candidate", False)
+        )
+        wrist_q5_boundary_hold_candidate = bool(
+            candidate.metadata.get("wrist_q5_boundary_hold_candidate", False)
+        )
+        boundary_hold_candidate = bool(
+            joint_limit_boundary_hold_candidate
+            or wrist_q5_boundary_hold_candidate
         )
         singularity_escape_candidate = bool(
             candidate.metadata.get("local_step_singularity_escape_candidate", False)
@@ -9707,15 +10197,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         elif boundary_hold_candidate and bounded_worsening:
             # The boundary candidate is derived from an ordinary candidate
             # that already passed the normal local-step gate, with only the
-            # inward component of a hard-limit joint projected back to the
-            # admitted reference.  Requiring fresh positive Cartesian
+            # inward component of a hard-limit joint or the protected wrist
+            # q5 entry projected back to the admitted reference.  Requiring
+            # fresh positive Cartesian
             # progress after that projection can turn a one-joint boundary
             # stop into an unnecessary bimanual hold when the requested pose
             # itself lies beyond the reachable boundary.  Preserve the other
             # admitted components only while they remain inside the ordinary
             # (not escape-relaxed) bounded-worsening contract; collision and
             # final joint admission are still rechecked by the caller.
-            progress_accept_reason = "joint_limit_boundary_hold_bounded_worsening"
+            progress_accept_reason = (
+                "wrist_q5_boundary_hold_bounded_worsening"
+                if wrist_q5_boundary_hold_candidate
+                else "joint_limit_boundary_hold_bounded_worsening"
+            )
         elif (
             limit_escape_candidate
             and bool(getattr(safety_profile, "local_step_limit_escape_accept_bounded_worse", True))
@@ -9764,6 +10259,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                     "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
                     "dual_boundary_hold_candidate": bool(boundary_hold_candidate),
+                    "dual_joint_limit_boundary_hold_candidate": bool(
+                        joint_limit_boundary_hold_candidate
+                    ),
+                    "dual_wrist_q5_boundary_hold_candidate": bool(
+                        wrist_q5_boundary_hold_candidate
+                    ),
                     "dual_boundary_hold_bounded_worsening": bool(
                         boundary_hold_candidate and bounded_worsening
                     ),
@@ -9836,6 +10337,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
                 "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
                 "dual_boundary_hold_candidate": bool(boundary_hold_candidate),
+                "dual_joint_limit_boundary_hold_candidate": bool(
+                    joint_limit_boundary_hold_candidate
+                ),
+                "dual_wrist_q5_boundary_hold_candidate": bool(
+                    wrist_q5_boundary_hold_candidate
+                ),
                 "dual_boundary_hold_bounded_worsening": bool(
                     boundary_hold_candidate and bounded_worsening
                 ),
@@ -9884,7 +10391,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "dual_worsen_limits": dict(worsen_limits),
                 "within_pose_tolerance": bool(within_tolerance),
                 "dual_recovery_state": (
-                    "joint_limit_boundary_hold"
+                    "wrist_q5_boundary_hold"
+                    if progress_accept_reason.startswith("wrist_q5_boundary_hold")
+                    else "joint_limit_boundary_hold"
                     if progress_accept_reason.startswith("joint_limit_boundary_hold")
                     else (
                         "joint_limit_escape"
@@ -10145,6 +10654,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     0.0,
                     min(1.0, float(motion_intent.get("hold_weight", 0.0) or 0.0)),
                 )
+                modifier_rotation_offset = motion_intent.get(
+                    "modifier_rotation_offset_norm_rad"
+                )
                 metadata[side] = {
                     "source": str(
                         motion_intent.get(
@@ -10169,6 +10681,23 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "transition_reason": motion_intent.get("transition_reason"),
                     "evidence": motion_intent.get("evidence"),
                     "motion_window": motion_intent.get("motion_window"),
+                    "modifier_active": bool(
+                        motion_intent.get("modifier_active", False)
+                    ),
+                    "modifier_offset_norm_m": motion_intent.get(
+                        "modifier_offset_norm_m"
+                    ),
+                    "modifier_rotation_offset_norm_rad": modifier_rotation_offset,
+                    "modifier_qpos_fast_path_alpha": (
+                        motion_intent.get("modifier_qpos_fast_path_alpha")
+                        if modifier_rotation_offset is not None
+                        else None
+                    ),
+                    "modifier_phase": (
+                        motion_intent.get("modifier_phase")
+                        if modifier_rotation_offset is not None
+                        else None
+                    ),
                 }
                 continue
             previous_target = self._last_target_poses.get(side)
@@ -10478,22 +11007,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
 
     def _arm_joint_entries(self, qpos: np.ndarray) -> tuple[tuple[str, int, int], ...]:
         q = np.asarray(qpos, dtype=float).reshape(-1)
-        if self.profile.solution_layout == "dual_arm_hand" and q.shape[0] >= 24:
-            return tuple(
-                [("left", index, index) for index in range(6)]
-                + [("right", index, 18 + index) for index in range(6)]
-            )
-        if q.shape[0] == 14:
-            return tuple(
-                [("left", index, 1 + index) for index in range(6)]
-                + [("right", index, 8 + index) for index in range(6)]
-            )
-        if q.shape[0] == 12:
-            return tuple(
-                [("left", index, index) for index in range(6)]
-                + [("right", index, 6 + index) for index in range(6)]
-            )
-        raise ValueError(f"{self.name} cannot map arm joint entries for solver shape {q.shape}.")
+        return arm_joint_entries(
+            solution_layout=self.profile.solution_layout,
+            vector_size=q.size,
+            owner_name=self.name,
+        )
 
     def _evaluate_jump_gate(
         self,

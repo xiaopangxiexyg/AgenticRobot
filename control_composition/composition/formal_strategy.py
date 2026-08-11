@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action.component_action import ComponentAction
 from robot_motion.runtime.immutable import deep_freeze
 
 from control_composition.information import CompositionInformationPlan
+from control_composition.residual_anchor_lifecycle import (
+    ResidualAnchorLifecycleSnapshot,
+)
 
 from .context import CompositionContextSnapshot
 from .core import (
@@ -35,11 +38,20 @@ from .core import (
 FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V2 = (
     "dexteleop.formal_composition_strategy_spec.v2"
 )
+FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V3 = (
+    "dexteleop.formal_composition_strategy_spec.v3"
+)
+FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V4 = (
+    "dexteleop.formal_composition_strategy_spec.v4"
+)
 FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V2 = (
     "dexteleop.formal_composition_strategy_input.v2"
 )
 FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V3 = (
     "dexteleop.formal_composition_strategy_input.v3"
+)
+FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V4 = (
+    "dexteleop.formal_composition_strategy_input.v4"
 )
 FORMAL_COMPOSITION_STRATEGY_RESULT_BINDING_HASH_DOMAIN_V2 = (
     "dexteleop.formal_composition_strategy_result_binding.v2"
@@ -69,6 +81,8 @@ class FormalCompositionStrategySpec:
     strategy_version: str
     composition_spec_hash: str
     required_context_channels: tuple[str, ...] = ()
+    optional_context_channels: tuple[str, ...] = ()
+    required_residual_anchor_lifecycle_spec_hash: str | None = None
     implementation_contract_hashes: tuple[str, ...] = ()
     parameter_payload: Mapping[str, Any] = field(default_factory=dict)
     maximum_decision_latency_sec: float | None = None
@@ -90,6 +104,14 @@ class FormalCompositionStrategySpec:
         )
         if len(channels) != len(set(channels)):
             raise ValueError("required_context_channels must be unique.")
+        optional_channels = tuple(
+            _required(value, name="optional_context_channel")
+            for value in self.optional_context_channels
+        )
+        if len(optional_channels) != len(set(optional_channels)):
+            raise ValueError("optional_context_channels must be unique.")
+        if set(channels) & set(optional_channels):
+            raise ValueError("Required and optional context channels must be disjoint.")
         implementation_contract_hashes = tuple(
             _required(value, name="implementation_contract_hash")
             for value in self.implementation_contract_hashes
@@ -106,6 +128,12 @@ class FormalCompositionStrategySpec:
                 raise ValueError(
                     "maximum_decision_latency_sec must be finite and positive."
                 )
+        lifecycle_spec_hash = self.required_residual_anchor_lifecycle_spec_hash
+        if lifecycle_spec_hash is not None:
+            lifecycle_spec_hash = _required(
+                lifecycle_spec_hash,
+                name="required_residual_anchor_lifecycle_spec_hash",
+            )
         payload = {
             "strategy_id": strategy_id,
             "strategy_version": strategy_version,
@@ -115,6 +143,15 @@ class FormalCompositionStrategySpec:
             "parameter_payload": parameters,
             "maximum_decision_latency_sec": maximum_latency,
         }
+        hash_domain = FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V2
+        if lifecycle_spec_hash is not None:
+            payload["required_residual_anchor_lifecycle_spec_hash"] = (
+                lifecycle_spec_hash
+            )
+            hash_domain = FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V3
+        if optional_channels:
+            payload["optional_context_channels"] = optional_channels
+            hash_domain = FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V4
         if implementation_contract_hashes:
             payload["implementation_contract_hashes"] = (
                 implementation_contract_hashes
@@ -127,6 +164,12 @@ class FormalCompositionStrategySpec:
             composition_spec_hash,
         )
         object.__setattr__(self, "required_context_channels", channels)
+        object.__setattr__(self, "optional_context_channels", optional_channels)
+        object.__setattr__(
+            self,
+            "required_residual_anchor_lifecycle_spec_hash",
+            lifecycle_spec_hash,
+        )
         object.__setattr__(
             self,
             "implementation_contract_hashes",
@@ -143,9 +186,13 @@ class FormalCompositionStrategySpec:
             "semantic_content_hash",
             canonical_content_hash(
                 payload,
-                domain=FORMAL_COMPOSITION_STRATEGY_SPEC_HASH_DOMAIN_V2,
+                domain=hash_domain,
             ),
         )
+
+    @property
+    def context_channels(self) -> tuple[str, ...]:
+        return self.required_context_channels + self.optional_context_channels
 
 
 @dataclass(frozen=True)
@@ -160,6 +207,9 @@ class FormalCompositionStrategyInput:
     input_snapshot: CompositionInputSnapshot
     context_snapshot: CompositionContextSnapshot | None
     information_plan: CompositionInformationPlan | None
+    residual_anchor_lifecycle_snapshot: (
+        ResidualAnchorLifecycleSnapshot | None
+    ) = None
     strategy_control_binding_id: str | None = None
     strategy_control_binding_hash: str | None = None
     semantic_content_hash: str = field(init=False)
@@ -199,7 +249,7 @@ class FormalCompositionStrategyInput:
             )
         if self.input_snapshot.control_domain_id != control_domain_id:
             raise ValueError("Formal strategy input belongs to another domain.")
-        channels = self.strategy_spec.required_context_channels
+        channels = self.strategy_spec.context_channels
         context_snapshot_id: str | None = None
         context_snapshot_hash: str | None = None
         if channels:
@@ -207,7 +257,11 @@ class FormalCompositionStrategyInput:
                 raise ValueError(
                     "Formal strategy context requires a CompositionInformationPlan."
                 )
-            if self.information_plan.required_context_channels != channels:
+            if (
+                self.information_plan.context_channels != channels
+                or self.information_plan.required_context_channels
+                != self.strategy_spec.required_context_channels
+            ):
                 raise ValueError(
                     "Formal strategy channels do not match the information plan."
                 )
@@ -245,6 +299,39 @@ class FormalCompositionStrategyInput:
             if self.information_plan is None
             else self.information_plan.semantic_content_hash
         )
+        lifecycle_snapshot = self.residual_anchor_lifecycle_snapshot
+        required_lifecycle_hash = (
+            self.strategy_spec.required_residual_anchor_lifecycle_spec_hash
+        )
+        lifecycle_snapshot_id = None
+        lifecycle_snapshot_hash = None
+        if required_lifecycle_hash is not None:
+            if not isinstance(
+                lifecycle_snapshot,
+                ResidualAnchorLifecycleSnapshot,
+            ):
+                raise ValueError(
+                    "Formal strategy requires residual anchor lifecycle input."
+                )
+            if (
+                lifecycle_snapshot.lifecycle_spec_hash
+                != required_lifecycle_hash
+                or lifecycle_snapshot.control_domain_id != control_domain_id
+                or lifecycle_snapshot.cutoff_at != self.input_snapshot.cutoff_at
+                or lifecycle_snapshot.cutoff_admission_sequence
+                != self.input_snapshot.cutoff_admission_sequence
+                or lifecycle_snapshot.target_effective_at
+                != self.input_snapshot.target_effective_at
+            ):
+                raise ValueError(
+                    "Residual anchor lifecycle snapshot must share the formal cut."
+                )
+            lifecycle_snapshot_id = lifecycle_snapshot.lifecycle_snapshot_id
+            lifecycle_snapshot_hash = lifecycle_snapshot.semantic_content_hash
+        elif lifecycle_snapshot is not None:
+            raise ValueError(
+                "Formal strategy did not declare residual anchor lifecycle input."
+            )
         payload = {
             "runtime_session_id": runtime_session_id,
             "control_domain_id": control_domain_id,
@@ -262,6 +349,13 @@ class FormalCompositionStrategyInput:
             "context_snapshot_hash": context_snapshot_hash,
             "information_plan_hash": information_plan_hash,
         }
+        if lifecycle_snapshot_id is not None:
+            payload["residual_anchor_lifecycle_snapshot_id"] = (
+                lifecycle_snapshot_id
+            )
+            payload["residual_anchor_lifecycle_snapshot_hash"] = (
+                lifecycle_snapshot_hash
+            )
         binding_id = self.strategy_control_binding_id
         binding_hash = self.strategy_control_binding_hash
         if (binding_id is None) != (binding_hash is None):
@@ -281,6 +375,8 @@ class FormalCompositionStrategyInput:
             payload["strategy_control_binding_id"] = binding_id
             payload["strategy_control_binding_hash"] = binding_hash
             hash_domain = FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V3
+        if lifecycle_snapshot_id is not None:
+            hash_domain = FORMAL_COMPOSITION_STRATEGY_INPUT_HASH_DOMAIN_V4
         object.__setattr__(
             self,
             "strategy_control_binding_id",
@@ -320,6 +416,7 @@ class CompositionStrategyDecision:
     reason: str
     composed_candidate: ComponentAction | None
     used_context_ids: tuple[str, ...] = ()
+    result_data: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         status = _required(self.output_status, name="output_status")
@@ -341,10 +438,12 @@ class CompositionStrategyDecision:
         )
         if len(used_context_ids) != len(set(used_context_ids)):
             raise ValueError("used_context_ids must be unique.")
+        result_data = deep_freeze(dict(self.result_data))
         object.__setattr__(self, "output_status", status)
         object.__setattr__(self, "reason", reason)
         object.__setattr__(self, "composed_candidate", action)
         object.__setattr__(self, "used_context_ids", used_context_ids)
+        object.__setattr__(self, "result_data", result_data)
 
 
 class FormalCompositionStrategy(Protocol):
@@ -357,6 +456,21 @@ class FormalCompositionStrategy(Protocol):
     ) -> CompositionStrategyDecision: ...
 
 
+@runtime_checkable
+class FormalCompositionPublicationTransaction(Protocol):
+    """Optional two-phase state commit tied to exact proposal admission."""
+
+    def validate_publication_transaction(
+        self,
+        evaluation: CompositionEvaluation,
+    ) -> None: ...
+
+    def commit_publication_transaction(
+        self,
+        evaluation: CompositionEvaluation,
+    ) -> None: ...
+
+
 class DeterministicCompositionStrategyV2:
     """Migration adapter that reproduces deterministic-v1 numerical behavior."""
 
@@ -365,7 +479,7 @@ class DeterministicCompositionStrategyV2:
             raise TypeError(
                 "spec must be a FormalCompositionStrategySpec."
             )
-        if spec.required_context_channels:
+        if spec.context_channels:
             raise ValueError(
                 "The deterministic migration strategy does not consume context."
             )
@@ -522,6 +636,8 @@ def build_formal_strategy_composition_evaluation(
         "strategy_used_context_ids": decision.used_context_ids,
         "composition_supported_until": supported_until,
     }
+    if decision.result_data:
+        payload["strategy_result_data"] = decision.result_data
     evaluation_hash_domain = COMPOSITION_EVALUATION_HASH_DOMAIN_V7
     if strategy_input.strategy_control_binding_id is not None:
         payload["strategy_control_binding_id"] = (
@@ -623,6 +739,7 @@ __all__ = [
     "CompositionStrategyDecision",
     "DeterministicCompositionStrategyV2",
     "FormalCompositionStrategy",
+    "FormalCompositionPublicationTransaction",
     "FormalCompositionStrategyInput",
     "FormalCompositionStrategyResultBinding",
     "FormalCompositionStrategySpec",

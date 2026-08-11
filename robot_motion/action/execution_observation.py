@@ -133,6 +133,9 @@ class ExecutionObservationPlan:
     maximum_reference_publish_hz: float | None = None
     maximum_measurement_publish_hz: float | None = None
     include_debug_lineage: bool = False
+    required_representation_by_component: Mapping[str, str] = field(
+        default_factory=dict
+    )
     semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -203,6 +206,26 @@ class ExecutionObservationPlan:
             raise ValueError(
                 "Frame observations require at least one component_id."
             )
+        required_representations = {
+            _required(component_id, name="required representation component_id"):
+            _required(
+                representation,
+                name=(
+                    "required_representation_by_component"
+                    f"[{component_id!r}]"
+                ),
+            )
+            for component_id, representation in dict(
+                self.required_representation_by_component
+            ).items()
+        }
+        if required_representations and set(required_representations) != set(
+            component_ids
+        ):
+            raise ValueError(
+                "required_representation_by_component must cover exactly the "
+                "selected component_ids when supplied."
+            )
         payload = {
             "plan_id": plan_id,
             "reference_mode": mode,
@@ -212,8 +235,23 @@ class ExecutionObservationPlan:
             "maximum_measurement_publish_hz": maximum_measurement_hz,
             "include_debug_lineage": bool(self.include_debug_lineage),
         }
+        frozen_required_representations = deep_freeze(
+            required_representations
+        )
+        # Keep the historical plan hash byte-for-byte when no representation
+        # requirement is supplied.  The new requirement is additive and only
+        # enters identity for callers that explicitly opt in.
+        if required_representations:
+            payload["required_representation_by_component"] = (
+                frozen_required_representations
+            )
         for name, value in payload.items():
             object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "required_representation_by_component",
+            frozen_required_representations,
+        )
         object.__setattr__(
             self,
             "semantic_content_hash",
@@ -445,6 +483,21 @@ def bind_execution_observation_plan(
         raise ValueError(
             "Target observation capability does not cover components: "
             f"{unknown_components!r}."
+        )
+    representation_mismatches = {
+        component_id: {
+            "required": required,
+            "provided": capability.representation_by_component[component_id],
+        }
+        for component_id, required in (
+            plan.required_representation_by_component.items()
+        )
+        if capability.representation_by_component[component_id] != required
+    }
+    if representation_mismatches:
+        raise ValueError(
+            "Target observation capability does not provide the requested "
+            f"component representations: {representation_mismatches!r}."
         )
     return ExecutionObservationBinding(
         plan_id=plan.plan_id,

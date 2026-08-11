@@ -10,7 +10,7 @@
       "semantic_type": "ACQUIRE_OBJECT",
       "display_name": "右手拿取毛笔",
       "ordinal": 1,
-      "arm_control": {"schema": "dexteleop.progress_step_arm_control.v1", "left": "fixed_hold", "right": "teleop", "fixed_scope": "arm_and_end_effector"},
+      "arm_control": {"schema": "dexteleop.progress_step_arm_control.v1", "left": "teleop", "right": "teleop", "fixed_scope": "arm_and_end_effector"},
       "allowed_next_step_ids": [
         "left_remove_brush_cap"
       ]

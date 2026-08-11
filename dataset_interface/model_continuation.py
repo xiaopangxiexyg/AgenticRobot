@@ -22,9 +22,11 @@ from dataset_contracts.model_continuation import (
     require_trained_model_rtc_v1_contract,
 )
 from dataset_contracts.policy_artifact import PolicyArtifactContract
+from dataset_contracts.pose_chunk import (
+    POSE_ACTION_MODE_ABSOLUTE as ACTION_POSE_MODE_ABSOLUTE,
+)
 from dataset_contracts.pose_frames import PoseFrameContract
 from dataset_contracts.v22 import DatasetLayoutBindingError
-from robot_motion.relative_action import ACTION_POSE_MODE_ABSOLUTE
 
 from .pose_chunk import (
     PoseActionChunkSample,

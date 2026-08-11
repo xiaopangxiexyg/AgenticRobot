@@ -12,13 +12,18 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 from robot_motion.position_control.config import PositionControlRates
 from robot_motion.position_control.trajectory import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+)
+from robot_motion.position_control.sample_aligned_trajectory import (
+    SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
+    SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET,
+    normalize_sample_aligned_source_latch_mode,
 )
 
 
@@ -27,11 +32,26 @@ RM65_BIMANUAL_POSITION_V1_NAME = "rm65_bimanual_position_v1"
 RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME = (
     "rm65_bimanual_position_v2_responsive"
 )
+RM65_BIMANUAL_POSITION_V2_BALANCED_NAME = (
+    "rm65_bimanual_position_v2_balanced"
+)
+RM65_BIMANUAL_POSITION_V2_SMOOTH_NAME = (
+    "rm65_bimanual_position_v2_smooth"
+)
+RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1_NAME = (
+    "rm65_bimanual_position_v2_balanced_60hz_jerk_v1"
+)
+RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2_NAME = (
+    "rm65_bimanual_position_v2_balanced_60hz_jerk_v2"
+)
 RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME = (
     "rm65_bimanual_position_sample_aligned_jerk_v1"
 )
 RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME = (
     "rm65_bimanual_position_sample_aligned_jerk_v2"
+)
+RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3_NAME = (
+    "rm65_bimanual_position_sample_aligned_jerk_v3"
 )
 RM65_BIMANUAL_POSITION_V1_QREF_PROFILE = "rm65_bimanual_position_v1_qref"
 LEGACY_POSITION_CONTROL_PROFILE_NAME = "legacy"
@@ -374,6 +394,15 @@ class RM65PositionCommandExecutionProfile:
     max_command_step_deg: float = 0.675
     follow_qpos_alpha: float = 0.9
     degraded_speed_scale: float = 0.5
+    # ``None`` preserves the historical action/sample-rate bucket.  A profile
+    # may explicitly bind the execution cut to a different already-admitted
+    # qref clock without changing dataset sampling or IK rates.
+    sample_aligned_source_hz: float | None = None
+    sample_aligned_source_latch_mode: str = (
+        SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET
+    )
+    sample_aligned_horizon_source_steps: int = 2
+    sample_aligned_safety_horizon_source_steps: int | None = None
     # V1 scales the absolute target itself in degraded mode.  A successor may
     # retain the full already-admitted qref and let the hard q/qd/qdd/jerk
     # envelope determine how much is safely reachable in the current cut.
@@ -383,8 +412,19 @@ class RM65PositionCommandExecutionProfile:
     # to discourage bang-bang jerk without weakening any hard bound.
     sample_aligned_jerk_regularization: float = 1e-9
     sample_aligned_jerk_delta_regularization: float = 0.0
+    sample_aligned_initial_jerk_delta_regularization: float = 0.0
     sample_aligned_terminal_velocity_regularization: float = 0.0
     sample_aligned_terminal_acceleration_regularization: float = 0.0
+    sample_aligned_reference_mode: str = "linear_hold"
+    sample_aligned_observer_window: int = 4
+    sample_aligned_observer_efficiency_power: float = 2.0
+    sample_aligned_observer_velocity_ema_alpha: float = 0.5
+    sample_aligned_observer_velocity_cap_scale: float = 0.5
+    sample_aligned_observer_coherence_min: float = 0.5
+    sample_aligned_observer_speed_guard_scale: float = 0.4
+    sample_aligned_terminal_velocity_displacement_scale: float = 0.75
+    sample_aligned_observer_stop_threshold_deg: float = 0.01
+    sample_aligned_observer_stop_velocity_decay: float = 0.0
 
     def __post_init__(self) -> None:
         planner = str(self.planner).strip()
@@ -425,6 +465,46 @@ class RM65PositionCommandExecutionProfile:
             name="degraded_speed_scale",
             minimum=0.0,
         )
+        sample_aligned_source_hz = (
+            None
+            if self.sample_aligned_source_hz is None
+            else _finite(
+                self.sample_aligned_source_hz,
+                name="sample_aligned_source_hz",
+                minimum=0.0,
+            )
+        )
+        if sample_aligned_source_hz is not None and sample_aligned_source_hz <= 0.0:
+            raise ValueError("sample_aligned_source_hz must be positive when set.")
+        sample_aligned_source_latch_mode = (
+            normalize_sample_aligned_source_latch_mode(
+                self.sample_aligned_source_latch_mode
+            )
+        )
+        horizon_source_steps = int(self.sample_aligned_horizon_source_steps)
+        if (
+            isinstance(self.sample_aligned_horizon_source_steps, bool)
+            or horizon_source_steps != self.sample_aligned_horizon_source_steps
+            or horizon_source_steps < 2
+        ):
+            raise ValueError(
+                "sample_aligned_horizon_source_steps must be an integer >= 2."
+            )
+        safety_horizon_source_steps = (
+            None
+            if self.sample_aligned_safety_horizon_source_steps is None
+            else int(self.sample_aligned_safety_horizon_source_steps)
+        )
+        if safety_horizon_source_steps is not None and (
+            isinstance(self.sample_aligned_safety_horizon_source_steps, bool)
+            or safety_horizon_source_steps
+            != self.sample_aligned_safety_horizon_source_steps
+            or safety_horizon_source_steps <= horizon_source_steps
+        ):
+            raise ValueError(
+                "sample_aligned_safety_horizon_source_steps must be an integer "
+                "greater than sample_aligned_horizon_source_steps."
+            )
         jerk_regularization = _finite(
             self.sample_aligned_jerk_regularization,
             name="sample_aligned_jerk_regularization",
@@ -433,6 +513,11 @@ class RM65PositionCommandExecutionProfile:
         jerk_delta_regularization = _finite(
             self.sample_aligned_jerk_delta_regularization,
             name="sample_aligned_jerk_delta_regularization",
+            minimum=0.0,
+        )
+        initial_jerk_delta_regularization = _finite(
+            self.sample_aligned_initial_jerk_delta_regularization,
+            name="sample_aligned_initial_jerk_delta_regularization",
             minimum=0.0,
         )
         terminal_velocity_regularization = _finite(
@@ -445,10 +530,91 @@ class RM65PositionCommandExecutionProfile:
             name="sample_aligned_terminal_acceleration_regularization",
             minimum=0.0,
         )
+        reference_mode = str(self.sample_aligned_reference_mode).strip().lower()
+        if reference_mode not in {
+            "linear_hold",
+            "linear_hold_nullspace_smooth",
+            "causal_hermite",
+            "causal_hermite_selective",
+        }:
+            raise ValueError(
+                "sample_aligned_reference_mode must be 'linear_hold', "
+                "'linear_hold_nullspace_smooth', 'causal_hermite' or "
+                "'causal_hermite_selective'."
+            )
+        if (
+            safety_horizon_source_steps is not None
+            and reference_mode != "linear_hold"
+        ):
+            raise ValueError(
+                "sample_aligned_safety_horizon_source_steps currently requires "
+                "sample_aligned_reference_mode='linear_hold'."
+            )
+        observer_window = int(self.sample_aligned_observer_window)
+        if (
+            isinstance(self.sample_aligned_observer_window, bool)
+            or observer_window != self.sample_aligned_observer_window
+            or observer_window < 2
+        ):
+            raise ValueError("sample_aligned_observer_window must be an integer >= 2.")
+        observer_efficiency_power = _finite(
+            self.sample_aligned_observer_efficiency_power,
+            name="sample_aligned_observer_efficiency_power",
+            minimum=0.0,
+        )
+        observer_velocity_ema_alpha = _finite(
+            self.sample_aligned_observer_velocity_ema_alpha,
+            name="sample_aligned_observer_velocity_ema_alpha",
+            minimum=0.0,
+        )
+        observer_velocity_cap_scale = _finite(
+            self.sample_aligned_observer_velocity_cap_scale,
+            name="sample_aligned_observer_velocity_cap_scale",
+            minimum=0.0,
+        )
+        observer_coherence_min = _finite(
+            self.sample_aligned_observer_coherence_min,
+            name="sample_aligned_observer_coherence_min",
+        )
+        observer_speed_guard_scale = _finite(
+            self.sample_aligned_observer_speed_guard_scale,
+            name="sample_aligned_observer_speed_guard_scale",
+            minimum=0.0,
+        )
+        terminal_velocity_displacement_scale = _finite(
+            self.sample_aligned_terminal_velocity_displacement_scale,
+            name="sample_aligned_terminal_velocity_displacement_scale",
+            minimum=0.0,
+        )
+        observer_stop_threshold_deg = _finite(
+            self.sample_aligned_observer_stop_threshold_deg,
+            name="sample_aligned_observer_stop_threshold_deg",
+            minimum=0.0,
+        )
+        observer_stop_velocity_decay = _finite(
+            self.sample_aligned_observer_stop_velocity_decay,
+            name="sample_aligned_observer_stop_velocity_decay",
+            minimum=0.0,
+        )
         if ramp <= 0.0 or step <= 0.0:
             raise ValueError("velocity_ramp_sec and max_command_step_deg must be positive.")
         if follow > 1.0 or degraded > 1.0:
             raise ValueError("follow alpha and degraded scale must be <= 1.")
+        if (
+            observer_velocity_ema_alpha > 1.0
+            or observer_velocity_cap_scale > 1.0
+            or observer_speed_guard_scale > 1.0
+            or observer_stop_velocity_decay > 1.0
+            or not -1.0 <= observer_coherence_min <= 1.0
+        ):
+            raise ValueError(
+                "sample-aligned observer fractions must be <= 1 and "
+                "coherence must be in [-1, 1]."
+            )
+        if terminal_velocity_displacement_scale <= 0.0:
+            raise ValueError(
+                "sample_aligned_terminal_velocity_displacement_scale must be positive."
+            )
         object.__setattr__(self, "planner", planner)
         object.__setattr__(self, "reference_max_age_sec", reference_max_age)
         object.__setattr__(self, "canfd_follow", bool(self.canfd_follow))
@@ -461,6 +627,26 @@ class RM65PositionCommandExecutionProfile:
         object.__setattr__(self, "max_command_step_deg", step)
         object.__setattr__(self, "follow_qpos_alpha", follow)
         object.__setattr__(self, "degraded_speed_scale", degraded)
+        object.__setattr__(
+            self,
+            "sample_aligned_source_hz",
+            sample_aligned_source_hz,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_source_latch_mode",
+            sample_aligned_source_latch_mode,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_horizon_source_steps",
+            horizon_source_steps,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_safety_horizon_source_steps",
+            safety_horizon_source_steps,
+        )
         object.__setattr__(
             self,
             "sample_aligned_scale_degraded_target",
@@ -478,6 +664,11 @@ class RM65PositionCommandExecutionProfile:
         )
         object.__setattr__(
             self,
+            "sample_aligned_initial_jerk_delta_regularization",
+            initial_jerk_delta_regularization,
+        )
+        object.__setattr__(
+            self,
             "sample_aligned_terminal_velocity_regularization",
             terminal_velocity_regularization,
         )
@@ -485,6 +676,48 @@ class RM65PositionCommandExecutionProfile:
             self,
             "sample_aligned_terminal_acceleration_regularization",
             terminal_acceleration_regularization,
+        )
+        object.__setattr__(self, "sample_aligned_reference_mode", reference_mode)
+        object.__setattr__(self, "sample_aligned_observer_window", observer_window)
+        object.__setattr__(
+            self,
+            "sample_aligned_observer_efficiency_power",
+            observer_efficiency_power,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_observer_velocity_ema_alpha",
+            observer_velocity_ema_alpha,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_observer_velocity_cap_scale",
+            observer_velocity_cap_scale,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_observer_coherence_min",
+            observer_coherence_min,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_observer_speed_guard_scale",
+            observer_speed_guard_scale,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_terminal_velocity_displacement_scale",
+            terminal_velocity_displacement_scale,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_observer_stop_threshold_deg",
+            observer_stop_threshold_deg,
+        )
+        object.__setattr__(
+            self,
+            "sample_aligned_observer_stop_velocity_decay",
+            observer_stop_velocity_decay,
         )
 
     def to_metadata(self) -> dict[str, Any]:
@@ -503,11 +736,18 @@ class RM65PositionCommandExecutionProfile:
             "degraded_speed_scale": self.degraded_speed_scale,
         }
         sample_aligned_v2 = (
-            not self.sample_aligned_scale_degraded_target
+            self.sample_aligned_source_hz is not None
+            or self.sample_aligned_source_latch_mode
+            != SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET
+            or self.sample_aligned_horizon_source_steps != 2
+            or self.sample_aligned_safety_horizon_source_steps is not None
+            or not self.sample_aligned_scale_degraded_target
             or self.sample_aligned_jerk_regularization != 1e-9
             or self.sample_aligned_jerk_delta_regularization != 0.0
+            or self.sample_aligned_initial_jerk_delta_regularization != 0.0
             or self.sample_aligned_terminal_velocity_regularization != 0.0
             or self.sample_aligned_terminal_acceleration_regularization != 0.0
+            or self.sample_aligned_reference_mode != "linear_hold"
         )
         if sample_aligned_v2:
             payload["sample_aligned_governor"] = {
@@ -516,13 +756,64 @@ class RM65PositionCommandExecutionProfile:
                 "jerk_delta_regularization": (
                     self.sample_aligned_jerk_delta_regularization
                 ),
+                "initial_jerk_delta_regularization": (
+                    self.sample_aligned_initial_jerk_delta_regularization
+                ),
                 "terminal_velocity_regularization": (
                     self.sample_aligned_terminal_velocity_regularization
                 ),
                 "terminal_acceleration_regularization": (
                     self.sample_aligned_terminal_acceleration_regularization
                 ),
+                "reference_mode": self.sample_aligned_reference_mode,
+                "observer_window": self.sample_aligned_observer_window,
+                "observer_efficiency_power": (
+                    self.sample_aligned_observer_efficiency_power
+                ),
+                "observer_velocity_ema_alpha": (
+                    self.sample_aligned_observer_velocity_ema_alpha
+                ),
+                "observer_velocity_cap_scale": (
+                    self.sample_aligned_observer_velocity_cap_scale
+                ),
+                "observer_coherence_min": (
+                    self.sample_aligned_observer_coherence_min
+                ),
+                "observer_speed_guard_scale": (
+                    self.sample_aligned_observer_speed_guard_scale
+                ),
+                "terminal_velocity_displacement_scale": (
+                    self.sample_aligned_terminal_velocity_displacement_scale
+                ),
+                "observer_stop_threshold_deg": (
+                    self.sample_aligned_observer_stop_threshold_deg
+                ),
+                "observer_stop_velocity_decay": (
+                    self.sample_aligned_observer_stop_velocity_decay
+                ),
             }
+            # Preserve the V1 profile payload/hash exactly.  The historical
+            # time-bucket latch remains the implicit default; only successors
+            # that opt into a different latch publish the new field.
+            if (
+                self.sample_aligned_source_latch_mode
+                != SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET
+            ):
+                payload["sample_aligned_governor"]["source_latch_mode"] = (
+                    self.sample_aligned_source_latch_mode
+                )
+            if self.sample_aligned_source_hz is not None:
+                payload["sample_aligned_governor"]["source_hz"] = (
+                    self.sample_aligned_source_hz
+                )
+            if self.sample_aligned_horizon_source_steps != 2:
+                payload["sample_aligned_governor"]["horizon_source_steps"] = (
+                    self.sample_aligned_horizon_source_steps
+                )
+            if self.sample_aligned_safety_horizon_source_steps is not None:
+                payload["sample_aligned_governor"][
+                    "safety_horizon_source_steps"
+                ] = self.sample_aligned_safety_horizon_source_steps
         return payload
 
 
@@ -614,6 +905,104 @@ RM65_BIMANUAL_POSITION_V2_RESPONSIVE = RM65BimanualPositionProfile(
     ),
 )
 
+# Frozen stable response/smoothness baseline validated on the 2026-08-03
+# balanced real-teleop trace.  It deliberately changes only the
+# ordinary-tracking fast-path EMA relative to responsive V2.  All IK,
+# branch/limit protection and 120 Hz command execution contracts remain
+# identical, so selecting responsive V2 is the atomic rollback.
+RM65_BIMANUAL_POSITION_V2_BALANCED = RM65BimanualPositionProfile(
+    name=RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+    rates=RM65_BIMANUAL_POSITION_V2_RESPONSIVE.rates,
+    source_shaping=RM65PositionSourceShapingProfile(
+        post_ik_qpos_normal_fast_path=True,
+        # The 2026-08-03 actuator trace showed residual ordinary-region IK
+        # micro-reversals rather than branch spikes.  Offline replay at 0.55
+        # reduced high-frequency qref energy while avoiding the large lag of
+        # a global jerk limiter or the historical 0.14 endpoint.
+        post_ik_qpos_normal_fast_path_alpha=0.55,
+        post_ik_qpos_normal_fast_path_guard_deg=4.0,
+        post_ik_qpos_normal_fast_path_quality_grace_sec=0.05,
+        wrist_q5_hysteresis_requires_escape_latch=True,
+    ),
+    ik_execution=RM65_BIMANUAL_POSITION_V2_RESPONSIVE.ik_execution,
+    command_execution=RM65_BIMANUAL_POSITION_V2_RESPONSIVE.command_execution,
+)
+
+# Default-off successor to the frozen balanced baseline.  The remaining
+# command-spectrum energy is concentrated near 30 Hz, consistent with small
+# frame-alternating 60 Hz IK reference changes.  Alpha 0.45 attenuates that
+# component by another ~23% relative to 0.55 while adding only ~0.4 reference
+# frames of low-frequency phase delay.  Selecting BALANCED restores the exact
+# validated baseline.
+RM65_BIMANUAL_POSITION_V2_SMOOTH = RM65BimanualPositionProfile(
+    name=RM65_BIMANUAL_POSITION_V2_SMOOTH_NAME,
+    rates=RM65_BIMANUAL_POSITION_V2_BALANCED.rates,
+    source_shaping=RM65PositionSourceShapingProfile(
+        post_ik_qpos_normal_fast_path=True,
+        post_ik_qpos_normal_fast_path_alpha=0.45,
+        post_ik_qpos_normal_fast_path_guard_deg=4.0,
+        post_ik_qpos_normal_fast_path_quality_grace_sec=0.05,
+        wrist_q5_hysteresis_requires_escape_latch=True,
+    ),
+    ik_execution=RM65_BIMANUAL_POSITION_V2_BALANCED.ik_execution,
+    command_execution=RM65_BIMANUAL_POSITION_V2_BALANCED.command_execution,
+)
+
+# Default-off 60 Hz qref / 120 Hz qcmd execution profile for the combined
+# position-admittance path.  Source shaping and IK are exactly the frozen V2
+# Balanced contract.  Only the already-admitted qref-to-qcmd executor changes:
+# a two-source-step tracking objective preserves the responsive 60 Hz cut,
+# while a 333 ms constraint horizon covers the 250 ms target-freshness window
+# plus scheduler margin and jointly bounds q/qd/qdd/jerk.  The 1e-4 jerk-delta
+# regularizer is a soft cost; it cannot weaken the hard reachable-set
+# certificate.  Selecting BALANCED is the complete rollback.
+RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1 = (
+    RM65BimanualPositionProfile(
+        name=RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1_NAME,
+        rates=RM65_BIMANUAL_POSITION_V2_BALANCED.rates,
+        source_shaping=RM65_BIMANUAL_POSITION_V2_BALANCED.source_shaping,
+        ik_execution=RM65_BIMANUAL_POSITION_V2_BALANCED.ik_execution,
+        command_execution=replace(
+            RM65_BIMANUAL_POSITION_V2_BALANCED.command_execution,
+            planner=POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+            target_velocity_filter_tau_sec=0.0,
+            velocity_ramp_sec=0.05,
+            follow_qpos_alpha=1.0,
+            sample_aligned_source_hz=60.0,
+            sample_aligned_horizon_source_steps=2,
+            sample_aligned_safety_horizon_source_steps=20,
+            sample_aligned_scale_degraded_target=False,
+            sample_aligned_jerk_regularization=1e-6,
+            sample_aligned_jerk_delta_regularization=1e-4,
+            sample_aligned_reference_mode="linear_hold",
+        ),
+    )
+)
+
+# Default-off successor to the 60 Hz jerk V1 executor.  It preserves the
+# exact source shaping, IK, hard q/qd/qdd/jerk limits and QP objective, but
+# treats each strictly newer authoritative 60 Hz parent-command timestamp as
+# one source cut.  V1 remains selectable as the exact time-bucket rollback;
+# selecting BALANCED removes the jerk executor entirely.
+RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2 = (
+    RM65BimanualPositionProfile(
+        name=RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2_NAME,
+        rates=RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1.rates,
+        source_shaping=(
+            RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1.source_shaping
+        ),
+        ik_execution=(
+            RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1.ik_execution
+        ),
+        command_execution=replace(
+            RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1.command_execution,
+            sample_aligned_source_latch_mode=(
+                SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP
+            ),
+        ),
+    )
+)
+
 # Opt-in execution experiment.  Source shaping and IK stay byte-for-byte equal
 # to V1; only accepted-qref execution changes.  A 15 Hz source cut is projected
 # onto the 120 Hz position/velocity/acceleration/jerk reachable set, and its
@@ -677,10 +1066,60 @@ RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2 = (
     )
 )
 
+# Default-off successor to V2.  It preserves the complete V2 terminal q/qd/qdd
+# state for every 15 Hz action bucket and only redistributes the eight executed
+# jerk samples in the terminal-state null space.  V2 remains the atomic
+# rollback; causal Hermite stays available as a research mode but is not the
+# registered V3 behavior.
+RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3 = (
+    RM65BimanualPositionProfile(
+        name=RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3_NAME,
+        rates=RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2.rates,
+        source_shaping=(
+            RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2.source_shaping
+        ),
+        ik_execution=RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2.ik_execution,
+        command_execution=RM65PositionCommandExecutionProfile(
+            planner=POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+            target_velocity_filter_tau_sec=0.0,
+            velocity_ramp_sec=0.05,
+            follow_qpos_alpha=1.0,
+            sample_aligned_scale_degraded_target=False,
+            sample_aligned_jerk_regularization=1e-6,
+            sample_aligned_jerk_delta_regularization=1e-5,
+            sample_aligned_initial_jerk_delta_regularization=0.0,
+            sample_aligned_terminal_velocity_regularization=0.0,
+            sample_aligned_terminal_acceleration_regularization=0.0,
+            sample_aligned_reference_mode="linear_hold_nullspace_smooth",
+            sample_aligned_observer_window=4,
+            sample_aligned_observer_efficiency_power=2.0,
+            sample_aligned_observer_velocity_ema_alpha=0.5,
+            sample_aligned_observer_velocity_cap_scale=0.5,
+            sample_aligned_observer_coherence_min=0.5,
+            sample_aligned_observer_speed_guard_scale=0.4,
+            sample_aligned_terminal_velocity_displacement_scale=0.75,
+            sample_aligned_observer_stop_threshold_deg=0.01,
+            sample_aligned_observer_stop_velocity_decay=0.0,
+        ),
+    )
+)
+
 RM65_BIMANUAL_POSITION_PROFILES = {
     RM65_BIMANUAL_POSITION_V1.name: RM65_BIMANUAL_POSITION_V1,
     RM65_BIMANUAL_POSITION_V2_RESPONSIVE.name: (
         RM65_BIMANUAL_POSITION_V2_RESPONSIVE
+    ),
+    RM65_BIMANUAL_POSITION_V2_BALANCED.name: (
+        RM65_BIMANUAL_POSITION_V2_BALANCED
+    ),
+    RM65_BIMANUAL_POSITION_V2_SMOOTH.name: (
+        RM65_BIMANUAL_POSITION_V2_SMOOTH
+    ),
+    RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1.name: (
+        RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1
+    ),
+    RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2.name: (
+        RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2
     ),
     RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1.name: (
         RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1
@@ -688,12 +1127,20 @@ RM65_BIMANUAL_POSITION_PROFILES = {
     RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2.name: (
         RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2
     ),
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3.name: (
+        RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3
+    ),
 }
 RM65_POSITION_CONTROL_PROFILE_CHOICES = (
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME,
+    RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+    RM65_BIMANUAL_POSITION_V2_SMOOTH_NAME,
+    RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1_NAME,
+    RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2_NAME,
     RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME,
     RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME,
+    RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3_NAME,
     LEGACY_POSITION_CONTROL_PROFILE_NAME,
 )
 
@@ -718,10 +1165,20 @@ __all__ = [
     "RM65_BIMANUAL_POSITION_V1_QREF_PROFILE",
     "RM65_BIMANUAL_POSITION_V2_RESPONSIVE",
     "RM65_BIMANUAL_POSITION_V2_RESPONSIVE_NAME",
+    "RM65_BIMANUAL_POSITION_V2_BALANCED",
+    "RM65_BIMANUAL_POSITION_V2_BALANCED_NAME",
+    "RM65_BIMANUAL_POSITION_V2_SMOOTH",
+    "RM65_BIMANUAL_POSITION_V2_SMOOTH_NAME",
+    "RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1",
+    "RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1_NAME",
+    "RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2",
+    "RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2_NAME",
     "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1",
     "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V1_NAME",
     "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2",
     "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V2_NAME",
+    "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3",
+    "RM65_BIMANUAL_POSITION_SAMPLE_ALIGNED_JERK_V3_NAME",
     "RM65_POSITION_CONTROL_PROFILE_CHOICES",
     "RM65BimanualPositionProfile",
     "RM65PositionCommandExecutionProfile",

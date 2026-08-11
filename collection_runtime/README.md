@@ -20,6 +20,17 @@ Implemented here:
   buffer. The concrete writer decides when acceptance occurred; this runtime
   mechanism never infers it from enqueue success or counters;
 - immutable artifact publication and episode-maintenance mechanics;
+- fail-closed capture admission plus journaled, reversible quarantine of a
+  provably abandoned final tail Episode. Unknown orphan artifacts still block
+  append, while a unique unsealed `N+1` legacy artifact group is moved under
+  `meta/capture_recovery/` with a durable receipt before that index is reused;
+- shared process-level quiescence detection for capture maintenance. It
+  recognizes exact formal `python -m` entrypoint arguments rather than
+  arbitrary parent-process command text;
+- state-aware tactile postprocess planning for mixed raw/compressed/hot/detached
+  datasets. It only composes the existing lossless recompression and verified
+  modality-storage transactions; interrupted workflows are replanned from
+  physical manifests and durable receipts rather than a second progress file;
 - dataset/task layout utilities;
 - version-neutral component-stream sample production, capture, chunked
   Parquet persistence, seal, and commit mechanics;
@@ -138,9 +149,11 @@ collection_runtime/
   dataset_episode_maintenance.py
   dataset_layout.py
   immutable_canonical_store.py
+  process_quiescence.py # shared formal-collection process exclusion
   sample_acceptance.py # writer-neutral admission receipt + bounded retention
   source_cut.py       # generic non-committable snapshot result
   stream_sink.py
+  tactile_postprocess.py # mixed-state lossless compression/storage orchestration
 ```
 
 `subtask_interface` is deliberately not used as the umbrella name:
