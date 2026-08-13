@@ -44,7 +44,7 @@ Run the full Pinocchio/Pink collision and IK scenario in the project robot
 environment:
 
 ```bash
-conda run -n dexteleop310 env PYTHONPATH=. \
+conda run --name "${DEXTELEOP_ENV_NAME:-dexteleop310}" env PYTHONPATH=. \
   python -m pytest sim/sim_real_tests/tests -q
 ```
 

@@ -7,6 +7,7 @@ import pytest
 from control_station.agent_gateway.protocol.contracts import AgentSkillRequest
 from control_station.agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
+    SkillDeploymentSafetyEnvelopeRef,
     SkillExecutionRoute,
     SkillParameterProfileRef,
     SkillRouteManifest,
@@ -175,6 +176,85 @@ def _grant(
         issued_at=issued_at,
         expires_at=expires_at,
     )
+
+
+def _sim_motion_surface(
+    *,
+    with_selection_feature: bool,
+) -> tuple[SkillExecutionRoute, SkillRouteManifest]:
+    route = SkillExecutionRoute(
+        skill_id="motion.move_tcp_to_pose",
+        skill_version="1",
+        skill_definition_hash="definition:motion.move_tcp_to_pose:v1",
+        route_id="sim.mujoco.right_arm_tcp_pose",
+        route_version="1",
+        parameter_schema_hash="params:motion.move_tcp_to_pose:v1",
+        execution_result_schema_hash="execution-result:motion.move_tcp_to_pose:v1",
+        task_evaluation_schema_hash="task-evaluation:motion.move_tcp_to_pose:v1",
+        allowed_parameter_profiles=(
+            SkillParameterProfileRef(
+                parameter_profile_id="bounded-v1",
+                parameter_profile_hash="profile:motion.move_tcp_to_pose:bounded-v1",
+                parameter_schema_hash="params:motion.move_tcp_to_pose:v1",
+            ),
+        ),
+        control_effect_class="motion",
+        privilege_tier="t1_sim_or_no_motion",
+        supported_modes=("sim_active",),
+        target_kind="sim",
+        may_move_robot=True,
+        may_open_publication=False,
+        requires_operator_confirmation=False,
+        requires_deadman=False,
+        max_operation_duration_ms=2_000,
+        cancellation_policy="hold_on_disconnect_or_timeout",
+    )
+    refs = (
+        (
+            SkillDeploymentSafetyEnvelopeRef(
+                object_id="sim.tcp.standard@1",
+                schema="dexteleop.deployment_safety_envelope.v1",
+                content_hash="envelope-hash:standard",
+                constraint_set_hash="constraints:standard",
+                allowed_route_ids=(route.route_id,),
+            ),
+        )
+        if with_selection_feature
+        else ()
+    )
+    manifest = SkillRouteManifest(
+        runtime_session_id="runtime:sim-motion-test",
+        control_domain_id="domain:right-arm",
+        station_manifest_hash="station:sim-motion-test",
+        execution_manifest_hash="execution:sim-motion-test",
+        skill_definition_catalog_hash="definition-catalog:sim-motion-test",
+        skill_schema_catalog_hash="schema-catalog:sim-motion-test",
+        target_binding_id="target:mujoco",
+        target_kind="sim",
+        current_mode="sim_active",
+        supported_transport_features=(
+            ("idempotency_v1", "safety_profile_selection_v1")
+            if with_selection_feature
+            else ("idempotency_v1",)
+        ),
+        skill_routes=(
+            SkillRouteManifestEntry(
+                route=route,
+                deployment_binding=SkillDeploymentBindingRef(
+                    deployment_binding_id="deployment:mujoco:test",
+                    deployment_binding_hash="binding:mujoco:test",
+                    target_binding_id="target:mujoco",
+                    target_kind="sim",
+                    execution_manifest_hash="execution:sim-motion-test",
+                    safety_envelope_refs=refs,
+                ),
+                evaluation_plan_hash=None,
+                availability_hash="availability:ready",
+            ),
+        ),
+        explicit_exclusions=("raw_action_submission",),
+    )
+    return route, manifest
 
 
 def test_t0_request_is_eligible_without_operator_or_motion_authority() -> None:
@@ -432,3 +512,58 @@ def test_real_motion_grant_still_only_yields_application_access() -> None:
     assert not hasattr(decision, "dispatch_permit")
     assert not hasattr(grant, "operator_control_lease")
     assert not hasattr(route, "required_lower_permit_kind")
+
+
+def test_sim_motion_accepts_only_an_exact_published_safety_envelope() -> None:
+    route, manifest = _sim_motion_surface(with_selection_feature=True)
+    selected = replace(
+        _request(manifest, route),
+        safety_profile_id="safety.standard@1",
+        safety_profile_hash="safety-profile-hash:standard",
+        deployment_safety_envelope_id="sim.tcp.standard@1",
+        deployment_safety_envelope_hash="envelope-hash:standard",
+        safety_constraint_set_hash="constraints:standard",
+    )
+    accepted = assess_skill_request_access(
+        policy=_policy(mode="sim_active"),
+        manifest=manifest,
+        request=selected,
+        current_station_revision=4,
+        now=12.0,
+    )
+    assert accepted.accepted
+
+    rejected = assess_skill_request_access(
+        policy=_policy(mode="sim_active"),
+        manifest=manifest,
+        request=replace(
+            selected,
+            deployment_safety_envelope_hash="envelope-hash:unpublished",
+        ),
+        current_station_revision=4,
+        now=12.0,
+    )
+    assert not rejected.accepted
+    assert rejected.reason_code == "deployment_safety_envelope_not_allowed"
+
+
+def test_compatibility_manifest_rejects_unadvertised_safety_selection() -> None:
+    route, manifest = _sim_motion_surface(with_selection_feature=False)
+    selected = replace(
+        _request(manifest, route),
+        safety_profile_id="safety.standard@1",
+        safety_profile_hash="safety-profile-hash:standard",
+        deployment_safety_envelope_id="sim.tcp.standard@1",
+        deployment_safety_envelope_hash="envelope-hash:standard",
+        safety_constraint_set_hash="constraints:standard",
+    )
+
+    rejected = assess_skill_request_access(
+        policy=_policy(mode="sim_active"),
+        manifest=manifest,
+        request=selected,
+        current_station_revision=4,
+        now=12.0,
+    )
+    assert not rejected.accepted
+    assert rejected.reason_code == "safety_profile_selection_not_supported"

@@ -31,6 +31,7 @@ from control_station.sim_hil import (
 from control_station.sim_hil_acceptance import (
     SimHILAcceptanceTraceCapture,
 )
+from control_station.sim_hil_profile.human import _SimHILHumanAttachment
 from control_station.composition import (
     MUJOCO_SIM_HIL_HUMAN_ROLE_V1,
     MUJOCO_SIM_HIL_POLICY_ROLE_V1,
@@ -180,6 +181,105 @@ def test_blend_resolution_fallback_latches_through_formal_alpha_control(
     assert app._last_blend_failure_fallback["status"] == "latched"
     assert app._last_blend_failure_fallback["failure"]["reason_code"] == (
         "collision_margin_low"
+    )
+
+
+def test_sim_collision_rejection_is_promoted_to_terminal_episode() -> None:
+    failure = ActionResolutionFailure(
+        reason_code="collision_margin_low",
+        resolver_status="hold_last_safe",
+        message="candidate is inside the configured collision margin",
+    )
+    cycle = SimpleNamespace(
+        execution=AuthoritativeControlStep(
+            status="compound_resolution_failure_hold",
+            resolution_failure=failure,
+        )
+    )
+    app = object.__new__(MujocoSimHILApplication)
+    app._last_error = None
+    app._first_control_fault = None
+    terminal_calls: list[dict[str, object]] = []
+    app.end_episode = lambda **kwargs: terminal_calls.append(dict(kwargs))
+
+    selected = app._collision_stop_failure(cycle)
+    assert selected is failure
+    app._terminate_episode_for_collision_stop(selected)
+
+    assert terminal_calls == [
+        {
+            "reason": "sim_collision_stop:collision_margin_low",
+            "force_cancellation": True,
+        }
+    ]
+    assert app._last_error == "SimCollisionStop:collision_margin_low"
+    assert app._first_control_fault == app._last_error
+
+    non_collision = SimpleNamespace(
+        execution=AuthoritativeControlStep(
+            status="compound_resolution_failure_hold",
+            resolution_failure=ActionResolutionFailure(
+                reason_code="target_unresolvable",
+                resolver_status="hold_last_safe",
+                message="IK did not converge",
+            ),
+        )
+    )
+    assert app._collision_stop_failure(non_collision) is None
+
+
+def test_actual_mujoco_forbidden_contact_is_promoted_separately() -> None:
+    app = object.__new__(MujocoSimHILApplication)
+    app._last_error = None
+    app._first_control_fault = None
+    terminal_calls: list[dict[str, object]] = []
+    app.end_episode = lambda **kwargs: terminal_calls.append(dict(kwargs))
+    recorded_facts = []
+    def record_guard(observation):
+        from sim.mujoco.deploy.contact_trace import (
+            project_mujoco_forbidden_contact_guard_result,
+        )
+
+        recorded_facts.append(
+            project_mujoco_forbidden_contact_guard_result(
+                observation,
+                runtime_session_id="runtime-session",
+                control_domain_id="sim-domain",
+                embodiment_instance_id="sim-embodiment",
+                clock_domain_id="sim-clock",
+            )
+        )
+
+    app.runtime = SimpleNamespace(
+        record_active_contact_guard_result=record_guard,
+    )
+    observation = {
+        "available": True,
+        "safe": False,
+        "observed_at": 12.0,
+        "physics_tick": 123,
+        "hard_penetration_limit_m": 0.001,
+        "geom1": "right_gripper_collision",
+        "geom2": "table_collision",
+        "penetration_depth_m": 0.0015,
+    }
+
+    app._terminate_episode_for_active_forbidden_contact(observation)
+
+    assert terminal_calls == [
+        {
+            "reason": "sim_collision_stop:active_forbidden_contact",
+            "force_cancellation": True,
+        }
+    ]
+    assert app._last_error == (
+        "SimCollisionStop:active_forbidden_contact:"
+        "right_gripper_collision ↔ table_collision"
+    )
+    assert len(recorded_facts) == 1
+    assert recorded_facts[0].event_type == "backend_guard_result"
+    assert recorded_facts[0].payload["reason_code"] == (
+        "active_forbidden_contact_hard_penetration"
     )
 
 
@@ -355,6 +455,83 @@ def test_sim_hil_application_config_accepts_explicit_operation_session() -> None
     assert config.control_domain_id == "agent-skill:mujoco-sim-hil"
     with pytest.raises(ValueError, match="runtime_session_id"):
         MujocoSimHILApplicationConfig(runtime_session_id=" ")
+
+
+def test_application_viewer_preview_starts_only_passive_visualization() -> None:
+    class Viewer:
+        def __init__(self) -> None:
+            self.start_count = 0
+            self.sync_count = 0
+
+        def start(self):
+            self.start_count += 1
+            return {"state": "running", "running": True}
+
+        def sync(self):
+            self.sync_count += 1
+            return True
+
+        def status(self):
+            return {"state": "running", "running": True}
+
+    viewer = Viewer()
+    app = object.__new__(MujocoSimHILApplication)
+    app._lock = threading.RLock()
+    app._started = False
+    app._closed = False
+    app._restart_required = False
+    app._viewer_preview_started = False
+    app._viewer_exit_requested = False
+    app.viewer = viewer
+
+    receipt = app.start_viewer_preview()
+
+    assert receipt["status"] == "viewer_preview"
+    assert receipt["sources_started"] is False
+    assert receipt["composition_started"] is False
+    assert receipt["command_dispatched"] is False
+    assert app.viewer_preview_started is True
+    assert app.sync_viewer_preview() is True
+    assert viewer.start_count == 1
+    assert viewer.sync_count == 1
+
+
+def test_human_attachment_is_allowed_during_nonexecuting_viewer_preview() -> None:
+    class HumanSource:
+        def __init__(self) -> None:
+            self.attached = False
+
+        def attach(self, _source):
+            self.attached = True
+            return {"status": "attached"}
+
+    app = object.__new__(MujocoSimHILApplication)
+    app._lock = threading.RLock()
+    app._started = False
+    app._held = False
+    app._viewer_preview_started = True
+    app._closed = False
+    app.human_source = HumanSource()
+    app.readiness_provider = SimpleNamespace(
+        calibration_ready=False,
+        home_ready=False,
+    )
+    app.gripper_input_selection = None
+    app.calibration_binding = {}
+    app._runtime_home_pose_desk_by_side_capture = None
+    attachment = _SimHILHumanAttachment(
+        source=object(),
+        gripper_input_selection=SimpleNamespace(resolved_source="angle_trigger"),
+        calibration_binding={"profile": "test"},
+        runtime_home_pose_desk_by_side_capture=lambda: {},
+    )
+
+    receipt = app.activate_human_attachment(attachment)
+
+    assert receipt["status"] == "attached"
+    assert app.human_source.attached is True
+    assert app.readiness_provider.calibration_ready is True
+    assert app.readiness_provider.home_ready is False
 
 
 def _hand_specs() -> dict[str, HandActionSpec]:
@@ -1417,6 +1594,27 @@ def test_sim_hil_cycle_hash_binds_only_target_facts_carried_at_return() -> None:
     assert pending.semantic_content_hash != another_request.semantic_content_hash
 
 
+def test_default_vive_coordinate_profile_is_exact_and_right_compatible() -> None:
+    assert DEFAULT_VIVE_COORDINATE_PROFILE.is_absolute()
+    assert DEFAULT_VIVE_COORDINATE_PROFILE.name == (
+        "vive_rm65_virtual_desk_coordinate_v1.json"
+    )
+    source = TeleopCalibration.load_json(DEFAULT_CALIBRATION_PROFILE)
+
+    merged, binding = _bind_vive_coordinate_profile(
+        source,
+        coordinate_profile_path=DEFAULT_VIVE_COORDINATE_PROFILE,
+        home_profile_path=DEFAULT_CALIBRATION_PROFILE,
+        required_sides=("right",),
+    )
+
+    assert Path(binding["vive_coordinate_profile_path"]) == (
+        DEFAULT_VIVE_COORDINATE_PROFILE.resolve()
+    )
+    assert "right" in tuple(binding["active_sides"])
+    assert "right_wrist" in merged.tracker_offsets
+
+
 @pytest.mark.optional
 def test_sim_hil_target_separates_policy_source_and_compose_controller_rates() -> None:
     _require_mujoco_runtime()
@@ -1455,6 +1653,10 @@ def test_sim_hil_target_separates_policy_source_and_compose_controller_rates() -
         assert planner_config.solve_time_budget_ms == pytest.approx(
             1000.0 / timing.ik_hz
         )
+        assert planner_config.collision_min_distance_m == pytest.approx(
+            target.scene.scene_spec.collision.safety_minimum_clearance_m
+        )
+        assert planner_config.collision_min_distance_m == pytest.approx(0.002)
         assert target.runtime.config.enable_component_execution_handoff is True
         target_port = target.runtime.target_execution_port
         assert target_port is not None

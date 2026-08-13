@@ -30,8 +30,10 @@ from .policy_human_allocation import (
     SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A,
     SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_B,
     SIM_HIL_POLICY_HUMAN_ALLOCATION_PROFILE_IDS,
+    build_exclusive_truncated_hitl_allocation_control_profile,
     build_policy_human_allocation_scheme_a_control_profile,
     build_policy_human_allocation_scheme_b_control_profile,
+    prepare_exclusive_truncated_hitl_allocation_profile,
     prepare_policy_human_allocation_scheme_a,
     prepare_policy_human_allocation_scheme_b,
 )
@@ -46,6 +48,15 @@ from .validation import _finite
 def _allocation_profile_builders(profile_id: str) -> tuple[Any, Any]:
     """Return the paired contract/runtime builders for one built-in profile."""
 
+    from .profile_selection import (
+        SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
+    )
+
+    if profile_id == SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL:
+        return (
+            prepare_exclusive_truncated_hitl_allocation_profile,
+            build_exclusive_truncated_hitl_allocation_control_profile,
+        )
     if profile_id == SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A:
         return (
             prepare_policy_human_allocation_scheme_a,
@@ -402,6 +413,7 @@ def build_application_graph(
         position_control_profile_name=config.position_control_profile_name,
         compose_target_hz=config.compose_target_hz,
         target_admission_margin_sec=config.target_admission_margin_sec,
+        collision_stop_enabled=config.sim_collision_stop_enabled,
         execution_observation_plan=execution_observation_plan,
         exposed_pose_sides=("right",),
     )

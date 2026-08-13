@@ -92,6 +92,9 @@ order:
 | `rm65_right_cube_pick_pose_xyz_gripper_estimator_v1.json` | fixed-spawn estimator-input ablation | xyz+gripper (4D) | pose+gripper (7D) | open pre-grasp; proprio+object-estimator actor |
 | `rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json` | randomized end-to-end 3 cm pick from home | xyz+gripper (4D) | direct pose+gripper (7D) | home, about 38 cm from cube; proprio+target-delta actor |
 | `rm65_right_cube_pick_goal_delta_xyz_gripper_v3.json` | collision/contact-quality constrained 3 cm pick | xyz+gripper (4D) | direct pose+gripper (7D) | home; three clear steps plus inner-contact quality |
+| `rm65_right_cube_pick_collision_uniform_light_v1.json` | matched-cost uniform collision-penalty ablation | xyz+gripper (4D) | direct pose+gripper (7D) | Pick v3 physics/success unchanged |
+| `rm65_right_cube_pick_collision_category_light_v1.json` | semantic collision-category penalty ablation | xyz+gripper (4D) | direct pose+gripper (7D) | Pick v3 physics/success unchanged |
+| `rm65_right_cube_pick_collision_category_balanced_v2.json` | stronger table/environment category ablation | xyz+gripper (4D) | direct pose+gripper (7D) | Pick v3 physics/success unchanged |
 | `rm65_right_tall_block_pick_goal_delta_xyz_gripper_v1.json` | 30x30x50 mm clearance curriculum | xyz+gripper (4D) | direct pose+gripper (7D) | home; separate hashed physical contract |
 
 The estimator profiles receive a simulator ground-truth proxy under an
@@ -225,6 +228,98 @@ on its 16-episode seed-20000 evaluation, but still required projection on 52.1%
 of actions. Across four scripted-oracle seeds, the taller block kept 4/4 grasp
 success and reduced mean intervention rate from 56.4% for the cube to 43.7%;
 the remaining self/table interventions must still be learned away.
+
+Collision diagnostics now preserve the canonical forbidden group-pair meaning
+instead of reducing every intervention to one bit: `robot_environment`,
+`gripper_environment`, `robot_object`, `robot_self`,
+`robot_gripper_self`, and `gripper_self`. Evaluation reports category action
+rates, rejection rates, mean projection fraction, phase/category counts, and
+concrete body pairs. PPO records the same per-category rates. These remain
+training/evaluation diagnostics and are not actor inputs.
+
+An optional `safety_collision_category_penalties` mapping applies a fixed
+reward cost only when admission modifies an action in the named category. It
+is additive to the projection-fraction cost, default-off, and cannot weaken or
+replace hard projection. A frozen seed-20000 baseline showed that the validated
+Pick actor's 55.0% intervention rate consisted of 27.5% gripper/environment,
+14.8% robot/environment, 12.5% robot self-collision, and 0.2% gripper
+self-collision per evaluated action. Self-collision occurred almost entirely
+before contact; gripper/table collision persisted before contact, during
+bilateral contact, and after contact.
+
+A seed-411 matched-cost 4096-step ablation used the same checkpoint, rollout,
+critic, and actor-reference coefficient. Uniform light penalty collapsed to
+5/16 deterministic successes, 64.1% projection, 31.4% rejection, and seven
+hard penetrations. Category-light improved that to 13/16, 58.2%, 28.5%, and
+five, demonstrating that collision type affects PPO credit assignment. Raising
+the non-privileged actor reference coefficient from 0.5 to 2.0 retained 15/16
+and one hard penetration, reduced robot-self requests from 12.5% to 9.2%, but
+shifted requests to gripper/environment and left total projection at 56.6%.
+Increasing table/environment weights (`category_balanced_v2`) produced 14/16
+and 59.6% projection. None beats the uncontinued checkpoint's 15/16, 55.0%,
+23.8% rejection, and one hard penetration, so all trained candidates remain in
+`/tmp` and the project checkpoint is unchanged. This evidence rejects a larger
+scalar penalty as the next main lever. Follow-up work should target repeated
+infeasible action requests through task-independent admission/event evidence;
+a constrained optimizer needs an explicit cost budget before it is allowed to
+influence PPO. PPO likelihood remains attached to its sampled latent action.
+
+Collision accounting is now separated into three task-independent facts:
+
+- a preventive admission event records one onset for a continuous projected
+  streak, its bounded blocked fraction, category, and maximum streak length;
+- an actual forbidden contact is read from MuJoCo's active-contact oracle over
+  the complete policy interval, not inferred from projection;
+- a hard violation remains the terminal penetration/safety fact.
+
+These values are written as independent `collision_*` metrics and per-episode
+fields. They are not actor observations, do not alter task reward, and do not
+change the admitted public pose action. The legacy projection/category reward
+terms remain compatibility options for earlier ablations.
+
+Inspect the exact compiled collision geometry, material profiles, solver and
+MultiCCD state without executing a policy action:
+
+```bash
+python -m sim.mujoco.diagnostics.collision_model \
+  --task-config sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json
+```
+
+The audit is task-reward agnostic: the task config selects the exact compiled
+runtime scene and post-settle contact profile, while the report operates only
+on MuJoCo model/contact facts.
+
+Probe the local executable xyz set at an exact deterministic projector onset:
+
+```bash
+python -m sim.mujoco_temp_pipeline.probe_executability \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_pick_goal_delta_xyz_gripper_v2_s211_bootstrap.pt \
+  --task-config sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v2.json \
+  --episodes 1 \
+  --seed 20000 \
+  --max-onsets 1 \
+  --device cpu \
+  --output /tmp/cube_pick_local_executability.json
+```
+
+The probe uses one primary environment and one scratch environment. For every
+candidate the scratch environment resets with the same seed and replays the
+exact public-action prefix, then runs the normal task conditioning, pose IK,
+planner, MuJoCo projector and physics step. This keeps memory constant and
+fails if replay does not reproduce the onset observation. Candidate xyz
+perturbations preserve the policy's gripper component. The report separates IK
+feasibility, projector identity, full rejection, actual forbidden contact,
+hard violation, nearest feasible correction and task/goal progress. Optional
+`--onset-category` and `--onset-phase` filters select later table or post-contact
+events without creating task-specific training curricula.
+
+`measured_pose_reanchor` entries are counterfactual diagnostic controls only;
+they are excluded from the policy-space feasible ratio. The probe never changes
+PPO sample identity, actor observation, task reward, IK defaults, or hard safety.
+Pose-target lag is also logged independently for clear, projected and onset
+actions. Use the pre-action-aligned lag fields for causal comparisons because
+anti-windup may reanchor the target after an intervention.
+
 When `--init-checkpoint` crosses two of these profiles, only actor-head rows
 with the same named latent component are transferred; new rows stay freshly
 initialized and the critic head is reset. Shared components retain the source
@@ -310,7 +405,7 @@ Use the project environment. PyTorch is locked to the official 2.10.0 CUDA
 12.6 wheel; it runs on CPU when this debug machine has no working NVIDIA driver.
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 cd /home/zc/HandMotion/Developing/DexTeleop
 python - <<'PY'
 import torch

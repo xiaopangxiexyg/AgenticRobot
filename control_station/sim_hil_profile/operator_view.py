@@ -50,6 +50,28 @@ def _classify_error(raw_error: str) -> tuple[str, str, str]:
     """Return a best-effort presentation summary while retaining raw_error."""
 
     lowered = raw_error.lower()
+    if "active_forbidden_contact" in lowered:
+        return (
+            "mujoco_forbidden_contact",
+            "MuJoCo 禁碰接触保护已触发",
+            "MuJoCo 已观测到超过硬穿透限值的禁碰接触；当前 episode "
+            "只能 Reset。",
+        )
+    if "collision_margin_low" in lowered:
+        return (
+            "lower_collision_margin_hold",
+            "规划器安全间隙保护已触发",
+            "下游规划器的代理模型低于预防间隙；这不表示 MuJoCo 已经"
+            "发生物理接触。当前 episode 只能 Reset，不能 rearm 或"
+            "切换来源继续。",
+        )
+    if "target_private_resolution_failure" in lowered:
+        return (
+            "lower_target_resolution_hold",
+            "执行目标未能解析，已保持输出",
+            "组合结果已经送达下游，但 IK、限位或目标解析未通过；"
+            "在执行诊断中查看具体拒绝原因。",
+        )
     if "rotation is not orthonormal" in lowered or "pose rotation" in lowered:
         return (
             "human_pose_invalid",
@@ -91,6 +113,267 @@ def _classify_error(raw_error: str) -> tuple[str, str, str]:
     )
 
 
+def _execution_fault_context(
+    status: Mapping[str, Any],
+) -> dict[str, object] | None:
+    """Preserve lower rejection facts that a generic gate reason may hide."""
+
+    composition = _mapping(status.get("composition"))
+    last_cycle = _mapping(composition.get("last_cycle"))
+    execution = _mapping(last_cycle.get("execution"))
+    failure = _mapping(execution.get("resolution_failure"))
+    gate = _mapping(status.get("execution_gate"))
+    contact = _mapping(status.get("sim_collision_contact"))
+    unsafe_contact = bool(
+        contact.get("available") and not contact.get("safe", True)
+    )
+    reason_code = failure.get("reason_code")
+    message = failure.get("message")
+    outcome_code = execution.get("target_completion_outcome_code")
+    gate_reason = gate.get("reason")
+    searchable = " ".join(
+        str(value)
+        for value in (reason_code, message, outcome_code, gate_reason)
+        if value not in {None, ""}
+    )
+    if not searchable and not unsafe_contact:
+        return None
+    lowered = searchable.lower()
+    category = (
+        "collision"
+        if unsafe_contact or "collision" in lowered
+        else "target_resolution"
+        if failure or outcome_code
+        else "execution_gate"
+    )
+    diagnostics = dict(failure.get("diagnostics") or {})
+    collision_summary = None
+    collision_semantics = None
+    if category == "collision":
+        parts: list[str] = []
+        if unsafe_contact:
+            collision_semantics = "mujoco_forbidden_contact_hard_penetration"
+            if contact.get("geom1") and contact.get("geom2"):
+                parts.append(
+                    f"实际接触 {contact['geom1']} ↔ {contact['geom2']}"
+                )
+            try:
+                parts.append(
+                    "穿透深度 "
+                    f"{1000.0 * float(contact.get('penetration_depth_m') or 0.0):.3f} mm"
+                )
+            except (TypeError, ValueError):
+                pass
+        else:
+            collision_semantics = (
+                "planner_proxy_preventive_clearance_not_physical_contact"
+            )
+            geometry_1 = diagnostics.get("collision_geometry_1")
+            geometry_2 = diagnostics.get("collision_geometry_2")
+            distance = diagnostics.get("best_candidate_distance_m")
+            threshold = diagnostics.get("collision_threshold_m")
+            if geometry_1 and geometry_2:
+                parts.append(f"代理对 {geometry_1} ↔ {geometry_2}")
+            try:
+                if distance is not None:
+                    parts.append(
+                        f"最近间隙 {1000.0 * float(distance):.3f} mm"
+                    )
+                if threshold is not None:
+                    parts.append(
+                        f"有效阈值 {1000.0 * float(threshold):.3f} mm"
+                    )
+            except (TypeError, ValueError):
+                pass
+        collision_summary = " · ".join(parts) or None
+    return {
+        "category": category,
+        "collision_semantics": collision_semantics,
+        "collision_summary": collision_summary,
+        "reason_code": reason_code,
+        "message": message,
+        "outcome_code": outcome_code,
+        "gate_status": gate.get("status"),
+        "gate_reason": gate_reason,
+        "diagnostics": diagnostics,
+        "searchable_summary": (
+            searchable
+            or "mujoco_forbidden_contact_hard_penetration"
+        ),
+    }
+
+
+def _human_demo_workflow(
+    status: Mapping[str, Any],
+    *,
+    acceptance: Mapping[str, Any],
+    setup: Mapping[str, Any],
+    capture: Mapping[str, Any],
+    recommended_action: Mapping[str, object] | None,
+    phase: str,
+) -> dict[str, object]:
+    """Project one concise, non-authoritative demo collection journey."""
+
+    started = bool(status.get("started", False))
+    held = bool(status.get("held", False))
+    episode_ended = bool(status.get("episode_ended", False))
+    preview_ready = bool(acceptance.get("sim_preview_ready", False))
+    capture_state = str(capture.get("status") or "ready")
+    committed = capture_state == "committed"
+    input_ready = bool(setup.get("input_ready", False))
+    profile_ready = bool(setup.get("profile_ready", False))
+    human_ready = bool(
+        setup.get("human_runtime_launch_ready", False)
+    )
+    active_intent_kind = (
+        None
+        if acceptance.get("active_intent_kind") is None
+        else str(acceptance.get("active_intent_kind"))
+    )
+    started_at_value = acceptance.get("formal_runtime_started_at")
+    finalized_at_value = acceptance.get("formal_runtime_finalized_at")
+    sampled_at_value = status.get("sampled_at")
+    recording_elapsed_sec = None
+    try:
+        if started_at_value is not None:
+            endpoint = (
+                finalized_at_value
+                if finalized_at_value is not None
+                else sampled_at_value
+            )
+            if endpoint is not None:
+                recording_elapsed_sec = max(
+                    0.0,
+                    float(endpoint) - float(started_at_value),
+                )
+    except (TypeError, ValueError):
+        recording_elapsed_sec = None
+
+    preview_state = "done" if preview_ready or started or committed else (
+        "active" if active_intent_kind == "prepare_sim_preview" else "ready"
+    )
+    input_state = (
+        "done"
+        if started or committed
+        else "active"
+        if active_intent_kind == "start_runtime"
+        else "ready"
+        if preview_ready and human_ready
+        else "blocked"
+        if preview_ready
+        else "waiting"
+    )
+    record_state = (
+        "done"
+        if committed
+        else "fault"
+        if capture_state == "faulted"
+        else "active"
+        if capture_state == "recording" or (started and not episode_ended)
+        else "ready"
+        if preview_ready and human_ready
+        else "waiting"
+    )
+    save_state = (
+        "done"
+        if committed
+        else "active"
+        if active_intent_kind == "finalize_capture"
+        else "ready"
+        if capture_state == "recording"
+        else "fault"
+        if capture_state == "faulted"
+        else "waiting"
+    )
+    operation_labels = {
+        "prepare_sim_preview": "正在构造静态仿真并打开 viewer",
+        "start_runtime": "正在接入 Human、采集 Home 并开始记录",
+        "finalize_capture": "正在保持输出、封存并写入磁盘",
+        "rearm": "正在重新检查并恢复遥操",
+        "capture_runtime_home": "正在重新采集 Runtime Home",
+        "rebuild_runtime": "正在关闭本次仿真并返回准备阶段",
+        "stop_runtime": "正在退出",
+    }
+    if committed:
+        state_label = "已保存"
+    elif active_intent_kind is not None:
+        state_label = operation_labels.get(active_intent_kind, "操作进行中")
+    elif started and held:
+        state_label = "记录保持中"
+    elif capture_state == "recording":
+        state_label = "遥操与记录中"
+    elif preview_ready:
+        state_label = "静态预览中"
+    else:
+        state_label = "等待打开仿真"
+
+    return {
+        "phase": str(phase),
+        "state_label": state_label,
+        "active_intent_kind": active_intent_kind,
+        "operation_label": (
+            None
+            if active_intent_kind is None
+            else operation_labels.get(active_intent_kind, "操作进行中")
+        ),
+        "primary_action": (
+            None
+            if recommended_action is None
+            else dict(recommended_action)
+        ),
+        "steps": [
+            {
+                "id": "preview",
+                "label": "打开静态仿真",
+                "state": preview_state,
+                "detail": "仅 viewer；不接设备、不控制、不记录",
+            },
+            {
+                "id": "human_ready",
+                "label": "确认 Human 输入",
+                "state": input_state,
+                "detail": (
+                    "VIVE 与坐标配置已就绪；扳机在启动时检查"
+                    if human_ready
+                    else "等待 VIVE 与坐标配置"
+                ),
+            },
+            {
+                "id": "recording",
+                "label": "遥操并记录",
+                "state": record_state,
+                "detail": "Human-only 控制与 ControlTrace 同时启动",
+            },
+            {
+                "id": "saved",
+                "label": "封存并保存",
+                "state": save_state,
+                "detail": "terminal HOLD 后执行 seal 与 durable commit",
+            },
+        ],
+        "input": {
+            "vive_ready": input_ready,
+            "coordinate_profile_ready": profile_ready,
+            "angle_trigger": (
+                "connected"
+                if started
+                else "checked_when_recording_starts"
+            ),
+        },
+        "recording": {
+            "active": capture_state == "recording",
+            "held": held,
+            "elapsed_sec": recording_elapsed_sec,
+        },
+        "capture": {
+            "status": capture_state,
+            "commit_status": capture.get("commit_status"),
+            "session_root": capture.get("session_root"),
+            "message": capture.get("message"),
+        },
+    }
+
+
 def build_sim_hil_operator_guidance(
     status: Mapping[str, Any],
 ) -> dict[str, object]:
@@ -116,11 +399,31 @@ def build_sim_hil_operator_guidance(
     started = bool(status.get("started", False))
     held = bool(status.get("held", False))
     episode_ended = bool(status.get("episode_ended", False))
+    collision_terminal = bool(
+        episode_ended
+        and str(status.get("episode_end_reason") or "").startswith(
+            "sim_collision_stop:"
+        )
+    )
     runtime_constructed = bool(startup.get("mujoco_constructed", False))
     restart_required = bool(startup.get("restart_required", False))
     shutdown_requested = bool(acceptance.get("shutdown_requested", False))
+    exclusive_profile = bool(
+        acceptance.get("exclusive_hitl_enabled", False)
+    )
+    # The exclusive profile reuses the streaming-allocation implementation,
+    # but its operator contract is only Policy versus Human.  Treating that
+    # implementation detail as generic allocation advertises the wrong start
+    # intent and creates a duplicate control path in the GUI.
     allocation_profile = bool(
         acceptance.get("allocation_runtime_enabled", False)
+    ) and not exclusive_profile
+    human_demonstration = (
+        str(acceptance.get("capture_profile") or "")
+        == "human_demonstration"
+    )
+    sim_preview_ready = bool(
+        acceptance.get("sim_preview_ready", False)
     )
     active_operation = bool(
         acceptance.get("active_intent_id")
@@ -138,6 +441,7 @@ def build_sim_hil_operator_guidance(
     calibration_stage = str(calibration.get("stage") or "")
     raw_error_value = acceptance.get("last_error") or status.get("last_error")
     raw_error = None if not raw_error_value else str(raw_error_value)
+    execution_fault = _execution_fault_context(status)
     capture_fault = str(capture.get("status") or "") == "faulted"
 
     blockers: list[dict[str, str]] = []
@@ -163,7 +467,7 @@ def build_sim_hil_operator_guidance(
             notices.append(
                 "标定结果尚未保存；保存前 Human 模式不可用。"
             )
-    if not policy_launch_ready:
+    if not human_demonstration and not policy_launch_ready:
         blockers.append(
             {
                 "code": "policy_runtime_not_ready",
@@ -181,11 +485,18 @@ def build_sim_hil_operator_guidance(
         notices.append(
             "当前分配方案未声明人类绝对接管；Human 仅使用已声明的修正模式。"
         )
-    if not allocation_profile and policy_launch_ready and not human_launch_ready:
+    if (
+        not human_demonstration
+        and not allocation_profile
+        and policy_launch_ready
+        and not human_launch_ready
+    ):
         notices.append(
-            "纯 PPO 可以独立启动；遥操和融合仍需 VIVE 输入与坐标配置。"
+            "Policy 可以独立启动；Human 仍需 VIVE 输入与坐标配置。"
+            if exclusive_profile
+            else "纯 PPO 可以独立启动；遥操和融合仍需 VIVE 输入与坐标配置。"
         )
-    if not started:
+    if not started and not sim_preview_ready:
         notices.append("夹爪设备、策略和 MuJoCo 会在启动过程中接入并校验。")
 
     phase: str
@@ -202,9 +513,56 @@ def build_sim_hil_operator_guidance(
         action = None
     elif active_operation:
         phase, severity = "operation_pending", "warning"
-        headline = "操作正在进行"
-        detail = "启动、设备接纳或恢复可能需要等待；期间仍可中断当前操作。"
+        active_kind = str(acceptance.get("active_intent_kind") or "")
+        operation_copy = {
+            "prepare_sim_preview": (
+                "正在打开静态仿真",
+                "正在加载场景并创建 viewer；此时不会接入遥操或开始记录。",
+            ),
+            "start_runtime": (
+                "正在开始遥操与记录",
+                "正在接入 VIVE/扳机、检查输入并采集 Runtime Home；全部通过后才会运行。",
+            ),
+            "finalize_capture": (
+                "正在封存并保存",
+                "正在保持输出并完成 seal、durable flush 与 commit，请不要直接关闭进程。",
+            ),
+        }.get(active_kind)
+        if human_demonstration and operation_copy is not None:
+            headline, detail = operation_copy
+        else:
+            headline = "操作正在进行"
+            detail = "启动、设备接纳或恢复可能需要等待；期间仍可中断当前操作。"
         action = _intent_action("cancel_operation", "中断当前操作")
+    elif collision_terminal:
+        # Collision termination dominates generic restart/fault projection.
+        # It must never regress to rearm, Home capture, or source switching
+        # merely because another status flag is present at the same time.
+        phase, severity = "episode_ended", "error"
+        actual_contact = bool(
+            execution_fault
+            and execution_fault.get("collision_semantics")
+            == "mujoco_forbidden_contact_hard_penetration"
+        )
+        headline = (
+            "MuJoCo 禁碰接触保护已触发"
+            if actual_contact
+            else "规划器安全间隙保护已触发"
+        )
+        detail = (
+            "MuJoCo 已观测到超过硬穿透限值的禁碰接触。当前 episode "
+            "只能 Reset，不能恢复或切换来源继续。"
+            if actual_contact
+            else (
+                "代理模型的预防间隙不足；这不等于 MuJoCo 已发生物理接触。"
+                "当前 episode 只能 Reset，不能恢复或切换来源继续。"
+            )
+        )
+        action = _intent_action(
+            "rebuild_runtime",
+            "Reset 仿真",
+            destructive=True,
+        )
     elif restart_required:
         phase, severity = "restart_required", "error"
         headline = "当前运行时必须重建"
@@ -218,12 +576,56 @@ def build_sim_hil_operator_guidance(
             if runtime_constructed and not episode_ended
             else _intent_action("stop_runtime", "退出控制", destructive=True)
         )
-    elif raw_error or capture_fault:
+    elif raw_error or execution_fault or capture_fault:
         phase, severity = "faulted", "error"
-        issue_code, headline, detail = _classify_error(
-            raw_error or str(capture.get("message") or "capture fault")
+        classification_input = " ".join(
+            value
+            for value in (
+                raw_error,
+                None
+                if execution_fault is None
+                else str(execution_fault["searchable_summary"]),
+                str(capture.get("message") or "") if capture_fault else None,
+            )
+            if value
         )
-        if started and held and not episode_ended:
+        issue_code, headline, detail = _classify_error(
+            classification_input or "capture fault"
+        )
+        if capture_fault:
+            action = _focus_action("operator-diagnostics", "查看记录故障")
+        elif human_demonstration and sim_preview_ready and not started:
+            headline = "Human 输入未通过，视角仍已保留"
+            detail = (
+                "检查 VIVE、坐标配置或角度扳机后可直接重试；静态 viewer 不会重建。"
+            )
+            action = _intent_action(
+                "start_runtime",
+                "重试开始遥操并记录",
+                control_mode="human_teleop",
+            )
+        elif human_demonstration and not started:
+            headline = "上次操作失败，可重新打开静态仿真"
+            detail = (
+                "当前仍未接入遥操或开始记录；检查提示后可安全重试静态预览。"
+            )
+            action = _intent_action(
+                "prepare_sim_preview",
+                "重新打开仿真并调整视角",
+            )
+        elif issue_code == "lower_collision_margin_hold" and started:
+            headline = "规划器安全间隙保护已触发"
+            detail = (
+                "代理模型低于预防间隙；这不表示已发生物理接触。"
+                "当前 episode 已终止，不能 rearm、重采 Home 或切换 "
+                "Policy/Human 继续，只能 Reset 仿真。"
+            )
+            action = _intent_action(
+                "rebuild_runtime",
+                "Reset 仿真",
+                destructive=True,
+            )
+        elif started and held and not episode_ended:
             action = _intent_action("rearm", "重新检查并恢复")
         elif allocation_profile and not started and not blockers:
             action = _intent_action(
@@ -235,8 +637,16 @@ def build_sim_hil_operator_guidance(
     elif episode_ended:
         phase, severity = "episode_ended", "warning"
         headline = "当前回合已结束"
-        detail = "本回合不会再次恢复执行；完成检查后退出控制。"
-        action = _intent_action("stop_runtime", "退出控制", destructive=True)
+        detail = (
+            "本回合已经封存并自动保存；确认提交状态后退出控制。"
+            if human_demonstration
+            else "本回合不会再次恢复执行；完成检查后退出控制。"
+        )
+        action = _intent_action(
+            "stop_runtime",
+            "退出控制",
+            destructive=True,
+        )
     elif started and held:
         phase, severity = "held", "warning"
         headline = "输出已保持"
@@ -244,8 +654,16 @@ def build_sim_hil_operator_guidance(
         action = _intent_action("rearm", "重新检查并恢复")
     elif started:
         phase, severity = "running", "ready"
-        headline = "Sim-HIL 正在运行"
-        if allocation_profile:
+        headline = (
+            "Human Demo 正在遥操并记录"
+            if human_demonstration
+            else "Sim-HIL 正在运行"
+        )
+        if human_demonstration:
+            detail = (
+                "Human 是唯一控制来源；完成本回合后封存会事务性提交并自动保存。"
+            )
+        elif allocation_profile:
             mode_id = str(
                 allocation_operations.get("allocation_override_mode")
                 or "automatic"
@@ -272,10 +690,55 @@ def build_sim_hil_operator_guidance(
                 f"分配规则：{mode}；本周期实际选择：{effective}。"
                 "所有动作仍由唯一 MuJoCo 执行链路下发。"
             )
+        elif exclusive_profile:
+            mode = str(acceptance.get("active_control_mode") or "")
+            source = {
+                "ppo_only": "Policy",
+                "human_teleop": "Human",
+            }.get(mode, "待确认来源")
+            detail = (
+                f"当前控制来源：{source}。使用同一组 Policy / Human 来源卡切换；"
+                "切换事务会先 HOLD，再完成 Home 或策略重置。"
+            )
         else:
             mode = str(acceptance.get("active_control_mode") or "未报告")
             detail = f"当前控制模式：{mode}。可在下方切换模式或保持输出。"
-        action = _intent_action("hold", "保持输出")
+        action = (
+            _intent_action(
+                "finalize_capture",
+                "结束回合、封存并保存",
+                destructive=True,
+            )
+            if human_demonstration
+            else _intent_action("hold", "保持输出")
+        )
+    elif human_demonstration and sim_preview_ready:
+        phase, severity = "sim_preview", "ready"
+        headline = "静态仿真已打开，可调整视角"
+        if human_launch_ready:
+            detail = (
+                "当前未接入遥操、未推进物理、未开始记录；视角确认后可一次性开始遥操与记录。"
+            )
+            action = _intent_action(
+                "start_runtime",
+                "开始遥操并记录",
+                control_mode="human_teleop",
+            )
+        else:
+            detail = (
+                "可以继续调整视角；开始记录前仍需 VIVE、角度扳机和坐标配置就绪。"
+            )
+            action = _focus_action("vive-setup-panel", "检查 Human 输入")
+    elif human_demonstration:
+        phase, severity = "ready_for_preview", "ready"
+        headline = "先打开静态仿真"
+        detail = (
+            "预览只构造场景并刷新 viewer，不接入遥操、不推进物理、也不创建回合记录。"
+        )
+        action = _intent_action(
+            "prepare_sim_preview",
+            "打开仿真并调整视角",
+        )
     elif workflow_active:
         phase, severity = "calibrating", "warning"
         headline = "VIVE 坐标标定进行中"
@@ -297,13 +760,26 @@ def build_sim_hil_operator_guidance(
         phase, severity = "ready_to_start", "ready"
         headline = "请选择启动模式"
         if human_launch_ready:
-            detail = "纯遥操、纯 PPO 和比例融合均可作为初始模式。"
-            action = _focus_action("control-modes", "选择启动模式")
+            if exclusive_profile:
+                detail = (
+                    "Policy 与 Human 都已就绪；在来源卡中选择任一来源启动。"
+                )
+                action = _focus_action(
+                    "exclusive-source-modules",
+                    "选择控制来源",
+                )
+            else:
+                detail = "纯遥操、纯 PPO 和比例融合均可作为初始模式。"
+                action = _focus_action("control-modes", "选择启动模式")
         else:
-            detail = "当前可先启动纯 PPO；Human 相关模式尚未满足输入条件。"
+            detail = (
+                "当前可先以 Policy 启动；Human 来源卡会持续显示缺少的准备条件。"
+                if exclusive_profile
+                else "当前可先启动纯 PPO；Human 相关模式尚未满足输入条件。"
+            )
             action = _intent_action(
                 "start_runtime",
-                "以纯 PPO 启动",
+                "以 Policy 启动" if exclusive_profile else "以纯 PPO 启动",
                 control_mode="ppo_only",
             )
     else:
@@ -325,6 +801,18 @@ def build_sim_hil_operator_guidance(
             detail = "启动所选方案前，需要被选中的 VIVE 来源持续提供新鲜数据。"
             action = _focus_action("vive-setup-panel", "查看输入设置")
 
+    workflow = (
+        _human_demo_workflow(
+            status,
+            acceptance=acceptance,
+            setup=setup,
+            capture=capture,
+            recommended_action=action,
+            phase=phase,
+        )
+        if human_demonstration
+        else None
+    )
     return {
         "schema": SIM_HIL_OPERATOR_GUIDANCE_SCHEMA_V1,
         "phase": phase,
@@ -333,9 +821,11 @@ def build_sim_hil_operator_guidance(
         "detail": detail,
         "issue_code": issue_code,
         "raw_error": raw_error,
+        "execution_fault": execution_fault,
         "blockers": blockers,
         "notices": notices,
         "recommended_action": action,
+        "human_demo_workflow": workflow,
     }
 
 

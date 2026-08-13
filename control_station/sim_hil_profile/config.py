@@ -40,13 +40,19 @@ DEFAULT_CALIBRATION_PROFILE = (
     / "calibration_profiles"
     / "20260627_112114_vive_rm65_virtual_desk.json"
 )
-DEFAULT_VIVE_COORDINATE_PROFILE = Path("latest")
+DEFAULT_VIVE_COORDINATE_PROFILE = (
+    REPO_ROOT
+    / "teleop_records"
+    / "control_station_vive_coordinate_profiles"
+    / "vive_rm65_virtual_desk_coordinate_v1.json"
+)
 DEFAULT_VIVE_PORT = 9999
 DEFAULT_STATUS_HOST = "127.0.0.1"
 DEFAULT_STATUS_PORT = 8787
 DEFAULT_SIM_HIL_COMPOSE_TARGET_HZ = 30.0
 SIM_HIL_BLEND_FAILURE_FALLBACKS = frozenset({"hold", "human", "policy"})
 SIM_HIL_HUMAN_TIMEOUT_FALLBACKS = frozenset({"hold", "policy"})
+SIM_HIL_POLICY_BACKENDS = frozenset({"temp_ppo", "openpi_state"})
 _LOOPBACK_STATUS_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
@@ -55,6 +61,15 @@ class MujocoSimHILApplicationConfig:
     """Station-only profile selection and lifecycle settings."""
 
     checkpoint_path: Path = DEFAULT_CHECKPOINT
+    policy_backend: str = "temp_ppo"
+    openpi_policy_artifact_path: Path | None = None
+    openpi_host: str = "127.0.0.1"
+    openpi_port: int = 8000
+    openpi_prompt: str | None = None
+    openpi_action_hz: float = 15.0
+    openpi_policy_hz: float = 15.0
+    openpi_action_chunk_execution_steps: int | None = None
+    openpi_prediction_queue_threshold: int = 4
     task_config_path: Path = DEFAULT_TASK_CONFIG
     calibration_profile_path: Path = DEFAULT_CALIBRATION_PROFILE
     vive_coordinate_profile_path: Path | None = DEFAULT_VIVE_COORDINATE_PROFILE
@@ -102,17 +117,73 @@ class MujocoSimHILApplicationConfig:
     human_timeout_fallback: str = "hold"
     defer_human_input: bool = False
     execution_difference_enabled: bool = True
+    # Pre-construction Sim behavior. Enabled preserves the existing collision
+    # rejection path; disabled allows MuJoCo contacts without stopping the
+    # Sim-HIL episode. This never applies to a real-robot target.
+    sim_collision_stop_enabled: bool = True
     mujoco_viewer_enabled: bool = False
     status_host: str = DEFAULT_STATUS_HOST
     status_port: int = DEFAULT_STATUS_PORT
 
     def __post_init__(self) -> None:
+        if not isinstance(self.sim_collision_stop_enabled, bool):
+            raise TypeError("sim_collision_stop_enabled must be a bool.")
         for name in (
             "checkpoint_path",
             "task_config_path",
             "calibration_profile_path",
         ):
             object.__setattr__(self, name, Path(getattr(self, name)).expanduser())
+        backend = str(self.policy_backend).strip().lower()
+        if backend not in SIM_HIL_POLICY_BACKENDS:
+            raise ValueError(
+                "policy_backend must be temp_ppo or openpi_state."
+            )
+        object.__setattr__(self, "policy_backend", backend)
+        artifact_path = self.openpi_policy_artifact_path
+        if artifact_path is not None:
+            artifact_path = Path(artifact_path).expanduser()
+            object.__setattr__(self, "openpi_policy_artifact_path", artifact_path)
+        if backend == "openpi_state" and artifact_path is None:
+            raise ValueError(
+                "openpi_state policy backend requires openpi_policy_artifact_path."
+            )
+        openpi_host = str(self.openpi_host).strip()
+        openpi_port = int(self.openpi_port)
+        if not openpi_host or not 0 < openpi_port <= 65535:
+            raise ValueError("openpi_host/openpi_port are invalid.")
+        object.__setattr__(self, "openpi_host", openpi_host)
+        object.__setattr__(self, "openpi_port", openpi_port)
+        if self.openpi_prompt is not None:
+            prompt = str(self.openpi_prompt).strip()
+            object.__setattr__(self, "openpi_prompt", prompt or None)
+        for name in ("openpi_action_hz", "openpi_policy_hz"):
+            value = _finite(getattr(self, name), name=name)
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive.")
+            object.__setattr__(self, name, value)
+        execution_steps = self.openpi_action_chunk_execution_steps
+        if execution_steps is not None:
+            execution_steps = int(execution_steps)
+            if execution_steps <= 0:
+                raise ValueError(
+                    "openpi_action_chunk_execution_steps must be positive."
+                )
+            object.__setattr__(
+                self,
+                "openpi_action_chunk_execution_steps",
+                execution_steps,
+            )
+        queue_threshold = int(self.openpi_prediction_queue_threshold)
+        if queue_threshold < 0:
+            raise ValueError(
+                "openpi_prediction_queue_threshold must be non-negative."
+            )
+        object.__setattr__(
+            self,
+            "openpi_prediction_queue_threshold",
+            queue_threshold,
+        )
         for name in ("runtime_session_id", "control_domain_id"):
             value = str(getattr(self, name)).strip()
             if not value:
@@ -289,5 +360,6 @@ __all__ = [
     "MujocoSimHILApplicationConfig",
     "SIM_HIL_BLEND_FAILURE_FALLBACKS",
     "SIM_HIL_HUMAN_TIMEOUT_FALLBACKS",
+    "SIM_HIL_POLICY_BACKENDS",
     "acceptance_profile_config",
 ]

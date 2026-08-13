@@ -665,8 +665,13 @@ class MujocoPositionExecutionRig(Rig):
         published = float(self._clock())
         if not math.isfinite(published):
             raise RuntimeError("monotonic clock returned a non-finite value.")
-        activation = published if activate_at is None else float(activate_at)
-        if activation + 1e-12 < published:
+        requested_activation = (
+            None if activate_at is None else float(activate_at)
+        )
+        if (
+            requested_activation is not None
+            and requested_activation + 1e-12 < published
+        ):
             raise ValueError("A scheduled qref cannot activate before publication.")
         with self._lock:
             if not self._started:
@@ -678,6 +683,26 @@ class MujocoPositionExecutionRig(Rig):
                     "MuJoCo position execution worker has failed: "
                     f"{self._last_worker_error}"
                 )
+            if requested_activation is None:
+                activation = published
+                if not self.config.realtime_worker:
+                    # Manual/offline physics advances on an explicit sim
+                    # timeline, while command preparation and caller pacing
+                    # advance the injected monotonic clock.  Realign only the
+                    # manual timeline before an immediate reference so a
+                    # command published after a slow IK/planning interval is
+                    # not left perpetually "in the future" and overwritten by
+                    # the next mailbox value.  The realtime worker maintains
+                    # its own deadline/missed-period alignment below, and
+                    # scheduled references retain their exact activate_at.
+                    planner_now = (
+                        self._clock_origin
+                        + self._execution.physics_time_sec
+                    )
+                    if activation > planner_now:
+                        self._clock_origin += activation - planner_now
+            else:
+                activation = requested_activation
             sequence = self._next_reference_sequence
             self._next_reference_sequence += 1
             self._pending_reference = _QueuedReference(

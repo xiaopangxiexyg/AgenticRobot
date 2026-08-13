@@ -166,6 +166,49 @@ def test_sim_hil_vive_status_shows_both_sender_roles_before_mapping() -> None:
     ]
 
 
+def test_sim_hil_vive_status_distinguishes_mapped_from_task_required_outputs() -> None:
+    source = VivePoseSource(
+        tracker_configs=[
+            ViveTrackerConfig(
+                name="physical-single",
+                side="right",
+                role="left_wrist",
+                channel_name="right_wrist_pose",
+            ),
+            ViveTrackerConfig(
+                name="synthetic-right",
+                side="left",
+                role="right_wrist",
+                channel_name="left_wrist_pose",
+            ),
+        ],
+        host="127.0.0.1",
+        port=9999,
+        clock_sync_port=0,
+    )
+    source._running = True
+    source._process_received_batch(
+        [(_single_vive_sender_packet(), 100.0, 20.0, ("192.0.2.7", 4000))]
+    )
+
+    status = _vive_receiver_status(
+        SimpleNamespace(sources=[source]),
+        wall_now=100.1,
+        required_output_channels=("right_wrist_pose",),
+    )
+
+    assert status["required_output_channels"] == ["right_wrist_pose"]
+    assert status["trackers"]["left"][
+        "selected_for_required_output_channels"
+    ] == ["right_wrist_pose"]
+    assert status["trackers"]["right"]["selected_for_output_channels"] == [
+        "left_wrist_pose"
+    ]
+    assert status["trackers"]["right"][
+        "selected_for_required_output_channels"
+    ] == []
+
+
 def test_sim_hil_rate_config_keeps_compose_rate_explicit_and_legacy_alias() -> None:
     default_config = MujocoSimHILApplicationConfig()
     assert default_config.position_control_profile_name == "position_15_60_120hz"
@@ -198,7 +241,10 @@ def test_allocation_gui_uses_distinct_typed_start_and_button_intents() -> None:
     assert "submitIntent('start_allocation_runtime')" in _HTML
     assert "submitIntent('start_runtime', 'proportional_blend', 0.5)" not in _HTML
     assert "acceptance.allocation_runtime_enabled" in _HTML
-    assert "if (!allocationProfile)" in _HTML
+    assert (
+        "if (!allocationProfile && !exclusiveProfile && "
+        "!humanDemonstration)" in _HTML
+    )
     assert "value.control_profile_id ===" not in _HTML
     assert 'id="allocation-automatic"' in _HTML
     assert 'id="allocation-base-only"' in _HTML
@@ -206,6 +252,159 @@ def test_allocation_gui_uses_distinct_typed_start_and_button_intents() -> None:
     assert 'id="allocation-absolute-overlay-owner" hidden' in _HTML
     assert "supportedAllocationSignals.has(signalName)" in _HTML
     assert 'id="allocation-rebase-and-clear"' in _HTML
+
+
+def test_exclusive_hitl_is_an_option_in_the_shared_streaming_gui() -> None:
+    assert "acceptance.exclusive_hitl_enabled" in _HTML
+    assert 'id="streaming-control-controls" class="setup-panel" hidden' in _HTML
+    assert "$('streaming-control-controls').hidden = !allocationProfile" in _HTML
+    assert 'id="exclusive-source-modules" class="setup-panel" hidden' in _HTML
+    assert 'id="exclusive-policy-module"' in _HTML
+    assert 'id="exclusive-human-module"' in _HTML
+    assert 'id="allocation-controls" hidden' in _HTML
+    assert 'id="exclusive-hitl-controls"' not in _HTML
+    assert 'id="start-exclusive-policy-runtime"' in _HTML
+    assert 'id="start-exclusive-human-runtime"' in _HTML
+    assert 'id="exclusive-hitl-takeover"' not in _HTML
+    assert 'id="exclusive-hitl-resume-policy"' not in _HTML
+    assert 'id="exclusive-cycle-timing"' in _HTML
+    assert 'class="source-runtime-meta"' in _HTML
+    assert "selectExclusiveSource('policy')" in _HTML
+    assert "selectExclusiveSource('human')" in _HTML
+    assert "? 'request_human_takeover'" in _HTML
+    assert ": 'request_policy_resume'" in _HTML
+    assert "targetSource === 'human' ? 'human_teleop' : 'ppo_only'" in _HTML
+    assert "policyButton.hidden = false" in _HTML
+    assert "humanButton.hidden = false" in _HTML
+    assert 'id="exclusive-current-owner"' in _HTML
+    assert 'id="exclusive-policy-action-reason"' in _HTML
+    assert 'id="exclusive-human-action-reason"' in _HTML
+    assert (
+        "target.hidden = allocationProfile || exclusiveProfile || "
+        "humanDemonstration" in _HTML
+    )
+
+
+def test_shared_gui_can_select_the_whole_control_workflow_before_start() -> None:
+    assert 'id="control-profile-panel"' in _HTML
+    assert 'id="control-profile-selector"' in _HTML
+    assert 'id="apply-control-profile"' in _HTML
+    assert "acceptance.available_control_profile_ids" in _HTML
+    assert "acceptance.control_profile_selection_locked" in _HTML
+    assert "select_control_profile" in _HTML
+    assert "payload.control_profile_id = controlProfileId" in _HTML
+    for profile_id in (
+        "fixed_alpha_compatibility",
+        "exclusive_truncated_hitl",
+        "policy_human_allocation_scheme_a",
+        "policy_human_allocation_scheme_b",
+    ):
+        assert profile_id in _HTML
+    assert "Runtime 已绑定完整 lifecycle / control-cycle profile" in _HTML
+    assert 'id="sim-collision-stop-selector"' in _HTML
+    assert 'id="apply-sim-collision-stop"' in _HTML
+    assert "select_sim_collision_stop" in _HTML
+    assert "payload.sim_collision_stop_enabled" in _HTML
+    assert "安全保护触发后终止（代理间隙 / 禁碰接触）" in _HTML
+    assert "关闭规划器碰撞约束（仅调试）" in _HTML
+
+
+def test_collision_stop_gui_allows_only_sim_reset() -> None:
+    assert 'id="collision-recovery"' in _HTML
+    assert 'id="collision-reset-runtime"' in _HTML
+    assert 'id="collision-policy-recovery"' not in _HTML
+    assert 'id="collision-capture-home"' not in _HTML
+    assert 'id="collision-rearm-runtime"' not in _HTML
+    assert "collisionTerminal" in _HTML
+    assert "当前 episode 不允许恢复、切换来源或重采 Home" in _HTML
+    assert "exclusive_hitl_policy_recovery_from_hold" not in _HTML
+    assert "submitLifecycleIntent('rebuild_runtime')" in _HTML
+    assert "sourceOperationBlocked = acceptanceBusy || episodeEnded" in _HTML
+    assert "|| Boolean(value.held)" in _HTML
+
+
+def test_operator_gui_separates_journey_safety_and_lifecycle_actions() -> None:
+    for element_id in (
+        "operator-journey",
+        "journey-prepare",
+        "journey-source",
+        "journey-run",
+        "journey-finish",
+        "runtime-primary-actions",
+        "runtime-lifecycle-actions",
+        "vive-calibration-tools",
+    ):
+        assert f'id="{element_id}"' in _HTML
+    assert 'id="hold-runtime" class="hold-action"' in _HTML
+    assert "$('hold-runtime').hidden" in _HTML
+    assert "$('rearm-runtime').hidden" in _HTML
+    assert "$('capture-runtime-home').hidden" in _HTML
+    assert "$('cancel-operation').hidden" in _HTML
+    assert "setIntentMessage" in _HTML
+    assert ".intent-message.pending" in _HTML
+    assert ".intent-message.success" in _HTML
+    assert ".intent-message.error" in _HTML
+
+
+def test_fixed_alpha_gui_can_apply_a_new_ratio_while_blend_is_active() -> None:
+    assert 'id="apply-blend-alpha"' in _HTML
+    assert 'id="active-blend-alpha"' in _HTML
+    assert "'set_control_mode'," in _HTML
+    assert "'proportional_blend'," in _HTML
+    assert "Number($('blend-alpha').value)" in _HTML
+    assert "已接纳 α" in _HTML
+    assert "compositionAlphaByComponent" in _HTML
+    assert "不是策略速度倍率" in _HTML
+
+
+def test_human_demonstration_gui_uses_server_advertised_mode_allowlist() -> None:
+    assert "acceptance.capture_profile" in _HTML
+    assert "availableControlModes" in _HTML
+    assert "if (!availableControlModes.has(modeId)) continue" in _HTML
+    assert "human_demonstration" in _HTML
+
+
+def test_human_demonstration_gui_separates_preview_start_and_durable_finalize() -> None:
+    assert (
+        'id="human-demo-workflow" class="setup-panel demo-workflow" hidden'
+        in _HTML
+    )
+    assert 'id="human-demo-progress"' in _HTML
+    assert 'id="human-demo-primary-action"' in _HTML
+    assert 'id="demo-recording-dot"' in _HTML
+    assert 'id="demo-operation-status"' in _HTML
+    assert 'id="demo-save-path"' in _HTML
+    assert 'id="demo-hold"' in _HTML
+    assert 'id="demo-swap-vive"' in _HTML
+    assert 'id="demo-cancel-operation"' in _HTML
+    assert 'id="human-demo-recovery"' in _HTML
+    assert "guidance.human_demo_workflow" in _HTML
+    assert "workflow.primary_action" in _HTML
+    assert "executeOperatorAction" in _HTML
+    assert "waitForIntentSettlement" in _HTML
+    assert "intentPending = false" in _HTML
+    assert "durable commit 已完成" in _HTML
+    assert "预览阶段不会接入遥操、推进物理或创建 episode" in _HTML
+    assert "const humanDemoPreviewCanSwap = humanDemonstration" in _HTML
+    assert "&& simPreviewReady && !runtimeStarted" in _HTML
+    assert "|| viveMappingFrozen" in _HTML
+    assert "demoSwap.hidden = started || ended" in _HTML
+    assert "() => submitIntent('swap_vive_sources')" in _HTML
+
+
+def test_human_demo_preview_keeps_human_detached_from_human_only_contract() -> None:
+    assert sim_hil_module._should_defer_gui_human_input(
+        capture_profile="human_demonstration",
+        initial_human_alpha=1.0,
+    ) is True
+    assert sim_hil_module._should_defer_gui_human_input(
+        capture_profile="acceptance",
+        initial_human_alpha=1.0,
+    ) is False
+    assert sim_hil_module._should_defer_gui_human_input(
+        capture_profile="acceptance",
+        initial_human_alpha=0.0,
+    ) is True
 
 
 def test_control_gui_prioritizes_operator_workflow_over_raw_diagnostics() -> None:
@@ -218,15 +417,6 @@ def test_control_gui_prioritizes_operator_workflow_over_raw_diagnostics() -> Non
     assert "operatorPhaseNames[guidance.phase]" in _HTML
     assert "starting ? uiValue('STARTING')" in _HTML
     assert "window.confirm(message)" in _HTML
-
-
-def test_control_gui_renders_read_only_admitted_human_deflection() -> None:
-    assert 'id="human-deflection-panel"' in _HTML
-    assert 'id="human-deflection-status"' in _HTML
-    assert 'id="human-deflection-views"' in _HTML
-    assert "renderHumanDeflection(human.relative_deflection || {})" in _HTML
-    assert "固定量程 ±120 mm" in _HTML
-    assert "该视图只读，不参与控制" in _HTML
 
 
 def test_allocation_gui_has_profile_specific_chinese_operator_copy() -> None:
@@ -257,6 +447,12 @@ def test_sim_hil_rate_cli_exposes_profile_and_compose_cadence() -> None:
     default_config = _config_from_args(build_arg_parser().parse_args([]))
     assert default_config.compose_target_hz == 30.0
     assert default_config.blend_failure_grace_sec == pytest.approx(0.0)
+    assert default_config.sim_collision_stop_enabled is True
+
+    collision_allowed = _config_from_args(
+        build_arg_parser().parse_args(["--no-sim-collision-stop"])
+    )
+    assert collision_allowed.sim_collision_stop_enabled is False
 
     args = build_arg_parser().parse_args(
         [
@@ -280,6 +476,22 @@ def test_sim_hil_rate_cli_exposes_profile_and_compose_cadence() -> None:
         build_arg_parser().parse_args(["--blend-failure-grace", "0.35"])
     )
     assert grace_config.blend_failure_grace_sec == pytest.approx(0.35)
+
+
+def test_exclusive_hitl_headless_cli_keeps_policy_default_without_gui_selection() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--control-profile",
+            "exclusive_truncated_hitl",
+            "--human-alpha",
+            "0.9",
+        ]
+    )
+
+    config = _config_from_args(args)
+
+    assert config.initial_human_alpha == 0.0
+    assert config.defer_human_input is True
 
 
 def test_policy_only_gui_setup_survives_vive_receiver_start_failure(
@@ -360,8 +572,11 @@ def test_sim_hil_control_gui_cli_is_explicit_and_has_a_capture_root() -> None:
     assert (
         _config_from_args(args).vive_coordinate_profile_path
         == DEFAULT_VIVE_COORDINATE_PROFILE
-        == Path("latest")
     )
+    assert DEFAULT_VIVE_COORDINATE_PROFILE.name == (
+        "vive_rm65_virtual_desk_coordinate_v1.json"
+    )
+    assert DEFAULT_VIVE_COORDINATE_PROFILE.is_absolute()
 
     calibration_args = build_arg_parser().parse_args(
         [
@@ -389,6 +604,52 @@ def test_sim_hil_control_gui_cli_is_explicit_and_has_a_capture_root() -> None:
     )
     assert compatibility_args.acceptance_gui is True
     assert build_arg_parser().parse_args(["--no-open-browser"]).open_browser is False
+
+    demo_args = build_arg_parser().parse_args(
+        [
+            "--enable",
+            "--control-gui",
+            "--capture-profile",
+            "human_demonstration",
+            "--capture-root",
+            "/tmp/sim-hil-demos",
+        ]
+    )
+    assert demo_args.capture_profile == "human_demonstration"
+    assert demo_args.acceptance_root == Path("/tmp/sim-hil-demos")
+
+    with pytest.raises(ValueError, match="requires --control-gui"):
+        sim_hil_module.run(
+            build_arg_parser().parse_args(
+                ["--enable", "--capture-profile", "human_demonstration"]
+            )
+        )
+    with pytest.raises(ValueError, match="fixed_alpha_compatibility"):
+        sim_hil_module.run(
+            build_arg_parser().parse_args(
+                [
+                    "--dry-run",
+                    "--control-gui",
+                    "--capture-profile",
+                    "human_demonstration",
+                    "--control-profile",
+                    "exclusive_truncated_hitl",
+                ]
+            )
+        )
+    with pytest.raises(ValueError, match="HOLD timeout fallback"):
+        sim_hil_module.run(
+            build_arg_parser().parse_args(
+                [
+                    "--dry-run",
+                    "--control-gui",
+                    "--capture-profile",
+                    "human_demonstration",
+                    "--human-timeout-fallback",
+                    "policy",
+                ]
+            )
+        )
 
 
 def test_sim_hil_acceptance_root_defaults_to_legacy_without_creation() -> None:
@@ -463,6 +724,7 @@ def test_sim_hil_acceptance_storage_receipt_is_session_scoped(
     )
     assert payload["selection_source"] == "canonical"
     assert payload["evidence_semantics"] == "control_trace_wal_seal_commit"
+    assert payload["capture_profile"] == "acceptance"
 
 
 def test_control_profile_base_alpha_is_only_a_factory_fallback() -> None:
@@ -991,10 +1253,10 @@ def test_runtime_home_recapture_is_passive_and_keeps_viewer_open() -> None:
         )
 
         @staticmethod
-        def prepare_input_pose_desk(pose):
-            raise AssertionError(
-                "Runtime Home must pass raw desk-frame samples to set_home_anchors."
-            )
+        def resolve_runtime_home_input_pose_desk(*, channel, calibration):
+            assert channel.frame_name == "desk"
+            assert calibration.desk_frame.name == "desk"
+            return np.asarray(channel.value, dtype=float)
 
         @staticmethod
         def set_home_anchors(*, human_pose_desk, robot_pose_desk):
@@ -1747,12 +2009,13 @@ def test_sim_hil_acceptance_endpoint_is_tokened_and_only_submits_intents() -> No
         assert b'id="vive-source-mapping"' in body
         assert b"source_role_by_output_channel" in body
         assert b'id="capture-card"' in body
-        assert b"const inactive = selectedChannels.length === 0" in body
-        assert "inactive ? '未选用'".encode("utf-8") in body
+        assert b"const inactive = requiredSelectedChannels.length === 0" in body
+        assert "本任务未使用".encode("utf-8") in body
+        assert "不参与本次单右臂控制".encode("utf-8") in body
         assert b"RESTART REQUIRED" in body
         assert b"/api/vive-status" in body
         assert b"setInterval(refreshVive, 250)" in body
-        assert b"intentKind === 'swap_vive_sources'" in body
+        assert b"waitForIntentSettlement" in body
         assert "输出 ${selected}".encode("utf-8") in body
 
         status, _headers, body = _request(

@@ -22,6 +22,9 @@ from .control_cycle import (
 SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY = (
     SIM_HIL_CONTROL_CYCLE_FIXED_ALPHA_COMPATIBILITY
 )
+SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL = (
+    "exclusive_truncated_hitl"
+)
 
 
 def _required(value: object, *, name: str) -> str:
@@ -108,12 +111,16 @@ class SimHILControlProfileBinding:
             raise TypeError("profile builder must be callable.")
 
 
-def _fixed_alpha_binding() -> SimHILControlProfileBinding:
+def _fixed_alpha_binding(
+    profile_id: str = SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
+) -> SimHILControlProfileBinding:
+    selected_profile = _required(profile_id, name="profile_id")
+
     def build(
         assembly: SimHILControlProfileAssembly,
     ) -> SimHILApplicationControlProfile:
         return SimHILApplicationControlProfile(
-            profile_id=SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
+            profile_id=selected_profile,
             session=assembly.compatibility_session,
             control_cycle_port=FixedAlphaCompatibilityControlCyclePort(
                 assembly.compatibility_session
@@ -121,7 +128,7 @@ def _fixed_alpha_binding() -> SimHILControlProfileBinding:
         )
 
     return SimHILControlProfileBinding(
-        profile_id=SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
+        profile_id=selected_profile,
         cycle_kind=SIM_HIL_CONTROL_CYCLE_FIXED_ALPHA_COMPATIBILITY,
         builder=build,
     )
@@ -130,7 +137,10 @@ def _fixed_alpha_binding() -> SimHILControlProfileBinding:
 def _binding_by_profile_id(
     additional_bindings: Iterable[SimHILControlProfileBinding],
 ) -> dict[str, SimHILControlProfileBinding]:
-    bindings = (_fixed_alpha_binding(), *tuple(additional_bindings))
+    bindings = (
+        _fixed_alpha_binding(),
+        *tuple(additional_bindings),
+    )
     if any(
         not isinstance(binding, SimHILControlProfileBinding)
         for binding in bindings
@@ -191,6 +201,7 @@ def select_sim_hil_application_control_profile(
 
 __all__ = [
     "SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY",
+    "SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL",
     "SimHILApplicationControlProfile",
     "SimHILControlProfileAssembly",
     "SimHILControlProfileBinding",

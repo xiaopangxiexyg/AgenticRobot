@@ -33,8 +33,9 @@ from teleop_runtime.real_teleop.temporary_dual_arm_safety import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ENTRYPOINT = ROOT / "teleop_runtime/debug/run_vive_rm65_real_teleop.py"
 FRONTEND = ROOT / "teleop_runtime/action/human_shadow_frontend.py"
+COMPONENT_BUILDER = ROOT / "teleop_runtime/real_teleop/component_builder.py"
+SHUTDOWN_RUNTIME = ROOT / "teleop_runtime/real_teleop/shutdown_runtime.py"
 
 
 def profile(**overrides) -> RealTeleopHumanShadowProfile:
@@ -597,16 +598,19 @@ def test_cli_defaults_off_and_rejects_incomplete_or_conflicting_modes() -> None:
 
 
 def test_canonical_gui_wiring_is_passive_default_off_and_closes_first() -> None:
-    source = ENTRYPOINT.read_text(encoding="utf-8")
     frontend_source = FRONTEND.read_text(encoding="utf-8")
+    component_source = COMPONENT_BUILDER.read_text(encoding="utf-8")
+    shutdown_source = SHUTDOWN_RUNTIME.read_text(encoding="utf-8")
 
     assert 'default="off"' in frontend_source
-    assert "human_command_observer=(" in source
-    assert "human_execution_observer=(" in source
-    assert "human_shadow_frontend.observe_emission" in source
-    assert "human_shadow_frontend.observe_legacy_execution" in source
-    assert source.index('("human_action_shadow", components.human_shadow_frontend.close)') < (
-        source.index('("teleop_session", components.session.close)')
+    assert "human_command_observer=(" in component_source
+    assert "human_execution_observer=(" in component_source
+    assert "human_shadow_frontend.observe_emission" in component_source
+    assert "human_shadow_frontend.observe_legacy_execution" in component_source
+    assert shutdown_source.index(
+        '("human_action_shadow", components.human_shadow_frontend.close)'
+    ) < shutdown_source.index(
+        '("teleop_session", components.session.close)'
     )
     assert "DispatchOwnerToken" not in frontend_source
     assert ".send_commands(" not in frontend_source

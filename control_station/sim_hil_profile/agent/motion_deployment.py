@@ -26,6 +26,7 @@ from control_station.agent_gateway.protocol.skill_catalog import (
     SkillDefinition,
     SkillDefinitionCatalog,
     SkillDeploymentBindingRef,
+    SkillDeploymentSafetyEnvelopeRef,
     SkillExecutionRoute,
     SkillRouteManifest,
     SkillRouteManifestEntry,
@@ -98,6 +99,16 @@ MUJOCO_AGENT_TCP_POSE_MAX_MEASUREMENT_AGE_MS_V1 = 500
 MUJOCO_AGENT_TCP_POSE_TRACE_PROFILE_ID_V1 = (
     "deployable_mujoco_agent_tcp_pose_no_model_v1"
 )
+MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1 = (
+    -0.60,
+    0.60,
+    -0.80,
+    0.80,
+    0.0,
+    0.90,
+)
+MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1 = 0.10
+MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1 = math.radians(15.0)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -134,15 +145,14 @@ class MujocoAgentTcpPoseMotionProfile:
     tool_config_hash: str
     calibration_hash: str
     workspace_bounds: tuple[float, float, float, float, float, float] = (
-        -0.60,
-        0.60,
-        -0.80,
-        0.80,
-        0.0,
-        0.90,
+        MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1
     )
-    max_translation_delta_m: float = 0.10
-    max_rotation_delta_rad: float = math.radians(15.0)
+    max_translation_delta_m: float = (
+        MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1
+    )
+    max_rotation_delta_rad: float = (
+        MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1
+    )
     translation_tolerance_m: float = 0.01
     rotation_tolerance_rad: float = math.radians(5.0)
     stable_measurement_count: int = 3
@@ -333,6 +343,7 @@ class MujocoAgentTcpPoseDeploymentBinding:
     trace_requirement_profile_id: str
     executor_id: str
     explicit_exclusions: tuple[str, ...]
+    safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -371,6 +382,17 @@ class MujocoAgentTcpPoseDeploymentBinding:
         if not exclusions or any(not str(item).strip() for item in exclusions):
             raise ValueError("explicit_exclusions must contain non-empty values.")
         object.__setattr__(self, "explicit_exclusions", exclusions)
+        safety_refs = tuple(self.safety_envelope_refs)
+        if any(
+            not isinstance(item, SkillDeploymentSafetyEnvelopeRef)
+            for item in safety_refs
+        ):
+            raise TypeError("safety_envelope_refs must contain typed refs.")
+        object.__setattr__(
+            self,
+            "safety_envelope_refs",
+            tuple(sorted(safety_refs, key=lambda item: item.object_id)),
+        )
 
     @property
     def semantic_content_hash(self) -> str:
@@ -379,7 +401,11 @@ class MujocoAgentTcpPoseDeploymentBinding:
                 **{
                     field_name: getattr(self, field_name)
                     for field_name in self.__dataclass_fields__
+                    if field_name != "safety_envelope_refs"
                 },
+                "safety_envelope_refs": tuple(
+                    item.to_wire() for item in self.safety_envelope_refs
+                ),
                 "controlled_component_ids": ("right_arm",),
                 "controlled_frame_id": "tool_tcp",
                 "target_kind": "sim",
@@ -395,6 +421,7 @@ class MujocoAgentTcpPoseDeploymentBinding:
             target_binding_id=self.target_binding_id,
             target_kind="sim",
             execution_manifest_hash=self.execution_manifest_hash,
+            safety_envelope_refs=self.safety_envelope_refs,
         )
 
 
@@ -1203,6 +1230,21 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         requires_task_evaluation=True,
     )
     validate_agent_motion_route_schema_v1(route=route, schema_entry=schema_entry)
+    safety_runtime = getattr(application, "tcp_pose_envelope_runtime", None)
+    safety_envelope_refs = (
+        ()
+        if safety_runtime is None
+        else tuple(
+            SkillDeploymentSafetyEnvelopeRef(
+                object_id=entry.envelope_id,
+                schema="dexteleop.deployment_safety_envelope.v1",
+                content_hash=entry.semantic_content_hash,
+                constraint_set_hash=entry.constraint_set_hash,
+                allowed_route_ids=entry.allowed_route_ids,
+            )
+            for entry in safety_runtime.catalog_entries
+        )
+    )
     binding = MujocoAgentTcpPoseDeploymentBinding(
         deployment_binding_id=(
             "sim.mujoco.agent_tcp_pose:" + exact["runtime_session_id"]
@@ -1243,6 +1285,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "second_dispatch_owner",
             "trajectory_streaming",
         ),
+        safety_envelope_refs=safety_envelope_refs,
     )
     evaluator_input_hash = canonical_content_hash(
         {
@@ -1564,6 +1607,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "own_operation_status_v1",
             "idempotency_v1",
             "authoritative_port_receipt_v1",
+            *(
+                ("safety_profile_selection_v1",)
+                if getattr(application, "tcp_pose_envelope_runtime", None)
+                is not None
+                else ()
+            ),
         ),
         skill_routes=tuple(route_items),
         explicit_exclusions=(
@@ -1636,11 +1685,14 @@ __all__ = [
     "MUJOCO_AGENT_TCP_POSE_HISTORY_ROUTE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_HISTORY_SOURCE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_MAX_MEASUREMENT_AGE_MS_V1",
+    "MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1",
+    "MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1",
     "MUJOCO_AGENT_TCP_POSE_PARAMETER_PROFILE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_STATE_EXECUTOR_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_STATE_PROFILE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_STATE_ROUTE_ID_V1",
+    "MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1",
     "MujocoAgentTcpPoseContractBundle",
     "MujocoAgentTcpPoseDeploymentBinding",
     "MujocoAgentTcpPoseHistoryProfile",

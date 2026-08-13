@@ -15,6 +15,12 @@ from typing import Any
 
 from robot_motion.action import ComponentAction
 from robot_motion.deploy.schema import pose_matrix_to_xyzquat
+from robot_motion.target_safety import (
+    TCPPoseEnvelopeActivationReceipt,
+    TCPPoseEnvelopeLifecycleError,
+    TCPPoseEnvelopeSafetyRuntime,
+    TCPPoseEnvelopeSelection,
+)
 from sim.mujoco.deploy.sim_hil_target import (
     MujocoAgentSkillMotionTarget,
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
@@ -39,6 +45,32 @@ def _required(value: object, *, field_name: str) -> str:
 class MujocoAgentSkillMotionStep:
     proposal_admission: Any
     authoritative_step: Any
+
+
+@dataclass(frozen=True)
+class MujocoAgentSkillActivation:
+    """READY transition plus the lower envelope activation proof."""
+
+    transition: Any
+    safety_activation_receipt: TCPPoseEnvelopeActivationReceipt | None
+
+    @property
+    def snapshot(self) -> Any:
+        return self.transition.snapshot
+
+    @property
+    def lower_event_ids(self) -> tuple[str, ...]:
+        refs = tuple(getattr(self.transition, "lower_event_ids", ()))
+        if self.safety_activation_receipt is None:
+            return refs
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.safety_activation_receipt.semantic_content_hash,
+                    *refs,
+                )
+            )
+        )
 
 
 class MujocoAgentSkillMotionApplication:
@@ -75,6 +107,13 @@ class MujocoAgentSkillMotionApplication:
         self.target_frame_profile = target.target_frame_profile
         self.tool_frame_profile = target.tool_frame_profile
         self.task_initialization_info = dict(target.task_initialization_info)
+        safety_runtime = target.tcp_pose_envelope_runtime
+        if safety_runtime is not None and not isinstance(
+            safety_runtime,
+            TCPPoseEnvelopeSafetyRuntime,
+        ):
+            raise TypeError("target TCP envelope runtime has an invalid type.")
+        self.tcp_pose_envelope_runtime = safety_runtime
         self.calibration_hash = _required(
             calibration_hash,
             field_name="calibration_hash",
@@ -108,7 +147,13 @@ class MujocoAgentSkillMotionApplication:
         with self._lock:
             return self._active_operation_id
 
-    def activate_operation(self, *, operation_id: str) -> Any:
+    def activate_operation(
+        self,
+        *,
+        operation_id: str,
+        route_id: str | None = None,
+        safety_selection: TCPPoseEnvelopeSelection | None = None,
+    ) -> Any:
         """Start once and explicitly open READY for one fresh operation."""
 
         normalized_id = _required(operation_id, field_name="operation_id")
@@ -120,14 +165,89 @@ class MujocoAgentSkillMotionApplication:
             if not self._started:
                 self.runtime.start()
                 self._started = True
-            transition = self.runtime.transition_execution_gate(
-                "ready",
-                reason="agent_skill_operation_activation",
-                source_event_ids=(normalized_id,),
-            )
+            safety_activation = None
+            if self.tcp_pose_envelope_runtime is not None:
+                if route_id is None or safety_selection is None:
+                    raise TCPPoseEnvelopeLifecycleError(
+                        "Agent motion requires an exact lower safety selection"
+                    )
+                gate = self.runtime.capture_execution_gate_snapshot(
+                    now=float(self.runtime.clock())
+                )
+                activation_boundary_refs: tuple[str, ...] = ()
+                if str(gate.status) != "hold":
+                    boundary = self.runtime.transition_execution_gate(
+                        "hold",
+                        reason="agent_skill_safety_profile_activation_boundary",
+                        source_event_ids=(normalized_id,),
+                        force_cancellation=True,
+                    )
+                    gate = boundary.snapshot
+                    activation_boundary_refs = tuple(
+                        getattr(boundary, "lower_event_ids", ())
+                    )
+                    if (
+                        str(gate.status) != "hold"
+                        or not activation_boundary_refs
+                    ):
+                        raise TCPPoseEnvelopeLifecycleError(
+                            "lower did not establish HOLD before safety activation"
+                        )
+                    self._held = True
+                if str(gate.status) != "hold":
+                    raise TCPPoseEnvelopeLifecycleError(
+                        "lower execution gate must be HOLD before safety activation"
+                    )
+                receiver = self.runtime.core.capture_receiver_state()
+                execution_epoch = int(receiver.current_execution_epoch)
+                safety_activation = self.tcp_pose_envelope_runtime.activate(
+                    selection=safety_selection,
+                    operation_id=normalized_id,
+                    route_id=_required(route_id, field_name="route_id"),
+                    execution_epoch=execution_epoch,
+                    source_event_ids=tuple(
+                        dict.fromkeys(
+                            (
+                                normalized_id,
+                                f"lower-execution-epoch:{execution_epoch}",
+                                *activation_boundary_refs,
+                            )
+                        )
+                    ),
+                    lower_state="hold",
+                )
+            try:
+                transition = self.runtime.transition_execution_gate(
+                    "ready",
+                    reason="agent_skill_operation_activation",
+                    source_event_ids=(
+                        normalized_id,
+                        *(
+                            ()
+                            if safety_activation is None
+                            else (safety_activation.semantic_content_hash,)
+                        ),
+                    ),
+                )
+            except Exception:
+                if safety_activation is not None:
+                    receiver = self.runtime.core.capture_receiver_state()
+                    self.tcp_pose_envelope_runtime.deactivate_after_hold(
+                        operation_id=normalized_id,
+                        next_execution_epoch=int(receiver.current_execution_epoch),
+                        hold_evidence_ids=(
+                            "agent-skill-ready-transition-failed",
+                        ),
+                    )
+                raise
             self._active_operation_id = normalized_id
             self._held = False
-            return transition
+            if safety_activation is None:
+                return transition
+            return MujocoAgentSkillActivation(
+                transition=transition,
+                safety_activation_receipt=safety_activation,
+            )
 
     def submit_and_step(
         self,
@@ -257,6 +377,18 @@ class MujocoAgentSkillMotionApplication:
                 ),
                 force_cancellation=True,
             )
+            if self.tcp_pose_envelope_runtime is not None:
+                receiver = self.runtime.core.capture_receiver_state()
+                hold_refs = tuple(getattr(transition, "lower_event_ids", ()))
+                if not hold_refs:
+                    raise TCPPoseEnvelopeLifecycleError(
+                        "lower HOLD did not provide envelope deactivation evidence"
+                    )
+                self.tcp_pose_envelope_runtime.deactivate_after_hold(
+                    operation_id=operation_id,
+                    next_execution_epoch=int(receiver.current_execution_epoch),
+                    hold_evidence_ids=hold_refs,
+                )
             self._held = True
             return transition
 
@@ -336,6 +468,7 @@ class MujocoAgentSkillMotionApplication:
 
 
 __all__ = [
+    "MujocoAgentSkillActivation",
     "MujocoAgentSkillMotionApplication",
     "MujocoAgentSkillMotionStep",
 ]

@@ -21,6 +21,15 @@ from robot_motion.action import (
     RobotAction,
 )
 from robot_motion.deploy.schema import pose_matrix_to_xyzquat
+from sim.demonstration_editing import (
+    DEMONSTRATION_COMPONENT_ACTION_RECEIPT_BINDING_KIND_V1,
+    DemonstrationComponentActionAdapter,
+    DemonstrationComponentActionBinding,
+    DemonstrationEdit,
+    DemonstrationTrajectory,
+    apply_demonstration_edit,
+    sample_edited_trajectory,
+)
 from sim.mujoco.config import GripperSpec
 from sim.mujoco.deploy import (
     MujocoComponentActionRobotActionV1Materializer,
@@ -34,6 +43,10 @@ from sim.mujoco.deploy import (
     MujocoSimHILTargetConfig,
     prepare_mujoco_sim_hil_target,
 )
+from sim.mujoco.deploy.pose_resolution import (
+    MujocoCoupledPoseToQposResolver,
+)
+from sim.mujoco.ik import RM65CanonicalIK
 
 
 def _scene():
@@ -64,6 +77,24 @@ def _scene():
                 side="right",
             ),
         },
+    )
+
+
+def test_pose_resolver_identity_records_disabled_collision_constraints() -> None:
+    ik = object.__new__(RM65CanonicalIK)
+    ik.planner = SimpleNamespace(collision_pair_count=0)
+    transformer = SimpleNamespace(
+        binding_receipt=SimpleNamespace(semantic_content_hash="a" * 64)
+    )
+
+    resolver = MujocoCoupledPoseToQposResolver(
+        ik,
+        pose_transformer=transformer,
+    )
+
+    assert resolver.resolver_contract_id == (
+        "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-"
+        "no-collision-v1"
     )
 
 
@@ -428,18 +459,67 @@ def test_native_component_profile_reaches_one_atomic_mujoco_target() -> None:
         target.task_config.right_gripper_name
     ]
     gripper_qpos = np.asarray(gripper_spec.open_qpos, dtype=np.float32)
-    action = ComponentAction(
-        action_schema=profile.action_schema,
-        values_by_component={
-            "right_arm": np.asarray(current_pose, dtype=np.float32),
-            "right_gripper": gripper_qpos,
-        },
+    hand_payload = profile.action_schema.payload_schema_by_component[
+        "right_gripper"
+    ]
+    demonstration = DemonstrationTrajectory(
+        trajectory_id="zero-edit-native-target-fixture",
+        reference_frame="right_arm_base",
+        controlled_frame="tool_tcp",
+        hand_component_id="right_gripper",
+        hand_target_representation="physical_joint_qpos",
+        hand_target_names=hand_payload.coordinate_names,
+        hand_target_units=hand_payload.units,
+        timestamps_sec=np.asarray([0.0, 0.1]),
+        tool_pose_xyzquat_xyzw=np.stack((current_pose, current_pose), axis=0),
+        hand_targets=np.stack((gripper_qpos, gripper_qpos), axis=0),
+        hand_edit_start_index=0,
+        hand_edit_end_index=1,
+        source_kind="committed_mujoco_control_trace_safe_action",
+        source_id="zero-edit-native-target-episode",
+        source_content_hash="c" * 64,
+    )
+    edit = DemonstrationEdit(
+        edit_id="zero-edit-native-target",
+        producer_id="zero-edit-native-target-probe",
+        sample_id="zero-edit-native-target-sample",
+        translation_m=np.zeros(3),
+        rotation_rotvec_rad=np.zeros(3),
+        hand_final_delta=np.zeros(gripper_qpos.shape[0]),
+    )
+    reference = sample_edited_trajectory(
+        apply_demonstration_edit(demonstration, edit),
+        0.1,
+    )
+    adapted = DemonstrationComponentActionAdapter(
+        DemonstrationComponentActionBinding(
+            binding_id="test.zero-edit-to-native-mujoco-target.v1",
+            action_schema=profile.action_schema,
+            pose_component_id="right_arm",
+            hand_component_id="right_gripper",
+            demonstration_hand_target_representation=(
+                "physical_joint_qpos"
+            ),
+        )
+    ).adapt(reference)
+    assert adapted.accepted
+    assert adapted.action is not None
+    assert adapted.receipt.edit_sample_id == "zero-edit-native-target-sample"
+    action = adapted.action
+    np.testing.assert_allclose(
+        action.value("right_arm").values,
+        current_pose,
+    )
+    np.testing.assert_allclose(
+        action.value("right_gripper").values,
+        gripper_qpos,
     )
     materializer(action, timestamp=0.0, source="test")
 
     target.runtime.start()
     try:
         now = float(target.runtime.clock())
+        input_receipts = []
         for role in ("human", "policy"):
             producer_id = f"native-{role}"
             target.runtime.activate_policy_node_producer(producer_id)
@@ -457,9 +537,42 @@ def test_native_component_profile_reaches_one_atomic_mujoco_target() -> None:
                     effective_from=now,
                     effective_until=now + 1.0,
                     effective_clock_domain_id=target.runtime.config.clock_domain_id,
+                    semantic_binding_id_by_kind={
+                        DEMONSTRATION_COMPONENT_ACTION_RECEIPT_BINDING_KIND_V1: (
+                            adapted.receipt.receipt_id
+                        )
+                    },
+                    semantic_binding_hash_by_kind={
+                        DEMONSTRATION_COMPONENT_ACTION_RECEIPT_BINDING_KIND_V1: (
+                            adapted.receipt.semantic_content_hash
+                        )
+                    },
+                    audit_metadata={
+                        "demonstration_edit_sample_id": (
+                            adapted.receipt.edit_sample_id
+                        )
+                    },
                 )
             )
             assert receipt.accepted
+            assert receipt.composition_input is not None
+            input_receipts.append(receipt)
+        for receipt in input_receipts:
+            record = receipt.composition_input
+            assert record is not None
+            assert record.semantic_binding_id_by_kind == {
+                DEMONSTRATION_COMPONENT_ACTION_RECEIPT_BINDING_KIND_V1: (
+                    adapted.receipt.receipt_id
+                )
+            }
+            assert record.semantic_binding_hash_by_kind == {
+                DEMONSTRATION_COMPONENT_ACTION_RECEIPT_BINDING_KIND_V1: (
+                    adapted.receipt.semantic_content_hash
+                )
+            }
+            assert record.audit_metadata == {
+                "demonstration_edit_sample_id": adapted.receipt.edit_sample_id
+            }
         target_effective_at = (
             float(target.runtime.clock())
             + target.runtime.core.config.decision_schedule.target_lead_time_sec

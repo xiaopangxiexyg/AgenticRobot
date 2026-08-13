@@ -12,6 +12,7 @@ from control_station.sim_hil_profile.control_cycle import (
 )
 from control_station.sim_hil_profile.factory import build_application_graph
 from control_station.sim_hil_profile.profile_selection import (
+    SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
     SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
     SimHILApplicationControlProfile,
     SimHILControlProfileAssembly,
@@ -85,6 +86,14 @@ def test_profile_selection_defaults_to_exact_fixed_alpha_compatibility() -> None
         FixedAlphaCompatibilityControlCyclePort,
     )
     assert profile.control_cycle_port.composition is profile.session
+
+
+def test_exclusive_hitl_is_not_registered_as_fixed_alpha_compatibility() -> None:
+    with pytest.raises(ValueError, match="No Sim-HIL application control binding"):
+        select_sim_hil_application_control_profile(
+            SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
+            assembly=_assembly(),
+        )
 
 
 def test_profile_selection_constructs_only_the_explicit_binding() -> None:

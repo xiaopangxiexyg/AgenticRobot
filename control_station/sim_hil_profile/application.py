@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from robot_motion.runtime.control_admission import ControlCut
+from control_composition.activation import CompositionActivationScope
 from robot_motion.deploy import (
     PolicyActionEmission,
     PolicyExecutionFeedbackApplication,
@@ -24,6 +25,11 @@ from robot_motion.deploy import (
 
 from .application_human import _SimHILApplicationHumanMixin
 from .application_status import _SimHILApplicationStatusMixin
+from .application_transition import _SimHILApplicationTransitionMixin
+from control_station.hitl import (
+    HITLActivationPrimeEvidence,
+    build_hitl_activation_prime_evidence,
+)
 from .config import (
     SIM_HIL_BLEND_FAILURE_FALLBACKS,
     SIM_HIL_HUMAN_TIMEOUT_FALLBACKS,
@@ -33,6 +39,7 @@ from .control_cycle import (
     SIM_HIL_ACTIVATION_PRIMING_APPLICATION_COMPATIBILITY,
     SIM_HIL_ACTIVATION_PRIMING_CONTROL_CYCLE_PORT,
     SIM_HIL_POLICY_SOURCE_ALWAYS,
+    SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE,
     FixedAlphaCompatibilityControlCyclePort,
     SimHILControlCyclePort,
     SimHILControlCyclePortSpec,
@@ -40,6 +47,7 @@ from .control_cycle import (
 from .human import _SimHILHumanAttachment
 from .policy_feedback import project_sim_hil_policy_execution_feedback
 from .policy_source import SimHILPolicyExecutionFeedbackPort
+from .profile_selection import SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL
 from .validation import _finite, _required
 
 
@@ -88,6 +96,7 @@ class MujocoSimHILPassiveApplicationCut:
 
 class MujocoSimHILApplication(
     _SimHILApplicationHumanMixin,
+    _SimHILApplicationTransitionMixin,
     _SimHILApplicationStatusMixin,
 ):
     """Own only the lifecycle of one Station-selected Sim-HIL composition."""
@@ -186,7 +195,12 @@ class MujocoSimHILApplication(
         self._first_control_fault: str | None = None
         self._held = False
         self._episode_ended = False
+        self._episode_end_reason: str | None = None
+        self._last_sim_contact_observation: dict[str, object] | None = None
         self._last_hold_outcome: Any | None = None
+        self._last_activation_prime_evidence: (
+            HITLActivationPrimeEvidence | None
+        ) = None
         self._next_decision_at: float | None = None
         self._overrun_dropped_cycles = 0
         self._last_schedule_overrun: dict[str, object] | None = None
@@ -205,6 +219,11 @@ class MujocoSimHILApplication(
         self._restart_required = False
         self._closed = False
         self._viewer_exit_requested = False
+        # A demonstration session may open the passive viewer before any
+        # Human device, source, composition, control cycle, or trace episode
+        # is activated.  This flag is deliberately application-local: the
+        # viewer remains observational and owns no execution authority.
+        self._viewer_preview_started = False
 
     @property
     def human_input_attached(self) -> bool:
@@ -214,6 +233,11 @@ class MujocoSimHILApplication(
     def viewer_exit_requested(self) -> bool:
         with self._lock:
             return bool(self._viewer_exit_requested)
+
+    @property
+    def viewer_preview_started(self) -> bool:
+        with self._lock:
+            return bool(self._viewer_preview_started and not self._started)
 
     @property
     def started(self) -> bool:
@@ -230,6 +254,22 @@ class MujocoSimHILApplication(
 
         with self._lock:
             return self._next_decision_at
+
+    @property
+    def last_hold_outcome(self) -> Any | None:
+        """Latest lower-owned HOLD outcome; read-only lifecycle evidence."""
+
+        with self._lock:
+            return self._last_hold_outcome
+
+    @property
+    def last_activation_prime_evidence(
+        self,
+    ) -> HITLActivationPrimeEvidence | None:
+        """Fresh source identities admitted after the latest activation."""
+
+        with self._lock:
+            return self._last_activation_prime_evidence
 
     @property
     def episode_ended(self) -> bool:
@@ -317,6 +357,11 @@ class MujocoSimHILApplication(
                 execution_gate = str(gate.status)
                 gate_epoch = int(gate.gate_epoch)
                 fault_class = None
+            elif self._viewer_preview_started:
+                lifecycle_state = "viewer_preview"
+                execution_gate = "not_started"
+                gate_epoch = 0
+                fault_class = None
             else:
                 lifecycle_state = "configured"
                 execution_gate = "not_started"
@@ -382,6 +427,21 @@ class MujocoSimHILApplication(
 
         cycle_port = getattr(self, "control_cycle_port", None)
         spec = None if cycle_port is None else cycle_port.spec
+        if (
+            spec is not None
+            and spec.policy_source_requirement
+            == SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE
+        ):
+            required = getattr(cycle_port, "policy_emission_required", None)
+            if not callable(required):
+                raise TypeError(
+                    "Control-cycle-owned policy selection requires "
+                    "policy_emission_required()."
+                )
+            value = required()
+            if not isinstance(value, bool):
+                raise TypeError("policy_emission_required() must return bool.")
+            return value
         if (
             spec is not None
             and spec.policy_source_requirement == SIM_HIL_POLICY_SOURCE_ALWAYS
@@ -457,15 +517,22 @@ class MujocoSimHILApplication(
                 )
             self.sleep(0.005)
 
-    def _prime_activation_inputs(self) -> None:
-        """Admit one fresh contributor pair after an activation barrier."""
+    def _prime_activation_inputs(
+        self,
+    ) -> HITLActivationPrimeEvidence | None:
+        """Admit exactly the fresh contributors required by this activation."""
 
         requested_at = _finite(self.clock(), name="activation.requested_at")
         alpha = dict(self.composition.human_alpha_by_component)
         human_active = any(value > 1e-12 for value in alpha.values())
         policy_active = any(value < 1.0 - 1e-12 for value in alpha.values())
+        policy_reset_at = None
         if policy_active:
             self.policy_source.reset_for_activation()
+            policy_reset_at = max(
+                requested_at,
+                _finite(self.clock(), name="activation.policy_reset_at"),
+            )
         human_step, human_emission = self._acquire_fresh_human_activation_emission(
             requested_at=requested_at,
             required=human_active,
@@ -480,7 +547,9 @@ class MujocoSimHILApplication(
                 requested_at,
                 _finite(self.clock(), name="activation.policy_requested_at"),
             )
-            policy_emission = self.policy_source.step(now=policy_requested_at)
+            policy_emission = self._acquire_fresh_policy_activation_emission(
+                requested_at=policy_requested_at,
+            )
         observed_at = max(
             requested_at,
             _finite(self.runtime.clock(), name="activation.observed_at"),
@@ -489,6 +558,7 @@ class MujocoSimHILApplication(
         if policy_emission is None and policy_active:
             raise RuntimeError("Policy source produced no fresh activation emission.")
         self._remember_policy_emission(policy_emission)
+        policy_submission = None
         if policy_emission is not None:
             policy_submission = self.composition.submit_policy_emission(
                 policy_emission,
@@ -504,6 +574,7 @@ class MujocoSimHILApplication(
                 "Human source produced no fresh activation emission within "
                 f"{self.config.human_emission_timeout_sec:.3f}s."
             )
+        human_submission = None
         if human_emission is not None:
             human_submission = self.composition.submit_human_emission(
                 human_emission,
@@ -516,6 +587,29 @@ class MujocoSimHILApplication(
                     "Fresh human activation emission was rejected: "
                     f"{None if human_submission is None else human_submission.error}"
                 )
+        scope = getattr(self.composition, "activation_scope", None)
+        if not isinstance(scope, CompositionActivationScope):
+            return None
+        return build_hitl_activation_prime_evidence(
+            activation_scope=scope,
+            primed_at=max(
+                observed_at,
+                _finite(self.clock(), name="activation.primed_at"),
+            ),
+            clock_domain_id=scope.clock_domain_id,
+            policy_required=policy_active,
+            human_required=human_active,
+            policy_reset_performed=policy_active,
+            policy_reset_at=policy_reset_at,
+            policy_emission=policy_emission,
+            human_emission=human_emission,
+            policy_submission=policy_submission,
+            human_submission=human_submission,
+            strict_source_identity=(
+                self.config.control_profile_id
+                == SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL
+            ),
+        )
 
     def _acquire_fresh_human_activation_emission(
         self,
@@ -537,11 +631,45 @@ class MujocoSimHILApplication(
             human_emission = getattr(human_step, "emission", None)
         return human_step, human_emission
 
-    def _activate_and_prime_control_cycle(self) -> None:
+    def _acquire_fresh_policy_activation_emission(
+        self,
+        *,
+        requested_at: float,
+    ) -> Any:
+        """Wait for one activation-local emission from sync or threaded sources."""
+
+        deadline = requested_at + self.config.warmup_timeout_sec
+        emission = self.policy_source.step(now=requested_at)
+        while emission is None:
+            now = _finite(self.clock(), name="activation.policy_wait_now")
+            if now >= deadline:
+                detail = str(
+                    getattr(self.policy_source, "last_error", None)
+                    or "no policy emission"
+                )
+                raise TimeoutError(
+                    "Policy source produced no fresh activation emission within "
+                    f"{self.config.warmup_timeout_sec:.3f}s: {detail}"
+                )
+            self.sleep(0.005)
+            emission = self.policy_source.step(
+                now=_finite(
+                    self.clock(),
+                    name="activation.policy_poll_at",
+                )
+            )
+        return emission
+
+    def _activate_and_prime_control_cycle(
+        self,
+        *,
+        human_emission_required: bool | None = None,
+    ) -> None:
         """Prime through the selected profile without sharing source semantics."""
 
         self._policy_emission_by_id.clear()
         self._last_policy_feedback_status = None
+        self._last_activation_prime_evidence = None
         activation_scope = getattr(
             self.composition,
             "activation_scope",
@@ -552,7 +680,9 @@ class MujocoSimHILApplication(
             # Preserve the established fixed-alpha priming owner and exact
             # submission path. New profiles must not inherit its alpha-derived
             # roles.
-            self._prime_activation_inputs()
+            self._last_activation_prime_evidence = (
+                self._prime_activation_inputs()
+            )
             self.control_cycle_port.activate(
                 activation_scope=activation_scope,
             )
@@ -567,10 +697,20 @@ class MujocoSimHILApplication(
             name="control_cycle_prime.requested_at",
         )
         policy_active = self._policy_contributor_active()
+        policy_reset_at = None
         if policy_active:
             self.policy_source.reset_for_activation()
+            policy_reset_at = max(
+                requested_at,
+                _finite(
+                    self.clock(),
+                    name="control_cycle_prime.policy_reset_at",
+                ),
+            )
         human_required = bool(
             self.control_cycle_port.spec.activation_human_emission_required
+            if human_emission_required is None
+            else human_emission_required
         )
         _human_step, human_emission = (
             self._acquire_fresh_human_activation_emission(
@@ -595,11 +735,9 @@ class MujocoSimHILApplication(
                     name="control_cycle_prime.policy_requested_at",
                 ),
             )
-            policy_emission = self.policy_source.step(now=policy_requested_at)
-            if policy_emission is None:
-                raise RuntimeError(
-                    "Policy source produced no fresh activation emission."
-                )
+            policy_emission = self._acquire_fresh_policy_activation_emission(
+                requested_at=policy_requested_at,
+            )
         self._remember_policy_emission(policy_emission)
         observed_at = max(
             requested_at,
@@ -618,13 +756,39 @@ class MujocoSimHILApplication(
             if activation_spec.activation_mode == "immediate_target"
             else observed_at + activation_spec.target_lead_time_sec
         )
-        self.control_cycle_port.prime_activation(
+        prime = self.control_cycle_port.prime_activation(
             now=observed_at,
             policy_emission=policy_emission,
             human_emission=human_emission,
             poll_human=False,
             target_effective_at=target_effective_at,
         )
+        if isinstance(activation_scope, CompositionActivationScope):
+            self._last_activation_prime_evidence = (
+                build_hitl_activation_prime_evidence(
+                    activation_scope=activation_scope,
+                    primed_at=max(
+                        observed_at,
+                        _finite(
+                            self.clock(),
+                            name="control_cycle_prime.primed_at",
+                        ),
+                    ),
+                    clock_domain_id=activation_scope.clock_domain_id,
+                    policy_required=policy_active,
+                    human_required=human_required,
+                    policy_reset_performed=policy_active,
+                    policy_reset_at=policy_reset_at,
+                    policy_emission=policy_emission,
+                    human_emission=human_emission,
+                    policy_submission=getattr(prime, "policy_submission", None),
+                    human_submission=getattr(prime, "human_submission", None),
+                    strict_source_identity=(
+                        self.config.control_profile_id
+                        == SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL
+                    ),
+                )
+            )
 
     def set_human_blend_alpha(
         self,
@@ -681,15 +845,32 @@ class MujocoSimHILApplication(
                 raise RuntimeError("Allocation operations require a running session.")
             if self._episode_ended:
                 raise RuntimeError("The Sim-HIL episode has ended.")
-            submit = getattr(
-                self.control_cycle_port,
-                "submit_operation_trigger",
-                None,
+            return self._submit_allocation_operation_locked(
+                signal_name=signal_name,
+                event_id=event_id,
+                source_fact_id=source_fact_id,
+                source_fact_hash=source_fact_hash,
+                occurred_at=occurred_at,
             )
-            if not callable(submit):
-                raise RuntimeError(
-                    "The selected Sim-HIL profile has no allocation operation port."
-                )
+
+    def _submit_allocation_operation_locked(
+        self,
+        *,
+        signal_name: str,
+        event_id: str,
+        source_fact_id: str,
+        source_fact_hash: str,
+        occurred_at: float,
+    ) -> Any:
+        submit = getattr(
+            self.control_cycle_port,
+            "submit_operation_trigger",
+            None,
+        )
+        if not callable(submit):
+            raise RuntimeError(
+                "The selected Sim-HIL profile has no allocation operation port."
+            )
         return submit(
             signal_name=signal_name,
             event_id=event_id,
@@ -766,6 +947,90 @@ class MujocoSimHILApplication(
             "message": getattr(failure, "message", None),
             "diagnostics": dict(getattr(failure, "diagnostics", {}) or {}),
         }
+
+    @staticmethod
+    def _collision_stop_failure(cycle: Any) -> Any | None:
+        """Return the exact lower collision rejection, if this cycle has one."""
+
+        execution = getattr(cycle, "execution", None)
+        if getattr(execution, "status", None) != (
+            "compound_resolution_failure_hold"
+        ):
+            return None
+        failure = getattr(execution, "resolution_failure", None)
+        return (
+            failure
+            if getattr(failure, "reason_code", None) == "collision_margin_low"
+            else None
+        )
+
+    def _terminate_episode_for_collision_stop(self, failure: Any) -> None:
+        """Promote one lower collision rejection to a terminal Sim episode."""
+
+        reason_code = str(getattr(failure, "reason_code", "") or "").strip()
+        if reason_code != "collision_margin_low":
+            raise ValueError(
+                "Sim collision termination requires collision_margin_low."
+            )
+        self._last_error = f"SimCollisionStop:{reason_code}"
+        if self._first_control_fault is None:
+            self._first_control_fault = self._last_error
+        self.end_episode(
+            reason=f"sim_collision_stop:{reason_code}",
+            force_cancellation=True,
+        )
+
+    def _capture_sim_contact_observation(self) -> dict[str, object]:
+        """Read lower-owned MuJoCo contact evidence without changing physics."""
+
+        rig = getattr(getattr(self, "runtime", None), "rig", None)
+        capture = getattr(rig, "capture_active_contact_observation", None)
+        if not callable(capture):
+            observation = {
+                "available": False,
+                "safe": True,
+                "semantics": "mujoco_active_forbidden_contacts",
+            }
+        else:
+            observation = dict(capture())
+        self._last_sim_contact_observation = observation
+        return observation
+
+    def _terminate_episode_for_active_forbidden_contact(
+        self,
+        observation: Mapping[str, object],
+    ) -> None:
+        """Promote a lower-owned hard-contact verdict to terminal Sim HOLD."""
+
+        evidence = dict(observation)
+        if not bool(evidence.get("available")) or bool(evidence.get("safe", True)):
+            raise ValueError(
+                "Active-contact termination requires an available unsafe verdict."
+            )
+        pair = " ↔ ".join(
+            str(value)
+            for value in (evidence.get("geom1"), evidence.get("geom2"))
+            if value
+        )
+        self._last_error = "SimCollisionStop:active_forbidden_contact"
+        if pair:
+            self._last_error += f":{pair}"
+        if self._first_control_fault is None:
+            self._first_control_fault = self._last_error
+        record_guard = getattr(
+            self.runtime,
+            "record_active_contact_guard_result",
+            None,
+        )
+        if not callable(record_guard):
+            raise TypeError(
+                "Sim runtime must expose record_active_contact_guard_result()."
+            )
+        record_guard(evidence)
+        self.end_episode(
+            reason="sim_collision_stop:active_forbidden_contact",
+            force_cancellation=True,
+        )
 
     def _apply_blend_failure_fallback(
         self,
@@ -969,12 +1234,12 @@ class MujocoSimHILApplication(
                     cancel_requested,
                     phase="viewer_start",
                 )
-                # Open the native viewer before starting the realtime physics
-                # worker.  ``launch_passive`` and the worker both touch the
-                # same MjModel/MjData; starting them concurrently has caused
-                # native crashes on some GLFW/GLX builds.  Input readiness was
-                # already checked by the passive human acceptance step, so
-                # this still cannot open a MuJoCo window for stale VIVE input.
+                # Open (or reuse) the native viewer before starting the
+                # realtime physics worker. ``launch_passive`` and the worker
+                # both touch the same MjModel/MjData; starting them
+                # concurrently has caused native crashes on some GLFW/GLX
+                # builds. A Human-demonstration preview may already own this
+                # viewer, but it has not advanced physics or opened authority.
                 if self.viewer is not None:
                     self.viewer.start()
                     # Native window construction may exceed the contributor
@@ -992,8 +1257,10 @@ class MujocoSimHILApplication(
                 self._activate_and_prime_control_cycle()
                 self._last_preflight = report
                 self._started = True
+                self._viewer_preview_started = False
                 self._held = False
                 self._episode_ended = False
+                self._episode_end_reason = None
                 self._next_decision_at = _finite(
                     self.runtime.clock(),
                     name="start.next_decision_at",
@@ -1019,6 +1286,60 @@ class MujocoSimHILApplication(
                     else f"{primary_error}; cleanup_error={cleanup_error}"
                 )
                 raise
+
+    def start_viewer_preview(self) -> dict[str, object]:
+        """Open only the passive MuJoCo viewer for scene/camera adjustment.
+
+        This boundary does not start sources, composition, the control-cycle
+        port, the physics worker, or episode recording.  The existing runtime
+        rig remains the sole scene owner and viewer synchronization is passive.
+        """
+
+        with self._lock:
+            if self._started:
+                raise RuntimeError(
+                    "Viewer preview must be opened before Sim-HIL starts."
+                )
+            if self._restart_required:
+                raise RuntimeError(
+                    "The Sim-HIL application requires rebuild before preview."
+                )
+            if self._closed:
+                raise RuntimeError(
+                    "The Sim-HIL application is closed and must be rebuilt."
+                )
+            if self.viewer is None:
+                raise RuntimeError(
+                    "Human demonstration preview requires the MuJoCo viewer."
+                )
+            viewer_status = dict(self.viewer.start())
+            self._viewer_preview_started = True
+            self._viewer_exit_requested = False
+            return {
+                "status": "viewer_preview",
+                "command_dispatched": False,
+                "authoritative": False,
+                "sources_started": False,
+                "composition_started": False,
+                "viewer": viewer_status,
+            }
+
+    def sync_viewer_preview(self) -> bool:
+        """Render one preview frame without stepping sources or simulation."""
+
+        with self._lock:
+            if not self._viewer_preview_started or self._started:
+                return False
+            if self.viewer is None:
+                return False
+            synchronized = bool(self.viewer.sync())
+            if not synchronized:
+                viewer_state = str(
+                    dict(self.viewer.status()).get("state") or ""
+                )
+                if viewer_state in {"closed_by_user", "faulted"}:
+                    self._viewer_exit_requested = True
+            return synchronized
 
     def _skip_missed_compose_cuts(
         self,
@@ -1217,10 +1538,30 @@ class MujocoSimHILApplication(
                         )
                     ),
                 )
-                self._apply_blend_failure_fallback(
-                    self._last_cycle,
-                    observed_at=observed_at,
+                collision_stop_failure = (
+                    self._collision_stop_failure(self._last_cycle)
+                    if getattr(
+                        self.config,
+                        "sim_collision_stop_enabled",
+                        True,
+                    )
+                    else None
                 )
+                active_contact = self._capture_sim_contact_observation()
+                active_forbidden_contact = bool(
+                    getattr(
+                        self.config,
+                        "sim_collision_stop_enabled",
+                        True,
+                    )
+                    and active_contact.get("available")
+                    and not active_contact.get("safe", True)
+                )
+                if collision_stop_failure is None:
+                    self._apply_blend_failure_fallback(
+                        self._last_cycle,
+                        observed_at=observed_at,
+                    )
                 feedback_observed_at = max(
                     observed_at,
                     _finite(
@@ -1284,6 +1625,14 @@ class MujocoSimHILApplication(
                     )
                     if self._first_control_fault is None:
                         self._first_control_fault = self._last_error
+                if active_forbidden_contact:
+                    self._terminate_episode_for_active_forbidden_contact(
+                        active_contact
+                    )
+                elif collision_stop_failure is not None:
+                    self._terminate_episode_for_collision_stop(
+                        collision_stop_failure
+                    )
                 if self.viewer is not None and not self.viewer.sync():
                     viewer_state = str(dict(self.viewer.status()).get("state") or "")
                     if viewer_state in {"closed_by_user", "faulted"}:
@@ -1401,8 +1750,9 @@ class MujocoSimHILApplication(
             if not self._started:
                 return None
             self._episode_ended = True
+            self._episode_end_reason = _required(reason, name="reason")
             return self.hold(
-                reason=f"episode_end:{reason}",
+                reason=f"episode_end:{self._episode_end_reason}",
                 force_cancellation=force_cancellation,
             )
 
@@ -1415,56 +1765,145 @@ class MujocoSimHILApplication(
         """Refresh both contributors around a new composition activation."""
 
         with self._lock:
-            if self._episode_ended:
-                raise RuntimeError(
-                    "An ended Sim-HIL episode requires target rebuild, not rearm."
-                )
-            if not self._started or not self._held:
-                raise RuntimeError(
-                    "MuJoCo Sim-HIL rearm requires a started held application."
-                )
-            timestamp = _finite(
-                self.clock() if now is None else now,
-                name="rearm.now",
-            )
-            # Establish the authoritative lower HOLD before resetting or
-            # waiting on contributors. Application-local ``_held`` is only a
-            # latch and cannot protect the target while a stale lower READY
-            # record is still current.
-            self._deactivate_cycle_and_request_lower_hold(
-                reason="sim_hil_application:rearm_boundary",
-            )
-            hold_observed_at = _finite(
-                self.runtime.clock(),
-                name="rearm.hold_observed_at",
-            )
-            if self._policy_contributor_active():
-                self.policy_source.reset_for_activation()
-            # Human/device sources are asynchronous.  One poll may legally
-            # return no new emission even while the receiver is healthy, so
-            # reuse the bounded startup freshness loop before rearm preflight.
-            self._wait_for_source_readiness(
+            report, _receipt = self._rearm_locked(
+                now=now,
                 cancel_requested=cancel_requested,
-                phase="rearm_source_refresh",
             )
-            # Source production may finish after the requested rearm cut.
-            # Validate readiness against an observation cut that can causally
-            # include those fresh emissions.
-            rearm_at = max(
-                timestamp,
-                hold_observed_at,
-                _finite(self.runtime.clock(), name="rearm.observed_at"),
-            )
-            report = self.composition.rearm(now=rearm_at)
-            self._activate_and_prime_control_cycle()
-            self._next_decision_at = _finite(
-                self.runtime.clock(),
-                name="rearm.next_decision_at",
-            )
-            self._last_schedule_overrun = None
-            self._held = False
-            self._last_error = None
             return report
+
+    def rearm_with_allocation_operation(
+        self,
+        *,
+        signal_name: str,
+        event_id: str,
+        source_fact_id: str,
+        source_fact_hash: str,
+        occurred_at: float,
+        human_emission_required: bool,
+        now: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> tuple[Any, Any]:
+        """Rearm and select a streaming allocation mode before cycles reopen.
+
+        This is a downstream transaction seam, not another composer.  The
+        selected allocation binding is activated and source-primed first; the
+        typed operation is then admitted while the application still holds
+        its cycle lock and before ``_held`` is cleared, so no target cycle can
+        observe the new activation with the old/default mode.
+        """
+
+        if not isinstance(human_emission_required, bool):
+            raise TypeError("human_emission_required must be bool.")
+        operation = {
+            "signal_name": signal_name,
+            "event_id": event_id,
+            "source_fact_id": source_fact_id,
+            "source_fact_hash": source_fact_hash,
+            "occurred_at": float(occurred_at),
+        }
+        with self._lock:
+            report, receipt = self._rearm_locked(
+                now=now,
+                cancel_requested=cancel_requested,
+                human_emission_required=human_emission_required,
+                activation_operation=operation,
+            )
+            assert receipt is not None
+            return report, receipt
+
+    def _rearm_locked(
+        self,
+        *,
+        now: float | None,
+        cancel_requested: Callable[[], bool] | None,
+        human_emission_required: bool | None = None,
+        activation_operation: dict[str, Any] | None = None,
+    ) -> tuple[Any, Any | None]:
+        """Locked implementation shared by ordinary and mode-selecting rearm."""
+
+        if self._episode_ended:
+            raise RuntimeError(
+                "An ended Sim-HIL episode requires target rebuild, not rearm."
+            )
+        if not self._started or not self._held:
+            raise RuntimeError(
+                "MuJoCo Sim-HIL rearm requires a started held application."
+            )
+        timestamp = _finite(
+            self.clock() if now is None else now,
+            name="rearm.now",
+        )
+        # Establish the authoritative lower HOLD before resetting or waiting
+        # on contributors. Application-local ``_held`` is only a latch and
+        # cannot protect the target while lower READY is still current.
+        self._deactivate_cycle_and_request_lower_hold(
+            reason="sim_hil_application:rearm_boundary",
+        )
+        hold_observed_at = _finite(
+            self.runtime.clock(),
+            name="rearm.hold_observed_at",
+        )
+        if self._policy_contributor_active():
+            self.policy_source.reset_for_activation()
+        self._wait_for_source_readiness(
+            cancel_requested=cancel_requested,
+            phase="rearm_source_refresh",
+        )
+        rearm_at = max(
+            timestamp,
+            hold_observed_at,
+            _finite(self.runtime.clock(), name="rearm.observed_at"),
+        )
+        report = self.composition.rearm(now=rearm_at)
+        try:
+            self._activate_and_prime_control_cycle(
+                human_emission_required=human_emission_required,
+            )
+            operation_receipt = None
+            if activation_operation is not None:
+                operation_receipt = self._submit_allocation_operation_locked(
+                    **activation_operation,
+                )
+                # Human absolute ownership needs a concrete allocation context
+                # before the first target cycle. Policy/base-only is the
+                # context-free fallback by contract and must remain resumable
+                # even when the passive Human source is unavailable.
+                if human_emission_required:
+                    synchronized_at = max(
+                        rearm_at,
+                        _finite(
+                            self.runtime.clock(),
+                            name="rearm.operation_context_observed_at",
+                        ),
+                    )
+                    activation_spec = self.runtime.reference_activation_spec
+                    target_effective_at = (
+                        synchronized_at
+                        if activation_spec.activation_mode == "immediate_target"
+                        else synchronized_at + activation_spec.target_lead_time_sec
+                    )
+                    self.control_cycle_port.synchronize_operation_context(
+                        now=synchronized_at,
+                        target_effective_at=target_effective_at,
+                        timeout_sec=self.config.warmup_timeout_sec,
+                    )
+        except BaseException:
+            # The lower session rearm has already moved its gate to READY.
+            # Keep a failed activation/selection transaction physically held,
+            # even though the application-local held latch never opened.
+            self._deactivate_cycle_and_request_lower_hold(
+                reason="sim_hil_application:rearm_operation_failed",
+                force_cancellation=True,
+            )
+            raise
+        self._next_decision_at = _finite(
+            self.runtime.clock(),
+            name="rearm.next_decision_at",
+        )
+        self._last_schedule_overrun = None
+        self._held = False
+        self._last_error = None
+        return report, operation_receipt
 
     def close(self) -> None:
         with self._lock:
@@ -1516,6 +1955,7 @@ class MujocoSimHILApplication(
                 except BaseException as error:  # noqa: BLE001 - cleanup continues.
                     errors.append(error)
             self._started = False
+            self._viewer_preview_started = False
             self._sources_started = False
             self._held = False
             if errors:

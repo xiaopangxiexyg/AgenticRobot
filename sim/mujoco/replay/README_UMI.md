@@ -60,7 +60,7 @@ MuJoCo contact force.
 Fast headless validation:
 
 ```bash
-conda run -n dexteleop310 python -m sim.mujoco.replay \
+conda run --name "${DEXTELEOP_ENV_NAME:-dexteleop310}" python -m sim.mujoco.replay \
   --dataset-root remote_data/umi/2026-07-19_umi_dual_wrist_debug_remote_raw \
   --episode 0 \
   --max-frames 30 \
@@ -70,7 +70,7 @@ conda run -n dexteleop310 python -m sim.mujoco.replay \
 Realtime viewer replay:
 
 ```bash
-conda run -n dexteleop310 python -m sim.mujoco.replay \
+conda run --name "${DEXTELEOP_ENV_NAME:-dexteleop310}" python -m sim.mujoco.replay \
   --dataset-root remote_data/umi/2026-07-19_umi_dual_wrist_debug_remote_raw \
   --episode 0 \
   --viewer

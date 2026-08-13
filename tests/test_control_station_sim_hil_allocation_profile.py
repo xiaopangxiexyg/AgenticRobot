@@ -24,10 +24,12 @@ from control_station.composition.mujoco_policy_human_allocation_operations impor
 from control_station.sim_hil_profile.policy_human_allocation import (
     SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A,
     SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_B,
+    prepare_exclusive_truncated_hitl_allocation_profile,
     prepare_policy_human_allocation_scheme_a,
     prepare_policy_human_allocation_scheme_b,
 )
 from control_station.sim_hil_profile.profile_selection import (
+    SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
     SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
 )
 from robot_motion.action import (
@@ -82,7 +84,7 @@ def test_scheme_a_preparation_is_resource_free_and_component_keyed() -> None:
     )
     assert (
         bundle.information_plan.context_requirements[0].maximum_age_sec
-        == pytest.approx(0.25)
+        == pytest.approx(0.5)
     )
     assert {"arm_base", "tool_tcp"}.issubset(
         bundle.input_contracts.residual_adapter.frame_graph.frame_by_id
@@ -139,7 +141,39 @@ def test_scheme_b_preparation_enables_three_state_target_continuity() -> None:
         policy.automatic_mode_ceiling == "absolute_overlay_owner"
         for policy in bundle.allocation_spec.component_policies
     )
+    assert bundle.composition_spec.required_roles == ("policy",)
     assert bundle.allocation_spec.transition_continuity_policy_hash is not None
+
+
+def test_exclusive_takeover_is_a_discrete_streaming_allocation_profile() -> None:
+    schema = _schema()
+    preparation = prepare_exclusive_truncated_hitl_allocation_profile(
+        action_schema=schema,
+        target_frame_graph=CoordinateFrameGraph(
+            graph_id="virtual-exclusive-hitl-target-frames",
+            frames=(CoordinateFrameSpec("arm/base"),),
+        ),
+        target_frame_profile_hash="target-frame-profile-hash",
+        tool_frame_profile_hash="tool-frame-profile-hash",
+        composer_producer_id="virtual-composer",
+    )
+
+    bundle = preparation.bundle
+    assert bundle.config.profile_id == (
+        SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL
+    )
+    assert bundle.config.automatic_override_enabled is False
+    assert bundle.config.rebase_operation_enabled is False
+    assert bundle.config.initial_override_mode == "base_only"
+    assert bundle.config.persistent_override_selection_lease_sec == pytest.approx(
+        0.5
+    )
+    assert bundle.config.require_human_roles_at_start is False
+    assert preparation.station_profiles.proposal.promotable_allocation_modes == (
+        "base_only",
+        "absolute_overlay_owner",
+    )
+    assert bundle.composition_spec.required_roles == ()
 
 
 def test_cli_keeps_fixed_alpha_default_and_allocation_is_explicit() -> None:

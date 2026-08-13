@@ -2,8 +2,9 @@
 
 The profile is deliberately narrow and default-off:
 
-* the temporary MuJoCo PPO checkpoint contributes ``right_arm`` pose plus
-  ``right_hand`` qpos from its task-local gripper delta;
+* the default temporary MuJoCo PPO checkpoint contributes ``right_arm`` pose
+  plus ``right_hand`` qpos; an explicitly selected OpenPI source may instead
+  observe the bimanual state and contribute the same current right-side scope;
 * real VIVE and Q6 are constructed through the passive teleop builder and can
   only produce a human emission;
 * the existing formal composition and one ``MujocoDeployRuntime`` own
@@ -55,6 +56,7 @@ from .sim_hil_profile.config import (
     MujocoSimHILApplicationConfig,
     SIM_HIL_BLEND_FAILURE_FALLBACKS,
     SIM_HIL_HUMAN_TIMEOUT_FALLBACKS,
+    SIM_HIL_POLICY_BACKENDS,
     acceptance_profile_config as _acceptance_profile_config,
 )
 from .sim_hil_profile.factory import (
@@ -79,6 +81,7 @@ from .sim_hil_profile.policy_human_allocation import (
     SIM_HIL_POLICY_HUMAN_ALLOCATION_PROFILE_IDS,
 )
 from .sim_hil_profile.profile_selection import (
+    SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
     SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
     require_sim_hil_control_profile_available,
 )
@@ -101,6 +104,12 @@ from .sim_hil_profile.status import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SIM_HIL_ACCEPTANCE_STORAGE_SCHEMA = (
     "dexteleop.control_station.sim_hil_acceptance_storage.v1"
+)
+SIM_HIL_CAPTURE_PROFILE_ACCEPTANCE = "acceptance"
+SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION = "human_demonstration"
+SIM_HIL_CAPTURE_PROFILES = (
+    SIM_HIL_CAPTURE_PROFILE_ACCEPTANCE,
+    SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION,
 )
 
 
@@ -129,6 +138,7 @@ def _write_acceptance_storage_receipt(
     session_root: Path,
     resolution: ArtifactWriteResolution,
     requested_layout: str,
+    capture_profile: str = SIM_HIL_CAPTURE_PROFILE_ACCEPTANCE,
 ) -> Path:
     """Durably bind one ControlTrace session to its selected storage root."""
 
@@ -144,6 +154,7 @@ def _write_acceptance_storage_receipt(
         "resolved_acceptance_root": str(resolution.path.expanduser().resolve()),
         "trace_session_root": str(session_root),
         "evidence_semantics": "control_trace_wal_seal_commit",
+        "capture_profile": str(capture_profile),
     }
     with temporary.open("x", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -170,12 +181,55 @@ def _build_application(
     injection without making the factory depend back on this CLI module.
     """
 
+    policy_source_builder = None
+    if config.policy_backend == "openpi_state":
+        from sim.mujoco.deploy.openpi_policy_source import (
+            build_mujoco_openpi_state_policy_source,
+        )
+
+        profile = _mujoco_openpi_state_policy_source_profile(config)
+        policy_source_builder = lambda context: (
+            build_mujoco_openpi_state_policy_source(profile, context)
+        )
     return _build_application_graph(
         config,
         trace_sink=trace_sink,
         human_source_builder=(
             _build_passive_single_vive_gripper_component_source
         ),
+        policy_source_builder=policy_source_builder,
+    )
+
+
+def _mujoco_openpi_state_policy_source_profile(
+    config: MujocoSimHILApplicationConfig,
+) -> Any:
+    """Project Station CLI selection into the lower concrete adapter profile."""
+
+    from sim.mujoco.deploy.openpi_policy_source import (
+        MujocoOpenPIStatePolicySourceProfile,
+    )
+
+    artifact_path = config.openpi_policy_artifact_path
+    if artifact_path is None:
+        raise ValueError(
+            "openpi_state policy backend requires openpi_policy_artifact_path."
+        )
+    return MujocoOpenPIStatePolicySourceProfile(
+        policy_artifact_path=artifact_path,
+        host=config.openpi_host,
+        port=config.openpi_port,
+        prompt=config.openpi_prompt,
+        action_hz=config.openpi_action_hz,
+        policy_hz=config.openpi_policy_hz,
+        action_chunk_execution_steps=(
+            config.openpi_action_chunk_execution_steps
+        ),
+        prediction_request_queue_threshold=(
+            config.openpi_prediction_queue_threshold
+        ),
+        output_active_sides=("right",),
+        model_observation_sides=("left", "right"),
     )
 
 
@@ -192,11 +246,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "Validate PPO/task/calibration bindings and simulator task "
+            "Validate policy/task/calibration bindings and simulator task "
             "initialization without starting devices, authority, or workers."
         ),
     )
+    parser.add_argument(
+        "--policy-backend",
+        choices=tuple(sorted(SIM_HIL_POLICY_BACKENDS)),
+        default="temp_ppo",
+        help=(
+            "Policy contributor backend. temp_ppo preserves the existing path; "
+            "openpi_state consumes a prepared state-only OpenPI artifact."
+        ),
+    )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--openpi-policy-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Prepared deployment policy_artifact.json for --policy-backend "
+            "openpi_state (not the raw checkpoint sidecar)."
+        ),
+    )
+    parser.add_argument("--openpi-host", default="127.0.0.1")
+    parser.add_argument("--openpi-port", type=int, default=8000)
+    parser.add_argument("--openpi-prompt", default=None)
+    parser.add_argument("--openpi-action-hz", type=float, default=15.0)
+    parser.add_argument("--openpi-policy-hz", type=float, default=15.0)
+    parser.add_argument(
+        "--openpi-action-chunk-execution-steps",
+        type=int,
+        default=None,
+        help="Optional executable prefix; omitted preserves the full trained chunk.",
+    )
+    parser.add_argument(
+        "--openpi-prediction-queue-threshold",
+        type=int,
+        default=4,
+        help=(
+            "Request the next chunk when this many admitted keyframes remain; "
+            "the result is appended and cannot rewrite the current chunk."
+        ),
+    )
     parser.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
     parser.add_argument(
         "--calibration-profile",
@@ -210,9 +302,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_VIVE_COORDINATE_PROFILE,
         help=(
             "Independent Control Station VIVE coordinate profile. "
-            "The default 'latest' selects the newest valid record from the "
-            "independent Station profile directory. Target geometry and robot "
-            "Home come from the loaded MuJoCo target."
+            "The default is the exact versioned repository profile; pass "
+            "'latest' explicitly to select the newest valid machine-local "
+            "record. Target geometry and robot Home come from the loaded "
+            "MuJoCo target."
         ),
     )
     parser.add_argument(
@@ -288,14 +381,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--control-profile",
         choices=(
             SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
+            SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
             SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A,
             SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_B,
         ),
         default=SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
         help=(
             "Composition control profile. The established fixed-alpha path "
-            "remains the default; dynamic allocation profiles are opt-in and "
-            "can start from policy baseline before Human devices are ready."
+            "remains the default; exclusive_truncated_hitl exposes only "
+            "transactional policy/human takeover, while dynamic allocation "
+            "profiles remain separately opt-in."
         ),
     )
     parser.add_argument("--duration", type=float, default=0.0, help="Run seconds; 0 means until interrupted.")
@@ -365,8 +460,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.5,
         help=(
             "Fixed-alpha profile only: initial human contribution in [0,1]. "
-            "Allocation profiles ignore this compatibility field and use typed "
-            "allocation operations."
+            "The exclusive truncated-HITL and allocation profiles ignore this "
+            "compatibility field and use typed source-selection operations."
         ),
     )
     parser.add_argument(
@@ -386,6 +481,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Open the lower-owned passive MuJoCo viewer. Defaults to enabled "
             "and is required for --control-gui; disabled by default for "
             "non-acceptance runs."
+        ),
+    )
+    parser.add_argument(
+        "--sim-collision-stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable terminal episode stop on the Sim pose planner's collision "
+            "rejection (default: enabled). Use --no-sim-collision-stop to "
+            "allow MuJoCo contacts without stopping the Sim-HIL episode."
         ),
     )
     parser.add_argument(
@@ -410,20 +515,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Enable the loopback typed-intent GUI for formal Sim-HIL use. "
             "It shows fixed-alpha modes or profile-selected allocation operations "
-            "according to --control-profile; allocation profiles attach Human "
-            "devices only when a Human operation first needs them. Requires "
+            "according to --control-profile; exclusive HITL can select Policy "
+            "or Human before launch, and allocation profiles attach Human devices "
+            "only when the selected operation needs them. Requires "
             "--enable and writes "
             "ControlTrace. "
             "--acceptance-gui is a compatibility alias."
         ),
     )
     parser.add_argument(
+        "--capture-root",
         "--acceptance-root",
+        dest="acceptance_root",
         type=Path,
         default=None,
         help=(
-            "Exact root for acceptance ControlTrace WAL, seal, and commit evidence. "
-            "When provided it overrides --artifact-layout."
+            "Exact root for ControlTrace WAL, seal, and commit evidence. When "
+            "provided it overrides --artifact-layout."
+        ),
+    )
+    parser.add_argument(
+        "--capture-profile",
+        choices=SIM_HIL_CAPTURE_PROFILES,
+        default=SIM_HIL_CAPTURE_PROFILE_ACCEPTANCE,
+        help=(
+            "ControlTrace capture semantics. human_demonstration locks the "
+            "control GUI to human-only operation and HOLD fallback."
         ),
     )
     parser.add_argument(
@@ -434,9 +551,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         default=configured_runtime_artifact_layout(),
         help=(
-            "Select the managed acceptance evidence root when --acceptance-root "
-            "is omitted. The repository default is legacy; local_paths.json can "
-            "coordinate a project-wide canonical cutover."
+            "Select the managed capture root when --capture-root is omitted. "
+            "The repository default is legacy; local_paths.json can coordinate "
+            "a project-wide canonical cutover."
         ),
     )
     parser.add_argument(
@@ -465,6 +582,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace) -> MujocoSimHILApplicationConfig:
+    exclusive_hitl = (
+        args.control_profile
+        == SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL
+    )
     compose_target_hz = (
         args.compose_hz
         if args.compose_hz is not None
@@ -476,6 +597,19 @@ def _config_from_args(args: argparse.Namespace) -> MujocoSimHILApplicationConfig
     )
     return MujocoSimHILApplicationConfig(
         checkpoint_path=args.checkpoint,
+        policy_backend=args.policy_backend,
+        openpi_policy_artifact_path=args.openpi_policy_artifact,
+        openpi_host=args.openpi_host,
+        openpi_port=args.openpi_port,
+        openpi_prompt=args.openpi_prompt,
+        openpi_action_hz=args.openpi_action_hz,
+        openpi_policy_hz=args.openpi_policy_hz,
+        openpi_action_chunk_execution_steps=(
+            args.openpi_action_chunk_execution_steps
+        ),
+        openpi_prediction_queue_threshold=(
+            args.openpi_prediction_queue_threshold
+        ),
         task_config_path=args.task_config,
         calibration_profile_path=args.calibration_profile,
         vive_coordinate_profile_path=args.vive_coordinate_profile,
@@ -497,10 +631,14 @@ def _config_from_args(args: argparse.Namespace) -> MujocoSimHILApplicationConfig
         warmup_timeout_sec=args.warmup_timeout,
         human_emission_timeout_sec=args.human_emission_timeout,
         target_admission_margin_sec=args.target_admission_margin_sec,
-        initial_human_alpha=args.human_alpha,
+        # Exclusive HITL is always born policy-only. Human construction and
+        # Runtime Home belong to the explicit takeover transaction.
+        initial_human_alpha=(0.0 if exclusive_hitl else args.human_alpha),
         blend_failure_grace_sec=args.blend_failure_grace,
         human_timeout_fallback=args.human_timeout_fallback,
+        defer_human_input=exclusive_hitl,
         execution_difference_enabled=bool(args.execution_difference),
+        sim_collision_stop_enabled=bool(args.sim_collision_stop),
         mujoco_viewer_enabled=(
             bool(args.acceptance_gui)
             if args.mujoco_viewer is None
@@ -523,6 +661,7 @@ def _build_dry_run_composition_contracts(
         build_component_keyed_mujoco_sim_hil_contracts,
     )
     from control_station.sim_hil_profile.policy_human_allocation import (
+        prepare_exclusive_truncated_hitl_allocation_profile,
         prepare_policy_human_allocation_scheme_a,
         prepare_policy_human_allocation_scheme_b,
     )
@@ -532,6 +671,9 @@ def _build_dry_run_composition_contracts(
         config.control_profile_id in SIM_HIL_POLICY_HUMAN_ALLOCATION_PROFILE_IDS
     )
     allocation_prepare = {
+        SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL: (
+            prepare_exclusive_truncated_hitl_allocation_profile
+        ),
         SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A: (
             prepare_policy_human_allocation_scheme_a
         ),
@@ -573,33 +715,70 @@ def _build_dry_run_composition_contracts(
     )
 
 
-def _run_dry_run(config: MujocoSimHILApplicationConfig) -> int:
+def _run_dry_run(
+    config: MujocoSimHILApplicationConfig,
+    *,
+    capture_profile: str = SIM_HIL_CAPTURE_PROFILE_ACCEPTANCE,
+) -> int:
     from sim.mujoco.deploy import (
         MujocoSimHILTargetConfig,
         build_rm65_right_cube_lift_component_target_profile,
         prepare_mujoco_sim_hil_target,
     )
-    from sim.mujoco_temp_pipeline.checkpoint import (
-        build_policy_from_checkpoint,
-        check_task_config_compatibility,
-    )
-    from sim.mujoco_temp_pipeline.policy import resolve_device
-    from sim.mujoco_temp_pipeline.hil_policy import (
-        validate_temp_ppo_hil_profile,
-    )
     from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
     from teleop_runtime.calibration import TeleopCalibration
 
     task = CubeLiftTaskConfig.load(config.task_config_path)
-    policy, _normalizer, payload = build_policy_from_checkpoint(
-        config.checkpoint_path,
-        device=resolve_device(config.device),
-    )
-    compatibility = check_task_config_compatibility(
-        payload,
-        config.task_config_path,
-    )
-    validate_temp_ppo_hil_profile(task, policy)
+    if config.policy_backend == "temp_ppo":
+        from sim.mujoco_temp_pipeline.checkpoint import (
+            build_policy_from_checkpoint,
+            check_task_config_compatibility,
+        )
+        from sim.mujoco_temp_pipeline.hil_policy import (
+            validate_temp_ppo_hil_profile,
+        )
+        from sim.mujoco_temp_pipeline.policy import resolve_device
+
+        policy, _normalizer, payload = build_policy_from_checkpoint(
+            config.checkpoint_path,
+            device=resolve_device(config.device),
+        )
+        compatibility = check_task_config_compatibility(
+            payload,
+            config.task_config_path,
+        )
+        validate_temp_ppo_hil_profile(task, policy)
+        policy_dimensions = [policy.observation_dim, policy.action_dim]
+        policy_artifact_path = None
+        policy_checkpoint_path = str(config.checkpoint_path)
+        policy_topology = {
+            "model_observation_sides": ["right"],
+            "output_active_sides": ["right"],
+        }
+    else:
+        from sim.mujoco.deploy.openpi_policy_source import (
+            preflight_mujoco_openpi_state_policy_source,
+        )
+
+        source_preflight = preflight_mujoco_openpi_state_policy_source(
+            _mujoco_openpi_state_policy_source_profile(config)
+        )
+        compatibility = {
+            key: source_preflight[key]
+            for key in (
+                "prepared_artifact_required",
+                "state_only_capability",
+                "server_connection_checked",
+                "full_bimanual_execution",
+                "projection",
+            )
+        }
+        policy_dimensions = source_preflight["policy_dimensions"]
+        artifact_path = config.openpi_policy_artifact_path
+        assert artifact_path is not None
+        policy_artifact_path = str(artifact_path)
+        policy_checkpoint_path = None
+        policy_topology = source_preflight["policy_topology"]
     calibration = TeleopCalibration.load_json(config.calibration_profile_path)
     calibration, calibration_binding = _bind_vive_coordinate_profile(
         calibration,
@@ -693,10 +872,13 @@ def _run_dry_run(config: MujocoSimHILApplicationConfig) -> int:
             {
                 "dry_run": True,
                 "enabled": bool(config.enabled),
+                "capture_profile": str(capture_profile),
                 "control_profile_id": config.control_profile_id,
                 "execution_target": "mujoco_only",
                 "real_arm_motion": False,
-                "checkpoint": str(config.checkpoint_path),
+                "policy_backend": config.policy_backend,
+                "checkpoint": policy_checkpoint_path,
+                "policy_artifact": policy_artifact_path,
                 "task_config": str(config.task_config_path),
                 "task_name": task.name,
                 "position_control_profile": (
@@ -705,7 +887,8 @@ def _run_dry_run(config: MujocoSimHILApplicationConfig) -> int:
                 "compose_target_hz": prepared_target.compose_target_hz,
                 "reference_hz": prepared_target.timing.reference_hz,
                 "command_hz": prepared_target.timing.command_hz,
-                "policy_dimensions": [policy.observation_dim, policy.action_dim],
+                "policy_dimensions": policy_dimensions,
+                "policy_topology": policy_topology,
                 "policy_profile_validated": True,
                 "compatibility": compatibility,
                 "calibration_profile": str(config.calibration_profile_path),
@@ -731,6 +914,24 @@ def _run_dry_run(config: MujocoSimHILApplicationConfig) -> int:
     return 0
 
 
+def _validate_capture_profile_args(
+    args: argparse.Namespace,
+    config: MujocoSimHILApplicationConfig,
+) -> None:
+    if args.capture_profile != SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION:
+        return
+    if not args.acceptance_gui:
+        raise ValueError(
+            "--capture-profile human_demonstration requires --control-gui."
+        )
+    if config.control_profile_id != SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY:
+        raise ValueError(
+            "human_demonstration requires fixed_alpha_compatibility."
+        )
+    if config.human_timeout_fallback != "hold":
+        raise ValueError("human_demonstration requires HOLD timeout fallback.")
+
+
 def run(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     if args.vive_calibration_gui and not args.acceptance_gui:
@@ -738,8 +939,12 @@ def run(args: argparse.Namespace) -> int:
             "--vive-calibration-gui is a compatibility flag for the "
             "integrated --control-gui calibration controls."
         )
+    _validate_capture_profile_args(args, config)
     if args.dry_run:
-        return _run_dry_run(config)
+        return _run_dry_run(
+            config,
+            capture_profile=args.capture_profile,
+        )
     if args.acceptance_gui and not args.enable:
         raise ValueError("--control-gui requires explicit --enable.")
     if args.acceptance_gui and not config.mujoco_viewer_enabled:
@@ -925,6 +1130,25 @@ def _sim_hil_bootstrap_status(
         "lifecycle": str(setup.get("phase") or "vive_setup"),
         "held": False,
         "episode_ended": False,
+        "episode_end_reason": None,
+        "sim_collision_stop": {
+            "enabled": bool(config.sim_collision_stop_enabled),
+            "mode": (
+                "planner_proxy_preventive_clearance_terminal_stop"
+                if config.sim_collision_stop_enabled
+                else "planner_collision_constraints_disabled"
+            ),
+            "trigger_semantics": (
+                "planner_proxy_preventive_clearance_or_"
+                "mujoco_forbidden_contact_hard_penetration"
+            ),
+            "planner_margin_requires_physical_contact": False,
+        },
+        "sim_collision_contact": {
+            "available": False,
+            "safe": True,
+            "semantics": "mujoco_active_forbidden_contacts",
+        },
         "startup": {
             "restart_required": False,
             "first_failure": None,
@@ -985,7 +1209,17 @@ def _sim_hil_bootstrap_status(
             "started": False,
             "ready": False,
             "refresh_state": "not_constructed",
-            "checkpoint": str(config.checkpoint_path),
+            "backend": config.policy_backend,
+            "checkpoint": (
+                str(config.checkpoint_path)
+                if config.policy_backend == "temp_ppo"
+                else None
+            ),
+            "policy_artifact": (
+                None
+                if config.openpi_policy_artifact_path is None
+                else str(config.openpi_policy_artifact_path)
+            ),
             "last_emission": {},
         },
         "human": {
@@ -1058,6 +1292,7 @@ def _run_acceptance_gui(
     import secrets
 
     from .sim_hil_acceptance import (
+        SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1,
         SimHILAcceptanceController,
         SimHILAcceptanceTraceCapture,
     )
@@ -1069,7 +1304,16 @@ def _run_acceptance_gui(
     gui_server = None
     try:
         storage_resolution = resolve_acceptance_root(args)
-        capture = SimHILAcceptanceTraceCapture(storage_resolution.path)
+        capture_profile = str(args.capture_profile)
+        capture = SimHILAcceptanceTraceCapture(
+            storage_resolution.path,
+            capture_purpose=(
+                "sim_hil_human_demonstration"
+                if capture_profile
+                == SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1
+                else "sim_hil_acceptance"
+            ),
+        )
         _write_acceptance_storage_receipt(
             session_root=capture.session_root,
             resolution=storage_resolution,
@@ -1080,6 +1324,7 @@ def _run_acceptance_gui(
                     LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
                 )
             ),
+            capture_profile=capture_profile,
         )
 
         def setup_factory(source_role: str) -> Any:
@@ -1096,9 +1341,12 @@ def _run_acceptance_gui(
             coordinate_profile_path: Path,
             source_role: str,
             initial_human_alpha: float,
+            control_profile_id: str,
+            sim_collision_stop_enabled: bool,
         ) -> MujocoSimHILApplication:
-            defer_human_input = bool(
-                initial_human_alpha <= 1e-12
+            defer_human_input = _should_defer_gui_human_input(
+                capture_profile=capture_profile,
+                initial_human_alpha=initial_human_alpha,
             )
             runtime_config = replace(
                 acceptance_config,
@@ -1108,6 +1356,10 @@ def _run_acceptance_gui(
                     else coordinate_profile_path
                 ),
                 vive_source_tracker_role=source_role,
+                control_profile_id=str(control_profile_id),
+                sim_collision_stop_enabled=bool(
+                    sim_collision_stop_enabled
+                ),
                 initial_human_alpha=float(initial_human_alpha),
                 defer_human_input=defer_human_input,
             )
@@ -1123,6 +1375,8 @@ def _run_acceptance_gui(
                 args.acceptance_device_timeout
             ),
             application_factory=application_factory,
+            application_factory_accepts_control_profile=True,
+            application_factory_accepts_sim_collision_stop=True,
             vive_setup_controller=setup_controller,
             vive_setup_factory=setup_factory,
             coordinate_profile_path=(
@@ -1133,6 +1387,23 @@ def _run_acceptance_gui(
                 acceptance_config.control_profile_id
                 in SIM_HIL_POLICY_HUMAN_ALLOCATION_PROFILE_IDS
             ),
+            exclusive_hitl_enabled=(
+                acceptance_config.control_profile_id
+                == SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL
+            ),
+            selected_control_profile_id=(
+                acceptance_config.control_profile_id
+            ),
+            available_control_profile_ids=(
+                SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY,
+                SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
+                SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A,
+                SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_B,
+            ),
+            selected_sim_collision_stop_enabled=(
+                acceptance_config.sim_collision_stop_enabled
+            ),
+            capture_profile=capture_profile,
         )
 
         cached_runtime_status: dict[str, Any] | None = None
@@ -1140,11 +1411,22 @@ def _run_acceptance_gui(
         def status_provider() -> dict[str, Any]:
             nonlocal cached_runtime_status
             acceptance_status = controller.status()
+            status_config = replace(
+                acceptance_config,
+                control_profile_id=str(
+                    acceptance_status["selected_control_profile_id"]
+                ),
+                sim_collision_stop_enabled=bool(
+                    acceptance_status[
+                        "selected_sim_collision_stop_enabled"
+                    ]
+                ),
+            )
             app = controller.current_application
             if app is None:
                 setup = controller.setup_status()
                 value = _sim_hil_bootstrap_status(
-                    acceptance_config,
+                    status_config,
                     setup=setup,
                     vive_status=controller.vive_status(),
                 )
@@ -1155,7 +1437,7 @@ def _run_acceptance_gui(
                 # status request behind the operation it must interrupt.
                 if cached_runtime_status is None:
                     value = _sim_hil_bootstrap_status(
-                        acceptance_config,
+                        status_config,
                         setup=controller.setup_status(),
                         vive_status=controller.vive_status(),
                     )
@@ -1232,6 +1514,19 @@ def _run_acceptance_gui(
                 except Exception:
                     pass
                 passive_observation_due_at = now + 0.05
+            elif (
+                app is not None
+                and app.viewer_preview_started
+                and now >= passive_observation_due_at
+            ):
+                # Camera/scene preview owns only passive viewer refresh.  It
+                # must not poll Human input, step policy/composition, advance
+                # physics, dispatch a target, or start ControlTrace capture.
+                try:
+                    app.sync_viewer_preview()
+                except Exception:
+                    pass
+                passive_observation_due_at = now + 0.02
             if app is not None and app.viewer_exit_requested:
                 break
             next_due = None if app is None else app._next_decision_at
@@ -1274,6 +1569,24 @@ def _run_acceptance_gui(
             controller.close()
         elif capture is not None:
             capture.close()
+
+
+def _should_defer_gui_human_input(
+    *,
+    capture_profile: str,
+    initial_human_alpha: float,
+) -> bool:
+    """Separate final composition alpha from pre-start device attachment."""
+
+    from .sim_hil_acceptance import (
+        SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1,
+    )
+
+    return bool(
+        str(capture_profile)
+        == SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1
+        or float(initial_human_alpha) <= 1e-12
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

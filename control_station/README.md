@@ -51,13 +51,14 @@ Current concrete-profile and migration debt is frozen as follows:
 | Current Station area | Long-term owner |
 |---|---|
 | action/context selection, TTL, fallback, difference, handoff/session semantics | `control_composition` |
-| human admission, passive teleop session, human emission fanout | `teleop_runtime.action` |
+| human admission, passive teleop session, human emission fanout | `teleop_runtime.action` (implemented; Station paths are compatibility/profile seams) |
 | replay binding/fanout/cursor-owned status | `teleop_runtime.replay` / `robot_motion.replay` |
 | sync/RTC policy binding and step validation | `teleop_runtime.deploy` / `robot_motion.deploy` |
 | OpenPI artifact/protocol assessment | `deployments.openpi` |
 | MuJoCo measurement, readiness, resolution and execution evidence | `sim.mujoco` |
 | authority, safety, IK, reference and dispatch | `robot_motion` |
-| ControlTrace/v2.4 projection and capture | `dataset_interface` and the existing capture owner |
+| ControlTrace/v2.4 projection | `dataset_interface` |
+| ControlTrace WAL/session capture | `teleop_runtime.control_trace` (until the whole capture runtime can move without a forbidden reverse dependency) |
 
 `control_station/composition/` is therefore a transitional name. After the
 concrete algorithms above have returned to their owners, the remaining thin,
@@ -89,13 +90,60 @@ The CLI runner remains in the stable facade; none of these modules owns device
 workers, composition algorithms, canonical safety, IK, dispatch, or dataset
 persistence.
 
+The standalone `python -m control_station vive-deflection` application is a
+read-only VIVE input viewer. It opens one VIVE pose receiver and a loopback
+GUI, loads the latest source-compatible Control Station VIVE coordinate
+profile by default, auto-captures the first fresh calibrated pose as Viewer
+Home, and supports
+explicit recenter. Its fixed display axes follow the calibrated retarget-frame
+contract: `+X` forward, `+Y` left, and `+Z` up; the six signed endpoints are
+labelled in both 3D panels. A profile with an explicit cardinal post-yaw is
+labelled by its resulting physical signed axes rather than being falsely
+presented as canonical; for example, a signed-sweep profile with `180 deg`
+shows `-X` forward and `-Y` left and carries a visible warning. Newly captured
+canonical profiles use `0 deg`. `--raw-vive-frame` is an explicit debug fallback
+and deliberately makes no front/back/left/right claim. It does not create
+MuJoCo, a policy, HIL composition, authority, recording, or any robot execution
+target. Its retarget-frame translation and Home-local-rotation projection is
+passive observability; Viewer Home is not a teleop Runtime Home or a
+composition residual anchor. A finite positive-
+determinant raw VIVE rotation may be projected to the nearest SO(3) only for
+axis-angle display; this never rewrites the source sample or any control path.
+The same GUI also contains a demo-only three-dimensional trajectory panel with
+two selectable SI-unit projections. The default `velocity_joystick` mode maps
+normalized Home translation to metres per second and integrates an explicit
+browser-local offset using elapsed display time; returning Home stops further
+integration and preserves the offset, while clear or successful recenter resets
+it. The compatible `position_offset` mode applies the current Home translation
+directly in metres with a dimensionless gain and carries no accumulator. Both
+the nominal and corrected trajectories remain live at 30 Hz, while the demo
+parabola uses a 2.4-second bounce period. The panel is an
+operator experiment, not a composition result, executable Reference,
+coordinate-frame adapter, or command producer.
+The demo parabola and its floor grid are authored in physical
+`forward/left/up` coordinates and mapped into the active profile's signed-axis
+basis before rendering. Human correction remains in that already projected
+profile frame and is added exactly once.
+
+`重新标定坐标系` opens the existing Control Station VIVE calibration GUI on a
+free loopback port. The calibration workflow shares the viewer's already-open
+VIVE receiver, so it neither binds the pose port a second time nor takes over
+the receiver lifecycle. It is restricted to the viewer's selected wrist side.
+Completed profiles are saved by the existing `save_coordinate_profile()` path
+under `teleop_records/control_station_vive_coordinate_profiles`. After a save,
+the viewer applies that exact artifact, resets Viewer Home, and clears the
+browser-local trajectory accumulator; no control/runtime Home is changed.
+
 The boundary tests keep current migration debt explicit: dataset projection is
 confined to `control_trace.py`, the existing
 `composition/mujoco_pose_composer.py` profile, and the default-off
 `composition/mujoco_sim_hil.py` profile, OpenPI knowledge to
-`preflight/openpi_rtc.py`, MuJoCo imports to concrete profiles, and numerical
-source code to the two source modules scheduled for extraction. New debt may
-not spread while those files are migrated.
+`preflight/openpi_rtc.py`, and MuJoCo imports to concrete profiles. Device-free
+synthetic Human production, receiver admission, passive ingress/fanout, and
+the observe-only `TeleopSession(rig=None)` source now live in
+`teleop_runtime.action`; their Station paths are compatibility/profile seams
+only. New debt may not spread while the remaining concrete profiles are
+migrated.
 
 ## Reuse model
 
@@ -104,11 +152,37 @@ Keep extension work on the narrowest stable seam:
 | New capability | Reuse | Add only when required |
 |---|---|---|
 | Robot arm/backend | RobotMotion authority, gate, epoch, cancellation and Station target lifecycle | Thin backend runtime/dispatch adapter and capability evidence |
-| Teleop device | `HumanCommandEmission`/human proposal seam and existing Station source lifecycle | Device-to-emission adapter; no new Arbiter or target composition |
+| Teleop device | `HumanCommandEmission`/human proposal seam and the lower-owned source lifecycle | Device-to-emission adapter plus a thin Station profile binding; no new Arbiter or target composition |
 | Simulation environment | RobotMotion authoritative runtime and generic Station target adapter | Sim measurement/execution adapter |
 | Model/checkpoint/server | `PolicyActionEmission` or RTC chunk protocol | Observation/action representation adapter only when the model contract differs |
 | Replay dataset/profile | Replay emission/proposal source and Station replay binding | Dataset reader/compatibility assessment, never a second cursor in Station |
-| Mixed-source handoff | `request_human_takeover` plus the pure handoff receipt reducer | One operation executor binding; never a reducer or coordinator per source pair |
+| Exclusive Human/Policy handoff | `control_station.hitl` switch and activation-evidence contracts | One sim/real lifecycle port; never a transaction, reducer, or coordinator per backend/model/robot |
+
+`control_station/hitl/` is the reusable application-lifecycle seam for
+exclusive Human/Policy switching. Exclusive control itself is a restricted
+profile of the common streaming allocation cycle (`base_only` or
+`absolute_overlay_owner` for the complete component set), not a fixed-alpha
+or backend-private composition path. The lifecycle seam knows only source roles, HOLD evidence,
+Runtime Home evidence, source-selection identity, activation identity, and one
+fresh target-source emission. A switch is not reported ready at that point:
+the concrete lifecycle port must also return the existing downstream target,
+target-admission, completion, command, and dispatch receipts from one formal
+cycle. These facts remain lower-owned and are linked through `evidence_refs`;
+the HITL seam does not reconstruct them. It imports no simulator, hardware,
+model client, teleop runtime, or ControlTrace projection and contains no
+component-name or arm-cardinality assumptions. `sim_hil_profile/exclusive_hitl.py`
+is the current concrete MuJoCo application adapter; a real deployment must add
+its own thin adapter before the existing single safety/IK/reference/dispatch
+owner.
+
+Control and recording remain one-way coupled.  `control_station.hitl` may call
+a best-effort evidence observer after building a result, while
+`control_station.control_trace` owns the passive projection.  A trace sink
+failure is reported by capture health and may invalidate dataset finalization,
+but cannot synchronously change the switch result or grant/revoke motion
+authority.  A capture-required application may separately translate faulted
+capture health into an explicit typed HOLD request; that policy remains outside
+the trace projector and carries its own visible reason/evidence.
 
 ### Operation preparation contract
 
@@ -131,8 +205,10 @@ prevent result admission also remain exceptions.
 
 The reusable target lifecycle lives in `targets/authoritative.py`. Concrete
 MuJoCo validation and manifests remain in `composition/mujoco_*.py` because
-they bind a source to one exact target profile. Generic source evidence lives
-in `sources/` and must not import `sim` or `hardware`.
+they bind a source to one exact target profile. Generic source production,
+admission, evidence, and passive observation live below Station;
+`control_station/sources/` contains only takeover-readiness and thin
+compatibility/profile bindings and must not import `sim` or `hardware`.
 
 Do not create one composition module per checkpoint, teleop device, robot arm,
 or task configuration when the typed source/target seam is unchanged. Prefer
@@ -285,27 +361,31 @@ Station admission. The short readiness-to-READY finalization uses a pending
 operation CAS, so a prior HOLD/ESTOP prevents lower READY rather than merely
 rejecting a completion after the lower runtime has already reopened.
 
-The same module now provides the narrower
+The lower `teleop_runtime.action` data plane provides the narrower
 `PassiveHumanCommandEmissionIngress` and
-`PassiveHumanCommandObserverFanout`. They are application-root wiring aids,
-not another teleop source: the fanout preserves the exact lower-owned emission
-object and isolates passive subscribers; the ingress uses a latest-preserving
-bounded queue and waits only from the Station side-effect worker. The ingress
-does **not** implement `HumanTakeoverReadinessProvider`. The current canonical
-real-teleop path has no typed post-takeover deadman-rearm or retargeter-rebase
-receipt, so production human takeover must remain fail-closed until both
-receipts exist and can be correlated with the same operation boundary.
+`PassiveHumanCommandObserverFanout`; `sources/human.py` only re-exports them
+beside the Station-owned takeover-readiness contract. They are passive wiring
+aids, not another teleop source: the fanout preserves the exact lower-owned
+emission object and isolates passive subscribers; the ingress uses a
+latest-preserving bounded queue and waits only from an application side-effect
+worker. The ingress does **not** implement
+`HumanTakeoverReadinessProvider`. The current canonical real-teleop path has no
+typed post-takeover deadman-rearm or retargeter-rebase receipt, so production
+human takeover must remain fail-closed until both receipts exist and can be
+correlated with the same operation boundary.
 
-`sources/teleop_pose.py` adds a narrower device-neutral observation boundary.
-It composes arbitrary `ObservationSource` and pose `Retargeter` instances into
-an existing `TeleopSession(rig=None, recorder=None)`, forbids recording and
-hardware-arm eligibility, and accepts exactly the finite pose effectors declared
-by `PassiveTeleopPoseSourceSpec` (the default remains the historical bimanual
-RM65 tuple). CS-6b1d may bind this source to the human slot while replay remains
-the only active authority. A typed Station source-connect operation may start
-the supplied tracker source, but no command can be dispatched and no human
-proposal is admitted by this passive step. The module deliberately imports no
-VIVE, robot, simulator, or model implementation; application profiles remain
+`teleop_runtime.action.passive_teleop` owns the narrower device-neutral
+observation boundary; `sources/teleop_pose.py` is its compatibility export. It
+composes arbitrary `ObservationSource` and pose `Retargeter` instances into an
+existing `TeleopSession(rig=None, recorder=None)`, forbids recording and
+hardware-arm eligibility, and accepts exactly the finite pose effectors
+declared by `PassiveTeleopPoseSourceSpec` (the default remains the historical
+bimanual RM65 tuple). CS-6b1d may bind this source to the human slot while
+replay remains the only active authority. A typed Station source-connect
+operation may start the supplied tracker source, but no command can be
+dispatched and no human proposal is admitted by this passive step. The lower
+module deliberately imports no VIVE, robot, simulator, or model implementation;
+application profiles remain
 responsible for constructing their concrete source and retargeters. The public
 `teleop_runtime.configs.build_bimanual_passive_session` profile now provides
 that projection for the current real setup: it reuses the canonical
@@ -632,10 +712,44 @@ it closes the current MuJoCo episode and restores the VIVE setup owner. Neither
 operation commands a physical robot to home. A composition failure is shown
 separately from later input diagnostics, so the operator can diagnose the
 first fault before choosing Home capture, re-arm, or a whole-runtime rebuild.
-With an explicit allocation profile the same page replaces fixed-alpha controls
-with typed `Auto allocation`, `Policy baseline`, `Human relative correction`,
-and `Rebase and clear residual` operations. Scheme B additionally exposes
-`Human absolute takeover`; Scheme A neither advertises nor accepts that button.
+The same control page now exposes one pre-construction `Control workflow`
+selector. `--control-profile` supplies its initial value; before MuJoCo is
+constructed the operator may select fixed-alpha compatibility, exclusive
+takeover, Scheme A, or Scheme B. One Runtime atomically binds the selected
+lifecycle/control-cycle pair. Selection is locked after construction and can
+change only after the explicit whole-runtime rebuild, so authority, Runtime
+Home, source history, and activation state never migrate implicitly between
+profiles.
+
+The same pre-construction panel selects the Sim planner's preventive-clearance
+guard. It is enabled by default. The planner clearance comes from the selected
+MuJoCo scene's `CollisionSpec.safety_minimum_clearance_m`; Sim-HIL does not
+inherit the real-side planner's 30 mm default. A lower `collision_margin_low`
+rejection means a configured Pinocchio proxy pair fell below that preventive
+clearance; it does not assert that MuJoCo has already produced a physical
+contact. Separately, Sim-HIL observes MuJoCo's active forbidden contacts and
+terminates when penetration exceeds the scene contract's hard-penetration
+limit; ordinary cube-table and gripper-object task contacts remain allowed.
+The lower resolver or contact observer first establishes evidence, then the
+Station terminates the current episode and offers only `Reset simulation`;
+re-arm, Runtime Home capture, and source switching cannot continue that
+episode. Diagnostics retain the best candidate distance, effective threshold,
+closest proxy pair, or actual forbidden contact pair and penetration depth.
+With the guard disabled (or `--no-sim-collision-stop` in headless use), the pose
+planner installs no collision pairs and observed MuJoCo contacts are not
+promoted to terminal lifecycle events. MuJoCo contact physics itself remains
+enabled. IK, joint constraints, non-finite checks, and other execution failures
+are unchanged. This selection is locked after target construction and applies
+only to the Sim target, never to real-robot safety.
+
+With an allocation profile the page replaces fixed-alpha controls with one
+`Policy / Human streaming control` panel. Dynamic profiles expose typed
+`Auto allocation`, `Policy baseline`, `Human relative correction`, and
+`Rebase and clear residual` options; Scheme B additionally exposes `Human
+absolute takeover`. The exclusive truncated-HITL profile uses the same panel
+and streaming backend, but shows only `Policy`, `Human takeover`, and `Policy
+resume` options. It is not a separate GUI or execution path. Scheme A neither
+advertises nor accepts absolute takeover.
 Its dedicated allocation start
 intent starts from the policy baseline and carries no fixed-alpha control mode
 or weight. Human devices and coordinate-profile readiness are deferred until
@@ -643,6 +757,13 @@ the first Auto/relative/absolute/rebase operation that consumes Human input.
 Until then the admitted composition contains only the real policy input; the
 optional allocation context is absent and the strategy records an explicit
 `base_only` selection rather than synthesizing Human data.
+
+If the enabled collision stop rejects a collision margin, the lower execution
+gate first establishes HOLD and the application promotes that exact typed
+rejection to a terminal episode. The page projects the structured reason
+instead of showing only a generic compound-authority error, and it never
+offers a source/Home/re-arm recovery path for that episode. Reset closes and
+rebuilds the lower-owned MuJoCo target.
 
 The control page starts before a MuJoCo target or policy runtime is
 constructed. One setup controller owns the VIVE receiver and projects live
@@ -782,7 +903,8 @@ different mode is silently exercised during startup. HOLD, re-arm, Runtime
 Home, rebuild, and trace finalization are
 independent lifecycle operations, not mode-unlock gates. Finalization requires
 an active recording episode but does not require all three modes to have been
-visited. `SimHILAcceptanceTraceCapture` remains the internal capture adapter:
+visited. `SimHILAcceptanceTraceCapture` remains a profile-default compatibility
+name over the lower-owned `teleop_runtime.control_trace` capture lifecycle:
 it binds the lower-owned `EpisodeTraceRecorderSink`, records both immediate
 source/composed differences and lower reference/measurement differences,
 establishes HOLD/cancellation at episode end, then seal/commits the trace.
@@ -804,6 +926,18 @@ capture, not a replacement for collection-runtime camera/tactile/native-stream
 writers. `--acceptance-gui` remains only a CLI compatibility alias for
 `--control-gui`.
 
+The Agent Gateway's visual path is pull-based and separate from its low-rate
+JSON state snapshot. A deployment can publish its complete current RGB source
+catalog and implement one bounded `capture_visual_snapshot` request. The
+request selects semantic roles plus hard count/dimension/byte limits; it does
+not grant the caller a streaming subscription or any motion/control authority.
+The MuJoCo Agent TCP-pose attachment currently publishes `main`, `wrist_left`,
+and `wrist_right`, renders requested frames under the existing scene/physics
+lock, and rejects a capture if the Station revision differs before or after
+the cut. Encoding and concrete camera IDs remain lower-owned. Other
+attachments, including real deployments, must bind their own producers to the
+same transport-neutral facade rather than importing the MuJoCo renderer.
+
 The Station loop follows the authoritative scheduler's exposed next deadline.
 If synchronous contributor work misses one or more upstream compose cuts,
 Station records and skips those cuts without burst catch-up; it does not add a
@@ -818,9 +952,11 @@ admission and remains the sole reference/activation owner.
 
 `--vive-coordinate-profile` selects a coordinate-only profile from the
 independent `control_station_vive_coordinate_profiles` directory. Its default
-is `latest`, resolved as the newest valid independent record. The checked
-legacy seed in that directory is a non-mutating extraction of the former
-combined profile.
+is the exact versioned repository profile
+`vive_rm65_virtual_desk_coordinate_v1.json`; it does not depend on which local
+profile was saved most recently. Passing `latest` explicitly selects the newest
+valid machine-local record. The checked legacy seed in that directory is a
+non-mutating extraction of the former combined profile.
 It owns only the VIVE frame, tracker offsets, canonical station-frame contract,
 and source artifact identity. `--calibration-profile` is currently retained
 only as the compatibility source of the stored human Home. Its robot Home and
@@ -858,8 +994,9 @@ device, checkpoint, or simulator.
   cancellation, safety and epoch semantics.
 - `sim`: simulation state measurement and execution implementation; it never
   imports Control Station or real teleop code.
-- `control_station/sources`: passive source bindings and source lifecycle; no
-  target execution and no concrete sim dependency.
+- `control_station/sources`: takeover-readiness and thin compatibility/profile
+  bindings only; generic source production, admission, fanout, and source
+  lifecycle remain lower-owned.
 - `control_station/targets`: reusable application-level target lifecycle over
   the shared authoritative runtime; no vendor backend.
 - `control_station/composition`: exact source/target/profile wiring only.
@@ -926,7 +1063,13 @@ closes the receiver and terminates that standalone session.
 The signed sweep directions are explicit: desk `+X` is captured back to front,
 desk `+Y` right to left, and desk `+Z` low to high. Move once in the displayed
 direction after the preparation countdown and do not reverse before the
-capture window ends. Reset restarts only the current stage; it is not an exit.
+capture window ends. These signed sweeps already establish the canonical axes,
+so newly captured Control Station profiles default to
+`virtual_desk_post_yaw_deg = 0`; `--virtual-desk-post-yaw-deg` is an explicit
+override, not a second implicit alignment step. Existing profiles with an
+explicit post-yaw remain unchanged, while legacy profiles without that field
+retain their load-time compatibility correction. Reset restarts only the
+current stage; it is not an exit.
 
 For right-arm Sim-HIL control, the same `--control-gui` contains VIVE
 readiness and calibration controls. It first selects `--vive-coordinate-profile`

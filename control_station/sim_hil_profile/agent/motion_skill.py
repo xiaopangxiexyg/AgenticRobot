@@ -27,6 +27,7 @@ from control_station.agent_gateway.runtime.station_operation_worker import (
     StationLifecycleExecutionCompletion,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.target_safety import TCPPoseEnvelopeSelection
 from robot_motion.action import ComponentAction
 
 from .motion_application import MujocoAgentSkillMotionApplication
@@ -295,9 +296,32 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 evidence_refs=(),
                 lower_hold_confirmed=False,
             )
-        transition = self.application.activate_operation(
-            operation_id=operation.operation_id,
-        )
+        if getattr(self.application, "tcp_pose_envelope_runtime", None) is None:
+            transition = self.application.activate_operation(
+                operation_id=operation.operation_id,
+            )
+        else:
+            safety_runtime = self.application.tcp_pose_envelope_runtime
+            selection = (
+                TCPPoseEnvelopeSelection(
+                    safety_profile_id=request.safety_profile_id,
+                    safety_profile_hash=request.safety_profile_hash,
+                    deployment_envelope_id=(
+                        request.deployment_safety_envelope_id
+                    ),
+                    deployment_envelope_hash=(
+                        request.deployment_safety_envelope_hash
+                    ),
+                    constraint_set_hash=request.safety_constraint_set_hash,
+                )
+                if request.has_safety_profile_selection
+                else safety_runtime.default_selection()
+            )
+            transition = self.application.activate_operation(
+                operation_id=operation.operation_id,
+                route_id=request.route_id,
+                safety_selection=selection,
+            )
         refs = tuple(getattr(transition, "lower_event_ids", ()))
         if not refs or getattr(transition.snapshot, "status", None) != "ready":
             return StationLifecycleActivationEvidence(

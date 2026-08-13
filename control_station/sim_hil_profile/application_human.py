@@ -41,14 +41,20 @@ class _SimHILApplicationHumanMixin:
         self,
         attachment: _SimHILHumanAttachment,
     ) -> dict[str, object]:
-        """Commit a prepared passive source while the execution gate is held."""
+        """Commit a prepared passive source at a non-executing boundary."""
 
         if not isinstance(attachment, _SimHILHumanAttachment):
             raise TypeError("attachment must be a _SimHILHumanAttachment.")
         with self._lock:
-            if not self._started or not self._held:
+            started_held = bool(self._started and self._held)
+            prestart_preview = bool(
+                not self._started
+                and getattr(self, "_viewer_preview_started", False)
+            )
+            if not started_held and not prestart_preview:
                 raise RuntimeError(
-                    "Human input attachment requires a started held runtime."
+                    "Human input attachment requires either a pre-start viewer "
+                    "preview or a started held runtime."
                 )
             receipt = self.human_source.attach(attachment.source)
             self.gripper_input_selection = (
@@ -313,32 +319,6 @@ class _SimHILApplicationHumanMixin:
             with self._lock:
                 self._human_input_check_active = False
 
-    @staticmethod
-    def _channel_pose_in_desk(
-        channel: Any,
-        calibration: Any,
-    ) -> Any:
-        from teleop_runtime.transforms import as_pose_matrix
-
-        pose = as_pose_matrix(channel.value)
-        frame_name = str(getattr(channel, "frame_name", "") or "")
-        metadata = dict(getattr(channel, "metadata", {}) or {})
-        tracker_role = metadata.get("tracker_role")
-        if frame_name in {"vive_world", "world"}:
-            return calibration.world_to_desk(
-                pose,
-                tracker_role=(
-                    None if tracker_role is None else str(tracker_role)
-                ),
-            )
-        if frame_name.endswith("_operator") or frame_name == "operator":
-            return calibration.operator_to_desk(pose)
-        if frame_name in {calibration.desk_frame.name, "desk"}:
-            return pose
-        raise ValueError(
-            f"Unsupported runtime-Home tracker frame {frame_name or '<none>'!r}."
-        )
-
     def capture_runtime_home(
         self,
         *,
@@ -447,9 +427,19 @@ class _SimHILApplicationHumanMixin:
                     getattr(channel, "valid", False)
                 ):
                     continue
-                pose_desk = self._channel_pose_in_desk(
-                    channel,
-                    calibration,
+                resolve_home_sample = getattr(
+                    retargeter,
+                    "resolve_runtime_home_input_pose_desk",
+                    None,
+                )
+                if not callable(resolve_home_sample):
+                    raise RuntimeError(
+                        "Runtime Home pose retargeter does not expose the "
+                        "canonical input-frame resolver."
+                    )
+                pose_desk = resolve_home_sample(
+                    channel=channel,
+                    calibration=calibration,
                 )
                 # ``set_home_anchors`` owns the tracker-local translation and
                 # rotation adjustment.  Keep capture samples in the raw desk

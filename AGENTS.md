@@ -26,15 +26,16 @@ is experimental.
   `control_station` modules. It owns no authority, canonical safety, execution,
   device/model worker, replay cursor, or episode lifecycle.
 - `control_station/`: GUI-facing application control plane. It owns typed
-  operator intents, application lifecycle coordination, rebuildable UI state,
-  profile selection, and thin source/target integration. It may coordinate
-  lower-owned runtimes through typed ports and receipts, but must not
-  reimplement reusable composition algorithms, source/model workers, replay
-  cursors, simulator/backend execution, dataset writers, canonical safety,
-  reference generation, or dispatch. Concrete application bindings may depend
-  on active lower-level packages, but none of those packages may import
-  `control_station`. Existing migration exceptions must remain explicit in
-  boundary tests or documentation.
+  operator intents, rebuildable UI state, application lifecycle/profile
+  coordination, and thin source/target bindings. It may construct lower
+  implementations and connect them through typed ports, but reusable source
+  and control semantics remain lower-owned: workers and source admission,
+  queues/cursors, control/data processing and journals, execution/persistence,
+  safety, and dispatch. Compatibility/profile shims may re-export APIs, bind
+  defaults, or translate application intents/status, but must not duplicate
+  lower implementations or state. `control_station` may import active lower
+  packages; lower packages must not import it.
+  Migration exceptions must remain explicit in boundary tests or documentation.
 - `robot_motion/`: shared motion semantics, Rig, Safety, Planner, position
   control, and runtime contracts; no vendor-device initialization or training.
 - `hardware/`: vendor SDKs and device backends; no dataset schema or learner.
@@ -67,9 +68,8 @@ reverse dependency is forbidden. `sim` must not reverse-depend on
 `teleop_runtime`. `control_station` is an application leaf: dependencies point
 into it from no lower-level package.
 
-Import legality does not imply semantic ownership. Code belongs to the package
-that owns its reusable domain semantics or resource lifecycle, not merely to
-the highest-level caller that currently uses it.
+Ownership follows reusable domain semantics and resource lifecycles, not import
+legality or the current caller.
 
 For one logical runtime resource or stream, source production, cursor or plan
 advancement, authority, canonical safety, dispatch, and episode commitment each

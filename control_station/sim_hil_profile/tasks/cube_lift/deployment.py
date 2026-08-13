@@ -725,6 +725,7 @@ def build_mujoco_cube_lift_agent_skill_contract_bundle(
             "own_operation_cancel_v1",
             "own_operation_status_v1",
             "idempotency_v1",
+            "authoritative_port_receipt_v1",
         ),
         skill_routes=(
             SkillRouteManifestEntry(

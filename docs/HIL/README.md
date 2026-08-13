@@ -5,26 +5,146 @@ VIVE + Q6/angle-trigger 输入经过 component-keyed composition 后，只驱动
 它不会构造真实 RM65 backend，也不会改变既有 teleop、replay、deploy 或 RTC 路径。
 后文仍保留历史 `CS-6b1f` replay→human takeover 说明，并明确标为历史 profile。
 
-当前推荐的 Scheme-A 本地无设备 preflight 是：
+## 0. 架构边界：五个正交平面
+
+当前 HIL 不再按“MuJoCo HITL”“OpenPI HITL”“双臂 HITL”分别复制实现，而是把变化
+限制在五个彼此正交的平面：
+
+```text
+operator/device event
+        │ typed intent
+        ▼
+Control Station application plane
+  control_station/hitl/                 backend/model/topology-neutral
+  ├─ exclusive lifecycle transaction
+  └─ activation + fresh-emission evidence
+        │ concrete lifecycle port
+        ├───────────────┐
+        ▼               ▼
+Sim binding           Real binding               application-specific only
+sim_hil_profile/      planned deploy binding
+exclusive_hitl.py     before the existing single execution owner
+        │               │
+        └──────┬────────┘
+               ▼
+source plane → control_composition allocation → proposal/admission → lower execution
+Human/Policy/   same-cut, component-keyed       safety/IK/reference/dispatch
+Replay/...      streaming action; exclusive =
+                base_only | absolute_overlay_owner
+
+Every stage ── passive facts/receipts ──> ControlTrace projection/capture
+                                         never points back into control
+```
+
+| 变化维度 | 通用契约 | 只允许出现具体知识的位置 |
+|---|---|---|
+| 截断接管/连续融合 | 截断切换在 `control_station/hitl`；融合规则在 `control_composition` | GUI 只选择显式 profile，不实现算法 |
+| Sim/real/其它 backend | 相同 switch、source、composition、proposal 契约 | backend lifecycle port 与 target adapter |
+| 虚拟、OpenPI 或其它模型 | 都先形成正式 `PolicyActionEmission` | 各模型 observation/action adapter 与 worker |
+| 单臂、双臂、多 component | `ComponentActionSchema` 按 component ID/representation 描述 | 具体本体的 frame、IK、safety、dispatch capability |
+| 记录/可视化 | 消费不可变 evidence/fact | trace capture、GUI、dataset projection；不得触发切换或下发 |
+
+因此不存在“ControlTrace 控制”路径。直接接管由 typed intent 和生命周期事务完成；
+ControlTrace 只记录已经发生的 HOLD、Home、selection、activation、emission 与错误。
+trace admission 或持久化失败会使 capture health/finalize 失败，但不会在切换事务内部
+撤销一次已经验证完成的切换或成为隐藏 authority gate。若所选采集 profile 明确要求
+完整记录，Station 的独立 capture-health policy 可随后用可见原因请求 HOLD；这是显式
+应用策略，不是 Trace 投影反向控制。
+
+当前能力矩阵必须与通用契约区分：
+
+| 边界 | 当前落地 | 尚未完成 |
+|---|---|---|
+| 截断式控制 | Sim 中 Policy-only ↔ Human-only 已接入通用 streaming allocation cycle；lifecycle port 只完成 HOLD/Home/activation 事务 | real deploy 对该 port 的具体 HOLD/Home/selection/activation binding |
+| 连续融合 | fixed-alpha 和 Scheme-A/B 保留为独立 profile | 不作为截断式验收前置条件 |
+| Policy | 虚拟 source 与当前 Sim policy source 复用同一 backend-neutral emission port；real sync/RTC deploy 可选地各投递一次被动 emission observation | 真机 Human source 的正式 composition/admission 与活动来源切换 |
+| 本体 | component core 支持数据化子集；当前主线示例为右臂 pose + gripper qpos | 新本体仍需自己的 target catalog/frame/IK/safety adapter |
+| 后端 | MuJoCo concrete binding 已有 | 真机不能同时启动旧 teleop loop 与 policy loop，必须复用单一下游 owner |
+
+增加新对象时的规则是：新模型只加 source adapter，新遥操设备只加 Human emission
+adapter，新 sim/真机只加 lifecycle/target adapter，新本体只声明 component schema 与
+下游 capability。以上变化都不应复制 switch transaction、composer、ControlTrace schema、
+policy queue 或 dispatcher。
+
+当前优先验收的是更简单的截断式 profile：
+`exclusive_truncated_hitl`。它不是另一套 composer，也不再绑定 fixed-alpha
+compatibility cycle；它是通用 streaming allocation 的一个受限 profile：所有
+component 仅允许原子选择 `base_only` 或 `absolute_overlay_owner`。0/1
+权重只是该离散来源选择的直观解释，不是对 pose/qpos/未来动作类型的协议限制：
+
+```text
+启动前选择 Policy ---------------------------> Policy-only
+
+启动前选择 Human -> HOLD -> 接入 Human -> 采集 Runtime Home
+                 -> Human-only activation + fresh Human emission -> 继续运行
+
+Policy-only --接管触发--> HOLD -> 接入 Human -> 采集 Runtime Home
+            -> Human-only activation + fresh Human emission -> 继续运行
+
+Human-only  --交还触发--> HOLD -> 作废旧 policy plan/chunk
+            -> 以当前 sim/robot observation 重新推理
+            -> Policy-only activation + fresh Policy emission -> 继续运行
+```
+
+切换事务会在 HOLD 内创建新 activation，提交全 component allocation
+override，并等待精确的 post-operation allocation context 被接纳，然后才
+允许下一次流式 target cycle。因此不会有“新 activation 先用默认 base-only
+跑一帧”的窗口。任一中间步骤失败都停留在下游 HOLD；不会恢复旧 chunk，也不会绕过既有
+composition、IK、Reference、限幅、安全或 dispatch。Human 交还后可以继续被动观测，
+但其权重严格为零，不能影响 composed output。这个 profile 不启用比例混合、relative
+residual、Rebase-and-clear 或自动 allocation，既有 fixed-alpha/Scheme-A/Scheme-B
+行为保持不变。
+
+本地无设备 preflight：
 
 ```bash
 PYTHONPATH=. python -m control_station sim-hil \
   --dry-run --device cpu \
-  --control-profile policy_human_allocation_scheme_a
+  --control-profile exclusive_truncated_hitl \
+  --vive-coordinate-profile \
+    teleop_records/control_station_vive_coordinate_profiles/vive_rm65_virtual_desk_coordinate_v1.json
 ```
 
-需要验证三态切换与连续 target handoff 时，显式切换到 Scheme-B：
+带真实 VIVE + angle-trigger 输入、但执行仍只在 MuJoCo 的交互命令：
 
 ```bash
-PYTHONPATH=. python -m control_station sim-hil \
-  --dry-run --device cpu \
-  --control-profile policy_human_allocation_scheme_b
+PYTHONPATH=. python -m control_station sim-hil --enable --control-gui \
+  --control-profile exclusive_truncated_hitl \
+  --compose-hz 30 \
+  --vive-coordinate-profile \
+    teleop_records/control_station_vive_coordinate_profiles/vive_rm65_virtual_desk_coordinate_v1.json \
+  --gripper-input-source angle_trigger \
+  --acceptance-root teleop_records/sim_hil_acceptance
 ```
 
-两个 profile 共用相同的 source、composition、proposal 和下游执行端口。Scheme-A
-只允许 baseline/relative；Scheme-B 允许 absolute takeover，并在 composition target
-层生成可记录的 continuity receipt。该 receipt 不代替下游 Reference/IK/限幅/安全或
-dispatch 证据。
+页面把 Policy 和 Human 显示为两个独立输入模块。同一对来源卡贯穿启动和运行：启动前
+按钮表示“以该来源启动”，启动后待命卡按钮变为“切换到该来源”，当前卡明确标为
+“正在控制”。不会再出现第二套接管/交还按钮。Human 独占期间不持续轮询未被选择的
+Policy。angle-trigger 仍然只提供夹爪 qpos，不能被隐式复用为切换按钮。
+
+常用操作按四个阶段显示：准备输入、选择来源、运行控制、结束收尾。VIVE 实时状态常驻；
+坐标标定和来源映射默认折叠，需要修改时再展开。运行阶段只常驻 HOLD、恢复和 Runtime
+Home；封存、重建和退出位于单独的生命周期区域，并保留确认提示。按钮不可用时，原因在
+按钮下方直接显示，不依赖鼠标悬停。GUI 启动页还可在 MuJoCo 构造前选择 Sim 碰撞
+处理，默认启用代理安全间隙保护。启用时，下游 `collision_margin_low` 表示规划器代理
+低于场景声明的预防间隙（不等于 MuJoCo 已发生物理接触），会先建立 HOLD，再终止
+当前 episode；之后只能 Reset 仿真，不能 rearm、重采 Runtime Home 或切换来源继续。
+此外，MuJoCo 若观测到超过硬穿透限值的实际禁碰接触，也会以独立语义终止；方块—桌面
+和夹爪—方块等任务允许接触不会被误判为禁碰接触。
+关闭时（CLI 等价选项为 `--no-sim-collision-stop`），pose planner 不安装碰撞 pairs，
+MuJoCo 物理接触仍存在，但碰撞不会停止 Sim；IK、关节约束、非有限数值与其他执行故障
+保持不变。该设置在 target 构造后锁定，且仅作用于 Sim，不改变任何真机安全链路。
+现有脚踏板 F13--F17 也已有 Fix/Init/进度映射；物理接管/交还触发器必须用后续显式
+profile 选择两个无冲突输入通道，而不能改写既有映射。
+
+每次进入切换事务后的成功或失败都会写入同一个 ControlTrace：触发 intent identity、请求/完成
+时间、下游 HOLD evidence、完整 Runtime Home（仅接管）、source-selection record、
+新 activation、目标来源的 fresh emission、policy reset 事实与错误。它们是控制事实，
+不等同于最终数据集，也不产生第二套 trace/authority/dispatcher。
+
+需要继续研究连续 residual/allocation 时，Scheme-A 和 Scheme-B 仍作为独立、显式
+profile 保留；它们与截断式 profile 共用 source、composition 和下游执行端口，但不在
+同一个 activation 中热切换。
 
 该主线不依赖 replay，也不伪造 replay cursor 或旧 Station session。它使用
 component-keyed `right_arm: cartesian_pose` 与
@@ -32,10 +152,12 @@ component-keyed `right_arm: cartesian_pose` 与
 执行表示。当前自动验收分为：
 
 1. fixed-alpha compatibility 保留 PPO-only、human-only 与比例混合回归；
-2. 显式 Scheme-A profile 验证 Policy baseline、Human relative correction、Auto
+2. 显式截断式 profile 验证 Policy-only → Human-only → Policy-only，以及每次切换的
+   HOLD/Home/selection/activation/fresh-emission 证据；
+3. 显式 Scheme-A profile 验证 Policy baseline、Human relative correction、Auto
    allocation 与 Rebase-and-clear；Scheme-B 在此基础上验证连续的 Human absolute
    takeover/handback；
-3. episode end 先 HOLD/cancel，再完成 ControlTrace WAL、seal、commit 与回读，
+4. episode end 先 HOLD/cancel，再完成 ControlTrace WAL、seal、commit 与回读，
    核对 source、composition、target/reference/measurement、两层 difference 和
    cancellation 事实。
 
@@ -43,10 +165,11 @@ component-keyed `right_arm: cartesian_pose` 与
 
 ```bash
 PYTHONPATH=. python -m pytest -q \
-  tests/test_control_station_mujoco_sim_hil.py::test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences
+  tests/test_control_station_exclusive_hitl.py::test_exclusive_hitl_virtual_policy_and_devices_switch_through_mujoco
 ```
 
-它加载选定 PPO checkpoint，但用虚拟 passive VIVE/gripper source，不打开硬件。
+它使用虚拟 policy 和本地虚拟 VIVE/gripper transport，贯通真实 component
+composition、MuJoCo target、IK、ControlTrace 以及两次截断切换，不打开硬件、不联网。
 真实 VIVE、Q6/angle trigger 的连接、recenter/deadman 与操作者行为仍需独立手工
 验收；通过上述测试不代表真机设备已验证。交互式 Sim-HIL 使用 immediate-qref，
 `--target-admission-margin-sec` 仅保留给显式 scheduled 诊断 profile；它不改变
@@ -59,8 +182,9 @@ PYTHONPATH=. python -m pytest -q \
 | 运行目标 | MuJoCo authoritative runtime |
 | policy 输入 | 临时单右臂 PPO，经正式 `PolicyActionEmission` seam 输出 pose + gripper qpos |
 | human 输入 | `PassiveTeleopComponentSessionSource`；右臂 pose + 右夹爪 qpos，不拥有 dispatch |
-| composition | 默认 fixed-alpha compatibility；Scheme-A（相对-only）和 Scheme-B（三态连续切换）都必须通过 `--control-profile` 显式选择 |
-| 操作 | Policy baseline、Human relative correction、Auto allocation、Rebase-and-clear、HOLD/re-arm；Scheme-B 另有 Human absolute takeover |
+| composition | 默认 fixed-alpha compatibility；当前优先验收的截断式 profile 与 Scheme-A/B 均须通过 `--control-profile` 显式选择 |
+| 截断式操作 | 启动前选择 Policy-only 或 Human-only；运行中接管/交还；来源权重只允许 0/1 |
+| 高级操作 | Scheme-A/B 保留 relative、Auto allocation、Rebase-and-clear；Scheme-B 另有 Human absolute takeover |
 | arm 表示 | composition 主线保持 Cartesian pose；MuJoCo target 内部才 pose→coupled IK→qpos |
 | capture | ControlTrace core WAL/seal/commit/readback；不冒充包含视觉/触觉的正式数据集 |
 | 真机副作用 | 可打开真实 VIVE/gripper 输入；执行目标仍是 MuJoCo，`real_arm_motion=false` |
@@ -70,7 +194,69 @@ PYTHONPATH=. python -m pytest -q \
 新的遥操设备、sim target 或模型 source 应优先复用已有 source/target/provider/emission
 seam；不要按设备、checkpoint 或 simulator 新建 composition。
 
-### 1.1 历史 CS-6b1f：pose takeover seam 与本体切换
+真机 deploy 当前新增的 `policy_emission_observer` 是仅供程序化调用方注入的
+default-off、bounded、non-blocking 被动端口。sync queue 与 RTC 都只在已有唯一
+`PolicyActionEmission` 形成后投递一次；观察端口异常只记录 debug event，不能阻塞或
+改变既有执行。它不是 composition consumer、source-selection receipt 或真机接管授权；
+未来 Active Human 接入必须另行复用正式 composition/proposal 与上述 lifecycle port。
+
+### 1.1 Policy + Human 无命令 composition shadow
+
+当前还提供一个 backend/model/topology-neutral 的程序化 shadow 会话：
+`control_station/composition/policy_human_shadow.py` 中的
+`PolicyHumanCompositionShadowSession`。它需要具体 Policy/Human emission adapter，
+所以属于 composition 应用绑定，不放进保持 source-runtime-neutral 的 `hitl/` 核心。
+它不是新的生产入口，也没有 CLI；未由应用根显式
+构造并注入时完全关闭。启用后，现有 deploy loop 和 teleop source 只做常数开销的被动
+投递，Station 线程才执行 input adaptation、receiver admission 和同一目标时刻的
+composition evaluation：
+
+```text
+existing policy loop ─ PolicyActionEmission ─┐
+                                             ├─ bounded passive ingress
+existing teleop source ─ HumanCommandEmission┘          │
+                                                        ▼ Station thread
+                                             CompositionInput admission
+                                                        │
+                                             evaluate_composition(target time)
+                                                        │
+                                      non-authoritative candidate + differences
+
+absent by construction: proposal publication / authority / HOLD / safety / IK /
+                        Reference / ExecutionTarget / command / dispatch
+```
+
+程序化接线只复用已有端口：
+
+```python
+policy_kwargs["policy_emission_observer"] = shadow_session
+human_fanout = PassiveHumanCommandObserverFanout(
+    {"composition-shadow": shadow_session.observe_human_emission}
+)
+cycle = shadow_session.evaluate_at(target_effective_at=station_target_time)
+```
+
+`target_effective_at` 是 composition 的对齐时刻，不是下游
+`ExecutionTarget`。每个会话只允许严格递增的目标时刻；当前没有未来 target 的
+replacement/version 语义。Human 的有效区间从 receiver 实际观察时刻开始，Policy
+保留正式 emission 自带的 keyframe/TTL 时序，最终由 `CompositionInputStore` 对目标
+时刻选择各角色输入。两个来源频率无须相同，也不会由 TTL 代替插值；Policy 只有在
+上游显式提供 guaranteed-next-step 时才可使用已有 chunk 插值接口。
+
+队列满时只淘汰最旧的 shadow 观察并增加 `evicted_count`，绝不向 policy 或 teleop
+control loop 施加背压。因此该会话适合实时可视化、差异检查和接线验证，但不是完整
+source recorder；需要完整复现的数据仍由正式 ControlTrace/collection owner 保存。
+Trace sink 失败会出现在每个 submission 的 `trace_failures` 中，但不会改变 composition
+结果。缺少必须来源时保留通用 `no_action/invalid` 结果，不在上层擅自发 HOLD。
+
+这条链已用单臂 pose 虚拟 Policy/Human、不同来源频率、队列淘汰、缺失 required role、
+trace sink 故障和重复目标拒绝做本地无设备验证；尚未连接真实 VIVE、真机执行器或
+模型服务，也不证明 Active takeover 已完成。sync deploy 中 observer 仍位于当前
+`prepare_next_action()` 形成正式 emission 之后，因而只能观察，不能插入既有安全与
+执行链。Active 接入仍需单独拆分“emit → composition/proposal/authority → canonical
+prepare”的所有权边界并保留现有 arm-hold/lookahead 语义。
+
+### 1.2 历史 CS-6b1f：pose takeover seam 与本体切换
 
 本节只记录早期 replay→human pose-takeover profile，不是当前单右臂 PPO +
 VIVE/gripper 应用的启动契约。
@@ -208,22 +394,91 @@ VIVE setup receiver；此时不会构造 MuJoCo target、PPO runtime 或 gripper
 Scheme-A/B 可直接点击“以策略基线启动动态分配”，此时不要求 VIVE、夹爪或坐标
 profile 就绪，也不会打开这些设备；首次选择自动分配、人类相对修正、绝对接管或
 rebase 时，才要求 Human 输入就绪并执行 HOLD → 接入 → Runtime Home → re-arm。
-默认的 `--vive-coordinate-profile latest` 会在 setup controller 创建时解析并加载
-最新有效 profile；GUI 展示和随后 runtime 构造绑定同一个具体文件，而不是分别
-二次解析 `latest`。若目录中尚无有效 profile，则保留首次标定流程。
+默认使用仓库内精确的
+`vive_rm65_virtual_desk_coordinate_v1.json`，不依赖本机最近保存的
+profile。只有显式传入 `--vive-coordinate-profile latest` 时，setup controller
+才会选择当前机器的最新有效 profile；GUI 展示和随后 runtime 构造仍绑定
+同一个已解析文件，不会二次解析 `latest`。若显式选择 `latest` 且目录中尚无有效
+profile，则保留首次标定流程。
 若 angle-trigger 使用非默认配置目录，再显式追加
 `--angle-trigger-config-root <config-root>`；验收指定设备时不要使用 `auto`
 代替明确的 `angle_trigger`，避免 Q6 探测或 fallback 改变本轮设备拓扑。
 
+#### 单臂 Human demonstration 采集
+
+需要采集可供离线 demonstration editing 使用的纯人类轨迹时，使用专用的
+`human_demonstration` capture profile。它仍复用同一个 Station GUI、控制权、共享
+safety、MuJoCo dispatch 和 ControlTrace episode owner，但只开放
+`human_teleop`；PPO-only 控制、比例融合、动态分配、策略接管和 policy timeout
+fallback 都会被服务端拒绝。该 profile 不创建第二套 recorder，也不会把 GUI 状态
+当成执行证据。其启动被拆成两个明确边界：第一步只构造最终的 Human-only composition
+合同并打开 passive MuJoCo viewer，Human source 仍未 attach，source/composition/
+physics/ControlTrace episode 都未启动；第二步才接入 VIVE 与 angle trigger，完成
+passive acceptance 和 Runtime Home，并同时开始遥操与记录。setup receiver 在第一步
+可以继续显示 VIVE 就绪信息，但它没有接到 MuJoCo 控制链路。
+
+当前仓库的 `latest` 坐标 profile 是左侧 profile，不能用于此右侧单臂命令。以下
+命令显式固定到已通过离线绑定检查的右侧 profile；更换 VIVE 安装或重新标定后，应
+把路径替换为新生成且 `active_sides=["right"]` 的具体文件，不要恢复成含义可漂移的
+`latest`：
+
+```bash
+# 终端 1：VIVE/OpenVR sender；跨主机时改为 MuJoCo 主机的可达 IP
+SIM_HIL_RECEIVER_IP=127.0.0.1
+python hardware/VIVE/mocap/vive_data_sender.py \
+  --single --host "$SIM_HIL_RECEIVER_IP" --port 9999 --hz 300
+
+# 终端 2：只控制 MuJoCo 的单右臂 Human demo capture
+PYTHONPATH=. python -m control_station sim-hil \
+  --enable --control-gui --device cpu \
+  --capture-profile human_demonstration \
+  --capture-root teleop_records/sim_hil_demonstrations \
+  --control-profile fixed_alpha_compatibility \
+  --human-alpha 1 \
+  --human-timeout-fallback hold \
+  --gripper-input-source angle_trigger \
+  --angle-trigger-config-root teleop_runtime/configs/hardware/angle_trigger \
+  --calibration-profile teleop_records/calibration_profiles/20260627_112114_vive_rm65_virtual_desk.json \
+  --vive-coordinate-profile teleop_records/control_station_vive_coordinate_profiles/20260808_220119_vive_coordinate.json \
+  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json \
+  --checkpoint sim/mujoco_temp_pipeline/records/20260728_215045_cube_lift_pregrasp_bridge_v5_center_guard/checkpoints/step_000050176_final.pt \
+  --vive-port 9999
+```
+
+网页中先点击主按钮“打开静态仿真”。此时只刷新静态 viewer，可以用 MuJoCo
+viewer 自带相机交互调整视角；方块和机器人不会被控制推进，也不会创建 episode。
+VIVE 与坐标绑定就绪且视角确认后，再点击主按钮“开始遥操并记录”；该操作才会解析并
+接入右侧 angle trigger，完成 passive input 检查和 Runtime Home，全部成功后才启动
+控制与 episode 记录。
+完成一次可见的抓取、抬升和短时保持后，点击“结束回合、封存并自动保存”；该操作会
+先建立 terminal HOLD，再执行现有 ControlTrace WAL/seal/commit 事务。等待页面显示
+“已封存并保存”或 capture 状态 `committed` 后再退出进程。中途退出或重建 runtime
+会显式中止未封存的记录。当前一个进程采一条 demo；采下一条时重新运行终端 2 命令。
+
+当前 GUI 将上述流程收敛成“本次轨迹”卡片中的一个主按钮，而不是同时暴露多个启动
+按钮。主按钮会按服务端状态依次显示“打开静态仿真”→“开始遥操并记录”→“结束回合、
+封存并保存”→“退出控制”；四步进度条、VIVE/坐标、angle trigger、记录计时和最终
+保存路径同时给出。启动和封存期间按钮保持锁定并显示正在执行的真实边界，仍可使用
+“中断当前等待”。若 Human passive preflight 失败，viewer 和已调整视角会保留，主按钮
+直接变为重试；不会要求重新构造场景。运行中的“立即保持输出”保持可见，Home 重采、
+重建和放弃则收在“恢复与放弃本次采集”中。记录链路故障只引导查看诊断，不会建议
+绕过故障 re-arm。
+
+封存得到的是完整 ControlTrace，不等同于已经进入训练集。离线导出仍会显式选择
+decision span，并要求与该 span 绑定的任务成功证据；只有随后导出的
+`safe_action` pose 和归一化 `gripper_close` 才进入通用 demonstration contract。
+dispatch receipt、MuJoCo measurement 和碰撞/任务结果继续保留为独立证据。
+
 从需要 Human 的控制模式启动时，Station 先关闭 setup receiver，再把其精确来源映射和
 profile 路径交给新 application；随后解析 Q6/angle trigger 并验证 passive human
 emission。纯策略/策略基线启动保留 setup owner，供之后按需接入 Human。原生
-MuJoCo passive viewer 在所需来源检查通过后、realtime physics
+普通 acceptance 模式的 MuJoCo passive viewer 在所需来源检查通过后、realtime physics
 worker 启动前构造；构造完成后会重新采集并验证一帧当前 human/policy emission，
 再进入 composition preflight。这样既不会因窗口构造耗时把健康来源误判为 stale，
 也不会放宽 TTL 或把旧帧改写为新帧。无 VIVE 等首次来源错误只留在网页中，不会
-先弹出一个无信号且无法操作的 MuJoCo 窗口。viewer 只读取并同步 lower-owned
-scene，不推进 physics，也不成为新的 authority 或 safety gate。
+先弹出一个无信号且无法操作的 MuJoCo 窗口。`human_demonstration` 是显式例外：它
+按上述两步流程先打开 viewer，之后才接入 Human。两种路径的 viewer 都只读取并同步
+lower-owned scene，不推进 physics，也不成为新的 authority 或 safety gate。
 
 等待输入或启动期间可点“中断启动 / 等待”。HTTP 线程只设置取消请求，实际资源
 清理由 Station control thread 完成。失败或取消会关闭本次未启动成功的 application，
@@ -496,6 +751,67 @@ PYTHONPATH=. python -m sim.mujoco_temp_pipeline.play \
 
 换 checkpoint 或 task config 时必须保持 checkpoint hash 兼容。loader 会在 hash 不一致时
 fail closed；`--allow-task-config-mismatch` 只用于碰撞回归诊断，不能作为 HIL 或策略部署配置。
+
+### 4.2 接入 state-only OpenPI action chunk
+
+该接入分为三层：`robot_motion.deploy.ThreadedPolicyEmissionSource` 是后端无关的
+非阻塞 chunk/emission source；`deployments.openpi.client` 只负责 prepared artifact、
+OpenPI 协议和 v2.2 action codec；`sim.mujoco.deploy.openpi_policy_source` 只把
+MuJoCo scene 采样为通用 `DeploymentObservation`。Station 只选择 profile；composition、下游 safety、IK、reference
+和 MuJoCo dispatch 均沿用已有链路，默认 `temp_ppo` 路径不变。
+
+先在模型机从 checkpoint 与训练 profile 生成一次 prepared deployment artifact，并做
+不加载模型的检查。输出 JSON 中的 `policy_artifact_json` 是客户端必须使用的文件；不要
+直接使用 checkpoint 目录中的原始 `policy_artifact.json`：
+
+```bash
+cd /home/user/zc/DexTeleop
+CKPT=/home/user/zc/openpi/checkpoints/<config>/<experiment>/60000
+PROFILE=deployments/openpi/configs/training/writing_stage1_0804_0806_state_h16_absolute_60k_v1.json
+
+PYTHONPATH=/home/user/zc/DexTeleop:/home/user/zc/openpi/src \
+  /home/user/zc/openpi/.venv/bin/python -m deployments.openpi.server \
+  --checkpoint-dir "$CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 --port 8078 \
+  --prepared-config-check-only
+```
+
+将该命令报告的 prepared artifact 原样复制到 Sim-HIL 主机后，先做无 server、无设备、
+无 worker、无控制循环的本地检查：
+
+```bash
+cd /path/to/DexTeleop
+POLICY_ARTIFACT=/absolute/path/to/copied.prepared.policy_artifact.json
+
+PYTHONPATH=. python -m control_station sim-hil \
+  --dry-run \
+  --policy-backend openpi_state \
+  --openpi-policy-artifact "$POLICY_ARTIFACT" \
+  --openpi-host <model-server-host> --openpi-port 8078 \
+  --openpi-action-hz 15 \
+  --openpi-policy-hz 15
+```
+
+模型机正式启动 server 时去掉 `--prepared-config-check-only`。本地 sim-only 交互启动为：
+
+```bash
+PYTHONPATH=. python -m control_station sim-hil \
+  --enable --control-gui \
+  --control-profile exclusive_truncated_hitl \
+  --policy-backend openpi_state \
+  --openpi-policy-artifact "$POLICY_ARTIFACT" \
+  --openpi-host <model-server-host> --openpi-port 8078 \
+  --openpi-action-hz 15 \
+  --openpi-policy-hz 15
+```
+
+当前 state-only writing artifact 观测左右双臂的 16D policy state，并输出双臂 chunk；
+现有 CubeLift Sim-HIL target 只把其中右臂和右 gripper 注册成 contributor。dry-run 会把
+该投影明确报告为 `bimanual_model_to_right_arm_and_gripper_contributor`。这足以验证通用
+worker、chunk 顺序、composition 和右侧下游接线，但不是 writing task 兼容性，也不是完整
+双臂执行验收；完整验收仍需匹配 writing scene 和双臂 target profile。
 当前工作树中的历史 `cube_lift_normal_v1.pt` 可能由旧 task JSON 生成，若上面的 evaluate
 报告 mismatch，不要使用 override 冒充有效策略。先生成与当前 task config 匹配的短 smoke
 checkpoint：

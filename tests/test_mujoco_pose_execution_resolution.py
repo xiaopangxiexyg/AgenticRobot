@@ -64,6 +64,8 @@ class _Scene:
 
 
 class _Planner:
+    collision_pair_count = 1
+
     def __init__(self, *, hold: bool = False) -> None:
         self.hold = bool(hold)
         self.targets: list[dict[str, np.ndarray]] = []
@@ -110,7 +112,13 @@ class _Planner:
                 "collision_check_attempts": (
                     [
                         {"scale": 1.0, "distance_m": 0.022},
-                        {"scale": 0.25, "distance_m": 0.029},
+                        {
+                            "scale": 0.25,
+                            "distance_m": 0.029,
+                            "collision_pair_index": 4,
+                            "collision_geometry_1": "right_hand_proxy_0",
+                            "collision_geometry_2": "table_0",
+                        },
                     ]
                     if self.hold
                     else []
@@ -337,6 +345,14 @@ def test_pose_resolution_hold_never_creates_executable_command() -> None:
         0.029
     )
     assert failure.diagnostics["collision_attempt_count"] == 2
+    assert failure.diagnostics["collision_threshold_m"] == pytest.approx(
+        0.0299
+    )
+    assert failure.diagnostics["collision_pair_index"] == 4
+    assert failure.diagnostics["collision_geometry_1"] == (
+        "right_hand_proxy_0"
+    )
+    assert failure.diagnostics["collision_geometry_2"] == "table_0"
 
 
 def test_resolution_lookup_rejects_untyped_command() -> None:

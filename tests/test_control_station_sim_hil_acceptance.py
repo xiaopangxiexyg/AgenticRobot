@@ -12,16 +12,77 @@ from control_station.sim_hil import (
 )
 from control_station.sim_hil_acceptance import (
     SIM_HIL_ACCEPTANCE_STAGES_V1,
+    STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1,
+    STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1,
     SimHILAcceptanceController,
     SimHILAcceptanceIntent,
     SimHILAcceptanceTraceCapture,
+    StationControlTraceEpisodeSessionCapture,
+    StationControlTraceFinalizationReceipt,
     sim_hil_acceptance_intent_from_json,
 )
+from control_station.hitl import (
+    EXCLUSIVE_HITL_HUMAN_TO_POLICY,
+    EXCLUSIVE_HITL_POLICY_TO_HUMAN,
+    ExclusiveHITLSwitchEvidence,
+)
+from control_station.control_trace import project_exclusive_hitl_switch
 from dataset_contracts.control_trace import ControlTraceFact
+from teleop_runtime.control_trace import (
+    CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1,
+    CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1,
+    ControlTraceEpisodeCapturePort,
+    ControlTraceEpisodeSessionCapture,
+    ControlTraceSessionFinalizationReceipt,
+)
 from teleop_runtime.sources.pose.vive import (
     VivePoseSource,
     ViveTrackerConfig,
 )
+
+
+def test_acceptance_capture_compatibility_names_resolve_to_lower_owner(
+    tmp_path,
+) -> None:
+    assert SimHILAcceptanceTraceCapture is StationControlTraceEpisodeSessionCapture
+    assert issubclass(
+        StationControlTraceEpisodeSessionCapture,
+        ControlTraceEpisodeSessionCapture,
+    )
+    assert StationControlTraceFinalizationReceipt is (
+        ControlTraceSessionFinalizationReceipt
+    )
+    assert STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1 == (
+        CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1
+    )
+    assert STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1 == (
+        CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1
+    )
+    capture = StationControlTraceEpisodeSessionCapture(tmp_path)
+    try:
+        assert isinstance(capture, ControlTraceEpisodeCapturePort)
+        assert capture.runtime_session_id == "control-station-sim-hil-ppo-session"
+        assert capture.control_domain_id == "mujoco-sim-hil"
+    finally:
+        capture.close()
+
+    generic = ControlTraceEpisodeSessionCapture(
+        tmp_path,
+        runtime_session_id="generic-runtime",
+        control_domain_id="generic-control-domain",
+        trace_requirement_profile_id=(
+            "deployable_sim_immediate_component_policy_human_composer_v1"
+        ),
+        clock_domain_id="generic.monotonic",
+        capture_purpose="generic_capture_test",
+    )
+    try:
+        assert isinstance(generic, ControlTraceEpisodeCapturePort)
+        assert generic.runtime_session_id == "generic-runtime"
+        assert generic.control_domain_id == "generic-control-domain"
+        assert generic.clock_domain_id == "generic.monotonic"
+    finally:
+        generic.close()
 
 
 class _FakeApplication:
@@ -30,6 +91,7 @@ class _FakeApplication:
         self.initial_alpha = 0.0
         self._held = False
         self._episode_ended = False
+        self._viewer_preview_started = False
         self.alpha_updates: list[float] = []
         self.calls: list[str] = []
         self._clock = 10.0
@@ -63,7 +125,21 @@ class _FakeApplication:
     def start(self):
         self.calls.append("start")
         self.started = True
+        self._viewer_preview_started = False
         return SimpleNamespace(passed=True)
+
+    @property
+    def viewer_preview_started(self) -> bool:
+        return bool(self._viewer_preview_started and not self.started)
+
+    def start_viewer_preview(self):
+        self.calls.append("start_viewer_preview")
+        self._viewer_preview_started = True
+        return {
+            "status": "viewer_preview",
+            "command_dispatched": False,
+            "authoritative": False,
+        }
 
     def capture_runtime_home(self):
         self.runtime_home_captures += 1
@@ -77,7 +153,16 @@ class _FakeApplication:
     def set_human_blend_alpha(self, alpha: float):
         self.calls.append(f"alpha:{alpha}")
         self.alpha_updates.append(float(alpha))
-        return SimpleNamespace(parameter_snapshot_id=f"alpha:{alpha}")
+        record = SimpleNamespace(
+            parameter_record_id=f"alpha-record:{alpha}:{len(self.alpha_updates)}",
+            semantic_content_hash=f"alpha-record-hash:{alpha}:{len(self.alpha_updates)}",
+        )
+        return SimpleNamespace(
+            accepted=True,
+            parameter_record=record,
+            # Retain the compatibility identity used by older lightweight tests.
+            parameter_snapshot_id=f"alpha:{alpha}",
+        )
 
     def set_blend_failure_fallback(
         self,
@@ -119,7 +204,10 @@ class _FakeApplication:
         return SimpleNamespace(
             receipt_id=f"operation:{signal_name}",
             semantic_content_hash=f"operation-hash:{signal_name}",
-            override_receipt=SimpleNamespace(receipt_id="override:1"),
+            override_receipt=SimpleNamespace(
+                receipt_id="override:1",
+                semantic_content_hash=f"override-hash:{signal_name}",
+            ),
             anchor_request=None,
         )
 
@@ -162,7 +250,7 @@ class _FakeApplication:
             "episode_ended": self._episode_ended,
             "visualization": {
                 "enabled": True,
-                "running": self.started,
+                "running": self.started or self._viewer_preview_started,
             },
             "execution_gate": {
                 "status": "hold" if self._held else "ready",
@@ -198,11 +286,19 @@ class _FakeApplication:
 
 class _FakeTraceCapture:
     def __init__(self) -> None:
+        self.runtime_session_id = "control-station-sim-hil-ppo-session"
+        self.control_domain_id = "mujoco-sim-hil"
+        self.clock_domain_id = "mujoco.sim_hil.monotonic"
         self.prepared = False
         self.finalized = False
         self.aborted = False
         self.closed = False
         self.rotation_count = 0
+        self.facts: list[ControlTraceFact] = []
+
+    def admit_trace(self, fact: ControlTraceFact) -> None:
+        assert isinstance(fact, ControlTraceFact)
+        self.facts.append(fact)
 
     def prepare(self, *, now: float):
         assert now > 0.0
@@ -247,6 +343,97 @@ class _FakeTraceCapture:
     def close(self, *, now: float):
         assert now > 0.0
         self.closed = True
+
+
+class _ExclusiveFakeApplication(_FakeApplication):
+    """Virtual policy/Human source switch with lower evidence identities."""
+
+    human_input_attached = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime = SimpleNamespace(
+            config=SimpleNamespace(
+                clock_domain_id="mujoco.sim_hil.monotonic",
+            )
+        )
+        self.last_hold_outcome = None
+        self.last_activation_prime_evidence = None
+        self.activation_sequence = 0
+
+    def hold(self, *, reason: str):
+        super().hold(reason=reason)
+        self.last_hold_outcome = SimpleNamespace(
+            lower_event_ids=(
+                f"lower-hold:{len([call for call in self.calls if call.startswith('hold:')])}",
+            )
+        )
+
+    def capture_runtime_home(self):
+        receipt = super().capture_runtime_home()
+        return {
+            **receipt,
+            "captured_at": self.clock(),
+            "clock_domain_id": "mujoco.sim_hil.monotonic",
+            "sample_count_by_side": {"right": 5},
+            "human_home_pose_desk_by_side": {"right": [1.0] * 16},
+            "robot_home_pose_desk_by_side": {"right": [2.0] * 16},
+        }
+
+    def rearm_with_allocation_operation(
+        self,
+        *,
+        signal_name,
+        event_id,
+        source_fact_id,
+        source_fact_hash,
+        occurred_at,
+        human_emission_required,
+        cancel_requested=None,
+    ):
+        report = super().rearm(cancel_requested=cancel_requested)
+        receipt = self.submit_allocation_button_operation(
+            signal_name=signal_name,
+            event_id=event_id,
+            source_fact_id=source_fact_id,
+            source_fact_hash=source_fact_hash,
+            occurred_at=occurred_at,
+        )
+        self.activation_sequence += 1
+        target_source = (
+            "human"
+            if signal_name == "allocation_absolute_overlay_owner"
+            else "policy"
+        )
+        assert human_emission_required is (target_source == "human")
+        activation_id = f"activation:{self.activation_sequence}"
+
+        def target_emission_identity(source: str) -> tuple[str, str]:
+            assert source == target_source
+            return (
+                f"{source}-emission:{self.activation_sequence}",
+                f"{source}-emission-hash:{self.activation_sequence}",
+            )
+
+        self.last_activation_prime_evidence = SimpleNamespace(
+            activation_id=activation_id,
+            activation_hash=f"{activation_id}:hash",
+            policy_reset_performed=True,
+            target_emission_identity=target_emission_identity,
+        )
+        return report, receipt
+
+    def establish_activation_execution(self, *, target_source: str):
+        self.calls.append(f"establish:{target_source}")
+        sequence = self.activation_sequence
+        return SimpleNamespace(
+            target_id=f"target:{sequence}",
+            target_hash=f"target-hash:{sequence}",
+            target_admission_receipt_id=f"target-admission:{sequence}",
+            target_completion_receipt_id=f"target-completion:{sequence}",
+            command_id=f"command:{sequence}",
+            dispatch_receipt_id=f"dispatch:{sequence}",
+        )
 
 
 class _FakeViveSetup:
@@ -349,6 +536,8 @@ def _intent(
     stage_id: str | None = None,
     control_mode: str | None = None,
     allocation_mode: str | None = None,
+    control_profile_id: str | None = None,
+    sim_collision_stop_enabled: bool | None = None,
     alpha: float | None = None,
     fallback_source: str | None = None,
     blend_failure_grace_sec: float | None = None,
@@ -361,6 +550,8 @@ def _intent(
         stage_id=stage_id,
         control_mode=control_mode,
         allocation_mode=allocation_mode,
+        control_profile_id=control_profile_id,
+        sim_collision_stop_enabled=sim_collision_stop_enabled,
         human_alpha=alpha,
         fallback_source=fallback_source,
         blend_failure_grace_sec=blend_failure_grace_sec,
@@ -481,6 +672,29 @@ def test_acceptance_intent_json_is_exact_and_blend_is_bounded() -> None:
     )
     assert rebase.allocation_mode is None
 
+    control_profile = sim_hil_acceptance_intent_from_json(
+        {
+            "client_id": "browser",
+            "client_sequence": 9,
+            "expected_revision": 0,
+            "intent_kind": "select_control_profile",
+            "control_profile_id": "policy_human_allocation_scheme_b",
+        }
+    )
+    assert control_profile.control_profile_id == (
+        "policy_human_allocation_scheme_b"
+    )
+
+    with pytest.raises(ValueError, match="requires control_profile_id"):
+        sim_hil_acceptance_intent_from_json(
+            {
+                "client_id": "browser",
+                "client_sequence": 10,
+                "expected_revision": 0,
+                "intent_kind": "select_control_profile",
+            }
+        )
+
     with pytest.raises(ValueError, match="requires hold, human, or policy"):
         sim_hil_acceptance_intent_from_json(
             {
@@ -489,6 +703,175 @@ def test_acceptance_intent_json_is_exact_and_blend_is_bounded() -> None:
                 "expected_revision": 0,
                 "intent_kind": "set_blend_failure_fallback",
                 "fallback_source": "automatic",
+            }
+        )
+
+
+def test_gui_control_profile_selection_is_preconstruction_and_atomic(
+    tmp_path,
+) -> None:
+    coordinate_profile = tmp_path / "coordinate.json"
+    coordinate_profile.write_text("{}", encoding="utf-8")
+    setup = _FakeViveSetup(
+        input_ready=True,
+        current_profile_path=coordinate_profile,
+    )
+    application = _LazyFakeApplication()
+    factory_calls: list[tuple[float, str, bool]] = []
+
+    def application_factory(
+        _path,
+        _role,
+        alpha,
+        control_profile_id,
+        sim_collision_stop_enabled,
+    ):
+        factory_calls.append(
+            (
+                float(alpha),
+                str(control_profile_id),
+                bool(sim_collision_stop_enabled),
+            )
+        )
+        return application
+
+    controller = SimHILAcceptanceController(
+        None,
+        application_factory=application_factory,
+        application_factory_accepts_control_profile=True,
+        application_factory_accepts_sim_collision_stop=True,
+        vive_setup_controller=setup,
+        vive_setup_factory=lambda role: _FakeViveSetup(
+            input_ready=True,
+            source_role=role,
+            current_profile_path=coordinate_profile,
+        ),
+        coordinate_profile_path=coordinate_profile,
+        selected_control_profile_id="fixed_alpha_compatibility",
+        available_control_profile_ids=(
+            "fixed_alpha_compatibility",
+            "exclusive_truncated_hitl",
+            "policy_human_allocation_scheme_a",
+            "policy_human_allocation_scheme_b",
+        ),
+    )
+
+    selected = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="select_control_profile",
+            control_profile_id="policy_human_allocation_scheme_b",
+        ),
+    )
+    assert selected["status"] == "control_profile_selected"
+    status = controller.status()
+    assert status["selected_control_profile_id"] == (
+        "policy_human_allocation_scheme_b"
+    )
+    assert status["allocation_runtime_enabled"] is True
+    assert status["exclusive_hitl_enabled"] is False
+    assert status["control_profile_selection_locked"] is False
+
+    collision_selected = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="select_sim_collision_stop",
+            sim_collision_stop_enabled=False,
+        ),
+    )
+    assert collision_selected["status"] == "sim_collision_stop_selected"
+    assert controller.status()[
+        "selected_sim_collision_stop_enabled"
+    ] is False
+
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=3,
+            kind="start_allocation_runtime",
+        ),
+    )
+    assert started["status"] == "running"
+    assert factory_calls == [
+        (0.0, "policy_human_allocation_scheme_b", False)
+    ]
+    assert controller.status()["control_profile_selection_locked"] is True
+
+    rejected = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=4,
+            kind="select_control_profile",
+            control_profile_id="exclusive_truncated_hitl",
+        ),
+    )
+    assert rejected["status"] == "failed"
+    assert "fixed after MuJoCo construction" in rejected["error"]
+    assert controller.status()["selected_control_profile_id"] == (
+        "policy_human_allocation_scheme_b"
+    )
+
+    collision_rejected = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=5,
+            kind="select_sim_collision_stop",
+            sim_collision_stop_enabled=True,
+        ),
+    )
+    assert collision_rejected["status"] == "failed"
+    assert "fixed after MuJoCo construction" in collision_rejected["error"]
+
+    rebuilt = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=6,
+            kind="rebuild_runtime",
+        ),
+    )
+    assert rebuilt["status"] == "runtime_rebuilt"
+    assert controller.status()["control_profile_selection_locked"] is False
+    switched = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=7,
+            kind="select_control_profile",
+            control_profile_id="exclusive_truncated_hitl",
+        ),
+    )
+    assert switched["status"] == "control_profile_selected"
+    assert controller.status()["exclusive_hitl_enabled"] is True
+
+
+def test_collision_stop_intent_requires_an_explicit_boolean() -> None:
+    intent = sim_hil_acceptance_intent_from_json(
+        {
+            "client_id": "browser",
+            "client_sequence": 1,
+            "expected_revision": 0,
+            "intent_kind": "select_sim_collision_stop",
+            "sim_collision_stop_enabled": False,
+        }
+    )
+    assert intent.sim_collision_stop_enabled is False
+
+    with pytest.raises(ValueError, match="requires a boolean"):
+        sim_hil_acceptance_intent_from_json(
+            {
+                "client_id": "browser",
+                "client_sequence": 2,
+                "expected_revision": 0,
+                "intent_kind": "select_sim_collision_stop",
+                "sim_collision_stop_enabled": "false",
             }
         )
 
@@ -639,6 +1022,8 @@ def test_formal_runtime_modes_are_freely_switchable_and_not_gated() -> None:
     assert started["status"] == "running"
     assert application.alpha_updates == [0.0]
     assert capture.prepared
+    assert controller.status()["formal_runtime_started_at"] is not None
+    assert controller.status()["formal_runtime_finalized_at"] is None
 
     blended = _submit_and_process(
         controller,
@@ -653,11 +1038,25 @@ def test_formal_runtime_modes_are_freely_switchable_and_not_gated() -> None:
     assert blended["status"] == "mode_selected"
     assert blended["human_alpha"] == 0.35
 
-    _submit_and_process(
+    updated_blend = _submit_and_process(
         controller,
         _intent(
             controller,
             sequence=3,
+            kind="set_control_mode",
+            control_mode="proportional_blend",
+            alpha=0.9,
+        ),
+    )
+    assert updated_blend["status"] == "mode_selected"
+    assert updated_blend["human_alpha"] == 0.9
+    assert application.alpha_updates[-2:] == [0.35, 0.9]
+
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=4,
             kind="set_control_mode",
             control_mode="human_teleop",
         ),
@@ -666,7 +1065,7 @@ def test_formal_runtime_modes_are_freely_switchable_and_not_gated() -> None:
         controller,
         _intent(
             controller,
-            sequence=4,
+            sequence=5,
             kind="set_control_mode",
             control_mode="ppo_only",
         ),
@@ -674,8 +1073,86 @@ def test_formal_runtime_modes_are_freely_switchable_and_not_gated() -> None:
     status = controller.status()
     assert status["active_control_mode"] == "ppo_only"
     assert status["active_human_alpha"] == 0.0
-    assert status["control_mode_change_count"] == 4
+    assert status["control_mode_change_count"] == 5
     assert status["completed_stage_ids"] == []
+
+    finalized = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=6,
+            kind="finalize_capture",
+        ),
+    )
+    assert finalized["status"] == "complete"
+    assert capture.finalized
+    assert controller.status()["formal_runtime_finalized_at"] is not None
+
+
+def test_human_demonstration_profile_rejects_policy_and_commits_human_only() -> None:
+    application = _FakeApplication()
+    capture = _FakeTraceCapture()
+    controller = SimHILAcceptanceController(
+        application,
+        trace_capture=capture,
+        capture_profile="human_demonstration",
+    )
+
+    assert controller.status()["capture_profile"] == "human_demonstration"
+    assert controller.status()["available_control_modes"] == ["human_teleop"]
+
+    policy = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="ppo_only",
+        ),
+    )
+    assert policy["status"] == "failed"
+    assert "permits only human_teleop" in policy["error"]
+
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="prepare_sim_preview",
+        ),
+    )
+    assert started["status"] == "viewer_preview"
+    assert capture.prepared is False
+
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=3,
+            kind="start_runtime",
+            control_mode="human_teleop",
+        ),
+    )
+    assert started["status"] == "running"
+    assert application.calls[:4] == [
+        "start_viewer_preview",
+        f"device:{controller.device_check_timeout_sec}",
+        "capture_runtime_home",
+        "start",
+    ]
+    assert capture.prepared
+
+    fallback = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=4,
+            kind="set_human_timeout_fallback",
+            fallback_source="policy",
+        ),
+    )
+    assert fallback["status"] == "failed"
+    assert "only HOLD fallback" in fallback["error"]
 
     finalized = _submit_and_process(
         controller,
@@ -687,6 +1164,582 @@ def test_formal_runtime_modes_are_freely_switchable_and_not_gated() -> None:
     )
     assert finalized["status"] == "complete"
     assert capture.finalized
+
+
+def test_human_demo_preview_defers_devices_control_and_trace_until_start(
+    tmp_path,
+) -> None:
+    profile = tmp_path / "coordinate.json"
+    profile.write_text("{}", encoding="utf-8")
+    setup = _FakeViveSetup(input_ready=False)
+
+    class DeferredDemoApplication(_LazyFakeApplication):
+        def __init__(self) -> None:
+            super().__init__()
+            self.human_input_attached = False
+
+        def prepare_human_attachment(
+            self,
+            *,
+            coordinate_profile_path,
+            source_role,
+        ):
+            assert self.viewer_preview_started is True
+            assert coordinate_profile_path == profile
+            assert source_role == "left_wrist"
+            self.calls.append("prepare_human")
+            return SimpleNamespace(
+                source=SimpleNamespace(close=lambda: None),
+            )
+
+        def activate_human_attachment(self, _attachment):
+            assert self.viewer_preview_started is True
+            assert self.started is False
+            self.human_input_attached = True
+            self.calls.append("attach_human")
+            return {
+                "status": "attached",
+                "command_dispatched": False,
+                "authoritative": False,
+            }
+
+    app = DeferredDemoApplication()
+    capture = _FakeTraceCapture()
+    factory_alphas: list[float] = []
+
+    def application_factory(_path, _role, initial_alpha):
+        app.initial_alpha = float(initial_alpha)
+        factory_alphas.append(float(initial_alpha))
+        return app
+
+    controller = SimHILAcceptanceController(
+        None,
+        trace_capture=capture,
+        application_factory=application_factory,
+        vive_setup_controller=setup,
+        vive_setup_factory=lambda role: _FakeViveSetup(
+            input_ready=True,
+            source_role=role,
+        ),
+        coordinate_profile_path=profile,
+        capture_profile="human_demonstration",
+    )
+
+    preview = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="prepare_sim_preview",
+        ),
+    )
+
+    assert preview["status"] == "viewer_preview"
+    assert preview["trace_recording"] is False
+    assert factory_alphas == [1.0]
+    assert app.calls == ["start_viewer_preview"]
+    assert app.started is False
+    assert app.human_input_attached is False
+    assert setup.closed is False
+    assert capture.prepared is False
+    assert controller.status()["sim_preview_ready"] is True
+    assert controller.status()["setup"]["phase"] == "sim_preview_ready"
+
+    setup.input_ready = True
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="start_runtime",
+            control_mode="human_teleop",
+        ),
+    )
+
+    assert started["status"] == "running"
+    assert started["mode_activation"] == "initial_profile"
+    assert app.calls == [
+        "start_viewer_preview",
+        "prepare_human",
+        "attach_human",
+        f"device:{controller.device_check_timeout_sec}",
+        "capture_runtime_home",
+        "start",
+    ]
+    assert app.alpha_updates == []
+    assert app.human_input_attached is True
+    assert setup.closed is True
+    assert capture.prepared is True
+    assert controller.status()["sim_preview_ready"] is False
+
+
+def test_human_demo_rejects_recording_start_before_preview() -> None:
+    application = _FakeApplication()
+    controller = SimHILAcceptanceController(
+        application,
+        trace_capture=_FakeTraceCapture(),
+        capture_profile="human_demonstration",
+    )
+
+    result = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="human_teleop",
+        ),
+    )
+
+    assert result["status"] == "failed"
+    assert "open the passive Sim preview" in result["error"]
+    assert application.started is False
+
+
+def test_human_demo_device_preflight_failure_keeps_camera_preview_for_retry() -> None:
+    class RetryableApplication(_FakeApplication):
+        def __init__(self) -> None:
+            super().__init__()
+            self.input_checks = 0
+
+        def run_human_input_acceptance_check(self, *, timeout_sec: float):
+            self.input_checks += 1
+            self.calls.append(f"device:{timeout_sec}")
+            if self.input_checks == 1:
+                raise TimeoutError("angle trigger is not ready")
+            return {
+                "status": "ready",
+                "command_dispatched": False,
+                "authoritative": False,
+            }
+
+    application = RetryableApplication()
+    capture = _FakeTraceCapture()
+    controller = SimHILAcceptanceController(
+        application,
+        trace_capture=capture,
+        capture_profile="human_demonstration",
+    )
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="prepare_sim_preview",
+        ),
+    )
+
+    failed = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="start_runtime",
+            control_mode="human_teleop",
+        ),
+    )
+
+    assert failed["status"] == "failed"
+    assert application.viewer_preview_started is True
+    assert application.started is False
+    assert capture.prepared is False
+    assert capture.aborted is False
+    assert controller.status()["sim_preview_ready"] is True
+
+    retried = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=3,
+            kind="start_runtime",
+            control_mode="human_teleop",
+        ),
+    )
+
+    assert retried["status"] == "running"
+    assert application.started is True
+    assert capture.prepared is True
+
+
+def test_exclusive_hitl_switches_policy_human_policy_with_one_trace() -> None:
+    application = _ExclusiveFakeApplication()
+    capture = _FakeTraceCapture()
+    controller = SimHILAcceptanceController(
+        application,
+        trace_capture=capture,
+        allocation_runtime_enabled=True,
+        exclusive_hitl_enabled=True,
+    )
+
+    started = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="ppo_only",
+        ),
+    )
+    assert started["status"] == "running"
+
+    takeover = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="request_human_takeover",
+        ),
+    )
+    assert takeover["status"] == "switch_ready"
+    assert takeover["control_mode"] == "human_teleop"
+    assert takeover["human_alpha"] == 1.0
+    human_switch = takeover["exclusive_hitl_switch"]
+    assert human_switch["direction"] == EXCLUSIVE_HITL_POLICY_TO_HUMAN
+    assert human_switch["target_source"] == "human"
+    assert human_switch["home_capture_id"] == "runtime-home:1"
+    assert human_switch["home_capture"]["sample_count_by_side"] == {"right": 5}
+    assert human_switch["source_selection_record_id"].startswith(
+        "override:1"
+    )
+    assert human_switch["activation_id"] == "activation:1"
+    assert human_switch["target_emission_id"] == "human-emission:1"
+    assert human_switch["source_reset_performed"] is False
+
+    calls_before_duplicate = list(application.calls)
+    duplicate = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=3,
+            kind="request_human_takeover",
+        ),
+    )
+    assert duplicate["status"] == "switch_ready"
+    assert duplicate["exclusive_hitl_switch"]["status"] == "already_active"
+    assert duplicate["exclusive_hitl_switch"]["previous_source"] == "human"
+    assert duplicate["exclusive_hitl_switch"]["target_source"] == "human"
+    assert application.calls == calls_before_duplicate
+
+    resume = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=4,
+            kind="request_policy_resume",
+        ),
+    )
+    assert resume["status"] == "switch_ready"
+    assert resume["control_mode"] == "ppo_only"
+    assert resume["human_alpha"] == 0.0
+    policy_switch = resume["exclusive_hitl_switch"]
+    assert policy_switch["direction"] == EXCLUSIVE_HITL_HUMAN_TO_POLICY
+    assert policy_switch["home_capture"] is None
+    assert policy_switch["activation_id"] == "activation:2"
+    assert policy_switch["target_emission_id"] == "policy-emission:2"
+    assert policy_switch["source_reset_performed"] is True
+
+    assert application.calls == [
+        "start",
+        "hold:human_mode_preflight",
+        f"device:{controller.device_check_timeout_sec}",
+        "capture_runtime_home",
+        "rearm",
+        "establish:human",
+        "hold:exclusive_hitl_policy_resume",
+        "rearm",
+        "establish:policy",
+    ]
+    assert application.allocation_operations == [
+        "allocation_absolute_overlay_owner",
+        "allocation_base_only",
+    ]
+    assert [fact.event_type for fact in capture.facts] == [
+        "exclusive_hitl_switch",
+        "exclusive_hitl_switch",
+        "exclusive_hitl_switch",
+    ]
+    assert tuple(capture.facts[0].payload["home_capture"][
+        "human_home_pose_desk_by_side"
+    ]["right"]) == (1.0,) * 16
+    status = controller.status()
+    assert status["active_control_mode"] == "ppo_only"
+    assert status["last_exclusive_hitl_switch"]["target_source"] == "policy"
+
+
+def test_exclusive_hitl_cannot_switch_source_from_collision_hold() -> None:
+    application = _ExclusiveFakeApplication()
+    controller = SimHILAcceptanceController(
+        application,
+        allocation_runtime_enabled=True,
+        exclusive_hitl_enabled=True,
+    )
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="ppo_only",
+        ),
+    )
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="request_human_takeover",
+        ),
+    )
+    application.hold(reason="collision_margin_low")
+
+    rejected = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=3,
+            kind="request_policy_resume",
+        ),
+    )
+
+    assert rejected["status"] == "failed"
+    assert "requires a running episode" in rejected["error"]
+    assert application.status()["held"] is True
+    assert "exclusive_hitl_policy_recovery_from_hold" not in application.calls
+
+
+def test_exclusive_hitl_trace_failure_is_observable_but_not_control() -> None:
+    class FailingTraceCapture(_FakeTraceCapture):
+        def admit_trace(self, fact: ControlTraceFact) -> None:
+            raise RuntimeError(f"trace-rejected:{fact.fact_id}")
+
+    application = _ExclusiveFakeApplication()
+    controller = SimHILAcceptanceController(
+        application,
+        trace_capture=FailingTraceCapture(),
+        allocation_runtime_enabled=True,
+        exclusive_hitl_enabled=True,
+    )
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="ppo_only",
+        ),
+    )
+
+    takeover = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="request_human_takeover",
+        ),
+    )
+
+    assert takeover["status"] == "switch_ready"
+    assert application.status()["held"] is False
+    status = controller.status()
+    assert status["active_control_mode"] == "human_teleop"
+    assert status["last_exclusive_hitl_trace_error"].startswith(
+        "RuntimeError:trace-rejected:"
+    )
+
+
+def test_exclusive_hitl_accepts_prestart_human_selection_and_rejects_blend() -> None:
+    application = _ExclusiveFakeApplication()
+    controller = SimHILAcceptanceController(
+        application,
+        allocation_runtime_enabled=True,
+        exclusive_hitl_enabled=True,
+    )
+
+    human_start = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="human_teleop",
+        ),
+    )
+    assert human_start["status"] == "running"
+    assert human_start["control_mode"] == "human_teleop"
+    assert human_start["initial_control_mode_requested"] == "human_teleop"
+    assert human_start["exclusive_hitl_switch"]["target_source"] == "human"
+    assert application.calls == [
+        "start",
+        "hold:human_mode_preflight",
+        f"device:{controller.device_check_timeout_sec}",
+        "capture_runtime_home",
+        "rearm",
+        "establish:human",
+    ]
+    direct_mode = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="set_control_mode",
+            control_mode="human_teleop",
+        ),
+    )
+    assert direct_mode["status"] == "failed"
+    assert "explicit takeover/resume triggers" in direct_mode["error"]
+
+
+def test_exclusive_hitl_missing_fresh_emission_stays_held_and_is_recorded() -> None:
+    class MissingPrimeApplication(_ExclusiveFakeApplication):
+        def rearm_with_allocation_operation(self, **kwargs):
+            result = super().rearm_with_allocation_operation(**kwargs)
+            self.last_activation_prime_evidence = None
+            return result
+
+    application = MissingPrimeApplication()
+    capture = _FakeTraceCapture()
+    controller = SimHILAcceptanceController(
+        application,
+        trace_capture=capture,
+        allocation_runtime_enabled=True,
+        exclusive_hitl_enabled=True,
+    )
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="ppo_only",
+        ),
+    )
+
+    failed = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="request_human_takeover",
+        ),
+    )
+
+    assert failed["status"] == "failed"
+    assert "no activation-prime evidence" in failed["error"]
+    assert application.status()["held"] is True
+    assert application.calls[-1] == "hold:exclusive_hitl_switch_failed"
+    assert capture.facts[-1].payload["status"] == "failed"
+    assert capture.facts[-1].payload["target_source"] == "human"
+
+
+def test_exclusive_hitl_does_not_publish_source_mode_before_target_admission() -> None:
+    class MissingTargetApplication(_ExclusiveFakeApplication):
+        def establish_activation_execution(self, *, target_source: str):
+            self.calls.append(f"establish:{target_source}")
+            raise RuntimeError("target admission unavailable")
+
+    application = MissingTargetApplication()
+    capture = _FakeTraceCapture()
+    controller = SimHILAcceptanceController(
+        application,
+        trace_capture=capture,
+        allocation_runtime_enabled=True,
+        exclusive_hitl_enabled=True,
+    )
+    _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=1,
+            kind="start_runtime",
+            control_mode="ppo_only",
+        ),
+    )
+
+    failed = _submit_and_process(
+        controller,
+        _intent(
+            controller,
+            sequence=2,
+            kind="request_human_takeover",
+        ),
+    )
+
+    assert failed["status"] == "failed"
+    assert "target admission unavailable" in failed["error"]
+    assert application.status()["held"] is True
+    assert controller.status()["active_control_mode"] == "ppo_only"
+    assert capture.facts[-1].payload["status"] == "failed"
+
+
+def test_exclusive_hitl_trace_fact_is_accepted_by_formal_capture(tmp_path) -> None:
+    capture = SimHILAcceptanceTraceCapture(
+        tmp_path,
+        trace_session_id="exclusive-hitl-trace-test",
+        max_spool_bytes=1 << 20,
+    )
+    home = {
+        "capture_id": "runtime-home:trace",
+        "captured_at": 10.1,
+        "clock_domain_id": capture.clock_domain_id,
+        "human_home_pose_desk_by_side": {"right": [1.0] * 16},
+        "robot_home_pose_desk_by_side": {"right": [2.0] * 16},
+        "command_dispatched": False,
+        "authoritative": False,
+    }
+    try:
+        capture.prepare(now=10.0)
+        evidence = ExclusiveHITLSwitchEvidence(
+            switch_id="exclusive-hitl-switch:trace",
+            trigger_intent_id="intent:trace",
+            trigger_intent_hash="intent-hash:trace",
+            direction=EXCLUSIVE_HITL_POLICY_TO_HUMAN,
+            previous_source="policy",
+            target_source="human",
+            requested_at=10.0,
+            completed_at=10.2,
+            clock_domain_id=capture.clock_domain_id,
+            succeeded=True,
+            status="ready",
+            hold_evidence_refs=("lower-hold:trace",),
+            home_capture_id="runtime-home:trace",
+            home_capture_hash="runtime-home-hash:trace",
+            home_capture=home,
+            source_selection_record_id="alpha-record:trace",
+            source_selection_record_hash="alpha-record-hash:trace",
+            activation_id="activation:trace",
+            activation_hash="activation-hash:trace",
+            target_emission_id="human-emission:trace",
+            target_emission_hash="human-emission-hash:trace",
+            target_id="target:trace",
+            target_hash="target-hash:trace",
+            target_admission_receipt_id="target-admission:trace",
+            target_completion_receipt_id="target-completion:trace",
+            command_id="command:trace",
+            dispatch_receipt_id="dispatch:trace",
+        )
+        fact = project_exclusive_hitl_switch(
+            evidence,
+            runtime_session_id=capture.runtime_session_id,
+            control_domain_id=capture.control_domain_id,
+        )
+
+        capture.admit_trace(fact)
+
+        records = [
+            record
+            for record in capture.trace_runtime.records()
+            if record.fact.event_type == "exclusive_hitl_switch"
+        ]
+        assert len(records) == 1
+        assert dict(records[0].fact.payload["home_capture"])["capture_id"] == (
+            home["capture_id"]
+        )
+        assert records[0].fact.payload["source_selection_record_id"] == (
+            "alpha-record:trace"
+        )
+    finally:
+        capture.abort(now=10.3)
+        capture.close(now=10.4)
 
 
 def test_blend_failure_fallback_is_a_typed_station_intent() -> None:

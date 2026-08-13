@@ -186,6 +186,34 @@ def test_request_json_shape_binds_route_and_detaches_parameters() -> None:
         agent_skill_request_from_json(payload)
 
 
+def test_request_safety_profile_selection_is_optional_but_atomic() -> None:
+    route = _route()
+    manifest = _manifest(route)
+    payload = _request_payload(manifest, route)
+    request = agent_skill_request_from_json(payload)
+
+    assert not request.has_safety_profile_selection
+    assert "safety_profile_id" not in request.to_wire()
+
+    payload["safety_profile_id"] = "safety.standard@1"
+    with pytest.raises(ValueError, match="supplied together"):
+        agent_skill_request_from_json(payload)
+
+    payload.update(
+        {
+            "safety_profile_hash": "safety-profile-hash:standard",
+            "deployment_safety_envelope_id": "sim.tcp.standard@1",
+            "deployment_safety_envelope_hash": "envelope-hash:standard",
+            "safety_constraint_set_hash": "constraints:standard",
+        }
+    )
+    selected = agent_skill_request_from_json(payload)
+    assert selected.has_safety_profile_selection
+    assert selected.to_wire()["deployment_safety_envelope_id"] == (
+        "sim.tcp.standard@1"
+    )
+
+
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     (

@@ -172,6 +172,9 @@ AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1 = (
 AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1 = (
     "authoritative_port_receipt_v1"
 )
+AGENT_GATEWAY_SAFETY_PROFILE_SELECTION_FEATURE_V1 = (
+    "safety_profile_selection_v1"
+)
 AGENT_GATEWAY_PORT_OPERATION_KINDS_V1 = ("activate", "cancel", "hold")
 
 
@@ -380,6 +383,11 @@ class AgentSkillRequest:
     requested_mode: str
     requested_timeout_ms: int
     skill_execution_grant_id: str | None = None
+    safety_profile_id: str | None = None
+    safety_profile_hash: str | None = None
+    deployment_safety_envelope_id: str | None = None
+    deployment_safety_envelope_hash: str | None = None
+    safety_constraint_set_hash: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -460,6 +468,35 @@ class AgentSkillRequest:
                 field_name="skill_execution_grant_id",
             ),
         )
+        safety_fields = (
+            "safety_profile_id",
+            "safety_profile_hash",
+            "deployment_safety_envelope_id",
+            "deployment_safety_envelope_hash",
+            "safety_constraint_set_hash",
+        )
+        normalized_safety = {
+            field_name: _optional(
+                getattr(self, field_name),
+                field_name=field_name,
+            )
+            for field_name in safety_fields
+        }
+        present = {
+            field_name
+            for field_name, value in normalized_safety.items()
+            if value is not None
+        }
+        if present and len(present) != len(safety_fields):
+            raise ValueError(
+                "Safety profile selection fields must be supplied together."
+            )
+        for field_name, value in normalized_safety.items():
+            object.__setattr__(self, field_name, value)
+
+    @property
+    def has_safety_profile_selection(self) -> bool:
+        return self.safety_profile_id is not None
 
     @property
     def semantic_content_hash(self) -> str:
@@ -480,7 +517,7 @@ class AgentSkillRequest:
         )
 
     def to_wire(self) -> dict[str, Any]:
-        return {
+        payload = {
             "client_id": self.client_id,
             "request_id": self.request_id,
             "idempotency_key": self.idempotency_key,
@@ -503,6 +540,23 @@ class AgentSkillRequest:
             "requested_timeout_ms": self.requested_timeout_ms,
             "skill_execution_grant_id": self.skill_execution_grant_id,
         }
+        if self.has_safety_profile_selection:
+            payload.update(
+                {
+                    "safety_profile_id": self.safety_profile_id,
+                    "safety_profile_hash": self.safety_profile_hash,
+                    "deployment_safety_envelope_id": (
+                        self.deployment_safety_envelope_id
+                    ),
+                    "deployment_safety_envelope_hash": (
+                        self.deployment_safety_envelope_hash
+                    ),
+                    "safety_constraint_set_hash": (
+                        self.safety_constraint_set_hash
+                    ),
+                }
+            )
+        return payload
 
 
 _SKILL_REQUEST_FIELDS = frozenset(
@@ -528,10 +582,20 @@ _SKILL_REQUEST_FIELDS = frozenset(
         "requested_mode",
         "requested_timeout_ms",
         "skill_execution_grant_id",
+        "safety_profile_id",
+        "safety_profile_hash",
+        "deployment_safety_envelope_id",
+        "deployment_safety_envelope_hash",
+        "safety_constraint_set_hash",
     }
 )
 _REQUIRED_SKILL_REQUEST_FIELDS = _SKILL_REQUEST_FIELDS - {
-    "skill_execution_grant_id"
+    "skill_execution_grant_id",
+    "safety_profile_id",
+    "safety_profile_hash",
+    "deployment_safety_envelope_id",
+    "deployment_safety_envelope_hash",
+    "safety_constraint_set_hash",
 }
 
 
@@ -569,6 +633,15 @@ def agent_skill_request_from_json(payload: Mapping[str, Any]) -> AgentSkillReque
         requested_mode=payload["requested_mode"],
         requested_timeout_ms=payload["requested_timeout_ms"],
         skill_execution_grant_id=payload.get("skill_execution_grant_id"),
+        safety_profile_id=payload.get("safety_profile_id"),
+        safety_profile_hash=payload.get("safety_profile_hash"),
+        deployment_safety_envelope_id=payload.get(
+            "deployment_safety_envelope_id"
+        ),
+        deployment_safety_envelope_hash=payload.get(
+            "deployment_safety_envelope_hash"
+        ),
+        safety_constraint_set_hash=payload.get("safety_constraint_set_hash"),
     )
 
 
@@ -1615,6 +1688,39 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
                 ],
             },
             "deployment_binding_ref_hash": {"type": "string", "minLength": 1},
+            "safety_envelope_refs": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "object_id": {"type": "string", "minLength": 1},
+                        "schema": {
+                            "const": "dexteleop.deployment_safety_envelope.v1"
+                        },
+                        "content_hash": {"type": "string", "minLength": 1},
+                        "constraint_set_hash": {
+                            "type": "string",
+                            "minLength": 1,
+                        },
+                        "allowed_route_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                    },
+                    "required": [
+                        "object_id",
+                        "schema",
+                        "content_hash",
+                        "constraint_set_hash",
+                        "allowed_route_ids",
+                    ],
+                },
+            },
         },
         "required": [
             "deployment_binding_id",
@@ -1736,6 +1842,20 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
                 "maximum": MAX_AGENT_SKILL_TIMEOUT_MS_V1,
             },
             "skill_execution_grant_id": nullable_string,
+            "safety_profile_id": {"type": "string", "minLength": 1},
+            "safety_profile_hash": {"type": "string", "minLength": 1},
+            "deployment_safety_envelope_id": {
+                "type": "string",
+                "minLength": 1,
+            },
+            "deployment_safety_envelope_hash": {
+                "type": "string",
+                "minLength": 1,
+            },
+            "safety_constraint_set_hash": {
+                "type": "string",
+                "minLength": 1,
+            },
         },
         required=tuple(sorted(_REQUIRED_SKILL_REQUEST_FIELDS)),
     )
@@ -2347,6 +2467,7 @@ __all__ = [
     "AGENT_CONTROL_REASON_CODES_V1",
     "AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1",
     "AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1",
+    "AGENT_GATEWAY_SAFETY_PROFILE_SELECTION_FEATURE_V1",
     "AGENT_GATEWAY_PORT_OPERATION_KINDS_V1",
     "AGENT_OWN_DOMAIN_HOLD_REQUEST_HASH_DOMAIN_V1",
     "AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1",

@@ -513,6 +513,10 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
         "rpent_dexteleop.toolkit",
         reason="paired RPent integration wheel is not installed",
     )
+    session_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.session",
+        reason="paired RPent integration wheel is not installed",
+    )
     DEX_CONTROL_TOOL_CANCEL_OWN_OPERATION = (
         toolkit_module.DEX_CONTROL_TOOL_CANCEL_OWN_OPERATION
     )
@@ -524,6 +528,7 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
     )
     DexTeleopToolExposurePolicy = toolkit_module.DexTeleopToolExposurePolicy
     DexTeleopToolkit = toolkit_module.DexTeleopToolkit
+    DexTeleopConsumerSession = session_module.DexTeleopConsumerSession
     application = _application()
     now = {"value": 20.0}
     application.runtime.clock = lambda: now["value"]
@@ -589,13 +594,16 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
             DEX_CONTROL_TOOL_REQUEST_HOLD_OWN_DOMAIN,
         }
     )
-    toolkit = DexTeleopToolkit(
+    consumer_session = DexTeleopConsumerSession(
         client=facade,
         client_id="rpent:b3",
+        request_id_factory=lambda: "request:cube-lift:1",
+    )
+    toolkit = DexTeleopToolkit(
+        session=consumer_session,
         exposure_policy=DexTeleopToolExposurePolicy(
             allowed_control_tools=control_tools
         ),
-        request_id_factory=lambda: "request:cube-lift:1",
     )
     specs = {item["name"]: item for item in toolkit.get_tools_spec()}
     assert control_tools <= set(specs)
@@ -617,7 +625,8 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
     request = service.operation_store.request_for_operation(operation_id)
     assert request is not None
     assert request.parameters == {}
-    assert response["rpent_contract_binding"]["route_hash"] == (
+    assert "rpent_contract_binding" not in response
+    assert toolkit.local_request_lineage[0].route_hash == (
         bundle.route_manifest.route(
             "task.cube_lift", "1"
         ).route.semantic_content_hash
@@ -627,6 +636,7 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
     forged["client_id"] = "another-client"
     with pytest.raises(PermissionError, match="authenticated connection"):
         facade.submit_skill_request(forged)
+    consumer_session.close()
 
 
 @pytest.mark.integration
@@ -642,8 +652,13 @@ def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
         "rpent_dexteleop.gateway.unix_transport",
         reason="paired RPent integration wheel is not installed",
     )
+    session_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.session",
+        reason="paired RPent integration wheel is not installed",
+    )
     DexTeleopToolkit = toolkit_module.DexTeleopToolkit
     UnixDexTeleopGatewayClient = transport_module.UnixDexTeleopGatewayClient
+    DexTeleopConsumerSession = session_module.DexTeleopConsumerSession
     application = _application()
     now = {"value": 25.0}
     application.runtime.clock = lambda: now["value"]
@@ -719,6 +734,7 @@ def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     client = None
+    consumer_session = None
     operation_id = None
     try:
         client = UnixDexTeleopGatewayClient(
@@ -728,11 +744,12 @@ def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
             expected_server_gid=os.getgid(),
             heartbeat_interval_sec=0.1,
         )
-        toolkit = DexTeleopToolkit(
+        consumer_session = DexTeleopConsumerSession(
             client=client,
             client_id="rpent:b3",
             request_id_factory=lambda: "request:cube-lift:uds:1",
         )
+        toolkit = DexTeleopToolkit(session=consumer_session)
         specs = {item["name"]: item for item in toolkit.get_tools_spec()}
         assert len(specs) == 2
         tool_name = next(
@@ -744,7 +761,8 @@ def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
         operation_id = admitted["operation"]["operation_id"]
         assert service.get_operation(operation_id).status == "admitted"
 
-        client.close()
+        consumer_session.close()
+        consumer_session = None
         client = None
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -764,7 +782,9 @@ def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
         )
         assert server.disconnect_events[-1].outcome_accepted
     finally:
-        if client is not None:
+        if consumer_session is not None:
+            consumer_session.close()
+        elif client is not None:
             client.close()
         server.shutdown()
         server.server_close()
@@ -928,7 +948,12 @@ def test_session_repeats_passive_tcp_pose_reads_without_consuming_motion_worker(
         "rpent_dexteleop.toolkit",
         reason="paired RPent integration wheel is not installed",
     )
+    session_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.session",
+        reason="paired RPent integration wheel is not installed",
+    )
     DexTeleopToolkit = toolkit_module.DexTeleopToolkit
+    DexTeleopConsumerSession = session_module.DexTeleopConsumerSession
     application = _application()
     now = {"value": 40.0}
     application.runtime.clock = lambda: now["value"]
@@ -1009,11 +1034,12 @@ def test_session_repeats_passive_tcp_pose_reads_without_consuming_motion_worker(
     facade = session.wire_adapter(authenticated_client_id="rpent:b3")
 
     request_ids = iter(("request:state:1", "request:state:2"))
-    toolkit = DexTeleopToolkit(
+    consumer_session = DexTeleopConsumerSession(
         client=facade,
         client_id="rpent:b3",
         request_id_factory=lambda: next(request_ids),
     )
+    toolkit = DexTeleopToolkit(session=consumer_session)
     specs = {item["name"]: item for item in toolkit.get_tools_spec()}
     state_tool = next(name for name in specs if "state_read_tcp_pose" in name)
     parameters = {
@@ -1050,3 +1076,4 @@ def test_session_repeats_passive_tcp_pose_reads_without_consuming_motion_worker(
         motion_route.semantic_content_hash
     ) == 0
     assert session.service.operation_store.total_admitted == 2
+    consumer_session.close()

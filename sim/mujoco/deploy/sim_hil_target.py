@@ -190,6 +190,7 @@ class MujocoAgentSkillMotionTarget:
     target_frame_profile: TargetFrameProfile
     tool_frame_profile: ToolFrameProfile
     task_initialization_info: Mapping[str, object]
+    tcp_pose_envelope_runtime: Any | None = None
 
 
 def prepare_mujoco_sim_hil_target(
@@ -278,6 +279,11 @@ def prepare_mujoco_sim_hil_target(
         position_actuation_profile=arm_profile,
         gripper_actuation_profile=gripper_profile,
     )
+    if config.collision_stop_enabled and not scene.collision_safety_available:
+        raise ValueError(
+            "Sim-HIL collision protection requires an enabled collision "
+            "contract in the selected MuJoCo scene."
+        )
     if task_config.scripted_pregrasp_reset or task_config.scripted_contact_reset:
         # The task kernel is the single owner of its simulator-only episode
         # preparation.  Reuse it instead of copying the scripted trajectory
@@ -413,7 +419,10 @@ def build_mujoco_sim_hil_target(
         MujocoPositionExecutionConfig,
         MujocoPositionExecutionRig,
     )
-    from robot_motion.rm65 import RM65PositionCollisionPlannerConfig
+    from robot_motion.rm65 import (
+        DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+        RM65PositionCollisionPlannerConfig,
+    )
     from sim.mujoco.ik import RM65CanonicalIK
     from .pose_resolution import MujocoCoupledPoseToQposResolver
     from .runtime import MujocoDeployConfig, MujocoDeployRuntime
@@ -473,6 +482,9 @@ def build_mujoco_sim_hil_target(
             profile=safety_profile,
         )
 
+    sim_collision_clearance_m = float(
+        scene.scene_spec.collision.safety_minimum_clearance_m
+    )
     ik = RM65CanonicalIK.from_tool_profiles(
         scene,
         {
@@ -487,6 +499,17 @@ def build_mujoco_sim_hil_target(
             reference_hz=compose_target_hz,
             # Preserve the selected lower IK stage's computation budget.
             solve_time_budget_ms=1000.0 / float(position_profile.rates.ik_hz),
+            # Sim-HIL uses the selected scene's preventive-clearance contract.
+            # Inheriting the real-side 30 mm planner default here made a
+            # proxy-distance rejection look like a physical MuJoCo collision,
+            # even though the task contract declares a 2 mm Sim clearance.
+            collision_min_distance_m=float(
+                sim_collision_clearance_m
+            ),
+            collision_distance_epsilon_m=min(
+                DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+                sim_collision_clearance_m,
+            ),
             collision_constraints_enabled=config.collision_stop_enabled,
         ),
     )
@@ -634,6 +657,7 @@ def build_mujoco_agent_skill_motion_target(
     prepared_target: MujocoSimHILPreparedTarget | None = None,
     execution_observation_sink: ExecutionObservationSink | None = None,
     trace_sink: Callable[[Any], None] | None = None,
+    tcp_pose_envelope_runtime: Any | None = None,
 ) -> MujocoAgentSkillMotionTarget:
     """Build the first no-model, right-arm Agent Skill execution target.
 
@@ -676,6 +700,10 @@ def build_mujoco_agent_skill_motion_target(
         CanonicalKeyframeSafetyProfile,
         IMMEDIATE_QREF_SIM_V1,
         apply_canonical_keyframe_safety,
+    )
+    from robot_motion.target_safety import (
+        RobotActionTCPPoseEnvelopeFilter,
+        TCPPoseEnvelopeSafetyRuntime,
     )
     from robot_motion.position_control import PositionKeyframeSafetyConfig
     from robot_motion.rm65 import RM65PositionCollisionPlannerConfig
@@ -739,6 +767,18 @@ def build_mujoco_agent_skill_motion_target(
         ),
     )
     support_horizon_sec = max(0.25, 1.0 / prepared.compose_target_hz)
+    pose_target_safety_filter = None
+    if tcp_pose_envelope_runtime is not None:
+        if not isinstance(
+            tcp_pose_envelope_runtime,
+            TCPPoseEnvelopeSafetyRuntime,
+        ):
+            raise TypeError(
+                "tcp_pose_envelope_runtime must be typed or None."
+            )
+        pose_target_safety_filter = RobotActionTCPPoseEnvelopeFilter(
+            tcp_pose_envelope_runtime
+        )
     runtime = MujocoDeployRuntime(
         rig,
         MujocoDeployConfig(
@@ -772,7 +812,10 @@ def build_mujoco_agent_skill_motion_target(
                 )
             ),
         ),
-        pose_resolver=MujocoCoupledPoseToQposResolver(ik),
+        pose_resolver=MujocoCoupledPoseToQposResolver(
+            ik,
+            pose_target_safety_filter=pose_target_safety_filter,
+        ),
         shared_safety=shared_safety,
         component_execution_binding=component_execution_binding,
         execution_observation_sink=execution_observation_sink,
@@ -793,6 +836,7 @@ def build_mujoco_agent_skill_motion_target(
         target_frame_profile=prepared.target_frame_profile,
         tool_frame_profile=prepared.tool_frame_profile,
         task_initialization_info=prepared.task_initialization_info,
+        tcp_pose_envelope_runtime=tcp_pose_envelope_runtime,
     )
 
 

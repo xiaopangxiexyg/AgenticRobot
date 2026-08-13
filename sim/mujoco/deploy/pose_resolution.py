@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 import threading
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -190,33 +190,102 @@ class MujocoCoupledPoseToQposResolver:
         ik: RM65CanonicalIK,
         *,
         pose_transformer: CanonicalDeskToRuntimePoseTransformer | None = None,
+        pose_target_safety_filter: Callable[[RobotAction], RobotAction] | None = None,
     ) -> None:
         if not isinstance(ik, RM65CanonicalIK):
             raise TypeError("ik must be RM65CanonicalIK.")
         self.ik = ik
         self.pose_transformer = pose_transformer
+        if pose_target_safety_filter is not None and not callable(
+            pose_target_safety_filter
+        ):
+            raise TypeError("pose_target_safety_filter must be callable or None.")
+        safety_filter_hash = (
+            None
+            if pose_target_safety_filter is None
+            else str(
+                getattr(
+                    pose_target_safety_filter,
+                    "filter_contract_hash",
+                    "",
+                )
+            ).strip()
+        )
+        if pose_target_safety_filter is not None and not safety_filter_hash:
+            raise ValueError(
+                "pose_target_safety_filter requires filter_contract_hash."
+            )
+        self.pose_target_safety_filter = pose_target_safety_filter
         transform_hash = (
             None
             if pose_transformer is None
             else pose_transformer.binding_receipt.semantic_content_hash
         )
-        self.resolver_contract_id = (
-            POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1
-            if transform_hash is None
-            else "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-v1"
+        collision_constraints_enabled = bool(
+            getattr(self.ik.planner, "collision_pair_count", 0) > 0
         )
-        self.resolver_contract_hash = (
+        base_contract_id = (
+            POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1
+            if collision_constraints_enabled
+            else "mujoco-rm65-coupled-arm-base-pose-to-qpos-no-collision-v1"
+        )
+        base_contract_hash = (
             POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1
-            if transform_hash is None
+            if collision_constraints_enabled
             else canonical_content_hash(
                 {
                     "base_resolver_contract_hash": (
                         POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1
                     ),
+                    "collision_constraints_enabled": False,
+                    "joint_constraints_unchanged": True,
+                },
+                domain=(
+                    "dexteleop.mujoco.pose_to_qpos_no_collision_resolver.v1"
+                ),
+            )
+        )
+        transformed_contract_id = (
+            base_contract_id
+            if transform_hash is None
+            else (
+                "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-v1"
+                if collision_constraints_enabled
+                else (
+                    "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-"
+                    "no-collision-v1"
+                )
+            )
+        )
+        transformed_contract_hash = (
+            base_contract_hash
+            if transform_hash is None
+            else canonical_content_hash(
+                {
+                    "base_resolver_contract_hash": (
+                        base_contract_hash
+                    ),
                     "transform_contract_hash": transform_hash,
                     "transform_stage": "after_shared_safety_before_coupled_ik",
                 },
                 domain="dexteleop.mujoco.transformed_pose_to_qpos_resolver.v1",
+            )
+        )
+        self.resolver_contract_id = (
+            transformed_contract_id
+            if safety_filter_hash is None
+            else f"{transformed_contract_id}+tcp-envelope-v1"
+        )
+        self.resolver_contract_hash = (
+            transformed_contract_hash
+            if safety_filter_hash is None
+            else canonical_content_hash(
+                {
+                    "base_resolver_contract_hash": transformed_contract_hash,
+                    "pose_target_safety_filter_hash": safety_filter_hash,
+                    "filter_stage": "final_after_pose_transform_before_coupled_ik",
+                },
+                domain="dexteleop.mujoco.safe_pose_to_qpos_resolver.v1",
             )
         )
         self._command_resolver = RobotActionResolver()
@@ -238,6 +307,10 @@ class MujocoCoupledPoseToQposResolver:
         else:
             transform_result = self.pose_transformer.transform(safe_action)
             solver_input = transform_result.transformed_action
+        if self.pose_target_safety_filter is not None:
+            solver_input = freeze_robot_action(
+                self.pose_target_safety_filter(solver_input)
+            )
         self._validate_arm_base_input(solver_input)
         targets = {
             side: PoseTarget(
@@ -270,14 +343,36 @@ class MujocoCoupledPoseToQposResolver:
                 if value.get("distance_m") is not None
                 and np.isfinite(float(value["distance_m"]))
             )
+            best_attempt = (
+                None
+                if not finite_distances
+                else max(
+                    (
+                        value
+                        for value in attempts
+                        if value.get("distance_m") is not None
+                        and np.isfinite(float(value["distance_m"]))
+                    ),
+                    key=lambda value: float(value["distance_m"]),
+                )
+            )
+            collision_min_distance = metadata.get(
+                "collision_min_distance_m"
+            )
+            collision_epsilon = metadata.get(
+                "collision_distance_epsilon_m"
+            )
             diagnostics = {
                 "solver": str(result.solver),
                 "hold": bool(result.hold),
-                "collision_min_distance_m": metadata.get(
-                    "collision_min_distance_m"
-                ),
-                "collision_distance_epsilon_m": metadata.get(
-                    "collision_distance_epsilon_m"
+                "collision_min_distance_m": collision_min_distance,
+                "collision_distance_epsilon_m": collision_epsilon,
+                "collision_threshold_m": (
+                    None
+                    if collision_min_distance is None
+                    or collision_epsilon is None
+                    else float(collision_min_distance)
+                    - float(collision_epsilon)
                 ),
                 "hold_reference_distance_m": metadata.get(
                     "collision_distance_m"
@@ -286,6 +381,21 @@ class MujocoCoupledPoseToQposResolver:
                     None if not finite_distances else max(finite_distances)
                 ),
                 "collision_attempt_count": len(attempts),
+                "collision_pair_index": (
+                    None
+                    if best_attempt is None
+                    else best_attempt.get("collision_pair_index")
+                ),
+                "collision_geometry_1": (
+                    None
+                    if best_attempt is None
+                    else best_attempt.get("collision_geometry_1")
+                ),
+                "collision_geometry_2": (
+                    None
+                    if best_attempt is None
+                    else best_attempt.get("collision_geometry_2")
+                ),
             }
             raise ActionResolutionError(
                 ActionResolutionFailure(

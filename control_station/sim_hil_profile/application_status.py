@@ -70,13 +70,17 @@ class _SimHILApplicationStatusMixin:
                 required_readiness = tuple(readiness.detail_by_check)
                 readiness_failures = tuple(readiness.failed_checks)
             policy_status = dict(self.policy_source.status(now=now))
+            policy_selected = bool(self._policy_contributor_active())
             policy_status["refresh_state"] = (
                 "suspended_by_application_hold"
                 if self._started and self._held
-                else "active"
+                else "selected_and_polled"
+                if self._started and policy_selected
+                else "standby_unselected"
                 if self._started
                 else "stopped"
             )
+            policy_status["selected_by_control_cycle"] = policy_selected
             policy_emission = getattr(self.policy_source, "last_emission", None)
             policy_status["last_emission"] = _emission_status(
                 policy_emission,
@@ -153,6 +157,7 @@ class _SimHILApplicationStatusMixin:
                 "vive_receiver": _vive_receiver_status(
                     human_session,
                     wall_now=wall_now,
+                    required_output_channels=("right_wrist_pose",),
                 ),
                 "last_step": None
                 if last_human_step is None
@@ -204,10 +209,43 @@ class _SimHILApplicationStatusMixin:
                     if self._started and self._held
                     else "running"
                     if self._started
+                    else "viewer_preview"
+                    if getattr(self, "_viewer_preview_started", False)
                     else "stopped"
                 ),
                 "held": self._held,
                 "episode_ended": self._episode_ended,
+                "episode_end_reason": getattr(
+                    self,
+                    "_episode_end_reason",
+                    None,
+                ),
+                "sim_collision_stop": {
+                    "enabled": bool(
+                        getattr(
+                            self.config,
+                            "sim_collision_stop_enabled",
+                            True,
+                        )
+                    ),
+                    "mode": (
+                        "planner_proxy_preventive_clearance_terminal_stop"
+                        if getattr(
+                            self.config,
+                            "sim_collision_stop_enabled",
+                            True,
+                        )
+                        else "planner_collision_constraints_disabled"
+                    ),
+                    "trigger_semantics": (
+                        "planner_proxy_preventive_clearance_or_"
+                        "mujoco_forbidden_contact_hard_penetration"
+                    ),
+                    "planner_margin_requires_physical_contact": False,
+                },
+                "sim_collision_contact": dict(
+                    self._capture_sim_contact_observation()
+                ),
                 "startup": {
                     "restart_required": self._restart_required,
                     "first_failure": self._startup_failure,
@@ -384,6 +422,11 @@ class _SimHILApplicationStatusMixin:
                     None
                     if self._runtime_home_capture is None
                     else dict(self._runtime_home_capture)
+                ),
+                "activation_prime": (
+                    None
+                    if self._last_activation_prime_evidence is None
+                    else self._last_activation_prime_evidence.to_payload()
                 ),
                 "execution_gate": {"status": "not_started"},
                 "target_execution": None,
@@ -576,5 +619,8 @@ class _SimHILApplicationStatusMixin:
         return {
             "schema": "dexteleop.control_station.sim_hil_vive_status.v1",
             "sampled_at": time.time(),
-            "vive_receiver": _vive_receiver_status(session),
+            "vive_receiver": _vive_receiver_status(
+                session,
+                required_output_channels=("right_wrist_pose",),
+            ),
         }

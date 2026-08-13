@@ -81,6 +81,64 @@ def test_submit_and_step_places_new_proposal_after_its_admission_cut(
     }
 
 
+def test_first_safety_profile_activation_establishes_lower_hold_before_ready() -> None:
+    calls: list[tuple[str, object]] = []
+
+    def transition(status: str, **kwargs):
+        calls.append((f"gate:{status}", kwargs))
+        return SimpleNamespace(
+            snapshot=SimpleNamespace(status=status),
+            lower_event_ids=(f"lower-gate:{status}",),
+        )
+
+    runtime = SimpleNamespace(
+        clock=lambda: 10.0,
+        start=lambda: calls.append(("start", None)),
+        capture_execution_gate_snapshot=lambda **_kwargs: SimpleNamespace(
+            status="ready"
+        ),
+        transition_execution_gate=transition,
+        core=SimpleNamespace(
+            capture_receiver_state=lambda: SimpleNamespace(
+                current_execution_epoch=1
+            )
+        ),
+    )
+
+    def activate_envelope(**kwargs):
+        calls.append(("envelope:activate", kwargs))
+        return SimpleNamespace(semantic_content_hash="safety-activation:1")
+
+    application = object.__new__(MujocoAgentSkillMotionApplication)
+    application.runtime = runtime
+    application.tcp_pose_envelope_runtime = SimpleNamespace(
+        activate=activate_envelope,
+        deactivate_after_hold=lambda **_kwargs: None,
+    )
+    application._lock = threading.RLock()
+    application._started = False
+    application._held = False
+    application._closed = False
+    application._active_operation_id = None
+
+    activation = application.activate_operation(
+        operation_id="operation:fixture",
+        route_id="sim.mujoco.motion",
+        safety_selection=object(),
+    )
+
+    assert activation.snapshot.status == "ready"
+    assert [name for name, _payload in calls] == [
+        "start",
+        "gate:hold",
+        "envelope:activate",
+        "gate:ready",
+    ]
+    envelope_call = calls[2][1]
+    assert envelope_call["execution_epoch"] == 1
+    assert "lower-gate:hold" in envelope_call["source_event_ids"]
+
+
 def test_tcp_pose_lifecycle_holds_without_dispatch_when_goal_is_already_stable() -> None:
     lifecycle = object.__new__(MujocoAgentTcpPoseSkillLifecycle)
     lifecycle._activated = True

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from ..protocol.contracts import (
+    AGENT_GATEWAY_SAFETY_PROFILE_SELECTION_FEATURE_V1,
     AGENT_SKILL_ACCESS_DECISION_HASH_DOMAIN_V1,
     AGENT_SKILL_ACCESS_POLICY_HASH_DOMAIN_V1,
     AGENT_SKILL_EXECUTION_GRANT_HASH_DOMAIN_V1,
@@ -611,6 +612,37 @@ def assess_skill_request_access(
     for matches, reason_code in identity_checks:
         if not matches:
             return reject(reason_code, route_entry=route_entry)
+    safety_selection_supported = (
+        AGENT_GATEWAY_SAFETY_PROFILE_SELECTION_FEATURE_V1
+        in manifest.supported_transport_features
+    )
+    if request.has_safety_profile_selection and not safety_selection_supported:
+        return reject(
+            "safety_profile_selection_not_supported",
+            route_entry=route_entry,
+        )
+    if request.has_safety_profile_selection:
+        matching_envelopes = tuple(
+            item
+            for item in binding.safety_envelope_refs
+            if (
+                item.object_id == request.deployment_safety_envelope_id
+                and item.content_hash
+                == request.deployment_safety_envelope_hash
+                and item.constraint_set_hash
+                == request.safety_constraint_set_hash
+            )
+        )
+        if len(matching_envelopes) != 1:
+            return reject(
+                "deployment_safety_envelope_not_allowed",
+                route_entry=route_entry,
+            )
+        if request.route_id not in matching_envelopes[0].allowed_route_ids:
+            return reject(
+                "deployment_safety_envelope_route_not_allowed",
+                route_entry=route_entry,
+            )
     try:
         route.profile(
             request.parameter_profile_id,

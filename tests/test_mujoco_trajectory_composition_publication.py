@@ -250,7 +250,7 @@ def _trajectory(
         ),
         ComponentActionTrajectoryKeyframe(
             target_effective_at=second_target,
-            effective_until=second_target + 0.20,
+            effective_until=second_target + 0.25,
             action=action,
             source_index=1,
             source_fact_ids=("virtual-chunk-keyframe:1",),
@@ -504,7 +504,7 @@ def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
             observed_at=now,
             observed_clock_domain_id=target.runtime.config.clock_domain_id,
         )
-        assert anchor_step.status == "anchor_captured"
+        assert anchor_step.status == "anchor_captured_relative_action_ready"
         anchor = residual_profile.input_adapter.anchor
         assert anchor is not None
         activation_cut = target.runtime.capture_control_cut(
@@ -603,7 +603,7 @@ def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
             residual_anchor_receipt_hash=(
                 anchor.receipt.semantic_content_hash
             ),
-            residual_effective_until=due_target + 0.20,
+            residual_effective_until=due_target + 0.25,
             residual_warp_spec=ResidualTemporalWarpSpec(
                 spec_id="virtual-residual-ramp",
                 ramp_duration_sec=due_target - first_target,

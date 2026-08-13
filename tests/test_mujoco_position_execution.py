@@ -45,6 +45,14 @@ class _FakeScene:
         self.qpos = {side: qpos.copy() for side, qpos in command.items()}
 
 
+class _Clock:
+    def __init__(self, value: float = 10.0) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+
 def _timing() -> TimingSpec:
     return TimingSpec(
         sample_hz=15.0,
@@ -130,6 +138,42 @@ def test_mujoco_position_rig_mailbox_keeps_only_latest_qref() -> None:
         rig.step_physics()
 
     snapshot = rig.snapshot()
+    assert snapshot["last_reference_sequence"] == 2
+    assert snapshot["pending_reference_sequence"] is None
+    assert snapshot["planner_by_side"]["left"]["target_q"] == [0.3] * 6
+    assert snapshot["planner_by_side"]["right"]["target_q"] == [-0.3] * 6
+
+
+def test_offline_immediate_qref_realigns_after_wall_clock_outpaces_physics() -> None:
+    scene = _FakeScene()
+    clock = _Clock()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+        monotonic_clock=clock,
+    )
+    rig.start()
+    rig.send_commands(_command(0.1, -0.1))
+    rig.step_physics()
+
+    # Model a slow IK/Agent planning interval without advancing MuJoCo.  The
+    # second immediate qref must activate on the next explicit physics tick,
+    # not remain pending behind the external clock forever.
+    clock.value += 1.0
+    receipts = rig.send_commands(_command(0.3, -0.3))
+    rig.step_physics()
+
+    snapshot = rig.snapshot()
+    assert all(
+        item.metadata["activate_at"] == pytest.approx(clock.value)
+        for item in receipts.values()
+    )
     assert snapshot["last_reference_sequence"] == 2
     assert snapshot["pending_reference_sequence"] is None
     assert snapshot["planner_by_side"]["left"]["target_q"] == [0.3] * 6

@@ -400,6 +400,7 @@ def _vive_receiver_status(
     session: Any,
     *,
     wall_now: float | None = None,
+    required_output_channels: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Project the passive VIVE receiver into GUI-safe diagnostic facts.
 
@@ -445,14 +446,29 @@ def _vive_receiver_status(
         now=now,
     )
     role_by_output = source.source_role_by_output_channel
+    required_outputs = (
+        None
+        if required_output_channels is None
+        else {str(channel) for channel in required_output_channels}
+    )
     for side, tracker_role in (
         ("left", "left_wrist"),
         ("right", "right_wrist"),
     ):
-        tracker_status[side]["selected_for_output_channels"] = sorted(
+        selected_outputs = sorted(
             channel_name
             for channel_name, selected_role in role_by_output.items()
             if selected_role == tracker_role
+        )
+        tracker_status[side]["selected_for_output_channels"] = selected_outputs
+        tracker_status[side]["selected_for_required_output_channels"] = (
+            selected_outputs
+            if required_outputs is None
+            else [
+                channel_name
+                for channel_name in selected_outputs
+                if channel_name in required_outputs
+            ]
         )
 
     # Transport freshness must be measured from socket arrival, not from the
@@ -528,6 +544,11 @@ def _vive_receiver_status(
         ),
         "dropped_stale_packet_count": int(stats.get("dropped_stale_packet_count") or 0),
         "source_role_by_output_channel": dict(role_by_output),
+        "required_output_channels": (
+            sorted(role_by_output)
+            if required_outputs is None
+            else sorted(required_outputs)
+        ),
         "source_mapping_generation": int(stats.get("source_mapping_generation") or 0),
         "channel_update_counts": dict(stats.get("channel_update_counts") or {}),
         "last_channel_update_at": dict(stats.get("last_channel_update_at") or {}),

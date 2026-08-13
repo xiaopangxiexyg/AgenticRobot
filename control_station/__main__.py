@@ -16,12 +16,22 @@ def main(argv: list[str] | None = None) -> int:
         from .vive_calibration_cli import main as vive_calibration_main
 
         return int(vive_calibration_main(values[1:]))
+    if values and values[0] == "vive-deflection":
+        from .vive_deflection_cli import main as vive_deflection_main
+
+        return int(vive_deflection_main(values[1:]))
     if values and values[0] == "refinement-annotation":
         from .refinement_annotation.cli import (
             main as refinement_annotation_main,
         )
 
         return int(refinement_annotation_main(values[1:]))
+    if values and values[0] == "agent-gateway-mujoco":
+        from .sim_hil_profile.agent.gateway_cli import (
+            main as agent_gateway_mujoco_main,
+        )
+
+        return int(agent_gateway_mujoco_main(values[1:]))
     parser = argparse.ArgumentParser(
         prog="python -m control_station",
         description="DexTeleop Control Station application entrypoints.",
@@ -32,7 +42,9 @@ def main(argv: list[str] | None = None) -> int:
         choices=(
             "sim-hil",
             "vive-calibration",
+            "vive-deflection",
             "refinement-annotation",
+            "agent-gateway-mujoco",
         ),
         help="application profile to run",
     )

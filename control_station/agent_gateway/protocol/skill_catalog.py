@@ -1118,6 +1118,50 @@ class CrossTargetDeploymentReviewRef:
 
 
 @dataclass(frozen=True)
+class SkillDeploymentSafetyEnvelopeRef:
+    """Public opaque ref to one exact lower-owned safety envelope."""
+
+    object_id: str
+    schema: str
+    content_hash: str
+    constraint_set_hash: str
+    allowed_route_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "object_id",
+            "schema",
+            "content_hash",
+            "constraint_set_hash",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+        if self.schema != "dexteleop.deployment_safety_envelope.v1":
+            raise ValueError("Unsupported deployment safety envelope schema.")
+        object.__setattr__(
+            self,
+            "allowed_route_ids",
+            _unique_sorted(
+                self.allowed_route_ids,
+                field_name="allowed_route_ids",
+                allow_empty=False,
+            ),
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "object_id": self.object_id,
+            "schema": self.schema,
+            "content_hash": self.content_hash,
+            "constraint_set_hash": self.constraint_set_hash,
+            "allowed_route_ids": list(self.allowed_route_ids),
+        }
+
+
+@dataclass(frozen=True)
 class SkillDeploymentBindingRef:
     """Public immutable reference to a lower-owned deployment binding."""
 
@@ -1129,6 +1173,7 @@ class SkillDeploymentBindingRef:
     cross_target_deployment_review: (
         CrossTargetDeploymentReviewRef | None
     ) = None
+    safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -1163,6 +1208,25 @@ class SkillDeploymentBindingRef:
                     "Cross-target review deployed_target_kind must match the "
                     "deployment binding target_kind."
                 )
+        envelopes = tuple(self.safety_envelope_refs)
+        if any(
+            not isinstance(item, SkillDeploymentSafetyEnvelopeRef)
+            for item in envelopes
+        ):
+            raise TypeError(
+                "safety_envelope_refs must contain typed envelope refs."
+            )
+        envelope_ids = tuple(item.object_id for item in envelopes)
+        envelope_hashes = tuple(item.content_hash for item in envelopes)
+        if len(set(envelope_ids)) != len(envelope_ids) or len(
+            set(envelope_hashes)
+        ) != len(envelope_hashes):
+            raise ValueError("Safety envelope IDs and hashes must be unique.")
+        object.__setattr__(
+            self,
+            "safety_envelope_refs",
+            tuple(sorted(envelopes, key=lambda item: item.object_id)),
+        )
 
     @property
     def semantic_content_hash(self) -> str:
@@ -1184,6 +1248,10 @@ class SkillDeploymentBindingRef:
                 else self.cross_target_deployment_review.to_wire()
             ),
         }
+        if self.safety_envelope_refs:
+            payload["safety_envelope_refs"] = [
+                item.to_wire() for item in self.safety_envelope_refs
+            ]
         if include_reference_hash:
             payload["deployment_binding_ref_hash"] = self.semantic_content_hash
         return payload
@@ -1356,6 +1424,26 @@ class SkillRouteManifest:
                 raise ValueError(
                     "real_observe manifests cannot expose motion or publication "
                     "opening Routes."
+                )
+            selection_feature = (
+                "safety_profile_selection_v1"
+                in self.supported_transport_features
+            )
+            if route.control_effect_class == "motion" and selection_feature:
+                if not binding.safety_envelope_refs:
+                    raise ValueError(
+                        "Safety-selectable motion Route requires lower envelope refs."
+                    )
+                if not any(
+                    route.route_id in item.allowed_route_ids
+                    for item in binding.safety_envelope_refs
+                ):
+                    raise ValueError(
+                        "Motion Route is absent from its safety envelope allowlists."
+                    )
+            if binding.safety_envelope_refs and not selection_feature:
+                raise ValueError(
+                    "Safety envelope refs require the selection transport feature."
                 )
         object.__setattr__(
             self,
@@ -1597,6 +1685,7 @@ __all__ = [
     "SkillDefinition",
     "SkillDefinitionCatalog",
     "SkillDeploymentBindingRef",
+    "SkillDeploymentSafetyEnvelopeRef",
     "SkillExecutionRoute",
     "SkillParameterProfileRef",
     "SkillRouteManifest",

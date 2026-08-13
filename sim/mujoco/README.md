@@ -61,6 +61,31 @@ from this runtime entry.
 
 ## Deployable shared-control fixture
 
+### Committed demonstration export
+
+`sim.mujoco.adapters.demonstration_trace` is a read-only bridge from one
+committed ControlTrace decision span into the backend-neutral
+`DemonstrationTrajectory` contract. It exports the canonical `safe_action`
+pose and explicitly configured hand representation, not the pre-safety
+selection, resolved qcmd, or measured qpos. Every selected decision must have
+a normal execution directive, executable shared-safety result, fully accepted
+arm/hand dispatch receipt, and a later MuJoCo backend measurement. The caller
+must also supply hash-bound task-success evidence for the exact first/last
+decision IDs; the bridge does not encode Cube-Lift or grasp-phase logic.
+
+The trace execution effector and exported demonstration component are separate
+contracts. For the current DM-Tac compatibility carrier, accepted execution is
+proved under `right_hand`, while export selects only slot 0 (`gripper_close`)
+and names the editable component `right_gripper`; the remaining five padded
+slots never become demonstration dimensions. The downstream representation
+adapter then projects this scalar through the scene-declared open/closed joint
+targets into the native two-joint `right_gripper` payload.
+
+This is an import/export and offline preflight boundary. It does not step
+MuJoCo or admit the trajectory back into the authoritative runtime. A passing
+zero-edit preflight proves only nominal edit/interpolation identity; physical
+replay and collision/task success remain downstream gates.
+
 `sim.mujoco.deploy` is the first backend binding for the shared authoritative
 control core. It is a library fixture, not a new production entrypoint. The
 single-policy profile samples measured MuJoCo arm qpos into a causal
@@ -402,7 +427,7 @@ downstream readers keep working across this package rename.
 Run from the repository root in the `dexteleop310` environment:
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 ```
 

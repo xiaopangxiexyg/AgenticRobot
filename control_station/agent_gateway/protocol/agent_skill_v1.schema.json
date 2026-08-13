@@ -181,7 +181,7 @@
     "max_json_depth": 16,
     "max_timeout_ms": 86400000
   },
-  "protocol_semantic_hash": "254ccc5f9d3e4d1b9c62c864ee7041e2ce1fac79ad993f95803d37c321082b84",
+  "protocol_semantic_hash": "559618022b937f0fd7791a1509e01c4b7ec26dcd164616e404b89c198f4a5573",
   "protocol_version": "dexteleop.agent_skill.v1",
   "schema": "dexteleop_agent_skill_schema_snapshot_v1",
   "schemas": {
@@ -1804,6 +1804,14 @@
           "minLength": 1,
           "type": "string"
         },
+        "deployment_safety_envelope_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "deployment_safety_envelope_id": {
+          "minLength": 1,
+          "type": "string"
+        },
         "expected_station_revision": {
           "minimum": 0,
           "type": "integer"
@@ -1858,6 +1866,18 @@
           "type": "string"
         },
         "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "safety_constraint_set_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "safety_profile_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "safety_profile_id": {
           "minLength": 1,
           "type": "string"
         },
@@ -1997,6 +2017,48 @@
             "execution_manifest_hash": {
               "minLength": 1,
               "type": "string"
+            },
+            "safety_envelope_refs": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "allowed_route_ids": {
+                    "items": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "constraint_set_hash": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "content_hash": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "object_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "schema": {
+                    "const": "dexteleop.deployment_safety_envelope.v1"
+                  }
+                },
+                "required": [
+                  "object_id",
+                  "schema",
+                  "content_hash",
+                  "constraint_set_hash",
+                  "allowed_route_ids"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
             },
             "target_binding_id": {
               "minLength": 1,
@@ -2326,6 +2388,6 @@
       "type": "object"
     }
   },
-  "snapshot_hash": "981742a1d39f29f12ac459809186df89d954a95a66d2ef65d2d188e2c42c3c43",
+  "snapshot_hash": "271edc01cdf6e43b40877ae83cd03723c47ccd5e45e72bba5f927b556687c4fc",
   "snapshot_hash_algorithm": "sha256_canonical_json_v1"
 }
