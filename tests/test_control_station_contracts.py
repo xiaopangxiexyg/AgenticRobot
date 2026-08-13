@@ -1275,7 +1275,11 @@ def test_control_station_core_modules_do_not_import_backend_or_sim_packages() ->
     # runtime and are intentionally allowed to import that runtime lazily.
     # The stable Station core remains backend-neutral; migration debt in
     # ``composition/`` is checked separately and must not spread there.
-    concrete_profile_modules = {"sim_hil.py"}
+    concrete_profile_modules = {
+        "real_teleop_entrypoint.py",
+        "rm65_calibration_debug_application.py",
+        "sim_hil.py",
+    }
     source = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted(package_root.glob("*.py"))
@@ -1314,20 +1318,12 @@ def test_lower_level_packages_do_not_reverse_depend_on_control_station() -> None
                     for name in imported_names
                 ):
                     violations.append(f"{path.relative_to(repository_root)}:{node.lineno}")
-    # Temporary application-edge seams for the RealTeleop/UMI GUI migration.
-    # They preserve the canonical teleop entrypoints and historic imports
-    # while browser state and pure input policy move to Control Station.  The
-    # exact file allowlist prevents this dependency from spreading into
-    # device, motion, safety, recorder, or generic collection owners.
+    # Historic command shims only. Browser state and pure input policy already
+    # live in Control Station; no lower API facade may be added to this list.
     assert sorted({item.rsplit(":", 1)[0] for item in violations}) == [
         "teleop_runtime/collection/umi/app.py",
-        "teleop_runtime/collection/umi/controller.py",
-        "teleop_runtime/debug/calibration_web_ui.py",
         "teleop_runtime/debug/run_vive_rm65_calibration_debug.py",
         "teleop_runtime/debug/run_vive_rm65_real_teleop.py",
-        "teleop_runtime/gui/calibration_web_ui.py",
-        "teleop_runtime/gui/startup_progress.py",
-        "teleop_runtime/real_teleop/gui_controls.py",
     ]
 
 

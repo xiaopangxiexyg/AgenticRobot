@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATION_ROOT = REPO_ROOT / "control_station"
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -78,6 +77,34 @@ def test_station_application_core_does_not_import_concrete_data_planes() -> None
     )
 
 
+def test_hitl_core_is_backend_model_topology_and_trace_neutral() -> None:
+    hitl_paths = _python_files(STATION_ROOT / "hitl")
+    assert _violations(
+        hitl_paths,
+        {
+            "deployments",
+            "hardware",
+            "sim",
+            "teleop_runtime",
+        },
+    ) == {}
+
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in hitl_paths
+    ).lower()
+    for concrete_name in (
+        "left_arm",
+        "right_arm",
+        "sim_hil",
+        "mujoco",
+        "openpi",
+        "rm65",
+        "vive",
+    ):
+        assert concrete_name not in source
+    assert "dataset_contracts.control_trace" not in source
+
+
 def test_real_teleop_and_umi_ui_packages_do_not_import_entity_data_planes() -> None:
     ui_paths = (
         *_python_files(STATION_ROOT / "real_teleop"),
@@ -107,6 +134,7 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
         _python_files(STATION_ROOT),
         {"dataset_interface"},
     ) == {
+        "control_station/real_teleop_entrypoint.py": ["dataset_interface"],
         "control_station/composition/mujoco_pose_composer.py": ["dataset_interface"],
         "control_station/composition/mujoco_sim_hil.py": ["dataset_interface"],
         "control_station/control_trace.py": ["dataset_interface"],
@@ -147,12 +175,15 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/composition/mujoco_rtc_policy.py": ["sim"],
         "control_station/composition/mujoco_sim_hil.py": ["sim"],
         "control_station/sim_hil.py": ["sim"],
+        "control_station/real_teleop_entrypoint.py": ["sim"],
+        "control_station/rm65_calibration_debug_application.py": ["sim"],
         # Concrete Agent application bindings remain Station leaves; the
         # simulator, execution, safety, and dispatch owners stay below them.
-        "control_station/sim_hil_profile/agent_motion_application.py": ["sim"],
-        "control_station/sim_hil_profile/agent_motion_factory.py": ["sim"],
-        "control_station/sim_hil_profile/agent_observation.py": ["sim"],
-        "control_station/sim_hil_profile/agent_skill_deployment.py": ["sim"],
+        "control_station/sim_hil_profile/agent/gateway_cli.py": ["sim"],
+        "control_station/sim_hil_profile/agent/motion_application.py": ["sim"],
+        "control_station/sim_hil_profile/agent/motion_factory.py": ["sim"],
+        "control_station/sim_hil_profile/agent/observation.py": ["sim"],
+        "control_station/sim_hil_profile/tasks/cube_lift/deployment.py": ["sim"],
         "control_station/sim_hil_profile/factory.py": ["sim"],
     }
 
@@ -162,11 +193,14 @@ def test_station_numerical_source_debt_is_explicit_and_cannot_spread() -> None:
         _python_files(STATION_ROOT),
         {"numpy", "scipy"},
     ) == {
+        "control_station/real_teleop_entrypoint.py": ["numpy", "scipy"],
+        "control_station/rm65_calibration_debug_application.py": [
+            "numpy",
+            "scipy",
+        ],
         # Thin typed-payload materialization for the concrete Agent profile;
         # no reusable numerical control algorithm is owned here.
-        "control_station/sim_hil_profile/agent_motion_skill.py": ["numpy"],
-        "control_station/sources/synthetic_human.py": ["numpy"],
-        "control_station/sources/teleop_pose.py": ["numpy"],
+        "control_station/sim_hil_profile/agent/motion_skill.py": ["numpy"],
     }
 
 
@@ -195,16 +229,29 @@ def test_lower_packages_do_not_reverse_depend_on_control_station() -> None:
         if not package_root.exists():
             continue
         violations.update(_violations(_python_files(package_root), {"control_station"}))
-    # Temporary application-edge compatibility seams. They retain canonical
-    # commands and historic imports after GUI/application ownership moved to
-    # Station. Device, motion, safety, and collection ownership remain below
-    # the leaf, and no such implementation may join this allowlist.
+    # Historic command shims only. Device, motion, safety, and collection
+    # ownership remain below the Station leaf, and no implementation or API
+    # facade may join this allowlist.
     assert violations == {
         "teleop_runtime/collection/umi/app.py": ["control_station"],
-        "teleop_runtime/debug/calibration_web_ui.py": ["control_station"],
         "teleop_runtime/debug/run_vive_rm65_calibration_debug.py": ["control_station"],
         "teleop_runtime/debug/run_vive_rm65_real_teleop.py": ["control_station"],
-        "teleop_runtime/gui/calibration_web_ui.py": ["control_station"],
-        "teleop_runtime/gui/startup_progress.py": ["control_station"],
-        "teleop_runtime/real_teleop/gui_controls.py": ["control_station"],
     }
+
+
+def test_historic_command_shims_are_thin_and_hold_no_runtime_owner() -> None:
+    shim_paths = (
+        REPO_ROOT / "teleop_runtime/collection/umi/app.py",
+        REPO_ROOT / "teleop_runtime/debug/run_vive_rm65_calibration_debug.py",
+        REPO_ROOT / "teleop_runtime/debug/run_vive_rm65_real_teleop.py",
+    )
+    allowed_import_roots = {"__future__", "control_station", "sys"}
+    for path in shim_paths:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        assert len(source.splitlines()) <= 20
+        assert not any(
+            isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            for node in ast.walk(tree)
+        )
+        assert _absolute_import_roots(path) <= allowed_import_roots
