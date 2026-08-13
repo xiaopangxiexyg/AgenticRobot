@@ -782,6 +782,11 @@ def test_explicit_legacy_hardlink_detach_preserves_sibling_and_is_rehydratable(
     sibling_link = tmp_path / "derived-dataset-shared-payload.bin"
     os.link(payload, sibling_link)
     expected = payload.read_bytes()
+    manifest = next((root / "tactile").rglob("manifest.json"))
+    manifest_relative = manifest.relative_to(root)
+    manifest_sibling = tmp_path / "derived-dataset-shared-manifest.json"
+    os.link(manifest, manifest_sibling)
+    expected_manifest = manifest.read_bytes()
 
     with pytest.raises(storage.ModalityStorageError, match="link_count=1"):
         storage.plan_modality_detach(
@@ -815,6 +820,12 @@ def test_explicit_legacy_hardlink_detach_preserves_sibling_and_is_rehydratable(
     assert not payload.exists()
     assert sibling_link.read_bytes() == expected
     assert sibling_link.stat().st_nlink == 1
+    retained_manifest = root / manifest_relative
+    assert retained_manifest.read_bytes() == expected_manifest
+    assert retained_manifest.stat().st_nlink == 1
+    assert manifest_sibling.read_bytes() == expected_manifest
+    assert manifest_sibling.stat().st_nlink == 1
+    assert retained_manifest.stat().st_ino != manifest_sibling.stat().st_ino
 
     rehydrate = storage.plan_modality_rehydrate(
         root,

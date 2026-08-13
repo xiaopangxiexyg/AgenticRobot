@@ -97,6 +97,14 @@ def main() -> int:
     parser.add_argument("--retry-max-delay-sec", type=float, default=60.0)
     parser.add_argument("--cold-staging-namespace", default="")
     parser.add_argument("--exclude-active-collection-date", default="")
+    parser.add_argument(
+        "--allow-disjoint-active-collection",
+        action="store_true",
+        help=(
+            "Allow production maintenance only when every active collection "
+            "dataset root is dynamically proven disjoint from the source."
+        ),
+    )
     args = parser.parse_args()
 
     plan_path = args.plan.expanduser().resolve(strict=True)
@@ -112,6 +120,9 @@ def main() -> int:
     )
     if args.exclude_active_collection_date and not active_roots:
         raise RuntimeError("no exact active collection dataset leaf was resolved")
+    allow_disjoint_collection = bool(active_roots) or bool(
+        args.allow_disjoint_active_collection
+    )
     deadline = time.monotonic() + float(args.wait_timeout_sec)
     while not _retired(wait_root, str(args.wait_inventory_hash)):
         if time.monotonic() >= deadline:
@@ -149,7 +160,7 @@ def main() -> int:
                 target_storage_id="nas2.tactile_archive",
                 confirm_no_active_readers=True,
                 allow_legacy_source=True,
-                allow_disjoint_active_collection=bool(active_roots),
+                allow_disjoint_active_collection=allow_disjoint_collection,
                 active_collection_dataset_roots=active_roots,
                 cold_staging_namespace=str(args.cold_staging_namespace),
             )
@@ -191,7 +202,7 @@ def main() -> int:
                 target_storage_id="nas2.tactile_archive",
                 confirm_no_active_readers=True,
                 allow_legacy_hardlinked_source=True,
-                allow_disjoint_active_collection=bool(active_roots),
+                allow_disjoint_active_collection=allow_disjoint_collection,
                 active_collection_dataset_roots=active_roots,
             )
             break

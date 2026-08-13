@@ -537,14 +537,22 @@ def _copy_inventory_artifacts(
     inventory: ModalityArtifactInventoryV1,
     *,
     roles: frozenset[str] = frozenset({"manifest", "payload"}),
+    allow_hardlinked_source: bool = False,
 ) -> None:
     for artifact in inventory.artifacts:
         if artifact.role not in roles:
             continue
-        _copy_file_new_inode(
-            source_root / artifact.logical_path,
-            target_root / artifact.logical_path,
-        )
+        source = source_root / artifact.logical_path
+        target = target_root / artifact.logical_path
+        if allow_hardlinked_source:
+            _copy_file_resumable(
+                source,
+                target,
+                artifact,
+                allow_hardlinked_source=True,
+            )
+        else:
+            _copy_file_new_inode(source, target)
 
 
 def _exact_artifact_tree(
@@ -1772,6 +1780,7 @@ def _retire_hot_payloads(
     artifact_root: Path,
     source_storage_id: str,
     target_storage_id: str,
+    allow_hardlinked_source: bool = False,
 ) -> Path:
     if not _has_receipt(dataset_root, inventory.semantic_content_hash, "export_shadow"):
         raise ModalityStorageError("retirement requires a successful export receipt")
@@ -1787,6 +1796,7 @@ def _retire_hot_payloads(
             stage,
             inventory,
             roles=frozenset({"manifest"}),
+            allow_hardlinked_source=allow_hardlinked_source,
         )
         _fsync_tree(stage)
         _write_journal(
@@ -2131,20 +2141,24 @@ def detach_modality(
             allow_disjoint_active_collection=allow_disjoint_active_collection,
             active_collection_dataset_roots=explicit_active_roots,
         )
-        retire = (
-            _retire_hot_module_tree
-            if scope == WHOLE_PREFIX_DETACH
-            else _retire_hot_payloads
-        )
-        receipt_paths.append(
-            retire(
+        if scope == WHOLE_PREFIX_DETACH:
+            retirement_receipt = _retire_hot_module_tree(
                 root,
                 inventory,
                 artifact_root=artifact_root,
                 source_storage_id=source_storage_id,
                 target_storage_id=target_storage_id,
             )
-        )
+        else:
+            retirement_receipt = _retire_hot_payloads(
+                root,
+                inventory,
+                artifact_root=artifact_root,
+                source_storage_id=source_storage_id,
+                target_storage_id=target_storage_id,
+                allow_hardlinked_source=allow_legacy_hardlinked_source,
+            )
+        receipt_paths.append(retirement_receipt)
         final = resolve_modality_availability(
             root,
             inventory,

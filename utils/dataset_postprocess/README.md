@@ -12,7 +12,7 @@ DexTeleop dataset 后处理工具集合。默认以 dry-run / 写新目录为主
 使用带 `pyarrow` 的环境：
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 ```
 
 ### 混合触觉数据的一体化入口（推荐）

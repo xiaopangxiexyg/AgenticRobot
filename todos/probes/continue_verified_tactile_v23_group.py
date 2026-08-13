@@ -125,6 +125,7 @@ def _detach(
     scan_payload_hashes: bool,
     max_delay: float,
     active_roots: tuple[Path, ...],
+    allow_disjoint_collection: bool,
 ) -> None:
     if _retired(root):
         print(
@@ -158,7 +159,7 @@ def _detach(
             confirm_no_active_readers=True,
             allow_legacy_hardlinked_source=True,
             legacy_scan_payload_hashes=scan_payload_hashes,
-            allow_disjoint_active_collection=bool(active_roots),
+            allow_disjoint_active_collection=allow_disjoint_collection,
             active_collection_dataset_roots=active_roots,
         )
 
@@ -188,6 +189,14 @@ def main() -> int:
     parser.add_argument("--retry-max-delay-sec", type=float, default=60.0)
     parser.add_argument("--cold-staging-namespace", default="")
     parser.add_argument("--exclude-active-collection-date", default="")
+    parser.add_argument(
+        "--allow-disjoint-active-collection",
+        action="store_true",
+        help=(
+            "Allow production maintenance only when every active collection "
+            "dataset root is dynamically proven disjoint from the source."
+        ),
+    )
     args = parser.parse_args()
 
     roots = _roots(args.plan.expanduser().resolve(strict=True))
@@ -201,6 +210,9 @@ def main() -> int:
     )
     if args.exclude_active_collection_date and not active_roots:
         raise RuntimeError("no exact active collection dataset leaf was resolved")
+    allow_disjoint_collection = bool(active_roots) or bool(
+        args.allow_disjoint_active_collection
+    )
     wait_root = roots[int(args.wait_entry_index)]
     selected_indices = {
         int(args.wait_entry_index),
@@ -231,6 +243,7 @@ def main() -> int:
             scan_payload_hashes=False,
             max_delay=float(args.retry_max_delay_sec),
             active_roots=active_roots,
+            allow_disjoint_collection=allow_disjoint_collection,
         )
 
     scan_root = roots[int(args.scan_export_entry_index)]
@@ -259,7 +272,7 @@ def main() -> int:
                 confirm_no_active_readers=True,
                 allow_legacy_source=True,
                 legacy_scan_payload_hashes=True,
-                allow_disjoint_active_collection=bool(active_roots),
+                allow_disjoint_active_collection=allow_disjoint_collection,
                 active_collection_dataset_roots=active_roots,
                 cold_staging_namespace=str(args.cold_staging_namespace),
             )
@@ -282,6 +295,7 @@ def main() -> int:
             scan_payload_hashes=True,
             max_delay=float(args.retry_max_delay_sec),
             active_roots=active_roots,
+            allow_disjoint_collection=allow_disjoint_collection,
         )
     print(json.dumps({"phase": "group_complete"}, sort_keys=True), flush=True)
     return 0
