@@ -260,6 +260,48 @@ def test_deploy_camera_defaults_match_formal_collection_startup() -> None:
     assert args.camera_start_stagger_sec == camera_runtime.CAMERA_START_STAGGER_SEC
 
 
+@pytest.mark.parametrize(
+    (
+        "warmup_policy",
+        "require_complete",
+        "restart_incomplete",
+        "restart_limit",
+        "reset_on_failure",
+    ),
+    [
+        ("bounded_first_frame", True, True, 3, False),
+        ("legacy", False, False, 0, True),
+    ],
+)
+def test_deploy_single_camera_uses_reversible_stream_lifecycle_profile(
+    warmup_policy: str,
+    require_complete: bool,
+    restart_incomplete: bool,
+    restart_limit: int,
+    reset_on_failure: bool,
+) -> None:
+    args = _parser().parse_args(
+        [
+            "--camera-mode",
+            "single",
+            "--camera-serial",
+            "SERIAL",
+            "--camera-startup-warmup-policy",
+            warmup_policy,
+        ]
+    )
+
+    source = run_policy.build_camera_sources(args)[args.camera_key]
+
+    assert source.config.require_complete_frameset is require_complete
+    assert source.config.restart_on_incomplete_frameset is restart_incomplete
+    assert (
+        source.config.restart_max_attempts_without_complete_frame
+        == restart_limit
+    )
+    assert source.config.startup_hardware_reset_on_failure is reset_on_failure
+
+
 def test_deploy_camera_self_check_uses_collection_freshness_gate() -> None:
     class _Source:
         name = "front"
