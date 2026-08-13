@@ -8,10 +8,15 @@ authorizes hardware.  Hardware authorization remains a separate runtime fact.
 from __future__ import annotations
 
 from robot_motion.action import (
+    ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH,
+    ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID,
     ActionComponentCatalog,
     ActionComponentSpec,
+    ComponentTargetCapabilitySpec,
     DecisionScheduleSpec,
     build_m6_candidate_policy_arm_qpos_manifest,
+    build_robot_action_v1_runtime_schema,
+    build_robot_action_v1_target_capability,
     build_scheduled_reference_segment_activation_spec,
 )
 from robot_motion.position_control import ExecutionCapabilityProfile
@@ -40,10 +45,10 @@ def build_rm65_policy_arm_qpos_candidate_capability() -> ExecutionCapabilityProf
     )
 
 
-def build_rm65_policy_arm_qpos_candidate_manifest():
-    """Return the deterministic ``m6_candidate_policy_arm_qpos_v1`` manifest."""
+def build_rm65_policy_arm_qpos_candidate_catalog() -> ActionComponentCatalog:
+    """Return the exact component catalog bound into the candidate."""
 
-    catalog = ActionComponentCatalog(
+    return ActionComponentCatalog(
         catalog_id="rm65-arms-only-inventory-v1",
         action_space="bimanual_qpos_v1",
         components=(
@@ -51,6 +56,34 @@ def build_rm65_policy_arm_qpos_candidate_manifest():
             ActionComponentSpec("right_arm", "arms", "right_arm", coupled=True),
         ),
     )
+
+
+def build_rm65_policy_arm_qpos_candidate_target_capability(
+) -> ComponentTargetCapabilitySpec:
+    """Expose the exact target capability previously retained only by hash.
+
+    The candidate manifest already binds this capability hash.  Returning the
+    immutable object lets a target-runtime provider reuse the same action
+    schema without changing the legacy manifest or execution path.
+    """
+
+    catalog = build_rm65_policy_arm_qpos_candidate_catalog()
+    action_schema = build_robot_action_v1_runtime_schema(
+        component_catalog=catalog,
+    )
+    return build_robot_action_v1_target_capability(
+        capability_id="m6-candidate-robot-action-v1-target",
+        action_schema=action_schema,
+        handler_contract_id=ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_ID,
+        handler_contract_hash=ROBOT_ACTION_V1_TARGET_ADAPTER_CONTRACT_HASH,
+        output_target_schema_hash=catalog.semantic_content_hash,
+    )
+
+
+def build_rm65_policy_arm_qpos_candidate_manifest():
+    """Return the deterministic ``m6_candidate_policy_arm_qpos_v1`` manifest."""
+
+    catalog = build_rm65_policy_arm_qpos_candidate_catalog()
     capability = build_rm65_policy_arm_qpos_candidate_capability()
     schedule = DecisionScheduleSpec(
         spec_id="rm65-arms-only-inventory-schedule-v1",
@@ -72,5 +105,7 @@ def build_rm65_policy_arm_qpos_candidate_manifest():
 
 __all__ = [
     "build_rm65_policy_arm_qpos_candidate_capability",
+    "build_rm65_policy_arm_qpos_candidate_catalog",
     "build_rm65_policy_arm_qpos_candidate_manifest",
+    "build_rm65_policy_arm_qpos_candidate_target_capability",
 ]
