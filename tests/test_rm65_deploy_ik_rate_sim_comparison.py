@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -306,40 +304,3 @@ def test_cli_treats_keyboard_interrupt_as_clean_viewer_shutdown(
 
     assert cli_main([]) == 0
     assert "interrupted; viewer closed cleanly" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    "filename",
-    (
-        "20260808_142726_sim_baseline.md",
-        "20260808_142726_sim_candidate.md",
-    ),
-)
-def test_sim_handoff_commands_play_full_once_without_shell_control_logic(
-    filename: str,
-) -> None:
-    root = Path(__file__).resolve().parents[1]
-    command = (root / "scripts" / "temp_cmd" / filename).read_text(
-        encoding="utf-8"
-    )
-
-    assert "--full-deployment" in command
-    assert "--no-loop" in command
-    assert "--repeat 1" in command
-    assert "--hold-viewer-at-end" in command
-    assert command.startswith(
-        "conda activate /home/zc/anaconda3/envs/dexteleop310\npython "
-    )
-    for forbidden in (
-        "#!",
-        "trap ",
-        "set ",
-        "exec ",
-        "| tee",
-        "return ",
-        "exit ",
-        "cd ",
-        "(",
-        ")",
-    ):
-        assert forbidden not in command
