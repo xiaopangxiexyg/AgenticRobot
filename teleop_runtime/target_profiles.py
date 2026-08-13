@@ -8,9 +8,11 @@ handle, opens a device, or grants motion authority.
 Asset references are hash identities only; local presence and integrity remain
 a later provider/application preflight responsibility.
 
-Concrete profile bindings live with their provider packages.  The catalog is
-explicitly assembled by an application so importing this module does not
-discover or import hardware integrations.
+Portable profile specs contain no Python loader and can be stored, audited, or
+compared without importing an integration package.  A provider package binds
+one of those specs to an explicit allowlisted loader.  The catalog is assembled
+by an application, so importing this module does not discover or import
+hardware integrations.
 """
 
 from __future__ import annotations
@@ -30,8 +32,15 @@ from robot_motion.target_runtime import (
 )
 
 
+TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1 = "dexteleop.target_runtime_profile_spec.v1"
+# The first profile-selection slice already exposed this hash identity.  A
+# portable spec is the same semantic object with the loader removed, so retain
+# the domain and all existing profile/preflight hashes.
 TARGET_RUNTIME_PROFILE_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.target_runtime_profile_binding.v1"
+)
+TARGET_RUNTIME_PROFILE_SPEC_HASH_DOMAIN_V1 = (
+    TARGET_RUNTIME_PROFILE_BINDING_HASH_DOMAIN_V1
 )
 TARGET_RUNTIME_PROFILE_PREFLIGHT_HASH_DOMAIN_V1 = (
     "dexteleop.target_runtime_profile_preflight.v1"
@@ -81,13 +90,19 @@ def _hashes_by_id(
 
 
 @dataclass(frozen=True)
-class TargetRuntimeProfileBinding:
-    """Hash-bound allowlist entry for one selectable target profile."""
+class TargetRuntimeProfileSpec:
+    """Portable exact-profile allowlist with no loader or vendor code.
+
+    A spec pins every resolved runtime surface that an application is willing
+    to use.  It intentionally contains only immutable data.  The provider
+    identity hash binds the future executable integration without embedding a
+    module path or importing its package.
+    """
 
     profile_id: str
     profile_version: str
     requirement_id_prefix: str
-    provider_entry: TargetRuntimeProviderRegistryEntry
+    provider_identity_hash: str
     supported_clock_domain_ids: tuple[str, ...]
     expected_manifest_version: str
     expected_embodiment_definition_id: str
@@ -104,21 +119,19 @@ class TargetRuntimeProfileBinding:
         default_factory=dict
     )
     semantic_content_hash: str = field(init=False)
+    schema: str = field(
+        default=TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1,
+        init=False,
+    )
 
     def __post_init__(self) -> None:
-        if not isinstance(
-            self.provider_entry,
-            TargetRuntimeProviderRegistryEntry,
-        ):
-            raise TypeError(
-                "provider_entry must be TargetRuntimeProviderRegistryEntry."
-            )
         identifiers = {
             name: _required(getattr(self, name), name=name)
             for name in (
                 "profile_id",
                 "profile_version",
                 "requirement_id_prefix",
+                "provider_identity_hash",
                 "expected_manifest_version",
                 "expected_embodiment_definition_id",
                 "expected_embodiment_definition_hash",
@@ -177,19 +190,26 @@ class TargetRuntimeProfileBinding:
             self,
             "semantic_content_hash",
             canonical_content_hash(
-                self.semantic_payload(include_hash=False),
-                domain=TARGET_RUNTIME_PROFILE_BINDING_HASH_DOMAIN_V1,
+                self._semantic_content_payload(),
+                domain=TARGET_RUNTIME_PROFILE_SPEC_HASH_DOMAIN_V1,
             ),
         )
 
-    def semantic_payload(self, *, include_hash: bool = True) -> dict[str, object]:
+    def _semantic_content_payload(self) -> dict[str, object]:
+        payload = self.to_payload(include_hash=False)
+        # The schema labels the portable envelope.  It is omitted from the
+        # content body to preserve the exact v1 binding hash already emitted
+        # before the loader-free representation was introduced.
+        payload.pop("schema")
+        return payload
+
+    def to_payload(self, *, include_hash: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
+            "schema": self.schema,
             "profile_id": self.profile_id,
             "profile_version": self.profile_version,
             "requirement_id_prefix": self.requirement_id_prefix,
-            "provider_identity_hash": (
-                self.provider_entry.provider_identity.semantic_content_hash
-            ),
+            "provider_identity_hash": self.provider_identity_hash,
             "supported_clock_domain_ids": self.supported_clock_domain_ids,
             "expected_manifest_version": self.expected_manifest_version,
             "expected_embodiment_definition_id": (
@@ -217,6 +237,85 @@ class TargetRuntimeProfileBinding:
         if include_hash:
             payload["semantic_content_hash"] = self.semantic_content_hash
         return payload
+
+    def semantic_payload(self, *, include_hash: bool = True) -> dict[str, object]:
+        return self.to_payload(include_hash=include_hash)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "TargetRuntimeProfileSpec":
+        if not isinstance(payload, Mapping):
+            raise TypeError("payload must be a mapping.")
+        if payload.get("schema") != TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1:
+            raise ValueError("Unsupported target runtime profile spec schema.")
+        clock_domains = payload.get("supported_clock_domain_ids", ())
+        component_ids = payload.get("expected_component_ids", ())
+        operation_hashes = payload.get(
+            "expected_operation_capability_hash_by_id",
+            {},
+        )
+        asset_hashes = payload.get(
+            "expected_asset_reference_hash_by_id",
+            {},
+        )
+        if isinstance(clock_domains, (str, bytes)):
+            raise TypeError("supported_clock_domain_ids must be a sequence.")
+        if isinstance(component_ids, (str, bytes)):
+            raise TypeError("expected_component_ids must be a sequence.")
+        if not isinstance(operation_hashes, Mapping):
+            raise TypeError(
+                "expected_operation_capability_hash_by_id must be a mapping."
+            )
+        if not isinstance(asset_hashes, Mapping):
+            raise TypeError(
+                "expected_asset_reference_hash_by_id must be a mapping."
+            )
+        result = cls(
+            profile_id=payload.get("profile_id", ""),
+            profile_version=payload.get("profile_version", ""),
+            requirement_id_prefix=payload.get("requirement_id_prefix", ""),
+            provider_identity_hash=payload.get("provider_identity_hash", ""),
+            supported_clock_domain_ids=tuple(clock_domains),
+            expected_manifest_version=payload.get(
+                "expected_manifest_version",
+                "",
+            ),
+            expected_embodiment_definition_id=payload.get(
+                "expected_embodiment_definition_id",
+                "",
+            ),
+            expected_embodiment_definition_hash=payload.get(
+                "expected_embodiment_definition_hash",
+                "",
+            ),
+            expected_target_handler_id=payload.get(
+                "expected_target_handler_id",
+                "",
+            ),
+            expected_action_schema_hash=payload.get(
+                "expected_action_schema_hash",
+                "",
+            ),
+            expected_component_target_capability_hash=payload.get(
+                "expected_component_target_capability_hash",
+                "",
+            ),
+            expected_component_ids=tuple(component_ids),
+            expected_execution_observation_capability_hash=payload.get(
+                "expected_execution_observation_capability_hash"
+            ),
+            expected_operation_capability_hash_by_id=dict(operation_hashes),
+            expected_asset_reference_hash_by_id=dict(asset_hashes),
+        )
+        declared_hash = payload.get("semantic_content_hash")
+        if (
+            declared_hash is not None
+            and str(declared_hash) != result.semantic_content_hash
+        ):
+            raise ValueError("Target runtime profile spec semantic hash mismatch.")
+        return result
 
     def validate_manifest(
         self,
@@ -248,7 +347,7 @@ class TargetRuntimeProfileBinding:
             (
                 "provider_identity_hash",
                 manifest.provider.semantic_content_hash,
-                self.provider_entry.provider_identity.semantic_content_hash,
+                self.provider_identity_hash,
             ),
             (
                 "embodiment_definition_id",
@@ -302,6 +401,172 @@ class TargetRuntimeProfileBinding:
                 "Resolved target runtime manifest differs from selected "
                 f"profile {self.profile_id!r}: {','.join(mismatches)}."
             )
+
+
+@dataclass(frozen=True)
+class TargetRuntimeProfileBinding:
+    """One portable profile spec bound to an allowlisted provider loader.
+
+    The constructor retains the original flat field surface for compatibility.
+    ``profile_spec`` is the authoritative, loader-free representation and the
+    binding's semantic hash is exactly the spec hash.
+    """
+
+    profile_id: str
+    profile_version: str
+    requirement_id_prefix: str
+    provider_entry: TargetRuntimeProviderRegistryEntry
+    supported_clock_domain_ids: tuple[str, ...]
+    expected_manifest_version: str
+    expected_embodiment_definition_id: str
+    expected_embodiment_definition_hash: str
+    expected_target_handler_id: str
+    expected_action_schema_hash: str
+    expected_component_target_capability_hash: str
+    expected_component_ids: tuple[str, ...]
+    expected_execution_observation_capability_hash: str | None
+    expected_operation_capability_hash_by_id: Mapping[str, str] = field(
+        default_factory=dict
+    )
+    expected_asset_reference_hash_by_id: Mapping[str, str] = field(
+        default_factory=dict
+    )
+    profile_spec: TargetRuntimeProfileSpec = field(init=False)
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.provider_entry,
+            TargetRuntimeProviderRegistryEntry,
+        ):
+            raise TypeError(
+                "provider_entry must be TargetRuntimeProviderRegistryEntry."
+            )
+        spec = TargetRuntimeProfileSpec(
+            profile_id=self.profile_id,
+            profile_version=self.profile_version,
+            requirement_id_prefix=self.requirement_id_prefix,
+            provider_identity_hash=(
+                self.provider_entry.provider_identity.semantic_content_hash
+            ),
+            supported_clock_domain_ids=tuple(self.supported_clock_domain_ids),
+            expected_manifest_version=self.expected_manifest_version,
+            expected_embodiment_definition_id=(
+                self.expected_embodiment_definition_id
+            ),
+            expected_embodiment_definition_hash=(
+                self.expected_embodiment_definition_hash
+            ),
+            expected_target_handler_id=self.expected_target_handler_id,
+            expected_action_schema_hash=self.expected_action_schema_hash,
+            expected_component_target_capability_hash=(
+                self.expected_component_target_capability_hash
+            ),
+            expected_component_ids=tuple(self.expected_component_ids),
+            expected_execution_observation_capability_hash=(
+                self.expected_execution_observation_capability_hash
+            ),
+            expected_operation_capability_hash_by_id=(
+                self.expected_operation_capability_hash_by_id
+            ),
+            expected_asset_reference_hash_by_id=(
+                self.expected_asset_reference_hash_by_id
+            ),
+        )
+        for name in (
+            "profile_id",
+            "profile_version",
+            "requirement_id_prefix",
+            "supported_clock_domain_ids",
+            "expected_manifest_version",
+            "expected_embodiment_definition_id",
+            "expected_embodiment_definition_hash",
+            "expected_target_handler_id",
+            "expected_action_schema_hash",
+            "expected_component_target_capability_hash",
+            "expected_component_ids",
+            "expected_execution_observation_capability_hash",
+            "expected_operation_capability_hash_by_id",
+            "expected_asset_reference_hash_by_id",
+        ):
+            object.__setattr__(self, name, getattr(spec, name))
+        object.__setattr__(self, "profile_spec", spec)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            spec.semantic_content_hash,
+        )
+
+    @classmethod
+    def from_spec(
+        cls,
+        spec: TargetRuntimeProfileSpec,
+        *,
+        provider_entry: TargetRuntimeProviderRegistryEntry,
+    ) -> "TargetRuntimeProfileBinding":
+        if not isinstance(spec, TargetRuntimeProfileSpec):
+            raise TypeError("spec must be TargetRuntimeProfileSpec.")
+        if not isinstance(provider_entry, TargetRuntimeProviderRegistryEntry):
+            raise TypeError(
+                "provider_entry must be TargetRuntimeProviderRegistryEntry."
+            )
+        if (
+            provider_entry.provider_identity.semantic_content_hash
+            != spec.provider_identity_hash
+        ):
+            raise ValueError(
+                "Target runtime profile spec belongs to another provider "
+                "identity."
+            )
+        return cls(
+            profile_id=spec.profile_id,
+            profile_version=spec.profile_version,
+            requirement_id_prefix=spec.requirement_id_prefix,
+            provider_entry=provider_entry,
+            supported_clock_domain_ids=spec.supported_clock_domain_ids,
+            expected_manifest_version=spec.expected_manifest_version,
+            expected_embodiment_definition_id=(
+                spec.expected_embodiment_definition_id
+            ),
+            expected_embodiment_definition_hash=(
+                spec.expected_embodiment_definition_hash
+            ),
+            expected_target_handler_id=spec.expected_target_handler_id,
+            expected_action_schema_hash=spec.expected_action_schema_hash,
+            expected_component_target_capability_hash=(
+                spec.expected_component_target_capability_hash
+            ),
+            expected_component_ids=spec.expected_component_ids,
+            expected_execution_observation_capability_hash=(
+                spec.expected_execution_observation_capability_hash
+            ),
+            expected_operation_capability_hash_by_id=(
+                spec.expected_operation_capability_hash_by_id
+            ),
+            expected_asset_reference_hash_by_id=(
+                spec.expected_asset_reference_hash_by_id
+            ),
+        )
+
+    def semantic_payload(self, *, include_hash: bool = True) -> dict[str, object]:
+        payload = self.profile_spec.to_payload(include_hash=include_hash)
+        # Preserve the original binding payload shape.  New portable callers
+        # should serialize ``profile_spec`` and therefore receive its schema.
+        payload.pop("schema")
+        return payload
+
+    def validate_manifest(
+        self,
+        manifest: ResolvedTargetRuntimeManifest,
+    ) -> None:
+        if (
+            self.provider_entry.provider_identity.semantic_content_hash
+            != self.profile_spec.provider_identity_hash
+        ):
+            raise ValueError(
+                "Target runtime profile binding provider identity drifted."
+            )
+        self.profile_spec.validate_manifest(manifest)
 
 
 @dataclass(frozen=True)
@@ -402,6 +667,11 @@ class TargetRuntimeProfileCatalog:
             for profile_id in self.profile_ids()
         )
 
+    def profile_specs(self) -> tuple[TargetRuntimeProfileSpec, ...]:
+        """List portable profiles without invoking any provider loader."""
+
+        return tuple(binding.profile_spec for binding in self.profile_bindings())
+
     def preflight(
         self,
         profile_id: str,
@@ -463,7 +733,10 @@ class TargetRuntimeProfileCatalog:
 __all__ = [
     "TARGET_RUNTIME_PROFILE_BINDING_HASH_DOMAIN_V1",
     "TARGET_RUNTIME_PROFILE_PREFLIGHT_HASH_DOMAIN_V1",
+    "TARGET_RUNTIME_PROFILE_SPEC_HASH_DOMAIN_V1",
+    "TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1",
     "TargetRuntimeProfileBinding",
     "TargetRuntimeProfileCatalog",
     "TargetRuntimeProfilePreflight",
+    "TargetRuntimeProfileSpec",
 ]

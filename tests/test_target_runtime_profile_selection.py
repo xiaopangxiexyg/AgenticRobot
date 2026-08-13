@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -22,8 +23,11 @@ from teleop_runtime.deploy.rm65_target_runtime_provider import (
     build_rm65_policy_arm_qpos_candidate_target_profile_binding,
 )
 from teleop_runtime.target_profiles import (
+    TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1,
+    TargetRuntimeProfileBinding,
     TargetRuntimeProfileCatalog,
     TargetRuntimeProfilePreflight,
+    TargetRuntimeProfileSpec,
 )
 
 
@@ -88,6 +92,99 @@ def test_profile_hash_excludes_loader_object_but_binds_provider_identity() -> No
     assert another_identity.semantic_content_hash != binding.semantic_content_hash
 
 
+def test_portable_profile_spec_round_trips_arbitrary_component_topology() -> None:
+    spec = TargetRuntimeProfileSpec(
+        profile_id="fixture-arbitrary-topology-v1",
+        profile_version="1",
+        requirement_id_prefix="fixture:arbitrary-target",
+        provider_identity_hash="fixture-provider-identity-hash-v1",
+        supported_clock_domain_ids=("clock.z", "clock.a"),
+        expected_manifest_version="1",
+        expected_embodiment_definition_id="fixture-arbitrary-definition-v1",
+        expected_embodiment_definition_hash="fixture-definition-hash-v1",
+        expected_target_handler_id="fixture-arbitrary-handler-v1",
+        expected_action_schema_hash="fixture-arbitrary-action-schema-v1",
+        expected_component_target_capability_hash=(
+            "fixture-arbitrary-target-capability-v1"
+        ),
+        expected_component_ids=(
+            "mobile_base/planar_velocity",
+            "mast/lift_position",
+            "tool/vacuum_state",
+        ),
+        expected_execution_observation_capability_hash=(
+            "fixture-arbitrary-observation-v1"
+        ),
+        expected_operation_capability_hash_by_id={
+            "embodiment.read_diagnostics": "fixture-diagnostics-hash-v1",
+            "tool.release": "fixture-release-hash-v1",
+        },
+        expected_asset_reference_hash_by_id={
+            "controller-map": "fixture-controller-map-hash-v1",
+            "kinematic-description": "fixture-kinematic-description-hash-v1",
+        },
+    )
+
+    payload = json.loads(json.dumps(spec.to_payload()))
+    restored = TargetRuntimeProfileSpec.from_payload(payload)
+
+    assert restored == spec
+    assert restored.schema == TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1
+    assert restored.supported_clock_domain_ids == ("clock.a", "clock.z")
+    assert restored.expected_component_ids == (
+        "mobile_base/planar_velocity",
+        "mast/lift_position",
+        "tool/vacuum_state",
+    )
+    assert "provider_entry" not in payload
+    assert "loader" not in payload
+
+
+def test_portable_profile_spec_rejects_schema_or_content_tampering() -> None:
+    spec = (
+        build_rm65_policy_arm_qpos_candidate_target_profile_binding().profile_spec
+    )
+    wrong_schema = spec.to_payload()
+    wrong_schema["schema"] = "fixture.unsupported-profile-schema.v9"
+    with pytest.raises(ValueError, match="Unsupported target runtime profile"):
+        TargetRuntimeProfileSpec.from_payload(wrong_schema)
+
+    tampered = spec.to_payload()
+    tampered["expected_component_ids"] = ["unexpected/component"]
+    with pytest.raises(ValueError, match="semantic hash mismatch"):
+        TargetRuntimeProfileSpec.from_payload(tampered)
+
+
+def test_portable_spec_binds_to_allowlisted_provider_identity_only() -> None:
+    binding = build_rm65_policy_arm_qpos_candidate_target_profile_binding()
+    restored_spec = TargetRuntimeProfileSpec.from_payload(
+        json.loads(json.dumps(binding.profile_spec.to_payload()))
+    )
+    restored_binding = TargetRuntimeProfileBinding.from_spec(
+        restored_spec,
+        provider_entry=binding.provider_entry,
+    )
+
+    assert restored_binding.profile_spec == binding.profile_spec
+    assert restored_binding.semantic_content_hash == binding.semantic_content_hash
+    assert restored_binding.provider_entry is binding.provider_entry
+    assert "schema" not in restored_binding.semantic_payload()
+
+    another_identity = replace(
+        binding.provider_entry.provider_identity,
+        provider_id="fixture.wrong-provider",
+        implementation_contract_hash="fixture-wrong-provider-contract",
+    )
+    with pytest.raises(ValueError, match="another provider identity"):
+        TargetRuntimeProfileBinding.from_spec(
+            restored_spec,
+            provider_entry=TargetRuntimeProviderRegistryEntry(
+                provider_identity=another_identity,
+                loader=binding.provider_entry.loader,
+            ),
+        )
+
+
 def test_catalog_lists_without_loading_and_loads_only_selected_profile() -> None:
     binding = build_rm65_policy_arm_qpos_candidate_target_profile_binding()
     selected_load_count = 0
@@ -130,6 +227,10 @@ def test_catalog_lists_without_loading_and_loads_only_selected_profile() -> None
         RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
     )
     assert tuple(item.profile_id for item in catalog.profile_bindings()) == (
+        "fixture-decoy-profile",
+        RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
+    )
+    assert tuple(item.profile_id for item in catalog.profile_specs()) == (
         "fixture-decoy-profile",
         RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
     )
