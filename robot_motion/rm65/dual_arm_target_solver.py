@@ -621,6 +621,10 @@ class DualArmCollisionAwareRetargeterConfig:
     # is admitted on the next reference tick.  Zero preserves the historical
     # Active fast-path behavior.
     output_qpos_admittance_micro_reversal_hold_deg: float = 0.0
+    # Optional nonzero step admitted on the confirmation tick instead of an
+    # exact joint hold.  It is capped by the hold threshold and is force-path
+    # metadata only; zero preserves the original one-tick stop.
+    output_qpos_admittance_micro_reversal_creep_deg: float = 0.0
     # When q5 is in the narrow escape band, use the already safety-bounded
     # fast EMA endpoint instead of the normal slow alpha.  This only changes
     # the q5 singular neighborhood; all other joints retain the normal
@@ -1008,6 +1012,22 @@ class DualArmCollisionAwareRetargeterConfig:
         self.output_qpos_admittance_micro_reversal_hold_deg = (
             admittance_reversal_hold_deg
         )
+        admittance_reversal_creep_deg = float(
+            self.output_qpos_admittance_micro_reversal_creep_deg
+        )
+        if (
+            not np.isfinite(admittance_reversal_creep_deg)
+            or admittance_reversal_creep_deg < 0.0
+            or admittance_reversal_creep_deg
+            > admittance_reversal_hold_deg + 1e-12
+        ):
+            raise ValueError(
+                "output_qpos_admittance_micro_reversal_creep_deg must be "
+                "finite and in [0, hold_deg]."
+            )
+        self.output_qpos_admittance_micro_reversal_creep_deg = (
+            admittance_reversal_creep_deg
+        )
         if self.output_qpos_smoothing_singularity_alpha is not None:
             singularity_alpha = float(self.output_qpos_smoothing_singularity_alpha)
             if not np.isfinite(singularity_alpha) or not 0.0 <= singularity_alpha <= 1.0:
@@ -1168,6 +1188,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self.target_override_filter: Callable[
             [dict[str, np.ndarray], TeleopObservation, Any | None],
             dict[str, np.ndarray] | None,
+        ] | None = None
+        # Canonical safety owns a separate, final target boundary.  Unlike
+        # ``target_override_filter`` (which composes optional source modifiers),
+        # this hook is evaluated inside every bimanual solve path immediately
+        # before IK.  Keeping it separate prevents a later-installed modifier
+        # or a direct recovery ``build_command_for_context`` call from bypassing
+        # an Active target-space safety projector.  The default remains inert.
+        self.pre_ik_target_safety_filter: Callable[
+            [dict[str, np.ndarray]],
+            Mapping[str, np.ndarray] | None,
         ] | None = None
         if ik_solver is not None:
             self.ik_solver = ik_solver
@@ -2216,6 +2246,40 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         profile = self._profile_template()
         left_target = as_pose_matrix(left_input_target)
         right_target = as_pose_matrix(right_input_target)
+        pre_ik_target_safety_metadata: dict[str, object] | None = None
+        if self.pre_ik_target_safety_filter is not None:
+            safety_result = self.pre_ik_target_safety_filter(
+                {
+                    "left": left_target.copy(),
+                    "right": right_target.copy(),
+                }
+            )
+            if safety_result is not None:
+                if not isinstance(safety_result, Mapping):
+                    raise TypeError(
+                        "pre-IK target safety filter must return a side mapping or None"
+                    )
+                expected_sides = {"left", "right"}
+                actual_sides = set(safety_result)
+                if actual_sides != expected_sides:
+                    raise ValueError(
+                        "pre-IK target safety filter must return exactly left and right; "
+                        f"got={sorted(actual_sides)}"
+                    )
+                left_target = as_pose_matrix(safety_result["left"])
+                right_target = as_pose_matrix(safety_result["right"])
+            metadata_provider = getattr(
+                self.pre_ik_target_safety_filter,
+                "command_metadata",
+                None,
+            )
+            if callable(metadata_provider):
+                provided_metadata = metadata_provider()
+                if not isinstance(provided_metadata, Mapping):
+                    raise TypeError(
+                        "pre-IK target safety command_metadata must return a mapping"
+                    )
+                pre_ik_target_safety_metadata = dict(provided_metadata)
         current_targets = {"left": left_target.copy(), "right": right_target.copy()}
         solver_targets_before_solve = self.current_world_targets()
         target_activity_metadata = self._target_activity_metadata(
@@ -2301,6 +2365,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "target_activity": dict(target_activity_metadata),
             }
         )
+        if pre_ik_target_safety_metadata is not None:
+            output_metadata["tcp_pose_envelope"] = pre_ik_target_safety_metadata
 
         status = "tracking"
         fallback_reason: str | None = None
@@ -4099,6 +4165,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         admittance_micro_reversal_hold_deg = float(
             self.config.output_qpos_admittance_micro_reversal_hold_deg
         )
+        admittance_micro_reversal_creep_deg = float(
+            self.config.output_qpos_admittance_micro_reversal_creep_deg
+        )
         singularity_boost_by_side: dict[str, dict[str, object]] = {}
         normal_fast_path_by_side: dict[str, dict[str, object]] = {}
         admittance_fast_path_by_side: dict[str, dict[str, object]] = {}
@@ -4318,7 +4387,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "micro_reversal_hold_threshold_deg": (
                     admittance_micro_reversal_hold_deg
                 ),
+                "micro_reversal_creep_deg": (
+                    admittance_micro_reversal_creep_deg
+                ),
                 "micro_reversal_held_joint_indices": [],
+                "micro_reversal_softened_joint_indices": [],
                 "micro_reversal_pending_joint_indices": [],
                 "hard_solver_guards_satisfied": bool(
                     singularity_mode_enabled
@@ -4392,6 +4465,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     np.asarray(raw_qpos, dtype=float).reshape(6) - previous_qpos
                 )
                 held_joint_indices: list[int] = []
+                softened_joint_indices: list[int] = []
                 pending = self._output_qpos_admittance_pending_reversal_direction[
                     side
                 ]
@@ -4421,15 +4495,27 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                             and min(abs(previous_value), abs(proposed))
                             <= threshold_rad + 1e-12
                         ):
-                            proposed_step[joint_index] = 0.0
+                            creep_rad = float(
+                                np.deg2rad(admittance_micro_reversal_creep_deg)
+                            )
+                            proposed_step[joint_index] = math.copysign(
+                                min(abs(proposed), creep_rad),
+                                proposed,
+                            )
                             pending[joint_index] = proposed_direction
-                            held_joint_indices.append(joint_index)
+                            if creep_rad <= 0.0:
+                                held_joint_indices.append(joint_index)
+                            else:
+                                softened_joint_indices.append(joint_index)
                 else:
                     pending.fill(0.0)
                 smoothed_by_side[side] = previous_qpos + proposed_step
                 admittance_fast_path_by_side[side][
                     "micro_reversal_held_joint_indices"
                 ] = held_joint_indices
+                admittance_fast_path_by_side[side][
+                    "micro_reversal_softened_joint_indices"
+                ] = softened_joint_indices
                 admittance_fast_path_by_side[side][
                     "micro_reversal_pending_joint_indices"
                 ] = np.flatnonzero(pending).astype(int).tolist()

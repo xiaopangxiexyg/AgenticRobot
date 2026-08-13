@@ -234,6 +234,7 @@ class RM65PositionCollisionPlannerConfig:
     collision_distance_epsilon_m: float = DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M
     collision_barrier_gain: float = DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN
     collision_safe_displacement_gain: float = DEFAULT_DUAL_ARM_COLLISION_SAFE_DISPLACEMENT_GAIN
+    collision_constraints_enabled: bool = True
     max_joint_velocity_rad_s: tuple[float, ...] | Sequence[float] = (
         DEFAULT_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S
     )
@@ -257,6 +258,8 @@ class RM65PositionCollisionPlannerConfig:
     ik_tuning: Any | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.collision_constraints_enabled, bool):
+            raise TypeError("collision_constraints_enabled must be a bool.")
         reference_hz = _finite_positive(self.reference_hz, name="reference_hz")
         scene_profile = str(self.scene_profile or DEFAULT_COLLISION_SCENE).strip()
         if not scene_profile:
@@ -711,6 +714,9 @@ class RM65PositionCollisionPlanner:
                     collision_barrier_gain=float(self.config.collision_barrier_gain),
                     collision_safe_displacement_gain=float(
                         self.config.collision_safe_displacement_gain
+                    ),
+                    collision_constraints_enabled=(
+                        self.config.collision_constraints_enabled
                     ),
                     debug_profile=bool(self.config.debug_profile),
                     ik_tuning=self.config.ik_tuning,

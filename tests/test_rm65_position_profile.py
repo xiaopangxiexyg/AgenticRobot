@@ -210,6 +210,12 @@ def test_balanced_60hz_jerk_v2_changes_only_source_latch_and_keeps_v1_rollback()
     assert v2.to_metadata()["action_execution"]["command"][
         "sample_aligned_governor"
     ]["source_latch_mode"] == SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP
+    # Formal pure-position release identity promoted after the 2026-08-11
+    # dual-arm real run.  Any semantic profile change must use a new name and
+    # hash rather than silently changing this released control surface.
+    assert v2.to_metadata()["sha256"] == (
+        "dc97dc0e07a6ffc486ed50042899bcfef448a844f48ff883201ee1542f900380"
+    )
 
 
 def test_sample_aligned_jerk_profile_is_execution_only_and_reversible() -> None:

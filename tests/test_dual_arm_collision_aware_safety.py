@@ -13,6 +13,13 @@ from robot_motion.rm65 import (
     BimanualPoseTarget,
     BimanualPoseTargetSource,
 )
+import robot_motion.rm65.ik as rm65_ik_module
+import robot_motion.rm65.dual_arm_ik as rm65_dual_arm_ik_module
+from robot_motion.rm65.ik import (
+    RM65DualArmCollisionIKConfig,
+    build_rm65_dual_arm_collision_ik_solver,
+)
+from robot_motion.rm65.scene_profiles import DualArmSceneProfile
 from robot_motion.rm65.dual_arm_ik import (
     MultiTaskIKSolver,
     _AdmittedReferenceMotionLimit,
@@ -1591,6 +1598,113 @@ def test_bimanual_contract_facade_has_explicit_compatibility_rollback() -> None:
     }
 
 
+def test_pre_ik_target_safety_filter_covers_direct_context_solve() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    safety_calls = 0
+    activity_targets: list[dict[str, np.ndarray]] = []
+    original_activity = retargeter._target_activity_metadata
+
+    def record_activity(targets, *, source_metadata_by_side):
+        activity_targets.append(
+            {
+                side: np.asarray(pose, dtype=float).copy()
+                for side, pose in targets.items()
+            }
+        )
+        return original_activity(
+            targets,
+            source_metadata_by_side=source_metadata_by_side,
+        )
+
+    retargeter._target_activity_metadata = record_activity  # type: ignore[method-assign]
+
+    def project(targets):
+        nonlocal safety_calls
+        safety_calls += 1
+        projected = {
+            side: np.asarray(pose, dtype=float).copy()
+            for side, pose in targets.items()
+        }
+        projected["left"][0, 3] = 0.05
+        return projected
+
+    project.command_metadata = lambda: {  # type: ignore[attr-defined]
+        "mode": "active",
+        "modified_sides": ["left"],
+    }
+
+    retargeter.pre_ik_target_safety_filter = project
+    active_source = EffectorCommand(
+        effector_name="left_arm",
+        side="left",
+        command_type="cartesian_pose",
+        value=_target_pose(),
+        frame_name="arm_base",
+        metadata={
+            "tracker_motion_intent": {
+                "state": "ACTIVE",
+                "inactive": False,
+                "hold_weight": 0.0,
+            }
+        },
+    )
+    context = DualArmTargetContext(
+        timestamp=3.0,
+        left_target=_target_pose(x_m=0.20),
+        right_target=_target_pose(x_m=-0.10),
+        left_world_to_base=None,
+        right_world_to_base=None,
+        left_cartesian=active_source,
+        right_cartesian=active_source.copy(),
+        left_input_skipped=None,
+        right_input_skipped=None,
+    )
+
+    command = retargeter.build_command_for_context(context)
+
+    assert safety_calls == 1
+    assert len(activity_targets) == 1
+    assert activity_targets[0]["left"][0, 3] == pytest.approx(0.05)
+    assert command.metadata["tcp_pose_envelope"] == {
+        "mode": "active",
+        "modified_sides": ["left"],
+    }
+
+
+def test_pre_ik_target_safety_filter_rejects_incomplete_pair_before_ik() -> None:
+    solver = _FakeDualArmSolver()
+    solve_calls = 0
+
+    def solve(*, targets):
+        nonlocal solve_calls
+        del targets
+        solve_calls += 1
+        return solver.current_q
+
+    solver.solve = solve  # type: ignore[attr-defined]
+    retargeter = _retargeter(solver)
+    retargeter.pre_ik_target_safety_filter = lambda targets: {
+        "left": targets["left"]
+    }
+    context = DualArmTargetContext(
+        timestamp=3.0,
+        left_target=_target_pose(x_m=0.20),
+        right_target=_target_pose(x_m=-0.10),
+        left_world_to_base=None,
+        right_world_to_base=None,
+        left_cartesian=None,
+        right_cartesian=None,
+        left_input_skipped=None,
+        right_input_skipped=None,
+    )
+
+    with pytest.raises(ValueError, match="exactly left and right"):
+        retargeter.build_command_for_context(context)
+
+    assert solve_calls == 0
+
+
 def test_bimanual_contract_facade_can_be_enabled_explicitly() -> None:
     retargeter = _retargeter(_FakeDualArmSolver())
     retargeter.config.bimanual_result_contract_enabled = True
@@ -1717,6 +1831,66 @@ def test_dual_arm_collision_retargeter_defaults_to_robot_motion_builder(monkeypa
     assert retargeter.ik_solver is solver
     assert retargeter.profile is scene
     assert calls == ["dual_arm_hand_proxy_open"]
+
+
+def test_rm65_ik_can_omit_collision_pairs_without_changing_kinematic_profile(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile = DualArmSceneProfile(
+        name="test_scene",
+        urdf_path=tmp_path / "robot.urdf",
+        package_dirs=(tmp_path,),
+        left_frame_name="left_tcp",
+        right_frame_name="right_tcp",
+        collision_pairs=(("left_link", "right_link"),),
+        hand_proxy_boxes=(),
+        fixed_scene_boxes=(),
+        left_pose_transform=np.eye(4),
+        right_pose_transform=np.eye(4),
+        solution_layout="auto",
+    )
+    constructed: list[dict[str, object]] = []
+
+    class Solver:
+        def __init__(self, **kwargs) -> None:
+            constructed.append(dict(kwargs))
+
+        def add_frame_task(self, *_args, **_kwargs) -> None:
+            return None
+
+        def add_posture_task(self, *_args, **_kwargs) -> None:
+            return None
+
+    tuning = SimpleNamespace(
+        objective_weights=lambda: SimpleNamespace(
+            dual_arm_position_cost=1.0,
+            dual_arm_orientation_cost=1.0,
+        )
+    )
+    monkeypatch.setattr(
+        rm65_ik_module,
+        "build_rm65_dual_arm_scene_profile",
+        lambda _name: profile,
+    )
+    monkeypatch.setattr(
+        rm65_dual_arm_ik_module,
+        "MultiTaskIKSolver",
+        Solver,
+    )
+
+    bundle = build_rm65_dual_arm_collision_ik_solver(
+        RM65DualArmCollisionIKConfig(
+            scene_profile="test_scene",
+            collision_constraints_enabled=False,
+            ik_tuning=tuning,
+        )
+    )
+
+    assert bundle.scene_profile.collision_pairs == ()
+    assert bundle.scene_profile.urdf_path == profile.urdf_path
+    assert bundle.scene_profile.left_frame_name == profile.left_frame_name
+    assert constructed[0]["robot_collision_pair_names"] == []
 
 
 def test_dual_arm_collision_retargeter_rejects_legacy_framework() -> None:
@@ -3783,7 +3957,14 @@ def test_rotational_admittance_owns_contact_and_return_smoothing_endpoints() -> 
     ] == "return"
 
 
-def test_active_admittance_holds_one_tiny_qpos_reversal_then_confirms_it() -> None:
+@pytest.mark.parametrize(
+    ("creep_deg", "expected_confirmation_step_deg"),
+    ((0.0, -0.055), (0.005, -0.051)),
+)
+def test_active_admittance_softens_one_tiny_qpos_reversal_then_confirms_it(
+    creep_deg: float,
+    expected_confirmation_step_deg: float,
+) -> None:
     retargeter = DualArmCollisionAwareRetargeter(
         DualArmCollisionAwareRetargeterConfig(
             solver_frequency=60.0,
@@ -3799,6 +3980,7 @@ def test_active_admittance_holds_one_tiny_qpos_reversal_then_confirms_it() -> No
             output_qpos_admittance_fast_path_enabled=True,
             output_qpos_admittance_fast_path_alpha=0.85,
             output_qpos_admittance_micro_reversal_hold_deg=0.05,
+            output_qpos_admittance_micro_reversal_creep_deg=creep_deg,
         ),
         ik_solver=_FakeDualArmSolver(),
     )
@@ -3852,16 +4034,27 @@ def test_active_admittance_holds_one_tiny_qpos_reversal_then_confirms_it() -> No
             admission_status="tracking",
         )
     )
-    assert held[0] == pytest.approx(first[0])
+    assert np.rad2deg(held[0] - first[0]) == pytest.approx(-creep_deg)
+    expected_held = [0] if creep_deg == 0.0 else []
+    expected_softened = [] if creep_deg == 0.0 else [0]
     assert held_metadata["admittance_fast_path"]["left"][
         "micro_reversal_held_joint_indices"
-    ] == [0]
+    ] == expected_held
+    assert held_metadata["admittance_fast_path"]["left"][
+        "micro_reversal_softened_joint_indices"
+    ] == expected_softened
     assert held_metadata["admittance_fast_path"]["left"][
         "micro_reversal_pending_joint_indices"
     ] == [0]
+    assert held_metadata["admittance_fast_path"]["left"][
+        "micro_reversal_creep_deg"
+    ] == pytest.approx(creep_deg)
     assert held_metadata["left"]["admittance_fast_path"][
         "micro_reversal_held_joint_indices"
-    ] == [0]
+    ] == expected_held
+    assert held_metadata["left"]["admittance_fast_path"][
+        "micro_reversal_softened_joint_indices"
+    ] == expected_softened
     retargeter._commit_admitted_velocity(
         reference_full_q=first,
         admitted_full_q=held,
@@ -3877,13 +4070,26 @@ def test_active_admittance_holds_one_tiny_qpos_reversal_then_confirms_it() -> No
             admission_status="tracking",
         )
     )
-    assert np.rad2deg(confirmed[0] - held[0]) == pytest.approx(-0.055)
+    assert np.rad2deg(confirmed[0] - held[0]) == pytest.approx(
+        expected_confirmation_step_deg
+    )
     assert confirmed_metadata["admittance_fast_path"]["left"][
         "micro_reversal_held_joint_indices"
     ] == []
     assert confirmed_metadata["admittance_fast_path"]["left"][
         "micro_reversal_pending_joint_indices"
     ] == []
+
+
+def test_active_admittance_reversal_creep_cannot_exceed_hold_threshold() -> None:
+    with pytest.raises(
+        ValueError,
+        match="micro_reversal_creep_deg",
+    ):
+        DualArmCollisionAwareRetargeterConfig(
+            output_qpos_admittance_micro_reversal_hold_deg=0.05,
+            output_qpos_admittance_micro_reversal_creep_deg=0.051,
+        )
 
 
 def test_normal_zone_fast_path_graces_soft_quality_dropout_but_not_hard_guard(

@@ -81,6 +81,10 @@ class MujocoSimHILTargetConfig:
     # selected profile's accepted input cadence is used.
     compose_target_hz: float | None = None
     target_admission_margin_sec: float = 0.05
+    # Sim-only startup selection.  When false the coupled pose planner keeps
+    # joint limits and IK but installs no collision pairs; MuJoCo contact
+    # physics itself is unchanged.
+    collision_stop_enabled: bool = True
     execution_observation_plan: ExecutionObservationPlan | None = None
     exposed_pose_sides: tuple[str, ...] = ("left", "right")
     # Generic Agent motion must not inherit task-specific scripted reset
@@ -105,6 +109,8 @@ class MujocoSimHILTargetConfig:
                 raise ValueError(f"{name} must be non-empty.")
         if not isinstance(self.allow_scripted_task_reset, bool):
             raise TypeError("allow_scripted_task_reset must be a bool.")
+        if not isinstance(self.collision_stop_enabled, bool):
+            raise TypeError("collision_stop_enabled must be a bool.")
         if self.compose_target_hz is not None:
             compose_target_hz = float(self.compose_target_hz)
             if not np.isfinite(compose_target_hz) or compose_target_hz <= 0.0:
@@ -481,6 +487,7 @@ def build_mujoco_sim_hil_target(
             reference_hz=compose_target_hz,
             # Preserve the selected lower IK stage's computation budget.
             solve_time_budget_ms=1000.0 / float(position_profile.rates.ik_hz),
+            collision_constraints_enabled=config.collision_stop_enabled,
         ),
     )
     strategy_control_factory = None

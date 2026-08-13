@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -66,11 +66,14 @@ class RM65DualArmCollisionIKConfig:
     collision_distance_epsilon_m: float = DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M
     collision_barrier_gain: float = DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN
     collision_safe_displacement_gain: float = DEFAULT_DUAL_ARM_COLLISION_SAFE_DISPLACEMENT_GAIN
+    collision_constraints_enabled: bool = True
     debug_viz: bool = False
     debug_profile: bool = False
     ik_tuning: Any | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.collision_constraints_enabled, bool):
+            raise TypeError("collision_constraints_enabled must be a bool.")
         if float(self.solver_frequency) <= 0.0:
             raise ValueError("solver_frequency must be positive.")
         if not np.isfinite(float(self.damping)) or float(self.damping) <= 0.0:
@@ -222,6 +225,11 @@ def build_rm65_dual_arm_collision_ik_solver(
 
     resolved_config = config if config is not None else RM65DualArmCollisionIKConfig()
     scene_profile = build_rm65_dual_arm_scene_profile(resolved_config.scene_profile)
+    if not resolved_config.collision_constraints_enabled:
+        # Preserve the exact kinematic model and frame layout while omitting
+        # only the optional collision pairs.  MuJoCo contact physics remains
+        # independent from this pose-to-qpos planning constraint.
+        scene_profile = replace(scene_profile, collision_pairs=())
     try:
         from .dual_arm_ik import MultiTaskIKSolver
         from .ik_tuning import load_ik_tuning_config
