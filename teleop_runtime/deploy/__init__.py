@@ -115,7 +115,7 @@ _LAZY_EXPORT_GROUPS = (
         ("HoldPolicy", "LoadedPolicy", "load_policy"),
     ),
     (
-        "teleop_runtime.deploy.rm65_execution_evidence",
+        "teleop_runtime.backends.arms.rm65_execution_evidence",
         (
             "RM65ExecutionEvidenceBundle",
             "build_rm65_execution_evidence_bundle",

@@ -12,10 +12,10 @@ from robot_motion.target_runtime import (
     TargetRuntimeProviderRegistry,
     TargetRuntimeProviderRegistryEntry,
 )
-from teleop_runtime.deploy.rm65_candidate_manifest import (
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
-from teleop_runtime.deploy.rm65_execution_evidence import (
+from teleop_runtime.backends.arms.rm65_execution_evidence import (
     build_rm65_execution_evidence_bundle,
 )
 from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate import (
@@ -162,7 +162,7 @@ def test_preflight_executes_without_loading_backend_or_vendor_sdk() -> None:
     script = """
 import json
 import sys
-from teleop_runtime.deploy.rm65_candidate_manifest import (
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
 from teleop_runtime.deploy.rm65_target_runtime_provider import (

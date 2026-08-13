@@ -56,9 +56,11 @@ The former `teleop_runtime.target_profiles`,
 re-export shims. They construct no registry or runtime state and preserve
 object identity with the canonical implementations. The RM65 candidate
 adapter is application-level compatibility projection rather than deployment
-ownership; its frozen candidate manifest and execution evidence remain in the
-deploy package until those deployment-specific contracts have a proven
-non-deployment consumer.
+ownership. Its frozen target capability/manifest and backend execution
+evidence live with the RM65 arm backend contracts under
+`teleop_runtime.backends.arms`; deploy paths remain compatibility exports.
+This prevents RM65 backend and diagnostic modules from importing the policy
+deployment frontend merely to share target facts.
 
 ## What an embodiment integration must provide
 

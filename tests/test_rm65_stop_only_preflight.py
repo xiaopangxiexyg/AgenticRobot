@@ -15,7 +15,7 @@ from teleop_runtime.backends.arms.rm65_stop_only_binding import (
     RM65StopOnlyHardwareAuthorization,
     RM65StopOnlyLegacyBinding,
 )
-from teleop_runtime.deploy.rm65_candidate_manifest import (
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
 

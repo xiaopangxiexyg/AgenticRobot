@@ -7,10 +7,18 @@ import sys
 
 import teleop_runtime
 import teleop_runtime.deploy as deploy_namespace
+import teleop_runtime.deploy.rm65_candidate_manifest as legacy_rm65_candidate
+import teleop_runtime.deploy.rm65_execution_evidence as legacy_rm65_evidence
 import teleop_runtime.deploy.rm65_target_runtime_provider as legacy_rm65_target
 import teleop_runtime.target_profiles as legacy_target_profiles
 import teleop_runtime.target_runtime as target_runtime_namespace
 import teleop_runtime.target_runtime_preparation as legacy_target_preparation
+from teleop_runtime.backends.arms import (
+    rm65_candidate_manifest as canonical_rm65_candidate,
+)
+from teleop_runtime.backends.arms import (
+    rm65_execution_evidence as canonical_rm65_evidence,
+)
 from teleop_runtime.target_runtime.integrations import (
     rm65_policy_arm_qpos_candidate as canonical_rm65_target,
 )
@@ -74,6 +82,38 @@ def test_target_runtime_compatibility_exports_preserve_object_identity() -> None
     assert legacy_rm65_target.RM65PolicyArmQposCandidateTargetProvider is (
         canonical_rm65_target.RM65PolicyArmQposCandidateTargetProvider
     )
+    assert legacy_rm65_candidate.build_rm65_policy_arm_qpos_candidate_manifest is (
+        canonical_rm65_candidate.build_rm65_policy_arm_qpos_candidate_manifest
+    )
+    assert legacy_rm65_evidence.RM65ExecutionEvidenceBundle is (
+        canonical_rm65_evidence.RM65ExecutionEvidenceBundle
+    )
+    assert deploy_namespace.RM65ExecutionEvidenceBundle is (
+        canonical_rm65_evidence.RM65ExecutionEvidenceBundle
+    )
+
+
+def test_rm65_backend_contract_import_does_not_reverse_import_deploy() -> None:
+    script = """
+import json
+import sys
+import teleop_runtime.backends.arms.rm65_idle_worker_preflight_binding
+
+print(json.dumps(sorted(
+    name
+    for name in sys.modules
+    if name == "teleop_runtime.deploy"
+    or name.startswith("teleop_runtime.deploy.")
+)))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
 
 
 def test_lazy_top_level_and_deploy_exports_preserve_object_identity() -> None:

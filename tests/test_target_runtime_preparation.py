@@ -9,7 +9,7 @@ from robot_motion.target_runtime import (
     TargetRuntimeProviderRegistryEntry,
     TargetRuntimeStatusSnapshot,
 )
-from teleop_runtime.deploy.rm65_candidate_manifest import (
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
 from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate import (

@@ -18,7 +18,9 @@ from teleop_runtime.backends.arms.rm65_worker_drain import (
     RM65ArmsOnlyWorkerDrainPlan,
 )
 
-from .rm65_execution_evidence import RM65ExecutionEvidenceBundle
+from teleop_runtime.backends.arms.rm65_execution_evidence import (
+    RM65ExecutionEvidenceBundle,
+)
 
 
 RM65_LEGACY_WORKER_BINDING_HASH_DOMAIN_V1 = (

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from robot_motion.action import M6_CANDIDATE_POLICY_ARM_QPOS_V1
-from teleop_runtime.deploy.rm65_candidate_manifest import (
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
     build_rm65_policy_arm_qpos_candidate_target_capability,
 )

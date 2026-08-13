@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from teleop_runtime.deploy.rm65_execution_evidence import (
+from teleop_runtime.backends.arms.rm65_execution_evidence import (
     resolve_rm65_historical_execution_evidence_contract,
 )
 

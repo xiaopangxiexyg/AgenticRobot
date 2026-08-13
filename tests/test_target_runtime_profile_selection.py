@@ -12,7 +12,7 @@ from robot_motion.target_runtime import (
 from robot_motion.action.execution_observation import (
     ExecutionObservationCapabilitySpec,
 )
-from teleop_runtime.deploy.rm65_candidate_manifest import (
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
 from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate import (

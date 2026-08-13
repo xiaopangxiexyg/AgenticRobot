@@ -36,7 +36,7 @@ from robot_motion.runtime.dispatch_owner import (
     DispatchPermitValidationReceipt,
 )
 from teleop_runtime.action import LegacyControlDomainExecutionContext
-from teleop_runtime.deploy.rm65_execution_evidence import RM65ExecutionEvidenceBundle
+from .rm65_execution_evidence import RM65ExecutionEvidenceBundle
 
 from .rm65_control_dispatch_call import (
     RM65ControlDispatchContext,

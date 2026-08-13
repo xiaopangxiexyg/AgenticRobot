@@ -27,11 +27,11 @@ from ..profiles import (
     TargetRuntimeProfileCatalog,
 )
 
-from ...deploy.rm65_candidate_manifest import (
+from ...backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
     build_rm65_policy_arm_qpos_candidate_target_capability,
 )
-from ...deploy.rm65_execution_evidence import (
+from ...backends.arms.rm65_execution_evidence import (
     RM65ExecutionEvidenceBundle,
     build_rm65_execution_evidence_bundle,
 )

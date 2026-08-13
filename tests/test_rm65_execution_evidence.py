@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tests.test_rm65_dispatch_inventory import _execution_manifest
-from teleop_runtime.deploy.rm65_execution_evidence import (
+from teleop_runtime.backends.arms.rm65_execution_evidence import (
     build_rm65_execution_evidence_bundle,
 )
 

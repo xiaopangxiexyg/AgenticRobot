@@ -67,11 +67,11 @@ from teleop_runtime.control_trace import (
 from teleop_runtime.control_trace.rm65_worker_drain import (
     admit_rm65_worker_drain_trace,
 )
-from teleop_runtime.deploy.rm65_candidate_manifest import (
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_capability,
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
-from teleop_runtime.deploy.rm65_execution_evidence import (
+from teleop_runtime.backends.arms.rm65_execution_evidence import (
     build_rm65_execution_evidence_bundle,
 )
 from teleop_runtime.position_control.deploy_executor import (
