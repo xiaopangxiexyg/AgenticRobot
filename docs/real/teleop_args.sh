@@ -32,6 +32,14 @@ export POSITION_ADMITTANCE_TRANSLATION_RESPONSE_WEIGHT="${POSITION_ADMITTANCE_TR
 export POSITION_ADMITTANCE_ROTATION_RESPONSE_WEIGHT="${POSITION_ADMITTANCE_ROTATION_RESPONSE_WEIGHT:-1.0}"
 export POSITION_ADMITTANCE_TRANSLATION_FILTER_TAU_SEC="${POSITION_ADMITTANCE_TRANSLATION_FILTER_TAU_SEC:-0.010857362}"
 export POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC="${POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC:-0.010857362}"
+# Default-off 60 Hz output follower and velocity-continuity limits for the
+# low-frequency force-modifier candidate.  The accepted/parity arrays below do
+# not consume these values; only the explicit DAMPED successor does.  Setting
+# either acceleration value to zero disables that limiter exactly.
+export POSITION_ADMITTANCE_TRANSLATION_OUTPUT_FOLLOW_TAU_SEC="${POSITION_ADMITTANCE_TRANSLATION_OUTPUT_FOLLOW_TAU_SEC:-0.025}"
+export POSITION_ADMITTANCE_ROTATION_OUTPUT_FOLLOW_TAU_SEC="${POSITION_ADMITTANCE_ROTATION_OUTPUT_FOLLOW_TAU_SEC:-0.025}"
+export POSITION_ADMITTANCE_TRANSLATION_MAX_OUTPUT_ACCELERATION_M_S2="${POSITION_ADMITTANCE_TRANSLATION_MAX_OUTPUT_ACCELERATION_M_S2:-1.2}"
+export POSITION_ADMITTANCE_ROTATION_MAX_OUTPUT_ANGULAR_ACCELERATION_RAD_S2="${POSITION_ADMITTANCE_ROTATION_MAX_OUTPUT_ANGULAR_ACCELERATION_RAD_S2:-3.0}"
 
 COMMON_REAL_TELEOP_ARGS=(
   --active-sides both
@@ -235,9 +243,21 @@ POSITION_FORMAL_V2_BALANCED_ARGS=(
   --position-control-profile rm65_bimanual_position_v2_balanced
 )
 
+# Formal pure-position release promoted from the 2026-08-11 dual-arm real run.
+# This selects the frozen V2 Balanced source/IK contract plus the strictly-newer
+# 60 Hz qref -> 120 Hz jerk horizon owner.  It enables no admittance modifier;
+# POSITION_FORMAL_V2_BALANCED_ARGS remains the complete execution rollback.
+# Frozen profile SHA256:
+# dc97dc0e07a6ffc486ed50042899bcfef448a844f48ff883201ee1542f900380
+POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ARGS=(
+  "${POSITION_FORMAL_V2_BALANCED_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_v2_balanced_60hz_jerk_v2
+)
+
 # 正式双臂 60 Hz 平移+旋转阻抗 overlay。该组保持 V2 Balanced 的 60 Hz 解 IK、
 # 碰撞/关节/动力学 admission、30 N / 5 Nm 力急停与数采语义，只在 pre-IK
-# copied target 上加入已经验收的 bounded modifier。四个环境变量是正式可调入口；
+# copied target 上加入已经验收的 bounded modifier。该基线使用 response weight 与
+# input filter tau 四个环境变量；显式 DAMPED successor 再使用两个 output tau；
 # Active 会拒绝超出响应权重 [0.25,4] 或 filter tau > 0.1 s 的配置。
 POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS=(
   "${POSITION_FORMAL_V2_BALANCED_ARGS[@]}"
@@ -260,10 +280,10 @@ POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS=(
   --position-admittance-rotation-filter-tau-sec "$POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC"
   --position-admittance-shadow-max-offset-m 0.08
   --position-admittance-shadow-max-velocity-m-s 0.06
-  --position-admittance-shadow-max-return-velocity-m-s 0.03
+  --position-admittance-shadow-max-return-velocity-m-s 0.42
   --position-admittance-shadow-max-slew-m-s 0.06
   --position-admittance-shadow-return-deadband-n 0.45
-  --position-admittance-shadow-return-rate-s 1
+  --position-admittance-shadow-return-rate-s 4
   --position-admittance-response-reference-hz 40
   --position-admittance-shadow-stale-sec 0.15
   --position-admittance-shadow-max-force-dt-sec 0.15
@@ -277,6 +297,29 @@ POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS=(
 POSITION_FORMAL_V2_BALANCED_60HZ_JERK_ADMITTANCE_ARGS=(
   "${POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS[@]}"
   --position-control-profile rm65_bimanual_position_v2_balanced_60hz_jerk_v1
+)
+
+# Default-off clock-ownership successor for the 60 Hz combined path.  It keeps
+# JERK V1's IK, collision, qref/qcmd dynamics and safety arguments unchanged;
+# only a strictly newer source timestamp may replace the cached 120 Hz horizon.
+# POSITION_FORMAL_V2_BALANCED_60HZ_JERK_ADMITTANCE_ARGS is the atomic rollback.
+POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ADMITTANCE_ARGS=(
+  "${POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS[@]}"
+  --position-control-profile rm65_bimanual_position_v2_balanced_60hz_jerk_v2
+)
+
+# Reversible successor for the 20 Hz wrench -> 60 Hz modifier sample-and-hold
+# observed in the 2026-08-11 free-motion traces.  It filters only the already
+# bounded translation/rotation modifier output and limits its 60 Hz velocity
+# change.  Input force/torque response, the released pure-position profile,
+# shared 60 Hz IK and every final hard offset/slew/endpoint/force-guard boundary
+# remain unchanged.  The JERK V2 admittance array above is the exact rollback.
+POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_DAMPED_ADMITTANCE_ARGS=(
+  "${POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ADMITTANCE_ARGS[@]}"
+  --position-admittance-translation-output-follow-tau-sec "$POSITION_ADMITTANCE_TRANSLATION_OUTPUT_FOLLOW_TAU_SEC"
+  --position-admittance-rotation-output-follow-tau-sec "$POSITION_ADMITTANCE_ROTATION_OUTPUT_FOLLOW_TAU_SEC"
+  --position-admittance-translation-max-output-acceleration-m-s2 "$POSITION_ADMITTANCE_TRANSLATION_MAX_OUTPUT_ACCELERATION_M_S2"
+  --position-admittance-rotation-max-output-angular-acceleration-rad-s2 "$POSITION_ADMITTANCE_ROTATION_MAX_OUTPUT_ANGULAR_ACCELERATION_RAD_S2"
 )
 
 # Default-off successor for residual ~30 Hz micro-vibration.  It changes only

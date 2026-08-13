@@ -88,7 +88,10 @@ canonical composition root；实际站点应显式提供设备、profile、datas
 | `POSITION_FORMAL_V1_ARGS` | 选择正式 position profile 和 control mode | 不配置 writer/debug |
 | `POSITION_FORMAL_V2_RESPONSIVE_ARGS` | 选择 opt-in 响应性 V2；硬执行包络与 V1 相同 | 不与 V1 task 混写 |
 | `POSITION_FORMAL_V2_BALANCED_ARGS` | 选择冻结的 V2 平滑稳定基线；普通区 fast-path alpha=0.55 | 不与 V2 responsive task 混写 |
+| `POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ARGS` | 2026-08-11 真机验收后冻结的双臂纯位控发布面；profile SHA256=`dc97dc0e…0380` | 不开启平移/旋转 admittance；`POSITION_FORMAL_V2_BALANCED_ARGS` 是执行回退 |
 | `POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS` | 在 V2 Balanced 的 pre-IK target 上叠加已验收双臂平移+旋转 bounded admittance | 不修改 60 Hz IK、碰撞、qref、force guard 或数采 action 语义 |
+| `POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ADMITTANCE_ARGS` | 在同一 Active 安全面上选择严格递增 source timestamp 的 120 Hz horizon owner | 不修改 60 Hz IK、碰撞、qref/qcmd 动力学或 force guard；JERK V1 数组是回退 |
+| `POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_DAMPED_ADMITTANCE_ARGS` | 只对已有界的 60 Hz 平移/旋转 modifier 启用默认 `25 ms` output follower，抑制 20 Hz 受力保持的走停切换 | 不改受力映射、60 Hz IK、120 Hz qcmd 规划器或任何硬包络；去掉该数组即回退 |
 | `POSITION_FORMAL_V2_SMOOTH_ARGS` | 选择默认关闭的残余微振动 A/B；普通区 fast-path alpha=0.45 | 不与 balanced task 混写 |
 | `POSITION_FORMAL_V3_QP_CONSTRAINED_ARGS` | 选择 opt-in admitted-anchor QP 约束；其余使用稳定 V1 | 不与 V1/V2 task 混写 |
 | `POSITION_FORCE_GUARD_CONSERVATIVE_ARGS` | 在正式 position 数组后恢复完整 `15 N / 2 Nm` 保守受力急停档 | 不改变 IK、qref 或执行 profile |
@@ -100,7 +103,7 @@ canonical composition root；实际站点应显式提供设备、profile、datas
 
 Argparse 使用后出现的值覆盖前值。正式命令中不要在这些数组之后随意追加历史 position flag。
 
-正式 60 Hz admittance 的可调入口是 source `teleop_args.sh` 前设置的四个环境变量：
+正式 60 Hz admittance 的可调入口是 source `teleop_args.sh` 前设置的六个环境变量：
 
 - `POSITION_ADMITTANCE_TRANSLATION_RESPONSE_WEIGHT` 与
   `POSITION_ADMITTANCE_ROTATION_RESPONSE_WEIGHT`：相对真机验收基线的顺应倍率，默认
@@ -110,6 +113,16 @@ Argparse 使用后出现的值覆盖前值。正式命令中不要在这些数�
   `POSITION_ADMITTANCE_ROTATION_FILTER_TAU_SEC`：当前 `profile_compliance` 真正生效的
   受力/扭矩输入阻尼，默认均为 `0.010857362 s`，值越大越平滑但响应越慢；Active
   上限为 `0.1 s`。
+- `POSITION_ADMITTANCE_TRANSLATION_OUTPUT_FOLLOW_TAU_SEC` 与
+  `POSITION_ADMITTANCE_ROTATION_OUTPUT_FOLLOW_TAU_SEC`：只被显式 `DAMPED` 数组使用，
+  默认 `0.025 s`。这一阶跟随发生在已有界 modifier 上，不重复滤波原始受力；
+  `0` 精确恢复现有行为，Active 上限为 `0.1 s`。无接触回程时输出只能逐分量
+  及总范数向零收缩，不会追赶已撤力的旧 requested modifier。
+
+正式 normal-parity Active 还要求 `420 mm/s + return_rate 4` 的无接触回程制动。
+该速率只有在完整平移 modifier 逐分量且总范数单调回零时才会被最终边界采用；受力向外
+运动仍受原 `60 mm/s` 上限约束。旧 `30 mm/s + return_rate 1` 日志仍可离线 replay，
+但真机 Active 启动会拒绝该旧参数。
 
 `--position-admittance-shadow-damping-n-s-m` 只属于旧 `second_order` 研究模型，在正式
 `profile_compliance` 链路中不参与计算，不应把它当作已生效的正式阻尼参数。
