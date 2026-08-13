@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,10 @@ ARM_BASELINE_PATH = Path(
 )
 ARM_RUNTIME_BINDING_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20260811_v2.json"
+)
+ARM_RUNTIME_BINDING_V1_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20260724_v1.json"
 )
 ARM_V3_BASELINE_PATH = Path(
@@ -39,6 +44,9 @@ ARM_V1_BASELINE_PATH = Path(
     "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v1.json"
 )
 CAMERA_REGISTRY_PATH = Path("robot_motion/configs/rm65_camera_registry.json")
+CAMERA_REGISTRY_V1_ARCHIVE_PATH = Path(
+    "sim/rm65/real2sim/artifacts/rm65_camera_registry_runtime_20260724_v1.json"
+)
 
 _LEGACY_CAMERA_REGISTRY_PATH = (
     "cameras/configs/rm65/cameras/realsense_registry.json"
@@ -283,13 +291,20 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
             artifact_kind="real2sim_fit_artifact",
         ).sha256
     )
-    assert artifacts["rm65-camera-registry-runtime-20260724-v1"].sha256 == (
+    assert artifacts["rm65-camera-registry-runtime-20260811-v2"].sha256 == (
         ArtifactRef.from_file(
             CAMERA_REGISTRY_PATH,
             artifact_id="camera-registry-check",
             artifact_kind="camera_registry",
         ).sha256
     )
+    assert artifacts[
+        "rm65-camera-registry-runtime-20260724-v1-archive"
+    ].sha256 == ArtifactRef.from_file(
+        CAMERA_REGISTRY_V1_ARCHIVE_PATH,
+        artifact_id="camera-registry-v1-archive-check",
+        artifact_kind="camera_registry",
+    ).sha256
     assert binding.resolved_timing == (
         Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
     )
@@ -308,7 +323,26 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
     assert held_out.status == "not_run"
 
 
-def test_camera_registry_owner_migration_is_the_only_v4_contract_change() -> None:
+def test_v1_runtime_binding_camera_dependency_remains_recoverable() -> None:
+    binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V1_PATH)
+    artifacts = {
+        artifact.artifact_id: artifact
+        for artifact in binding.dependency_artifacts
+    }
+
+    assert artifacts["rm65-camera-registry-runtime-20260724-v1"].sha256 == (
+        ArtifactRef.from_file(
+            CAMERA_REGISTRY_V1_ARCHIVE_PATH,
+            artifact_id="camera-registry-v1-archive-check",
+            artifact_kind="camera_registry",
+        ).sha256
+    )
+    assert binding.artifact_sha256 == (
+        "ee37ac1f0128e6254e2ea6b557adda098aad0afa189c84b454fc3c16451c8820"
+    )
+
+
+def test_camera_registry_owner_migration_is_the_only_v1_contract_change() -> None:
     fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
     current_contract = CONTRACT_PATH.read_text(encoding="utf-8")
 
@@ -322,16 +356,36 @@ def test_camera_registry_owner_migration_is_the_only_v4_contract_change() -> Non
         fit.simulation_contract.sha256
     )
 
-    current_registry = CAMERA_REGISTRY_PATH.read_text(encoding="utf-8")
-    assert current_registry.count(_CURRENT_CAMERA_REGISTRY_DESCRIPTION) == 1
-    assert _LEGACY_CAMERA_REGISTRY_DESCRIPTION not in current_registry
-    reconstructed_legacy_registry = current_registry.replace(
+    archived_registry = CAMERA_REGISTRY_V1_ARCHIVE_PATH.read_text(encoding="utf-8")
+    assert archived_registry.count(_CURRENT_CAMERA_REGISTRY_DESCRIPTION) == 1
+    assert _LEGACY_CAMERA_REGISTRY_DESCRIPTION not in archived_registry
+    reconstructed_legacy_registry = archived_registry.replace(
         _CURRENT_CAMERA_REGISTRY_DESCRIPTION,
         _LEGACY_CAMERA_REGISTRY_DESCRIPTION,
     )
     assert hashlib.sha256(reconstructed_legacy_registry.encode("utf-8")).hexdigest() == (
         _LEGACY_CAMERA_REGISTRY_SHA256
     )
+
+
+def test_current_camera_registry_change_is_exactly_the_wrist_serial_swap() -> None:
+    archived_registry = json.loads(
+        CAMERA_REGISTRY_V1_ARCHIVE_PATH.read_text(encoding="utf-8")
+    )
+    current_registry = json.loads(CAMERA_REGISTRY_PATH.read_text(encoding="utf-8"))
+
+    archived_left_serial = archived_registry["cameras"]["left_wrist"]["serial"]
+    archived_right_serial = archived_registry["cameras"]["right_wrist"]["serial"]
+    assert current_registry["cameras"]["left_wrist"]["serial"] == (
+        archived_right_serial
+    )
+    assert current_registry["cameras"]["right_wrist"]["serial"] == (
+        archived_left_serial
+    )
+
+    archived_registry["cameras"]["left_wrist"]["serial"] = archived_right_serial
+    archived_registry["cameras"]["right_wrist"]["serial"] = archived_left_serial
+    assert current_registry == archived_registry
 
 
 def test_historical_v3_baseline_preserves_failed_held_out_result() -> None:

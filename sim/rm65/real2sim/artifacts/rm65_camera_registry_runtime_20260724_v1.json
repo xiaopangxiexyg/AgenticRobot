@@ -1,0 +1,148 @@
+{
+  "schema_version": "dexteleop.camera_registry.v1",
+  "description": "RM65 shared RealSense camera registry v1. Intrinsics are profile-specific and may be filled from runtime device_info; extrinsics are keyed by camera frame so multiple URDFs can reuse the same logical camera.",
+  "cameras": {
+    "front": {
+      "serial": "213222079798",
+      "model": "RealSense",
+      "stream": "color",
+      "profile": {
+        "width": 640,
+        "height": 480,
+        "fps": 15,
+        "format": "yuyv"
+      },
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "head_camera_frame": {
+            "parent_frame": "left_arm_base_link",
+            "transform_convention": "T_camera_to_parent maps camera-frame points into the parent frame; URDF fixed joint origin stores the same child-in-parent pose.",
+            "T_camera_to_parent": [
+              [
+                -0.9997060575371781,
+                -0.022332354917384938,
+                0.009437396214874305,
+                -0.24702469925260906
+              ],
+              [
+                -0.023990617640407604,
+                0.8550212861242094,
+                -0.5180376921998383,
+                -0.02023152752523157
+              ],
+              [
+                0.0034998269534842314,
+                -0.5181118278888706,
+                -0.8553057260494338,
+                0.6520053369743016
+              ],
+              [
+                0,
+                0,
+                0,
+                1
+              ]
+            ],
+            "source": {
+              "type": "handeye",
+              "path": "teleop_records/headeye/20260711_155405_rm65_handeye.json",
+              "matrix": "T_camera_to_base",
+              "calibration_arm": "left"
+            },
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
+                "frame": "head_camera_frame",
+                "parent_frame": "left_arm_base_link"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "mount": "single_front"
+      }
+    },
+    "left_wrist": {
+      "serial": "261122273924",
+      "model": "RealSense D405",
+      "stream": "color",
+      "profile": {
+        "width": 640,
+        "height": 480,
+        "fps": 15,
+        "format": "yuyv"
+      },
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "left_camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
+                "frame": "left_camera_rgb",
+                "parent_frame": "left_arm_link6"
+              }
+            ]
+          },
+          "camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v1/rm65_inspire_gripper_v1.urdf",
+                "frame": "camera_rgb"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v1/rm65_inspire_gripper_v1_debug_frames.urdf",
+                "frame": "camera_rgb"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "mount": "single_left_wrist"
+      }
+    },
+    "right_wrist": {
+      "serial": "260522278055",
+      "model": "RealSense D405",
+      "stream": "color",
+      "profile": {
+        "width": 640,
+        "height": 480,
+        "fps": 15,
+        "format": "yuyv"
+      },
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "right_camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
+                "frame": "right_camera_rgb",
+                "parent_frame": "right_arm_link6"
+              }
+            ]
+          },
+          "camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v1/rm65_inspire_gripper_v1.urdf",
+                "frame": "camera_rgb"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v1/rm65_inspire_gripper_v1_debug_frames.urdf",
+                "frame": "camera_rgb"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "mount": "single_right_wrist"
+      }
+    }
+  }
+}

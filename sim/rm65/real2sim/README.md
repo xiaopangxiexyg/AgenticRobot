@@ -87,13 +87,19 @@ requires a new clean capture collected after v4 is frozen and never used for
 tuning.
 
 The v4 fit manifest remains immutable when unrelated runtime configuration
-ownership changes. The current complete simulation contract is bound to that
-fit through
+changes. The current complete simulation contract is bound to that fit through
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260811_v2.json`.
+This binding records the corrected left/right wrist-camera serial assignment,
+binds the current registry and the exact archived 20260724.v1 registry by
+content hash, and explicitly carries forward the v4 `provisional` and held-out
+`not_run` status. It is a runtime contract rebind, not a refit or a new fidelity
+result.
+
+The historical v1 binding remains immutable at
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260724_v1.json`.
-This binding records the camera-registry move into `robot_motion/configs/`,
-binds both current inputs by content hash, and explicitly carries forward the
-v4 `provisional` and held-out `not_run` status. It is a runtime contract rebind,
-not a refit or a new fidelity result.
+Its exact camera-registry payload is retained at
+`artifacts/rm65_camera_registry_runtime_20260724_v1.json`; consumers must not
+compare that historical binding against the mutable current registry path.
 
 ### DM-Tac position baseline: `20260722.v1`
 
