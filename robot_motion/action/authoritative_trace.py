@@ -42,7 +42,7 @@ from .arbitration_runtime import (
 )
 from .arbiter import ArbitrationResult
 from .authority import AuthorityEvent
-from .executor import teleop_command_semantic_payload
+from .executor import ActionResolutionFailure, teleop_command_semantic_payload
 from .execution_shadow import SharedExecutionShadowEvaluation
 from .execution_manifest import ControlExecutionManifest
 from .execution_handoff import (
@@ -68,6 +68,9 @@ MEASUREMENT_ALIGNMENT_HASH_DOMAIN_V1 = "dexteleop.measurement_alignment.v1"
 PUBLICATION_REJECTION_HASH_DOMAIN_V1 = "dexteleop.publication_rejection.v1"
 COMPOUND_AUTHORITY_FAILURE_HASH_DOMAIN_V1 = (
     "dexteleop.compound_authority_failure.v1"
+)
+TARGET_RESOLUTION_FAILURE_HASH_DOMAIN_V1 = (
+    "dexteleop.target_resolution_failure.v1"
 )
 
 
@@ -1508,6 +1511,58 @@ def project_target_execution_completion(
     )
 
 
+def project_target_resolution_failure(
+    context: AuthoritativeTraceContext,
+    failure: ActionResolutionFailure,
+    *,
+    request: TargetExecutionRequest,
+    completion: TargetExecutionCompletionReceipt,
+) -> ControlTraceFact:
+    """Persist bounded lower-resolver evidence beside a failed completion."""
+
+    if not isinstance(failure, ActionResolutionFailure):
+        raise TypeError("failure must be an ActionResolutionFailure.")
+    if not isinstance(request, TargetExecutionRequest):
+        raise TypeError("request must be a TargetExecutionRequest.")
+    if not isinstance(completion, TargetExecutionCompletionReceipt):
+        raise TypeError("completion must be a TargetExecutionCompletionReceipt.")
+    if (
+        completion.status != "failed"
+        or completion.target_execution_request_id != request.request_id
+        or completion.target_execution_request_hash
+        != request.semantic_content_hash
+        or completion.outcome_code != failure.outcome_code
+    ):
+        raise ValueError(
+            "Resolution failure must bind the exact failed target completion."
+        )
+    semantic_payload = {
+        "target_execution_request_id": request.request_id,
+        "target_execution_request_hash": request.semantic_content_hash,
+        "completion_receipt_id": completion.receipt_id,
+        "completion_receipt_hash": completion.semantic_content_hash,
+        "reason_code": failure.reason_code,
+        "resolver_status": failure.resolver_status,
+        "message": failure.message,
+        "diagnostics": dict(failure.diagnostics),
+    }
+    semantic_hash = canonical_content_hash(
+        semantic_payload,
+        domain=TARGET_RESOLUTION_FAILURE_HASH_DOMAIN_V1,
+    )
+    failure_id = f"target-resolution-failure:{semantic_hash}"
+    return context.fact(
+        fact_id=failure_id,
+        event_type="target_resolution_failure",
+        occurred_at=completion.available_at,
+        payload={
+            "failure_id": failure_id,
+            **semantic_payload,
+            "semantic_content_hash": semantic_hash,
+        },
+    )
+
+
 def project_component_execution_target(
     context: AuthoritativeTraceContext,
     target: ComponentExecutionTarget,
@@ -1695,6 +1750,7 @@ __all__ = [
     "project_target_execution_request",
     "project_target_execution_submission",
     "project_target_execution_completion",
+    "project_target_resolution_failure",
     "project_component_execution_target",
     "project_component_execution_target_admission",
     "project_component_execution_target_activation",

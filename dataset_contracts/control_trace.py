@@ -143,6 +143,7 @@ CONTROL_TRACE_EVENT_SPECS_V24 = (
     _spec("target_execution_request", "execution", "authoritative"),
     _spec("target_execution_submission", "execution", "authoritative"),
     _spec("target_execution_completion", "execution", "authoritative"),
+    _spec("target_resolution_failure", "execution", "authoritative"),
     _spec("execution_directive", "execution", "authoritative"),
     _spec("shared_execution_evaluation", "execution", "shadow"),
     _spec("legacy_execution_observation", "execution", "legacy"),
@@ -1100,6 +1101,13 @@ CONTROL_TRACE_RECORD_SPECS_V1 = (
         "semantic_content_hash",
     ),
     _record_spec(
+        "target_resolution_failure",
+        "failure_id", "target_execution_request_id",
+        "target_execution_request_hash", "completion_receipt_id",
+        "completion_receipt_hash", "reason_code", "resolver_status",
+        "message", "diagnostics", "semantic_content_hash",
+    ),
+    _record_spec(
         "execution_directive",
         "directive_id", "decision_id", "publication_attempt_id",
         "arbitration_result_id", "global_status",
@@ -1117,6 +1125,11 @@ CONTROL_TRACE_RECORD_SPECS_V1 = (
         "proposed_directive", "proposed_directive_hash", "safety_result",
         "safety_result_hash", "command_intent", "command_intent_hash",
         "semantic_content_hash",
+    ),
+    _record_spec(
+        "backend_guard_result",
+        "guard_result_id", "guard_id", "observed_at", "physics_tick",
+        "status", "reason_code", "diagnostics", "semantic_content_hash",
     ),
     _record_spec(
         "hardware_preflight_authorization",

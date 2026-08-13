@@ -92,6 +92,7 @@ from .authoritative_trace import (
     project_replay_execution_authorization,
     project_shared_safety_result,
     project_target_execution_completion,
+    project_target_resolution_failure,
     project_target_execution_request,
     project_target_execution_submission,
 )
@@ -2000,6 +2001,15 @@ class AuthoritativeControlRuntime:
                         target_completion_receipt,
                     )
                 )
+                if resolution_failure is not None:
+                    step_facts.append(
+                        project_target_resolution_failure(
+                            self.trace_context,
+                            resolution_failure,
+                            request=target_execution_request,
+                            completion=target_completion_receipt,
+                        )
+                    )
             if compound_profile is None:
                 self._emit(step_facts)
                 return AuthoritativeControlStep(

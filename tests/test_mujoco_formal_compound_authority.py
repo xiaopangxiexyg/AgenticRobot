@@ -1070,6 +1070,21 @@ def test_typed_resolution_failure_is_traced_and_existing_hold_is_idempotent(
     assert step.target_completion_receipt.outcome_code == (
         "target_private_resolution_failure.collision_margin_low"
     )
+    resolution_failures = [
+        fact
+        for fact in runtime.trace_facts
+        if fact.event_type == "target_resolution_failure"
+    ]
+    assert len(resolution_failures) == 1
+    assert resolution_failures[0].payload["reason_code"] == (
+        "collision_margin_low"
+    )
+    assert resolution_failures[0].payload["diagnostics"] == {
+        "best_candidate_distance_m": 0.029
+    }
+    assert resolution_failures[0].payload["completion_receipt_id"] == (
+        step.target_completion_receipt.receipt_id
+    )
     assert step.cancellation is None
     assert len(
         [
