@@ -102,6 +102,7 @@ def test_passive_viewer_is_closed_before_scene_can_be_released(monkeypatch) -> N
         "replay_done",
         "viewer_close",
         "viewer_drained",
+        "viewer_drained",
         "scene_release",
     ]
 

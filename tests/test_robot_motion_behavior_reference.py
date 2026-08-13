@@ -49,6 +49,7 @@ def test_motion_safety_config_exposes_only_enforced_monitor_limits() -> None:
     assert tuple(item.name for item in fields(MotionSafetyConfig)) == (
         "max_translation_jump_m",
         "max_rotation_jump_deg",
+        "pose_jump_baseline_max_gap_sec",
         "stale_timeout_sec",
         "invalid_frame_limit",
         "freeze_on_fault",
