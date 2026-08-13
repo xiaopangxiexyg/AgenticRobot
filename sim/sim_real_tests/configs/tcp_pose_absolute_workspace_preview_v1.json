@@ -1,0 +1,31 @@
+{
+  "schema_version": "sim_real_tests.tcp_pose_absolute_workspace_preview.v1",
+  "role": "visual_review_only_not_a_runtime_safety_profile",
+  "urdf_path": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
+  "reference_frame_link": "workspace_near_boundary_frame",
+  "table_link": "table",
+  "camera_pole_link": "camera_pole",
+  "profiles": {
+    "absolute_loose": {
+      "xy_table_scale": 0.9,
+      "z_pole_height_scale": 0.7,
+      "x_alignment": "center",
+      "z_min_clearance_m": 0.0,
+      "rgba": [0.12, 0.52, 1.0, 0.09]
+    },
+    "absolute_standard": {
+      "xy_table_scale": 0.72,
+      "z_pole_height_scale": 0.56,
+      "x_alignment": "positive_open",
+      "z_min_clearance_m": 0.02,
+      "rgba": [0.18, 0.9, 0.28, 0.1]
+    },
+    "absolute_tight": {
+      "xy_table_scale": 0.5,
+      "z_pole_height_scale": 0.4,
+      "x_alignment": "positive_open",
+      "z_min_clearance_m": 0.08,
+      "rgba": [0.18, 0.3, 0.8, 0.1]
+    }
+  }
+}
