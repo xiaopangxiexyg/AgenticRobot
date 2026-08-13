@@ -471,6 +471,26 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tcp-pose-envelope-profile",
+        type=str,
+        default="",
+        help=(
+            "Optional strict JSON profile for the final tool-TCP pose envelope "
+            "before IK. Providing a profile alone installs shadow observation; "
+            "the default empty value leaves the existing control path unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--tcp-pose-envelope-active",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Explicitly project final tool-TCP pose targets into the selected "
+            "envelope before IK. Requires --tcp-pose-envelope-profile and is "
+            "default-off."
+        ),
+    )
+    parser.add_argument(
         "--arm-control-mode",
         choices=["impedance", "position"],
         default="impedance",
@@ -791,9 +811,11 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         default=POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE,
         help=(
             "Explicit production Active envelope. cautious remains the default; "
-            "half_normal enables the audited 40 mm / 30 mm/s staged test; "
-            "normal_parity is restricted to an admitted combined 5-degree "
-            "rotation Active profile."
+            "half_normal requires its audited 60 mm/s, return-rate 2 release "
+            "brake; normal_parity requires its audited 420 mm/s, return-rate 4 "
+            "release brake and is restricted to an admitted combined 5-degree "
+            "rotation Active profile. Both faster rates are return-only final "
+            "bounds and never expand outward wrench motion."
         ),
     )
     parser.add_argument(
@@ -922,6 +944,44 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Rotation torque-input damping/filter time constant. Larger values "
             "are smoother and slower; the default preserves the accepted profile."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-translation-output-follow-tau-sec",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Optional 60 Hz first-order follower on the already bounded "
+            "translation modifier. Zero preserves exact accepted behavior; "
+            "a small positive value smooths 20 Hz wrench sample-and-hold "
+            "without changing input filtering, IK, or final offset/slew bounds."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-output-follow-tau-sec",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Optional 60 Hz first-order follower on the already bounded "
+            "rotation modifier. Zero preserves exact accepted behavior."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-translation-max-output-acceleration-m-s2",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Optional acceleration limit for the 60 Hz translation modifier "
+            "output velocity. Zero preserves the accepted follower exactly."
+        ),
+    )
+    parser.add_argument(
+        "--position-admittance-rotation-max-output-angular-acceleration-rad-s2",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Optional angular-acceleration limit for the 60 Hz rotation "
+            "modifier output velocity. Zero preserves accepted behavior."
         ),
     )
     parser.add_argument(
@@ -1973,13 +2033,21 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         "--calibration-timeout",
         type=_positive_float,
         default=10.0,
-        help="Timeout for runtime home calibration after the receiver starts.",
+        help=(
+            "Overall timeout for runtime Home stability/capture. Entering or "
+            "resuming real teleoperation additionally fails if any required "
+            "VIVE tracker timestamp stops advancing for 1 second."
+        ),
     )
     parser.add_argument(
         "--calibration-samples",
         type=int,
         default=20,
-        help="Number of valid wrist frames to average per side during runtime home calibration.",
+        help=(
+            "Number of valid wrist frames used per side to validate runtime Home. "
+            "On the default real-arm path, the exact anchor is a fresh stable "
+            "VIVE packet captured after the atomic arm snapshot."
+        ),
     )
     parser.add_argument(
         "--runtime-home-atomic-arm-snapshot",
@@ -1996,10 +2064,12 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Build runtime human Home from fresh VIVE packets with linearly "
-            "increasing recency weights and one final fresh packet. Enabled by "
+            "Use fresh VIVE packets for runtime Home. With the default atomic "
+            "real-arm snapshot, historical packets validate stillness and one "
+            "new stable post-snapshot packet becomes the exact human anchor. "
+            "The option name is retained for command compatibility. Enabled by "
             "default; --no-runtime-home-late-weighted-vive restores the legacy "
-            "uniform latest-value polling average."
+            "uniform latest-value polling average and disables the exact cut."
         ),
     )
     parser.add_argument(

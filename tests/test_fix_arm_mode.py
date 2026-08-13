@@ -9,7 +9,7 @@ import numpy as np
 
 from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
 from teleop_runtime.diagnostics import FaultEvent, FaultSeverity
-from teleop_runtime.gui.calibration_web_ui import CalibrationWebUi
+from control_station.web.calibration_web_ui import CalibrationWebUi
 from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from teleop_runtime.special_tasks.fix_arm import (
     FixArmCommandController,

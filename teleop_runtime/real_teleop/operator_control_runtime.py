@@ -43,6 +43,7 @@ from .gripper_policy import (
 )
 from .plus_curation_runtime import RealTeleopPlusCurationRuntime
 from .tracker_side_check import evaluate_tracker_side_assignment
+from .defaults import DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC
 
 
 _SUPPORT_NAMES = (
@@ -2981,14 +2982,14 @@ class RealTeleopControlInput:
             self._tracker_side_request_from_hold = from_hold
             self._tracker_side_request_source = str(source)
             self._tracker_side_request_kind = str(request_kind)
+            request_time = time.time() if now is None else float(now)
             self._tracker_side_request_deadline = (
-                (
-                    self._two_pedal_fast_home_deadline
-                    if self._two_pedal_fast_home_deadline > 0.0
-                    else (time.time() if now is None else float(now)) + 1.0
+                self._two_pedal_fast_home_deadline
+                if (
+                    str(request_kind) == "two_pedal_fast"
+                    and self._two_pedal_fast_home_deadline > 0.0
                 )
-                if str(request_kind) == "two_pedal_fast"
-                else 0.0
+                else request_time + DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC
             )
             self._tracker_side_check.update(
                 {
@@ -3238,11 +3239,12 @@ class RealTeleopControlInput:
     def _poll_tracker_side_request_timeout(self, *, now: float) -> None:
         if (
             not self._tracker_side_request_pending
-            or self._tracker_side_request_kind != "two_pedal_fast"
             or self._tracker_side_request_deadline <= 0.0
             or float(now) < self._tracker_side_request_deadline
         ):
             return
+        request_kind = str(self._tracker_side_request_kind)
+        request_from_hold = bool(self._tracker_side_request_from_hold)
         self._tracker_side_request_pending = False
         self._tracker_side_request_from_hold = False
         self._tracker_side_request_source = ""
@@ -3257,25 +3259,43 @@ class RealTeleopControlInput:
             {
                 "home_request_pending": False,
                 "confirmation_required": False,
-                "confirmation_result": "two_pedal_tracker_timeout",
+                "confirmation_result": (
+                    "two_pedal_tracker_timeout"
+                    if request_kind == "two_pedal_fast"
+                    else "runtime_home_tracker_timeout"
+                ),
             }
         )
-        message = (
-            "双踏板切换失败：1 秒内未获得新鲜且可判定的左右 Tracker；"
-            "本次切换已取消。"
-        )
-        self._publish_two_pedal_alert(
-            level="red",
-            message=message,
-            now=now,
-            duration_sec=3.0,
-        )
-        if self.ui is not None:
-            self.ui.publish(
-                tracker_side_check=dict(self._tracker_side_check),
-                active_controls=self._current_active_controls(),
+        if request_kind == "two_pedal_fast":
+            message = (
+                "双踏板切换失败：1 秒内未获得新鲜且可判定的左右 Tracker；"
+                "本次切换已取消。"
             )
-            self.ui.append_message("TwoPedal", message)
+            self._publish_two_pedal_alert(
+                level="red",
+                message=message,
+                now=now,
+                duration_sec=3.0,
+            )
+            if self.ui is not None:
+                self.ui.publish(
+                    tracker_side_check=dict(self._tracker_side_check),
+                    active_controls=self._current_active_controls(),
+                )
+                self.ui.append_message("TwoPedal", message)
+            return
+
+        message = (
+            "恢复遥操已取消：1 秒内未获得新鲜且可判定的左右 Tracker；"
+            "机械臂保持 Hold，可恢复 VIVE 后重新点击“开始遥操”。"
+            if request_from_hold
+            else (
+                "开始遥操已取消：1 秒内未获得新鲜且可判定的左右 Tracker；"
+                "已回到未遥操状态，可恢复 VIVE 后重新点击“开始遥操”。"
+            )
+        )
+        _log("InputMapping", message, now=now)
+        self.publish_calibration_waiting(message)
 
     def _final_tracker_side_home_admission(self) -> bool:
         """Recheck the fresh side relation immediately before Home capture."""
@@ -4623,7 +4643,9 @@ class RealTeleopControlInput:
                 capture_left_valid=False,
                 capture_right_valid=False,
                 capture_elapsed_sec=0.0,
-                capture_duration_sec=float(getattr(self.args, "calibration_timeout", 0.0)),
+                capture_duration_sec=float(
+                    getattr(self.args, "calibration_timeout", 10.0)
+                ),
                 capture_prep_remaining_sec=0.0,
                 capture_waiting_for_samples=False,
             )

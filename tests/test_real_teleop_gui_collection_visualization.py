@@ -16,7 +16,7 @@ import numpy as np
 
 from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
-from teleop_runtime.gui import calibration_web_ui
+from control_station.web import calibration_web_ui
 from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from teleop_runtime.sources.pose import VivePoseSource
 from teleop_runtime.tactile_visualizer import DMTacDistributedForceVisualizer
@@ -740,6 +740,80 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertFalse(control._calibration_requested)
         self.assertEqual(control._two_pedal_alert_level, "red")
         self.assertEqual(control._two_pedal_alert_expires_at, 14.0)
+
+    def test_normal_start_fresh_tracker_wait_times_out_to_not_started_state(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(calibration_timeout=10.0),
+            components=components,
+        )
+        control._tracker_side_check = {
+            "status": "unavailable",
+            "warning_required": False,
+            "message": "stale",
+        }
+
+        control._request_calibration_with_tracker_side_guard(
+            source="gui",
+            now=10.0,
+        )
+
+        self.assertTrue(control._tracker_side_request_pending)
+        self.assertEqual(control._tracker_side_request_deadline, 11.0)
+        self.assertFalse(control._calibration_requested)
+
+        control._poll_tracker_side_request_timeout(now=11.0)
+
+        self.assertFalse(control._tracker_side_request_pending)
+        self.assertFalse(control._calibration_requested)
+        self.assertFalse(control._teleop_started)
+        self.assertFalse(control._hold_active)
+        self.assertEqual(
+            control._tracker_side_check["confirmation_result"],
+            "runtime_home_tracker_timeout",
+        )
+        self.assertEqual(ui.published[-1]["stage"], "RM65 真机遥操准备")
+        self.assertIn("p", ui.published[-1]["active_controls"])
+        self.assertTrue(
+            any("已回到未遥操状态" in message for _, message in ui.messages)
+        )
+
+    def test_normal_resume_fresh_tracker_wait_times_out_to_existing_hold(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(calibration_timeout=10.0),
+            components=components,
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        control._tracker_side_check = {
+            "status": "unavailable",
+            "warning_required": False,
+            "message": "stale",
+        }
+
+        control._request_calibration_with_tracker_side_guard(
+            source="gui",
+            now=20.0,
+        )
+        control._poll_tracker_side_request_timeout(now=21.0)
+
+        self.assertTrue(control._teleop_started)
+        self.assertTrue(control._hold_active)
+        self.assertFalse(control._calibration_requested)
+        self.assertEqual(ui.published[-1]["stage"], "Hold / 停臂保持")
+        self.assertIn("p", ui.published[-1]["active_controls"])
+        self.assertTrue(
+            any("机械臂保持 Hold" in message for _, message in ui.messages)
+        )
 
     def test_two_pedal_tracker_wait_and_home_share_one_second_budget(self) -> None:
         components = _components()

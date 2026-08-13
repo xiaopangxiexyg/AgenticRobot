@@ -597,6 +597,38 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertTrue(any("startup probe failed" in message for message in result.messages))
         self.assertFalse(any("[DMTAC CONFIG ERROR]" in message for message in result.messages))
 
+    def test_dmtac_preflight_ignores_missing_inactive_gripper_without_reconfiguration(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        full_scan = _dmtac_scan()
+        assignment = usb_assignment.build_assignment_from_tokens(
+            full_scan,
+            left_gripper="0",
+            right_gripper="1",
+        )
+        right_only_scan = _dmtac_scan()
+        right_only_scan["grippers"] = [right_only_scan["grippers"][1]]
+
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("right",),
+            require_dmtac_tactile=False,
+            auto_configure=True,
+        )
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=right_only_scan),
+            patch.object(usb_assignment, "load_assignment", return_value=assignment),
+            patch.object(usb_assignment, "save_assignment") as save_mock,
+        ):
+            device_preflight.prepare_dmtac(options, result)
+
+        self.assertIsNotNone(result.dmtac_assignment)
+        self.assertEqual(
+            result.dmtac_assignment["assignments"]["right"]["gripper"]["port"],
+            "/dev/serial/by-id/right-gripper",
+        )
+        self.assertEqual(save_mock.call_count, 0)
+        self.assertFalse(any("entering reassignment" in message for message in result.messages))
+
     def test_dmtac_preflight_still_fails_without_config_when_no_gripper_reachable(self) -> None:
         usb_assignment, *_ = device_preflight._load_dmtac_modules()
         scan = _dmtac_scan()
@@ -892,6 +924,52 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertTrue(args.dmtac_tactile)
         self.assertEqual(len(seen_options), 1)
         self.assertTrue(seen_options[0].require_dmtac_tactile)
+
+    def test_real_teleop_mixed_hand_backend_preflights_only_enabled_dmtac_side(self) -> None:
+        seen_options: list[device_preflight.DevicePreflightOptions] = []
+
+        def fake_prepare(options: device_preflight.DevicePreflightOptions):
+            seen_options.append(options)
+            return SimpleNamespace(
+                ok=True,
+                messages=["ok"],
+                q6_ports={},
+                dmtac_assignment={
+                    "assignments": {
+                        "right": {"gripper": {"port": "/dev/gripper-right"}}
+                    }
+                },
+                permission_fixes=[],
+            )
+
+        argv = [
+            "prog",
+            "--gui",
+            "--active-sides",
+            "both",
+            "--left-arm-ip",
+            "192.168.0.10",
+            "--right-arm-ip",
+            "192.168.0.11",
+            "--no-arm-ip-save-latest",
+            "--hand-backend",
+            "dmtac-gripper",
+            "--left-hand-backend",
+            "none",
+            "--gripper-angle-trigger",
+            "--no-camera",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(
+            cli_runtime_config,
+            "prepare_devices_for_teleop",
+            fake_prepare,
+        ):
+            args = real_teleop.parse_args()
+
+        self.assertEqual(args.active_sides, ("left", "right"))
+        self.assertEqual(len(seen_options), 1)
+        self.assertEqual(seen_options[0].active_sides, ("right",))
+        self.assertTrue(seen_options[0].require_dmtac_gripper)
 
     def test_real_teleop_missing_arm_ip_fails_before_device_preflight(self) -> None:
         argv = [

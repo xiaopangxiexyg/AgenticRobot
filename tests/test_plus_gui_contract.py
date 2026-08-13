@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 
-from teleop_runtime.gui.calibration_web_ui import CalibrationWebUi, _encode_http_event_payload
+from control_station.web.calibration_web_ui import (
+    CalibrationWebUi,
+    _encode_http_event_payload,
+)
 
 
 def test_plus_gui_event_payload_is_explicit_and_bounded() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from teleop_runtime.gui import calibration_web_ui
+from control_station.web import calibration_web_ui
 
 
 def test_runtime_home_capture_progress_is_exposed_as_gui_diagnostic() -> None:

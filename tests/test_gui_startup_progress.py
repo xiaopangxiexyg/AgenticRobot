@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from teleop_runtime.collection.umi.components import UmiComponents
-from teleop_runtime.gui.startup_progress import GuiStartupProgress
+from control_station.web.startup_progress import GuiStartupProgress
 
 
 class _FakeUi:

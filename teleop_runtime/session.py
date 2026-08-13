@@ -132,6 +132,10 @@ class TeleopSession:
         command_filter: Callable[[TeleopCommand, TeleopObservation, float], TeleopCommand] | None = None,
         command_guard: Callable[[TeleopCommand, TeleopObservation, float], FaultEvent | None]
         | None = None,
+        command_dispatch_admission: Callable[
+            [TeleopCommand, TeleopObservation, float], bool
+        ]
+        | None = None,
         fault_filter: Callable[
             [Sequence[FaultEvent], dict[str, ObservationChannel], float], Sequence[FaultEvent]
         ]
@@ -154,6 +158,7 @@ class TeleopSession:
         self.channel_filter = channel_filter
         self.command_filter = command_filter
         self.command_guard = command_guard
+        self.command_dispatch_admission = command_dispatch_admission
         self.fault_filter = fault_filter
         self.human_command_observer = human_command_observer
         self.human_command_filter_observer = human_command_filter_observer
@@ -1074,13 +1079,24 @@ class TeleopSession:
             )
         mark_phase("session.command_guard")
 
+        dispatch_admitted = True
+        if self.command_dispatch_admission is not None:
+            dispatch_admitted = bool(
+                self.command_dispatch_admission(
+                    command,
+                    observation,
+                    current_time,
+                )
+            )
+            mark_phase("session.command_dispatch_admission")
+
         if self.recorder is not None:
             self.recorder.record_command(command)
             mark_phase("session.record_command")
 
         command_dispatched = False
         dispatch_receipts: Mapping[str, object | None] | None = None
-        if self.rig is not None and self.state_machine.state in {
+        if dispatch_admitted and self.rig is not None and self.state_machine.state in {
             TeleopRunState.ARMED,
             TeleopRunState.RUNNING,
         }:
@@ -1098,7 +1114,13 @@ class TeleopSession:
         self._observe_human_legacy_execution(
             command=command,
             observed_at=time.monotonic(),
-            outcome="dispatched" if command_dispatched else "not_dispatched",
+            outcome=(
+                "dispatched"
+                if command_dispatched
+                else "dispatch_inhibited"
+                if not dispatch_admitted
+                else "not_dispatched"
+            ),
             command_dispatched=command_dispatched,
             dispatch_receipts=dispatch_receipts,
             phase_recorder=phase_recorder,

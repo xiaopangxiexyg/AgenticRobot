@@ -76,7 +76,7 @@ from teleop_runtime.collection.umi.types import (
     UmiPoseMeasurement,
     UmiSample,
 )
-from teleop_runtime.gui.calibration_web_ui import _render_initial_html
+from control_station.web.calibration_web_ui import _render_initial_html
 
 
 ROOT = Path(__file__).parents[1]

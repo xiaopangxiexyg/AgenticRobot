@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from itertools import product
 
-from teleop_runtime.gui.calibration_web_ui import CalibrationWebUi
+from control_station.web.calibration_web_ui import CalibrationWebUi
 from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,

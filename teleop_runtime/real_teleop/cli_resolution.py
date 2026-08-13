@@ -191,6 +191,13 @@ def parse_real_teleop_args() -> argparse.Namespace:
     # Fine-grained legacy fields retain their original raw values so callers can
     # still distinguish explicit overrides from mode-derived defaults.
     args.arm_control_mode = args.arm_execution_config.mode
+    if bool(getattr(args, "tcp_pose_envelope_active", False)) and not str(
+        getattr(args, "tcp_pose_envelope_profile", "") or ""
+    ).strip():
+        parser.error(
+            "--tcp-pose-envelope-active requires "
+            "--tcp-pose-envelope-profile."
+        )
     position_admittance_shadow = bool(
         getattr(args, "position_admittance_shadow", False)
     )

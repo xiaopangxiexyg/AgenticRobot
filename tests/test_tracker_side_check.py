@@ -8,7 +8,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 from teleop_runtime.calibration import TeleopCalibration
-from teleop_runtime.gui import calibration_web_ui
+from control_station.web import calibration_web_ui
 from teleop_runtime.real_teleop.tracker_side_check import (
     evaluate_tracker_side_assignment,
 )

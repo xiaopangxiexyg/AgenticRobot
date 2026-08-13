@@ -120,8 +120,14 @@ def _run_gui_device_preflight(
     if getattr(args, "dmtac_tactile", None) is False:
         require_tactile = False
 
+    # DevicePreflightOptions.active_sides scopes Q6/DMTAC assignment checks;
+    # camera validation still covers the configured camera map independently.
+    # A mixed hand topology (for example, one intentionally disabled gripper)
+    # must therefore validate only the sides that actually own DMTAC backends,
+    # while arm construction and camera admission remain bimanual.
+    preflight_device_sides = dmtac_sides if require_dmtac_stack else active_sides
     options = DevicePreflightOptions(
-        active_sides=active_sides,
+        active_sides=preflight_device_sides,
         camera_config=str(getattr(args, "camera_config", DEFAULT_CAMERA_CONFIG_PATH)),
         require_camera=not bool(getattr(args, "no_camera", False)),
         require_q6=require_q6,

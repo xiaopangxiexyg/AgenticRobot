@@ -1356,7 +1356,12 @@ def prepare_dmtac(
             comparison = usb_assignment.compare_assignment_to_scan(assignment, scan)
             text = usb_assignment.format_comparison(comparison)
             effective = comparison["effective_assignment"]
-            if not comparison.get("missing") and _configured_dmtac_complete(
+            active_missing = _missing_dmtac_active_items(
+                comparison,
+                active_sides=options.active_sides,
+                require_tactile=options.require_dmtac_tactile,
+            )
+            if not active_missing and _configured_dmtac_complete(
                 usb_assignment,
                 effective,
                 active_sides=options.active_sides,

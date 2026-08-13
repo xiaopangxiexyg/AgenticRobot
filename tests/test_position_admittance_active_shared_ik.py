@@ -93,6 +93,52 @@ def _cautious_config() -> CartesianAdmittanceConfig:
     )
 
 
+def test_exact_runtime_home_target_is_zero_step_in_shared_60hz_ik() -> None:
+    initial_qpos = _initial_qpos()
+    retargeter, _ = _build_retargeter(
+        initial_qpos=initial_qpos,
+        config_payload={
+            "position_control_profile": {
+                "name": RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+                "scene_profile": "dual_arm_hand_proxy_open",
+            },
+            "arm_max_angvel_effective_rad_s": [
+                5.6,
+                5.6,
+                7.2,
+                12.0,
+                12.0,
+                16.0,
+            ],
+        },
+        left_tool_pose=_tool_pose(
+            Path(DEFAULT_LEFT_TOOL_PROFILE), side="left"
+        ),
+        right_tool_pose=_tool_pose(
+            Path(DEFAULT_RIGHT_TOOL_PROFILE), side="right"
+        ),
+    )
+    exact_home_targets = retargeter.solver_world_targets_for_qpos_pair(
+        left_qpos=initial_qpos["left"],
+        right_qpos=initial_qpos["right"],
+    )
+    command = retargeter.build_command_for_context(
+        _context(frame={}, targets=exact_home_targets),
+        targets=exact_home_targets,
+    )
+
+    for side in SIDES:
+        qpos, metadata = _command_qpos(command, side=side)
+        np.testing.assert_allclose(
+            qpos,
+            initial_qpos[side],
+            atol=1e-10,
+            rtol=0.0,
+        )
+        assert metadata["ik_branch_candidate"] == "current_pose_hold"
+        assert metadata["ik_solve_iterations"] == 0
+
+
 def test_active_observer_and_shared_ik_close_in_one_solver_frame(
 ) -> None:
     initial_qpos = _initial_qpos()
@@ -296,8 +342,9 @@ def test_dual_side_formal_active_closes_through_one_shared_ik_budget() -> None:
         _cautious_config(),
         max_offset_m=(0.08, 0.08, 0.08),
         max_velocity_m_s=(0.06, 0.06, 0.06),
-        max_return_velocity_m_s=(0.03, 0.03, 0.03),
+        max_return_velocity_m_s=(0.42, 0.42, 0.42),
         max_output_slew_m_s=(0.06, 0.06, 0.06),
+        return_rate_s=4.0,
     )
     observer = install_position_admittance_active(
         retargeter=retargeter,

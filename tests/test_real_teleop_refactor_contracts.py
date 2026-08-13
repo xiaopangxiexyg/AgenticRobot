@@ -78,7 +78,7 @@ from teleop_runtime.real_teleop import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ENTRYPOINT = ROOT / "teleop_runtime/debug/run_vive_rm65_real_teleop.py"
+ENTRYPOINT = ROOT / "control_station/real_teleop_entrypoint.py"
 
 
 def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
@@ -90,6 +90,24 @@ def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
         10.0,
         clock=lambda: 9.5,
     ) == pytest.approx(10.0)
+
+
+def test_real_teleop_start_and_resume_separate_freshness_from_overall_timeout() -> None:
+    assert defaults.runtime_home_fresh_data_timeout_sec(0.25) == pytest.approx(0.25)
+    assert defaults.runtime_home_fresh_data_timeout_sec(1.0) == pytest.approx(1.0)
+    assert defaults.runtime_home_fresh_data_timeout_sec(10.0) == pytest.approx(1.0)
+
+    runtime_source = (ROOT / "teleop_runtime/real_teleop/runtime.py").read_text(
+        encoding="utf-8"
+    )
+    control_loop_source = (
+        ROOT / "teleop_runtime/real_teleop/control_loop.py"
+    ).read_text(encoding="utf-8")
+    assert "timeout_sec=args.calibration_timeout" in runtime_source
+    assert "timeout_sec=args.calibration_timeout" in control_loop_source
+    freshness_call = "fresh_data_timeout_sec=runtime_home_fresh_data_timeout_sec("
+    assert freshness_call in runtime_source
+    assert freshness_call in control_loop_source
 
 
 def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
@@ -132,7 +150,10 @@ def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
         ROOT / "teleop_runtime/collection/writer_runtime.py"
     ).read_text(encoding="utf-8")
 
-    assert "from ..collection.writer_runtime import CollectionWriterRuntime" in debug_source
+    assert (
+        "from teleop_runtime.collection.writer_runtime import CollectionWriterRuntime"
+        in debug_source
+    )
     assert "from ..collection.writer_runtime import CollectionWriterRuntime" in real_recorder_source
     assert "self.writer_runtime = CollectionWriterRuntime(" in real_recorder_source
     assert "self.writer_runtime = CollectionWriterRuntime(" in collection_runtime_source
@@ -177,7 +198,9 @@ def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
     from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 
     assert legacy_entrypoint.RealTeleopDatasetRecorder is RealTeleopDatasetRecorder
-    assert legacy_entrypoint.RealTeleopDatasetRecorder.__module__ == legacy_entrypoint.__name__
+    assert legacy_entrypoint.RealTeleopDatasetRecorder.__module__ == (
+        "teleop_runtime.debug.run_vive_rm65_real_teleop"
+    )
     cli_resolution_source = (
         ROOT / "teleop_runtime/real_teleop/cli_resolution.py"
     ).read_text(encoding="utf-8")
@@ -293,7 +316,9 @@ def test_extracted_debug_timing_report_keeps_legacy_ansi_frame() -> None:
 
 def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None:
     assert legacy_entrypoint.RealTeleopComponents is components.RealTeleopComponents
-    assert legacy_entrypoint.RealTeleopComponents.__module__ == legacy_entrypoint.__name__
+    assert legacy_entrypoint.RealTeleopComponents.__module__ == (
+        "teleop_runtime.debug.run_vive_rm65_real_teleop"
+    )
     component_fields = tuple(item.name for item in fields(components.RealTeleopComponents))
     assert component_fields[:4] == (
         "session",
@@ -301,10 +326,11 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
         "left_command_backend",
         "right_command_backend",
     )
-    assert component_fields[-3:] == (
+    assert component_fields[-4:] == (
         "fix_arm_controller",
         "init_arm_controller",
         "position_reference_publisher",
+        "startup_home_continuity_gate",
     )
 
     for name in (
@@ -321,7 +347,9 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
         assert getattr(legacy_entrypoint, name) is getattr(cli_value_parsers, name)
 
     assert legacy_entrypoint.RealDatasetFinalizeTask is dataset_finalize.RealDatasetFinalizeTask
-    assert legacy_entrypoint.RealDatasetFinalizeTask.__module__ == legacy_entrypoint.__name__
+    assert legacy_entrypoint.RealDatasetFinalizeTask.__module__ == (
+        "teleop_runtime.debug.run_vive_rm65_real_teleop"
+    )
     task = dataset_finalize.RealDatasetFinalizeTask(
         episode_index=3,
         frame_count=4,
@@ -452,13 +480,15 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 439
-    assert sum(len(action.option_strings) for action in parser._actions) == 497
+    assert len(parser._actions) == 447
+    assert sum(len(action.option_strings) for action in parser._actions) == 506
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).artifact_layout == "legacy"
     assert parser.parse_args([]).v25p_native_shadow is False
     assert parser.parse_args([]).v25p_native_storage_layout == "record_cjson_v1"
+    assert parser.parse_args([]).tactile_bundle_root == ""
+    assert parser.parse_args([]).tactile_bundle_min_free_gb == 0.0
     assert parser.parse_args([]).position_ik_branch_continuity_anchor is False
     assert parser.parse_args([]).position_joint_limit_guard_mode == "legacy"
     assert parser.parse_args([]).runtime_home_atomic_arm_snapshot is True
@@ -1321,6 +1351,245 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
     ).read_text(encoding="utf-8")
     assert "from teleop_runtime.debug" not in source
     assert "from ..debug" not in source
+
+
+def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        startup_runtime,
+        "_reset_runtime_motion_state_from_real_qpos",
+        lambda *args, **kwargs: events.append("motion_reset") or True,
+    )
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+
+    class SafetyFilter:
+        execution_epoch = 0
+        profile = SimpleNamespace(anchor_required_sides=("left", "right"))
+
+        def rebind_from_calibration_home(self, **kwargs):
+            events.append(f"rebind:{kwargs['execution_epoch']}")
+            return SimpleNamespace(semantic_content_hash="anchor-hash")
+
+    session = SimpleNamespace(
+        mark_home_recalibrated=lambda reason: events.append("mark_home"),
+        set_calibration_ready=lambda: events.append("calibration_ready"),
+        mark_debug_passed=lambda: events.append("debug_passed"),
+        arm_hardware=lambda: events.append("arm_hardware"),
+        hold_hardware=lambda reason: events.append("hold_hardware"),
+    )
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=SimpleNamespace(
+            pre_ik_target_safety_filter=SafetyFilter()
+        ),
+        position_reference_publisher=SimpleNamespace(
+            reset_epoch=lambda: events.append("epoch_reset") or 4
+        ),
+        position_admittance_endpoint_guard=None,
+        session=session,
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=True,
+        runtime_home_qpos_snapshot={
+            "left": np.zeros(6),
+            "right": np.zeros(6),
+        },
+    )
+
+    assert events.index("rebind:4") < events.index("arm_hardware")
+    assert "hold_hardware" not in events
+    assert events[-1] == "teleop_running"
+
+
+def test_startup_home_continuity_gate_arms_before_real_hardware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    home_qpos = {"left": np.zeros(6), "right": np.zeros(6)}
+    monkeypatch.setattr(
+        startup_runtime,
+        "_reset_runtime_motion_state_from_real_qpos",
+        lambda *args, **kwargs: {"left": True, "right": True},
+    )
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+
+    class ContinuityGate:
+        def arm_from_home(self, qpos_by_side):
+            assert qpos_by_side is home_qpos
+            events.append("continuity_armed")
+            return {"status": "waiting_for_candidate"}
+
+    session = SimpleNamespace(
+        mark_home_recalibrated=lambda reason: events.append("mark_home"),
+        set_calibration_ready=lambda: events.append("calibration_ready"),
+        mark_debug_passed=lambda: events.append("debug_passed"),
+        arm_hardware=lambda: events.append("arm_hardware"),
+        hold_hardware=lambda reason: events.append("hold_hardware"),
+    )
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=None,
+        position_reference_publisher=SimpleNamespace(reset_epoch=lambda: 8),
+        position_admittance_endpoint_guard=None,
+        startup_home_continuity_gate=ContinuityGate(),
+        session=session,
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=True,
+        runtime_home_qpos_snapshot=home_qpos,
+    )
+
+    assert events.index("continuity_armed") < events.index("arm_hardware")
+    assert "hold_hardware" not in events
+
+
+def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+    safety_filter = SimpleNamespace(
+        profile=SimpleNamespace(anchor_required_sides=("left",)),
+        execution_epoch=0,
+        apply_to_target=True,
+    )
+    components = SimpleNamespace(
+        active_sides=("left",),
+        dual_arm_retargeter=SimpleNamespace(
+            pre_ik_target_safety_filter=safety_filter
+        ),
+        position_reference_publisher=SimpleNamespace(reset_epoch=lambda: 1),
+        session=SimpleNamespace(
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=lambda: events.append("arm_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=False,
+    )
+
+    assert events == ["hold_hardware", "waiting"]
+
+
+def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+    safety_filter = SimpleNamespace(
+        profile=SimpleNamespace(anchor_required_sides=("left",)),
+        execution_epoch=0,
+        apply_to_target=False,
+    )
+    components = SimpleNamespace(
+        active_sides=("left",),
+        dual_arm_retargeter=SimpleNamespace(
+            pre_ik_target_safety_filter=safety_filter
+        ),
+        position_reference_publisher=SimpleNamespace(reset_epoch=lambda: 1),
+        session=SimpleNamespace(
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=lambda: events.append("arm_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=False,
+    )
+
+    assert "hold_hardware" not in events
+    assert "waiting" not in events
+    assert events == [
+        "calibration_ready",
+        "debug_passed",
+        "force_enable",
+        "arm_hardware",
+        "teleop_running",
+    ]
+
+
+def test_active_tcp_pose_envelope_fault_has_explicit_pre_dispatch_hold_path() -> None:
+    source = (
+        ROOT / "teleop_runtime/real_teleop/control_loop.py"
+    ).read_text(encoding="utf-8")
+    run_step_marker = "step_result = components.session.run_step("
+    active_fault_marker = "except TCPPoseEnvelopeRuntimeError as exc:"
+    generic_fault_marker = (
+        "except Exception as exc:  # noqa: BLE001 - only safety races are consumed here."
+    )
+
+    run_step_index = source.index(run_step_marker)
+    active_fault_index = source.index(active_fault_marker, run_step_index)
+    generic_fault_index = source.index(generic_fault_marker, active_fault_index)
+    hold_index = source.index(
+        "require_home_recalibration=True",
+        active_fault_index,
+    )
+    request_index = source.index(
+        'reason="tcp_pose_envelope_active_pre_ik_fault"',
+        active_fault_index,
+    )
+
+    assert run_step_index < active_fault_index < generic_fault_index
+    assert active_fault_index < hold_index < generic_fault_index
+    assert active_fault_index < request_index < generic_fault_index
 
 
 def test_startup_home_wait_quiesces_idle_maintenance_during_delay(

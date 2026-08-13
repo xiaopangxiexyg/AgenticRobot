@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 import threading
 
 import pytest
@@ -22,40 +23,15 @@ from control_station.umi.input_mapping import (
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
-def test_legacy_real_teleop_gui_controls_reexport_station_objects() -> None:
-    canonical = importlib.import_module(
-        "control_station.real_teleop.control_availability"
-    )
-    legacy = importlib.import_module("teleop_runtime.real_teleop.gui_controls")
-
-    assert tuple(legacy.__all__) == tuple(canonical.__all__)
-    for public_name in canonical.__all__:
-        assert getattr(legacy, public_name) is getattr(canonical, public_name)
-
-
-def test_legacy_web_ui_proxy_preserves_objects_and_private_debug_hooks() -> None:
-    canonical = importlib.import_module("control_station.web.calibration_web_ui")
-    legacy = importlib.import_module("teleop_runtime.gui.calibration_web_ui")
-
-    for name in (
-        "CalibrationWebUi",
-        "CalibrationWebUiState",
-        "WebUiKeyInput",
-        "_HTML_PAGE",
-        "_FALLBACK_SCRIPT",
-        "_encode_http_event_payload",
-        "_render_initial_html",
-        "_runtime_home_diagnostic_payload",
+def test_obsolete_station_facades_are_absent() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    for relative_path in (
+        "teleop_runtime/debug/calibration_web_ui.py",
+        "teleop_runtime/gui/calibration_web_ui.py",
+        "teleop_runtime/gui/startup_progress.py",
+        "teleop_runtime/real_teleop/gui_controls.py",
     ):
-        assert getattr(legacy, name) is getattr(canonical, name)
-
-
-def test_legacy_startup_progress_reexports_station_objects() -> None:
-    canonical = importlib.import_module("control_station.web.startup_progress")
-    legacy = importlib.import_module("teleop_runtime.gui.startup_progress")
-
-    assert legacy.GuiStartupProgress is canonical.GuiStartupProgress
-    assert legacy.StartupProgressUi is canonical.StartupProgressUi
+        assert not (repository_root / relative_path).exists()
 
 
 def test_legacy_gui_status_payload_path_delegates_to_real_teleop_owner() -> None:

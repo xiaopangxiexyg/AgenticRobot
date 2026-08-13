@@ -64,6 +64,30 @@ def _parse_real_teleop_args(argv: list[str]) -> argparse.Namespace:
         return real_teleop.parse_args()
 
 
+def test_tcp_pose_envelope_cli_is_default_off_and_requires_explicit_active() -> None:
+    defaults = _parse_real_teleop_args([])
+    assert defaults.tcp_pose_envelope_profile == ""
+    assert defaults.tcp_pose_envelope_active is False
+
+    shadow = _parse_real_teleop_args(
+        ["--tcp-pose-envelope-profile", "tcp-envelope.json"]
+    )
+    assert shadow.tcp_pose_envelope_profile == "tcp-envelope.json"
+    assert shadow.tcp_pose_envelope_active is False
+
+    active = _parse_real_teleop_args(
+        [
+            "--tcp-pose-envelope-profile",
+            "tcp-envelope.json",
+            "--tcp-pose-envelope-active",
+        ]
+    )
+    assert active.tcp_pose_envelope_active is True
+
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(["--tcp-pose-envelope-active"])
+
+
 def test_default_common_position_profile_contract_has_independent_15_60_120_clocks() -> None:
     rates = POSITION_PROFILE.rates
 
@@ -508,9 +532,11 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
         "--position-admittance-shadow-max-velocity-m-s",
         "0.06",
         "--position-admittance-shadow-max-return-velocity-m-s",
-        "0.03",
+        "0.42",
         "--position-admittance-shadow-max-slew-m-s",
         "0.06",
+        "--position-admittance-shadow-return-rate-s",
+        "4",
         "--position-admittance-rotation-active-profile",
         "balanced-5deg",
         "--position-admittance-active-max-tool-rotation-excursion-deg",
@@ -701,9 +727,11 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
         "--position-admittance-shadow-max-velocity-m-s",
         "0.03",
         "--position-admittance-shadow-max-return-velocity-m-s",
-        "0.015",
+        "0.06",
         "--position-admittance-shadow-max-slew-m-s",
         "0.03",
+        "--position-admittance-shadow-return-rate-s",
+        "2",
         "--position-admittance-active-max-tool-excursion-m",
         "0.08",
     ]
@@ -785,6 +813,48 @@ def test_idle_tactile_compression_is_opt_in_and_rejects_hot_path_conflicts() -> 
         ["--idle-tactile-compression", "--no-collection"],
         ["--idle-tactile-compression", "--tactile-storage", "parquet"],
         ["--idle-tactile-compression", "--tactile-compression", "zstd"],
+    ):
+        with pytest.raises(SystemExit):
+            _parse_real_teleop_args(conflicting)
+
+
+def test_native_tactile_bundle_cli_is_opt_in_and_fail_closed() -> None:
+    defaults = _parse_real_teleop_args([])
+    assert defaults.tactile_bundle_root == ""
+    assert defaults.tactile_bundle_min_free_gb == 0.0
+
+    enabled = _parse_real_teleop_args(
+        [
+            "--tactile-bundle-root",
+            "/tmp/dexteleop-test-tactile-device",
+            "--tactile-bundle-min-free-gb",
+            "12.5",
+        ]
+    )
+    assert enabled.tactile_bundle_root == "/tmp/dexteleop-test-tactile-device"
+    assert enabled.tactile_bundle_min_free_gb == 12.5
+    assert enabled.tactile_storage == "external"
+    assert enabled.tactile_artifact_integrity is True
+
+    for conflicting in (
+        ["--tactile-bundle-min-free-gb", "1"],
+        ["--tactile-bundle-root", "/tmp/tactile", "--no-collection"],
+        [
+            "--tactile-bundle-root",
+            "/tmp/tactile",
+            "--tactile-storage",
+            "parquet",
+        ],
+        [
+            "--tactile-bundle-root",
+            "/tmp/tactile",
+            "--idle-tactile-compression",
+        ],
+        [
+            "--tactile-bundle-root",
+            "/tmp/tactile",
+            "--no-tactile-artifact-integrity",
+        ],
     ):
         with pytest.raises(SystemExit):
             _parse_real_teleop_args(conflicting)

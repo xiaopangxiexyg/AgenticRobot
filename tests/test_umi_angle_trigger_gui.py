@@ -13,7 +13,7 @@ from teleop_runtime.configs.dmtac_hardware import (
     _unique_dmtac_gripper_completion,
     _usb_assignment_module,
 )
-from teleop_runtime.gui.calibration_web_ui import _HTML_PAGE
+from control_station.web.calibration_web_ui import _HTML_PAGE
 
 
 def _sensor(name: str, *, location: str, servo_id: int) -> SensorCandidate:

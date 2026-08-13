@@ -1,9 +1,7 @@
-"""Browser GUI helpers for teleop runtime tools."""
+"""Lower-owned GUI runtime helpers.
 
-from .calibration_web_ui import CalibrationWebUi, CalibrationWebUiState, WebUiKeyInput
+Control Station browser presentation is imported from ``control_station.web``.
+This package root intentionally does not re-export that application surface.
+"""
 
-__all__ = [
-    "CalibrationWebUi",
-    "CalibrationWebUiState",
-    "WebUiKeyInput",
-]
+__all__: list[str] = []

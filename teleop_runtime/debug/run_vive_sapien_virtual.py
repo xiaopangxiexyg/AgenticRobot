@@ -1638,6 +1638,34 @@ def _channel_pose_in_desk(channel, calibration) -> np.ndarray:
     raise ValueError(f"Unsupported calibration input frame: {frame_name or '<none>'}")
 
 
+def _runtime_human_home_pose(
+    samples: list[np.ndarray],
+    *,
+    late_weighted: bool,
+    fresh_post_snapshot_pose: np.ndarray | None = None,
+) -> np.ndarray:
+    """Resolve the human Home anchor without mixing different time cuts.
+
+    A post-snapshot pose is already the accepted latest tracker observation for
+    the robot Home transaction and therefore must be used exactly. Historical
+    samples remain useful for stillness validation, but averaging them into the
+    anchor creates a deterministic first-target residual whenever the tracker
+    drifted during capture.
+    """
+
+    if fresh_post_snapshot_pose is not None:
+        pose = as_pose_matrix(fresh_post_snapshot_pose)
+        if not np.all(np.isfinite(pose)):
+            raise ValueError("Fresh runtime human Home pose must be finite.")
+        return pose.copy()
+    weights = (
+        np.arange(1, len(samples) + 1, dtype=float)
+        if late_weighted
+        else None
+    )
+    return _mean_pose(samples, weights=weights)
+
+
 def _runtime_home_calibration(
     components: VirtualRunComponents,
     *,
@@ -1650,6 +1678,7 @@ def _runtime_home_calibration(
     stability_profile: str = "strict",
     atomic_robot_home_snapshot: bool = True,
     late_weighted_human_home: bool = True,
+    fresh_data_timeout_sec: float | None = None,
 ) -> dict[str, np.ndarray]:
     calibration = components.session.calibration
     assert calibration is not None
@@ -1706,9 +1735,10 @@ def _runtime_home_calibration(
         if atomic_robot_home_snapshot:
             _log(
                 "Calibration",
-                "start-pose source=real; one final dual-arm snapshot will be "
-                "captured after the last fresh VIVE Home sample and reused by "
-                "robot Home, preview/IK, and command reset",
+                "start-pose source=real; after the initial stable VIVE window, "
+                "one dual-arm snapshot will be reused by robot Home, preview/IK, "
+                "and command reset; a subsequent fresh stable VIVE cut will be "
+                "the exact human Home anchor",
             )
         else:
             synced = _sync_preview_from_real_state(components, required=False)
@@ -1732,12 +1762,43 @@ def _runtime_home_calibration(
             "Calibration",
             "start-pose source=virtual preview defaults/current local state; pressing 'p' will capture tracker home and current preview arm home",
         )
+    follows_live_real_state = _preview_should_follow_live_real_state(
+        arm_mode=arm_mode,
+        components=components,
+    )
+    # The default real-robot transaction uses the existing late/fresh feature
+    # switch as its rollback boundary.  When enabled, historical samples only
+    # prove stillness; a fresh tracker cut captured after the atomic arm qpos is
+    # the exact human Home anchor.
+    fresh_post_snapshot_active = bool(
+        late_weighted_human_home
+        and atomic_robot_home_snapshot
+        and follows_live_real_state
+    )
+    stability_required = bool(require_stable or fresh_post_snapshot_active)
     calibration_timing_start = time.perf_counter()
+    timeout_sec = float(timeout_sec)
+    timeout_started_at = time.monotonic()
+    timeout_deadline = timeout_started_at + timeout_sec
+    freshness_timeout = (
+        None
+        if fresh_data_timeout_sec is None
+        else float(fresh_data_timeout_sec)
+    )
+    if freshness_timeout is not None and freshness_timeout <= 0.0:
+        raise ValueError("fresh_data_timeout_sec must be positive when provided")
     start_time = time.time()
     samples: dict[str, list[np.ndarray]] = {side: [] for side in home_sides}
     last_sample_timestamp: dict[str, float | None] = {
         side: None for side in home_sides
     }
+    last_observed_timestamp: dict[str, float | None] = {
+        side: None for side in home_sides
+    }
+    last_fresh_packet_at = {
+        side: timeout_started_at for side in home_sides
+    }
+    fresh_packet_counts = {side: 0 for side in home_sides}
     late_weighted_active = bool(late_weighted_human_home and num_samples > 1)
     sample_target = int(num_samples) + (1 if late_weighted_active else 0)
     profile_name = str(stability_profile or "strict").strip().lower()
@@ -1746,11 +1807,16 @@ def _runtime_home_calibration(
             "runtime Home stability_profile must be 'strict' or 'transition', "
             f"got {stability_profile!r}"
         )
+    if fresh_post_snapshot_active:
+        human_home_estimator = "fresh_stable_post_arm_snapshot"
+    elif late_weighted_active:
+        human_home_estimator = "late_linear"
+    else:
+        human_home_estimator = "legacy_uniform"
     _log(
         "Calibration",
         f"stability_profile={profile_name} capture_sides={','.join(home_sides)} "
-        f"human_home_estimator="
-        f"{'late_linear_fresh_final' if late_weighted_active else 'legacy_uniform'} "
+        f"human_home_estimator={human_home_estimator} "
         f"robot_home_snapshot="
         f"{'atomic_shared' if atomic_robot_home_snapshot else 'legacy_reread'}",
     )
@@ -1765,6 +1831,69 @@ def _runtime_home_calibration(
         {1, max(1, num_samples // 2), num_samples, sample_target}
     )
     reported: dict[str, set[int]] = {side: set() for side in home_sides}
+
+    def pending_sample_sides() -> tuple[str, ...]:
+        return tuple(
+            side for side in home_sides if len(samples[side]) < sample_target
+        )
+
+    def fresh_stale_sides(
+        sides: tuple[str, ...],
+        *,
+        checked_at: float,
+        last_fresh_at: dict[str, float],
+    ) -> tuple[str, ...]:
+        if freshness_timeout is None:
+            return ()
+        return tuple(
+            side
+            for side in sides
+            if checked_at - last_fresh_at[side] >= freshness_timeout
+        )
+
+    def observe_fresh_packets(
+        channels,
+        sides: tuple[str, ...],
+        *,
+        observed_at: float,
+        last_timestamp: dict[str, float | None],
+        last_fresh_at: dict[str, float],
+        packet_counts: dict[str, int],
+    ) -> None:
+        for side in sides:
+            channel = channels.get(f"{side}_wrist_pose")
+            if channel is None or not channel.valid:
+                continue
+            channel_timestamp = float(channel.timestamp)
+            if not np.isfinite(channel_timestamp):
+                raise ValueError(
+                    f"{side}_wrist_pose timestamp must be finite during runtime Home"
+                )
+            previous_timestamp = last_timestamp[side]
+            if (
+                previous_timestamp is None
+                or channel_timestamp > previous_timestamp
+            ):
+                last_timestamp[side] = channel_timestamp
+                last_fresh_at[side] = observed_at
+                packet_counts[side] += 1
+
+    def raise_freshness_timeout(
+        *,
+        phase: str,
+        stale_sides: tuple[str, ...],
+        packet_counts: dict[str, int],
+        stability_reasons: dict[str, str],
+    ) -> None:
+        raise TimeoutError(
+            "Timed out because required VIVE tracker timestamp(s) did not "
+            f"advance for {freshness_timeout:.3f}s during {phase}. "
+            f"stale_sides={list(stale_sides)} "
+            f"fresh_packet_counts={dict(packet_counts)} "
+            f"accepted_sample_counts="
+            f"{{{', '.join(f'{side!r}: {len(samples[side])}' for side in home_sides)}}} "
+            f"stability_reasons={stability_reasons}"
+        )
 
     def publish_progress(*, now: float, channels=None, waiting: bool = False) -> None:
         if progress_callback is None:
@@ -1782,7 +1911,7 @@ def _runtime_home_calibration(
             sample_counts={side: len(samples[side]) for side in home_sides},
             valid_by_side=valid,
             min_samples=int(sample_target),
-            elapsed_sec=max(0.0, now - start_time),
+            elapsed_sec=max(0.0, time.monotonic() - timeout_started_at),
             timeout_sec=float(timeout_sec),
             waiting_for_samples=bool(waiting),
             now=now,
@@ -1792,15 +1921,64 @@ def _runtime_home_calibration(
 
     while any(len(samples[side]) < sample_target for side in home_sides):
         now = time.time()
-        if now - start_time > timeout_sec:
+        monotonic_now = time.monotonic()
+        if monotonic_now >= timeout_deadline:
             counts = {side: len(samples[side]) for side in home_sides}
             publish_progress(now=now, waiting=True)
             raise TimeoutError(
-                "Timed out waiting for active wrist tracker(s) during runtime calibration. "
-                f"sample_counts={counts}. "
-                "Verify sender tracker_role values and receiver tracker-name arguments."
+                "Runtime Home overall timeout while validating stable VIVE data. "
+                f"accepted_sample_counts={counts} "
+                f"fresh_packet_counts={fresh_packet_counts} "
+                "stability_reasons="
+                f"{{{', '.join(f'{side!r}: {stability_by_side[side].reason!r}' for side in home_sides)}}}"
+            )
+        pending_sides = pending_sample_sides()
+        stale_sides = fresh_stale_sides(
+            pending_sides,
+            checked_at=monotonic_now,
+            last_fresh_at=last_fresh_packet_at,
+        )
+        if stale_sides:
+            raise_freshness_timeout(
+                phase="initial_stable_window",
+                stale_sides=stale_sides,
+                packet_counts=fresh_packet_counts,
+                stability_reasons={
+                    side: stability_by_side[side].reason for side in pending_sides
+                },
             )
         channels, _ = components.session.poll_sources(now)
+        poll_finished_at = time.monotonic()
+        if poll_finished_at >= timeout_deadline:
+            counts = {side: len(samples[side]) for side in home_sides}
+            publish_progress(now=time.time(), channels=channels, waiting=True)
+            raise TimeoutError(
+                "Runtime Home overall timeout while polling stable VIVE data. "
+                f"accepted_sample_counts={counts} "
+                f"fresh_packet_counts={fresh_packet_counts}"
+            )
+        stale_sides = fresh_stale_sides(
+            pending_sides,
+            checked_at=poll_finished_at,
+            last_fresh_at=last_fresh_packet_at,
+        )
+        if stale_sides:
+            raise_freshness_timeout(
+                phase="initial_stable_window",
+                stale_sides=stale_sides,
+                packet_counts=fresh_packet_counts,
+                stability_reasons={
+                    side: stability_by_side[side].reason for side in pending_sides
+                },
+            )
+        observe_fresh_packets(
+            channels,
+            pending_sides,
+            observed_at=poll_finished_at,
+            last_timestamp=last_observed_timestamp,
+            last_fresh_at=last_fresh_packet_at,
+            packet_counts=fresh_packet_counts,
+        )
         _update_optional_hand_preview_from_channels(
             components,
             channels,
@@ -1857,7 +2035,7 @@ def _runtime_home_calibration(
                     # the highest-weight Home observation.
                     continue
                 pose_desk = _channel_pose_in_desk(channel, calibration)
-                if require_stable:
+                if stability_required:
                     decision = stability_by_side[side].observe(
                         pose_desk,
                         source_timestamp=channel_timestamp,
@@ -1894,10 +2072,6 @@ def _runtime_home_calibration(
 
     sync_elapsed_ms = 0.0
     robot_qpos_snapshot: dict[str, np.ndarray] = {}
-    follows_live_real_state = _preview_should_follow_live_real_state(
-        arm_mode=arm_mode,
-        components=components,
-    )
     if follows_live_real_state and atomic_robot_home_snapshot:
         sync_start = time.perf_counter()
         robot_qpos_snapshot = _capture_atomic_real_qpos_snapshot(
@@ -1920,6 +2094,135 @@ def _runtime_home_calibration(
             f"locked preview start pose from real state synced={synced} "
             f"elapsed={sync_elapsed_ms:.1f}ms",
         )
+    fresh_human_home_by_side: dict[str, np.ndarray] = {}
+    fresh_human_home_elapsed_ms = 0.0
+    if fresh_post_snapshot_active:
+        # Start a new stillness window after the arm snapshot. This makes the
+        # accepted tracker pose causally newer than the qpos anchor and avoids
+        # treating an old latest-value packet as a fresh Home observation.
+        fresh_start = time.perf_counter()
+        fresh_stability_by_side = {
+            side: stability_factory() for side in home_sides
+        }
+        pending_sides = set(home_sides)
+        fresh_phase_started_at = time.monotonic()
+        post_snapshot_last_timestamp = {
+            side: last_observed_timestamp[side] for side in home_sides
+        }
+        post_snapshot_last_fresh_at = {
+            side: fresh_phase_started_at for side in home_sides
+        }
+        post_snapshot_fresh_packet_counts = {
+            side: 0 for side in home_sides
+        }
+        _log(
+            "Calibration",
+            "arm Home is locked; validating one fresh stable VIVE cut for the "
+            "exact human Home anchor",
+        )
+        while pending_sides:
+            now = time.time()
+            monotonic_now = time.monotonic()
+            if monotonic_now >= timeout_deadline:
+                reasons = {
+                    side: fresh_stability_by_side[side].reason
+                    for side in sorted(pending_sides)
+                }
+                raise TimeoutError(
+                    "Timed out waiting for a fresh stable post-arm-snapshot VIVE "
+                    f"Home cut. pending_sides={sorted(pending_sides)} "
+                    f"reasons={reasons}"
+                )
+            stale_sides = fresh_stale_sides(
+                tuple(sorted(pending_sides)),
+                checked_at=monotonic_now,
+                last_fresh_at=post_snapshot_last_fresh_at,
+            )
+            if stale_sides:
+                raise_freshness_timeout(
+                    phase="post_arm_snapshot_exact_home",
+                    stale_sides=stale_sides,
+                    packet_counts=post_snapshot_fresh_packet_counts,
+                    stability_reasons={
+                        side: fresh_stability_by_side[side].reason
+                        for side in sorted(pending_sides)
+                    },
+                )
+            channels, _ = components.session.poll_sources(now)
+            poll_finished_at = time.monotonic()
+            if poll_finished_at >= timeout_deadline:
+                reasons = {
+                    side: fresh_stability_by_side[side].reason
+                    for side in sorted(pending_sides)
+                }
+                raise TimeoutError(
+                    "Timed out waiting for a fresh stable post-arm-snapshot VIVE "
+                    f"Home cut. pending_sides={sorted(pending_sides)} "
+                    f"reasons={reasons}"
+                )
+            stale_sides = fresh_stale_sides(
+                tuple(sorted(pending_sides)),
+                checked_at=poll_finished_at,
+                last_fresh_at=post_snapshot_last_fresh_at,
+            )
+            if stale_sides:
+                raise_freshness_timeout(
+                    phase="post_arm_snapshot_exact_home",
+                    stale_sides=stale_sides,
+                    packet_counts=post_snapshot_fresh_packet_counts,
+                    stability_reasons={
+                        side: fresh_stability_by_side[side].reason
+                        for side in sorted(pending_sides)
+                    },
+                )
+            observe_fresh_packets(
+                channels,
+                tuple(sorted(pending_sides)),
+                observed_at=poll_finished_at,
+                last_timestamp=post_snapshot_last_timestamp,
+                last_fresh_at=post_snapshot_last_fresh_at,
+                packet_counts=post_snapshot_fresh_packet_counts,
+            )
+            _update_optional_hand_preview_from_channels(
+                components,
+                channels,
+                timestamp=now,
+            )
+            for side in tuple(sorted(pending_sides)):
+                channel = channels.get(f"{side}_wrist_pose")
+                if channel is None or not channel.valid:
+                    continue
+                channel_timestamp = float(channel.timestamp)
+                cutoff_timestamp = last_sample_timestamp[side]
+                if (
+                    cutoff_timestamp is not None
+                    and channel_timestamp <= cutoff_timestamp
+                ):
+                    continue
+                pose_desk = _channel_pose_in_desk(channel, calibration)
+                decision = fresh_stability_by_side[side].observe(
+                    pose_desk,
+                    source_timestamp=channel_timestamp,
+                    first_accepted_pose=None,
+                )
+                if not decision.accepted:
+                    continue
+                fresh_human_home_by_side[side] = pose_desk.copy()
+                last_sample_timestamp[side] = channel_timestamp
+                pending_sides.remove(side)
+                _log(
+                    "Calibration",
+                    f"{side} exact human Home locked from fresh post-snapshot "
+                    f"tracker timestamp={channel_timestamp:.6f}",
+                    now=now,
+                )
+            if pending_sides:
+                publish_progress(now=now, channels=channels, waiting=True)
+                time.sleep(0.01)
+        fresh_human_home_elapsed_ms = (
+            time.perf_counter() - fresh_start
+        ) * 1000.0
+        publish_progress(now=time.time(), waiting=False)
     home_summaries: list[str] = []
     qpos_summaries: list[str] = []
     side_timing_summaries: list[str] = []
@@ -1927,12 +2230,11 @@ def _runtime_home_calibration(
     for side in home_sides:
         side_start = time.perf_counter()
         mean_start = time.perf_counter()
-        weights = (
-            np.arange(1, len(samples[side]) + 1, dtype=float)
-            if late_weighted_active
-            else None
+        human_home = _runtime_human_home_pose(
+            samples[side],
+            late_weighted=late_weighted_active,
+            fresh_post_snapshot_pose=fresh_human_home_by_side.get(side),
         )
-        human_home = _mean_pose(samples[side], weights=weights)
         mean_elapsed_ms = (time.perf_counter() - mean_start) * 1000.0
         robot_home_start = time.perf_counter()
         robot_home_desk, qpos, robot_source = _resolve_robot_home_for_side(
@@ -1973,6 +2275,7 @@ def _runtime_home_calibration(
         f"runtime_home sampling={sample_elapsed_ms:.1f}ms "
         f"post_sample={post_sample_elapsed_ms:.1f}ms "
         f"real_state_sync={sync_elapsed_ms:.1f}ms "
+        f"fresh_human_home={fresh_human_home_elapsed_ms:.1f}ms "
         + " | ".join(side_timing_summaries),
     )
     _log("Calibration", "robot_home " + " ".join(home_summaries))
