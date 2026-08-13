@@ -19,7 +19,10 @@ from sim.mujoco.deploy.sim_hil_target import (
     MujocoAgentSkillMotionTarget,
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
-from sim.mujoco.scene import MujocoCameraRenderer
+from sim.mujoco.rgb_snapshot import (
+    EncodedMujocoRgbFrame,
+    MujocoRgbSnapshotSource,
+)
 
 from ..application import MujocoSimHILPassiveApplicationCut
 
@@ -81,7 +84,9 @@ class MujocoAgentSkillMotionApplication:
         self._held = False
         self._closed = False
         self._active_operation_id: str | None = None
-        self._camera_renderers: dict[tuple[int, int], MujocoCameraRenderer] = {}
+        self._visual_snapshot_source = MujocoRgbSnapshotSource(
+            capture_scene=self._capture_visual_scene,
+        )
 
     @property
     def started(self) -> bool:
@@ -202,67 +207,29 @@ class MujocoAgentSkillMotionApplication:
     def visual_source_catalog(self) -> tuple[Mapping[str, object], ...]:
         """Describe every current RGB source without rendering a frame."""
 
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Agent motion application is closed.")
+        return self._visual_snapshot_source.source_catalog()
 
-            def capture(scene: Any) -> tuple[Mapping[str, object], ...]:
-                metadata = scene.camera_metadata()
-                return tuple(
-                    {
-                        "source_id": name,
-                        "native_width": int(metadata[name]["width"]),
-                        "native_height": int(metadata[name]["height"]),
-                    }
-                    for name in scene.camera_names
-                )
-
-            return self.runtime.rig.capture_scene(capture)
-
-    def capture_visual_frames(
+    def capture_visual_jpeg_frames(
         self,
         *,
         source_ids: tuple[str, ...],
         width: int,
         height: int,
-    ) -> Mapping[str, Any]:
-        """Render one scene-consistent RGB cut under the physics-owner lock."""
+    ) -> Mapping[str, EncodedMujocoRgbFrame]:
+        """Capture validated JPEG frames through the lower MuJoCo source."""
 
-        if not source_ids or len(source_ids) > 8:
-            raise ValueError("source_ids must contain between one and eight entries.")
-        if len(set(source_ids)) != len(source_ids):
-            raise ValueError("source_ids must not contain duplicates.")
-        if (
-            isinstance(width, bool)
-            or not isinstance(width, int)
-            or not 1 <= width <= 1920
-            or isinstance(height, bool)
-            or not isinstance(height, int)
-            or not 1 <= height <= 1080
-        ):
-            raise ValueError("visual dimensions exceed the bounded RGB contract.")
+        return self._visual_snapshot_source.capture_jpeg_frames(
+            source_ids=source_ids,
+            width=width,
+            height=height,
+        )
+
+    def _capture_visual_scene(self, capture: Callable[[Any], Any]) -> Any:
+        """Keep renderer access serialized with motion and lifecycle changes."""
+
         with self._lock:
             if self._closed:
                 raise RuntimeError("Agent motion application is closed.")
-
-            def capture(scene: Any) -> Mapping[str, Any]:
-                available = frozenset(scene.camera_names)
-                missing = tuple(name for name in source_ids if name not in available)
-                if missing:
-                    raise ValueError(f"unknown visual sources: {list(missing)}")
-                key = (width, height)
-                renderer = self._camera_renderers.get(key)
-                if renderer is None:
-                    if len(self._camera_renderers) >= 4:
-                        raise RuntimeError("visual renderer dimension cache is full.")
-                    renderer = MujocoCameraRenderer(
-                        scene,
-                        width=width,
-                        height=height,
-                    )
-                    self._camera_renderers[key] = renderer
-                return renderer.render_all(source_ids)
-
             return self.runtime.rig.capture_scene(capture)
 
     def request_hold(
@@ -351,6 +318,7 @@ class MujocoAgentSkillMotionApplication:
             )
 
     def close_after_hold(self) -> None:
+        visual_source: MujocoRgbSnapshotSource | None = None
         with self._lock:
             if self._closed:
                 return
@@ -358,12 +326,13 @@ class MujocoAgentSkillMotionApplication:
                 raise RuntimeError("Closing a started motion application requires HOLD.")
             if self._started:
                 self.runtime.close()
-            renderers = getattr(self, "_camera_renderers", {})
-            for renderer in renderers.values():
-                renderer.close()
-            renderers.clear()
+            visual_source = getattr(self, "_visual_snapshot_source", None)
             self._closed = True
             self._active_operation_id = None
+        # Do not invert the source-lock -> application-lock order used during
+        # capture.  Once _closed is visible, no new scene capture can begin.
+        if visual_source is not None:
+            visual_source.close()
 
 
 __all__ = [

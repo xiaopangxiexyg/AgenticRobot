@@ -4,12 +4,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
-
-import numpy as np
-from PIL import Image
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
@@ -130,7 +126,7 @@ class MujocoAgentVisualSnapshotProvider:
                 )
             selected.append(matches[0])
         source_ids = tuple(str(source["source_id"]) for source in selected)
-        arrays = self._application.capture_visual_frames(
+        encoded_frames = self._application.capture_visual_jpeg_frames(
             source_ids=source_ids,
             width=width,
             height=height,
@@ -142,7 +138,15 @@ class MujocoAgentVisualSnapshotProvider:
         total_bytes = 0
         for source in selected:
             source_id = str(source["source_id"])
-            encoded = _encode_jpeg(arrays[source_id])
+            encoded_frame = encoded_frames[source_id]
+            if (
+                encoded_frame.source_id != source_id
+                or encoded_frame.width != width
+                or encoded_frame.height != height
+                or encoded_frame.media_type != "image/jpeg"
+            ):
+                raise RuntimeError("visual_snapshot_frame_contract_mismatch")
+            encoded = encoded_frame.data
             total_bytes += len(encoded)
             if total_bytes > max_total_bytes:
                 raise RuntimeError("visual_snapshot_payload_limit_exceeded")
@@ -153,7 +157,7 @@ class MujocoAgentVisualSnapshotProvider:
                     "frame_id": f"visual-frame:{media_hash}",
                     "source_id": source_id,
                     "role": source["role"],
-                    "media_type": "image/jpeg",
+                    "media_type": encoded_frame.media_type,
                     "width": width,
                     "height": height,
                     "media_content_hash": media_hash,
@@ -191,21 +195,6 @@ class MujocoAgentVisualSnapshotProvider:
             role = _ROLE_BY_SOURCE_ID.get(source_id, f"auxiliary_{source_id}")
             sources.append({**dict(source), "role": role})
         return sources
-
-
-def _encode_jpeg(image: object) -> bytes:
-    array = np.asarray(image)
-    if array.ndim != 3 or array.shape[2] != 3 or array.dtype != np.uint8:
-        raise RuntimeError("MuJoCo visual source did not return uint8 HWC RGB.")
-    output = io.BytesIO()
-    Image.fromarray(array, mode="RGB").save(
-        output,
-        format="JPEG",
-        quality=85,
-        optimize=True,
-    )
-    return output.getvalue()
-
 
 __all__ = [
     "MUJOCO_AGENT_VISUAL_CATALOG_SCHEMA_V1",
