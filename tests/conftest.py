@@ -100,6 +100,7 @@ CONTRACT_MODULES = frozenset(
         "test_sim_contracts.py",
         "test_teleop_action_contract.py",
         "test_teleop_collection_topology.py",
+        "test_teleop_runtime_lazy_imports.py",
         "test_v25p_capture_profiles.py",
         "test_v25p_contracts.py",
     }

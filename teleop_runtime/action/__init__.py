@@ -154,10 +154,6 @@ from .legacy_execution_context import (
     LegacyMotionDispatchPreparation,
     LegacySafetyDispatchPreparation,
 )
-from .rm65_candidate_safety_matrix import (
-    M6_CANDIDATE_POLICY_ARM_QPOS_SAFETY_MATRIX_V1,
-    build_m6_candidate_policy_arm_qpos_scoped_safety_matrix,
-)
 from .vector_pipeline import (
     VectorActionLayout,
     VectorRobotActionBuildResult,
@@ -206,6 +202,10 @@ _LAZY_PASSIVE_TELEOP_EXPORTS = {
     "build_passive_teleop_component_session_source",
     "build_passive_teleop_pose_session_source",
 }
+_LAZY_RM65_CANDIDATE_SAFETY_EXPORTS = {
+    "M6_CANDIDATE_POLICY_ARM_QPOS_SAFETY_MATRIX_V1",
+    "build_m6_candidate_policy_arm_qpos_scoped_safety_matrix",
+}
 
 
 def __getattr__(name: str):
@@ -223,6 +223,10 @@ def __getattr__(name: str):
         from . import passive_teleop
 
         return getattr(passive_teleop, name)
+    if name in _LAZY_RM65_CANDIDATE_SAFETY_EXPORTS:
+        from . import rm65_candidate_safety_matrix
+
+        return getattr(rm65_candidate_safety_matrix, name)
 
     if name in _LAZY_REPLAY_PROPOSAL_EXPORTS:
         from . import replay_proposal
