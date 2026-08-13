@@ -45,6 +45,7 @@ from robot_motion.types import IKResolveRequest
 
 
 ActionSource = Callable[[int, float, dict[str, object] | None], Iterable[float] | None]
+FinalTCPPoseProjector = Callable[[str, np.ndarray], np.ndarray]
 _IK_HARD_DEADLINE_RETURN_CODE = -101
 
 
@@ -724,6 +725,12 @@ class RM65BaseImpedanceController:
         self._debug_tool_frame_active = False
         self._model_fk_pose: list[float] | None = None
         self._latest_wrench_context: dict[str, object] | None = None
+        # Optional upper-runtime safety seam.  Hardware owns neither the
+        # envelope profile nor its frame/epoch bindings; it only guarantees
+        # that the final nominal-plus-admittance TCP pose passes this callback
+        # once before any pose IK path.  ``None`` preserves legacy behavior.
+        self._final_tcp_pose_projector: FinalTCPPoseProjector | None = None
+        self._final_tcp_pose_projector_lock = threading.RLock()
         self._last_step_time: float | None = None
         self._current_step_dt: float | None = None
         self._previous_command_pose: list[float] | None = None
@@ -822,6 +829,17 @@ class RM65BaseImpedanceController:
             self.robot = Arm(RM65, self.ip)
         if int(self.robot.Arm_Socket_State()) != 0:
             raise RuntimeError(f"{self.side}: failed to connect ip={self.ip}")
+
+    def set_final_tcp_pose_projector(
+        self,
+        projector: FinalTCPPoseProjector | None,
+    ) -> None:
+        """Install a fail-closed projector for the final composed tool TCP."""
+
+        if projector is not None and not callable(projector):
+            raise TypeError("final TCP pose projector must be callable or None")
+        with self._final_tcp_pose_projector_lock:
+            self._final_tcp_pose_projector = projector
 
     def _read_state(self) -> dict[str, list[float]]:
         assert self.robot is not None
@@ -4442,6 +4460,72 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
     def _initial_reference(self, state: dict[str, list[float]]) -> list[float]:
         return normalize_pose(state["pose"])
 
+    def _project_final_composed_tcp_pose(
+        self,
+        *,
+        reference_pose: list[float],
+        requested_offset: list[float],
+    ) -> tuple[list[float], bool]:
+        """Project nominal plus force offset and return its effective offset."""
+
+        with self._final_tcp_pose_projector_lock:
+            projector = self._final_tcp_pose_projector
+        if projector is None:
+            return list(requested_offset), False
+
+        raw_command_pose = apply_pose_offset(reference_pose, requested_offset)
+        raw_matrix = pose6_to_matrix(raw_command_pose)
+        effective_matrix = np.array(
+            projector(self.side, np.array(raw_matrix, dtype=float, copy=True)),
+            dtype=float,
+            copy=True,
+        )
+        if effective_matrix.shape != (4, 4) or not np.all(np.isfinite(effective_matrix)):
+            raise RuntimeError(
+                f"{self.side}: final TCP pose projector returned an invalid 4x4 pose"
+            )
+        effective_pose = normalize_pose(matrix_to_pose6(effective_matrix))
+        linear_adjustment_m, angular_adjustment_rad = _pose_delta(
+            raw_command_pose,
+            effective_pose,
+        )
+        modified = bool(
+            linear_adjustment_m > 1e-10 or angular_adjustment_rad > 1e-10
+        )
+        effective_offset = _pose_offset_from_reference(
+            reference_pose=reference_pose,
+            command_pose=effective_pose,
+        )
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["final_tcp_pose_projector_enabled"] = True
+            self._latest_wrench_context["final_tcp_pose_projector_modified"] = modified
+            self._latest_wrench_context["final_tcp_pose_projector_linear_adjustment_m"] = (
+                float(linear_adjustment_m)
+            )
+            self._latest_wrench_context["final_tcp_pose_projector_angular_adjustment_rad"] = (
+                float(angular_adjustment_rad)
+            )
+            self._latest_wrench_context["final_tcp_pose_projector_raw_pose"] = list(
+                raw_command_pose
+            )
+            self._latest_wrench_context["final_tcp_pose_projector_effective_pose"] = list(
+                effective_pose
+            )
+        if modified:
+            # Feed the actually admissible persistent displacement back into
+            # the admittance state on active force axes.  This prevents a
+            # hidden force offset from integrating beyond the spatial bound.
+            self._sync_admittance_to_realized_pose_offset(
+                reference_pose=reference_pose,
+                command_pose=effective_pose,
+                requested_offset=requested_offset,
+                realization_source="final_tcp_pose_envelope",
+            )
+            # The anti-windup helper may intentionally preserve inactive-axis
+            # state.  That state update must never replace this cycle's exact
+            # geometric safety projection.
+        return list(effective_offset), modified
+
     def _sync_admittance_to_realized_pose_offset(
         self,
         *,
@@ -4927,18 +5011,11 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             else finite_list(preferred_joint, expected_len=6, label="preferred_joint")
         )
         offset_values = finite_list(offset, expected_len=6, label="pose_offset")
-        linear_offset_m = norm(offset_values[:3])
-        angular_offset_rad = norm(offset_values[3:])
         exact_qpos_transit = self.exact_qpos_transit_active
         if exact_qpos_transit and preferred is None:
             raise RuntimeError(
                 f"{self.side}: exact qpos transit requires a fresh solver_output_qpos"
             )
-        force_guard_active, force_guard_metadata = self._direct_joint_hint_force_guard_state()
-        offset_within_direct_hint = bool(
-            linear_offset_m <= float(self.config.direct_joint_hint_max_linear_offset_m)
-            and angular_offset_rad <= float(self.config.direct_joint_hint_max_angular_offset_rad)
-        )
         if self._passthrough_position_control_enabled() and preferred is not None:
             command_pose = normalize_pose(reference)
             command_joint = list(preferred)
@@ -4969,6 +5046,21 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 f"{self.side}: passthrough position control requires 15Hz solver_output_qpos; "
                 "refusing to fall back to SDK IK."
             )
+        final_tcp_pose_projector_modified = False
+        if not exact_qpos_transit:
+            offset_values, final_tcp_pose_projector_modified = (
+                self._project_final_composed_tcp_pose(
+                    reference_pose=reference,
+                    requested_offset=offset_values,
+                )
+            )
+        linear_offset_m = norm(offset_values[:3])
+        angular_offset_rad = norm(offset_values[3:])
+        force_guard_active, force_guard_metadata = self._direct_joint_hint_force_guard_state()
+        offset_within_direct_hint = bool(
+            linear_offset_m <= float(self.config.direct_joint_hint_max_linear_offset_m)
+            and angular_offset_rad <= float(self.config.direct_joint_hint_max_angular_offset_rad)
+        )
         if self._deployment_dual_rate_ik_enabled() and not exact_qpos_transit:
             return self._deployment_dual_rate_command_from_reference(
                 reference=reference,
@@ -4977,6 +5069,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             )
         direct_joint_hint = bool(
             preferred is not None
+            and not final_tcp_pose_projector_modified
             and (exact_qpos_transit or offset_within_direct_hint or force_guard_active)
         )
         if preferred is not None:
@@ -5062,13 +5155,17 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             self._ik_seed = list(command_joint)
             return command_pose, command_joint
 
-        if preferred is not None and reference_from_preferred_joint is not None:
+        if (
+            preferred is not None
+            and reference_from_preferred_joint is not None
+            and not final_tcp_pose_projector_modified
+        ):
             try:
                 if self._ik_resolver is not None:
                     command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
                         self._command_from_pose_with_resolver(
                             reference_pose=reference_from_preferred_joint,
-                            offset=offset,
+                            offset=offset_values,
                             seed_joint_override=preferred,
                             use_joint_velocity_limit=True,
                         )
@@ -5077,7 +5174,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
                         self._command_from_pose_with_ik_backoff(
                             reference_pose=reference_from_preferred_joint,
-                            offset=offset,
+                            offset=offset_values,
                             seed_joint_override=preferred,
                         )
                     )
@@ -5107,7 +5204,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                         seed_joint=seed_joint,
                         target_pose=command_pose,
                         reference=reference_from_preferred_joint,
-                        offset=offset,
+                        offset=offset_values,
                     )
                 )
                 held = self._hold_last_safe_command_after_ik_failure(
@@ -5127,7 +5224,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     seed_joint=seed_joint,
                     target_pose=command_pose,
                     reference=reference_from_preferred_joint,
-                    offset=offset,
+                    offset=offset_values,
                 )
             command_joint = finite_list(command_joint[:6], expected_len=6, label="ik_joint_deg")
             try:
@@ -5167,7 +5264,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
                 command_solver(
                     reference_pose=reference,
-                    offset=offset,
+                    offset=offset_values,
                     seed_joint_override=preferred,
                 )
             )
@@ -5195,7 +5292,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     seed_joint=seed_joint,
                     target_pose=command_pose,
                     reference=reference,
-                    offset=offset,
+                    offset=offset_values,
                 )
             )
             held = self._hold_last_safe_command_after_ik_failure(
@@ -5219,7 +5316,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 seed_joint=seed_joint,
                 target_pose=command_pose,
                 reference=reference,
-                offset=offset,
+                offset=offset_values,
             )
         command_joint = finite_list(command_joint[:6], expected_len=6, label="ik_joint_deg")
         try:

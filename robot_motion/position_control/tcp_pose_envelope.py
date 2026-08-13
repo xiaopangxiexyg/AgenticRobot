@@ -40,6 +40,9 @@ TCP_POSE_ENVELOPE_ANCHOR_HASH_DOMAIN_DEVELOPMENT = (
 TCP_POSE_ENVELOPE_RESULT_HASH_DOMAIN_DEVELOPMENT = (
     "dexteleop.tcp_pose_envelope_result.development"
 )
+TCP_POSE_ENVELOPE_FEEDBACK_HASH_DOMAIN_DEVELOPMENT = (
+    "dexteleop.tcp_pose_envelope_feedback.development"
+)
 TCP_CONTROLLED_FRAME_ID = "tool_tcp"
 
 RelativeTranslationAxes = Literal["canonical_axes", "anchor_local_axes"]
@@ -62,6 +65,10 @@ class TCPPoseEnvelopeBindingError(TCPPoseEnvelopeError):
 
 class TCPPoseEnvelopeInfeasibleError(TCPPoseEnvelopeError):
     """Raised when configured translation constraints have no intersection."""
+
+
+class TCPPoseEnvelopeRotationCutLocusError(TCPPoseEnvelopeError):
+    """Raised when a clipped SO(3) direction is non-unique near 180 degrees."""
 
 
 def _required_text(value: object, *, name: str) -> str:
@@ -734,6 +741,299 @@ class TCPPoseEnvelopeProjectionResult:
         }
 
 
+TCPPoseEnvelopeFeedbackState = Literal[
+    "unbound",
+    "pending",
+    "clear",
+    "limited",
+    "fault",
+]
+
+
+@dataclass(frozen=True)
+class TCPPoseEnvelopeSideFeedback:
+    """Compact per-side result for low-rate downstream observation."""
+
+    modified: bool
+    translation_adjustment_m: float
+    rotation_adjustment_rad: float
+    violated_translation_constraints: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.modified) is not bool:
+            raise TCPPoseEnvelopeError("modified must be bool")
+        for name in ("translation_adjustment_m", "rotation_adjustment_rad"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise TCPPoseEnvelopeError(
+                    f"{name} must be finite and non-negative"
+                )
+            object.__setattr__(self, name, value)
+        constraints = tuple(
+            _required_text(item, name="violated_translation_constraints.item")
+            for item in self.violated_translation_constraints
+        )
+        if len(set(constraints)) != len(constraints):
+            raise TCPPoseEnvelopeError(
+                "violated_translation_constraints must not contain duplicates"
+            )
+        object.__setattr__(
+            self,
+            "violated_translation_constraints",
+            constraints,
+        )
+
+    @classmethod
+    def from_projection(
+        cls,
+        projection: TCPPoseEnvelopeSideProjection,
+    ) -> TCPPoseEnvelopeSideFeedback:
+        if not isinstance(projection, TCPPoseEnvelopeSideProjection):
+            raise TypeError("projection must be TCPPoseEnvelopeSideProjection")
+        return cls(
+            modified=projection.modified,
+            translation_adjustment_m=projection.translation_adjustment_m,
+            rotation_adjustment_rad=projection.rotation_adjustment_rad,
+            violated_translation_constraints=(
+                projection.violated_translation_constraints
+            ),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "modified": self.modified,
+            "translation_adjustment_m": self.translation_adjustment_m,
+            "rotation_adjustment_rad": self.rotation_adjustment_rad,
+            "violated_translation_constraints": list(
+                self.violated_translation_constraints
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class TCPPoseEnvelopeProjectionFeedback:
+    """Small immutable receipt exposed by a downstream envelope adapter.
+
+    This is deliberately an observational contract.  It contains no raw or
+    effective pose matrices and owns no safety authority.  The Active adapter
+    remains the sole owner of projection and fail-closed behavior; an upper
+    layer may poll this receipt without participating in the control loop.
+    """
+
+    mode: Literal["active", "shadow"]
+    state: TCPPoseEnvelopeFeedbackState
+    profile_id: str
+    profile_hash: str | None
+    execution_epoch: int
+    anchor_hash: str | None
+    frame_count: int
+    target_role: str | None
+    projection_hash: str | None
+    modified_sides: tuple[str, ...]
+    side_adjustment_by_side: Mapping[str, TCPPoseEnvelopeSideFeedback]
+    reason: str
+    error: str | None = None
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"active", "shadow"}:
+            raise TCPPoseEnvelopeError("mode must be 'active' or 'shadow'")
+        if self.state not in {"unbound", "pending", "clear", "limited", "fault"}:
+            raise TCPPoseEnvelopeError("invalid TCP envelope feedback state")
+        profile_id = _required_text(self.profile_id, name="profile_id")
+        profile_hash = (
+            None
+            if self.profile_hash is None
+            else _required_text(self.profile_hash, name="profile_hash")
+        )
+        if self.state in {"pending", "clear", "limited"} and profile_hash is None:
+            raise TCPPoseEnvelopeError(
+                "bound TCP envelope feedback requires profile_hash"
+            )
+        epoch = _non_negative_int(self.execution_epoch, name="execution_epoch")
+        frame_count = _non_negative_int(self.frame_count, name="frame_count")
+        anchor_hash = (
+            None
+            if self.anchor_hash is None
+            else _required_text(self.anchor_hash, name="anchor_hash")
+        )
+        target_role = (
+            None
+            if self.target_role is None
+            else _required_text(self.target_role, name="target_role")
+        )
+        projection_hash = (
+            None
+            if self.projection_hash is None
+            else _required_text(self.projection_hash, name="projection_hash")
+        )
+        modified_sides = tuple(
+            _required_text(side, name="modified_sides.item")
+            for side in self.modified_sides
+        )
+        if len(set(modified_sides)) != len(modified_sides):
+            raise TCPPoseEnvelopeError("modified_sides must not contain duplicates")
+        if not isinstance(self.side_adjustment_by_side, Mapping):
+            raise TypeError("side_adjustment_by_side must be a mapping")
+        side_adjustments: dict[str, TCPPoseEnvelopeSideFeedback] = {}
+        for raw_side, adjustment in self.side_adjustment_by_side.items():
+            side = _required_text(raw_side, name="side_adjustment_by_side.side")
+            if not isinstance(adjustment, TCPPoseEnvelopeSideFeedback):
+                raise TypeError(
+                    "side_adjustment_by_side values must be "
+                    "TCPPoseEnvelopeSideFeedback"
+                )
+            side_adjustments[side] = adjustment
+        expected_modified = tuple(
+            side
+            for side, adjustment in sorted(side_adjustments.items())
+            if adjustment.modified
+        )
+        if tuple(sorted(modified_sides)) != expected_modified:
+            raise TCPPoseEnvelopeError(
+                "modified_sides must match modified side adjustments"
+            )
+        if self.state == "limited" and not modified_sides:
+            raise TCPPoseEnvelopeError("limited feedback must name a modified side")
+        if self.state == "clear" and modified_sides:
+            raise TCPPoseEnvelopeError("clear feedback cannot name modified sides")
+        error = (
+            None if self.error is None else _required_text(self.error, name="error")
+        )
+        if self.state == "fault" and error is None:
+            raise TCPPoseEnvelopeError("fault feedback requires error")
+        if self.state != "fault" and error is not None:
+            raise TCPPoseEnvelopeError("non-fault feedback cannot carry error")
+        reason = _required_text(self.reason, name="reason")
+        frozen_adjustments = MappingProxyType(dict(sorted(side_adjustments.items())))
+        payload = {
+            "mode": self.mode,
+            "state": self.state,
+            "controlled_frame": TCP_CONTROLLED_FRAME_ID,
+            "profile_id": profile_id,
+            "profile_hash": profile_hash,
+            "execution_epoch": epoch,
+            "anchor_hash": anchor_hash,
+            "frame_count": frame_count,
+            "target_role": target_role,
+            "projection_hash": projection_hash,
+            "modified_sides": list(modified_sides),
+            "side_adjustments": {
+                side: adjustment.to_payload()
+                for side, adjustment in frozen_adjustments.items()
+            },
+            "reason": reason,
+            "error": error,
+        }
+        object.__setattr__(self, "profile_id", profile_id)
+        object.__setattr__(self, "profile_hash", profile_hash)
+        object.__setattr__(self, "execution_epoch", epoch)
+        object.__setattr__(self, "anchor_hash", anchor_hash)
+        object.__setattr__(self, "frame_count", frame_count)
+        object.__setattr__(self, "target_role", target_role)
+        object.__setattr__(self, "projection_hash", projection_hash)
+        object.__setattr__(self, "modified_sides", modified_sides)
+        object.__setattr__(self, "side_adjustment_by_side", frozen_adjustments)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "error", error)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=TCP_POSE_ENVELOPE_FEEDBACK_HASH_DOMAIN_DEVELOPMENT,
+            ),
+        )
+
+    @classmethod
+    def from_evaluation(
+        cls,
+        *,
+        apply_to_target: bool,
+        bound: bool,
+        profile_id: str,
+        profile_hash: str | None,
+        execution_epoch: int,
+        anchor_hash: str | None,
+        frame_count: int,
+        target_role: str | None,
+        projection: TCPPoseEnvelopeProjectionResult | None,
+        error: str | None,
+    ) -> TCPPoseEnvelopeProjectionFeedback:
+        side_adjustments = (
+            {}
+            if projection is None
+            else {
+                side: TCPPoseEnvelopeSideFeedback.from_projection(side_projection)
+                for side, side_projection in projection.side_projection_by_side.items()
+            }
+        )
+        modified_sides = (
+            () if projection is None else projection.modified_sides
+        )
+        if error is not None:
+            state: TCPPoseEnvelopeFeedbackState = "fault"
+            reason = str(error)
+        elif not bound:
+            state = "unbound"
+            reason = "profile_unbound"
+        elif projection is None:
+            state = "pending"
+            reason = "awaiting_first_evaluation"
+        elif modified_sides:
+            state = "limited"
+            reason = "target_projected:" + ",".join(modified_sides)
+        else:
+            state = "clear"
+            reason = "within_envelope"
+        return cls(
+            mode="active" if apply_to_target else "shadow",
+            state=state,
+            profile_id=profile_id,
+            profile_hash=profile_hash,
+            execution_epoch=execution_epoch,
+            anchor_hash=anchor_hash,
+            frame_count=frame_count,
+            target_role=target_role,
+            projection_hash=(
+                None
+                if projection is None
+                else projection.semantic_content_hash
+            ),
+            modified_sides=modified_sides,
+            side_adjustment_by_side=side_adjustments,
+            reason=reason,
+            error=error,
+        )
+
+    @property
+    def receipt_ref(self) -> str:
+        return self.semantic_content_hash
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": "robot_motion.tcp_pose_envelope_feedback.v1",
+            "mode": self.mode,
+            "state": self.state,
+            "controlled_frame": TCP_CONTROLLED_FRAME_ID,
+            "profile_id": self.profile_id,
+            "profile_hash": self.profile_hash,
+            "execution_epoch": self.execution_epoch,
+            "anchor_hash": self.anchor_hash,
+            "frame_count": self.frame_count,
+            "target_role": self.target_role,
+            "projection_hash": self.projection_hash,
+            "modified_sides": list(self.modified_sides),
+            "side_adjustments": {
+                side: adjustment.to_payload()
+                for side, adjustment in self.side_adjustment_by_side.items()
+            },
+            "reason": self.reason,
+            "error": self.error,
+            "receipt_ref": self.receipt_ref,
+        }
+
+
 @dataclass(frozen=True)
 class _Halfspace:
     normal: np.ndarray
@@ -776,7 +1076,7 @@ def _project_to_halfspace_intersection(
     point: np.ndarray,
     constraints: Sequence[_Halfspace],
 ) -> tuple[np.ndarray, tuple[str, ...], tuple[str, ...]]:
-    """Project one 3-vector onto a closed polyhedron by active-set enumeration."""
+    """Project one 3-vector onto a closed polyhedron exactly."""
 
     if not constraints:
         return point.copy(), (), ()
@@ -788,6 +1088,53 @@ def _project_to_halfspace_intersection(
         labels[index]
         for index in np.flatnonzero(raw_residual > _CONSTRAINT_TOL)
     )
+
+    # Absolute bounds and the default canonical-axis relative bounds form one
+    # axis-aligned box intersection.  Project it exactly with component clips
+    # instead of enumerating active sets at the safety boundary.  The generic
+    # path below remains authoritative for anchor-local rotated boxes and mixed
+    # polyhedra.
+    axis_by_constraint: list[tuple[int, float]] = []
+    for normal in matrix:
+        axis = int(np.argmax(np.abs(normal)))
+        sign = float(normal[axis])
+        residual_normal = normal.copy()
+        residual_normal[axis] = 0.0
+        if (
+            not math.isclose(abs(sign), 1.0, rel_tol=0.0, abs_tol=1e-12)
+            or not np.allclose(
+                residual_normal,
+                np.zeros(3, dtype=float),
+                rtol=0.0,
+                atol=1e-12,
+            )
+        ):
+            axis_by_constraint = []
+            break
+        axis_by_constraint.append((axis, sign))
+    if len(axis_by_constraint) == len(constraints):
+        lower = np.full(3, -math.inf, dtype=float)
+        upper_box = np.full(3, math.inf, dtype=float)
+        for index, (axis, sign) in enumerate(axis_by_constraint):
+            if sign > 0.0:
+                upper_box[axis] = min(upper_box[axis], upper[index])
+            else:
+                lower[axis] = max(lower[axis], -upper[index])
+        if np.any(lower > upper_box + _CONSTRAINT_TOL):
+            raise TCPPoseEnvelopeInfeasibleError(
+                "absolute and relative TCP translation bounds have an empty "
+                "intersection"
+            )
+        projected = np.minimum(np.maximum(point, lower), upper_box)
+        projected_residual = matrix @ projected - upper
+        active = tuple(
+            labels[index]
+            for index in np.flatnonzero(
+                np.abs(projected_residual) <= 5.0 * _CONSTRAINT_TOL
+            )
+        )
+        return projected, violated, active
+
     if not violated:
         active = tuple(
             labels[index]
@@ -991,6 +1338,124 @@ def _validate_projection_binding(
             )
 
 
+def _project_tcp_pose_envelope_side_unchecked(
+    *,
+    side: str,
+    raw_pose: np.ndarray,
+    profile: TCPPoseEnvelopeProfile,
+    anchor_receipt: TCPPoseEnvelopeAnchorReceipt | None,
+) -> tuple[np.ndarray, TCPPoseEnvelopeSideProjection]:
+    """Project one already validated side without changing binding authority."""
+
+    config = profile.side_config_by_side.get(side)
+    if config is None or not config.enabled:
+        return raw_pose, TCPPoseEnvelopeSideProjection(
+            modified=False,
+            translation_modified=False,
+            rotation_modified=False,
+            translation_adjustment_m=0.0,
+            rotation_adjustment_rad=0.0,
+            raw_anchor_rotation_rad=None,
+            effective_anchor_rotation_rad=None,
+        )
+
+    anchor_pose = (
+        None
+        if anchor_receipt is None
+        else anchor_receipt.tcp_pose_by_side.get(side)
+    )
+    constraints = _translation_constraints(config, anchor_pose=anchor_pose)
+    projected_translation, violated, active = _project_to_halfspace_intersection(
+        raw_pose[:3, 3],
+        constraints,
+    )
+    output = np.asarray(raw_pose, dtype=float).copy()
+    output[:3, 3] = projected_translation
+
+    raw_anchor_rotation: float | None = None
+    effective_anchor_rotation: float | None = None
+    if config.max_rotation_rad is not None:
+        if anchor_pose is None:
+            raise TCPPoseEnvelopeBindingError(
+                f"anchor pose is required for side {side!r} rotation bound"
+            )
+        anchor_rotation = _rotation_from_pose(anchor_pose)
+        raw_rotation = _rotation_from_pose(raw_pose)
+        delta = anchor_rotation.inv() * raw_rotation
+        raw_anchor_rotation = float(delta.magnitude())
+        if raw_anchor_rotation > config.max_rotation_rad + _CONSTRAINT_TOL:
+            # At the SO(3) cut locus the shortest rotation axis is not unique.
+            if raw_anchor_rotation >= math.pi - 1e-6:
+                raise TCPPoseEnvelopeRotationCutLocusError(
+                    f"relative TCP rotation for side {side!r} is too close "
+                    "to 180 degrees for a unique bounded projection"
+                )
+            rotvec = delta.as_rotvec()
+            if raw_anchor_rotation > 0.0:
+                rotvec *= config.max_rotation_rad / raw_anchor_rotation
+            output[:3, :3] = (
+                anchor_rotation * Rotation.from_rotvec(rotvec)
+            ).as_matrix()
+            effective_anchor_rotation = float(config.max_rotation_rad)
+        else:
+            effective_anchor_rotation = raw_anchor_rotation
+
+    output = _pose(output, name=f"effective_tcp_pose_by_side.{side}")
+    translation_adjustment = float(
+        np.linalg.norm(output[:3, 3] - raw_pose[:3, 3])
+    )
+    rotation_adjustment = float(
+        (
+            _rotation_from_pose(raw_pose).inv()
+            * _rotation_from_pose(output)
+        ).magnitude()
+    )
+    translation_modified = translation_adjustment > _CONSTRAINT_TOL
+    rotation_modified = rotation_adjustment > _CONSTRAINT_TOL
+    return output, TCPPoseEnvelopeSideProjection(
+        modified=translation_modified or rotation_modified,
+        translation_modified=translation_modified,
+        rotation_modified=rotation_modified,
+        translation_adjustment_m=translation_adjustment,
+        rotation_adjustment_rad=rotation_adjustment,
+        raw_anchor_rotation_rad=raw_anchor_rotation,
+        effective_anchor_rotation_rad=effective_anchor_rotation,
+        violated_translation_constraints=violated,
+        active_translation_constraints=active,
+    )
+
+
+def _projection_result(
+    *,
+    raw_poses: Mapping[str, np.ndarray],
+    profile: TCPPoseEnvelopeProfile,
+    anchor_receipt: TCPPoseEnvelopeAnchorReceipt | None,
+) -> TCPPoseEnvelopeProjectionResult:
+    effective: dict[str, np.ndarray] = {}
+    diagnostics: dict[str, TCPPoseEnvelopeSideProjection] = {}
+    for side, raw_pose in raw_poses.items():
+        effective[side], diagnostics[side] = (
+            _project_tcp_pose_envelope_side_unchecked(
+                side=side,
+                raw_pose=raw_pose,
+                profile=profile,
+                anchor_receipt=anchor_receipt,
+            )
+        )
+
+    return TCPPoseEnvelopeProjectionResult(
+        raw_tcp_pose_by_side=raw_poses,
+        effective_tcp_pose_by_side=effective,
+        side_projection_by_side=diagnostics,
+        envelope_profile_hash=profile.semantic_content_hash,
+        anchor_hash=(
+            None
+            if anchor_receipt is None
+            else anchor_receipt.semantic_content_hash
+        ),
+    )
+
+
 def project_tcp_pose_envelope(
     raw_tcp_pose_by_side: Mapping[str, object],
     *,
@@ -1029,94 +1494,56 @@ def project_tcp_pose_envelope(
         execution_epoch=execution_epoch,
         anchor_receipt=anchor_receipt,
     )
+    return _projection_result(
+        raw_poses=raw_poses,
+        profile=profile,
+        anchor_receipt=anchor_receipt,
+    )
 
-    effective: dict[str, np.ndarray] = {}
-    diagnostics: dict[str, TCPPoseEnvelopeSideProjection] = {}
-    for side, raw_pose in raw_poses.items():
-        config = profile.side_config_by_side.get(side)
-        if config is None or not config.enabled:
-            effective[side] = raw_pose
-            diagnostics[side] = TCPPoseEnvelopeSideProjection(
-                modified=False,
-                translation_modified=False,
-                rotation_modified=False,
-                translation_adjustment_m=0.0,
-                rotation_adjustment_rad=0.0,
-                raw_anchor_rotation_rad=None,
-                effective_anchor_rotation_rad=None,
-            )
-            continue
 
-        anchor_pose = (
-            None
-            if anchor_receipt is None
-            else anchor_receipt.tcp_pose_by_side.get(side)
-        )
-        constraints = _translation_constraints(config, anchor_pose=anchor_pose)
-        projected_translation, violated, active = _project_to_halfspace_intersection(
-            raw_pose[:3, 3],
-            constraints,
-        )
-        output = np.asarray(raw_pose, dtype=float).copy()
-        output[:3, 3] = projected_translation
+def project_tcp_pose_envelope_side(
+    side: str,
+    raw_tcp_pose: object,
+    *,
+    profile: TCPPoseEnvelopeProfile,
+    target_frame_binding_hash: str,
+    tool_frame_binding_hash_by_side: Mapping[str, str],
+    controlled_frame_id: str,
+    reference_frame_by_side: Mapping[str, str],
+    execution_epoch: int,
+    anchor_receipt: TCPPoseEnvelopeAnchorReceipt | None = None,
+) -> TCPPoseEnvelopeProjectionResult:
+    """Project one independent arm while preserving the full profile binding.
 
-        raw_anchor_rotation: float | None = None
-        effective_anchor_rotation: float | None = None
-        if config.max_rotation_rad is not None:
-            if anchor_pose is None:
-                raise TCPPoseEnvelopeBindingError(
-                    f"anchor pose is required for side {side!r} rotation bound"
-                )
-            anchor_rotation = _rotation_from_pose(anchor_pose)
-            raw_rotation = _rotation_from_pose(raw_pose)
-            delta = anchor_rotation.inv() * raw_rotation
-            raw_anchor_rotation = float(delta.magnitude())
-            if raw_anchor_rotation > config.max_rotation_rad + _CONSTRAINT_TOL:
-                rotvec = delta.as_rotvec()
-                if raw_anchor_rotation > 0.0:
-                    rotvec *= config.max_rotation_rad / raw_anchor_rotation
-                output[:3, :3] = (
-                    anchor_rotation * Rotation.from_rotvec(rotvec)
-                ).as_matrix()
-                effective_anchor_rotation = float(config.max_rotation_rad)
-            else:
-                effective_anchor_rotation = raw_anchor_rotation
+    This entry point exists for independently scheduled arm workers.  It does
+    not relax the pair API's requirement that a paired command contain every
+    enabled side, and it does not create a side-specific profile identity.
+    """
 
-        output = _pose(output, name=f"effective_tcp_pose_by_side.{side}")
-        translation_adjustment = float(
-            np.linalg.norm(output[:3, 3] - raw_pose[:3, 3])
+    if not isinstance(profile, TCPPoseEnvelopeProfile):
+        raise TypeError("profile must be TCPPoseEnvelopeProfile")
+    normalized_side = _required_text(side, name="side")
+    if normalized_side not in profile.side_config_by_side:
+        raise TCPPoseEnvelopeBindingError(
+            f"side {normalized_side!r} is absent from the envelope profile"
         )
-        rotation_adjustment = float(
-            (
-                _rotation_from_pose(raw_pose).inv()
-                * _rotation_from_pose(output)
-            ).magnitude()
-        )
-        translation_modified = translation_adjustment > _CONSTRAINT_TOL
-        rotation_modified = rotation_adjustment > _CONSTRAINT_TOL
-        effective[side] = output
-        diagnostics[side] = TCPPoseEnvelopeSideProjection(
-            modified=translation_modified or rotation_modified,
-            translation_modified=translation_modified,
-            rotation_modified=rotation_modified,
-            translation_adjustment_m=translation_adjustment,
-            rotation_adjustment_rad=rotation_adjustment,
-            raw_anchor_rotation_rad=raw_anchor_rotation,
-            effective_anchor_rotation_rad=effective_anchor_rotation,
-            violated_translation_constraints=violated,
-            active_translation_constraints=active,
-        )
-
-    return TCPPoseEnvelopeProjectionResult(
-        raw_tcp_pose_by_side=raw_poses,
-        effective_tcp_pose_by_side=effective,
-        side_projection_by_side=diagnostics,
-        envelope_profile_hash=profile.semantic_content_hash,
-        anchor_hash=(
-            None
-            if anchor_receipt is None
-            else anchor_receipt.semantic_content_hash
-        ),
+    raw_poses = _freeze_pose_mapping(
+        {normalized_side: raw_tcp_pose},
+        name="raw_tcp_pose_by_side",
+    )
+    _validate_projection_binding(
+        profile=profile,
+        target_frame_binding_hash=target_frame_binding_hash,
+        tool_frame_binding_hash_by_side=tool_frame_binding_hash_by_side,
+        controlled_frame_id=controlled_frame_id,
+        reference_frame_by_side=reference_frame_by_side,
+        execution_epoch=execution_epoch,
+        anchor_receipt=anchor_receipt,
+    )
+    return _projection_result(
+        raw_poses=raw_poses,
+        profile=profile,
+        anchor_receipt=anchor_receipt,
     )
 
 
@@ -1124,6 +1551,7 @@ __all__ = [
     "RELATIVE_TRANSLATION_AXES",
     "TCP_CONTROLLED_FRAME_ID",
     "TCP_POSE_ENVELOPE_ANCHOR_HASH_DOMAIN_DEVELOPMENT",
+    "TCP_POSE_ENVELOPE_FEEDBACK_HASH_DOMAIN_DEVELOPMENT",
     "TCP_POSE_ENVELOPE_PROFILE_HASH_DOMAIN_DEVELOPMENT",
     "TCP_POSE_ENVELOPE_RESULT_HASH_DOMAIN_DEVELOPMENT",
     "RelativeTranslationAxes",
@@ -1132,8 +1560,12 @@ __all__ = [
     "TCPPoseEnvelopeError",
     "TCPPoseEnvelopeInfeasibleError",
     "TCPPoseEnvelopeProfile",
+    "TCPPoseEnvelopeProjectionFeedback",
     "TCPPoseEnvelopeProjectionResult",
+    "TCPPoseEnvelopeRotationCutLocusError",
     "TCPPoseEnvelopeSideConfig",
+    "TCPPoseEnvelopeSideFeedback",
     "TCPPoseEnvelopeSideProjection",
     "project_tcp_pose_envelope",
+    "project_tcp_pose_envelope_side",
 ]

@@ -14,8 +14,10 @@ from robot_motion.position_control.tcp_pose_envelope import (
     TCPPoseEnvelopeError,
     TCPPoseEnvelopeInfeasibleError,
     TCPPoseEnvelopeProfile,
+    TCPPoseEnvelopeRotationCutLocusError,
     TCPPoseEnvelopeSideConfig,
     project_tcp_pose_envelope,
+    project_tcp_pose_envelope_side,
 )
 
 
@@ -104,6 +106,70 @@ def _project(
     )
 
 
+def test_single_side_projection_preserves_pair_contract_and_profile_identity() -> None:
+    profile = _profile(
+        {
+            "left": TCPPoseEnvelopeSideConfig(
+                relative_min_xyz_m=(-0.01, -0.01, -0.01),
+                relative_max_xyz_m=(0.01, 0.01, 0.01),
+            ),
+            "right": TCPPoseEnvelopeSideConfig(
+                relative_min_xyz_m=(-0.02, -0.02, -0.02),
+                relative_max_xyz_m=(0.02, 0.02, 0.02),
+            ),
+        }
+    )
+    anchor = _anchor(
+        profile,
+        {"left": _pose(), "right": _pose((0.2, 0.0, 0.0))},
+    )
+
+    with pytest.raises(TCPPoseEnvelopeBindingError, match="missing enabled sides"):
+        _project({"left": _pose((0.03, 0.0, 0.0))}, profile, anchor=anchor)
+
+    result = project_tcp_pose_envelope_side(
+        "left",
+        _pose((0.03, 0.0, 0.0)),
+        profile=profile,
+        target_frame_binding_hash=TARGET_HASH,
+        tool_frame_binding_hash_by_side=TOOL_HASH_BY_SIDE,
+        controlled_frame_id=TCP_CONTROLLED_FRAME_ID,
+        reference_frame_by_side=REFERENCE_BY_SIDE,
+        execution_epoch=4,
+        anchor_receipt=anchor,
+    )
+
+    assert tuple(result.raw_tcp_pose_by_side) == ("left",)
+    assert result.envelope_profile_hash == profile.semantic_content_hash
+    assert result.anchor_hash == anchor.semantic_content_hash
+    assert result.modified_sides == ("left",)
+    np.testing.assert_allclose(
+        result.effective_tcp_pose_by_side["left"][:3, 3],
+        (0.01, 0.0, 0.0),
+    )
+
+
+def test_single_side_projection_rejects_side_absent_from_profile() -> None:
+    profile = _profile(
+        {
+            "left": TCPPoseEnvelopeSideConfig(
+                absolute_min_xyz_m=(-1.0, -1.0, -1.0),
+                absolute_max_xyz_m=(1.0, 1.0, 1.0),
+            )
+        }
+    )
+
+    with pytest.raises(TCPPoseEnvelopeBindingError, match="absent"):
+        project_tcp_pose_envelope_side(
+            "right",
+            _pose(),
+            profile=profile,
+            target_frame_binding_hash=TARGET_HASH,
+            tool_frame_binding_hash_by_side=TOOL_HASH_BY_SIDE,
+            controlled_frame_id=TCP_CONTROLLED_FRAME_ID,
+            reference_frame_by_side=REFERENCE_BY_SIDE,
+            execution_epoch=4,
+        )
 def test_side_config_rejects_incomplete_or_empty_enabled_bounds() -> None:
     with pytest.raises(TCPPoseEnvelopeError, match="provided together"):
         TCPPoseEnvelopeSideConfig(absolute_min_xyz_m=(-1.0, -1.0, -1.0))
@@ -369,6 +435,25 @@ def test_rotation_wrap_at_plus_minus_pi_does_not_create_full_turn() -> None:
     assert np.rad2deg(diagnostic.raw_anchor_rotation_rad) == pytest.approx(2.0)
     assert diagnostic.rotation_modified is False
     np.testing.assert_allclose(result.effective_tcp_pose_by_side["left"], raw)
+
+
+def test_rotation_cut_locus_fails_closed_instead_of_flipping_axis() -> None:
+    profile = _profile(
+        {
+            "left": TCPPoseEnvelopeSideConfig(
+                max_rotation_rad=np.deg2rad(30.0),
+            )
+        }
+    )
+    anchor_pose = _pose()
+    raw = _pose(rotation=Rotation.from_euler("x", 180.0, degrees=True))
+
+    with pytest.raises(TCPPoseEnvelopeRotationCutLocusError, match="180 degrees"):
+        _project(
+            {"left": raw},
+            profile,
+            anchor=_anchor(profile, {"left": anchor_pose}),
+        )
 
 
 @pytest.mark.parametrize(

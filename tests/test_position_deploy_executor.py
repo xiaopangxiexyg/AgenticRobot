@@ -750,6 +750,160 @@ def test_pose_segment_emits_reference_points_without_rerunning_safety() -> None:
         executor.close()
 
 
+def test_pose_target_projector_runs_once_before_deploy_reference_generation() -> None:
+    calls: list[dict[str, object]] = []
+
+    def projector(
+        targets,
+        *,
+        observation,
+        execution_work_item,
+        target_role,
+    ):
+        calls.append(
+            {
+                "targets": {
+                    side: np.asarray(pose, dtype=float).copy()
+                    for side, pose in targets.items()
+                },
+                "observation": observation,
+                "execution_work_item": execution_work_item,
+                "target_role": target_role,
+            }
+        )
+        projected = {
+            side: np.asarray(pose, dtype=float).copy()
+            for side, pose in targets.items()
+        }
+        projected["left"][0, 3] = 0.12
+        return projected
+
+    commands: list[TeleopCommand] = []
+    observation = _observation()
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=lambda command: commands.append(command),
+        pose_target_projector=projector,
+        wall_clock=lambda: 1_700_000_000.0,
+    )
+    executor.start()
+    try:
+        executor.submit(
+            _filtered_pose("left", _pose(0.20)),
+            observation,
+            "unit_policy",
+        )
+        expected_points = int(
+            round(executor.config.reference_hz / executor.config.sample_hz)
+        )
+        _wait_until(lambda: len(commands) >= expected_points)
+
+        assert len(calls) == 1
+        assert calls[0]["observation"] is observation
+        assert calls[0]["execution_work_item"] is None
+        assert calls[0]["target_role"] == "current"
+        emitted_x = [
+            float(command.commands["left_arm"].metadata["target_xyzquat"][0])
+            for command in commands[:expected_points]
+        ]
+        assert emitted_x[-1] > 0.11
+        assert max(emitted_x) <= 0.12 + 1e-7
+    finally:
+        executor.close()
+
+
+def test_qpos_target_does_not_enter_pose_target_projector() -> None:
+    calls = 0
+
+    def projector(targets, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return targets
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        pose_target_projector=projector,
+    )
+    try:
+        executor.submit(
+            _filtered_qpos("left", np.zeros(6, dtype=float)),
+            _observation(),
+            "unit_policy",
+        )
+        assert calls == 0
+    finally:
+        executor.close()
+
+
+def test_pose_target_projector_feedback_is_passively_exposed_in_snapshot() -> None:
+    class _Projector:
+        def __call__(self, targets, **_kwargs):
+            return targets
+
+        def feedback_snapshot(self):
+            return {
+                "schema_version": "unit.tcp_pose_envelope_feedback.v1",
+                "state": "limited",
+                "profile_id": "unit-envelope",
+                "modified_sides": ["left"],
+                "receipt_ref": "unit-receipt",
+            }
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        pose_target_projector=_Projector(),
+    )
+    try:
+        feedback = executor.snapshot()["pose_target_projector_feedback"]
+        assert feedback == {
+            "schema_version": "unit.tcp_pose_envelope_feedback.v1",
+            "state": "limited",
+            "profile_id": "unit-envelope",
+            "modified_sides": ["left"],
+            "receipt_ref": "unit-receipt",
+        }
+        assert executor.snapshot()["fault_latched"] is False
+    finally:
+        executor.close()
+
+
+def test_active_pose_target_projector_failure_latches_hold_before_ik() -> None:
+    hold_calls: list[str] = []
+
+    def reject_projector(_targets, **_kwargs):
+        raise RuntimeError("unit binding drift")
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        pose_target_projector=reject_projector,
+        dispatch_callback=lambda _command: None,
+        hold_callback=lambda: hold_calls.append("hold"),
+    )
+    try:
+        with pytest.raises(
+            PositionDeployExecutorFault,
+            match="pre-IK tool_tcp pose envelope rejected current",
+        ):
+            executor.submit(
+                _filtered_pose("left", _pose(0.16)),
+                _observation(),
+                "unit_policy",
+            )
+        snapshot = executor.snapshot()
+        assert snapshot["fault_latched"] is True
+        assert snapshot["fault_stage"] == "target_pose_envelope"
+        assert snapshot["fault_metadata"]["manual_rearm_allowed"] is False
+        assert snapshot["fault_metadata"]["manual_rearm_required"] is False
+        assert snapshot["fault_metadata"]["restart_and_rehome_required"] is True
+        assert hold_calls == ["hold"]
+    finally:
+        executor.close()
+
+
 def test_position_reference_observer_is_passive_and_uses_actual_parent_pair() -> None:
     commands: list[TeleopCommand] = []
     observed = []

@@ -609,6 +609,7 @@ class PositionDeployExecutor:
         hold_callback: Callable[[], None] | None = None,
         collision_planner_factory: Callable[[], RM65PositionPlannerProtocol] | None = None,
         reference_observer: LegacyPositionReferenceObserver | None = None,
+        pose_target_projector: Callable[..., Mapping[str, np.ndarray]] | None = None,
         execution_epoch_guard: ExecutionEpochGuard | None = None,
         worker_drain_participant: ExecutionCancellationParticipantSpec | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -642,6 +643,8 @@ class PositionDeployExecutor:
             getattr(reference_observer, "submit_nowait", None)
         ):
             raise TypeError("reference_observer must provide submit_nowait() or be None")
+        if pose_target_projector is not None and not callable(pose_target_projector):
+            raise TypeError("pose_target_projector must be callable or None")
         if (execution_epoch_guard is None) != (worker_drain_participant is None):
             raise ValueError(
                 "execution_epoch_guard and worker_drain_participant must be configured together"
@@ -685,6 +688,7 @@ class PositionDeployExecutor:
         self.hold_callback = hold_callback
         self._collision_planner_factory = collision_planner_factory
         self._reference_observer = reference_observer
+        self._pose_target_projector = pose_target_projector
         self._execution_epoch_guard = execution_epoch_guard
         self._worker_drain_participant = worker_drain_participant
         self._collision_planner: RM65PositionPlannerProtocol | None = None
@@ -1076,6 +1080,12 @@ class PositionDeployExecutor:
         )
 
         pose_by_side, qpos_by_side = self._target_maps(filtered, observation)
+        pose_by_side = self._project_pose_targets_fail_closed(
+            pose_by_side,
+            observation=observation,
+            execution_work_item=execution_work_item,
+            target_role="current",
+        )
         resolved_lookahead_observation = (
             observation
             if lookahead_observation is None
@@ -1090,6 +1100,12 @@ class PositionDeployExecutor:
             ) = self._target_maps(
                 lookahead_filtered,
                 resolved_lookahead_observation,
+            )
+            lookahead_pose_by_side = self._project_pose_targets_fail_closed(
+                lookahead_pose_by_side,
+                observation=resolved_lookahead_observation,
+                execution_work_item=lookahead_execution_work_item,
+                target_role="lookahead",
             )
         resolved_second_lookahead_observation = (
             resolved_lookahead_observation
@@ -1106,6 +1122,12 @@ class PositionDeployExecutor:
                 second_lookahead_filtered,
                 resolved_second_lookahead_observation,
             )
+            second_lookahead_pose_by_side = self._project_pose_targets_fail_closed(
+                second_lookahead_pose_by_side,
+                observation=resolved_second_lookahead_observation,
+                execution_work_item=lookahead_execution_work_item,
+                target_role="second_lookahead",
+            )
         resolved_third_lookahead_observation = (
             resolved_second_lookahead_observation
             if third_lookahead_observation is None
@@ -1120,6 +1142,12 @@ class PositionDeployExecutor:
             ) = self._target_maps(
                 third_lookahead_filtered,
                 resolved_third_lookahead_observation,
+            )
+            third_lookahead_pose_by_side = self._project_pose_targets_fail_closed(
+                third_lookahead_pose_by_side,
+                observation=resolved_third_lookahead_observation,
+                execution_work_item=lookahead_execution_work_item,
+                target_role="third_lookahead",
             )
         try:
             self._validate_observation_reference_domain(
@@ -1787,6 +1815,7 @@ class PositionDeployExecutor:
         *,
         observation: DeploymentObservation | None = None,
         stage: str = "safety_gate",
+        manual_rearm_allowed: bool = True,
     ) -> None:
         """Latch a keyframe-safety failure and synchronously clear/hold output."""
 
@@ -1799,7 +1828,9 @@ class PositionDeployExecutor:
             fault_text = "unspecified safety fault"
         metadata: dict[str, Any] = {
             "faults": [item for item in fault_text.split(", ") if item],
-            "manual_rearm_required": True,
+            "manual_rearm_allowed": bool(manual_rearm_allowed),
+            "manual_rearm_required": bool(manual_rearm_allowed),
+            "restart_and_rehome_required": not bool(manual_rearm_allowed),
         }
         if observation is not None:
             metadata["observation_timestamp"] = float(observation.timestamp)
@@ -2065,6 +2096,9 @@ class PositionDeployExecutor:
         }
 
     def snapshot(self) -> dict[str, Any]:
+        pose_target_projector_feedback = (
+            self._snapshot_pose_target_projector_feedback()
+        )
         with self._lock:
             fault = self._fault
             tail_drain = self._source_tail_drain_status_locked()
@@ -2212,6 +2246,9 @@ class PositionDeployExecutor:
                 "execution_epoch_rejected_count": int(
                     self._execution_epoch_rejected_count
                 ),
+                "pose_target_projector_feedback": (
+                    pose_target_projector_feedback
+                ),
                 "inflight_execution_work_item_id": (
                     None
                     if self._inflight_execution_work_item is None
@@ -2285,6 +2322,39 @@ class PositionDeployExecutor:
                     )
                 ),
                 "segment_collision_certified": False,
+            }
+
+    def _snapshot_pose_target_projector_feedback(
+        self,
+    ) -> dict[str, Any] | None:
+        """Read optional projector feedback outside the executor control lock.
+
+        The projector remains the owner of its own immutable latest-value
+        receipt.  This method is observational only: a missing or malformed
+        feedback interface cannot alter projection, Hold, queue, or dispatch
+        behavior.
+        """
+
+        projector = self._pose_target_projector
+        if projector is None:
+            return None
+        feedback_snapshot = getattr(projector, "feedback_snapshot", None)
+        if not callable(feedback_snapshot):
+            return None
+        try:
+            feedback = feedback_snapshot()
+            to_payload = getattr(feedback, "to_payload", None)
+            payload = to_payload() if callable(to_payload) else feedback
+            if not isinstance(payload, Mapping):
+                raise TypeError("feedback_snapshot must return a mapping or payload")
+            return dict(payload)
+        except Exception as exc:  # noqa: BLE001 - passive observation only.
+            return {
+                "schema_version": (
+                    "teleop_runtime.pose_target_projector_feedback_error.v1"
+                ),
+                "state": "observer_error",
+                "error": f"{type(exc).__name__}: {exc}",
             }
 
     def collision_reset_preflight(
@@ -2528,6 +2598,114 @@ class PositionDeployExecutor:
                 raise ValueError(f"{side} safe pose keyframe is invalid")
             pose_by_side[side] = np.asarray(pose, dtype=float).copy()
         return pose_by_side, qpos_by_side
+
+    def _project_pose_targets(
+        self,
+        pose_by_side: Mapping[str, np.ndarray],
+        *,
+        observation: DeploymentObservation,
+        execution_work_item: ExecutionWorkItem | None,
+        target_role: str,
+    ) -> dict[str, np.ndarray]:
+        """Apply one optional target-space safety owner before any deploy IK.
+
+        Direct-qpos streams intentionally bypass this Pose-only seam.  The
+        callback is evaluated on the policy thread before stream acquisition,
+        collision planning, queue commitment, or reference-worker execution.
+        """
+
+        projector = self._pose_target_projector
+        if projector is None or not pose_by_side:
+            # Preserve the previous default path exactly: no extra numeric
+            # work, validation, or allocation beyond the shallow side map.
+            return dict(pose_by_side)
+        detached = {
+            str(side): np.asarray(pose, dtype=float).reshape(4, 4).copy()
+            for side, pose in pose_by_side.items()
+        }
+        projected = projector(
+            detached,
+            observation=observation,
+            execution_work_item=execution_work_item,
+            target_role=str(target_role),
+        )
+        if not isinstance(projected, Mapping):
+            raise TypeError("pose_target_projector must return a side mapping")
+        if set(projected) != set(detached):
+            raise ValueError(
+                "pose_target_projector must preserve the target side set; "
+                f"expected={sorted(detached)} got={sorted(projected)}"
+            )
+        validated: dict[str, np.ndarray] = {}
+        for side in detached:
+            try:
+                pose = np.asarray(projected[side], dtype=float).reshape(4, 4)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"pose_target_projector returned an invalid pose for {side}"
+                ) from exc
+            if not np.all(np.isfinite(pose)):
+                raise ValueError(
+                    f"pose_target_projector returned a non-finite pose for {side}"
+                )
+            if not np.allclose(
+                pose[3],
+                (0.0, 0.0, 0.0, 1.0),
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError(
+                    f"pose_target_projector returned a non-homogeneous pose for {side}"
+                )
+            rotation = pose[:3, :3]
+            if not np.allclose(
+                rotation.T @ rotation,
+                np.eye(3),
+                rtol=0.0,
+                atol=1e-8,
+            ) or not math.isclose(
+                float(np.linalg.det(rotation)),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            ):
+                raise ValueError(
+                    f"pose_target_projector returned a non-rigid pose for {side}"
+                )
+            validated[side] = pose.copy()
+        return validated
+
+    def _project_pose_targets_fail_closed(
+        self,
+        pose_by_side: Mapping[str, np.ndarray],
+        *,
+        observation: DeploymentObservation,
+        execution_work_item: ExecutionWorkItem | None,
+        target_role: str,
+    ) -> dict[str, np.ndarray]:
+        """Latch and Hold any configured pre-IK projection failure."""
+
+        try:
+            return self._project_pose_targets(
+                pose_by_side,
+                observation=observation,
+                execution_work_item=execution_work_item,
+                target_role=target_role,
+            )
+        except PositionDeployExecutorFault:
+            raise
+        except Exception as exc:  # noqa: BLE001 - configured safety must fail closed.
+            message = (
+                "pre-IK tool_tcp pose envelope rejected "
+                f"{target_role}: {type(exc).__name__}: {exc}"
+            )
+            self.latch_safety_fault(
+                ["tcp_pose_envelope_rejected", message],
+                observation=observation,
+                stage="target_pose_envelope",
+                manual_rearm_allowed=False,
+            )
+            raise PositionDeployExecutorFault(message) from exc
 
     @staticmethod
     def _anchor_maps(

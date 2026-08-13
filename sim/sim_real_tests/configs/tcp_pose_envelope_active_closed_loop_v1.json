@@ -1,0 +1,19 @@
+{
+  "schema_version": "sim_real_tests.tcp_pose_envelope_active_closed_loop.v1",
+  "scenario": "tcp_pose_envelope_active_closed_loop",
+  "source_hz": 15.0,
+  "reference_hz": 60.0,
+  "translation_half_extent_m": 0.015,
+  "max_rotation_deg": 8.0,
+  "inside_translation_m": 0.006,
+  "outside_translation_m": 0.030,
+  "inside_rotation_deg": 2.0,
+  "outside_rotation_deg": 15.0,
+  "ramp_source_frames": 4,
+  "outside_hold_source_frames": 4,
+  "return_source_frames": 4,
+  "final_hold_source_frames": 4,
+  "minimum_nonzero_residual_m": 0.00001,
+  "projection_tolerance_m": 0.00000001,
+  "projection_tolerance_deg": 0.00001
+}

@@ -485,6 +485,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._send_lock = threading.RLock()
         self._emergency_stopped = False
         self._force_hard_stop_callback: Callable[[str, str], None] | None = None
+        self._final_tcp_pose_projector: Callable[[str, np.ndarray], np.ndarray] | None = None
         self._loop_stop_event = threading.Event()
         self._loop_thread: threading.Thread | None = None
         self._last_send_time: float | None = None
@@ -563,6 +564,9 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             left_ip=self.config.arm_ip,
             right_ip=self.config.arm_ip,
         )
+        self._controller.set_final_tcp_pose_projector(
+            self._final_tcp_pose_projector
+        )
         if self.config.observation_only:
             state = self.refresh_state_from_hardware()
             if not bool(state.get("hardware_read_success")):
@@ -584,6 +588,20 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             raise TypeError("force hard-stop callback must be callable or None")
         with self._state_lock:
             self._force_hard_stop_callback = callback
+
+    def set_final_tcp_pose_projector(
+        self,
+        projector: Callable[[str, np.ndarray], np.ndarray] | None,
+    ) -> None:
+        """Install the upper-runtime final composed TCP safety projector."""
+
+        if projector is not None and not callable(projector):
+            raise TypeError("final TCP pose projector must be callable or None")
+        with self._state_lock:
+            self._final_tcp_pose_projector = projector
+            controller = self._controller
+        if controller is not None:
+            controller.set_final_tcp_pose_projector(projector)
 
     def read_impedance_force_guard_data(self) -> dict[str, object]:
         """Return the latest validated force sample without another SDK read."""

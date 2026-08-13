@@ -239,6 +239,28 @@ class RM65ImpedanceTest(unittest.TestCase):
             np.asarray([0.0, 0.0, 0.14, 0.0, 0.0, 0.0]),
         )
 
+    def test_impedance_backend_forwards_final_tcp_projector_to_controller(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="left",
+                connect_hardware=False,
+            )
+        )
+        received = []
+
+        class FakeController:
+            def set_final_tcp_pose_projector(self, projector) -> None:
+                received.append(projector)
+
+        projector = lambda _side, pose: pose
+        backend.set_final_tcp_pose_projector(projector)
+        backend._controller = FakeController()  # type: ignore[assignment]
+        backend.set_final_tcp_pose_projector(projector)
+
+        self.assertIs(backend._final_tcp_pose_projector, projector)
+        self.assertEqual(received, [projector])
+
     def test_config_from_profile_accepts_follow_alias(self) -> None:
         profile = {
             "tool_name": "DMTAC_M",
@@ -3107,6 +3129,101 @@ class RM65ImpedanceTest(unittest.TestCase):
             controller._latest_wrench_context["applied_offset_realization_angular_error_rad"],
             0.0,
         )
+
+    def test_pose_controller_projects_final_composed_tcp_before_ik_and_antiwinds(self) -> None:
+        reference = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        requested_offset = [0.03, 0.0, 0.0, 0.0, 0.0, 0.0]
+        controller = RM65PoseImpedanceController(
+            arm="left",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_M",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+                max_command_joint_velocity_deg_s=1000.0,
+                max_linear_offset_m=0.05,
+            ),
+            robot=None,
+        )
+        controller._ik_resolver = object()
+        controller._ik_seed = [0.0] * 6
+        controller._previous_command_joint = [0.0] * 6
+        controller._previous_command_pose = list(reference)
+        controller._current_step_dt = 0.1
+        controller._admittance = PoseAdmittance(
+            enabled_axes=[True] * 6,
+            max_angular_offset_rad=1.0,
+            offset=list(requested_offset),
+        )
+        controller._latest_wrench_context = {
+            "offset": list(requested_offset),
+            "active_wrench": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "target_offset_after_offset_limit": list(requested_offset),
+        }
+        projected_inputs: list[np.ndarray] = []
+        solver_offsets: list[list[float]] = []
+
+        def projector(side: str, raw_pose: np.ndarray) -> np.ndarray:
+            self.assertEqual(side, "left")
+            projected_inputs.append(np.array(raw_pose, copy=True))
+            output = np.array(raw_pose, copy=True)
+            output[0, 3] = 0.01
+            return output
+
+        def solver(**kwargs):
+            solver_offsets.append(list(kwargs["offset"]))
+            command_pose = apply_pose_offset(
+                kwargs["reference_pose"],
+                kwargs["offset"],
+            )
+            return command_pose, [0.0] * 6, [0.0] * 6, 1.0, list(kwargs["offset"]), 0
+
+        controller.set_final_tcp_pose_projector(projector)
+        controller._command_from_pose_with_resolver = solver  # type: ignore[method-assign]
+
+        command_pose, _ = controller._command_from_reference(reference, requested_offset)
+
+        self.assertEqual(len(projected_inputs), 1)
+        self.assertAlmostEqual(projected_inputs[0][0, 3], 0.03)
+        self.assertAlmostEqual(solver_offsets[0][0], 0.01)
+        self.assertAlmostEqual(command_pose[0], 0.01)
+        self.assertAlmostEqual(controller._admittance.offset[0], 0.01)
+        self.assertTrue(
+            controller._latest_wrench_context["final_tcp_pose_projector_modified"]
+        )
+        self.assertEqual(
+            controller._latest_wrench_context["final_command_pose_realization_source"],
+            "final_command_pose",
+        )
+
+    def test_pose_controller_final_projector_failure_is_fail_closed_before_ik(self) -> None:
+        controller = RM65PoseImpedanceController(
+            arm="left",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_M",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+            ),
+            robot=None,
+        )
+        controller._ik_seed = [0.0] * 6
+        solver_called = False
+
+        def solver(**kwargs):
+            nonlocal solver_called
+            solver_called = True
+            raise AssertionError(kwargs)
+
+        controller._command_from_pose_with_ik_backoff = solver  # type: ignore[method-assign]
+        controller.set_final_tcp_pose_projector(
+            lambda _side, _pose: np.full((4, 4), np.nan)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "invalid 4x4 pose"):
+            controller._command_from_reference(
+                [0.0, 0.0, 0.35, 0.0, 0.0, 0.0],
+                [0.01, 0.0, 0.0, 0.0, 0.0, 0.0],
+            )
+        self.assertFalse(solver_called)
 
     def test_pose_controller_antiwindup_syncs_only_active_axes(self) -> None:
         reference = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
