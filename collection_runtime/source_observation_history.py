@@ -1,5 +1,5 @@
 # Copyright (c) 2026 DexTeleop Contributors
-"""Disk-primary, source-neutral history for low-rate planning observations.
+"""Disk-primary history for low-rate, lower-owned source observations.
 
 The source owner supplies already-read immutable JSON projections.  This module
 owns only append/query/retention mechanics; it never reads a robot or simulator,
@@ -25,13 +25,13 @@ from typing_extensions import Self
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-PLANNING_HISTORY_SOURCE_BINDING_HASH_DOMAIN_V1 = (
+SOURCE_OBSERVATION_HISTORY_SOURCE_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.planning_history.source_binding.v1"
 )
-PLANNING_HISTORY_RECORD_HASH_DOMAIN_V1 = "dexteleop.planning_history.record.v1"
-PLANNING_HISTORY_SLICE_HASH_DOMAIN_V1 = "dexteleop.planning_history.slice.v1"
-PLANNING_HISTORY_STORE_SCHEMA_VERSION_V1 = 1
-PLANNING_HISTORY_SAMPLING_POLICIES_V1 = (
+SOURCE_OBSERVATION_HISTORY_RECORD_HASH_DOMAIN_V1 = "dexteleop.planning_history.record.v1"
+SOURCE_OBSERVATION_HISTORY_SLICE_HASH_DOMAIN_V1 = "dexteleop.planning_history.slice.v1"
+SOURCE_OBSERVATION_HISTORY_STORE_SCHEMA_VERSION_V1 = 1
+SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1 = (
     "latest",
     "uniform",
     "boundary_only",
@@ -39,7 +39,7 @@ PLANNING_HISTORY_SAMPLING_POLICIES_V1 = (
 )
 
 
-class PlanningHistoryStoreError(RuntimeError):
+class SourceObservationHistoryStoreError(RuntimeError):
     """A durable history operation failed or violated its stream contract."""
 
 
@@ -123,7 +123,7 @@ def _compact_json(value: Any) -> str:
 
 
 @dataclass(frozen=True)
-class PlanningHistorySourceBinding:
+class SourceObservationHistoryBinding:
     """Immutable identity of one lower-owned low-rate projection stream."""
 
     source_id: str
@@ -163,7 +163,7 @@ class PlanningHistorySourceBinding:
             "semantic_content_hash",
             canonical_content_hash(
                 self.to_payload(),
-                domain=PLANNING_HISTORY_SOURCE_BINDING_HASH_DOMAIN_V1,
+                domain=SOURCE_OBSERVATION_HISTORY_SOURCE_BINDING_HASH_DOMAIN_V1,
             ),
         )
 
@@ -175,12 +175,12 @@ class PlanningHistorySourceBinding:
             "channels": self.channels,
             "capture_profile_hash": self.capture_profile_hash,
             "source_contract": _thaw_json(self.source_contract),
-            "store_schema_version": PLANNING_HISTORY_STORE_SCHEMA_VERSION_V1,
+            "store_schema_version": SOURCE_OBSERVATION_HISTORY_STORE_SCHEMA_VERSION_V1,
         }
 
 
 @dataclass(frozen=True)
-class PlanningHistoryRecord:
+class SourceObservationRecord:
     """One already-produced causal projection accepted by the disk store."""
 
     record_id: str
@@ -237,7 +237,7 @@ class PlanningHistoryRecord:
             "semantic_content_hash",
             canonical_content_hash(
                 self.to_payload(),
-                domain=PLANNING_HISTORY_RECORD_HASH_DOMAIN_V1,
+                domain=SOURCE_OBSERVATION_HISTORY_RECORD_HASH_DOMAIN_V1,
             ),
         )
 
@@ -257,9 +257,9 @@ class PlanningHistoryRecord:
 
 
 @dataclass(frozen=True)
-class StoredPlanningHistoryRecord:
+class StoredSourceObservationRecord:
     sequence: int
-    record: PlanningHistoryRecord
+    record: SourceObservationRecord
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -267,8 +267,8 @@ class StoredPlanningHistoryRecord:
             "sequence",
             _positive_int(self.sequence, field_name="sequence"),
         )
-        if not isinstance(self.record, PlanningHistoryRecord):
-            raise TypeError("record must be PlanningHistoryRecord.")
+        if not isinstance(self.record, SourceObservationRecord):
+            raise TypeError("record must be SourceObservationRecord.")
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -279,7 +279,7 @@ class StoredPlanningHistoryRecord:
 
 
 @dataclass(frozen=True)
-class PlanningHistorySlice:
+class SourceObservationHistorySlice:
     """One bounded immutable query result, independent of storage layout."""
 
     slice_id: str
@@ -291,7 +291,7 @@ class PlanningHistorySlice:
     window_begin_at: float
     window_end_at: float
     sampling_policy: str
-    records: tuple[StoredPlanningHistoryRecord, ...]
+    records: tuple[StoredSourceObservationRecord, ...]
     truncated: bool
     semantic_content_hash: str = field(init=False)
 
@@ -320,11 +320,11 @@ class PlanningHistorySlice:
         object.__setattr__(self, "window_begin_at", begin)
         object.__setattr__(self, "window_end_at", end)
         policy = _required(self.sampling_policy, field_name="sampling_policy")
-        if policy not in PLANNING_HISTORY_SAMPLING_POLICIES_V1:
+        if policy not in SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1:
             raise ValueError(f"Unsupported sampling_policy: {policy!r}.")
         records = tuple(self.records)
-        if any(not isinstance(item, StoredPlanningHistoryRecord) for item in records):
-            raise TypeError("records must contain StoredPlanningHistoryRecord values.")
+        if any(not isinstance(item, StoredSourceObservationRecord) for item in records):
+            raise TypeError("records must contain StoredSourceObservationRecord values.")
         sequences = tuple(item.sequence for item in records)
         if tuple(sorted(sequences)) != sequences or len(set(sequences)) != len(
             sequences
@@ -352,7 +352,7 @@ class PlanningHistorySlice:
             "semantic_content_hash",
             canonical_content_hash(
                 self.to_payload(),
-                domain=PLANNING_HISTORY_SLICE_HASH_DOMAIN_V1,
+                domain=SOURCE_OBSERVATION_HISTORY_SLICE_HASH_DOMAIN_V1,
             ),
         )
 
@@ -373,7 +373,7 @@ class PlanningHistorySlice:
 
 
 @dataclass(frozen=True)
-class PlanningHistoryStoreLimits:
+class SourceObservationHistoryStoreLimits:
     retention_sec: float
     max_records: int
     max_record_payload_bytes: int
@@ -397,7 +397,7 @@ class PlanningHistoryStoreLimits:
 
 
 @dataclass(frozen=True)
-class PlanningHistoryAppendResult:
+class SourceObservationHistoryAppendResult:
     sequence: int
     accepted: bool
     durable: bool
@@ -405,7 +405,7 @@ class PlanningHistoryAppendResult:
 
 
 @dataclass(frozen=True)
-class PlanningHistoryGcResult:
+class SourceObservationHistoryGcResult:
     deleted_records: int
     retained_records: int
 
@@ -413,29 +413,29 @@ class PlanningHistoryGcResult:
 @dataclass(frozen=True)
 class _StoredRow:
     sequence: int
-    record: PlanningHistoryRecord
+    record: SourceObservationRecord
     payload_bytes: int
 
 
-class SQLitePlanningHistoryStore:
+class SQLiteSourceObservationHistoryStore:
     """One disk-primary history store for one immutable source binding."""
 
     def __init__(
         self,
         *,
         root: Path,
-        binding: PlanningHistorySourceBinding,
-        limits: PlanningHistoryStoreLimits,
+        binding: SourceObservationHistoryBinding,
+        limits: SourceObservationHistoryStoreLimits,
         filename: str = "planning_history.sqlite3",
     ) -> None:
         if not isinstance(root, Path):
             raise TypeError("root must be pathlib.Path.")
         if not root.is_absolute():
             raise ValueError("Planning history root must be absolute.")
-        if not isinstance(binding, PlanningHistorySourceBinding):
-            raise TypeError("binding must be PlanningHistorySourceBinding.")
-        if not isinstance(limits, PlanningHistoryStoreLimits):
-            raise TypeError("limits must be PlanningHistoryStoreLimits.")
+        if not isinstance(binding, SourceObservationHistoryBinding):
+            raise TypeError("binding must be SourceObservationHistoryBinding.")
+        if not isinstance(limits, SourceObservationHistoryStoreLimits):
+            raise TypeError("limits must be SourceObservationHistoryStoreLimits.")
         name = _required(filename, field_name="filename")
         if Path(name).name != name:
             raise ValueError("filename must be a basename.")
@@ -483,15 +483,15 @@ class SQLitePlanningHistoryStore:
                 self._connection.close()
                 self._closed = True
 
-    def append(self, record: PlanningHistoryRecord) -> PlanningHistoryAppendResult:
-        if not isinstance(record, PlanningHistoryRecord):
-            raise TypeError("record must be PlanningHistoryRecord.")
+    def append(self, record: SourceObservationRecord) -> SourceObservationHistoryAppendResult:
+        if not isinstance(record, SourceObservationRecord):
+            raise TypeError("record must be SourceObservationRecord.")
         if (
             record.source_binding_hash != self.binding.semantic_content_hash
             or record.runtime_session_id != self.binding.runtime_session_id
             or record.channel not in self.binding.channels
         ):
-            raise PlanningHistoryStoreError(
+            raise SourceObservationHistoryStoreError(
                 "Record does not match the immutable history source binding."
             )
         payload_json = _compact_json(record.payload)
@@ -500,7 +500,7 @@ class SQLitePlanningHistoryStore:
             evidence_json.encode("utf-8")
         )
         if payload_bytes > self.limits.max_record_payload_bytes:
-            raise PlanningHistoryStoreError("Record exceeds max_record_payload_bytes.")
+            raise SourceObservationHistoryStoreError("Record exceeds max_record_payload_bytes.")
         with self._lock, self._connection:
             existing = self._connection.execute(
                 """
@@ -512,10 +512,10 @@ class SQLitePlanningHistoryStore:
             ).fetchone()
             if existing is not None:
                 if existing[1] != record.semantic_content_hash:
-                    raise PlanningHistoryStoreError(
+                    raise SourceObservationHistoryStoreError(
                         f"History record ID conflict: {record.record_id!r}."
                     )
-                return PlanningHistoryAppendResult(
+                return SourceObservationHistoryAppendResult(
                     sequence=int(existing[0]),
                     accepted=False,
                     durable=True,
@@ -534,7 +534,7 @@ class SQLitePlanningHistoryStore:
                 or record.available_at < float(previous[1])
                 or record.cutoff_at < float(previous[2])
             ):
-                raise PlanningHistoryStoreError(
+                raise SourceObservationHistoryStoreError(
                     "History record clocks must be monotonic within a source."
                 )
             cursor = self._connection.execute(
@@ -564,7 +564,7 @@ class SQLitePlanningHistoryStore:
             sequence = int(cursor.lastrowid)
             self._recent.append(sequence)
             self._gc_locked(now=record.cutoff_at)
-        return PlanningHistoryAppendResult(
+        return SourceObservationHistoryAppendResult(
             sequence=sequence,
             accepted=True,
             durable=True,
@@ -581,16 +581,16 @@ class SQLitePlanningHistoryStore:
         max_samples: int,
         max_payload_bytes: int,
         sampling_policy: str,
-    ) -> PlanningHistorySlice:
+    ) -> SourceObservationHistorySlice:
         query_channels = _unique_texts(channels, field_name="channels")
         if not query_channels or set(query_channels) - set(self.binding.channels):
-            raise PlanningHistoryStoreError(
+            raise SourceObservationHistoryStoreError(
                 "Query channels must be a non-empty source-binding subset."
             )
         cutoff = _finite(cutoff_at, field_name="cutoff_at")
         window = _finite(history_window_sec, field_name="history_window_sec")
         if window <= 0.0 or window > self.limits.retention_sec:
-            raise PlanningHistoryStoreError(
+            raise SourceObservationHistoryStoreError(
                 "history_window_sec must be within configured retention."
             )
         sample_limit = _positive_int(max_samples, field_name="max_samples")
@@ -599,8 +599,8 @@ class SQLitePlanningHistoryStore:
             field_name="max_payload_bytes",
         )
         policy = _required(sampling_policy, field_name="sampling_policy")
-        if policy not in PLANNING_HISTORY_SAMPLING_POLICIES_V1:
-            raise PlanningHistoryStoreError(f"Unsupported sampling_policy: {policy!r}.")
+        if policy not in SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1:
+            raise SourceObservationHistoryStoreError(f"Unsupported sampling_policy: {policy!r}.")
         begin = cutoff - window
         placeholders = ",".join("?" for _ in query_channels)
         with self._lock:
@@ -628,7 +628,7 @@ class SQLitePlanningHistoryStore:
         while selected_list and _rows_wire_bytes(selected_list) > payload_limit:
             selected_list.pop(0)
             truncated = True
-        return PlanningHistorySlice(
+        return SourceObservationHistorySlice(
             slice_id=_required(slice_id, field_name="slice_id"),
             source_id=self.binding.source_id,
             source_binding_hash=self.binding.semantic_content_hash,
@@ -639,18 +639,18 @@ class SQLitePlanningHistoryStore:
             window_end_at=cutoff,
             sampling_policy=policy,
             records=tuple(
-                StoredPlanningHistoryRecord(item.sequence, item.record)
+                StoredSourceObservationRecord(item.sequence, item.record)
                 for item in selected_list
             ),
             truncated=truncated,
         )
 
-    def gc(self, *, now: float) -> PlanningHistoryGcResult:
+    def gc(self, *, now: float) -> SourceObservationHistoryGcResult:
         timestamp = _finite(now, field_name="now")
         with self._lock, self._connection:
             return self._gc_locked(now=timestamp)
 
-    def _gc_locked(self, *, now: float) -> PlanningHistoryGcResult:
+    def _gc_locked(self, *, now: float) -> SourceObservationHistoryGcResult:
         cutoff = now - self.limits.retention_sec
         before = int(
             self._connection.execute(
@@ -683,7 +683,7 @@ class SQLitePlanningHistoryStore:
                 "SELECT COUNT(*) FROM planning_history_records"
             ).fetchone()[0]
         )
-        return PlanningHistoryGcResult(
+        return SourceObservationHistoryGcResult(
             deleted_records=before - retained,
             retained_records=retained,
         )
@@ -691,7 +691,7 @@ class SQLitePlanningHistoryStore:
     def _row_from_sql(self, row: tuple[Any, ...]) -> _StoredRow:
         payload = json.loads(row[9])
         evidence_refs = tuple(json.loads(row[10]))
-        record = PlanningHistoryRecord(
+        record = SourceObservationRecord(
             record_id=row[1],
             source_binding_hash=row[3],
             runtime_session_id=row[4],
@@ -704,7 +704,7 @@ class SQLitePlanningHistoryStore:
             boundary_event=row[11],
         )
         if record.semantic_content_hash != row[2]:
-            raise PlanningHistoryStoreError(
+            raise SourceObservationHistoryStoreError(
                 f"Persisted history record hash mismatch: {record.record_id!r}."
             )
         return _StoredRow(int(row[0]), record, int(row[12]))
@@ -741,7 +741,7 @@ class SQLitePlanningHistoryStore:
 
     def _bind_source(self) -> None:
         expected = {
-            "store_schema_version": str(PLANNING_HISTORY_STORE_SCHEMA_VERSION_V1),
+            "store_schema_version": str(SOURCE_OBSERVATION_HISTORY_STORE_SCHEMA_VERSION_V1),
             "source_binding_hash": self.binding.semantic_content_hash,
             "source_binding_payload": _compact_json(self.binding.to_payload()),
         }
@@ -752,7 +752,7 @@ class SQLitePlanningHistoryStore:
                 ).fetchall()
             )
             if existing and existing != expected:
-                raise PlanningHistoryStoreError(
+                raise SourceObservationHistoryStoreError(
                     "Existing planning history database uses another source binding."
                 )
             for key, value in expected.items():
@@ -817,25 +817,25 @@ def _rows_wire_bytes(rows: Sequence[_StoredRow]) -> int:
     return len(
         _compact_json(
             [
-                StoredPlanningHistoryRecord(item.sequence, item.record).to_payload()
+                StoredSourceObservationRecord(item.sequence, item.record).to_payload()
                 for item in rows
             ]
         ).encode("utf-8")
     )
 
 
-class PlanningHistoryRecorder:
+class SourceObservationHistoryRecorder:
     """Explicitly-started periodic caller around one application-owned capture."""
 
     def __init__(
         self,
         *,
-        store: SQLitePlanningHistoryStore,
-        capture: Callable[[], PlanningHistoryRecord | None],
+        store: SQLiteSourceObservationHistoryStore,
+        capture: Callable[[], SourceObservationRecord | None],
         interval_sec: float,
     ) -> None:
-        if not isinstance(store, SQLitePlanningHistoryStore):
-            raise TypeError("store must be SQLitePlanningHistoryStore.")
+        if not isinstance(store, SQLiteSourceObservationHistoryStore):
+            raise TypeError("store must be SQLiteSourceObservationHistoryStore.")
         if not callable(capture):
             raise TypeError("capture must be callable.")
         interval = _finite(interval_sec, field_name="interval_sec")
@@ -859,12 +859,12 @@ class PlanningHistoryRecorder:
         with self._lock:
             return self._last_error
 
-    def capture_once(self) -> PlanningHistoryAppendResult | None:
+    def capture_once(self) -> SourceObservationHistoryAppendResult | None:
         record = self._capture()
         if record is None:
             return None
-        if not isinstance(record, PlanningHistoryRecord):
-            raise TypeError("capture must return PlanningHistoryRecord or None.")
+        if not isinstance(record, SourceObservationRecord):
+            raise TypeError("capture must return SourceObservationRecord or None.")
         return self.store.append(record)
 
     def start(self) -> None:
@@ -872,7 +872,7 @@ class PlanningHistoryRecorder:
 
         with self._lock:
             if self._thread is not None:
-                raise PlanningHistoryStoreError("History recorder is already started.")
+                raise SourceObservationHistoryStoreError("History recorder is already started.")
             self._stop.clear()
             self._last_error = None
             thread = threading.Thread(
@@ -911,19 +911,19 @@ class PlanningHistoryRecorder:
 
 
 __all__ = [
-    "PLANNING_HISTORY_RECORD_HASH_DOMAIN_V1",
-    "PLANNING_HISTORY_SAMPLING_POLICIES_V1",
-    "PLANNING_HISTORY_SLICE_HASH_DOMAIN_V1",
-    "PLANNING_HISTORY_SOURCE_BINDING_HASH_DOMAIN_V1",
-    "PLANNING_HISTORY_STORE_SCHEMA_VERSION_V1",
-    "PlanningHistoryAppendResult",
-    "PlanningHistoryGcResult",
-    "PlanningHistoryRecord",
-    "PlanningHistoryRecorder",
-    "PlanningHistorySlice",
-    "PlanningHistorySourceBinding",
-    "PlanningHistoryStoreError",
-    "PlanningHistoryStoreLimits",
-    "SQLitePlanningHistoryStore",
-    "StoredPlanningHistoryRecord",
+    "SOURCE_OBSERVATION_HISTORY_RECORD_HASH_DOMAIN_V1",
+    "SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1",
+    "SOURCE_OBSERVATION_HISTORY_SLICE_HASH_DOMAIN_V1",
+    "SOURCE_OBSERVATION_HISTORY_SOURCE_BINDING_HASH_DOMAIN_V1",
+    "SOURCE_OBSERVATION_HISTORY_STORE_SCHEMA_VERSION_V1",
+    "SourceObservationHistoryAppendResult",
+    "SourceObservationHistoryGcResult",
+    "SourceObservationRecord",
+    "SourceObservationHistoryRecorder",
+    "SourceObservationHistorySlice",
+    "SourceObservationHistoryBinding",
+    "SourceObservationHistoryStoreError",
+    "SourceObservationHistoryStoreLimits",
+    "SQLiteSourceObservationHistoryStore",
+    "StoredSourceObservationRecord",
 ]

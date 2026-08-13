@@ -5,18 +5,18 @@ from pathlib import Path
 
 import pytest
 
-from collection_runtime.planning_history import (
-    PlanningHistoryRecord,
-    PlanningHistoryRecorder,
-    PlanningHistorySourceBinding,
-    PlanningHistoryStoreError,
-    PlanningHistoryStoreLimits,
-    SQLitePlanningHistoryStore,
+from collection_runtime.source_observation_history import (
+    SourceObservationRecord,
+    SourceObservationHistoryRecorder,
+    SourceObservationHistoryBinding,
+    SourceObservationHistoryStoreError,
+    SourceObservationHistoryStoreLimits,
+    SQLiteSourceObservationHistoryStore,
 )
 
 
-def _binding() -> PlanningHistorySourceBinding:
-    return PlanningHistorySourceBinding(
+def _binding() -> SourceObservationHistoryBinding:
+    return SourceObservationHistoryBinding(
         source_id="right-arm-tcp-low-rate-v1",
         runtime_session_id="runtime-session-history-1",
         clock_domain_id="runtime-monotonic-v1",
@@ -30,8 +30,8 @@ def _binding() -> PlanningHistorySourceBinding:
     )
 
 
-def _limits(*, max_records: int = 16) -> PlanningHistoryStoreLimits:
-    return PlanningHistoryStoreLimits(
+def _limits(*, max_records: int = 16) -> SourceObservationHistoryStoreLimits:
+    return SourceObservationHistoryStoreLimits(
         retention_sec=60.0,
         max_records=max_records,
         max_record_payload_bytes=8_192,
@@ -40,20 +40,20 @@ def _limits(*, max_records: int = 16) -> PlanningHistoryStoreLimits:
 
 
 def _record(
-    binding: PlanningHistorySourceBinding,
+    binding: SourceObservationHistoryBinding,
     index: int,
     *,
     record_id: str | None = None,
     boundary_event: str | None = None,
     payload_extra: dict[str, object] | None = None,
-) -> PlanningHistoryRecord:
+) -> SourceObservationRecord:
     measured_at = 10.0 + index
     payload = {
         "pose_by_component": {"right_arm": [0.1 * index, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]},
         "measurement_id": f"measurement-{index}",
     }
     payload.update(payload_extra or {})
-    return PlanningHistoryRecord(
+    return SourceObservationRecord(
         record_id=record_id or f"history-record-{index}",
         source_binding_hash=binding.semantic_content_hash,
         runtime_session_id=binding.runtime_session_id,
@@ -67,9 +67,21 @@ def _record(
     )
 
 
+def test_python_rename_preserves_published_hash_domains_and_wire_hashes() -> None:
+    binding = _binding()
+    record = _record(binding, 0)
+
+    assert binding.semantic_content_hash == (
+        "8604c65c547a8be661602218656f1d8b451abb9e5cc17fd319342d828ae9ae51"
+    )
+    assert record.semantic_content_hash == (
+        "72ee56668b34b501ba081ae1eb0e6e57627c67f77d0019137f5dc7f273ee8e5b"
+    )
+
+
 def test_store_requires_explicit_absolute_root(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="root must be absolute"):
-        SQLitePlanningHistoryStore(
+        SQLiteSourceObservationHistoryStore(
             root=Path("relative-history"),
             binding=_binding(),
             limits=_limits(),
@@ -80,7 +92,7 @@ def test_store_requires_explicit_absolute_root(tmp_path: Path) -> None:
 def test_store_is_durable_idempotent_and_binding_closed(tmp_path: Path) -> None:
     binding = _binding()
     history_root = (tmp_path / "history").resolve()
-    with SQLitePlanningHistoryStore(
+    with SQLiteSourceObservationHistoryStore(
         root=history_root,
         binding=binding,
         limits=_limits(),
@@ -91,7 +103,7 @@ def test_store_is_durable_idempotent_and_binding_closed(tmp_path: Path) -> None:
         assert replay.idempotent and replay.sequence == first.sequence
         assert store.database_path.is_file()
 
-    with SQLitePlanningHistoryStore(
+    with SQLiteSourceObservationHistoryStore(
         root=history_root,
         binding=binding,
         limits=_limits(),
@@ -108,7 +120,7 @@ def test_store_is_durable_idempotent_and_binding_closed(tmp_path: Path) -> None:
         assert [item.sequence for item in result.records] == [1]
         assert result.records[0].record.record_id == "history-record-0"
 
-    other_binding = PlanningHistorySourceBinding(
+    other_binding = SourceObservationHistoryBinding(
         source_id="another-source",
         runtime_session_id=binding.runtime_session_id,
         clock_domain_id=binding.clock_domain_id,
@@ -116,8 +128,8 @@ def test_store_is_durable_idempotent_and_binding_closed(tmp_path: Path) -> None:
         capture_profile_hash="capture-profile-hash-2",
         source_contract={"representation": "cartesian_pose"},
     )
-    with pytest.raises(PlanningHistoryStoreError, match="another source binding"):
-        SQLitePlanningHistoryStore(
+    with pytest.raises(SourceObservationHistoryStoreError, match="another source binding"):
+        SQLiteSourceObservationHistoryStore(
             root=history_root,
             binding=other_binding,
             limits=_limits(),
@@ -128,7 +140,7 @@ def test_boundary_plus_uniform_is_bounded_and_content_addressed(
     tmp_path: Path,
 ) -> None:
     binding = _binding()
-    with SQLitePlanningHistoryStore(
+    with SQLiteSourceObservationHistoryStore(
         root=(tmp_path / "history").resolve(),
         binding=binding,
         limits=_limits(),
@@ -172,7 +184,7 @@ def test_boundary_plus_uniform_is_bounded_and_content_addressed(
 
 def test_store_rejects_clock_regression_and_applies_retention(tmp_path: Path) -> None:
     binding = _binding()
-    with SQLitePlanningHistoryStore(
+    with SQLiteSourceObservationHistoryStore(
         root=(tmp_path / "history").resolve(),
         binding=binding,
         limits=_limits(max_records=2),
@@ -188,7 +200,7 @@ def test_store_rejects_clock_regression_and_applies_retention(tmp_path: Path) ->
             max_payload_bytes=8_192,
             sampling_policy="uniform",
         )
-        with pytest.raises(PlanningHistoryStoreError, match="clocks must be monotonic"):
+        with pytest.raises(SourceObservationHistoryStoreError, match="clocks must be monotonic"):
             store.append(
                 _record(
                     binding,
@@ -203,18 +215,18 @@ def test_store_rejects_clock_regression_and_applies_retention(tmp_path: Path) ->
 
 def test_recorder_is_default_off_and_manual_capture_is_explicit(tmp_path: Path) -> None:
     binding = _binding()
-    with SQLitePlanningHistoryStore(
+    with SQLiteSourceObservationHistoryStore(
         root=(tmp_path / "history").resolve(),
         binding=binding,
         limits=_limits(),
     ) as store:
         calls: list[int] = []
 
-        def capture() -> PlanningHistoryRecord:
+        def capture() -> SourceObservationRecord:
             calls.append(len(calls))
             return _record(binding, calls[-1])
 
-        recorder = PlanningHistoryRecorder(
+        recorder = SourceObservationHistoryRecorder(
             store=store,
             capture=capture,
             interval_sec=1.0,
