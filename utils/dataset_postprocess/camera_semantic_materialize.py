@@ -33,6 +33,11 @@ from dataset_interface.camera_semantics import (
     load_camera_role_binding,
     resolve_camera_snapshot,
 )
+from dataset_interface.modality_artifacts import (
+    PAYLOAD_ONLY_DETACH,
+    WHOLE_PREFIX_DETACH,
+    verified_detachment_scope,
+)
 
 from .io import read_json, read_jsonl
 
@@ -48,6 +53,8 @@ CAMERA_ARTIFACT_MAP_KEYS = (
     "wrist_keep_mask_paths",
 )
 _EPISODE_RE = re.compile(r"episode_(\d+)")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_TACTILE_SIDECAR_RELATIVE = Path("meta/modality_artifacts/tactile")
 
 
 class CameraSemanticMaterializationError(RuntimeError):
@@ -188,6 +195,212 @@ def _episode_records(root: Path) -> tuple[dict[str, Any], ...]:
             )
         seen.add(index)
     return rows
+
+
+def _episode_tactile_references(
+    root: Path,
+    episodes: tuple[Mapping[str, Any], ...],
+) -> set[str]:
+    references: set[str] = set()
+    for episode in episodes:
+        episode_index = int(episode["episode_index"])
+        tactile_paths = episode.get("tactile_paths", {})
+        if tactile_paths is None:
+            continue
+        if not isinstance(tactile_paths, Mapping):
+            raise CameraSemanticMaterializationError(
+                f"Episode {episode_index} tactile_paths must be an object."
+            )
+        for side, raw_path in tactile_paths.items():
+            relative = _safe_relative_path(
+                root,
+                raw_path,
+                label=f"episode {episode_index} tactile_paths.{side}",
+            )
+            if not relative.parts or relative.parts[0] != "tactile":
+                raise CameraSemanticMaterializationError(
+                    f"Tactile manifest lies outside tactile/: {relative}"
+                )
+            references.add(relative.as_posix())
+    return references
+
+
+def _tactile_artifact_graph(payload: Mapping[str, Any]) -> tuple[
+    str,
+    tuple[tuple[str, str, int, str], ...],
+]:
+    inventory_hash = str(payload.get("semantic_content_hash") or "").strip()
+    if not _SHA256_RE.fullmatch(inventory_hash):
+        raise CameraSemanticMaterializationError(
+            "Tactile inventory has no valid semantic_content_hash."
+        )
+    raw_artifacts = payload.get("artifacts")
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        raise CameraSemanticMaterializationError(
+            f"Tactile inventory {inventory_hash} has no artifacts."
+        )
+    artifacts: list[tuple[str, str, int, str]] = []
+    for raw in raw_artifacts:
+        if not isinstance(raw, Mapping):
+            raise CameraSemanticMaterializationError(
+                f"Tactile inventory {inventory_hash} has a non-object artifact."
+            )
+        logical_path = str(raw.get("logical_path") or "").strip()
+        role = str(raw.get("role") or "").strip()
+        try:
+            size_bytes = int(raw.get("size_bytes", -1))
+        except (TypeError, ValueError) as exc:
+            raise CameraSemanticMaterializationError(
+                f"Tactile inventory {inventory_hash} has invalid size_bytes."
+            ) from exc
+        sha256 = str(raw.get("sha256") or "").strip()
+        relative = Path(logical_path)
+        if (
+            role not in {"manifest", "payload"}
+            or size_bytes < 0
+            or not _SHA256_RE.fullmatch(sha256)
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.parts
+            or relative.parts[0] != "tactile"
+        ):
+            raise CameraSemanticMaterializationError(
+                f"Tactile inventory {inventory_hash} has an unsafe artifact."
+            )
+        artifacts.append((logical_path, role, size_bytes, sha256))
+    if len({item[0] for item in artifacts}) != len(artifacts):
+        raise CameraSemanticMaterializationError(
+            f"Tactile inventory {inventory_hash} has duplicate artifact paths."
+        )
+    return inventory_hash, tuple(sorted(artifacts))
+
+
+def _tactile_detach_audit(
+    root: Path,
+    episodes: tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Prove camera export will not read or duplicate cold tactile payloads."""
+
+    references = _episode_tactile_references(root, episodes)
+    if not references:
+        return {
+            "status": "not_referenced",
+            "safe_for_camera_materialization": True,
+            "inventory_hashes": [],
+            "detachment_scope": None,
+            "manifest_count": 0,
+            "payload_count": 0,
+            "present_hot_payload_count": 0,
+            "cold_payloads_read": False,
+        }
+    inventory_dir = root / _TACTILE_SIDECAR_RELATIVE / "inventories"
+    if not inventory_dir.is_dir():
+        return {
+            "status": "missing_detachment_inventory",
+            "safe_for_camera_materialization": False,
+            "inventory_hashes": [],
+            "detachment_scope": None,
+            "manifest_count": len(references),
+            "payload_count": 0,
+            "present_hot_payload_count": 0,
+            "cold_payloads_read": False,
+        }
+
+    candidates: list[
+        tuple[str, str, tuple[tuple[str, str, int, str], ...]]
+    ] = []
+    for path in sorted(inventory_dir.glob("*.json")):
+        payload = read_json(path)
+        if not payload:
+            raise CameraSemanticMaterializationError(
+                f"Tactile inventory is empty or invalid: {path}"
+            )
+        inventory_hash, artifacts = _tactile_artifact_graph(payload)
+        scope = verified_detachment_scope(root, inventory_hash)
+        if scope is not None:
+            candidates.append((inventory_hash, scope, artifacts))
+    if not candidates:
+        return {
+            "status": "no_verified_retirement",
+            "safe_for_camera_materialization": False,
+            "inventory_hashes": [],
+            "detachment_scope": None,
+            "manifest_count": len(references),
+            "payload_count": 0,
+            "present_hot_payload_count": 0,
+            "cold_payloads_read": False,
+        }
+
+    graphs = {candidate[2] for candidate in candidates}
+    if len(graphs) != 1:
+        raise CameraSemanticMaterializationError(
+            "Verified tactile retirements describe different artifact graphs."
+        )
+    artifacts = next(iter(graphs))
+    manifests = {item[0]: item for item in artifacts if item[1] == "manifest"}
+    payloads = {item[0]: item for item in artifacts if item[1] == "payload"}
+    if set(manifests) != references:
+        raise CameraSemanticMaterializationError(
+            "Episode tactile_paths differ from the verified retired manifest graph."
+        )
+    present_payloads = sorted(
+        logical_path for logical_path in payloads if (root / logical_path).exists()
+    )
+    actual_hot = {
+        path.relative_to(root).as_posix()
+        for path in (root / "tactile").rglob("*")
+        if path.is_file() or path.is_symlink()
+    }
+    if actual_hot == set(manifests):
+        scope = PAYLOAD_ONLY_DETACH
+        expected_hot = set(manifests)
+    elif not actual_hot:
+        scope = WHOLE_PREFIX_DETACH
+        expected_hot = set()
+    else:
+        scope = None
+        expected_hot = set()
+    matching_candidates = [
+        candidate for candidate in candidates if candidate[1] == scope
+    ]
+    unsafe_hot = sorted(actual_hot - expected_hot)
+    missing_hot = sorted(expected_hot - actual_hot)
+    manifest_mismatches: list[str] = []
+    if scope == PAYLOAD_ONLY_DETACH:
+        for logical_path, _, size_bytes, sha256 in manifests.values():
+            path = root / logical_path
+            if not path.is_file() or path.is_symlink():
+                manifest_mismatches.append(logical_path)
+                continue
+            stat = path.stat()
+            if int(stat.st_nlink) != 1 or int(stat.st_size) != size_bytes:
+                manifest_mismatches.append(logical_path)
+                continue
+            if _sha256_file(path) != sha256:
+                manifest_mismatches.append(logical_path)
+    safe = (
+        bool(matching_candidates)
+        and not present_payloads
+        and not unsafe_hot
+        and not missing_hot
+        and not manifest_mismatches
+        and scope in {PAYLOAD_ONLY_DETACH, WHOLE_PREFIX_DETACH}
+    )
+    return {
+        "status": "detached_verified" if safe else "detached_state_mismatch",
+        "safe_for_camera_materialization": safe,
+        "inventory_hashes": sorted(
+            candidate[0] for candidate in matching_candidates
+        ),
+        "detachment_scope": scope,
+        "manifest_count": len(manifests),
+        "payload_count": len(payloads),
+        "present_hot_payload_count": len(present_payloads),
+        "unexpected_hot_path_count": len(unsafe_hot),
+        "missing_hot_manifest_count": len(missing_hot),
+        "manifest_mismatch_count": len(manifest_mismatches),
+        "cold_payloads_read": False,
+    }
 
 
 def _resolution_maps(
@@ -510,6 +723,7 @@ class CameraSemanticMaterializationPlan:
     source_file_count: int
     source_byte_count: int
     source_hardlinked_file_count: int
+    tactile_detach_audit: Mapping[str, Any]
     episode_count: int
     frame_count: int
     status_counts: Mapping[str, int]
@@ -557,6 +771,7 @@ def plan_camera_semantic_materialization(
     resolver = DatasetCameraSemanticResolver(source, binding)
     episodes = _episode_records(source)
     files, inventory_hash, byte_count, hardlinked_count = _source_inventory(source)
+    tactile_detach_audit = _tactile_detach_audit(source, episodes)
     status_counts: Counter[str] = Counter()
     frame_count = 0
     remapped_rows = 0
@@ -603,6 +818,7 @@ def plan_camera_semantic_materialization(
         source_file_count=len(files),
         source_byte_count=byte_count,
         source_hardlinked_file_count=hardlinked_count,
+        tactile_detach_audit=tactile_detach_audit,
         episode_count=len(episodes),
         frame_count=frame_count,
         status_counts=dict(sorted(status_counts.items())),
@@ -727,6 +943,12 @@ def materialize_camera_semantics(
     if not str(expected_plan_hash).strip() or expected_plan_hash != plan.plan_hash:
         raise CameraSemanticMaterializationError(
             "Apply requires the exact current --expected-plan-hash."
+        )
+    if not bool(plan.tactile_detach_audit["safe_for_camera_materialization"]):
+        raise CameraSemanticMaterializationError(
+            "Camera materialization requires tactile to be unreferenced or already "
+            "retired with verified receipts; current tactile status is "
+            f"{plan.tactile_detach_audit['status']}."
         )
     source = Path(plan.source_root)
     output = Path(plan.output_root)
@@ -906,6 +1128,13 @@ def materialize_camera_semantics(
         video_count, decoded_frames = _validate_materialized_videos(
             staging, output_episode_tuple
         )
+        output_tactile_audit = _tactile_detach_audit(
+            staging, output_episode_tuple
+        )
+        if output_tactile_audit != plan.tactile_detach_audit:
+            raise CameraSemanticMaterializationError(
+                "Materialized tactile references/receipts differ from the frozen source audit."
+            )
         _, final_inventory_hash, _, _ = _source_inventory(source)
         if final_inventory_hash != plan.source_inventory_hash:
             raise CameraSemanticMaterializationError(

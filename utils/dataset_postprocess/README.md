@@ -48,6 +48,14 @@ ffprobe 解码帧数和 ffmpeg `-xerror` 全段/尾帧解码后才原子发布�
 `DatasetCameraSemanticResolver` 和普通按 canonical key 读取的 loader 都看到 identity，避免
 organized provenance 再次把已经换名的数据交换一次。
 
+相机物化不会读取或复制冷端触觉 payload。含 `tactile_paths` 的数据集只有在 hot 端状态与已
+验证 retirement receipt 一致时才允许 `--apply`：`payload-only` 必须只剩完整、独立 inode 的
+manifest，`whole-prefix` 必须不存在整个 `tactile/`。dry-run 的 `tactile_detach_audit` 会明确
+给出 scope、manifest/payload 数量及 `cold_payloads_read=false`；缺 receipt、仍有 payload、
+manifest hash/大小变化、未知热端文件或不同 artifact graph 都会 fail closed。输出继续保留同一
+`tactile_paths`、inventory 和 receipt，且发布前重新得到完全相同的 detach audit。因此应先完成并
+验证触觉迁出，再物化相机语义；不要把 NAS/cold root 传给相机工具。
+
 新正式采集的 thread writer 默认采用 `--storage-queue-backpressure-policy block`：相机存储队列
 满时在控制热路径之外背压 sample assembly，不再由每个相机独立丢最旧帧。旧的
 `drop_oldest` 仍是显式兼容选项，但可能重新产生单侧 frame gap；正式数据不应使用。process

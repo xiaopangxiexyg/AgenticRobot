@@ -8,6 +8,11 @@ import subprocess
 
 import pytest
 
+from dataset_contracts.modality_artifacts import (
+    ModalityArtifactInventoryV1,
+    ModalityArtifactRecordV1,
+    ModalityStorageTransferReceiptV1,
+)
 from dataset_interface.camera_semantics import (
     CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH,
     DatasetCameraSemanticResolver,
@@ -184,6 +189,125 @@ def _write_source_dataset(root: Path) -> tuple[Path, Path]:
     return root / left_video, root / right_video
 
 
+def _add_detached_tactile_evidence(root: Path) -> tuple[Path, str]:
+    episode_path = root / "meta/episodes.jsonl"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    manifest_relative = Path("tactile/episode_000000/left/manifest.json")
+    payload_relative = Path("tactile/episode_000000/left/frames.bin")
+    episode["tactile_paths"] = {"left": manifest_relative.as_posix()}
+    episode_path.write_text(json.dumps(episode) + "\n", encoding="utf-8")
+
+    manifest = root / manifest_relative
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps({"stream": {"path": payload_relative.name}}),
+        encoding="utf-8",
+    )
+    payload_bytes = b"detached-tactile-payload"
+    inventory = ModalityArtifactInventoryV1(
+        modality_key="tactile",
+        source_dataset_base_fingerprint="1" * 64,
+        source_episode_catalog_sha256="2" * 64,
+        source_episode_count=1,
+        logical_prefixes=("tactile",),
+        artifacts=tuple(
+            sorted(
+                (
+                    ModalityArtifactRecordV1(
+                        logical_path=manifest_relative.as_posix(),
+                        role="manifest",
+                        size_bytes=manifest.stat().st_size,
+                        sha256=_sha256(manifest),
+                        episode_index=0,
+                        side="left",
+                    ),
+                    ModalityArtifactRecordV1(
+                        logical_path=payload_relative.as_posix(),
+                        role="payload",
+                        size_bytes=len(payload_bytes),
+                        sha256=hashlib.sha256(payload_bytes).hexdigest(),
+                        episode_index=0,
+                        side="left",
+                    ),
+                ),
+                key=lambda item: item.logical_path,
+            )
+        ),
+    )
+    sidecar = root / "meta/modality_artifacts/tactile"
+    inventory_path = sidecar / "inventories" / f"{inventory.semantic_content_hash}.json"
+    inventory_path.parent.mkdir(parents=True)
+    inventory_path.write_text(json.dumps(inventory.to_dict()), encoding="utf-8")
+    receipt = ModalityStorageTransferReceiptV1(
+        operation_id="retire_hot_payloads.camera_test",
+        operation="retire_hot_payloads",
+        inventory_hash=inventory.semantic_content_hash,
+        source_storage_id="hot.test",
+        target_storage_id="cold.test",
+        file_count=inventory.file_count,
+        total_bytes=inventory.total_bytes,
+        status="complete",
+        independent_copy_verified=True,
+        completed_at="2026-08-13T00:00:00+00:00",
+    )
+    receipt_path = sidecar / "receipts" / f"{receipt.operation_id}.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(json.dumps(receipt.to_dict()), encoding="utf-8")
+    return manifest, inventory.semantic_content_hash
+
+
+def _replace_with_whole_prefix_retirement(root: Path, inventory_hash: str) -> None:
+    shutil.rmtree(root / "tactile")
+    receipt_dir = root / "meta/modality_artifacts/tactile/receipts"
+    shutil.rmtree(receipt_dir)
+    receipt_dir.mkdir(parents=True)
+    receipt = ModalityStorageTransferReceiptV1(
+        operation_id="retire_hot_module_tree.camera_test",
+        operation="retire_hot_module_tree",
+        inventory_hash=inventory_hash,
+        source_storage_id="hot.test",
+        target_storage_id="cold.test",
+        file_count=2,
+        total_bytes=1,
+        status="complete",
+        independent_copy_verified=True,
+        completed_at="2026-08-13T00:00:01+00:00",
+    )
+    (receipt_dir / f"{receipt.operation_id}.json").write_text(
+        json.dumps(receipt.to_dict()), encoding="utf-8"
+    )
+
+
+def _add_equivalent_stale_scope_evidence(root: Path, inventory_hash: str) -> str:
+    sidecar = root / "meta/modality_artifacts/tactile"
+    source_inventory = json.loads(
+        (sidecar / "inventories" / f"{inventory_hash}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    equivalent_hash = "a" * 64
+    source_inventory["semantic_content_hash"] = equivalent_hash
+    (sidecar / "inventories" / f"{equivalent_hash}.json").write_text(
+        json.dumps(source_inventory), encoding="utf-8"
+    )
+    receipt = ModalityStorageTransferReceiptV1(
+        operation_id="retire_hot_module_tree.stale_equivalent",
+        operation="retire_hot_module_tree",
+        inventory_hash=equivalent_hash,
+        source_storage_id="hot.test",
+        target_storage_id="cold.test",
+        file_count=2,
+        total_bytes=1,
+        status="complete",
+        independent_copy_verified=True,
+        completed_at="2026-08-12T00:00:00+00:00",
+    )
+    (sidecar / "receipts" / f"{receipt.operation_id}.json").write_text(
+        json.dumps(receipt.to_dict()), encoding="utf-8"
+    )
+    return equivalent_hash
+
+
 @pytest.mark.optional
 def test_materialization_swaps_complete_camera_families_and_preserves_gaps(
     tmp_path: Path,
@@ -284,3 +408,126 @@ def test_apply_requires_frozen_plan_and_never_overwrites(tmp_path: Path) -> None
             registry,
             expected_plan_hash=plan.plan_hash,
         )
+
+
+@pytest.mark.optional
+def test_materialization_preserves_detached_tactile_graph_without_cold_reads(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_source_dataset(source)
+    source_manifest, inventory_hash = _add_detached_tactile_evidence(source)
+    source_manifest_hash = _sha256(source_manifest)
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "output"
+
+    plan = plan_camera_semantic_materialization(source, output, registry)
+
+    assert plan.tactile_detach_audit == {
+        "status": "detached_verified",
+        "safe_for_camera_materialization": True,
+        "inventory_hashes": [inventory_hash],
+        "detachment_scope": "payload_only",
+        "manifest_count": 1,
+        "payload_count": 1,
+        "present_hot_payload_count": 0,
+        "unexpected_hot_path_count": 0,
+        "missing_hot_manifest_count": 0,
+        "manifest_mismatch_count": 0,
+        "cold_payloads_read": False,
+    }
+    result = materialize_camera_semantics(
+        source,
+        output,
+        registry,
+        expected_plan_hash=plan.plan_hash,
+    )
+
+    output_episode = json.loads(
+        (output / "meta/episodes.jsonl").read_text(encoding="utf-8")
+    )
+    assert output_episode["tactile_paths"] == {
+        "left": "tactile/episode_000000/left/manifest.json"
+    }
+    output_manifest = output / output_episode["tactile_paths"]["left"]
+    assert _sha256(output_manifest) == source_manifest_hash
+    assert not (output / "tactile/episode_000000/left/frames.bin").exists()
+    assert result["tactile_detach_audit"]["cold_payloads_read"] is False
+
+
+@pytest.mark.optional
+def test_materialization_refuses_tactile_that_is_not_retired(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_source_dataset(source)
+    _, _ = _add_detached_tactile_evidence(source)
+    receipt_dir = source / "meta/modality_artifacts/tactile/receipts"
+    for receipt in receipt_dir.glob("*.json"):
+        receipt.unlink()
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "output"
+
+    plan = plan_camera_semantic_materialization(source, output, registry)
+
+    assert plan.tactile_detach_audit["status"] == "no_verified_retirement"
+    assert plan.tactile_detach_audit["safe_for_camera_materialization"] is False
+    with pytest.raises(Exception, match="already retired"):
+        materialize_camera_semantics(
+            source,
+            output,
+            registry,
+            expected_plan_hash=plan.plan_hash,
+        )
+
+
+@pytest.mark.optional
+def test_materialization_preserves_whole_prefix_retirement(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_source_dataset(source)
+    _, inventory_hash = _add_detached_tactile_evidence(source)
+    _replace_with_whole_prefix_retirement(source, inventory_hash)
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "output"
+
+    plan = plan_camera_semantic_materialization(source, output, registry)
+
+    assert plan.tactile_detach_audit["status"] == "detached_verified"
+    assert plan.tactile_detach_audit["detachment_scope"] == "whole_prefix"
+    result = materialize_camera_semantics(
+        source,
+        output,
+        registry,
+        expected_plan_hash=plan.plan_hash,
+    )
+    assert not (output / "tactile").exists()
+    assert result["tactile_detach_audit"]["cold_payloads_read"] is False
+
+
+@pytest.mark.optional
+def test_materialization_selects_retirement_matching_current_hot_scope(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_source_dataset(source)
+    _, inventory_hash = _add_detached_tactile_evidence(source)
+    stale_hash = _add_equivalent_stale_scope_evidence(source, inventory_hash)
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+
+    plan = plan_camera_semantic_materialization(
+        source, tmp_path / "output", registry
+    )
+
+    assert plan.tactile_detach_audit["detachment_scope"] == "payload_only"
+    assert plan.tactile_detach_audit["inventory_hashes"] == [inventory_hash]
+    assert stale_hash not in plan.tactile_detach_audit["inventory_hashes"]
