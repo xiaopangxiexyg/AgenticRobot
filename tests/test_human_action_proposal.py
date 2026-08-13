@@ -881,6 +881,7 @@ def _armed_session(
     observer,
     filter_observer=None,
     execution_observer=None,
+    dispatch_admission=None,
 ) -> tuple[TeleopSession, _Rig]:
     rig = _Rig(events)
 
@@ -904,6 +905,7 @@ def _armed_session(
         rig=rig,
         command_filter=command_filter,
         command_guard=command_guard,
+        command_dispatch_admission=dispatch_admission,
         human_command_observer=observer,
         human_command_filter_observer=filter_observer,
         human_execution_observer=execution_observer,
@@ -913,6 +915,46 @@ def _armed_session(
     session.mark_debug_passed()
     session.arm_hardware()
     return session, rig
+
+
+def test_session_dispatch_admission_withholds_without_fault_or_state_transition() -> None:
+    events: list[str] = []
+    admitted = False
+
+    def admission(_command, _observation, _now) -> bool:
+        events.append("admission")
+        return admitted
+
+    session, rig = _armed_session(
+        events=events,
+        observer=None,
+        dispatch_admission=admission,
+    )
+    try:
+        held = session.run_step(now=1.0)
+        assert not held.command_dispatched
+        assert held.state.value == "ARMED"
+        assert rig.sent == []
+
+        admitted = True
+        released = session.run_step(now=1.1)
+        assert released.command_dispatched
+        assert released.state.value == "RUNNING"
+        assert len(rig.sent) == 1
+    finally:
+        session.close()
+
+    assert events == [
+        "retarget",
+        "filter",
+        "guard",
+        "admission",
+        "retarget",
+        "filter",
+        "guard",
+        "admission",
+        "dispatch",
+    ]
 
 
 def test_session_human_observer_is_passive_and_runs_before_filter_guard_dispatch() -> None:

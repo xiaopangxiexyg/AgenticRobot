@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import threading
 
 import pytest
 
@@ -18,7 +20,9 @@ from robot_motion.runtime import (
     ExecutionWorkItem,
 )
 from teleop_runtime.action.legacy_execution_context import (
+    LEGACY_CONTROL_LIFECYCLE_GATE_COMPATIBILITY_V1,
     LegacyControlDomainExecutionContext,
+    LegacyControlOwnerStateTransitionRequest,
 )
 from teleop_runtime.backends.arms.rm65_dispatch_inventory import (
     assess_rm65_arms_only_dispatch_inventory,
@@ -83,7 +87,10 @@ def _manifest():
     )
 
 
-def _context() -> LegacyControlDomainExecutionContext:
+def _context(
+    *,
+    clock: ManualClock | None = None,
+) -> LegacyControlDomainExecutionContext:
     manifest = _manifest()
     inventory = build_rm65_arms_only_dispatch_inventory(manifest)
     assessment = assess_rm65_arms_only_dispatch_inventory(inventory)
@@ -98,7 +105,7 @@ def _context() -> LegacyControlDomainExecutionContext:
         inventory_assessment=assessment,
         initial_authority_epoch=0,
         initial_execution_epoch=0,
-        clock=ManualClock(),
+        clock=ManualClock() if clock is None else clock,
     )
 
 
@@ -125,8 +132,139 @@ def test_context_owns_one_unbound_legacy_scope_without_hardware_authorization() 
     assert snapshot.segment_generation_by_group == {"arms": 0}
     assert not snapshot.production_binding_enabled
     assert snapshot.hardware_authorization_id is None
+    assert snapshot.lifecycle_state == "configured"
+    assert snapshot.execution_gate == "hold"
+    assert snapshot.owner_state_revision == 0
+    assert snapshot.last_execution_cancellation_id is None
+    assert snapshot.last_owner_transition_id is None
+    assert snapshot.semantic_content_hash
     assert not context.inventory_assessment.legacy_mediation_ready
     assert not context.inventory_assessment.confers_execution_authorization
+
+
+def test_owner_snapshot_identity_is_stable_between_state_changes() -> None:
+    clock = ManualClock()
+    context = _context(clock=clock)
+    before = context.snapshot()
+
+    clock.value += 5.0
+    reread = context.snapshot()
+
+    assert reread.owner_state_revision == before.owner_state_revision
+    assert reread.captured_at == before.captured_at
+    assert reread.execution_gate_snapshot_hash == before.execution_gate_snapshot_hash
+    assert reread.semantic_content_hash == before.semantic_content_hash
+
+    transition = _transition(context, "shadow_ready", "hold")
+    assert transition.snapshot.owner_state_revision == before.owner_state_revision + 1
+    assert transition.snapshot.captured_at == clock.value
+    assert transition.snapshot.semantic_content_hash != before.semantic_content_hash
+
+
+def _transition(
+    context: LegacyControlDomainExecutionContext,
+    lifecycle: str,
+    gate: str,
+    *,
+    reason: str | None = None,
+    recovery_authorization_id: str | None = None,
+):
+    return context.transition_owner_state(
+        LegacyControlOwnerStateTransitionRequest(
+            target_lifecycle_state=lifecycle,
+            target_execution_gate=gate,
+            reason=reason or f"fixture_{lifecycle}",
+            recovery_authorization_id=recovery_authorization_id,
+        )
+    )
+
+
+def test_context_is_unique_typed_lifecycle_and_execution_gate_owner() -> None:
+    context = _context()
+
+    ready = _transition(context, "shadow_ready", "hold")
+    running = _transition(context, "running", "ready")
+    duplicate = _transition(context, "running", "ready")
+    held = _transition(context, "hold", "hold")
+
+    assert ready.changed and ready.receipt is not None
+    assert running.changed and running.receipt is not None
+    assert duplicate.changed is False and duplicate.receipt is None
+    assert duplicate.snapshot.owner_state_revision == 2
+    assert held.snapshot.owner_state_revision == 3
+    assert held.snapshot.lifecycle_state == "hold"
+    assert held.snapshot.execution_gate == "hold"
+    assert held.snapshot.execution_gate_epoch == 3
+    assert held.snapshot.last_owner_transition_hash == held.receipt.semantic_content_hash
+
+
+def test_reference_work_is_minted_only_from_the_unique_ready_owner_cut() -> None:
+    context = _context()
+    with pytest.raises(RuntimeError, match="RUNNING/READY"):
+        context.create_reference_segment_work_item(
+            source_decision_id="decision-before-ready",
+            source_reference_segment_id="segment-before-ready",
+        )
+    _transition(context, "shadow_ready", "hold")
+    running = _transition(context, "running", "ready")
+
+    work = context.create_reference_segment_work_item(
+        source_decision_id="decision-ready",
+        source_reference_segment_id="segment-ready",
+    )
+
+    assert work.work_kind == "reference_segment"
+    assert work.authority_epoch == running.snapshot.authority_epoch
+    assert work.execution_epoch == running.snapshot.execution_epoch
+    assert work.segment_generation_by_group == {"arms": 0}
+    assert context.execution_guard.check_at_dequeue(work).accepted
+
+
+def test_context_rejects_inconsistent_pairs_and_unproved_fault_recovery() -> None:
+    context = _context()
+
+    with pytest.raises(ValueError, match="requires 'hold'"):
+        _transition(context, "armed", "ready")
+    fault = _transition(context, "fault", "fault")
+    assert fault.snapshot.lifecycle_state == "fault"
+    with pytest.raises(ValueError, match="explicit recovery authorization"):
+        _transition(context, "hold", "hold")
+    recovered = _transition(
+        context,
+        "hold",
+        "hold",
+        recovery_authorization_id="manual-rearm-receipt-1",
+    )
+    assert recovered.snapshot.lifecycle_state == "hold"
+    assert recovered.snapshot.execution_gate == "hold"
+
+
+def test_context_serializes_competing_hold_and_running_transitions() -> None:
+    context = _context()
+    _transition(context, "shadow_ready", "hold")
+
+    targets = [("running", "ready"), ("hold", "hold")] * 16
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = tuple(
+            pool.map(
+                lambda target: _transition(context, *target),
+                targets,
+            )
+        )
+
+    for outcome in outcomes:
+        snapshot = outcome.snapshot
+        assert (
+            LEGACY_CONTROL_LIFECYCLE_GATE_COMPATIBILITY_V1[
+                snapshot.lifecycle_state
+            ]
+            == snapshot.execution_gate
+        )
+    final = context.snapshot()
+    assert final.owner_state_revision == 1 + sum(
+        outcome.changed for outcome in outcomes
+    )
+    assert final.execution_gate_epoch == final.owner_state_revision
 
 
 def test_final_motion_fake_composition_checks_work_then_consumes_one_permit() -> None:
@@ -267,6 +405,9 @@ def test_quick_stop_cannot_be_admitted_before_owner_registry_observes_cancel() -
         capability=_capability(),
     )
 
+    with pytest.raises(RuntimeError, match="between cancellation linearization"):
+        context.snapshot()
+
     with pytest.raises(ValueError, match="synchronized new execution epoch"):
         context.admit_fake_rm65_quick_stop(
             cancellation=cancellation,
@@ -275,3 +416,65 @@ def test_quick_stop_cannot_be_admitted_before_owner_registry_observes_cancel() -
             maximum_duration_sec=0.1,
             maximum_tick_count=1,
         )
+
+
+def test_context_atomic_cancellation_keeps_owner_snapshot_publishable() -> None:
+    context = _context()
+
+    cancellation = context.cancel_execution(
+        ExecutionCancellationRequest(
+            reason="hold",
+            authority_epoch=0,
+            requested_scope="control_domain",
+            source_event_ids=("atomic-hold-request",),
+        ),
+        capability=_capability(),
+    )
+    snapshot = context.snapshot()
+
+    assert snapshot.execution_epoch == cancellation.execution_epoch == 1
+    assert context.dispatch_owners.snapshot().current_execution_epoch == 1
+    assert snapshot.lifecycle_state == "transitioning"
+    assert snapshot.execution_gate == "transitioning"
+    assert snapshot.owner_state_revision == 2
+    assert snapshot.last_execution_cancellation_id == cancellation.cancellation_id
+    assert snapshot.last_execution_cancellation_hash == (
+        cancellation.semantic_content_hash
+    )
+
+
+def test_atomic_cancel_race_never_publishes_ready_after_cancellation() -> None:
+    context = _context()
+    _transition(context, "shadow_ready", "hold")
+    _transition(context, "running", "ready")
+    barrier = threading.Barrier(2)
+
+    def cancel():
+        barrier.wait()
+        return context.cancel_execution(
+            ExecutionCancellationRequest(
+                reason="hold",
+                authority_epoch=0,
+                requested_scope="control_domain",
+                source_event_ids=("race-cancel",),
+            ),
+            capability=_capability(),
+        )
+
+    def resume():
+        barrier.wait()
+        try:
+            return _transition(context, "running", "ready", reason="race-resume")
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cancel_future = pool.submit(cancel)
+        resume_future = pool.submit(resume)
+        cancellation = cancel_future.result()
+        resume_future.result()
+
+    snapshot = context.snapshot()
+    assert snapshot.execution_epoch == cancellation.execution_epoch
+    assert snapshot.lifecycle_state == "transitioning"
+    assert snapshot.execution_gate == "transitioning"

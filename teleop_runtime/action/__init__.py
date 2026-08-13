@@ -77,6 +77,21 @@ from .human_proposal import (
     SourceAdapterReceipt,
     SourceComponentMappingReceipt,
 )
+from .human_observer import (
+    HumanPoseSourceContract,
+    PassiveHumanCommandEmissionIngress,
+    PassiveHumanCommandEmissionIngressStatus,
+    PassiveHumanCommandObserverFanout,
+)
+from .synthetic_human import (
+    SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
+    SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1,
+    SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1,
+    SyntheticHumanPoseSource,
+    SyntheticHumanPoseSourceSpec,
+    SyntheticHumanQposSource,
+    SyntheticHumanQposSourceSpec,
+)
 from .human_residual import (
     HUMAN_RESIDUAL_POSE_ALGORITHM_DEVELOPMENT,
     HumanPoseSample,
@@ -128,9 +143,14 @@ from .human_position_shadow import (
     bind_human_position_backend_evidence,
 )
 from .legacy_execution_context import (
+    LEGACY_CONTROL_LIFECYCLE_GATE_COMPATIBILITY_V1,
+    LEGACY_CONTROL_LIFECYCLE_STATES_V1,
     LEGACY_EXECUTION_CONTEXT_MODES_V1,
     LegacyControlDomainExecutionContext,
     LegacyControlDomainExecutionContextSnapshot,
+    LegacyControlOwnerStateTransitionOutcome,
+    LegacyControlOwnerStateTransitionReceipt,
+    LegacyControlOwnerStateTransitionRequest,
     LegacyMotionDispatchPreparation,
     LegacySafetyDispatchPreparation,
 )
@@ -156,10 +176,53 @@ _LAZY_REPLAY_SHADOW_FRONTEND_EXPORTS = {
     "ReplayGuiShadowConsumer",
     "ReplayGuiShadowProfile",
 }
+_LAZY_HUMAN_ADMISSION_EXPORTS = {
+    "HumanObservationCutAdmissionCore",
+    "HumanProposalAdmissionCore",
+    "admit_human_command_emission",
+    "admit_human_observation_cut",
+}
+_LAZY_HUMAN_COMPOSITION_EXPORTS = {
+    "HumanComponentActionAdaptation",
+    "HumanCompositionInputAdaptation",
+    "adapt_human_emission_to_component_action",
+    "adapt_human_emission_to_composition_input",
+}
+_LAZY_PASSIVE_TELEOP_EXPORTS = {
+    "AttachablePassiveTeleopComponentSource",
+    "PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1",
+    "PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
+    "PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1",
+    "PassiveTeleopComponentBindingReceipt",
+    "PassiveTeleopComponentClockBridge",
+    "PassiveTeleopComponentSessionSource",
+    "PassiveTeleopComponentSourceSpec",
+    "PassiveTeleopComponentSpec",
+    "PassiveTeleopComponentStep",
+    "PassiveTeleopPoseBindingReceipt",
+    "PassiveTeleopPoseSessionSource",
+    "PassiveTeleopPoseSourceSpec",
+    "PassiveTeleopPoseStep",
+    "build_passive_teleop_component_session_source",
+    "build_passive_teleop_pose_session_source",
+}
 
 
 def __getattr__(name: str):
-    """Load replay-only adapters without polluting normal collection imports."""
+    """Load dependency-heavy adapters without polluting collection imports."""
+
+    if name in _LAZY_HUMAN_ADMISSION_EXPORTS:
+        from . import human_admission
+
+        return getattr(human_admission, name)
+    if name in _LAZY_HUMAN_COMPOSITION_EXPORTS:
+        from . import human_composition_input
+
+        return getattr(human_composition_input, name)
+    if name in _LAZY_PASSIVE_TELEOP_EXPORTS:
+        from . import passive_teleop
+
+        return getattr(passive_teleop, name)
 
     if name in _LAZY_REPLAY_PROPOSAL_EXPORTS:
         from . import replay_proposal
@@ -178,6 +241,7 @@ __all__ = [
     "ActionExecutorConfig",
     "ActionRecord",
     "ActionVectorEncoding",
+    "AttachablePassiveTeleopComponentSource",
     "ArmActionSpec",
     "BIMANUAL_EE_POSE_HAND16_V1",
     "BIMANUAL_EE_POSE_V1",
@@ -205,9 +269,22 @@ __all__ = [
     "HUMAN_JOINT_POSITION_RESIDUAL_ALGORITHM_DEVELOPMENT",
     "HUMAN_RESIDUAL_POSE_ALGORITHM_DEVELOPMENT",
     "HUMAN_SOURCE_ADAPTER_CONTRACT_ID_V1",
+    "PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1",
+    "PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
+    "PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1",
+    "SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
+    "SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1",
+    "SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1",
+    "SyntheticHumanPoseSource",
+    "SyntheticHumanPoseSourceSpec",
+    "SyntheticHumanQposSource",
+    "SyntheticHumanQposSourceSpec",
     "HumanCommandContribution",
     "HumanCommandEmission",
     "HumanCommandFilterObservation",
+    "HumanComponentActionAdaptation",
+    "HumanCompositionInputAdaptation",
+    "HumanObservationCutAdmissionCore",
     "HumanComponentResidualAdaptationReceipt",
     "HumanComponentResidualAdapter",
     "HumanComponentResidualAnchor",
@@ -226,9 +303,11 @@ __all__ = [
     "HumanJointPositionSample",
     "HumanProposalAdapter",
     "HumanProposalAdapterConfig",
+    "HumanProposalAdmissionCore",
     "HumanProposalAdapterResult",
     "HumanPositionBackendBindingEvidence",
     "HumanPoseSample",
+    "HumanPoseSourceContract",
     "HumanPoseChannelAdaptationReceipt",
     "HumanPoseChannelAdaptationResult",
     "HumanPoseChannelAdapter",
@@ -242,12 +321,30 @@ __all__ = [
     "ViveHumanResidualCoordinateBinding",
     "INSPIRE_HAND_DOF",
     "LEGACY_EXECUTION_CONTEXT_MODES_V1",
+    "LEGACY_CONTROL_LIFECYCLE_GATE_COMPATIBILITY_V1",
+    "LEGACY_CONTROL_LIFECYCLE_STATES_V1",
     "LegacyControlDomainExecutionContext",
     "LegacyControlDomainExecutionContextSnapshot",
+    "LegacyControlOwnerStateTransitionOutcome",
+    "LegacyControlOwnerStateTransitionReceipt",
+    "LegacyControlOwnerStateTransitionRequest",
     "LegacyMotionDispatchPreparation",
     "LegacySafetyDispatchPreparation",
     "M6_CANDIDATE_POLICY_ARM_QPOS_SAFETY_MATRIX_V1",
     "NullCommandDispatcher",
+    "PassiveHumanCommandEmissionIngress",
+    "PassiveHumanCommandEmissionIngressStatus",
+    "PassiveHumanCommandObserverFanout",
+    "PassiveTeleopComponentBindingReceipt",
+    "PassiveTeleopComponentClockBridge",
+    "PassiveTeleopComponentSessionSource",
+    "PassiveTeleopComponentSourceSpec",
+    "PassiveTeleopComponentSpec",
+    "PassiveTeleopComponentStep",
+    "PassiveTeleopPoseBindingReceipt",
+    "PassiveTeleopPoseSessionSource",
+    "PassiveTeleopPoseSourceSpec",
+    "PassiveTeleopPoseStep",
     "QPOS_VECTOR_DIM",
     "QPOS_HAND16_VECTOR_DIM",
     "ROBOT_ACTION_VECTOR_HAND16_LAYOUT_VERSION",
@@ -274,10 +371,16 @@ __all__ = [
     "hand_action_specs_from_metadata",
     "arm_action_specs_metadata",
     "arm_action_specs_from_metadata",
+    "admit_human_command_emission",
+    "admit_human_observation_cut",
+    "adapt_human_emission_to_component_action",
+    "adapt_human_emission_to_composition_input",
     "bind_human_legacy_safety_evidence",
     "bind_human_position_backend_evidence",
     "build_human_legacy_aligned_safety_profile",
     "build_m6_candidate_policy_arm_qpos_scoped_safety_matrix",
+    "build_passive_teleop_component_session_source",
+    "build_passive_teleop_pose_session_source",
     "build_vive_human_residual_coordinate_binding",
     "matrix_to_xyzquat",
     "normalize_side",
