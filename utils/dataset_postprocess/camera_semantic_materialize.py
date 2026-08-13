@@ -27,6 +27,7 @@ from dataset_contracts.camera_semantics import (
     CameraSemanticResolution,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.modality_artifacts import ModalityArtifactInventoryV1
 from dataset_interface.camera_semantics import (
     CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH,
     DatasetCameraSemanticResolver,
@@ -229,31 +230,27 @@ def _tactile_artifact_graph(payload: Mapping[str, Any]) -> tuple[
     str,
     tuple[tuple[str, str, int, str], ...],
 ]:
-    inventory_hash = str(payload.get("semantic_content_hash") or "").strip()
+    try:
+        inventory = ModalityArtifactInventoryV1.from_dict(payload)
+    except Exception as exc:
+        raise CameraSemanticMaterializationError(
+            f"Invalid tactile inventory contract: {exc}"
+        ) from exc
+    inventory_hash = inventory.semantic_content_hash
     if not _SHA256_RE.fullmatch(inventory_hash):
         raise CameraSemanticMaterializationError(
             "Tactile inventory has no valid semantic_content_hash."
         )
-    raw_artifacts = payload.get("artifacts")
-    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+    if not inventory.artifacts:
         raise CameraSemanticMaterializationError(
             f"Tactile inventory {inventory_hash} has no artifacts."
         )
     artifacts: list[tuple[str, str, int, str]] = []
-    for raw in raw_artifacts:
-        if not isinstance(raw, Mapping):
-            raise CameraSemanticMaterializationError(
-                f"Tactile inventory {inventory_hash} has a non-object artifact."
-            )
-        logical_path = str(raw.get("logical_path") or "").strip()
-        role = str(raw.get("role") or "").strip()
-        try:
-            size_bytes = int(raw.get("size_bytes", -1))
-        except (TypeError, ValueError) as exc:
-            raise CameraSemanticMaterializationError(
-                f"Tactile inventory {inventory_hash} has invalid size_bytes."
-            ) from exc
-        sha256 = str(raw.get("sha256") or "").strip()
+    for artifact in inventory.artifacts:
+        logical_path = artifact.logical_path
+        role = artifact.role
+        size_bytes = artifact.size_bytes
+        sha256 = artifact.sha256
         relative = Path(logical_path)
         if (
             role not in {"manifest", "payload"}

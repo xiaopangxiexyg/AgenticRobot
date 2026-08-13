@@ -285,8 +285,30 @@ def _add_equivalent_stale_scope_evidence(root: Path, inventory_hash: str) -> str
             encoding="utf-8"
         )
     )
-    equivalent_hash = "a" * 64
-    source_inventory["semantic_content_hash"] = equivalent_hash
+    source_inventory["source_dataset_base_fingerprint"] = "3" * 64
+    source_inventory.pop("semantic_content_hash")
+    equivalent = ModalityArtifactInventoryV1.from_dict(
+        {
+            **source_inventory,
+            "semantic_content_hash": ModalityArtifactInventoryV1(
+                modality_key=source_inventory["modality_key"],
+                source_dataset_base_fingerprint=source_inventory[
+                    "source_dataset_base_fingerprint"
+                ],
+                source_episode_catalog_sha256=source_inventory[
+                    "source_episode_catalog_sha256"
+                ],
+                source_episode_count=source_inventory["source_episode_count"],
+                logical_prefixes=tuple(source_inventory["logical_prefixes"]),
+                artifacts=tuple(
+                    ModalityArtifactRecordV1.from_dict(item)
+                    for item in source_inventory["artifacts"]
+                ),
+            ).semantic_content_hash,
+        }
+    )
+    equivalent_hash = equivalent.semantic_content_hash
+    source_inventory = equivalent.to_dict()
     (sidecar / "inventories" / f"{equivalent_hash}.json").write_text(
         json.dumps(source_inventory), encoding="utf-8"
     )
@@ -531,3 +553,27 @@ def test_materialization_selects_retirement_matching_current_hot_scope(
     assert plan.tactile_detach_audit["detachment_scope"] == "payload_only"
     assert plan.tactile_detach_audit["inventory_hashes"] == [inventory_hash]
     assert stale_hash not in plan.tactile_detach_audit["inventory_hashes"]
+
+
+@pytest.mark.optional
+def test_materialization_rejects_tampered_tactile_inventory(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_source_dataset(source)
+    _, inventory_hash = _add_detached_tactile_evidence(source)
+    inventory_path = (
+        source
+        / "meta/modality_artifacts/tactile/inventories"
+        / f"{inventory_hash}.json"
+    )
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    inventory["artifacts"][0]["size_bytes"] += 1
+    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+
+    with pytest.raises(Exception, match="Invalid tactile inventory contract"):
+        plan_camera_semantic_materialization(
+            source, tmp_path / "output", registry
+        )
