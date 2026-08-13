@@ -339,9 +339,11 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         default=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
         help=(
             "RealSense post-pipeline startup warmup. legacy preserves the "
-            "historical synchronous N-frame wait and reset retry; "
-            "bounded_first_frame waits for one valid frame within each configured "
-            "startup_frame_grace_sec attempt, using short cancellable SDK waits; "
+            "historical synchronous N-frame wait, reset retry, any-frameset "
+            "admission, and unbounded runtime recovery; bounded_first_frame "
+            "requires one complete configured color/depth frameset within each "
+            "startup_frame_grace_sec attempt and enables bounded incomplete-stream "
+            "recovery, using short cancellable SDK waits; "
             "one failed pipeline is cleanly reopened once before admission fails, "
             "then the unchanged global multi-frame camera self-check runs. "
             "Pipeline negotiation remains serial and no USB reset is implied. "

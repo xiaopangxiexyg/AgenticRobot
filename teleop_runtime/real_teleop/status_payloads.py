@@ -99,6 +99,18 @@ def _camera_status_for_source(
     restart_count = _safe_int_value(info.get("restart_count"))
     restart_attempt_count = _safe_int_value(info.get("restart_attempt_count"))
     restart_failure_count = _safe_int_value(info.get("restart_failure_count"))
+    incomplete_frameset_count = _safe_int_value(
+        info.get("incomplete_frameset_count")
+    )
+    consecutive_incomplete_frameset_count = _safe_int_value(
+        info.get("consecutive_incomplete_frameset_count")
+    )
+    missing_color_frame_count = _safe_int_value(
+        info.get("missing_color_frame_count")
+    )
+    missing_depth_frame_count = _safe_int_value(
+        info.get("missing_depth_frame_count")
+    )
     last_frame_age_sec = _safe_float_value(info.get("last_frame_age_sec"))
     stale_after_sec = _safe_float_value(info.get("stale_after_sec"))
     if stale_after_sec is None or stale_after_sec <= 0.0:
@@ -240,6 +252,20 @@ def _camera_status_for_source(
         "restart_count": restart_count,
         "restart_attempt_count": restart_attempt_count,
         "restart_failure_count": restart_failure_count,
+        "restart_attempts_without_complete_frame": _safe_int_value(
+            info.get("restart_attempts_without_complete_frame")
+        ),
+        "incomplete_frameset_count": incomplete_frameset_count,
+        "consecutive_incomplete_frameset_count": (
+            consecutive_incomplete_frameset_count
+        ),
+        "missing_color_frame_count": missing_color_frame_count,
+        "missing_depth_frame_count": missing_depth_frame_count,
+        "last_color_receive_timestamp": info.get("last_color_receive_timestamp"),
+        "last_depth_receive_timestamp": info.get("last_depth_receive_timestamp"),
+        "lifecycle_state": info.get("lifecycle_state"),
+        "generation": _safe_int_value(info.get("generation")),
+        "worker_alive": bool(info.get("worker_alive")),
         "last_error": last_error,
         "last_runtime_error": last_runtime_error,
         "last_restart_timestamp": info.get("last_restart_timestamp"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -43,6 +44,27 @@ class _FakeProfile:
         return _FakeDevice()
 
 
+class _FakeFrame:
+    pass
+
+
+class _FakeFrameSet:
+    def __init__(self, *, color: bool = True, depth: bool = False) -> None:
+        self.color = _FakeFrame() if color else None
+        self.depth = _FakeFrame() if depth else None
+
+    def get_color_frame(self) -> _FakeFrame | None:
+        return self.color
+
+    def get_depth_frame(self) -> _FakeFrame | None:
+        return self.depth
+
+
+class _FakeAlign:
+    def process(self, frames: _FakeFrameSet) -> _FakeFrameSet:
+        return frames
+
+
 class _FakePipeline:
     def __init__(self, owner: _FakeRealSense | None = None) -> None:
         self.owner = owner
@@ -60,11 +82,17 @@ class _FakePipeline:
         self.start_configs.append(stream_config)
         return _FakeProfile()
 
-    def wait_for_frames(self, *, timeout_ms: int) -> object:
+    def wait_for_frames(self, *, timeout_ms: int) -> _FakeFrameSet:
         self.wait_timeouts.append(timeout_ms)
         if self.owner is not None and self.owner.wait_errors:
             raise self.owner.wait_errors.pop(0)
-        return object()
+        if self.owner is not None and self.owner.wait_frames:
+            return self.owner.wait_frames.pop(0)
+        depth_enabled = bool(
+            self.start_configs
+            and any(stream[0] == "depth" for stream in self.start_configs[-1].streams)
+        )
+        return _FakeFrameSet(color=True, depth=depth_enabled)
 
 
 class _FakeRealSense:
@@ -79,6 +107,7 @@ class _FakeRealSense:
         self.devices: list[_FakeHardwareDevice] = []
         self.start_errors: list[RuntimeError] = []
         self.wait_errors: list[RuntimeError] = []
+        self.wait_frames: list[_FakeFrameSet] = []
 
     def pipeline(self) -> _FakePipeline:
         self.last_pipeline = _FakePipeline(self)
@@ -89,9 +118,9 @@ class _FakeRealSense:
         self.last_config = _FakeStreamConfig()
         return self.last_config
 
-    def align(self, stream: object) -> object:
+    def align(self, stream: object) -> _FakeAlign:
         self.align_requests.append(stream)
-        return object()
+        return _FakeAlign()
 
     def context(self) -> object:
         return SimpleNamespace(query_devices=lambda: list(self.devices))
@@ -447,6 +476,10 @@ def test_realsense_startup_reset_defaults_are_serialized() -> None:
     assert payload["startup_hardware_reset_reconnect_poll_sec"] == 0.25
     assert payload["restart_on_black_frames"] is True
     assert payload["restart_after_black_frames"] == 5
+    assert payload["require_complete_frameset"] is False
+    assert payload["restart_on_incomplete_frameset"] is False
+    assert payload["restart_after_incomplete_framesets"] == 5
+    assert payload["restart_max_attempts_without_complete_frame"] == 0
 
 
 def test_realsense_startup_warmup_policy_rejects_unknown_value() -> None:
@@ -563,3 +596,211 @@ def test_realsense_classifies_disconnect_errors_for_pipeline_restart() -> None:
         "wait_for_frames cannot be called before start()"
     )
     assert not RealSenseRGBSource._is_recoverable_runtime_error("bad image shape")
+
+
+def test_realsense_bounded_warmup_requires_color_and_depth_together() -> None:
+    fake_rs = _FakeRealSense()
+    fake_rs.wait_frames = [
+        _FakeFrameSet(color=True, depth=False),
+        _FakeFrameSet(color=False, depth=True),
+        _FakeFrameSet(color=True, depth=True),
+    ]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            enable_depth=True,
+            require_complete_frameset=True,
+            startup_reset=False,
+            startup_warmup_frames=1,
+            startup_frame_grace_sec=3.0,
+            startup_wait_timeout_ms=1000,
+            wait_timeout_ms=1000,
+        )
+    )
+
+    pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline.wait_timeouts == [1000, 1000, 1000]
+
+
+def test_realsense_compatibility_warmup_accepts_historical_any_frameset() -> None:
+    fake_rs = _FakeRealSense()
+    fake_rs.wait_frames = [_FakeFrameSet(color=True, depth=False)]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            enable_depth=True,
+            require_complete_frameset=False,
+            startup_reset=False,
+            startup_warmup_frames=1,
+        )
+    )
+
+    pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline.wait_timeouts == [1000]
+
+
+def test_realsense_bounded_warmup_rejects_alternating_color_and_depth() -> None:
+    fake_rs = _FakeRealSense()
+    fake_rs.wait_frames = [
+        _FakeFrameSet(color=True, depth=False),
+        _FakeFrameSet(color=False, depth=True),
+        _FakeFrameSet(color=True, depth=False),
+    ]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            enable_depth=True,
+            require_complete_frameset=True,
+            startup_reset=False,
+            startup_warmup_frames=1,
+            startup_frame_grace_sec=3.0,
+            startup_wait_timeout_ms=1000,
+            wait_timeout_ms=1000,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete_frameset"):
+        source._start_pipeline(fake_rs)
+
+    assert fake_rs.pipelines[0].wait_timeouts == [1000, 1000, 1000]
+
+
+def test_realsense_incomplete_framesets_are_observable_and_request_restart() -> None:
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            enable_depth=True,
+            restart_on_incomplete_frameset=True,
+            restart_after_incomplete_framesets=2,
+        )
+    )
+    now = time.time()
+
+    assert source._record_incomplete_frameset(
+        _FakeFrame(),
+        None,
+        received_at=now,
+    ) is False
+    assert source._record_incomplete_frameset(
+        None,
+        _FakeFrame(),
+        received_at=now + 0.01,
+    ) is True
+
+    info = source.device_info()
+    assert info["incomplete_frameset_count"] == 2
+    assert info["consecutive_incomplete_frameset_count"] == 2
+    assert info["missing_color_frame_count"] == 1
+    assert info["missing_depth_frame_count"] == 1
+    assert str(info["last_error"]).startswith("incomplete_frameset:")
+
+    source._record_complete_frameset(received_at=now + 0.02)
+    assert source.device_info()["consecutive_incomplete_frameset_count"] == 0
+
+
+def test_realsense_restart_circuit_faults_before_unbounded_reopen() -> None:
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            restart_max_attempts_without_complete_frame=2,
+        )
+    )
+    shutdown_event = threading.Event()
+    with source._lock:
+        source._running = True
+        source._lifecycle_state = realsense_rgb._LIFECYCLE_RUNNING
+        source._generation = 7
+        source._restart_attempts_without_complete_frame = 2
+        source._shutdown_event = shutdown_event
+
+    source._restart_pipeline(
+        "pipeline_missing",
+        reason="pipeline_missing",
+        generation=7,
+        shutdown_event=shutdown_event,
+    )
+
+    info = source.device_info()
+    assert info["lifecycle_state"] == "faulted"
+    assert info["running"] is False
+    assert str(info["last_error"]).startswith("restart_circuit_open:")
+    assert shutdown_event.is_set()
+
+
+def test_realsense_native_start_edges_are_serialized_across_sources() -> None:
+    counter_lock = threading.Lock()
+    active_starts = 0
+    max_active_starts = 0
+
+    class Pipeline:
+        def stop(self) -> None:
+            return None
+
+    class Worker:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def start(self) -> None:
+            return None
+
+        def join(self, timeout=None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return False
+
+    class Source(RealSenseRGBSource):
+        def _start_pipeline(self, rs):
+            del rs
+            nonlocal active_starts, max_active_starts
+            with counter_lock:
+                active_starts += 1
+                max_active_starts = max(max_active_starts, active_starts)
+            time.sleep(0.02)
+            with counter_lock:
+                active_starts -= 1
+            return Pipeline(), object()
+
+        def _device_info_from_profile(self, profile):
+            del profile
+            return {}
+
+    sources = [
+        Source(RealSenseRGBCameraConfig(serial=f"SERIAL{index}"))
+        for index in range(2)
+    ]
+    errors: list[BaseException] = []
+
+    def start_source(source: Source) -> None:
+        try:
+            source.start()
+        except BaseException as exc:  # noqa: BLE001 - retained for thread assertion.
+            errors.append(exc)
+
+    callers = [
+        threading.Thread(target=start_source, args=(source,)) for source in sources
+    ]
+    with (
+        patch.object(realsense_rgb, "_load_pyrealsense2", return_value=object()),
+        patch.object(
+            realsense_rgb.threading,
+            "Thread",
+            side_effect=lambda **kwargs: Worker(str(kwargs["name"])),
+        ),
+    ):
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join()
+
+    assert errors == []
+    assert max_active_starts == 1
+    for source in sources:
+        source.close()

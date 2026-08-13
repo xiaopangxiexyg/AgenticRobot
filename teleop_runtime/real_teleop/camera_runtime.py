@@ -178,14 +178,86 @@ def apply_real_teleop_camera_startup_defaults(
             f"{requested_warmup_policy!r}."
         )
     for camera_key, config in camera_configs.items():
-        configured_warmup_policy = str(config.startup_warmup_policy)
-        config.startup_warmup_policy = requested_warmup_policy
         config.metadata = dict(config.metadata)
-        config.metadata["configured_startup_warmup_policy"] = (
+        configured_warmup_policy = str(
+            config.metadata.get(
+                "configured_startup_warmup_policy",
+                config.startup_warmup_policy,
+            )
+        )
+        configured_require_complete_frameset = bool(
+            config.metadata.get(
+                "configured_require_complete_frameset",
+                config.require_complete_frameset,
+            )
+        )
+        configured_restart_on_incomplete_frameset = bool(
+            config.metadata.get(
+                "configured_restart_on_incomplete_frameset",
+                config.restart_on_incomplete_frameset,
+            )
+        )
+        configured_restart_attempt_limit = int(
+            config.metadata.get(
+                "configured_restart_max_attempts_without_complete_frame",
+                config.restart_max_attempts_without_complete_frame,
+            )
+        )
+        configured_hardware_reset_on_failure = bool(
+            config.metadata.get(
+                "configured_startup_hardware_reset_on_failure",
+                config.startup_hardware_reset_on_failure,
+            )
+        )
+        config.startup_warmup_policy = requested_warmup_policy
+        config.metadata.setdefault(
+            "configured_startup_warmup_policy",
             configured_warmup_policy
         )
         config.metadata["real_teleop_startup_warmup_policy"] = (
             requested_warmup_policy
+        )
+        config.metadata.setdefault(
+            "configured_require_complete_frameset",
+            configured_require_complete_frameset
+        )
+        config.metadata.setdefault(
+            "configured_restart_on_incomplete_frameset",
+            configured_restart_on_incomplete_frameset
+        )
+        config.metadata.setdefault(
+            "configured_restart_max_attempts_without_complete_frame",
+            configured_restart_attempt_limit
+        )
+        config.metadata.setdefault(
+            "configured_startup_hardware_reset_on_failure",
+            configured_hardware_reset_on_failure
+        )
+        robust_stream_lifecycle = (
+            requested_warmup_policy
+            == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+        )
+        config.require_complete_frameset = robust_stream_lifecycle
+        config.restart_on_incomplete_frameset = robust_stream_lifecycle
+        config.restart_max_attempts_without_complete_frame = (
+            (
+                configured_restart_attempt_limit
+                if configured_restart_attempt_limit > 0
+                else 3
+            )
+            if robust_stream_lifecycle
+            else 0
+        )
+        # The robust profile owns a clean, bounded reopen first. Hardware reset
+        # remains available only through the explicit startup-reset option;
+        # legacy keeps the configured connection-error reset fallback.
+        config.startup_hardware_reset_on_failure = (
+            False
+            if robust_stream_lifecycle
+            else configured_hardware_reset_on_failure
+        )
+        config.metadata["real_teleop_robust_stream_lifecycle"] = (
+            robust_stream_lifecycle
         )
         configured_color_format = str(config.color_format)
         if configured_color_format != requested_color_format:

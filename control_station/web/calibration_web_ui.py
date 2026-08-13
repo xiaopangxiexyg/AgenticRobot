@@ -3929,6 +3929,13 @@ function renderCameraStatus(state) {
       `frames: ${formatCount(item.frame_count)} age=${formatAge(item.last_frame_age_sec)}`,
       `timeout: ${formatCount(item.timeout_count)} consecutive=${formatCount(item.consecutive_timeout_count)}`,
       `restart: ${formatCount(item.restart_count)} preview=${preview}`,
+      `stream health: incomplete=${formatCount(item.incomplete_frameset_count)}`
+        + ` consecutive=${formatCount(item.consecutive_incomplete_frameset_count)}`
+        + ` missing_color=${formatCount(item.missing_color_frame_count)}`
+        + ` missing_depth=${formatCount(item.missing_depth_frame_count)}`,
+      `lifecycle: ${item.lifecycle_state || "-"}`
+        + ` generation=${formatCount(item.generation)}`
+        + ` worker_alive=${formatFlag(item.worker_alive)}`,
     ];
     if (item.depth_required || item.depth_enabled) {
       const depthWidth = item.depth_width == null ? "-" : String(item.depth_width);

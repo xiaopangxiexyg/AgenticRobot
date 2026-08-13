@@ -407,6 +407,41 @@ def test_realsense_close_joins_worker_even_when_pipeline_stop_fails() -> None:
     assert source._thread is None
 
 
+def test_realsense_close_timeout_faults_and_blocks_new_worker_generation() -> None:
+    class Worker:
+        name = "stuck-camera-worker"
+
+        def __init__(self) -> None:
+            self.alive = True
+
+        def join(self, timeout=None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(serial="unit", camera_key="front")
+    )
+    worker = Worker()
+    source._thread = worker
+    source._running = True
+    source._lifecycle_state = "running"
+
+    with pytest.raises(LifecycleCleanupError, match="join_timeout"):
+        source.close()
+
+    assert source.device_info()["lifecycle_state"] == "faulted"
+    assert source.device_info()["worker_alive"] is True
+    with pytest.raises(RuntimeError, match="prior worker.*still alive"):
+        source.start()
+
+    worker.alive = False
+    source.close()
+    assert source.device_info()["lifecycle_state"] == "stopped"
+    assert source._thread is None
+
+
 def test_session_recorder_closes_every_handle_after_flush_failures() -> None:
     calls: list[str] = []
 

@@ -5447,6 +5447,13 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 "timeout_count": 0,
                 "consecutive_timeout_count": 0,
                 "restart_count": 0,
+                "incomplete_frameset_count": 3,
+                "consecutive_incomplete_frameset_count": 0,
+                "missing_color_frame_count": 1,
+                "missing_depth_frame_count": 2,
+                "lifecycle_state": "running",
+                "generation": 4,
+                "worker_alive": True,
             }
         )
         waiting = _FakeCameraSource(
@@ -5477,6 +5484,11 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         self.assertEqual(status["front"]["status_level"], "ok")
         self.assertTrue(status["front"]["preview_active"])
+        self.assertEqual(status["front"]["incomplete_frameset_count"], 3)
+        self.assertEqual(status["front"]["missing_depth_frame_count"], 2)
+        self.assertEqual(status["front"]["lifecycle_state"], "running")
+        self.assertEqual(status["front"]["generation"], 4)
+        self.assertTrue(status["front"]["worker_alive"])
         self.assertEqual(status["left_wrist"]["status_level"], "waiting")
         self.assertIn("Frame did not arrive", status["left_wrist"]["status_message"])
         self.assertEqual(status["right_wrist"]["status_level"], "error")

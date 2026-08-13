@@ -1396,6 +1396,77 @@ def test_real_teleop_camera_startup_warmup_policy_reaches_every_source(
             source.config.metadata["real_teleop_startup_warmup_policy"]
             == "bounded_first_frame"
         )
+        assert source.config.require_complete_frameset is True
+        assert source.config.restart_on_incomplete_frameset is True
+        assert source.config.restart_max_attempts_without_complete_frame == 3
+        assert source.config.startup_hardware_reset_on_failure is False
+        assert source.config.metadata["real_teleop_robust_stream_lifecycle"] is True
+
+
+def test_real_teleop_legacy_camera_profile_disables_robust_stream_lifecycle(
+    tmp_path,
+) -> None:
+    camera_config = tmp_path / "realsense.json"
+    camera_config.write_text(
+        json.dumps(
+            {
+                "left_wrist": {
+                    "serial": "L",
+                    "width": 640,
+                    "height": 480,
+                    "fps": 15,
+                    "enable_depth": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        no_camera=False,
+        camera_config=str(camera_config),
+        no_collection=False,
+        vis_cam=False,
+        camera_color_format="bgr8",
+        camera_startup_warmup_policy="legacy",
+        wrist_depth_mask=False,
+        wrist_depth_raw=False,
+    )
+
+    source = real_teleop._build_camera_sources(args)["left_wrist"]
+
+    assert source.config.startup_warmup_policy == "legacy"
+    assert source.config.require_complete_frameset is False
+    assert source.config.restart_on_incomplete_frameset is False
+    assert source.config.restart_max_attempts_without_complete_frame == 0
+    assert source.config.startup_hardware_reset_on_failure is True
+    assert source.config.metadata["real_teleop_robust_stream_lifecycle"] is False
+
+
+def test_real_teleop_camera_profile_can_roll_back_same_config_object() -> None:
+    config = camera_runtime.RealSenseRGBCameraConfig(
+        serial="L",
+        camera_key="left_wrist",
+        startup_hardware_reset_on_failure=True,
+    )
+
+    camera_runtime.apply_real_teleop_camera_startup_defaults(
+        {"left_wrist": config},
+        warmup_policy="bounded_first_frame",
+    )
+    assert config.require_complete_frameset is True
+    assert config.restart_on_incomplete_frameset is True
+    assert config.restart_max_attempts_without_complete_frame == 3
+    assert config.startup_hardware_reset_on_failure is False
+
+    camera_runtime.apply_real_teleop_camera_startup_defaults(
+        {"left_wrist": config},
+        warmup_policy="legacy",
+    )
+    assert config.startup_warmup_policy == "legacy"
+    assert config.require_complete_frameset is False
+    assert config.restart_on_incomplete_frameset is False
+    assert config.restart_max_attempts_without_complete_frame == 0
+    assert config.startup_hardware_reset_on_failure is True
 
 
 def test_real_teleop_movement_multiple_defaults_to_1_35() -> None:
