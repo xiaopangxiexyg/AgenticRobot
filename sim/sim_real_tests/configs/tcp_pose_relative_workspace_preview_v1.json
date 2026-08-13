@@ -1,0 +1,18 @@
+{
+  "schema_version": "sim_real_tests.tcp_pose_relative_workspace_preview.v1",
+  "role": "visual_review_only_not_a_runtime_safety_profile",
+  "profiles": {
+    "relative_tight": {
+      "translation_half_extent_m": 0.1,
+      "max_rotation_deg": 45.0
+    },
+    "relative_standard": {
+      "translation_half_extent_m": 0.2,
+      "max_rotation_deg": 90.0
+    },
+    "relative_loose": {
+      "translation_half_extent_m": 0.3,
+      "max_rotation_deg": 120.0
+    }
+  }
+}
