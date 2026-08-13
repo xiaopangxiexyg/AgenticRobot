@@ -8,7 +8,7 @@ been migrated.
 
 ## Implemented boundary
 
-The target-facing integration is split into four layers:
+Application selection and target-facing integration use five layers:
 
 1. `robot_motion.target_runtime` owns backend-neutral provider, manifest,
    capability, operation, observation, status, handle, and binding contracts.
@@ -30,6 +30,12 @@ The target-facing integration is split into four layers:
    before explicit commitment invokes provider-owned construction rollback.
    Preparation never calls an operation or execution port and does not grant
    authority.
+5. `EmbodimentApplicationSuiteSpec` sits above target profiles and pins one
+   complete embodiment integration package, its assets, and its complete
+   application surfaces. `EmbodimentApplicationSuiteBinding` pairs those
+   surfaces with explicit lazy loaders. The catalog loads only one selected
+   surface and returns it as an opaque implementation; it does not split,
+   instantiate, or invoke the embodiment's algorithms.
 
 The application owns profile selection and the lifetime of the returned
 aggregate. The concrete provider owns target construction, its ports, and its
@@ -46,6 +52,9 @@ The canonical application imports are now grouped under
   selection, and offline preflight;
 - `preparation` owns the transactional handoff from exact preflight to an
   inert handle acquisition;
+- `application_suites` owns portable whole-integration profiles, explicit
+  surface-loader bindings, and selected-only loading of opaque application
+  implementations;
 - `integrations` is an explicit, non-discovering namespace for concrete
   application adapters. Importing `teleop_runtime.target_runtime` does not
   import an integration.
@@ -61,6 +70,25 @@ evidence live with the RM65 arm backend contracts under
 `teleop_runtime.backends.arms`; deploy paths remain compatibility exports.
 This prevents RM65 backend and diagnostic modules from importing the policy
 deployment frontend merely to share target facts.
+
+### Whole-integration boundary
+
+An embodiment application surface is a complete vertical implementation. It
+may own embodiment-specific teleoperation algorithms, retargeting, IK,
+collision handling, control and recovery policy, state reading, dispatch,
+calibration, assets, collection adapters, and deployment adapters. The shared
+suite catalog identifies and selects that complete implementation; it does not
+require those internals to implement a common algorithm or component layout.
+The complete surface is the replacement unit: the framework does not
+independently select its IK, retargeting, collision, recovery, or dispatch
+algorithm.
+
+RM65's current real-teleop implementation is intentionally RM65-specific. Its
+dual-arm optimization, collision scene, recovery behavior, force-control
+paths, and component aggregate are not candidates for mechanical extraction
+merely to satisfy a generic builder signature. Code moves into a shared layer
+only after multiple embodiments demonstrate the same domain semantics and
+resource ownership.
 
 ## What an embodiment integration must provide
 
@@ -98,12 +126,16 @@ creating the handle.
 
 ## Switching and application composition
 
-Selection is by a stable application profile ID, not by importing a module
-path from configuration and not by replacing a URDF in an existing builder.
+Selection is by a stable application suite and surface ID, not by importing a
+module path from configuration and not by replacing a URDF in an existing
+builder.
 A safe future switch has these phases:
 
 ```text
-portable spec selection
+portable application-suite and surface selection
+  -> explicit allowlisted surface loader
+  -> complete embodiment-specific application implementation
+  -> that surface's exact target-profile selection
   -> allowlisted provider binding
   -> side-effect-free manifest preflight
   -> pending inert-handle acquisition and validation
@@ -128,12 +160,12 @@ the application prepare another target. A profile hash match proves contract
 identity only; it does not prove local asset presence, fresh state, hardware
 readiness, safety acceptance, or motion authorization.
 
-Source devices and teleoperation mappings are separate integrations. A new
-controller may reuse the same target provider through source/retarget adapters;
-a new target may reuse existing sources if their component action contract is
-compatible. Dataset capture remains bound to pure embodiment and stream
-profiles in `dataset_contracts`/`dataset_interface`; runtime objects and SDKs
-must not enter dataset schemas.
+An application suite may package its own source devices, teleoperation
+mapping, and algorithms. Reuse through source/retarget adapters remains
+possible when semantics genuinely match, but is not a framework requirement.
+Dataset capture remains bound to pure embodiment and stream profiles in
+`dataset_contracts`/`dataset_interface`; runtime objects and SDKs must not
+enter dataset schemas.
 
 ## Compatibility status
 
@@ -143,6 +175,10 @@ formal entrypoints are unchanged. It cannot create a target-runtime handle.
 
 No second real embodiment, simulated embodiment, SDK adapter, production
 builder migration, or motion path is introduced by this framework work.
+Application-suite fixtures cover multiple complete surfaces with different
+target profiles, portable serialization, asset closure, selected-only lazy
+loading, opaque implementations, and loaded-identity drift. They do not claim
+that any current RM65 surface has been bound to a suite.
 Arbitrary-topology synthetic fixtures cover a single 7-DoF manipulator plus an
 independent 1-DoF tool, nonempty observation/operation/asset surfaces, profile
 serialization, selected-only loading, configuration drift, invalid handles,
@@ -152,7 +188,8 @@ fail-closed behavior; they are not downstream runtime or hardware acceptance.
 
 The formal RM65 real-teleop and collection builders remain compatibility code.
 They directly own RM65/VIVE/Inspire/DM-Tac calibration, IK, collision,
-renderer, recovery, and hardware policy and therefore must not be relabeled as
-generic merely by wrapping their constructor in a profile. Production builder
-migration requires a concrete target with validated control, safety,
-lifecycle, reading, dispatch, and asset semantics.
+renderer, recovery, and hardware policy and remain one RM65 vertical
+integration. They must not be relabeled as generic or decomposed merely by
+wrapping their constructor in a profile. A future application composition
+root may select that complete surface after an exact suite binding exists;
+the surface's internal control logic remains RM65-owned.

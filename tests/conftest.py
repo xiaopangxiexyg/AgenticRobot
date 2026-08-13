@@ -86,6 +86,7 @@ CONTRACT_MODULES = frozenset(
         "test_dataset_v22_deploy.py",
         "test_dataset_v22_layout.py",
         "test_embodiment_generalization_firewall.py",
+        "test_embodiment_application_suites.py",
         "test_model_continuation_data_contract.py",
         "test_openpi_model_rtc_artifact_binding.py",
         "test_package_migrations.py",
