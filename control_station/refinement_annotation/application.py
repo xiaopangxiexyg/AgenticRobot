@@ -2554,7 +2554,7 @@ class RefinementAnnotationApplication:
             "source_attempt_outcome": source.outcome,
             "source_terminal_fact_id": item.progress.timeline.terminal_fact_id,
             "termination_cause": item.progress.timeline.termination_cause,
-            "default_end_progress_step_id": candidates[-1].progress_step_id,
+            "default_end_progress_step_id": source.progress_step_id,
             "options": [
                 option_payload(index, step)
                 for index, step in enumerate(candidates)
@@ -2785,6 +2785,9 @@ class RefinementAnnotationApplication:
         )
         occurrences: list[dict[str, Any]] = []
         capture_end_context = self._capture_end_step_context(item)
+        # A MANUAL_STOP proves where capture ended, but it does not prove that
+        # unrecorded later steps completed.  Bootstrap from the last recorded
+        # Attempt and let the annotator explicitly extend the projection.
         auto_capture_end_context = (
             capture_end_context
             if item.progress.timeline.termination_cause == "MANUAL_STOP"
@@ -2862,7 +2865,7 @@ class RefinementAnnotationApplication:
                     abnormal_intervals=(),
                     recoverable_failures=(),
                     end_progress_step_id=(
-                        auto_capture_end_context[1][-1].progress_step_id
+                        auto_capture_end_context[0].progress_step_id
                     ),
                 )
             )

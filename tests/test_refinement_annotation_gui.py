@@ -525,7 +525,7 @@ def _finalized_manual_stop_dataset(
     return identity.episode_uuid
 
 
-def test_manual_stop_defaults_to_last_step_and_can_reflow_to_early_step(
+def test_manual_stop_defaults_to_recorded_step_and_can_reflow_to_early_step(
     tmp_path: Path,
 ) -> None:
     episode_uuid = _finalized_manual_stop_dataset(tmp_path)
@@ -543,14 +543,14 @@ def test_manual_stop_defaults_to_last_step_and_can_reflow_to_early_step(
             "b",
             "c",
         ]
-        assert editor["default_end_progress_step_id"] == "c"
+        assert editor["default_end_progress_step_id"] == "b"
         assert detail["draft"]["capture_end_step"][
             "end_progress_step_id"
-        ] == "c"
+        ] == "b"
         assert [
             value["progress_step_id"]
             for value in detail["draft"]["occurrences"]
-        ] == ["a", "a", "b", "c"]
+        ] == ["a", "a", "b"]
 
         original_draft = detail["draft"]
         early = application.reflow_capture_end_step(
@@ -594,7 +594,7 @@ def test_manual_stop_defaults_to_last_step_and_can_reflow_to_early_step(
         application.close()
 
 
-def test_manual_stop_in_first_step_defaults_to_full_profile_and_can_end_first(
+def test_manual_stop_in_first_step_defaults_to_first_and_can_extend(
     tmp_path: Path,
 ) -> None:
     episode_uuid = _finalized_manual_stop_dataset(
@@ -610,25 +610,34 @@ def test_manual_stop_in_first_step_defaults_to_full_profile_and_can_end_first(
         assert detail["capture_end_step_editor"][
             "source_progress_step_id"
         ] == "a"
+        assert detail["capture_end_step_editor"][
+            "default_end_progress_step_id"
+        ] == "a"
         assert detail["draft"]["capture_end_step"][
             "end_progress_step_id"
-        ] == "c"
+        ] == "a"
         assert [
             value["progress_step_id"]
             for value in detail["draft"]["occurrences"]
-        ] == ["a", "a", "b", "c"]
+        ] == ["a", "a"]
 
-        first_only = application.reflow_capture_end_step(
+        full_profile = application.reflow_capture_end_step(
             episode_uuid,
             detail["draft"],
-            end_progress_step_id="a",
+            end_progress_step_id="c",
         )["draft"]
         assert [
-            value["stage_id"] for value in first_only["occurrences"]
-        ] == ["a1", "a2"]
-        assert application.commit(episode_uuid, first_only)[
+            value["progress_step_id"]
+            for value in full_profile["occurrences"]
+        ] == ["a", "a", "b", "c"]
+        assert application.commit(episode_uuid, full_profile)[
             "coverage_status"
         ] == "COMPLETE"
+        reopened = application.episode_detail(episode_uuid)["draft"]
+        assert reopened["capture_end_step"]["end_progress_step_id"] == "c"
+        assert [
+            value["progress_step_id"] for value in reopened["occurrences"]
+        ] == ["a", "a", "b", "c"]
     finally:
         application.close()
 
