@@ -26,6 +26,7 @@ from dataset_interface.composition_control_trace import (
 )
 
 from .contracts import ControlStationRunManifest
+from .hitl import ExclusiveHITLSwitchEvidence
 from .publication_barrier import StationPublicationBarrierSnapshot
 from .state_machine import (
     ControlStationOperationTransition,
@@ -453,8 +454,38 @@ def project_station_publication_barrier_transition(
     )
 
 
+def project_exclusive_hitl_switch(
+    evidence: ExclusiveHITLSwitchEvidence,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    embodiment_instance_id: str | None = None,
+) -> ControlTraceFact:
+    """Project one passive HITL switch fact without admitting it anywhere."""
+
+    if not isinstance(evidence, ExclusiveHITLSwitchEvidence):
+        raise TypeError("evidence must be ExclusiveHITLSwitchEvidence.")
+    session_id = str(runtime_session_id).strip()
+    domain_id = str(control_domain_id).strip()
+    if not session_id or not domain_id:
+        raise ValueError(
+            "runtime_session_id and control_domain_id must be non-empty."
+        )
+    return ControlTraceFact.create(
+        fact_id=evidence.switch_id,
+        event_type="exclusive_hitl_switch",
+        runtime_session_id=session_id,
+        control_domain_id=domain_id,
+        embodiment_instance_id=embodiment_instance_id,
+        occurred_at=evidence.completed_at,
+        clock_domain_id=evidence.clock_domain_id,
+        payload=evidence.to_payload(),
+    )
+
+
 __all__ = [
     "StationControlTraceBridge",
+    "project_exclusive_hitl_switch",
     "project_station_intent_transition",
     "project_station_operation_transition",
     "project_station_publication_barrier_transition",
