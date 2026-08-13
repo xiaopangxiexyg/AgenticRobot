@@ -14,11 +14,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from collection_runtime.planning_history import (
-    PlanningHistoryRecord,
-    PlanningHistorySlice,
-    PlanningHistoryStoreError,
-    SQLitePlanningHistoryStore,
+from collection_runtime.source_observation_history import (
+    SourceObservationHistorySlice,
+    SourceObservationHistoryStoreError,
+    SourceObservationRecord,
+    SQLiteSourceObservationHistoryStore,
 )
 from control_station.agent_gateway.protocol.state_schemas import (
     agent_state_history_slice_content_hash_v1,
@@ -90,7 +90,7 @@ class MujocoAgentTcpPoseHistoryProvider:
         *,
         observation_producer: MujocoAgentObservationProducer,
         contract_bundle: MujocoAgentTcpPoseContractBundle,
-        store: SQLitePlanningHistoryStore,
+        store: SQLiteSourceObservationHistoryStore,
     ) -> None:
         if not isinstance(observation_producer, MujocoAgentObservationProducer):
             raise TypeError("observation_producer must be typed.")
@@ -98,8 +98,8 @@ class MujocoAgentTcpPoseHistoryProvider:
             raise TypeError("contract_bundle must be typed.")
         if observation_producer.contract_bundle is not contract_bundle:
             raise ValueError("Observation producer uses another contract bundle.")
-        if not isinstance(store, SQLitePlanningHistoryStore):
-            raise TypeError("store must be SQLitePlanningHistoryStore.")
+        if not isinstance(store, SQLiteSourceObservationHistoryStore):
+            raise TypeError("store must be SQLiteSourceObservationHistoryStore.")
         profile = contract_bundle.history_profile
         source_binding = contract_bundle.history_source_binding
         deployment_binding = contract_bundle.history_deployment_binding
@@ -128,7 +128,7 @@ class MujocoAgentTcpPoseHistoryProvider:
         *,
         active_operation_id: str | None,
         boundary_event: str | None = None,
-    ) -> PlanningHistoryRecord | None:
+    ) -> SourceObservationRecord | None:
         """Return one record for an explicitly owned recorder; do not append it."""
 
         return self.observation_producer.capture_tcp_pose_history_record(
@@ -155,7 +155,7 @@ class MujocoAgentTcpPoseHistoryProvider:
             boundary_event="history_query",
         )
         if not isinstance(capture, MujocoAgentTcpPoseHistoryCapture):
-            raise PlanningHistoryStoreError(
+            raise SourceObservationHistoryStoreError(
                 "A typed passive TCP pose history sample is unavailable."
             )
         self.store.append(capture.history_record)
@@ -199,19 +199,19 @@ class MujocoAgentTcpPoseHistoryProvider:
         self,
         *,
         capture: MujocoAgentTcpPoseHistoryCapture,
-        history_slice: PlanningHistorySlice,
+        history_slice: SourceObservationHistorySlice,
         parameters: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         samples: list[dict[str, Any]] = []
         for stored in history_slice.records:
             sample = _wire_json(stored.record.payload)
             if not isinstance(sample, dict) or set(sample) != _SAMPLE_FIELDS:
-                raise PlanningHistoryStoreError(
+                raise SourceObservationHistoryStoreError(
                     "Stored TCP pose history sample has another projection schema."
                 )
             samples.append({"history_sequence": stored.sequence, **sample})
         if not samples:
-            raise PlanningHistoryStoreError(
+            raise SourceObservationHistoryStoreError(
                 "TCP pose history query produced no causally available samples."
             )
         truncated = history_slice.truncated
@@ -223,7 +223,7 @@ class MujocoAgentTcpPoseHistoryProvider:
         )
         while _result_bytes(result) > self.profile.max_result_payload_bytes:
             if len(samples) == 1:
-                raise PlanningHistoryStoreError(
+                raise SourceObservationHistoryStoreError(
                     "One TCP pose history sample exceeds the result payload bound."
                 )
             samples.pop(0)
@@ -247,7 +247,7 @@ class MujocoAgentTcpPoseHistoryProvider:
         self,
         *,
         capture: MujocoAgentTcpPoseHistoryCapture,
-        history_slice: PlanningHistorySlice,
+        history_slice: SourceObservationHistorySlice,
         samples: list[dict[str, Any]],
         truncated: bool,
     ) -> dict[str, Any]:
@@ -262,6 +262,7 @@ class MujocoAgentTcpPoseHistoryProvider:
             "history_source_contract_hash": self.source_binding.semantic_content_hash,
             "window_begin_at": history_slice.window_begin_at,
             "window_end_at": history_slice.window_end_at,
+            "sampling_policy": history_slice.sampling_policy,
             "sample_count": len(samples),
             "component_ids": ["right_arm"],
             "reference_frame_id": self.observation_producer.reference_frame_id,

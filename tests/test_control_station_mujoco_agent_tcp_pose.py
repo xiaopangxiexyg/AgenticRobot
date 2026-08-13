@@ -608,10 +608,15 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "rpent_dexteleop.toolkit",
         reason="paired RPent integration wheel is not installed",
     )
+    session_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.session",
+        reason="paired RPent integration wheel is not installed",
+    )
     InMemoryDexTeleopGatewayClient = (
         client_module.InMemoryDexTeleopGatewayClient
     )
     DexTeleopToolkit = toolkit_module.DexTeleopToolkit
+    DexTeleopConsumerSession = session_module.DexTeleopConsumerSession
     _application, runtime, direct, bundle, _captured_manifest_args = (
         _build_no_model_contract_bundle_fixture(monkeypatch)
     )
@@ -663,11 +668,12 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         route_manifest=bundle.route_manifest.to_wire(),
         observation_snapshot=snapshot.to_wire(),
     )
-    toolkit = DexTeleopToolkit(
+    consumer_session = DexTeleopConsumerSession(
         client=client,
         client_id="rpent:fixture",
         request_id_factory=lambda: "request:rpent-agent-motion-fixture",
     )
+    toolkit = DexTeleopToolkit(session=consumer_session)
     motion_spec = next(
         spec
         for spec in toolkit.get_tools_spec()
@@ -686,3 +692,4 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
     assert client.submitted_requests[0]["route_hash"] == (
         motion_entry.route.semantic_content_hash
     )
+    consumer_session.close()

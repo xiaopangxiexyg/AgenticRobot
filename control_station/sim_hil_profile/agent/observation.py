@@ -14,9 +14,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from collection_runtime.planning_history import (
-    PlanningHistoryRecord,
-    PlanningHistorySourceBinding,
+from collection_runtime.source_observation_history import (
+    SourceObservationRecord,
+    SourceObservationHistoryBinding,
 )
 from control_station.agent_gateway.protocol.contracts import AgentObservationSnapshot
 from control_station.agent_gateway.protocol.state_schemas import (
@@ -94,7 +94,7 @@ class MujocoAgentTcpPoseHistoryCapture:
     snapshot: AgentObservationSnapshot
     observation_cut: ObservationCutRecord
     measurement: ExecutionMeasurementObservation
-    history_record: PlanningHistoryRecord
+    history_record: SourceObservationRecord
 
 
 @dataclass(frozen=True)
@@ -280,7 +280,7 @@ class MujocoAgentObservationProducer:
         if history_source_binding is not None:
             if not isinstance(
                 history_source_binding,
-                PlanningHistorySourceBinding,
+                SourceObservationHistoryBinding,
             ):
                 raise TypeError("history_source_binding must be typed.")
             if (
@@ -691,7 +691,7 @@ class MujocoAgentObservationProducer:
         if observation_cut is None or measurement is None:
             return None
         pose = measurement.value_by_component["right_arm"]
-        record = PlanningHistoryRecord(
+        record = SourceObservationRecord(
             record_id=(
                 "planning-history-record:" + observation_cut.semantic_content_hash
             ),
@@ -739,7 +739,7 @@ class MujocoAgentObservationProducer:
         *,
         active_operation_id: str | None,
         boundary_event: str | None = None,
-    ) -> PlanningHistoryRecord | None:
+    ) -> SourceObservationRecord | None:
         """Recorder callback form; it performs one source-owned passive read."""
 
         capture = self.capture_tcp_pose_history_sample(

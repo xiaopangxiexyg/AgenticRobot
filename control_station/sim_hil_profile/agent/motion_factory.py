@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from collection_runtime.planning_history import SQLitePlanningHistoryStore
+from collection_runtime.source_observation_history import SQLiteSourceObservationHistoryStore
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ExecutionObservationPlan
 from sim.mujoco.deploy import (
@@ -222,7 +222,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         source_binding = contract_bundle.history_source_binding
         if source_binding is None:
             raise RuntimeError("History contract lacks its source binding.")
-        history_store = SQLitePlanningHistoryStore(
+        history_store = SQLiteSourceObservationHistoryStore(
             root=history_storage.root,
             binding=source_binding,
             limits=history_storage.profile.store_limits,
@@ -234,8 +234,8 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             contract_bundle=contract_bundle,
             allowed_client_ids=allowed_client_ids,
             max_retained_operations=max_retained_operations,
-            planning_history_store=history_store,
-            owns_planning_history_store=history_store is not None,
+            source_observation_history_store=history_store,
+            owns_source_observation_history_store=history_store is not None,
         )
     except Exception:
         if history_store is not None:

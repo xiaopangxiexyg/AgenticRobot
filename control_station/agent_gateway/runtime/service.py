@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..protocol.contracts import (
+    AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
     AgentObservationSnapshot,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
@@ -102,7 +103,7 @@ class AgentGatewayObservationOutcome:
 
 @dataclass(frozen=True)
 class AgentGatewayControlPlaneOutcome:
-    """Scoped Agent control result; fake receipts stay off the public wire."""
+    """Scoped control result with a feature-gated authoritative projection."""
 
     accepted: bool
     reason_code: str
@@ -110,8 +111,18 @@ class AgentGatewayControlPlaneOutcome:
     operation: AgentSkillOperation | None = None
     idempotent_replay: bool = False
     port_receipt: AgentSkillOperationPortReceipt | None = None
+    publish_authoritative_port_receipt: bool = False
 
     def to_wire(self) -> dict[str, Any]:
+        public_receipt = (
+            self.port_receipt.to_wire()
+            if self.publish_authoritative_port_receipt
+            and isinstance(
+                self.port_receipt,
+                AgentGatewayAuthoritativePortReceipt,
+            )
+            else None
+        )
         return {
             "accepted": self.accepted,
             "reason_code": self.reason_code,
@@ -120,6 +131,7 @@ class AgentGatewayControlPlaneOutcome:
             "operation": (
                 None if self.operation is None else self.operation.to_wire()
             ),
+            "port_receipt": public_receipt,
         }
 
 
@@ -521,6 +533,10 @@ class AgentGatewayService:
             request.semantic_content_hash,
             public_operation,
             port_receipt=outcome.port_receipt,
+            publish_authoritative_port_receipt=(
+                AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1
+                in self.manifest.supported_transport_features
+            ),
         )
         self._complete_control_request(
             action="cancel_own_operation",
@@ -594,6 +610,10 @@ class AgentGatewayService:
             request.semantic_content_hash,
             public_operation,
             port_receipt=outcome.port_receipt,
+            publish_authoritative_port_receipt=(
+                AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1
+                in self.manifest.supported_transport_features
+            ),
         )
         self._complete_control_request(
             action="request_hold_own_domain",
@@ -1521,6 +1541,9 @@ class AgentGatewayService:
                 known_outcome.operation,
                 idempotent_replay=True,
                 port_receipt=known_outcome.port_receipt,
+                publish_authoritative_port_receipt=(
+                    known_outcome.publish_authoritative_port_receipt
+                ),
             )
 
     def _complete_control_request(

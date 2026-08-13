@@ -7,6 +7,7 @@ from dataclasses import replace
 import pytest
 
 from control_station.agent_gateway.protocol.contracts import (
+    AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
     AgentObservationSnapshot,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
@@ -151,7 +152,11 @@ def _capability(
     )
 
 
-def _manifest(capability: SkillExecutionRoute) -> SkillRouteManifest:
+def _manifest(
+    capability: SkillExecutionRoute,
+    *,
+    authoritative_receipt_feature: bool = False,
+) -> SkillRouteManifest:
     return SkillRouteManifest(
         runtime_session_id="runtime:b2a-service",
         control_domain_id="domain:arms",
@@ -162,7 +167,15 @@ def _manifest(capability: SkillExecutionRoute) -> SkillRouteManifest:
         target_binding_id="target:null-b2a-service",
         target_kind="null",
         current_mode="dry_run",
-        supported_transport_features=("idempotency_v1", "poll_status_v1"),
+        supported_transport_features=(
+            "idempotency_v1",
+            "poll_status_v1",
+            *(
+                (AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,)
+                if authoritative_receipt_feature
+                else ()
+            ),
+        ),
         skill_routes=(
             SkillRouteManifestEntry(
                 route=capability,
@@ -559,6 +572,94 @@ def test_generic_service_accepts_authoritative_start_and_hold_receipts() -> None
     assert cancelled.port_receipt.authoritative_lower_receipt
     assert cancelled.port_receipt.proves_motion_or_hold
     assert port.calls == ["activate", "hold"]
+
+
+@pytest.mark.parametrize("advertise_receipt", (False, True))
+def test_authoritative_control_receipt_projection_is_feature_gated(
+    advertise_receipt: bool,
+) -> None:
+    clock = _ManualClock()
+    capability = _capability(cancellation_policy="hold_on_cancel")
+    manifest = _manifest(
+        capability,
+        authoritative_receipt_feature=advertise_receipt,
+    )
+    port = _AuthoritativeStationPort(clock)
+    service = AgentGatewayService(
+        manifest=manifest,
+        access_policy=_policy(),
+        operation_port=port,
+        payload_validators=_payload_validators(capability),
+        clock=clock,
+    )
+    assert service.publish_observation(
+        snapshot=_snapshot(manifest),
+        now=10.0,
+    ).accepted
+    admitted = _submit(service, manifest, capability).operation
+    assert admitted is not None
+    assert service.activate_operation(
+        operation_id=admitted.operation_id,
+        current_station_revision=4,
+        now=10.1,
+    ).accepted
+
+    request = _cancel_request(manifest, admitted.operation_id)
+    outcome = service.cancel_own_operation(
+        request=request,
+        current_station_revision=4,
+        now=10.2,
+    )
+    replay = service.cancel_own_operation(
+        request=request,
+        current_station_revision=4,
+        now=10.3,
+    )
+    assert outcome.accepted and replay.accepted and replay.idempotent_replay
+    wire = outcome.to_wire()
+    replay_wire = replay.to_wire()
+    if advertise_receipt:
+        receipt = wire["port_receipt"]
+        assert receipt is not None
+        assert receipt["operation_kind"] == "hold"
+        assert receipt["operation_id"] == admitted.operation_id
+        assert receipt["authoritative_lower_receipt"] is True
+        assert receipt["proves_motion_or_hold"] is True
+        assert replay_wire["port_receipt"] == receipt
+    else:
+        assert wire["port_receipt"] is None
+        assert replay_wire["port_receipt"] is None
+
+
+def test_no_io_receipt_never_projects_as_authoritative_proof() -> None:
+    clock = _ManualClock()
+    capability = _capability()
+    manifest = _manifest(
+        capability,
+        authoritative_receipt_feature=True,
+    )
+    port = DeterministicNoIoAgentSkillOperationPort(clock=clock)
+    service = NoIoAgentGatewayService(
+        manifest=manifest,
+        access_policy=_policy(),
+        operation_port=port,
+        clock=clock,
+    )
+    assert service.publish_observation(
+        snapshot=_snapshot(manifest),
+        now=10.0,
+    ).accepted
+    admitted = _submit(service, manifest, capability).operation
+    assert admitted is not None
+    outcome = service.cancel_own_operation(
+        request=_cancel_request(manifest, admitted.operation_id),
+        current_station_revision=4,
+        now=10.1,
+    )
+    assert outcome.accepted
+    assert outcome.port_receipt is not None
+    assert outcome.port_receipt.authoritative_lower_receipt is False
+    assert outcome.to_wire()["port_receipt"] is None
 
 
 def test_authoritative_service_requires_server_side_payload_validators() -> None:

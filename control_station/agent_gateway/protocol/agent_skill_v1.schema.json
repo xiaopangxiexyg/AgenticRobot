@@ -153,6 +153,7 @@
     "access_decision": "dexteleop.agent_skill.access_decision.v1",
     "access_policy": "dexteleop.agent_skill.access_policy.v1",
     "aggregate_evaluation_receipt": "dexteleop.agent_skill.aggregate_evaluation_receipt.v1",
+    "authoritative_port_receipt": "dexteleop.agent_gateway.authoritative_port_receipt.v1",
     "cross_target_deployment_review_ref": "dexteleop.agent_skill.cross_target_deployment_review_ref.v1",
     "definition": "dexteleop.agent_skill.definition.v1",
     "definition_catalog": "dexteleop.agent_skill.definition_catalog.v1",
@@ -180,7 +181,7 @@
     "max_json_depth": 16,
     "max_timeout_ms": 86400000
   },
-  "protocol_semantic_hash": "38c5d2c78c6f8c645c94d4fed4f1c7ab90101c3077fc54ba03940fb1474b98fd",
+  "protocol_semantic_hash": "254ccc5f9d3e4d1b9c62c864ee7041e2ce1fac79ad993f95803d37c321082b84",
   "protocol_version": "dexteleop.agent_skill.v1",
   "schema": "dexteleop_agent_skill_schema_snapshot_v1",
   "schemas": {
@@ -308,7 +309,201 @@
       ],
       "type": "object"
     },
+    "authoritative_port_receipt": {
+      "$id": "urn:dexteleop:agent-gateway:authoritative-port-receipt:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "authoritative_lower_receipt": {
+          "const": true
+        },
+        "call_sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "completed_at": {
+          "type": "number"
+        },
+        "evidence_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "evidence_scope": {
+          "const": "authoritative_lower_reference"
+        },
+        "lower_operation_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_kind": {
+          "enum": [
+            "activate",
+            "cancel",
+            "hold"
+          ],
+          "type": "string"
+        },
+        "port_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "proves_motion_or_hold": {
+          "type": "boolean"
+        },
+        "receipt_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "receipt_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "succeeded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "receipt_id",
+        "port_id",
+        "operation_kind",
+        "operation_id",
+        "succeeded",
+        "status",
+        "completed_at",
+        "call_sequence",
+        "lower_operation_id",
+        "evidence_refs",
+        "evidence_scope",
+        "authoritative_lower_receipt",
+        "proves_motion_or_hold",
+        "receipt_hash"
+      ],
+      "type": "object"
+    },
     "control_plane_response": {
+      "$defs": {
+        "authoritative_port_receipt": {
+          "additionalProperties": false,
+          "properties": {
+            "authoritative_lower_receipt": {
+              "const": true
+            },
+            "call_sequence": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "completed_at": {
+              "type": "number"
+            },
+            "evidence_refs": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "evidence_scope": {
+              "const": "authoritative_lower_reference"
+            },
+            "lower_operation_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "operation_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "operation_kind": {
+              "enum": [
+                "activate",
+                "cancel",
+                "hold"
+              ],
+              "type": "string"
+            },
+            "port_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "proves_motion_or_hold": {
+              "type": "boolean"
+            },
+            "receipt_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "receipt_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "status": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "succeeded": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "receipt_id",
+            "port_id",
+            "operation_kind",
+            "operation_id",
+            "succeeded",
+            "status",
+            "completed_at",
+            "call_sequence",
+            "lower_operation_id",
+            "evidence_refs",
+            "evidence_scope",
+            "authoritative_lower_receipt",
+            "proves_motion_or_hold",
+            "receipt_hash"
+          ],
+          "type": "object"
+        }
+      },
       "$id": "urn:dexteleop:agent-control:response:v1",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -323,6 +518,16 @@
           "anyOf": [
             {
               "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "port_receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/authoritative_port_receipt"
             },
             {
               "type": "null"
@@ -2121,6 +2326,6 @@
       "type": "object"
     }
   },
-  "snapshot_hash": "68ce6743c28cdf847d3fabc333c464ba4f5105fb4eb556e29b3a7e28400fa388",
+  "snapshot_hash": "981742a1d39f29f12ac459809186df89d954a95a66d2ef65d2d188e2c42c3c43",
   "snapshot_hash_algorithm": "sha256_canonical_json_v1"
 }

@@ -49,6 +49,15 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
         self.requests.append(("get_observation_snapshot", None))
         return {"snapshot": "current"}
 
+    def get_visual_source_catalog(self):
+        self.requests.append(("get_visual_source_catalog", None))
+        return {"sources": ["main"]}
+
+    def capture_visual_snapshot(self, payload):
+        self._assert_client(payload)
+        self.requests.append(("capture_visual_snapshot", dict(payload)))
+        return {"frames": ["main"]}
+
     def submit_skill_request(self, payload):
         self._assert_client(payload)
         self.requests.append(("submit_skill_request", dict(payload)))
@@ -258,6 +267,10 @@ def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity()
         assert client.get_agent_skill_schema_catalog() == {"catalog": "schemas"}
         assert client.get_skill_route_manifest() == {"manifest": "routes"}
         assert client.get_observation_snapshot() == {"snapshot": "current"}
+        assert client.get_visual_source_catalog() == {"sources": ["main"]}
+        assert client.capture_visual_snapshot(
+            {"client_id": "rpent:local", "selected_roles": ["main"]}
+        ) == {"frames": ["main"]}
         admitted = client.submit_skill_request(
             {"client_id": "rpent:local", "parameters": {}}
         )
@@ -345,6 +358,8 @@ def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown() -> No
         "get_agent_skill_schema_catalog",
         "get_skill_route_manifest",
         "get_observation_snapshot",
+        "get_visual_source_catalog",
+        "capture_visual_snapshot",
         "submit_skill_request",
         "get_own_operation",
         "cancel_own_operation",

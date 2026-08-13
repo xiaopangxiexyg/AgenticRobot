@@ -35,6 +35,8 @@ AGENT_GATEWAY_UNIX_JSON_METHODS_V1 = frozenset(
         "get_agent_skill_schema_catalog",
         "get_skill_route_manifest",
         "get_observation_snapshot",
+        "get_visual_source_catalog",
+        "capture_visual_snapshot",
         "submit_skill_request",
         "get_own_operation",
         "cancel_own_operation",
@@ -56,6 +58,7 @@ _NO_PAYLOAD_METHODS = frozenset(
         "get_agent_skill_schema_catalog",
         "get_skill_route_manifest",
         "get_observation_snapshot",
+        "get_visual_source_catalog",
     }
 )
 class AgentGatewayUnixProtocolError(RuntimeError):
@@ -647,6 +650,10 @@ class AgentGatewayUnixJsonServer(
                 result = facade.get_skill_route_manifest()
             elif request.method == "get_observation_snapshot":
                 result = facade.get_observation_snapshot()
+            elif request.method == "get_visual_source_catalog":
+                result = facade.get_visual_source_catalog()
+            elif request.method == "capture_visual_snapshot":
+                result = facade.capture_visual_snapshot(request.payload or {})
             elif request.method == "submit_skill_request":
                 result = facade.submit_skill_request(request.payload or {})
             elif request.method == "get_own_operation":

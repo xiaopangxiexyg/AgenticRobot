@@ -19,6 +19,7 @@ from sim.mujoco.deploy.sim_hil_target import (
     MujocoAgentSkillMotionTarget,
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
+from sim.mujoco.scene import MujocoCameraRenderer
 
 from ..application import MujocoSimHILPassiveApplicationCut
 
@@ -80,6 +81,7 @@ class MujocoAgentSkillMotionApplication:
         self._held = False
         self._closed = False
         self._active_operation_id: str | None = None
+        self._camera_renderers: dict[tuple[int, int], MujocoCameraRenderer] = {}
 
     @property
     def started(self) -> bool:
@@ -139,9 +141,21 @@ class MujocoAgentSkillMotionApplication:
             if self._active_operation_id != normalized_id:
                 raise ValueError("Operation does not own the Agent motion session.")
             now = float(self.runtime.clock())
+            schedule = self.runtime.core.config.decision_schedule
+            # A direct proposal is not visible to a control cut captured at
+            # the timestamp sampled immediately before its admission.  The
+            # immediate-reference schedule has zero configured target lead,
+            # so submitting and stepping at ``now`` deterministically omits
+            # the just-admitted proposal and produces ``no_action``.  Give
+            # that proposal one decision period to cross the admission cut;
+            # scheduled-reference profiles already provide a larger lead and
+            # retain their exact configured timing.
             target_at = (
                 now
-                + self.runtime.core.config.decision_schedule.target_lead_time_sec
+                + max(
+                    float(schedule.target_lead_time_sec),
+                    float(schedule.period_sec),
+                )
             )
             admission = self.runtime.submit_component_action(
                 action,
@@ -182,6 +196,72 @@ class MujocoAgentSkillMotionApplication:
                 if len(values) != 7 or not all(math.isfinite(item) for item in values):
                     raise RuntimeError("right_arm TCP pose is invalid.")
                 return {"right_arm": values}
+
+            return self.runtime.rig.capture_scene(capture)
+
+    def visual_source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        """Describe every current RGB source without rendering a frame."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+
+            def capture(scene: Any) -> tuple[Mapping[str, object], ...]:
+                metadata = scene.camera_metadata()
+                return tuple(
+                    {
+                        "source_id": name,
+                        "native_width": int(metadata[name]["width"]),
+                        "native_height": int(metadata[name]["height"]),
+                    }
+                    for name in scene.camera_names
+                )
+
+            return self.runtime.rig.capture_scene(capture)
+
+    def capture_visual_frames(
+        self,
+        *,
+        source_ids: tuple[str, ...],
+        width: int,
+        height: int,
+    ) -> Mapping[str, Any]:
+        """Render one scene-consistent RGB cut under the physics-owner lock."""
+
+        if not source_ids or len(source_ids) > 8:
+            raise ValueError("source_ids must contain between one and eight entries.")
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("source_ids must not contain duplicates.")
+        if (
+            isinstance(width, bool)
+            or not isinstance(width, int)
+            or not 1 <= width <= 1920
+            or isinstance(height, bool)
+            or not isinstance(height, int)
+            or not 1 <= height <= 1080
+        ):
+            raise ValueError("visual dimensions exceed the bounded RGB contract.")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+
+            def capture(scene: Any) -> Mapping[str, Any]:
+                available = frozenset(scene.camera_names)
+                missing = tuple(name for name in source_ids if name not in available)
+                if missing:
+                    raise ValueError(f"unknown visual sources: {list(missing)}")
+                key = (width, height)
+                renderer = self._camera_renderers.get(key)
+                if renderer is None:
+                    if len(self._camera_renderers) >= 4:
+                        raise RuntimeError("visual renderer dimension cache is full.")
+                    renderer = MujocoCameraRenderer(
+                        scene,
+                        width=width,
+                        height=height,
+                    )
+                    self._camera_renderers[key] = renderer
+                return renderer.render_all(source_ids)
 
             return self.runtime.rig.capture_scene(capture)
 
@@ -278,6 +358,10 @@ class MujocoAgentSkillMotionApplication:
                 raise RuntimeError("Closing a started motion application requires HOLD.")
             if self._started:
                 self.runtime.close()
+            renderers = getattr(self, "_camera_renderers", {})
+            for renderer in renderers.values():
+                renderer.close()
+            renderers.clear()
             self._closed = True
             self._active_operation_id = None
 

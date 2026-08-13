@@ -16,15 +16,16 @@ from typing import Protocol, runtime_checkable
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from ..protocol.contracts import AgentSkillOperation, AgentSkillRequest
+from ..protocol.contracts import (
+    AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1,
+    AGENT_GATEWAY_PORT_OPERATION_KINDS_V1,
+    AgentSkillOperation,
+    AgentSkillRequest,
+)
 
 AGENT_GATEWAY_PORT_RECEIPT_HASH_DOMAIN_V1 = (
     "dexteleop.agent_gateway.no_io_port_receipt.v1"
 )
-AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_gateway.authoritative_port_receipt.v1"
-)
-AGENT_GATEWAY_PORT_OPERATION_KINDS_V1 = ("activate", "cancel", "hold")
 
 
 def _required_text(value: object, *, field_name: str) -> str:

@@ -36,6 +36,12 @@ AGENT_STATE_SCHEMA_KINDS_V1 = (
 AGENT_STATE_HISTORY_SLICE_HASH_DOMAIN_V1 = (
     "dexteleop.agent_state.tcp_pose_history_slice.v1"
 )
+AGENT_STATE_HISTORY_SAMPLING_POLICIES_V1 = (
+    "latest",
+    "uniform",
+    "boundary_only",
+    "boundary_plus_uniform",
+)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -438,6 +444,10 @@ def tcp_pose_history_state_schema_entry_v1(
         "history_slice_hash": {"type": "string", "minLength": 1},
         "window_begin_at": {"type": "number"},
         "window_end_at": {"type": "number"},
+        "sampling_policy": {
+            "type": "string",
+            "enum": list(AGENT_STATE_HISTORY_SAMPLING_POLICIES_V1),
+        },
         "sample_count": {
             "type": "integer",
             "minimum": 1,
@@ -700,6 +710,8 @@ def validate_agent_state_result_v1(
         raise ValueError("TCP pose history result exceeds max_payload_bytes.")
     for field_name in ("history_source_id", "history_source_contract_hash"):
         _required(result.get(field_name), field_name=field_name)
+    if result.get("sampling_policy") not in AGENT_STATE_HISTORY_SAMPLING_POLICIES_V1:
+        raise ValueError("History result has an unsupported sampling_policy.")
     window_begin = _finite(result.get("window_begin_at"), field_name="window_begin_at")
     window_end = _finite(result.get("window_end_at"), field_name="window_end_at")
     if window_end != cutoff:
@@ -808,6 +820,7 @@ def validate_agent_state_route_schema_v1(
 
 
 __all__ = [
+    "AGENT_STATE_HISTORY_SAMPLING_POLICIES_V1",
     "AGENT_STATE_HISTORY_SLICE_HASH_DOMAIN_V1",
     "AGENT_STATE_SCHEMA_KINDS_V1",
     "TCP_POSE_HISTORY_STATE_SKILL_ID_V1",

@@ -224,6 +224,7 @@ def test_tcp_pose_history_is_bounded_monotonic_and_content_hashed() -> None:
         "history_source_contract_hash": "causal-history-contract:v1",
         "window_begin_at": 11.0,
         "window_end_at": 12.0,
+        "sampling_policy": "boundary_plus_uniform",
         "sample_count": 2,
         "samples": [
             _measurement(sequence=20, measured_at=11.2),

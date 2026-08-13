@@ -7,10 +7,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from collection_runtime.planning_history import (
-    PLANNING_HISTORY_SAMPLING_POLICIES_V1,
-    PlanningHistorySourceBinding,
-    PlanningHistoryStoreLimits,
+from collection_runtime.source_observation_history import (
+    SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1,
+    SourceObservationHistoryBinding,
+    SourceObservationHistoryStoreLimits,
 )
 from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
@@ -261,7 +261,7 @@ class MujocoAgentTcpPoseHistoryProfile:
             raise ValueError(
                 "max_record_payload_bytes cannot exceed the result payload bound."
             )
-        if self.sampling_policy not in PLANNING_HISTORY_SAMPLING_POLICIES_V1:
+        if self.sampling_policy not in SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1:
             raise ValueError("Unsupported planning history sampling policy.")
         object.__setattr__(self, "retention_sec", retention)
         object.__setattr__(self, "capture_interval_sec", interval)
@@ -275,8 +275,8 @@ class MujocoAgentTcpPoseHistoryProfile:
         )
 
     @property
-    def store_limits(self) -> PlanningHistoryStoreLimits:
-        return PlanningHistoryStoreLimits(
+    def store_limits(self) -> SourceObservationHistoryStoreLimits:
+        return SourceObservationHistoryStoreLimits(
             retention_sec=self.retention_sec,
             max_records=self.max_records,
             max_record_payload_bytes=self.max_record_payload_bytes,
@@ -507,7 +507,7 @@ class MujocoAgentTcpPoseContractBundle:
     station_manifest: ControlStationRunManifest
     execution_manifest: Any
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None
-    history_source_binding: PlanningHistorySourceBinding | None = None
+    history_source_binding: SourceObservationHistoryBinding | None = None
     history_deployment_binding: (
         MujocoPassiveTcpPoseHistoryDeploymentBinding | None
     ) = None
@@ -558,7 +558,7 @@ class MujocoAgentTcpPoseContractBundle:
                 raise TypeError("history_profile must use the typed history profile.")
             if not isinstance(
                 self.history_source_binding,
-                PlanningHistorySourceBinding,
+                SourceObservationHistoryBinding,
             ):
                 raise TypeError(
                     "history_source_binding must use the typed source binding."
@@ -1036,7 +1036,7 @@ def _history_validators(
     schema_entry: Any,
     exact: Mapping[str, str],
     profile: MujocoAgentTcpPoseHistoryProfile,
-    source_binding: PlanningHistorySourceBinding,
+    source_binding: SourceObservationHistoryBinding,
 ) -> AgentSkillPayloadValidatorSet:
     parameter_fields = {
         "component_ids",
@@ -1409,7 +1409,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             route=history_route,
             schema_entry=history_schema,
         )
-        history_source_binding = PlanningHistorySourceBinding(
+        history_source_binding = SourceObservationHistoryBinding(
             source_id=MUJOCO_AGENT_TCP_POSE_HISTORY_SOURCE_ID_V1,
             runtime_session_id=exact["runtime_session_id"],
             clock_domain_id=exact["clock_domain_id"],
@@ -1563,6 +1563,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "own_operation_cancel_v1",
             "own_operation_status_v1",
             "idempotency_v1",
+            "authoritative_port_receipt_v1",
         ),
         skill_routes=tuple(route_items),
         explicit_exclusions=(

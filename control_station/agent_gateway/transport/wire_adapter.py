@@ -56,6 +56,10 @@ class BoundAgentGatewayWireAdapter:
         service: AgentGatewayService,
         publish_observation: Callable[[], AgentGatewayObservationOutcome],
         current_station_revision: Callable[[], int],
+        visual_source_catalog: Callable[[], Mapping[str, Any]] | None = None,
+        capture_visual_snapshot: (
+            Callable[[Mapping[str, Any]], Mapping[str, Any]] | None
+        ) = None,
         operation_launcher: Callable[[str], Any] | None = None,
         grant_resolver: (
             Callable[[AgentSkillRequest], SkillExecutionGrant | None] | None
@@ -75,6 +79,16 @@ class BoundAgentGatewayWireAdapter:
             raise TypeError("publish_observation must be callable.")
         if not callable(current_station_revision):
             raise TypeError("current_station_revision must be callable.")
+        if visual_source_catalog is not None and not callable(visual_source_catalog):
+            raise TypeError("visual_source_catalog must be callable or None.")
+        if capture_visual_snapshot is not None and not callable(
+            capture_visual_snapshot
+        ):
+            raise TypeError("capture_visual_snapshot must be callable or None.")
+        if (visual_source_catalog is None) != (capture_visual_snapshot is None):
+            raise TypeError(
+                "visual catalog and snapshot callbacks must be configured together."
+            )
         if operation_launcher is not None and not callable(operation_launcher):
             raise TypeError("operation_launcher must be callable or None.")
         if grant_resolver is not None and not callable(grant_resolver):
@@ -104,6 +118,8 @@ class BoundAgentGatewayWireAdapter:
         self.service = service
         self._publish_observation = publish_observation
         self._current_station_revision = current_station_revision
+        self._visual_source_catalog = visual_source_catalog
+        self._capture_visual_snapshot = capture_visual_snapshot
         self._operation_launcher = operation_launcher
         self._grant_resolver = grant_resolver
 
@@ -136,6 +152,20 @@ class BoundAgentGatewayWireAdapter:
                 "Gateway observation publication failed: " + outcome.reason_code
             )
         return outcome.snapshot.to_wire()
+
+    def get_visual_source_catalog(self) -> Mapping[str, Any]:
+        if self._visual_source_catalog is None:
+            raise RuntimeError("visual_snapshot_unavailable")
+        return self._visual_source_catalog()
+
+    def capture_visual_snapshot(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_client(payload)
+        if self._capture_visual_snapshot is None:
+            raise RuntimeError("visual_snapshot_unavailable")
+        return self._capture_visual_snapshot(payload)
 
     def submit_skill_request(
         self,

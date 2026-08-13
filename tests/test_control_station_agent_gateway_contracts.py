@@ -313,6 +313,10 @@ def test_portable_schema_snapshot_is_route_based_and_strict() -> None:
     assert "own_operation_cancel_request" in document["schemas"]
     assert "own_domain_hold_request" in document["schemas"]
     assert "control_plane_response" in document["schemas"]
+    assert "authoritative_port_receipt" in document["schemas"]
+    assert document["hash_domains"]["authoritative_port_receipt"] == (
+        "dexteleop.agent_gateway.authoritative_port_receipt.v1"
+    )
     assert "capability_manifest" not in document["schemas"]
     request_schema = document["schemas"]["skill_request"]
     assert "route_hash" in request_schema["properties"]

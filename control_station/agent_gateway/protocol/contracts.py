@@ -166,6 +166,14 @@ AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1 = (
 AGENT_OWN_DOMAIN_HOLD_REQUEST_HASH_DOMAIN_V1 = (
     "dexteleop.agent_control.own_domain_hold_request.v1"
 )
+AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1 = (
+    "dexteleop.agent_gateway.authoritative_port_receipt.v1"
+)
+AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1 = (
+    "authoritative_port_receipt_v1"
+)
+AGENT_GATEWAY_PORT_OPERATION_KINDS_V1 = ("activate", "cancel", "hold")
+
 
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str):
@@ -1276,6 +1284,43 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
 
     nullable_string = _nullable({"type": "string", "minLength": 1})
     nullable_integer = _nullable({"type": "integer", "minimum": 0})
+    authoritative_port_receipt_properties = {
+        "receipt_id": {"type": "string", "minLength": 1},
+        "port_id": {"type": "string", "minLength": 1},
+        "operation_kind": {
+            "type": "string",
+            "enum": list(AGENT_GATEWAY_PORT_OPERATION_KINDS_V1),
+        },
+        "operation_id": nullable_string,
+        "succeeded": {"type": "boolean"},
+        "status": {"type": "string", "minLength": 1},
+        "completed_at": {"type": "number"},
+        "call_sequence": {"type": "integer", "minimum": 0},
+        "lower_operation_id": nullable_string,
+        "evidence_refs": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": True,
+        },
+        "evidence_scope": {"const": "authoritative_lower_reference"},
+        "authoritative_lower_receipt": {"const": True},
+        "proves_motion_or_hold": {"type": "boolean"},
+        "receipt_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+        },
+    }
+    authoritative_port_receipt_body = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": authoritative_port_receipt_properties,
+        "required": list(authoritative_port_receipt_properties),
+    }
+    authoritative_port_receipt = _json_schema_object(
+        schema_id="urn:dexteleop:agent-gateway:authoritative-port-receipt:v1",
+        properties=authoritative_port_receipt_properties,
+        required=tuple(authoritative_port_receipt_properties),
+    )
     profile_ref = {
         "type": "object",
         "additionalProperties": False,
@@ -1883,6 +1928,9 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "request_hash": {"type": "string", "minLength": 1},
             "idempotent_replay": {"type": "boolean"},
             "operation": _nullable({"type": "object"}),
+            "port_receipt": _nullable(
+                {"$ref": "#/$defs/authoritative_port_receipt"}
+            ),
         },
         required=(
             "accepted",
@@ -1891,6 +1939,9 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "idempotent_replay",
             "operation",
         ),
+        definitions={
+            "authoritative_port_receipt": authoritative_port_receipt_body,
+        },
     )
     grant = _json_schema_object(
         schema_id="urn:dexteleop:agent-skill:execution-grant:v1",
@@ -2143,6 +2194,7 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         "own_operation_cancel_request": own_operation_cancel_request,
         "own_domain_hold_request": own_domain_hold_request,
         "control_plane_response": control_plane_response,
+        "authoritative_port_receipt": authoritative_port_receipt,
         "observation_snapshot": snapshot,
         "skill_operation": operation,
         "skill_execution_grant": grant,
@@ -2229,6 +2281,9 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
             AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1
         ),
         "own_operation_query": AGENT_OWN_OPERATION_QUERY_HASH_DOMAIN_V1,
+        "authoritative_port_receipt": (
+            AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1
+        ),
         "operation": AGENT_SKILL_OPERATION_HASH_DOMAIN_V1,
         "protocol_schema": AGENT_SKILL_PROTOCOL_SCHEMA_HASH_DOMAIN_V1,
         "request": AGENT_SKILL_REQUEST_HASH_DOMAIN_V1,
@@ -2290,6 +2345,9 @@ def agent_skill_schema_snapshot_json() -> str:
 
 __all__ = [
     "AGENT_CONTROL_REASON_CODES_V1",
+    "AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1",
+    "AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1",
+    "AGENT_GATEWAY_PORT_OPERATION_KINDS_V1",
     "AGENT_OWN_DOMAIN_HOLD_REQUEST_HASH_DOMAIN_V1",
     "AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1",
     "AGENT_OWN_OPERATION_QUERY_HASH_DOMAIN_V1",

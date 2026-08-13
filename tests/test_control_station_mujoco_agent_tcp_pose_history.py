@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import control_station.sim_hil_profile.agent.motion_deployment as deployment
-from collection_runtime.planning_history import SQLitePlanningHistoryStore
+from collection_runtime.source_observation_history import SQLiteSourceObservationHistoryStore
 from control_station.sim_hil_profile.agent.motion_application import (
     MujocoAgentSkillMotionApplication,
 )
@@ -232,7 +232,7 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
             allowed_client_ids=("rpent:history-fixture",),
         )
 
-    with SQLitePlanningHistoryStore(
+    with SQLiteSourceObservationHistoryStore(
         root=(tmp_path / "planning-history").resolve(),
         binding=bundle.history_source_binding,
         limits=profile.store_limits,
@@ -241,8 +241,8 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
             application=application,
             contract_bundle=bundle,
             allowed_client_ids=("rpent:history-fixture",),
-            planning_history_store=store,
-            owns_planning_history_store=True,
+            source_observation_history_store=store,
+            owns_source_observation_history_store=True,
         )
         assert session.history_provider is not None
         assert session.history_executor is not None
@@ -292,8 +292,13 @@ def test_installed_rpent_toolkit_reads_exactly_bound_history(
         "rpent_dexteleop.toolkit",
         reason="paired RPent integration wheel is not installed",
     )
+    session_module = pytest.importorskip(
+        "rpent_dexteleop.gateway.session",
+        reason="paired RPent integration wheel is not installed",
+    )
     DexTeleopToolExposurePolicy = toolkit_module.DexTeleopToolExposurePolicy
     DexTeleopToolkit = toolkit_module.DexTeleopToolkit
+    DexTeleopConsumerSession = session_module.DexTeleopConsumerSession
     application, state = _build_application(monkeypatch)
     profile = _history_profile()
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
@@ -301,7 +306,7 @@ def test_installed_rpent_toolkit_reads_exactly_bound_history(
         history_profile=profile,
     )
 
-    with SQLitePlanningHistoryStore(
+    with SQLiteSourceObservationHistoryStore(
         root=(tmp_path / "paired-planning-history").resolve(),
         binding=bundle.history_source_binding,
         limits=profile.store_limits,
@@ -310,8 +315,8 @@ def test_installed_rpent_toolkit_reads_exactly_bound_history(
             application=application,
             contract_bundle=bundle,
             allowed_client_ids=("rpent:history-fixture",),
-            planning_history_store=store,
-            owns_planning_history_store=True,
+            source_observation_history_store=store,
+            owns_source_observation_history_store=True,
         )
         assert session.history_recorder is not None
         assert session.history_recorder.capture_once() is not None
@@ -327,7 +332,7 @@ def test_installed_rpent_toolkit_reads_exactly_bound_history(
             "history_window_ms": 5_000,
             "max_samples": 4,
         }
-        toolkit = DexTeleopToolkit(
+        consumer_session = DexTeleopConsumerSession(
             client=SimpleNamespace(
                 get_skill_definition_catalog=facade.get_skill_definition_catalog,
                 get_agent_skill_schema_catalog=facade.get_agent_skill_schema_catalog,
@@ -339,11 +344,14 @@ def test_installed_rpent_toolkit_reads_exactly_bound_history(
                 request_hold_own_domain=facade.request_hold_own_domain,
             ),
             client_id="rpent:history-fixture",
+            operation_timeout_cap_ms=1_000,
+            request_id_factory=lambda: "request:tcp-pose-history:toolkit:1",
+        )
+        toolkit = DexTeleopToolkit(
+            session=consumer_session,
             exposure_policy=DexTeleopToolExposurePolicy(
                 allowed_skill_ids=frozenset({"state.read_tcp_pose_history"})
             ),
-            requested_timeout_ms=1_000,
-            request_id_factory=lambda: "request:tcp-pose-history:toolkit:1",
         )
         history_tools = [
             binding
@@ -363,6 +371,7 @@ def test_installed_rpent_toolkit_reads_exactly_bound_history(
             sample["pose_by_component"]["right_arm"][0] for sample in result["samples"]
         ] == pytest.approx([0.1, 0.2])
         assert not application.started
+        consumer_session.close()
         session.close()
         assert store.closed
 
@@ -383,7 +392,7 @@ def test_collection_history_module_keeps_source_and_application_boundaries() -> 
     module_path = (
         Path(__file__).resolve().parents[1]
         / "collection_runtime"
-        / "planning_history.py"
+        / "source_observation_history.py"
     )
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
     imported_roots = {

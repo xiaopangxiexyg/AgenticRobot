@@ -12,9 +12,9 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from collection_runtime.planning_history import (
-    PlanningHistoryRecorder,
-    SQLitePlanningHistoryStore,
+from collection_runtime.source_observation_history import (
+    SourceObservationHistoryRecorder,
+    SQLiteSourceObservationHistoryStore,
 )
 from control_station.agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
 from control_station.agent_gateway.runtime.executor_registry import (
@@ -60,6 +60,7 @@ from .observation_binding import (
     build_mujoco_agent_motion_observation_source_binding,
 )
 from .tcp_pose_history import MujocoAgentTcpPoseHistoryProvider
+from .visual_observation import MujocoAgentVisualSnapshotProvider
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -83,13 +84,14 @@ class MujocoAgentTcpPoseGatewaySession:
     application: MujocoAgentSkillMotionApplication
     contract_bundle: MujocoAgentTcpPoseContractBundle
     observation_producer: MujocoAgentObservationProducer
+    visual_snapshot_provider: MujocoAgentVisualSnapshotProvider
     motion_executor: ReusableStationAgentSkillOperationExecutor
     state_executor: PassiveReadSkillExecutor
     history_provider: MujocoAgentTcpPoseHistoryProvider | None
     history_executor: PassiveReadSkillExecutor | None
-    history_recorder: PlanningHistoryRecorder | None
-    planning_history_store: SQLitePlanningHistoryStore | None
-    owns_planning_history_store: bool
+    history_recorder: SourceObservationHistoryRecorder | None
+    source_observation_history_store: SQLiteSourceObservationHistoryStore | None
+    owns_source_observation_history_store: bool
     service: AgentGatewayService
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -101,16 +103,19 @@ class MujocoAgentTcpPoseGatewaySession:
         init=False,
         repr=False,
     )
-    _planning_history_store_closed: bool = field(
+    _source_observation_history_store_closed: bool = field(
         default=False,
         init=False,
         repr=False,
     )
 
     def __post_init__(self) -> None:
-        if not isinstance(self.owns_planning_history_store, bool):
-            raise TypeError("owns_planning_history_store must be boolean.")
-        if self.owns_planning_history_store and self.planning_history_store is None:
+        if not isinstance(self.owns_source_observation_history_store, bool):
+            raise TypeError("owns_source_observation_history_store must be boolean.")
+        if (
+            self.owns_source_observation_history_store
+            and self.source_observation_history_store is None
+        ):
             raise ValueError("Owned planning history store must be present.")
 
     def wire_adapter(
@@ -129,6 +134,8 @@ class MujocoAgentTcpPoseGatewaySession:
             current_station_revision=lambda: (
                 self.observation_producer.current_station_revision
             ),
+            visual_source_catalog=self.visual_snapshot_provider.source_catalog,
+            capture_visual_snapshot=self.visual_snapshot_provider.capture,
             operation_launcher=self.service.launch_operation,
         )
 
@@ -198,12 +205,12 @@ class MujocoAgentTcpPoseGatewaySession:
                 )
             self._finish_lower_close(self._close_outcome)
             if (
-                self.owns_planning_history_store
-                and self.planning_history_store is not None
-                and not self._planning_history_store_closed
+                self.owns_source_observation_history_store
+                and self.source_observation_history_store is not None
+                and not self._source_observation_history_store_closed
             ):
-                self.planning_history_store.close()
-                self._planning_history_store_closed = True
+                self.source_observation_history_store.close()
+                self._source_observation_history_store_closed = True
             return self._close_outcome
 
 
@@ -214,8 +221,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     allowed_client_ids: tuple[str, ...],
     max_retained_operations: int = 16,
     clock: Callable[[], float] | None = None,
-    planning_history_store: SQLitePlanningHistoryStore | None = None,
-    owns_planning_history_store: bool = False,
+    source_observation_history_store: SQLiteSourceObservationHistoryStore | None = None,
+    owns_source_observation_history_store: bool = False,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
@@ -223,17 +230,20 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("application must be a motion application.")
     if not isinstance(contract_bundle, MujocoAgentTcpPoseContractBundle):
         raise TypeError("contract_bundle must be typed.")
-    if not isinstance(owns_planning_history_store, bool):
-        raise TypeError("owns_planning_history_store must be boolean.")
+    if not isinstance(owns_source_observation_history_store, bool):
+        raise TypeError("owns_source_observation_history_store must be boolean.")
     history_enabled = contract_bundle.history_profile is not None
     if history_enabled and not isinstance(
-        planning_history_store,
-        SQLitePlanningHistoryStore,
+        source_observation_history_store,
+        SQLiteSourceObservationHistoryStore,
     ):
         raise ValueError("Enabled history requires an exact injected disk store.")
-    if not history_enabled and planning_history_store is not None:
+    if not history_enabled and source_observation_history_store is not None:
         raise ValueError("A history store cannot be bound without a history Route.")
-    if owns_planning_history_store and planning_history_store is None:
+    if (
+        owns_source_observation_history_store
+        and source_observation_history_store is None
+    ):
         raise ValueError("Owned planning history store must be injected.")
     clients = tuple(
         _required(value, field_name="allowed_client_ids item")
@@ -304,13 +314,22 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             contract_bundle=contract_bundle,
         ),
     )
+    visual_snapshot_provider = MujocoAgentVisualSnapshotProvider(
+        application=application,
+        current_station_revision=lambda: (
+            observation_producer.current_station_revision
+        ),
+    )
     history_provider = (
         MujocoAgentTcpPoseHistoryProvider(
             observation_producer=observation_producer,
             contract_bundle=contract_bundle,
-            store=planning_history_store,
+            store=source_observation_history_store,
         )
-        if isinstance(planning_history_store, SQLitePlanningHistoryStore)
+        if isinstance(
+            source_observation_history_store,
+            SQLiteSourceObservationHistoryStore,
+        )
         else None
     )
 
@@ -463,15 +482,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ),
     )
     history_recorder = (
-        PlanningHistoryRecorder(
-            store=planning_history_store,
+        SourceObservationHistoryRecorder(
+            store=source_observation_history_store,
             capture=lambda: history_provider.capture_record(
                 active_operation_id=service.operation_store.active_operation_id,
             ),
             interval_sec=contract_bundle.history_profile.capture_interval_sec,
         )
         if history_provider is not None
-        and planning_history_store is not None
+        and source_observation_history_store is not None
         and contract_bundle.history_profile is not None
         else None
     )
@@ -479,13 +498,14 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         application=application,
         contract_bundle=contract_bundle,
         observation_producer=observation_producer,
+        visual_snapshot_provider=visual_snapshot_provider,
         motion_executor=motion_executor,
         state_executor=state_executor,
         history_provider=history_provider,
         history_executor=history_executor,
         history_recorder=history_recorder,
-        planning_history_store=planning_history_store,
-        owns_planning_history_store=owns_planning_history_store,
+        source_observation_history_store=source_observation_history_store,
+        owns_source_observation_history_store=owns_source_observation_history_store,
         service=service,
     )
 

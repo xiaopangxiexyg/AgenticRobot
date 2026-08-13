@@ -235,6 +235,9 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self._activated = False
         self._closed = False
         self._execution_refs: set[str] = set()
+        self._first_step_refs: tuple[str, ...] = ()
+        self._latest_step_refs: tuple[str, ...] = ()
+        self._activation_measured_pose: tuple[float, ...] | None = None
 
     def _validate_call(
         self,
@@ -279,6 +282,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 lower_hold_confirmed=False,
             )
         measured = self._capture_pose()
+        self._activation_measured_pose = measured
         translation, rotation = _pose_error(measured, self.target_pose)
         if (
             translation > self.motion_profile.max_translation_delta_m
@@ -326,15 +330,66 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 refs.add(value)
         authoritative = step.authoritative_step
         if authoritative is not None:
+            fact_ref_by_type: dict[str, str] = {}
+            untyped_fact_refs: set[str] = set()
             for fact in tuple(getattr(authoritative, "trace_facts", ())):
                 value = getattr(fact, "fact_id", None)
                 if isinstance(value, str) and value.strip():
-                    refs.add(value)
+                    event_type = getattr(fact, "event_type", None)
+                    if isinstance(event_type, str) and event_type.strip():
+                        fact_ref_by_type[event_type] = value
+                    else:
+                        untyped_fact_refs.add(value)
+            priority = (
+                "target_execution_request",
+                "target_execution_submission",
+                "shared_safety_result",
+                "target_execution_completion",
+                "dispatch_owner",
+                "dispatch_receipt",
+                "component_execution_target",
+                "component_execution_target_admission",
+                "measurement_alignment",
+            )
+            ordered_fact_refs = [
+                fact_ref_by_type.pop(event_type)
+                for event_type in priority
+                if event_type in fact_ref_by_type
+            ]
+            ordered_fact_refs.extend(
+                fact_ref_by_type[event_type]
+                for event_type in sorted(fact_ref_by_type)
+            )
+            ordered_fact_refs.extend(sorted(untyped_fact_refs))
+            # Full per-cycle facts remain in the append-only ControlTrace.
+            # The Skill receipt carries only a bounded representative cut.
+            refs.update(ordered_fact_refs[:48])
             request = getattr(authoritative, "target_execution_request", None)
             request_id = getattr(request, "request_id", None)
             if isinstance(request_id, str) and request_id.strip():
                 refs.add(request_id)
         return tuple(sorted(refs))
+
+    def _remember_step_evidence(self, step: Any) -> None:
+        refs = self._step_refs(step)
+        if not self._first_step_refs:
+            self._first_step_refs = refs
+        self._latest_step_refs = refs
+
+    def _execution_evidence_refs(self) -> tuple[str, ...]:
+        stable = tuple(sorted(self._execution_refs))
+        if len(stable) > 128:
+            raise RuntimeError("Stable TCP pose evidence exceeds protocol bounds.")
+        dynamic = tuple(
+            sorted(
+                {
+                    *self._first_step_refs,
+                    *self._latest_step_refs,
+                }
+                - set(stable)
+            )
+        )
+        return tuple(sorted((*stable, *dynamic[: 128 - len(stable)])))
 
     def _hold(self, *, reason: str) -> StationLifecycleControlEvidence:
         transition = self.application.request_hold(
@@ -355,7 +410,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
         reason_code: str,
         hold: StationLifecycleControlEvidence,
     ) -> StationLifecycleExecutionCompletion:
-        refs = tuple(sorted(self._execution_refs))
+        refs = self._execution_evidence_refs()
         if not refs:
             raise RuntimeError(
                 "TCP pose completion has no lower execution evidence."
@@ -379,6 +434,54 @@ class MujocoAgentTcpPoseSkillLifecycle:
             raise RuntimeError("TCP pose lifecycle was not activated.")
         stable = 0
         period = 1.0 / float(self.application.runtime.config.decision_hz)
+
+        # A semantic goal may already hold at operation activation.  Confirm
+        # that fact over the same bounded stability count used after dispatch,
+        # then establish lower HOLD and verify the post-HOLD state.  Do not
+        # inject an unnecessary command merely to manufacture a dispatch when
+        # the requested physical effect is already true.
+        for sample in range(self.motion_profile.stable_measurement_count):
+            if bool(cancel_requested()):
+                hold = self._hold(reason="tcp_pose_operation_cancelled")
+                return self._failure(
+                    reason_code="tcp_pose_operation_cancelled_after_hold",
+                    hold=hold,
+                )
+            activation_pose = getattr(
+                self,
+                "_activation_measured_pose",
+                None,
+            )
+            measured = (
+                activation_pose
+                if sample == 0 and activation_pose is not None
+                else self._capture_pose()
+            )
+            if not self._within_terminal_tolerance(measured):
+                stable = 0
+                break
+            stable += 1
+            if sample + 1 < self.motion_profile.stable_measurement_count:
+                self.sleep(period)
+        if stable >= self.motion_profile.stable_measurement_count:
+            hold = self._hold(reason="tcp_pose_target_already_satisfied")
+            if not hold.lower_hold_confirmed:
+                return self._failure(
+                    reason_code="tcp_pose_terminal_hold_unconfirmed",
+                    hold=hold,
+                )
+            final_pose = self._capture_pose()
+            if not self._within_terminal_tolerance(final_pose):
+                return self._failure(
+                    reason_code="tcp_pose_post_hold_pose_outside_tolerance",
+                    hold=hold,
+                )
+            return self._success(
+                operation=operation,
+                request=request,
+                final_pose=final_pose,
+            )
+
         for cycle in range(self.motion_profile.max_control_cycles):
             if bool(cancel_requested()):
                 hold = self._hold(reason="tcp_pose_operation_cancelled")
@@ -400,7 +503,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                     self.motion_profile.physics_ticks_per_control_cycle
                 ),
             )
-            self._execution_refs.update(self._step_refs(step))
+            self._remember_step_evidence(step)
             if not step.proposal_admission.accepted:
                 hold = self._hold(reason="tcp_pose_proposal_rejected")
                 return self._failure(
@@ -469,7 +572,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
             "motion.tcp_pose_arrival_rule",
             "1",
         )
-        refs = tuple(sorted(self._execution_refs))
+        refs = self._execution_evidence_refs()
         evaluator_receipt = SkillEvaluationReceipt(
             operation_id=operation.operation_id,
             request_hash=request.semantic_content_hash,
