@@ -1,0 +1,113 @@
+# Embodiment runtime provider contract
+
+This document describes the current implementation boundary for adding a
+target embodiment without coupling shared control, teleoperation, collection,
+deployment, or dataset code to a vendor SDK. It is an interface contract, not
+evidence that a second embodiment or the existing RM65 production path has
+been migrated.
+
+## Implemented boundary
+
+The target-facing integration is split into four layers:
+
+1. `robot_motion.target_runtime` owns backend-neutral provider, manifest,
+   capability, operation, observation, status, handle, and binding contracts.
+   It does not import hardware, simulation, teleoperation, deployment, or
+   `control_station` implementations.
+2. `TargetRuntimeProfileSpec` is the portable, serializable application
+   allowlist. It pins the provider identity, embodiment definition, component
+   action schema, target capability, operations, observations, assets, and
+   supported clocks. It contains no Python loader or module path.
+3. `TargetRuntimeProfileBinding` pairs one spec with an explicit allowlisted
+   provider loader. `TargetRuntimeProfileCatalog` loads only the selected
+   provider and performs an offline manifest preflight. Importing or listing
+   profiles does not discover integrations or import vendor code.
+4. `prepare_target_runtime_handle` re-resolves the selected configuration,
+   requires the exact preflight manifest, and may construct only a provider
+   declared `inert_handle`. It reads the initial status and requires
+   `created/not ready`. It never calls an operation or execution port and does
+   not grant authority.
+
+The application owns profile selection and the lifetime of the returned
+aggregate. The concrete provider owns target construction, its ports, and its
+device-specific lifecycle implementation. Canonical authority, safety, permit
+issuance/consumption, action adaptation, and dispatch remain with their
+existing lower owners.
+
+## What an embodiment integration must provide
+
+An integration package that will eventually be selectable must provide:
+
+- a stable `TargetRuntimeProviderIdentity`, including its API, implementation
+  and dependency identities and either `preflight_only` or `inert_handle`
+  construction mode;
+- a side-effect-free manifest resolver that binds every handle-affecting
+  choice to a `ResolvedTargetRuntimeManifest`;
+- exact component-keyed action and target capabilities, including payload
+  schemas, frames, units, resources, and allowed active combinations;
+- observation and lifecycle/device operation capabilities when supported;
+- content identities for required assets such as robot descriptions, meshes,
+  controller maps, tool profiles, and calibration schemas;
+- for an `inert_handle` provider, one handle whose execution, status,
+  observation, and operation ports all expose the same resolved manifest and
+  whose construction does not connect, start, home, command, or activate a
+  target;
+- provider-owned rollback for failed construction and provider-specific
+  lifecycle/cleanup behavior. The generic registry cannot invent a safe close
+  operation for an unknown target.
+
+Provider configuration is deliberately opaque to the shared contract, but it
+is not outside integrity checks: any configuration value that can change the
+future target identity, semantics, operations, observations, or assets must
+change the resolved manifest. Preparation detects a different manifest before
+creating the handle.
+
+## Switching and application composition
+
+Selection is by a stable application profile ID, not by importing a module
+path from configuration and not by replacing a URDF in an existing builder.
+A safe future switch has these phases:
+
+```text
+portable spec selection
+  -> allowlisted provider binding
+  -> side-effect-free manifest preflight
+  -> inert handle preparation
+  -> application/lower-owner lifecycle and authority gates
+  -> execution
+```
+
+Switching an active target is not implemented by the catalog. The current
+target must first complete its declared, permitted hold/close lifecycle and
+release its resources through its provider-owned implementation. Only then may
+the application prepare another target. A profile hash match proves contract
+identity only; it does not prove local asset presence, fresh state, hardware
+readiness, safety acceptance, or motion authorization.
+
+Source devices and teleoperation mappings are separate integrations. A new
+controller may reuse the same target provider through source/retarget adapters;
+a new target may reuse existing sources if their component action contract is
+compatible. Dataset capture remains bound to pure embodiment and stream
+profiles in `dataset_contracts`/`dataset_interface`; runtime objects and SDKs
+must not enter dataset schemas.
+
+## Compatibility status
+
+The RM65 policy-arm-qpos candidate is currently an exact `preflight_only`
+compatibility provider. Its frozen manifest/evidence hashes and existing
+formal entrypoints are unchanged. It cannot create a target-runtime handle.
+
+No second real embodiment, simulated embodiment, SDK adapter, production
+builder migration, or motion path is introduced by this framework work.
+Arbitrary-topology synthetic fixtures cover a single 7-DoF manipulator plus an
+independent 1-DoF tool, nonempty observation/operation/asset surfaces, profile
+serialization, selected-only loading, configuration drift, invalid handles,
+and preflight-only rejection. These fixtures validate interface shape and
+fail-closed behavior; they are not downstream runtime or hardware acceptance.
+
+The formal RM65 real-teleop and collection builders remain compatibility code.
+They directly own RM65/VIVE/Inspire/DM-Tac calibration, IK, collision,
+renderer, recovery, and hardware policy and therefore must not be relabeled as
+generic merely by wrapping their constructor in a profile. Production builder
+migration requires a concrete target with validated control, safety,
+lifecycle, reading, dispatch, and asset semantics.
