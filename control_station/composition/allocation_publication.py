@@ -17,8 +17,13 @@ from dataclasses import dataclass
 from typing import Callable
 
 from control_composition.allocation import (
+    ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_EXISTING,
+    ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_NEW,
     ALLOCATION_PUBLICATION_OUTCOME_ATTEMPT_READY,
     ALLOCATION_PUBLICATION_OUTCOME_GENERATION_FENCED,
+    ALLOCATION_PUBLICATION_OUTCOME_INVALIDATED,
+    ALLOCATION_PUBLICATION_OUTCOME_LATE,
+    ALLOCATION_PUBLICATION_OUTCOME_TERMINAL_REJECTION,
     ALLOCATION_PUBLICATION_RUNTIME_PENDING,
     AllocationPublicationBasis,
     AllocationPublicationOutcome,
@@ -31,6 +36,17 @@ from control_composition.composition import (
     CompositionContextAdmissionReceipt,
     CompositionContextDraft,
     CompositionContextRecord,
+)
+
+
+_TERMINAL_ATTEMPT_OUTCOMES = frozenset(
+    {
+        ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_NEW,
+        ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_EXISTING,
+        ALLOCATION_PUBLICATION_OUTCOME_TERMINAL_REJECTION,
+        ALLOCATION_PUBLICATION_OUTCOME_INVALIDATED,
+        ALLOCATION_PUBLICATION_OUTCOME_LATE,
+    }
 )
 
 from ..publication_barrier import StationPublicationBarrier
@@ -275,6 +291,30 @@ class StationAllocationPublicationPort:
                     return False
                 self._condition.wait(timeout=remaining)
             return True
+
+    def wait_for_terminal_attempt(
+        self,
+        attempt_id: str,
+        *,
+        timeout_sec: float,
+    ) -> AllocationPublicationOutcome | None:
+        """Wait for one exact worker attempt, never merely for queue progress."""
+
+        normalized = _required(attempt_id, name="attempt_id")
+        timeout = _nonnegative_timeout(timeout_sec, name="timeout_sec")
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                for outcome in reversed(self._outcomes):
+                    if (
+                        outcome.attempt_id == normalized
+                        and outcome.outcome_kind in _TERMINAL_ATTEMPT_OUTCOMES
+                    ):
+                        return outcome
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._condition.wait(timeout=remaining)
 
     def start(self) -> StationAllocationPublicationSnapshot:
         if not self.profile.enabled:

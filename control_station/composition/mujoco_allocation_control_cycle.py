@@ -11,10 +11,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import time
 from typing import Any, Callable
 
 from control_composition.activation import CompositionActivationScope
-from control_composition.allocation import AllocationPublicationBasis
+from control_composition.allocation import (
+    ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_EXISTING,
+    ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_NEW,
+    ALLOCATION_PUBLICATION_OUTCOME_ATTEMPT_READY,
+    COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER,
+    AllocationPublicationBasis,
+)
 from control_station.sim_hil_profile.allocation_control_cycle import (
     SimHILAllocationActivationPrime,
     SimHILAllocationActivationBinding,
@@ -83,6 +90,7 @@ class MujocoAllocationControlCycleBinding(SimHILAllocationActivationBinding):
         basis_factory: MujocoAllocationBasisFactory,
         operation_controller: Any | None = None,
         physics_ticks_after_dispatch: int = 0,
+        suspend_policy_during_absolute_owner: bool = False,
     ) -> None:
         if not isinstance(activation_scope, CompositionActivationScope):
             raise TypeError("activation_scope must be typed.")
@@ -102,6 +110,10 @@ class MujocoAllocationControlCycleBinding(SimHILAllocationActivationBinding):
             raise TypeError("source_publisher must be callable.")
         if not callable(basis_factory):
             raise TypeError("basis_factory must be callable.")
+        if not isinstance(suspend_policy_during_absolute_owner, bool):
+            raise TypeError(
+                "suspend_policy_during_absolute_owner must be bool."
+            )
         physics_ticks = physics_ticks_after_dispatch
         if (
             isinstance(physics_ticks, bool)
@@ -143,6 +155,9 @@ class MujocoAllocationControlCycleBinding(SimHILAllocationActivationBinding):
         self.basis_factory = basis_factory
         self.operation_controller = operation_controller
         self.physics_ticks_after_dispatch = physics_ticks
+        self.suspend_policy_during_absolute_owner = (
+            suspend_policy_during_absolute_owner
+        )
         self._closed = False
         self._close_reason: str | None = None
         # Construction only occurs from the application port's activate hook,
@@ -164,6 +179,94 @@ class MujocoAllocationControlCycleBinding(SimHILAllocationActivationBinding):
         if not callable(status):
             return {"supported_signals": []}
         return dict(status())
+
+    def policy_emission_required(self) -> bool:
+        """Report whether the selected allocation mode consumes Policy.
+
+        Human absolute ownership is an alternative complete source.  Keeping
+        synchronous Policy production in that mode would add model latency to
+        every teleoperation cycle even though the result cannot be selected.
+        All other modes retain Policy as the baseline contributor.
+        """
+
+        if not self.suspend_policy_during_absolute_owner:
+            return True
+        state = self.allocation_publication_port.allocation_runtime
+        if state is None:
+            raise RuntimeError("Allocation publication port is unbound.")
+        override = state.allocation_override_state
+        return not (
+            override is not None
+            and override.requested_mode
+            == COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER
+        )
+
+    def synchronize_operation_context(
+        self,
+        *,
+        now: float,
+        target_effective_at: float,
+        timeout_sec: float,
+    ) -> Any:
+        """Publish the post-operation allocation before target cycles resume."""
+
+        if self._closed:
+            raise RuntimeError("MuJoCo allocation binding is closed.")
+        timeout = float(timeout_sec)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_sec must be positive.")
+        deadline = time.monotonic() + timeout
+        cutoff_at = max(float(now), float(self.runtime.clock()))
+        target = max(float(target_effective_at), cutoff_at)
+        basis = self.basis_factory(cutoff_at, target)
+        # Activity evidence intentionally requires two causal samples.  The
+        # activation prime supplies the first; poll the already-attached Human
+        # source while execution remains in HOLD until the second sample can
+        # close a post-operation allocation cut.
+        while basis is None and time.monotonic() < deadline:
+            source = self.source_publisher(
+                cutoff_at,
+                None,
+                None,
+                True,
+                target,
+            )
+            cutoff_at = max(cutoff_at, source.observed_at, float(self.runtime.clock()))
+            target = max(target, cutoff_at)
+            basis = self.basis_factory(cutoff_at, target)
+            if basis is None:
+                time.sleep(0.005)
+        if not isinstance(basis, AllocationPublicationBasis):
+            raise TimeoutError(
+                "Timed out acquiring a post-operation allocation basis."
+            )
+        cycle = self.allocation_publication_port.offer_basis(lambda: basis)
+        outcome = cycle.outcome
+        if (
+            outcome is None
+            or outcome.outcome_kind != ALLOCATION_PUBLICATION_OUTCOME_ATTEMPT_READY
+            or outcome.attempt_id is None
+        ):
+            raise RuntimeError(
+                "Allocation operation could not prepare a context publication."
+            )
+        terminal = self.allocation_publication_port.wait_for_terminal_attempt(
+            outcome.attempt_id,
+            timeout_sec=max(0.0, deadline - time.monotonic()),
+        )
+        if terminal is None:
+            raise TimeoutError(
+                "Timed out publishing the selected allocation context."
+            )
+        if terminal.outcome_kind not in {
+            ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_NEW,
+            ALLOCATION_PUBLICATION_OUTCOME_ACCEPTED_EXISTING,
+        }:
+            raise RuntimeError(
+                "Selected allocation context was not admitted: "
+                f"{terminal.outcome_kind}:{terminal.reason}"
+            )
+        return terminal
 
     @property
     def activation_scope(self) -> CompositionActivationScope:

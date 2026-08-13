@@ -25,7 +25,7 @@ from robot_motion.deploy import PolicyActionEmission
 
 from .control_cycle import (
     SIM_HIL_ACTIVATION_PRIMING_CONTROL_CYCLE_PORT,
-    SIM_HIL_POLICY_SOURCE_ALWAYS,
+    SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE,
     SimHILControlCyclePortSpec,
 )
 from .validation import _required
@@ -109,6 +109,8 @@ class SimHILAllocationActivationBinding(Protocol):
 
     def execute_lower(self, *, now: float) -> AuthoritativeControlStep: ...
 
+    def policy_emission_required(self) -> bool: ...
+
     def fence(self, *, reason: str) -> None: ...
 
     def join(self, *, timeout_sec: float) -> bool: ...
@@ -186,7 +188,7 @@ class AllocationProposalExecutionControlCyclePort:
         self._spec = SimHILControlCyclePortSpec(
             port_id=_required(port_id, name="port_id"),
             cycle_kind=SIM_HIL_CONTROL_CYCLE_ALLOCATION_PROPOSAL_EXECUTION,
-            policy_source_requirement=SIM_HIL_POLICY_SOURCE_ALWAYS,
+            policy_source_requirement=SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE,
             application_blend_failure_fallback_enabled=False,
             application_human_timeout_fallback_enabled=False,
             activation_priming_owner=(SIM_HIL_ACTIVATION_PRIMING_CONTROL_CYCLE_PORT),
@@ -213,6 +215,29 @@ class AllocationProposalExecutionControlCyclePort:
     def active(self) -> bool:
         with self._lock:
             return self._active and not self._closed
+
+    def policy_emission_required(self) -> bool:
+        """Return whether the active allocation mode consumes Policy now.
+
+        Before activation, allocation profiles start from their declared
+        baseline mode, so Policy remains required for startup priming.  Once
+        active, the activation-local binding is the sole source of truth.
+        """
+
+        with self._lock:
+            binding = self._binding
+            active = self._active and not self._closed
+        if not active or binding is None:
+            return True
+        required = getattr(binding, "policy_emission_required", None)
+        if not callable(required):
+            raise TypeError(
+                "Allocation binding must expose policy_emission_required()."
+            )
+        value = required()
+        if not isinstance(value, bool):
+            raise TypeError("policy_emission_required() must return bool.")
+        return value
 
     def activate(
         self,
@@ -355,6 +380,22 @@ class AllocationProposalExecutionControlCyclePort:
         if not callable(status):
             return {"supported_signals": [], "active": True}
         return {"active": True, **dict(status())}
+
+    def synchronize_operation_context(self, **kwargs: Any) -> Any:
+        """Wait for the exact post-operation context before cycles resume."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Control-cycle port is closed.")
+            if not self._active or self._binding is None:
+                raise RuntimeError("Control-cycle port is not active.")
+            binding = self._binding
+        synchronize = getattr(binding, "synchronize_operation_context", None)
+        if not callable(synchronize):
+            raise RuntimeError(
+                "Selected allocation binding cannot synchronize operations."
+            )
+        return synchronize(**kwargs)
 
     def close(self) -> None:
         retired: tuple[SimHILAllocationActivationBinding, ...]

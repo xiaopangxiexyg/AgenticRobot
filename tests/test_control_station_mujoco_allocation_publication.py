@@ -125,6 +125,52 @@ def test_same_cut_ready_result_admits_exact_proposal_without_step() -> None:
         fixture.runtime.close()
 
 
+def test_expired_support_is_reported_without_interrupting_lower_runtime(
+    monkeypatch,
+) -> None:
+    fixture = _fixture(enable_composer_authority=True)
+    try:
+        fixture.controller.start()
+        offered = fixture.controller.offer_basis(lambda: _basis(fixture))
+        assert offered.worker_notified
+        assert fixture.port.wait_for_outcomes(2, timeout_sec=2.0)
+        publisher = _publisher(fixture)
+        original_submit = fixture.runtime.submit_evaluated_composition
+
+        def submit_after_support_deadline(evaluation, **kwargs):
+            fixture.clock.value = 10.3
+            return original_submit(evaluation, **kwargs)
+
+        monkeypatch.setattr(
+            fixture.runtime,
+            "submit_evaluated_composition",
+            submit_after_support_deadline,
+        )
+        fixture.clock.value = 10.04
+
+        cycle = publisher.publish_at(
+            target_effective_at=10.05,
+            cutoff_at=10.04,
+        )
+
+        assert cycle.status == "proposal_not_admitted"
+        assert cycle.submission.proposal_admission is not None
+        assert not cycle.submission.proposal_admission.accepted
+        assert cycle.submission.proposal_admission.rejection_code == (
+            "composition_support_expired_before_proposal_publication"
+        )
+        assert len(fixture.runtime.core.proposals) == 0
+
+        # The one lower execution owner still runs its ordinary no-proposal
+        # path; publication timing does not become an application fault.
+        lower = fixture.runtime.step(now=fixture.clock.value)
+        assert lower.status != "dispatched"
+        assert fixture.scene.physics_command_count == 0
+    finally:
+        fixture.controller.close()
+        fixture.runtime.close()
+
+
 def test_absolute_mode_remains_observable_but_is_not_promoted() -> None:
     fixture = _fixture(enable_composer_authority=True)
     try:

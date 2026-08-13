@@ -267,27 +267,33 @@ class MujocoPolicyHumanAllocationOperationController:
                 proposal_ttl_sec=self.proposal_ttl_sec,
             )
             for signal, mode in requested_mode_by_signal.items()
-            if mode == COMPOSITION_ALLOCATION_OVERRIDE_AUTOMATIC
-            or mode in promotable_modes
+            if (
+                (
+                    mode == COMPOSITION_ALLOCATION_OVERRIDE_AUTOMATIC
+                    and self.bundle.config.automatic_override_enabled
+                )
+                or mode in promotable_modes
+            )
         }
-        rules[MUJOCO_ALLOCATION_SIGNAL_REBASE_AND_CLEAR] = CompositionTriggerRule(
-            rule_id=f"{subject}.button.residual-rebase-and-clear",
-            trigger_source_id="control-station-gui-button",
-            trigger_source_spec_hash=(
-                MUJOCO_ALLOCATION_BUTTON_SOURCE_SPEC_HASH_DEVELOPMENT
-            ),
-            origin_kind=COMPOSITION_TRIGGER_ORIGIN_DIRECT_EVENT,
-            signal_name=MUJOCO_ALLOCATION_SIGNAL_REBASE_AND_CLEAR,
-            edge_policy=COMPOSITION_TRIGGER_EDGE_EACH_EVENT,
-            operation_kind=MUJOCO_ALLOCATION_REBASE_OPERATION_KIND,
-            subject_id=subject,
-            component_ids=components,
-            operation_payload_contract_hash=(
-                MUJOCO_ALLOCATION_REBASE_PAYLOAD_CONTRACT_DEVELOPMENT
-            ),
-            operation_payload={"capture_mode": "first_fresh_after_barrier"},
-            proposal_ttl_sec=self.proposal_ttl_sec,
-        )
+        if self.bundle.config.rebase_operation_enabled:
+            rules[MUJOCO_ALLOCATION_SIGNAL_REBASE_AND_CLEAR] = CompositionTriggerRule(
+                rule_id=f"{subject}.button.residual-rebase-and-clear",
+                trigger_source_id="control-station-gui-button",
+                trigger_source_spec_hash=(
+                    MUJOCO_ALLOCATION_BUTTON_SOURCE_SPEC_HASH_DEVELOPMENT
+                ),
+                origin_kind=COMPOSITION_TRIGGER_ORIGIN_DIRECT_EVENT,
+                signal_name=MUJOCO_ALLOCATION_SIGNAL_REBASE_AND_CLEAR,
+                edge_policy=COMPOSITION_TRIGGER_EDGE_EACH_EVENT,
+                operation_kind=MUJOCO_ALLOCATION_REBASE_OPERATION_KIND,
+                subject_id=subject,
+                component_ids=components,
+                operation_payload_contract_hash=(
+                    MUJOCO_ALLOCATION_REBASE_PAYLOAD_CONTRACT_DEVELOPMENT
+                ),
+                operation_payload={"capture_mode": "first_fresh_after_barrier"},
+                proposal_ttl_sec=self.proposal_ttl_sec,
+            )
         return rules
 
     def submit_button_event(

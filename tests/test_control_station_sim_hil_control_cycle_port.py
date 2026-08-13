@@ -16,6 +16,7 @@ from control_station.sim_hil_profile.allocation_control_cycle import (
 )
 from control_station.sim_hil_profile.control_cycle import (
     SIM_HIL_POLICY_SOURCE_ALWAYS,
+    SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE,
     FixedAlphaCompatibilityControlCyclePort,
     SimHILControlCyclePortSpec,
 )
@@ -53,6 +54,10 @@ class _VirtualAllocationBinding:
         self.join_calls: list[float] = []
         self.publish_calls: list[dict[str, object]] = []
         self.prime_calls: list[dict[str, object]] = []
+        self.policy_required = True
+
+    def policy_emission_required(self) -> bool:
+        return self.policy_required
 
     def publish_cycle(self, **kwargs):
         assert not self.closed
@@ -261,6 +266,92 @@ def test_allocation_profile_rejects_the_legacy_fixed_alpha_control() -> None:
 
     assert events == []
     allocation_port.close()
+
+
+def test_allocation_port_delegates_dynamic_policy_requirement() -> None:
+    events: list[str] = []
+    binding: _VirtualAllocationBinding | None = None
+
+    def build(scope):
+        nonlocal binding
+        binding = _VirtualAllocationBinding(scope, events)
+        return binding
+
+    port = AllocationProposalExecutionControlCyclePort(
+        port_id="dynamic-policy-source",
+        binding_factory=build,
+    )
+    assert port.spec.policy_source_requirement == (
+        SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE
+    )
+    assert port.policy_emission_required() is True
+    port.activate(activation_scope=_activation())
+    assert binding is not None
+    binding.policy_required = False
+    assert port.policy_emission_required() is False
+    binding.policy_required = True
+    assert port.policy_emission_required() is True
+    port.close()
+
+
+def test_human_absolute_cycle_does_not_run_unselected_policy_source() -> None:
+    events: list[str] = []
+    bindings: list[_VirtualAllocationBinding] = []
+
+    def build(scope):
+        binding = _VirtualAllocationBinding(scope, events)
+        bindings.append(binding)
+        return binding
+
+    port = AllocationProposalExecutionControlCyclePort(
+        port_id="human-without-policy-hot-path",
+        binding_factory=build,
+    )
+    scope = _activation()
+    port.activate(activation_scope=scope)
+    port.prime_activation(
+        now=10.0,
+        policy_emission=SimpleNamespace(emission_id="startup-policy"),
+        human_emission=SimpleNamespace(emission_id="startup-human"),
+        poll_human=False,
+        target_effective_at=10.0,
+    )
+    bindings[0].policy_required = False
+    runtime = SimpleNamespace(
+        clock=lambda: 10.0,
+        config=SimpleNamespace(decision_hz=30.0),
+        reference_activation_spec=SimpleNamespace(
+            activation_mode="immediate_target",
+            target_lead_time_sec=0.0,
+        ),
+        capture_execution_gate_snapshot=lambda *, now: SimpleNamespace(
+            status="ready"
+        ),
+        next_decision_due_at=None,
+    )
+    policy_calls: list[float] = []
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=runtime,
+        composition=SimpleNamespace(),
+        control_cycle_port=port,
+        policy_source=SimpleNamespace(
+            step=lambda *, now: policy_calls.append(now)
+        ),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app._started = True
+    app._next_decision_at = 10.0
+
+    app.step(now=10.0)
+
+    assert policy_calls == []
+    assert bindings[0].publish_calls[-1]["policy_emission"] is None
+    port.close()
 
 
 def test_application_orders_port_lifecycle_around_lower_hold_and_rearm() -> None:

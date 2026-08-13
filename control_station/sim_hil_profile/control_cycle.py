@@ -22,6 +22,7 @@ from .validation import _required
 SIM_HIL_CONTROL_CYCLE_FIXED_ALPHA_COMPATIBILITY = "fixed_alpha_compatibility"
 SIM_HIL_POLICY_SOURCE_COMPOSITION_ALPHA = "composition_alpha"
 SIM_HIL_POLICY_SOURCE_ALWAYS = "always"
+SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE = "control_cycle"
 SIM_HIL_ACTIVATION_PRIMING_APPLICATION_COMPATIBILITY = "application_compatibility"
 SIM_HIL_ACTIVATION_PRIMING_CONTROL_CYCLE_PORT = "control_cycle_port"
 
@@ -54,6 +55,7 @@ class SimHILControlCyclePortSpec:
         if requirement not in {
             SIM_HIL_POLICY_SOURCE_COMPOSITION_ALPHA,
             SIM_HIL_POLICY_SOURCE_ALWAYS,
+            SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE,
         }:
             raise ValueError("Unsupported Sim-HIL policy source requirement.")
         object.__setattr__(self, "policy_source_requirement", requirement)
@@ -229,6 +231,7 @@ __all__ = [
     "SIM_HIL_CONTROL_CYCLE_FIXED_ALPHA_COMPATIBILITY",
     "SIM_HIL_POLICY_SOURCE_ALWAYS",
     "SIM_HIL_POLICY_SOURCE_COMPOSITION_ALPHA",
+    "SIM_HIL_POLICY_SOURCE_CONTROL_CYCLE",
     "FixedAlphaCompatibilityControlCyclePort",
     "SimHILControlCyclePort",
     "SimHILControlCyclePortSpec",

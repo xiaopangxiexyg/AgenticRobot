@@ -42,7 +42,10 @@ from robot_motion.action import ComponentActionSchema
 from robot_motion.coordinate_frames import CoordinateFrameGraph, CoordinateFrameSpec
 
 from .allocation_control_cycle import AllocationProposalExecutionControlCyclePort
-from .profile_selection import SimHILApplicationControlProfile
+from .profile_selection import (
+    SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
+    SimHILApplicationControlProfile,
+)
 
 
 SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A = (
@@ -55,10 +58,12 @@ SIM_HIL_POLICY_HUMAN_ALLOCATION_PROFILE_IDS = frozenset(
     {
         SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_A,
         SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_B,
+        SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
     }
 )
 _POSE_ROTATION_NORMALIZATION_RAD = math.radians(10.0)
 _SCHEME_B_TARGET_HANDOFF_DURATION_SEC = 0.25
+_PERSISTENT_OVERRIDE_SELECTION_LEASE_SEC = 0.5
 _PROFILE_BINDING_HASH_DOMAIN = (
     "dexteleop.control_station.sim_hil_allocation_profile_binding.development"
 )
@@ -109,6 +114,10 @@ def _prepare_policy_human_allocation_profile(
     automatic_mode_ceiling: str,
     proposal_promotable_modes: tuple[str, ...],
     target_handoff_duration_sec: float | None,
+    automatic_override_enabled: bool = True,
+    rebase_operation_enabled: bool = True,
+    initial_override_mode: str | None = None,
+    composition_required_roles: tuple[str, ...] | None = None,
     action_schema: ComponentActionSchema,
     target_frame_graph: CoordinateFrameGraph,
     target_frame_profile_hash: str,
@@ -247,6 +256,13 @@ def _prepare_policy_human_allocation_profile(
             # start in base_only and admit Human only at an explicit mode
             # transition.
             require_human_roles_at_start=False,
+            composition_required_roles=composition_required_roles,
+            automatic_override_enabled=automatic_override_enabled,
+            rebase_operation_enabled=rebase_operation_enabled,
+            initial_override_mode=initial_override_mode,
+            persistent_override_selection_lease_sec=(
+                _PERSISTENT_OVERRIDE_SELECTION_LEASE_SEC
+            ),
             proposal_promotable_modes=proposal_promotable_modes,
         ),
     )
@@ -258,6 +274,37 @@ def _prepare_policy_human_allocation_profile(
     )
 
 
+def prepare_exclusive_truncated_hitl_allocation_profile(
+    *,
+    action_schema: ComponentActionSchema,
+    target_frame_graph: CoordinateFrameGraph,
+    target_frame_profile_hash: str,
+    tool_frame_profile_hash: str,
+    composer_producer_id: str,
+) -> SimHILPolicyHumanAllocationPreparation:
+    """Build discrete policy/human takeover on the streaming allocation path."""
+
+    return _prepare_policy_human_allocation_profile(
+        profile_id=SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
+        automatic_mode_ceiling=COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
+        proposal_promotable_modes=(
+            COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
+            COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER,
+        ),
+        target_handoff_duration_sec=None,
+        automatic_override_enabled=False,
+        rebase_operation_enabled=False,
+        initial_override_mode=COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
+        # Policy and Human-absolute are complete alternative owners. A static
+        # Policy requirement would force unused model refreshes during Human
+        # takeover merely to keep an unrelated input alive.
+        composition_required_roles=(),
+        action_schema=action_schema,
+        target_frame_graph=target_frame_graph,
+        target_frame_profile_hash=target_frame_profile_hash,
+        tool_frame_profile_hash=tool_frame_profile_hash,
+        composer_producer_id=composer_producer_id,
+    )
 def prepare_policy_human_allocation_scheme_a(
     *,
     action_schema: ComponentActionSchema,
@@ -445,6 +492,14 @@ def _build_policy_human_allocation_control_profile(
             "promotable_modes": (
                 preparation.station_profiles.proposal.promotable_allocation_modes
             ),
+            "automatic_override_enabled": (
+                bundle.config.automatic_override_enabled
+            ),
+            "rebase_operation_enabled": bundle.config.rebase_operation_enabled,
+            "initial_override_mode": bundle.config.initial_override_mode,
+            "persistent_override_selection_lease_sec": (
+                bundle.config.persistent_override_selection_lease_sec
+            ),
             "send_actions": preparation.station_profiles.proposal.send_actions,
         },
         domain=_PROFILE_PROPOSAL_GATE_HASH_DOMAIN,
@@ -518,6 +573,32 @@ def build_policy_human_allocation_scheme_a_control_profile(
     )
 
 
+def build_exclusive_truncated_hitl_allocation_control_profile(
+    *,
+    preparation: SimHILPolicyHumanAllocationPreparation,
+    runtime: Any,
+    human_source: Any,
+    human_source_spec: Any,
+    readiness_provider: Any,
+    policy_binding: Any,
+    component_action_projector: Any,
+    physics_ticks_after_dispatch: int,
+) -> SimHILApplicationControlProfile:
+    """Join discrete takeover to the common streaming allocation cycle."""
+
+    return _build_policy_human_allocation_control_profile(
+        expected_profile_id=SIM_HIL_CONTROL_PROFILE_EXCLUSIVE_TRUNCATED_HITL,
+        preparation=preparation,
+        runtime=runtime,
+        human_source=human_source,
+        human_source_spec=human_source_spec,
+        readiness_provider=readiness_provider,
+        policy_binding=policy_binding,
+        component_action_projector=component_action_projector,
+        physics_ticks_after_dispatch=physics_ticks_after_dispatch,
+    )
+
+
 def build_policy_human_allocation_scheme_b_control_profile(
     *,
     preparation: SimHILPolicyHumanAllocationPreparation,
@@ -551,8 +632,10 @@ __all__ = [
     "SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_B",
     "SIM_HIL_POLICY_HUMAN_ALLOCATION_PROFILE_IDS",
     "SimHILPolicyHumanAllocationPreparation",
+    "build_exclusive_truncated_hitl_allocation_control_profile",
     "build_policy_human_allocation_scheme_a_control_profile",
     "build_policy_human_allocation_scheme_b_control_profile",
+    "prepare_exclusive_truncated_hitl_allocation_profile",
     "prepare_policy_human_allocation_scheme_a",
     "prepare_policy_human_allocation_scheme_b",
 ]

@@ -12,6 +12,7 @@ from typing import Any, Sequence
 from control_composition.activation import CompositionActivationScope
 from control_composition.allocation import (
     AllocationPublicationRuntime,
+    CompositionAllocationOverrideRequest,
     empty_composition_allocation_override_state,
     empty_composition_allocation_state,
 )
@@ -233,8 +234,39 @@ class MujocoPolicyHumanAllocationBindingFactory:
                 component_ids=bundle.allocation_spec.component_ids,
                 allowed_modes=bundle.config.proposal_promotable_modes,
             ),
+            persistent_override_selection_lease_sec=(
+                bundle.config.persistent_override_selection_lease_sec
+            ),
             clock=runtime.clock,
         )
+        initial_mode = bundle.config.initial_override_mode
+        if initial_mode is not None:
+            selected_at = max(
+                float(activation_scope.input_barrier_at),
+                float(runtime.clock()),
+            )
+            allocation_runtime.apply_override(
+                CompositionAllocationOverrideRequest(
+                    runtime_session_id=runtime.config.runtime_session_id,
+                    control_domain_id=runtime.config.control_domain_id,
+                    composition_activation_id=activation_scope.activation_id,
+                    composition_activation_hash=(
+                        activation_scope.semantic_content_hash
+                    ),
+                    allocation_spec_hash=(
+                        bundle.allocation_spec.semantic_content_hash
+                    ),
+                    component_ids=bundle.allocation_spec.component_ids,
+                    requested_mode=initial_mode,
+                    requested_at=selected_at,
+                    available_at=selected_at,
+                    clock_domain_id=runtime.config.clock_domain_id,
+                    source_fact_ids=(activation_scope.activation_id,),
+                    source_fact_hashes=(
+                        activation_scope.semantic_content_hash,
+                    ),
+                )
+            )
         allocation_port = StationAllocationPublicationPort(
             profile=self.station_profiles.allocation_context,
             allocation_runtime=allocation_runtime,
@@ -332,6 +364,10 @@ class MujocoPolicyHumanAllocationBindingFactory:
             basis_factory=capture_basis,
             operation_controller=operation_controller,
             physics_ticks_after_dispatch=config.physics_ticks_after_dispatch,
+            suspend_policy_during_absolute_owner=(
+                bundle.config.baseline_role
+                not in bundle.composition_contracts.composition_spec.required_roles
+            ),
         )
 
 

@@ -8,6 +8,7 @@ HOLD, target resolution, IK, reference, or dispatch policy.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
@@ -90,6 +91,21 @@ class MujocoPolicyHumanAllocationProfileConfig:
     # support a stable deferred human-source port may opt into policy-only
     # activation and admit the human roles at a later typed boundary.
     require_human_roles_at_start: bool = True
+    # ``None`` preserves the legacy derivation. Profiles whose modes select
+    # complete alternative sources may declare an empty always-required set
+    # and let each allocation mode require only the inputs it consumes.
+    composition_required_roles: tuple[str, ...] | None = None
+    # Operator/device triggers may request automatic reduction only when the
+    # selected application profile exposes that mode.  Discrete takeover is
+    # the same streaming allocation path with this switch disabled, not a
+    # second fixed-alpha composer.
+    automatic_override_enabled: bool = True
+    rebase_operation_enabled: bool = True
+    initial_override_mode: str | None = None
+    # A persistent operator override is renewed through finite contexts so a
+    # stopped publisher still fails closed.  This lease is independent of the
+    # dynamic activity-evidence TTL and does not extend action-input TTLs.
+    persistent_override_selection_lease_sec: float | None = None
     proposal_promotable_modes: tuple[str, ...] = (
         MUJOCO_POLICY_HUMAN_ALLOCATION_PROMOTABLE_MODES_SCHEME_A
     )
@@ -114,10 +130,13 @@ class MujocoPolicyHumanAllocationProfileConfig:
                 self.enabled,
                 self.send_actions,
                 self.require_human_roles_at_start,
+                self.automatic_override_enabled,
+                self.rebase_operation_enabled,
             )
         ):
             raise TypeError(
-                "enabled, send_actions, and require_human_roles_at_start "
+                "enabled, send_actions, require_human_roles_at_start, and "
+                "automatic_override_enabled, and rebase_operation_enabled "
                 "must be booleans."
             )
         if self.send_actions:
@@ -129,6 +148,19 @@ class MujocoPolicyHumanAllocationProfileConfig:
             self.profile_id == MUJOCO_POLICY_HUMAN_ALLOCATION_PROFILE_OFF
         ):
             raise ValueError("An enabled allocation profile requires an id.")
+        override_lease = self.persistent_override_selection_lease_sec
+        if override_lease is not None:
+            override_lease = float(override_lease)
+            if not math.isfinite(override_lease) or override_lease <= 0.0:
+                raise ValueError(
+                    "persistent_override_selection_lease_sec must be positive "
+                    "and finite."
+                )
+            object.__setattr__(
+                self,
+                "persistent_override_selection_lease_sec",
+                override_lease,
+            )
         promotable_modes = tuple(
             _required(mode, name="proposal_promotable_mode")
             for mode in self.proposal_promotable_modes
@@ -150,6 +182,17 @@ class MujocoPolicyHumanAllocationProfileConfig:
             "proposal_promotable_modes",
             promotable_modes,
         )
+        initial_mode = self.initial_override_mode
+        if initial_mode is not None:
+            initial_mode = _required(
+                initial_mode,
+                name="initial_override_mode",
+            )
+            if initial_mode not in promotable_modes:
+                raise ValueError(
+                    "initial_override_mode must be proposal-promotable."
+                )
+            object.__setattr__(self, "initial_override_mode", initial_mode)
         roles = (
             self.baseline_role,
             self.residual_role,
@@ -157,6 +200,23 @@ class MujocoPolicyHumanAllocationProfileConfig:
         )
         if len(set(roles)) != len(roles):
             raise ValueError("Allocation action roles must be distinct.")
+        required_roles = self.composition_required_roles
+        if required_roles is not None:
+            required_roles = tuple(
+                _required(role, name="composition_required_role")
+                for role in required_roles
+            )
+            if len(required_roles) != len(set(required_roles)):
+                raise ValueError("composition_required_roles must be unique.")
+            if not set(required_roles).issubset(roles):
+                raise ValueError(
+                    "composition_required_roles must be allocation action roles."
+                )
+            object.__setattr__(
+                self,
+                "composition_required_roles",
+                required_roles,
+            )
 
 
 @dataclass(frozen=True)
@@ -307,13 +367,17 @@ def build_mujoco_policy_human_allocation_profile(
         allocation_spec=allocation_spec,
         allocation_context_channel=profile.allocation_context_channel,
         required_roles=(
-            (
-                profile.baseline_role,
-                profile.residual_role,
-                profile.absolute_overlay_role,
+            profile.composition_required_roles
+            if profile.composition_required_roles is not None
+            else (
+                (
+                    profile.baseline_role,
+                    profile.residual_role,
+                    profile.absolute_overlay_role,
+                )
+                if profile.require_human_roles_at_start
+                else (profile.baseline_role,)
             )
-            if profile.require_human_roles_at_start
-            else (profile.baseline_role,)
         ),
         allow_missing_allocation_context=(
             not profile.require_human_roles_at_start
@@ -329,7 +393,13 @@ def build_mujoco_policy_human_allocation_profile(
                     COMPOSITION_ALLOCATION_CONTEXT_CONTRACT_HASH_DEVELOPMENT,
                 ),
                 payload_access="inline",
-                maximum_age_sec=float(evidence_ttl_sec),
+                maximum_age_sec=max(
+                    float(evidence_ttl_sec),
+                    float(
+                        profile.persistent_override_selection_lease_sec
+                        or evidence_ttl_sec
+                    ),
+                ),
                 required=profile.require_human_roles_at_start,
             ),
         ),
