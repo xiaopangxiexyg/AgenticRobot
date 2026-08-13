@@ -528,6 +528,11 @@ class DMTacGripperBackendConfig:
     # Kept after the existing public fields so legacy positional construction
     # keeps its old meaning.
     observation_only: bool = False
+    # Explicit deployment-only no-I/O mode.  The configured scalar is an
+    # operator-provided assumption used to preserve the model's fixed DMTAC
+    # state layout when that physical gripper is intentionally disconnected.
+    # It is never reported as measured hardware feedback.
+    disconnected_state_scalar: float | None = None
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
@@ -554,6 +559,24 @@ class DMTacGripperBackendConfig:
             raise ValueError("gripper_telemetry_command_grace_s must be non-negative.")
         if float(self.reconnect_cooldown_sec) < 0.0:
             raise ValueError("reconnect_cooldown_sec must be non-negative.")
+        if self.disconnected_state_scalar is not None:
+            disconnected_scalar = float(self.disconnected_state_scalar)
+            if (
+                not np.isfinite(disconnected_scalar)
+                or not 0.0 <= disconnected_scalar <= 1.0
+            ):
+                raise ValueError("disconnected_state_scalar must be finite and in [0, 1].")
+            if self.connect_hardware or self.connect_tactile or self.send_commands:
+                raise ValueError(
+                    "disconnected_state_scalar requires connect_hardware=False, "
+                    "connect_tactile=False, and send_commands=False."
+                )
+            self.disconnected_state_scalar = disconnected_scalar
+            self.enable_telemetry = False
+            self.reconnect_on_error = False
+            self.clear_fault_on_start = False
+            self.open_on_start = False
+            self.tactile_reset_on_start = False
         if int(self.tactile_max_fps) <= 0:
             raise ValueError("tactile_max_fps must be positive.")
         self.tactile_fields = normalize_dmtac_tactile_fields(self.tactile_fields)
@@ -683,6 +706,13 @@ class DMTacGripperBackend(EffectorBackend):
         self._last_reconnect_attempt_at: float | None = None
         self._last_reconnect_error: str | None = None
         self._reconnect_count = 0
+        if self.config.disconnected_state_scalar is not None:
+            self._latest_joint_pos = self._q6_from_scalar(
+                float(self.config.disconnected_state_scalar),
+                dim=int(self.config.command_dim),
+                max_value=float(self.config.max_action),
+            )
+            self._latest_joint_timestamp = time.time()
 
     @property
     def name(self) -> str:
@@ -1120,6 +1150,15 @@ class DMTacGripperBackend(EffectorBackend):
             raise RuntimeError(
                 f"{self.name} is observation-only; refusing gripper command dispatch."
             )
+        if self.config.disconnected_state_scalar is not None:
+            target_scalar = self._extract_gripper_scalar(command.value)
+            self._last_send_attempt_timestamp = time.time()
+            self._last_send_elapsed_s = 0.0
+            self._last_send_lock_wait_s = 0.0
+            self._last_send_status = "intentionally_disconnected_noop"
+            self._last_send_skip_reason = "configured_disconnected"
+            self._last_send_target_scalar = float(target_scalar)
+            return True
         sent = self._send_joint_pos(command.value, bypass_send_commands=False, force=False)
         if sent:
             self._last_command = command.copy()
@@ -1130,6 +1169,14 @@ class DMTacGripperBackend(EffectorBackend):
             raise RuntimeError(
                 f"{self.name} is observation-only; refusing fixed gripper command dispatch."
             )
+        if self.config.disconnected_state_scalar is not None:
+            self._extract_gripper_scalar(joint_pos)
+            self._last_send_attempt_timestamp = time.time()
+            self._last_send_elapsed_s = 0.0
+            self._last_send_lock_wait_s = 0.0
+            self._last_send_status = "intentionally_disconnected_noop"
+            self._last_send_skip_reason = "configured_disconnected"
+            return True
         return self._send_joint_pos(joint_pos, bypass_send_commands=True, force=True)
 
     def set_torque(self, torque: float) -> float:
@@ -1788,6 +1835,8 @@ class DMTacGripperBackend(EffectorBackend):
         gripper_state = None
         if self.device is not None and getattr(self.device, "gripper", None) is not None:
             gripper_state = getattr(self.device.gripper, "last_state", None)
+        if self.config.disconnected_state_scalar is not None:
+            self._latest_joint_timestamp = time.time()
         joint_pos = self._latest_joint_pos
         measured_joint_pos = self._latest_measured_joint_pos
         commanded_joint_pos = self._last_sent_command
@@ -1853,7 +1902,19 @@ class DMTacGripperBackend(EffectorBackend):
             "joint_pos": None if joint_pos is None else joint_pos.copy(),
             "measured_joint_pos": None if measured_joint_pos is None else measured_joint_pos.copy(),
             "joint_timestamp": self._latest_joint_timestamp,
-            "gripper_measurement_timestamp": self._latest_joint_timestamp,
+            "gripper_measurement_timestamp": (
+                None
+                if self.config.disconnected_state_scalar is not None
+                else self._latest_joint_timestamp
+            ),
+            "gripper_state_source": (
+                "configured_disconnected_assumption"
+                if self.config.disconnected_state_scalar is not None
+                else "runtime_backend"
+            ),
+            "gripper_state_assumed": bool(
+                self.config.disconnected_state_scalar is not None
+            ),
             "gripper_commanded_scalar": commanded_scalar,
             "gripper_measured_scalar": measured_scalar,
             "gripper_state_scalar": None if joint_pos is None else float(joint_pos[scalar_index]),
@@ -1931,6 +1992,9 @@ class DMTacGripperBackend(EffectorBackend):
             "connect_tactile": bool(self.config.connect_tactile),
             "observation_only": bool(self.config.observation_only),
             "send_commands": bool(self.config.send_commands),
+            "intentionally_disconnected": bool(
+                self.config.disconnected_state_scalar is not None
+            ),
             "is_connected": self.device is not None,
             "gripper_is_connected": self.device is not None
             and getattr(self.device, "gripper", None) is not None,
