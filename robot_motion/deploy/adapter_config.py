@@ -96,6 +96,7 @@ class PolicyAdapterConfig:
 
     adapter_id: str
     active_sides: tuple[str, ...] = ("left", "right")
+    model_observation_sides: tuple[str, ...] | None = None
     arms_enabled: bool = True
     hands_enabled: bool = True
     action_space: str = DEPLOY_ACTION_VECTOR_ACTION_SPACE
@@ -135,6 +136,17 @@ class PolicyAdapterConfig:
         sides = normalize_active_sides(self.active_sides)
         if not sides:
             raise ValueError("active_sides must not be empty.")
+        observation_sides = (
+            sides
+            if self.model_observation_sides is None
+            else normalize_active_sides(self.model_observation_sides)
+        )
+        if not observation_sides:
+            raise ValueError("model_observation_sides must not be empty.")
+        if not set(sides).issubset(set(observation_sides)):
+            raise ValueError(
+                "model_observation_sides must cover every active output side."
+            )
         action_space = _non_empty_identity(self.action_space, name="action_space")
         action_dim = int(self.action_dim)
         if action_dim <= 0:
@@ -250,6 +262,7 @@ class PolicyAdapterConfig:
 
         object.__setattr__(self, "adapter_id", adapter_id)
         object.__setattr__(self, "active_sides", sides)
+        object.__setattr__(self, "model_observation_sides", observation_sides)
         object.__setattr__(self, "arms_enabled", bool(self.arms_enabled))
         object.__setattr__(self, "hands_enabled", bool(self.hands_enabled))
         object.__setattr__(self, "action_space", action_space)
@@ -304,6 +317,7 @@ class PolicyAdapterConfig:
             "schema": POLICY_ADAPTER_CONFIG_SCHEMA_V1,
             "adapter_id": self.adapter_id,
             "active_sides": list(self.active_sides),
+            "model_observation_sides": list(self.model_observation_sides),
             "arms_enabled": self.arms_enabled,
             "hands_enabled": self.hands_enabled,
             "action_space": self.action_space,
@@ -342,6 +356,11 @@ class PolicyAdapterConfig:
         return cls(
             adapter_id=str(payload["adapter_id"]),
             active_sides=tuple(payload.get("active_sides", ("left", "right"))),
+            model_observation_sides=(
+                None
+                if payload.get("model_observation_sides") is None
+                else tuple(payload["model_observation_sides"])
+            ),
             arms_enabled=bool(payload.get("arms_enabled", True)),
             hands_enabled=bool(payload.get("hands_enabled", True)),
             action_space=str(payload.get("action_space", DEPLOY_ACTION_VECTOR_ACTION_SPACE)),
@@ -394,6 +413,7 @@ class PolicyAdapterConfig:
 
         return PolicyDeployRuntimeConfig(
             active_sides=self.active_sides,
+            model_observation_sides=self.model_observation_sides,
             arms_enabled=self.arms_enabled,
             hands_enabled=self.hands_enabled,
             policy_action_pose_mode=self.action_pose_mode,

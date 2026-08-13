@@ -108,6 +108,11 @@ class PolicyDeployRuntimeConfig:
     """
 
     active_sides: tuple[str, ...]
+    # Model input topology may be wider than the contributor output topology.
+    # For example, a bimanual policy can observe both arms while a selected
+    # application profile explicitly contributes only its right-arm channels.
+    # ``None`` preserves the historical one-topology behavior.
+    model_observation_sides: tuple[str, ...] | None = None
     arms_enabled: bool = True
     hands_enabled: bool = False
     policy_action_pose_mode: str = "absolute"
@@ -146,6 +151,26 @@ class PolicyDeployRuntimeConfig:
         if len(set(sides)) != len(sides):
             raise ValueError("active_sides must not contain duplicates.")
         object.__setattr__(self, "active_sides", sides)
+        observation_sides = self.model_observation_sides
+        if observation_sides is None:
+            observation_sides = sides
+        else:
+            observation_sides = tuple(
+                str(side).strip().lower() for side in observation_sides
+            )
+            if not observation_sides:
+                raise ValueError("model_observation_sides must not be empty.")
+            if any(side not in {"left", "right"} for side in observation_sides):
+                raise ValueError(
+                    "model_observation_sides must contain only 'left' and/or 'right'."
+                )
+            if len(set(observation_sides)) != len(observation_sides):
+                raise ValueError("model_observation_sides must not contain duplicates.")
+            if not set(sides).issubset(set(observation_sides)):
+                raise ValueError(
+                    "model_observation_sides must cover every active output side."
+                )
+        object.__setattr__(self, "model_observation_sides", observation_sides)
         object.__setattr__(
             self,
             "policy_action_pose_mode",
@@ -1686,7 +1711,7 @@ class PolicyDeployRuntime:
         return prepare_observation_for_policy_pose_mode(
             observation,
             target_mode=self.config.policy_action_pose_mode,
-            active_sides=self.config.active_sides,
+            active_sides=self.config.model_observation_sides,
             policy_absolute_frame=self.config.policy_absolute_frame,
             runtime_pose_frame_contract=self.config.runtime_pose_frame_contract,
         )

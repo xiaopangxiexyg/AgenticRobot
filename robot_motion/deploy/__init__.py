@@ -210,6 +210,19 @@ from .execution_feedback import (
     PolicyExecutionFeedbackApplication,
     project_policy_execution_feedback,
 )
+from .emission_source import (
+    DeployActionPreparer,
+    PolicyObservationCapture,
+    ThreadedPolicyEmissionSource,
+    ThreadedPolicyEmissionSourceConfig,
+)
+from .emission_port import (
+    PassivePolicyEmissionObserverPort,
+    PolicyEmissionSourcePort,
+    PolicyExecutionFeedbackPort,
+    require_passive_policy_emission_observer,
+    require_policy_emission_source,
+)
 from .observation import (
     DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
     DeploymentObservation,
@@ -472,6 +485,11 @@ __all__ = [
     "POLICY_EXECUTION_RELATION_UNKNOWN",
     "PolicyExecutionFeedback",
     "PolicyExecutionFeedbackApplication",
+    "PassivePolicyEmissionObserverPort",
+    "PolicyEmissionSourcePort",
+    "PolicyExecutionFeedbackPort",
+    "require_passive_policy_emission_observer",
+    "require_policy_emission_source",
     "project_policy_execution_feedback",
     "PolicyActionPreparationResult",
     "POLICY_NEXT_STEP_EXECUTION_BASIS_V1",
