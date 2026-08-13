@@ -35,20 +35,38 @@ from dataset_interface.prepared_training import (
 OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V1 = (
     "dexteleop.openpi_prepared_skill_binding.v1"
 )
+OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V2 = (
+    "dexteleop.openpi_prepared_skill_binding.v2"
+)
 OPENPI_PREPARED_SKILL_BINDING_MANIFEST_DOMAIN_V1 = (
     "dexteleop.openpi_prepared_skill_binding.manifest.v1"
+)
+OPENPI_PREPARED_SKILL_BINDING_MANIFEST_DOMAIN_V2 = (
+    "dexteleop.openpi_prepared_skill_binding.manifest.v2"
 )
 OPENPI_PREPARED_SKILL_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.openpi_prepared_skill_binding.identity.v1"
 )
+OPENPI_PREPARED_SKILL_BINDING_HASH_DOMAIN_V2 = (
+    "dexteleop.openpi_prepared_skill_binding.identity.v2"
+)
 OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V1 = (
     "dexteleop.openpi_prepared_prompt_binding.v1"
+)
+OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V2 = (
+    "dexteleop.openpi_prepared_prompt_binding.v2"
 )
 OPENPI_PREPARED_PROMPT_BINDING_MANIFEST_DOMAIN_V1 = (
     "dexteleop.openpi_prepared_prompt_binding.manifest.v1"
 )
+OPENPI_PREPARED_PROMPT_BINDING_MANIFEST_DOMAIN_V2 = (
+    "dexteleop.openpi_prepared_prompt_binding.manifest.v2"
+)
 OPENPI_PREPARED_PROMPT_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.openpi_prepared_prompt_binding.identity.v1"
+)
+OPENPI_PREPARED_PROMPT_BINDING_HASH_DOMAIN_V2 = (
+    "dexteleop.openpi_prepared_prompt_binding.identity.v2"
 )
 OPENPI_PREPARED_PROMPT_VIEW_HASH_DOMAIN_V1 = (
     "dexteleop.openpi_prepared_prompt_binding.view_set.v1"
@@ -60,10 +78,19 @@ OPENPI_PREPARED_SKILL_ADAPTER_IMPLEMENTATION_V2 = (
     "deployments.openpi.prepared_skill_interval_adapter.v2"
 )
 OPENPI_SOURCE_MIXING_NATURAL_V1 = "natural_concat_shuffle_v1"
+OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1 = (
+    "repeat_each_source_window_by_bound_weight_v1"
+)
 OPENPI_PROMPT_STAGE_SAMPLING_NATURAL_V1 = "natural_prompt_windows_v1"
 OPENPI_PROMPT_STAGE_SAMPLING_BALANCED_V1 = (
     "balanced_min_windows_rotate_v1"
 )
+OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1 = (
+    "canonical_80_train_variants_20_stratified_v1"
+)
+OPENPI_PROMPT_FAMILY_TRAINING_VARIANT_COUNT_V1 = 12
+OPENPI_PROMPT_FAMILY_HELD_OUT_VARIANT_COUNT_V1 = 4
+OPENPI_PROMPT_FAMILY_EXACT_QUOTA_DENOMINATOR_V1 = 5
 
 
 class OpenPIPreparedSkillError(ValueError):
@@ -97,16 +124,58 @@ class OpenPIPreparedSkillBinding:
     action_pose_mode: str
     source_mixing_policy: str
     episodes: tuple[OpenPIPreparedEpisodeSelection, ...]
+    source_repeat_weights: tuple[tuple[str, int], ...] = ()
+    selection_policy_id: str = "strict_success_non_abnormal"
     binding_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
+        source_ids = self.source_dataset_ids
+        weights = tuple(
+            (str(source_id).strip(), int(weight))
+            for source_id, weight in self.source_repeat_weights
+        )
+        if weights:
+            if (
+                tuple(sorted(source_id for source_id, _weight in weights))
+                != source_ids
+                or len({source_id for source_id, _weight in weights})
+                != len(weights)
+                or any(weight <= 0 for _source_id, weight in weights)
+            ):
+                raise OpenPIPreparedSkillError(
+                    "Prepared repeat weights must bind every source exactly once."
+                )
+            if (
+                self.source_mixing_policy
+                != OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1
+            ):
+                raise OpenPIPreparedSkillError(
+                    "Prepared repeat weights require the weighted source policy."
+                )
+        elif self.source_mixing_policy != OPENPI_SOURCE_MIXING_NATURAL_V1:
+            raise OpenPIPreparedSkillError(
+                "Prepared non-natural source mixing requires repeat weights."
+            )
+        policy_id = str(self.selection_policy_id).strip()
+        if not policy_id:
+            raise OpenPIPreparedSkillError(
+                "Prepared selection_policy_id must be non-empty."
+            )
+        object.__setattr__(self, "source_repeat_weights", tuple(sorted(weights)))
+        object.__setattr__(self, "selection_policy_id", policy_id)
         payload = self.to_payload(include_hash=False)
         object.__setattr__(
             self,
             "binding_hash",
             canonical_content_hash(
                 payload,
-                domain=OPENPI_PREPARED_SKILL_BINDING_HASH_DOMAIN_V1,
+                domain=(
+                    OPENPI_PREPARED_SKILL_BINDING_HASH_DOMAIN_V1
+                    if not self.source_repeat_weights
+                    and self.selection_policy_id
+                    == "strict_success_non_abnormal"
+                    else OPENPI_PREPARED_SKILL_BINDING_HASH_DOMAIN_V2
+                ),
             ),
         )
 
@@ -117,6 +186,17 @@ class OpenPIPreparedSkillBinding:
     @property
     def source_dataset_ids(self) -> tuple[str, ...]:
         return tuple(sorted({item.source_dataset_id for item in self.episodes}))
+
+    def repeat_weight_for(self, source_dataset_id: str) -> int:
+        if not self.source_repeat_weights:
+            return 1
+        weights = dict(self.source_repeat_weights)
+        try:
+            return int(weights[str(source_dataset_id)])
+        except KeyError as exc:
+            raise OpenPIPreparedSkillError(
+                f"Prepared binding has no repeat weight for {source_dataset_id!r}."
+            ) from exc
 
     def selection_for(
         self,
@@ -136,7 +216,12 @@ class OpenPIPreparedSkillBinding:
 
     def to_payload(self, *, include_hash: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
-            "schema": OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V1,
+            "schema": (
+                OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V1
+                if not self.source_repeat_weights
+                and self.selection_policy_id == "strict_success_non_abnormal"
+                else OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V2
+            ),
             "training_view_hash": self.training_view_hash,
             "skill_id": self.skill_id,
             "skill_training_contract_hash": self.skill_training_contract_hash,
@@ -175,9 +260,39 @@ class OpenPIPreparedSkillBinding:
                 OPENPI_PREPARED_SKILL_ADAPTER_IMPLEMENTATION_V2
             ),
         }
+        if payload["schema"] == OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V2:
+            payload["selection_policy_id"] = self.selection_policy_id
+            payload["source_repeat_weights"] = [
+                {"source_dataset_id": source_id, "repeat_weight": weight}
+                for source_id, weight in self.source_repeat_weights
+            ]
+            payload["prepared_interval_repeated_window_count"] = sum(
+                self.repeat_weight_for(episode.source_dataset_id)
+                * (end - begin - self.action_horizon + 1)
+                for episode in self.episodes
+                for begin, end in episode.intervals
+            )
         if include_hash:
             payload["binding_hash"] = self.binding_hash
         return payload
+
+
+def effective_prompt_stage_window_count(
+    binding: OpenPIPreparedPromptBinding,
+) -> int:
+    """Return the balanced per-stage count after exact family-quota alignment."""
+
+    target = min(
+        skill.expected_openpi_window_count
+        for skill in binding.prompt_skills
+    )
+    if binding.prompt_family_sampling_policy is not None:
+        target -= target % OPENPI_PROMPT_FAMILY_EXACT_QUOTA_DENOMINATOR_V1
+    if target <= 0:
+        raise OpenPIPreparedSkillError(
+            "Prompt-stage balancing produced no usable windows."
+        )
+    return target
 
 
 @dataclass(frozen=True)
@@ -193,6 +308,8 @@ class OpenPIPreparedPromptSkill:
     episode_count: int
     window_count: int
     expected_openpi_window_count: int
+    training_prompt_variants: tuple[str, ...] = ()
+    held_out_prompt_variants: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -215,9 +332,21 @@ class OpenPIPreparedPromptSkill:
             raise OpenPIPreparedSkillError(
                 "Prepared prompt Skill counts must be positive."
             )
+        for family_name, prompts in (
+            ("training_prompt_variants", self.training_prompt_variants),
+            ("held_out_prompt_variants", self.held_out_prompt_variants),
+        ):
+            if any(not str(value).strip() for value in prompts):
+                raise OpenPIPreparedSkillError(
+                    f"Prepared prompt Skill {family_name} must be non-empty."
+                )
+            if len(set(prompts)) != len(prompts):
+                raise OpenPIPreparedSkillError(
+                    f"Prepared prompt Skill has duplicate {family_name}."
+                )
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "stage_id": self.stage_id,
             "skill_id": self.skill_id,
             "prompt": self.prompt,
@@ -232,6 +361,14 @@ class OpenPIPreparedPromptSkill:
                 self.expected_openpi_window_count
             ),
         }
+        if self.training_prompt_variants or self.held_out_prompt_variants:
+            payload["training_prompt_variants"] = list(
+                self.training_prompt_variants
+            )
+            payload["held_out_prompt_variants"] = list(
+                self.held_out_prompt_variants
+            )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -304,6 +441,8 @@ class OpenPIPreparedPromptBinding:
     prompt_stage_sampling_policy: str
     prompt_stage_sampling_seed: int
     episodes: tuple[OpenPIPreparedPromptEpisodeSelection, ...]
+    prompt_family_sampling_policy: str | None = None
+    prompt_family_sampling_seed: int = 20260811
     training_view_hash: str = field(init=False)
     binding_hash: str = field(init=False)
     _selection_by_key: Mapping[
@@ -323,6 +462,20 @@ class OpenPIPreparedPromptBinding:
                 raise OpenPIPreparedSkillError(
                     f"Prepared prompt binding has duplicate {attribute}."
                 )
+        family_prompts = tuple(
+            prompt
+            for skill in self.prompt_skills
+            for prompt in (
+                skill.prompt,
+                *skill.training_prompt_variants,
+                *skill.held_out_prompt_variants,
+            )
+        )
+        if len(set(family_prompts)) != len(family_prompts):
+            raise OpenPIPreparedSkillError(
+                "Prepared prompt binding requires globally unique canonical, "
+                "training-variant, and held-out prompts."
+            )
         if int(self.action_horizon) <= 0:
             raise OpenPIPreparedSkillError(
                 "Prepared prompt binding action_horizon must be positive."
@@ -334,6 +487,33 @@ class OpenPIPreparedPromptBinding:
             raise OpenPIPreparedSkillError(
                 "Prepared prompt binding has an unsupported stage sampler."
             )
+        if self.prompt_family_sampling_policy is None:
+            if any(
+                skill.training_prompt_variants
+                or skill.held_out_prompt_variants
+                for skill in self.prompt_skills
+            ):
+                raise OpenPIPreparedSkillError(
+                    "Prepared prompt families require an explicit sampler."
+                )
+        elif (
+            self.prompt_family_sampling_policy
+            != OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1
+        ):
+            raise OpenPIPreparedSkillError(
+                "Prepared prompt binding has an unsupported family sampler."
+            )
+        else:
+            for skill in self.prompt_skills:
+                if len(skill.training_prompt_variants) != (
+                    OPENPI_PROMPT_FAMILY_TRAINING_VARIANT_COUNT_V1
+                ) or len(skill.held_out_prompt_variants) != (
+                    OPENPI_PROMPT_FAMILY_HELD_OUT_VARIANT_COUNT_V1
+                ):
+                    raise OpenPIPreparedSkillError(
+                        "The 80/20 prompt-family sampler requires exactly "
+                        "12 training variants and 4 held-out prompts per stage."
+                    )
         if not self.episodes:
             raise OpenPIPreparedSkillError(
                 "Prepared prompt binding requires Episode selections."
@@ -422,7 +602,11 @@ class OpenPIPreparedPromptBinding:
             "binding_hash",
             canonical_content_hash(
                 self.to_payload(include_hash=False),
-                domain=OPENPI_PREPARED_PROMPT_BINDING_HASH_DOMAIN_V1,
+                domain=(
+                    OPENPI_PREPARED_PROMPT_BINDING_HASH_DOMAIN_V1
+                    if self.prompt_family_sampling_policy is None
+                    else OPENPI_PREPARED_PROMPT_BINDING_HASH_DOMAIN_V2
+                ),
             ),
         )
 
@@ -473,7 +657,11 @@ class OpenPIPreparedPromptBinding:
 
     def to_payload(self, *, include_hash: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
-            "schema": OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V1,
+            "schema": (
+                OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V1
+                if self.prompt_family_sampling_policy is None
+                else OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V2
+            ),
             "training_view_hash": self.training_view_hash,
             "prompt_skills": [skill.to_payload() for skill in self.prompt_skills],
             "camera_slot_to_dataset_key": [
@@ -512,8 +700,20 @@ class OpenPIPreparedPromptBinding:
             ],
             "adapter_implementation_id": (
                 "deployments.openpi.prepared_prompt_interval_adapter.v1"
+                if self.prompt_family_sampling_policy is None
+                else "deployments.openpi.prepared_prompt_interval_adapter.v2"
             ),
         }
+        if self.prompt_family_sampling_policy is not None:
+            payload["prompt_family_sampling_policy"] = (
+                self.prompt_family_sampling_policy
+            )
+            payload["prompt_family_sampling_seed"] = (
+                self.prompt_family_sampling_seed
+            )
+            payload["canonical_prompt_percent"] = 80
+            payload["training_variant_prompt_percent"] = 20
+            payload["held_out_prompts_in_training"] = False
         if include_hash:
             payload["binding_hash"] = self.binding_hash
         return payload
@@ -691,6 +891,10 @@ def compose_openpi_prepared_prompt_binding(
         OPENPI_PROMPT_STAGE_SAMPLING_NATURAL_V1
     ),
     prompt_stage_sampling_seed: int = 20260811,
+    training_prompt_variants: Mapping[str, Sequence[str]] | None = None,
+    held_out_prompt_variants: Mapping[str, Sequence[str]] | None = None,
+    prompt_family_sampling_policy: str | None = None,
+    prompt_family_sampling_seed: int = 20260811,
 ) -> OpenPIPreparedPromptBinding:
     """Compose disjoint single-Skill bindings without copying source data."""
 
@@ -730,6 +934,25 @@ def compose_openpi_prepared_prompt_binding(
         raise OpenPIPreparedSkillError(
             "Prepared prompt OpenPI window counts must be positive."
         )
+    training_families = {
+        str(stage_id): tuple(str(prompt).strip() for prompt in prompts)
+        for stage_id, prompts in (training_prompt_variants or {}).items()
+    }
+    held_out_families = {
+        str(stage_id): tuple(str(prompt).strip() for prompt in prompts)
+        for stage_id, prompts in (held_out_prompt_variants or {}).items()
+    }
+    stage_ids = {str(stage_id).strip() for stage_id, _prompt, _binding in values}
+    if set(training_families) - stage_ids or set(held_out_families) - stage_ids:
+        raise OpenPIPreparedSkillError(
+            "Prepared prompt families reference an unknown stage."
+        )
+    if prompt_family_sampling_policy is None and (
+        training_families or held_out_families
+    ):
+        prompt_family_sampling_policy = (
+            OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1
+        )
     prompt_skills = tuple(
         OpenPIPreparedPromptSkill(
             stage_id=str(stage_id).strip(),
@@ -741,6 +964,12 @@ def compose_openpi_prepared_prompt_binding(
             episode_count=len(binding.episodes),
             window_count=int(binding.to_payload()["window_count"]),
             expected_openpi_window_count=openpi_counts[str(stage_id)],
+            training_prompt_variants=training_families.get(
+                str(stage_id), ()
+            ),
+            held_out_prompt_variants=held_out_families.get(
+                str(stage_id), ()
+            ),
         )
         for stage_id, prompt, binding in values
     )
@@ -808,6 +1037,8 @@ def compose_openpi_prepared_prompt_binding(
         prompt_stage_sampling_policy=str(prompt_stage_sampling_policy),
         prompt_stage_sampling_seed=int(prompt_stage_sampling_seed),
         episodes=episodes,
+        prompt_family_sampling_policy=prompt_family_sampling_policy,
+        prompt_family_sampling_seed=int(prompt_family_sampling_seed),
     )
 
 
@@ -826,7 +1057,10 @@ def load_openpi_prepared_skill_binding_manifest(
         raise OpenPIPreparedSkillError(
             "Prepared Skill binding manifest is incomplete."
         )
-    if binding_payload.get("schema") != OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V1:
+    if binding_payload.get("schema") not in {
+        OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V1,
+        OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V2,
+    }:
         raise OpenPIPreparedSkillError(
             "Prepared Skill binding manifest has an unsupported schema."
         )
@@ -864,6 +1098,20 @@ def load_openpi_prepared_skill_binding_manifest(
         action_pose_mode=str(binding_payload.get("action_pose_mode", "")),
         source_mixing_policy=str(
             binding_payload.get("source_mixing_policy", "")
+        ),
+        source_repeat_weights=tuple(
+            (
+                str(item["source_dataset_id"]),
+                int(item["repeat_weight"]),
+            )
+            for item in binding_payload.get("source_repeat_weights", ())
+            if isinstance(item, Mapping)
+        ),
+        selection_policy_id=str(
+            binding_payload.get(
+                "selection_policy_id",
+                "strict_success_non_abnormal",
+            )
         ),
         episodes=tuple(
             OpenPIPreparedEpisodeSelection(
@@ -915,7 +1163,10 @@ def load_openpi_prepared_prompt_binding(
         raise OpenPIPreparedSkillError(
             "Prepared prompt binding manifest is incomplete."
         )
-    if binding_payload.get("schema") != OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V1:
+    if binding_payload.get("schema") not in {
+        OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V1,
+        OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V2,
+    }:
         raise OpenPIPreparedSkillError(
             "Prepared prompt binding manifest has an unsupported schema."
         )
@@ -940,6 +1191,14 @@ def load_openpi_prepared_prompt_binding(
             window_count=int(item["window_count"]),
             expected_openpi_window_count=int(
                 item["expected_openpi_window_count"]
+            ),
+            training_prompt_variants=tuple(
+                str(prompt)
+                for prompt in item.get("training_prompt_variants", ())
+            ),
+            held_out_prompt_variants=tuple(
+                str(prompt)
+                for prompt in item.get("held_out_prompt_variants", ())
             ),
         )
         for item in binding_payload.get("prompt_skills", ())
@@ -994,6 +1253,14 @@ def load_openpi_prepared_prompt_binding(
             binding_payload.get("prompt_stage_sampling_seed", 0)
         ),
         episodes=episodes,
+        prompt_family_sampling_policy=(
+            None
+            if "prompt_family_sampling_policy" not in binding_payload
+            else str(binding_payload["prompt_family_sampling_policy"])
+        ),
+        prompt_family_sampling_seed=int(
+            binding_payload.get("prompt_family_sampling_seed", 20260811)
+        ),
     )
     if binding.to_payload() != dict(binding_payload):
         raise OpenPIPreparedSkillError(
@@ -1061,7 +1328,11 @@ def materialize_openpi_prepared_skill_binding(
                             if isinstance(binding, OpenPIPreparedPromptBinding)
                             else "prepared_skill"
                         ),
-                        "quality_class": "strict_success_non_abnormal",
+                        "quality_class": (
+                            binding.selection_policy_id
+                            if isinstance(binding, OpenPIPreparedSkillBinding)
+                            else "strict_success_non_abnormal"
+                        ),
                         "prepared_training_view_hash": (
                             binding.training_view_hash
                         ),
@@ -1093,9 +1364,17 @@ def materialize_openpi_prepared_skill_binding(
         payload = binding.to_payload()
         payload["source_manifests"] = source_manifests
         manifest_domain = (
-            OPENPI_PREPARED_PROMPT_BINDING_MANIFEST_DOMAIN_V1
+            (
+                OPENPI_PREPARED_PROMPT_BINDING_MANIFEST_DOMAIN_V1
+                if binding.prompt_family_sampling_policy is None
+                else OPENPI_PREPARED_PROMPT_BINDING_MANIFEST_DOMAIN_V2
+            )
             if isinstance(binding, OpenPIPreparedPromptBinding)
-            else OPENPI_PREPARED_SKILL_BINDING_MANIFEST_DOMAIN_V1
+            else (
+                OPENPI_PREPARED_SKILL_BINDING_MANIFEST_DOMAIN_V1
+                if not binding.source_repeat_weights
+                else OPENPI_PREPARED_SKILL_BINDING_MANIFEST_DOMAIN_V2
+            )
         )
         (staging / "manifest.cjson").write_bytes(
             canonical_bytes(
@@ -1198,6 +1477,7 @@ class OpenPIPreparedSkillDataset:
         self._epoch = 0
         self._raw_indices_by_stage: dict[str, tuple[int, ...]] | None = None
         self._index_map: tuple[int, ...] | None = None
+        self._prompt_by_virtual_index: tuple[str, ...] | None = None
         self._balanced_composition: dict[str, int] | None = None
         if (
             isinstance(binding, OpenPIPreparedPromptBinding)
@@ -1255,7 +1535,7 @@ class OpenPIPreparedSkillDataset:
         if self._raw_indices_by_stage is None:
             return
         assert isinstance(self.binding, OpenPIPreparedPromptBinding)
-        target = min(len(values) for values in self._raw_indices_by_stage.values())
+        target = effective_prompt_stage_window_count(self.binding)
         selected_by_stage: list[np.ndarray] = []
         for stage_ordinal, skill in enumerate(self.binding.prompt_skills):
             values = np.asarray(
@@ -1277,6 +1557,46 @@ class OpenPIPreparedSkillDataset:
             for position in range(target)
             for stage in range(len(selected_by_stage))
         )
+        self._prompt_by_virtual_index = None
+        if self.binding.prompt_family_sampling_policy is not None:
+            prompts_by_stage: list[np.ndarray] = []
+            canonical_count = target * 4 // 5
+            variant_total = target - canonical_count
+            for stage_ordinal, skill in enumerate(self.binding.prompt_skills):
+                variants = skill.training_prompt_variants
+                base_count, extra_count = divmod(
+                    variant_total,
+                    len(variants),
+                )
+                variant_counts = [base_count] * len(variants)
+                for offset in range(extra_count):
+                    variant_counts[(int(epoch) + offset) % len(variants)] += 1
+                stage_prompts = np.asarray(
+                    [skill.prompt] * canonical_count
+                    + [
+                        prompt
+                        for prompt, count in zip(variants, variant_counts)
+                        for _ in range(count)
+                    ],
+                    dtype=object,
+                )
+                random = np.random.default_rng(
+                    np.random.SeedSequence(
+                        [
+                            self.binding.prompt_family_sampling_seed,
+                            int(epoch),
+                            stage_ordinal,
+                            0x50524F4D,
+                        ]
+                    )
+                )
+                random.shuffle(stage_prompts)
+                prompts_by_stage.append(stage_prompts)
+            self._prompt_by_virtual_index = tuple(
+                str(prompts_by_stage[stage][position])
+                for position in range(target)
+                for stage in range(len(prompts_by_stage))
+            )
         composition: dict[str, int] = {}
         source_id_by_root = {
             episode.source_dataset_root: episode.source_dataset_id
@@ -1333,8 +1653,25 @@ class OpenPIPreparedSkillDataset:
             )
         return result
 
+    def prepared_prompt_family_indices(self) -> dict[str, int]:
+        """Return the first virtual index for every training-time prompt."""
+
+        if not isinstance(self.binding, OpenPIPreparedPromptBinding):
+            return {}
+        if self._prompt_by_virtual_index is None:
+            stage_indices = self.prepared_prompt_stage_indices()
+            return {
+                skill.prompt: stage_indices[skill.stage_id]
+                for skill in self.binding.prompt_skills
+            }
+        result: dict[str, int] = {}
+        for virtual_index, prompt in enumerate(self._prompt_by_virtual_index):
+            result.setdefault(prompt, virtual_index)
+        return result
+
     def __getitem__(self, index: int) -> Any:
-        index = self._raw_index(index)
+        virtual_index = int(index)
+        index = self._raw_index(virtual_index)
         source_root, episode_index, row_index = _sample_locator(
             self.dataset,
             int(index),
@@ -1351,10 +1688,14 @@ class OpenPIPreparedSkillDataset:
         sample = self.dataset[int(index)]
         prompt = None
         if isinstance(self.binding, OpenPIPreparedPromptBinding):
-            prompt = self.binding.prompt_for(
-                source_root,
-                episode_index,
-                row_index,
+            prompt = (
+                self.binding.prompt_for(
+                    source_root,
+                    episode_index,
+                    row_index,
+                )
+                if self._prompt_by_virtual_index is None
+                else self._prompt_by_virtual_index[virtual_index]
             )
         if isinstance(sample, Mapping) and (
             self.state_augmentation_key in sample
@@ -1411,7 +1752,7 @@ class OpenPIPreparedSkillDataset:
         if self._raw_indices_by_stage is None:
             return base
         assert isinstance(self.binding, OpenPIPreparedPromptBinding)
-        return {
+        metadata = {
             "source_mixing": base,
             "prompt_stage_sampling_policy": (
                 self.binding.prompt_stage_sampling_policy
@@ -1423,12 +1764,38 @@ class OpenPIPreparedSkillDataset:
                 key: len(value)
                 for key, value in self._raw_indices_by_stage.items()
             },
-            "effective_window_count_per_stage": min(
-                len(value) for value in self._raw_indices_by_stage.values()
+            "effective_window_count_per_stage": (
+                effective_prompt_stage_window_count(self.binding)
             ),
             "effective_epoch_window_count": len(self),
             "selection": "deterministic_epoch_rotated_without_replacement",
         }
+        if self._prompt_by_virtual_index is not None:
+            minimum_raw_count = min(
+                len(value) for value in self._raw_indices_by_stage.values()
+            )
+            prompt_counts: dict[str, int] = {}
+            for prompt in self._prompt_by_virtual_index:
+                prompt_counts[prompt] = prompt_counts.get(prompt, 0) + 1
+            metadata.update(
+                {
+                    "prompt_family_sampling_policy": (
+                        self.binding.prompt_family_sampling_policy
+                    ),
+                    "prompt_family_sampling_seed": (
+                        self.binding.prompt_family_sampling_seed
+                    ),
+                    "canonical_prompt_percent": 80,
+                    "training_variant_prompt_percent": 20,
+                    "held_out_prompts_in_training": False,
+                    "prompt_family_quota_trimmed_window_count_per_stage": (
+                        minimum_raw_count
+                        - effective_prompt_stage_window_count(self.binding)
+                    ),
+                    "training_prompt_counts": prompt_counts,
+                }
+            )
+        return metadata
 
 
 class OpenPINaturalMergeSampler:
@@ -1493,20 +1860,49 @@ def patch_openpi_prepared_skill_dataset(
         raise OpenPIPreparedSkillError(
             "OpenPI has no compatible mixed-dataset sampler seam."
         )
-    if binding.source_mixing_policy != OPENPI_SOURCE_MIXING_NATURAL_V1:
+    if binding.source_mixing_policy not in {
+        OPENPI_SOURCE_MIXING_NATURAL_V1,
+        OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1,
+    }:
         raise OpenPIPreparedSkillError(
-            "Prepared binding does not request the supported natural merge."
+            "Prepared binding requests an unsupported source merge."
         )
     original_build_index = dataset_type._build_index
     original_mixed_init = mixed_type.__init__
     original_mixing_metadata = getattr(mixed_type, "mixing_metadata", None)
     original_create = data_loader.create_torch_dataset
 
+    def repeat_weight(source_id: str) -> int:
+        return (
+            binding.repeat_weight_for(source_id)
+            if isinstance(binding, OpenPIPreparedSkillBinding)
+            else 1
+        )
+
     def filtered_build_index(instance: Any) -> list[tuple[int, int]]:
         if int(instance.action_horizon) != binding.action_horizon:
             raise OpenPIPreparedSkillError(
                 "OpenPI action horizon differs from the prepared binding."
             )
+        source_root = Path(instance.dataset_root).expanduser().resolve()
+        source_id = next(
+            (
+                episode.source_dataset_id
+                for episode in binding.episodes
+                if episode.source_dataset_root == source_root
+            ),
+            str(source_root),
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "openpi_prepared_source_index_start",
+                    "source_dataset_id": source_id,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         base_index = original_build_index(instance)
         filtered: list[tuple[int, int]] = []
         for episode_position, row_index in base_index:
@@ -1523,26 +1919,70 @@ def patch_openpi_prepared_skill_dataset(
             raise OpenPIPreparedSkillError(
                 "One OpenPI source produced no prepared Skill windows."
             )
+        print(
+            json.dumps(
+                {
+                    "event": "openpi_prepared_source_index_complete",
+                    "source_dataset_id": source_id,
+                    "openpi_quality_valid_window_count": len(filtered),
+                    "repeat_weight": repeat_weight(source_id),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return filtered
 
-    def natural_mixed_init(instance: Any, *args: Any, **kwargs: Any) -> None:
+    def prepared_mixed_init(instance: Any, *args: Any, **kwargs: Any) -> None:
         original_mixed_init(instance, *args, **kwargs)
         instance._mix_index = tuple(
             (source_position, sample_position)
             for source_position, child in enumerate(instance._datasets)
             for sample_position in range(len(child))
+            for _repeat in range(
+                repeat_weight(
+                    str(instance.source_configs[source_position].name)
+                )
+            )
         )
         if not instance._mix_index:
             raise OpenPIPreparedSkillError(
-                "OpenPI natural merge produced no prepared Skill windows."
+                "OpenPI prepared merge produced no Skill windows."
             )
+        print(
+            json.dumps(
+                {
+                    "event": "openpi_prepared_mix_index_complete",
+                    "repeated_epoch_sample_count": len(instance._mix_index),
+                    "source_repeat_weights": {
+                        source_id: repeat_weight(source_id)
+                        for source_id in binding.source_dataset_ids
+                    },
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
-    def natural_mixing_metadata(instance: Any) -> dict[str, Any]:
+    def prepared_mixing_metadata(instance: Any) -> dict[str, Any]:
+        weighted = (
+            isinstance(binding, OpenPIPreparedSkillBinding)
+            and bool(binding.source_repeat_weights)
+        )
         return {
-            "schema": "dexteleop_v23_natural_merge_v1",
-            "source_mixing_policy": OPENPI_SOURCE_MIXING_NATURAL_V1,
+            "schema": (
+                "dexteleop_v23_bound_source_repeat_v1"
+                if weighted
+                else "dexteleop_v23_natural_merge_v1"
+            ),
+            "source_mixing_policy": binding.source_mixing_policy,
             "epoch_sample_counts": instance.composition(),
-            "each_quality_valid_window_once_per_epoch": True,
+            "each_quality_valid_window_once_per_epoch": not weighted,
+            "repeat_each_quality_valid_window_by_source_weight": weighted,
+            "source_repeat_weights": {
+                source_id: repeat_weight(source_id)
+                for source_id in binding.source_dataset_ids
+            },
             "shuffle": "deterministic_individual_sample_epoch_shuffle_v1",
             "sources": [source.to_dict() for source in instance.source_configs],
         }
@@ -1563,9 +2003,9 @@ def patch_openpi_prepared_skill_dataset(
         )
 
     data_loader.create_torch_dataset = create_prepared_dataset
-    mixed_type.__init__ = natural_mixed_init
+    mixed_type.__init__ = prepared_mixed_init
     if callable(original_mixing_metadata):
-        mixed_type.mixing_metadata = natural_mixing_metadata
+        mixed_type.mixing_metadata = prepared_mixing_metadata
     setattr(data_loader, sampler_name, OpenPINaturalMergeSampler)
     try:
         yield
@@ -1579,11 +2019,15 @@ def patch_openpi_prepared_skill_dataset(
 
 
 __all__ = [
+    "OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1",
     "OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V1",
+    "OPENPI_PREPARED_PROMPT_BINDING_SCHEMA_V2",
     "OPENPI_PREPARED_SKILL_ADAPTER_IMPLEMENTATION_V1",
     "OPENPI_PREPARED_SKILL_ADAPTER_IMPLEMENTATION_V2",
     "OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V1",
+    "OPENPI_PREPARED_SKILL_BINDING_SCHEMA_V2",
     "OPENPI_SOURCE_MIXING_NATURAL_V1",
+    "OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1",
     "OpenPINaturalMergeSampler",
     "OpenPIPreparedPromptBinding",
     "OpenPIPreparedPromptEpisodeSelection",
@@ -1595,6 +2039,7 @@ __all__ = [
     "OpenPIPreparedSkillError",
     "binding_source_manifests",
     "compose_openpi_prepared_prompt_binding",
+    "effective_prompt_stage_window_count",
     "load_openpi_prepared_prompt_binding",
     "load_openpi_prepared_skill_binding_manifest",
     "load_openpi_prepared_skill_binding",

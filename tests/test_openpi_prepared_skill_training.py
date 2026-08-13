@@ -11,7 +11,9 @@ import numpy as np
 import pytest
 
 from deployments.openpi.training.prepared_skill import (
+    OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1,
     OPENPI_SOURCE_MIXING_NATURAL_V1,
+    OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1,
     OPENPI_PROMPT_STAGE_SAMPLING_BALANCED_V1,
     OpenPINaturalMergeSampler,
     OpenPIPreparedEpisodeSelection,
@@ -34,6 +36,7 @@ from deployments.openpi.training.prepared_skill_launch import (
     _openpi_data_assets_root,
     _openpi_model_rtc_receipt_import_binding,
     _prepared_metadata_binding,
+    _prompt_family_token_preflight,
     _resolved_policy_metadata_binding,
     _resolve_train_checkpoint_policy,
     _skill_projection_catalog,
@@ -538,6 +541,184 @@ def test_prepared_prompt_binding_balances_stage_windows_without_replacement(
     assert dataset.mixing_metadata()["effective_epoch_window_count"] == 2
 
 
+def test_prepared_prompt_family_enforces_exact_80_20_and_excludes_held_out(
+    tmp_path: Path,
+) -> None:
+    first = _binding(tmp_path)
+    first = dataclasses.replace(
+        first,
+        episodes=(
+            dataclasses.replace(first.episodes[0], intervals=((0, 82),)),
+        ),
+    )
+    second = dataclasses.replace(
+        first,
+        training_view_hash="e" * 64,
+        skill_id="fixture.skill.stage2",
+        skill_training_contract_hash="f" * 64,
+        episodes=(
+            dataclasses.replace(first.episodes[0], intervals=((100, 182),)),
+        ),
+    )
+    training_variants = {
+        stage_id: tuple(
+            f"{stage_id} training prompt variant {index}"
+            for index in range(12)
+        )
+        for stage_id in ("stage1", "stage2")
+    }
+    held_out_variants = {
+        stage_id: tuple(
+            f"{stage_id} held-out prompt variant {index}"
+            for index in range(4)
+        )
+        for stage_id in ("stage1", "stage2")
+    }
+    canonical = {
+        "stage1": "stage1 canonical prompt",
+        "stage2": "stage2 canonical prompt",
+    }
+    binding = compose_openpi_prepared_prompt_binding(
+        (
+            ("stage1", canonical["stage1"], first),
+            ("stage2", canonical["stage2"], second),
+        ),
+        organized_dataset_root=tmp_path / "joint-family",
+        prompt_stage_sampling_policy=(
+            OPENPI_PROMPT_STAGE_SAMPLING_BALANCED_V1
+        ),
+        prompt_stage_sampling_seed=7,
+        training_prompt_variants=training_variants,
+        held_out_prompt_variants=held_out_variants,
+        prompt_family_sampling_policy=(
+            OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1
+        ),
+        prompt_family_sampling_seed=11,
+    )
+
+    class Episode:
+        episode_index = 0
+
+    class NumericDataset:
+        dataset_root = tmp_path / "source-a"
+        _episodes = (Episode(),)
+        _index = tuple((0, row) for row in (*range(67), *range(100, 167)))
+
+        @staticmethod
+        def __getitem__(index: int) -> dict[str, object]:
+            return {"row": NumericDataset._index[index][1]}
+
+        @staticmethod
+        def __len__() -> int:
+            return len(NumericDataset._index)
+
+    dataset = OpenPIPreparedSkillDataset(
+        NumericDataset(),
+        binding,
+        "augmentation-key",
+    )
+    assert len(dataset) == 130
+    epoch0_prompts = tuple(dataset[index]["prompt"] for index in range(len(dataset)))
+    counts0 = {
+        prompt: epoch0_prompts.count(prompt)
+        for prompt in set(epoch0_prompts)
+    }
+    for stage_id in ("stage1", "stage2"):
+        assert counts0[canonical[stage_id]] == 52
+        assert sum(
+            counts0.get(prompt, 0)
+            for prompt in training_variants[stage_id]
+        ) == 13
+        assert counts0[training_variants[stage_id][0]] == 2
+        assert all(
+            prompt not in counts0 for prompt in held_out_variants[stage_id]
+        )
+    assert len({dataset[index]["row"] for index in range(len(dataset))}) == 130
+
+    dataset.set_epoch(1)
+    epoch1_prompts = tuple(dataset[index]["prompt"] for index in range(len(dataset)))
+    counts1 = {
+        prompt: epoch1_prompts.count(prompt)
+        for prompt in set(epoch1_prompts)
+    }
+    for stage_id in ("stage1", "stage2"):
+        assert counts1[canonical[stage_id]] == 52
+        assert counts1[training_variants[stage_id][0]] == 1
+        assert counts1[training_variants[stage_id][1]] == 2
+    assert epoch1_prompts != epoch0_prompts
+    dataset.set_epoch(0)
+    assert tuple(
+        dataset[index]["prompt"] for index in range(len(dataset))
+    ) == epoch0_prompts
+
+    metadata = dataset.mixing_metadata()
+    assert metadata["openpi_quality_valid_window_counts_by_stage"] == {
+        "stage1": 67,
+        "stage2": 67,
+    }
+    assert metadata["effective_window_count_per_stage"] == 65
+    assert metadata["prompt_family_quota_trimmed_window_count_per_stage"] == 2
+    assert metadata["canonical_prompt_percent"] == 80
+    assert metadata["training_variant_prompt_percent"] == 20
+    assert metadata["held_out_prompts_in_training"] is False
+    root = materialize_openpi_prepared_skill_binding(
+        binding,
+        binding.organized_dataset_root,
+    )
+    loaded = load_openpi_prepared_prompt_binding(root)
+    assert loaded.to_payload() == binding.to_payload()
+
+
+def test_prompt_family_token_preflight_covers_training_and_held_out(
+    tmp_path: Path,
+) -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "deployments/openpi/configs/training"
+        / "writing_multistage_prompt_family_0804_0806_front_h16_absolute_v2.json"
+    )
+    profile = _load_profile(profile_path)
+
+    class SentencePiece:
+        @staticmethod
+        def encode(value: str, *, add_bos: bool) -> list[int]:
+            assert add_bos is True
+            return list(range(len(value.split()) + 1))
+
+    class Paligemma:
+        _tokenizer = SentencePiece()
+        _max_len = 200
+
+    class TokenizePrompt:
+        tokenizer = Paligemma()
+        discrete_state_input = True
+
+    data_config = types.SimpleNamespace(
+        model_transforms=types.SimpleNamespace(inputs=(TokenizePrompt(),))
+    )
+    model_config = types.SimpleNamespace(max_token_len=200)
+
+    summary = _prompt_family_token_preflight(
+        profile,
+        data_config,
+        model_config,
+    )
+    assert summary is not None
+    assert summary["prompt_count"] == 68
+    assert summary["measured_combination_count"] == 204
+    assert summary["state_dimension"] == 16
+    assert summary["truncation_detected"] is False
+
+    too_short = dict(profile)
+    too_short["max_full_token_length"] = 1
+    with pytest.raises(ValueError, match="exceeds the profile limit"):
+        _prompt_family_token_preflight(
+            too_short,
+            data_config,
+            model_config,
+        )
+
+
 def test_post_identity_transform_runs_for_numeric_only_sample(
     tmp_path: Path,
 ) -> None:
@@ -819,6 +1000,29 @@ def test_binding_materializes_source_local_episode_manifests(tmp_path: Path) -> 
     assert {tuple(row["camera_slots"]) for row in rows} == {("base_0_rgb",)}
     assert {row["source_episode_index"] for row in rows} == {0}
 
+    weighted = dataclasses.replace(
+        binding,
+        source_mixing_policy=OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1,
+        source_repeat_weights=(("source-a", 1), ("source-b", 6)),
+        selection_policy_id="coarse_stage1_non_abnormal_fixture_v1",
+    )
+    weighted_root = materialize_openpi_prepared_skill_binding(
+        weighted,
+        tmp_path / "weighted-out",
+    )
+    assert (
+        load_openpi_prepared_skill_binding_manifest(weighted_root).to_payload()
+        == weighted.to_payload()
+    )
+    assert weighted.to_payload()["prepared_interval_repeated_window_count"] == 8
+    weighted_rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(weighted_root.glob("source_*.jsonl"))
+    ]
+    assert {row["quality_class"] for row in weighted_rows} == {
+        "coarse_stage1_non_abnormal_fixture_v1"
+    }
+
 
 def test_openpi_patch_intersects_horizon_and_globalizes_source_identity(
     tmp_path: Path,
@@ -928,6 +1132,28 @@ def test_openpi_patch_intersects_horizon_and_globalizes_source_identity(
         assert dataset.mixing_metadata()["source_mixing_policy"] == (
             OPENPI_SOURCE_MIXING_NATURAL_V1
         )
+
+    weighted = dataclasses.replace(
+        binding,
+        source_mixing_policy=OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1,
+        source_repeat_weights=(("source-a", 1), ("source-b", 6)),
+        selection_policy_id="coarse_stage1_non_abnormal_fixture_v1",
+    )
+    with patch_openpi_prepared_skill_dataset(weighted):
+        weighted_dataset = data_loader.create_torch_dataset(None, 16, None)
+        assert len(weighted_dataset) == 8
+        assert weighted_dataset.composition() == {
+            "source-a": 2,
+            "source-b": 6,
+        }
+        metadata = weighted_dataset.mixing_metadata()
+        assert metadata["source_mixing_policy"] == (
+            OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1
+        )
+        assert metadata["source_repeat_weights"] == {
+            "source-a": 1,
+            "source-b": 6,
+        }
 
     assert data_loader.create_torch_dataset is original_create
     assert data_loader._DexTeleopV22ExactMixSampler is FakeExactMixSampler
@@ -1415,6 +1641,46 @@ def test_writing_0804_0806_joint_prompt_profile_binds_all_stages() -> None:
         == profile["expected_task_id"]
         for stage in stages
     )
+
+
+def test_writing_0804_0807_prompt_family_profile_binds_all_stages() -> None:
+    root = (
+        Path(__file__).resolve().parents[1]
+        / "deployments/openpi/configs/training"
+    )
+    profile = _load_profile(
+        root
+        / "writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json"
+    )
+    stages = profile["_resolved_prompt_stages"]
+    assert len(profile["sources"]) == 7
+    assert tuple(stage["stage_id"] for stage in stages) == (
+        "stage1",
+        "stage2",
+        "stage3",
+        "stage4",
+    )
+    assert tuple(stage["expected_window_count"] for stage in stages) == (
+        97250,
+        71511,
+        123287,
+        101492,
+    )
+    assert tuple(
+        stage["expected_openpi_window_count"] for stage in stages
+    ) == (84193, 68109, 99919, 9827)
+    assert tuple(stage["expected_child_binding_hash"] for stage in stages) == (
+        "f8b2f722c1e6bb35d70b26f5eb715c25722ad33247f88ba653ac23ba9fcd1c2e",
+        "8df5e18c7853e4eb0ae8530afb9868054f58e8cc61c815a7f0196818eda21ac0",
+        "634b6f1c3c416f1646754aa20cc6d8f466b6e8ad2bf6b570fbd34a29dcfde401",
+        "3b5c6e48549a38a54c1a84b704aee9b73cc7e38231d2c7054cecaad2abbc71c7",
+    )
+    assert profile["expected_total_window_count"] == 393540
+    assert profile["expected_union_episode_count"] == 1217
+    assert profile["expected_effective_epoch_window_count"] == 39300
+    assert profile["canonical_prompt_percent"] == 80
+    assert profile["training_variant_prompt_percent"] == 20
+    assert all(len(stage["profile"]["annotation_selection"]) == 34 for stage in stages)
 
 
 def test_prepared_profile_rejects_unknown_skill_catalog(tmp_path: Path) -> None:

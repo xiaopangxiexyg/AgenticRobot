@@ -15,6 +15,8 @@ import sys
 import types
 from typing import Any, Iterator, Mapping
 
+import numpy as np
+
 from dataset_interface.prepared_training import (
     PreparedSourceDataset,
     build_prepared_training_view,
@@ -37,16 +39,22 @@ from deployments.openpi.state_only import (
 )
 
 from .prepared_skill import (
+    OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1,
     OpenPIPreparedPromptBinding,
     OpenPIPreparedSkillBinding,
     OpenPIPreparedSkillError,
     binding_source_manifests,
     compose_openpi_prepared_prompt_binding,
+    effective_prompt_stage_window_count,
     load_openpi_prepared_prompt_binding,
     load_openpi_prepared_skill_binding_manifest,
     load_openpi_prepared_skill_binding,
     materialize_openpi_prepared_skill_binding,
     patch_openpi_prepared_skill_dataset,
+)
+from .stage1_scenario import (
+    STAGE1_SCENARIO_SELECTION_POLICY_V1,
+    prepare_stage1_scenario_selections,
 )
 from .prepared_model_rtc import (
     adapt_prepared_skill_model_rtc_config,
@@ -62,6 +70,12 @@ from .launch import MODEL_CONTINUATION_TRAINING_RUN_METADATA_KEY_V1
 PROFILE_SCHEMA_V1 = "dexteleop.openpi_prepared_skill_training_profile.v1"
 PROMPT_PROFILE_SCHEMA_V1 = (
     "dexteleop.openpi_prepared_prompt_training_profile.v1"
+)
+PROMPT_FAMILY_PROFILE_SCHEMA_V2 = (
+    "dexteleop.openpi_prepared_prompt_family_training_profile.v2"
+)
+STAGE1_SCENARIO_PROFILE_SCHEMA_V1 = (
+    "dexteleop.openpi_stage1_scenario_training_profile.v1"
 )
 DEFAULT_PROFILE = (
     Path(__file__).resolve().parents[1]
@@ -196,6 +210,8 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("schema") not in {
         PROFILE_SCHEMA_V1,
         PROMPT_PROFILE_SCHEMA_V1,
+        PROMPT_FAMILY_PROFILE_SCHEMA_V2,
+        STAGE1_SCENARIO_PROFILE_SCHEMA_V1,
     }:
         raise ValueError(f"Unsupported prepared Skill training profile: {source}.")
     required = [
@@ -210,8 +226,32 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
         "openpi_config_name",
         "openpi_asset_id",
     ]
-    if payload.get("schema") == PROFILE_SCHEMA_V1:
+    schema = payload.get("schema")
+    is_prompt_profile = schema in {
+        PROMPT_PROFILE_SCHEMA_V1,
+        PROMPT_FAMILY_PROFILE_SCHEMA_V2,
+    }
+    if schema == PROFILE_SCHEMA_V1:
         required.extend(("sources", "target_skill_id"))
+    elif schema == STAGE1_SCENARIO_PROFILE_SCHEMA_V1:
+        required.extend(
+            (
+                "sources",
+                "target_skill_id",
+                "target_progress_step_id",
+                "expected_total_raw_episode_count",
+                "expected_total_raw_frame_count",
+                "expected_total_eligible_episode_count",
+                "expected_prepared_interval_window_count",
+                "expected_prepared_interval_repeated_window_count",
+                "expected_openpi_quality_valid_window_count",
+                "expected_openpi_repeated_epoch_sample_count",
+                "expected_policy_io_layout_hash",
+                "source_mixing_policy",
+                "default_prompt",
+                "tail_policy",
+            )
+        )
     else:
         required.extend(
             (
@@ -228,6 +268,17 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
                 "tail_policy",
             )
         )
+        if schema == PROMPT_FAMILY_PROFILE_SCHEMA_V2:
+            required.extend(
+                (
+                    "prompt_family_sampling_policy",
+                    "prompt_family_sampling_seed",
+                    "canonical_prompt_percent",
+                    "training_variant_prompt_percent",
+                    "max_full_token_length",
+                    "prompt_state_dimension",
+                )
+            )
     missing = [name for name in required if not payload.get(name)]
     if missing:
         raise ValueError(f"Prepared Skill profile is missing: {missing}.")
@@ -240,7 +291,7 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
             "State-only OpenPI training requires "
             "openpi_norm_stats_assets_dir."
         )
-    if payload.get("schema") == PROMPT_PROFILE_SCHEMA_V1:
+    if is_prompt_profile:
         raw_stages = payload.get("prompt_stages")
         if not isinstance(raw_stages, list) or len(raw_stages) < 2:
             raise ValueError(
@@ -252,7 +303,20 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
                 raise ValueError("Prepared prompt stage must be an object.")
             stage_id = str(item.get("stage_id", "")).strip()
             skill_id = str(item.get("skill_id", "")).strip()
-            prompt = str(item.get("prompt", "")).strip()
+            prompt_key = (
+                "prompt"
+                if schema == PROMPT_PROFILE_SCHEMA_V1
+                else "canonical_prompt"
+            )
+            prompt = str(item.get(prompt_key, "")).strip()
+            training_variants = tuple(
+                str(value).strip()
+                for value in item.get("training_prompt_variants", ())
+            )
+            held_out_variants = tuple(
+                str(value).strip()
+                for value in item.get("held_out_prompt_variants", ())
+            )
             profile_value = str(item.get("profile", "")).strip()
             expected_windows = int(item.get("expected_window_count", 0))
             expected_openpi_windows = int(
@@ -280,6 +344,17 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
                     "expected_window_count, and positive "
                     "expected_openpi_window_count."
                 )
+            if schema == PROMPT_FAMILY_PROFILE_SCHEMA_V2 and (
+                len(training_variants) != 12
+                or len(held_out_variants) != 4
+                or any(not value for value in training_variants)
+                or any(not value for value in held_out_variants)
+            ):
+                raise ValueError(
+                    "Prepared prompt-family stage requires exactly 12 "
+                    "non-empty training variants and 4 non-empty held-out "
+                    "prompts."
+                )
             child_path = Path(profile_value).expanduser()
             if not child_path.is_absolute():
                 child_path = source.parent / child_path
@@ -297,6 +372,8 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
                     "stage_id": stage_id,
                     "skill_id": skill_id,
                     "prompt": prompt,
+                    "training_prompt_variants": training_variants,
+                    "held_out_prompt_variants": held_out_variants,
                     "expected_window_count": expected_windows,
                     "expected_openpi_window_count": expected_openpi_windows,
                     "expected_child_binding_hash": child_binding_hash,
@@ -309,6 +386,29 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
             if len(set(values)) != len(values):
                 raise ValueError(
                     f"Prepared prompt profile has duplicate {key}."
+                )
+        if schema == PROMPT_FAMILY_PROFILE_SCHEMA_V2:
+            all_prompts = tuple(
+                prompt
+                for item in resolved
+                for prompt in (
+                    item["prompt"],
+                    *item["training_prompt_variants"],
+                    *item["held_out_prompt_variants"],
+                )
+            )
+            if len(set(all_prompts)) != len(all_prompts):
+                raise ValueError(
+                    "Prepared prompt-family profile requires every canonical, "
+                    "training, and held-out prompt to be globally unique."
+                )
+            if (
+                int(payload["canonical_prompt_percent"]) != 80
+                or int(payload["training_variant_prompt_percent"]) != 20
+            ):
+                raise ValueError(
+                    "Prepared prompt-family profile requires an exact 80/20 "
+                    "canonical/training-variant split."
                 )
         common_keys = (
             "expected_task_id",
@@ -353,6 +453,77 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
                 )
         payload["_resolved_prompt_stages"] = resolved
         payload["_profile_path"] = str(source)
+    elif schema == STAGE1_SCENARIO_PROFILE_SCHEMA_V1:
+        source_values = payload.get("sources")
+        if not isinstance(source_values, list) or not source_values:
+            raise ValueError("Stage1 scenario profile requires source datasets.")
+        expected_weights = {
+            "fixed_middle": 1,
+            "initial_multi_choice": 4,
+            "midcourse_interrupt": 6,
+        }
+        seen_classes: set[str] = set()
+        seen_ids: set[str] = set()
+        raw_episode_total = 0
+        raw_frame_total = 0
+        for item in source_values:
+            if not isinstance(item, Mapping):
+                raise ValueError("Stage1 scenario source must be an object.")
+            source_id = str(item.get("source_dataset_id", "")).strip()
+            scenario_class = str(item.get("scenario_class", "")).strip()
+            task_scope = str(item.get("task_scope", "")).strip()
+            expected_task_id = str(item.get("expected_task_id", "")).strip()
+            repeat_weight = int(item.get("repeat_weight", 0))
+            raw_episodes = int(item.get("expected_raw_episode_count", 0))
+            raw_frames = int(item.get("expected_raw_frame_count", 0))
+            openpi_windows = int(
+                item.get("expected_openpi_quality_valid_window_count", 0)
+            )
+            if (
+                not source_id
+                or source_id in seen_ids
+                or scenario_class not in expected_weights
+                or not task_scope
+                or not expected_task_id
+                or repeat_weight != expected_weights.get(scenario_class)
+                or raw_episodes <= 0
+                or raw_frames <= 0
+                or openpi_windows <= 0
+            ):
+                raise ValueError(
+                    "Stage1 scenario source requires a unique id, known class, "
+                    "expected task id, positive inventory, and exact 1:4:6 weight."
+                )
+            if scenario_class in {
+                "initial_multi_choice",
+                "midcourse_interrupt",
+            } and task_scope != "stage1_only":
+                raise ValueError(
+                    f"{scenario_class} must be declared stage1_only."
+                )
+            seen_ids.add(source_id)
+            seen_classes.add(scenario_class)
+            raw_episode_total += raw_episodes
+            raw_frame_total += raw_frames
+        if seen_classes != set(expected_weights):
+            raise ValueError(
+                "Stage1 scenario profile must include all three scenario classes."
+            )
+        if (
+            raw_episode_total != int(payload["expected_total_raw_episode_count"])
+            or raw_frame_total != int(payload["expected_total_raw_frame_count"])
+        ):
+            raise ValueError(
+                "Stage1 scenario source inventories differ from profile totals."
+            )
+        if (
+            str(payload["source_mixing_policy"])
+            != OPENPI_SOURCE_MIXING_REPEAT_BY_SOURCE_V1
+        ):
+            raise ValueError(
+                "Stage1 scenario profile requires exact per-source repetition."
+            )
+        payload["_profile_path"] = str(source)
     return payload
 
 
@@ -373,12 +544,27 @@ def _validate_source_task_ids(
     profile: Mapping[str, Any],
     sources: tuple[PreparedSourceDataset, ...],
 ) -> None:
-    expected = str(profile.get("expected_task_id", "")).strip()
-    if not expected:
+    global_expected = str(profile.get("expected_task_id", "")).strip()
+    expected_by_source = {
+        str(item["source_dataset_id"]): str(
+            item.get("expected_task_id", global_expected)
+        ).strip()
+        for item in profile.get("sources", ())
+        if isinstance(item, Mapping)
+    }
+    if not global_expected and not any(expected_by_source.values()):
         return
 
     mismatches: list[str] = []
     for source in sources:
+        expected = expected_by_source.get(
+            source.source_dataset_id,
+            global_expected,
+        )
+        if not expected:
+            raise ValueError(
+                f"Source {source.source_dataset_id!r} has no expected task_id."
+            )
         root = source.dataset_root.expanduser().resolve()
         info_path = root / "meta" / "info.json"
         tasks_path = root / "meta" / "tasks.jsonl"
@@ -422,7 +608,7 @@ def _validate_source_task_ids(
 
     if mismatches:
         raise ValueError(
-            f"Source task_id differs from expected {expected!r}: "
+            "Source task_id differs from its explicitly bound expected value: "
             + "; ".join(mismatches)
         )
 
@@ -577,6 +763,30 @@ def _prepare_prompt_profile(
             profile["prompt_stage_sampling_policy"]
         ),
         prompt_stage_sampling_seed=int(profile["prompt_stage_sampling_seed"]),
+        training_prompt_variants=(
+            None
+            if profile.get("schema") != PROMPT_FAMILY_PROFILE_SCHEMA_V2
+            else {
+                str(item["stage_id"]): item["training_prompt_variants"]
+                for item in resolved
+            }
+        ),
+        held_out_prompt_variants=(
+            None
+            if profile.get("schema") != PROMPT_FAMILY_PROFILE_SCHEMA_V2
+            else {
+                str(item["stage_id"]): item["held_out_prompt_variants"]
+                for item in resolved
+            }
+        ),
+        prompt_family_sampling_policy=(
+            None
+            if profile.get("schema") != PROMPT_FAMILY_PROFILE_SCHEMA_V2
+            else str(profile["prompt_family_sampling_policy"])
+        ),
+        prompt_family_sampling_seed=int(
+            profile.get("prompt_family_sampling_seed", 20260811)
+        ),
     )
     expected_contract = (
         tuple(
@@ -606,10 +816,7 @@ def _prepare_prompt_profile(
             "Prepared prompt total window count differs: "
             f"actual={actual_total} expected={expected_total}."
         )
-    minimum_stage_windows = min(
-        skill.expected_openpi_window_count
-        for skill in binding.prompt_skills
-    )
+    minimum_stage_windows = effective_prompt_stage_window_count(binding)
     effective_epoch_windows = minimum_stage_windows * len(binding.prompt_skills)
     expected_effective = int(profile["expected_effective_epoch_window_count"])
     if effective_epoch_windows != expected_effective:
@@ -630,6 +837,256 @@ def _prepare_prompt_profile(
     return tuple(reports), binding, root
 
 
+def _prepare_stage1_scenario_profile(
+    profile: Mapping[str, Any],
+    *,
+    dry_run: bool,
+) -> tuple[Any, OpenPIPreparedSkillBinding | None, Path | None]:
+    sources = _sources(profile)
+    _validate_source_task_ids(profile, sources)
+    report, selections, training_view_hash = (
+        prepare_stage1_scenario_selections(
+            sources,
+            tuple(profile["sources"]),
+            target_skill_id=str(profile["target_skill_id"]),
+            target_progress_step_id=str(
+                profile["target_progress_step_id"]
+            ),
+            action_horizon=int(profile["action_horizon"]),
+        )
+    )
+    actual_total = len(report.included_episode_identities)
+    expected_total = int(profile["expected_total_eligible_episode_count"])
+    actual_by_source = {
+        str(item["source_dataset_id"]): int(item["included_episode_count"])
+        for item in report.source_statistics
+    }
+    if actual_total != expected_total:
+        raise ValueError(
+            "Stage1 eligible Episode count differs: "
+            f"actual={actual_total} expected={expected_total} "
+            f"by_source={actual_by_source}."
+        )
+    expected_by_source = {
+        str(item["source_dataset_id"]): int(
+            item["expected_eligible_episode_count"]
+        )
+        for item in profile["sources"]
+    }
+    if actual_by_source != expected_by_source:
+        raise ValueError(
+            "Stage1 eligible source counts differ: "
+            f"actual={actual_by_source} expected={expected_by_source}."
+        )
+    actual_raw_windows = sum(
+        int(item["prepared_interval_window_count"])
+        for item in report.source_statistics
+    )
+    actual_effective_windows = sum(
+        int(item["prepared_interval_repeated_window_count"])
+        for item in report.source_statistics
+    )
+    if (
+        actual_raw_windows
+        != int(profile["expected_prepared_interval_window_count"])
+        or actual_effective_windows
+        != int(profile["expected_prepared_interval_repeated_window_count"])
+    ):
+        raise ValueError(
+            "Stage1 window counts differ from the profile: "
+            f"actual_raw={actual_raw_windows} "
+            "expected_raw="
+            f"{profile['expected_prepared_interval_window_count']} "
+            f"actual_effective={actual_effective_windows} "
+            "expected_effective="
+            f"{profile['expected_prepared_interval_repeated_window_count']}."
+        )
+    expected_layout_hash = str(profile["expected_policy_io_layout_hash"])
+    layout_mismatches: list[str] = []
+    for source in sources:
+        info = json.loads(
+            (source.dataset_root / "meta/info.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        actual_layout_hash = str(info.get("policy_io_layout_hash", ""))
+        if actual_layout_hash != expected_layout_hash:
+            layout_mismatches.append(
+                f"{source.source_dataset_id}={actual_layout_hash!r}"
+            )
+    if layout_mismatches:
+        raise ValueError(
+            "Stage1 source policy-I/O hashes differ from the profile: "
+            + "; ".join(layout_mismatches)
+        )
+    if dry_run:
+        return report, None, None
+
+    catalog = load_builtin_writing_stage1_skill_projection_catalog()
+    target_skill_id = str(profile["target_skill_id"])
+    skill = catalog.skill_by_id.get(target_skill_id)
+    if skill is None:
+        raise ValueError(f"Unknown Stage1 Skill {target_skill_id!r}.")
+    organized_root = Path(
+        str(profile["organized_dataset_root"])
+    ).expanduser().resolve()
+    binding = OpenPIPreparedSkillBinding(
+        view_root=(
+            organized_root / "derived/training_views" / training_view_hash
+        ),
+        organized_dataset_root=organized_root,
+        training_view_hash=training_view_hash,
+        skill_id=target_skill_id,
+        skill_training_contract_hash=skill.semantic_content_hash,
+        training_domain="NOMINAL",
+        camera_slot_to_dataset_key=tuple(
+            (str(slot), str(key))
+            for slot, key in dict(
+                profile["camera_slot_to_dataset_key"]
+            ).items()
+        ),
+        action_horizon=int(profile["action_horizon"]),
+        action_pose_mode=str(profile["action_pose_mode"]),
+        source_mixing_policy=str(profile["source_mixing_policy"]),
+        episodes=selections,
+        source_repeat_weights=tuple(
+            (
+                str(item["source_dataset_id"]),
+                int(item["repeat_weight"]),
+            )
+            for item in profile["sources"]
+        ),
+        selection_policy_id=STAGE1_SCENARIO_SELECTION_POLICY_V1,
+    )
+    binding_root = materialize_openpi_prepared_skill_binding(
+        binding,
+        organized_root,
+    )
+    report_root = organized_root / "build_reports"
+    report_root.mkdir(parents=True, exist_ok=True)
+    report_path = report_root / f"{report.semantic_content_hash}.json"
+    if not report_path.exists():
+        report_path.write_text(
+            json.dumps(report.to_payload(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return report, binding, binding_root
+
+
+def _prompt_family_token_preflight(
+    profile: Mapping[str, Any],
+    data_config: Any,
+    model_config: Any,
+) -> dict[str, Any] | None:
+    """Measure untruncated PI0.5 prompt+state tokens for the full family."""
+
+    if profile.get("schema") != PROMPT_FAMILY_PROFILE_SCHEMA_V2:
+        return None
+    model_inputs = tuple(getattr(data_config.model_transforms, "inputs", ()))
+    candidates = tuple(
+        transform
+        for transform in model_inputs
+        if transform.__class__.__name__ == "TokenizePrompt"
+    )
+    if len(candidates) != 1:
+        raise OpenPIPreparedSkillError(
+            "Prompt-family preflight requires exactly one TokenizePrompt transform."
+        )
+    transform = candidates[0]
+    if not bool(getattr(transform, "discrete_state_input", False)):
+        raise OpenPIPreparedSkillError(
+            "Prompt-family preflight requires PI0.5 discrete state input."
+        )
+    tokenizer = getattr(transform, "tokenizer", None)
+    sentencepiece = getattr(tokenizer, "_tokenizer", None)
+    tokenizer_max_len = int(getattr(tokenizer, "_max_len", 0))
+    model_max_len = int(getattr(model_config, "max_token_len", 0))
+    if (
+        sentencepiece is None
+        or not callable(getattr(sentencepiece, "encode", None))
+        or tokenizer_max_len <= 0
+        or tokenizer_max_len != model_max_len
+    ):
+        raise OpenPIPreparedSkillError(
+            "Prompt-family preflight could not bind the configured PaliGemma "
+            "tokenizer length."
+        )
+    state_dimension = int(profile["prompt_state_dimension"])
+    configured_limit = int(profile["max_full_token_length"])
+    if state_dimension <= 0 or configured_limit <= 0:
+        raise OpenPIPreparedSkillError(
+            "Prompt-family token preflight limits must be positive."
+        )
+    records: list[dict[str, Any]] = []
+    for stage in profile["prompt_stages"]:
+        prompt_groups = {
+            "canonical": (str(stage["canonical_prompt"]),),
+            "training_variant": tuple(
+                str(value) for value in stage["training_prompt_variants"]
+            ),
+            "held_out": tuple(
+                str(value) for value in stage["held_out_prompt_variants"]
+            ),
+        }
+        for prompt_kind, prompts in prompt_groups.items():
+            for prompt in prompts:
+                for state_value in (-1.0, 0.0, 1.0):
+                    state = np.full(
+                        (state_dimension,), state_value, dtype=np.float32
+                    )
+                    discretized_state = (
+                        np.digitize(
+                            state,
+                            bins=np.linspace(-1, 1, 256 + 1)[:-1],
+                        )
+                        - 1
+                    )
+                    cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+                    state_text = " ".join(map(str, discretized_state))
+                    full_prompt = (
+                        f"Task: {cleaned}, State: {state_text};\nAction: "
+                    )
+                    full_length = len(
+                        sentencepiece.encode(full_prompt, add_bos=True)
+                    )
+                    records.append(
+                        {
+                            "stage_id": str(stage["stage_id"]),
+                            "prompt_kind": prompt_kind,
+                            "state_value": state_value,
+                            "full_token_length": full_length,
+                        }
+                    )
+    longest = max(records, key=lambda item: item["full_token_length"])
+    if int(longest["full_token_length"]) > configured_limit:
+        raise OpenPIPreparedSkillError(
+            "Prompt-family full token length exceeds the profile limit: "
+            f"longest={longest} limit={configured_limit}."
+        )
+    if int(longest["full_token_length"]) > tokenizer_max_len:
+        raise OpenPIPreparedSkillError(
+            "Prompt-family tokenization would be truncated by OpenPI: "
+            f"longest={longest} max_token_len={tokenizer_max_len}."
+        )
+    return {
+        "tokenizer": "PaligemmaTokenizer",
+        "discrete_state_input": True,
+        "prompt_count": sum(
+            1 + len(stage["training_prompt_variants"])
+            + len(stage["held_out_prompt_variants"])
+            for stage in profile["prompt_stages"]
+        ),
+        "representative_state_values": [-1.0, 0.0, 1.0],
+        "state_dimension": state_dimension,
+        "measured_combination_count": len(records),
+        "max_full_token_length": int(longest["full_token_length"]),
+        "profile_limit": configured_limit,
+        "openpi_max_token_len": tokenizer_max_len,
+        "longest_case": longest,
+        "truncation_detected": False,
+    }
+
+
 def prepare_profile(
     profile: Mapping[str, Any],
     *,
@@ -642,11 +1099,19 @@ def prepare_profile(
 ]:
     """Compile exact eligible Episodes and optionally publish immutable views."""
 
-    if profile.get("schema") == PROMPT_PROFILE_SCHEMA_V1:
+    if profile.get("schema") in {
+        PROMPT_PROFILE_SCHEMA_V1,
+        PROMPT_FAMILY_PROFILE_SCHEMA_V2,
+    }:
         return _prepare_prompt_profile(
             profile,
             dry_run=dry_run,
             verify_source_files=verify_source_files,
+        )
+    if profile.get("schema") == STAGE1_SCENARIO_PROFILE_SCHEMA_V1:
+        return _prepare_stage1_scenario_profile(
+            profile,
+            dry_run=dry_run,
         )
 
     sources = _sources(profile)
@@ -815,7 +1280,11 @@ def _openpi_config(
         dexteleop_v23_policy.DexTeleopV23DatasetSourceConfig(
             name=source_id,
             dataset_root=source_root,
-            sample_weight=1,
+            sample_weight=(
+                binding.repeat_weight_for(source_id)
+                if isinstance(binding, OpenPIPreparedSkillBinding)
+                else 1
+            ),
             front_occlusion_schedule=((0.0, 1.0),),
             explicit_mask_keys=base.data.explicit_mask_keys,
             episode_manifest=episode_manifest,
@@ -872,6 +1341,9 @@ def _openpi_config(
         strict_media_integrity=True,
         state_augmentation=state_augmentation,
         dataset_sources=source_configs,
+        default_prompt=str(
+            profile.get("default_prompt", base.data.default_prompt)
+        ),
     )
     train_overrides: dict[str, Any] = {}
     if "openpi_num_train_steps" in profile:
@@ -944,14 +1416,29 @@ def _natural_mixing_metadata(
     sources = tuple(getattr(config.data, "dataset_sources", ()) or ())
     if not sources:
         raise ValueError("Prepared natural merge requires dataset_sources.")
+    weighted = (
+        isinstance(binding, OpenPIPreparedSkillBinding)
+        and bool(binding.source_repeat_weights)
+    )
     metadata = {
-        "schema": "dexteleop_v23_natural_merge_v1",
+        "schema": (
+            "dexteleop_v23_bound_source_repeat_v1"
+            if weighted
+            else "dexteleop_v23_natural_merge_v1"
+        ),
         "source_mixing_policy": binding.source_mixing_policy,
         "source_order": [str(source.name) for source in sources],
-        "each_quality_valid_window_once_per_epoch": True,
+        "each_quality_valid_window_once_per_epoch": not weighted,
+        "repeat_each_quality_valid_window_by_source_weight": weighted,
         "shuffle": "deterministic_individual_sample_epoch_shuffle_v1",
         "sources": [source.to_dict() for source in sources],
     }
+    if weighted:
+        assert isinstance(binding, OpenPIPreparedSkillBinding)
+        metadata["source_repeat_weights"] = {
+            source_id: binding.repeat_weight_for(source_id)
+            for source_id in binding.source_dataset_ids
+        }
     if isinstance(binding, OpenPIPreparedPromptBinding):
         metadata.update(
             prompt_stage_sampling_policy=(
@@ -966,9 +1453,8 @@ def _natural_mixing_metadata(
                 skill.stage_id: skill.expected_openpi_window_count
                 for skill in binding.prompt_skills
             },
-            effective_window_count_per_stage=min(
-                skill.expected_openpi_window_count
-                for skill in binding.prompt_skills
+            effective_window_count_per_stage=(
+                effective_prompt_stage_window_count(binding)
             ),
         )
     return metadata
@@ -1466,6 +1952,17 @@ def _print_summary(
             else binding.to_payload()["window_count"]
         ),
     }
+    if binding is not None and isinstance(binding, OpenPIPreparedSkillBinding):
+        binding_payload = binding.to_payload()
+        if "prepared_interval_repeated_window_count" in binding_payload:
+            summary["prepared_interval_repeated_window_count"] = binding_payload[
+                "prepared_interval_repeated_window_count"
+            ]
+            summary["source_repeat_weights"] = dict(
+                binding.source_repeat_weights
+            )
+    if hasattr(report, "source_statistics"):
+        summary["source_statistics"] = list(report.source_statistics)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
@@ -1509,7 +2006,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     profile = _load_profile(args.profile)
     if (
-        profile.get("schema") == PROMPT_PROFILE_SCHEMA_V1
+        profile.get("schema") in {
+            PROMPT_PROFILE_SCHEMA_V1,
+            PROMPT_FAMILY_PROFILE_SCHEMA_V2,
+        }
         and args.model_rtc_profile is not None
     ):
         parser.error(
@@ -1676,6 +2176,11 @@ def main(argv: list[str] | None = None) -> int:
             load_images=False if state_only_bridge is not None else None,
         ):
             data_config = config.data.create(config.assets_dirs, config.model)
+            prompt_token_preflight = _prompt_family_token_preflight(
+                profile,
+                data_config,
+                config.model,
+            )
             dataset = data_loader.create_torch_dataset(
                 data_config,
                 config.model.action_horizon,
@@ -1695,30 +2200,82 @@ def main(argv: list[str] | None = None) -> int:
                 dataset[index]
             prompt_stage_samples = None
             if isinstance(binding, OpenPIPreparedPromptBinding):
-                stage_index_getter = getattr(
-                    dataset,
-                    "prepared_prompt_stage_indices",
-                    None,
-                )
-                if not callable(stage_index_getter):
-                    raise OpenPIPreparedSkillError(
-                        "Prompt sample-check requires stage sample indices."
-                    )
-                stage_indices = stage_index_getter()
                 prompt_stage_samples = {}
-                for prompt_skill in binding.prompt_skills:
-                    sample_index = int(stage_indices[prompt_skill.stage_id])
-                    sample = dataset[sample_index]
-                    actual_prompt = str(sample.get("prompt", ""))
-                    if actual_prompt != prompt_skill.prompt:
+                if binding.prompt_family_sampling_policy is None:
+                    index_getter = getattr(
+                        dataset,
+                        "prepared_prompt_stage_indices",
+                        None,
+                    )
+                    if not callable(index_getter):
                         raise OpenPIPreparedSkillError(
-                            "OpenPI prepared sample prompt differs from the "
-                            f"binding for {prompt_skill.stage_id!r}."
+                            "Prompt sample-check requires stage sample indices."
+                        )
+                    stage_indices = index_getter()
+                    prompt_indices = {
+                        skill.prompt: int(stage_indices[skill.stage_id])
+                        for skill in binding.prompt_skills
+                    }
+                else:
+                    index_getter = getattr(
+                        dataset,
+                        "prepared_prompt_family_indices",
+                        None,
+                    )
+                    if not callable(index_getter):
+                        raise OpenPIPreparedSkillError(
+                            "Prompt-family sample-check requires family indices."
+                        )
+                    prompt_indices = index_getter()
+                    expected_training_prompts = {
+                        prompt
+                        for skill in binding.prompt_skills
+                        for prompt in (
+                            skill.prompt,
+                            *skill.training_prompt_variants,
+                        )
+                    }
+                    held_out_prompts = {
+                        prompt
+                        for skill in binding.prompt_skills
+                        for prompt in skill.held_out_prompt_variants
+                    }
+                    if set(prompt_indices) != expected_training_prompts:
+                        raise OpenPIPreparedSkillError(
+                            "Prompt-family sample-check did not expose every and "
+                            "only training-time prompt."
+                        )
+                    if set(prompt_indices) & held_out_prompts:
+                        raise OpenPIPreparedSkillError(
+                            "Held-out prompt entered the training dataset."
+                        )
+                for prompt_skill in binding.prompt_skills:
+                    stage_prompts = (
+                        prompt_skill.prompt,
+                        *prompt_skill.training_prompt_variants,
+                    )
+                    verified_prompts: list[dict[str, Any]] = []
+                    for expected_prompt in stage_prompts:
+                        sample_index = int(prompt_indices[expected_prompt])
+                        sample = dataset[sample_index]
+                        actual_prompt = str(sample.get("prompt", ""))
+                        if actual_prompt != expected_prompt:
+                            raise OpenPIPreparedSkillError(
+                                "OpenPI prepared sample prompt differs from the "
+                                f"binding for {prompt_skill.stage_id!r}."
+                            )
+                        verified_prompts.append(
+                            {
+                                "sample_index": sample_index,
+                                "prompt": actual_prompt,
+                            }
                         )
                     prompt_stage_samples[prompt_skill.stage_id] = {
-                        "sample_index": sample_index,
                         "skill_id": prompt_skill.skill_id,
-                        "prompt": actual_prompt,
+                        "verified_training_prompts": verified_prompts,
+                        "held_out_prompt_count": len(
+                            prompt_skill.held_out_prompt_variants
+                        ),
                     }
             mix_group_size = sum(
                 int(source.sample_weight)
@@ -1788,6 +2345,79 @@ def main(argv: list[str] | None = None) -> int:
                 child = children[int(source_position)]
                 source_root = Path(child.dataset_root).expanduser().resolve()
                 mixed_epoch_samples[root_to_source_id[source_root]] += 1
+            if isinstance(binding, OpenPIPreparedSkillBinding):
+                expected_mixed_epoch_samples = {
+                    source_id: count * binding.repeat_weight_for(source_id)
+                    for source_id, count in quality_valid_windows.items()
+                }
+                if dict(mixed_epoch_samples) != expected_mixed_epoch_samples:
+                    raise OpenPIPreparedSkillError(
+                        "OpenPI source repetition differs from the binding: "
+                        f"actual={dict(mixed_epoch_samples)} "
+                        f"expected={expected_mixed_epoch_samples}."
+                    )
+                if profile.get("schema") == STAGE1_SCENARIO_PROFILE_SCHEMA_V1:
+                    expected_quality_by_source = {
+                        str(item["source_dataset_id"]): int(
+                            item[
+                                "expected_openpi_quality_valid_window_count"
+                            ]
+                        )
+                        for item in profile["sources"]
+                    }
+                    if quality_valid_windows != expected_quality_by_source:
+                        raise OpenPIPreparedSkillError(
+                            "OpenPI Stage1 quality-valid source counts differ "
+                            "from the profile: "
+                            f"actual={quality_valid_windows} "
+                            f"expected={expected_quality_by_source}."
+                        )
+                    if (
+                        sum(quality_valid_windows.values())
+                        != int(
+                            profile[
+                                "expected_openpi_quality_valid_window_count"
+                            ]
+                        )
+                        or sum(mixed_epoch_samples.values())
+                        != int(
+                            profile[
+                                "expected_openpi_repeated_epoch_sample_count"
+                            ]
+                        )
+                    ):
+                        raise OpenPIPreparedSkillError(
+                            "OpenPI Stage1 total sample counts differ from "
+                            "the profile."
+                        )
+            openpi_source_mixing = dataset.mixing_metadata()
+            if (
+                isinstance(binding, OpenPIPreparedPromptBinding)
+                and binding.prompt_family_sampling_policy is not None
+            ):
+                training_prompt_counts = dict(
+                    openpi_source_mixing.get("training_prompt_counts", {})
+                )
+                target = effective_prompt_stage_window_count(binding)
+                for skill in binding.prompt_skills:
+                    canonical_count = training_prompt_counts.get(skill.prompt, 0)
+                    variant_counts = tuple(
+                        training_prompt_counts.get(prompt, 0)
+                        for prompt in skill.training_prompt_variants
+                    )
+                    if (
+                        canonical_count != target * 4 // 5
+                        or sum(variant_counts) != target // 5
+                        or max(variant_counts) - min(variant_counts) > 1
+                        or any(
+                            prompt in training_prompt_counts
+                            for prompt in skill.held_out_prompt_variants
+                        )
+                    ):
+                        raise OpenPIPreparedSkillError(
+                            "Prompt-family sample counts violate the exact 80/20 "
+                            "quota or held-out isolation."
+                        )
             sample_check_summary = {
                 "prepared_interval_windows_by_source": dict(
                     sorted(prepared_windows.items())
@@ -1801,7 +2431,7 @@ def main(argv: list[str] | None = None) -> int:
                 "openpi_mixed_epoch_samples_by_source": dict(
                     sorted(mixed_epoch_samples.items())
                 ),
-                "openpi_source_mixing": dataset.mixing_metadata(),
+                "openpi_source_mixing": openpi_source_mixing,
                 "openpi_sampler_unique_sample_count": len(sampled_indices),
                 "openpi_dataset_length": len(dataset),
                 "observation_mode": (
@@ -1825,6 +2455,10 @@ def main(argv: list[str] | None = None) -> int:
                 sample_check_summary[
                     "openpi_prompt_stage_samples"
                 ] = prompt_stage_samples
+            if prompt_token_preflight is not None:
+                sample_check_summary[
+                    "openpi_prompt_token_preflight"
+                ] = prompt_token_preflight
             print(json.dumps(sample_check_summary, indent=2))
         return 0
     if args.command == "train":
