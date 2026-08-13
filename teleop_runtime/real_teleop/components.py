@@ -55,5 +55,6 @@ class RealTeleopComponents:
     fix_arm_controller: FixArmCommandController | None
     init_arm_controller: InitArmCommandController | None
     position_reference_publisher: PositionReferencePublisher | None
+    startup_home_continuity_gate: StartupHomeContinuityGate | None = None
 
 __all__ = ["RealTeleopComponents"]

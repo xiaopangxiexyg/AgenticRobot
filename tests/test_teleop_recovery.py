@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as R
 
+import teleop_runtime.debug.run_vive_sapien_virtual as virtual_runtime
 from robot_motion.rm65 import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
@@ -33,6 +34,8 @@ from teleop_runtime.debug.run_vive_sapien_virtual import (
     _mean_pose,
     _preview_tcp_pose_desk,
     _resolve_robot_home_for_side,
+    _runtime_home_calibration,
+    _runtime_human_home_pose,
     _send_optional_hand_command,
     _update_optional_hand_preview_from_channels,
     build_components,
@@ -158,6 +161,394 @@ def test_runtime_home_late_weighted_pose_favors_newer_samples() -> None:
     assert uniform[0, 3] == pytest.approx(1.0)
     assert late_weighted[0, 3] == pytest.approx(4.0 / 3.0)
     assert late_weighted[0, 3] > uniform[0, 3]
+
+
+def test_runtime_home_fresh_post_snapshot_pose_eliminates_history_residual() -> None:
+    samples = [_pose(tx=value) for value in (0.0, 0.003, 0.006)]
+    fresh_pose = _pose(tx=0.009, yaw_deg=0.4)
+    robot_home = _pose(tx=-0.28, yaw_deg=-70.0)
+
+    historical_anchor = _runtime_human_home_pose(
+        samples,
+        late_weighted=True,
+    )
+    exact_anchor = _runtime_human_home_pose(
+        samples,
+        late_weighted=True,
+        fresh_post_snapshot_pose=fresh_pose,
+    )
+
+    # The previous recency weighting reduces but cannot remove the first-target
+    # mismatch on a drifting capture window.
+    assert fresh_pose[0, 3] - historical_anchor[0, 3] == pytest.approx(0.005)
+    np.testing.assert_allclose(exact_anchor, fresh_pose, atol=1e-12)
+
+    retargeter = PoseToArmRetargeter(
+        PoseToArmRetargeterConfig(
+            side="left",
+            input_channel_name="left_wrist_pose",
+            control_mode="absolute",
+        )
+    )
+    retargeter.set_home_anchors(
+        human_pose_desk=exact_anchor,
+        robot_pose_desk=robot_home,
+    )
+    np.testing.assert_allclose(
+        retargeter._apply_absolute_mapping(fresh_pose),
+        robot_home,
+        atol=1e-12,
+    )
+
+
+def test_real_runtime_home_uses_stable_pose_after_atomic_arm_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Calibration:
+        metadata: dict[str, object] = {}
+        desk_frame = SimpleNamespace(name="desk")
+
+        def get_arm_for_side(self, _side: str):
+            return SimpleNamespace(T_D_B=None)
+
+        def capture_home_pose(self, _name: str, _pose: np.ndarray) -> None:
+            return None
+
+        def capture_home_qpos(self, _name: str, _qpos: np.ndarray) -> None:
+            return None
+
+    class Retargeter:
+        def __init__(self) -> None:
+            self.human_home = None
+            self.robot_home = None
+
+        def set_home_anchors(
+            self,
+            *,
+            human_pose_desk: np.ndarray,
+            robot_pose_desk: np.ndarray,
+        ) -> None:
+            self.human_home = human_pose_desk.copy()
+            self.robot_home = robot_pose_desk.copy()
+
+    snapshot_locked = False
+    source_timestamp = 0.0
+    monotonic_clock = 0.0
+    retargeter = Retargeter()
+
+    class Session:
+        calibration = Calibration()
+
+        def poll_sources(self, _now: float):
+            nonlocal monotonic_clock, source_timestamp
+            monotonic_clock += 0.05
+            source_timestamp += 0.05
+            pose = _pose(tx=0.009 if snapshot_locked else 0.0)
+            return (
+                {
+                    "left_wrist_pose": ObservationChannel(
+                        channel_name="left_wrist_pose",
+                        capability="pose6d",
+                        side="left",
+                        value=pose,
+                        frame_name="desk",
+                        timestamp=source_timestamp,
+                        source_name="runtime-home-test",
+                        valid=True,
+                        critical=True,
+                    )
+                },
+                [],
+            )
+
+    components = SimpleNamespace(
+        session=Session(),
+        active_sides=("left",),
+        left_state_backend=object(),
+        right_state_backend=None,
+        initial_alignment=None,
+        renderer=None,
+        left_retargeter=retargeter,
+        right_retargeter=Retargeter(),
+    )
+
+    def capture_atomic(_components, *, required: bool):
+        nonlocal snapshot_locked
+        assert required
+        snapshot_locked = True
+        return {"left": np.zeros(6)}
+
+    monkeypatch.setattr(
+        virtual_runtime,
+        "_capture_atomic_real_qpos_snapshot",
+        capture_atomic,
+    )
+    monkeypatch.setattr(
+        virtual_runtime,
+        "_resolve_robot_home_for_side",
+        lambda *args, **kwargs: (np.eye(4), np.zeros(6), "test_snapshot"),
+    )
+    monkeypatch.setattr(
+        virtual_runtime,
+        "_update_optional_hand_preview_from_channels",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(virtual_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(virtual_runtime.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        virtual_runtime.time,
+        "monotonic",
+        lambda: monotonic_clock,
+    )
+
+    snapshot = _runtime_home_calibration(
+        components,
+        arm_mode="real",
+        timeout_sec=5.0,
+        fresh_data_timeout_sec=0.5,
+        num_samples=12,
+        atomic_robot_home_snapshot=True,
+        late_weighted_human_home=True,
+    )
+
+    assert snapshot_locked
+    assert monotonic_clock > 1.0
+    np.testing.assert_allclose(snapshot["left"], np.zeros(6), atol=0.0)
+    np.testing.assert_allclose(retargeter.human_home, _pose(tx=0.009), atol=1e-12)
+    np.testing.assert_allclose(retargeter.robot_home, np.eye(4), atol=1e-12)
+
+
+def test_runtime_home_rejects_packet_that_arrives_after_timeout() -> None:
+    class Calibration:
+        metadata: dict[str, object] = {}
+        desk_frame = SimpleNamespace(name="desk")
+
+        def get_arm_for_side(self, _side: str):
+            return SimpleNamespace(T_D_B=None)
+
+    class Session:
+        calibration = Calibration()
+
+        def poll_sources(self, _now: float):
+            time.sleep(0.02)
+            return (
+                {
+                    "left_wrist_pose": ObservationChannel(
+                        channel_name="left_wrist_pose",
+                        capability="pose6d",
+                        side="left",
+                        value=np.eye(4),
+                        frame_name="desk",
+                        timestamp=time.time(),
+                        source_name="late-packet-test",
+                        valid=True,
+                        critical=True,
+                    )
+                },
+                [],
+            )
+
+    components = SimpleNamespace(
+        session=Session(),
+        active_sides=("left",),
+        left_state_backend=None,
+        right_state_backend=None,
+        initial_alignment=None,
+        renderer=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+
+    with pytest.raises(TimeoutError, match="Runtime Home overall timeout"):
+        _runtime_home_calibration(
+            components,
+            arm_mode="virtual",
+            timeout_sec=0.01,
+            num_samples=1,
+            atomic_robot_home_snapshot=False,
+            late_weighted_human_home=False,
+        )
+
+
+def test_runtime_home_freshness_watchdog_rejects_repeated_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_clock = 0.0
+
+    class Calibration:
+        metadata: dict[str, object] = {}
+        desk_frame = SimpleNamespace(name="desk")
+
+        def get_arm_for_side(self, _side: str):
+            return SimpleNamespace(T_D_B=None)
+
+    class Session:
+        calibration = Calibration()
+
+        def poll_sources(self, _now: float):
+            nonlocal monotonic_clock
+            monotonic_clock += 0.4
+            return (
+                {
+                    "left_wrist_pose": ObservationChannel(
+                        channel_name="left_wrist_pose",
+                        capability="pose6d",
+                        side="left",
+                        value=np.eye(4),
+                        frame_name="desk",
+                        timestamp=1.0,
+                        source_name="frozen-timestamp-test",
+                        valid=True,
+                        critical=True,
+                    )
+                },
+                [],
+            )
+
+    components = SimpleNamespace(
+        session=Session(),
+        active_sides=("left",),
+        left_state_backend=None,
+        right_state_backend=None,
+        initial_alignment=None,
+        renderer=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    monkeypatch.setattr(
+        virtual_runtime.time,
+        "monotonic",
+        lambda: monotonic_clock,
+    )
+    monkeypatch.setattr(virtual_runtime.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(virtual_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        virtual_runtime,
+        "_update_optional_hand_preview_from_channels",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"timestamp\(s\) did not advance for 1.000s",
+    ) as error:
+        _runtime_home_calibration(
+            components,
+            arm_mode="virtual",
+            timeout_sec=10.0,
+            fresh_data_timeout_sec=1.0,
+            num_samples=5,
+            require_stable=True,
+            atomic_robot_home_snapshot=False,
+            late_weighted_human_home=False,
+        )
+
+    message = str(error.value)
+    assert "stale_sides=['left']" in message
+    assert "fresh_packet_counts={'left': 1}" in message
+    assert monotonic_clock < 10.0
+
+
+def test_runtime_home_post_snapshot_watchdog_rejects_frozen_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_clock = 0.0
+    source_timestamp = 0.0
+    snapshot_locked = False
+
+    class Calibration:
+        metadata: dict[str, object] = {}
+        desk_frame = SimpleNamespace(name="desk")
+
+        def get_arm_for_side(self, _side: str):
+            return SimpleNamespace(T_D_B=None)
+
+        def capture_home_pose(self, _name: str, _pose: np.ndarray) -> None:
+            return None
+
+        def capture_home_qpos(self, _name: str, _qpos: np.ndarray) -> None:
+            return None
+
+    class Retargeter:
+        def set_home_anchors(self, **_kwargs) -> None:
+            return None
+
+    class Session:
+        calibration = Calibration()
+
+        def poll_sources(self, _now: float):
+            nonlocal monotonic_clock, source_timestamp
+            monotonic_clock += 0.2
+            if not snapshot_locked:
+                source_timestamp += 0.2
+            return (
+                {
+                    "left_wrist_pose": ObservationChannel(
+                        channel_name="left_wrist_pose",
+                        capability="pose6d",
+                        side="left",
+                        value=np.eye(4),
+                        frame_name="desk",
+                        timestamp=source_timestamp,
+                        source_name="post-snapshot-freeze-test",
+                        valid=True,
+                        critical=True,
+                    )
+                },
+                [],
+            )
+
+    components = SimpleNamespace(
+        session=Session(),
+        active_sides=("left",),
+        left_state_backend=object(),
+        right_state_backend=None,
+        initial_alignment=None,
+        renderer=None,
+        left_retargeter=Retargeter(),
+        right_retargeter=Retargeter(),
+    )
+
+    def capture_atomic(_components, *, required: bool):
+        nonlocal snapshot_locked
+        assert required
+        snapshot_locked = True
+        return {"left": np.zeros(6)}
+
+    monkeypatch.setattr(
+        virtual_runtime,
+        "_capture_atomic_real_qpos_snapshot",
+        capture_atomic,
+    )
+    monkeypatch.setattr(
+        virtual_runtime,
+        "_update_optional_hand_preview_from_channels",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(virtual_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(virtual_runtime.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        virtual_runtime.time,
+        "monotonic",
+        lambda: monotonic_clock,
+    )
+
+    with pytest.raises(TimeoutError) as error:
+        _runtime_home_calibration(
+            components,
+            arm_mode="real",
+            timeout_sec=10.0,
+            fresh_data_timeout_sec=0.5,
+            num_samples=1,
+            atomic_robot_home_snapshot=True,
+            late_weighted_human_home=True,
+        )
+
+    message = str(error.value)
+    assert "post_arm_snapshot_exact_home" in message
+    assert "fresh_packet_counts={'left': 0}" in message
+    assert snapshot_locked
+    assert monotonic_clock < 10.0
 
 
 class StubPoseSource:

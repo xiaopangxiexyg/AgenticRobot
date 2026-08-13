@@ -811,6 +811,7 @@ def _arm_after_start_calibration(
     home_captured: bool,
     position_force_guard_monitor: object | None = None,
     runtime_home_qpos_snapshot: Mapping[str, np.ndarray] | None = None,
+    runtime_home_capture_sides: tuple[str, ...] | None = None,
 ) -> None:
     arm_after_start = time.perf_counter()
     reset_elapsed_ms = 0.0
@@ -841,6 +842,29 @@ def _arm_after_start_calibration(
             return
         reset_elapsed_ms = (time.perf_counter() - reset_start) * 1000.0
         _log("Calibration", f"runtime restart motion state reset from live real qpos synced={synced}")
+        startup_continuity_gate = getattr(
+            components,
+            "startup_home_continuity_gate",
+            None,
+        )
+        if startup_continuity_gate is not None:
+            try:
+                continuity_snapshot = startup_continuity_gate.arm_from_home(
+                    runtime_home_qpos_snapshot or {}
+                )
+            except Exception as exc:  # noqa: BLE001 - startup admission fails closed.
+                message = (
+                    "runtime Home 首帧连续性闸门建立失败，保持停臂："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("StartupHomeContinuity", message)
+                components.session.hold_hardware(message)
+                clutch_input.publish_calibration_waiting(message)
+                return
+            _log(
+                "StartupHomeContinuity",
+                f"armed receipt={continuity_snapshot}",
+            )
         endpoint_guard = getattr(
             components,
             "position_admittance_endpoint_guard",
@@ -880,12 +904,85 @@ def _arm_after_start_calibration(
                     )
                     return
     state_machine_start = time.perf_counter()
+    reference_epoch: int | None = None
+    if components.position_reference_publisher is not None:
+        reference_epoch = components.position_reference_publisher.reset_epoch()
+    retargeter = getattr(components, "dual_arm_retargeter", None)
+    safety_filter = (
+        None
+        if retargeter is None
+        else getattr(retargeter, "pre_ik_target_safety_filter", None)
+    )
+    anchor_required_sides = tuple(
+        getattr(
+            getattr(safety_filter, "profile", None),
+            "anchor_required_sides",
+            (),
+        )
+    )
+    safety_filter_active = bool(
+        getattr(safety_filter, "apply_to_target", False)
+    )
     if home_captured:
+        rebind_from_home = getattr(
+            safety_filter,
+            "rebind_from_calibration_home",
+            None,
+        )
+        if callable(rebind_from_home):
+            safety_epoch = (
+                int(reference_epoch)
+                if reference_epoch is not None
+                else int(getattr(safety_filter, "execution_epoch", 0)) + 1
+            )
+            try:
+                anchor = rebind_from_home(
+                    execution_epoch=safety_epoch,
+                    captured_at=time.monotonic(),
+                    captured_sides=(
+                        tuple(components.active_sides)
+                        if runtime_home_capture_sides is None
+                        else tuple(runtime_home_capture_sides)
+                    ),
+                    anchor_id=f"runtime_home:{safety_epoch}",
+                    clock_domain_id="python_monotonic",
+                )
+            except Exception as exc:  # noqa: BLE001 - Active fails closed.
+                if safety_filter_active:
+                    message = (
+                        "TCP Pose 安全运行区间绑定 runtime Home 失败，保持停臂："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    _log("TCPPoseEnvelope", message)
+                    components.session.hold_hardware(message)
+                    clutch_input.publish_calibration_waiting(message)
+                    return
+                _log(
+                    "TCPPoseEnvelope",
+                    "Shadow runtime Home binding failed; observation remains "
+                    "non-authoritative and hardware lifecycle is unchanged: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                anchor = None
+            _log(
+                "TCPPoseEnvelope",
+                "runtime Home bound before arm "
+                f"epoch={safety_epoch} "
+                f"sides={list(runtime_home_capture_sides or components.active_sides)} "
+                f"anchor_hash={None if anchor is None else anchor.semantic_content_hash}",
+            )
         components.session.mark_home_recalibrated("RM65 runtime home captured")
+    elif anchor_required_sides and safety_filter_active:
+        message = (
+            "TCP Pose 相对安全运行区间需要本次运行的 runtime Home；"
+            "当前未捕获 Home，拒绝真机 arm。"
+        )
+        _log("TCPPoseEnvelope", message)
+        components.session.hold_hardware(message)
+        clutch_input.publish_calibration_waiting(message)
+        return
     components.session.set_calibration_ready()
     components.session.mark_debug_passed()
-    if components.position_reference_publisher is not None:
-        components.position_reference_publisher.reset_epoch()
     state_machine_elapsed_ms = (time.perf_counter() - state_machine_start) * 1000.0
     force_control_start = time.perf_counter()
     _enable_impedance_force_control_after_runtime_home(
@@ -901,7 +998,12 @@ def _arm_after_start_calibration(
     clutch_input.publish_teleop_running(
         home_ready=home_captured,
         message=(
-            "runtime home 完成，已进入真机遥操。"
+            (
+                "runtime home 完成，正在验证首帧连续性；通过前保持不下发机械臂命令。"
+                if getattr(components, "startup_home_continuity_gate", None)
+                is not None
+                else "runtime home 完成，已进入真机遥操。"
+            )
             if home_captured
             else "runtime home 未就绪，未进入正常真机遥操。"
         ),

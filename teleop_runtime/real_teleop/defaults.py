@@ -24,6 +24,23 @@ DEFAULT_INIT_ARM_QPOS_SPEED_SCALE = 5.0
 DEFAULT_POSITION_MAX_ACCELERATION_RAD_S2 = (7.0, 7.0, 9.0, 15.0, 15.0, 20.0)
 DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M = 0.45
 DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG = 160.0
+# Entering real teleoperation is a bounded safety transaction. This hard cap
+# applies to the pre-Home fresh Tracker admission and to any interval during
+# runtime Home in which a required Tracker timestamp stops advancing. It is
+# deliberately separate from the overall stability/capture timeout.
+DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC = 1.0
+
+
+def runtime_home_fresh_data_timeout_sec(configured_timeout_sec: float) -> float:
+    """Bound one no-new-VIVE interval during start/restart Home."""
+
+    return max(
+        0.001,
+        min(
+            DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC,
+            float(configured_timeout_sec),
+        ),
+    )
 
 
 __all__ = [
@@ -34,5 +51,7 @@ __all__ = [
     "DEFAULT_POSITION_MAX_ACCELERATION_RAD_S2",
     "DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG",
     "DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M",
+    "DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC",
     "INIT_ARM_QPOS_SPEED_BASELINE_PROFILE",
+    "runtime_home_fresh_data_timeout_sec",
 ]

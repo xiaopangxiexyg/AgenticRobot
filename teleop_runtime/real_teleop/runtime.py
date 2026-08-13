@@ -74,6 +74,7 @@ from .tactile_idle_compression import (
     RealTeleopIdleTactileCompression,
 )
 from .visualization_runtime import build_visualization_runtime
+from .defaults import runtime_home_fresh_data_timeout_sec
 
 _REQUIRED_SUPPORT_NAMES = (
     "ActionDebugLogRecorder",
@@ -1923,6 +1924,9 @@ def run_real_teleop(
                     components,
                     arm_mode="real",
                     timeout_sec=args.calibration_timeout,
+                    fresh_data_timeout_sec=runtime_home_fresh_data_timeout_sec(
+                        args.calibration_timeout
+                    ),
                     num_samples=args.calibration_samples,
                     progress_callback=clutch_input.publish_runtime_home_progress,
                     atomic_robot_home_snapshot=bool(
@@ -1936,7 +1940,8 @@ def run_real_teleop(
                 message = _runtime_home_failure_message(exc)
                 _log("Calibration", message)
                 clutch_input.publish_calibration_waiting(
-                    f"{message}\n请检查 VIVE sender/tracker_role 后重新选择操作。"
+                    f"{message}\n本次开始遥操已取消并回到未遥操状态；"
+                    "请检查 VIVE sender/tracker_role 后重新点击“开始遥操”。"
                 )
                 if not clutch_input.enabled:
                     raise

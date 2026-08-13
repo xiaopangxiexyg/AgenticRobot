@@ -77,9 +77,14 @@ from ..position_control import (
     PositionReferencePublisher,
     PositionReferencePublisherConfig,
 )
+from ..position_control.tcp_pose_envelope_runtime import (
+    install_tcp_pose_envelope_filter,
+    load_tcp_pose_envelope_profile,
+)
 from .position_admittance_shadow import (
     POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
     POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA,
+    POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG,
     POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG,
     PositionAdmittanceEndpointExcursionGuard,
     position_admittance_active_apply_sides,
@@ -122,6 +127,10 @@ from .command_filters import (
     _fix_arm_required_effectors_by_side,
 )
 from .components import RealTeleopComponents
+from .startup_home_continuity import (
+    StartupHomeContinuityConfig,
+    StartupHomeContinuityGate,
+)
 from .control_profile import (
     arm_control_mode as _arm_control_mode_arg,
     canfd_follow_runtime_config as _canfd_follow_runtime_config,
@@ -247,6 +256,17 @@ def build_real_teleop_components(
     impedance_mode = _impedance_mode_arg(args)
     strict_tool_profile = _strict_tool_profile_arg(args)
     force_tare_sec = _force_tare_sec_arg(args)
+    tcp_pose_envelope_profile_path = str(
+        getattr(args, "tcp_pose_envelope_profile", "") or ""
+    ).strip()
+    tcp_pose_envelope_active = bool(
+        getattr(args, "tcp_pose_envelope_active", False)
+    )
+    if tcp_pose_envelope_active and not tcp_pose_envelope_profile_path:
+        raise ValueError(
+            "--tcp-pose-envelope-active requires "
+            "--tcp-pose-envelope-profile"
+        )
     # ``active_sides`` is the authority for this runtime.  The command may
     # intentionally carry both saved/configured arm IPs while operating one
     # arm (for example, a shared command template or a later side switch).
@@ -1219,6 +1239,9 @@ def build_real_teleop_components(
                         output_qpos_admittance_micro_reversal_hold_deg=float(
                             POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG
                         ),
+                        output_qpos_admittance_micro_reversal_creep_deg=float(
+                            POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG
+                        ),
                         # A singular wrist uses a bounded, responsive endpoint
                         # only inside the narrow q5 escape band.  This avoids
                         # the normal 0.14 alpha making the guarded wrist feel
@@ -1370,6 +1393,47 @@ def build_real_teleop_components(
     if dual_arm_retargeter is None:
         side_retargeters = {"left": left_retargeter, "right": right_retargeter}
         retargeters.extend(side_retargeters[side] for side in active_sides)
+
+    tcp_pose_envelope_filter = None
+    if tcp_pose_envelope_profile_path:
+        if dual_arm_retargeter is None:
+            raise RuntimeError(
+                "TCP pose envelope requires the coupled dual-arm retargeter so "
+                "the final pre-IK pair has one authoritative safety owner"
+            )
+        tcp_pose_envelope_profile = load_tcp_pose_envelope_profile(
+            tcp_pose_envelope_profile_path,
+            calibration=calibration,
+            retargeter=dual_arm_retargeter,
+            active_sides=active_sides,
+        )
+        tcp_pose_envelope_filter = install_tcp_pose_envelope_filter(
+            retargeter=dual_arm_retargeter,
+            profile=tcp_pose_envelope_profile,
+            calibration=calibration,
+            execution_epoch=0,
+            anchor_receipt=None,
+            apply_to_target=tcp_pose_envelope_active,
+        )
+        calibration.metadata["tcp_pose_envelope"] = {
+            "configured": True,
+            "apply_to_target": tcp_pose_envelope_active,
+            "profile_id": tcp_pose_envelope_profile.profile_id,
+            "profile_hash": tcp_pose_envelope_profile.semantic_content_hash,
+            "controlled_frame_id": tcp_pose_envelope_profile.controlled_frame_id,
+            "enabled_sides": list(tcp_pose_envelope_profile.enabled_sides),
+            "anchor_required_sides": list(
+                tcp_pose_envelope_profile.anchor_required_sides
+            ),
+            "profile_path": tcp_pose_envelope_profile_path,
+        }
+        _log(
+            "TCPPoseEnvelope",
+            "installed final pre-IK "
+            f"mode={'active' if tcp_pose_envelope_active else 'shadow'} "
+            f"profile={tcp_pose_envelope_profile.profile_id} "
+            f"sides={list(tcp_pose_envelope_profile.enabled_sides)}",
+        )
 
     position_admittance_endpoint_guard = None
     if bool(getattr(args, "position_admittance_active", False)):
@@ -1708,6 +1772,10 @@ def build_real_teleop_components(
                     impedance_overrides=dict(impedance_overrides),
                 )
             )
+            if tcp_pose_envelope_filter is not None:
+                command_backend.set_final_tcp_pose_projector(
+                    tcp_pose_envelope_filter.project_arm_base_tool_tcp
+                )
         else:
             command_backend = RM65ArmBackend(
                 RM65ArmBackendConfig(
@@ -2143,6 +2211,31 @@ def build_real_teleop_components(
             ),
         )
     )
+    startup_home_continuity_gate = None
+    if (
+        arm_control_mode == "position"
+        and position_command_planner
+        in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }
+    ):
+        startup_command_backends = {
+            "left": left_command_backend,
+            "right": right_command_backend,
+        }
+        startup_home_continuity_gate = StartupHomeContinuityGate(
+            config=StartupHomeContinuityConfig(active_sides=active_sides),
+            fk_by_side={
+                side: (
+                    lambda qpos, backend=startup_command_backends[side]:
+                    backend.compute_tcp_pose(qpos=qpos)
+                )
+                for side in active_sides
+            },
+            logger=lambda message: _log("StartupHomeContinuity", message),
+        )
+
     session = TeleopSession(
         config=TeleopSessionConfig(
             mode="vive_rm65_real_teleop",
@@ -2198,6 +2291,11 @@ def build_real_teleop_components(
             fix_arm_controller=fix_arm_controller,
             init_arm_controller=init_arm_controller,
             dual_arm_retargeter=dual_arm_retargeter,
+        ),
+        command_dispatch_admission=(
+            None
+            if startup_home_continuity_gate is None
+            else startup_home_continuity_gate.admit
         ),
         fault_filter=_compose_real_fault_filter(
             fix_arm_controller=fix_arm_controller,
@@ -2400,6 +2498,7 @@ def build_real_teleop_components(
         fix_arm_controller=fix_arm_controller,
         init_arm_controller=init_arm_controller,
         position_reference_publisher=position_reference_publisher,
+        startup_home_continuity_gate=startup_home_continuity_gate,
     )
 
 __all__ = ["build_real_teleop_components"]

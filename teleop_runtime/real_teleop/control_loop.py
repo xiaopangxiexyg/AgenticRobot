@@ -37,6 +37,10 @@ from .position_admittance_shadow import (
     PositionAdmittanceActiveFault,
     admitted_solver_world_poses_from_joint_command,
 )
+from ..position_control.tcp_pose_envelope_runtime import (
+    TCPPoseEnvelopeRuntimeError,
+)
+from .defaults import runtime_home_fresh_data_timeout_sec
 
 _REQUIRED_SUPPORT_NAMES = (
     "AsyncDMTacDistributedForceVisualizer",
@@ -725,6 +729,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     step_index = context.step_index()
     recovery_plan = None
     last_dispatched_main_command = None
+    last_startup_home_continuity_key: tuple[int, str] | None = None
     progress_workflow: RealTeleopProgressWorkflowPort | None = None
     progress_workflow_recorder: object | None = None
     promotable_hold_pause: PromotableHoldPause | None = None
@@ -2052,6 +2057,9 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     components,
                     arm_mode="real",
                     timeout_sec=clutch_input.two_pedal_fast_home_timeout_sec(),
+                    fresh_data_timeout_sec=runtime_home_fresh_data_timeout_sec(
+                        clutch_input.two_pedal_fast_home_timeout_sec()
+                    ),
                     num_samples=1,
                     progress_callback=clutch_input.publish_runtime_home_progress,
                     require_stable=True,
@@ -2105,6 +2113,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 runtime_home_qpos_snapshot=(
                     fast_home_qpos_snapshot
                     if bool(getattr(args, "runtime_home_atomic_arm_snapshot", True))
+                    else None
+                ),
+                runtime_home_capture_sides=(
+                    (fast_two_pedal_fixed_side,)
+                    if fast_two_pedal_fixed_side is not None
                     else None
                 ),
             )
@@ -2182,6 +2195,9 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     components,
                     arm_mode="real",
                     timeout_sec=args.calibration_timeout,
+                    fresh_data_timeout_sec=runtime_home_fresh_data_timeout_sec(
+                        args.calibration_timeout
+                    ),
                     num_samples=args.calibration_samples,
                     progress_callback=clutch_input.publish_runtime_home_progress,
                     capture_sides=(
@@ -2206,7 +2222,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 message = _runtime_home_failure_message(exc)
                 _log("Calibration", message, now=loop_start)
                 clutch_input.publish_calibration_waiting(
-                    f"{message}\n请检查 VIVE sender/tracker_role 后重新选择操作。"
+                    f"{message}\n本次恢复遥操已取消，机械臂保持 Hold；"
+                    "请检查 VIVE sender/tracker_role 后重新点击“开始遥操”。"
                 )
                 if profile_home_pending is not None:
                     clutch_input.request_hold(
@@ -2266,6 +2283,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 runtime_home_qpos_snapshot=(
                     runtime_home_qpos_snapshot
                     if bool(getattr(args, "runtime_home_atomic_arm_snapshot", True))
+                    else None
+                ),
+                runtime_home_capture_sides=(
+                    profile_home_pending.capture_sides
+                    if profile_home_pending is not None
                     else None
                 ),
             )
@@ -2716,11 +2738,64 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 reason="position_admittance_active_pre_ik_fault"
             )
             continue
+        except TCPPoseEnvelopeRuntimeError as exc:
+            message = f"TCP Pose envelope pre-IK fault: {exc}"
+            _log(
+                "TCPPoseEnvelope",
+                "Active target rejected before IK/dispatch; requesting Hold: "
+                + message,
+                now=loop_start,
+            )
+            components.session.hold_hardware(
+                message,
+                require_home_recalibration=True,
+            )
+            clutch_input.request_hold(
+                reason="tcp_pose_envelope_active_pre_ik_fault"
+            )
+            continue
         except Exception as exc:  # noqa: BLE001 - only safety races are consumed here.
             if handle_safety_dispatch_exception(exc):
                 continue
             raise
         mark_loop_phase("loop.session_run_step")
+        startup_continuity = (
+            None
+            if step_result.command is None
+            else step_result.command.metadata.get("startup_home_continuity")
+        )
+        if isinstance(startup_continuity, Mapping):
+            startup_status = str(startup_continuity.get("status", "") or "")
+            startup_key = (
+                int(startup_continuity.get("epoch", 0)),
+                startup_status,
+            )
+            if startup_status and startup_key != last_startup_home_continuity_key:
+                last_startup_home_continuity_key = startup_key
+                dispatch_allowed = bool(
+                    startup_continuity.get("dispatch_allowed", False)
+                )
+                if dispatch_allowed:
+                    startup_message = (
+                        "首帧连续性验证通过；已将当前 qref 交给既有位控规划器。"
+                    )
+                else:
+                    startup_message = (
+                        "首帧连续性验证中，机械臂命令保持不下发："
+                        + str(
+                            startup_continuity.get("reason")
+                            or (
+                                f"连续帧 {int(startup_continuity.get('stable_frames', 0))}/"
+                                f"{int(startup_continuity.get('required_consecutive_frames', 0))}"
+                            )
+                        )
+                    )
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "StartupHomeContinuity",
+                        startup_message,
+                    )
+                    control_ui.publish(control_hint=startup_message)
         if _request_position_admittance_endpoint_hold(
             step_result.command,
             clutch_input=clutch_input,
