@@ -41,6 +41,19 @@ def _fixture() -> dict[str, object]:
 def _characterize_current_candidate() -> dict[str, object]:
     manifest = build_rm65_policy_arm_qpos_candidate_manifest()
     evidence = build_rm65_execution_evidence_bundle(manifest)
+    preflight = preflight_rm65_policy_arm_qpos_candidate_target(
+        RM65PolicyArmQposCandidateTargetConfig(
+            control_execution_manifest=manifest,
+            embodiment_instance_id="lab-a-rm65-pair-01",
+            embodiment_instance_hash=(
+                "instance-profile-hash:lab-a-rm65-pair-01"
+            ),
+            clock_domain_id="control.monotonic",
+        ),
+        runtime_session_id="session-preflight-1",
+        control_domain_id="rm65-arms",
+        bound_at=100.0,
+    )
     return {
         "schema_version": (
             "rm65_policy_arm_qpos_candidate_characterization.v1"
@@ -109,6 +122,18 @@ def _characterize_current_candidate() -> dict[str, object]:
             "shared_authority_gate_ready": (
                 evidence.shared_authority_gate.ready
             ),
+        },
+        "preflight": {
+            "manifest_id": preflight.resolved_manifest.manifest_id,
+            "manifest_hash": (
+                preflight.resolved_manifest.semantic_content_hash
+            ),
+            "requirement_id": preflight.binding_receipt.requirement_id,
+            "requirement_hash": preflight.binding_receipt.requirement_hash,
+            "binding_hash": (
+                preflight.binding_receipt.semantic_content_hash
+            ),
+            "preflight_hash": preflight.semantic_content_hash,
         },
     }
 

@@ -73,5 +73,13 @@
     ],
     "semantic_content_hash": "a975582987caa972d6d1ec14695face858f26c64c9726a4af565409382507f80"
   },
+  "preflight": {
+    "binding_hash": "9537ed0ab1010ebaf43f0fbfb4a1590af4217e59c7a77090e3619da34a1eb75b",
+    "manifest_hash": "d04a6a063d5f6af825800c23078fb665aca25d0f5de026d2570350e6dc060517",
+    "manifest_id": "resolved-rm65-policy-arm-qpos-candidate:abd0b6d0085f3a12fb27ddee6619a485b0507f04a80c09deae58ee7ac3b5375a",
+    "preflight_hash": "eda5e4b670af92766b4566ff378cfc67b4a4600ca90e3aaae98e03485cb2884b",
+    "requirement_hash": "92d51fb56becaf9b58b4429a6be84cd241fc4ea4dbdf50dc6cb16e3a7eeb908f",
+    "requirement_id": "rm65-policy-arm-qpos-candidate-preflight:session-preflight-1:rm65-arms"
+  },
   "schema_version": "rm65_policy_arm_qpos_candidate_characterization.v1"
 }

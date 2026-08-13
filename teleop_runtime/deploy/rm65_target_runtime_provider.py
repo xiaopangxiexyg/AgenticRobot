@@ -20,10 +20,11 @@ from robot_motion.target_runtime import (
     TargetRuntimeAssetReference,
     TargetRuntimeBindingReceipt,
     TargetRuntimeProviderIdentity,
-    TargetRuntimeProviderRegistry,
     TargetRuntimeProviderRegistryEntry,
-    TargetRuntimeRequirement,
-    bind_target_runtime_requirement,
+)
+from teleop_runtime.target_profiles import (
+    TargetRuntimeProfileBinding,
+    TargetRuntimeProfileCatalog,
 )
 
 from .rm65_candidate_manifest import (
@@ -41,6 +42,16 @@ RM65_POLICY_ARM_QPOS_CANDIDATE_PROVIDER_ID = (
 )
 RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_HANDLER_ID = (
     "dexteleop.rm65_policy_arm_qpos_candidate.target.v1"
+)
+RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID = (
+    "rm65-policy-arm-qpos-candidate-v1"
+)
+RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_VERSION = "1"
+RM65_POLICY_ARM_QPOS_CANDIDATE_REQUIREMENT_ID_PREFIX = (
+    "rm65-policy-arm-qpos-candidate-preflight"
+)
+RM65_POLICY_ARM_QPOS_CANDIDATE_SUPPORTED_CLOCK_DOMAIN_IDS = (
+    "control.monotonic",
 )
 RM65_POLICY_ARM_QPOS_CANDIDATE_EMBODIMENT_DEFINITION_ID = (
     "dexteleop.rm65_bimanual_policy_arm_qpos_candidate.v1"
@@ -264,6 +275,46 @@ def _definition_hash(
     )
 
 
+def build_rm65_policy_arm_qpos_candidate_embodiment_definition_hash() -> str:
+    """Return the frozen provider-independent RM65 definition identity."""
+
+    candidate = build_rm65_policy_arm_qpos_candidate_manifest()
+    evidence = build_rm65_execution_evidence_bundle(candidate)
+    return _definition_hash(candidate, evidence)
+
+
+def _asset_references(
+    candidate: ControlExecutionManifest,
+    evidence: RM65ExecutionEvidenceBundle,
+) -> tuple[TargetRuntimeAssetReference, ...]:
+    return (
+        TargetRuntimeAssetReference(
+            asset_id="legacy-control-execution-manifest",
+            asset_kind="control_execution_manifest",
+            content_hash=candidate.semantic_content_hash,
+        ),
+        TargetRuntimeAssetReference(
+            asset_id="legacy-dispatch-inventory",
+            asset_kind="dispatch_inventory",
+            content_hash=(
+                evidence.dispatch_inventory.semantic_content_hash
+            ),
+        ),
+        TargetRuntimeAssetReference(
+            asset_id="legacy-safety-migration-matrix",
+            asset_kind="safety_migration_matrix",
+            content_hash=(
+                evidence.safety_migration_matrix.semantic_content_hash
+            ),
+        ),
+        TargetRuntimeAssetReference(
+            asset_id="legacy-worker-drain-plan",
+            asset_kind="worker_drain_plan",
+            content_hash=evidence.worker_drain_plan.semantic_content_hash,
+        ),
+    )
+
+
 class RM65PolicyArmQposCandidateTargetProvider:
     """Project the existing candidate into a shared, preflight-only manifest."""
 
@@ -339,34 +390,7 @@ class RM65PolicyArmQposCandidateTargetProvider:
             component_target_capability=target_capability,
             execution_observation_capability=None,
             operation_capabilities=(),
-            asset_references=(
-                TargetRuntimeAssetReference(
-                    asset_id="legacy-control-execution-manifest",
-                    asset_kind="control_execution_manifest",
-                    content_hash=candidate.semantic_content_hash,
-                ),
-                TargetRuntimeAssetReference(
-                    asset_id="legacy-dispatch-inventory",
-                    asset_kind="dispatch_inventory",
-                    content_hash=(
-                        evidence.dispatch_inventory.semantic_content_hash
-                    ),
-                ),
-                TargetRuntimeAssetReference(
-                    asset_id="legacy-safety-migration-matrix",
-                    asset_kind="safety_migration_matrix",
-                    content_hash=(
-                        evidence.safety_migration_matrix.semantic_content_hash
-                    ),
-                ),
-                TargetRuntimeAssetReference(
-                    asset_id="legacy-worker-drain-plan",
-                    asset_kind="worker_drain_plan",
-                    content_hash=(
-                        evidence.worker_drain_plan.semantic_content_hash
-                    ),
-                ),
-            ),
+            asset_references=_asset_references(candidate, evidence),
         )
 
     def create_target_runtime_handle(
@@ -394,6 +418,62 @@ def build_rm65_policy_arm_qpos_candidate_provider_entry(
     )
 
 
+def build_rm65_policy_arm_qpos_candidate_target_profile_binding(
+) -> TargetRuntimeProfileBinding:
+    """Bind the selectable profile to the exact frozen RM65 candidate."""
+
+    candidate = build_rm65_policy_arm_qpos_candidate_manifest()
+    evidence = build_rm65_execution_evidence_bundle(candidate)
+    target_capability = (
+        build_rm65_policy_arm_qpos_candidate_target_capability()
+    )
+    if (
+        target_capability.semantic_content_hash
+        != candidate.component_target_capability_hash
+        or target_capability.action_schema_hash
+        != candidate.action_schema_hash
+    ):
+        raise ValueError(
+            "RM65 target profile capability drifted from the frozen candidate."
+        )
+    assets = _asset_references(candidate, evidence)
+    return TargetRuntimeProfileBinding(
+        profile_id=RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
+        profile_version=(
+            RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_VERSION
+        ),
+        requirement_id_prefix=(
+            RM65_POLICY_ARM_QPOS_CANDIDATE_REQUIREMENT_ID_PREFIX
+        ),
+        provider_entry=(
+            build_rm65_policy_arm_qpos_candidate_provider_entry()
+        ),
+        supported_clock_domain_ids=(
+            RM65_POLICY_ARM_QPOS_CANDIDATE_SUPPORTED_CLOCK_DOMAIN_IDS
+        ),
+        expected_manifest_version="1",
+        expected_embodiment_definition_id=(
+            RM65_POLICY_ARM_QPOS_CANDIDATE_EMBODIMENT_DEFINITION_ID
+        ),
+        expected_embodiment_definition_hash=(
+            _definition_hash(candidate, evidence)
+        ),
+        expected_target_handler_id=(
+            RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_HANDLER_ID
+        ),
+        expected_action_schema_hash=candidate.action_schema_hash,
+        expected_component_target_capability_hash=(
+            target_capability.semantic_content_hash
+        ),
+        expected_component_ids=candidate.controlled_components,
+        expected_execution_observation_capability_hash=None,
+        expected_operation_capability_hash_by_id={},
+        expected_asset_reference_hash_by_id={
+            item.asset_id: item.semantic_content_hash for item in assets
+        },
+    )
+
+
 def preflight_rm65_policy_arm_qpos_candidate_target(
     config: RM65PolicyArmQposCandidateTargetConfig,
     *,
@@ -403,34 +483,19 @@ def preflight_rm65_policy_arm_qpos_candidate_target(
 ) -> RM65PolicyArmQposCandidatePreflight:
     """Resolve and bind the current candidate without constructing a target."""
 
-    registry = TargetRuntimeProviderRegistry()
-    registry.register(
-        build_rm65_policy_arm_qpos_candidate_provider_entry()
-    )
-    manifest = registry.resolve_manifest(
-        RM65_POLICY_ARM_QPOS_CANDIDATE_PROVIDER_ID,
+    profile_preflight = TargetRuntimeProfileCatalog(
+        (
+            build_rm65_policy_arm_qpos_candidate_target_profile_binding(),
+        )
+    ).preflight(
+        RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
         config,
         runtime_session_id=runtime_session_id,
         control_domain_id=control_domain_id,
-    )
-    requirement = TargetRuntimeRequirement(
-        requirement_id=(
-            "rm65-policy-arm-qpos-candidate-preflight:"
-            f"{manifest.runtime_session_id}:{manifest.control_domain_id}"
-        ),
-        runtime_session_id=manifest.runtime_session_id,
-        control_domain_id=manifest.control_domain_id,
-        clock_domain_id=manifest.clock_domain_id,
-        embodiment_instance_id=manifest.embodiment_instance_id,
-        target_handler_id=manifest.target_handler_id,
-        action_schema_hash=manifest.action_schema_hash,
-        required_component_ids=manifest.component_ids,
-    )
-    binding = bind_target_runtime_requirement(
-        requirement,
-        manifest,
         bound_at=bound_at,
     )
+    manifest = profile_preflight.resolved_manifest
+    binding = profile_preflight.binding_receipt
     evidence = build_rm65_execution_evidence_bundle(
         config.control_execution_manifest
     )
@@ -449,10 +514,16 @@ __all__ = [
     "RM65_POLICY_ARM_QPOS_CANDIDATE_EMBODIMENT_DEFINITION_ID",
     "RM65_POLICY_ARM_QPOS_CANDIDATE_PROVIDER_ID",
     "RM65_POLICY_ARM_QPOS_CANDIDATE_PROVIDER_IDENTITY",
+    "RM65_POLICY_ARM_QPOS_CANDIDATE_REQUIREMENT_ID_PREFIX",
+    "RM65_POLICY_ARM_QPOS_CANDIDATE_SUPPORTED_CLOCK_DOMAIN_IDS",
     "RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_HANDLER_ID",
+    "RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID",
+    "RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_VERSION",
     "RM65PolicyArmQposCandidatePreflight",
     "RM65PolicyArmQposCandidateTargetConfig",
     "RM65PolicyArmQposCandidateTargetProvider",
+    "build_rm65_policy_arm_qpos_candidate_embodiment_definition_hash",
     "build_rm65_policy_arm_qpos_candidate_provider_entry",
+    "build_rm65_policy_arm_qpos_candidate_target_profile_binding",
     "preflight_rm65_policy_arm_qpos_candidate_target",
 ]
