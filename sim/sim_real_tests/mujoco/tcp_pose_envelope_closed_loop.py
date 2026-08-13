@@ -20,18 +20,19 @@ from typing import Any, Mapping
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.position_control import (
     TimestampedMotionTarget,
     resample_motion_targets,
 )
-from robot_motion.position_control.tcp_pose_envelope import (
-    TCP_CONTROLLED_FRAME_ID,
+from robot_motion.target_safety.tcp_pose_envelope import (
     TCPPoseEnvelopeAnchorReceipt,
     TCPPoseEnvelopeProfile,
-    TCPPoseEnvelopeProjectionResult,
     TCPPoseEnvelopeSideConfig,
-    project_tcp_pose_envelope,
+)
+from sim.mujoco.adapters.tcp_pose_envelope import (
+    install_mujoco_tcp_pose_envelope_filter,
+    mujoco_target_frame_binding_hash,
+    mujoco_tool_frame_binding_hashes,
 )
 from sim.mujoco.control.desk_tcp_position import DeskTcpPositionControl
 
@@ -44,12 +45,6 @@ DEFAULT_CONFIG_PATH = (
     / "tcp_pose_envelope_active_closed_loop_v1.json"
 )
 
-_TARGET_BINDING_DOMAIN = (
-    "dexteleop.sim_real_tcp_pose_envelope_target_binding.development"
-)
-_TOOL_BINDING_DOMAIN = (
-    "dexteleop.sim_real_tcp_pose_envelope_tool_binding.development"
-)
 _REFERENCE_FRAME = "mujoco_world"
 _EXECUTION_EPOCH = 1
 
@@ -152,126 +147,6 @@ def _max_basis_direction_error_deg(reference: np.ndarray, actual: np.ndarray) ->
 
 def _world_to_desk(control: DeskTcpPositionControl, pose_world: np.ndarray) -> np.ndarray:
     return np.linalg.inv(control.world_from_desk) @ np.asarray(pose_world, dtype=float)
-
-
-def _tool_binding_hashes(control: DeskTcpPositionControl) -> dict[str, str]:
-    identity = np.eye(4, dtype=float)
-    return {
-        side: canonical_content_hash(
-            {
-                "side": side,
-                "controlled_frame_id": TCP_CONTROLLED_FRAME_ID,
-                "solver_to_tool_tcp": control.retargeter.tool_tcp_world_target_from_solver_world_target(
-                    side=side,
-                    solver_world_target=identity,
-                ).tolist(),
-            },
-            domain=_TOOL_BINDING_DOMAIN,
-        )
-        for side in ("left", "right")
-    }
-
-
-class _ActiveWorldTCPPoseEnvelopeFilter:
-    """Simulation binding glue around the shared pure target projector."""
-
-    def __init__(
-        self,
-        *,
-        control: DeskTcpPositionControl,
-        anchor_tool_world_by_side: Mapping[str, np.ndarray],
-        config: TCPPoseEnvelopeClosedLoopConfig,
-    ) -> None:
-        self.control = control
-        self.tool_binding_hash_by_side = _tool_binding_hashes(control)
-        self.target_binding_hash = canonical_content_hash(
-            {
-                "reference_frame": _REFERENCE_FRAME,
-                "world_from_desk": control.world_from_desk.tolist(),
-                "world_to_base_by_side": {
-                    side: transform.tolist()
-                    for side, transform in control.world_to_base_by_side.items()
-                },
-            },
-            domain=_TARGET_BINDING_DOMAIN,
-        )
-        half = float(config.translation_half_extent_m)
-        self.profile = TCPPoseEnvelopeProfile(
-            profile_id="sim-active-left-relative-envelope-v1",
-            target_frame_binding_hash=self.target_binding_hash,
-            tool_frame_binding_hash_by_side=self.tool_binding_hash_by_side,
-            reference_frame_by_side={
-                "left": _REFERENCE_FRAME,
-                "right": _REFERENCE_FRAME,
-            },
-            side_config_by_side={
-                "left": TCPPoseEnvelopeSideConfig(
-                    relative_min_xyz_m=(-half, -half, -half),
-                    relative_max_xyz_m=(half, half, half),
-                    relative_axes="canonical_axes",
-                    max_rotation_rad=math.radians(config.max_rotation_deg),
-                )
-            },
-        )
-        self.anchor = TCPPoseEnvelopeAnchorReceipt.capture(
-            anchor_id="mujoco_measured_start_tool_tcp",
-            profile=self.profile,
-            execution_epoch=_EXECUTION_EPOCH,
-            clock_domain_id="mujoco_physics_time",
-            tcp_pose_by_side={"left": anchor_tool_world_by_side["left"]},
-            captured_at_by_side={"left": float(control.scene.data.time)},
-        )
-        self.projections: list[TCPPoseEnvelopeProjectionResult] = []
-        self._last_projection: TCPPoseEnvelopeProjectionResult | None = None
-
-    def __call__(
-        self,
-        solver_targets_by_side: dict[str, np.ndarray],
-    ) -> dict[str, np.ndarray]:
-        tool_targets = {
-            side: self.control.retargeter.tool_tcp_world_target_from_solver_world_target(
-                side=side,
-                solver_world_target=target,
-            )
-            for side, target in solver_targets_by_side.items()
-        }
-        projection = project_tcp_pose_envelope(
-            tool_targets,
-            profile=self.profile,
-            target_frame_binding_hash=self.target_binding_hash,
-            tool_frame_binding_hash_by_side=self.tool_binding_hash_by_side,
-            controlled_frame_id=TCP_CONTROLLED_FRAME_ID,
-            reference_frame_by_side={
-                side: _REFERENCE_FRAME for side in tool_targets
-            },
-            execution_epoch=_EXECUTION_EPOCH,
-            anchor_receipt=self.anchor,
-        )
-        self.projections.append(projection)
-        self._last_projection = projection
-        output = {
-            side: np.asarray(target, dtype=float).copy()
-            for side, target in solver_targets_by_side.items()
-        }
-        for side in projection.modified_sides:
-            output[side] = (
-                self.control.retargeter.solver_world_target_from_tool_tcp_world_target(
-                    side=side,
-                    tool_tcp_world_target=projection.effective_tcp_pose_by_side[side],
-                )
-            )
-        return output
-
-    def command_metadata(self) -> dict[str, Any]:
-        return {
-            "mode": "active",
-            "target_boundary": "final_pre_ik_tool_tcp",
-            "projection": (
-                None
-                if self._last_projection is None
-                else self._last_projection.to_payload()
-            ),
-        }
 
 
 def _source_targets(
@@ -391,12 +266,49 @@ def run_tcp_pose_envelope_active_closed_loop(
             left_qpos=initial_qpos["left"],
             right_qpos=initial_qpos["right"],
         )
-        active_filter = _ActiveWorldTCPPoseEnvelopeFilter(
-            control=control,
-            anchor_tool_world_by_side=anchor_tool_world,
-            config=cfg,
+        target_binding_hash = mujoco_target_frame_binding_hash(
+            reference_frame=_REFERENCE_FRAME,
+            world_from_desk=control.world_from_desk,
+            world_to_base_by_side=control.world_to_base_by_side,
         )
-        control.retargeter.pre_ik_target_safety_filter = active_filter
+        tool_binding_hash_by_side = mujoco_tool_frame_binding_hashes(
+            control.retargeter,
+            sides=("left", "right"),
+        )
+        half = float(cfg.translation_half_extent_m)
+        profile = TCPPoseEnvelopeProfile(
+            profile_id="sim-active-left-relative-envelope-v1",
+            target_frame_binding_hash=target_binding_hash,
+            tool_frame_binding_hash_by_side=tool_binding_hash_by_side,
+            reference_frame_by_side={
+                "left": _REFERENCE_FRAME,
+                "right": _REFERENCE_FRAME,
+            },
+            side_config_by_side={
+                "left": TCPPoseEnvelopeSideConfig(
+                    relative_min_xyz_m=(-half, -half, -half),
+                    relative_max_xyz_m=(half, half, half),
+                    relative_axes="canonical_axes",
+                    max_rotation_rad=math.radians(cfg.max_rotation_deg),
+                )
+            },
+        )
+        anchor = TCPPoseEnvelopeAnchorReceipt.capture(
+            anchor_id="mujoco_measured_start_tool_tcp",
+            profile=profile,
+            execution_epoch=_EXECUTION_EPOCH,
+            clock_domain_id="mujoco_physics_time",
+            tcp_pose_by_side={"left": anchor_tool_world["left"]},
+            captured_at_by_side={"left": float(control.scene.data.time)},
+        )
+        active_filter = install_mujoco_tcp_pose_envelope_filter(
+            retargeter=control.retargeter,
+            profile=profile,
+            target_frame_binding_hash=target_binding_hash,
+            execution_epoch=_EXECUTION_EPOCH,
+            anchor_receipt=anchor,
+            apply_to_target=True,
+        )
         source_targets = _source_targets(
             control=control,
             anchor_tool_world_by_side=anchor_tool_world,
@@ -446,7 +358,9 @@ def run_tcp_pose_envelope_active_closed_loop(
             )
             if result.status not in {"tracking", "boundary_active"}:
                 ik_failure_count += 1
-            projection = active_filter.projections[-1]
+            projection = active_filter.last_projection
+            if projection is None:
+                raise RuntimeError("Active TCP envelope produced no projection")
             side_projection = projection.side_projection_by_side["left"]
             raw_left = projection.raw_tcp_pose_by_side["left"]
             effective_left = projection.effective_tcp_pose_by_side["left"]
@@ -599,7 +513,9 @@ def run_tcp_pose_envelope_active_closed_loop(
                 }
             )
 
-        final_projection = active_filter.projections[-1]
+        final_projection = active_filter.last_projection
+        if final_projection is None:
+            raise RuntimeError("Active TCP envelope produced no final projection")
         final_left = final_projection.effective_tcp_pose_by_side["left"]
         final_anchor_error_m = float(
             np.linalg.norm(final_left[:3, 3] - anchor_tool_world["left"][:3, 3])
@@ -650,7 +566,7 @@ def run_tcp_pose_envelope_active_closed_loop(
                 "physics_hz": control.contract.timing.physics_hz,
                 "source_target_count": len(source_targets),
                 "reference_count": len(references),
-                "projection_count": len(active_filter.projections),
+                "projection_count": active_filter.projection_count,
                 "modified_reference_count": modified_reference_count,
                 "translation_modified_reference_count": (
                     translation_modified_reference_count

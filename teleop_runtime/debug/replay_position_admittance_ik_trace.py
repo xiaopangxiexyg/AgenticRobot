@@ -51,6 +51,7 @@ from robot_motion.runtime import EffectorCommand
 from robot_motion.transforms import interpolate_pose
 from teleop_runtime.real_teleop.position_admittance_shadow import (
     POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA,
+    POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG,
     POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG,
 )
 from teleop_runtime.retargeters.dual_arm_collision_aware import (
@@ -433,6 +434,9 @@ def _build_retargeter(
             ),
             output_qpos_admittance_micro_reversal_hold_deg=(
                 POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG
+            ),
+            output_qpos_admittance_micro_reversal_creep_deg=(
+                POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG
             ),
             output_qpos_smoothing_singularity_alpha=0.65,
             current_target_hold_enabled=True,

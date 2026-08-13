@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 
 from dataset_contracts.pose_frames import PoseFrameContract
-from robot_motion.position_control.tcp_pose_envelope import (
+from robot_motion.target_safety.tcp_pose_envelope import (
     TCPPoseEnvelopeSideConfig,
 )
-from teleop_runtime.position_control.deploy_tcp_pose_envelope import (
+from teleop_runtime.target_safety.deploy_tcp_pose_envelope import (
     DeployTCPPoseEnvelopeProjector,
 )
-from teleop_runtime.position_control.tcp_pose_envelope_runtime import (
+from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeFileSpec,
     TCPPoseEnvelopeRuntimeError,
     load_tcp_pose_envelope_file_spec,

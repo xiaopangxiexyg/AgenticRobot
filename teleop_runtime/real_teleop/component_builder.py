@@ -77,7 +77,7 @@ from ..position_control import (
     PositionReferencePublisher,
     PositionReferencePublisherConfig,
 )
-from ..position_control.tcp_pose_envelope_runtime import (
+from ..target_safety.tcp_pose_envelope_runtime import (
     install_tcp_pose_envelope_filter,
     load_tcp_pose_envelope_profile,
 )

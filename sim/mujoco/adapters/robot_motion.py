@@ -852,6 +852,41 @@ class MujocoPositionExecutionRig(Rig):
         with self._lock:
             return capture(self.scene)
 
+    def capture_active_contact_observation(self) -> dict[str, object]:
+        """Observe current MuJoCo forbidden contacts without advancing physics."""
+
+        with self._lock:
+            projector_factory = getattr(self.scene, "collision_projector", None)
+            data = getattr(self.scene, "data", None)
+            if not callable(projector_factory) or data is None:
+                return {
+                    "available": False,
+                    "safe": True,
+                    "semantics": "mujoco_active_forbidden_contacts",
+                    "observed_at": float(self._clock()),
+                    "physics_tick": int(self._worker_physics_ticks),
+                }
+            projector = projector_factory()
+            if projector is None:
+                return {
+                    "available": False,
+                    "safe": True,
+                    "semantics": "mujoco_active_forbidden_contacts",
+                    "observed_at": float(self._clock()),
+                    "physics_tick": int(self._worker_physics_ticks),
+                }
+            check = projector.oracle.check_contacts(data)
+            return {
+                "available": True,
+                "semantics": "mujoco_active_forbidden_contacts",
+                "hard_penetration_limit_m": float(
+                    projector.policy.hard_penetration_m
+                ),
+                "observed_at": float(self._clock()),
+                "physics_tick": int(self._worker_physics_ticks),
+                **check.to_dict(),
+            }
+
     def capture_active_reference(self) -> dict[str, object] | None:
         """Return a read-only copy of the qref currently owned by execution."""
 

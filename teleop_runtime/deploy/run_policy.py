@@ -246,10 +246,10 @@ from ..position_control import (
     build_position_collision_planner_from_started_backends,
     resolve_real_arm_execution_config,
 )
-from ..position_control.deploy_tcp_pose_envelope import (
+from ..target_safety.deploy_tcp_pose_envelope import (
     DeployTCPPoseEnvelopeProjector,
 )
-from ..position_control.tcp_pose_envelope_runtime import (
+from ..target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeRuntimeError,
     load_tcp_pose_envelope_file_spec,
 )
@@ -3742,7 +3742,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--camera-startup-warmup-policy",
         choices=REALSENSE_STARTUP_WARMUP_POLICIES,
         default=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
-        help=("RealSense warmup policy shared with formal real-teleop collection."),
+        help=(
+            "RealSense warmup/recovery profile shared with formal collection. "
+            "bounded_first_frame requires complete configured streams and bounded "
+            "recovery; legacy preserves the historical rollback behavior."
+        ),
     )
     parser.add_argument(
         "--camera-startup-hardware-reset",
@@ -5548,6 +5552,17 @@ def build_camera_sources(
                 f"--camera-key {config.camera_key!r} is not selected by policy artifact "
                 f"{list(selected_camera_keys)}."
             )
+        apply_real_teleop_camera_startup_defaults(
+            {config.camera_key: config},
+            color_format=str(getattr(args, "camera_color_format", "bgr8")),
+            warmup_policy=str(
+                getattr(
+                    args,
+                    "camera_startup_warmup_policy",
+                    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+                )
+            ),
+        )
         return {config.camera_key: RealSenseRGBSource(config)}
     camera_configs = load_realsense_camera_config_map(Path(args.camera_config))
     if selected_camera_keys is not None:

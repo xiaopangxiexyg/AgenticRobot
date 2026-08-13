@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from robot_motion.position_control.tcp_pose_envelope import (
+from robot_motion.target_safety.tcp_pose_envelope import (
     TCPPoseEnvelopeProfile,
     TCPPoseEnvelopeSideConfig,
 )
-from teleop_runtime.position_control.tcp_pose_envelope_runtime import (
+from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCP_POSE_ENVELOPE_FILE_SCHEMA_V1,
     TCPPoseEnvelopeRuntimeError,
     TCPPoseEnvelopeTargetFilter,

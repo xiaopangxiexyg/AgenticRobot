@@ -37,7 +37,7 @@ from .position_admittance_shadow import (
     PositionAdmittanceActiveFault,
     admitted_solver_world_poses_from_joint_command,
 )
-from ..position_control.tcp_pose_envelope_runtime import (
+from ..target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeRuntimeError,
 )
 from .defaults import runtime_home_fresh_data_timeout_sec

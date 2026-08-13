@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as Rotation
 
-from robot_motion.position_control.tcp_pose_envelope import (
+from robot_motion.target_safety.tcp_pose_envelope import (
     TCP_CONTROLLED_FRAME_ID,
     TCPPoseEnvelopeAnchorReceipt,
     TCPPoseEnvelopeBindingError,
