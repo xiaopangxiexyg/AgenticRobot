@@ -2,6 +2,12 @@
 
 本目录包含用途明确分开的程序：
 
+- `vive_data_sender_stable.py`：低抖动、单文件部署 sender。它直接调用 `openvr`，
+  不搜索、不导入、也不修改仓库设备驱动；主循环每帧只获取一次 OpenVR pose
+  snapshot，设备事件只标记 registry 需要刷新，刷新复用同一 snapshot。UDP 错误不会
+  在采样线程执行指数退避，状态打印默认关闭且启用后由 latest-only 后台线程输出。
+  数据面仍为当前 `teleop_runtime.vive/v1`，并保留可选的独立校时控制面。需要排查
+  sender 抖动或将单个文件复制到 SteamVR 主机时，优先使用此入口。
 - `vive_data_sender.py`：本地默认的新 sender。从 OpenVR 取 pose/速度并发送
   `teleop_runtime.vive/v1` UDP JSON（300 Hz），并自动尝试独立 UDP 校时。默认行为仍
   严格要求恰好两个 GenericTracker，并按设备名字典序将较小者分配为 `left_wrist`、
@@ -19,21 +25,20 @@
 
 ## 单文件发送端迁移
 
-`vive_data_sender.py` 本身是可独立复制的发送端文件。把这一个文件复制到 Windows
-SteamVR 电脑即可；发送端不需要同时复制 `clock_sync.py`、`teleop_runtime/` 或其他
-仓库模块。内嵌实现只要求目标 Python 环境能够执行 `import openvr`，不要求
-`numpy` 或 `transforms3d`：
+推荐复制 `vive_data_sender_stable.py` 到 Windows SteamVR 电脑。发送端不需要同时
+复制设备驱动、`clock_sync.py`、`teleop_runtime/` 或其他仓库模块；目标 Python 环境
+只需能够执行 `import openvr`：
 
 ```powershell
 python -c "import openvr; print(openvr.__file__)"
-python .\vive_data_sender.py --host <receiver-ip> --port 9999 --hz 200
+python .\vive_data_sender_stable.py --host <receiver-ip> --port 9999 --hz 200
 ```
 
-排查 `stale` 时先看 sender 每秒的 `[Status]` 行：`rate`/`loop` 反映实际采样
-循环，`valid` 反映 OpenVR 当前 tracker 是否有效，`send_errors` 反映 UDP 是否真正
-发送失败；`get_pose`、`registry` 和 `trackers_max` 会在慢循环时打印。`rate` 持续接近
-目标且 `send_errors=0` 时，发送端通常仍在发送，即使某个 tracker 的 `valid=false`
-也只是一个带错误原因的有效 UDP 帧，不等于链路断开。
+稳定版默认异步打印 1 Hz 状态；其 `[Status]` 会给出采样/UDP send 调用成功频率、
+deadline miss、各阶段最大耗时以及 UDP drop/error。状态由有界 latest-only 后台线程
+打印，不进入 OpenVR 采样关键路径。需要完全静默时可显式添加 `--print-hz 0`。
+`rate` 持续接近目标且 `udp_errors=0` 只能证明 sender 本地调用正常，不能证明
+Wi-Fi/AP/内核队列已经及时把数据交付 receiver。
 
 接收端再按层判断：`packet_count`/`datagram_count`/`packet_age_monotonic_sec` 是 UDP
 到达证据；`processed_packet_count`、`process_error_count` 和
@@ -45,14 +50,14 @@ session hold/fault 或 action contract，而不是盲目重启 sender。接收�
 `worker_alive=false` 且 `process_error_count` 增长则是 receiver worker 异常，应重建
 receiver；不要同时启动诊断 receiver 和遥操作 receiver 竞争 9999 端口。
 
-若完整 `triad_openvr.py` 与 sender 一起复制，启动时仍会按确定顺序搜索 sender
+旧 `vive_data_sender.py` 若与完整设备驱动一起复制，启动时仍会按确定顺序搜索 sender
 同目录、其子目录以及父目录下的子目录，并优先使用找到的完整驱动。没有找到，或完整
 驱动缺少 `numpy`/`transforms3d` 等非必要依赖时，会自动回退到内嵌 OpenVR 适配器；
 控制台会打印实际选择。搜索会跳过 `.git`、虚拟环境和缓存目录，也不会退回到环境中
 同名的第三方 `triad_openvr` 包。
 
-仓库内两个 sender 入口仍共用同一份 OpenVR pose/v1 数据面实现。不要运行旧
-`VIVE_sender/` 或旧 `data_sender*.py` sender 副本；这些入口不属于当前链路。
+稳定版是独立实现，不替换旧入口，也不改变旧入口行为。不要运行旧 `VIVE_sender/`
+或旧 `data_sender*.py` sender 副本；这些入口不属于当前链路。
 校时端口、启动命令和 compatibility matrix 见
 [`CLOCK_SYNC.md`](CLOCK_SYNC.md)。
 

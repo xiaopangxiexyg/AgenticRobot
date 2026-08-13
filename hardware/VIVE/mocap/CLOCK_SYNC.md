@@ -14,7 +14,12 @@ protocol: teleop_runtime.vive/v1
 ```
 
 Clock messages are never sent to that port and the v1 pose JSON is not
-extended.  The repository now has two sender entry points:
+extended.  The repository has three deliberately separate sender entry points:
+
+- `vive_data_sender_stable.py` is the dependency-light, low-jitter one-file
+  entry point. It preserves the current v1 pose fields and optional clock
+  control while accessing `openvr` directly. Use it for current receivers when
+  sender scheduling stability is the priority.
 
 - `vive_data_sender.py` is the **new local default**. It starts the separate
   control client in `optional` mode automatically. The sender-side subset of
@@ -54,7 +59,7 @@ The real-teleop entry point accepts the same `--vive-clock-sync-*` options.
 On the VIVE sender machine, keep the existing pose destination unchanged:
 
 ```bash
-python vive_data_sender.py --host <collector-ip> --port 9999
+python vive_data_sender_stable.py --host <collector-ip> --port 9999
 ```
 
 The new sender's default `optional` mode keeps streaming v1 poses when the
