@@ -1,5 +1,9 @@
 """Deployable MuJoCo frontend using the shared authoritative control core."""
 
+from .contact_trace import (
+    MUJOCO_CONTACT_GUARD_ID_V1,
+    project_mujoco_forbidden_contact_guard_result,
+)
 from .async_topology import (
     AsyncHarnessRelease,
     AsyncHarnessSubmissionReceipt,
@@ -176,4 +180,6 @@ __all__ = [
     "build_mujoco_pose_component_target_profile",
     "build_mujoco_pose_qpos_component_target_profile",
     "build_rm65_right_cube_lift_component_target_profile",
+    "MUJOCO_CONTACT_GUARD_ID_V1",
+    "project_mujoco_forbidden_contact_guard_result",
 ]

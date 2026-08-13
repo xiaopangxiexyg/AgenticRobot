@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -162,6 +163,46 @@ def test_mujoco_position_rig_rejects_partial_bimanual_reference() -> None:
         assert "atomic qref" in str(exc)
     else:
         raise AssertionError("partial bimanual reference must be rejected")
+
+
+def test_mujoco_position_rig_reports_actual_forbidden_contact_separately() -> None:
+    scene = _FakeScene()
+    scene.data = object()
+    check = SimpleNamespace(
+        to_dict=lambda: {
+            "safe": False,
+            "minimum_distance_m": -0.0015,
+            "penetration_depth_m": 0.0015,
+            "geom1": "right_gripper_collision",
+            "geom2": "table_collision",
+            "body1": "right_gripper",
+            "body2": "table",
+            "pair_class": "1:4",
+            "collision_category": "gripper_environment",
+        }
+    )
+    projector = SimpleNamespace(
+        oracle=SimpleNamespace(check_contacts=lambda _data: check),
+        policy=SimpleNamespace(hard_penetration_m=0.001),
+    )
+    scene.collision_projector = lambda: projector
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+        ),
+    )
+
+    observation = rig.capture_active_contact_observation()
+
+    assert observation["available"] is True
+    assert observation["safe"] is False
+    assert observation["semantics"] == "mujoco_active_forbidden_contacts"
+    assert observation["hard_penetration_limit_m"] == pytest.approx(0.001)
+    assert observation["penetration_depth_m"] == pytest.approx(0.0015)
 
 
 def test_mujoco_position_rig_close_does_not_wait_on_live_worker_lock() -> None:

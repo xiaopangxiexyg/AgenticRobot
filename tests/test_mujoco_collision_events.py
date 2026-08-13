@@ -80,6 +80,43 @@ def test_collision_event_tracker_validates_vector_contract() -> None:
         )
 
 
+def test_forbidden_contact_guard_projection_preserves_terminal_pair() -> None:
+    from sim.mujoco.deploy.contact_trace import (
+        project_mujoco_forbidden_contact_guard_result,
+    )
+
+    fact = project_mujoco_forbidden_contact_guard_result(
+        {
+            "available": True,
+            "safe": False,
+            "observed_at": 12.0,
+            "physics_tick": 123,
+            "minimum_distance_m": -0.0015,
+            "penetration_depth_m": 0.0015,
+            "hard_penetration_limit_m": 0.001,
+            "geom1": "right_gripper_collision",
+            "geom2": "table_collision",
+            "body1": "right_gripper",
+            "body2": "table",
+            "pair_class": "1:4",
+            "collision_category": "gripper_environment",
+        },
+        runtime_session_id="runtime-session",
+        control_domain_id="sim-domain",
+        embodiment_instance_id="sim-embodiment",
+        clock_domain_id="sim-clock",
+    )
+
+    assert fact.event_type == "backend_guard_result"
+    assert fact.payload["status"] == "unsafe_terminal"
+    assert fact.payload["diagnostics"]["geom1"] == (
+        "right_gripper_collision"
+    )
+    assert fact.payload["diagnostics"]["penetration_depth_m"] == pytest.approx(
+        0.0015
+    )
+
+
 @pytest.mark.optional
 def test_cube_lift_info_separates_projected_and_actual_collision_facts() -> None:
     pytest.importorskip("mujoco")

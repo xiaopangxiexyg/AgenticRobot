@@ -159,6 +159,7 @@ from .pose_resolution import (
     build_mujoco_component_execution_target,
     build_mujoco_pose_qpos_execution_target,
 )
+from .contact_trace import project_mujoco_forbidden_contact_guard_result
 from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
 )
@@ -2339,6 +2340,22 @@ class MujocoDeployRuntime:
         if any(not isinstance(fact, ControlTraceFact) for fact in values):
             raise TypeError("facts must contain only ControlTraceFact values.")
         self.core.record_external_facts(values)
+
+    def record_active_contact_guard_result(
+        self,
+        observation: Mapping[str, object],
+    ) -> ControlTraceFact:
+        """Persist one lower-owned terminal MuJoCo contact-guard verdict."""
+
+        fact = project_mujoco_forbidden_contact_guard_result(
+            observation,
+            runtime_session_id=self.config.runtime_session_id,
+            control_domain_id=self.config.control_domain_id,
+            embodiment_instance_id=self.config.embodiment_instance_id,
+            clock_domain_id=self.config.clock_domain_id,
+        )
+        self.record_external_facts((fact,))
+        return fact
 
     def capture_control_cut(
         self,
