@@ -810,6 +810,12 @@ def _recorder(
     )
     recorder.dataset_root = tmp_path
     recorder.writer = _Writer()
+    recorder.writer_storage_config = LeRobotV21WriterConfig(
+        root_dir=tmp_path,
+        task_id="task-a",
+        write_parquet=False,
+        write_video=False,
+    )
     recorder.writer_runtime = None
     recorder.writer_observer = _WriterLifecycle()
     recorder.collection_worker_mode = "thread"
@@ -863,22 +869,22 @@ def _use_actual_v23_writer(
     *,
     dataset_root: Path,
 ) -> None:
-    recorder.writer = LeRobotV21Writer(
-        LeRobotV21WriterConfig(
-            root_dir=dataset_root,
-            task_id="task-a",
-            write_video=False,
-            policy_io_layout=PolicyIOLayout(
-                arm_reference_frame_by_side={
-                    "left": "left_rm65_base",
-                    "right": "right_rm65_base",
-                }
-            ),
-            pose_frame_contract=PoseFrameContract.v23_forced_raw(
-                _v23_pose_source()
-            ),
-        )
+    writer_storage_config = LeRobotV21WriterConfig(
+        root_dir=dataset_root,
+        task_id="task-a",
+        write_video=False,
+        policy_io_layout=PolicyIOLayout(
+            arm_reference_frame_by_side={
+                "left": "left_rm65_base",
+                "right": "right_rm65_base",
+            }
+        ),
+        pose_frame_contract=PoseFrameContract.v23_forced_raw(
+            _v23_pose_source()
+        ),
     )
+    recorder.writer_storage_config = writer_storage_config
+    recorder.writer = LeRobotV21Writer(writer_storage_config)
 
 
 def _write_and_finalize_actual_v23_episode(

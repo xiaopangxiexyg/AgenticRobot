@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
-from pathlib import Path
+import shutil
 import tempfile
 import unittest
 import uuid
+from contextlib import redirect_stdout
+from pathlib import Path
 
 import numpy as np
 
@@ -36,6 +39,7 @@ from teleop_runtime.collection.writer_v21 import (
     LeRobotV21Writer,
     LeRobotV21WriterConfig,
 )
+from utils.dataset_postprocess.cli import main as dataset_postprocess_main
 
 
 class NativeTactileBundleTest(unittest.TestCase):
@@ -851,6 +855,124 @@ class NativeTactileBundleTest(unittest.TestCase):
                 payload["streams"]["M_RAW"]["compression"],
                 "zstd",
             )
+
+    def test_copied_bundle_can_attach_and_materialize_after_source_is_unavailable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            core, source_storage = self._roots(temporary)
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=core,
+                    dataset_name="portable_bundle_dataset",
+                    write_video=False,
+                    write_parquet=False,
+                    tactile_storage="external",
+                    tactile_compression="zstd",
+                    tactile_artifact_integrity=True,
+                    tactile_bundle_root=source_storage,
+                    tactile_bundle_require_distinct_device=False,
+                )
+            )
+            writer.start_episode(episode_identity=self._identity())
+            for job in writer.plan_sample_jobs(self._collector_sample()):
+                writer.handle_job(job)
+            writer.finalize_episode(0)
+
+            source_bundle = writer.tactile_bundle_store.bundle_dataset_root
+            dataset_uuid = (
+                writer.tactile_bundle_store.dataset_identity.dataset_uuid
+            )
+            source_payload = next((source_bundle / "tactile").rglob("*.zst"))
+            expected_payload = source_payload.read_bytes()
+
+            migrated_storage = base / "migrated-tactile-device"
+            migrated_bundle = migrated_storage / "datasets" / dataset_uuid
+            migrated_bundle.parent.mkdir(parents=True)
+            shutil.copytree(
+                source_bundle,
+                migrated_bundle,
+                copy_function=shutil.copy2,
+            )
+            migrated_payload = (
+                migrated_bundle / source_payload.relative_to(source_bundle)
+            )
+            self.assertNotEqual(
+                (source_payload.stat().st_dev, source_payload.stat().st_ino),
+                (migrated_payload.stat().st_dev, migrated_payload.stat().st_ino),
+            )
+
+            source_offline = base / "source-bundle-offline"
+            os.replace(source_bundle, source_offline)
+            with self.assertRaises(TactileBundleAttachmentError):
+                attach_tactile_bundle(core, source_storage)
+
+            status_stdout = io.StringIO()
+            with redirect_stdout(status_stdout):
+                status_code = dataset_postprocess_main(
+                    [
+                        "tactile-bundle-status",
+                        str(core),
+                        "--tactile-root",
+                        str(migrated_storage),
+                    ]
+                )
+            status = json.loads(status_stdout.getvalue())
+            self.assertEqual(status_code, 0)
+            self.assertEqual(status["dataset_uuid"], dataset_uuid)
+            self.assertEqual(status["episode_count"], 1)
+            self.assertGreater(status["payload_count"], 0)
+
+            plan_stdout = io.StringIO()
+            with redirect_stdout(plan_stdout):
+                plan_code = dataset_postprocess_main(
+                    [
+                        "tactile-bundle-materialize",
+                        str(core),
+                        "--tactile-root",
+                        str(migrated_storage),
+                    ]
+                )
+            plan = json.loads(plan_stdout.getvalue())
+            self.assertEqual(plan_code, 0)
+            self.assertEqual(plan["dataset_uuid"], dataset_uuid)
+
+            apply_stdout = io.StringIO()
+            with redirect_stdout(apply_stdout):
+                apply_code = dataset_postprocess_main(
+                    [
+                        "tactile-bundle-materialize",
+                        str(core),
+                        "--tactile-root",
+                        str(migrated_storage),
+                        "--plan-hash",
+                        plan["plan_hash"],
+                        "--confirm-dataset-uuid",
+                        dataset_uuid,
+                        "--confirm-no-active-writers",
+                        "--confirm-no-active-readers",
+                        "--apply",
+                    ]
+                )
+            materialized = json.loads(apply_stdout.getvalue())
+            self.assertEqual(apply_code, 0)
+            self.assertEqual(materialized["dataset_uuid"], dataset_uuid)
+
+            restored_payload = core / source_payload.relative_to(source_bundle)
+            self.assertEqual(restored_payload.read_bytes(), expected_payload)
+            self.assertNotEqual(
+                (migrated_payload.stat().st_dev, migrated_payload.stat().st_ino),
+                (restored_payload.stat().st_dev, restored_payload.stat().st_ino),
+            )
+
+            migrated_offline = base / "migrated-bundle-offline"
+            os.replace(migrated_bundle, migrated_offline)
+            self.assertEqual(restored_payload.read_bytes(), expected_payload)
+            receipts = tuple(
+                (core / "meta/tactile_bundle_v1/materializations").glob("*.json")
+            )
+            self.assertEqual(len(receipts), 1)
 
 
 if __name__ == "__main__":

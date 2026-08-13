@@ -16,6 +16,18 @@ tactile child process; camera hardware reset remains separately opt-in.
 that cameras, USB assignments, tactile calibration, or runtime recovery are
 ready on a target host.
 
+## Native tactile bundle capture probe
+
+`camera_tactile_bundle_capture_probe.py` records a short diagnostic episode
+from the live RealSense and DMTAC tactile sources through the production v2.1
+writer with native tactile separation enabled.  It requires the core output
+parent and the pre-existing tactile storage root to be on distinct filesystem
+devices.  Like the health probe, it constructs no arm backend, no gripper
+transport, no teleoperation session, and no command dispatcher.  Its output is
+diagnostic-only and must not be mixed into a formal training dataset.  A
+successful run also performs a full payload-hash attachment check and prints a
+content-bound materialization plan; it does not copy, merge, or remove data.
+
 ## 2026-08-09 path migration
 
 `tests/manual_camera_tactile_health_probe.py` moved to

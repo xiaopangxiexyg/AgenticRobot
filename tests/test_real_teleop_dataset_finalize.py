@@ -12,6 +12,7 @@ import pytest
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from collection_runtime.async_writer import AsyncWriterStats
 from teleop_runtime.collection.schema_v22 import StrictV22SampleRejection
+from teleop_runtime.collection.writer_v21 import LeRobotV21WriterConfig
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,
     EpisodeTraceRecorderSink,
@@ -58,11 +59,13 @@ class _FakeWriter:
         self.finalized: list[tuple[int, dict[str, object]]] = []
         self.next_episode_index = 12
         self.started: list[dict[str, object]] = []
+        self.started_identities: list[object | None] = []
         self.discarded: list[int] = []
 
-    def start_episode(self, *, metadata=None) -> int:
+    def start_episode(self, *, metadata=None, episode_identity=None) -> int:
         self.events.append("writer_start_episode")
         self.started.append(dict(metadata or {}))
+        self.started_identities.append(episode_identity)
         return int(self.next_episode_index)
 
     def discard_episode(self, episode_index: int) -> bool:
@@ -73,6 +76,29 @@ class _FakeWriter:
     def finalize_episode(self, episode_index: int, *, summary=None) -> None:
         self.events.append("writer_finalize_episode")
         self.finalized.append((int(episode_index), dict(summary or {})))
+
+
+def _writer_storage_config(
+    root_dir: Path,
+    *,
+    task_id: str = "test-task",
+    task_description: str = "Test task",
+    dataset_name: str = "test-dataset",
+    tactile_bundle_root: Path | None = None,
+) -> LeRobotV21WriterConfig:
+    """Build the real storage contract used by constructor-bypassing fixtures."""
+
+    return LeRobotV21WriterConfig(
+        root_dir=root_dir,
+        task_id=task_id,
+        task_description=task_description,
+        dataset_name=dataset_name,
+        write_parquet=False,
+        write_video=False,
+        tactile_artifact_integrity=tactile_bundle_root is not None,
+        tactile_bundle_root=tactile_bundle_root,
+        tactile_bundle_require_distinct_device=False,
+    )
 
 
 def _new_recorder(tmp_path: Path, events: list[str]) -> real_teleop.RealTeleopDatasetRecorder:
@@ -97,6 +123,7 @@ def _new_recorder(tmp_path: Path, events: list[str]) -> real_teleop.RealTeleopDa
     recorder.writer_pool = _FakeWriterPool()
     recorder.writer_observer = _BlockingWriterObserver(events)
     recorder.writer = _FakeWriter(events)
+    recorder.writer_storage_config = _writer_storage_config(tmp_path)
     recorder.finalize_tasks = []
     recorder.saved_episodes = 0
     recorder.discarded_episodes = 0
@@ -116,13 +143,17 @@ def test_recorder_configuration_guard_detects_post_warmup_task_change(tmp_path: 
         collection_task_id="task-a",
         collection_task_description="Task A",
         dataset_name="dataset-a",
+        tactile_storage="external",
+        tactile_bundle_root="",
+        tactile_bundle_min_free_gb=0.0,
     )
     recorder.dataset_root = tmp_path / "dataset"
     recorder.capture_modality_contract = CaptureModalityContract(
         ignored_camera_keys=("right_wrist",),
         ignored_tactile_keys=("left",),
     )
-    recorder.writer_storage_config = SimpleNamespace(
+    recorder.writer_storage_config = _writer_storage_config(
+        tmp_path / "dataset",
         task_id="task-a",
         task_description="Task A",
         dataset_name="dataset-a",
@@ -130,6 +161,14 @@ def test_recorder_configuration_guard_detects_post_warmup_task_change(tmp_path: 
 
     assert recorder.configured_for_current_args() is True
     recorder.require_configured_for_current_args()
+
+    recorder.args.tactile_bundle_root = str(tmp_path / "tactile-device")
+    assert recorder.configured_for_current_args() is False
+    recorder.args.tactile_bundle_root = ""
+
+    recorder.args.tactile_bundle_min_free_gb = 1.0
+    assert recorder.configured_for_current_args() is False
+    recorder.args.tactile_bundle_min_free_gb = 0.0
 
     recorder.args.collection_task_id = "task-b"
     assert recorder.configured_for_current_args() is False
@@ -448,6 +487,7 @@ def test_control_trace_binding_metadata_is_additive_at_legacy_episode_start(
         real_teleop.RealTeleopDatasetRecorder
     )
     recorder.writer = _FakeWriter(events)
+    recorder.writer_storage_config = _writer_storage_config(tmp_path)
     recorder.active_episode_index = None
     recorder.active_started_at = None
     recorder.finalize_tasks = []
@@ -496,6 +536,37 @@ def test_control_trace_binding_metadata_is_additive_at_legacy_episode_start(
     assert trace.episode_membership.episode_uuid == "episode-uuid-12"
 
 
+def test_native_tactile_bundle_start_receives_authoritative_episode_identity(
+    tmp_path: Path,
+) -> None:
+    writer = _FakeWriter([])
+    recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+        real_teleop.RealTeleopDatasetRecorder
+    )
+    recorder.writer = writer
+    recorder.writer_storage_config = _writer_storage_config(
+        tmp_path,
+        tactile_bundle_root=tmp_path / "tactile-device",
+    )
+    recorder.collection_worker_mode = "thread"
+    recorder.sample_builder = SimpleNamespace(set_episode=lambda _index: None)
+    recorder.active_episode_index = None
+    recorder.active_started_at = None
+    recorder.finalize_tasks = []
+    recorder.gripper_force_contract = None
+    recorder.actual_feedback_warmup_status = lambda _now: (True, "ready")
+    recorder._record_timestamps = deque()
+    recorder._episode_uuid_factory = lambda: "native-bundle-episode-uuid"
+
+    episode_index = recorder.start_episode({}, now=1.0)
+
+    assert episode_index == 12
+    assert writer.started_identities == [recorder.active_episode_identity]
+    assert recorder.active_episode_identity.episode_uuid == (
+        "native-bundle-episode-uuid"
+    )
+
+
 def test_process_native_stream_start_uses_trace_episode_uuid(
     tmp_path: Path,
 ) -> None:
@@ -529,6 +600,7 @@ def test_process_native_stream_start_uses_trace_episode_uuid(
         real_teleop.RealTeleopDatasetRecorder
     )
     recorder.writer = writer
+    recorder.writer_storage_config = _writer_storage_config(tmp_path)
     recorder.process_worker = writer
     recorder.collection_worker_mode = "process"
     recorder.active_episode_index = None
@@ -592,6 +664,7 @@ def test_episode_owner_passes_one_identity_to_v25p_and_control_trace(
         real_teleop.RealTeleopDatasetRecorder
     )
     recorder.writer = _FakeWriter([])
+    recorder.writer_storage_config = _writer_storage_config(tmp_path)
     recorder.collection_worker_mode = "thread"
     recorder.sample_builder = SimpleNamespace(set_episode=lambda _index: None)
     recorder.process_worker = SimpleNamespace(native_stream_contracts={})
@@ -661,6 +734,7 @@ def test_v25p_bind_failure_rolls_back_legacy_and_trace_preparation(
         real_teleop.RealTeleopDatasetRecorder
     )
     recorder.writer = writer
+    recorder.writer_storage_config = _writer_storage_config(tmp_path)
     recorder.collection_worker_mode = "thread"
     recorder.sample_builder = SimpleNamespace(set_episode=lambda _index: None)
     recorder.process_worker = SimpleNamespace(native_stream_contracts={})
