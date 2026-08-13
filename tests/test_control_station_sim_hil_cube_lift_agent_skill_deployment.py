@@ -450,6 +450,7 @@ def test_application_passive_cut_is_no_start_no_step_and_uses_existing_owner() -
     application._episode_ended = False
     application._restart_required = False
     application._closed = False
+    application._viewer_preview_started = False
     application._first_control_fault = None
     calls = {"scene": 0, "gate": 0}
 
