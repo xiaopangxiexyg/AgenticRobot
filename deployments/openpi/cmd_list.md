@@ -87,7 +87,8 @@
 ```bash
 export DEXTELEOP_ROOT=/home/user/zc/DexTeleop
 export OPENPI_ROOT=/home/user/zc/openpi
-export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
 
 export SERVER_IP=127.0.0.1
 export OPENPI_PORT=8078
@@ -274,7 +275,8 @@ client 终端重新执行第 4 节对应的选择块，然后运行：
 
 ```bash
 cd "$DEXTELEOP_ROOT"
-export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
 
 "$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
   --policy-artifact-json "$OPENPI_ARTIFACT" \
@@ -309,7 +311,8 @@ protocol，不连接 websocket、相机、夹爪或机械臂。它不会把 chec
 
 ```bash
 cd "$DEXTELEOP_ROOT"
-export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
 
 "$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
   --host "$SERVER_IP" \
@@ -345,7 +348,8 @@ export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
 
 ```bash
 cd "$DEXTELEOP_ROOT"
-export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
 
 "$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
   --host "$SERVER_IP" \
@@ -421,7 +425,7 @@ no-action 通过并退出后，仍在终端 B 执行下面的完整命令进入�
 
 ```bash
 cd /home/user/zc/DexTeleop
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 
 python -m deployments.openpi.client.real \
   --host 127.0.0.1 \
@@ -511,6 +515,29 @@ dataset-frame qpos 初始化轨迹时，可在第 9 节 client 命令末尾追�
 这是 L5 当前姿态接管 override。使用前必须确认当前双臂 qpos、TCP、夹爪状态、工作空间和新
 policy 首个 chunk 都处于允许范围；absolute policy 还必须确认当前状态属于其训练/部署起始分布。
 
+### 9.2 可选断联 DMTAC 夹爪
+
+第 9、10 节以及后续相同 prepared client 命令默认行为不变，仍连接并控制左右夹爪。如果
+某个夹爪明确不在线，可在 client 命令末尾只追加以下一组参数；`left` 也可替换为 `right`
+或 `both`：
+
+```bash
+--disconnected-gripper-sides left \
+  --disconnected-gripper-state 0.0
+```
+
+`--disconnected-gripper-state` 是送给模型的固定假定状态，范围 `[0,1]`，`0=open`、
+`1=closed`；默认值为 `0.0`。它会在 runtime 状态中标记为
+`configured_disconnected_assumption`，不是硬件测量。选中侧不会打开 gripper 串口或 DM-Tac
+触觉、不会启动重连、不会发送夹爪命令；策略产生的该侧夹爪动作记录为
+`intentionally_disconnected_noop`，其余夹爪、双臂、相机、碰撞、force guard、ready 和
+policy 流程保持不变。Stage1 dataset-frame qpos-init 会跳过断联侧的物理夹爪初始化，但仍
+正常初始化双臂和在线夹爪。
+
+不要用该选项掩盖一个本应在线但异常掉线的夹爪；这种情况仍应保持默认 fail-closed 行为并
+排查硬件。假定状态必须与现场未连接夹爪的实际开合尽量一致，否则模型看到的状态与物理场景
+不一致。
+
 ## 10. Prepared writing stage2：checkpoint-bound 部署
 
 本节用于已经完整训练的旧 stage2：`writing.remove_brush_cap_and_return_cap`。远端
@@ -568,7 +595,8 @@ current-pose startup，完成后仍需按 `A` 放行 policy：
 
 ```bash
 cd /home/user/zc/DexTeleop
-export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
 
 "$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
   --host 127.0.0.1 \
@@ -689,7 +717,8 @@ uv run scripts/serve_dexteleop_policy.py \
 
 ```bash
 cd /home/user/zc/DexTeleop
-export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
 export SERVER_IP=127.0.0.1
 export OPENPI_PORT=8078
 
@@ -979,3 +1008,266 @@ export PROFILE=deployments/openpi/configs/training/writing_multistage_prompt_080
 `writing-multistage-prompt-0804-0806-front-h16-absolute-b1-nw4-v1`。不要给首次
 训练添加 `--resume`；launcher 会拒绝不存在或没有正整数 step 的 checkpoint 目录，
 不会从一个空目录伪恢复。
+
+## 17. 0804–0806 writing 四阶段 prompt-family 训练（推荐 v2）
+
+v2 保留第 16 节单 prompt profile 作为完整回退，不覆盖其 workspace、asset、实验名或
+binding。每个 stage 使用 1 条简短 canonical prompt、12 条训练同义句和 4 条 held-out
+同义句。每个 8,995 样本的 stage/epoch 中，canonical 固定为 7,196（80%），12 条训练
+同义句合计 1,799（20%，单条 149 或 150）；held-out 从不进入训练或生产部署 allowlist。
+
+2026-08-11 已完成真实 OpenPI `prepare` 和 `sample-check`：binding hash 为
+`1dd199320fafd3f4e53202a9b227b26ee604f12aa205d089d119d09f30597ce3`，每个 epoch
+共 35,980 个唯一窗口。PaliGemma 对全部 68 条文本和 16 维全 `-1/0/1` 状态的 204 个
+组合，截断前最长 103 token，低于 profile 限制 160 和模型上限 200。
+
+检查、norm stats 和首次训练使用同一个 v2 profile：
+
+```bash
+cd /home/user/zc/DexTeleop
+export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
+export PROFILE=deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0806_front_h16_absolute_v2.json
+
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  prepare --profile "$PROFILE"
+
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  sample-check --profile "$PROFILE"
+
+CUDA_VISIBLE_DEVICES=0 "$OPENPI_PYTHON" -u \
+  -m deployments.openpi.training.prepared_skill_launch \
+  norm-stats --profile "$PROFILE" \
+  --stats-batch-size 20 --stats-num-workers 0 \
+  --skip-source-file-verification
+```
+
+本轮未运行上面的 norm stats。它成功完成后，首次训练使用前台交互命令；按 `S` 保存并
+继续，按一次 `Ctrl+C` 保存并退出：
+
+```bash
+cd /home/user/zc/DexTeleop
+export CUDA_VISIBLE_DEVICES=0
+export WANDB_MODE=offline
+export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
+export PROFILE=deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0806_front_h16_absolute_v2.json
+
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  train --profile "$PROFILE"
+```
+
+默认实验名是
+`writing-multistage-prompt-family-0804-0806-front-h16-absolute-b1-nw4-v2`。只有该目录
+已经存在正整数 step checkpoint 时才恢复：
+
+```bash
+cd /home/user/zc/DexTeleop
+export CUDA_VISIBLE_DEVICES=0
+export WANDB_MODE=offline
+export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
+export PROFILE=deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0806_front_h16_absolute_v2.json
+
+"$OPENPI_PYTHON" -u -m deployments.openpi.training.prepared_skill_launch \
+  train --profile "$PROFILE" --resume
+```
+
+产生 checkpoint 后，部署继续使用第 5～10 节的 checkpoint-bound prepared 路线，并把
+`--prepared-training-profile` 指向本节 v2 profile。client 的 `--prompt` 必须精确选择
+artifact 中某个 stage 的 canonical 或 12 条训练同义句；16 条 held-out 只用于离线泛化
+评估，生产 client 会拒绝它们。
+
+## 18. 0804–0807 writing 四阶段 prompt-family 训练与部署
+
+本节对应
+`writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json`。它保留第 9、10
+节既有 checkpoint-bound prepared server/client 结构：训练得到一个共同 checkpoint，server
+只加载一次该 checkpoint；四个阶段由 client 每次启动时选择文本条件，不创建四套 server，
+也不改动既有机械臂、夹爪、相机、qpos-init、碰撞和 force-guard 参数。
+
+### 18.1 训练命令
+
+正式训练仍使用现有前台交互 launcher；按 `S` 保存并继续，按一次 `Ctrl+C` 保存并退出：
+
+```bash
+cd /home/user/zc/DexTeleop
+export CUDA_VISIBLE_DEVICES=0
+export WANDB_MODE=offline
+/home/user/zc/openpi/.venv/bin/python -u -m deployments.openpi.training.prepared_skill_launch train \
+  --profile deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json
+```
+
+该 profile 绑定 0804–0807 的 7 个数据源、1,217 个 union Episode 和 393,540 个合法
+prepared 窗口；训练每个 effective epoch 平衡抽取 39,300 个窗口。四个 stage 均使用一个
+canonical prompt、12 个训练同义句和 4 个 held-out 同义句；canonical/训练同义句按
+80%/20% 进入训练，held-out 不进入训练和生产 allowlist。默认训练步数为 600,000，每
+30,000 step 保存一次。不要给首次训练添加 `--resume`；恢复时仍只在实验目录已有正整数
+step checkpoint 后给同一命令添加 `--resume`。
+
+### 18.2 文本阶段选择契约
+
+prepared deployment artifact 会绑定四个 stage、canonical prompt 和训练同义句 allowlist。
+client 新增可选 `--prompt-stage STAGE_ID`，从 artifact 解析 canonical prompt：
+
+| `STAGE_ID` | Skill | canonical prompt 摘要 |
+| --- | --- | --- |
+| `stage1` | `writing.bimanual_acquire_brush_and_present_for_cap_removal` | 右夹爪拿起带盖毛笔并递给左夹爪 |
+| `stage2` | `writing.remove_brush_cap_and_return_cap` | 左夹爪取盖归位，右夹爪保持毛笔稳定 |
+| `stage3` | `writing.write_with_brush` | 右夹爪书写，左臂和左夹爪保持静止 |
+| `stage4` | `writing.return_brush` | 右夹爪归还毛笔，左侧保持静止 |
+
+`--prompt-stage` 与原有 `--prompt` 二选一。`--prompt` 仍可用于 artifact 内的 canonical 或
+12 个训练同义句，因此旧文本部署接口保留；不在 artifact allowlist 内的文本以及 16 个
+held-out 文本会在创建相机、夹爪和机械臂 backend 前失败。prompt-conditioned artifact 不再
+允许省略两者，以免无文本请求进入模型。
+
+### 18.3 选择 checkpoint 并做无硬件绑定检查
+
+把 `CKPT_STEP` 改成实际存在且包含 `policy_artifact.json`、params 和本 profile norm stats 的
+数字 step。这里的 `30000` 只是可选择 step 的写法，不表示该 checkpoint 已在当前机器验证：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
+export CKPT_STEP=30000
+export OPENPI_CKPT=/home/user/zc/openpi/checkpoints/writing-multistage-prompt-family-0804-0807-front-h16-absolute-prepared-v2/writing-multistage-prompt-family-0804-0807-front-h16-absolute-b1-nw4-v2/$CKPT_STEP
+
+"$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json \
+  --prompt-stage stage1 \
+  --contract-check-only
+```
+
+输出中的 `prompt_selection.source` 应为 `prepared_stage`，`stage_id` 应为 `stage1`，prompt
+必须与 artifact 中 stage1 canonical prompt 完全一致。该命令不加载模型、不连接 server、
+相机、夹爪或机械臂。四个 stage 可分别替换后重复检查。
+
+### 18.4 终端 A：同一个多阶段 checkpoint server
+
+server 命令保持既有 prepared 结构，不需要也不建议设置 `--default-prompt`；每次推理的文本由
+client 请求携带：
+
+```bash
+cd /home/user/zc/DexTeleop
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+export CKPT_STEP=30000
+export OPENPI_CKPT=/home/user/zc/openpi/checkpoints/writing-multistage-prompt-family-0804-0807-front-h16-absolute-prepared-v2/writing-multistage-prompt-family-0804-0807-front-h16-absolute-b1-nw4-v2/$CKPT_STEP
+
+python -m deployments.openpi.server \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+server 启动后先检查 `/healthz` 和 `/metadata`。stage1–4 共用这个进程；只有更换 checkpoint、
+profile 或 OpenPI config 时才停止并重启 server。
+
+### 18.5 终端 B：stage1 从数据集初始姿态启动
+
+下方保留第 9 节现有 position 15/60/120 Hz、qpos-init、相机、队列、force guard 和人工
+`g`/`A` 放行结构，仅把 checkpoint/profile 换成多阶段版本并新增
+`--prompt-stage stage1`：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=30000
+export OPENPI_CKPT=/home/user/zc/openpi/checkpoints/writing-multistage-prompt-family-0804-0807-front-h16-absolute-prepared-v2/writing-multistage-prompt-family-0804-0807-front-h16-absolute-b1-nw4-v2/$CKPT_STEP
+
+python -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json \
+  --prompt-stage stage1 \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage \
+  --policy-qpos-init-episode 0 \
+  --policy-qpos-init-frame 0 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-collision-check \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --send-actions \
+  --debug
+```
+
+首次真机前按第 7 节规则派生 no-action：删除 `--send-actions` 并添加
+`--max-steps 100`，其余参数包括 `--prompt-stage stage1` 保持不变。
+
+### 18.6 终端 B：stage2/3/4 从当前姿态继续
+
+stage1 正常退出并确认当前姿态适合作为下一阶段输入后，保持终端 A 的同一个 server。终端 B
+每次只运行一个 client；先设置要执行的 stage，再执行相同 client 命令：
+
+```bash
+export PROMPT_STAGE=stage2
+```
+
+`stage2` 完成并退出后分别改为 `stage3`、`stage4` 重复。正式 client 命令如下：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=30000
+export OPENPI_CKPT=/home/user/zc/openpi/checkpoints/writing-multistage-prompt-family-0804-0807-front-h16-absolute-prepared-v2/writing-multistage-prompt-family-0804-0807-front-h16-absolute-b1-nw4-v2/$CKPT_STEP
+export PROMPT_STAGE=stage2
+
+python -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json \
+  --prompt-stage "$PROMPT_STAGE" \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  --no-init-qpos \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --send-actions \
+  --debug
+```
+
+该方式只复用同一个模型 server 和当前物理姿态，不保留上一个 client 的 action queue、模型
+history 或未执行 chunk，也不会自动判断一个 stage 是否成功完成；操作者必须在每次切换前
+确认动作已停止、当前双臂/夹爪状态满足下一阶段分布，然后重新完成当前姿态 startup 和人工
+ready 放行。no-action 仍按第 7 节规则派生。第 9.2 节断联夹爪选项可以原样追加，不改变文本
+stage 绑定。
