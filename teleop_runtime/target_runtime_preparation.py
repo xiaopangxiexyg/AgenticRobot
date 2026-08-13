@@ -4,7 +4,8 @@ This is the narrow handoff between profile preflight and a concrete provider.
 It may construct only a provider-declared inert handle.  It does not invoke a
 target operation, submit an action, start or home a device, mint a permit, or
 grant execution authority.  The returned handle remains a set of lower-owned
-ports and its subsequent lifecycle belongs to the calling application.
+ports.  The returned preparation retains construction rollback until the
+calling application explicitly commits the handle to its lifecycle owner.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from typing import Any
 from robot_motion.target_runtime import (
     ResolvedTargetRuntimeManifest,
     TargetRuntimeHandle,
+    TargetRuntimeHandleAcquisition,
     TargetRuntimeProviderRegistry,
     TargetRuntimeStatusSnapshot,
 )
@@ -24,15 +26,22 @@ from .target_profiles import TargetRuntimeProfilePreflight
 
 @dataclass(frozen=True)
 class TargetRuntimeHandlePreparation:
-    """Validated inert handle plus its exact preflight and initial status.
+    """Validated, uncommitted inert handle plus exact preflight and status.
 
     This is an in-process resource handoff, not a serializable receipt.  The
-    handle object is therefore deliberately excluded from value equality.
+    acquisition object is deliberately excluded from value equality.  Its
+    owner must either call ``commit_runtime_handle`` exactly once before
+    handing the handle to a lifecycle owner, or call
+    ``rollback_uncommitted_handle``.  Using it as a context manager rolls back
+    a still-pending acquisition on exit.
     """
 
     profile_preflight: TargetRuntimeProfilePreflight
     initial_status: TargetRuntimeStatusSnapshot
-    runtime_handle: TargetRuntimeHandle = field(repr=False, compare=False)
+    runtime_handle_acquisition: TargetRuntimeHandleAcquisition = field(
+        repr=False,
+        compare=False,
+    )
     runtime_handle_created: bool = field(default=True, init=False)
     target_operation_invoked: bool = field(default=False, init=False)
     execution_submitted: bool = field(default=False, init=False)
@@ -48,6 +57,14 @@ class TargetRuntimeHandlePreparation:
             )
         if not isinstance(self.initial_status, TargetRuntimeStatusSnapshot):
             raise TypeError("initial_status must be TargetRuntimeStatusSnapshot.")
+        if not isinstance(
+            self.runtime_handle_acquisition,
+            TargetRuntimeHandleAcquisition,
+        ):
+            raise TypeError(
+                "runtime_handle_acquisition must be "
+                "TargetRuntimeHandleAcquisition."
+            )
         manifest = self.profile_preflight.resolved_manifest
         handle_manifest = getattr(
             self.runtime_handle,
@@ -109,6 +126,52 @@ class TargetRuntimeHandlePreparation:
         if self.initial_status.ready:
             raise ValueError("An inert target runtime handle cannot begin ready.")
 
+    @property
+    def runtime_handle(self) -> TargetRuntimeHandle:
+        return self.runtime_handle_acquisition.runtime_handle
+
+    @property
+    def runtime_handle_acquisition_state(self) -> str:
+        return self.runtime_handle_acquisition.state
+
+    def commit_runtime_handle(self) -> TargetRuntimeHandle:
+        """Transfer the handle to the application's lifecycle owner."""
+
+        return self.runtime_handle_acquisition.commit()
+
+    def rollback_uncommitted_handle(
+        self,
+        *,
+        reason: str = "target runtime preparation abandoned",
+    ) -> bool:
+        """Release an uncommitted handle through its concrete provider."""
+
+        return self.runtime_handle_acquisition.rollback(reason=reason)
+
+    def __enter__(self) -> "TargetRuntimeHandlePreparation":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        if self.runtime_handle_acquisition.state != "pending":
+            return
+        if exc is None:
+            self.rollback_uncommitted_handle(
+                reason="target runtime preparation context exited uncommitted",
+            )
+            return
+        self.runtime_handle_acquisition.rollback_after_failure(
+            exc,
+            reason=(
+                "target runtime preparation context failed before handle "
+                "commitment"
+            ),
+        )
+
 
 def prepare_target_runtime_handle(
     profile_preflight: TargetRuntimeProfilePreflight,
@@ -153,20 +216,28 @@ def prepare_target_runtime_handle(
             "the selected profile preflight."
         )
 
-    handle = provider_registry.create_handle(
+    acquisition = provider_registry.acquire_handle(
         provider_identity.provider_id,
         config,
         manifest=resolved_again,
         binding_receipt=profile_preflight.binding_receipt,
     )
-    initial_status = (
-        handle.target_runtime_status_provider.capture_target_runtime_status()
-    )
-    return TargetRuntimeHandlePreparation(
-        profile_preflight=profile_preflight,
-        initial_status=initial_status,
-        runtime_handle=handle,
-    )
+    try:
+        handle = acquisition.runtime_handle
+        initial_status = (
+            handle.target_runtime_status_provider.capture_target_runtime_status()
+        )
+        return TargetRuntimeHandlePreparation(
+            profile_preflight=profile_preflight,
+            initial_status=initial_status,
+            runtime_handle_acquisition=acquisition,
+        )
+    except BaseException as error:
+        acquisition.rollback_after_failure(
+            error,
+            reason="target runtime initial-status validation failed",
+        )
+        raise
 
 
 __all__ = [

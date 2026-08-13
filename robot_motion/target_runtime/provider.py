@@ -11,6 +11,7 @@ or configures a real or simulated target later.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Callable, Protocol
 
 from .binding import TargetRuntimeBindingReceipt
@@ -44,6 +45,10 @@ class TargetRuntimeProvider(Protocol):
         """
         ...
 
+
+class TargetRuntimeHandleProvider(TargetRuntimeProvider, Protocol):
+    """Provider extension required only for ``inert_handle`` identities."""
+
     def create_target_runtime_handle(
         self,
         config: Any,
@@ -59,8 +64,138 @@ class TargetRuntimeProvider(Protocol):
         """
         ...
 
+    def rollback_target_runtime_handle_construction(
+        self,
+        handle: TargetRuntimeHandle,
+        *,
+        reason: str,
+    ) -> None:
+        """Release resources owned by an uncommitted handle construction.
+
+        Handle-capable providers must implement this as an idempotent,
+        non-motion rollback.  It must not submit execution work, invoke a
+        declared target operation, or assume that the returned handle passed
+        structural or initial-status validation.  If construction raises
+        before returning a handle, the provider remains responsible for
+        rolling back its own partial construction internally.
+        """
+        ...
+
 
 TargetRuntimeProviderLoader = Callable[[], TargetRuntimeProvider]
+
+
+class TargetRuntimeHandleRollbackError(RuntimeError):
+    """Both handle preparation and its required provider rollback failed."""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        triggering_error: BaseException,
+        rollback_error: BaseException,
+        acquisition: "TargetRuntimeHandleAcquisition",
+    ) -> None:
+        super().__init__(
+            "Target runtime handle rollback failed after "
+            f"{type(triggering_error).__name__}: {reason}. "
+            f"Rollback raised {type(rollback_error).__name__}."
+        )
+        self.reason = reason
+        self.triggering_error = triggering_error
+        self.rollback_error = rollback_error
+        # Preserve the only object that can retry provider-owned rollback.
+        self.acquisition = acquisition
+
+
+class TargetRuntimeHandleAcquisition:
+    """Transactional ownership of one provider-created inert handle.
+
+    The acquisition begins ``pending``.  Its owner must either commit exactly
+    once to transfer the handle to a lifecycle owner, or roll it back through
+    the provider.  The registry and application preparation layer use the
+    same object so every pre-commit validation failure has the same cleanup
+    path.  This object owns no target lifecycle or dispatch authority.
+    """
+
+    def __init__(
+        self,
+        handle: TargetRuntimeHandle,
+        *,
+        rollback: Callable[[TargetRuntimeHandle, str], None],
+    ) -> None:
+        self._handle = handle
+        self._rollback: Callable[[TargetRuntimeHandle, str], None] | None = rollback
+        self._state = "pending"
+        self._lock = Lock()
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def runtime_handle(self) -> TargetRuntimeHandle:
+        with self._lock:
+            if self._state == "rolled_back":
+                raise RuntimeError(
+                    "Target runtime handle acquisition was rolled back."
+                )
+            return self._handle
+
+    def commit(self) -> TargetRuntimeHandle:
+        """Transfer the validated handle to its next lifecycle owner."""
+
+        with self._lock:
+            if self._state != "pending":
+                raise RuntimeError(
+                    "Target runtime handle acquisition can only be committed "
+                    f"from pending state, not {self._state}."
+                )
+            self._state = "committed"
+            self._rollback = None
+            return self._handle
+
+    def rollback(self, *, reason: str) -> bool:
+        """Invoke provider-owned rollback once; return false if already done."""
+
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("Target runtime handle rollback reason is required.")
+        with self._lock:
+            if self._state == "committed":
+                raise RuntimeError(
+                    "A committed target runtime handle cannot be rolled back."
+                )
+            if self._state == "rolled_back":
+                return False
+            rollback = self._rollback
+            if rollback is None:
+                raise RuntimeError(
+                    "Pending target runtime handle acquisition lacks rollback."
+                )
+            rollback(self._handle, normalized_reason)
+            self._state = "rolled_back"
+            self._rollback = None
+            return True
+
+    def rollback_after_failure(
+        self,
+        triggering_error: BaseException,
+        *,
+        reason: str,
+    ) -> None:
+        """Rollback, retaining both errors if provider cleanup also fails."""
+
+        try:
+            self.rollback(reason=reason)
+        except BaseException as rollback_error:
+            raise TargetRuntimeHandleRollbackError(
+                reason=reason,
+                triggering_error=triggering_error,
+                rollback_error=rollback_error,
+                acquisition=self,
+            ) from rollback_error
 
 
 @dataclass(frozen=True)
@@ -148,14 +283,14 @@ class TargetRuntimeProviderRegistry:
             )
         return manifest
 
-    def create_handle(
+    def acquire_handle(
         self,
         provider_id: str,
         config: Any,
         *,
         manifest: ResolvedTargetRuntimeManifest,
         binding_receipt: TargetRuntimeBindingReceipt,
-    ) -> TargetRuntimeHandle:
+    ) -> TargetRuntimeHandleAcquisition:
         if not isinstance(manifest, ResolvedTargetRuntimeManifest):
             raise TypeError("manifest must be ResolvedTargetRuntimeManifest.")
         if not isinstance(binding_receipt, TargetRuntimeBindingReceipt):
@@ -186,13 +321,44 @@ class TargetRuntimeProviderRegistry:
             != manifest.embodiment_instance_id
         ):
             raise ValueError("Binding receipt belongs to another target manifest.")
-        handle = provider.create_target_runtime_handle(
+        create_handle = getattr(
+            provider,
+            "create_target_runtime_handle",
+            None,
+        )
+        rollback = getattr(
+            provider,
+            "rollback_target_runtime_handle_construction",
+            None,
+        )
+        if not callable(create_handle) or not callable(rollback):
+            raise TypeError(
+                "An inert-handle target runtime provider must expose both "
+                "create_target_runtime_handle and "
+                "rollback_target_runtime_handle_construction before creating "
+                "a handle."
+            )
+        handle = create_handle(
             config,
             manifest=manifest,
             binding_receipt=binding_receipt,
         )
-        self._validate_handle(handle, manifest)
-        return handle
+        acquisition = TargetRuntimeHandleAcquisition(
+            handle,
+            rollback=lambda target_handle, reason: rollback(
+                target_handle,
+                reason=reason,
+            ),
+        )
+        try:
+            self._validate_handle(handle, manifest)
+        except BaseException as error:
+            acquisition.rollback_after_failure(
+                error,
+                reason="registry handle validation failed",
+            )
+            raise
+        return acquisition
 
     def _entry(self, provider_id: str) -> TargetRuntimeProviderRegistryEntry:
         normalized = str(provider_id).strip()
@@ -306,6 +472,9 @@ class TargetRuntimeProviderRegistry:
 
 
 __all__ = [
+    "TargetRuntimeHandleAcquisition",
+    "TargetRuntimeHandleProvider",
+    "TargetRuntimeHandleRollbackError",
     "TargetRuntimeProvider",
     "TargetRuntimeProviderLoader",
     "TargetRuntimeProviderRegistry",

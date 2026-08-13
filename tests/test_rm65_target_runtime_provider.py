@@ -326,7 +326,7 @@ def test_preflight_only_registry_rejects_runtime_handle_before_provider_call(
     )
 
     with pytest.raises(RuntimeError, match="preflight-only"):
-        registry.create_handle(
+        registry.acquire_handle(
             RM65_POLICY_ARM_QPOS_CANDIDATE_PROVIDER_ID,
             config,
             manifest=preflight.resolved_manifest,

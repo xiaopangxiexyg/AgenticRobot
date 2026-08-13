@@ -26,6 +26,7 @@ from robot_motion.target_runtime import (
     TARGET_RUNTIME_PROVIDER_API_V1,
     ResolvedTargetRuntimeManifest,
     TargetRuntimeAssetReference,
+    TargetRuntimeHandleRollbackError,
     TargetRuntimeOperationCapability,
     TargetRuntimeOperationReceipt,
     TargetRuntimeOperationRequest,
@@ -584,6 +585,8 @@ class _FakeProvider:
         self.provider_identity = identity
         self.manifest = manifest
         self.created_handle_count = 0
+        self.rolled_back_handle_count = 0
+        self.rollback_reasons: list[str] = []
 
     def resolve_target_runtime_manifest(
         self,
@@ -608,6 +611,16 @@ class _FakeProvider:
         assert manifest.semantic_content_hash == self.manifest.semantic_content_hash
         self.created_handle_count += 1
         return _FakeHandle(manifest)
+
+    def rollback_target_runtime_handle_construction(
+        self,
+        handle: object,
+        *,
+        reason: str,
+    ) -> None:
+        assert handle is not None
+        self.rolled_back_handle_count += 1
+        self.rollback_reasons.append(reason)
 
 
 def _runtime_requirement(
@@ -662,21 +675,25 @@ def test_provider_registry_is_allowlisted_lazy_and_does_not_own_handles() -> Non
         manifest,
         bound_at=30.0,
     )
-    handle_a = registry.create_handle(
+    acquisition_a = registry.acquire_handle(
         manifest.provider.provider_id,
         {"profile": "fixture"},
         manifest=manifest,
         binding_receipt=binding,
     )
-    handle_b = registry.create_handle(
+    acquisition_b = registry.acquire_handle(
         manifest.provider.provider_id,
         {"profile": "fixture"},
         manifest=manifest,
         binding_receipt=binding,
     )
 
+    handle_a = acquisition_a.commit()
+    handle_b = acquisition_b.commit()
+
     assert load_count == 1
     assert provider.created_handle_count == 2
+    assert provider.rolled_back_handle_count == 0
     assert handle_a is not handle_b
     assert handle_a.resolved_target_runtime_manifest is manifest
 
@@ -741,9 +758,148 @@ def test_provider_registry_rejects_loaded_identity_or_handle_drift() -> None:
     )
 
     with pytest.raises(ValueError, match="another manifest"):
-        registry.create_handle(
+        registry.acquire_handle(
             manifest.provider.provider_id,
             {"profile": "fixture"},
             manifest=manifest,
             binding_receipt=binding,
         )
+    assert provider.rolled_back_handle_count == 1
+    assert provider.rollback_reasons == ["registry handle validation failed"]
+
+
+def test_provider_registry_requires_rollback_before_handle_construction() -> None:
+    manifest = _manifest()
+    provider = _FakeProvider(manifest.provider, manifest)
+    provider.rollback_target_runtime_handle_construction = None
+    registry = TargetRuntimeProviderRegistry()
+    registry.register(
+        TargetRuntimeProviderRegistryEntry(
+            provider_identity=manifest.provider,
+            loader=lambda: provider,
+        )
+    )
+    binding = bind_target_runtime_requirement(
+        _runtime_requirement(manifest),
+        manifest,
+        bound_at=30.0,
+    )
+
+    with pytest.raises(TypeError, match="must expose.*rollback"):
+        registry.acquire_handle(
+            manifest.provider.provider_id,
+            {"profile": "fixture"},
+            manifest=manifest,
+            binding_receipt=binding,
+        )
+    assert provider.created_handle_count == 0
+
+
+def test_acquisition_rollback_is_idempotent_and_prevents_commit() -> None:
+    manifest = _manifest()
+    provider = _FakeProvider(manifest.provider, manifest)
+    registry = TargetRuntimeProviderRegistry()
+    registry.register(
+        TargetRuntimeProviderRegistryEntry(
+            provider_identity=manifest.provider,
+            loader=lambda: provider,
+        )
+    )
+    binding = bind_target_runtime_requirement(
+        _runtime_requirement(manifest),
+        manifest,
+        bound_at=30.0,
+    )
+    acquisition = registry.acquire_handle(
+        manifest.provider.provider_id,
+        {"profile": "fixture"},
+        manifest=manifest,
+        binding_receipt=binding,
+    )
+
+    assert acquisition.rollback(reason="fixture abandoned")
+    assert not acquisition.rollback(reason="fixture repeated rollback")
+    assert provider.rolled_back_handle_count == 1
+    assert acquisition.state == "rolled_back"
+    with pytest.raises(RuntimeError, match="rolled back"):
+        _ = acquisition.runtime_handle
+    with pytest.raises(RuntimeError, match="only be committed"):
+        acquisition.commit()
+
+
+def test_acquisition_commit_prevents_construction_rollback() -> None:
+    manifest = _manifest()
+    provider = _FakeProvider(manifest.provider, manifest)
+    registry = TargetRuntimeProviderRegistry()
+    registry.register(
+        TargetRuntimeProviderRegistryEntry(
+            provider_identity=manifest.provider,
+            loader=lambda: provider,
+        )
+    )
+    binding = bind_target_runtime_requirement(
+        _runtime_requirement(manifest),
+        manifest,
+        bound_at=30.0,
+    )
+    acquisition = registry.acquire_handle(
+        manifest.provider.provider_id,
+        {"profile": "fixture"},
+        manifest=manifest,
+        binding_receipt=binding,
+    )
+
+    handle = acquisition.commit()
+
+    assert handle.resolved_target_runtime_manifest is manifest
+    assert acquisition.state == "committed"
+    with pytest.raises(RuntimeError, match="committed.*cannot be rolled back"):
+        acquisition.rollback(reason="fixture invalid late rollback")
+    assert provider.rolled_back_handle_count == 0
+
+
+def test_acquisition_retains_both_validation_and_rollback_failures() -> None:
+    manifest = _manifest()
+    provider = _FakeProvider(manifest.provider, manifest)
+    registry = TargetRuntimeProviderRegistry()
+    registry.register(
+        TargetRuntimeProviderRegistryEntry(
+            provider_identity=manifest.provider,
+            loader=lambda: provider,
+        )
+    )
+    binding = bind_target_runtime_requirement(
+        _runtime_requirement(manifest),
+        manifest,
+        bound_at=30.0,
+    )
+    wrong_manifest = replace(manifest, embodiment_instance_hash="another-instance")
+    provider.create_target_runtime_handle = lambda *args, **kwargs: _FakeHandle(
+        wrong_manifest
+    )
+    successful_rollback = provider.rollback_target_runtime_handle_construction
+    rollback_attempt_count = 0
+
+    def fail_rollback_once(handle: object, *, reason: str) -> None:
+        nonlocal rollback_attempt_count
+        rollback_attempt_count += 1
+        if rollback_attempt_count == 1:
+            raise OSError("fixture cleanup failed")
+        successful_rollback(handle, reason=reason)
+
+    provider.rollback_target_runtime_handle_construction = fail_rollback_once
+
+    with pytest.raises(TargetRuntimeHandleRollbackError) as raised:
+        registry.acquire_handle(
+            manifest.provider.provider_id,
+            {"profile": "fixture"},
+            manifest=manifest,
+            binding_receipt=binding,
+        )
+
+    assert isinstance(raised.value.triggering_error, ValueError)
+    assert isinstance(raised.value.rollback_error, OSError)
+    assert raised.value.acquisition.state == "pending"
+    assert raised.value.acquisition.rollback(reason="fixture cleanup retry")
+    assert raised.value.acquisition.state == "rolled_back"
+    assert provider.rolled_back_handle_count == 1

@@ -24,9 +24,12 @@ The target-facing integration is split into four layers:
    profiles does not discover integrations or import vendor code.
 4. `prepare_target_runtime_handle` re-resolves the selected configuration,
    requires the exact preflight manifest, and may construct only a provider
-   declared `inert_handle`. It reads the initial status and requires
-   `created/not ready`. It never calls an operation or execution port and does
-   not grant authority.
+   declared `inert_handle`. Construction remains a pending transactional
+   acquisition while the registry validates the handle and the application
+   reads and validates its initial `created/not ready` status. Every failure
+   before explicit commitment invokes provider-owned construction rollback.
+   Preparation never calls an operation or execution port and does not grant
+   authority.
 
 The application owns profile selection and the lifetime of the returned
 aggregate. The concrete provider owns target construction, its ports, and its
@@ -52,9 +55,15 @@ An integration package that will eventually be selectable must provide:
   observation, and operation ports all expose the same resolved manifest and
   whose construction does not connect, start, home, command, or activate a
   target;
-- provider-owned rollback for failed construction and provider-specific
-  lifecycle/cleanup behavior. The generic registry cannot invent a safe close
-  operation for an unknown target.
+- for an `inert_handle` provider, an idempotent
+  `rollback_target_runtime_handle_construction` implementation that releases
+  resources associated with any returned, uncommitted handle without
+  submitting execution work or invoking target operations. It must tolerate a
+  handle that fails structural or initial-status validation;
+- internal rollback for partial construction that raises before returning a
+  handle, plus provider-specific committed lifecycle/cleanup behavior. The
+  generic registry cannot roll back a handle it never received and cannot
+  invent a safe close operation for an unknown active target.
 
 Provider configuration is deliberately opaque to the shared contract, but it
 is not outside integrity checks: any configuration value that can change the
@@ -72,12 +81,22 @@ A safe future switch has these phases:
 portable spec selection
   -> allowlisted provider binding
   -> side-effect-free manifest preflight
-  -> inert handle preparation
+  -> pending inert-handle acquisition and validation
+  -> explicit commit to one lifecycle owner
   -> application/lower-owner lifecycle and authority gates
   -> execution
 ```
 
-Switching an active target is not implemented by the catalog. The current
+The returned `TargetRuntimeHandlePreparation` is still uncommitted. A caller
+must explicitly call `commit_runtime_handle` when it is ready to become the
+single lifecycle owner, or call `rollback_uncommitted_handle`; using the
+preparation as a context manager automatically rolls back if it exits while
+still pending. Commitment is an ownership handoff only. It does not start a
+target, invoke an operation, submit execution, or grant authority. Once
+committed, provider construction rollback is no longer legal.
+
+Switching an active target is not implemented by the catalog. A pending target
+may be abandoned only through construction rollback. A committed current
 target must first complete its declared, permitted hold/close lifecycle and
 release its resources through its provider-owned implementation. Only then may
 the application prepare another target. A profile hash match proves contract
@@ -102,7 +121,8 @@ builder migration, or motion path is introduced by this framework work.
 Arbitrary-topology synthetic fixtures cover a single 7-DoF manipulator plus an
 independent 1-DoF tool, nonempty observation/operation/asset surfaces, profile
 serialization, selected-only loading, configuration drift, invalid handles,
-and preflight-only rejection. These fixtures validate interface shape and
+initial-status failure, transactional commit/rollback, rollback failure, and
+preflight-only rejection. These fixtures validate interface shape and
 fail-closed behavior; they are not downstream runtime or hardware acceptance.
 
 The formal RM65 real-teleop and collection builders remain compatibility code.

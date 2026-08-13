@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from robot_motion.target_runtime import (
+    TargetRuntimeHandleRollbackError,
     TargetRuntimeProviderRegistryEntry,
     TargetRuntimeStatusSnapshot,
 )
@@ -99,16 +100,53 @@ def test_preparation_creates_only_an_inert_arbitrary_topology_handle() -> None:
     preparation = prepare_target_runtime_handle(preflight, config)
 
     assert provider.created_handle_count == 1
+    assert provider.rolled_back_handle_count == 0
     assert preparation.runtime_handle_created
+    assert preparation.runtime_handle_acquisition_state == "pending"
     assert not preparation.target_operation_invoked
     assert not preparation.execution_submitted
     assert not preparation.confers_execution_authorization
     assert preparation.initial_status.lifecycle_state == "created"
     assert not preparation.initial_status.ready
-    assert preparation.runtime_handle.resolved_target_runtime_manifest.component_ids == (
+    component_ids = (
+        preparation.runtime_handle.resolved_target_runtime_manifest.component_ids
+    )
+    assert component_ids == (
         "manipulator/joint_position",
         "tool/grip",
     )
+    handle = preparation.commit_runtime_handle()
+    assert preparation.runtime_handle_acquisition_state == "committed"
+    assert handle is preparation.runtime_handle
+    with pytest.raises(RuntimeError, match="only be committed"):
+        preparation.commit_runtime_handle()
+
+
+def test_preparation_context_rolls_back_an_uncommitted_handle_once() -> None:
+    preflight, provider, config = _preflight_and_provider()
+
+    with prepare_target_runtime_handle(preflight, config) as preparation:
+        assert preparation.runtime_handle_acquisition_state == "pending"
+
+    assert preparation.runtime_handle_acquisition_state == "rolled_back"
+    assert provider.rolled_back_handle_count == 1
+    assert provider.rollback_reasons == [
+        "target runtime preparation context exited uncommitted"
+    ]
+    assert not preparation.rollback_uncommitted_handle(
+        reason="fixture repeated rollback"
+    )
+
+
+def test_preparation_context_does_not_rollback_a_committed_handle() -> None:
+    preflight, provider, config = _preflight_and_provider()
+
+    with prepare_target_runtime_handle(preflight, config) as preparation:
+        handle = preparation.commit_runtime_handle()
+
+    assert preparation.runtime_handle_acquisition_state == "committed"
+    assert preparation.runtime_handle is handle
+    assert provider.rolled_back_handle_count == 0
 
 
 def test_preparation_rejects_config_that_resolves_another_manifest() -> None:
@@ -183,6 +221,68 @@ def test_preparation_rejects_noncreated_handle_without_operations() -> None:
     with pytest.raises(ValueError, match="must begin in created state"):
         prepare_target_runtime_handle(preflight, config)
     assert provider.created_handle_count == 1
+    assert provider.rolled_back_handle_count == 1
+    assert provider.rollback_reasons == [
+        "target runtime initial-status validation failed"
+    ]
+
+
+def test_preparation_rolls_back_when_initial_status_capture_fails() -> None:
+    preflight, provider, config = _preflight_and_provider()
+    manifest = preflight.resolved_manifest
+    handle = _FakeHandle(manifest)
+
+    def fail_status_capture() -> TargetRuntimeStatusSnapshot:
+        raise RuntimeError("fixture status unavailable")
+
+    handle.target_runtime_status_provider.capture_target_runtime_status = (
+        fail_status_capture
+    )
+
+    def create_handle(*args: object, **kwargs: object) -> _FakeHandle:
+        provider.created_handle_count += 1
+        return handle
+
+    provider.create_target_runtime_handle = create_handle
+
+    with pytest.raises(RuntimeError, match="fixture status unavailable"):
+        prepare_target_runtime_handle(preflight, config)
+    assert provider.created_handle_count == 1
+    assert provider.rolled_back_handle_count == 1
+    assert provider.rollback_reasons == [
+        "target runtime initial-status validation failed"
+    ]
+
+
+def test_preparation_context_rolls_back_when_caller_fails() -> None:
+    preflight, provider, config = _preflight_and_provider()
+
+    with pytest.raises(RuntimeError, match="fixture caller failed"):
+        with prepare_target_runtime_handle(preflight, config):
+            raise RuntimeError("fixture caller failed")
+
+    assert provider.rolled_back_handle_count == 1
+    assert provider.rollback_reasons == [
+        "target runtime preparation context failed before handle commitment"
+    ]
+
+
+def test_preparation_context_retains_caller_and_rollback_failures() -> None:
+    preflight, provider, config = _preflight_and_provider()
+
+    def fail_rollback(*args: object, **kwargs: object) -> None:
+        raise OSError("fixture cleanup failed")
+
+    provider.rollback_target_runtime_handle_construction = fail_rollback
+
+    with pytest.raises(TargetRuntimeHandleRollbackError) as raised:
+        with prepare_target_runtime_handle(preflight, config):
+            raise RuntimeError("fixture caller failed")
+
+    assert isinstance(raised.value.triggering_error, RuntimeError)
+    assert str(raised.value.triggering_error) == "fixture caller failed"
+    assert isinstance(raised.value.rollback_error, OSError)
+    assert raised.value.acquisition.state == "pending"
 
 
 def test_preflight_only_profile_fails_before_loading_provider() -> None:

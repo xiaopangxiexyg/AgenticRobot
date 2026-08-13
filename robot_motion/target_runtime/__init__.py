@@ -35,6 +35,9 @@ from .contracts import (
     TargetRuntimeStatusSnapshot,
 )
 from .provider import (
+    TargetRuntimeHandleAcquisition,
+    TargetRuntimeHandleProvider,
+    TargetRuntimeHandleRollbackError,
     TargetRuntimeProvider,
     TargetRuntimeProviderLoader,
     TargetRuntimeProviderRegistry,
@@ -61,6 +64,9 @@ __all__ = [
     "TargetRuntimeAssetReference",
     "TargetRuntimeBindingReceipt",
     "TargetRuntimeHandle",
+    "TargetRuntimeHandleAcquisition",
+    "TargetRuntimeHandleProvider",
+    "TargetRuntimeHandleRollbackError",
     "TargetRuntimeOperationCapability",
     "TargetRuntimeOperationPort",
     "TargetRuntimeOperationReceipt",
