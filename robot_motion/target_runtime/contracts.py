@@ -79,6 +79,9 @@ TARGET_RUNTIME_OPERATION_PERMIT_KINDS_V1 = frozenset(
 TARGET_RUNTIME_OPERATION_RECEIPT_STATUSES_V1 = frozenset(
     {"completed", "rejected", "failed"}
 )
+TARGET_RUNTIME_PROVIDER_HANDLE_MODES_V1 = frozenset(
+    {"preflight_only", "inert_handle"}
+)
 
 
 def _required(value: object, *, name: str) -> str:
@@ -137,6 +140,7 @@ class TargetRuntimeProviderIdentity:
     implementation_contract_hash: str
     package_name: str
     package_version: str
+    runtime_handle_mode: str
     dependency_lock_hash: str | None = None
     semantic_content_hash: str = field(init=False)
 
@@ -150,8 +154,14 @@ class TargetRuntimeProviderIdentity:
                 "implementation_contract_hash",
                 "package_name",
                 "package_version",
+                "runtime_handle_mode",
             )
         }
+        if (
+            payload["runtime_handle_mode"]
+            not in TARGET_RUNTIME_PROVIDER_HANDLE_MODES_V1
+        ):
+            raise ValueError("Unsupported target-runtime provider handle mode.")
         payload["dependency_lock_hash"] = _optional(
             self.dependency_lock_hash,
             name="dependency_lock_hash",
@@ -175,6 +185,7 @@ class TargetRuntimeProviderIdentity:
             "implementation_contract_hash": self.implementation_contract_hash,
             "package_name": self.package_name,
             "package_version": self.package_version,
+            "runtime_handle_mode": self.runtime_handle_mode,
             "dependency_lock_hash": self.dependency_lock_hash,
             "semantic_content_hash": self.semantic_content_hash,
         }
@@ -844,6 +855,7 @@ __all__ = [
     "TARGET_RUNTIME_OPERATION_RECEIPT_STATUSES_V1",
     "TARGET_RUNTIME_OPERATION_REQUEST_HASH_DOMAIN_V1",
     "TARGET_RUNTIME_PROVIDER_API_V1",
+    "TARGET_RUNTIME_PROVIDER_HANDLE_MODES_V1",
     "TARGET_RUNTIME_PROVIDER_IDENTITY_HASH_DOMAIN_V1",
     "TARGET_RUNTIME_STATUS_SNAPSHOT_HASH_DOMAIN_V1",
     "ResolvedTargetRuntimeManifest",

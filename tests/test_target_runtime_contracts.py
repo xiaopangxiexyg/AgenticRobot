@@ -201,6 +201,7 @@ def _manifest() -> ResolvedTargetRuntimeManifest:
             implementation_contract_hash="provider-contract-hash-v1",
             package_name="dexteleop-single-manipulator",
             package_version="1.2.0",
+            runtime_handle_mode="inert_handle",
             dependency_lock_hash="provider-lock-hash-v1",
         ),
         component_target_capability=_target_capability(),
@@ -678,6 +679,25 @@ def test_provider_registry_is_allowlisted_lazy_and_does_not_own_handles() -> Non
     assert provider.created_handle_count == 2
     assert handle_a is not handle_b
     assert handle_a.resolved_target_runtime_manifest is manifest
+
+
+def test_provider_identity_hash_binds_runtime_handle_mode() -> None:
+    identity = _manifest().provider
+    preflight_identity = replace(
+        identity,
+        runtime_handle_mode="preflight_only",
+    )
+
+    assert (
+        identity.semantic_content_hash
+        != preflight_identity.semantic_content_hash
+    )
+    assert preflight_identity.semantic_payload()["runtime_handle_mode"] == (
+        "preflight_only"
+    )
+
+    with pytest.raises(ValueError, match="handle mode"):
+        replace(identity, runtime_handle_mode="device_handle")
 
 
 def test_provider_registry_rejects_loaded_identity_or_handle_drift() -> None:

@@ -2,9 +2,10 @@
 
 Providers are registered explicitly by stable ID.  Registry discovery never
 imports a module path from configuration, starts a device, or owns the
-lifecycle of a returned handle. Concrete providers must keep vendor imports
-behind their loader and construct an inert handle; an authorized lower
-operation starts or configures a real or simulated target later.
+lifecycle of a returned handle. Concrete providers must declare whether they
+are preflight-only or can construct an inert handle. Handle-capable providers
+keep vendor imports behind their loader; an authorized lower operation starts
+or configures a real or simulated target later.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ class TargetRuntimeProvider(Protocol):
         manifest: ResolvedTargetRuntimeManifest,
         binding_receipt: TargetRuntimeBindingReceipt,
     ) -> TargetRuntimeHandle:
-        """Create an inert handle; device activation remains an operation."""
+        """Create an inert handle when the provider identity permits it."""
         ...
 
 
@@ -151,8 +152,13 @@ class TargetRuntimeProviderRegistry:
             raise TypeError(
                 "binding_receipt must be TargetRuntimeBindingReceipt."
             )
-        provider = self._load_provider(provider_id)
         expected_identity = self._entry(provider_id).provider_identity
+        if expected_identity.runtime_handle_mode != "inert_handle":
+            raise RuntimeError(
+                "Target runtime provider is preflight-only and cannot create "
+                "a runtime handle."
+            )
+        provider = self._load_provider(provider_id)
         if (
             manifest.provider.semantic_content_hash
             != expected_identity.semantic_content_hash

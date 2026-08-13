@@ -1,0 +1,77 @@
+{
+  "evidence": {
+    "bundle_hash": "6b83ef5d5daa74900a9f06ad55a59a44ee2e86c7a67ee07bfcdadd5025599d3a",
+    "confers_execution_authorization": false,
+    "dispatch_inventory_hash": "a9f7fd14e58ccc9581ce419074662a41ab6bcbd221e5169704a4309e9483ae9e",
+    "dispatch_seam_ids": [
+      "rm65.cleanup.close.disconnect",
+      "rm65.cleanup.close.stop_before_disconnect",
+      "rm65.cleanup.startup_rollback.force_stop",
+      "rm65.lifecycle.force_position.start",
+      "rm65.lifecycle.home.pre_sdk.send_joint_target",
+      "rm65.lifecycle.home.target_admission",
+      "rm65.lifecycle.rearm.position_executor",
+      "rm65.motion.background.worker_dequeue",
+      "rm65.motion.pre_sdk.send_joint_target",
+      "rm65.motion.target_admission.send_command",
+      "rm65.safety.background_fault.stop_fallback_loop",
+      "rm65.safety.emergency_stop.force_and_arm",
+      "rm65.safety.hold.direct_stop",
+      "rm65.safety.position_stream_disengage.stop",
+      "rm65.safety.quick_stop.operation_admission",
+      "rm65.safety.quick_stop.tick.pre_sdk"
+    ],
+    "integration_status": "evidence_only_unbound",
+    "inventory_gate_ready": true,
+    "legacy_mediation_gate_ready": false,
+    "production_binding_enabled": false,
+    "safety_migration_matrix_hash": "aa802499a7f089f37b15420ce16e9e2f1008eb730bc3b248b17b3ecc4e4ea7fa",
+    "shared_authority_gate_ready": false,
+    "worker_drain_plan_hash": "d697723a41d6cacf32c7e451fc6ee8bddb1a0c0ddd759a1cc9653b9db9c02710",
+    "worker_participant_ids": [
+      "position-deploy-reference-worker",
+      "rm65-left-background-stream-worker",
+      "rm65-right-background-stream-worker"
+    ]
+  },
+  "manifest": {
+    "action_schema_hash": "f09465bdc7db93e49a3abacf1608fd5ab7a9425fb741d71f1b8cae02c5e0dddc",
+    "action_space": "bimanual_qpos_v1",
+    "actual_reference_frame_producer": "not_applicable",
+    "component_catalog_hash": "88b82baab79a76b301ad3b9e87d48dd4df38a45ffafcf0d3bb8c7bf80fb71c15",
+    "component_target_capability_hash": "4fbbd05b180656fedc1d3ffb4249b0e288a17d54c57250bb0d6e280d71249e1c",
+    "controlled_components": [
+      "left_arm",
+      "right_arm"
+    ],
+    "exclusion_hash_by_capability": {
+      "fix_arm_human_motion": "22152b410ea634d0ba0cd521128efadd62f6df466b468752c56538f69ba5d8ec",
+      "hand_dmtac_v1": "331a83d770cbe7db0017f08cc6a6847f7922de66d71a6b6bbe25b5e1b9208c26",
+      "hand_inspire_v1": "368a2233a063f98bcc9d09bf2dc264d97c8279693f6c445efbe7b15c0d484dff",
+      "human_motion_takeover": "437b7f54401c2c98f618b786ff27955ec0d41761e60e082b06e23d29255d9352",
+      "pose_impedance": "1ef266eae3309c5c25df7e987f73a0f3e9dd4b914e234a0a8836def565e563b3",
+      "replay_authority": "e9ef43ceeb7e8e9baf2f05660e167402f457ec041e952ae9c9f8d77dbf8d031d"
+    },
+    "human_motion_proposal_status": "not_applicable",
+    "lifecycle_control_requests": [
+      "recovery",
+      "home",
+      "rearm"
+    ],
+    "manifest_id": "m6_candidate_policy_arm_qpos_v1",
+    "manifest_version": "v1",
+    "motion_authority_sources": [
+      "policy"
+    ],
+    "safety_control_requests": [
+      "hold",
+      "estop",
+      "manual_stop"
+    ],
+    "selection_groups": [
+      "arms"
+    ],
+    "semantic_content_hash": "a975582987caa972d6d1ec14695face858f26c64c9726a4af565409382507f80"
+  },
+  "schema_version": "rm65_policy_arm_qpos_candidate_characterization.v1"
+}
