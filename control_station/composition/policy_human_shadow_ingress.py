@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from .policy_human_shadow_contracts import (
     PassiveCompositionIngressStatus,
-    _required,
+    normalize_required_text,
 )
 
 
@@ -23,7 +23,10 @@ class LatestPreservingShadowIngress:
     """Small queue whose pressure can never reach a source control loop."""
 
     def __init__(self, source_kind: str, *, capacity: int) -> None:
-        self.source_kind = _required(source_kind, name="source_kind")
+        self.source_kind = normalize_required_text(
+            source_kind,
+            name="source_kind",
+        )
         size = int(capacity)
         if size <= 0:
             raise ValueError("Shadow ingress capacity must be positive.")

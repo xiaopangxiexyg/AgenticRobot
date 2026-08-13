@@ -30,8 +30,8 @@ from .policy_human_shadow_contracts import (
     PassiveCompositionIngressStatus,
     PolicyHumanCompositionShadowCycle,
     PolicyHumanCompositionShadowProfile,
-    _finite,
-    _required,
+    normalize_finite_float,
+    normalize_required_text,
 )
 from .policy_human_shadow_ingress import (
     LatestPreservingShadowIngress,
@@ -80,7 +80,10 @@ class PolicyHumanCompositionShadowSession:
         if not callable(resolved_clock):
             raise TypeError("clock must be callable.")
         policy_role = policy_input_adapter.binding.role
-        resolved_human_role = _required(human_role, name="human_role")
+        resolved_human_role = normalize_required_text(
+            human_role,
+            name="human_role",
+        )
         if policy_role == resolved_human_role:
             raise ValueError("Policy and human roles must be distinct.")
         if not {policy_role, resolved_human_role}.issubset(
@@ -92,14 +95,14 @@ class PolicyHumanCompositionShadowSession:
             policy_input_adapter,
             human_input_adapter,
         )
-        horizon = _finite(
+        horizon = normalize_finite_float(
             human_effective_horizon_sec,
             name="human_effective_horizon_sec",
         )
         if horizon <= 0.0:
             raise ValueError("human_effective_horizon_sec must be positive.")
         channels = tuple(
-            _required(item, name="required_context_channel")
+            normalize_required_text(item, name="required_context_channel")
             for item in required_context_channels
         )
         if len(channels) != len(set(channels)):
@@ -117,7 +120,7 @@ class PolicyHumanCompositionShadowSession:
         self.residual_anchor_lifecycle_scope_id = (
             None
             if residual_anchor_lifecycle_scope_id is None
-            else _required(
+            else normalize_required_text(
                 residual_anchor_lifecycle_scope_id,
                 name="residual_anchor_lifecycle_scope_id",
             )
@@ -230,7 +233,10 @@ class PolicyHumanCompositionShadowSession:
         self._policy_ingress.offer(
             ObservedShadowEmission(
                 next(self._ingress_sequence),
-                _finite(self.clock(), name="policy observed_at"),
+                normalize_finite_float(
+                    self.clock(),
+                    name="policy observed_at",
+                ),
                 emission,
             )
         )
@@ -246,7 +252,10 @@ class PolicyHumanCompositionShadowSession:
         return self._human_ingress.offer(
             ObservedShadowEmission(
                 next(self._ingress_sequence),
-                _finite(self.clock(), name="human observed_at"),
+                normalize_finite_float(
+                    self.clock(),
+                    name="human observed_at",
+                ),
                 emission,
             )
         )
@@ -272,9 +281,14 @@ class PolicyHumanCompositionShadowSession:
                 policy_ingress=policy_status,
                 human_ingress=human_status,
             )
-        target = _finite(target_effective_at, name="target_effective_at")
+        target = normalize_finite_float(
+            target_effective_at,
+            name="target_effective_at",
+        )
         cutoff = (
-            None if cutoff_at is None else _finite(cutoff_at, name="cutoff_at")
+            None
+            if cutoff_at is None
+            else normalize_finite_float(cutoff_at, name="cutoff_at")
         )
         with self._evaluation_lock:
             if (

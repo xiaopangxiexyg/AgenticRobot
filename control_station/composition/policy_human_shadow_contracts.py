@@ -12,14 +12,14 @@ from control_composition.runtime import CompositeProposalSubmission
 POLICY_HUMAN_COMPOSITION_SHADOW_PROFILE_OFF = "off"
 
 
-def _finite(value: object, *, name: str) -> float:
+def normalize_finite_float(value: object, *, name: str) -> float:
     normalized = float(value)
     if not math.isfinite(normalized):
         raise ValueError(f"{name} must be finite.")
     return normalized
 
 
-def _required(value: object, *, name: str) -> str:
+def normalize_required_text(value: object, *, name: str) -> str:
     normalized = str(value).strip()
     if not normalized:
         raise ValueError(f"{name} must be non-empty.")
@@ -35,7 +35,7 @@ class PolicyHumanCompositionShadowProfile:
     send_actions: bool = False
 
     def __post_init__(self) -> None:
-        profile_id = _required(self.profile_id, name="profile_id")
+        profile_id = normalize_required_text(self.profile_id, name="profile_id")
         if not isinstance(self.enabled, bool) or not isinstance(
             self.send_actions,
             bool,
@@ -80,22 +80,25 @@ class CompositionShadowInputSubmission:
         object.__setattr__(
             self,
             "source_kind",
-            _required(self.source_kind, name="source_kind"),
+            normalize_required_text(self.source_kind, name="source_kind"),
         )
         object.__setattr__(
             self,
             "input_role",
-            _required(self.input_role, name="input_role"),
+            normalize_required_text(self.input_role, name="input_role"),
         )
         object.__setattr__(
             self,
             "source_emission_id",
-            _required(self.source_emission_id, name="source_emission_id"),
+            normalize_required_text(
+                self.source_emission_id,
+                name="source_emission_id",
+            ),
         )
         object.__setattr__(
             self,
             "observed_at",
-            _finite(self.observed_at, name="observed_at"),
+            normalize_finite_float(self.observed_at, name="observed_at"),
         )
         if self.input_receipt is not None and not isinstance(
             self.input_receipt,
@@ -128,7 +131,7 @@ class PolicyHumanCompositionShadowCycle:
     error: str | None = None
 
     def __post_init__(self) -> None:
-        profile_id = _required(self.profile_id, name="profile_id")
+        profile_id = normalize_required_text(self.profile_id, name="profile_id")
         if self.status not in {"disabled", "evaluated", "evaluation_error"}:
             raise ValueError("Unsupported composition shadow cycle status.")
         if self.status == "disabled":
@@ -144,7 +147,10 @@ class PolicyHumanCompositionShadowCycle:
         else:
             if self.target_effective_at is None:
                 raise ValueError("Evaluated shadow cycle requires a target time.")
-            _finite(self.target_effective_at, name="target_effective_at")
+            normalize_finite_float(
+                self.target_effective_at,
+                name="target_effective_at",
+            )
         if self.status == "evaluated":
             if not isinstance(self.evaluation, CompositeProposalSubmission):
                 raise TypeError("Evaluated cycle requires a typed evaluation.")
@@ -184,4 +190,6 @@ __all__ = [
     "PassiveCompositionIngressStatus",
     "PolicyHumanCompositionShadowCycle",
     "PolicyHumanCompositionShadowProfile",
+    "normalize_finite_float",
+    "normalize_required_text",
 ]
