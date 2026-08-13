@@ -1,4 +1,10 @@
 from .causal_align import CausalAlignPlan, causal_align_dataset, plan_causal_align
+from .camera_semantic_materialize import (
+    CameraSemanticMaterializationError,
+    CameraSemanticMaterializationPlan,
+    materialize_camera_semantics,
+    plan_camera_semantic_materialization,
+)
 from .delete_episodes import EpisodeDeletionPlan, delete_episodes, plan_episode_deletion
 from .fault_nan_tail import FaultNanTail, detect_fault_nan_tail
 from .force_collision_labels import (
@@ -28,6 +34,8 @@ __all__ = [
     "EpisodeDeletionPlan",
     "EpisodeSplitPlan",
     "CausalAlignPlan",
+    "CameraSemanticMaterializationError",
+    "CameraSemanticMaterializationPlan",
     "ForceCollisionEpisodeLabel",
     "ForceCollisionLabelPlan",
     "FaultNanTail",
@@ -48,11 +56,13 @@ __all__ = [
     "detect_fault_nan_tail",
     "detect_stutter_segments",
     "label_force_collisions",
+    "materialize_camera_semantics",
     "migrate_umi_workspace_near_boundary",
     "migrate_umi_arm_action_to_next_observation",
     "parse_episode_selection",
     "plan_force_collision_labels",
     "plan_causal_align",
+    "plan_camera_semantic_materialization",
     "plan_episode_split",
     "plan_nan_tail_trim",
     "plan_episode_deletion",

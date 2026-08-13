@@ -26,10 +26,17 @@ WritePlanner = Callable[[Any, CollectorComponents], Iterable[WriteJob]]
 class CollectionWriterObserverConfig:
     name: str = "collection_writer_observer"
     storage_queue_size: int = 0
+    storage_queue_backpressure_policy: str = "drop_oldest"
 
     def __post_init__(self) -> None:
         if int(self.storage_queue_size) < 0:
             raise ValueError("storage_queue_size must be >= 0.")
+        policy = str(self.storage_queue_backpressure_policy).strip().lower()
+        if policy not in {"block", "drop_oldest"}:
+            raise ValueError(
+                "storage_queue_backpressure_policy must be block or drop_oldest."
+            )
+        object.__setattr__(self, "storage_queue_backpressure_policy", policy)
 
 
 @dataclass(frozen=True)
@@ -41,6 +48,7 @@ class StorageRouteStats:
     dropped: int
     high_water: int
     max_queue_size: int
+    backpressure_policy: str
 
 
 _StorageItem = WriteJob | object
@@ -54,10 +62,12 @@ class _StorageRouteQueue:
         key: str,
         writer_pool: AsyncWriterPool,
         max_queue_size: int,
+        backpressure_policy: str,
     ):
         self.key = str(key)
         self.writer_pool = writer_pool
         self.max_queue_size = int(max_queue_size)
+        self.backpressure_policy = str(backpressure_policy)
         self._queue: queue.Queue[_StorageItem] = queue.Queue(maxsize=self.max_queue_size)
         self._thread: threading.Thread | None = None
         self._started = False
@@ -98,6 +108,19 @@ class _StorageRouteQueue:
         if self._closed:
             raise RuntimeError(f"storage queue '{self.key}' is closed.")
         self.start()
+        if self.backpressure_policy == "block":
+            while True:
+                self.raise_if_failed()
+                if self._closed:
+                    raise RuntimeError(f"storage queue '{self.key}' is closed.")
+                try:
+                    self._queue.put(job, timeout=0.05)
+                    break
+                except queue.Full:
+                    continue
+            self._enqueued += 1
+            self._high_water = max(self._high_water, int(self._queue.qsize()))
+            return True
         try:
             self._queue.put_nowait(job)
         except queue.Full:
@@ -189,6 +212,7 @@ class _StorageRouteQueue:
             dropped=int(self._dropped),
             high_water=int(self._high_water),
             max_queue_size=int(self.max_queue_size),
+            backpressure_policy=self.backpressure_policy,
         )
 
 
@@ -256,6 +280,7 @@ class CollectionWriterObserver:
                 key=route_key,
                 writer_pool=self.writer_pool,
                 max_queue_size=int(self.config.storage_queue_size),
+                backpressure_policy=self.config.storage_queue_backpressure_policy,
             )
             self._storage_routes[route_key] = route
         return route
@@ -349,6 +374,9 @@ class CollectionWriterObserver:
         return {
             "enabled": self.storage_queue_enabled,
             "storage_queue_size": int(self.config.storage_queue_size),
+            "storage_queue_backpressure_policy": (
+                self.config.storage_queue_backpressure_policy
+            ),
             "routes": {
                 key: asdict(route.stats())
                 for key, route in sorted(self._storage_routes.items())

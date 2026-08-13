@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from dataset_contracts.camera_semantics import (
+    CAMERA_SEMANTIC_MATERIALIZATION_HASH_DOMAIN_V1,
+    CAMERA_SEMANTIC_MATERIALIZATION_SCHEMA_V1,
     CameraRoleBinding,
     CameraSemanticContractError,
     CameraSemanticResolution,
@@ -20,6 +22,9 @@ REALSENSE_SNAPSHOT_HASH_DOMAIN_V1 = (
     "dexteleop.realsense_device_snapshot.v1"
 )
 CAMERA_ROLE_REGISTRY_ENV = "DEXTELEOP_CAMERA_ROLE_REGISTRY"
+CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH = (
+    Path("meta") / "camera_semantics" / "materialization.json"
+)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -270,6 +275,75 @@ class DatasetCameraSemanticResolver:
 
     def _load(self) -> None:
         meta = self.dataset_root / "meta"
+        materialization_path = (
+            self.dataset_root / CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH
+        )
+        if materialization_path.is_file():
+            materialization = _read_json_object(materialization_path)
+            schema = str(materialization.get("schema") or "")
+            if schema != CAMERA_SEMANTIC_MATERIALIZATION_SCHEMA_V1:
+                raise CameraSemanticContractError(
+                    "Unsupported camera semantic materialization schema "
+                    f"{schema!r}: {materialization_path}"
+                )
+            receipt_hash = str(materialization.get("receipt_hash") or "")
+            hash_payload = dict(materialization)
+            hash_payload.pop("receipt_hash", None)
+            expected_receipt_hash = canonical_content_hash(
+                hash_payload,
+                domain=CAMERA_SEMANTIC_MATERIALIZATION_HASH_DOMAIN_V1,
+            )
+            if receipt_hash != expected_receipt_hash:
+                raise CameraSemanticContractError(
+                    "Camera semantic materialization receipt hash mismatch: "
+                    f"{materialization_path}"
+                )
+            if not bool(materialization.get("complete", False)):
+                raise CameraSemanticContractError(
+                    f"Camera semantic materialization is incomplete: {materialization_path}"
+                )
+            if str(materialization.get("binding_hash") or "") != self.binding.contract_hash:
+                raise CameraSemanticContractError(
+                    "Camera semantic materialization binding differs from the "
+                    "requested physical camera registry."
+                )
+            snapshot_path = meta / "devices" / "realsense.json"
+            resolution = self._load_resolution(
+                snapshot_path,
+                source_id=self.dataset_root.name,
+            )
+            if resolution.status != "identity":
+                raise CameraSemanticContractError(
+                    "A materialized dataset must expose canonical camera keys in "
+                    "its output RealSense snapshot."
+                )
+            if (
+                str(materialization.get("output_snapshot_hash") or "")
+                != resolution.source_device_snapshot_hash
+            ):
+                raise CameraSemanticContractError(
+                    "Camera semantic materialization output snapshot hash mismatch."
+                )
+            episode_rows = _read_jsonl(meta / "episodes.jsonl")
+            try:
+                actual_episode_indices = sorted(
+                    int(row["episode_index"]) for row in episode_rows
+                )
+                declared_episode_indices = sorted(
+                    int(value)
+                    for value in materialization.get("episode_indices", ())
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise CameraSemanticContractError(
+                    "Camera semantic materialization has invalid episode coverage."
+                ) from exc
+            if actual_episode_indices != declared_episode_indices:
+                raise CameraSemanticContractError(
+                    "Camera semantic materialization episode coverage differs "
+                    "from meta/episodes.jsonl."
+                )
+            self._direct = resolution
+            return
         provenance_path = meta / "provenance.jsonl"
         provenance = _read_jsonl(provenance_path)
         if not provenance:
@@ -475,6 +549,7 @@ class DatasetCameraSemanticResolver:
 
 __all__ = [
     "CAMERA_ROLE_REGISTRY_ENV",
+    "CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH",
     "DatasetCameraSemanticResolver",
     "REALSENSE_SNAPSHOT_HASH_DOMAIN_V1",
     "camera_role_binding_from_registry",

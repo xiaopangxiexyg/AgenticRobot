@@ -2576,7 +2576,18 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         default=64,
         help=(
             "Per-camera video storage queue size before the async writer pool. "
-            "When full, the oldest non-critical video frame is dropped."
+            "Queue-full behavior is selected separately; use 0 for direct submit."
+        ),
+    )
+    parser.add_argument(
+        "--storage-queue-backpressure-policy",
+        choices=("block", "drop_oldest"),
+        default="block",
+        help=(
+            "Video/depth storage queue behavior when full. block is the formal-"
+            "collection default: sample assembly waits off the control hot path so "
+            "one camera cannot independently lose a row. drop_oldest preserves the "
+            "legacy best-effort behavior and may create per-camera frame gaps."
         ),
     )
     parser.add_argument(

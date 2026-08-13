@@ -208,6 +208,7 @@ def _dataset_storage_debug_text(dataset_recorder: RealTeleopDatasetRecorder) -> 
         return (
             "storage_queue=enabled"
             f":size:{int(stats.get('storage_queue_size', 0) or 0)},routes:none"
+            f",policy:{str(stats.get('storage_queue_backpressure_policy', 'unknown'))}"
         )
     parts: list[str] = []
     for key, route in sorted(routes.items()):
@@ -222,7 +223,11 @@ def _dataset_storage_debug_text(dataset_recorder: RealTeleopDatasetRecorder) -> 
             f"high:{int(route.get('high_water', 0) or 0)}/"
             f"{int(route.get('max_queue_size', 0) or 0)}"
         )
-    return "storage_queue=" + "; ".join(parts)
+    return (
+        "storage_queue="
+        f"policy:{str(stats.get('storage_queue_backpressure_policy', 'unknown'))};"
+        + "; ".join(parts)
+    )
 
 
 def _dataset_recording_debug_text(

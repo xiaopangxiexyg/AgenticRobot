@@ -142,6 +142,7 @@ DATASET_COMMON_ARGS=(
   --writer-workers 6
   --writer-queue-size 1024
   --storage-queue-size 128
+  --storage-queue-backpressure-policy block
   --wrist-depth-mask
 )
 

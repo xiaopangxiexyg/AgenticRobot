@@ -285,7 +285,13 @@ class RealTeleopDatasetRecorder:
                 * 1024.0
                 * 1024.0
             ),
-            allow_missing_video_frames=int(args.storage_queue_size) > 0,
+            allow_missing_video_frames=(
+                int(args.storage_queue_size) > 0
+                and str(
+                    getattr(args, "storage_queue_backpressure_policy", "block")
+                )
+                == "drop_oldest"
+            ),
             write_wrist_depth_mask=bool(getattr(args, "wrist_depth_mask", False)),
             write_wrist_depth_raw=bool(getattr(args, "wrist_depth_raw", False)),
             hand_action_specs=_collection_hand_action_specs(args, components.active_sides),
@@ -607,6 +613,9 @@ class RealTeleopDatasetRecorder:
                 config=CollectionWriterObserverConfig(
                     name="real_teleop_dataset_observer",
                     storage_queue_size=int(args.storage_queue_size),
+                    storage_queue_backpressure_policy=str(
+                        getattr(args, "storage_queue_backpressure_policy", "block")
+                    ),
                 ),
             )
             # Keep the established attribute for diagnostics and downstream tools;

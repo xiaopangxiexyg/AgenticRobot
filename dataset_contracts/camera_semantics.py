@@ -21,6 +21,12 @@ CAMERA_SEMANTIC_RESOLUTION_SCHEMA_V1 = (
 CAMERA_SEMANTIC_RESOLUTION_HASH_DOMAIN_V1 = (
     "dexteleop.camera_semantic_resolution.v1"
 )
+CAMERA_SEMANTIC_MATERIALIZATION_SCHEMA_V1 = (
+    "dexteleop.camera_semantic_materialization.v1"
+)
+CAMERA_SEMANTIC_MATERIALIZATION_HASH_DOMAIN_V1 = (
+    "dexteleop.camera_semantic_materialization.v1"
+)
 
 
 class CameraSemanticContractError(ValueError):

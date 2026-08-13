@@ -19,6 +19,10 @@ from dataset_interface.tactile_bundle import attach_tactile_bundle
 from dataset_interface.validation import validate_v23_dataset
 
 from .causal_align import causal_align_dataset, plan_causal_align
+from .camera_semantic_materialize import (
+    materialize_camera_semantics,
+    plan_camera_semantic_materialization,
+)
 from .delete_episodes import delete_episodes, plan_episode_deletion
 from .fault_nan_tail import detect_fault_nan_tail
 from .force_collision_labels import label_force_collisions, plan_force_collision_labels
@@ -216,6 +220,25 @@ def _cmd_plan_causal_align(args: argparse.Namespace) -> int:
         no_prior_policy=str(args.no_prior_policy),
     )
     _print_json(plan.to_dict())
+    return 0
+
+
+def _cmd_camera_semantic_materialize(args: argparse.Namespace) -> int:
+    plan = plan_camera_semantic_materialization(
+        args.dataset_root,
+        args.output_root,
+        args.registry,
+    )
+    if bool(args.apply):
+        result = materialize_camera_semantics(
+            args.dataset_root,
+            args.output_root,
+            args.registry,
+            expected_plan_hash=str(args.expected_plan_hash or ""),
+        )
+        _print_json(result)
+    else:
+        _print_json(plan.to_dict())
     return 0
 
 
@@ -610,6 +633,31 @@ def build_parser() -> argparse.ArgumentParser:
         description="Postprocess DexTeleop LeRobot-style datasets."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    camera_materialize = subparsers.add_parser(
+        "camera-semantics-materialize",
+        help=(
+            "Plan or materialize serial-resolved wrist-camera namespaces into "
+            "a fresh ordinary-loader dataset without modifying the source."
+        ),
+    )
+    camera_materialize.add_argument("dataset_root")
+    camera_materialize.add_argument("--output-root", required=True)
+    camera_materialize.add_argument("--registry", required=True)
+    camera_materialize.add_argument(
+        "--expected-plan-hash",
+        default="",
+        help="Required with --apply; copy from the immediately preceding dry-run.",
+    )
+    camera_materialize.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Publish a fresh-inode output only after Parquet, receipt, decoded "
+            "frame-count, and full/tail video validation."
+        ),
+    )
+    camera_materialize.set_defaults(func=_cmd_camera_semantic_materialize)
 
     default_postprocess = subparsers.add_parser(
         "postprocess",

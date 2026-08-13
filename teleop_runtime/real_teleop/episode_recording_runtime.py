@@ -287,6 +287,9 @@ def build_episode_recording_runtime(
                     "tactile_storage": str(args.tactile_storage),
                     "tactile_compression": str(getattr(args, "tactile_compression", "none")),
                     "storage_queue_size": int(args.storage_queue_size),
+                    "storage_queue_backpressure_policy": str(
+                        getattr(args, "storage_queue_backpressure_policy", "block")
+                    ),
                 }
             )
             try:

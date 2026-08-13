@@ -10,12 +10,15 @@ import numpy as np
 import pytest
 
 from dataset_contracts.camera_semantics import (
+    CAMERA_SEMANTIC_MATERIALIZATION_HASH_DOMAIN_V1,
+    CAMERA_SEMANTIC_MATERIALIZATION_SCHEMA_V1,
     CameraRole,
     CameraRoleBinding,
     CameraSemanticContractError,
     CameraSemanticResolution,
     ResolvedCameraRole,
 )
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.policy_artifact import (
     PolicyArtifactContract,
     PolicyCameraInput,
@@ -24,6 +27,7 @@ from dataset_contracts.policy_artifact import (
 from dataset_contracts.v22 import EndEffectorSpec, PolicyIOLayout
 from dataset_interface.camera_semantics import (
     CAMERA_ROLE_REGISTRY_ENV,
+    CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH,
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
     resolve_camera_snapshot,
@@ -227,6 +231,56 @@ def test_historical_and_corrected_snapshots_resolve_by_serial() -> None:
         "left_wrist": "left_wrist",
         "right_wrist": "right_wrist",
     }
+
+
+def test_materialization_receipt_exposes_identity_and_bypasses_old_provenance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "materialized"
+    _write_direct_dataset(root, corrected=True)
+    _write_frame_index_episode(root, left=[0, 1], right=[0, 1])
+    (root / "meta" / "provenance.jsonl").write_text(
+        json.dumps(
+            {
+                "output_episode_index": 0,
+                "source_dataset_root": str(tmp_path / "unavailable_old_source"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    snapshot_resolution = resolve_camera_snapshot(
+        _snapshot(corrected=True),
+        _binding(),
+        source_id=root.name,
+    )
+    receipt = {
+        "schema": CAMERA_SEMANTIC_MATERIALIZATION_SCHEMA_V1,
+        "complete": True,
+        "binding_hash": _binding().contract_hash,
+        "output_snapshot_hash": snapshot_resolution.source_device_snapshot_hash,
+        "episode_indices": [0],
+    }
+    receipt["receipt_hash"] = canonical_content_hash(
+        receipt,
+        domain=CAMERA_SEMANTIC_MATERIALIZATION_HASH_DOMAIN_V1,
+    )
+    receipt_path = root / CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    resolver = DatasetCameraSemanticResolver(root, _binding())
+
+    assert resolver.resolution_for_episode(0).status == "identity"
+    assert resolver.resolution_for_episode(0).canonical_to_stored_key == {
+        "left_wrist": "left_wrist",
+        "right_wrist": "right_wrist",
+    }
+
+    receipt["episode_indices"] = [0, 1]
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(CameraSemanticContractError, match="receipt hash mismatch"):
+        DatasetCameraSemanticResolver(root, _binding())
 
 
 def test_camera_role_binding_hash_is_independent_of_json_key_order() -> None:

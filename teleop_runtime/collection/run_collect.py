@@ -1900,7 +1900,16 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help=(
             "Per-camera video storage queue size before the async writer pool. "
-            "When full, the oldest non-critical video frame is dropped. Use 0 for legacy direct submit."
+            "Use 0 for direct submit."
+        ),
+    )
+    parser.add_argument(
+        "--storage-queue-backpressure-policy",
+        choices=("block", "drop_oldest"),
+        default="block",
+        help=(
+            "Queue-full behavior. block preserves required-camera row alignment; "
+            "drop_oldest is legacy best-effort storage and may create frame gaps."
         ),
     )
     parser.add_argument(
@@ -5522,7 +5531,13 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             write_video=bool(args.write_video and not args.no_camera),
             tactile_storage=str(getattr(args, "tactile_storage", "external")),
             tactile_compression=str(getattr(args, "tactile_compression", "none")),
-            allow_missing_video_frames=int(getattr(args, "storage_queue_size", 64)) > 0,
+            allow_missing_video_frames=(
+                int(getattr(args, "storage_queue_size", 64)) > 0
+                and str(
+                    getattr(args, "storage_queue_backpressure_policy", "block")
+                )
+                == "drop_oldest"
+            ),
             hand_action_specs=_collection_hand_action_specs(args, active_sides),
             policy_io_layout=policy_io_resolution.layout,
             policy_io_layout_provenance=policy_io_resolution.provenance,
@@ -5594,6 +5609,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         ),
         writer_observer_config=CollectionWriterObserverConfig(
             storage_queue_size=int(getattr(args, "storage_queue_size", 64)),
+            storage_queue_backpressure_policy=str(
+                getattr(args, "storage_queue_backpressure_policy", "block")
+            ),
         ),
     )
     return CollectApp(

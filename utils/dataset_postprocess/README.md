@@ -15,6 +15,44 @@ DexTeleop dataset 后处理工具集合。默认以 dry-run / 写新目录为主
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 ```
 
+### 旧数据腕部相机物理左右归一化
+
+`camera-semantics-materialize` 根据采集时保存的 RealSense 序列号和当前相机角色注册表，逐
+episode 判断存储键是否颠倒。dry-run 会列出每个 episode 的
+`canonical_to_stored_key`、左右 video index 不一致行数、源 inode/hardlink 数量和预计复制字节数：
+
+```bash
+python -m utils.dataset_postprocess camera-semantics-materialize \
+  DATASET_ROOT \
+  --output-root OUTPUT_ROOT \
+  --registry robot_motion/configs/rm65_camera_registry.json
+```
+
+确认计划后，把上一步输出的 `plan_hash` 原样回填：
+
+```bash
+python -m utils.dataset_postprocess camera-semantics-materialize \
+  DATASET_ROOT \
+  --output-root OUTPUT_ROOT \
+  --registry robot_motion/configs/rm65_camera_registry.json \
+  --apply \
+  --expected-plan-hash PLAN_HASH
+```
+
+该工具不原地修改源数据，也不只交换 RGB 图像键。它同时迁移完整的
+`observation.images.left_wrist.*` / `right_wrist.*` Parquet 列族、RGB 视频、wrist depth/mask
+artifact、episode 路径表和设备快照。单侧历史缺帧会保留在对应的物理相机上；不会借用另一侧
+`video_frame_index` 补齐。输出文件均为 fresh inode；每段视频必须通过 Parquet 声明帧数、
+ffprobe 解码帧数和 ffmpeg `-xerror` 全段/尾帧解码后才原子发布，因此应先根据 dry-run 的
+`source_byte_count` 预留完整输出空间。输出中的 materialization receipt 会使现有
+`DatasetCameraSemanticResolver` 和普通按 canonical key 读取的 loader 都看到 identity，避免
+organized provenance 再次把已经换名的数据交换一次。
+
+新正式采集的 thread writer 默认采用 `--storage-queue-backpressure-policy block`：相机存储队列
+满时在控制热路径之外背压 sample assembly，不再由每个相机独立丢最旧帧。旧的
+`drop_oldest` 仍是显式兼容选项，但可能重新产生单侧 frame gap；正式数据不应使用。process
+writer 继续按完整 sample 原子接纳/拒绝，不依赖这一 thread-only 队列。
+
 ### 混合触觉数据的一体化入口（推荐）
 
 `tactile-maintain` 是面向既有数据集的状态感知入口。默认只生成 JSON 计划，不写数据；它会从
