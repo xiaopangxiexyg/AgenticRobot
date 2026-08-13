@@ -88,7 +88,7 @@ idle-worker profile；带target streaming与production mediation仍需独立授�
 推荐启动方式：
 
 ```bash
-conda activate /home/user/miniconda3/envs/dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 
 python -m teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz \
   --left-arm-ip 192.168.101.21 \

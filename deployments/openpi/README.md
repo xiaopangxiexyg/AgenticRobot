@@ -282,14 +282,15 @@ operation，不启动DexTeleop target、设备或动作下发。
 | 机器/职责 | 根目录 | 环境 |
 | --- | --- | --- |
 | OpenPI server / GPU | `/home/user/zc/openpi` | `uv` / `.venv` |
-| DexTeleop client / 硬件 | `/home/user/zc/DexTeleop` | `/home/user/miniconda3/envs/dexteleop310/bin/python` |
+| DexTeleop client / 硬件 | `/home/user/zc/DexTeleop` | Conda 环境 `${DEXTELEOP_ENV_NAME:-dexteleop310}` |
 
 以下变量应在 **DexTeleop client 机器**上设置；若 server 与 client 是同一台机器，`SERVER_IP=127.0.0.1` 仅适用于本机检查，局域网部署应使用可路由 IP。
 
 ```bash
 export DEXTELEOP_ROOT=/home/user/zc/DexTeleop
 export OPENPI_ROOT=/home/user/zc/openpi
-export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
 
 export SERVER_IP=127.0.0.1
 export OPENPI_PORT=8078

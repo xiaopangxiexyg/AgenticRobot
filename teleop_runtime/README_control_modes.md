@@ -348,7 +348,7 @@ target.rotation = current_human.rotation
 仓库现有 README 里推荐：
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 ```
 
 如果只做虚拟跑法，至少要保证：

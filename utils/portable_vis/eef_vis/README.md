@@ -77,8 +77,8 @@ Visualize one dataset episode with two synchronized 3D panels:
 - right panel: `action_t` vs `observation.state_{t+1}`
 
 ```bash
-/home/zc/anaconda3/envs/dexteleop310/bin/python \
-  utils/portable_vis/eef_vis/visualize_pose_action_alignment.py \
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python utils/portable_vis/eef_vis/visualize_pose_action_alignment.py \
   datasets/2026-07-06_vive_rm65_real_teleop \
   --episode 10
 ```
@@ -93,8 +93,8 @@ Use `--no-open` when running on a headless machine, and `--output` to choose a
 specific HTML path:
 
 ```bash
-/home/zc/anaconda3/envs/dexteleop310/bin/python \
-  utils/portable_vis/eef_vis/visualize_pose_action_alignment.py \
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python utils/portable_vis/eef_vis/visualize_pose_action_alignment.py \
   datasets/2026-07-06_vive_rm65_real_teleop/data/chunk-000/episode_000010.parquet \
   --output /tmp/pose_action_alignment_ep10.html \
   --no-open

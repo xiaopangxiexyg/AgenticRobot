@@ -16,8 +16,8 @@ The existing `EgoData` environment contains both the MCAP reader and
 Matplotlib:
 
 ```bash
-/home/zc/anaconda3/envs/EgoData/bin/python \
-  -m utils.portable_vis.sxr_ego_head_pose.visualize_head_extrinsics \
+conda activate EgoData
+python -m utils.portable_vis.sxr_ego_head_pose.visualize_head_extrinsics \
   /home/zc/Downloads/episode_20260529_0100
 ```
 
@@ -26,8 +26,8 @@ Press Space to pause/resume. Press `q` or Escape to close.
 Use a decode-only check when no graphical display is available:
 
 ```bash
-/home/zc/anaconda3/envs/EgoData/bin/python \
-  -m utils.portable_vis.sxr_ego_head_pose.visualize_head_extrinsics \
+conda activate EgoData
+python -m utils.portable_vis.sxr_ego_head_pose.visualize_head_extrinsics \
   /home/zc/Downloads/episode_20260529_0100 \
   --dry-run
 ```

@@ -26,14 +26,50 @@
 
 ## 命令约定
 
-- 除非页面另有说明，命令都从仓库根目录、在 Bash 中执行，并假定已经激活
-  `dexteleop310`。
+- 除非页面另有说明，命令都从仓库根目录、在 Bash 中执行，并假定已经激活项目环境。
+  不要把 `/home/.../miniconda3/envs/.../bin/python` 写进长期文档；不同机器的 Conda
+  安装目录可能不同。
+- 新终端统一使用下面的可移植前缀。默认环境名是 `dexteleop310`；若安装时用了
+  `scripts/install_conda_env.sh --env-name NAME`，只需在激活前覆盖
+  `DEXTELEOP_ENV_NAME=NAME`：
+
+  ```bash
+  cd /path/to/DexTeleop
+  export DEXTELEOP_ROOT="$PWD"
+  export DEXTELEOP_ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
+  eval "$(conda shell.bash hook)"
+  conda activate "$DEXTELEOP_ENV_NAME"
+  ```
+
+  已经执行过 `conda init` 的交互式 shell 可以省略 `eval` 行。后续一律使用当前环境中的
+  `python`、`python -m pytest` 和 `python -m pip`；只有需要把解释器路径传给子进程时，才用
+  `DEXTELEOP_PYTHON="$(command -v python)"` 动态取得，不能猜 Conda 安装前缀。
+- OpenPI 模型 server 不属于这个 Conda 环境，继续使用它自己的 `uv` / `.venv`；相关文档用
+  `OPENPI_ROOT` 表达路径。`.venv-annotation` 和 `isaacgym38` 也按各自环境章节激活，不能与
+  `dexteleop310` 混用。
 - `/path/to/...` 表示必须替换的本机路径；`${NAME:?set NAME}` 表示必须先设置的环境变量，
   未设置时 Bash 会在连接设备前停止。
 - `latest` 是当前站点保存的 assignment，不是跨机器通用配置。换机器、换 USB 口或换设备后
   必须重新做对应的只读检查/assignment。
 - `--help`、dry-run 和离线命令也可能加载较重的软件依赖，但不应连接真实执行器；若实际行为
   与风险等级不符，立即停止并修正文档。
+
+## 常用命令速查
+
+先执行上面的环境前缀，再按用途进入对应领域文档：
+
+| 用途 | 命令 | 等级 |
+|---|---|---|
+| Canonical 入口检查 | `python -m teleop_runtime.debug.run_vive_rm65_real_teleop --help` | R0 |
+| Headless collection 检查 | `python -m teleop_runtime.collection --help` | R0 |
+| Policy deploy 检查 | `python -m teleop_runtime.deploy --help` | R0 |
+| MuJoCo replay 检查 | `python -m sim.mujoco.replay --help` | R0 |
+| 最快单元测试 | `PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -m 'unit and not optional' -q` | R0 |
+| 统一设备只读检查 | `python -m teleop_runtime.configure_devices --check` | H1 |
+
+真机遥操、正式数采、replay 和动作 deploy 的完整命令不放在速查表中，避免跳过 profile、
+设备和安全前置条件；从 [real](./real/README.md) 进入。数据写入类命令先使用对应页面的
+dry-run，再显式应用。
 
 ## 现有 README 的归属
 

@@ -5,8 +5,8 @@ Project a DexTeleop episode's arm TCP `state_t`, `action_t`, and
 the static `front` camera.
 
 ```bash
-/home/zc/anaconda3/envs/dexteleop310/bin/python \
-  utils/portable_vis/real_projection_view/project_real_trajectory.py \
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python utils/portable_vis/real_projection_view/project_real_trajectory.py \
   datasets/2026-07-06_vive_rm65_real_teleop \
   --episode 10 \
   --lag 8
@@ -21,8 +21,8 @@ The default output is:
 Use `--no-open` when running from a headless terminal:
 
 ```bash
-/home/zc/anaconda3/envs/dexteleop310/bin/python \
-  utils/portable_vis/real_projection_view/project_real_trajectory.py \
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python utils/portable_vis/real_projection_view/project_real_trajectory.py \
   datasets/2026-07-06_vive_rm65_real_teleop \
   --episode 10 \
   --lag 8 \

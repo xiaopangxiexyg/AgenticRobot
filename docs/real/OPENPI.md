@@ -64,7 +64,7 @@ training config 名称不同，可额外传 `--config CONFIG_NAME`；只有确�
 
 ```bash
 cd "$DEXTELEOP_ROOT"
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 export CHECKPOINT_DIR="$CHECKPOINT_LINK"
 export POLICY_SERVER_HOST=127.0.0.1
 ```

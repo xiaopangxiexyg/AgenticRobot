@@ -6,6 +6,7 @@
 | 专题 | 用途 |
 |---|---|
 | [TELEOP_COLLECTION](./TELEOP_COLLECTION.md) | 启动顺序、正式 profile 参数、数采验收和回退 |
+| [原生触觉分离存储](./NATIVE_TACTILE_BUNDLE.md) | 采集期双根写入、可迁移身份、校验附着与原子恢复 |
 | [长程 Progress Profile](./TELEOP_COLLECTION.md#38-可选长程进度语义与独立-gui) | GUI 选择、数据集唯一绑定、Failure/Retry 和回退方式 |
 | [长程细粒度阶段标注](./LONG_HORIZON_STAGE_ANNOTATION.md) | 已封存 Episode 的视频时间轴、Failure/stage 标注和训练排除 |
 | [REPLAY](./REPLAY.md) | 离线/真机 replay 参数和安全门 |
@@ -15,7 +16,8 @@
 
 ## 0. 运行前确认
 
-- 从仓库根目录使用 Bash 或 zsh，并已激活 `dexteleop310`。
+- 从仓库根目录使用 Bash 或 zsh，并已按 [统一环境前缀](../README.md#命令约定) 激活
+  `${DEXTELEOP_ENV_NAME:-dexteleop310}`。
 - 如果使用复制的 checkout，先把 `DEXTELEOP_ROOT` 指向该副本；下面命令默认使用
   `/home/user/zc/DexTeleop`，不会猜测副本目录名。例如远端当前副本实际是
   `/home/user/zc/DexTelop_0726`（`DexTelop` 少一个 `e`）。
@@ -100,7 +102,7 @@ q5 release-band 的“保持上一侧”条件，并启用 `[1,2,4]` 半径的�
 ### 踏板:
 
 ```bash
-sudo -E /home/user/miniconda3/envs/dexteleop310/bin/python -m teleop_runtime.configure_devices --fix-permissions
+sudo -E "$(command -v python)" -m teleop_runtime.configure_devices --fix-permissions
 
 python -m hardware.foot_pad --count 2
 ```
@@ -121,8 +123,8 @@ python -m hardware.foot_pad --count 2
   fi
   cd -- "$DEXTELEOP_ROOT"
   export PYTHONPATH="$DEXTELEOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-  source /home/user/miniconda3/etc/profile.d/conda.sh
-  conda activate /home/user/miniconda3/envs/dexteleop310
+  eval "$(conda shell.bash hook)"
+  conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
   set -euo pipefail
   : "${LEFT_ARM_IP:=192.168.101.21}"
   : "${RIGHT_ARM_IP:=192.168.1.20}"
@@ -253,8 +255,8 @@ Home。若任一 Arm_Stop 未确认或控制线程无法退出，则保持 fail-
   fi
   cd -- "$DEXTELEOP_ROOT"
   export PYTHONPATH="$DEXTELEOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-  source /home/user/miniconda3/etc/profile.d/conda.sh
-  conda activate /home/user/miniconda3/envs/dexteleop310
+  eval "$(conda shell.bash hook)"
+  conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
   set -euo pipefail
   : "${LEFT_ARM_IP:=192.168.101.21}"
   : "${RIGHT_ARM_IP:=192.168.1.20}"
@@ -299,8 +301,8 @@ writer、不启动腕部 depth stream，也不写 standalone debug 文件。它�
   fi
   cd -- "$DEXTELEOP_ROOT"
   export PYTHONPATH="$DEXTELEOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-  source /home/user/miniconda3/etc/profile.d/conda.sh
-  conda activate /home/user/miniconda3/envs/dexteleop310
+  eval "$(conda shell.bash hook)"
+  conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
   set -euo pipefail
   : "${LEFT_ARM_IP:=192.168.101.21}"
   : "${RIGHT_ARM_IP:=192.168.1.20}"

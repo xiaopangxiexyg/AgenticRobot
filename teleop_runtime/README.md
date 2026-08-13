@@ -111,7 +111,7 @@ hand16 中的空槽必须按无效值处理，而不是按 0 处理：
 - RM65 arm backend：RM65 SDK，可导入 `hardware.rm65.robotic_arm_package.robotic_arm`
 - Inspire hand backend：`hardware/inspire_tac/inspire_tac_modbus.py` 依赖的 `pymodbus`
 - arm IK：`rm65_inspire_tac.ik.SingleArmIKSolver` 依赖 `pinocchio`
-- 推荐环境：`conda activate dexteleop310`
+- 推荐环境：`conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"`
 
 如果只做 dry-run，可以先把 arm / hand backend 的 `connect_hardware=False`。
 

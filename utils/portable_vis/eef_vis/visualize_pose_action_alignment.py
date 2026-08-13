@@ -117,9 +117,9 @@ def _require_pyarrow_parquet() -> Any:
         import pyarrow.parquet as pq
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "Reading episode parquet requires pyarrow. Try:\n"
-            "/home/zc/anaconda3/envs/dexteleop310/bin/python "
-            "utils/portable_vis/eef_vis/visualize_pose_action_alignment.py ..."
+            "Reading episode parquet requires pyarrow. Activate the DexTeleop "
+            "environment with `conda activate dexteleop310`, then run "
+            "`python utils/portable_vis/eef_vis/visualize_pose_action_alignment.py ...`."
         ) from exc
     return pq
 

@@ -125,12 +125,17 @@ python scripts/export_annotation_projection.py \
 cd /path/to/DexTeleop
 export DEXTELEOP_ROOT="$PWD"
 bash scripts/install_conda_env.sh
+export DEXTELEOP_ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
 eval "$(conda shell.bash hook)"
-conda activate dexteleop310
+conda activate "$DEXTELEOP_ENV_NAME"
 ```
 
 `/path/to/DexTeleop` 必须替换为本机 clone 路径。本文后续用 `DEXTELEOP_ROOT` 表示该目录；
 另开 shell 时需要重新导出它。
+
+`conda shell.bash hook` 根据当前 `conda` 命令自动解析安装目录；长期命令不要写死
+`/home/.../miniconda3` 或 `/home/.../anaconda3`。如果安装时使用了
+`--env-name NAME`，在后续终端中设置相同的 `DEXTELEOP_ENV_NAME=NAME` 即可。
 
 如果 SDK 位于仓库外：
 
@@ -149,7 +154,7 @@ bash scripts/install_conda_env.sh --skip-vendor-sdk
 环境：
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 uv lock --python 3.10
 bash scripts/install_conda_env.sh --update
 ```
@@ -158,9 +163,10 @@ bash scripts/install_conda_env.sh --update
 自动卸载环境中曾经手工安装、但已不在锁文件中的 PyPI 包。若需要彻底清除这类残留，建议删除并重建环境：
 
 ```bash
+export DEXTELEOP_ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
 conda deactivate
-conda env remove --name dexteleop310
-bash scripts/install_conda_env.sh
+conda env remove --name "$DEXTELEOP_ENV_NAME"
+bash scripts/install_conda_env.sh --env-name "$DEXTELEOP_ENV_NAME"
 ```
 
 已有同名环境不会被覆盖；也可以通过 `--env-name NAME`、`--sdk-root PATH` 覆盖默认环境名或 SDK 路径。
@@ -215,7 +221,7 @@ DexTeleop 侧安装 `pyzmq`。
 激活环境后，从仓库根目录执行基本 smoke test：
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 cd "${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}"
 
 PYTHONNOUSERSITE=1 python - <<'PY'
@@ -442,7 +448,7 @@ MuJoCo 和 SAPIEN 已由完整主环境安装。官方 Python binding 包内已�
 下载 MuJoCo 二进制，也不要在主环境中再执行一套不受项目元数据约束的 `pip install`。
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 python - <<'PY'
 import gymnasium
 import mujoco

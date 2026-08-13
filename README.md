@@ -16,6 +16,8 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 | 被替代命令与历史报告 | [`docs/legacy/`](./docs/legacy/README.md) |
 
 环境依赖和锁文件的完整说明仍以 [`README_ENV.md`](./README_ENV.md) 为准。
+所有长期命令都通过环境名激活 Conda，不依赖 `miniconda3` / `anaconda3` 的安装路径；统一
+前缀和常用命令速查见 [`docs/README.md`](./docs/README.md#命令约定)。
 
 第一次使用建议按顺序完成：安装环境 → 运行 R0 入口检查 → 阅读目标领域的简洁入口 →
 做仿真或只读设备预检 → 最后才进入 H2/M 操作。R0/R1/H1/H2/M 的含义见

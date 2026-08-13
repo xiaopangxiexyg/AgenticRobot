@@ -129,9 +129,9 @@ def require_pyarrow_parquet() -> Any:
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "pose_action_next_state requires pyarrow. "
-            "Run with an environment that has pyarrow, for example "
-            "/home/zc/anaconda3/envs/dexteleop310/bin/python "
-            "utils/statistic/pose_action_next_state.py"
+            "Activate the DexTeleop environment with "
+            "`conda activate dexteleop310`, then run "
+            "`python utils/statistic/pose_action_next_state.py`."
         ) from exc
     return pq
 

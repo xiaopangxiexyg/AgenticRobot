@@ -8,7 +8,8 @@
 Run:
 
 ```bash
-/home/zc/anaconda3/envs/dexteleop310/bin/python utils/statistic/pose_action_next_state.py \
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python utils/statistic/pose_action_next_state.py \
   --dataset-root datasets \
   --output-dir utils/statistic/pose_action_next_state_reports
 ```
@@ -37,7 +38,8 @@ fallback.
 Run:
 
 ```bash
-/home/zc/anaconda3/envs/dexteleop310/bin/python utils/statistic/pose_action_lag_scan.py \
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python utils/statistic/pose_action_lag_scan.py \
   --dataset-root datasets \
   --max-lag 15 \
   --output-dir utils/statistic/pose_action_lag_scan_reports
@@ -52,7 +54,8 @@ counted repeatedly.
 For single-trajectory timing checks, scan just the latest or a specific episode:
 
 ```bash
-/home/zc/anaconda3/envs/dexteleop310/bin/python utils/statistic/pose_action_lag_scan.py \
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python utils/statistic/pose_action_lag_scan.py \
   --dataset-root datasets/2026-07-09_vive_rm65_real_teleop \
   --latest-episode \
   --max-lag 15

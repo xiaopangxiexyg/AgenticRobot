@@ -92,7 +92,7 @@
 推荐命令：
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 
 python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \

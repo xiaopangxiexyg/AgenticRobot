@@ -10,7 +10,7 @@
 ## 环境
 
 ```bash
-conda activate XXXXXXXX
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 
 # 在 DexTeleop 仓库根目录执行
 export REPO=$(pwd)
@@ -24,7 +24,8 @@ python run_gripper.py --help
 
 说明：
 
-- 如果实际环境名不是 `XXXXXXXX`，用当前调试环境名替换。
+- 如果安装完整项目环境时使用了 `--env-name NAME`，先设置
+  `DEXTELEOP_ENV_NAME=NAME`；不要写死 Conda 安装目录。
 - `python -m pip install -e .` 在 SDK 根目录执行，用于安装 `dmrobotics`；不要在 `hardware/DMTAC_gripper/` 内执行。
 - `requirements.txt` 只包含本目录运行脚本需要的外部依赖，例如 `numpy`、`pyserial`、`opencv-python`。
 

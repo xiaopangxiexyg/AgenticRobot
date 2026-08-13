@@ -8,7 +8,7 @@
 在仓库根目录进入真机环境：
 
 ```bash
-conda activate /home/user/miniconda3/envs/dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 ```
 

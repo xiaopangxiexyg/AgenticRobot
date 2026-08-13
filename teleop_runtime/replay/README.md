@@ -8,7 +8,7 @@
 ## 启动 GUI
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 cd /home/zc/HandMotion/Developing/DexTeleop
 
 python -m teleop_runtime.replay \
@@ -256,7 +256,7 @@ python -m teleop_runtime.debug.view_rm65_pose_lift_sim_replay \
 `collection.continuity_segment_index` 插值：
 
 ```bash
-conda run -n dexteleop310 python -m \
+conda run --name "${DEXTELEOP_ENV_NAME:-dexteleop310}" python -m \
   teleop_runtime.debug.view_rm65_pose_lift_sim_replay \
   --dataset-root remote_data/pose_lift_0727_full_v2 \
   --representative-suite 0727-v4-vs-official-governor \

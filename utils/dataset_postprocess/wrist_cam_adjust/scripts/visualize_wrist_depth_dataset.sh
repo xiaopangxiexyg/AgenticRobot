@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
-PYTHON_BIN="${PYTHON_BIN:-/home/zc/anaconda3/envs/dexteleop310/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 DATASET="${1:-datasets/2026-07-05_vive_rm65_real_teleop}"
 EPISODE="${2:-0}"
 AT_SEC="${AT_SEC:-5.0}"

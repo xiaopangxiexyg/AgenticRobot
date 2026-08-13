@@ -22,12 +22,16 @@ python -m control_station refinement-annotation
 ```bash
 cd /path/to/DexTeleop
 bash scripts/install_conda_env.sh
+export DEXTELEOP_ROOT="$PWD"
+export DEXTELEOP_ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
 eval "$(conda shell.bash hook)"
-conda activate dexteleop310
+conda activate "$DEXTELEOP_ENV_NAME"
 ```
 
 `/path/to/DexTeleop` 必须替换为本机 clone 路径。`conda shell.bash hook` 只初始化当前 shell，
-不修改 shell 配置；持久化设置见 [`README_ENV.md`](../../README_ENV.md)。
+不依赖 Conda 的安装目录，也不修改 shell 配置；持久化设置见
+[`README_ENV.md`](../../README_ENV.md)。安装时若使用了 `--env-name NAME`，把
+`DEXTELEOP_ENV_NAME` 设置为同一个名称即可。
 
 ## 2. 入口检查（R0）
 
