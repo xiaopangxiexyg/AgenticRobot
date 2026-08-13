@@ -17,6 +17,7 @@ SHARED_CONTROL_ROOTS = (
     REPO_ROOT / "control_composition",
     REPO_ROOT / "robot_motion/action",
     REPO_ROOT / "robot_motion/runtime",
+    REPO_ROOT / "robot_motion/target_runtime",
 )
 
 
