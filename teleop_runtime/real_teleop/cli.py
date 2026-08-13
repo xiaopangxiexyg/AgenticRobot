@@ -2414,6 +2414,27 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tactile-bundle-root",
+        type=str,
+        default="",
+        help=(
+            "Optional pre-existing local storage-device root for native tactile "
+            "separation. Tactile payloads and portable bundle metadata are written "
+            "under datasets/<dataset_uuid>; the core dataset stores logical paths "
+            "and mirrored commit receipts only. The filesystem must differ from "
+            "--dataset-root. Empty (default) preserves existing storage."
+        ),
+    )
+    parser.add_argument(
+        "--tactile-bundle-min-free-gb",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Minimum free GiB required on --tactile-bundle-root at startup. "
+            "Zero performs the normal writable/device checks without an extra reserve."
+        ),
+    )
+    parser.add_argument(
         "--writer-workers",
         type=_positive_int,
         default=4,

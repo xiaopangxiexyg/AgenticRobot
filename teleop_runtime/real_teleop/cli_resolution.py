@@ -449,6 +449,40 @@ def parse_real_teleop_args() -> argparse.Namespace:
             "--collection-worker-mode process is currently position-only; "
             "force/impedance collection intentionally retains the established thread path."
         )
+    tactile_bundle_root = str(
+        getattr(args, "tactile_bundle_root", "") or ""
+    ).strip()
+    tactile_bundle_min_free_gb = float(
+        getattr(args, "tactile_bundle_min_free_gb", 0.0) or 0.0
+    )
+    if not tactile_bundle_root and tactile_bundle_min_free_gb > 0.0:
+        parser.error(
+            "--tactile-bundle-min-free-gb requires --tactile-bundle-root."
+        )
+    if tactile_bundle_root:
+        if bool(getattr(args, "no_collection", False)):
+            parser.error(
+                "--tactile-bundle-root requires formal collection; remove "
+                "--no-collection."
+            )
+        if str(getattr(args, "tactile_storage", "external")) != "external":
+            parser.error(
+                "--tactile-bundle-root requires --tactile-storage external."
+            )
+        if bool(getattr(args, "idle_tactile_compression", False)):
+            parser.error(
+                "--tactile-bundle-root is not yet compatible with "
+                "--idle-tactile-compression; use inline --tactile-compression "
+                "zstd/lz4/none."
+            )
+        if _argv_has_option(raw_argv, "--no-tactile-artifact-integrity"):
+            parser.error(
+                "--tactile-bundle-root cannot be combined with explicit "
+                "--no-tactile-artifact-integrity."
+            )
+        # Native separation always seals exact payload bytes.  This is a hard
+        # part of the bundle contract, not an optional diagnostic flag.
+        args.tactile_artifact_integrity = True
     if bool(getattr(args, "idle_tactile_compression", False)):
         if bool(getattr(args, "no_collection", False)):
             parser.error(

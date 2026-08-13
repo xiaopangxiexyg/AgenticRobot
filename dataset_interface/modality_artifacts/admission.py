@@ -227,7 +227,11 @@ def _capture_inventory_hot_status(
     return SELF_CONTAINED, ""
 
 
-def assert_dataset_capture_writable(dataset_root: str | Path) -> None:
+def assert_dataset_capture_writable(
+    dataset_root: str | Path,
+    *,
+    tactile_bundle_root: str | Path | None = None,
+) -> None:
     """Fail closed when append would invalidate detached tactile identity.
 
     Empty/new roots and complete non-tactile datasets remain compatible.  This
@@ -235,6 +239,38 @@ def assert_dataset_capture_writable(dataset_root: str | Path) -> None:
     """
 
     root = Path(dataset_root).expanduser().resolve()
+    native_identity = root / "meta/tactile_bundle_v1/dataset_identity.cjson"
+    if native_identity.is_file():
+        if tactile_bundle_root is None:
+            raise DatasetCaptureWritableError(
+                "dataset uses native tactile separation; the bound tactile bundle "
+                "root is required before capture append"
+            )
+        if (root / "tactile").exists():
+            raise DatasetCaptureWritableError(
+                "native tactile dataset has a materialized core tactile/ tree; "
+                "append requires an explicit clean native-split dataset state"
+            )
+        try:
+            from dataset_interface.tactile_bundle import attach_tactile_bundle
+
+            attach_tactile_bundle(
+                root,
+                tactile_bundle_root,
+                verify_payload_hashes=False,
+            )
+        except Exception as exc:
+            raise DatasetCaptureWritableError(
+                "native tactile bundle cannot be attached for capture append: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        return
+    if tactile_bundle_root is not None and _catalog_has_tactile(
+        root / "meta/episodes.jsonl"
+    ):
+        raise DatasetCaptureWritableError(
+            "cannot enable native tactile separation on a populated unbound dataset"
+        )
     sidecar_root = root / MODALITY_ARTIFACT_SIDECAR_RELATIVE
     pending = sidecar_root / "active_transaction.json"
     if pending.exists():

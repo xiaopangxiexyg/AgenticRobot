@@ -253,6 +253,68 @@ def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_pat
     ).is_file()
 
 
+def test_process_collection_worker_writes_native_tactile_bundle(tmp_path) -> None:
+    core_root = tmp_path / "core"
+    tactile_root = tmp_path / "tactile-device"
+    core_root.mkdir()
+    tactile_root.mkdir()
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=core_root,
+            dataset_name="process-native-tactile",
+            nominal_fps=15.0,
+            task_id="process-native-tactile",
+            write_parquet=False,
+            write_video=False,
+            tactile_artifact_integrity=True,
+            tactile_bundle_root=tactile_root,
+            tactile_bundle_require_distinct_device=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=2,
+            shared_slot_count=2,
+            shared_slot_bytes=4096,
+            worker_nice=0,
+        ),
+    )
+    identity = EpisodeCaptureIdentity(
+        episode_uuid="process-native-tactile-episode",
+        legacy_episode_index=0,
+        lifecycle_owner_id="tests.process_writer",
+        prepared_at=1.0,
+        prepared_clock_domain_id="test_clock",
+    )
+    try:
+        worker.start()
+        episode_index = worker.start_episode(
+            {"formal_dataset": True},
+            episode_identity=identity,
+        )
+        assert worker.submit_snapshot(_snapshot()) is True
+        worker.flush()
+        worker.finalize_episode(episode_index, summary={"test": True})
+    finally:
+        worker.close()
+
+    assert not (core_root / "tactile").exists()
+    episode_record = json.loads(
+        (core_root / "meta/episodes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    dataset_uuid = episode_record["tactile_bundle"]["dataset_uuid"]
+    bundle_root = tactile_root / "datasets" / dataset_uuid
+    assert (bundle_root / episode_record["tactile_paths"]["left"]).is_file()
+    assert (
+        core_root / episode_record["tactile_bundle"]["core_commit_ref"]
+    ).is_file()
+
+
 def test_process_worker_rejects_stale_v22_sample_without_poisoning_worker(tmp_path) -> None:
     layout = load_policy_io_layout(
         Path(__file__).parents[1]

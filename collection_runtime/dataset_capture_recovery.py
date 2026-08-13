@@ -343,6 +343,7 @@ def _plan_transaction(
     root: Path,
     *,
     unowned_tactile_paths: tuple[str, ...],
+    require_unowned_tactile_tail: bool = True,
 ) -> dict[str, Any]:
     catalog_path = root / "meta/episodes.jsonl"
     finalized = set(_catalog_indices(catalog_path))
@@ -350,10 +351,14 @@ def _plan_transaction(
     artifacts = _discover_episode_artifact_units(root)
     unfinalized = set(artifacts) - finalized
     tactile_indices = _unowned_tactile_indices(unowned_tactile_paths)
-    if tactile_indices != {next_episode_index}:
+    if require_unowned_tactile_tail and tactile_indices != {next_episode_index}:
         raise DatasetCaptureRecoveryError(
             "unowned tactile files are not confined to the unique next Episode: "
             f"expected={next_episode_index} actual={sorted(tactile_indices)}"
+        )
+    if not require_unowned_tactile_tail and tactile_indices:
+        raise DatasetCaptureRecoveryError(
+            "native tactile core recovery unexpectedly received hot tactile paths"
         )
     if unfinalized != {next_episode_index}:
         raise DatasetCaptureRecoveryError(
@@ -398,8 +403,30 @@ def _plan_transaction(
     }
 
 
+def _plan_native_tactile_core_tail(
+    root: Path,
+    *,
+    tactile_bundle_root: str | Path | None,
+) -> dict[str, Any] | None:
+    if tactile_bundle_root is None or not (
+        root / "meta/tactile_bundle_v1/dataset_identity.cjson"
+    ).is_file():
+        return None
+    finalized = set(_catalog_indices(root / "meta/episodes.jsonl"))
+    artifacts = _discover_episode_artifact_units(root)
+    if not (set(artifacts) - finalized):
+        return None
+    return _plan_transaction(
+        root,
+        unowned_tactile_paths=(),
+        require_unowned_tactile_tail=False,
+    )
+
+
 def prepare_dataset_capture_writable(
     dataset_root: str | Path,
+    *,
+    tactile_bundle_root: str | Path | None = None,
 ) -> DatasetCaptureRecoveryResult:
     """Validate capture append, quarantining only a provable abandoned tail.
 
@@ -412,7 +439,10 @@ def prepare_dataset_capture_writable(
     if journal.is_file():
         with _recovery_lock(root):
             result = _apply_transaction(root, _read_json(journal))
-        assert_dataset_capture_writable(root)
+        assert_dataset_capture_writable(
+            root,
+            tactile_bundle_root=tactile_bundle_root,
+        )
         warnings.warn(
             "resumed abandoned dataset Episode recovery; artifacts remain available at "
             f"{result.quarantine_root}",
@@ -421,16 +451,47 @@ def prepare_dataset_capture_writable(
         )
         return result
     try:
-        assert_dataset_capture_writable(root)
-        return DatasetCaptureRecoveryResult(recovered=False)
+        assert_dataset_capture_writable(
+            root,
+            tactile_bundle_root=tactile_bundle_root,
+        )
     except UnownedTactileFilesError:
         pass
+    else:
+        with _recovery_lock(root):
+            assert_dataset_capture_writable(
+                root,
+                tactile_bundle_root=tactile_bundle_root,
+            )
+            transaction = _plan_native_tactile_core_tail(
+                root,
+                tactile_bundle_root=tactile_bundle_root,
+            )
+            if transaction is None:
+                return DatasetCaptureRecoveryResult(recovered=False)
+            _atomic_write_json(journal, transaction)
+            result = _apply_transaction(root, transaction)
+        assert_dataset_capture_writable(
+            root,
+            tactile_bundle_root=tactile_bundle_root,
+        )
+        warnings.warn(
+            "quarantined abandoned native-tactile core Episode artifacts before "
+            f"capture append; episode={result.episode_index} "
+            f"recovery={result.quarantine_root}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return result
     with _recovery_lock(root):
         if journal.is_file():
             result = _apply_transaction(root, _read_json(journal))
         else:
             try:
-                assert_dataset_capture_writable(root)
+                assert_dataset_capture_writable(
+                    root,
+                    tactile_bundle_root=tactile_bundle_root,
+                )
                 return DatasetCaptureRecoveryResult(recovered=False)
             except UnownedTactileFilesError as exc:
                 transaction = _plan_transaction(
@@ -439,7 +500,10 @@ def prepare_dataset_capture_writable(
                 )
             _atomic_write_json(journal, transaction)
             result = _apply_transaction(root, transaction)
-    assert_dataset_capture_writable(root)
+    assert_dataset_capture_writable(
+        root,
+        tactile_bundle_root=tactile_bundle_root,
+    )
     warnings.warn(
         "quarantined abandoned dataset Episode artifacts before capture append; "
         f"episode={result.episode_index} recovery={result.quarantine_root}",

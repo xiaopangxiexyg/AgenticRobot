@@ -1097,6 +1097,9 @@ def _worker_main(
                         if identity_payload is None
                         else EpisodeCaptureIdentity.from_payload(identity_payload)
                     )
+                    tactile_bundle_enabled = (
+                        writer_config.tactile_bundle_root is not None
+                    )
                     if native_stream_contracts and not episode_uuid:
                         raise ValueError(
                             "Native stream process mode requires an episode UUID."
@@ -1105,13 +1108,20 @@ def _worker_main(
                         raise ValueError(
                             "episode_uuid was provided without native stream contracts."
                         )
-                    if v25p_shadow_config is not None and episode_identity is None:
+                    if (
+                        v25p_shadow_config is not None or tactile_bundle_enabled
+                    ) and episode_identity is None:
                         raise ValueError(
-                            "v2.5-p native shadow requires the owner's episode identity."
+                            "configured subordinate episode storage requires the owner's "
+                            "episode identity."
                         )
-                    if v25p_shadow_config is None and episode_identity is not None:
+                    if (
+                        v25p_shadow_config is None
+                        and not tactile_bundle_enabled
+                        and episode_identity is not None
+                    ):
                         raise ValueError(
-                            "episode_identity was provided without a v2.5-p native shadow."
+                            "episode_identity was provided without a configured consumer."
                         )
                     if episode_identity is not None:
                         if episode_uuid and episode_uuid != episode_identity.episode_uuid:
@@ -1137,7 +1147,10 @@ def _worker_main(
                         v25p_native_shadow_identity = episode_identity
                     try:
                         episode_index = writer.start_episode(
-                            metadata=dict(message.get("metadata") or {})
+                            metadata=dict(message.get("metadata") or {}),
+                            episode_identity=(
+                                episode_identity if tactile_bundle_enabled else None
+                            ),
                         )
                     except BaseException:
                         if (
@@ -1154,10 +1167,14 @@ def _worker_main(
                         and int(episode_index) != episode_identity.legacy_episode_index
                     ):
                         writer.discard_episode(int(episode_index))
-                        assert v25p_native_shadow is not None
-                        assert v25p_native_shadow_identity is not None
-                        v25p_native_shadow.discard_episode(v25p_native_shadow_identity)
-                        v25p_native_shadow_identity = None
+                        if (
+                            v25p_native_shadow is not None
+                            and v25p_native_shadow_identity is not None
+                        ):
+                            v25p_native_shadow.discard_episode(
+                                v25p_native_shadow_identity
+                            )
+                            v25p_native_shadow_identity = None
                         raise RuntimeError(
                             "Legacy episode index changed after owner identity preparation."
                         )
@@ -1994,6 +2011,7 @@ class ProcessCollectionWorker:
         episode_identity: EpisodeCaptureIdentity | None = None,
     ) -> int:
         normalized_uuid = str(episode_uuid or "").strip()
+        tactile_bundle_enabled = self.writer_config.tactile_bundle_root is not None
         if self.native_stream_contracts and not normalized_uuid:
             raise ValueError(
                 "episode_uuid is required when native streams are configured."
@@ -2006,13 +2024,19 @@ class ProcessCollectionWorker:
             raise ValueError(
                 "episode_uuid is only accepted when native streams are configured."
             )
-        if self.v25p_shadow_config is not None and episode_identity is None:
+        if (
+            self.v25p_shadow_config is not None or tactile_bundle_enabled
+        ) and episode_identity is None:
             raise ValueError(
-                "episode_identity is required when the v2.5-p shadow is configured."
+                "episode_identity is required by configured subordinate episode storage."
             )
-        if self.v25p_shadow_config is None and episode_identity is not None:
+        if (
+            self.v25p_shadow_config is None
+            and not tactile_bundle_enabled
+            and episode_identity is not None
+        ):
             raise ValueError(
-                "episode_identity is only accepted when the v2.5-p shadow is configured."
+                "episode_identity is only accepted when a consumer is configured."
             )
         if episode_identity is not None:
             if normalized_uuid and normalized_uuid != episode_identity.episode_uuid:

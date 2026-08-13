@@ -20,11 +20,16 @@ from collection_runtime.dataset_capture_recovery import (
     prepare_dataset_capture_writable,
 )
 from collection_runtime.modality_inventory import build_and_publish_modality_inventory
+from collection_runtime.tactile_bundle_store import (
+    NativeTactileBundleStore,
+    TactileBundleSealReport,
+)
 from dataset_contracts.arm_mode import (
     ARM_HOLD_TRAINING_PROJECTION_ID_V1,
     arm_hold_training_projection_metadata,
 )
 from dataset_contracts.causal_snapshot import DEFAULT_CAUSAL_SNAPSHOT_CONTRACT
+from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.pose_frames import (
     POSE_FRAME_CONTRACT_METADATA_KEY,
     POSE_STORAGE_FRAME_DESK,
@@ -296,6 +301,9 @@ class LeRobotV21WriterConfig:
     tactile_storage: str = TACTILE_STORAGE_EXTERNAL
     tactile_compression: str = TACTILE_COMPRESSION_NONE
     tactile_artifact_integrity: bool = False
+    tactile_bundle_root: str | Path | None = None
+    tactile_bundle_require_distinct_device: bool = True
+    tactile_bundle_minimum_free_bytes: int = 0
     allow_missing_video_frames: bool = False
     arm_action_specs: Mapping[str, Any] | None = None
     hand_action_specs: Mapping[str, Any] | None = None
@@ -334,6 +342,24 @@ class LeRobotV21WriterConfig:
             raise ValueError(
                 "tactile_artifact_integrity requires tactile_storage='external'"
             )
+        if self.tactile_bundle_root is not None:
+            self.tactile_bundle_root = Path(self.tactile_bundle_root)
+            if storage != TACTILE_STORAGE_EXTERNAL:
+                raise ValueError(
+                    "tactile_bundle_root requires tactile_storage='external'"
+                )
+            if not self.tactile_artifact_integrity:
+                raise ValueError(
+                    "tactile_bundle_root requires tactile_artifact_integrity=true"
+                )
+        self.tactile_bundle_require_distinct_device = bool(
+            self.tactile_bundle_require_distinct_device
+        )
+        self.tactile_bundle_minimum_free_bytes = int(
+            self.tactile_bundle_minimum_free_bytes
+        )
+        if self.tactile_bundle_minimum_free_bytes < 0:
+            raise ValueError("tactile_bundle_minimum_free_bytes must be non-negative")
         requested_arm_action_specs = self.arm_action_specs
         self.hand_action_specs = normalize_hand_action_specs(self.hand_action_specs)
         self.policy_io_layout_provenance = dict(self.policy_io_layout_provenance or {})
@@ -614,6 +640,7 @@ class _EpisodeState:
     episode_id: str
     chunk_id: str
     metadata: dict[str, Any]
+    episode_identity: EpisodeCaptureIdentity | None = None
     rows_by_frame: dict[int, dict[str, Any]] = field(default_factory=dict)
     stats: EpisodeStatsAccumulator | None = None
     video_states: dict[str, _VideoState] = field(default_factory=dict)
@@ -644,8 +671,38 @@ class LeRobotV21Writer:
         self.last_tactile_inventory_hash: str | None = None
         self.last_tactile_inventory_error: str | None = None
         self.tactile_inventory_publication_deferred = False
-        prepare_dataset_capture_writable(self.root_dir)
-        if self.config.tactile_artifact_integrity:
+        self.tactile_bundle_store: NativeTactileBundleStore | None = None
+        if self.config.tactile_bundle_root is not None:
+            # The bundle store owns the two-root bootstrap transaction.  It
+            # must run before attachment admission so an interrupted first
+            # startup (core identity durable, storage identity not yet
+            # durable) can finish safely while the episode catalog is still
+            # empty.  Once any episode is committed, the store refuses to
+            # synthesize a missing storage identity.
+            self.tactile_bundle_store = NativeTactileBundleStore(
+                core_dataset_root=self.root_dir,
+                tactile_storage_root=self.config.tactile_bundle_root,
+                dataset_label=str(self.config.dataset_name),
+                require_distinct_device=bool(
+                    self.config.tactile_bundle_require_distinct_device
+                ),
+                minimum_free_bytes=int(
+                    self.config.tactile_bundle_minimum_free_bytes
+                ),
+            )
+        prepare_dataset_capture_writable(
+            self.root_dir,
+            tactile_bundle_root=self.config.tactile_bundle_root,
+        )
+        self._tactile_artifact_root = (
+            self.root_dir
+            if self.tactile_bundle_store is None
+            else self.tactile_bundle_store.bundle_dataset_root
+        )
+        if (
+            self.config.tactile_artifact_integrity
+            and self.tactile_bundle_store is None
+        ):
             self.tactile_inventory_publication_deferred = not (
                 assert_dataset_capture_integrity_compatible(self.root_dir)
             )
@@ -685,11 +742,21 @@ class LeRobotV21Writer:
             self._next_episode_index = 0
             self._finalized_episode_count = 0
             self._finalized_frame_count = 0
-            # The complete dataset directory may have been removed while this
-            # idle writer remained alive. Recreate the required structure and
-            # then discover persisted counters from the current filesystem.
-            prepare_dataset_capture_writable(self.root_dir)
-            if self.config.tactile_artifact_integrity:
+            # A non-bundle dataset may be recreated after an explicit idle
+            # maintenance operation.  A live two-root writer must instead
+            # prove that both original identities and devices still exist;
+            # silently recreating either side could bind it to a replacement
+            # mount or a different dataset.
+            if self.tactile_bundle_store is not None:
+                self.tactile_bundle_store.revalidate_runtime_storage()
+            prepare_dataset_capture_writable(
+                self.root_dir,
+                tactile_bundle_root=self.config.tactile_bundle_root,
+            )
+            if (
+                self.tactile_bundle_store is None
+                and self.config.tactile_artifact_integrity
+            ):
                 self.tactile_inventory_publication_deferred = not (
                     assert_dataset_capture_integrity_compatible(self.root_dir)
                 )
@@ -959,6 +1026,10 @@ class LeRobotV21Writer:
                 },
                 "features": features,
         }
+        if self.tactile_bundle_store is not None:
+            info["tactile_bundle"] = dict(
+                self.tactile_bundle_store.dataset_binding_payload
+            )
         if layout is not None:
             info["dexteleop_dataset_schema"] = (
                 DEXTELEOP_DATASET_SCHEMA_V23
@@ -1014,6 +1085,7 @@ class LeRobotV21Writer:
         *,
         metadata: Mapping[str, Any] | None = None,
         episode_index: int | None = None,
+        episode_identity: EpisodeCaptureIdentity | None = None,
     ) -> int:
         with self._lock:
             resolved_index = (
@@ -1021,7 +1093,20 @@ class LeRobotV21Writer:
                 if episode_index is None
                 else int(episode_index)
             )
-            self._ensure_episode_state(resolved_index, metadata=metadata)
+            if self.tactile_bundle_store is not None:
+                if episode_identity is None:
+                    raise ValueError(
+                        "episode_identity is required for native tactile separation"
+                    )
+                if episode_identity.legacy_episode_index != resolved_index:
+                    raise ValueError(
+                        "episode identity index does not match writer episode index"
+                    )
+            self._ensure_episode_state(
+                resolved_index,
+                metadata=metadata,
+                episode_identity=episode_identity,
+            )
             return resolved_index
 
     def tactile_frame_counts(self, episode_index: int) -> dict[str, int]:
@@ -1040,9 +1125,15 @@ class LeRobotV21Writer:
         episode_index: int,
         *,
         metadata: Mapping[str, Any] | None = None,
+        episode_identity: EpisodeCaptureIdentity | None = None,
     ) -> _EpisodeState:
         if episode_index in self._episodes:
             state = self._episodes[episode_index]
+            if (
+                episode_identity is not None
+                and state.episode_identity != episode_identity
+            ):
+                raise ValueError("active episode identity changed")
             if metadata:
                 state.metadata.update(_to_serializable(dict(metadata)))
             self._bind_episode_policy_io_layout(state.metadata)
@@ -1095,11 +1186,18 @@ class LeRobotV21Writer:
             },
         )
         episode_metadata.setdefault("hand_spec_required", True)
+        if self.tactile_bundle_store is not None:
+            if episode_identity is None:
+                raise ValueError(
+                    "native tactile separation requires an owner episode identity"
+                )
+            self.tactile_bundle_store.prepare_episode(episode_identity)
         state = _EpisodeState(
             episode_index=int(episode_index),
             episode_id=episode_id,
             chunk_id=chunk_id,
             metadata=episode_metadata,
+            episode_identity=episode_identity,
         )
         self._episodes[episode_index] = state
         self._next_episode_index = max(self._next_episode_index, episode_index + 1)
@@ -1238,9 +1336,9 @@ class LeRobotV21Writer:
         state = _TactileSideState(
             side=side,
             relative_dir=relative_dir,
-            path_dir=self.root_dir / relative_dir,
+            path_dir=self._tactile_artifact_root / relative_dir,
             manifest_relative_path=manifest_relative_path,
-            manifest_path=self.root_dir / manifest_relative_path,
+            manifest_path=self._tactile_artifact_root / manifest_relative_path,
         )
         episode.tactile_states[side] = state
         return state
@@ -1978,7 +2076,7 @@ class LeRobotV21Writer:
         stream = _TactileSensorStream(
             sensor_key=str(sensor_key),
             relative_path=relative_path,
-            path=self.root_dir / relative_path,
+            path=self._tactile_artifact_root / relative_path,
             compression=compression,
             chunk_frame_count=TACTILE_CHUNK_FRAME_COUNT,
             artifact_integrity=bool(self.config.tactile_artifact_integrity),
@@ -2314,6 +2412,13 @@ class LeRobotV21Writer:
             for state in episode.tactile_states.values():
                 self._close_tactile_state(state)
                 shutil.rmtree(state.path_dir, ignore_errors=True)
+            if (
+                self.tactile_bundle_store is not None
+                and episode.episode_identity is not None
+            ):
+                self.tactile_bundle_store.discard_prepared_episode(
+                    episode.episode_identity
+                )
             for state in episode.wrist_depth_states.values():
                 state.close_handle()
                 shutil.rmtree(state.path_dir, ignore_errors=True)
@@ -2451,6 +2556,21 @@ class LeRobotV21Writer:
                 ),
             )
 
+        tactile_bundle_report: TactileBundleSealReport | None = None
+        if self.tactile_bundle_store is not None:
+            if episode.episode_identity is None:
+                raise RuntimeError(
+                    "native tactile episode lost its authoritative episode identity"
+                )
+            tactile_bundle_report = self.tactile_bundle_store.seal_episode(
+                identity=episode.episode_identity,
+                rows=rows,
+                tactile_paths=tactile_paths,
+            )
+            episode.metadata["tactile_bundle_episode"] = (
+                tactile_bundle_report.episode_binding_payload()
+            )
+
         assert episode.stats is not None
         stats = episode.stats.finalize(nominal_fps=self.config.nominal_fps)
         video_paths = {
@@ -2551,6 +2671,10 @@ class LeRobotV21Writer:
             "metadata": dict(episode.metadata),
             "summary": summary_payload,
         }
+        if tactile_bundle_report is not None:
+            episode_record["tactile_bundle"] = (
+                tactile_bundle_report.episode_binding_payload()
+            )
         episode_stats_record = {
             "episode_index": int(stats.episode_index),
             "frame_count": int(stats.frame_count),
@@ -2581,7 +2705,11 @@ class LeRobotV21Writer:
         self._finalized_episode_count += 1
         self._finalized_frame_count += int(stats.frame_count)
         self._write_info_locked()
-        if tactile_paths and self.config.tactile_artifact_integrity:
+        if (
+            tactile_paths
+            and self.config.tactile_artifact_integrity
+            and self.tactile_bundle_store is None
+        ):
             try:
                 all_streams_sealed = assert_dataset_capture_integrity_compatible(
                     self.root_dir

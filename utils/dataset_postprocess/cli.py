@@ -11,6 +11,11 @@ from collection_runtime.tactile_postprocess import (
     apply_tactile_postprocess,
     plan_tactile_postprocess,
 )
+from collection_runtime.tactile_bundle_materialize import (
+    materialize_tactile_bundle,
+    plan_tactile_bundle_materialization,
+)
+from dataset_interface.tactile_bundle import attach_tactile_bundle
 from dataset_interface.validation import validate_v23_dataset
 
 from .causal_align import causal_align_dataset, plan_causal_align
@@ -256,6 +261,44 @@ def _cmd_modality_status(args: argparse.Namespace) -> int:
             inventory_hash=_optional_path(args.inventory_hash),
         )
     )
+    return 0
+
+
+def _cmd_tactile_bundle_status(args: argparse.Namespace) -> int:
+    attached = attach_tactile_bundle(
+        args.dataset_root,
+        args.tactile_root,
+        verify_payload_hashes=bool(args.verify_payload_hashes),
+    )
+    _print_json(attached.report.to_dict())
+    return 0
+
+
+def _cmd_tactile_bundle_materialize(args: argparse.Namespace) -> int:
+    plan = plan_tactile_bundle_materialization(
+        args.dataset_root,
+        args.tactile_root,
+    )
+    if not bool(args.apply):
+        _print_json(plan.to_dict())
+        return 0
+    if (
+        str(args.plan_hash) != plan.plan_hash
+        or str(args.confirm_dataset_uuid) != plan.dataset_uuid
+        or not bool(args.confirm_no_active_writers)
+        or not bool(args.confirm_no_active_readers)
+    ):
+        raise ValueError(
+            "--apply requires the current --plan-hash, matching "
+            "--confirm-dataset-uuid, --confirm-no-active-writers, and "
+            "--confirm-no-active-readers"
+        )
+    report = materialize_tactile_bundle(
+        args.dataset_root,
+        args.tactile_root,
+        expected_plan_hash=plan.plan_hash,
+    )
+    _print_json(report.to_dict())
     return 0
 
 
@@ -763,6 +806,60 @@ def build_parser() -> argparse.ArgumentParser:
     modality_status.add_argument("--modality", choices=("tactile",), default="tactile")
     modality_status.add_argument("--inventory-hash", default="")
     modality_status.set_defaults(func=_cmd_modality_status)
+
+    tactile_bundle_status = subparsers.add_parser(
+        "tactile-bundle-status",
+        help=(
+            "Attach a native tactile bundle read-only and verify dataset, Episode, "
+            "commit, artifact, and frame-alignment identities."
+        ),
+    )
+    tactile_bundle_status.add_argument("dataset_root")
+    tactile_bundle_status.add_argument("--tactile-root", required=True)
+    tactile_bundle_status.add_argument(
+        "--verify-payload-hashes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Hash every tactile payload (default). --no-verify-payload-hashes "
+            "still validates manifests, sizes, identities, and alignment."
+        ),
+    )
+    tactile_bundle_status.set_defaults(func=_cmd_tactile_bundle_status)
+
+    tactile_bundle_materialize = subparsers.add_parser(
+        "tactile-bundle-materialize",
+        help=(
+            "Plan or atomically restore an attached native tactile bundle as a "
+            "self-contained dataset tactile/ tree using fresh inodes."
+        ),
+    )
+    tactile_bundle_materialize.add_argument("dataset_root")
+    tactile_bundle_materialize.add_argument("--tactile-root", required=True)
+    tactile_bundle_materialize.add_argument("--plan-hash", default="")
+    tactile_bundle_materialize.add_argument("--confirm-dataset-uuid", default="")
+    tactile_bundle_materialize.add_argument(
+        "--confirm-no-active-writers",
+        action="store_true",
+        help=(
+            "Required with --apply; confirms collection and every other dataset "
+            "writer are stopped."
+        ),
+    )
+    tactile_bundle_materialize.add_argument(
+        "--confirm-no-active-readers",
+        action="store_true",
+        help="Required with --apply before the tactile/ namespace is published.",
+    )
+    tactile_bundle_materialize.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Apply the exact fresh plan. Without this flag the command is a "
+            "read-only full-hash proposal."
+        ),
+    )
+    tactile_bundle_materialize.set_defaults(func=_cmd_tactile_bundle_materialize)
 
     modality_export = subparsers.add_parser(
         "modality-export",

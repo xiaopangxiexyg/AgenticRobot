@@ -32,7 +32,7 @@ from dataset_interface.gripper_force import (
 from dataset_interface.modality_artifacts import (
     assert_dataset_capture_integrity_compatible,
 )
-from robot_motion.action import HandActionSpec
+from robot_motion.action import INSPIRE_HAND_DOF, HandActionSpec
 from robot_motion.runtime import (
     LifecycleStartupError,
     collect_lifecycle_failures,
@@ -115,7 +115,11 @@ from .gripper_policy import (
     gripper_force_dataset_contract_from_args as _gripper_force_dataset_contract_from_args,
     gripper_force_dataset_metadata as _gripper_force_dataset_metadata,
 )
-from .hand_config import dmtac_sides as _dmtac_sides
+from .hand_config import (
+    HAND_BACKEND_DMTAC_GRIPPER,
+    HAND_BACKEND_INSPIRE,
+    hand_backend_mode_for_side as _hand_backend_mode_for_side,
+)
 from .movement import movement_multiple_value as _movement_multiple_value
 from .progress_adapter import (
     RealTeleopProgressEpisode,
@@ -145,10 +149,29 @@ def _collection_hand_action_specs(
     args: argparse.Namespace,
     active_sides: Sequence[str],
 ) -> Mapping[str, HandActionSpec] | None:
-    dmtac_sides = _dmtac_sides(args, active_sides)
-    if not dmtac_sides:
-        return None
-    return {side: HandActionSpec.dmtac_gripper(side) for side in dmtac_sides}
+    specs: dict[str, HandActionSpec] = {}
+    for side in active_sides:
+        mode = _hand_backend_mode_for_side(args, side)
+        if mode == HAND_BACKEND_DMTAC_GRIPPER:
+            specs[side] = HandActionSpec.dmtac_gripper(side)
+        elif mode == HAND_BACKEND_INSPIRE:
+            specs[side] = HandActionSpec.inspire_tac(side)
+        else:
+            specs[side] = HandActionSpec(
+                side=side,
+                hand_model="none",
+                slot_count=INSPIRE_HAND_DOF,
+                active_dof=0,
+                active_mask=(False,) * INSPIRE_HAND_DOF,
+                joint_names=(),
+                command_space="none",
+                invalid_slot_value="zero_padding",
+                semantics=(
+                    "No hand actuator is present for this side; every legacy hand slot "
+                    "is inactive padding and must not be interpreted as a command."
+                ),
+            )
+    return specs
 
 
 class RealTeleopDatasetRecorder:
@@ -162,8 +185,20 @@ class RealTeleopDatasetRecorder:
         self.args = args
         self.components = components
         self.dataset_root = Path(args.dataset_root)
-        prepare_dataset_capture_writable(self.dataset_root)
-        if bool(getattr(args, "tactile_artifact_integrity", False)):
+        tactile_bundle_root = str(
+            getattr(args, "tactile_bundle_root", "") or ""
+        ).strip()
+        # In native tactile-bundle mode, the writer (or process-writer child)
+        # owns two-root identity bootstrap and recovery.  Running attachment
+        # admission here first would make a first-start crash between the two
+        # identity publications impossible to resume.  The ordinary single-
+        # root path keeps its existing eager admission check.
+        if not tactile_bundle_root:
+            prepare_dataset_capture_writable(self.dataset_root)
+        if (
+            bool(getattr(args, "tactile_artifact_integrity", False))
+            and not str(getattr(args, "tactile_bundle_root", "") or "").strip()
+        ):
             assert_dataset_capture_integrity_compatible(self.dataset_root)
         configured_force_contract = _gripper_force_dataset_contract_from_args(args)
         persisted_force_contract = read_gripper_force_contract(self.dataset_root)
@@ -238,6 +273,17 @@ class RealTeleopDatasetRecorder:
             tactile_compression=str(getattr(args, "tactile_compression", "none")),
             tactile_artifact_integrity=bool(
                 getattr(args, "tactile_artifact_integrity", False)
+            ),
+            tactile_bundle_root=(
+                None
+                if not str(getattr(args, "tactile_bundle_root", "") or "").strip()
+                else Path(str(getattr(args, "tactile_bundle_root")))
+            ),
+            tactile_bundle_minimum_free_bytes=int(
+                float(getattr(args, "tactile_bundle_min_free_gb", 0.0))
+                * 1024.0
+                * 1024.0
+                * 1024.0
             ),
             allow_missing_video_frames=int(args.storage_queue_size) > 0,
             write_wrist_depth_mask=bool(getattr(args, "wrist_depth_mask", False)),
@@ -849,6 +895,27 @@ class RealTeleopDatasetRecorder:
             )
             if current_force_contract != existing_force_contract:
                 return False
+        desired_tactile_bundle_text = str(
+            getattr(self.args, "tactile_bundle_root", "") or ""
+        ).strip()
+        desired_tactile_bundle_root = (
+            None
+            if not desired_tactile_bundle_text
+            else Path(desired_tactile_bundle_text).expanduser().resolve()
+        )
+        configured_tactile_bundle_root = (
+            None
+            if self.writer_storage_config.tactile_bundle_root is None
+            else Path(self.writer_storage_config.tactile_bundle_root)
+            .expanduser()
+            .resolve()
+        )
+        desired_tactile_bundle_minimum_free_bytes = int(
+            float(getattr(self.args, "tactile_bundle_min_free_gb", 0.0) or 0.0)
+            * 1024.0
+            * 1024.0
+            * 1024.0
+        )
         return bool(
             desired_root == self.dataset_root
             and desired_contract == self.capture_modality_contract
@@ -858,6 +925,15 @@ class RealTeleopDatasetRecorder:
             and str(self.writer_storage_config.task_id) == str(self.args.collection_task_id)
             and str(self.writer_storage_config.task_description) == str(self.args.collection_task_description)
             and str(self.writer_storage_config.dataset_name) == str(self.args.dataset_name)
+            and str(self.writer_storage_config.tactile_storage)
+            == str(self.args.tactile_storage)
+            and str(self.writer_storage_config.tactile_compression)
+            == str(getattr(self.args, "tactile_compression", "none"))
+            and bool(self.writer_storage_config.tactile_artifact_integrity)
+            == bool(getattr(self.args, "tactile_artifact_integrity", False))
+            and configured_tactile_bundle_root == desired_tactile_bundle_root
+            and int(self.writer_storage_config.tactile_bundle_minimum_free_bytes)
+            == desired_tactile_bundle_minimum_free_bytes
         )
 
     def require_configured_for_current_args(self) -> None:
@@ -1343,6 +1419,8 @@ class RealTeleopDatasetRecorder:
                 ),
             }
         writer_start_kwargs: dict[str, Any] = {"metadata": metadata_payload}
+        if self.writer_storage_config.tactile_bundle_root is not None:
+            writer_start_kwargs["episode_identity"] = episode_identity
         if (
             getattr(self, "collection_worker_mode", "thread") == "process"
             and bool(getattr(self.process_worker, "native_stream_contracts", {}))
