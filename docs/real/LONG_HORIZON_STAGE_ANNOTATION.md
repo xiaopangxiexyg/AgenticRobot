@@ -86,10 +86,11 @@ python -m control_station refinement-annotation \
 服务器只允许绑定 loopback。升级后的多个标注程序可以通过 SSHFS/NFS 同时打开同一个
 数据集，但同一时刻只能有一个程序编辑某个 Episode。跨机器互斥使用服务端原子创建的
 `meta/progress/stage_annotation_locks/<episode_uuid>.lock/` 目录；其中 `owner.json`
-记录标注员、主机、PID、取得时间和随机 lock ID。程序切换 Episode 或关闭时，只有再次
-核对 lock ID 后才会用同目录原子 rename 释放锁。锁不会按时间自动抢占；如果机器崩溃或
-网络中断留下陈旧目录，必须先核实记录的 owner 已经停止，再人工处理，禁止仅凭“时间较
-久”删除。
+记录标注员、主机、PID、取得时间、随机 lock ID，以及经过哈希的机器身份、boot ID 和
+进程启动标识。程序切换 Episode 或关闭时，只有再次核对 lock ID 后才会用同目录原子
+rename 释放锁。锁不会按时间自动抢占；新客户端只会自动隔离能够证明属于本机、且原进程
+已消失、成为 zombie、机器已重启或 PID 已复用的锁。其他机器、旧格式或身份信息不完整的
+锁继续 fail-closed，必须先核实记录的 owner 已停止再人工处理，禁止仅凭“时间较久”删除。
 
 历史的 `meta/progress/stage_annotations/.writer.lock` 现在只作为旧客户端兼容 guard：
 新程序持有共享锁，旧程序仍请求独占锁。SSHFS 配置不一定跨机器传播 `flock`，因此共享
@@ -137,10 +138,10 @@ profile；有效 sample 不足以让每个 occurrence 至少拥有一个样本�
 如果正式数采在非最终子任务直接按“数采结束”，采集事实会保留为
 `MANUAL_STOP + ABORTED`（窗口采集也可能是 `WINDOW_COMPLETED +
 TRUNCATED_AT_CAPTURE_END`），不会伪造成 `FULL_TASK_COMPLETED`。后标注界面此时显示
-“采集结束位置”选择器：明确的 `MANUAL_STOP` 新建草稿默认选择 profile 最后一个
-子任务，表示常规完整完成；若本条只采集了前几个子任务，标注员选择实际最后正常完成
-的子任务。`ABORTED/UNKNOWN` 等旧式或模糊中止不自动套用这个默认值，必须由标注员
-显式选择。系统随后按线性
+“采集结束位置”选择器：明确的 `MANUAL_STOP` 新建草稿默认选择原始最后 Attempt
+所在的子任务，不会推断未记录的后续流程已经完成；若本条实际完成到更晚子任务但采集端
+没有记录对应 Advance，标注员可显式选择实际最后正常完成的子任务。
+`ABORTED/UNKNOWN` 等旧式或模糊中止不自动套用默认值，必须由标注员显式选择。系统随后按线性
 profile 重建所选结束位置对应的成功子阶段，并允许继续拖动白色边界精调；如果采集端
 已经误启动了下一个 Attempt，再选择前一个子任务会从该子任务最近一次 Attempt 起点
 覆盖到 Episode 结束，而不会把后续误启动 Attempt 当成已完成任务。封存结果在原 stage
@@ -343,7 +344,7 @@ profile 或 profiled/unprofiled progress Episode。
 `teleop_runtime` 的 portable refinement-annotation projection。它不连接硬件，也不是生产采集入口：
 
 ```bash
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 cd /home/zc/HandMotion/Developing/DexTeleop
 
 python -m scripts.generate_refinement_annotation_mock \

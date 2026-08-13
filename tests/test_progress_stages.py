@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,20 @@ def _hold_episode_annotation_lock(
         workspace.acquire_episode(episode_uuid="episode-cross-process")
         ready.set()  # type: ignore[attr-defined]
         release.wait(timeout=5.0)  # type: ignore[attr-defined]
+
+
+def _abandon_episode_annotation_lock(
+    dataset_root: str,
+    ready: object,
+) -> None:
+    workspace = DatasetStageAnnotationWorkspace(
+        dataset_root,
+        annotator_id="crashed-child",
+    )
+    workspace.acquire()
+    workspace.acquire_episode(episode_uuid="episode-crashed-process")
+    ready.set()  # type: ignore[attr-defined]
+    os._exit(0)
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -799,6 +814,10 @@ def test_annotation_workspace_lock_and_immutable_commit(tmp_path: Path) -> None:
         assert owner["episode_uuid"] == "episode-1"
         assert owner["annotator_id"] == "fixture"
         assert owner["lock_id"]
+        assert len(owner["host_identity_hash"]) == 64
+        assert owner["boot_id"]
+        assert owner["pid_namespace_id"].startswith("pid:[")
+        assert owner["process_start_time_ticks"] > 0
         workspace.save_draft(
             episode_uuid="episode-1",
             draft={"cursor": 1.5},
@@ -876,3 +895,112 @@ def test_episode_annotation_lock_excludes_a_separate_process(
             process.terminate()
             process.join(timeout=2.0)
     assert process.exitcode == 0
+
+
+def test_episode_annotation_lock_recovers_proven_crashed_same_machine_owner(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    process = context.Process(
+        target=_abandon_episode_annotation_lock,
+        args=(str(tmp_path), ready),
+    )
+    process.start()
+    assert ready.wait(timeout=5.0)
+    process.join(timeout=5.0)
+    assert not process.is_alive()
+    assert process.exitcode == 0
+    lock_root = (
+        tmp_path / "meta" / "progress" / "stage_annotation_locks"
+    )
+    abandoned_owner = json.loads(
+        (
+            lock_root
+            / "episode-crashed-process.lock"
+            / "owner.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    with DatasetStageAnnotationWorkspace(
+        tmp_path,
+        annotator_id="replacement",
+    ) as replacement:
+        owner = replacement.acquire_episode(
+            episode_uuid="episode-crashed-process"
+        )
+        assert owner["annotator_id"] == "replacement"
+        quarantine = lock_root / (
+            ".episode-crashed-process.lock.stale-"
+            f"{abandoned_owner['lock_id']}"
+        )
+        assert json.loads(
+            (quarantine / "owner.json").read_text(encoding="utf-8")
+        )["annotator_id"] == "crashed-child"
+
+
+def test_episode_annotation_lock_does_not_reap_unverifiable_legacy_owner(
+    tmp_path: Path,
+) -> None:
+    with DatasetStageAnnotationWorkspace(
+        tmp_path,
+        annotator_id="legacy-owner",
+    ) as owner_workspace:
+        owner_workspace.acquire_episode(episode_uuid="episode-legacy-owner")
+        owner_path = (
+            owner_workspace.episode_lock_path(
+                episode_uuid="episode-legacy-owner"
+            )
+            / "owner.json"
+        )
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        owner.pop("host_identity_hash", None)
+        owner.pop("boot_id", None)
+        owner.pop("pid_namespace_id", None)
+        owner.pop("process_start_time_ticks", None)
+        owner["pid"] = 999_999_999
+        owner_path.write_text(json.dumps(owner), encoding="utf-8")
+
+        with DatasetStageAnnotationWorkspace(
+            tmp_path,
+            annotator_id="replacement",
+        ) as replacement:
+            with pytest.raises(
+                StageAnnotationStoreError,
+                match="already being annotated.*legacy-owner",
+            ):
+                replacement.acquire_episode(
+                    episode_uuid="episode-legacy-owner"
+                )
+
+
+def test_episode_annotation_lock_does_not_reap_foreign_machine_owner(
+    tmp_path: Path,
+) -> None:
+    with DatasetStageAnnotationWorkspace(
+        tmp_path,
+        annotator_id="foreign-owner",
+    ) as owner_workspace:
+        owner_workspace.acquire_episode(episode_uuid="episode-foreign-owner")
+        owner_path = (
+            owner_workspace.episode_lock_path(
+                episode_uuid="episode-foreign-owner"
+            )
+            / "owner.json"
+        )
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        owner["host_identity_hash"] = "0" * 64
+        owner["pid"] = 999_999_999
+        owner_path.write_text(json.dumps(owner), encoding="utf-8")
+
+        with DatasetStageAnnotationWorkspace(
+            tmp_path,
+            annotator_id="replacement",
+        ) as replacement:
+            with pytest.raises(
+                StageAnnotationStoreError,
+                match="already being annotated.*foreign-owner",
+            ):
+                replacement.acquire_episode(
+                    episode_uuid="episode-foreign-owner"
+                )

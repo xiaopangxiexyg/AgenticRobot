@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -59,6 +60,11 @@ STAGE_ANNOTATION_EPISODE_LOCK_RELATIVE_ROOT = Path(
 )
 _EPISODE_LOCK_OWNER_FILE = "owner.json"
 _EPISODE_LOCK_SCHEMA = "dexteleop.stage_annotation_episode_lock.local.v1"
+_MACHINE_ID_PATH = Path("/etc/machine-id")
+_DMI_PRODUCT_UUID_PATH = Path("/sys/class/dmi/id/product_uuid")
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+_PROC_ROOT = Path("/proc")
+_HOST_IDENTITY_HASH_DOMAIN = b"dexteleop.stage-annotation-host.v1\0"
 _UNSUPPORTED_FLOCK_ERRNOS = frozenset(
     value
     for value in (
@@ -90,6 +96,80 @@ class _HeldEpisodeLock:
     lock_id: str
     lock_dir: Path
     owner: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _ObservedProcessIdentity:
+    exists: bool
+    state: str | None = None
+    start_time_ticks: int | None = None
+
+
+def _read_optional_system_token(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def _local_host_identity_hash() -> str | None:
+    machine_id = _read_optional_system_token(_MACHINE_ID_PATH)
+    if machine_id is None:
+        return None
+    dmi_product_uuid = _read_optional_system_token(_DMI_PRODUCT_UUID_PATH)
+    identity = machine_id.encode("utf-8")
+    if dmi_product_uuid is not None:
+        identity += b"\0" + dmi_product_uuid.encode("utf-8")
+    return hashlib.sha256(
+        _HOST_IDENTITY_HASH_DOMAIN + identity
+    ).hexdigest()
+
+
+def _local_pid_namespace_id() -> str | None:
+    try:
+        value = os.readlink(_PROC_ROOT / "self" / "ns" / "pid").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _observe_process_identity(pid: int) -> _ObservedProcessIdentity:
+    try:
+        value = (_PROC_ROOT / str(pid) / "stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _ObservedProcessIdentity(exists=False)
+    except (OSError, UnicodeError):
+        # A process may exist but be unreadable due to platform or permission
+        # restrictions.  Treat that as unknown and retain the lock.
+        return _ObservedProcessIdentity(exists=True)
+    command_end = value.rfind(")")
+    if command_end < 0:
+        return _ObservedProcessIdentity(exists=True)
+    fields = value[command_end + 1 :].split()
+    # Fields after the command begin with Linux proc stat field 3 (state).
+    # Process start time is field 22, therefore index 19 in this suffix.
+    if len(fields) <= 19:
+        return _ObservedProcessIdentity(exists=True)
+    try:
+        start_time_ticks = int(fields[19])
+    except ValueError:
+        return _ObservedProcessIdentity(exists=True)
+    return _ObservedProcessIdentity(
+        exists=True,
+        state=fields[0],
+        start_time_ticks=start_time_ticks,
+    )
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        normalized = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
 
 
 def _fsync_lock_directory(path: Path) -> None:
@@ -373,6 +453,101 @@ class DatasetStageAnnotationWorkspace:
         finally:
             temporary.unlink(missing_ok=True)
 
+    @staticmethod
+    def _owner_is_provably_stale(owner: Mapping[str, Any] | None) -> bool:
+        """Return true only for a dead owner proven to be on this machine."""
+
+        if owner is None:
+            return False
+        local_host_identity = _local_host_identity_hash()
+        owner_host_identity = str(
+            owner.get("host_identity_hash", "")
+        ).strip()
+        if (
+            local_host_identity is None
+            or not owner_host_identity
+            or owner_host_identity != local_host_identity
+            or str(owner.get("hostname", "")).strip()
+            != socket.gethostname()
+        ):
+            return False
+
+        owner_boot_id = str(owner.get("boot_id", "")).strip()
+        local_boot_id = _read_optional_system_token(_BOOT_ID_PATH)
+        if (
+            owner_boot_id
+            and local_boot_id is not None
+            and owner_boot_id != local_boot_id
+        ):
+            # The stable machine identity matches, but the boot does not: the
+            # recorded process cannot still exist.
+            return True
+
+        owner_pid_namespace = str(
+            owner.get("pid_namespace_id", "")
+        ).strip()
+        local_pid_namespace = _local_pid_namespace_id()
+        if (
+            not owner_pid_namespace
+            or local_pid_namespace is None
+            or owner_pid_namespace != local_pid_namespace
+        ):
+            # A shared host identity is insufficient across containers or PID
+            # namespaces because the same numeric PID may name another process.
+            return False
+
+        pid = _positive_int(owner.get("pid"))
+        if pid is None:
+            return False
+        observed = _observe_process_identity(pid)
+        if not observed.exists or observed.state == "Z":
+            return True
+
+        owner_start_time = _positive_int(
+            owner.get("process_start_time_ticks")
+        )
+        return bool(
+            owner_start_time is not None
+            and observed.start_time_ticks is not None
+            and owner_start_time != observed.start_time_ticks
+        )
+
+    @classmethod
+    def _quarantine_provably_stale_lock(
+        cls,
+        lock_dir: Path,
+        owner: Mapping[str, Any] | None,
+    ) -> bool:
+        """Atomically clear one verified stale canonical lock directory."""
+
+        if not cls._owner_is_provably_stale(owner):
+            return False
+        lock_id = str(owner.get("lock_id", "")).strip() if owner else ""
+        if not lock_id:
+            return False
+        # Re-read immediately before rename so stale evidence cannot be used to
+        # remove a lock that was released and reacquired in the meantime.
+        current = cls._read_lock_owner(lock_dir)
+        if current is None or current.get("lock_id") != lock_id:
+            return False
+        quarantine = lock_dir.with_name(
+            f".{lock_dir.name}.stale-{lock_id}"
+        )
+        try:
+            lock_dir.rename(quarantine)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise StageAnnotationStoreError(
+                f"Cannot quarantine stale Episode annotation lock "
+                f"{lock_dir}: {exc}"
+            ) from exc
+        # Keep the non-empty, lock-id-specific tombstone.  Besides preserving
+        # audit evidence, it makes a second concurrent reaper's rename fail
+        # instead of allowing it to move a newly acquired canonical lock.
+        _fsync_lock_directory(quarantine.parent)
+        return True
+
     def acquire_episode(
         self,
         *,
@@ -405,20 +580,46 @@ class DatasetStageAnnotationWorkspace:
                 "pid": os.getpid(),
                 "acquired_at": time.time(),
             }
-            try:
-                lock_dir.mkdir()
-            except FileExistsError as exc:
-                observed = self._read_lock_owner(lock_dir)
-                raise StageAnnotationStoreError(
-                    f"Episode {normalized!r} is already being annotated by "
-                    f"another program ({self._owner_description(observed)}). "
-                    "The lock is never stolen automatically; verify the "
-                    "recorded owner before removing a stale lock."
-                ) from exc
-            except OSError as exc:
-                raise StageAnnotationStoreError(
-                    f"Cannot acquire Episode annotation lock {lock_dir}: {exc}"
-                ) from exc
+            host_identity = _local_host_identity_hash()
+            boot_id = _read_optional_system_token(_BOOT_ID_PATH)
+            pid_namespace_id = _local_pid_namespace_id()
+            process_identity = _observe_process_identity(os.getpid())
+            if host_identity is not None:
+                owner["host_identity_hash"] = host_identity
+            if boot_id is not None:
+                owner["boot_id"] = boot_id
+            if pid_namespace_id is not None:
+                owner["pid_namespace_id"] = pid_namespace_id
+            if process_identity.start_time_ticks is not None:
+                owner["process_start_time_ticks"] = (
+                    process_identity.start_time_ticks
+                )
+            for attempt in range(2):
+                try:
+                    lock_dir.mkdir()
+                    break
+                except FileExistsError as exc:
+                    observed = self._read_lock_owner(lock_dir)
+                    if (
+                        attempt == 0
+                        and self._quarantine_provably_stale_lock(
+                            lock_dir,
+                            observed,
+                        )
+                    ):
+                        continue
+                    raise StageAnnotationStoreError(
+                        f"Episode {normalized!r} is already being annotated by "
+                        f"another program ({self._owner_description(observed)}). "
+                        "Only a lock with a provably dead same-machine process "
+                        "identity is recovered automatically; verify the "
+                        "recorded owner before removing any other stale lock."
+                    ) from exc
+                except OSError as exc:
+                    raise StageAnnotationStoreError(
+                        f"Cannot acquire Episode annotation lock "
+                        f"{lock_dir}: {exc}"
+                    ) from exc
 
             try:
                 self._write_lock_owner(lock_dir, owner)
