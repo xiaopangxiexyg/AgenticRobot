@@ -177,7 +177,11 @@ A ready `CompositionEvaluation` also carries
 `composition_supported_until`, the earliest known half-open support boundary
 across its participating inputs, enabled source leases, required contexts, and
 declared context maximum age. Proposal promotion may shorten this boundary but
-cannot extend it, and an already expired result cannot be published. Shadow
+cannot extend it. An already expired result returns a typed proposal
+non-admission; it is never inserted into the proposal buffer and does not turn
+normal publication latency into an application exception. The existing lower
+execution owner alone decides whether its no-new-proposal path keeps an already
+valid target or enters HOLD. Shadow
 evaluation may repeat the same target on a later cut, but successful production
 publication is strictly target-monotonic within one composer producer
 activation. The current contract does not publish or revise a long future
@@ -1271,6 +1275,15 @@ requires motion **and** magnitude below their independent exit thresholds plus
 minimum dwell. Multi-component evaluation is atomic and rejects mixed anchor
 receipt generations. Missing/stale evidence returns `no_decision`, preserves
 state, and does not silently become `base_only`.
+
+An explicit persistent allocation override still requires fresh evidence to
+form each new decision, but its selected mode may use a separately configured
+finite rolling lease. That lease prevents an operator-selected mode from
+inheriting the much shorter activity-evidence TTL. It does not extend any
+Human/Policy action input, and automatic or partially automatic selection
+remains bounded by the corresponding evidence validity. Stopping context
+publication eventually expires the rolling lease, so this changes neither
+authority nor downstream fallback ownership.
 
 A ready allocation decision is published through the existing
 `CompositionContextStore`. The reusable `AllocationPublicationRuntime` keeps

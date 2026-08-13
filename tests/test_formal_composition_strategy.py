@@ -24,7 +24,10 @@ from control_composition.information import (
     CompositionInformationPlan,
 )
 from control_composition.retention import TimeWindowRetentionSpec
-from control_composition.runtime import ControlCompositionRuntime
+from control_composition.runtime import (
+    COMPOSITION_PROMOTION_REJECTION_SUPPORT_EXPIRED,
+    ControlCompositionRuntime,
+)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_interface.composition_control_trace import (
     project_composition_domain_event,
@@ -592,6 +595,60 @@ def test_composition_support_ceiling_and_publication_target_monotonicity() -> No
             effective_until=10.14,
         )
     assert len(proposals) == 1
+
+
+def test_expired_composition_support_is_a_typed_non_admission() -> None:
+    spec = composition_spec()
+    strategy_spec = FormalCompositionStrategySpec(
+        strategy_id="expired-support-strategy",
+        strategy_version="1",
+        composition_spec_hash=spec.semantic_content_hash,
+    )
+    clock, runtime, proposals, _ = build_runtime(
+        DeterministicCompositionStrategyV2(strategy_spec)
+    )
+    assert runtime.admit_composition_input(
+        replace(input_draft(), effective_until=10.15)
+    ).accepted
+    evaluation = runtime.evaluate_composition(
+        spec=spec,
+        target_effective_at=10.1,
+    )
+    assert (
+        evaluation.composition_evaluation.composition_supported_until
+        == pytest.approx(10.15)
+    )
+
+    # Half-open support means publication exactly at the deadline is a normal
+    # non-admission, not an application/control-loop exception.
+    clock.value = 10.15
+    submission = runtime.admit_evaluated_composition(
+        evaluation,
+        runtime_session_id="session-0",
+        producer_id="composer-0",
+        producer_epoch=1,
+        sequence=0,
+        effective_until=10.15,
+    )
+
+    assert submission.proposal_admission is not None
+    assert not submission.proposal_admission.accepted
+    assert submission.proposal_admission.rejection_code == (
+        COMPOSITION_PROMOTION_REJECTION_SUPPORT_EXPIRED
+    )
+    assert submission.proposal_admission.proposal is None
+    assert len(proposals) == 0
+
+    retry = runtime.admit_evaluated_composition(
+        evaluation,
+        runtime_session_id="session-0",
+        producer_id="composer-0",
+        producer_epoch=1,
+        sequence=0,
+        effective_until=10.15,
+    )
+    assert retry.proposal_admission is submission.proposal_admission
+    assert len(proposals) == 0
 
 
 class ContextScaleStrategy:

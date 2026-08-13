@@ -85,6 +85,7 @@ class AllocationPublicationRuntime:
         producer_epoch: int,
         initial_reducer_state: CompositionAllocationState,
         initial_override_state: CompositionAllocationOverrideState | None = None,
+        persistent_override_selection_lease_sec: float | None = None,
         initial_publication_sequence: int = -1,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -124,6 +125,18 @@ class AllocationPublicationRuntime:
                 )
         if not callable(clock):
             raise TypeError("clock must be callable.")
+        override_lease = (
+            None
+            if persistent_override_selection_lease_sec is None
+            else _finite(
+                persistent_override_selection_lease_sec,
+                name="persistent_override_selection_lease_sec",
+            )
+        )
+        if override_lease is not None and override_lease <= 0.0:
+            raise ValueError(
+                "persistent_override_selection_lease_sec must be positive."
+            )
         if isinstance(initial_publication_sequence, bool) or not isinstance(
             initial_publication_sequence, int
         ) or initial_publication_sequence < -1:
@@ -153,6 +166,7 @@ class AllocationPublicationRuntime:
             name="producer_epoch",
         )
         self._clock = clock
+        self.persistent_override_selection_lease_sec = override_lease
         self._committed_state = initial_reducer_state
         self._override_state = initial_override_state
         self._last_reserved_sequence = initial_publication_sequence
@@ -453,6 +467,21 @@ class AllocationPublicationRuntime:
                     reason="allocation_basis_support_expired",
                     occurred_at=now,
                 )
+            override_state = self._override_state
+            override_active = (
+                override_state is not None
+                and any(
+                    mode is not None
+                    for mode in override_state.override_mode_by_component.values()
+                )
+            )
+            override_valid_until = (
+                None
+                if not override_active
+                or self.persistent_override_selection_lease_sec is None
+                else effective_from
+                + self.persistent_override_selection_lease_sec
+            )
             evaluation = evaluate_composition_allocation(
                 self._committed_state,
                 spec=self.allocation_spec,
@@ -462,7 +491,8 @@ class AllocationPublicationRuntime:
                 ),
                 evaluated_at=now,
                 clock_domain_id=basis.control_cut.clock_domain_id,
-                override_state=self._override_state,
+                override_state=override_state,
+                persistent_override_valid_until=override_valid_until,
             )
             decision = evaluation.decision
             if decision.output_status == COMPOSITION_ALLOCATION_STATUS_NO_DECISION:
@@ -487,7 +517,11 @@ class AllocationPublicationRuntime:
                 produced_clock_domain_id=basis.control_cut.clock_domain_id,
                 effective_from=effective_from,
                 effective_clock_domain_id=basis.control_cut.clock_domain_id,
-                support_until=basis.support_until,
+                support_until=(
+                    basis.support_until
+                    if override_valid_until is None
+                    else max(basis.support_until, override_valid_until)
+                ),
                 allocation_scope_id=self.allocation_scope_id,
                 activity_basis_id=basis.basis_id,
                 activity_basis_hash=basis.semantic_content_hash,

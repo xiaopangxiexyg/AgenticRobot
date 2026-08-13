@@ -159,6 +159,7 @@ def evaluate_composition_allocation(
     evaluated_at: float,
     clock_domain_id: str,
     override_state: CompositionAllocationOverrideState | None = None,
+    persistent_override_valid_until: float | None = None,
 ) -> CompositionAllocationEvaluation:
     """Evaluate one atomic component set without changing authority.
 
@@ -186,6 +187,26 @@ def evaluate_composition_allocation(
             or override_state.clock_domain_id != clock
         ):
             raise ValueError("Allocation override belongs to another spec/topology.")
+    override_valid_until = (
+        None
+        if persistent_override_valid_until is None
+        else _finite(
+            persistent_override_valid_until,
+            name="persistent_override_valid_until",
+        )
+    )
+    if override_valid_until is not None:
+        if override_state is None or not any(
+            mode is not None
+            for mode in override_state.override_mode_by_component.values()
+        ):
+            raise ValueError(
+                "Persistent override validity requires an active explicit override."
+            )
+        if override_valid_until <= now:
+            raise ValueError(
+                "Persistent override validity must extend beyond evaluation time."
+            )
     override_identity = (
         {}
         if override_state is None
@@ -330,6 +351,11 @@ def evaluate_composition_allocation(
         if transitioned:
             next_modes[component_id] = candidate_mode
             next_entered[component_id] = now
+        selection_valid_until = (
+            override_valid_until
+            if forced_mode is not None and override_valid_until is not None
+            else min(observation.valid_until, magnitude.valid_until)
+        )
         selections.append(
             ComponentAllocationSelection(
                 component_id=component_id,
@@ -350,10 +376,7 @@ def evaluate_composition_allocation(
                 anchor_request_generation=(
                     magnitude.anchor_request_generation
                 ),
-                valid_until=min(
-                    observation.valid_until,
-                    magnitude.valid_until,
-                ),
+                valid_until=selection_valid_until,
             )
         )
 

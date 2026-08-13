@@ -209,3 +209,155 @@ def test_absolute_override_is_rejected_by_scheme_a_allowlist() -> None:
             ),
             admitted_at=1.0,
         )
+
+
+def test_persistent_override_uses_a_separate_rolling_selection_lease() -> None:
+    spec = _allocation_spec()
+    activation = _activation()
+    clock = Clock(10.1)
+    runtime = AllocationPublicationRuntime(
+        allocation_scope_id="operator-tool",
+        allocation_spec=spec,
+        activation_scope=activation,
+        runtime_session_id="session",
+        control_domain_id="robot",
+        control_clock_reset_epoch=0,
+        context_channel="allocation",
+        producer_id="allocation-producer",
+        producer_epoch=1,
+        initial_reducer_state=empty_composition_allocation_state(
+            "allocation-producer",
+            spec=spec,
+        ),
+        initial_override_state=_override_state(spec, activation),
+        persistent_override_selection_lease_sec=0.5,
+        clock=clock,
+    )
+    runtime.apply_override(
+        _request(
+            runtime.allocation_override_state,
+            mode=COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
+            at=10.05,
+            suffix="base",
+        )
+    )
+
+    outcome = runtime.offer_basis(
+        _basis(
+            activation,
+            index=1,
+            cut_at=10.05,
+            valid_until=10.3,
+            support_until=10.3,
+        )
+    )
+
+    assert outcome.outcome_kind == ALLOCATION_PUBLICATION_OUTCOME_ATTEMPT_READY
+    attempt = runtime.snapshot().pending_attempt
+    assert attempt is not None
+    assert attempt.context_draft.effective_from == pytest.approx(10.1)
+    assert attempt.context_draft.effective_until == pytest.approx(10.6)
+    assert attempt.allocation_decision.selections[0].valid_until == pytest.approx(
+        10.6
+    )
+    assert attempt.activity_basis.support_until == pytest.approx(10.3)
+
+
+def test_automatic_allocation_keeps_evidence_bounded_selection_lifetime() -> None:
+    spec = _allocation_spec()
+    activation = _activation()
+    clock = Clock(10.1)
+    runtime = AllocationPublicationRuntime(
+        allocation_scope_id="operator-tool",
+        allocation_spec=spec,
+        activation_scope=activation,
+        runtime_session_id="session",
+        control_domain_id="robot",
+        control_clock_reset_epoch=0,
+        context_channel="allocation",
+        producer_id="allocation-producer",
+        producer_epoch=1,
+        initial_reducer_state=empty_composition_allocation_state(
+            "allocation-producer",
+            spec=spec,
+        ),
+        initial_override_state=_override_state(spec, activation),
+        persistent_override_selection_lease_sec=0.5,
+        clock=clock,
+    )
+
+    outcome = runtime.offer_basis(
+        _basis(
+            activation,
+            index=1,
+            cut_at=10.05,
+            valid_until=10.3,
+            support_until=10.3,
+        )
+    )
+
+    assert outcome.outcome_kind == ALLOCATION_PUBLICATION_OUTCOME_ATTEMPT_READY
+    attempt = runtime.snapshot().pending_attempt
+    assert attempt is not None
+    assert attempt.context_draft.effective_until == pytest.approx(10.3)
+    assert attempt.allocation_decision.selections[0].valid_until == pytest.approx(
+        10.3
+    )
+
+
+def test_partial_override_does_not_extend_automatic_component_selection() -> None:
+    spec = _allocation_spec(components=("arm", "gripper"))
+    activation = _activation(activated_at=0.0)
+    initial = _override_state(spec, activation)
+    request = CompositionAllocationOverrideRequest(
+        runtime_session_id=initial.runtime_session_id,
+        control_domain_id=initial.control_domain_id,
+        composition_activation_id=initial.composition_activation_id,
+        composition_activation_hash=initial.composition_activation_hash,
+        allocation_spec_hash=initial.allocation_spec_hash,
+        component_ids=("arm",),
+        requested_mode=COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
+        requested_at=1.0,
+        available_at=1.0,
+        clock_domain_id=initial.clock_domain_id,
+        source_fact_ids=("button:arm-only",),
+        source_fact_hashes=("button-hash:arm-only",),
+    )
+    override = apply_composition_allocation_override(
+        initial,
+        request,
+        admitted_at=1.0,
+    ).state_after
+
+    evaluation = evaluate_composition_allocation(
+        empty_composition_allocation_state("allocation", spec=spec),
+        spec=spec,
+        activity_by_component={
+            component_id: _activity(
+                component_id,
+                level=0.0,
+                evaluated_at=1.01,
+                valid_until=1.3,
+            )
+            for component_id in spec.component_ids
+        },
+        residual_magnitude_by_component={
+            component_id: _magnitude(
+                component_id,
+                level=0.0,
+                evaluated_at=1.01,
+                valid_until=1.3,
+            )
+            for component_id in spec.component_ids
+        },
+        evaluated_at=1.01,
+        clock_domain_id="control.monotonic",
+        override_state=override,
+        persistent_override_valid_until=1.6,
+    )
+
+    valid_until = {
+        selection.component_id: selection.valid_until
+        for selection in evaluation.decision.selections
+    }
+    assert valid_until == {"arm": pytest.approx(1.6), "gripper": pytest.approx(1.3)}

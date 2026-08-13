@@ -113,6 +113,11 @@ from control_composition.residual_anchor_lifecycle import (
 )
 
 
+COMPOSITION_PROMOTION_REJECTION_SUPPORT_EXPIRED = (
+    "composition_support_expired_before_proposal_publication"
+)
+
+
 @dataclass(frozen=True)
 class CompositeProposalSubmission:
     input_snapshot: CompositionInputSnapshot
@@ -1124,12 +1129,46 @@ class ControlCompositionRuntime:
             if publication_transaction is not None:
                 publication_transaction.validate_publication_transaction(result)
             produced_at = float(self.clock())
-            if (
-                result.composition_supported_until is None
-                or produced_at >= result.composition_supported_until
-            ):
+            if result.composition_supported_until is None:
                 raise ValueError(
-                    "Composition support expired before proposal publication."
+                    "Ready composition evaluation has no support deadline."
+                )
+            if produced_at >= result.composition_supported_until:
+                receipt = ProposalAdmissionReceipt(
+                    accepted=False,
+                    rejection_code=(
+                        COMPOSITION_PROMOTION_REJECTION_SUPPORT_EXPIRED
+                    ),
+                    message=(
+                        "Composition support expired before proposal publication."
+                    ),
+                )
+                self._proposal_admission_by_composition_evaluation_id[
+                    result.composition_evaluation_id
+                ] = (
+                    producer_id,
+                    normalized_epoch,
+                    normalized_sequence,
+                    normalized_until,
+                    policy_node_id,
+                    receipt,
+                )
+                return CompositeProposalSubmission(
+                    input_snapshot=evaluation.input_snapshot,
+                    composition_evaluation=result,
+                    proposal_admission=receipt,
+                    context_snapshot=evaluation.context_snapshot,
+                    source_difference_observation=(
+                        evaluation.source_difference_observation
+                    ),
+                    source_difference_error=evaluation.source_difference_error,
+                    evaluation_record=evaluation.evaluation_record,
+                    source_eligibility_snapshot=(
+                        evaluation.source_eligibility_snapshot
+                    ),
+                    residual_anchor_lifecycle_snapshot=(
+                        evaluation.residual_anchor_lifecycle_snapshot
+                    ),
                 )
             draft = build_composite_action_proposal_draft(
                 result,
@@ -2306,4 +2345,8 @@ class ControlCompositionRuntime:
         )
 
 
-__all__ = ["CompositeProposalSubmission", "ControlCompositionRuntime"]
+__all__ = [
+    "COMPOSITION_PROMOTION_REJECTION_SUPPORT_EXPIRED",
+    "CompositeProposalSubmission",
+    "ControlCompositionRuntime",
+]
