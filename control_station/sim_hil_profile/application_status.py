@@ -11,7 +11,6 @@ import copy
 import time
 from typing import Any
 
-from .human_deflection import project_admitted_human_deflection
 from .status import (
     SIM_HIL_STATUS_SCHEMA_V1,
     _composition_step_status,
@@ -173,10 +172,6 @@ class _SimHILApplicationStatusMixin:
                 },
                 "passive_observation_error": (
                     self._last_passive_observation_error
-                ),
-                "relative_deflection": project_admitted_human_deflection(
-                    self._last_cycle,
-                    now=now,
                 ),
             }
 
