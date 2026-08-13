@@ -16,6 +16,64 @@ def _args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def test_deploy_tcp_pose_envelope_is_default_off_and_explicitly_activated() -> None:
+    defaults = _args([])
+    assert defaults.tcp_pose_envelope_profile is None
+    assert defaults.tcp_pose_envelope_active is False
+
+    shadow = _args(
+        ["--tcp-pose-envelope-profile", "/tmp/tcp-envelope.json"]
+    )
+    assert shadow.tcp_pose_envelope_profile == Path("/tmp/tcp-envelope.json")
+    assert shadow.tcp_pose_envelope_active is False
+
+    active = _args(
+        [
+            "--tcp-pose-envelope-profile",
+            "/tmp/tcp-envelope.json",
+            "--tcp-pose-envelope-active",
+        ]
+    )
+    assert active.tcp_pose_envelope_active is True
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (
+            ["--tcp-pose-envelope-active"],
+            "requires --tcp-pose-envelope-profile",
+        ),
+        (
+            [
+                "--no-arms",
+                "--tcp-pose-envelope-profile",
+                "/tmp/tcp-envelope.json",
+            ],
+            "require enabled arms in position or pose-impedance mode",
+        ),
+    ],
+)
+def test_deploy_tcp_pose_envelope_rejects_unsafe_cli_combinations(
+    argv: list[str],
+    message: str,
+) -> None:
+    args = _args(argv)
+    with pytest.raises(ValueError, match=message):
+        run_policy.validate_args(args, raw_argv=argv)
+
+
+def test_deploy_tcp_pose_envelope_accepts_pose_impedance_mode() -> None:
+    argv = [
+        "--arm-control-mode",
+        "impedance",
+        "--tcp-pose-envelope-profile",
+        "/tmp/tcp-envelope.json",
+    ]
+
+    run_policy.validate_args(_args(argv), raw_argv=argv)
+
+
 def test_deployment_debug_defaults_to_legacy_root() -> None:
     resolution = run_policy.resolve_deployment_debug_root(
         _args([]),
