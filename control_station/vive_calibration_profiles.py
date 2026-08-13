@@ -241,7 +241,18 @@ def _profile_root(root: Path | None) -> Path:
 
 def _profile_path(root: Path, name_or_path: str | Path) -> Path:
     raw = Path(name_or_path).expanduser()
-    candidate = raw if raw.is_absolute() else root / raw
+    # CLI callers may provide either a profile name or an existing path
+    # relative to their current working directory.  Resolve the latter before
+    # applying the store-boundary check; otherwise ``store/path.json`` is
+    # incorrectly interpreted as ``store/store/path.json``.  Existing files
+    # outside the selected store remain rejected below.
+    candidate = (
+        raw
+        if raw.is_absolute()
+        else raw
+        if raw.exists()
+        else root / raw
+    )
     candidate = candidate.resolve()
     if candidate.parent != root:
         raise ValueError("VIVE coordinate profile must be stored directly in the Control Station profile directory.")

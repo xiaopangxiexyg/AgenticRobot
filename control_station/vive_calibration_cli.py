@@ -7,6 +7,8 @@ import json
 import time
 from pathlib import Path
 
+from teleop_runtime.calibration import SIGNED_SWEEP_DEFAULT_POST_YAW_DEG
+
 from .vive_calibration import ViveCoordinateCalibrationConfig, ViveCoordinateCalibrationController
 from .vive_calibration_gui import ViveCoordinateCalibrationGui
 from .vive_calibration_profiles import (
@@ -55,7 +57,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-axis-variance-ratio", type=float, default=0.5)
     parser.add_argument("--min-start-end-distance-m", type=float, default=0.08)
     parser.add_argument("--max-axis-correction-deg", type=float, default=20.0)
-    parser.add_argument("--virtual-desk-post-yaw-deg", type=float, default=180.0)
+    parser.add_argument(
+        "--virtual-desk-post-yaw-deg",
+        type=float,
+        default=SIGNED_SWEEP_DEFAULT_POST_YAW_DEG,
+        help=(
+            "Optional post-rotation about calibrated +Z. The signed sweep "
+            "directions already define +X forward and +Y left, so the default "
+            "is 0 degrees."
+        ),
+    )
     parser.add_argument("--profile-dir", type=Path, default=None)
     parser.add_argument(
         "--ui-host",
@@ -112,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
                     "profile_kind": VIVE_COORDINATE_PROFILE_KIND,
                     "active_sides": list(config.active_sides),
                     "desk_tracker": config.desk_tracker,
+                    "virtual_desk_post_yaw_deg": (
+                        config.virtual_desk_post_yaw_deg
+                    ),
                     "vive_port": config.vive_port,
                     "clock_sync_port": config.vive_clock_sync_port,
                     "profile_dir": str(config.profile_dir),

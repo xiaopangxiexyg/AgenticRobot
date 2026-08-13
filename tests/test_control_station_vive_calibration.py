@@ -203,7 +203,7 @@ def test_single_side_reuses_shared_workflow_and_saves_independent_profile(tmp_pa
         min_axis_variance_ratio=0.5,
         min_start_end_distance_m=0.02,
         max_axis_non_orthogonality_deg=20.0,
-        virtual_desk_post_yaw_deg=180.0,
+        virtual_desk_post_yaw_deg=0.0,
     )
     result = calibrate_vive_coordinate_profile(
         args,
@@ -213,6 +213,12 @@ def test_single_side_reuses_shared_workflow_and_saves_independent_profile(tmp_pa
         save_on_complete=False,
     )
     assert result is None
+    np.testing.assert_allclose(
+        calibration.world_to_desk_pose()[:3, :3],
+        np.eye(3),
+        atol=1e-9,
+    )
+    assert calibration.metadata["virtual_desk_post_yaw_deg"] == 0.0
     calibration.metadata["profile_ready"] = True
     saved_path = save_coordinate_profile(calibration, root=tmp_path, profile_name="single_right")
     loaded, loaded_path = load_coordinate_profile("single_right", root=tmp_path)
@@ -220,6 +226,26 @@ def test_single_side_reuses_shared_workflow_and_saves_independent_profile(tmp_pa
     assert loaded.metadata["profile_kind"] == VIVE_COORDINATE_PROFILE_KIND
     assert loaded.metadata["active_sides"] == ["right"]
     assert sorted(loaded.tracker_offsets) == ["right_wrist"]
+
+
+def test_new_station_signed_sweep_defaults_to_no_xy_flip() -> None:
+    config = ViveCoordinateCalibrationConfig(active_sides=("left",))
+
+    assert config.virtual_desk_post_yaw_deg == 0.0
+
+
+def test_station_snapshot_exposes_signed_sweep_post_yaw(tmp_path: Path) -> None:
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("left",),
+            profile_dir=tmp_path,
+        ),
+        source=_LiveControllerSource(("left_wrist_pose",)),
+    )
+    try:
+        assert controller.snapshot()["virtual_desk_post_yaw_deg"] == 0.0
+    finally:
+        controller.close()
 
 
 def test_latest_profile_selects_newest_valid_independent_record(
@@ -250,6 +276,53 @@ def test_latest_profile_selects_newest_valid_independent_record(
     assert first != second
     assert resolved == second
     assert loaded.metadata["profile_name"] == "second"
+
+
+def test_existing_relative_profile_path_is_resolved_before_store_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_root = tmp_path / "profiles"
+    calibration = new_coordinate_calibration(active_sides=("right",))
+    calibration.set_world_to_desk(np.eye(4))
+    calibration.set_tracker_offset("right_wrist", np.eye(4))
+    saved = save_coordinate_profile(
+        calibration,
+        root=profile_root,
+        profile_name="right_relative",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    loaded, resolved = load_coordinate_profile(
+        saved.relative_to(tmp_path),
+        root=profile_root,
+    )
+
+    assert resolved == saved
+    assert loaded.metadata["active_sides"] == ["right"]
+
+
+def test_existing_relative_profile_outside_store_remains_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_root = tmp_path / "profiles"
+    outside_root = tmp_path / "outside"
+    calibration = new_coordinate_calibration(active_sides=("right",))
+    calibration.set_world_to_desk(np.eye(4))
+    calibration.set_tracker_offset("right_wrist", np.eye(4))
+    outside = save_coordinate_profile(
+        calibration,
+        root=outside_root,
+        profile_name="outside",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="stored directly"):
+        load_coordinate_profile(
+            outside.relative_to(tmp_path),
+            root=profile_root,
+        )
 
 
 def test_real_teleop_profile_marker_is_rejected(tmp_path: Path) -> None:

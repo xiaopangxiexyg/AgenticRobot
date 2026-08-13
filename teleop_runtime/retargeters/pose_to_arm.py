@@ -369,6 +369,50 @@ class PoseToArmRetargeter(Retargeter):
         channel,
         calibration: TeleopCalibration,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, float | bool]]:
+        (
+            pose_desk,
+            pose_operator,
+            normalization,
+        ) = self._resolve_raw_pose_desk_and_operator(
+            channel=channel,
+            calibration=calibration,
+        )
+        return (
+            self.prepare_input_pose_desk(pose_desk),
+            self._apply_input_pose_adjustments(pose_operator),
+            normalization,
+        )
+
+    def resolve_runtime_home_input_pose_desk(
+        self,
+        *,
+        channel,
+        calibration: TeleopCalibration,
+    ) -> np.ndarray:
+        """Resolve one raw Runtime-Home sample with normal input semantics.
+
+        Runtime Home must use the same logical calibration role and frame path
+        as :meth:`retarget`, while leaving tracker-local offsets unapplied for
+        :meth:`set_home_anchors` to apply exactly once.  Keeping this operation
+        on the retargeter prevents application integrations from guessing a
+        role from the physical source channel when one tracker is intentionally
+        mapped to another arm.
+        """
+
+        pose_desk, _pose_operator, _normalization = (
+            self._resolve_raw_pose_desk_and_operator(
+                channel=channel,
+                calibration=calibration,
+            )
+        )
+        return pose_desk
+
+    def _resolve_raw_pose_desk_and_operator(
+        self,
+        *,
+        channel,
+        calibration: TeleopCalibration,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float | bool]]:
         pose, normalization = project_near_rigid_pose(
             channel.value,
             name=f"{self.config.input_channel_name} input pose",
@@ -379,29 +423,17 @@ class PoseToArmRetargeter(Retargeter):
         if frame_name in {"vive_world", "world"}:
             pose_operator = calibration.world_to_operator(pose, tracker_role=tracker_role)
             pose_desk = calibration.operator_to_desk(pose_operator)
-            return (
-                self.prepare_input_pose_desk(pose_desk),
-                self._apply_input_pose_adjustments(pose_operator),
-                normalization,
-            )
+            return pose_desk, pose_operator, normalization
         if frame_name.endswith("_operator") or frame_name == "operator":
             pose_operator = pose
             pose_desk = calibration.operator_to_desk(pose_operator)
-            return (
-                self.prepare_input_pose_desk(pose_desk),
-                self._apply_input_pose_adjustments(pose_operator),
-                normalization,
-            )
+            return pose_desk, pose_operator, normalization
         if frame_name in {calibration.desk_frame.name, "desk"}:
             pose_desk = pose
             if calibration.T_O_D is None:
                 raise RuntimeError("Cannot recover operator-frame pose without T_O_D calibration.")
             pose_operator = calibration.T_O_D @ pose_desk
-            return (
-                self.prepare_input_pose_desk(pose_desk),
-                self._apply_input_pose_adjustments(pose_operator),
-                normalization,
-            )
+            return pose_desk, pose_operator, normalization
         raise ValueError(
             f"{self.name} does not know how to map input frame '{frame_name or '<none>'}' to desk."
         )

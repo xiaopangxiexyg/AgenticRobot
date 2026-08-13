@@ -198,8 +198,17 @@ def test_logical_calibration_role_is_independent_of_upstream_tracker_role() -> N
 
     command = retargeter.retarget(observation, calibration)
     arm = command.commands["right_arm"]
+    runtime_home_pose_desk = retargeter.resolve_runtime_home_input_pose_desk(
+        channel=observation.channels["right_wrist_pose"],
+        calibration=calibration,
+    )
 
     np.testing.assert_allclose(arm.value, _translation(0.25), atol=1e-12)
+    np.testing.assert_allclose(
+        runtime_home_pose_desk,
+        _translation(0.25),
+        atol=1e-12,
+    )
     assert arm.metadata["tracker_role"] == "right_wrist"
     assert arm.metadata["source_tracker_role"] == "left_wrist"
 

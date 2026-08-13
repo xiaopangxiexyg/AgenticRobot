@@ -17,7 +17,11 @@ from pathlib import Path
 
 import numpy as np
 
-from ..calibration import TeleopCalibration, VIRTUAL_DESK_SWEEP_CONVENTION_VERSION
+from ..calibration import (
+    SIGNED_SWEEP_DEFAULT_POST_YAW_DEG,
+    TeleopCalibration,
+    VIRTUAL_DESK_SWEEP_CONVENTION_VERSION,
+)
 from ..calibration_flow import (
     average_pose,
     euler_xyz_deg_to_matrix,
@@ -1012,7 +1016,13 @@ def calibrate_vive_coordinate_profile(
             f"raw sweep 非正交较大 {max_raw_non_orthogonality:.2f}deg，但正交拟合已接受。",
         )
     base_world_to_desk = result.T_W_V.copy()
-    yaw_deg = float(getattr(args, "virtual_desk_post_yaw_deg", 180.0))
+    yaw_deg = float(
+        getattr(
+            args,
+            "virtual_desk_post_yaw_deg",
+            SIGNED_SWEEP_DEFAULT_POST_YAW_DEG,
+        )
+    )
     world_to_desk = base_world_to_desk @ _virtual_desk_post_rotation_pose(yaw_deg)
     calibration.set_world_to_desk(world_to_desk)
     calibration.metadata.update(

@@ -12,6 +12,11 @@ from .tcp import canonical_tcp_frame
 from .transforms import as_pose_matrix, clip_pose_translation, identity_pose, invert_pose
 
 VIRTUAL_DESK_SWEEP_CONVENTION_VERSION = 2
+# Version-2 sweeps are signed in their canonical positive directions
+# (back->front, right->left, low->high), so no additional XY flip is needed.
+SIGNED_SWEEP_DEFAULT_POST_YAW_DEG = 0.0
+# Compatibility correction for profiles saved before the signed-sweep metadata
+# existed.  Keep this separate from the default for a newly captured sweep.
 DEFAULT_VIRTUAL_DESK_POST_YAW_DEG = 180.0
 
 

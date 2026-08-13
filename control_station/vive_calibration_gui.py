@@ -436,9 +436,15 @@ function render(state) {
   byId("load").disabled = busy || workflowActive || !byId("profileSelect").value;
   byId("begin").disabled = busy || workflowActive || !Boolean((state.input_preflight || {}).ready) || Boolean(state.shutdown_requested);
   byId("exit").disabled = busy || Boolean(state.shutdown_requested);
-  byId("sides").disabled = busy || workflowActive;
-  byId("deskTracker").disabled = busy || workflowActive;
+  byId("exit").textContent = state.source_started
+    ? "退出标定 / 取消启动" : "关闭标定页";
+  const availableSides = state.available_active_sides || ["left", "right"];
+  const sharedSingleSide = Boolean(state.source_started === false)
+    && availableSides.length === 1;
+  byId("sides").disabled = busy || workflowActive || sharedSingleSide;
+  byId("deskTracker").disabled = busy || workflowActive || sharedSingleSide;
   byId("swapVive").disabled = busy || workflowActive
+    || !Boolean(state.source_swap_supported)
     || !["idle", "view", "completed", "error"].includes(state.stage);
 }
 async function send(event, payload = {}) {
@@ -483,7 +489,10 @@ byId("reset").addEventListener("click", () => submit("reset_stage"));
 byId("cancel").addEventListener("click", () => submit("cancel_calibration"));
 byId("swapVive").addEventListener("click", () => submit("swap_vive_sources"));
 byId("exit").addEventListener("click", () => {
-  if (window.confirm("退出会关闭 VIVE 标定接收器，并取消等待本次标定结果的启动。确定退出吗？")) submit("close");
+  const message = latest && latest.source_started
+    ? "退出会关闭 VIVE 标定接收器，并取消等待本次标定结果的启动。确定退出吗？"
+    : "关闭本标定页？共享的 VIVE 偏转查看器会继续运行。";
+  if (window.confirm(message)) submit("close");
 });
 byId("save").addEventListener("click", () => submit("save_profile", {profile_name:byId("profileName").value}));
 byId("load").addEventListener("click", () => {

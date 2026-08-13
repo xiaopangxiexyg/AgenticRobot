@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 from project_paths import control_station_vive_coordinate_profiles_dir
+from teleop_runtime.calibration import SIGNED_SWEEP_DEFAULT_POST_YAW_DEG
 from teleop_runtime.real_teleop.vive_calibration_runtime import (
     ViveCoordinateCalibrationContext,
     calibrate_vive_coordinate_profile,
@@ -203,7 +204,7 @@ class ViveCoordinateCalibrationConfig:
     min_axis_variance_ratio: float = 0.5
     min_start_end_distance_m: float = 0.08
     max_axis_correction_deg: float = 20.0
-    virtual_desk_post_yaw_deg: float = 180.0
+    virtual_desk_post_yaw_deg: float = SIGNED_SWEEP_DEFAULT_POST_YAW_DEG
     input_ready_max_age_sec: float = _INPUT_READY_MAX_AGE_SEC
     profile_dir: Path | None = None
     # Optional read-only startup selection. ``latest`` resolves the newest
@@ -518,6 +519,13 @@ class ViveCoordinateCalibrationController:
 
     def _set_active_sides(self, value: object) -> None:
         sides = normalize_active_sides(value if isinstance(value, str) else tuple(value))
+        available_sides = tuple(
+            getattr(self._source, "available_active_sides", ("left", "right"))
+        )
+        if any(side not in available_sides for side in sides):
+            raise ValueError(
+                "Selected calibration sides are unavailable from this shared source."
+            )
         if self._workflow_thread is not None and self._workflow_thread.is_alive():
             raise RuntimeError("Cannot change active sides during capture.")
         with self._lock:
@@ -532,6 +540,13 @@ class ViveCoordinateCalibrationController:
             raise ValueError("desk_tracker must be auto, left, right, or auxiliary.")
         if tracker == "auxiliary" and not str(self.config.auxiliary_tracker_name or "").strip():
             raise ValueError("desk_tracker=auxiliary requires auxiliary_tracker_name.")
+        available_sides = tuple(
+            getattr(self._source, "available_active_sides", ("left", "right"))
+        )
+        if tracker in {"left", "right"} and tracker not in available_sides:
+            raise ValueError(
+                "Selected desk tracker is unavailable from this shared source."
+            )
         if self._workflow_thread is not None and self._workflow_thread.is_alive():
             raise RuntimeError("Cannot change desk tracker during capture.")
         with self._lock:
@@ -825,7 +840,17 @@ class ViveCoordinateCalibrationController:
                 "motion_authorized": False,
                 "real_arm_motion": False,
                 "active_sides": list(self.config.active_sides),
+                "available_active_sides": list(
+                    getattr(
+                        self._source,
+                        "available_active_sides",
+                        ("left", "right"),
+                    )
+                ),
                 "desk_tracker": self.config.desk_tracker,
+                "virtual_desk_post_yaw_deg": float(
+                    self.config.virtual_desk_post_yaw_deg
+                ),
                 "stage": self._stage,
                 "stage_label": _STAGES.get(self._stage, self._stage),
                 "phase": self._phase,
@@ -854,6 +879,9 @@ class ViveCoordinateCalibrationController:
                 "source_stats": source_stats,
                 "source_role_by_output_channel": (
                     source_role_by_output_channel
+                ),
+                "source_swap_supported": callable(
+                    getattr(self._source, "swap_left_right_source_roles", None)
                 ),
                 "source_swap_count": self._source_swap_count,
                 "last_source_swap_receipt": self._last_source_swap_receipt,
