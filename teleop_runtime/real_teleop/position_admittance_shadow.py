@@ -11,6 +11,7 @@ authority.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, replace
@@ -58,13 +59,16 @@ POSITION_ADMITTANCE_ACTIVE_ENVELOPES = {
     POSITION_ADMITTANCE_ACTIVE_ENVELOPE_HALF_NORMAL: {
         "max_offset_m": 0.04,
         "max_velocity_m_s": 0.03,
-        "max_return_velocity_m_s": 0.015,
+        "max_return_velocity_m_s": 0.06,
         "max_output_slew_m_s": 0.03,
     },
     POSITION_ADMITTANCE_ACTIVE_ENVELOPE_NORMAL_PARITY: {
         "max_offset_m": 0.08,
         "max_velocity_m_s": 0.06,
-        "max_return_velocity_m_s": 0.03,
+        # The larger rate is return-only: the final boundary admits it only
+        # for a complete componentwise-and-norm step toward zero.  Existing
+        # 0.03 m/s commands remain valid and behaviorally unchanged.
+        "max_return_velocity_m_s": 0.42,
         "max_output_slew_m_s": 0.06,
     },
 }
@@ -102,6 +106,12 @@ POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG = 3.5
 POSITION_ADMITTANCE_ROTATION_ACTIVE_BALANCED_MAX_TOOL_EXCURSION_DEG = 5.5
 POSITION_ADMITTANCE_ROTATION_ACTIVE_NOMINAL_TRANSLATION_LIMIT_M = 0.005
 POSITION_ADMITTANCE_ACTIVE_MAX_STALE_SEC = 0.15
+POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX = 0.1
+POSITION_ADMITTANCE_ACTIVE_RETURN_RATE_S_MAX = 4.0
+POSITION_ADMITTANCE_ACTIVE_NORMAL_PARITY_RETURN_VELOCITY_M_S = 0.42
+POSITION_ADMITTANCE_ACTIVE_NORMAL_PARITY_RETURN_RATE_S = 4.0
+POSITION_ADMITTANCE_ACTIVE_HALF_NORMAL_RETURN_VELOCITY_M_S = 0.06
+POSITION_ADMITTANCE_ACTIVE_HALF_NORMAL_RETURN_RATE_S = 2.0
 # Public tuning is expressed relative to the real-robot profile that passed
 # dual-arm acceptance.  The weights scale compliance (not the final envelope):
 # a weight of 2.0 produces twice the unconstrained offset for the same
@@ -149,6 +159,11 @@ POSITION_ADMITTANCE_ROTATION_RELEASE_QPOS_RAMP_SEC = 0.075
 # reversal is released on the following 60 Hz reference tick, while larger
 # direction changes and monotonic force response keep the fast endpoint.
 POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG = 0.05
+# The rerecorded Active trace showed the zero-step form firing 505 frames in
+# 59.1 s.  Preserve its one-tick reversal suppression, but admit at most this
+# sub-visible creep instead of forcing an exact per-joint stop.  Zero remains
+# available in the retargeter config as the atomic rollback behavior.
+POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG = 0.005
 
 
 class PositionAdmittanceActiveFault(RuntimeError):
@@ -187,6 +202,105 @@ def position_admittance_active_qpos_fast_path_alpha(
     if maximum_slew <= POSITION_ADMITTANCE_ACTIVE_HIGH_SLEW_THRESHOLD_M_S + 1e-12:
         return POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA
     return POSITION_ADMITTANCE_ACTIVE_HIGH_SLEW_QPOS_FAST_PATH_ALPHA
+
+
+def position_admittance_final_translation_slew_rate_m_s(
+    config: CartesianAdmittanceConfig,
+    *,
+    previous_offset_m: Sequence[float],
+    candidate_offset_m: Sequence[float],
+    passive_return_active: bool,
+    tolerance: float = 1e-9,
+) -> tuple[np.ndarray, bool]:
+    """Select the final-bound slew rate without weakening outward motion.
+
+    The faster return rate is eligible only while the controller declares
+    passive return and the complete candidate modifier moves monotonically
+    toward zero componentwise and in total norm.  Production enforcement and
+    offline release audits share this predicate so a diagnostic cannot label
+    an outward or non-monotonic step as a valid return.
+    """
+
+    previous = np.asarray(previous_offset_m, dtype=float).reshape(3)
+    candidate = np.asarray(candidate_offset_m, dtype=float).reshape(3)
+    enabled = np.asarray(config.enabled_axes, dtype=bool)
+    returning_to_zero = bool(
+        passive_return_active
+        and np.all(
+            np.abs(candidate[enabled])
+            <= np.abs(previous[enabled]) + float(tolerance)
+        )
+        and float(np.linalg.norm(candidate))
+        <= float(np.linalg.norm(previous)) + float(tolerance)
+    )
+    return (
+        np.asarray(
+            (
+                config.max_return_velocity_m_s
+                if returning_to_zero
+                else config.max_output_slew_m_s
+            ),
+            dtype=float,
+        ),
+        returning_to_zero,
+    )
+
+
+def position_admittance_final_translation_slew_ratio(
+    config: CartesianAdmittanceConfig,
+    *,
+    previous_offset_m: Sequence[float],
+    candidate_offset_m: Sequence[float],
+    passive_return_active: bool,
+    dt_sec: float,
+) -> tuple[float, bool]:
+    """Return the exact component-and-norm ratio used by the final bound."""
+
+    dt = float(dt_sec)
+    if not np.isfinite(dt) or dt < 0.0:
+        raise ValueError(
+            "final translation slew dt must be finite and nonnegative"
+        )
+    previous = np.asarray(previous_offset_m, dtype=float).reshape(3)
+    candidate = np.asarray(candidate_offset_m, dtype=float).reshape(3)
+    delta = candidate - previous
+    enabled = np.asarray(config.enabled_axes, dtype=bool)
+    rates, returning_to_zero = (
+        position_admittance_final_translation_slew_rate_m_s(
+            config,
+            previous_offset_m=previous,
+            candidate_offset_m=candidate,
+            passive_return_active=passive_return_active,
+        )
+    )
+    limits = rates * dt
+    ratios: list[float] = []
+    for component_delta, component_limit in zip(
+        np.abs(delta[enabled]),
+        limits[enabled],
+        strict=True,
+    ):
+        ratios.append(
+            0.0
+            if component_delta <= 0.0
+            else (
+                float("inf")
+                if component_limit <= 0.0
+                else float(component_delta / component_limit)
+            )
+        )
+    norm_delta = float(np.linalg.norm(delta))
+    norm_limit = float(np.max(limits[enabled])) if np.any(enabled) else 0.0
+    ratios.append(
+        0.0
+        if norm_delta <= 0.0
+        else (
+            float("inf")
+            if norm_limit <= 0.0
+            else norm_delta / norm_limit
+        )
+    )
+    return max(ratios, default=0.0), returning_to_zero
 
 
 def _positive_response_weight(value: object, *, name: str) -> float:
@@ -248,6 +362,23 @@ def position_rotational_admittance_config(
             float(value) / weight for value in baseline.stiffness_nm_rad
         ),
         torque_filter_tau_sec=filter_tau_sec,
+        output_follow_tau_sec=float(
+            getattr(
+                args,
+                "position_admittance_rotation_output_follow_tau_sec",
+                baseline.output_follow_tau_sec,
+            )
+        ),
+        max_output_angular_acceleration_rad_s2=(
+            float(
+                getattr(
+                    args,
+                    "position_admittance_rotation_max_output_angular_acceleration_rad_s2",
+                    0.0,
+                )
+            ),
+        )
+        * 3,
     )
 
 
@@ -261,6 +392,8 @@ def _rotational_config_matches_profile_shape(
             config,
             stiffness_nm_rad=expected.stiffness_nm_rad,
             torque_filter_tau_sec=expected.torque_filter_tau_sec,
+            output_follow_tau_sec=expected.output_follow_tau_sec,
+            max_output_angular_acceleration_rad_s2=(0.0, 0.0, 0.0),
         )
         == expected
     )
@@ -334,6 +467,14 @@ def validate_position_admittance_active_config(
             "active position admittance translation filter tau must be <= "
             f"{POSITION_ADMITTANCE_ACTIVE_FILTER_TAU_SEC_MAX:g} s"
         )
+    if (
+        config.output_follow_tau_sec
+        > POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX + 1e-12
+    ):
+        raise ValueError(
+            "active position admittance translation output-follow tau must be <= "
+            f"{POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX:g} s"
+        )
     envelope_name = str(active_envelope).strip()
     try:
         envelope = POSITION_ADMITTANCE_ACTIVE_ENVELOPES[envelope_name]
@@ -352,6 +493,39 @@ def validate_position_admittance_active_config(
                 "active position admittance "
                 f"{field} must be <= {upper_bound:g}"
             )
+    exact_return = {
+        POSITION_ADMITTANCE_ACTIVE_ENVELOPE_HALF_NORMAL: (
+            POSITION_ADMITTANCE_ACTIVE_HALF_NORMAL_RETURN_VELOCITY_M_S,
+            POSITION_ADMITTANCE_ACTIVE_HALF_NORMAL_RETURN_RATE_S,
+        ),
+        POSITION_ADMITTANCE_ACTIVE_ENVELOPE_NORMAL_PARITY: (
+            POSITION_ADMITTANCE_ACTIVE_NORMAL_PARITY_RETURN_VELOCITY_M_S,
+            POSITION_ADMITTANCE_ACTIVE_NORMAL_PARITY_RETURN_RATE_S,
+        ),
+    }.get(envelope_name)
+    if exact_return is not None:
+        exact_return_velocity, exact_return_rate = exact_return
+        if not np.allclose(
+            config.max_return_velocity_m_s,
+            exact_return_velocity,
+            atol=tolerance,
+            rtol=0.0,
+        ):
+            raise ValueError(
+                f"active {envelope_name} requires exact "
+                "max_return_velocity_m_s="
+                f"{exact_return_velocity:g}"
+            )
+        if not math.isclose(
+            config.return_rate_s,
+            exact_return_rate,
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"active {envelope_name} requires exact return_rate_s="
+                f"{exact_return_rate:g}"
+            )
     if config.stale_after_sec > POSITION_ADMITTANCE_ACTIVE_MAX_STALE_SEC:
         raise ValueError(
             "active position admittance stale_after_sec must be <= "
@@ -361,6 +535,11 @@ def validate_position_admittance_active_config(
         raise ValueError(
             "active position admittance max_force_dt_sec must be <= "
             f"{POSITION_ADMITTANCE_ACTIVE_MAX_STALE_SEC:g}"
+        )
+    if config.return_rate_s > POSITION_ADMITTANCE_ACTIVE_RETURN_RATE_S_MAX:
+        raise ValueError(
+            "active position admittance return_rate_s must be <= "
+            f"{POSITION_ADMITTANCE_ACTIVE_RETURN_RATE_S_MAX:g}"
         )
     return config
 
@@ -382,7 +561,8 @@ def validate_position_rotational_admittance_active_config(
     if not _rotational_config_matches_profile_shape(config, profile):
         raise ValueError(
             "active rotational admittance tuning may change only response "
-            f"weight and filter tau within the {profile} profile"
+            f"weight, input filter tau, and output-follow tau within the "
+            f"{profile} profile"
         )
     stiffness = np.asarray(config.stiffness_nm_rad, dtype=float)
     expected_stiffness = np.asarray(expected.stiffness_nm_rad, dtype=float)
@@ -414,6 +594,14 @@ def validate_position_rotational_admittance_active_config(
         raise ValueError(
             "active rotational admittance filter tau must be <= "
             f"{POSITION_ADMITTANCE_ACTIVE_FILTER_TAU_SEC_MAX:g} s"
+        )
+    if (
+        config.output_follow_tau_sec
+        > POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX + 1e-12
+    ):
+        raise ValueError(
+            "active rotational admittance output-follow tau must be <= "
+            f"{POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX:g} s"
         )
     return config
 
@@ -651,6 +839,23 @@ def position_admittance_shadow_config(args: Any) -> CartesianAdmittanceConfig:
         force_filter_tau_sec=float(
             getattr(args, "position_admittance_shadow_filter_tau_sec")
         ),
+        output_follow_tau_sec=float(
+            getattr(
+                args,
+                "position_admittance_translation_output_follow_tau_sec",
+                0.0,
+            )
+        ),
+        max_output_acceleration_m_s2=(
+            float(
+                getattr(
+                    args,
+                    "position_admittance_translation_max_output_acceleration_m_s2",
+                    0.0,
+                )
+            ),
+        )
+        * 3,
         max_offset_m=triplet("position_admittance_shadow_max_offset_m"),
         max_velocity_m_s=triplet(
             "position_admittance_shadow_max_velocity_m_s"
@@ -1385,9 +1590,14 @@ class PositionAdmittanceShadowTargetFilter:
                     f"{side} final admittance modifier time moved backwards"
                 )
             delta = offset - previous
-            slew_limits = (
-                np.asarray(self.config.max_output_slew_m_s, dtype=float) * dt
+            slew_rate, _ = position_admittance_final_translation_slew_rate_m_s(
+                self.config,
+                previous_offset_m=previous,
+                candidate_offset_m=offset,
+                passive_return_active=state.passive_return_active,
+                tolerance=tolerance,
             )
+            slew_limits = slew_rate * dt
             if np.any(np.abs(delta[enabled]) > slew_limits[enabled] + tolerance):
                 raise PositionAdmittanceActiveFault(
                     f"{side} final admittance modifier exceeds a component slew limit"
@@ -1737,6 +1947,7 @@ class PositionAdmittanceShadowTargetFilter:
             "filtered_force_control_n": list(
                 state.filtered_force_control_n
             ),
+            "passive_return_active": bool(state.passive_return_active),
             "state_reason": state.reason,
             "sample_state_reason": (
                 state.reason
@@ -2713,9 +2924,16 @@ __all__ = [
     "POSITION_ADMITTANCE_ACTIVE_HIGH_SLEW_QPOS_FAST_PATH_ALPHA",
     "POSITION_ADMITTANCE_ACTIVE_HIGH_SLEW_THRESHOLD_M_S",
     "POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG",
+    "POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG",
     "POSITION_ADMITTANCE_ACTIVE_SIDE_CHOICES",
     "POSITION_ADMITTANCE_ACTIVE_RESPONSE_WEIGHT_MAX",
     "POSITION_ADMITTANCE_ACTIVE_RESPONSE_WEIGHT_MIN",
+    "POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX",
+    "POSITION_ADMITTANCE_ACTIVE_RETURN_RATE_S_MAX",
+    "POSITION_ADMITTANCE_ACTIVE_NORMAL_PARITY_RETURN_RATE_S",
+    "POSITION_ADMITTANCE_ACTIVE_NORMAL_PARITY_RETURN_VELOCITY_M_S",
+    "POSITION_ADMITTANCE_ACTIVE_HALF_NORMAL_RETURN_RATE_S",
+    "POSITION_ADMITTANCE_ACTIVE_HALF_NORMAL_RETURN_VELOCITY_M_S",
     "POSITION_ADMITTANCE_ROTATION_ACTIVE_QPOS_FAST_PATH_ALPHA",
     "POSITION_ADMITTANCE_ROTATION_ACTIVE_BALANCED_MAX_TOOL_EXCURSION_DEG",
     "POSITION_ADMITTANCE_ROTATION_ACTIVE_BALANCED_PROFILE",
@@ -2737,6 +2955,8 @@ __all__ = [
     "position_admittance_shadow_config",
     "position_admittance_active_config",
     "position_admittance_active_apply_sides",
+    "position_admittance_final_translation_slew_rate_m_s",
+    "position_admittance_final_translation_slew_ratio",
     "position_admittance_active_qpos_fast_path_alpha",
     "position_admittance_active_uses_home_endpoint_guard",
     "position_admittance_rotation_response_weight",

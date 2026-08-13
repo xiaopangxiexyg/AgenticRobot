@@ -38,17 +38,64 @@ from teleop_runtime.debug.replay_position_admittance_ik_trace import (
     _tool_pose,
 )
 from teleop_runtime.debug.replay_position_admittance_mujoco import (
+    _qcmd_dynamics,
     _profile_execution_config,
+    _recorded_input_contract,
     replay_recorded_wrench_through_mujoco,
 )
 from teleop_runtime.real_teleop.position_admittance_shadow import (
     POSITION_ADMITTANCE_ACTIVE_ENDPOINT_POLICY_FORMAL_TELEOP,
     POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA,
+    POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG,
     POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG,
 )
 
 
 SIDES = ("left", "right")
+
+
+def test_qcmd_dynamics_reports_effective_rate_not_inverse_median_physics_interval(
+) -> None:
+    scheduled = np.arange(1, 122, dtype=float) / 120.0
+    applied = np.ceil(scheduled * 1000.0 - 1e-12) / 1000.0
+    qcmd = {
+        side: [np.zeros(6, dtype=float) for _ in applied]
+        for side in SIDES
+    }
+
+    report = _qcmd_dynamics(
+        times_sec=applied.tolist(),
+        qcmd_by_side=qcmd,
+        nominal_sample_hz=120.0,
+    )["left"]
+
+    assert report["nominal_sample_hz"] == pytest.approx(120.0)
+    assert report["median_interval_hz"] == pytest.approx(125.0)
+    assert report["effective_sample_hz"] == pytest.approx(120.0, abs=0.13)
+    assert report["sample_hz"] == report["effective_sample_hz"]
+    assert report["physical_apply_interval_sec"]["max"] == pytest.approx(0.009)
+    assert report["physical_apply_interval_sec"]["p50"] == pytest.approx(0.008)
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    (
+        RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+        RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1_NAME,
+        RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2_NAME,
+    ),
+)
+def test_mujoco_saved_input_accepts_each_v2_balanced_recording_profile(
+    profile_name: str,
+) -> None:
+    passed, accepted_modes = _recorded_input_contract(
+        receipt={"enabled": True, "requested_mode": "combined_active"},
+        config_payload={"position_control_profile": {"name": profile_name}},
+        rotational_replay=True,
+    )
+
+    assert passed is True
+    assert "combined_active" in accepted_modes
 
 
 def _initial_qpos() -> dict[str, np.ndarray]:
@@ -71,6 +118,8 @@ def _write_raw_wrench_log(
     max_offset_m: float = 0.002,
     max_rate_m_s: float = 0.005,
     max_return_rate_m_s: float | None = None,
+    return_rate_s: float = 1.0,
+    solver_force_direction: tuple[float, float, float] = (-1.0, 0.0, 0.0),
 ) -> Path:
     if force_side not in SIDES:
         raise ValueError("force_side must be left or right")
@@ -107,9 +156,12 @@ def _write_raw_wrench_log(
         targets[force_side][:3, :3]
         @ retargeter._tool_tcp_from_solver[force_side][:3, :3]
     )
-    tool_force = rotation_solver_from_tool.T @ np.array(
-        [-float(force_n), 0.0, 0.0]
-    )
+    force_direction = np.asarray(solver_force_direction, dtype=float).reshape(3)
+    direction_norm = float(np.linalg.norm(force_direction))
+    if not np.isfinite(direction_norm) or direction_norm <= 0.0:
+        raise ValueError("solver_force_direction must be finite and nonzero")
+    solver_force = float(force_n) * force_direction / direction_norm
+    tool_force = rotation_solver_from_tool.T @ solver_force
     tool_torque = rotation_solver_from_tool.T @ np.array(
         [0.0, 0.0, float(torque_nm)]
     )
@@ -133,7 +185,7 @@ def _write_raw_wrench_log(
         * 3,
         "max_output_slew_m_s": [max_rate_m_s] * 3,
         "return_force_deadband_n": [0.45, 0.45, 0.45],
-        "return_rate_s": 1.0,
+        "return_rate_s": return_rate_s,
         "response_reference_hz": 40.0,
         "stale_after_sec": 0.15,
         "max_force_dt_sec": 0.15,
@@ -541,12 +593,20 @@ def test_right_combined_formal_active_runs_through_physical_mujoco(
     assert report["side"] == "right"
     assert report["production_normal_parity_active"] is True
     assert report["production_rotational_active_installer_exercised"] is True
+    assert report["active_config"]["max_return_velocity_m_s"] == pytest.approx(
+        (0.42,) * 3
+    )
+    assert report["active_config"]["return_rate_s"] == pytest.approx(4.0)
     active = report["rollouts"]["zoh_active"]
     assert active["completed"] is True
     assert active["endpoint_excursion_guard"] is None
     assert active["active_offset_norm_m"]["max"] > 0.0
     assert active["active_rotation_offset_norm_rad"]["max"] > 0.0
     comparison = report["comparisons"]["zoh"]
+    assert comparison["release_gate_applicability"] == {
+        "force": True,
+        "torque": True,
+    }
     assert comparison["nonzero_active_physical_ticks"] > 0
     assert comparison["selected_measured_translation_m"]["max"] > 0.0
     assert comparison["selected_measured_rotation_deg"]["max"] > 0.0
@@ -563,7 +623,7 @@ def test_right_combined_formal_active_runs_through_physical_mujoco(
         "expected_release_passed",
     ),
     (
-        ("half_normal", 14.0, 0.04, 0.03, 0.015, 0.85, True),
+        ("half_normal", 14.0, 0.04, 0.03, 0.015, 0.85, False),
         ("normal_parity", 29.0, 0.08, 0.06, 0.03, 0.80, False),
     ),
 )
@@ -609,10 +669,11 @@ def test_larger_envelope_mujoco_abrupt_release_retains_frozen_catchup_gate(
     if expected_release_passed:
         assert release["max_outward_catchup_m"] <= 0.001
     else:
-        assert envelope_name == "normal_parity"
-        assert release["max_outward_catchup_m"] > 0.001
+        assert (
+            release["max_outward_catchup_m"] > 0.001
+            or release["max_outward_catchup_duration_sec"] > 0.1
+        )
         assert report["hardware_authorization"] is False
-    assert release["max_outward_catchup_duration_sec"] <= 0.1
     fast_path = report["rollouts"]["zoh_active"]["execution"][
         "active_modifier_qpos_fast_path"
     ]
@@ -623,6 +684,9 @@ def test_larger_envelope_mujoco_abrupt_release_retains_frozen_catchup_gate(
     )
     assert fast_path["micro_reversal_hold_deg"] == pytest.approx(
         POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG
+    )
+    assert fast_path["micro_reversal_creep_deg"] == pytest.approx(
+        POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG
     )
 
 

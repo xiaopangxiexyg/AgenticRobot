@@ -62,6 +62,12 @@ def replay_recorded_rotational_admittance_through_mujoco(
     production_combined_normal_parity: bool = False,
     endpoint_policy: str = POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
     position_execution_profile_name: str = RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+    translation_filter_tau_sec: float | None = None,
+    rotation_filter_tau_sec: float | None = None,
+    translation_output_follow_tau_sec: float | None = None,
+    rotation_output_follow_tau_sec: float | None = None,
+    translation_max_output_acceleration_m_s2: float | None = None,
+    rotation_max_output_angular_acceleration_rad_s2: float | None = None,
 ) -> dict[str, Any]:
     if sum(
         bool(value)
@@ -111,6 +117,16 @@ def replay_recorded_rotational_admittance_through_mujoco(
         ),
         endpoint_policy=endpoint_policy,
         position_execution_profile_name=position_execution_profile_name,
+        translation_filter_tau_sec=translation_filter_tau_sec,
+        rotation_filter_tau_sec=rotation_filter_tau_sec,
+        translation_output_follow_tau_sec=translation_output_follow_tau_sec,
+        rotation_output_follow_tau_sec=rotation_output_follow_tau_sec,
+        translation_max_output_acceleration_m_s2=(
+            translation_max_output_acceleration_m_s2
+        ),
+        rotation_max_output_angular_acceleration_rad_s2=(
+            rotation_max_output_angular_acceleration_rad_s2
+        ),
     )
     report["rotational_envelope"] = str(envelope).strip().lower()
     report["max_tool_rotation_excursion_deg"] = max_rotation_deg
@@ -181,6 +197,12 @@ def main() -> None:
         ),
         default=RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
     )
+    parser.add_argument("--translation-filter-tau-sec", type=float, default=None)
+    parser.add_argument("--rotation-filter-tau-sec", type=float, default=None)
+    parser.add_argument("--translation-output-follow-tau-sec", type=float, default=None)
+    parser.add_argument("--rotation-output-follow-tau-sec", type=float, default=None)
+    parser.add_argument("--translation-max-output-acceleration-m-s2", type=float, default=None)
+    parser.add_argument("--rotation-max-output-angular-acceleration-rad-s2", type=float, default=None)
     args = parser.parse_args()
     modes = (
         ("zoh", "linear")
@@ -205,6 +227,16 @@ def main() -> None:
         ),
         endpoint_policy=args.active_endpoint_policy,
         position_execution_profile_name=args.position_execution_profile,
+        translation_filter_tau_sec=args.translation_filter_tau_sec,
+        rotation_filter_tau_sec=args.rotation_filter_tau_sec,
+        translation_output_follow_tau_sec=args.translation_output_follow_tau_sec,
+        rotation_output_follow_tau_sec=args.rotation_output_follow_tau_sec,
+        translation_max_output_acceleration_m_s2=(
+            args.translation_max_output_acceleration_m_s2
+        ),
+        rotation_max_output_angular_acceleration_rad_s2=(
+            args.rotation_max_output_angular_acceleration_rad_s2
+        ),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     if not report["passed"]:

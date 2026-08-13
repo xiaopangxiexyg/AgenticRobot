@@ -291,6 +291,131 @@ def test_profile_compliance_abrupt_release_is_monotonic_and_slew_bounded() -> No
     ) <= 0.001 + 1e-12
 
 
+def test_profile_compliance_return_velocity_is_an_independent_final_bound() -> None:
+    controller = _controller(
+        _profile_compliance_config(
+            max_offset_m=(0.02, 0.02, 0.02),
+            max_velocity_m_s=(0.06, 0.06, 0.06),
+            max_return_velocity_m_s=(0.12, 0.12, 0.12),
+            max_output_slew_m_s=(0.06, 0.06, 0.06),
+            return_rate_s=100.0,
+        )
+    )
+    controller.rebase_realized_offset(
+        (0.01, 0.0, 0.0),
+        output_time_sec=1.0,
+    )
+
+    integrated = controller.step_new_sample(
+        _sample(source_time=1.05),
+        now_sec=1.05,
+    )
+    returned = controller.sample_output(now_sec=1.05)
+
+    assert integrated.passive_return_active is True
+    assert returned.passive_return_active is True
+    assert integrated.requested_offset_m[0] == pytest.approx(0.004)
+    assert returned.output_offset_m[0] == pytest.approx(0.004)
+    assert 0.01 - returned.output_offset_m[0] == pytest.approx(0.12 * 0.05)
+    assert 0.01 - returned.output_offset_m[0] > 0.06 * 0.05
+
+
+def test_output_follow_smooths_20hz_request_without_delayed_release_catchup() -> None:
+    controller = _controller(
+        _profile_compliance_config(output_follow_tau_sec=0.025)
+    )
+    controller.sample_output(now_sec=1.0 + 1.0 / 60.0)
+    controller.sample_output(now_sec=1.0 + 2.0 / 60.0)
+
+    integrated = controller.step_new_sample(
+        _sample(force=(0.70, 0.0, 0.0), source_time=1.05),
+        now_sec=1.05,
+    )
+    first = controller.sample_output(now_sec=1.05)
+    second = controller.sample_output(now_sec=1.05 + 1.0 / 60.0)
+
+    assert integrated.requested_offset_m[0] == pytest.approx(0.001)
+    assert 0.0 < first.output_offset_m[0] < integrated.requested_offset_m[0]
+    assert first.output_offset_m[0] < second.output_offset_m[0]
+    assert second.output_offset_m[0] < integrated.requested_offset_m[0]
+
+    released = controller.step_new_sample(
+        _sample(source_time=1.10),
+        now_sec=1.10,
+    )
+    before_release_output = second.output_offset_m[0]
+    after_release = controller.sample_output(now_sec=1.10)
+
+    assert released.passive_return_active is True
+    assert released.requested_offset_m[0] > before_release_output
+    # The lagging follower must not chase the old outward request after force
+    # removal; it holds until requested state has decayed inside the output.
+    assert after_release.output_offset_m[0] <= before_release_output + 1e-12
+
+
+def test_output_acceleration_limit_bounds_nonpassive_velocity_changes() -> None:
+    acceleration_limit = 1.2
+    controller = _controller(
+        _profile_compliance_config(
+            force_filter_tau_sec=0.0,
+            output_follow_tau_sec=0.025,
+            max_output_acceleration_m_s2=(acceleration_limit,) * 3,
+        )
+    )
+    outputs = [np.asarray(controller.snapshot(now_sec=1.0).output_offset_m)]
+    times = [1.0]
+    for tick in range(1, 13):
+        now = 1.0 + tick / 60.0
+        if tick % 3 == 0:
+            force = 5.0 if tick <= 6 else -5.0
+            controller.step_new_sample(
+                _sample(force=(force, 0.0, 0.0), source_time=now),
+                now_sec=now,
+            )
+        state = controller.sample_output(now_sec=now)
+        outputs.append(np.asarray(state.output_offset_m))
+        times.append(now)
+
+    output = np.asarray(outputs)
+    dt = np.diff(np.asarray(times))
+    velocity = np.diff(output, axis=0) / dt[:, None]
+    acceleration = np.diff(velocity, axis=0) / dt[1:, None]
+
+    assert np.max(np.linalg.norm(acceleration, axis=1)) <= (
+        acceleration_limit + 1e-9
+    )
+
+
+def test_output_acceleration_limit_never_preserves_outward_release_inertia() -> None:
+    controller = _controller(
+        _profile_compliance_config(
+            force_filter_tau_sec=0.0,
+            output_follow_tau_sec=0.025,
+            max_output_acceleration_m_s2=(0.6,) * 3,
+        )
+    )
+    for tick in range(1, 7):
+        now = 1.0 + tick / 60.0
+        if tick % 3 == 0:
+            controller.step_new_sample(
+                _sample(force=(5.0, 0.0, 0.0), source_time=now),
+                now_sec=now,
+            )
+        loaded = controller.sample_output(now_sec=now)
+    before_release = np.asarray(loaded.output_offset_m)
+
+    controller.step_new_sample(
+        _sample(source_time=1.15),
+        now_sec=1.15,
+    )
+    released = controller.sample_output(now_sec=1.15)
+    after_release = np.asarray(released.output_offset_m)
+
+    assert released.passive_return_active is True
+    assert np.all(np.abs(after_release) <= np.abs(before_release) + 1e-12)
+    assert np.linalg.norm(after_release) <= np.linalg.norm(before_release) + 1e-12
+
+
 def test_frame_transform_is_required_and_applied_explicitly() -> None:
     missing = _controller()
     missing_result = missing.step_new_sample(
@@ -510,6 +635,17 @@ def test_configuration_rejects_rotation_like_or_unsafe_values() -> None:
         CartesianAdmittanceConfig(force_sign=(1.0, 0.0, 1.0))
     with pytest.raises(ValueError, match="positive"):
         CartesianAdmittanceConfig(max_offset_m=(0.0, 0.01, 0.01))
+    with pytest.raises(ValueError, match="output_follow_tau_sec"):
+        CartesianAdmittanceConfig(output_follow_tau_sec=-0.1)
+    with pytest.raises(ValueError, match="max_output_acceleration_m_s2"):
+        CartesianAdmittanceConfig(
+            max_output_acceleration_m_s2=(-0.1, 0.0, 0.0)
+        )
+    with pytest.raises(ValueError, match="zero on every enabled axis"):
+        CartesianAdmittanceConfig(
+            enabled_axes=(True, True, False),
+            max_output_acceleration_m_s2=(1.2, 0.0, 0.0),
+        )
 
 
 def test_future_sample_and_output_clock_rollback_freeze() -> None:

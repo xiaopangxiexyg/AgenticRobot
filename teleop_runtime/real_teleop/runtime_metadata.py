@@ -135,6 +135,16 @@ def position_admittance_response_metadata(
                 if translation_config is None
                 else float(translation_config.force_filter_tau_sec)
             ),
+            "output_follow_tau_sec": (
+                None
+                if translation_config is None
+                else float(translation_config.output_follow_tau_sec)
+            ),
+            "max_output_acceleration_m_s2": (
+                None
+                if translation_config is None
+                else list(translation_config.max_output_acceleration_m_s2)
+            ),
             "physical_damping_n_s_m_applied": (
                 translation_physical_damping_applied
             ),
@@ -157,6 +167,18 @@ def position_admittance_response_metadata(
                 None
                 if rotational_config is None
                 else float(rotational_config.torque_filter_tau_sec)
+            ),
+            "output_follow_tau_sec": (
+                None
+                if rotational_config is None
+                else float(rotational_config.output_follow_tau_sec)
+            ),
+            "max_output_angular_acceleration_rad_s2": (
+                None
+                if rotational_config is None
+                else list(
+                    rotational_config.max_output_angular_acceleration_rad_s2
+                )
             ),
             "physical_damping_term_applied": False,
             "effective_config": (

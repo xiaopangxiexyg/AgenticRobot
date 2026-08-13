@@ -35,6 +35,8 @@ from robot_motion.position_control.rotational_admittance import (
 )
 from robot_motion.rm65.position_profile import (
     RM65_BIMANUAL_POSITION_V2_BALANCED,
+    RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1_NAME,
+    RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2_NAME,
     RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
     RM65_POSITION_CONTROL_PROFILE_CHOICES,
     resolve_rm65_bimanual_position_profile,
@@ -54,6 +56,7 @@ from sim.mujoco.control.desk_tcp_position import (
 )
 from sim.mujoco.scene import MujocoScene
 from teleop_runtime.real_teleop.position_admittance_shadow import (
+    POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX,
     POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
     POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
     POSITION_ADMITTANCE_ACTIVE_ENDPOINT_POLICY_FORMAL_TELEOP,
@@ -65,6 +68,7 @@ from teleop_runtime.real_teleop.position_admittance_shadow import (
     admitted_solver_world_poses_from_joint_command,
     install_position_admittance_active,
     position_admittance_active_uses_home_endpoint_guard,
+    position_admittance_final_translation_slew_ratio,
     validate_position_admittance_active_authority,
     validate_position_rotational_admittance_active_config,
 )
@@ -261,10 +265,14 @@ def _qcmd_dynamics(
     *,
     times_sec: Sequence[float],
     qcmd_by_side: Mapping[str, Sequence[np.ndarray]],
+    nominal_sample_hz: float,
 ) -> dict[str, dict[str, Any]]:
-    """Summarize the exact 120 Hz commands, including near-Nyquist chatter."""
+    """Summarize logical qcmd samples and quantized physical apply timing."""
 
     times = np.asarray(times_sec, dtype=float).reshape(-1)
+    nominal_hz = float(nominal_sample_hz)
+    if not math.isfinite(nominal_hz) or nominal_hz <= 0.0:
+        raise ValueError("qcmd nominal_sample_hz must be positive and finite")
     result: dict[str, dict[str, Any]] = {}
     for side in SIDES:
         qcmd = np.asarray(qcmd_by_side[side], dtype=float)
@@ -291,13 +299,22 @@ def _qcmd_dynamics(
         acceleration_deg = np.rad2deg(np.max(np.abs(acceleration), axis=1))
         jerk_deg = np.rad2deg(np.max(np.abs(jerk), axis=1))
 
-        sample_hz = float(1.0 / np.median(dt))
+        median_interval_hz = float(1.0 / np.median(dt))
+        effective_sample_hz = float((len(times) - 1) / (times[-1] - times[0]))
+        nominal_period_sec = 1.0 / nominal_hz
+        apply_interval_error_sec = dt - nominal_period_sec
         sample_index = np.arange(len(qcmd), dtype=float)
         design = np.column_stack((sample_index, np.ones_like(sample_index)))
         trend, *_ = np.linalg.lstsq(design, qcmd, rcond=None)
         detrended = qcmd - design @ trend
         power = np.abs(np.fft.rfft(detrended, axis=0)) ** 2
-        frequencies = np.fft.rfftfreq(len(qcmd), d=1.0 / sample_hz)
+        # The planner emits one logical sample per nominal command cut.  The
+        # MuJoCo actuator applies those samples on the first following physics
+        # tick, so 1000 Hz physics yields alternating 8/9 ms intervals.  Use
+        # the logical rate for spectrum bins and report application-time
+        # quantization separately; the inverse median interval (125 Hz here)
+        # is not the long-run command rate.
+        frequencies = np.fft.rfftfreq(len(qcmd), d=nominal_period_sec)
         total_mask = (frequencies >= 1.0) & (frequencies <= 60.0)
         band_mask = (frequencies >= 27.0) & (frequencies <= 30.0)
         total_by_joint = np.sum(power[total_mask], axis=0)
@@ -308,7 +325,14 @@ def _qcmd_dynamics(
         wrist_band = float(np.sum(band_by_joint[3:6]))
         result[side] = {
             "sample_count": int(len(times)),
-            "sample_hz": sample_hz,
+            "sample_hz": effective_sample_hz,
+            "nominal_sample_hz": nominal_hz,
+            "effective_sample_hz": effective_sample_hz,
+            "median_interval_hz": median_interval_hz,
+            "physical_apply_interval_sec": _stats(dt.tolist()),
+            "physical_apply_interval_error_sec": _stats(
+                apply_interval_error_sec.tolist()
+            ),
             "acceleration_deg_s2": _stats(acceleration_deg.tolist()),
             "jerk_deg_s3": _stats(jerk_deg.tolist()),
             "acceleration_by_joint_deg_s2": [
@@ -684,7 +708,11 @@ def _admittance_config_for_envelope(
         # translation-disabled Active configuration.  The production-named
         # branch is admitted again by the real Active installer below; the
         # offline-named branch retains the historical counterfactual bypass.
-        limits = OFFLINE_ACTIVE_ENVELOPES["normal_parity"]
+        limits = OFFLINE_ACTIVE_ENVELOPES[
+            "normal_parity_release_braked"
+            if envelope == PRODUCTION_NORMAL_PARITY_ENVELOPE
+            else "normal_parity"
+        ]
 
         def vector(name: str) -> tuple[float, float, float]:
             value = float(limits[name])
@@ -697,6 +725,11 @@ def _admittance_config_for_envelope(
             max_velocity_m_s=vector("max_velocity_m_s"),
             max_return_velocity_m_s=vector("max_return_velocity_m_s"),
             max_output_slew_m_s=vector("max_output_slew_m_s"),
+            return_rate_s=(
+                4.0
+                if envelope == PRODUCTION_NORMAL_PARITY_ENVELOPE
+                else recorded.return_rate_s
+            ),
         )
     raise ValueError(
         "admittance_envelope must be cautious-active, recorded-shadow, "
@@ -1068,6 +1101,9 @@ def _physical_rollout(
     timing_jitter_sec: list[float] = []
     active_offsets: list[float] = []
     active_slew_ratios: list[float] = []
+    active_return_slew_ratios: list[float] = []
+    active_standard_slew_ratios: list[float] = []
+    passive_return_direction_mismatch_ticks = 0
     active_rotation_offsets: list[float] = []
     active_rotation_slew_ratios: list[float] = []
     previous_offset = np.zeros(3, dtype=float)
@@ -1089,6 +1125,8 @@ def _physical_rollout(
     status_counts: Counter[str] = Counter()
     admittance_micro_reversal_hold_ticks: Counter[str] = Counter()
     admittance_micro_reversal_held_joints: Counter[str] = Counter()
+    admittance_micro_reversal_soften_ticks: Counter[str] = Counter()
+    admittance_micro_reversal_softened_joints: Counter[str] = Counter()
     model_errors: list[dict[str, Any]] = []
     endpoint_excursions_m: list[float] = []
     endpoint_dispatched_excursions_m: list[float] = []
@@ -1235,6 +1273,22 @@ def _physical_rollout(
                     held_joint_count > 0
                 )
                 admittance_micro_reversal_held_joints[side] += held_joint_count
+                softened_joint_indices = admittance_fast_path.get(
+                    "micro_reversal_softened_joint_indices",
+                    (),
+                )
+                softened_joint_count = (
+                    len(softened_joint_indices)
+                    if isinstance(softened_joint_indices, Sequence)
+                    and not isinstance(softened_joint_indices, (str, bytes))
+                    else 0
+                )
+                admittance_micro_reversal_soften_ticks[side] += int(
+                    softened_joint_count > 0
+                )
+                admittance_micro_reversal_softened_joints[side] += (
+                    softened_joint_count
+                )
             qref_step_ratios.append(
                 max(
                     float(
@@ -1320,12 +1374,26 @@ def _physical_rollout(
                     modifier_nonzero and selected_qref_step > 1e-12
                 )
                 observer_dt = now - previous_observer_time
-                slew_limit = float(max(config.max_output_slew_m_s)) * max(
-                    observer_dt,
-                    1e-12,
+                passive_return_active = bool(
+                    snapshot.get("passive_return_active")
                 )
-                active_slew_ratios.append(
-                    float(np.linalg.norm(offset - previous_offset)) / slew_limit
+                slew_ratio, returning_to_zero = (
+                    position_admittance_final_translation_slew_ratio(
+                        config,
+                        previous_offset_m=previous_offset,
+                        candidate_offset_m=offset,
+                        passive_return_active=passive_return_active,
+                        dt_sec=max(observer_dt, 1e-12),
+                    )
+                )
+                active_slew_ratios.append(slew_ratio)
+                (
+                    active_return_slew_ratios
+                    if returning_to_zero
+                    else active_standard_slew_ratios
+                ).append(slew_ratio)
+                passive_return_direction_mismatch_ticks += int(
+                    passive_return_active and not returning_to_zero
                 )
                 if rotational_config is not None:
                     rotation_motion_step = float(
@@ -1510,6 +1578,7 @@ def _physical_rollout(
     qcmd_dynamics = _qcmd_dynamics(
         times_sec=qcmd_command_times,
         qcmd_by_side=qcmd_command_samples,
+        nominal_sample_hz=timing.command_hz,
     )
     report = {
         "name": name,
@@ -1567,6 +1636,11 @@ def _physical_rollout(
         "active_offset_norm_m": _stats(active_offsets),
         "final_active_offset_m": final_active_offset,
         "active_slew_ratio": _stats(active_slew_ratios),
+        "active_return_slew_ratio": _stats(active_return_slew_ratios),
+        "active_standard_slew_ratio": _stats(active_standard_slew_ratios),
+        "passive_return_direction_mismatch_ticks": int(
+            passive_return_direction_mismatch_ticks
+        ),
         "active_rotation_offset_norm_rad": _stats(active_rotation_offsets),
         "final_active_rotation_offset_rad": final_active_rotation,
         "active_rotation_slew_ratio": _stats(active_rotation_slew_ratios),
@@ -1604,6 +1678,14 @@ def _physical_rollout(
         },
         "admittance_micro_reversal_held_joints_by_side": {
             side: int(admittance_micro_reversal_held_joints[side])
+            for side in SIDES
+        },
+        "admittance_micro_reversal_soften_ticks_by_side": {
+            side: int(admittance_micro_reversal_soften_ticks[side])
+            for side in SIDES
+        },
+        "admittance_micro_reversal_softened_joints_by_side": {
+            side: int(admittance_micro_reversal_softened_joints[side])
             for side in SIDES
         },
         "checks": {
@@ -1705,6 +1787,9 @@ def _physical_rollout(
                 ),
                 "micro_reversal_hold_deg": float(
                     retargeter.config.output_qpos_admittance_micro_reversal_hold_deg
+                ),
+                "micro_reversal_creep_deg": float(
+                    retargeter.config.output_qpos_admittance_micro_reversal_creep_deg
                 ),
                 "requested_alpha": (
                     None
@@ -1883,6 +1968,36 @@ def _compare_rollouts(
     max_selected_translation = _finite_max(selected_translation)
     max_selected_rotation = _finite_max(selected_rotation)
     max_opposite_qpos = _finite_max(opposite_qpos)
+    opposite_raw_target_translation_m = [
+        float(
+            np.linalg.norm(
+                pose[:3, 3]
+                - baseline.raw_target_pose[opposite_side][0][:3, 3]
+            )
+        )
+        for pose in baseline.raw_target_pose[opposite_side]
+    ]
+    opposite_raw_target_rotation_deg = [
+        _rotation_error_deg(
+            baseline.raw_target_pose[opposite_side][0][:3, :3],
+            pose[:3, :3],
+        )
+        for pose in baseline.raw_target_pose[opposite_side]
+    ]
+    max_opposite_raw_target_translation_m = _finite_max(
+        opposite_raw_target_translation_m
+    )
+    max_opposite_raw_target_rotation_deg = _finite_max(
+        opposite_raw_target_rotation_deg
+    )
+    opposite_fixed_gate_applicable = bool(
+        max_opposite_raw_target_translation_m is not None
+        and max_opposite_raw_target_translation_m
+        <= MUJOCO_FRAME_TRANSLATION_TOLERANCE_M
+        and max_opposite_raw_target_rotation_deg is not None
+        and max_opposite_raw_target_rotation_deg
+        <= MUJOCO_FRAME_ROTATION_TOLERANCE_DEG
+    )
     nonzero_physical_ticks = sum(
         translation > 1e-6 or rotation > 1e-4
         for translation, rotation in zip(
@@ -1904,6 +2019,10 @@ def _compare_rollouts(
     translation_modifier_present = any(
         float(np.linalg.norm(value)) > 1e-9
         for value in candidate.active_offset_m
+    )
+    rotation_modifier_present = any(
+        float(np.linalg.norm(value)) > 1e-9
+        for value in candidate.active_rotation_rotvec_rad
     )
     rotation_release_transients = (
         None
@@ -1930,8 +2049,14 @@ def _compare_rollouts(
         ),
         "opposite_side_counterfactual_fixed": bool(
             completed
-            and max_opposite_qpos is not None
-            and max_opposite_qpos <= MUJOCO_FIXED_SIDE_COUNTERFACTUAL_LIMIT_RAD
+            and (
+                not opposite_fixed_gate_applicable
+                or (
+                    max_opposite_qpos is not None
+                    and max_opposite_qpos
+                    <= MUJOCO_FIXED_SIDE_COUNTERFACTUAL_LIMIT_RAD
+                )
+            )
         ),
         "zero_force_release_rejoins_baseline": bool(
             completed
@@ -1953,7 +2078,10 @@ def _compare_rollouts(
             completed
             and (
                 True
-                if rotation_release_transients is None
+                if (
+                    rotation_release_transients is None
+                    or not rotation_modifier_present
+                )
                 else rotation_release_transients["passed"]
             )
         ),
@@ -1994,8 +2122,22 @@ def _compare_rollouts(
         "opposite_measured_qpos_delta_rad": _stats(opposite_qpos),
         "opposite_qref_delta_rad": _stats(opposite_qref),
         "opposite_qcmd_delta_rad": _stats(opposite_qcmd),
+        "opposite_fixed_gate_applicable": opposite_fixed_gate_applicable,
+        "opposite_raw_target_translation_m": _stats(
+            opposite_raw_target_translation_m
+        ),
+        "opposite_raw_target_rotation_deg": _stats(
+            opposite_raw_target_rotation_deg
+        ),
         "force_release_transients": release_transients,
         "torque_release_transients": rotation_release_transients,
+        "release_gate_applicability": {
+            "force": bool(translation_modifier_present),
+            "torque": bool(
+                release_torque_deadband_nm is not None
+                and rotation_modifier_present
+            ),
+        },
         "release_counterfactual_baselines": {
             "force": (
                 baseline.name
@@ -2074,7 +2216,11 @@ def _recorded_input_contract(
                 "name"
             )
         )
-        == RM65_BIMANUAL_POSITION_V2_BALANCED_NAME
+        in {
+            RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+            RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V1_NAME,
+            RM65_BIMANUAL_POSITION_V2_BALANCED_60HZ_JERK_V2_NAME,
+        }
     )
     return passed, accepted_modes
 
@@ -2096,6 +2242,12 @@ def _replay_recorded_wrench_through_mujoco_evaluation(
     combined_translation_rotation_active: bool = False,
     endpoint_policy: str = POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
     position_execution_profile_name: str = RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+    translation_filter_tau_sec: float | None = None,
+    rotation_filter_tau_sec: float | None = None,
+    translation_output_follow_tau_sec: float | None = None,
+    rotation_output_follow_tau_sec: float | None = None,
+    translation_max_output_acceleration_m_s2: float | None = None,
+    rotation_max_output_angular_acceleration_rad_s2: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, _PhysicalRollout]]:
     """Run both physical branches and retain the trajectory evidence."""
 
@@ -2127,6 +2279,51 @@ def _replay_recorded_wrench_through_mujoco_evaluation(
     if combined_translation_rotation_active and rotational_config is None:
         raise ValueError(
             "combined translation and rotation replay requires rotational_config"
+        )
+    for name, value in (
+        ("translation_filter_tau_sec", translation_filter_tau_sec),
+        ("rotation_filter_tau_sec", rotation_filter_tau_sec),
+        ("translation_output_follow_tau_sec", translation_output_follow_tau_sec),
+        ("rotation_output_follow_tau_sec", rotation_output_follow_tau_sec),
+    ):
+        if value is not None and (
+            not math.isfinite(float(value))
+            or float(value) < 0.0
+            or float(value)
+            > POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX + 1e-12
+        ):
+            raise ValueError(
+                f"{name} must be finite and within [0, "
+                f"{POSITION_ADMITTANCE_ACTIVE_OUTPUT_FOLLOW_TAU_SEC_MAX:g}]"
+            )
+    if (
+        rotation_filter_tau_sec is not None
+        or rotation_output_follow_tau_sec is not None
+    ) and rotational_config is None:
+        raise ValueError(
+            "rotation filter/output tau requires rotational_config"
+        )
+    for name, value in (
+        (
+            "translation_max_output_acceleration_m_s2",
+            translation_max_output_acceleration_m_s2,
+        ),
+        (
+            "rotation_max_output_angular_acceleration_rad_s2",
+            rotation_max_output_angular_acceleration_rad_s2,
+        ),
+    ):
+        if value is not None and (
+            not math.isfinite(float(value)) or float(value) < 0.0
+        ):
+            raise ValueError(f"{name} must be finite and non-negative")
+    if (
+        rotation_max_output_angular_acceleration_rad_s2 is not None
+        and rotational_config is None
+    ):
+        raise ValueError(
+            "rotation_max_output_angular_acceleration_rad_s2 requires "
+            "rotational_config"
         )
     position_admittance_active_uses_home_endpoint_guard(endpoint_policy)
     modes = tuple(str(mode).strip().lower() for mode in interpolation_modes)
@@ -2163,7 +2360,29 @@ def _replay_recorded_wrench_through_mujoco_evaluation(
 
     log_path = _resolve_log(Path(path))
     rows = _read_mujoco_rows(log_path)
-    frames = _frame_rows(rows)
+    recorded_frames = _frame_rows(rows)
+    frames: list[Mapping[str, Any]] = []
+    cached_snapshot_frames = 0
+    previous_observed_at: float | None = None
+    previous_admittance: object = None
+    for frame_index, frame in enumerate(recorded_frames):
+        left_payload = _frame_payload(frame, side="left")
+        observed_at = float(left_payload.get("observed_at_monotonic_sec"))
+        admittance_snapshot = frame.get("position_admittance")
+        if (
+            previous_observed_at is not None
+            and observed_at == previous_observed_at
+        ):
+            if admittance_snapshot != previous_admittance:
+                raise ValueError(
+                    "cached frame changed position admittance without a newer "
+                    f"observation at frame {frame_index}"
+                )
+            cached_snapshot_frames += 1
+            continue
+        frames.append(frame)
+        previous_observed_at = observed_at
+        previous_admittance = admittance_snapshot
     if not frames:
         raise ValueError("MuJoCo replay requires action-debug frames")
     receipt = _position_admittance_receipt(rows)
@@ -2175,7 +2394,43 @@ def _replay_recorded_wrench_through_mujoco_evaluation(
         recorded_admittance_config,
         admittance_envelope=envelope,
     )
+    if translation_filter_tau_sec is not None:
+        config = replace(
+            config,
+            force_filter_tau_sec=float(translation_filter_tau_sec),
+        )
+    if translation_output_follow_tau_sec is not None:
+        config = replace(
+            config,
+            output_follow_tau_sec=float(translation_output_follow_tau_sec),
+        )
+    if translation_max_output_acceleration_m_s2 is not None:
+        config = replace(
+            config,
+            max_output_acceleration_m_s2=(
+                float(translation_max_output_acceleration_m_s2),
+            )
+            * 3,
+        )
     if rotational_config is not None:
+        if rotation_filter_tau_sec is not None:
+            rotational_config = replace(
+                rotational_config,
+                torque_filter_tau_sec=float(rotation_filter_tau_sec),
+            )
+        if rotation_output_follow_tau_sec is not None:
+            rotational_config = replace(
+                rotational_config,
+                output_follow_tau_sec=float(rotation_output_follow_tau_sec),
+            )
+        if rotation_max_output_angular_acceleration_rad_s2 is not None:
+            rotational_config = replace(
+                rotational_config,
+                max_output_angular_acceleration_rad_s2=(
+                    float(rotation_max_output_angular_acceleration_rad_s2),
+                )
+                * 3,
+            )
         rotational_config_is_production = True
         if envelope == PRODUCTION_NORMAL_PARITY_ENVELOPE:
             validate_position_admittance_active_authority(
@@ -2491,7 +2746,9 @@ def _replay_recorded_wrench_through_mujoco_evaluation(
         "path": str(log_path),
         "side": selected_side,
         "input": {
+            "recorded_frame_count": len(recorded_frames),
             "frame_count": len(frames),
+            "collapsed_cached_snapshot_frames": cached_snapshot_frames,
             "recorded_duration_sec": float(frame_times[-1] - frame_times[0]),
             "sampled_action_debug_hz_median": sampled_hz,
             "recorded_position_profile": _mapping(
@@ -2573,6 +2830,12 @@ def replay_recorded_wrench_through_mujoco(
     combined_translation_rotation_active: bool = False,
     endpoint_policy: str = POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
     position_execution_profile_name: str = RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+    translation_filter_tau_sec: float | None = None,
+    rotation_filter_tau_sec: float | None = None,
+    translation_output_follow_tau_sec: float | None = None,
+    rotation_output_follow_tau_sec: float | None = None,
+    translation_max_output_acceleration_m_s2: float | None = None,
+    rotation_max_output_angular_acceleration_rad_s2: float | None = None,
 ) -> dict[str, Any]:
     """Run baseline and production-Active candidates through physical MuJoCo."""
 
@@ -2594,6 +2857,18 @@ def replay_recorded_wrench_through_mujoco(
         ),
         endpoint_policy=endpoint_policy,
         position_execution_profile_name=position_execution_profile_name,
+        translation_filter_tau_sec=translation_filter_tau_sec,
+        rotation_filter_tau_sec=rotation_filter_tau_sec,
+        translation_output_follow_tau_sec=(
+            translation_output_follow_tau_sec
+        ),
+        rotation_output_follow_tau_sec=rotation_output_follow_tau_sec,
+        translation_max_output_acceleration_m_s2=(
+            translation_max_output_acceleration_m_s2
+        ),
+        rotation_max_output_angular_acceleration_rad_s2=(
+            rotation_max_output_angular_acceleration_rad_s2
+        ),
     )
     return report
 
@@ -2638,6 +2913,18 @@ def main() -> None:
         ),
         default=RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
     )
+    parser.add_argument(
+        "--translation-output-follow-tau-sec",
+        type=float,
+        default=None,
+        help="Optional offline/Active-valid 60 Hz translation output follower.",
+    )
+    parser.add_argument(
+        "--translation-max-output-acceleration-m-s2",
+        type=float,
+        default=None,
+        help="Optional 60 Hz translation modifier acceleration limit.",
+    )
     args = parser.parse_args()
     modes = ("zoh", "linear") if args.interpolation == "both" else (args.interpolation,)
     report = replay_recorded_wrench_through_mujoco(
@@ -2651,6 +2938,12 @@ def main() -> None:
         right_tool_profile=args.right_tool_profile,
         simulation_contract_path=args.simulation_contract,
         position_execution_profile_name=args.position_execution_profile,
+        translation_output_follow_tau_sec=(
+            args.translation_output_follow_tau_sec
+        ),
+        translation_max_output_acceleration_m_s2=(
+            args.translation_max_output_acceleration_m_s2
+        ),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     if not report["passed"]:

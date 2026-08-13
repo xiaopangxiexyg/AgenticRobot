@@ -126,6 +126,12 @@ class RotationalAdmittanceConfig:
     stiffness_nm_rad: tuple[float, float, float] = (10.0, 10.0, 10.0)
     torque_deadband_nm: tuple[float, float, float] = (0.04, 0.04, 0.04)
     torque_filter_tau_sec: float = 0.0
+    output_follow_tau_sec: float = 0.0
+    max_output_angular_acceleration_rad_s2: tuple[float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+    )
     torque_sign: tuple[float, float, float] = (1.0, 1.0, 1.0)
     max_offset_rad: tuple[float, float, float] = (0.01, 0.01, 0.01)
     max_velocity_rad_s: tuple[float, float, float] = (0.02, 0.02, 0.02)
@@ -161,11 +167,27 @@ class RotationalAdmittanceConfig:
         for name in (
             "torque_deadband_nm",
             "return_torque_deadband_nm",
+            "max_output_angular_acceleration_rad_s2",
         ):
             object.__setattr__(
                 self,
                 name,
                 _nonnegative_vector(getattr(self, name), name=name),
+            )
+        acceleration = np.asarray(
+            self.max_output_angular_acceleration_rad_s2,
+            dtype=float,
+        )
+        enabled = np.asarray(self.enabled_axes, dtype=bool)
+        enabled_acceleration = acceleration[enabled]
+        if (
+            enabled_acceleration.size
+            and np.any(enabled_acceleration > 0.0)
+            and np.any(enabled_acceleration == 0.0)
+        ):
+            raise ValueError(
+                "max_output_angular_acceleration_rad_s2 must be zero on every "
+                "enabled axis (disabled) or positive on every enabled axis"
             )
         signs = _finite_vector(self.torque_sign, size=3, name="torque_sign")
         if np.any(np.abs(signs) != 1.0):
@@ -184,7 +206,11 @@ class RotationalAdmittanceConfig:
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive")
             object.__setattr__(self, name, value)
-        for name in ("torque_filter_tau_sec", "return_rate_s"):
+        for name in (
+            "torque_filter_tau_sec",
+            "output_follow_tau_sec",
+            "return_rate_s",
+        ):
             value = _finite_time(getattr(self, name), name=name)
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative")
@@ -215,6 +241,7 @@ class BoundedRotationalAdmittance:
         self._requested = np.zeros(3, dtype=float)
         self._output = np.zeros(3, dtype=float)
         self._velocity = np.zeros(3, dtype=float)
+        self._output_velocity = np.zeros(3, dtype=float)
         self._tare_values: np.ndarray | None = None
         self._tare_frame: str | None = None
         self._tare_generation: int | None = None
@@ -228,6 +255,7 @@ class BoundedRotationalAdmittance:
         self._deadbanded_torque = np.zeros(3, dtype=float)
         self._filtered_torque = np.zeros(3, dtype=float)
         self._filter_initialized = False
+        self._passive_return_active = False
 
     @property
     def enabled(self) -> bool:
@@ -242,6 +270,7 @@ class BoundedRotationalAdmittance:
         self._requested.fill(0.0)
         self._output.fill(0.0)
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
         self._tare_values = np.asarray(tare_sample.values_n_nm, dtype=float)
         self._tare_frame = tare_sample.frame
         self._tare_generation = tare_sample.tare_generation
@@ -259,13 +288,16 @@ class BoundedRotationalAdmittance:
         self._deadbanded_torque.fill(0.0)
         self._filtered_torque.fill(0.0)
         self._filter_initialized = False
+        self._passive_return_active = False
         return self.snapshot(now_sec=output_time_sec)
 
     def freeze(self, reason: str) -> None:
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
         self._deadbanded_torque.fill(0.0)
         self._filtered_torque.fill(0.0)
         self._filter_initialized = False
+        self._passive_return_active = False
         self._frozen = True
         self._reason = str(reason).strip() or "frozen"
         self._new_sample_integrated = False
@@ -278,9 +310,11 @@ class BoundedRotationalAdmittance:
         self._last_sample_identity = None
         self._last_sample_source_time = None
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
         self._deadbanded_torque.fill(0.0)
         self._filtered_torque.fill(0.0)
         self._filter_initialized = False
+        self._passive_return_active = False
         self._frozen = False
         self._reason = "resumed_awaiting_sample"
 
@@ -306,6 +340,8 @@ class BoundedRotationalAdmittance:
             self._requested = value.copy()
         self._output = value.copy()
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
+        self._passive_return_active = False
         if output_time is not None:
             self._last_output_time = output_time
         self._reason = "realized_rebase"
@@ -395,6 +431,7 @@ class BoundedRotationalAdmittance:
         self._deadbanded_torque = deadbanded
         self._filtered_torque = filtered
         self._filter_initialized = True
+        self._passive_return_active = passive_return
 
     def step_new_sample(
         self,
@@ -510,16 +547,77 @@ class BoundedRotationalAdmittance:
 
         dt = now - self._last_output_time
         enabled = np.asarray(self.config.enabled_axes, dtype=bool)
+        output_target = self._requested
+        if (
+            self.config.output_follow_tau_sec > 0.0
+            and self._passive_return_active
+        ):
+            output_target = np.zeros(3, dtype=float)
+            for axis in range(3):
+                if not enabled[axis] or abs(self._output[axis]) <= 1e-15:
+                    continue
+                requested = self._requested[axis]
+                current = self._output[axis]
+                if requested * current > 0.0:
+                    output_target[axis] = math.copysign(
+                        min(abs(requested), abs(current)),
+                        current,
+                    )
+        raw_delta = output_target - self._output
+        if self.config.output_follow_tau_sec > 0.0:
+            raw_delta = raw_delta * (
+                1.0 - math.exp(-dt / self.config.output_follow_tau_sec)
+            )
         delta = _clamp_rotvec_bound(
-            self._requested - self._output,
+            raw_delta,
             component_limits=np.asarray(self.config.max_output_slew_rad_s) * dt,
             enabled_axes=enabled,
         )
-        self._output = _clamp_rotvec_bound(
+        acceleration_limit = np.asarray(
+            self.config.max_output_angular_acceleration_rad_s2,
+            dtype=float,
+        )
+        if np.any(acceleration_limit[enabled] > 0.0):
+            desired_velocity = delta / dt
+            velocity_delta = _clamp_rotvec_bound(
+                desired_velocity - self._output_velocity,
+                component_limits=acceleration_limit * dt,
+                enabled_axes=enabled,
+            )
+            output_velocity = _clamp_rotvec_bound(
+                self._output_velocity + velocity_delta,
+                component_limits=np.asarray(
+                    self.config.max_output_slew_rad_s,
+                    dtype=float,
+                ),
+                enabled_axes=enabled,
+            )
+            delta = output_velocity * dt
+        previous_output = self._output.copy()
+        candidate_output = _clamp_rotvec_bound(
             self._output + delta,
             component_limits=np.asarray(self.config.max_offset_rad, dtype=float),
             enabled_axes=enabled,
         )
+        if (
+            np.any(acceleration_limit[enabled] > 0.0)
+            and self._passive_return_active
+        ):
+            candidate_output = np.where(
+                candidate_output * previous_output > 0.0,
+                np.sign(previous_output)
+                * np.minimum(
+                    np.abs(candidate_output),
+                    np.abs(previous_output),
+                ),
+                0.0,
+            )
+            if float(np.linalg.norm(candidate_output)) > float(
+                np.linalg.norm(previous_output)
+            ):
+                candidate_output = previous_output
+        self._output = candidate_output
+        self._output_velocity = (self._output - previous_output) / dt
         self._last_output_time = now
         self._reason = "output_sampled"
         return self.snapshot(now_sec=now)

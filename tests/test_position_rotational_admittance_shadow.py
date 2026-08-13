@@ -57,8 +57,9 @@ def _translation_disabled() -> CartesianAdmittanceConfig:
         response_model="profile_compliance",
         max_offset_m=(0.08, 0.08, 0.08),
         max_velocity_m_s=(0.06, 0.06, 0.06),
-        max_return_velocity_m_s=(0.03, 0.03, 0.03),
+        max_return_velocity_m_s=(0.42, 0.42, 0.42),
         max_output_slew_m_s=(0.06, 0.06, 0.06),
+        return_rate_s=4.0,
         stale_after_sec=0.15,
         max_force_dt_sec=0.15,
     )
@@ -392,8 +393,14 @@ def test_production_active_installer_admits_normal_parity_combined_5deg(
         side = observer.snapshot(now_sec=now)["sides"]["left"]
         translation = np.asarray(side["applied_total_offset_m"], dtype=float)
         rotation = np.asarray(side["applied_rotation_rotvec_rad"], dtype=float)
+        returning_to_zero = bool(
+            side["passive_return_active"]
+            and np.all(np.abs(translation) <= np.abs(previous_translation) + 1e-9)
+            and np.linalg.norm(translation)
+            <= np.linalg.norm(previous_translation) + 1e-9
+        )
         assert np.linalg.norm(translation - previous_translation) <= (
-            0.06 * 0.05 + 1e-9
+            (0.42 if returning_to_zero else 0.06) * 0.05 + 1e-9
         )
         assert np.linalg.norm(rotation - previous_rotation) <= (
             np.deg2rad(maximum_slew_deg_s) * 0.05 + 1e-9

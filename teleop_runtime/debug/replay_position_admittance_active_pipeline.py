@@ -25,6 +25,7 @@ from teleop_runtime.real_teleop.position_admittance_shadow import (
     POSITION_ADMITTANCE_ACTIVE_MAX_STALE_SEC,
     PositionAdmittanceShadowTargetFilter,
     admitted_solver_world_poses_from_joint_command,
+    position_admittance_final_translation_slew_ratio,
 )
 
 from .replay_position_admittance_ik_trace import (
@@ -71,6 +72,12 @@ OFFLINE_ACTIVE_ENVELOPES = {
         "max_offset_m": 0.08,
         "max_velocity_m_s": 0.06,
         "max_return_velocity_m_s": 0.03,
+        "max_output_slew_m_s": 0.06,
+    },
+    "normal_parity_release_braked": {
+        "max_offset_m": 0.08,
+        "max_velocity_m_s": 0.06,
+        "max_return_velocity_m_s": 0.42,
         "max_output_slew_m_s": 0.06,
     },
 }
@@ -372,6 +379,9 @@ def _active_rollout(
     }
     offsets: list[float] = []
     offset_slew_ratios: list[float] = []
+    return_offset_slew_ratios: list[float] = []
+    standard_offset_slew_ratios: list[float] = []
+    passive_return_direction_mismatch_ticks = 0
     joint_step_ratios: list[float] = []
     target_translation_residuals: list[float] = []
     target_rotation_residuals: list[float] = []
@@ -500,11 +510,24 @@ def _active_rollout(
         active_motion_tick_count += int(
             offset_norm > 1e-12 and selected_qpos_step > 1e-12
         )
-        slew_limit = float(max(config.max_output_slew_m_s)) * tick_period
-        offset_slew_ratios.append(
-            0.0
-            if slew_limit <= 0.0
-            else float(np.linalg.norm(offset - previous_offset)) / slew_limit
+        passive_return_active = bool(snapshot.get("passive_return_active"))
+        slew_ratio, returning_to_zero = (
+            position_admittance_final_translation_slew_ratio(
+                config,
+                previous_offset_m=previous_offset,
+                candidate_offset_m=offset,
+                passive_return_active=passive_return_active,
+                dt_sec=tick_period,
+            )
+        )
+        offset_slew_ratios.append(slew_ratio)
+        (
+            return_offset_slew_ratios
+            if returning_to_zero
+            else standard_offset_slew_ratios
+        ).append(slew_ratio)
+        passive_return_direction_mismatch_ticks += int(
+            passive_return_active and not returning_to_zero
         )
         previous_offset = offset
         anchor = _vector(
@@ -622,6 +645,17 @@ def _active_rollout(
                 "max_offset_m": max(offsets) if offsets else None,
                 "offset_limit_m": max_offset,
                 "max_slew_ratio": max(offset_slew_ratios, default=None),
+                "max_return_slew_ratio": max(
+                    return_offset_slew_ratios,
+                    default=None,
+                ),
+                "max_standard_slew_ratio": max(
+                    standard_offset_slew_ratios,
+                    default=None,
+                ),
+                "passive_return_direction_mismatch_ticks": (
+                    passive_return_direction_mismatch_ticks
+                ),
                 "max_anchor_norm_m": max_anchor_norm_m,
                 "state_update_count": state_update_count,
             },
@@ -683,6 +717,11 @@ def _active_rollout(
         "model_errors": model_errors,
         "offset_norm_m": _stats(offsets),
         "offset_slew_ratio": _stats(offset_slew_ratios),
+        "return_offset_slew_ratio": _stats(return_offset_slew_ratios),
+        "standard_offset_slew_ratio": _stats(standard_offset_slew_ratios),
+        "passive_return_direction_mismatch_ticks": (
+            passive_return_direction_mismatch_ticks
+        ),
         "joint_step_ratio": _stats(joint_step_ratios),
         "nominal_translation_residual_m": _stats(nominal_residuals),
         "modifier_tracking_residual_m": _stats(

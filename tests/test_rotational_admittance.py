@@ -103,6 +103,72 @@ def test_new_20hz_torque_sample_is_integrated_only_once_across_60hz_reads() -> N
     assert read_two.requested_rotvec_rad == first.requested_rotvec_rad
 
 
+def test_rotation_output_follow_is_continuous_and_never_catches_up_after_release() -> None:
+    controller = _controller(
+        _config(
+            torque_filter_tau_sec=0.0,
+            output_follow_tau_sec=0.025,
+        )
+    )
+    controller.sample_output(now_sec=1.0 + 1.0 / 60.0)
+    controller.sample_output(now_sec=1.0 + 2.0 / 60.0)
+
+    integrated = controller.step_new_sample(
+        _sample(torque=(0.05, 0.0, 0.0), source_time=1.05),
+        now_sec=1.05,
+        rotation_control_from_sample=np.eye(3),
+    )
+    first = controller.sample_output(now_sec=1.05)
+    second = controller.sample_output(now_sec=1.05 + 1.0 / 60.0)
+
+    assert integrated.requested_rotvec_rad[0] == pytest.approx(0.001)
+    assert 0.0 < first.output_rotvec_rad[0] < integrated.requested_rotvec_rad[0]
+    assert first.output_rotvec_rad[0] < second.output_rotvec_rad[0]
+    assert second.output_rotvec_rad[0] < integrated.requested_rotvec_rad[0]
+
+    controller.step_new_sample(
+        _sample(source_time=1.10),
+        now_sec=1.10,
+        rotation_control_from_sample=np.eye(3),
+    )
+    after_release = controller.sample_output(now_sec=1.10)
+    assert after_release.output_rotvec_rad[0] <= second.output_rotvec_rad[0] + 1e-12
+
+
+def test_rotation_output_acceleration_limit_bounds_nonpassive_velocity_changes() -> None:
+    acceleration_limit = 3.0
+    controller = _controller(
+        _config(
+            torque_filter_tau_sec=0.0,
+            output_follow_tau_sec=0.025,
+            max_output_angular_acceleration_rad_s2=(acceleration_limit,) * 3,
+        )
+    )
+    outputs = [np.asarray(controller.snapshot(now_sec=1.0).output_rotvec_rad)]
+    times = [1.0]
+    for tick in range(1, 13):
+        now = 1.0 + tick / 60.0
+        if tick % 3 == 0:
+            torque = 1.0 if tick <= 6 else -1.0
+            controller.step_new_sample(
+                _sample(torque=(torque, 0.0, 0.0), source_time=now),
+                now_sec=now,
+                rotation_control_from_sample=np.eye(3),
+            )
+        state = controller.sample_output(now_sec=now)
+        outputs.append(np.asarray(state.output_rotvec_rad))
+        times.append(now)
+
+    output = np.asarray(outputs)
+    dt = np.diff(np.asarray(times))
+    velocity = np.diff(output, axis=0) / dt[:, None]
+    acceleration = np.diff(velocity, axis=0) / dt[1:, None]
+
+    assert np.max(np.linalg.norm(acceleration, axis=1)) <= (
+        acceleration_limit + 1e-9
+    )
+
+
 def test_tool_torque_is_rotated_into_control_frame_before_deadband() -> None:
     controller = _controller(
         _config(
@@ -298,6 +364,12 @@ def test_rotation_composition_is_world_frame_so3_not_euler_addition() -> None:
         {"torque_sign": (1.0, 0.0, 1.0)},
         {"max_offset_rad": (0.0, 0.1, 0.1)},
         {"torque_deadband_nm": (-0.1, 0.0, 0.0)},
+        {"output_follow_tau_sec": -0.1},
+        {"max_output_angular_acceleration_rad_s2": (-0.1, 0.0, 0.0)},
+        {
+            "enabled_axes": (True, True, True),
+            "max_output_angular_acceleration_rad_s2": (3.0, 0.0, 3.0),
+        },
     ],
 )
 def test_invalid_config_fails_closed(kwargs: dict[str, object]) -> None:

@@ -20,6 +20,7 @@ import numpy as np
 
 from robot_motion.rm65.position_profile import (
     RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
+    RM65_POSITION_CONTROL_PROFILE_CHOICES,
 )
 from sim.contracts import SimulationContract
 from sim.mujoco.control.desk_tcp_position import (
@@ -428,6 +429,9 @@ def _playback_indices(
 def _compact_report(report: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
     comparison = report["comparisons"][mode]
     active = report["rollouts"][f"{mode}_active"]
+    selected_translation = comparison.get("selected_measured_translation_m") or {}
+    selected_rotation = comparison.get("selected_measured_rotation_deg") or {}
+    opposite_qpos = comparison.get("opposite_measured_qpos_delta_rad") or {}
     return {
         "path": report["path"],
         "mode": mode,
@@ -457,15 +461,10 @@ def _compact_report(report: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
             )
         ),
         "active_qref_motion_ticks": active["active_qref_motion_ticks"],
-        "measured_endpoint_delta_max_m": comparison[
-            "selected_measured_translation_m"
-        ]["max"],
-        "measured_endpoint_rotation_max_deg": comparison[
-            "selected_measured_rotation_deg"
-        ]["max"],
-        "opposite_measured_qpos_delta_max_rad": comparison[
-            "opposite_measured_qpos_delta_rad"
-        ]["max"],
+        "comparison_error": comparison.get("error"),
+        "measured_endpoint_delta_max_m": selected_translation.get("max"),
+        "measured_endpoint_rotation_max_deg": selected_rotation.get("max"),
+        "opposite_measured_qpos_delta_max_rad": opposite_qpos.get("max"),
     }
 
 
@@ -496,6 +495,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--replay-hz", type=_positive_float, default=DEFAULT_REPLAY_HZ)
     parser.add_argument("--release-tail-sec", type=_positive_float, default=10.0)
+    parser.add_argument(
+        "--translation-output-follow-tau-sec",
+        type=_nonnegative_float,
+        default=None,
+        help="Optional 60 Hz translation modifier output follower; 0 is rollback.",
+    )
+    parser.add_argument(
+        "--rotation-output-follow-tau-sec",
+        type=_nonnegative_float,
+        default=None,
+        help="Optional 60 Hz rotation modifier output follower; 0 is rollback.",
+    )
+    parser.add_argument(
+        "--translation-max-output-acceleration-m-s2",
+        type=_nonnegative_float,
+        default=None,
+        help="Optional translation modifier acceleration limit; 0 is rollback.",
+    )
+    parser.add_argument(
+        "--rotation-max-output-angular-acceleration-rad-s2",
+        type=_nonnegative_float,
+        default=None,
+        help="Optional rotation modifier angular-acceleration limit; 0 is rollback.",
+    )
     parser.add_argument(
         "--visible-release-tail-sec",
         type=_nonnegative_float,
@@ -533,6 +556,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--simulation-contract",
         type=Path,
         default=DEFAULT_SIMULATION_CONTRACT_PATH,
+    )
+    parser.add_argument(
+        "--position-execution-profile",
+        choices=tuple(
+            value
+            for value in RM65_POSITION_CONTROL_PROFILE_CHOICES
+            if value != "legacy"
+        ),
+        default=RM65_BIMANUAL_POSITION_V2_BALANCED_NAME,
     )
     return parser.parse_args(argv)
 
@@ -573,6 +605,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         rotational_config=rotational_config,
         max_tool_rotation_excursion_deg=max_rotation_excursion_deg,
+        position_execution_profile_name=str(args.position_execution_profile),
+        translation_output_follow_tau_sec=(
+            args.translation_output_follow_tau_sec
+        ),
+        rotation_output_follow_tau_sec=args.rotation_output_follow_tau_sec,
+        translation_max_output_acceleration_m_s2=(
+            args.translation_max_output_acceleration_m_s2
+        ),
+        rotation_max_output_angular_acceleration_rad_s2=(
+            args.rotation_max_output_angular_acceleration_rad_s2
+        ),
     )
     summary = _compact_report(report, mode=mode)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)

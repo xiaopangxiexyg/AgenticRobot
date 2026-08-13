@@ -221,6 +221,14 @@ def test_public_admittance_weights_and_effective_damping_are_traceable() -> None
             "0.03",
             "--position-admittance-rotation-filter-tau-sec",
             "0.04",
+            "--position-admittance-translation-output-follow-tau-sec",
+            "0.025",
+            "--position-admittance-rotation-output-follow-tau-sec",
+            "0.025",
+            "--position-admittance-translation-max-output-acceleration-m-s2",
+            "1.2",
+            "--position-admittance-rotation-max-output-angular-acceleration-rad-s2",
+            "3.0",
         ]
     )
 
@@ -231,8 +239,14 @@ def test_public_admittance_weights_and_effective_damping_are_traceable() -> None
     )
     assert translation.stiffness_n_m == pytest.approx((125.0,) * 3)
     assert translation.force_filter_tau_sec == pytest.approx(0.03)
+    assert translation.output_follow_tau_sec == pytest.approx(0.025)
+    assert translation.max_output_acceleration_m_s2 == pytest.approx((1.2,) * 3)
     assert rotation.stiffness_nm_rad == pytest.approx((25.0 / 1.5,) * 3)
     assert rotation.torque_filter_tau_sec == pytest.approx(0.04)
+    assert rotation.output_follow_tau_sec == pytest.approx(0.025)
+    assert rotation.max_output_angular_acceleration_rad_s2 == pytest.approx(
+        (3.0,) * 3
+    )
 
     metadata = position_admittance_response_metadata(args)
     assert metadata["modifier_stage"] == "pre_ik_target"
@@ -246,11 +260,21 @@ def test_public_admittance_weights_and_effective_damping_are_traceable() -> None
         [0.008] * 3
     )
     assert metadata["translation"]["physical_damping_n_s_m_applied"] is False
+    assert metadata["translation"]["output_follow_tau_sec"] == pytest.approx(
+        0.025
+    )
+    assert metadata["translation"]["max_output_acceleration_m_s2"] == pytest.approx(
+        [1.2] * 3
+    )
     assert metadata["rotation"]["response_weight"] == pytest.approx(1.5)
     assert metadata["rotation"]["effective_compliance_rad_nm"] == pytest.approx(
         [0.06] * 3
     )
     assert metadata["rotation"]["physical_damping_term_applied"] is False
+    assert metadata["rotation"]["output_follow_tau_sec"] == pytest.approx(0.025)
+    assert metadata["rotation"][
+        "max_output_angular_acceleration_rad_s2"
+    ] == pytest.approx([3.0] * 3)
 
 
 def test_second_order_zero_stiffness_metadata_preserves_legacy_damping_model() -> None:
@@ -301,6 +325,7 @@ def test_accepted_admittance_weight_defaults_are_exactly_behavior_preserving() -
     )
     assert translation.stiffness_n_m == (250.0, 250.0, 250.0)
     assert translation.force_filter_tau_sec == pytest.approx(0.010857362)
+    assert translation.output_follow_tau_sec == 0.0
     assert rotation == rotational_admittance_config_for_profile(
         ROTATIONAL_ADMITTANCE_PROFILE_ROTATION_EMPHASIS_5DEG
     )
@@ -976,6 +1001,71 @@ def test_active_contact_release_returns_transient_without_persistent_rebase(
     assert left["last_contact_rebase"] is None
 
 
+def test_active_final_envelope_admits_only_bounded_motion_toward_zero_at_return_rate(
+) -> None:
+    monitor = _Monitor()
+    config = replace(
+        _active_cautious_config(),
+        max_offset_m=(0.02,) * 3,
+        max_velocity_m_s=(0.06,) * 3,
+        max_return_velocity_m_s=(0.12,) * 3,
+        max_output_slew_m_s=(0.06,) * 3,
+        return_rate_s=100.0,
+    )
+    observer = _observer(monitor, apply_to_target=True, config=config)
+    controller = observer.controllers["left"]
+    controller.rebase_realized_offset(
+        (0.01, 0.0, 0.0),
+        output_time_sec=1.0,
+    )
+    observer._last_composed_offset_by_side["left"] = np.asarray(
+        (0.01, 0.0, 0.0),
+        dtype=float,
+    )
+    observer._last_composed_time_by_side["left"] = 1.0
+    returned = controller.step_new_sample(
+        CartesianAdmittanceWrenchSample(
+            values_n_nm=(0.0,) * 6,
+            frame="tool",
+            source_time_sec=1.05,
+            receive_time_sec=1.05,
+            tare_generation=1,
+        ),
+        now_sec=1.05,
+        rotation_control_from_sample=np.eye(3),
+    )
+    returned = controller.sample_output(now_sec=1.05)
+
+    admitted = observer._checked_final_modifier(
+        side="left",
+        state=returned,
+        now_sec=1.05,
+    )
+    assert admitted == pytest.approx((0.004, 0.0, 0.0))
+
+    # The faster limit is never available for an outward step, even if a
+    # malformed caller marks the snapshot as passive return.
+    malformed = replace(
+        returned,
+        output_offset_m=(0.011, 0.0, 0.0),
+        passive_return_active=True,
+    )
+    observer._last_composed_offset_by_side["left"] = np.asarray(
+        (0.004, 0.0, 0.0),
+        dtype=float,
+    )
+    observer._last_composed_time_by_side["left"] = 1.05
+    with pytest.raises(
+        PositionAdmittanceActiveFault,
+        match="component slew limit",
+    ):
+        observer._checked_final_modifier(
+            side="left",
+            state=malformed,
+            now_sec=1.10,
+        )
+
+
 def test_active_incident_residual_is_rejected_before_nonzero_overlay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1637,10 +1727,23 @@ def test_active_half_normal_requires_its_explicit_named_envelope() -> None:
     with pytest.raises(ValueError, match="max_offset_m must be <= 0.002"):
         validate_position_admittance_active_config(half_normal_config)
 
-    assert validate_position_admittance_active_config(
+    with pytest.raises(
+        ValueError,
+        match="requires exact max_return_velocity_m_s=0.06",
+    ):
+        validate_position_admittance_active_config(
+            half_normal_config,
+            active_envelope=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_HALF_NORMAL,
+        )
+    release_braked_half = replace(
         half_normal_config,
+        max_return_velocity_m_s=(0.06,) * 3,
+        return_rate_s=2.0,
+    )
+    assert validate_position_admittance_active_config(
+        release_braked_half,
         active_envelope=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_HALF_NORMAL,
-    ) is half_normal_config
+    ) is release_braked_half
 
     full_config = replace(
         half_normal_config,
@@ -1654,10 +1757,40 @@ def test_active_half_normal_requires_its_explicit_named_envelope() -> None:
             full_config,
             active_envelope=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_HALF_NORMAL,
         )
+    with pytest.raises(
+        ValueError,
+        match="requires exact max_return_velocity_m_s=0.42",
+    ):
+        validate_position_admittance_active_config(
+            full_config,
+            active_envelope=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_NORMAL_PARITY,
+        )
+
+
+def test_normal_parity_allows_only_bounded_return_braking_parameters() -> None:
+    release_braked = replace(
+        _active_cautious_config(),
+        max_offset_m=(0.08,) * 3,
+        max_velocity_m_s=(0.06,) * 3,
+        max_return_velocity_m_s=(0.42,) * 3,
+        max_output_slew_m_s=(0.06,) * 3,
+        return_rate_s=4.0,
+    )
+
     assert validate_position_admittance_active_config(
-        full_config,
+        release_braked,
         active_envelope=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_NORMAL_PARITY,
-    ) is full_config
+    ) is release_braked
+    with pytest.raises(ValueError, match="max_return_velocity_m_s must be <= 0.42"):
+        validate_position_admittance_active_config(
+            replace(release_braked, max_return_velocity_m_s=(0.4201,) * 3),
+            active_envelope=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_NORMAL_PARITY,
+        )
+    with pytest.raises(ValueError, match="requires exact return_rate_s=4"):
+        validate_position_admittance_active_config(
+            replace(release_braked, return_rate_s=4.01),
+            active_envelope=POSITION_ADMITTANCE_ACTIVE_ENVELOPE_NORMAL_PARITY,
+        )
 
 
 def test_active_install_rejects_the_normal_shadow_parity_envelope() -> None:
@@ -1738,6 +1871,43 @@ def test_active_config_rejects_each_cautious_envelope_overrun(
     with pytest.raises(ValueError, match=field):
         validate_position_admittance_active_config(
             replace(_active_cautious_config(), **{field: value})
+        )
+
+
+def test_active_output_follow_tau_is_explicitly_bounded_for_both_modifiers() -> None:
+    translation = replace(
+        _active_cautious_config(),
+        output_follow_tau_sec=0.025,
+        max_output_acceleration_m_s2=(1.2,) * 3,
+    )
+    rotation = replace(
+        rotational_admittance_config_for_profile(
+            ROTATIONAL_ADMITTANCE_PROFILE_ROTATION_EMPHASIS_5DEG
+        ),
+        output_follow_tau_sec=0.025,
+        max_output_angular_acceleration_rad_s2=(3.0,) * 3,
+    )
+
+    assert validate_position_admittance_active_config(translation) is translation
+    assert (
+        validate_position_rotational_admittance_active_config(
+            rotation,
+            active_profile=(
+                ROTATIONAL_ADMITTANCE_PROFILE_ROTATION_EMPHASIS_5DEG
+            ),
+        )
+        is rotation
+    )
+    with pytest.raises(ValueError, match="output-follow tau"):
+        validate_position_admittance_active_config(
+            replace(translation, output_follow_tau_sec=0.1001)
+        )
+    with pytest.raises(ValueError, match="output-follow tau"):
+        validate_position_rotational_admittance_active_config(
+            replace(rotation, output_follow_tau_sec=0.1001),
+            active_profile=(
+                ROTATIONAL_ADMITTANCE_PROFILE_ROTATION_EMPHASIS_5DEG
+            ),
         )
 
 

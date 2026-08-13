@@ -20,6 +20,7 @@ from teleop_runtime.debug.replay_position_admittance_mujoco import (
 from teleop_runtime.debug.view_position_admittance_mujoco import (
     ForceControlResultVisualizer,
     ForceControlVisualizationConfig,
+    _compact_report,
     _frame_status,
     parse_args,
     run,
@@ -350,6 +351,10 @@ def test_recorded_shadow_envelope_preserves_saved_normal_limits() -> None:
         ),
         admittance_envelope="normal-parity-offline",
     )
+    production_normal = _admittance_config_for_envelope(
+        recorded,
+        admittance_envelope="normal-parity-active",
+    )
 
     assert recorded_shadow is recorded
     assert recorded_shadow.max_offset_m == (0.08, 0.08, 0.08)
@@ -362,11 +367,14 @@ def test_recorded_shadow_envelope_preserves_saved_normal_limits() -> None:
     assert offline_normal.max_velocity_m_s == (0.06, 0.06, 0.06)
     assert offline_normal.max_return_velocity_m_s == (0.03, 0.03, 0.03)
     assert offline_normal.max_output_slew_m_s == (0.06, 0.06, 0.06)
+    assert production_normal.max_return_velocity_m_s == (0.42, 0.42, 0.42)
+    assert production_normal.return_rate_s == pytest.approx(4.0)
 
 
 def test_prepare_only_runs_evaluation_without_constructing_viewer(
     monkeypatch,
 ) -> None:
+    forwarded: dict[str, object] = {}
     report = {
         "path": "/tmp/force.jsonl",
         "admittance_envelope": "cautious-active",
@@ -391,22 +399,44 @@ def test_prepare_only_runs_evaluation_without_constructing_viewer(
             }
         },
     }
+    def fake_evaluation(*args, **kwargs):
+        forwarded.update(kwargs)
+        return report, {}
+
     monkeypatch.setattr(
         "teleop_runtime.debug.view_position_admittance_mujoco."
         "_replay_recorded_wrench_through_mujoco_evaluation",
-        lambda *args, **kwargs: (report, {}),
+        fake_evaluation,
     )
     monkeypatch.setattr(
         "teleop_runtime.debug.view_position_admittance_mujoco."
         "_build_visualization_scene",
         lambda path: pytest.fail("prepare-only must not construct a scene"),
     )
-    args = parse_args(["--log", "/tmp/force.jsonl", "--prepare-only"])
+    args = parse_args(
+        [
+            "--log",
+            "/tmp/force.jsonl",
+            "--prepare-only",
+            "--translation-output-follow-tau-sec",
+            "0.025",
+            "--translation-max-output-acceleration-m-s2",
+            "1.2",
+        ]
+    )
 
     assert run(args) == report
     assert args.interpolation == "zoh"
     assert args.admittance_envelope == "cautious-active"
     assert Path(args.log) == Path("/tmp/force.jsonl")
+    assert forwarded["translation_output_follow_tau_sec"] == pytest.approx(0.025)
+    assert forwarded["rotation_output_follow_tau_sec"] is None
+    assert forwarded[
+        "translation_max_output_acceleration_m_s2"
+    ] == pytest.approx(1.2)
+    assert forwarded[
+        "rotation_max_output_angular_acceleration_rad_s2"
+    ] is None
 
 
 def test_recorded_shadow_viewer_mode_is_explicit() -> None:
@@ -420,6 +450,42 @@ def test_recorded_shadow_viewer_mode_is_explicit() -> None:
     )
 
     assert args.admittance_envelope == "recorded-shadow"
+
+
+def test_compact_report_preserves_clock_mismatch_without_masking_it() -> None:
+    report = {
+        "path": "/tmp/force.jsonl",
+        "admittance_envelope": "normal-parity-offline",
+        "hardware_authorization": False,
+        "safety_passed": False,
+        "coverage_passed": False,
+        "comparisons": {
+            "zoh": {
+                "passed": False,
+                "safety_passed": False,
+                "error": "baseline and Active MuJoCo sample clocks differ",
+            }
+        },
+        "rollouts": {
+            "zoh_active": {
+                "completed_reference_ticks": 14,
+                "physics_ticks": 28,
+                "active_offset_norm_m": {"max": 0.001},
+                "final_active_offset_m": 0.001,
+                "active_rotation_offset_norm_rad": {"max": 0.002},
+                "final_active_rotation_offset_rad": 0.002,
+                "active_qref_motion_ticks": 10,
+            }
+        },
+    }
+
+    compact = _compact_report(report, mode="zoh")
+
+    assert compact["comparison_error"] == (
+        "baseline and Active MuJoCo sample clocks differ"
+    )
+    assert compact["measured_endpoint_delta_max_m"] is None
+    assert compact["measured_endpoint_rotation_max_deg"] is None
 
 
 def test_offline_normal_parity_viewer_mode_is_explicit() -> None:

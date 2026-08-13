@@ -146,6 +146,8 @@ class CartesianAdmittanceConfig:
     stiffness_n_m: tuple[float, float, float] = (100.0, 100.0, 100.0)
     force_deadband_n: tuple[float, float, float] = (0.0, 0.0, 0.0)
     force_filter_tau_sec: float = 0.0
+    output_follow_tau_sec: float = 0.0
+    max_output_acceleration_m_s2: tuple[float, float, float] = (0.0, 0.0, 0.0)
     force_sign: tuple[float, float, float] = (1.0, 1.0, 1.0)
     max_offset_m: tuple[float, float, float] = (0.005, 0.005, 0.005)
     max_velocity_m_s: tuple[float, float, float] = (0.01, 0.01, 0.01)
@@ -190,11 +192,27 @@ class CartesianAdmittanceConfig:
             "stiffness_n_m",
             "force_deadband_n",
             "return_force_deadband_n",
+            "max_output_acceleration_m_s2",
         ):
             object.__setattr__(
                 self,
                 name,
                 _nonnegative_vector(getattr(self, name), name=name),
+            )
+        acceleration = np.asarray(
+            self.max_output_acceleration_m_s2,
+            dtype=float,
+        )
+        enabled = np.asarray(self.enabled_axes, dtype=bool)
+        enabled_acceleration = acceleration[enabled]
+        if (
+            enabled_acceleration.size
+            and np.any(enabled_acceleration > 0.0)
+            and np.any(enabled_acceleration == 0.0)
+        ):
+            raise ValueError(
+                "max_output_acceleration_m_s2 must be zero on every enabled "
+                "axis (disabled) or positive on every enabled axis"
             )
         force_sign = _finite_vector(self.force_sign, size=3, name="force_sign")
         if np.any(np.abs(force_sign) != 1.0):
@@ -213,20 +231,17 @@ class CartesianAdmittanceConfig:
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive")
             object.__setattr__(self, name, value)
-        filter_tau = _finite_time(
-            self.force_filter_tau_sec,
-            name="force_filter_tau_sec",
-        )
-        if filter_tau < 0.0:
-            raise ValueError("force_filter_tau_sec must be non-negative")
-        object.__setattr__(self, "force_filter_tau_sec", filter_tau)
+        for name in ("force_filter_tau_sec", "output_follow_tau_sec"):
+            value = _finite_time(getattr(self, name), name=name)
+            if value < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+            object.__setattr__(self, name, value)
         return_rate = _finite_time(self.return_rate_s, name="return_rate_s")
         if return_rate < 0.0:
             raise ValueError("return_rate_s must be non-negative")
         object.__setattr__(self, "return_rate_s", return_rate)
         if response_model == "profile_compliance":
             stiffness = np.asarray(self.stiffness_n_m, dtype=float)
-            enabled = np.asarray(self.enabled_axes, dtype=bool)
             if np.any(stiffness[enabled] <= 0.0):
                 raise ValueError(
                     "profile_compliance requires positive stiffness on enabled axes"
@@ -284,6 +299,7 @@ class CartesianAdmittanceSnapshot:
     integration_dt_sec: float | None
     deadbanded_force_control_n: tuple[float, float, float]
     filtered_force_control_n: tuple[float, float, float]
+    passive_return_active: bool
 
 
 class BoundedCartesianAdmittance:
@@ -294,6 +310,7 @@ class BoundedCartesianAdmittance:
         self._requested_offset = np.zeros(3, dtype=float)
         self._output_offset = np.zeros(3, dtype=float)
         self._velocity = np.zeros(3, dtype=float)
+        self._output_velocity = np.zeros(3, dtype=float)
         self._tare_values: np.ndarray | None = None
         self._tare_frame: str | None = None
         self._tare_generation: int | None = None
@@ -308,6 +325,7 @@ class BoundedCartesianAdmittance:
         self._deadbanded_force = np.zeros(3, dtype=float)
         self._filtered_force = np.zeros(3, dtype=float)
         self._force_filter_initialized = False
+        self._passive_return_active = False
 
     @property
     def enabled(self) -> bool:
@@ -324,6 +342,7 @@ class BoundedCartesianAdmittance:
         self._requested_offset.fill(0.0)
         self._output_offset.fill(0.0)
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
         self._tare_values = np.asarray(tare_sample.values_n_nm, dtype=float)
         self._tare_frame = tare_sample.frame
         self._tare_generation = tare_sample.tare_generation
@@ -342,13 +361,16 @@ class BoundedCartesianAdmittance:
         self._deadbanded_force.fill(0.0)
         self._filtered_force.fill(0.0)
         self._force_filter_initialized = False
+        self._passive_return_active = False
         return self.snapshot(now_sec=output_time_sec)
 
     def freeze(self, reason: str) -> None:
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
         self._deadbanded_force.fill(0.0)
         self._filtered_force.fill(0.0)
         self._force_filter_initialized = False
+        self._passive_return_active = False
         self._frozen = True
         self._reason = str(reason).strip() or "frozen"
         self._new_sample_integrated = False
@@ -364,9 +386,11 @@ class BoundedCartesianAdmittance:
         self._last_sample_source_time = None
         self._last_sample_receive_time = None
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
         self._deadbanded_force.fill(0.0)
         self._filtered_force.fill(0.0)
         self._force_filter_initialized = False
+        self._passive_return_active = False
         self._frozen = False
         self._reason = "resumed_awaiting_sample"
 
@@ -412,6 +436,8 @@ class BoundedCartesianAdmittance:
             self._requested_offset = offset.copy()
         self._output_offset = offset.copy()
         self._velocity.fill(0.0)
+        self._output_velocity.fill(0.0)
+        self._passive_return_active = False
         if output_time is not None:
             self._last_output_time = output_time
         self._reason = "realized_rebase"
@@ -541,6 +567,7 @@ class BoundedCartesianAdmittance:
         previous_requested = self._requested_offset.copy()
         maximum_velocity = np.asarray(self.config.max_velocity_m_s, dtype=float)
         maximum_offset = np.asarray(self.config.max_offset_m, dtype=float)
+        passive_return = False
 
         if self.config.response_model == "profile_compliance":
             stiffness = np.asarray(self.config.stiffness_n_m, dtype=float)
@@ -578,12 +605,15 @@ class BoundedCartesianAdmittance:
             )
             step_velocity = maximum_velocity
             if passive_return:
-                step_velocity = np.minimum(
-                    maximum_velocity,
-                    np.asarray(
-                        self.config.max_return_velocity_m_s,
-                        dtype=float,
-                    ),
+                # Return velocity is an independent, explicitly configured
+                # no-contact bound.  It may be lower than outward motion for
+                # legacy parity or higher for a release-braking profile; using
+                # min(max_velocity, max_return_velocity) made the latter
+                # impossible and left a stale downstream target to catch up
+                # after abrupt force removal.
+                step_velocity = np.asarray(
+                    self.config.max_return_velocity_m_s,
+                    dtype=float,
                 )
             step = _clamp_translation_bound(
                 target - previous_requested,
@@ -626,6 +656,7 @@ class BoundedCartesianAdmittance:
         self._deadbanded_force = deadbanded
         self._filtered_force = filtered_force
         self._force_filter_initialized = True
+        self._passive_return_active = passive_return
         self._reason = "sample_integrated"
         self._new_sample_integrated = True
         self._integration_dt_sec = dt
@@ -666,21 +697,95 @@ class BoundedCartesianAdmittance:
 
         dt = now - self._last_output_time
         enabled = np.asarray(self.config.enabled_axes, dtype=bool)
-        max_delta = np.asarray(self.config.max_output_slew_m_s, dtype=float) * dt
+        output_slew = np.asarray(
+            (
+                self.config.max_return_velocity_m_s
+                if self._passive_return_active
+                else self.config.max_output_slew_m_s
+            ),
+            dtype=float,
+        )
+        output_target = self._requested_offset
+        if (
+            self.config.output_follow_tau_sec > 0.0
+            and self._passive_return_active
+        ):
+            # A filtered output may still lag outside the already-decaying
+            # requested state when force is removed.  Never chase that stale
+            # outward gap: each enabled component may only keep or reduce its
+            # current magnitude during passive return.  This closes the same
+            # delayed-catch-up failure that the final return envelope audits.
+            output_target = np.zeros(3, dtype=float)
+            for axis in range(3):
+                if not enabled[axis] or abs(self._output_offset[axis]) <= 1e-15:
+                    continue
+                requested = self._requested_offset[axis]
+                current = self._output_offset[axis]
+                if requested * current > 0.0:
+                    output_target[axis] = math.copysign(
+                        min(abs(requested), abs(current)),
+                        current,
+                    )
+        raw_delta = output_target - self._output_offset
+        if self.config.output_follow_tau_sec > 0.0:
+            raw_delta = raw_delta * (
+                1.0 - math.exp(-dt / self.config.output_follow_tau_sec)
+            )
+        max_delta = output_slew * dt
         delta = _clamp_translation_bound(
-            self._requested_offset - self._output_offset,
+            raw_delta,
             component_limits=max_delta,
             enabled_axes=enabled,
         )
+        acceleration_limit = np.asarray(
+            self.config.max_output_acceleration_m_s2,
+            dtype=float,
+        )
+        if np.any(acceleration_limit[enabled] > 0.0):
+            desired_velocity = delta / dt
+            velocity_delta = _clamp_translation_bound(
+                desired_velocity - self._output_velocity,
+                component_limits=acceleration_limit * dt,
+                enabled_axes=enabled,
+            )
+            output_velocity = _clamp_translation_bound(
+                self._output_velocity + velocity_delta,
+                component_limits=output_slew,
+                enabled_axes=enabled,
+            )
+            delta = output_velocity * dt
         # Re-assert the absolute envelope at the final 60 Hz output boundary.
         # Requested state is already bounded, but the output state can survive
         # a profile/code transition or a realized-state rebase.  Never rely on
         # convex interpolation alone for a command-authority safety invariant.
-        self._output_offset = _clamp_translation_bound(
+        previous_output = self._output_offset.copy()
+        candidate_output = _clamp_translation_bound(
             self._output_offset + delta,
             component_limits=np.asarray(self.config.max_offset_m, dtype=float),
             enabled_axes=enabled,
         )
+        if (
+            np.any(acceleration_limit[enabled] > 0.0)
+            and self._passive_return_active
+        ):
+            # Release safety dominates acceleration continuity.  A lagging
+            # output velocity may be pointing outward when force disappears;
+            # never preserve that inertia at the force modifier boundary.
+            candidate_output = np.where(
+                candidate_output * previous_output > 0.0,
+                np.sign(previous_output)
+                * np.minimum(
+                    np.abs(candidate_output),
+                    np.abs(previous_output),
+                ),
+                0.0,
+            )
+            if float(np.linalg.norm(candidate_output)) > float(
+                np.linalg.norm(previous_output)
+            ):
+                candidate_output = previous_output
+        self._output_offset = candidate_output
+        self._output_velocity = (self._output_offset - previous_output) / dt
         self._last_output_time = now
         self._reason = "output_sampled"
         return self.snapshot(now_sec=now)
@@ -707,6 +812,7 @@ class BoundedCartesianAdmittance:
             filtered_force_control_n=tuple(
                 float(value) for value in self._filtered_force
             ),
+            passive_return_active=bool(self._passive_return_active),
         )
 
 
