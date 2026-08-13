@@ -12,17 +12,15 @@ from robot_motion.target_runtime import (
 from teleop_runtime.deploy.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
-from teleop_runtime.deploy.rm65_target_runtime_provider import (
+from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate import (
     RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
     RM65PolicyArmQposCandidateTargetConfig,
     build_rm65_policy_arm_qpos_candidate_target_profile_binding,
 )
-from teleop_runtime.target_profiles import (
+from teleop_runtime.target_runtime import (
     TargetRuntimeProfileBinding,
     TargetRuntimeProfileCatalog,
     TargetRuntimeProfilePreflight,
-)
-from teleop_runtime.target_runtime_preparation import (
     prepare_target_runtime_handle,
 )
 

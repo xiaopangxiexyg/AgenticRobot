@@ -18,7 +18,7 @@ from teleop_runtime.deploy.rm65_candidate_manifest import (
 from teleop_runtime.deploy.rm65_execution_evidence import (
     build_rm65_execution_evidence_bundle,
 )
-from teleop_runtime.deploy.rm65_target_runtime_provider import (
+from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate import (
     RM65_POLICY_ARM_QPOS_CANDIDATE_PROVIDER_ID,
     RM65PolicyArmQposCandidateTargetConfig,
     build_rm65_policy_arm_qpos_candidate_provider_entry,

@@ -37,6 +37,29 @@ device-specific lifecycle implementation. Canonical authority, safety, permit
 issuance/consumption, action adaptation, and dispatch remain with their
 existing lower owners.
 
+### Application module layout
+
+The canonical application imports are now grouped under
+`teleop_runtime.target_runtime`:
+
+- `profiles` owns portable profile specs, allowlisted bindings, catalog
+  selection, and offline preflight;
+- `preparation` owns the transactional handoff from exact preflight to an
+  inert handle acquisition;
+- `integrations` is an explicit, non-discovering namespace for concrete
+  application adapters. Importing `teleop_runtime.target_runtime` does not
+  import an integration.
+
+The former `teleop_runtime.target_profiles`,
+`teleop_runtime.target_runtime_preparation`, and
+`teleop_runtime.deploy.rm65_target_runtime_provider` paths are compatibility
+re-export shims. They construct no registry or runtime state and preserve
+object identity with the canonical implementations. The RM65 candidate
+adapter is application-level compatibility projection rather than deployment
+ownership; its frozen candidate manifest and execution evidence remain in the
+deploy package until those deployment-specific contracts have a proven
+non-deployment consumer.
+
 ## What an embodiment integration must provide
 
 An integration package that will eventually be selectable must provide:

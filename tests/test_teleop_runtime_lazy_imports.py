@@ -7,6 +7,13 @@ import sys
 
 import teleop_runtime
 import teleop_runtime.deploy as deploy_namespace
+import teleop_runtime.deploy.rm65_target_runtime_provider as legacy_rm65_target
+import teleop_runtime.target_profiles as legacy_target_profiles
+import teleop_runtime.target_runtime as target_runtime_namespace
+import teleop_runtime.target_runtime_preparation as legacy_target_preparation
+from teleop_runtime.target_runtime.integrations import (
+    rm65_policy_arm_qpos_candidate as canonical_rm65_target,
+)
 from teleop_runtime.registry import (
     backend_registry,
     retargeter_registry,
@@ -24,6 +31,7 @@ import json
 import sys
 import teleop_runtime
 import teleop_runtime.deploy.rm65_candidate_manifest
+import teleop_runtime.target_runtime
 import teleop_runtime.target_runtime_preparation
 import teleop_runtime.backends.arms.rm65_dispatch_inventory
 
@@ -31,11 +39,17 @@ forbidden_prefixes = (
     "hardware.rm65.Robotic_Arm",
     "hardware.rm65.rm_api2_adapter",
 )
-print(json.dumps(sorted(
-    name
-    for name in sys.modules
-    if name.startswith(forbidden_prefixes)
-)))
+print(json.dumps({
+    "forbidden": sorted(
+        name
+        for name in sys.modules
+        if name.startswith(forbidden_prefixes)
+    ),
+    "integration_loaded": (
+        "teleop_runtime.target_runtime.integrations."
+        "rm65_policy_arm_qpos_candidate" in sys.modules
+    ),
+}))
 """
     completed = subprocess.run(
         [sys.executable, "-c", script],
@@ -44,7 +58,22 @@ print(json.dumps(sorted(
         capture_output=True,
         text=True,
     )
-    assert json.loads(completed.stdout) == []
+    assert json.loads(completed.stdout) == {
+        "forbidden": [],
+        "integration_loaded": False,
+    }
+
+
+def test_target_runtime_compatibility_exports_preserve_object_identity() -> None:
+    assert legacy_target_profiles.TargetRuntimeProfileCatalog is (
+        target_runtime_namespace.TargetRuntimeProfileCatalog
+    )
+    assert legacy_target_preparation.prepare_target_runtime_handle is (
+        target_runtime_namespace.prepare_target_runtime_handle
+    )
+    assert legacy_rm65_target.RM65PolicyArmQposCandidateTargetProvider is (
+        canonical_rm65_target.RM65PolicyArmQposCandidateTargetProvider
+    )
 
 
 def test_lazy_top_level_and_deploy_exports_preserve_object_identity() -> None:
