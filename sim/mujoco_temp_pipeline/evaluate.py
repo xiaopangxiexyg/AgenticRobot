@@ -11,6 +11,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
+from sim.mujoco.collision_safety import CollisionEventTracker
 from sim.mujoco.runtime import CubeLiftVectorExecutor
 from sim.mujoco.tasks.cube_lift.config import (
     CubeLiftTaskConfig,
@@ -24,6 +25,7 @@ from sim.mujoco.tasks.cube_lift.learning import (
 from .action_diagnostics import ActionDiagnostics
 from .checkpoint import build_policy_from_checkpoint, check_task_config_compatibility
 from .policy import resolve_device
+from .pose_target_diagnostics import PoseTargetDiagnostics
 from .train import DEFAULT_CHECKPOINT, DEFAULT_TASK_CONFIG
 
 
@@ -153,12 +155,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     minimum_safety_distance = float("inf")
     hard_penetrations = 0
     clearance_violations = 0
+    collision_preventive_events = 0
+    collision_preventive_blocked_fraction_sum = 0.0
+    collision_preventive_streak_steps_max = 0
+    collision_preventive_event_categories: Counter[str] = Counter()
+    collision_actual_forbidden_contacts = 0
+    collision_hard_violations = 0
     tracking_error_sum = 0.0
     tracking_error_samples = 0
     tracking_error_max = 0.0
     gripper_tracking_error_sum = 0.0
     gripper_tracking_error_max = 0.0
     action_diagnostics = ActionDiagnostics()
+    pose_target_diagnostics = PoseTargetDiagnostics()
+    collision_event_tracker = CollisionEventTracker(args.num_envs)
     try:
         observation, _infos = env.reset()
         max_steps = args.episodes * 600
@@ -204,6 +214,121 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 info.get("final_info", info) if done[env_id] else info
                 for env_id, info in enumerate(infos)
             )
+            collision_events = collision_event_tracker.observe(
+                preventive_intervention=np.asarray(
+                    [
+                        bool(
+                            info.get(
+                                "safety_intervention",
+                                info.get("safety_modified", False),
+                            )
+                        )
+                        for info in transition_infos
+                    ],
+                    dtype=bool,
+                ),
+                projection_alpha=np.asarray(
+                    [
+                        float(info.get("safety_projection_alpha", 1.0))
+                        for info in transition_infos
+                    ],
+                    dtype=np.float32,
+                ),
+                preventive_category=np.asarray(
+                    [
+                        info.get("safety_blocking_category")
+                        for info in transition_infos
+                    ],
+                    dtype=object,
+                ),
+                actual_forbidden_contact=np.asarray(
+                    [
+                        bool(
+                            info.get(
+                                "safety_actual_forbidden_contact",
+                                info.get("termination_reason")
+                                == "robot_environment_penetration",
+                            )
+                        )
+                        for info in transition_infos
+                    ],
+                    dtype=bool,
+                ),
+                actual_category=np.asarray(
+                    [
+                        info.get("safety_actual_collision_category")
+                        for info in transition_infos
+                    ],
+                    dtype=object,
+                ),
+                hard_violation=np.asarray(
+                    [
+                        bool(
+                            info.get(
+                                "safety_actual_hard_violation",
+                                info.get("termination_reason")
+                                == "robot_environment_penetration",
+                            )
+                        )
+                        for info in transition_infos
+                    ],
+                    dtype=bool,
+                ),
+                episode_done=done,
+            )
+            pose_target_diagnostics.update(
+                np.asarray(
+                    [
+                        np.nan
+                        if info.get("pose_target_pre_action_translation_error_m") is None
+                        else float(info["pose_target_pre_action_translation_error_m"])
+                        for info in transition_infos
+                    ],
+                    dtype=np.float64,
+                ),
+                projection_alpha=np.asarray(
+                    [
+                        float(info.get("safety_projection_alpha", 1.0))
+                        for info in transition_infos
+                    ],
+                    dtype=np.float64,
+                ),
+                preventive_intervention=np.asarray(
+                    [
+                        bool(
+                            info.get(
+                                "safety_intervention",
+                                info.get("safety_modified", False),
+                            )
+                        )
+                        for info in transition_infos
+                    ],
+                    dtype=bool,
+                ),
+                preventive_onset=collision_events.preventive_onset,
+            )
+            collision_preventive_events += int(
+                np.count_nonzero(collision_events.preventive_onset)
+            )
+            collision_preventive_blocked_fraction_sum += float(
+                np.sum(collision_events.preventive_blocked_fraction)
+            )
+            collision_preventive_streak_steps_max = max(
+                collision_preventive_streak_steps_max,
+                int(np.max(collision_events.preventive_streak_steps)),
+            )
+            collision_actual_forbidden_contacts += int(
+                np.count_nonzero(collision_events.actual_forbidden_contact)
+            )
+            collision_hard_violations += int(
+                np.count_nonzero(collision_events.hard_violation)
+            )
+            for category in collision_events.preventive_category[
+                collision_events.preventive_onset
+            ]:
+                collision_preventive_event_categories[
+                    "unknown" if category is None else str(category)
+                ] += 1
             for info in transition_infos:
                 tracking_error_sum += float(info.get("arm_tracking_error_rad_mean", 0.0))
                 tracking_error_max = max(
@@ -327,6 +452,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "policy_action_transform_hash": action_transform.semantic_content_hash,
         "task_action_layout": task_config.action_layout,
         **action_diagnostics.summary(),
+        **pose_target_diagnostics.summary(),
         "action_offset_results": [
             {
                 "action_offset": offset,
@@ -387,6 +513,30 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         ),
         "hard_penetration_count": hard_penetrations,
         "clearance_violation_count": clearance_violations,
+        "collision_preventive_event_count": collision_preventive_events,
+        "collision_preventive_event_rate": (
+            collision_preventive_events / max(evaluated_actions, 1)
+        ),
+        "collision_preventive_blocked_fraction_mean": (
+            collision_preventive_blocked_fraction_sum
+            / max(evaluated_actions, 1)
+        ),
+        "collision_preventive_streak_steps_max": (
+            collision_preventive_streak_steps_max
+        ),
+        "collision_preventive_event_category_counts": dict(
+            sorted(collision_preventive_event_categories.items())
+        ),
+        "collision_actual_forbidden_contact_count": (
+            collision_actual_forbidden_contacts
+        ),
+        "collision_actual_forbidden_contact_rate": (
+            collision_actual_forbidden_contacts / max(evaluated_actions, 1)
+        ),
+        "collision_hard_violation_count": collision_hard_violations,
+        "collision_hard_violation_rate": (
+            collision_hard_violations / max(evaluated_actions, 1)
+        ),
         "arm_tracking_error_rad_mean": (
             tracking_error_sum / max(tracking_error_samples, 1)
         ),

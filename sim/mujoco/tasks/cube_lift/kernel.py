@@ -264,6 +264,7 @@ class CubeLiftKernel:
         self._accepted_controlled_qpos = self.scene.kinematic_controlled_qpos()
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._policy_worst_active_collision_check = None
         self._post_settle_geom_friction: tuple[
             tuple[int, np.ndarray, np.ndarray], ...
         ] = ()
@@ -294,6 +295,8 @@ class CubeLiftKernel:
                 )
             self._post_settle_geom_friction = tuple(overrides)
         self._pose_target_reanchored = False
+        self._pre_action_pose_target_translation_error_m: float | None = None
+        self._pre_action_pose_target_rotation_error_deg: float | None = None
         self._scripted_contact_reset_applied = False
         self._scripted_pregrasp_reset_applied = False
         self._post_contact_phase_active = False
@@ -349,7 +352,10 @@ class CubeLiftKernel:
         self._termination_reason = None
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._policy_worst_active_collision_check = None
         self._pose_target_reanchored = False
+        self._pre_action_pose_target_translation_error_m = None
+        self._pre_action_pose_target_rotation_error_deg = None
         self._scripted_contact_reset_applied = False
         self._scripted_pregrasp_reset_applied = False
         self._post_contact_phase_active = False
@@ -524,6 +530,7 @@ class CubeLiftKernel:
         self._last_accepted_action.fill(0.0)
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._policy_worst_active_collision_check = None
         self._pose_target_reanchored = False
         self._scripted_pregrasp_reset_applied = True
         self._scripted_contact_loss_steps = 0
@@ -631,6 +638,7 @@ class CubeLiftKernel:
         self._last_accepted_action.fill(0.0)
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._policy_worst_active_collision_check = None
         self._pose_target_reanchored = False
         self._scripted_contact_reset_applied = True
         self._scripted_contact_loss_steps = 0
@@ -674,6 +682,14 @@ class CubeLiftKernel:
             raise ValueError("CubeLift action must be a finite 7-D vector.")
         if np.any(values < -1.0) or np.any(values > 1.0):
             raise ValueError("CubeLift action values must lie in [-1, 1].")
+        (
+            self._pre_action_pose_target_translation_error_m,
+            self._pre_action_pose_target_rotation_error_deg,
+        ) = self._pose_target_error()
+        # Aggregate actual forbidden contacts over this complete policy
+        # interval. The final physics tick alone can miss a brief soft contact
+        # that already separated before the next observation is emitted.
+        self._policy_worst_active_collision_check = None
         self._last_requested_action[:] = values
         previous_measured_close = self._measured_gripper_close(1)
         left_contact, right_contact = self._cube_finger_contacts()
@@ -1125,6 +1141,20 @@ class CubeLiftKernel:
             if self._collision_projector is None
             else self._collision_projector.oracle.check_contacts(self.data)
         )
+        if (
+            self._last_active_collision_check is not None
+            and np.isfinite(
+                self._last_active_collision_check.minimum_distance_m
+            )
+            and (
+                self._policy_worst_active_collision_check is None
+                or self._last_active_collision_check.minimum_distance_m
+                < self._policy_worst_active_collision_check.minimum_distance_m
+            )
+        ):
+            self._policy_worst_active_collision_check = (
+                self._last_active_collision_check
+            )
         self._physics_tick += 1
 
     def _advance_ticks(self, ticks: int, *, check_success: bool) -> tuple[int, int]:
@@ -1527,6 +1557,15 @@ class CubeLiftKernel:
             if self.config.reach_target_delta_observation_source
             else None
         )
+        (
+            pose_target_translation_error_m,
+            pose_target_rotation_error_deg,
+        ) = self._pose_target_error()
+        active_collision_check = self._policy_worst_active_collision_check
+        actual_forbidden_contact = bool(
+            active_collision_check is not None
+            and np.isfinite(active_collision_check.minimum_distance_m)
+        )
         compact: dict[str, Any] = {
             "reset": bool(reset),
             "episode_step": self._episode_steps,
@@ -1594,6 +1633,16 @@ class CubeLiftKernel:
                 if self._last_pose_action_step is None
                 else self._last_pose_action_step.ik_result.status
             ),
+            "pose_ik_success": (
+                None
+                if self._last_pose_action_step is None
+                else bool(self._last_pose_action_step.ik_result.success)
+            ),
+            "pose_ik_iterations": (
+                None
+                if self._last_pose_action_step is None
+                else int(self._last_pose_action_step.ik_result.iterations)
+            ),
             "pose_ik_hold": (
                 None
                 if self._last_pose_action_step is None
@@ -1635,6 +1684,14 @@ class CubeLiftKernel:
             ),
             "pose_target_anti_windup": self.config.pose_target_anti_windup,
             "pose_target_reanchored": self._pose_target_reanchored,
+            "pose_target_translation_error_m": pose_target_translation_error_m,
+            "pose_target_rotation_error_deg": pose_target_rotation_error_deg,
+            "pose_target_pre_action_translation_error_m": (
+                self._pre_action_pose_target_translation_error_m
+            ),
+            "pose_target_pre_action_rotation_error_deg": (
+                self._pre_action_pose_target_rotation_error_deg
+            ),
             "scripted_pregrasp_reset": self._scripted_pregrasp_reset_applied,
             "scripted_pregrasp_action_modified": (
                 self._scripted_pregrasp_action_modified
@@ -1762,6 +1819,29 @@ class CubeLiftKernel:
                 )
                 else self._last_safety_result.blocking_check.minimum_distance_m
             ),
+            # Active physical contact is distinct from the counterfactual
+            # projection above. These simulator-only facts are emitted for
+            # cost accounting and diagnostics; they never enter the actor
+            # observation contract.
+            "safety_actual_forbidden_contact": actual_forbidden_contact,
+            "safety_actual_collision_category": (
+                None
+                if not actual_forbidden_contact
+                else active_collision_check.collision_category
+            ),
+            "safety_actual_minimum_distance_m": (
+                float("inf")
+                if not actual_forbidden_contact
+                else float(active_collision_check.minimum_distance_m)
+            ),
+            "safety_actual_penetration_depth_m": (
+                0.0
+                if not actual_forbidden_contact
+                else float(active_collision_check.penetration_depth_m)
+            ),
+            "safety_actual_hard_violation": bool(
+                actual_forbidden_contact and not active_collision_check.safe
+            ),
         }
         if reach_guidance is not None:
             compact.update(
@@ -1805,6 +1885,22 @@ class CubeLiftKernel:
                 else self._last_active_collision_check.to_dict()
             ),
         }
+
+    def _pose_target_error(self) -> tuple[float | None, float | None]:
+        if self._pose_action_controller is None:
+            return None, None
+        target_pose = self._pose_action_controller.target_pose_arm_base
+        measured_pose = self._pose_action_controller._current_tool_pose_arm_base()
+        translation_error_m = float(
+            np.linalg.norm(target_pose[:3, 3] - measured_pose[:3, 3])
+        )
+        rotation_delta = target_pose[:3, :3] @ measured_pose[:3, :3].T
+        rotation_cosine = float(
+            np.clip((np.trace(rotation_delta) - 1.0) * 0.5, -1.0, 1.0)
+        )
+        return translation_error_m, float(
+            np.rad2deg(np.arccos(rotation_cosine))
+        )
 
     def _capture_settled_snapshot(self) -> None:
         self._settled_snapshot = {

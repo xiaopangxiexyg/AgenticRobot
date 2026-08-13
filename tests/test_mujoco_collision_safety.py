@@ -234,12 +234,19 @@ def test_general_qpos_controller_holds_last_state_for_unsafe_target() -> None:
         before = env.scene.get_arm_qpos("right")
         controller = QposController(env.scene)
         controller.apply(
-            {
-                "right": np.asarray(
-                    (-1.08336, 1.57079, -0.07441, -1.00963, 1.59197, -2.2),
-                    dtype=float,
-                )
-            }
+                {
+                    "right": np.asarray(
+                        (
+                            -2.91216875,
+                            -0.08460413,
+                            -1.86886070,
+                            -1.83527002,
+                            -1.36042304,
+                            1.66282724,
+                        ),
+                        dtype=float,
+                    )
+                }
         )
         assert controller.last_safety_result is not None
         assert controller.last_safety_result.modified

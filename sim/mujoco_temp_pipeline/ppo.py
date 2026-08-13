@@ -10,7 +10,10 @@ import numpy as np
 import torch
 from torch import nn
 
-from sim.mujoco.collision_safety import FORBIDDEN_COLLISION_CATEGORIES
+from sim.mujoco.collision_safety import (
+    FORBIDDEN_COLLISION_CATEGORIES,
+    CollisionEventTracker,
+)
 from sim.mujoco.runtime import CubeLiftVectorExecutor
 from sim.mujoco.tasks.cube_lift.config import (
     CubeLiftTaskConfig,
@@ -31,6 +34,7 @@ from .action_diagnostics import ActionDiagnostics
 from .config import PPOConfig, RewardShapingConfig
 from .normalization import RunningMeanStd
 from .policy import ActorCritic, resolve_device
+from .pose_target_diagnostics import PoseTargetDiagnostics
 from .reward import shape_rewards
 
 
@@ -60,11 +64,18 @@ class RolloutBatch:
     episode_raw_returns: tuple[float, ...]
     episodes: tuple[dict[str, Any], ...]
     action_diagnostics: dict[str, float | None]
+    pose_target_diagnostics: dict[str, float | None]
     safety_projection_rate: float
     safety_rejection_rate: float
     safety_recovery_rate: float
     safety_projection_alpha_mean: float
     safety_collision_category_rates: dict[str, float]
+    collision_preventive_event_rate: float
+    collision_preventive_blocked_fraction_mean: float
+    collision_preventive_streak_steps_max: int
+    collision_preventive_event_category_rates: dict[str, float]
+    collision_actual_forbidden_contact_rate: float
+    collision_hard_violation_rate: float
     effective_action_override_rate: float
     effective_action_delta_mean: float
     post_contact_phase_active_rate: float
@@ -408,6 +419,23 @@ class PPOSmokeTrainer:
         self._episode_raw_return = np.zeros(ppo_config.num_envs, dtype=np.float64)
         self._episode_shaped_return = np.zeros(ppo_config.num_envs, dtype=np.float64)
         self._episode_length = np.zeros(ppo_config.num_envs, dtype=np.int32)
+        self._collision_event_tracker = CollisionEventTracker(ppo_config.num_envs)
+        self._episode_collision_preventive_event_count = np.zeros(
+            ppo_config.num_envs,
+            dtype=np.int32,
+        )
+        self._episode_collision_blocked_fraction_sum = np.zeros(
+            ppo_config.num_envs,
+            dtype=np.float64,
+        )
+        self._episode_collision_actual_contact_count = np.zeros(
+            ppo_config.num_envs,
+            dtype=np.int32,
+        )
+        self._episode_collision_hard_violation_count = np.zeros(
+            ppo_config.num_envs,
+            dtype=np.int32,
+        )
         self._episode_resting_cube_z = CubeLiftRewardState.from_flat(
             self._reward_observation
         ).cube_z.astype(np.float32, copy=True)
@@ -567,6 +595,14 @@ class PPOSmokeTrainer:
         safety_collision_category_counts = {
             category: 0 for category in FORBIDDEN_COLLISION_CATEGORIES
         }
+        collision_preventive_event_category_counts = {
+            category: 0 for category in FORBIDDEN_COLLISION_CATEGORIES
+        }
+        collision_preventive_event_count = 0
+        collision_preventive_blocked_fraction_sum = 0.0
+        collision_preventive_streak_steps_max = 0
+        collision_actual_forbidden_contact_count = 0
+        collision_hard_violation_count = 0
         safety_sample_count = 0
         effective_action_override_count = 0
         effective_action_delta_sum = 0.0
@@ -588,6 +624,7 @@ class PPOSmokeTrainer:
         reward_term_sums: dict[str, float] = {}
         reward_term_samples = 0
         action_diagnostics = ActionDiagnostics()
+        pose_target_diagnostics = PoseTargetDiagnostics()
 
         self.policy.eval()
         for step in range(cfg.rollout_steps):
@@ -676,6 +713,97 @@ class PPOSmokeTrainer:
                         & safety_intervention.astype(bool)
                     )
                 )
+            actual_forbidden_contact = np.asarray(
+                [
+                    bool(
+                        info.get(
+                            "safety_actual_forbidden_contact",
+                            info.get("termination_reason")
+                            == "robot_environment_penetration",
+                        )
+                    )
+                    for info in transition_infos
+                ],
+                dtype=bool,
+            )
+            actual_collision_category = np.asarray(
+                [
+                    info.get("safety_actual_collision_category")
+                    for info in transition_infos
+                ],
+                dtype=object,
+            )
+            actual_hard_violation = np.asarray(
+                [
+                    bool(
+                        info.get(
+                            "safety_actual_hard_violation",
+                            info.get("termination_reason")
+                            == "robot_environment_penetration",
+                        )
+                    )
+                    for info in transition_infos
+                ],
+                dtype=bool,
+            )
+            collision_events = self._collision_event_tracker.observe(
+                preventive_intervention=safety_intervention,
+                projection_alpha=safety_alpha,
+                preventive_category=safety_collision_category,
+                actual_forbidden_contact=actual_forbidden_contact,
+                actual_category=actual_collision_category,
+                hard_violation=actual_hard_violation,
+                episode_done=done,
+            )
+            pose_target_diagnostics.update(
+                np.asarray(
+                    [
+                        np.nan
+                        if info.get("pose_target_pre_action_translation_error_m") is None
+                        else float(info["pose_target_pre_action_translation_error_m"])
+                        for info in transition_infos
+                    ],
+                    dtype=np.float64,
+                ),
+                projection_alpha=safety_alpha,
+                preventive_intervention=safety_intervention.astype(bool),
+                preventive_onset=collision_events.preventive_onset,
+            )
+            collision_preventive_event_count += int(
+                np.count_nonzero(collision_events.preventive_onset)
+            )
+            collision_preventive_blocked_fraction_sum += float(
+                np.sum(collision_events.preventive_blocked_fraction)
+            )
+            collision_preventive_streak_steps_max = max(
+                collision_preventive_streak_steps_max,
+                int(np.max(collision_events.preventive_streak_steps)),
+            )
+            collision_actual_forbidden_contact_count += int(
+                np.count_nonzero(collision_events.actual_forbidden_contact)
+            )
+            collision_hard_violation_count += int(
+                np.count_nonzero(collision_events.hard_violation)
+            )
+            for category in FORBIDDEN_COLLISION_CATEGORIES:
+                collision_preventive_event_category_counts[category] += int(
+                    np.count_nonzero(
+                        collision_events.preventive_onset
+                        & (collision_events.preventive_category == category)
+                    )
+                )
+            self._episode_collision_preventive_event_count += (
+                collision_events.preventive_onset.astype(np.int32)
+            )
+            self._episode_collision_blocked_fraction_sum += (
+                collision_events.preventive_blocked_fraction
+            )
+            self._episode_collision_actual_contact_count += (
+                collision_events.actual_forbidden_contact.astype(np.int32)
+            )
+            self._episode_collision_hard_violation_count += (
+                collision_events.hard_violation.astype(np.int32)
+            )
             post_contact_phase_active = np.asarray(
                 [
                     bool(info.get("post_contact_phase_active", False))
@@ -992,11 +1120,27 @@ class PPOSmokeTrainer:
                         "shaped_return": float(self._episode_shaped_return[env_id]),
                         "success": bool(success),
                         "termination_reason": termination_reason,
+                        "collision_preventive_event_count": int(
+                            self._episode_collision_preventive_event_count[env_id]
+                        ),
+                        "collision_blocked_fraction_sum": float(
+                            self._episode_collision_blocked_fraction_sum[env_id]
+                        ),
+                        "collision_actual_forbidden_contact_count": int(
+                            self._episode_collision_actual_contact_count[env_id]
+                        ),
+                        "collision_hard_violation_count": int(
+                            self._episode_collision_hard_violation_count[env_id]
+                        ),
                     }
                 )
                 self._episode_raw_return[env_id] = 0.0
                 self._episode_shaped_return[env_id] = 0.0
                 self._episode_length[env_id] = 0
+                self._episode_collision_preventive_event_count[env_id] = 0
+                self._episode_collision_blocked_fraction_sum[env_id] = 0.0
+                self._episode_collision_actual_contact_count[env_id] = 0
+                self._episode_collision_hard_violation_count[env_id] = 0
 
             next_reward_observation = transition_reward_next.copy()
             for env_id in np.flatnonzero(done):
@@ -1071,6 +1215,7 @@ class PPOSmokeTrainer:
             episode_raw_returns=tuple(episode_returns),
             episodes=tuple(episode_records),
             action_diagnostics=action_diagnostics.summary(),
+            pose_target_diagnostics=pose_target_diagnostics.summary(),
             safety_projection_rate=safety_modified_count / max(safety_sample_count, 1),
             safety_rejection_rate=safety_rejected_count / max(safety_sample_count, 1),
             safety_recovery_rate=safety_recovery_count / max(safety_sample_count, 1),
@@ -1079,6 +1224,29 @@ class PPOSmokeTrainer:
                 category: count / max(safety_sample_count, 1)
                 for category, count in safety_collision_category_counts.items()
             },
+            collision_preventive_event_rate=(
+                collision_preventive_event_count / max(safety_sample_count, 1)
+            ),
+            collision_preventive_blocked_fraction_mean=(
+                collision_preventive_blocked_fraction_sum
+                / max(safety_sample_count, 1)
+            ),
+            collision_preventive_streak_steps_max=(
+                collision_preventive_streak_steps_max
+            ),
+            collision_preventive_event_category_rates={
+                category: count / max(safety_sample_count, 1)
+                for category, count in (
+                    collision_preventive_event_category_counts.items()
+                )
+            },
+            collision_actual_forbidden_contact_rate=(
+                collision_actual_forbidden_contact_count
+                / max(safety_sample_count, 1)
+            ),
+            collision_hard_violation_rate=(
+                collision_hard_violation_count / max(safety_sample_count, 1)
+            ),
             effective_action_override_rate=(
                 effective_action_override_count / max(safety_sample_count, 1)
             ),

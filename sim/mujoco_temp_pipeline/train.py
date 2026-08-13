@@ -874,6 +874,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "policy_action_dim": trainer.action_dim,
                 "environment_action_dim": trainer.environment_action_dim,
                 **rollout.action_diagnostics,
+                **rollout.pose_target_diagnostics,
                 "learning_rate": float(trainer.optimizer.param_groups[0]["lr"]),
                 "safety_projection_rate": rollout.safety_projection_rate,
                 "safety_rejection_rate": rollout.safety_rejection_rate,
@@ -885,6 +886,30 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         rollout.safety_collision_category_rates.items()
                     )
                 },
+                # Task-independent collision cost components remain separate
+                # from shaped reward and actor inputs. A future constrained
+                # optimizer can consume them without redefining task success.
+                "collision_preventive_event_rate": (
+                    rollout.collision_preventive_event_rate
+                ),
+                "collision_preventive_blocked_fraction_mean": (
+                    rollout.collision_preventive_blocked_fraction_mean
+                ),
+                "collision_preventive_streak_steps_max": (
+                    rollout.collision_preventive_streak_steps_max
+                ),
+                **{
+                    f"collision_preventive_event_{category}_rate": rate
+                    for category, rate in (
+                        rollout.collision_preventive_event_category_rates.items()
+                    )
+                },
+                "collision_actual_forbidden_contact_rate": (
+                    rollout.collision_actual_forbidden_contact_rate
+                ),
+                "collision_hard_violation_rate": (
+                    rollout.collision_hard_violation_rate
+                ),
                 "downstream_action_modified_rate": (
                     rollout.effective_action_override_rate
                 ),

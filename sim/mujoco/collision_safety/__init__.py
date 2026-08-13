@@ -1,5 +1,6 @@
 """Collision-safe prescribed-motion helpers for MuJoCo environments."""
 
+from .events import CollisionEventBatch, CollisionEventTracker
 from .oracle import CollisionSafetyOracle
 from .policy import CollisionSafetyPolicy
 from .projection import CollisionProjectionResult, KinematicCollisionProjector
@@ -11,6 +12,8 @@ from .result import (
 from .staged import project_grippers_then_arms
 
 __all__ = [
+    "CollisionEventBatch",
+    "CollisionEventTracker",
     "CollisionCheckResult",
     "CollisionProjectionResult",
     "CollisionSafetyOracle",
