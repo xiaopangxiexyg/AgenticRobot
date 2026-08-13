@@ -7,6 +7,9 @@ from typing import Any
 
 from deployments.policy_artifact import load_policy_artifact
 from deployments.openpi.client.preflight import preflight_policy_artifact
+from deployments.openpi.client.observation_adapter import (
+    resolve_prepared_prompt_selection,
+)
 from deployments.openpi.camera_semantics import validate_declared_camera_semantics
 from deployments.openpi.image_wire import (
     OPENPI_IMAGE_WIRE_JPEG_V1,
@@ -164,7 +167,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--prompt", default=None)
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help=(
+            "Explicit prompt text. Prompt-conditioned prepared artifacts accept "
+            "only their checkpoint-bound canonical or training-variant prompts."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-stage",
+        default=None,
+        metavar="STAGE_ID",
+        help=(
+            "Resolve a stage such as stage1, stage2, stage3, or stage4 to its "
+            "canonical prompt from the prepared checkpoint artifact."
+        ),
+    )
     parser.add_argument(
         "--image-wire-codec",
         choices=tuple(_IMAGE_WIRE_CLI_TO_CODEC),
@@ -267,6 +286,26 @@ def main(argv: list[str] | None = None) -> int:
             "Inject the checked-in real-runtime arguments for the selected lab "
             "profile. Explicit trailing runtime flags override profile values. "
             "The profile never enables --send-actions."
+        ),
+    )
+    parser.add_argument(
+        "--disconnected-gripper-sides",
+        choices=("none", "left", "right", "both"),
+        default="none",
+        help=(
+            "Keep selected DMTAC gripper side(s) intentionally offline while "
+            "preserving the prepared model I/O layout. No serial/tactile "
+            "connection or gripper command is sent for those sides."
+        ),
+    )
+    parser.add_argument(
+        "--disconnected-gripper-state",
+        type=float,
+        default=0.0,
+        metavar="SCALAR",
+        help=(
+            "Fixed assumed [0,1] state for selected disconnected grippers "
+            "(0=open, 1=closed); it is marked as assumed, not measured."
         ),
     )
     parser.add_argument(
@@ -451,6 +490,14 @@ def main(argv: list[str] | None = None) -> int:
                     "policy artifact camera_role_binding_hash differs from "
                     "--camera-role-registry."
                 )
+    try:
+        resolved_prompt, resolved_prompt_stage = resolve_prepared_prompt_selection(
+            None if policy_artifact is None else policy_artifact.metadata,
+            prompt=_optional_text(args.prompt),
+            prompt_stage=_optional_text(args.prompt_stage),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if (
         args.rtc_profile
         == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
@@ -486,13 +533,18 @@ def main(argv: list[str] | None = None) -> int:
                 "--contract-check-only requires --checkpoint-dir or "
                 "--policy-artifact-json."
             )
-        print(
-            json.dumps(
-                preflight_policy_artifact(policy_artifact).to_dict(),
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        report = preflight_policy_artifact(policy_artifact).to_dict()
+        if resolved_prompt is not None:
+            report["prompt_selection"] = {
+                "source": (
+                    "prepared_stage"
+                    if resolved_prompt_stage is not None
+                    else "explicit_prompt"
+                ),
+                "stage_id": resolved_prompt_stage,
+                "prompt": resolved_prompt,
+            }
+        print(json.dumps(report, indent=2, sort_keys=True))
         return 0
     strict_model_id = _optional_text(args.expected_model_id)
     strict_checkpoint_step = _optional_text(args.expected_checkpoint_step)
@@ -505,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         "host": args.host,
         "port": int(args.port),
         "api_key": _optional_text(args.api_key),
-        "prompt": _optional_text(args.prompt),
+        "prompt": resolved_prompt,
         # Model identity is intentionally not part of the default downstream
         # protocol gate. Keep the old exact check available only when a caller
         # explicitly opts in.
@@ -543,6 +595,13 @@ def main(argv: list[str] | None = None) -> int:
         }
     policy_kwargs = {key: value for key, value in policy_kwargs.items() if value is not None}
 
+    if resolved_prompt_stage is not None:
+        print(
+            "[OpenPI] prepared prompt stage selected: "
+            f"stage={resolved_prompt_stage} prompt={resolved_prompt!r}",
+            flush=True,
+        )
+
     from teleop_runtime.deploy.run_policy import main as run_real_policy
 
     runtime_args: list[str] = []
@@ -551,6 +610,15 @@ def main(argv: list[str] | None = None) -> int:
             _rm65_bimanual_dmtac_args(rtc_real_shadow=bool(args.rtc_real_shadow))
         )
     runtime_args.extend(teleop_args)
+    if args.disconnected_gripper_sides != "none":
+        runtime_args.extend(
+            (
+                "--disconnected-gripper-sides",
+                str(args.disconnected_gripper_sides),
+                "--disconnected-gripper-state",
+                str(float(args.disconnected_gripper_state)),
+            )
+        )
     if artifact_path is not None:
         runtime_args.extend(("--policy-artifact-json", str(artifact_path)))
     if args.debug:

@@ -20,6 +20,7 @@ from robot_motion.deploy.schema import normalize_active_sides
 
 
 CameraRenderer = Callable[[str], Any]
+TcpPoseBySideProvider = Callable[[], Mapping[str, Any]]
 
 
 def _normalize_mapping(value: Mapping[str, Any] | None, *, name: str) -> dict[str, Any]:
@@ -144,15 +145,23 @@ class MujocoDeploymentObservationAdapter:
         config: MujocoDeploymentObservationConfig,
         *,
         renderer: Any | None = None,
+        tcp_pose_by_side_provider: TcpPoseBySideProvider | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(config, MujocoDeploymentObservationConfig):
             raise TypeError("config must be a MujocoDeploymentObservationConfig.")
         if not callable(clock):
             raise TypeError("clock must be callable.")
+        if tcp_pose_by_side_provider is not None and not callable(
+            tcp_pose_by_side_provider
+        ):
+            raise TypeError(
+                "tcp_pose_by_side_provider must be callable or None."
+            )
         self.scene = scene
         self.config = config
         self.renderer = renderer
+        self.tcp_pose_by_side_provider = tcp_pose_by_side_provider
         self.clock = clock
         self._step_index = 0
         self._last_action: np.ndarray | None = None
@@ -165,6 +174,12 @@ class MujocoDeploymentObservationAdapter:
         if vector.shape != (26,) or not np.all(np.isfinite(vector)):
             raise ValueError("last_action must be one finite 26D runtime action vector.")
         self._last_action = vector.copy()
+
+    def reset(self) -> None:
+        """Release policy-local history without mutating simulator state."""
+
+        self._step_index = 0
+        self._last_action = None
 
     def _find_gripper_name(self, side: str) -> str:
         configured = self.config.gripper_name_by_side.get(side)
@@ -233,12 +248,25 @@ class MujocoDeploymentObservationAdapter:
             raise ValueError("step_index must be non-negative.")
 
         arm_states: dict[str, dict[str, Any]] = {}
+        provided_pose_by_side = (
+            None
+            if self.tcp_pose_by_side_provider is None
+            else dict(self.tcp_pose_by_side_provider())
+        )
+        if provided_pose_by_side is not None and set(provided_pose_by_side) != set(
+            self.config.active_sides
+        ):
+            raise ValueError(
+                "tcp_pose_by_side_provider must return exactly the active sides."
+            )
         for side in self.config.active_sides:
             qpos = np.asarray(self.scene.get_arm_qpos(side), dtype=np.float32).reshape(-1)
             if qpos.shape != (6,) or not np.all(np.isfinite(qpos)):
                 raise ValueError(f"MuJoCo {side} arm qpos is not a finite 6D vector.")
             pose = np.asarray(
-                self.scene.body_pose(self.config.tcp_body_by_side[side]),
+                self.scene.body_pose(self.config.tcp_body_by_side[side])
+                if provided_pose_by_side is None
+                else provided_pose_by_side[side],
                 dtype=np.float64,
             )
             if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):

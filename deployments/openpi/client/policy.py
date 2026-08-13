@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from typing import Any, Mapping
 
 from deployments.client.contracts import (
@@ -53,6 +54,10 @@ class OpenPIClientPolicyConfig:
     image_key_map: Mapping[str, str] | None = None
     include_debug_metadata: bool = True
     retry_interval_s: float = 2.0
+    # Preserve synchronous construction for legacy callers.  The shared
+    # threaded source opts in so metadata negotiation happens on its model
+    # worker, never while the application/control graph is constructed.
+    defer_connect: bool = False
     policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None
     policy_artifact: PolicyArtifactContract | Mapping[str, Any] | None = None
     # Explicit numeric contract carried to the OpenPI observation boundary.
@@ -209,6 +214,7 @@ class OpenPIClientPolicyConfig:
         object.__setattr__(self, "required_image_keys", required_image_keys)
         object.__setattr__(self, "image_key_map", image_key_map)
         object.__setattr__(self, "retry_interval_s", float(self.retry_interval_s))
+        object.__setattr__(self, "defer_connect", bool(self.defer_connect))
         object.__setattr__(self, "allowed_prompts", requested_allowed_prompts)
         object.__setattr__(
             self,
@@ -237,6 +243,11 @@ class OpenPIClientPolicy:
         remote_policy: RemoteModelPolicy | None = None,
     ) -> None:
         self.config = OpenPIClientPolicyConfig() if config is None else config
+        if remote_policy is not None and self.config.defer_connect:
+            raise ValueError(
+                "defer_connect cannot be used with an already constructed "
+                "remote_policy."
+            )
         strict_v22 = (
             self.config.policy_io_layout is not None
             and self.config.deploy_schema_version == DEXTELEOP_DEPLOY_SCHEMA_V2
@@ -294,19 +305,33 @@ class OpenPIClientPolicy:
                 else artifact.arm_hold_output.contract_hash
             ),
         )
+        observation_config = OpenPIObservationAdapterConfig(
+            prompt=self.config.prompt,
+            allowed_prompts=self.config.allowed_prompts,
+            image_key_map=self.config.image_key_map,
+            required_image_keys=self.config.required_image_keys,
+            include_debug_metadata=self.config.include_debug_metadata,
+            state_key=(artifact.state_key if artifact is not None else "state"),
+            state_discrete_key=(
+                artifact.state_discrete_key if artifact is not None else "state_discrete"
+            ),
+            normalization_contract=self.config.normalization_contract,
+        )
+        observation_adapter = lambda observation: deployment_observation_to_openpi(
+            observation,
+            observation_config,
+        )
+        remote_config = RemotePolicyConfig(
+            action_key=self.config.action_key,
+            action_dim=self.config.action_dim,
+            action_discrete_key=self.config.action_discrete_key,
+            action_discrete_dim=self.config.action_discrete_dim,
+            contract=contract,
+            source="openpi_remote_policy",
+            arm_hold_output=(None if artifact is None else artifact.arm_hold_output),
+        )
+        transport = None
         if remote_policy is None:
-            observation_config = OpenPIObservationAdapterConfig(
-                prompt=self.config.prompt,
-                allowed_prompts=self.config.allowed_prompts,
-                image_key_map=self.config.image_key_map,
-                required_image_keys=self.config.required_image_keys,
-                include_debug_metadata=self.config.include_debug_metadata,
-                state_key=(artifact.state_key if artifact is not None else "state"),
-                state_discrete_key=(
-                    artifact.state_discrete_key if artifact is not None else "state_discrete"
-                ),
-                normalization_contract=self.config.normalization_contract,
-            )
             transport = OpenPIWebsocketTransport(
                 host=self.config.host,
                 port=self.config.port,
@@ -314,27 +339,19 @@ class OpenPIClientPolicy:
                 retry_interval_s=self.config.retry_interval_s,
                 image_wire_config=self.config.image_wire_config,
             )
-            remote_policy = RemoteModelPolicy(
-                transport=transport,
-                observation_adapter=lambda observation: deployment_observation_to_openpi(
-                    observation,
-                    observation_config,
-                ),
-                config=RemotePolicyConfig(
-                    action_key=self.config.action_key,
-                    action_dim=self.config.action_dim,
-                    action_discrete_key=self.config.action_discrete_key,
-                    action_discrete_dim=self.config.action_discrete_dim,
-                    contract=contract,
-                    source="openpi_remote_policy",
-                    arm_hold_output=(
-                        None if artifact is None else artifact.arm_hold_output
-                    ),
-                ),
-            )
+            if not self.config.defer_connect:
+                remote_policy = RemoteModelPolicy(
+                    transport=transport,
+                    observation_adapter=observation_adapter,
+                    config=remote_config,
+                )
         else:
             validate_server_metadata(remote_policy.server_metadata, contract)
         self.remote_policy = remote_policy
+        self._deferred_transport = transport
+        self._deferred_observation_adapter = observation_adapter
+        self._deferred_remote_config = remote_config
+        self._connect_lock = threading.Lock()
         self.v22_adapter = (
             None
             if self.config.policy_io_layout is None
@@ -345,14 +362,79 @@ class OpenPIClientPolicy:
                 ),
             )
         )
-        self.name = _policy_name(self.remote_policy.server_metadata)
-        self.metadata = dict(getattr(self.remote_policy, "metadata", {}) or {})
+        if self.remote_policy is None:
+            self.name = _policy_name_from_config(self.config)
+            self.metadata = {
+                "policy": "openpi_remote_policy",
+                "connection": "deferred",
+            }
+        else:
+            self.name = _policy_name(self.remote_policy.server_metadata)
+            self.metadata = dict(getattr(self.remote_policy, "metadata", {}) or {})
         if self.v22_adapter is not None:
             self.metadata["policy_io_layout_hash"] = self.v22_adapter.layout.layout_hash
             self.metadata["policy_io_layout"] = self.v22_adapter.layout.to_dict()
 
+    def _ensure_remote_policy(self) -> RemoteModelPolicy:
+        remote_policy = self.remote_policy
+        if remote_policy is not None:
+            return remote_policy
+        with self._connect_lock:
+            remote_policy = self.remote_policy
+            if remote_policy is None:
+                transport = self._deferred_transport
+                if transport is None:
+                    raise RuntimeError("Deferred OpenPI transport is unavailable.")
+                remote_policy = RemoteModelPolicy(
+                    transport=transport,
+                    observation_adapter=self._deferred_observation_adapter,
+                    config=self._deferred_remote_config,
+                )
+                self.remote_policy = remote_policy
+                self.name = _policy_name(remote_policy.server_metadata)
+                metadata = dict(getattr(remote_policy, "metadata", {}) or {})
+                if self.v22_adapter is not None:
+                    metadata["policy_io_layout_hash"] = (
+                        self.v22_adapter.layout.layout_hash
+                    )
+                    metadata["policy_io_layout"] = (
+                        self.v22_adapter.layout.to_dict()
+                    )
+                self.metadata = metadata
+        return remote_policy
+
+    def _transport(self) -> Any:
+        if self.remote_policy is not None:
+            return self.remote_policy.transport
+        if self._deferred_transport is None:
+            raise RuntimeError("OpenPI transport is unavailable.")
+        return self._deferred_transport
+
     def reset(self) -> None:
-        self.remote_policy.reset()
+        self._transport().reset()
+
+    def request_cancel(self) -> bool:
+        """Request non-blocking transport cancellation for source reactivation."""
+
+        hook = getattr(self._transport(), "request_cancel", None)
+        if not callable(hook):
+            return False
+        return bool(hook())
+
+    def begin_session(self) -> bool:
+        """Re-arm a cancelled transport after its inference worker drained."""
+
+        hook = getattr(self._transport(), "begin_session", None)
+        if not callable(hook):
+            return False
+        return bool(hook())
+
+    def close(self) -> None:
+        """Release the model transport; this never owns target dispatch."""
+
+        hook = getattr(self._transport(), "close", None)
+        if callable(hook):
+            hook()
 
     def create_raw_rtc_adapter(
         self,
@@ -385,9 +467,10 @@ class OpenPIClientPolicy:
             if active_sides is None
             else tuple(str(side) for side in active_sides)
         )
+        remote_policy = self._ensure_remote_policy()
         return OpenPIFinalChunkRtcBackend(
-            transport=self.remote_policy.transport,
-            remote_policy=self.remote_policy,
+            transport=remote_policy.transport,
+            remote_policy=remote_policy,
             config=OpenPIFinalChunkRtcConfig(
                 artifact=artifact,
                 frame_contract_hash=frame_contract_hash,
@@ -451,10 +534,11 @@ class OpenPIClientPolicy:
         )
 
     def predict(self, observation: Any):
+        remote_policy = self._ensure_remote_policy()
         if self.v22_adapter is None:
-            return self.remote_policy.predict(observation)
+            return remote_policy.predict(observation)
         typed_observation = self.v22_adapter.observation_from_deployment(observation)
-        output = self.remote_policy.predict(typed_observation)
+        output = remote_policy.predict(typed_observation)
         return self.v22_adapter.to_legacy_normalized_actions(output, source="openpi_v22_policy")
 
 
@@ -481,6 +565,7 @@ def create_policy(
     image_key_map: Mapping[str, str] | None = None,
     include_debug_metadata: bool = True,
     retry_interval_s: float = 2.0,
+    defer_connect: bool = False,
     policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None,
     policy_artifact: PolicyArtifactContract | Mapping[str, Any] | None = None,
     normalization_contract: Mapping[str, Any] | None = None,
@@ -517,6 +602,7 @@ def create_policy(
             image_key_map=image_key_map,
             include_debug_metadata=bool(include_debug_metadata),
             retry_interval_s=float(retry_interval_s),
+            defer_connect=bool(defer_connect),
             policy_io_layout=policy_io_layout,
             policy_artifact=policy_artifact,
             normalization_contract=normalization_contract,
@@ -532,3 +618,10 @@ def _policy_name(metadata: dict[str, Any]) -> str:
         if value:
             return f"openpi:{value}"
     return "openpi_remote"
+
+
+def _policy_name_from_config(config: OpenPIClientPolicyConfig) -> str:
+    model_id = config.expected_model_id
+    if not model_id and config.policy_artifact is not None:
+        model_id = config.policy_artifact.model_id
+    return f"openpi:{model_id}" if model_id else "openpi_remote"

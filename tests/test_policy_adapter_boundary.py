@@ -186,3 +186,39 @@ def test_mujoco_observation_bridge_is_read_only_and_renders_required_images() ->
     np.testing.assert_allclose(observation.arm_states["right"]["actual_qpos"], np.arange(6))
     assert observation.hand_states["right"]["gripper_state_scalar"] == 0.25
 
+
+def test_mujoco_observation_bridge_accepts_explicit_arm_base_tool_tcp_pose() -> None:
+    pose = np.eye(4, dtype=float)
+    pose[:3, 3] = [0.8, -0.1, 0.4]
+    adapter = MujocoDeploymentObservationAdapter(
+        _FakeScene(),
+        MujocoDeploymentObservationConfig(
+            active_sides=("right",),
+            tcp_body_by_side={"right": "unused_world_endpoint"},
+        ),
+        tcp_pose_by_side_provider=lambda: {"right": pose},
+        clock=lambda: 12.0,
+    )
+
+    observation = adapter.capture()
+
+    np.testing.assert_allclose(
+        observation.arm_states["right"]["current_tcp_pose"],
+        pose,
+    )
+    np.testing.assert_allclose(
+        observation.arm_states["right"]["actual_tcp_pose"],
+        pose,
+    )
+
+    invalid = MujocoDeploymentObservationAdapter(
+        _FakeScene(),
+        MujocoDeploymentObservationConfig(
+            active_sides=("right",),
+            tcp_body_by_side={"right": "unused_world_endpoint"},
+        ),
+        tcp_pose_by_side_provider=dict,
+        clock=lambda: 12.0,
+    )
+    with pytest.raises(ValueError, match="exactly the active sides"):
+        invalid.capture()

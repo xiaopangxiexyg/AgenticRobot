@@ -124,6 +124,25 @@ the contract/hash only for entries that explicitly reference a profile. Legacy
 registry entries and clients that do not request a normalization hash remain
 unchanged, while new clients can opt into strict preflight.
 
+### Backend-neutral emission source
+
+`OpenPIEmissionSourceConfig` and `build_openpi_policy_emission_source()` bind a
+prepared OpenPI artifact to the shared `ThreadedPolicyEmissionSource`.  The
+caller supplies only a `DeploymentObservation` capture callback; the source has
+no MuJoCo, real-robot, GUI, composition, safety, IK, or dispatch dependency.
+Model inference runs on one private worker, while prediction admission, chunk
+ordering and one-keyframe `PolicyActionEmission` creation remain on the caller
+thread.  A failed prefetch cannot revoke the tail of an already admitted chunk,
+and an activation generation change discards late completion before emission.
+
+`model_observation_sides` and `output_active_sides` are separate.  This allows a
+bimanual model observation to produce an explicitly scoped contributor (for
+example right arm and right gripper) without pretending the target supports a
+full bimanual command.  The selected output sides must be a subset of the model
+observation sides.  A prepared artifact with an explicit executable
+`normalization_contract` is mandatory; a raw checkpoint artifact with missing
+normalization ownership is rejected.
+
 ## RTC-4b-A raw-RTC offline adapter
 
 该 adapter 保持 OpenPI 的既有 final-chunk model/server 接口；它不消费未来动作。模型消费

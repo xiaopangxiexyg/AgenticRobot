@@ -60,6 +60,9 @@ PREPARED_TRAINING_PROFILE_SCHEMA_V1 = (
 PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1 = (
     "dexteleop.openpi_prepared_prompt_training_profile.v1"
 )
+PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2 = (
+    "dexteleop.openpi_prepared_prompt_family_training_profile.v2"
+)
 PREPARED_DEPLOYMENT_BINDING_SCHEMA_V1 = (
     "dexteleop.openpi_prepared_deployment_binding.v1"
 )
@@ -141,10 +144,15 @@ def load_prepared_training_profile(path: str | Path) -> dict[str, Any]:
     if schema not in {
         PREPARED_TRAINING_PROFILE_SCHEMA_V1,
         PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1,
+        PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2,
     }:
         raise ValueError(f"Unsupported prepared training profile: {source}")
     required_keys = list(_PROFILE_REQUIRED_KEYS)
-    if schema == PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1:
+    prompt_profile = schema in {
+        PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1,
+        PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2,
+    }
+    if prompt_profile:
         required_keys.remove("target_skill_id")
         required_keys.extend(
             (
@@ -176,7 +184,7 @@ def load_prepared_training_profile(path: str | Path) -> dict[str, Any]:
         raise ValueError("Prepared training profile action_pose_mode is unsupported.")
     if int(profile["action_horizon"]) <= 0:
         raise ValueError("Prepared training profile action_horizon must be positive.")
-    if schema == PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1:
+    if prompt_profile:
         prompt_stages = profile.get("prompt_stages")
         if (
             not isinstance(prompt_stages, Sequence)
@@ -187,7 +195,12 @@ def load_prepared_training_profile(path: str | Path) -> dict[str, Any]:
             raise ValueError(
                 "Prepared prompt training profile requires prompt_stages."
             )
-        for key in ("stage_id", "skill_id", "prompt"):
+        prompt_key = (
+            "prompt"
+            if schema == PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1
+            else "canonical_prompt"
+        )
+        for key in ("stage_id", "skill_id", prompt_key):
             values = tuple(str(item.get(key) or "").strip() for item in prompt_stages)
             if any(not value for value in values) or len(set(values)) != len(values):
                 raise ValueError(
@@ -202,6 +215,61 @@ def load_prepared_training_profile(path: str | Path) -> dict[str, Any]:
                 "Prepared prompt training profile requires positive prepared "
                 "and OpenPI window counts for every stage."
             )
+        if schema == PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2:
+            required_family = (
+                "prompt_family_sampling_policy",
+                "prompt_family_sampling_seed",
+                "canonical_prompt_percent",
+                "training_variant_prompt_percent",
+                "max_full_token_length",
+                "prompt_state_dimension",
+            )
+            missing_family = [
+                key for key in required_family if not profile.get(key)
+            ]
+            if missing_family:
+                raise ValueError(
+                    "Prepared prompt-family profile is missing required fields: "
+                    + ", ".join(missing_family)
+                )
+            prompt_values: list[str] = []
+            for item in prompt_stages:
+                training_variants = tuple(
+                    str(value).strip()
+                    for value in item.get("training_prompt_variants", ())
+                )
+                held_out_variants = tuple(
+                    str(value).strip()
+                    for value in item.get("held_out_prompt_variants", ())
+                )
+                if (
+                    len(training_variants) != 12
+                    or len(held_out_variants) != 4
+                    or any(not value for value in training_variants)
+                    or any(not value for value in held_out_variants)
+                ):
+                    raise ValueError(
+                        "Prepared prompt-family stages require exactly 12 "
+                        "training variants and 4 held-out prompts."
+                    )
+                prompt_values.extend(
+                    (
+                        str(item["canonical_prompt"]).strip(),
+                        *training_variants,
+                        *held_out_variants,
+                    )
+                )
+            if len(set(prompt_values)) != len(prompt_values):
+                raise ValueError(
+                    "Prepared prompt-family prompts must be globally unique."
+                )
+            if (
+                int(profile["canonical_prompt_percent"]) != 80
+                or int(profile["training_variant_prompt_percent"]) != 20
+            ):
+                raise ValueError(
+                    "Prepared prompt-family profile requires an exact 80/20 split."
+                )
     if (
         profile.get("openpi_observation_mode")
         == OPENPI_STATE_ONLY_PROFILE_V1
@@ -555,9 +623,14 @@ def _validate_checkpoint_training_metadata(
     payload: Mapping[str, Any],
     profile: Mapping[str, Any],
 ) -> None:
-    prompt_profile = (
-        profile.get("schema") == PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1
+    prompt_family_profile = (
+        profile.get("schema")
+        == PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2
     )
+    prompt_profile = profile.get("schema") in {
+        PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1,
+        PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2,
+    }
     metadata_key = (
         "prepared_prompt_training_binding"
         if prompt_profile
@@ -618,6 +691,14 @@ def _validate_checkpoint_training_metadata(
                 str(item.get("stage_id") or ""),
                 str(item.get("skill_id") or ""),
                 str(item.get("prompt") or ""),
+                tuple(
+                    str(value)
+                    for value in item.get("training_prompt_variants", ())
+                ),
+                tuple(
+                    str(value)
+                    for value in item.get("held_out_prompt_variants", ())
+                ),
                 int(item.get("window_count", 0)),
                 int(item.get("expected_openpi_window_count", 0)),
             )
@@ -628,7 +709,19 @@ def _validate_checkpoint_training_metadata(
             (
                 str(item["stage_id"]),
                 str(item["skill_id"]),
-                str(item["prompt"]),
+                str(
+                    item[
+                        "canonical_prompt" if prompt_family_profile else "prompt"
+                    ]
+                ),
+                tuple(
+                    str(value)
+                    for value in item.get("training_prompt_variants", ())
+                ),
+                tuple(
+                    str(value)
+                    for value in item.get("held_out_prompt_variants", ())
+                ),
                 int(item["expected_window_count"]),
                 int(item["expected_openpi_window_count"]),
             )
@@ -656,6 +749,37 @@ def _validate_checkpoint_training_metadata(
                 prepared.get("prompt_stage_sampling_seed", 0)
             ),
         )
+        if prompt_family_profile:
+            expected_prepared.update(
+                schema="dexteleop.openpi_prepared_prompt_binding.v2",
+                prompt_family_sampling_policy=str(
+                    profile["prompt_family_sampling_policy"]
+                ),
+                prompt_family_sampling_seed=int(
+                    profile["prompt_family_sampling_seed"]
+                ),
+                canonical_prompt_percent=80,
+                training_variant_prompt_percent=20,
+                held_out_prompts_in_training=False,
+            )
+            actual_prepared.update(
+                schema=str(prepared.get("schema") or ""),
+                prompt_family_sampling_policy=str(
+                    prepared.get("prompt_family_sampling_policy") or ""
+                ),
+                prompt_family_sampling_seed=int(
+                    prepared.get("prompt_family_sampling_seed", 0)
+                ),
+                canonical_prompt_percent=int(
+                    prepared.get("canonical_prompt_percent", 0)
+                ),
+                training_variant_prompt_percent=int(
+                    prepared.get("training_variant_prompt_percent", 0)
+                ),
+                held_out_prompts_in_training=bool(
+                    prepared.get("held_out_prompts_in_training", True)
+                ),
+            )
     else:
         expected_prepared["skill_id"] = str(profile["target_skill_id"])
         actual_prepared["skill_id"] = str(prepared.get("skill_id") or "")
@@ -828,12 +952,36 @@ def _expected_deployment(
         "norm_stats_ref": stats_ref,
         "norm_stats_hash": stats_hash,
     }
-    if profile.get("schema") == PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1:
+    if profile.get("schema") in {
+        PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1,
+        PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2,
+    }:
+        prompt_family_profile = (
+            profile.get("schema")
+            == PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2
+        )
         prompt_stages = [
             {
                 "stage_id": str(item["stage_id"]),
                 "skill_id": str(item["skill_id"]),
-                "prompt": str(item["prompt"]),
+                "prompt": str(
+                    item[
+                        "canonical_prompt" if prompt_family_profile else "prompt"
+                    ]
+                ),
+                **(
+                    {
+                        "allowed_prompts": [
+                            str(item["canonical_prompt"]),
+                            *(
+                                str(value)
+                                for value in item["training_prompt_variants"]
+                            ),
+                        ]
+                    }
+                    if prompt_family_profile
+                    else {}
+                ),
             }
             for item in profile["prompt_stages"]
         ]

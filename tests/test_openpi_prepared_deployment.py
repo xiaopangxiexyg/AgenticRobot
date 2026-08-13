@@ -5,9 +5,11 @@ import dataclasses
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 
+import numpy as np
 import pytest
 
 from dataset_contracts.normalization import (
@@ -50,7 +52,15 @@ from deployments.openpi.client import real as openpi_real
 from deployments.openpi.client.normalization import (
     make_openpi_quantile_normalization_contract,
 )
+from deployments.openpi.client.observation_adapter import (
+    prepared_allowed_prompts,
+    prepared_prompt_for_stage,
+    resolve_prepared_prompt_selection,
+)
+from teleop_runtime.backends.grippers import DMTacGripperBackend
 from teleop_runtime.deploy import run_policy
+from teleop_runtime.deploy.observation import build_deployment_observation
+from teleop_runtime.schemas import EffectorCommand, TeleopCommand
 
 
 def _fixture(
@@ -1122,6 +1132,8 @@ def test_prepared_client_explicit_position_overlay_resolves_15_60_120(
                 "qpos_episode": args.policy_qpos_init_episode,
                 "qpos_frame": args.policy_qpos_init_frame,
                 "send_actions": args.send_actions,
+                "disconnected_gripper_sides": args.disconnected_gripper_sides,
+                "disconnected_gripper_state": args.disconnected_gripper_state,
             }
         )
         return 0
@@ -1150,6 +1162,10 @@ def test_prepared_client_explicit_position_overlay_resolves_15_60_120(
             "0",
             "--policy-qpos-init-frame",
             "0",
+            "--disconnected-gripper-sides",
+            "left",
+            "--disconnected-gripper-state",
+            "0.25",
             "--send-actions",
         ]
     ) == 0
@@ -1165,7 +1181,275 @@ def test_prepared_client_explicit_position_overlay_resolves_15_60_120(
         "qpos_episode": 0,
         "qpos_frame": 0,
         "send_actions": True,
+        "disconnected_gripper_sides": ("left",),
+        "disconnected_gripper_state": 0.25,
     }
+
+
+def test_selected_disconnected_gripper_is_no_io_and_skips_physical_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = argparse.ArgumentParser()
+    run_policy.add_args(parser)
+    args = parser.parse_args(
+        [
+            "--no-arms",
+            "--hand-backend",
+            "dmtac-gripper",
+            "--active-sides",
+            "both",
+            "--disconnected-gripper-sides",
+            "left",
+            "--disconnected-gripper-state",
+            "0.25",
+        ]
+    )
+    active_sides = run_policy.validate_args(args)
+    assignment = {
+        "assignments": {
+            "right": {
+                "gripper": {
+                    "port": "/dev/serial/by-id/right-gripper",
+                    "gripper_id": 1,
+                    "baudrate": 115200,
+                    "timeout": 0.03,
+                },
+                "tactile": {"inner": None, "outer": None},
+            }
+        }
+    }
+    load_calls: list[dict[str, object]] = []
+
+    def _load_assignment(*_args: object, **kwargs: object) -> dict[str, object]:
+        load_calls.append(dict(kwargs))
+        return assignment
+
+    monkeypatch.setattr(run_policy, "load_dmtac_hardware_assignment", _load_assignment)
+
+    backends = run_policy.build_hand_backends(args, active_sides)
+    specs = run_policy.hand_action_specs_for_backends(
+        args,
+        backends,
+        active_sides,
+    )
+    disconnected = backends["left"]
+    assert load_calls == [
+        {
+            "validate_current_usb": False,
+            "allow_missing": False,
+            "assume_yes_for_extra": True,
+        }
+    ]
+    assert isinstance(disconnected, DMTacGripperBackend)
+    assert disconnected.config.connect_hardware is False
+    assert disconnected.config.connect_tactile is False
+    assert disconnected.config.send_commands is False
+    disconnected.start()
+    assert disconnected.device is None
+    assert disconnected.is_ready()
+
+    before = disconnected.get_state()
+    assert before["intentionally_disconnected"] is True
+    assert before["gripper_state_assumed"] is True
+    assert before["gripper_state_source"] == "configured_disconnected_assumption"
+    assert before["gripper_measurement_timestamp"] is None
+    assert before["gripper_reconnect_on_error"] is False
+    assert float(before["joint_pos"][0]) == pytest.approx(0.25)
+    assert before["gripper_measured_scalar"] is None
+    assert disconnected.send_command(
+        EffectorCommand(
+            effector_name="left_hand",
+            side="left",
+            command_type="gripper_scalar",
+            value=np.asarray([0.8], dtype=np.float32),
+        )
+    )
+    after = disconnected.get_state()
+    assert after["gripper_last_send_status"] == "intentionally_disconnected_noop"
+    assert float(after["joint_pos"][0]) == pytest.approx(0.25)
+    assert after["last_sent_command"] is None
+
+    discrete = TeleopCommand(timestamp=time.time())
+    discrete.add_command(
+        EffectorCommand(
+            effector_name="left_hand",
+            side="left",
+            command_type="gripper_scalar",
+            value=np.asarray([0.6], dtype=np.float32),
+        )
+    )
+    receipt = run_policy._dispatch_position_discrete_command_checked(
+        discrete,
+        hand_backends={"left": disconnected},
+    )
+    assert receipt["accepted"] is True
+    assert receipt["skipped"] is True
+    assert (
+        receipt["effectors"]["left_hand"]["status"]
+        == "intentionally_disconnected_noop"
+    )
+    assert specs["left"]["hand_model"] == "dmtac_gripper"
+    assert set(run_policy.policy_qpos_init_hand_action_specs(args, specs)) == {
+        "right"
+    }
+    observation_now = time.time()
+    observation = build_deployment_observation(
+        active_sides=("left", "right"),
+        arms_enabled=False,
+        hands_enabled=True,
+        end_effector_sides=("left", "right"),
+        step_index=0,
+        arm_states={},
+        hand_states={
+            "left": disconnected.get_state(),
+            "right": {
+                "joint_pos": np.zeros(6, dtype=np.float32),
+                "joint_timestamp": observation_now,
+            },
+        },
+        timestamp=observation_now,
+        hand_state_max_age_sec=0.2,
+    )
+    assert observation.faults == []
+    assert int(np.sum(observation.state_valid)) == 12
+
+
+def test_default_connected_gripper_keeps_usb_validation_and_transport_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = argparse.ArgumentParser()
+    run_policy.add_args(parser)
+    args = parser.parse_args(
+        [
+            "--no-arms",
+            "--hand-backend",
+            "dmtac-gripper",
+            "--active-sides",
+            "left",
+        ]
+    )
+    active_sides = run_policy.validate_args(args)
+    assignment = {
+        "assignments": {
+            "left": {
+                "gripper": {
+                    "port": "/dev/serial/by-id/left-gripper",
+                    "gripper_id": 1,
+                    "baudrate": 115200,
+                    "timeout": 0.03,
+                },
+                "tactile": {"inner": None, "outer": None},
+            }
+        }
+    }
+    load_calls: list[dict[str, object]] = []
+
+    def _load_assignment(*_args: object, **kwargs: object) -> dict[str, object]:
+        load_calls.append(dict(kwargs))
+        return assignment
+
+    monkeypatch.setattr(run_policy, "load_dmtac_hardware_assignment", _load_assignment)
+    backends = run_policy.build_hand_backends(args, active_sides)
+
+    assert load_calls == [
+        {
+            "validate_current_usb": True,
+            "allow_missing": False,
+            "assume_yes_for_extra": True,
+        }
+    ]
+    connected = backends["left"]
+    assert isinstance(connected, DMTacGripperBackend)
+    assert connected.config.connect_hardware is True
+    assert connected.config.send_commands is True
+    assert connected.config.disconnected_state_scalar is None
+
+
+def test_both_disconnected_grippers_do_not_load_assignment_or_open_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = argparse.ArgumentParser()
+    run_policy.add_args(parser)
+    args = parser.parse_args(
+        [
+            "--no-arms",
+            "--hand-backend",
+            "dmtac-gripper",
+            "--active-sides",
+            "both",
+            "--disconnected-gripper-sides",
+            "both",
+        ]
+    )
+    active_sides = run_policy.validate_args(args)
+
+    def _unexpected_assignment_load(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("both-disconnected mode must not load DMTAC assignment")
+
+    monkeypatch.setattr(
+        run_policy,
+        "load_dmtac_hardware_assignment",
+        _unexpected_assignment_load,
+    )
+    backends = run_policy.build_hand_backends(args, active_sides)
+    assert set(backends) == {"left", "right"}
+    for backend in backends.values():
+        backend.start()
+        assert isinstance(backend, DMTacGripperBackend)
+        assert backend.device is None
+        assert backend.is_ready()
+        assert backend.get_state()["intentionally_disconnected"] is True
+
+
+def test_disconnected_gripper_selection_is_strictly_bounded() -> None:
+    parser = argparse.ArgumentParser()
+    run_policy.add_args(parser)
+    with pytest.raises(ValueError, match="subset"):
+        run_policy.validate_args(
+            parser.parse_args(
+                [
+                    "--no-arms",
+                    "--hand-backend",
+                    "dmtac-gripper",
+                    "--active-sides",
+                    "right",
+                    "--disconnected-gripper-sides",
+                    "left",
+                ]
+            )
+        )
+    with pytest.raises(ValueError, match="dmtac-gripper"):
+        run_policy.validate_args(
+            parser.parse_args(
+                [
+                    "--no-arms",
+                    "--hand-backend",
+                    "inspire",
+                    "--active-sides",
+                    "left",
+                    "--left-hand-ip",
+                    "127.0.0.1",
+                    "--disconnected-gripper-sides",
+                    "left",
+                ]
+            )
+        )
+    with pytest.raises(ValueError, match="finite and in"):
+        run_policy.validate_args(
+            parser.parse_args(
+                [
+                    "--no-arms",
+                    "--hand-backend",
+                    "dmtac-gripper",
+                    "--active-sides",
+                    "left",
+                    "--disconnected-gripper-sides",
+                    "left",
+                    "--disconnected-gripper-state",
+                    "nan",
+                ]
+            )
+        )
 
 
 def test_joint_prompt_checkpoint_metadata_is_bound_exactly() -> None:
@@ -1225,3 +1509,238 @@ def test_joint_prompt_checkpoint_metadata_is_bound_exactly() -> None:
             payload,
             profile,
         )
+
+
+def test_prompt_family_checkpoint_metadata_and_deploy_allowlist_are_exact() -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "deployments/openpi/configs/training"
+        / "writing_multistage_prompt_family_0804_0806_front_h16_absolute_v2.json"
+    )
+    profile = prepared_deployment.load_prepared_training_profile(profile_path)
+    payload = {
+        "prepared_prompt_training_binding": {
+            "schema": "dexteleop.openpi_prepared_prompt_binding.v2",
+            "camera_slot_to_dataset_key": [
+                {
+                    "model_slot": "base_0_rgb",
+                    "dataset_camera_key": "front",
+                }
+            ],
+            "action_horizon": 16,
+            "action_pose_mode": "absolute",
+            "episode_count": 890,
+            "window_count": 300426,
+            "prompt_stage_sampling_policy": "balanced_min_windows_rotate_v1",
+            "prompt_stage_sampling_seed": 20260811,
+            "prompt_family_sampling_policy": (
+                "canonical_80_train_variants_20_stratified_v1"
+            ),
+            "prompt_family_sampling_seed": 20260812,
+            "canonical_prompt_percent": 80,
+            "training_variant_prompt_percent": 20,
+            "held_out_prompts_in_training": False,
+            "prompt_skills": [
+                {
+                    "stage_id": item["stage_id"],
+                    "skill_id": item["skill_id"],
+                    "prompt": item["canonical_prompt"],
+                    "training_prompt_variants": list(
+                        item["training_prompt_variants"]
+                    ),
+                    "held_out_prompt_variants": list(
+                        item["held_out_prompt_variants"]
+                    ),
+                    "window_count": item["expected_window_count"],
+                    "expected_openpi_window_count": item[
+                        "expected_openpi_window_count"
+                    ],
+                }
+                for item in profile["prompt_stages"]
+            ],
+        },
+        "dataset_mixing": {
+            "sources": [
+                {
+                    "name": item["source_dataset_id"],
+                    "dataset_root": item["dataset_root"],
+                }
+                for item in profile["sources"]
+            ]
+        },
+    }
+    prepared_deployment._validate_checkpoint_training_metadata(payload, profile)
+
+    deployment_stages = [
+        {
+            "stage_id": item["stage_id"],
+            "skill_id": item["skill_id"],
+            "prompt": item["canonical_prompt"],
+            "allowed_prompts": [
+                item["canonical_prompt"],
+                *item["training_prompt_variants"],
+            ],
+        }
+        for item in profile["prompt_stages"]
+    ]
+    allowed = prepared_allowed_prompts(
+        {
+            "openpi_prepared_deployment_binding": {
+                "prompt_stages": deployment_stages
+            }
+        }
+    )
+    assert allowed is not None
+    assert len(allowed) == 52
+    assert all(
+        prompt not in allowed
+        for item in profile["prompt_stages"]
+        for prompt in item["held_out_prompt_variants"]
+    )
+    metadata = {
+        "openpi_prepared_deployment_binding": {
+            "prompt_stages": deployment_stages
+        }
+    }
+    for item in profile["prompt_stages"]:
+        assert prepared_prompt_for_stage(metadata, item["stage_id"]) == item[
+            "canonical_prompt"
+        ]
+    explicit_variant = profile["prompt_stages"][2]["training_prompt_variants"][4]
+    assert resolve_prepared_prompt_selection(
+        metadata,
+        prompt=explicit_variant,
+        prompt_stage=None,
+    ) == (explicit_variant, None)
+    assert resolve_prepared_prompt_selection(
+        metadata,
+        prompt=None,
+        prompt_stage="stage4",
+    ) == (profile["prompt_stages"][3]["canonical_prompt"], "stage4")
+    with pytest.raises(ValueError, match="requires --prompt-stage or --prompt"):
+        resolve_prepared_prompt_selection(
+            metadata,
+            prompt=None,
+            prompt_stage=None,
+        )
+    with pytest.raises(ValueError, match="not allowed"):
+        resolve_prepared_prompt_selection(
+            metadata,
+            prompt=profile["prompt_stages"][0]["held_out_prompt_variants"][0],
+            prompt_stage=None,
+        )
+    with pytest.raises(ValueError, match="available stages"):
+        prepared_prompt_for_stage(metadata, "stage5")
+
+    payload["prepared_prompt_training_binding"]["prompt_skills"][0][
+        "held_out_prompt_variants"
+    ][0] = "changed held-out prompt"
+    with pytest.raises(ValueError, match="disagrees"):
+        prepared_deployment._validate_checkpoint_training_metadata(
+            payload,
+            profile,
+        )
+
+
+def test_real_client_resolves_0807_prompt_stage_before_runtime_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "deployments/openpi/configs/training"
+        / "writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json"
+    )
+    profile = prepared_deployment.load_prepared_training_profile(profile_path)
+    prompt_stages = [
+        {
+            "stage_id": item["stage_id"],
+            "skill_id": item["skill_id"],
+            "prompt": item["canonical_prompt"],
+            "allowed_prompts": [
+                item["canonical_prompt"],
+                *item["training_prompt_variants"],
+            ],
+        }
+        for item in profile["prompt_stages"]
+    ]
+    artifact = PolicyArtifactContract(
+        policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+        model_id=str(profile["openpi_config_name"]),
+        checkpoint_step=30000,
+        dataset_schema="dexteleop_dataset_v2.3",
+        camera_input=PolicyCameraInputContract(
+            inputs=(
+                PolicyCameraInput(
+                    source_key="front",
+                    model_input_key="observation.images.front",
+                    server_camera_slot="base_0_rgb",
+                ),
+            )
+        ),
+        pose_action_chunk=PoseActionChunkContract(
+            action_horizon=16,
+            action_pose_mode="absolute",
+            tail_policy="drop",
+        ),
+        pose_training_data=PoseTrainingDataContract.native_v23(),
+        pose_frame_contract_hashes=("sha256:" + "1" * 64,),
+        metadata={
+            "openpi_prepared_deployment_binding": {
+                "prompt_stages": prompt_stages,
+            }
+        },
+    )
+    artifact_path = tmp_path / "prompt-family.policy_artifact.json"
+    artifact_path.write_text(json.dumps(artifact.to_dict()), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        openpi_real.main(
+            [
+                "--policy-artifact-json",
+                str(artifact_path),
+                "--contract-check-only",
+            ]
+        )
+    assert "requires --prompt-stage or --prompt" in capsys.readouterr().err
+
+    assert openpi_real.main(
+        [
+            "--policy-artifact-json",
+            str(artifact_path),
+            "--prompt-stage",
+            "stage3",
+            "--contract-check-only",
+        ]
+    ) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["prompt_selection"] == {
+        "source": "prepared_stage",
+        "stage_id": "stage3",
+        "prompt": profile["prompt_stages"][2]["canonical_prompt"],
+    }
+
+    captured: dict[str, object] = {}
+
+    def _capture_runtime(argv: list[str], **_kwargs: object) -> int:
+        captured["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr(run_policy, "main", _capture_runtime)
+    assert openpi_real.main(
+        [
+            "--policy-artifact-json",
+            str(artifact_path),
+            "--prompt-stage",
+            "stage2",
+        ]
+    ) == 0
+    delegated = captured["argv"]
+    assert isinstance(delegated, list)
+    policy_kwargs_index = delegated.index("--policy-kwargs-json") + 1
+    policy_kwargs = json.loads(delegated[policy_kwargs_index])
+    assert policy_kwargs["prompt"] == profile["prompt_stages"][1][
+        "canonical_prompt"
+    ]
+    assert "prompt_stage" not in policy_kwargs

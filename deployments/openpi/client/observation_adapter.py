@@ -222,12 +222,112 @@ def prepared_allowed_prompts(
         raise ValueError(
             "Prepared deployment prompt_stages must be a sequence of mappings."
         )
-    prompts = tuple(str(item.get("prompt") or "").strip() for item in raw_stages)
+    collected: list[str] = []
+    for item in raw_stages:
+        canonical = str(item.get("prompt") or "").strip()
+        if "allowed_prompts" not in item:
+            collected.append(canonical)
+            continue
+        allowed = item["allowed_prompts"]
+        if not isinstance(allowed, (list, tuple)):
+            raise ValueError(
+                "Prepared deployment allowed_prompts must be a sequence."
+            )
+        stage_prompts = tuple(str(value).strip() for value in allowed)
+        if not stage_prompts or stage_prompts[0] != canonical:
+            raise ValueError(
+                "Prepared deployment allowed_prompts must start with the "
+                "stage canonical prompt."
+            )
+        collected.extend(stage_prompts)
+    prompts = tuple(collected)
     if not prompts or any(not prompt for prompt in prompts) or len(set(prompts)) != len(prompts):
         raise ValueError(
             "Prepared deployment prompt allowlist must be non-empty and unique."
         )
     return prompts
+
+
+def prepared_prompt_for_stage(
+    artifact_metadata: Mapping[str, Any] | None,
+    stage_id: str,
+) -> str:
+    """Resolve one stage's canonical prompt from checkpoint-bound metadata."""
+
+    requested_stage = str(stage_id).strip()
+    if not requested_stage:
+        raise ValueError("OpenPI prompt stage id must be non-empty.")
+    if not isinstance(artifact_metadata, Mapping):
+        raise ValueError(
+            "OpenPI --prompt-stage requires a prepared prompt-conditioned artifact."
+        )
+    binding = artifact_metadata.get("openpi_prepared_deployment_binding")
+    if not isinstance(binding, Mapping):
+        raise ValueError(
+            "OpenPI --prompt-stage requires a prepared prompt-conditioned artifact."
+        )
+    raw_stages = binding.get("prompt_stages")
+    if not isinstance(raw_stages, (list, tuple)) or any(
+        not isinstance(item, Mapping) for item in raw_stages
+    ):
+        raise ValueError(
+            "Prepared deployment artifact does not declare valid prompt_stages."
+        )
+    # Reuse the full allowlist validator so a stage cannot be selected from a
+    # malformed or partially rewritten prompt contract.
+    prepared_allowed_prompts(artifact_metadata)
+    prompts_by_stage: dict[str, str] = {}
+    for item in raw_stages:
+        item_stage = str(item.get("stage_id") or "").strip()
+        canonical = str(item.get("prompt") or "").strip()
+        if not item_stage or not canonical:
+            raise ValueError(
+                "Prepared deployment prompt stages require stage_id and prompt."
+            )
+        if item_stage in prompts_by_stage:
+            raise ValueError(
+                "Prepared deployment prompt stage ids must be unique."
+            )
+        prompts_by_stage[item_stage] = canonical
+    if requested_stage not in prompts_by_stage:
+        raise ValueError(
+            f"Unknown OpenPI prompt stage {requested_stage!r}; available stages: "
+            + ", ".join(prompts_by_stage)
+        )
+    return prompts_by_stage[requested_stage]
+
+
+def resolve_prepared_prompt_selection(
+    artifact_metadata: Mapping[str, Any] | None,
+    *,
+    prompt: str | None,
+    prompt_stage: str | None,
+) -> tuple[str | None, str | None]:
+    """Validate explicit text or resolve an artifact-bound canonical stage."""
+
+    explicit_prompt = None if prompt is None else str(prompt).strip() or None
+    requested_stage = (
+        None if prompt_stage is None else str(prompt_stage).strip() or None
+    )
+    if explicit_prompt is not None and requested_stage is not None:
+        raise ValueError("Use only one of --prompt or --prompt-stage.")
+    allowed_prompts = prepared_allowed_prompts(artifact_metadata)
+    if requested_stage is not None:
+        return (
+            prepared_prompt_for_stage(artifact_metadata, requested_stage),
+            requested_stage,
+        )
+    if allowed_prompts is None:
+        return explicit_prompt, None
+    if explicit_prompt is None:
+        raise ValueError(
+            "Prompt-conditioned OpenPI artifact requires --prompt-stage or --prompt."
+        )
+    if explicit_prompt not in allowed_prompts:
+        raise ValueError(
+            "OpenPI --prompt is not allowed by the checkpoint artifact."
+        )
+    return explicit_prompt, None
 
 
 def _as_uint8_hwc(value: Any, *, key: str) -> np.ndarray:
