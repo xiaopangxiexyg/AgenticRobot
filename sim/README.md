@@ -30,6 +30,7 @@ sim/
       object.py               # free-body shape, mass, inertia and pose
       spec.py                 # composes the versioned SceneSpec
     manifest.py               # one validated contract bundle
+  demonstration_editing/      # pure demo trajectory/edit/reference semantics; no policy, safety, or engine owner
   configs/                    # reproducible contract profiles
   rm65/                       # engine-independent RM65 embodiment behavior/evidence
     actuation/                # causal qcmd -> actuator-target profile and core
@@ -53,6 +54,15 @@ sim/
 Do not add task rewards, policy adapters, actuator models, randomization, and
 dataset writing to `mjcf.py`. New responsibilities should get their own
 package at the corresponding layer.
+
+`sim/demonstration_editing` is the formal, backend-neutral home for the
+DemoGrasp-inspired structural primitive: one immutable high-level edit is
+applied to one successful pose-and-hand demonstration, then sampled by time as
+a nominal reference. It does not import DemoGrasp, MuJoCo, Torch,
+`teleop_runtime`, or `sim.mujoco_temp_pipeline`; it owns no recorder, learner,
+reward, collision policy, IK, authority, or dispatch. Task/model adapters must
+keep the high-level edit sample, nominal requested reference, safety-admitted
+reference, and measured execution as separate identities.
 
 ## Canonical physical profile
 
