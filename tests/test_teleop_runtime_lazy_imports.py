@@ -24,6 +24,7 @@ import json
 import sys
 import teleop_runtime
 import teleop_runtime.deploy.rm65_candidate_manifest
+import teleop_runtime.target_runtime_preparation
 import teleop_runtime.backends.arms.rm65_dispatch_inventory
 
 forbidden_prefixes = (

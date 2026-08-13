@@ -36,7 +36,12 @@ class TargetRuntimeProvider(Protocol):
         runtime_session_id: str,
         control_domain_id: str,
     ) -> ResolvedTargetRuntimeManifest:
-        """Resolve an immutable manifest without opening a device."""
+        """Resolve an immutable manifest without opening a device.
+
+        Every configuration choice that can alter the future handle's target
+        identity, command or observation semantics, operations, or required
+        assets must be represented by the resolved manifest.
+        """
         ...
 
     def create_target_runtime_handle(
@@ -46,7 +51,12 @@ class TargetRuntimeProvider(Protocol):
         manifest: ResolvedTargetRuntimeManifest,
         binding_receipt: TargetRuntimeBindingReceipt,
     ) -> TargetRuntimeHandle:
-        """Create an inert handle when the provider identity permits it."""
+        """Create an inert handle when the provider identity permits it.
+
+        Construction must not connect, start, home, command, or otherwise
+        activate a real or simulated target.  Those transitions belong to
+        declared operations and the existing authoritative dispatch owner.
+        """
         ...
 
 
