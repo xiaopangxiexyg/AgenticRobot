@@ -28,7 +28,9 @@ from .human import (
 )
 from .human_component_input import (
     HumanComponentActionAdaptation,
+    HumanCompositionInputAdaptation,
     adapt_human_emission_to_component_action,
+    adapt_human_emission_to_composition_input,
 )
 from .teleop_pose import (
     AttachablePassiveTeleopComponentSource,
@@ -79,12 +81,14 @@ __all__ = [
     "HumanTakeoverReadinessCandidate",
     "HumanTakeoverReadinessProvider",
     "HumanComponentActionAdaptation",
+    "HumanCompositionInputAdaptation",
     "PassiveHumanCommandEmissionIngress",
     "PassiveHumanCommandEmissionIngressStatus",
     "PassiveHumanCommandObserverFanout",
     "admit_human_command_emission",
     "admit_human_observation_cut",
     "adapt_human_emission_to_component_action",
+    "adapt_human_emission_to_composition_input",
     "AttachablePassiveTeleopComponentSource",
     "PassiveTeleopComponentBindingReceipt",
     "PassiveTeleopComponentClockBridge",

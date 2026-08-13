@@ -19,7 +19,39 @@ from control_station.sources import (
 )
 from robot_motion.action import ArmActionSpec, HandActionSpec
 from robot_motion.runtime import EffectorCommand, ObservationChannel, TeleopCommand
+from teleop_runtime.action.passive_teleop import (
+    AttachablePassiveTeleopComponentSource as LowerAttachablePassiveTeleopComponentSource,
+    PassiveTeleopComponentClockBridge as LowerPassiveTeleopComponentClockBridge,
+    PassiveTeleopComponentSessionSource as LowerPassiveTeleopComponentSessionSource,
+    PassiveTeleopComponentSourceSpec as LowerPassiveTeleopComponentSourceSpec,
+    PassiveTeleopComponentSpec as LowerPassiveTeleopComponentSpec,
+    PassiveTeleopPoseSessionSource as LowerPassiveTeleopPoseSessionSource,
+    PassiveTeleopPoseSourceSpec as LowerPassiveTeleopPoseSourceSpec,
+    build_passive_teleop_component_session_source as lower_build_passive_teleop_component_session_source,
+    build_passive_teleop_pose_session_source as lower_build_passive_teleop_pose_session_source,
+)
 from teleop_runtime.session import TeleopSession, TeleopSessionConfig
+
+
+def test_passive_teleop_station_exports_resolve_to_lower_owner() -> None:
+    assert (
+        AttachablePassiveTeleopComponentSource
+        is LowerAttachablePassiveTeleopComponentSource
+    )
+    assert PassiveTeleopComponentClockBridge is LowerPassiveTeleopComponentClockBridge
+    assert PassiveTeleopComponentSessionSource is LowerPassiveTeleopComponentSessionSource
+    assert PassiveTeleopComponentSourceSpec is LowerPassiveTeleopComponentSourceSpec
+    assert PassiveTeleopComponentSpec is LowerPassiveTeleopComponentSpec
+    assert PassiveTeleopPoseSessionSource is LowerPassiveTeleopPoseSessionSource
+    assert PassiveTeleopPoseSourceSpec is LowerPassiveTeleopPoseSourceSpec
+    assert (
+        build_passive_teleop_component_session_source
+        is lower_build_passive_teleop_component_session_source
+    )
+    assert (
+        build_passive_teleop_pose_session_source
+        is lower_build_passive_teleop_pose_session_source
+    )
 
 
 def _pose(x: float) -> np.ndarray:

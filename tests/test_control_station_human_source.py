@@ -4,11 +4,81 @@ import numpy as np
 import pytest
 
 from control_station.sources import (
+    HumanComponentActionAdaptation,
+    HumanCompositionInputAdaptation,
+    HumanObservationCutAdmissionCore,
+    HumanPoseSourceContract,
+    HumanProposalAdmissionCore,
     PassiveHumanCommandEmissionIngress,
+    PassiveHumanCommandEmissionIngressStatus,
     PassiveHumanCommandObserverFanout,
+    SyntheticHumanPoseSource,
+    SyntheticHumanPoseSourceSpec,
     SyntheticHumanQposSource,
     SyntheticHumanQposSourceSpec,
+    adapt_human_emission_to_component_action,
+    adapt_human_emission_to_composition_input,
+    admit_human_command_emission,
+    admit_human_observation_cut,
 )
+from teleop_runtime.action.human_composition_input import (
+    HumanComponentActionAdaptation as LowerHumanComponentActionAdaptation,
+    HumanCompositionInputAdaptation as LowerHumanCompositionInputAdaptation,
+    adapt_human_emission_to_component_action as lower_adapt_human_emission_to_component_action,
+    adapt_human_emission_to_composition_input as lower_adapt_human_emission_to_composition_input,
+)
+from teleop_runtime.action.human_admission import (
+    HumanObservationCutAdmissionCore as LowerHumanObservationCutAdmissionCore,
+    HumanProposalAdmissionCore as LowerHumanProposalAdmissionCore,
+    admit_human_command_emission as lower_admit_human_command_emission,
+    admit_human_observation_cut as lower_admit_human_observation_cut,
+)
+from teleop_runtime.action.human_observer import (
+    HumanPoseSourceContract as LowerHumanPoseSourceContract,
+    PassiveHumanCommandEmissionIngress as LowerPassiveHumanCommandEmissionIngress,
+    PassiveHumanCommandEmissionIngressStatus as LowerPassiveHumanCommandEmissionIngressStatus,
+    PassiveHumanCommandObserverFanout as LowerPassiveHumanCommandObserverFanout,
+)
+from teleop_runtime.action.synthetic_human import (
+    SyntheticHumanPoseSource as LowerSyntheticHumanPoseSource,
+    SyntheticHumanPoseSourceSpec as LowerSyntheticHumanPoseSourceSpec,
+    SyntheticHumanQposSource as LowerSyntheticHumanQposSource,
+    SyntheticHumanQposSourceSpec as LowerSyntheticHumanQposSourceSpec,
+)
+
+
+def test_synthetic_human_station_exports_resolve_to_lower_owner() -> None:
+    assert SyntheticHumanPoseSource is LowerSyntheticHumanPoseSource
+    assert SyntheticHumanPoseSourceSpec is LowerSyntheticHumanPoseSourceSpec
+    assert SyntheticHumanQposSource is LowerSyntheticHumanQposSource
+    assert SyntheticHumanQposSourceSpec is LowerSyntheticHumanQposSourceSpec
+
+
+def test_human_data_plane_station_exports_resolve_to_lower_owner() -> None:
+    assert HumanComponentActionAdaptation is LowerHumanComponentActionAdaptation
+    assert HumanCompositionInputAdaptation is LowerHumanCompositionInputAdaptation
+    assert HumanObservationCutAdmissionCore is LowerHumanObservationCutAdmissionCore
+    assert HumanProposalAdmissionCore is LowerHumanProposalAdmissionCore
+    assert HumanPoseSourceContract is LowerHumanPoseSourceContract
+    assert (
+        PassiveHumanCommandEmissionIngress
+        is LowerPassiveHumanCommandEmissionIngress
+    )
+    assert (
+        PassiveHumanCommandEmissionIngressStatus
+        is LowerPassiveHumanCommandEmissionIngressStatus
+    )
+    assert PassiveHumanCommandObserverFanout is LowerPassiveHumanCommandObserverFanout
+    assert admit_human_command_emission is lower_admit_human_command_emission
+    assert admit_human_observation_cut is lower_admit_human_observation_cut
+    assert (
+        adapt_human_emission_to_component_action
+        is lower_adapt_human_emission_to_component_action
+    )
+    assert (
+        adapt_human_emission_to_composition_input
+        is lower_adapt_human_emission_to_composition_input
+    )
 
 
 def _source() -> SyntheticHumanQposSource:
