@@ -188,7 +188,9 @@ def test_position_ik_output_is_explicit_absolute_qpos_shadow_not_lossy_pose() ->
     assert observed.adaptation.robot_action.action_space == "bimanual_qpos_v1"
     assert observed.shadow_step.evaluation is not None
     np.testing.assert_array_equal(
-        observed.shadow_step.evaluation.would_select_action.arm_qpos_by_side["left"],
+        observed.shadow_step.evaluation.would_select_action.value(
+            "left_arm"
+        ).values,
         np.arange(6, dtype=np.float32),
     )
     frontend.close(reason="qpos_shadow_fixture")

@@ -113,7 +113,10 @@ def _build_runner(
 def _selected_left_qpos(decision) -> np.ndarray:
     selected = decision.authoritative_step.decision
     assert selected is not None
-    return np.asarray(selected.selected_action.arm_qpos_by_side["left"], dtype=float)
+    return np.asarray(
+        selected.selected_action.value("left_arm").values,
+        dtype=float,
+    )
 
 
 def test_zero_latency_virtual_policy_reaches_existing_authoritative_sim_sink() -> None:
