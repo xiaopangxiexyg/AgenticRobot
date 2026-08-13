@@ -31,6 +31,7 @@ def test_catalog_separates_linear_and_tree_namespaces() -> None:
     tree = list_managed_task_profiles(topology_kind="ROOTED_TREE")
 
     assert tuple(item.profile_id for item in linear) == (
+        "dmtac_bimanual_writing_acquire_present_window_v1",
         "dmtac_rm65_bimanual_position_v1_progress",
         "dmtac_rm65_bimanual_position_writing_five_stage_progress",
         "dmtac_rm65_bimanual_position_writing_four_stage_progress",

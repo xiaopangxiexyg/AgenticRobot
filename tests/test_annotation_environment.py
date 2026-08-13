@@ -21,8 +21,6 @@ def test_annotation_extra_excludes_device_sim_model_and_training_stacks() -> Non
     source = _annotation_extra_source()
     for requirement in (
         '"numpy==1.26.4"',
-        '"scipy==1.13.1"',
-        '"osqp==1.1.3"',
         '"pyarrow==24.0.0"',
     ):
         assert requirement in source
@@ -36,6 +34,8 @@ def test_annotation_extra_excludes_device_sim_model_and_training_stacks() -> Non
         "torch",
         "onnxruntime",
         "grpcio",
+        "scipy",
+        "osqp",
         "qpsolvers",
         "pin-pink",
     ):
