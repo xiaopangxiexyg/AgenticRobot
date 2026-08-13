@@ -2048,34 +2048,87 @@ class MultiTaskIKSolver:
             return None
         return min_distance
 
-    def compute_min_collision_distance(self, q: np.ndarray | None = None) -> float | None:
+    def _loaded_min_collision_distance_details(self) -> dict[str, Any]:
+        """Describe the closest already-computed Pinocchio collision pair."""
+
+        minimum = float("inf")
+        closest_index: int | None = None
+        for index, result in enumerate(self.robot.collision_data.distanceResults):
+            distance_value = getattr(result, "min_distance", None)
+            if distance_value is None:
+                distance_value = getattr(result, "minimum_distance", None)
+            if distance_value is None:
+                continue
+            distance = float(distance_value)
+            if np.isfinite(distance) and distance < minimum:
+                minimum = distance
+                closest_index = int(index)
+        details: dict[str, Any] = {
+            "minimum_distance_m": (
+                None if closest_index is None else float(minimum)
+            ),
+            "collision_pair_index": closest_index,
+            "collision_geometry_1": None,
+            "collision_geometry_2": None,
+        }
+        pairs = tuple(self.robot.collision_model.collisionPairs)
+        geometries = tuple(self.robot.collision_model.geometryObjects)
+        if closest_index is None or closest_index >= len(pairs):
+            return details
+        pair = pairs[closest_index]
+        first = int(getattr(pair, "first"))
+        second = int(getattr(pair, "second"))
+        if 0 <= first < len(geometries):
+            details["collision_geometry_1"] = str(geometries[first].name)
+        if 0 <= second < len(geometries):
+            details["collision_geometry_2"] = str(geometries[second].name)
+        return details
+
+    def compute_min_collision_distance_details(
+        self,
+        q: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """Compute bounded closest-pair evidence for diagnostics and tracing."""
+
         start_time = time.perf_counter() if self.debug_profile else 0.0
-        if len(self.robot.collision_model.collisionPairs) == 0:
-            if self.debug_profile:
-                self.last_collision_distance_profile = {
-                    "recomputed": False,
-                    "pair_count": 0,
-                    "total_ms": (time.perf_counter() - start_time) * 1000.0,
-                    "min_distance_m": None,
-                }
-            return None
-        q_eval = self.current_q if q is None else np.asarray(q, dtype=float).reshape(-1)
-        self.pin.computeDistances(
-            self.robot.model,
-            self.robot.data,
-            self.robot.collision_model,
-            self.robot.collision_data,
-            q_eval,
-        )
-        min_distance = self._scan_loaded_min_collision_distance()
+        pair_count = len(self.robot.collision_model.collisionPairs)
+        if pair_count == 0:
+            details = {
+                "minimum_distance_m": None,
+                "collision_pair_index": None,
+                "collision_geometry_1": None,
+                "collision_geometry_2": None,
+            }
+        else:
+            q_eval = (
+                self.current_q
+                if q is None
+                else np.asarray(q, dtype=float).reshape(-1)
+            )
+            self.pin.computeDistances(
+                self.robot.model,
+                self.robot.data,
+                self.robot.collision_model,
+                self.robot.collision_data,
+                q_eval,
+            )
+            details = self._loaded_min_collision_distance_details()
         if self.debug_profile:
             self.last_collision_distance_profile = {
-                "recomputed": True,
-                "pair_count": len(self.robot.collision_model.collisionPairs),
+                "recomputed": pair_count > 0,
+                "pair_count": pair_count,
                 "total_ms": (time.perf_counter() - start_time) * 1000.0,
-                "min_distance_m": min_distance,
+                "min_distance_m": details["minimum_distance_m"],
+                "collision_pair_index": details["collision_pair_index"],
+                "collision_geometry_1": details["collision_geometry_1"],
+                "collision_geometry_2": details["collision_geometry_2"],
             }
-        return min_distance
+        return details
+
+    def compute_min_collision_distance(self, q: np.ndarray | None = None) -> float | None:
+        details = self.compute_min_collision_distance_details(q)
+        value = details["minimum_distance_m"]
+        return None if value is None else float(value)
 
     def solve(self, targets: list[np.ndarray] | None = None) -> np.ndarray:
         solve_start = time.perf_counter() if self.debug_profile else 0.0

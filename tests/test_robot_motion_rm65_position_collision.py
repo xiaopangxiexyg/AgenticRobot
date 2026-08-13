@@ -777,6 +777,38 @@ def test_collision_distance_unavailable_holds_last_safe_pair_atomically() -> Non
     assert result.metadata["segment_collision_certified"] is False
 
 
+def test_collision_failure_records_closest_proxy_pair_for_diagnostics() -> None:
+    solver = _FakeDualSolver()
+
+    def distance_details(qpos):
+        solver.distance_q.append(np.asarray(qpos, dtype=float).reshape(12).copy())
+        return {
+            "minimum_distance_m": (
+                0.10 if len(solver.distance_q) == 1 else 0.001
+            ),
+            "collision_pair_index": 4,
+            "collision_geometry_1": "right_hand_proxy_0",
+            "collision_geometry_2": "table_0",
+        }
+
+    solver.compute_min_collision_distance_details = distance_details
+    planner = _planner(solver)
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+    solver.solve_output[0] = 0.01
+
+    result = planner.plan_pose_reference({"left": _target(0.1)})
+
+    assert result.hold is True
+    assert result.metadata["failure"]["code"] == "collision_margin_low"
+    attempts = result.metadata["collision_check_attempts"]
+    assert attempts
+    assert all(
+        attempt["collision_geometry_1"] == "right_hand_proxy_0"
+        and attempt["collision_geometry_2"] == "table_0"
+        for attempt in attempts
+    )
+
+
 def test_solver_exception_holds_last_safe_pair() -> None:
     solver = _FakeDualSolver()
     planner = _planner(solver)

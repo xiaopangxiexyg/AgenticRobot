@@ -1367,7 +1367,9 @@ class RM65PositionCollisionPlanner:
                     result["reason"] = f"joint_certificate_modified:{side}"
                     return result
 
-            distance, distance_ms = self._collision_distance(candidate)
+            distance, distance_ms, distance_details = self._collision_distance(
+                candidate
+            )
             collision_safe, collision_reason = self._collision_safe(distance)
             if not collision_safe:
                 result.update(
@@ -1375,6 +1377,7 @@ class RM65PositionCollisionPlanner:
                         "reason": str(collision_reason or "collision_unsafe"),
                         "collision_distance_m": distance,
                         "collision_check_ms": float(distance_ms),
+                        **distance_details,
                     }
                 )
                 return result
@@ -1504,7 +1507,9 @@ class RM65PositionCollisionPlanner:
                 full_q,
                 self._last_admitted_velocity_full,
             )
-            distance, distance_ms = self._collision_distance(full_q)
+            distance, distance_ms, _distance_details = self._collision_distance(
+                full_q
+            )
             safe, reason = self._collision_safe(distance)
             if not safe:
                 raise ValueError(
@@ -1918,13 +1923,16 @@ class RM65PositionCollisionPlanner:
                 limited_full_q = self._embed_arm_qpos(reference_full_q, limited_arm_qpos)
                 self._require_arm_qpos_within_limits(limited_full_q, name="limited IK qpos")
 
-                distance, distance_ms = self._collision_distance(limited_full_q)
+                distance, distance_ms, distance_details = (
+                    self._collision_distance(limited_full_q)
+                )
                 collision_attempts.append(
                     {
                         "phase": "post_joint_limits",
                         "scale": 1.0,
                         "distance_m": distance,
                         "elapsed_ms": distance_ms,
+                        **distance_details,
                     }
                 )
                 safe, collision_reason = self._collision_safe(distance)
@@ -1948,15 +1956,18 @@ class RM65PositionCollisionPlanner:
                             candidate_full_q,
                             name=f"collision backoff qpos scale={scale:g}",
                         )
-                        candidate_distance, candidate_ms = self._collision_distance(
-                            candidate_full_q
-                        )
+                        (
+                            candidate_distance,
+                            candidate_ms,
+                            candidate_details,
+                        ) = self._collision_distance(candidate_full_q)
                         collision_attempts.append(
                             {
                                 "phase": "post_joint_limits_collision_backoff",
                                 "scale": float(scale),
                                 "distance_m": candidate_distance,
                                 "elapsed_ms": candidate_ms,
+                                **candidate_details,
                             }
                         )
                         candidate_safe, candidate_reason = self._collision_safe(
@@ -2109,9 +2120,12 @@ class RM65PositionCollisionPlanner:
                 reason = exc.code
             distance: float | None = None
             distance_ms = 0.0
+            distance_details: dict[str, object] = {}
             if reason is None:
                 try:
-                    distance, distance_ms = self._collision_distance(full_q)
+                    distance, distance_ms, distance_details = (
+                        self._collision_distance(full_q)
+                    )
                     collision_safe, collision_reason = self._collision_safe(distance)
                     if not collision_safe:
                         reason = collision_reason
@@ -2130,6 +2144,7 @@ class RM65PositionCollisionPlanner:
                     "source": str(source),
                     "collision_pair_count": int(self._collision_pair_count),
                     "collision_check_ms": float(distance_ms),
+                    **distance_details,
                     "collision_min_distance_m": float(
                         self.config.collision_min_distance_m
                     ),
@@ -3195,17 +3210,41 @@ class RM65PositionCollisionPlanner:
         collision_model = getattr(getattr(self.solver, "robot", None), "collision_model", None)
         return len(getattr(collision_model, "collisionPairs", ()) or ())
 
-    def _collision_distance(self, full_q: np.ndarray) -> tuple[float | None, float]:
+    def _collision_distance(
+        self,
+        full_q: np.ndarray,
+    ) -> tuple[float | None, float, dict[str, object]]:
         started = time.perf_counter()
-        method = getattr(self.solver, "compute_min_collision_distance", None)
-        value = None if not callable(method) else method(np.asarray(full_q, dtype=float).copy())
+        details_method = getattr(
+            self.solver,
+            "compute_min_collision_distance_details",
+            None,
+        )
+        details: dict[str, object] = {}
+        if callable(details_method):
+            raw_details = dict(
+                details_method(np.asarray(full_q, dtype=float).copy()) or {}
+            )
+            value = raw_details.pop("minimum_distance_m", None)
+            details = {
+                str(name): item
+                for name, item in raw_details.items()
+                if item is None or isinstance(item, (bool, int, float, str))
+            }
+        else:
+            method = getattr(self.solver, "compute_min_collision_distance", None)
+            value = (
+                None
+                if not callable(method)
+                else method(np.asarray(full_q, dtype=float).copy())
+            )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if value is None:
-            return None, elapsed_ms
+            return None, elapsed_ms, details
         distance = float(value)
         if not math.isfinite(distance):
-            return None, elapsed_ms
-        return distance, elapsed_ms
+            return None, elapsed_ms, details
+        return distance, elapsed_ms, details
 
     def _collision_safe(self, distance_m: float | None) -> tuple[bool, str | None]:
         if self._collision_pair_count <= 0:
