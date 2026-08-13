@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import errno
 import math
@@ -72,7 +73,13 @@ from dataset_interface.progress_recoverable_failures import (
     recoverable_failure_sample_axis_hash,
 )
 from dataset_interface.progress_stages import resolve_stage_training_index
+from dataset_interface.retrospective_progress_artifacts import (
+    LoadedRetrospectiveProgressEpisode,
+)
 from dataset_interface.sample_axis import EpisodeSampleAxis
+from dataset_interface.progress_annotation_read_cache import (
+    ProgressAnnotationReadCache,
+)
 
 
 _DRAFT_SCHEMA = "dexteleop.stage_annotation_draft.local.v1"
@@ -125,6 +132,7 @@ class RefinementAnnotationApplication:
         second_review: bool = False,
         allowed_source_roots: Sequence[str | Path] = (),
         defer_initial_refresh: bool = False,
+        read_cache: ProgressAnnotationReadCache | None = None,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.annotator_id = str(annotator_id).strip()
@@ -142,6 +150,7 @@ class RefinementAnnotationApplication:
             annotator_id=self.annotator_id,
         )
         self.workspace.acquire()
+        self._read_cache = read_cache or ProgressAnnotationReadCache()
         self._lock = threading.RLock()
         self._episode_operation_lock = threading.RLock()
         self._summary_load_locks = tuple(
@@ -165,6 +174,10 @@ class RefinementAnnotationApplication:
         self._annotation_summary_cache: dict[
             str,
             _EpisodeAnnotationSummary,
+        ] = {}
+        self._annotation_root_fingerprints: dict[
+            str,
+            tuple[object, ...],
         ] = {}
         self._episode_list_revision = 0
         self._sample_axis_cache: OrderedDict[
@@ -195,6 +208,7 @@ class RefinementAnnotationApplication:
                 self._items.clear()
                 self._annotation_sets_cache.clear()
                 self._annotation_summary_cache.clear()
+                self._annotation_root_fingerprints.clear()
                 self._sample_axis_cache.clear()
 
     def _catalog_fingerprint(self) -> tuple[object, ...]:
@@ -240,6 +254,7 @@ class RefinementAnnotationApplication:
                 for cache in (
                     self._annotation_sets_cache,
                     self._annotation_summary_cache,
+                    self._annotation_root_fingerprints,
                     self._sample_axis_cache,
                 ):
                     for episode_uuid in tuple(cache):
@@ -256,15 +271,38 @@ class RefinementAnnotationApplication:
             cursor = None if force_full else self._catalog_cursor
             current_items = dict(self._items)
         try:
-            batch = read_progress_annotation_work_item_batch(
-                self.dataset_root,
-                cursor=cursor,
-                allowed_source_roots=self.allowed_source_roots,
-                progress_callback=self._update_refresh_progress,
-                # Exact badges are loaded lazily for visible rows. Avoid an
-                # O(Episodes x annotation versions) SSHFS walk at startup.
-                load_annotation_state=False,
-            )
+            batch = None
+            if force_full:
+                fingerprint = self._catalog_fingerprint()
+                cached_prefix = self._read_cache.load_catalog_prefix(
+                    self.dataset_root
+                )
+                if cached_prefix is not None:
+                    if cached_prefix.catalog_fingerprint == fingerprint:
+                        batch = cached_prefix
+                    else:
+                        cursor = cached_prefix.cursor
+                        current_items = {
+                            item.episode_uuid: item
+                            for item in cached_prefix.items
+                        }
+                        for item in cached_prefix.items:
+                            self._publish_refresh_item(item)
+            if batch is None:
+                batch = read_progress_annotation_work_item_batch(
+                    self.dataset_root,
+                    cursor=cursor,
+                    allowed_source_roots=self.allowed_source_roots,
+                    progress_callback=self._update_refresh_progress,
+                    item_callback=(
+                        self._publish_refresh_item if force_full else None
+                    ),
+                    # Exact badges are loaded lazily for visible rows. Avoid an
+                    # O(Episodes x annotation versions) SSHFS walk at startup.
+                    load_annotation_state=False,
+                )
+                if batch.full_scan:
+                    self._read_cache.save_catalog(batch)
         except Exception as exc:
             self._finish_refresh(None, None, None, exc)
             if raise_error:
@@ -278,6 +316,18 @@ class RefinementAnnotationApplication:
             items.update(
                 (item.episode_uuid, item)
                 for item in batch.items
+            )
+            self._read_cache.save_catalog(
+                replace(
+                    batch,
+                    items=tuple(
+                        sorted(
+                            items.values(),
+                            key=lambda item: item.episode_index,
+                        )
+                    ),
+                    full_scan=True,
+                )
             )
         self._finish_refresh(
             items,
@@ -295,6 +345,25 @@ class RefinementAnnotationApplication:
                 return
             self._refresh_completed = max(0, int(completed))
             self._refresh_total = max(0, int(total))
+
+    def _publish_refresh_item(self, item: ProgressAnnotationWorkItem) -> None:
+        """Expose verified full-scan results as soon as each is available."""
+
+        with self._lock:
+            if self._closed:
+                return
+            existing = self._items.get(item.episode_uuid)
+            if existing is not None:
+                item = replace(
+                    item,
+                    has_draft=item.has_draft or existing.has_draft,
+                    annotation_set_count=max(
+                        item.annotation_set_count,
+                        existing.annotation_set_count,
+                    ),
+                )
+            self._items[item.episode_uuid] = item
+            self._episode_list_revision += 1
 
     def refresh(
         self,
@@ -381,7 +450,12 @@ class RefinementAnnotationApplication:
                 self._sample_axis_cache.move_to_end(item.episode_uuid)
                 return cached[1]
 
-        sample_axis = load_episode_sample_axis(item)
+        persistent = self._read_cache.load_sample_axis(item)
+        if persistent is not None:
+            sample_axis = persistent
+        else:
+            sample_axis = load_episode_sample_axis(item)
+            self._read_cache.save_sample_axis(item, sample_axis)
         with self._lock:
             self._sample_axis_cache[item.episode_uuid] = (
                 cache_key,
@@ -458,12 +532,24 @@ class RefinementAnnotationApplication:
                 with self._summary_load_lock(episode_uuid):
                     with self._lock:
                         active = self._active_episode_uuid
-                        if active != episode_uuid:
-                            # A different machine may have published since
-                            # this row was last visible. Immutable manifest-last
-                            # sets are safe to rediscover without its edit lock.
+                        cached = episode_uuid in self._annotation_sets_cache
+                    if (
+                        active != episode_uuid
+                        and cached
+                        and not self._annotation_cache_matches_storage(item)
+                    ):
+                        with self._lock:
+                            # A different machine published a new immutable
+                            # manifest-last set. Reload only after the Episode
+                            # annotation directory actually changed; visible
+                            # rows must not reread every sealed version every
+                            # 15 seconds on a remote mount.
                             self._annotation_sets_cache.pop(episode_uuid, None)
                             self._annotation_summary_cache.pop(episode_uuid, None)
+                            self._annotation_root_fingerprints.pop(
+                                episode_uuid,
+                                None,
+                            )
                     summary = self._episode_summary(
                         item,
                         load_annotations=True,
@@ -497,6 +583,40 @@ class RefinementAnnotationApplication:
                 }
             )
         return {"summaries": summaries, "errors": errors}
+
+    def _annotation_root_fingerprint(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> tuple[object, ...]:
+        root = (
+            self.dataset_root
+            / STAGE_ANNOTATION_RELATIVE_ROOT
+            / item.episode_uuid
+        )
+        try:
+            value = root.stat()
+        except FileNotFoundError:
+            return ("missing",)
+        except OSError as exc:
+            return ("error", type(exc).__name__, getattr(exc, "errno", None))
+        return (
+            "directory",
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    def _annotation_cache_matches_storage(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> bool:
+        with self._lock:
+            cached = self._annotation_root_fingerprints.get(item.episode_uuid)
+        return cached is not None and cached == self._annotation_root_fingerprint(
+            item
+        )
 
     @staticmethod
     def _report_operation_progress(
@@ -553,11 +673,13 @@ class RefinementAnnotationApplication:
             try:
                 with self._summary_load_lock(normalized):
                     with self._lock:
-                        # Another machine may have committed while this Episode
-                        # was not locally owned.  Reload after acquiring its
-                        # cross-machine lock and after any summary read finishes.
+                        # Do not trust a directory timestamp after taking a
+                        # cross-machine lock: NFS attribute caches may briefly
+                        # retain an old value. Preserve the original exact
+                        # discovery behavior for every newly opened Episode.
                         self._annotation_sets_cache.pop(normalized, None)
                         self._annotation_summary_cache.pop(normalized, None)
+                        self._annotation_root_fingerprints.pop(normalized, None)
                     try:
                         detail = self._episode_detail_owned(normalized)
                     except Exception:
@@ -566,6 +688,10 @@ class RefinementAnnotationApplication:
                         with self._lock:
                             self._annotation_sets_cache.pop(normalized, None)
                             self._annotation_summary_cache.pop(normalized, None)
+                            self._annotation_root_fingerprints.pop(
+                                normalized,
+                                None,
+                            )
                             self._sample_axis_cache.pop(normalized, None)
                         raise
 
@@ -584,6 +710,7 @@ class RefinementAnnotationApplication:
                     with self._lock:
                         self._annotation_sets_cache.pop(normalized, None)
                         self._annotation_summary_cache.pop(normalized, None)
+                        self._annotation_root_fingerprints.pop(normalized, None)
                         self._sample_axis_cache.pop(normalized, None)
                 try:
                     self.workspace.release_episode(episode_uuid=normalized)
@@ -597,21 +724,76 @@ class RefinementAnnotationApplication:
 
     def _episode_detail_owned(self, episode_uuid: str) -> dict[str, Any]:
         item = self._item(episode_uuid)
+        progress_manifest_name = (
+            "migration_manifest.cjson"
+            if isinstance(item.progress, LoadedRetrospectiveProgressEpisode)
+            else "manifest.cjson"
+        )
+        required_sources = (
+            (
+                item.progress_episode_dir / progress_manifest_name,
+                (self.dataset_root,),
+            ),
+            (
+                item.parquet_path,
+                (self.dataset_root, *self.allowed_source_roots),
+            ),
+            *(
+                (
+                    path,
+                    (self.dataset_root, *self.allowed_source_roots),
+                )
+                for path in item.video_paths.values()
+            ),
+        )
+        missing: list[str] = []
+        for path, allowed_roots in required_sources:
+            try:
+                resolved = path.resolve(strict=True)
+                if not any(
+                    resolved.is_relative_to(root)
+                    for root in allowed_roots
+                ):
+                    raise ValueError("source path escapes its admitted roots")
+            except (FileNotFoundError, OSError, ValueError):
+                missing.append(str(path))
+                continue
+            if not resolved.is_file():
+                missing.append(str(path))
+        if missing:
+            raise RefinementAnnotationApplicationError(
+                "Cannot open Episode because sealed source files are no "
+                f"longer available: {', '.join(missing)}"
+            )
         stage_profile = item.progress.stage_profile
         stage_entry = item.progress.stage_entry_binding
         assert stage_profile is not None
         assert stage_entry is not None
-        annotation_sets = self._sealed_annotation_sets(item)
-        sample_axis = self._sample_axis(item)
-        try:
-            stored_draft = self.workspace.load_draft(
-                episode_uuid=episode_uuid
+        # These three reads are independent and each can be dominated by
+        # remote filesystem latency.  Overlap them without weakening the
+        # Episode lock already held by the caller.
+        with ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="annotation-episode-open",
+        ) as executor:
+            annotation_sets_future = executor.submit(
+                self._sealed_annotation_sets,
+                item,
             )
-        except StageAnnotationStoreError as exc:
-            raise RefinementAnnotationApplicationError(
-                "Cannot load the local annotation draft. The dataset "
-                f"storage may be disconnected or unreadable: {exc}"
-            ) from exc
+            sample_axis_future = executor.submit(self._sample_axis, item)
+            stored_draft_future = executor.submit(
+                self.workspace.load_draft,
+                episode_uuid=episode_uuid,
+            )
+            annotation_sets = annotation_sets_future.result()
+            sample_axis = sample_axis_future.result()
+            try:
+                stored_draft = stored_draft_future.result()
+            except StageAnnotationStoreError as exc:
+                raise RefinementAnnotationApplicationError(
+                    "Cannot load the local annotation draft. The dataset "
+                    f"storage may be disconnected or unreadable: {exc}"
+                ) from exc
         draft = stored_draft
         if stored_draft is not None:
             self._mark_item_has_draft(episode_uuid)
@@ -1618,6 +1800,7 @@ class RefinementAnnotationApplication:
         with self._lock:
             self._annotation_sets_cache.pop(episode_uuid, None)
             self._annotation_summary_cache.pop(episode_uuid, None)
+            self._annotation_root_fingerprints.pop(episode_uuid, None)
         self._mark_item_annotation_committed(episode_uuid)
         self._report_operation_progress(
             progress_callback,
@@ -2059,51 +2242,79 @@ class RefinementAnnotationApplication:
             / STAGE_ANNOTATION_RELATIVE_ROOT
             / item.episode_uuid
         )
-        if not root.is_dir():
-            self._cache_annotation_sets(item.episode_uuid, ())
-            return ()
         assert item.progress.stage_profile is not None
-        loaded: list[LoadedStageAnnotationSet] = []
-        for child in sorted(root.iterdir(), key=lambda value: value.name):
-            if not child.is_dir() or not (child / "manifest.cjson").is_file():
-                continue
-            try:
-                value = load_stage_annotation_set(child)
-            except StageAnnotationStoreError as exc:
-                raise RefinementAnnotationApplicationError(
-                    f"Cannot reopen invalid sealed annotation set "
-                    f"{child.name!r}: {exc}"
-                ) from exc
-            binding = value.binding
-            if (
-                binding.episode_capture_identity_hash
-                != item.episode_identity_hash
-                or binding.source_progress_manifest_hash
-                != item.progress_manifest_hash
-                or binding.task_stage_profile_hash
-                != item.progress.stage_profile.semantic_content_hash
-            ):
-                raise RefinementAnnotationApplicationError(
-                    f"Sealed annotation set {child.name!r} is bound to a "
-                    "different Episode, Progress seal, or stage profile."
+        for attempt in range(2):
+            before = self._annotation_root_fingerprint(item)
+            if before == ("missing",):
+                self._cache_annotation_sets(
+                    item.episode_uuid,
+                    (),
+                    root_fingerprint=before,
                 )
-            loaded.append(value)
-        result = tuple(
-            sorted(
-                loaded,
-                key=lambda value: (
-                    value.binding.created_at,
-                    value.binding.annotation_set_id,
-                ),
+                return ()
+            if before and before[0] == "error":
+                raise RefinementAnnotationApplicationError(
+                    f"Cannot inspect sealed annotation directory: {root}"
+                )
+            loaded: list[LoadedStageAnnotationSet] = []
+            for child in sorted(root.iterdir(), key=lambda value: value.name):
+                if (
+                    not child.is_dir()
+                    or not (child / "manifest.cjson").is_file()
+                ):
+                    continue
+                try:
+                    value = load_stage_annotation_set(child)
+                except StageAnnotationStoreError as exc:
+                    raise RefinementAnnotationApplicationError(
+                        f"Cannot reopen invalid sealed annotation set "
+                        f"{child.name!r}: {exc}"
+                    ) from exc
+                binding = value.binding
+                if (
+                    binding.episode_capture_identity_hash
+                    != item.episode_identity_hash
+                    or binding.source_progress_manifest_hash
+                    != item.progress_manifest_hash
+                    or binding.task_stage_profile_hash
+                    != item.progress.stage_profile.semantic_content_hash
+                ):
+                    raise RefinementAnnotationApplicationError(
+                        f"Sealed annotation set {child.name!r} is bound to a "
+                        "different Episode, Progress seal, or stage profile."
+                    )
+                loaded.append(value)
+            after = self._annotation_root_fingerprint(item)
+            if before != after:
+                if attempt == 0:
+                    continue
+                raise RefinementAnnotationApplicationError(
+                    "Sealed annotation versions changed repeatedly while they "
+                    "were being read; retry after the other publisher finishes."
+                )
+            result = tuple(
+                sorted(
+                    loaded,
+                    key=lambda value: (
+                        value.binding.created_at,
+                        value.binding.annotation_set_id,
+                    ),
+                )
             )
-        )
-        self._cache_annotation_sets(item.episode_uuid, result)
-        return result
+            self._cache_annotation_sets(
+                item.episode_uuid,
+                result,
+                root_fingerprint=after,
+            )
+            return result
+        raise AssertionError("annotation set read retry loop did not return")
 
     def _cache_annotation_sets(
         self,
         episode_uuid: str,
         values: tuple[LoadedStageAnnotationSet, ...],
+        *,
+        root_fingerprint: tuple[object, ...] | None = None,
     ) -> None:
         summary = self._summarize_annotation_sets(values)
         with self._lock:
@@ -2111,6 +2322,10 @@ class RefinementAnnotationApplication:
             self._annotation_sets_cache[episode_uuid] = values
             self._annotation_sets_cache.move_to_end(episode_uuid)
             self._annotation_summary_cache[episode_uuid] = summary
+            if root_fingerprint is not None:
+                self._annotation_root_fingerprints[episode_uuid] = (
+                    root_fingerprint
+                )
             item = self._items.get(episode_uuid)
             item_count_changed = (
                 item is not None
@@ -2126,7 +2341,13 @@ class RefinementAnnotationApplication:
             if previous_summary != summary or item_count_changed:
                 self._episode_list_revision += 1
             while len(self._annotation_sets_cache) > _ANNOTATION_SET_CACHE_LIMIT:
-                self._annotation_sets_cache.popitem(last=False)
+                evicted_episode_uuid, _ = self._annotation_sets_cache.popitem(
+                    last=False
+                )
+                self._annotation_root_fingerprints.pop(
+                    evicted_episode_uuid,
+                    None,
+                )
 
     @staticmethod
     def _annotation_set_summary(

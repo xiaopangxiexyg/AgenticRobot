@@ -473,6 +473,7 @@ def read_progress_annotation_work_item_batch(
     cursor: ProgressAnnotationCatalogCursor | None = None,
     allowed_source_roots: Sequence[str | Path] = (),
     progress_callback: Callable[[int, int], None] | None = None,
+    item_callback: Callable[["ProgressAnnotationWorkItem"], None] | None = None,
     load_annotation_state: bool = True,
 ) -> ProgressAnnotationCatalogBatch:
     """Read only newly appended catalog records when the cursor is valid.
@@ -592,6 +593,8 @@ def read_progress_annotation_work_item_batch(
                 for completed, item in enumerate(hydrated, start=1):
                     if item is not None:
                         results.append(item)
+                        if item_callback is not None:
+                            item_callback(item)
                     if progress_callback is not None:
                         progress_callback(completed, total)
         else:
@@ -604,6 +607,8 @@ def read_progress_annotation_work_item_batch(
                 )
                 if item is not None:
                     results.append(item)
+                    if item_callback is not None:
+                        item_callback(item)
                 if progress_callback is not None:
                     progress_callback(completed, total)
     except ProgressAnnotationJobError:

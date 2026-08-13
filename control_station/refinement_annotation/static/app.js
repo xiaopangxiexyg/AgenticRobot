@@ -36,6 +36,9 @@ const state = {
   datasetBrowserPath: "",
   datasetBrowserPurpose: "launcher",
   datasetBrowserLoading: false,
+  datasetBrowserDirectories: [],
+  datasetBrowserRenderLimit: 250,
+  defaultCameraPreference: "auto",
   deletionHistory: [],
   sealedReeditBaseline: null,
   sealedReeditSourceId: null,
@@ -51,13 +54,19 @@ let episodeSummaryFlushTimer = 0;
 const pendingEpisodeSummaryIds = new Set();
 const inFlightEpisodeSummaryIds = new Set();
 const episodeSummaryRefreshedAt = new Map();
+const datasetBrowserCache = new Map();
+const datasetBrowserRequests = new Map();
 
 const EPISODE_REFRESH_INTERVAL_MS = 4000;
 const EPISODE_RENDER_BATCH_SIZE = 200;
 const EPISODE_SUMMARY_BATCH_SIZE = 32;
 const EPISODE_SUMMARY_REFRESH_MS = 15000;
+const DATASET_BROWSER_CACHE_MS = 15000;
+const DATASET_BROWSER_RENDER_BATCH_SIZE = 250;
 const EPISODE_PANEL_STORAGE_KEY =
   "dexteleop.annotation.episode_panel_collapsed";
+const DEFAULT_CAMERA_STORAGE_KEY =
+  "dexteleop.annotation.default_camera";
 const DISPLAY_GAP_THRESHOLD_SEC = 1.0;
 const DISPLAY_GAP_DURATION_SEC = 1.0;
 const STEP_COLOR_FAMILIES = [
@@ -462,6 +471,27 @@ function renderRememberedOptions() {
   }
 }
 
+function storedDefaultCameraPreference() {
+  const value = String(
+    window.localStorage.getItem(DEFAULT_CAMERA_STORAGE_KEY) || "auto",
+  );
+  return ["auto", "front", "left_wrist", "right_wrist"].includes(value)
+    ? value
+    : "auto";
+}
+
+function preferredCameraForEpisode(episode) {
+  const available = Array.isArray(episode?.camera_keys)
+    ? episode.camera_keys
+    : [];
+  const preferred = state.defaultCameraPreference;
+  if (preferred !== "auto" && available.includes(preferred)) return preferred;
+  if (available.includes(episode?.default_camera_key)) {
+    return episode.default_camera_key;
+  }
+  return available[0] || null;
+}
+
 function showConfiguredWorkspace(workspace) {
   state.workspaceConfigured = true;
   state.workspace = workspace;
@@ -488,6 +518,8 @@ async function initializeWorkspace() {
   );
   setEpisodePanelCollapsed(state.episodePanelCollapsed, {persist: false});
   renderRememberedOptions();
+  state.defaultCameraPreference = storedDefaultCameraPreference();
+  $("launcher-default-camera").value = state.defaultCameraPreference;
   try {
     const payload = await requestJson("/api/workspace");
     const workspace = payload.workspace;
@@ -497,6 +529,11 @@ async function initializeWorkspace() {
     if (workspace.configured) {
       showConfiguredWorkspace(workspace);
       await loadEpisodes();
+    } else {
+      // Hide the first remote directory round trip behind launcher setup.
+      void fetchDatasetBrowser(workspace.dataset_root || "").catch(() => {
+        // The visible picker will report an actionable error if opened.
+      });
     }
   } catch (error) {
     $("launcher-status").textContent = error.message;
@@ -504,11 +541,38 @@ async function initializeWorkspace() {
   }
 }
 
+async function fetchDatasetBrowser(path = "") {
+  const requested = String(path || "").trim();
+  const cached = datasetBrowserCache.get(requested);
+  if (cached && Date.now() - cached.loadedAt < DATASET_BROWSER_CACHE_MS) {
+    return cached.payload;
+  }
+  const inFlight = datasetBrowserRequests.get(requested);
+  if (inFlight) return inFlight;
+  const pending = requestJson(
+    `/api/dataset-browser?path=${encodeURIComponent(requested)}`,
+  ).then((payload) => {
+    const value = {payload, loadedAt: Date.now()};
+    datasetBrowserCache.set(requested, value);
+    datasetBrowserCache.set(payload.current, value);
+    return payload;
+  }).finally(() => {
+    datasetBrowserRequests.delete(requested);
+  });
+  datasetBrowserRequests.set(requested, pending);
+  return pending;
+}
+
 async function openWorkspace() {
   if (state.busy) return;
   const datasetRoot = $("launcher-dataset-root").value.trim();
   const annotatorId = $("launcher-annotator-id").value.trim();
   const secondReview = $("launcher-second-review").checked;
+  state.defaultCameraPreference = $("launcher-default-camera").value;
+  window.localStorage.setItem(
+    DEFAULT_CAMERA_STORAGE_KEY,
+    state.defaultCameraPreference,
+  );
   state.busy = true;
   $("open-workspace").disabled = true;
   try {
@@ -562,7 +626,9 @@ function renderDatasetBrowserDirectories(directories) {
     );
     return;
   }
-  for (const directory of directories) {
+  const visible = directories.slice(0, state.datasetBrowserRenderLimit);
+  const fragment = document.createDocumentFragment();
+  for (const directory of visible) {
     const button = element("button", "dataset-browser-entry");
     button.type = "button";
     button.title = directory.path;
@@ -572,7 +638,22 @@ function renderDatasetBrowserDirectories(directories) {
     button.appendChild(label);
     button.appendChild(element("small", "", "进入 ›"));
     button.addEventListener("click", () => browseDatasetPath(directory.path));
-    root.appendChild(button);
+    fragment.appendChild(button);
+  }
+  root.appendChild(fragment);
+  if (visible.length < directories.length) {
+    const remaining = directories.length - visible.length;
+    const more = element(
+      "button",
+      "dataset-browser-entry",
+      `显示后续 ${Math.min(DATASET_BROWSER_RENDER_BATCH_SIZE, remaining)} 个目录`,
+    );
+    more.type = "button";
+    more.addEventListener("click", () => {
+      state.datasetBrowserRenderLimit += DATASET_BROWSER_RENDER_BATCH_SIZE;
+      renderDatasetBrowserDirectories(state.datasetBrowserDirectories);
+    });
+    root.appendChild(more);
   }
 }
 
@@ -586,9 +667,7 @@ async function browseDatasetPath(path = "") {
   $("dataset-browser-select").disabled = true;
   setDatasetBrowserStatus("正在读取目录…");
   try {
-    const payload = await requestJson(
-      `/api/dataset-browser?path=${encodeURIComponent(requested)}`,
-    );
+    const payload = await fetchDatasetBrowser(requested);
     setServerOnline(true);
     state.datasetBrowserPath = payload.current;
     $("dataset-browser-path").value = payload.current;
@@ -597,7 +676,9 @@ async function browseDatasetPath(path = "") {
     const parent = payload.parent || "";
     $("dataset-browser-parent").dataset.path = parent;
     $("dataset-browser-parent").disabled = !parent;
-    renderDatasetBrowserDirectories(payload.directories || []);
+    state.datasetBrowserDirectories = payload.directories || [];
+    state.datasetBrowserRenderLimit = DATASET_BROWSER_RENDER_BATCH_SIZE;
+    renderDatasetBrowserDirectories(state.datasetBrowserDirectories);
     setDatasetBrowserStatus(
       `${(payload.directories || []).length} 个子目录 · 选择当前目录不会修改数据集。`,
     );
@@ -2051,7 +2132,7 @@ async function selectEpisode(episodeUuid) {
     setSavedDraftSnapshot(
       payload.episode.draft_requires_seal ? null : state.draft,
     );
-    state.selectedCamera = payload.episode.default_camera_key;
+    state.selectedCamera = preferredCameraForEpisode(payload.episode);
     state.selectedOccurrenceId = null;
     state.abnormalStart = null;
     clearRecoverableFailureCapture({clearNote: true});
@@ -2178,7 +2259,7 @@ function scheduleNextEpisodeWarmup() {
   const index = selectedEpisodeListIndex();
   const next = index >= 0 ? state.episodes[index + 1] : null;
   if (!next || isSingleStageEpisode(next)) return;
-  const camera = next.default_camera_key || next.camera_keys?.[0];
+  const camera = preferredCameraForEpisode(next);
   if (!camera) return;
   state.videoPrefetchTimer = window.setTimeout(() => {
     state.videoPrefetchTimer = 0;
@@ -3431,6 +3512,13 @@ $("next-episode-collapsed").addEventListener(
   () => navigateEpisode(1),
 );
 $("open-workspace").addEventListener("click", openWorkspace);
+$("launcher-default-camera").addEventListener("change", (event) => {
+  state.defaultCameraPreference = event.target.value;
+  window.localStorage.setItem(
+    DEFAULT_CAMERA_STORAGE_KEY,
+    state.defaultCameraPreference,
+  );
+});
 $("choose-dataset-root").addEventListener(
   "click",
   () => openDatasetBrowser("launcher"),

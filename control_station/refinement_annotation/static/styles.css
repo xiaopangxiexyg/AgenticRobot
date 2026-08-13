@@ -70,7 +70,8 @@ select, input[type="text"] {
   color: #c7d0d5;
   font-size: 12px;
 }
-.launcher-card input { min-width: 0; width: 100%; }
+.launcher-card input, .launcher-card select { min-width: 0; width: 100%; }
+.launcher-card label > small { color: var(--muted); line-height: 1.4; }
 .path-picker {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

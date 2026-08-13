@@ -29,6 +29,9 @@ from control_station.refinement_annotation.application import (
     RefinementAnnotationApplicationError,
 )
 from control_station.refinement_annotation.cli import build_parser
+from dataset_interface.progress_annotation_read_cache import (
+    ProgressAnnotationReadCache,
+)
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.progress_profile import (
     ProgressStepDefinitionV1,
@@ -202,6 +205,11 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "function publishCurrentAnnotations" in app_source
         assert "function requestJsonWithProgress" in app_source
         assert "function renderCatalogScanProgress" in app_source
+        assert 'id="launcher-default-camera"' in body.decode("utf-8")
+        assert "function preferredCameraForEpisode" in app_source
+        assert "DEFAULT_CAMERA_STORAGE_KEY" in app_source
+        assert "function fetchDatasetBrowser" in app_source
+        assert "DATASET_BROWSER_RENDER_BATCH_SIZE" in app_source
         assert b'id="operation-progress"' in body
         assert ".operation-progress-fill.indeterminate" in style_source
         assert "payload.episode.draft_requires_seal ? null" in app_source
@@ -1992,6 +2000,219 @@ def test_application_poll_uses_catalog_cursor_after_append(
         assert cursors[0] is not None
     finally:
         application.close()
+
+
+def test_full_catalog_scan_publishes_verified_items_incrementally(
+    tmp_path: Path,
+) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    observed: list[str] = []
+
+    batch = read_progress_annotation_work_item_batch(
+        tmp_path,
+        item_callback=lambda item: observed.append(item.episode_uuid),
+        load_annotation_state=False,
+    )
+
+    assert observed == [episode_uuid]
+    assert tuple(item.episode_uuid for item in batch.items) == (episode_uuid,)
+
+
+def test_persistent_read_cache_avoids_reloading_immutable_catalog_and_axis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import control_station.refinement_annotation.application as application_module
+
+    dataset_root = tmp_path / "dataset"
+    episode_uuid = _finalized_failure_retry_dataset(dataset_root)
+    cache_root = tmp_path / "read-cache"
+    first = RefinementAnnotationApplication(
+        dataset_root,
+        annotator_id="first",
+        read_cache=ProgressAnnotationReadCache(cache_root),
+    )
+    try:
+        first.episode_detail(episode_uuid)
+    finally:
+        first.close()
+
+    def unexpected_catalog(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("immutable catalog was reloaded")
+
+    def unexpected_sample_axis(_item: object) -> object:
+        raise AssertionError("immutable sample axis was reloaded")
+
+    monkeypatch.setattr(
+        application_module,
+        "read_progress_annotation_work_item_batch",
+        unexpected_catalog,
+    )
+    monkeypatch.setattr(
+        application_module,
+        "load_episode_sample_axis",
+        unexpected_sample_axis,
+    )
+    second = RefinementAnnotationApplication(
+        dataset_root,
+        annotator_id="second",
+        read_cache=ProgressAnnotationReadCache(cache_root),
+    )
+    try:
+        detail = second.episode_detail(episode_uuid)
+        assert detail["episode_uuid"] == episode_uuid
+        assert len(detail["sample_timestamps"]) == 9
+    finally:
+        second.close()
+
+
+def test_persistent_catalog_prefix_hydrates_only_appended_records_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import control_station.refinement_annotation.application as application_module
+
+    dataset_root = tmp_path / "dataset"
+    episode_uuid = _finalized_failure_retry_dataset(dataset_root)
+    cache_root = tmp_path / "read-cache"
+    first = RefinementAnnotationApplication(
+        dataset_root,
+        annotator_id="first",
+        read_cache=ProgressAnnotationReadCache(cache_root),
+    )
+    first.close()
+    with (dataset_root / "meta" / "episodes.jsonl").open(
+        "a",
+        encoding="utf-8",
+    ) as handle:
+        handle.write('{"metadata":null}\n')
+
+    original = application_module.read_progress_annotation_work_item_batch
+    observed_cursors: list[object] = []
+
+    def observed_read(root: object, **kwargs: object) -> object:
+        observed_cursors.append(kwargs.get("cursor"))
+        return original(root, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        application_module,
+        "read_progress_annotation_work_item_batch",
+        observed_read,
+    )
+    second = RefinementAnnotationApplication(
+        dataset_root,
+        annotator_id="second",
+        read_cache=ProgressAnnotationReadCache(cache_root),
+    )
+    try:
+        assert observed_cursors and observed_cursors[0] is not None
+        assert [
+            value["episode_uuid"]
+            for value in second.list_episodes()["episodes"]
+        ] == [episode_uuid]
+    finally:
+        second.close()
+
+
+def test_cached_episode_refuses_escaped_source_and_releases_temporary_lock(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    episode_uuid = _finalized_failure_retry_dataset(dataset_root)
+    cache_root = tmp_path / "read-cache"
+    first = RefinementAnnotationApplication(
+        dataset_root,
+        annotator_id="first",
+        read_cache=ProgressAnnotationReadCache(cache_root),
+    )
+    first.close()
+    parquet = next(dataset_root.glob("data/**/*.parquet"))
+    outside = tmp_path / "outside.parquet"
+    outside.write_bytes(parquet.read_bytes())
+    parquet.unlink()
+    parquet.symlink_to(outside)
+
+    second = RefinementAnnotationApplication(
+        dataset_root,
+        annotator_id="second",
+        read_cache=ProgressAnnotationReadCache(cache_root),
+    )
+    try:
+        with pytest.raises(
+            RefinementAnnotationApplicationError,
+            match="sealed source files are no longer available",
+        ):
+            second.episode_detail(episode_uuid)
+        with DatasetStageAnnotationWorkspace(
+            dataset_root,
+            annotator_id="probe",
+        ) as probe:
+            probe.acquire_episode(episode_uuid=episode_uuid)
+            probe.release_episode(episode_uuid=episode_uuid)
+    finally:
+        second.close()
+
+
+def test_visible_annotation_summary_reuses_unchanged_immutable_sets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import control_station.refinement_annotation.application as application_module
+
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    writer = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="writer",
+        read_cache=ProgressAnnotationReadCache(tmp_path / "writer-cache"),
+    )
+    try:
+        detail = writer.episode_detail(episode_uuid)
+        writer.commit(episode_uuid, detail["draft"])
+    finally:
+        writer.close()
+
+    calls = 0
+    original = application_module.load_stage_annotation_set
+
+    def counted_load(path: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        application_module,
+        "load_stage_annotation_set",
+        counted_load,
+    )
+    reader = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="reader",
+        read_cache=ProgressAnnotationReadCache(tmp_path / "reader-cache"),
+    )
+    try:
+        first_summary = reader.episode_annotation_summaries((episode_uuid,))
+        second_summary = reader.episode_annotation_summaries((episode_uuid,))
+        assert calls == 1
+        assert first_summary["summaries"][0]["annotation_set_count"] == 1
+        assert second_summary["summaries"][0]["annotation_set_count"] == 1
+
+        other = RefinementAnnotationApplication(
+            tmp_path,
+            annotator_id="other",
+            read_cache=ProgressAnnotationReadCache(tmp_path / "other-cache"),
+        )
+        try:
+            detail = other.episode_detail(episode_uuid)
+            other.commit(episode_uuid, detail["draft"])
+        finally:
+            other.close()
+
+        calls = 0
+        changed = reader.episode_annotation_summaries((episode_uuid,))
+        assert changed["summaries"][0]["annotation_set_count"] == 2
+        assert calls == 2
+    finally:
+        reader.close()
 
 
 def test_annotation_set_object_cache_is_bounded_but_summaries_remain(

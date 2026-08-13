@@ -75,6 +75,18 @@
         >
         <datalist id="recent-annotator-ids"></datalist>
       </label>
+      <label>
+        默认视频视角
+        <select id="launcher-default-camera">
+          <option value="auto">自动（优先 front）</option>
+          <option value="front">正视角（front）</option>
+          <option value="left_wrist">左腕视角（left_wrist）</option>
+          <option value="right_wrist">右腕视角（right_wrist）</option>
+        </select>
+        <small>
+          Episode 不包含所选视角时会自动回退到该 Episode 的默认视角。
+        </small>
+      </label>
       <label class="launcher-mode-toggle">
         <input id="launcher-second-review" type="checkbox">
         <span>

@@ -332,6 +332,11 @@ must be rebuilt from sealed progress/annotation artifacts after loss or format
 change. Catalog failure therefore cannot change the validity of an annotation
 commit.
 
+`dataset_interface.progress_annotation_read_cache` owns the separate,
+rebuildable read cache used by the refinement-annotation application. It
+reconstructs only sealed lower artifacts and persists no GUI or Station state;
+`control_station` supplies paths and presents the resulting read view.
+
 The selected timeline, salvage anchor, and training exclusions remain derived
 Python views. General correction contracts, annotation-set selection policy,
 canonical coverage receipts, and training-exclusion persistence remain outside
