@@ -4,6 +4,7 @@ from importlib import import_module
 
 
 _PROFILE_MODULES = (
+    "policy_human_shadow",
     "allocation_publication",
     "mujoco_allocation_publication",
     "mujoco_allocation_control_cycle",
@@ -187,6 +188,12 @@ __all__ = [
     "TrajectoryCompositionShadowController",
     "TrajectoryCompositionShadowCycle",
     "TrajectoryCompositionShadowProfile",
+    "POLICY_HUMAN_COMPOSITION_SHADOW_PROFILE_OFF",
+    "CompositionShadowInputSubmission",
+    "PassiveCompositionIngressStatus",
+    "PolicyHumanCompositionShadowCycle",
+    "PolicyHumanCompositionShadowProfile",
+    "PolicyHumanCompositionShadowSession",
     "TRAJECTORY_INTENT_PREVIEW_PROFILE_OFF",
     "TrajectoryIntentPreviewController",
     "TrajectoryIntentPreviewCycle",
