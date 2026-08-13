@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from numbers import Integral
 import threading
 import time
 from typing import Callable
@@ -73,6 +74,19 @@ def _finite(value: object, *, name: str) -> float:
     if not math.isfinite(normalized):
         raise ValueError(f"{name} must be finite.")
     return normalized
+
+
+def _parse_sdk_result(result: object) -> tuple[int | None, str]:
+    """Preserve the RM65 stop result as typed evidence without importing backend internals."""
+
+    if isinstance(result, Integral) and not isinstance(result, bool):
+        return int(result), str(int(result))
+    text = "" if result is None else str(result)
+    prefix = text.split(":", 1)[0].strip()
+    try:
+        return int(prefix), text
+    except (TypeError, ValueError):
+        return None, text
 
 
 @dataclass(frozen=True)
@@ -203,6 +217,9 @@ class RM65IdleWorkerStopCallReceipt:
     dispatch_accepted: bool
     dispatch_status: str
     dispatch_validation_hash: str
+    sdk_result_code: int | None
+    sdk_result_text: str
+    sdk_succeeded: bool
     sdk_result_repr: str
 
 
@@ -247,6 +264,7 @@ class RM65IdleWorkerBackendBinding:
 
 @dataclass(frozen=True)
 class RM65IdleWorkerDrainPreflightSnapshot:
+    binding_id: str
     runtime_session_id: str
     authorization_id: str
     profile_id: str
@@ -303,6 +321,21 @@ class RM65IdleWorkerDrainPreflightBinding:
         self.evidence_bundle = evidence_bundle
         self.authorization = authorization
         self.clock = clock
+        binding_identity_payload = {
+            "runtime_session_id": self.runtime_session_id,
+            "owner_runtime_id": _identifier(
+                owner_runtime_id,
+                name="owner_runtime_id",
+            ),
+            "authorization_id": authorization.authorization_id,
+            "execution_manifest_hash": authorization.execution_manifest_hash,
+            "dispatch_inventory_hash": authorization.dispatch_inventory_hash,
+            "worker_drain_plan_hash": authorization.worker_drain_plan_hash,
+        }
+        self.binding_id = "rm65-idle-worker-preflight:" + canonical_content_hash(
+            binding_identity_payload,
+            domain=RM65_IDLE_WORKER_BINDING_HASH_DOMAIN_V1,
+        )
         self.context = (
             LegacyControlDomainExecutionContext.create_hardware_idle_drain_stop_only_preflight(
                 runtime_session_id=self.runtime_session_id,
@@ -398,6 +431,7 @@ class RM65IdleWorkerDrainPreflightBinding:
         with self._lock:
             context = self.context.snapshot()
             payload = {
+                "binding_id": self.binding_id,
                 "runtime_session_id": self.runtime_session_id,
                 "authorization_id": self.authorization.authorization_id,
                 "profile_id": self.authorization.profile_id,
@@ -583,6 +617,7 @@ class RM65IdleWorkerDrainPreflightBinding:
             self._validated_stop_dispatches.append(
                 (permit, result.owner_validation)
             )
+            sdk_result_code, sdk_result_text = _parse_sdk_result(result.result)
             self._stop_receipts.append(
                 RM65IdleWorkerStopCallReceipt(
                     side=context.side,
@@ -596,6 +631,9 @@ class RM65IdleWorkerDrainPreflightBinding:
                     dispatch_accepted=result.validation.accepted,
                     dispatch_status=result.validation.status,
                     dispatch_validation_hash=result.validation.semantic_content_hash,
+                    sdk_result_code=sdk_result_code,
+                    sdk_result_text=sdk_result_text,
+                    sdk_succeeded=sdk_result_code == 0,
                     sdk_result_repr=repr(result.result),
                 )
             )

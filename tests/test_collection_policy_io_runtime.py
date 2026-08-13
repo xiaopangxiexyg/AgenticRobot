@@ -136,6 +136,26 @@ def test_auto_resolver_selects_checked_in_asymmetric_inspire_preset() -> None:
     assert resolved.provenance["preset"] == "dual_arm_left_none_right_inspire_v22.json"
 
 
+def test_auto_resolver_supports_left_none_right_dmtac_without_fake_left_state() -> None:
+    right_backend, right_retargeter = _dmtac_pair("right")
+
+    resolved = resolve_collection_policy_io_layout(
+        "auto",
+        active_sides=("left", "right"),
+        hand_backends_by_side={"left": None, "right": right_backend},
+        hand_retargeters_by_side={"left": None, "right": right_retargeter},
+    )
+
+    assert resolved.layout is not None
+    assert resolved.provenance["mode"] == "auto_generated"
+    assert resolved.layout.end_effector("left").adapter == "none_v1"
+    assert resolved.layout.end_effector("right").state_source_field == (
+        "gripper_measured_scalar"
+    )
+    assert resolved.layout.action_dim == 15
+    assert resolved.layout.state_dim == 15
+
+
 def test_strict_bimanual_dmtac_row_uses_measured_scalar_not_q6_fallback() -> None:
     left_backend, left_retargeter = _dmtac_pair("left")
     right_backend, right_retargeter = _dmtac_pair("right")
@@ -361,4 +381,22 @@ def test_real_teleop_side_backend_overrides_feed_dmtac_action_specs() -> None:
     assert real_teleop._hand_backend_mode_for_side(args, "right") == "dmtac-gripper"
     specs = real_teleop._collection_hand_action_specs(args, ("left", "right"))
     assert specs is not None
-    assert set(specs) == {"right"}
+    assert set(specs) == {"left", "right"}
+    assert specs["left"].hand_model == "none"
+    assert specs["left"].active_dof == 0
+    assert specs["left"].active_mask == (False,) * 6
+    assert specs["right"].hand_model == "dmtac_gripper"
+
+
+def test_real_teleop_hand_specs_preserve_inspire_default() -> None:
+    args = SimpleNamespace(
+        hand_backend="inspire",
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+
+    specs = real_teleop._collection_hand_action_specs(args, ("left", "right"))
+    assert specs is not None
+    assert specs["left"].hand_model == "inspire_tac"
+    assert specs["right"].hand_model == "inspire_tac"
+    assert specs["left"].active_dof == 6

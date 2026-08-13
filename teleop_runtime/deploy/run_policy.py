@@ -87,6 +87,10 @@ from robot_motion.deploy.runtime import (
     PolicyDeployRuntimeConfig,
     resolve_action_queue_policy,
 )
+from robot_motion.deploy.emission_port import (
+    PassivePolicyEmissionObserverPort,
+    require_passive_policy_emission_observer,
+)
 from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
     ACTION_DIM,
@@ -164,6 +168,10 @@ from ..action.replay_proposal import (
     DatasetReplayProposalShadowConfig,
     replay_adapter_debug_payload,
 )
+from ..action.legacy_execution_context import (
+    LegacyControlOwnerStateTransitionOutcome,
+    LegacyControlOwnerStateTransitionRequest,
+)
 from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
 from .position_plan_cut import DeploymentPositionPlanCutDetector
 from .rtc_frontend import RtcPolicyShadowConfig, RtcPolicyShadowFrontend
@@ -237,6 +245,13 @@ from ..position_control import (
     build_official_all_ik_governor_from_started_backends,
     build_position_collision_planner_from_started_backends,
     resolve_real_arm_execution_config,
+)
+from ..position_control.deploy_tcp_pose_envelope import (
+    DeployTCPPoseEnvelopeProjector,
+)
+from ..position_control.tcp_pose_envelope_runtime import (
+    TCPPoseEnvelopeRuntimeError,
+    load_tcp_pose_envelope_file_spec,
 )
 from ..sources.camera import (
     REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
@@ -1855,6 +1870,34 @@ def _parse_active_sides(value: str | list[str] | tuple[str, ...]) -> tuple[str, 
     return tuple(side for side in ALL_SIDES if side in set(parts))
 
 
+def _parse_disconnected_gripper_sides(
+    value: str | list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        parts = [
+            part.strip().lower()
+            for item in value
+            for part in str(item).replace(",", " ").split()
+            if part.strip()
+        ]
+    else:
+        parts = [
+            part.strip().lower()
+            for part in str(value).replace(",", " ").split()
+            if part.strip()
+        ]
+    if not parts or parts == ["none"]:
+        return ()
+    if parts == ["both"]:
+        return tuple(ALL_SIDES)
+    invalid = sorted(set(parts) - set(ALL_SIDES))
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            "disconnected-gripper-sides must be none, left, right, or both"
+        )
+    return tuple(side for side in ALL_SIDES if side in set(parts))
+
+
 def _parse_end_effector_sides(
     value: str | list[str] | tuple[str, ...],
     *,
@@ -2181,10 +2224,16 @@ def _dmtac_backend_configs(
     cached = getattr(args, "_dmtac_backend_configs", None)
     if isinstance(cached, dict):
         return dict(cached)
+    disconnected_sides = set(
+        _parse_disconnected_gripper_sides(
+            getattr(args, "disconnected_gripper_sides", ())
+        )
+    )
     dmtac_sides = tuple(
         side
         for side in active_sides
         if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+        and side not in disconnected_sides
     )
     if not dmtac_sides:
         setattr(args, "_dmtac_backend_configs", {})
@@ -2194,11 +2243,21 @@ def _dmtac_backend_configs(
     configs: dict[str, DMTacGripperBackendConfig] = {}
     if bool(getattr(args, "dmtac_default_config", True)):
         try:
+            validate_current_usb = bool(
+                getattr(args, "dmtac_validate_current_usb", True)
+            ) and not bool(disconnected_sides)
+            if disconnected_sides and bool(
+                getattr(args, "dmtac_validate_current_usb", True)
+            ):
+                print(
+                    "[DMTAC] saved assignment will be read without a USB/gripper "
+                    "probe because intentionally disconnected sides must receive "
+                    "no transport I/O; connected sides remain fail-closed at backend startup.",
+                    flush=True,
+                )
             assignment = load_dmtac_hardware_assignment(
                 str(getattr(args, "dmtac_config", "latest") or "latest"),
-                validate_current_usb=bool(
-                    getattr(args, "dmtac_validate_current_usb", True)
-                ),
+                validate_current_usb=validate_current_usb,
                 allow_missing=bool(getattr(args, "dmtac_allow_missing", False)),
                 assume_yes_for_extra=bool(
                     getattr(args, "dmtac_assume_yes_for_extra", True)
@@ -2411,6 +2470,27 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "Versioned position action-execution profile. Policy/dataset main actions "
             "are already source-shaped, so the formal deploy path does not repeat "
             "collection-side inactive, tracker, or post-IK qref smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--tcp-pose-envelope-profile",
+        type=Path,
+        default=None,
+        help=(
+            "Optional strict JSON tool-TCP workspace/rotation envelope. The "
+            "deploy adapter projects runtime-raw Pose targets in canonical desk "
+            "before IK; providing a profile alone is shadow-only and leaves "
+            "commands unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--tcp-pose-envelope-active",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Explicitly activate the configured deploy tool-TCP envelope. "
+            "Default is off; requires --tcp-pose-envelope-profile and position "
+            "Pose execution."
         ),
     )
     parser.add_argument(
@@ -3481,6 +3561,26 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional right-side override for --hand-backend.",
     )
+    parser.add_argument(
+        "--disconnected-gripper-sides",
+        choices=("none", "left", "right", "both"),
+        default="none",
+        help=(
+            "DMTAC side(s) intentionally kept offline: none, left, right, or both. "
+            "Selected sides open no gripper/tactile transport and accept policy "
+            "gripper commands only as audited no-ops."
+        ),
+    )
+    parser.add_argument(
+        "--disconnected-gripper-state",
+        type=float,
+        default=0.0,
+        metavar="SCALAR",
+        help=(
+            "Fixed assumed [0,1] state for intentionally disconnected DMTAC "
+            "grippers (0=open, 1=closed). This is not hardware feedback."
+        ),
+    )
     parser.add_argument("--left-hand-ip", type=str, default="")
     parser.add_argument("--right-hand-ip", type=str, default="")
     parser.add_argument("--hand-modbus-port", type=int, default=6000)
@@ -4306,6 +4406,23 @@ def validate_args(
     args.arm_control_hz = execution_config.arm_control_hz
     args.position_reference_hz = execution_config.position_reference_hz
     args.arm_follow_qpos_alpha = execution_config.arm_follow_qpos_alpha
+    tcp_pose_envelope_requested = args.tcp_pose_envelope_profile is not None
+    if bool(args.tcp_pose_envelope_active) and not tcp_pose_envelope_requested:
+        raise ValueError(
+            "--tcp-pose-envelope-active requires --tcp-pose-envelope-profile."
+        )
+    if tcp_pose_envelope_requested and (
+        not bool(args.arms_enabled)
+        or args.arm_control_mode
+        not in {
+            RM65_ARM_CONTROL_MODE_POSITION,
+            RM65_ARM_CONTROL_MODE_IMPEDANCE,
+        }
+    ):
+        raise ValueError(
+            "deploy TCP pose envelopes require enabled arms in position or "
+            "pose-impedance mode; hand-only paths are unsupported."
+        )
     if rtc_profile_enabled and args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION:
         rates = RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.position_rates
         if not math.isclose(
@@ -4360,6 +4477,37 @@ def validate_args(
     )
     args.end_effector_sides = end_effector_sides
     hands_enabled = bool(end_effector_sides)
+    disconnected_gripper_sides = _parse_disconnected_gripper_sides(
+        getattr(args, "disconnected_gripper_sides", "none")
+    )
+    unavailable_disconnected = set(disconnected_gripper_sides) - set(
+        end_effector_sides
+    )
+    if unavailable_disconnected:
+        raise ValueError(
+            "--disconnected-gripper-sides must be a subset of configured "
+            "--end-effector-sides, got "
+            + ",".join(sorted(unavailable_disconnected))
+        )
+    for side in disconnected_gripper_sides:
+        if _hand_backend_mode_for_side(args, side) != HAND_BACKEND_DMTAC_GRIPPER:
+            raise ValueError(
+                f"--disconnected-gripper-sides {side} requires that side to use "
+                "--hand-backend dmtac-gripper."
+            )
+        if str(getattr(args, f"{side}_gripper_port", "") or "").strip():
+            raise ValueError(
+                f"--{side}-gripper-port cannot be combined with intentionally "
+                f"disconnected {side} gripper."
+            )
+    disconnected_state = float(getattr(args, "disconnected_gripper_state", 0.0))
+    if (
+        not np.isfinite(disconnected_state)
+        or not 0.0 <= disconnected_state <= 1.0
+    ):
+        raise ValueError("--disconnected-gripper-state must be finite and in [0, 1].")
+    args.disconnected_gripper_sides = disconnected_gripper_sides
+    args.disconnected_gripper_state = disconnected_state
     if bool(args.allow_missing_v22_end_effectors) and hands_enabled:
         raise ValueError(
             "--allow-missing-v22-end-effectors is only valid with "
@@ -4831,6 +4979,9 @@ def _dispatch_position_discrete_command_checked(
             if status == "rate_limited":
                 accepted = False
                 skipped = True
+            elif status == "intentionally_disconnected_noop":
+                accepted = True
+                skipped = True
             elif status == "skipped_threshold":
                 # The requested value is already within the configured no-op
                 # threshold; no additional physical packet is required.
@@ -5241,6 +5392,29 @@ def build_hand_backends(
         if side in active_sides
         and _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
     }
+    disconnected_sides = _parse_disconnected_gripper_sides(
+        getattr(args, "disconnected_gripper_sides", ())
+    )
+    if disconnected_sides:
+        policy = _resolved_gripper_policy(args)
+        for side in disconnected_sides:
+            if side not in active_sides:
+                continue
+            backends[side] = DMTacGripperBackend(
+                DMTacGripperBackendConfig(
+                    side=side,
+                    effector_name=f"{side}_hand",
+                    connect_hardware=False,
+                    connect_tactile=False,
+                    send_commands=False,
+                    enable_telemetry=False,
+                    command_dim=int(policy["output_dim"]),
+                    max_action=float(policy["max_action"]),
+                    disconnected_state_scalar=float(
+                        args.disconnected_gripper_state
+                    ),
+                )
+            )
 
     tactile_regions = parse_tactile_regions(args.hand_tactile_regions)
     observation_only = bool(getattr(args, "rtc_real_shadow", False))
@@ -5570,6 +5744,24 @@ def hand_action_specs_for_backends(
         else:
             specs[side] = HandActionSpec.inspire_tac(side)
     return hand_action_specs_metadata(specs)
+
+
+def policy_qpos_init_hand_action_specs(
+    args: argparse.Namespace,
+    hand_action_specs: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Exclude no-I/O grippers from physical dataset-start initialization."""
+
+    disconnected_sides = set(
+        _parse_disconnected_gripper_sides(
+            getattr(args, "disconnected_gripper_sides", ())
+        )
+    )
+    return {
+        side: spec
+        for side, spec in hand_action_specs.items()
+        if side not in disconnected_sides
+    }
 
 
 def print_controls(
@@ -5950,6 +6142,8 @@ def main(
     rtc_emission_fanout: PolicyActionEmissionFanout | None = None,
     rtc_emission_publisher: RtcPolicyEmissionPublisher | None = None,
     rtc_model_adapter_factory: Callable[..., Any] | None = None,
+    policy_emission_observer: PassivePolicyEmissionObserverPort | None = None,
+    legacy_worker_binding: RM65LegacyWorkerExecutionBinding | None = None,
 ) -> int:
     if rtc_step_fanout is not None and not isinstance(
         rtc_step_fanout,
@@ -5975,12 +6169,23 @@ def main(
             "Use rtc_emission_publisher or the compatibility "
             "rtc_emission_fanout, not both."
         )
+    if policy_emission_observer is not None:
+        require_passive_policy_emission_observer(policy_emission_observer)
+    if legacy_worker_binding is not None and not isinstance(
+        legacy_worker_binding,
+        RM65LegacyWorkerExecutionBinding,
+    ):
+        raise TypeError(
+            "legacy_worker_binding must be an RM65LegacyWorkerExecutionBinding or None."
+        )
     parser = argparse.ArgumentParser(
         description="Deploy a policy on teleop_runtime RM65 arms, optional InspireTac hands, and RealSense."
     )
     add_args(parser)
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    if legacy_worker_binding is not None:
+        args._rm65_legacy_worker_binding = legacy_worker_binding
     debug_replay = bool(args.debug_replay_dataset or args.debug_replay_parquet)
     policy_kwargs = {} if debug_replay else parse_policy_kwargs(args.policy_kwargs_json)
     policy_artifact = (
@@ -6122,6 +6327,33 @@ def main(
         hardware_output=bool(args.send_actions),
         allow_missing_end_effectors=bool(args.allow_missing_v22_end_effectors),
     )
+    deploy_tcp_pose_envelope_projector: DeployTCPPoseEnvelopeProjector | None = None
+    tcp_pose_envelope_requested = args.tcp_pose_envelope_profile is not None
+    if tcp_pose_envelope_requested:
+        pose_frame_contract = deploy_session_contract.runtime_pose_frame_contract
+        if pose_frame_contract is None:
+            raise ValueError(
+                "deploy TCP pose envelopes require an explicit runtime pose-frame "
+                "contract so arm-base targets can be projected in canonical desk."
+            )
+        envelope_file_spec = load_tcp_pose_envelope_file_spec(
+            args.tcp_pose_envelope_profile,
+            active_sides=active_sides,
+        )
+        deploy_tcp_pose_envelope_projector = DeployTCPPoseEnvelopeProjector(
+            file_spec=envelope_file_spec,
+            pose_frame_contract=pose_frame_contract,
+            active_sides=active_sides,
+            apply_to_target=bool(args.tcp_pose_envelope_active),
+        )
+        print(
+            "[TCPPoseEnvelope] deploy "
+            + ("ACTIVE" if args.tcp_pose_envelope_active else "SHADOW")
+            + " configured; frame=canonical_desk controlled=tool_tcp "
+            + f"profile={envelope_file_spec.profile_id!r}; binding is deferred "
+            "to a fresh runtime-start Pose.",
+            flush=True,
+        )
     policy_observation_contract = _policy_observation_contract(
         policy=policy,
         policy_artifact=policy_artifact,
@@ -6333,6 +6565,19 @@ def main(
         control_hz=backend_control_hz,
         action_hz=float(effective_action_hz),
     )
+    if (
+        deploy_tcp_pose_envelope_projector is not None
+        and args.arm_control_mode == RM65_ARM_CONTROL_MODE_IMPEDANCE
+    ):
+        for side, backend in arm_backends.items():
+            if not isinstance(backend, RM65ImpedanceArmBackend):
+                raise TypeError(
+                    f"{side} deploy impedance envelope requires "
+                    "RM65ImpedanceArmBackend"
+                )
+            backend.set_final_tcp_pose_projector(
+                deploy_tcp_pose_envelope_projector.project_arm_base_tool_tcp
+            )
     hand_backends = build_hand_backends(args, end_effector_sides)
     hand_state_poller = (
         HandStateHistoryPoller(
@@ -6348,6 +6593,15 @@ def main(
         hand_action_specs_for_backends(args, hand_backends, end_effector_sides)
         if hands_enabled
         else {}
+    )
+    disconnected_gripper_sides = set(
+        _parse_disconnected_gripper_sides(
+            getattr(args, "disconnected_gripper_sides", ())
+        )
+    )
+    qpos_init_hand_action_specs = policy_qpos_init_hand_action_specs(
+        args,
+        hand_action_specs,
     )
     arm_reader = ArmStateReader(
         arm_backends,
@@ -6592,7 +6846,7 @@ def main(
         else DeployPolicyQposInitController(
             policy_qpos_init_plan,
             active_sides=active_sides,
-            hand_action_specs_by_side=hand_action_specs,
+            hand_action_specs_by_side=qpos_init_hand_action_specs,
             settings=DeployPolicyQposInitSettings(
                 qpos_reached_tolerance_rad=float(args.policy_qpos_init_qpos_tolerance),
                 move_to_start_timeout_s=float(args.policy_qpos_init_timeout_s),
@@ -6869,6 +7123,7 @@ def main(
                 if send_actions
                 else None
             ),
+            pose_target_projector=deploy_tcp_pose_envelope_projector,
             collision_planner_factory=(
                 (
                     (
@@ -6998,6 +7253,8 @@ def main(
         observation: Any,
         *,
         policy_name: str,
+        source_decision_id: str | None = None,
+        source_reference_segment_id: str | None = None,
         lookahead_canonical_action: Any | None = None,
         lookahead_observation: Any | None = None,
         second_lookahead_canonical_action: Any | None = None,
@@ -7044,6 +7301,39 @@ def main(
                 kind="hand",
             )
         if arm_command is not None:
+            execution_work_item = None
+            lookahead_execution_work_item = None
+            if position_worker_binding is not None:
+                if not source_decision_id or not source_reference_segment_id:
+                    raise RuntimeError(
+                        "epoch-mediated position submission requires exact source lineage"
+                    )
+                submit_legacy_owner_state(
+                    lifecycle_state="running",
+                    execution_gate="ready",
+                    reason="legacy_reference_work_admission",
+                    source_event_ids=(
+                        str(source_decision_id),
+                        str(source_reference_segment_id),
+                    ),
+                )
+                execution_work_item = (
+                    position_worker_binding.context.create_reference_segment_work_item(
+                        source_decision_id=str(source_decision_id),
+                        source_reference_segment_id=str(
+                            source_reference_segment_id
+                        ),
+                    )
+                )
+                if lookahead_canonical_action is not None:
+                    lookahead_execution_work_item = (
+                        position_worker_binding.context.create_reference_segment_work_item(
+                            source_decision_id=str(source_decision_id),
+                            source_reference_segment_id=(
+                                str(source_reference_segment_id) + ":lookahead"
+                            ),
+                        )
+                    )
             position_submit_started = time.monotonic()
             try:
                 source_index = position_deploy_executor.submit(
@@ -7070,6 +7360,8 @@ def main(
                         else third_lookahead_canonical_action.filtered
                     ),
                     third_lookahead_observation=third_lookahead_observation,
+                    execution_work_item=execution_work_item,
+                    lookahead_execution_work_item=lookahead_execution_work_item,
                     source_plan_cut=source_plan_cut,
                 )
             except PositionDeployExecutorFault:
@@ -7080,6 +7372,7 @@ def main(
                     "safety_gate",
                     "15hz_keyframe_safety",
                     "reference_anchor_safety",
+                    "target_pose_envelope",
                 }:
                     return _PreparedActionExecution(
                         accepted=False,
@@ -7327,7 +7620,43 @@ def main(
         )
         return True
 
+    def submit_legacy_owner_state(
+        *,
+        lifecycle_state: str,
+        execution_gate: str,
+        reason: str,
+        source_event_ids: tuple[str, ...] = (),
+        recovery_authorization_id: str | None = None,
+    ) -> LegacyControlOwnerStateTransitionOutcome | None:
+        """Submit state to the unique lower owner; never mutate a mirror."""
+
+        if legacy_worker_binding is None:
+            return None
+        outcome = legacy_worker_binding.context.transition_owner_state(
+            LegacyControlOwnerStateTransitionRequest(
+                target_lifecycle_state=lifecycle_state,
+                target_execution_gate=execution_gate,
+                reason=reason,
+                source_event_ids=source_event_ids,
+                recovery_authorization_id=recovery_authorization_id,
+            )
+        )
+        if outcome.changed and outcome.receipt is not None:
+            debug_logger.log_event(
+                "legacy_control_owner_transition",
+                {
+                    "transition_id": outcome.receipt.transition_id,
+                    "transition_hash": outcome.receipt.semantic_content_hash,
+                    "lifecycle_state": outcome.snapshot.lifecycle_state,
+                    "execution_gate": outcome.snapshot.execution_gate,
+                    "owner_state_revision": outcome.snapshot.owner_state_revision,
+                    "reason": reason,
+                },
+            )
+        return outcome
+
     keyboard_interrupt_stop_error: str | None = None
+    pending_legacy_owner_recovery_authorization_id: str | None = None
     try:
         print(
             "[Deploy] policy="
@@ -7344,6 +7673,14 @@ def main(
             f"queue_policy={action_queue_policy} "
             f"rtc_profile={args.rtc_profile}"
         )
+        if disconnected_gripper_sides:
+            print(
+                "[Deploy] intentionally disconnected DMTAC gripper(s): "
+                f"sides={sorted(disconnected_gripper_sides)} "
+                f"assumed_state={float(args.disconnected_gripper_state):.3f}; "
+                "serial/tactile connection and command transmission are disabled.",
+                flush=True,
+            )
         if action_hz_info.get("source") != "cli.hz":
             print(
                 "[Deploy] action_hz="
@@ -7360,6 +7697,15 @@ def main(
                 ("fresh_dual_hardware" if send_actions else "dry_run_state_allowed")
                 if executor_config.collision_required
                 else "disabled"
+            )
+            tcp_pose_envelope_label = (
+                "off"
+                if deploy_tcp_pose_envelope_projector is None
+                else (
+                    "active(pre_ik_canonical_desk)"
+                    if args.tcp_pose_envelope_active
+                    else "shadow(pre_ik_canonical_desk)"
+                )
             )
             print(
                 "[PositionDeploy] chain="
@@ -7398,6 +7744,7 @@ def main(
                 f"{'on(process_local)' if bool(args.position_worker_cpu_reservation) else 'off'} "
                 "reference_dispatch_audit="
                 f"{args.position_reference_dispatch_audit_mode} "
+                f"tcp_pose_envelope={tcp_pose_envelope_label} "
                 f"collision_reference={'on' if executor_config.collision_required else 'off(dry-run)'} "
                 f"collision_scope={'selected_scene_endpoint+sampled_interval' if official_governor_active else 'selected_scene_endpoint_only'} "
                 "segment_reference_to_command_certified=false "
@@ -7646,6 +7993,11 @@ def main(
             fixed_init_enabled=fixed_init_controller is not None,
             policy_qpos_init_enabled=policy_qpos_init_controller is not None,
         )
+        submit_legacy_owner_state(
+            lifecycle_state="shadow_ready",
+            execution_gate="hold",
+            reason="policy_deploy_fake_binding_started_default_hold",
+        )
         if policy_qpos_init_controller is not None and bool(args.auto_start):
             enable_deferred_impedance_force_control(
                 trigger="auto_start_policy_qpos_init"
@@ -7670,6 +8022,12 @@ def main(
             enable_deferred_impedance_force_control(trigger="auto_start")
 
         position_force_guard_fault_handled = False
+        tcp_pose_envelope_bind_pending = (
+            deploy_tcp_pose_envelope_projector is not None
+        )
+        tcp_pose_envelope_execution_epoch = 0
+        tcp_pose_envelope_last_bind_error: str | None = None
+        tcp_pose_envelope_fault_latched = False
         with NonBlockingKeyboard() as keyboard:
             while True:
                 loop_started_at = time.time()
@@ -7705,6 +8063,23 @@ def main(
                         else:
                             position_deploy_executor.raise_if_fault()
                 pre_action_executor_completed_at = time.monotonic()
+                legacy_owner_desired_state = (
+                    ("fault", "fault", "legacy_safety_fault_latched")
+                    if (
+                        position_safety_fault_latched
+                        or position_force_guard_fault_latched
+                        or impedance_force_guard_fault_latched
+                    )
+                    else (
+                        "hold",
+                        "hold",
+                        (
+                            "legacy_output_eligibility_pending"
+                            if policy_active
+                            else "legacy_policy_inactive"
+                        ),
+                    )
+                )
                 if position_force_guard_fault_latched:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
@@ -7980,6 +8355,87 @@ def main(
                 )
                 pre_action_observation_completed_at = time.monotonic()
                 faults = list(observation.faults)
+                if tcp_pose_envelope_fault_latched:
+                    faults.append("tcp_pose_envelope_restart_required")
+                envelope_init_blocks = bool(
+                    (
+                        fixed_init_controller is not None
+                        and fixed_init_controller.blocks_policy
+                    )
+                    or (
+                        policy_qpos_init_controller is not None
+                        and policy_qpos_init_controller.blocks_policy
+                    )
+                )
+                if (
+                    tcp_pose_envelope_bind_pending
+                    and deploy_tcp_pose_envelope_projector is not None
+                    and not envelope_init_blocks
+                    and not observation.faults
+                ):
+                    next_envelope_epoch = tcp_pose_envelope_execution_epoch + 1
+                    try:
+                        anchor = deploy_tcp_pose_envelope_projector.bind_from_observation(
+                            observation,
+                            execution_epoch=next_envelope_epoch,
+                            captured_at=control_loop_started_at,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - Active must fail closed.
+                        bind_error = f"{type(exc).__name__}: {exc}"
+                        if bind_error != tcp_pose_envelope_last_bind_error:
+                            console_log_event(
+                                "TCPPoseEnvelope",
+                                (
+                                    "ERROR" if args.tcp_pose_envelope_active else "WAIT"
+                                )
+                                + ": fresh tool_tcp start-Pose binding failed: "
+                                + bind_error,
+                                now=loop_started_at,
+                            )
+                            tcp_pose_envelope_last_bind_error = bind_error
+                        if bool(args.tcp_pose_envelope_active):
+                            policy_active = False
+                            policy_deploy_runtime.clear_action_queue()
+                            tcp_pose_envelope_bind_pending = False
+                            tcp_pose_envelope_fault_latched = True
+                            faults.append("tcp_pose_envelope_restart_required")
+                            if position_deploy_executor is not None:
+                                position_deploy_executor.latch_safety_fault(
+                                    ["tcp_pose_envelope_binding_failed", bind_error],
+                                    observation=observation,
+                                    stage="target_pose_envelope",
+                                    manual_rearm_allowed=False,
+                                )
+                                position_safety_fault_latched = True
+                            else:
+                                hold_deploy_arm_backends(
+                                    arm_backends,
+                                    reason=(
+                                        "active TCP pose envelope binding failed: "
+                                        + bind_error
+                                    ),
+                                )
+                    else:
+                        tcp_pose_envelope_execution_epoch = next_envelope_epoch
+                        tcp_pose_envelope_bind_pending = False
+                        tcp_pose_envelope_last_bind_error = None
+                        tcp_pose_envelope_fault_latched = False
+                        console_log_event(
+                            "TCPPoseEnvelope",
+                            "READY: fresh tool_tcp start Pose bound; mode="
+                            + (
+                                "active"
+                                if args.tcp_pose_envelope_active
+                                else "shadow"
+                            )
+                            + f" epoch={next_envelope_epoch} anchor="
+                            + (
+                                "none:absolute_only"
+                                if anchor is None
+                                else anchor.semantic_content_hash
+                            ),
+                            now=loop_started_at,
+                        )
                 if position_force_guard_fault_latched:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
@@ -8069,6 +8525,31 @@ def main(
                         else:
                             impedance_force_guard_fault = None
                             impedance_force_guard_fault_latched = False
+                            pending_legacy_owner_recovery_authorization_id = (
+                                "legacy-owner-recovery:"
+                                + canonical_content_hash(
+                                    {
+                                        "recovery_kind": (
+                                            "impedance_force_guard_manual_rearm"
+                                        ),
+                                        "runtime_session_id": (
+                                            None
+                                            if legacy_worker_binding is None
+                                            else legacy_worker_binding.context.runtime_session_id
+                                        ),
+                                        "control_domain_id": (
+                                            None
+                                            if legacy_worker_binding is None
+                                            else legacy_worker_binding.context.control_domain_id
+                                        ),
+                                        "rearmed_sides": tuple(sorted(arm_backends)),
+                                        "observed_at": control_loop_started_at,
+                                    },
+                                    domain=(
+                                        "dexteleop.legacy_owner_recovery_authorization.v1"
+                                    ),
+                                )
+                            )
                             policy.reset()
                             _reset_startup_initializer(
                                 startup_initializer,
@@ -8094,7 +8575,9 @@ def main(
                     faults.append("position_safety_fault_manual_rearm_required")
                     if rearm_requested and position_deploy_executor is not None:
                         try:
-                            position_deploy_executor.manual_rearm(observation)
+                            rearm_details = position_deploy_executor.manual_rearm(
+                                observation
+                            )
                         except (
                             Exception
                         ) as exc:  # noqa: BLE001 - operator-facing re-arm gate.
@@ -8103,6 +8586,33 @@ def main(
                                 f"unavailable/out of domain: {type(exc).__name__}: {exc}"
                             )
                         else:
+                            pending_legacy_owner_recovery_authorization_id = (
+                                "legacy-owner-recovery:"
+                                + canonical_content_hash(
+                                    {
+                                        "recovery_kind": (
+                                            "position_safety_manual_rearm"
+                                        ),
+                                        "runtime_session_id": (
+                                            None
+                                            if legacy_worker_binding is None
+                                            else legacy_worker_binding.context.runtime_session_id
+                                        ),
+                                        "control_domain_id": (
+                                            None
+                                            if legacy_worker_binding is None
+                                            else legacy_worker_binding.context.control_domain_id
+                                        ),
+                                        "rearm_details": to_serializable(
+                                            rearm_details
+                                        ),
+                                        "observed_at": control_loop_started_at,
+                                    },
+                                    domain=(
+                                        "dexteleop.legacy_owner_recovery_authorization.v1"
+                                    ),
+                                )
+                            )
                             last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
                             policy.reset()
                             _reset_startup_initializer(
@@ -8176,6 +8686,8 @@ def main(
                             print(
                                 "[Deploy] fixed-init complete; press g to run startup init/policy."
                             )
+                        if deploy_tcp_pose_envelope_projector is not None:
+                            tcp_pose_envelope_bind_pending = True
                         fixed_completed_this_step = True
 
                 policy_qpos_completed_this_step = False
@@ -8211,6 +8723,11 @@ def main(
                         policy_deploy_runtime.reset_prediction_schedule()
                         ready_confirmed = not wait_for_ready_confirm
                         policy_active = True
+                        if deploy_tcp_pose_envelope_projector is not None:
+                            # This loop's observation precedes the final qpos-init
+                            # command/hold. Bind only from the next fresh causal
+                            # observation, matching the existing reference cut.
+                            tcp_pose_envelope_bind_pending = True
                         policy_qpos_completed_this_step = True
                         _announce_policy_qpos_init_complete(
                             wait_for_ready_confirm=wait_for_ready_confirm,
@@ -8245,6 +8762,11 @@ def main(
                     can_run_policy = not (
                         bool(args.require_ready_observation) and faults
                     )
+                    if (
+                        bool(args.tcp_pose_envelope_active)
+                        and tcp_pose_envelope_bind_pending
+                    ):
+                        can_run_policy = False
                     if _debug_replay_execution_exhausted(
                         policy,
                         queued_actions=policy_deploy_runtime.action_queue_length(),
@@ -8303,6 +8825,12 @@ def main(
                                         canonical_action,
                                         observation,
                                         policy_name="startup_init",
+                                        source_decision_id=(
+                                            f"startup-init-decision:{step_index}"
+                                        ),
+                                        source_reference_segment_id=(
+                                            f"startup-init-reference:{step_index}"
+                                        ),
                                     )
                                     if execution.accepted:
                                         position_action_submitted_this_loop = (
@@ -8574,6 +9102,19 @@ def main(
                         and not defer_position_action_until_fresh_cut
                         and not collision_reset_waiting
                     )
+                    legacy_owner_desired_state = (
+                        (
+                            "running",
+                            "ready",
+                            "legacy_output_eligible",
+                        )
+                        if allow_policy_output
+                        else (
+                            "hold",
+                            "hold",
+                            "legacy_output_not_eligible",
+                        )
+                    )
                     if policy_arbiter_shadow is not None:
                         shadow_gate_status = (
                             "fault"
@@ -8785,6 +9326,29 @@ def main(
                             != POLICY_ASYNC_PRODUCER_ELIGIBLE
                         ):
                             policy_active = False
+                    emission_observer_error: str | None = None
+                    if (
+                        policy_emission_observer is not None
+                        and action_step.emission is not None
+                    ):
+                        try:
+                            policy_emission_observer.put_nowait(
+                                action_step.emission
+                            )
+                        except Exception as error:  # noqa: BLE001 - passive tap.
+                            emission_observer_error = (
+                                f"{type(error).__name__}:{error}"
+                            )
+                            debug_logger.log_event(
+                                "passive_policy_emission_observer_error",
+                                {
+                                    "emission_id": (
+                                        action_step.emission.emission_id
+                                    ),
+                                    "error": emission_observer_error,
+                                    "authoritative": False,
+                                },
+                            )
                     arbiter_shadow_step = None
                     if policy_arbiter_shadow is not None:
                         if action_step.emission is not None:
@@ -9119,6 +9683,22 @@ def main(
                                     canonical_action,
                                     observation,
                                     policy_name=policy.name,
+                                    source_decision_id=(
+                                        action_step.emission.emission_id
+                                        if action_step.emission is not None
+                                        else (
+                                            "legacy-policy-decision:"
+                                            f"{policy.name}:{step_index}"
+                                        )
+                                    ),
+                                    source_reference_segment_id=(
+                                        plan_cut_proposal.cut.cut_id
+                                        if plan_cut_proposal is not None
+                                        else (
+                                            "legacy-policy-reference:"
+                                            f"{policy.name}:{step_index}"
+                                        )
+                                    ),
                                     lookahead_canonical_action=(
                                         lookahead_canonical_action
                                     ),
@@ -9277,6 +9857,48 @@ def main(
                     ):
                         position_deploy_executor.clear()
                         last_action = observation.hold_action()
+
+                if (
+                    position_safety_fault_latched
+                    or position_force_guard_fault_latched
+                    or impedance_force_guard_fault_latched
+                ):
+                    legacy_owner_desired_state = (
+                        "fault",
+                        "fault",
+                        "legacy_safety_fault_latched",
+                    )
+                elif not policy_active:
+                    legacy_owner_desired_state = (
+                        "hold",
+                        "hold",
+                        "legacy_policy_inactive",
+                    )
+                owner_transition = submit_legacy_owner_state(
+                    lifecycle_state=legacy_owner_desired_state[0],
+                    execution_gate=legacy_owner_desired_state[1],
+                    reason=legacy_owner_desired_state[2],
+                    source_event_ids=(
+                        ()
+                        if pending_legacy_owner_recovery_authorization_id is None
+                        else (
+                            pending_legacy_owner_recovery_authorization_id,
+                        )
+                    ),
+                    recovery_authorization_id=(
+                        pending_legacy_owner_recovery_authorization_id
+                        if legacy_owner_desired_state[0] == "hold"
+                        else None
+                    ),
+                )
+                if (
+                    owner_transition is not None
+                    and owner_transition.changed
+                    and owner_transition.receipt is not None
+                    and owner_transition.receipt.recovery_authorization_id
+                    == pending_legacy_owner_recovery_authorization_id
+                ):
+                    pending_legacy_owner_recovery_authorization_id = None
 
                 fault_text = _compact_faults(faults)
                 if fault_text != last_fault_text:
@@ -9511,6 +10133,16 @@ def main(
     finally:
         position_workers_stopped = True
         cleanup_errors: list[str] = []
+        try:
+            submit_legacy_owner_state(
+                lifecycle_state="stopped",
+                execution_gate="hold",
+                reason="policy_deploy_cleanup_started",
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup must continue.
+            cleanup_errors.append(
+                "legacy_control_owner_stop: " + f"{type(exc).__name__}: {exc}"
+            )
         if keyboard_interrupt_stop_error is not None:
             cleanup_errors.append(
                 "keyboard_interrupt_emergency_stop: " + keyboard_interrupt_stop_error

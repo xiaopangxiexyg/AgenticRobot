@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import time
 from pathlib import Path
 import json
@@ -54,6 +55,10 @@ from teleop_runtime.deploy.rm65_candidate_manifest import (
 )
 from teleop_runtime.deploy.rm65_execution_evidence import (
     build_rm65_execution_evidence_bundle,
+)
+from teleop_runtime.deploy.rm65_legacy_hold_convergence import (
+    compile_rm65_idle_worker_backend_hold_receipt,
+    converge_rm65_legacy_control_stop,
 )
 from teleop_runtime.position_control.deploy_executor import (
     PositionDeployExecutor,
@@ -331,6 +336,122 @@ def test_one_registry_drains_exact_three_real_worker_classes_without_hardware_st
             left.hold_motion("m5_8b1_idle_worker_drain:operator_confirmed")
     finally:
         left.arm = None
+        position.close()
+        left.close()
+        right.close()
+
+
+def test_dual_successful_stop_receipts_converge_the_same_owner_to_hold() -> None:
+    _manifest, _evidence, _authorization, binding = _binding()
+    capability = build_rm65_policy_arm_qpos_candidate_capability()
+    position = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=30.0,
+            reference_hz=capability.reference_resample_hz,
+            command_hz=capability.command_hz,
+        ),
+        canonical_pipeline=_pipeline(),
+        **binding.position_executor_kwargs(),
+    )
+    left = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="192.0.2.1",
+            side="left",
+            connect_hardware=True,
+            initial_qpos=None,
+            configure_singularity_thresholds=False,
+            force_position_control=False,
+            background_streaming_enabled=True,
+        ),
+        hardware_idle_worker_preflight_binding=binding.backend_binding("left"),
+    )
+    right = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="192.0.2.2",
+            side="right",
+            connect_hardware=True,
+            initial_qpos=None,
+            configure_singularity_thresholds=False,
+            force_position_control=False,
+            background_streaming_enabled=True,
+        ),
+        hardware_idle_worker_preflight_binding=binding.backend_binding("right"),
+    )
+
+    class StopOnlyArm:
+        def Arm_Slow_Stop(self):
+            return 0
+
+    left.arm = StopOnlyArm()
+    right.arm = StopOnlyArm()
+    try:
+        cancellation = binding.context.cancel_execution(
+            ExecutionCancellationRequest(
+                reason="hold",
+                authority_epoch=0,
+                requested_scope="control_domain",
+                source_event_ids=("fixture-stop-convergence",),
+            ),
+            capability=capability,
+        )
+        worker_drain = drain_rm65_arms_only_workers(
+            plan=binding.worker_drain_plan,
+            cancellation=cancellation,
+            position_reference_worker=position,
+            left_background_worker=left,
+            right_background_worker=right,
+        )
+        binding.accept_completed_worker_drain(
+            worker_drain,
+            cancellation=cancellation,
+        )
+        left.hold_motion("m5_8b1_idle_worker_drain:fixture")
+        right.hold_motion("m5_8b1_idle_worker_drain:fixture")
+        failed_right = replace(
+            binding.stop_receipts[1],
+            sdk_result_code=-1,
+            sdk_result_text="-1",
+            sdk_succeeded=False,
+            sdk_result_repr="-1",
+        )
+        successful_stop_receipts = binding.stop_receipts
+        binding._stop_receipts = [successful_stop_receipts[0], failed_right]
+        rejected_hold = compile_rm65_idle_worker_backend_hold_receipt(
+            binding=binding,
+            cancellation=cancellation,
+            acknowledged_at=time.monotonic(),
+            clock_domain_id=binding.context.clock_domain_id,
+        )
+        assert not rejected_hold.complete
+        assert rejected_hold.rejected_backend_ids == ("right",)
+        binding._stop_receipts = list(successful_stop_receipts)
+
+        backend_hold = compile_rm65_idle_worker_backend_hold_receipt(
+            binding=binding,
+            cancellation=cancellation,
+            acknowledged_at=time.monotonic(),
+            clock_domain_id=binding.context.clock_domain_id,
+        )
+
+        receipt = converge_rm65_legacy_control_stop(
+            binding=binding,
+            cancellation=cancellation,
+            worker_drain=worker_drain,
+            backend_hold=backend_hold,
+        )
+
+        assert backend_hold.complete
+        assert backend_hold.production_binding_enabled
+        assert receipt.complete
+        assert receipt.production_binding_enabled
+        assert receipt.lifecycle_state == "hold"
+        assert receipt.execution_gate == "hold"
+        assert binding.context.snapshot().semantic_content_hash == (
+            receipt.owner_state_hash
+        )
+    finally:
+        left.arm = None
+        right.arm = None
         position.close()
         left.close()
         right.close()

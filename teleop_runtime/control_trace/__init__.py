@@ -59,12 +59,26 @@ from .execution_projection import (
     project_worker_epoch_drain,
     project_worker_epoch_drain_aggregate,
 )
+from .session_capture import (
+    CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1,
+    CONTROL_TRACE_SESSION_CAPTURE_RUNTIME_CAPACITY_V1,
+    CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1,
+    ControlTraceEpisodeCapturePort,
+    ControlTraceEpisodeSessionCapture,
+    ControlTraceSessionFinalizationReceipt,
+)
 
 __all__ = [
     "ControlTraceRuntime",
     "ControlTraceAdmissionLatencyReport",
     "ControlTraceJournalEntry",
     "ControlTraceRuntimeSnapshot",
+    "ControlTraceEpisodeCapturePort",
+    "ControlTraceEpisodeSessionCapture",
+    "ControlTraceSessionFinalizationReceipt",
+    "CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1",
+    "CONTROL_TRACE_SESSION_CAPTURE_RUNTIME_CAPACITY_V1",
+    "CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1",
     "CONTROL_TRACE_CAPTURE_DISPOSITIONS_V1",
     "ControlTraceCaptureRouter",
     "ControlTraceCaptureRoutingReceipt",

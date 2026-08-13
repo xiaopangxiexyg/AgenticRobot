@@ -220,7 +220,7 @@ policy observation frame adapter、policy output normalization、chunk decoder�
 
 ```bash
 cd /home/user/zc/DexTeleop
-conda activate dexteleop310
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 
 python -m teleop_runtime.deploy \
   --send-actions \
