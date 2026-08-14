@@ -1,0 +1,12 @@
+{
+  "schema_version": "dexteleop.camera_registry.v1",
+  "description": "Frozen camera-role input for the 2026-08-14 camera-semantic correction batch. Only fields consumed by load_camera_role_binding are retained.",
+  "cameras": {
+    "left_wrist": {
+      "serial": "260522278055"
+    },
+    "right_wrist": {
+      "serial": "261122273924"
+    }
+  }
+}

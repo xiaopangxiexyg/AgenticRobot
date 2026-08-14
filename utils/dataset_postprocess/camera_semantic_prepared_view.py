@@ -80,7 +80,12 @@ def _sha256_file(path: Path) -> str:
 
 
 def _is_excluded_path(relative: Path) -> bool:
-    return any(
+    tactile_metadata = (
+        bool(relative.parts)
+        and relative.parts[0] == "meta"
+        and any("tactile" in part.lower() for part in relative.parts[1:])
+    )
+    return tactile_metadata or any(
         relative == prefix or prefix in relative.parents
         for prefix in _EXCLUDED_META_PREFIXES
     ) or relative == Path(CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH)
@@ -398,12 +403,27 @@ def plan_camera_semantic_prepared_view(
     )
 
 
+def _strip_tactile_fields(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strip_tactile_fields(item)
+            for key, item in value.items()
+            if "tactile" not in str(key).lower()
+        }
+    if isinstance(value, list):
+        return [_strip_tactile_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_tactile_fields(item) for item in value)
+    return value
+
+
 def _strip_tactile_episode_fields(record: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        str(key): value
-        for key, value in record.items()
-        if "tactile" not in str(key).lower()
-    }
+    stripped = _strip_tactile_fields(record)
+    if not isinstance(stripped, dict):  # pragma: no cover - type contract
+        raise CameraSemanticPreparedViewError(
+            "Prepared-view episode projection must remain an object."
+        )
+    return stripped
 
 
 def _prepared_info(
@@ -412,20 +432,14 @@ def _prepared_info(
     swap_wrist_feature_declarations: bool,
     plan: CameraSemanticPreparedViewPlan,
 ) -> dict[str, Any]:
-    output = _rewrite_info(
-        info,
-        swap_wrist_feature_declarations=swap_wrist_feature_declarations,
+    rewritten = _rewrite_info(
+        info, swap_wrist_feature_declarations=swap_wrist_feature_declarations
     )
-    features = output.get("features")
-    if isinstance(features, Mapping):
-        output["features"] = {
-            str(key): value
-            for key, value in features.items()
-            if "tactile" not in str(key).lower()
-        }
-    for key in tuple(output):
-        if "tactile" in str(key).lower():
-            output.pop(key, None)
+    output = _strip_tactile_fields(rewritten)
+    if not isinstance(output, dict):  # pragma: no cover - type contract
+        raise CameraSemanticPreparedViewError(
+            "Prepared-view info projection must remain an object."
+        )
     output["dexteleop_dataset_projection"] = {
         "schema": "dexteleop.camera_semantic_prepared_view_projection.v1",
         "manifest_path": CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
@@ -552,6 +566,7 @@ def materialize_camera_semantic_prepared_view(
     rewritten_inputs = {
         Path("meta/episodes.jsonl"),
         Path("meta/info.json"),
+        Path("meta/modality_validity.json"),
         Path("meta/devices/realsense.json"),
         Path(CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH),
     }
@@ -643,6 +658,21 @@ def materialize_camera_semantic_prepared_view(
                 plan=plan,
             ),
         )
+        modality_validity_path = source / "meta/modality_validity.json"
+        if modality_validity_path.is_file():
+            modality_validity = read_json(modality_validity_path)
+            if not modality_validity:
+                raise CameraSemanticPreparedViewError(
+                    "Source meta/modality_validity.json is invalid."
+                )
+            projected_validity = _strip_tactile_fields(modality_validity)
+            if not isinstance(projected_validity, dict):
+                raise CameraSemanticPreparedViewError(
+                    "Prepared modality-validity projection must remain an object."
+                )
+            _write_json_fsync(
+                staging / "meta/modality_validity.json", projected_validity
+            )
         output_snapshot = _camera_snapshot_from_binding(binding)
         _write_json_fsync(
             staging / "meta/devices/realsense.json", output_snapshot

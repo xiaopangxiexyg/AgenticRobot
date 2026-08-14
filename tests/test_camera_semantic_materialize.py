@@ -632,6 +632,35 @@ def test_prepared_view_corrects_mismatched_indices_without_reading_tactile(
     tactile_payload.write_bytes(b"hot-tactile-must-not-be-copied")
     receipt_dir = source / "meta/modality_artifacts/tactile/receipts"
     shutil.rmtree(receipt_dir)
+    tactile_recompression = source / "meta/tactile_recompression/run.json"
+    tactile_recompression.parent.mkdir(parents=True)
+    tactile_recompression.write_text(
+        json.dumps({"tactile_payload": "must-not-be-projected"}),
+        encoding="utf-8",
+    )
+    (source / "meta/modality_validity.json").write_text(
+        json.dumps(
+            {
+                "capture": {
+                    "ignored_modalities": {"camera": [], "tactile": []},
+                    "missing_value_policy": {
+                        "camera": "frame_absent_valid_false",
+                        "tactile": "value_absent_valid_false",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    info_path = source / "meta/info.json"
+    source_info = json.loads(info_path.read_text(encoding="utf-8"))
+    source_info["nested_capture_contract"] = {
+        "modality_source_clock": {
+            "camera": "receiver_wall_time",
+            "tactile": "local_wall_time",
+        }
+    }
+    info_path.write_text(json.dumps(source_info), encoding="utf-8")
     registry = tmp_path / "registry.json"
     _write_registry(registry)
     output = tmp_path / "prepared"
@@ -655,6 +684,7 @@ def test_prepared_view_corrects_mismatched_indices_without_reading_tactile(
     assert result["validated_video_count"] == 2
     assert not (output / "tactile").exists()
     assert not (output / "meta/modality_artifacts/tactile").exists()
+    assert not (output / "meta/tactile_recompression").exists()
     manifest = load_camera_semantic_prepared_view(
         output, verify_payload_hashes=True
     )
@@ -673,6 +703,23 @@ def test_prepared_view_corrects_mismatched_indices_without_reading_tactile(
         (output / "meta/episodes.jsonl").read_text(encoding="utf-8")
     )
     assert "tactile_paths" not in episode
+    output_info = json.loads(
+        (output / "meta/info.json").read_text(encoding="utf-8")
+    )
+    assert output_info["nested_capture_contract"]["modality_source_clock"] == {
+        "camera": "receiver_wall_time"
+    }
+    output_validity = json.loads(
+        (output / "meta/modality_validity.json").read_text(encoding="utf-8")
+    )
+    assert output_validity == {
+        "capture": {
+            "ignored_modalities": {"camera": []},
+            "missing_value_policy": {
+                "camera": "frame_absent_valid_false"
+            },
+        }
+    }
     output_left = output / episode["video_paths"]["left_wrist"]
     output_right = output / episode["video_paths"]["right_wrist"]
     assert _sha256(output_left) == _sha256(source_right_video)

@@ -1078,6 +1078,7 @@ remote_tail_log.sh
 remote_ps.sh
 remote_view.sh
 remote_sync_check.sh
+remote_dataset_camera_semantics.sh
 ```
 
 示例：
@@ -1091,6 +1092,11 @@ remote_sync_check.sh
 ./remote_safety_check.sh -H dex-remote --arm-ip 192.168.1.18 --require-device /dev/video0
 ./remote_view.sh -H dex-remote --path '~/DexTeleop/logs/latest.log' --tail 200
 ./remote_sync_check.sh -H dex-remote --local ~/DexTeleop --remote '~/DexTeleop' --path teleop_runtime/foo.py
+./remote_dataset_camera_semantics.sh -H dex-remote \
+  --project '~/DexTeleop' --env dexteleop310 \
+  --source-root /data/source_dataset \
+  --output-root /data/camera_semantic_prepared_views/source_dataset \
+  --registry /data/frozen_camera_role_registry.json --dry-run
 ```
 
 ### 实际同步和执行模型
@@ -1158,6 +1164,13 @@ remote_safety_check.sh
 
 remote_rsync_project.sh --delete
   即使传了 --yes，真实删除模式也必须额外传入 --confirm-delete RESOLVED_REMOTE_PATH。
+
+remote_dataset_camera_semantics.sh
+  是相机语义 prepared view 的专用 L3 非运动维护入口。它固定执行
+  `utils.dataset_postprocess camera-semantics-prepare-view`，不提供 module、script
+  或任意参数透传；默认只做完整 dry-run。`--apply` 必须携带前一次计划给出的
+  64 位 `--expected-plan-hash`，并在远端 Python 启动前拒绝已存在的输出目录。
+  它不改变通用 Python wrapper 的控制风险检测，也不能调用设备或机器人入口。
 ```
 
 示例安全流程：

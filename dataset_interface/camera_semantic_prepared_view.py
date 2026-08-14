@@ -22,6 +22,18 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _contains_tactile_key(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            "tactile" in str(key).lower()
+            or _contains_tactile_key(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tactile_key(item) for item in value)
+    return False
+
+
 def camera_semantic_prepared_view_manifest_path(
     dataset_root: str | Path,
 ) -> Path:
@@ -67,7 +79,19 @@ def load_camera_semantic_prepared_view(
                 f"Prepared view refuses symlinks: {path}"
             )
         if path.is_file() and path != manifest_path:
-            actual_files.add(path.relative_to(root).as_posix())
+            relative = path.relative_to(root)
+            if (
+                relative.parts
+                and relative.parts[0] == "meta"
+                and any(
+                    "tactile" in part.lower() for part in relative.parts[1:]
+                )
+            ):
+                raise CameraSemanticPreparedViewContractError(
+                    "Camera-semantic prepared view contains tactile-specific "
+                    f"metadata: {relative.as_posix()}"
+                )
+            actual_files.add(relative.as_posix())
     declared_files = {item.relative_path for item in manifest.files}
     if actual_files != declared_files:
         raise CameraSemanticPreparedViewContractError(
@@ -101,7 +125,7 @@ def load_camera_semantic_prepared_view(
             raise CameraSemanticPreparedViewContractError(
                 f"Invalid prepared-view episode row {line_number}."
             ) from exc
-        if any("tactile" in str(key).lower() for key in row):
+        if _contains_tactile_key(row):
             raise CameraSemanticPreparedViewContractError(
                 "Prepared-view episode records cannot retain tactile fields."
             )
@@ -113,6 +137,21 @@ def load_camera_semantic_prepared_view(
         raise CameraSemanticPreparedViewContractError(
             "Camera-semantic prepared view unexpectedly contains tactile/."
         )
+    for relative in (Path("meta/info.json"), Path("meta/modality_validity.json")):
+        path = root / relative
+        if not path.is_file():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CameraSemanticPreparedViewContractError(
+                f"Cannot read prepared-view metadata {relative}: {exc}"
+            ) from exc
+        if _contains_tactile_key(value):
+            raise CameraSemanticPreparedViewContractError(
+                "Camera-semantic prepared view retains tactile keys in "
+                f"{relative.as_posix()}."
+            )
     return manifest
 
 
