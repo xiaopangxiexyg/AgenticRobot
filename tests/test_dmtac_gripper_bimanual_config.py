@@ -1,34 +1,27 @@
 from __future__ import annotations
 
-import json
 import argparse
+import json
 import os
 import queue
-from pathlib import Path
 import tempfile
 import threading
 import time
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
 from teleop_runtime import (
     DMTacGripperBackendConfig,
+    TeleopSessionConfig,
     build_annotated_dual_rm65_calibration,
     build_bimanual_session,
-    TeleopSessionConfig,
 )
 from teleop_runtime.action import robot_action_from_teleop_command
 from teleop_runtime.backends.grippers import DMTacGripperBackend
-from teleop_runtime.deploy import run_policy as deploy_run_policy
-from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
-from teleop_runtime.real_teleop import cli_runtime_config
-from teleop_runtime.real_teleop.gripper_policy import (
-    GripperForceRequestError,
-    parse_gripper_force_request,
-)
 from teleop_runtime.collection import run_collect
 from teleop_runtime.collection.sample_assembler import CollectorSample
 from teleop_runtime.collection.schema_v21 import collector_sample_to_row
@@ -37,8 +30,22 @@ from teleop_runtime.configs.dmtac_hardware import (
     manual_dmtac_backend_config_for_side,
     require_dmtac_sides_resolved,
 )
-from teleop_runtime.retargeters import ScalarToGripperRetargeter, ScalarToGripperRetargeterConfig
-from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopObservation
+from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.deploy import run_policy as deploy_run_policy
+from teleop_runtime.real_teleop import cli_runtime_config
+from teleop_runtime.real_teleop.gripper_policy import (
+    GripperForceRequestError,
+    parse_gripper_force_request,
+)
+from teleop_runtime.retargeters import (
+    ScalarToGripperRetargeter,
+    ScalarToGripperRetargeterConfig,
+)
+from teleop_runtime.schemas import (
+    EffectorCommand,
+    ObservationChannel,
+    TeleopObservation,
+)
 
 
 class DMTacGripperBimanualConfigTest(unittest.TestCase):

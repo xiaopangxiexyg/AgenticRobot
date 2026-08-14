@@ -15,18 +15,19 @@ import json
 import math
 import select
 import sys
-import threading
 import termios
+import threading
 import time
 import tty
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import numpy as np
+from typing_extensions import Self
 
-from ..configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.layout import episode_id_from_index
 from dataset_contracts.policy_artifact import policy_artifact_from_metadata
@@ -38,16 +39,15 @@ from dataset_contracts.v22 import (
 )
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from deployments.client import load_policy_artifact
-from project_paths import repo_path
-from runtime_artifact_paths import (
-    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
-    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
-    ArtifactWriteResolution,
-    RuntimeArtifactLayout,
-    configured_runtime_artifact_layout,
-    resolve_artifact_write_path,
+from deployments.client.policy import load_policy
+from deployments.client.rtc_executor import (
+    rtc_client_inference_bundle_debug_payload,
 )
-from robot_motion.rm65.assets import require_asset_path
+from deployments.client.rtc_frontend import (
+    build_rtc_conditioned_model_shadow_frontend_v3,
+    build_rtc_model_shadow_frontend,
+)
+from project_paths import repo_path
 from robot_motion.action import (
     ActionComponentCatalog,
     ActionComponentSpec,
@@ -61,7 +61,6 @@ from robot_motion.deploy.actions import (
     ActionSafetyFilterConfig,
     NormalizedAction,
 )
-from robot_motion.deploy.canonical_action import CanonicalDeployActionPipeline
 from robot_motion.deploy.async_producer import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
@@ -71,6 +70,12 @@ from robot_motion.deploy.async_producer import (
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
 )
+from robot_motion.deploy.canonical_action import CanonicalDeployActionPipeline
+from robot_motion.deploy.emission_port import (
+    PassivePolicyEmissionObserverPort,
+    require_passive_policy_emission_observer,
+)
+from robot_motion.deploy.next_step import sync_queue_preserves_same_chunk_successor
 from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
     build_deployment_observation,
@@ -78,7 +83,6 @@ from robot_motion.deploy.observation import (
 from robot_motion.deploy.observation_view import (
     default_deploy_policy_observation_contract,
 )
-from robot_motion.deploy.next_step import sync_queue_preserves_same_chunk_successor
 from robot_motion.deploy.pose_adapter import (
     convert_policy_absolute_vector_to_runtime_raw,
 )
@@ -86,10 +90,6 @@ from robot_motion.deploy.runtime import (
     PolicyDeployRuntime,
     PolicyDeployRuntimeConfig,
     resolve_action_queue_policy,
-)
-from robot_motion.deploy.emission_port import (
-    PassivePolicyEmissionObserverPort,
-    require_passive_policy_emission_observer,
 )
 from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
@@ -106,19 +106,33 @@ from robot_motion.deploy.session_contract import (
     resolve_deploy_session_contract,
     resolve_policy_action_pose_mode_from_artifact,
 )
+from robot_motion.pose_frame_profiles import (
+    default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
+)
+from robot_motion.position_control import (
+    DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
+    DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
+    DEFAULT_POSITION_VELOCITY_RAMP_SEC,
+    POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_CHOICES,
+    POSITION_PLAN_SPLICE_DYNAMICS_OFF,
+    POSITION_PLAN_SPLICE_DYNAMICS_PROFILE_CHOICES,
+    PositionSourcePlanCut,
+    PositionStreamStartAcquisitionConfig,
+    resolve_position_plan_splice_dynamics_config,
+)
 from robot_motion.replay.trajectory import QPOS_INIT_SOURCES
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
     DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
     DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
+    LEGACY_POSITION_CONTROL_PROFILE_NAME,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
-    LEGACY_POSITION_CONTROL_PROFILE_NAME,
-    RM65_BIMANUAL_POSITION_V1,
     RM65_BIMANUAL_POSITION_V1_NAME,
-    RM65_POSITION_CONTROL_PROFILE_CHOICES,
     RM65_POSE_LIFT_PROFILE_CHOICES,
     RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
+    RM65_POSITION_CONTROL_PROFILE_CHOICES,
     RM65_POSITION_TRACKING_FOLLOW_ALPHA,
     RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
@@ -130,21 +144,7 @@ from robot_motion.rm65 import (
     resolve_rm65_pose_lift_profile,
     resolve_rm65_qref_acceleration_profile,
 )
-from robot_motion.position_control import (
-    DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
-    DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
-    DEFAULT_POSITION_VELOCITY_RAMP_SEC,
-    POSITION_PLAN_SPLICE_DYNAMICS_OFF,
-    POSITION_PLAN_SPLICE_DYNAMICS_PROFILE_CHOICES,
-    POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
-    POSITION_COMMAND_PLANNER_CHOICES,
-    PositionSourcePlanCut,
-    PositionStreamStartAcquisitionConfig,
-    resolve_position_plan_splice_dynamics_config,
-)
-from robot_motion.pose_frame_profiles import (
-    default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
-)
+from robot_motion.rm65.assets import require_asset_path
 from robot_motion.runtime import (
     TeleopCommand,
     available_cpu_ids,
@@ -153,53 +153,41 @@ from robot_motion.runtime import (
 )
 from robot_motion.runtime.causal_history import CausalSnapshotHistory
 from robot_motion.runtime_gate import IKActionChunkGate
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    ArtifactWriteResolution,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
 
-from ..backends.arms import (
-    DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
-    RM65ArmBackend,
-    RM65ArmBackendConfig,
-    RM65_BACKGROUND_TARGET_ADMISSION_CHOICES,
-    RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
-    RM65ImpedanceArmBackend,
-    RM65ImpedanceArmBackendConfig,
+from ..action.legacy_execution_context import (
+    LegacyControlOwnerStateTransitionOutcome,
+    LegacyControlOwnerStateTransitionRequest,
 )
 from ..action.replay_proposal import (
     DatasetReplayProposalShadowAdapter,
     DatasetReplayProposalShadowConfig,
     replay_adapter_debug_payload,
 )
-from ..action.legacy_execution_context import (
-    LegacyControlOwnerStateTransitionOutcome,
-    LegacyControlOwnerStateTransitionRequest,
-)
-from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
-from .position_plan_cut import DeploymentPositionPlanCutDetector
-from .rtc_frontend import RtcPolicyShadowConfig, RtcPolicyShadowFrontend
-from .rtc_debug import (
-    RTC_DEBUG_LEVEL_OFF,
-    RTC_DEBUG_LEVEL_SUMMARY,
-    RTC_DEBUG_LEVEL_TRACE,
-    RTC_DEBUG_LEVELS,
-    RtcDebugEventObserver,
-    normalize_rtc_debug_level,
-)
-from .rtc_step_fanout import (
-    PolicyActionEmissionFanout,
-    RtcFrontendStepFanout,
-    RtcPolicyEmissionPublisher,
-)
-from deployments.client.rtc_frontend import (
-    build_rtc_conditioned_model_shadow_frontend_v3,
-    build_rtc_model_shadow_frontend,
+from ..backends.arms import (
+    DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
+    RM65_BACKGROUND_TARGET_ADMISSION_CHOICES,
+    RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    RM65ArmBackend,
+    RM65ArmBackendConfig,
+    RM65ImpedanceArmBackend,
+    RM65ImpedanceArmBackendConfig,
 )
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
     DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
     DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
     DMTAC_TACTILE_FIELDS,
+    GRIPPER_ACTION_MAX,
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
-    GRIPPER_ACTION_MAX,
     normalize_dmtac_tactile_fields,
 )
 from ..backends.hands import (
@@ -212,6 +200,7 @@ from ..collection.hand_state_polling import (
     HandStateHistoryPoller,
     HandStateHistoryPollerConfig,
 )
+from ..configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from ..configs.dmtac_hardware import (
     add_dmtac_assignment_arguments,
     dmtac_backend_configs_from_assignment,
@@ -228,73 +217,38 @@ from ..defaults import (
 from ..execution_mode_contract import validate_dataset_arm_control_mode
 from ..hand_mapping import parse_tactile_regions
 from ..interfaces import EffectorBackend
-from ..log_utils import ChangeGate, log_event as console_log_event
+from ..log_utils import ChangeGate
+from ..log_utils import log_event as console_log_event
 from ..position_control import (
     ARM_EXECUTION_PROFILE_CHOICES,
     CONTINUOUS_WAYPOINT_WORKER_ISOLATION_CHOICES,
     CONTINUOUS_WAYPOINT_WORKER_PROCESS,
     CONTINUOUS_WAYPOINT_WORKER_THREAD,
+    OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND,
+    PINK_POSE_LIFT_BACKEND,
     POSITION_15_60_120HZ_PROFILE_NAME,
+    POSITION_PATH_LIFT_BACKEND_CHOICES,
     PositionDeployExecutor,
     PositionDeployExecutorConfig,
     PositionDeployExecutorFault,
-    OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND,
-    PINK_POSE_LIFT_BACKEND,
-    POSITION_PATH_LIFT_BACKEND_CHOICES,
     apply_rm65_position_profile_defaults,
     build_official_all_ik_governor_from_started_backends,
     build_position_collision_planner_from_started_backends,
     resolve_real_arm_execution_config,
 )
-from ..target_safety.deploy_tcp_pose_envelope import (
-    DeployTCPPoseEnvelopeProjector,
-)
-from ..target_safety.tcp_pose_envelope_runtime import (
-    TCPPoseEnvelopeRuntimeError,
-    load_tcp_pose_envelope_file_spec,
-)
-from ..sources.camera import (
-    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
-    REALSENSE_STARTUP_WARMUP_POLICIES,
-    RealSenseRGBCameraConfig,
-    RealSenseRGBSource,
-    load_realsense_camera_config_map,
-)
 from ..real_teleop.camera_runtime import (
     CAMERA_START_STAGGER_SEC as REAL_TELEOP_CAMERA_START_STAGGER_SEC,
+)
+from ..real_teleop.camera_runtime import (
     CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES,
     CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
     CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC,
     CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
     CameraStartupFreshnessGate,
-    _start_camera_sources_best_effort as _start_real_teleop_camera_sources_best_effort,
     apply_real_teleop_camera_startup_defaults,
 )
-from ..real_teleop.status_payloads import _build_camera_status
-from ..tactile_visualizer import (
-    TactileUVVisualizer,
-    TactileVisualizerConfig,
-    tactile_by_side_from_hand_states,
-)
-from .dispatch import (
-    POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
-    POSITION_REFERENCE_DISPATCH_AUDIT_POST,
-    dispatch_position_reference_command,
-    dispatch_teleop_command,
-    require_arm_backends_ready_for_position_dispatch,
-)
-from .arbiter_shadow import (
-    ARBITER_SHADOW_MODE_SHADOW,
-    ARBITER_SHADOW_MODES_M3,
-    PassivePolicyArbiterShadow,
-    PolicyArbiterShadowConfig,
-)
-from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
-from .impedance_force_guard import (
-    ImpedanceForceGuardConfig,
-    ImpedanceForceGuardFault,
-    ImpedanceForceGuardMonitor,
-    bimanual_emergency_stop,
+from ..real_teleop.camera_runtime import (
+    _start_camera_sources_best_effort as _start_real_teleop_camera_sources_best_effort,
 )
 from ..real_teleop.position_force_guard import (
     POSITION_FORCE_SOURCES,
@@ -303,24 +257,74 @@ from ..real_teleop.position_force_guard import (
     PositionForceGuardTripped,
     position_force_guard_config,
 )
-from deployments.client.policy import load_policy
-from deployments.client.rtc_executor import (
-    rtc_client_inference_bundle_debug_payload,
+from ..real_teleop.status_payloads import _build_camera_status
+from ..sources.camera import (
+    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+    REALSENSE_STARTUP_WARMUP_POLICIES,
+    RealSenseRGBCameraConfig,
+    RealSenseRGBSource,
+    load_realsense_camera_config_map,
+)
+from ..tactile_visualizer import (
+    TactileUVVisualizer,
+    TactileVisualizerConfig,
+    tactile_by_side_from_hand_states,
+)
+from ..target_safety.deploy_tcp_pose_envelope import (
+    DeployTCPPoseEnvelopeProjector,
+)
+from ..target_safety.tcp_pose_envelope_runtime import (
+    load_tcp_pose_envelope_file_spec,
+)
+from .arbiter_shadow import (
+    ARBITER_SHADOW_MODE_SHADOW,
+    ARBITER_SHADOW_MODES_M3,
+    PassivePolicyArbiterShadow,
+    PolicyArbiterShadowConfig,
+)
+from .dispatch import (
+    POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
+    POSITION_REFERENCE_DISPATCH_AUDIT_POST,
+    dispatch_position_reference_command,
+    dispatch_teleop_command,
+    require_arm_backends_ready_for_position_dispatch,
+)
+from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
+from .impedance_force_guard import (
+    ImpedanceForceGuardConfig,
+    ImpedanceForceGuardFault,
+    ImpedanceForceGuardMonitor,
+    bimanual_emergency_stop,
 )
 from .policy_qpos_init import (
     DeployPolicyQposInitController,
     DeployPolicyQposInitSettings,
     load_deploy_policy_qpos_init_plan,
 )
+from .position_plan_cut import DeploymentPositionPlanCutDetector
 from .replay import (
     DatasetReplayPolicy,
     infer_replay_action_hz,
     load_dataset_replay_policy,
     resolve_replay_parquet_path,
 )
+from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
+from .rtc_debug import (
+    RTC_DEBUG_LEVEL_OFF,
+    RTC_DEBUG_LEVEL_SUMMARY,
+    RTC_DEBUG_LEVEL_TRACE,
+    RTC_DEBUG_LEVELS,
+    RtcDebugEventObserver,
+    normalize_rtc_debug_level,
+)
+from .rtc_frontend import RtcPolicyShadowConfig, RtcPolicyShadowFrontend
+from .rtc_step_fanout import (
+    PolicyActionEmissionFanout,
+    RtcFrontendStepFanout,
+    RtcPolicyEmissionPublisher,
+)
 from .safety_shadow import evaluate_policy_legacy_aligned_safety
 from .startup_init import StartupInitializer, resolve_startup_init_action
-
 
 DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 # Deployment runs the vision policy at roughly 15 Hz on the RM65 profile.  A
@@ -440,7 +444,7 @@ class NonBlockingKeyboard:
         self._fd: int | None = None
         self._old_settings: list[Any] | None = None
 
-    def __enter__(self) -> "NonBlockingKeyboard":
+    def __enter__(self) -> Self:
         if sys.stdin.isatty():
             self._fd = sys.stdin.fileno()
             self._old_settings = termios.tcgetattr(self._fd)
@@ -644,7 +648,7 @@ def _debug_compact_value(
                 "omitted": True,
                 "reason": "compact_deploy_debug_depth",
                 "type": "mapping",
-                "size": int(len(value)),
+                "size": len(value),
             }
         items = list(value.items())
         payload = {
@@ -664,7 +668,7 @@ def _debug_compact_value(
                 "omitted": True,
                 "reason": "compact_deploy_debug_depth",
                 "type": "sequence",
-                "size": int(len(value)),
+                "size": len(value),
             }
         payload = [
             _debug_compact_value(
@@ -746,7 +750,7 @@ def _debug_metadata_summary(
     omitted = [str(key) for key in metadata if str(key) not in payload]
     if omitted:
         payload["_debug_omitted_metadata"] = {
-            "count": int(len(omitted)),
+            "count": len(omitted),
             "keys": omitted[:32],
         }
     return payload
@@ -906,7 +910,7 @@ def _debug_vector(
         return None
     try:
         vector = np.asarray(value, dtype=float).reshape(-1)
-    except Exception:
+    except (TypeError, ValueError):
         return None
     if length is not None and vector.shape != (int(length),):
         return None
@@ -920,7 +924,7 @@ def _debug_xyzquat(value: Any) -> np.ndarray | None:
         return None
     try:
         array = np.asarray(value, dtype=float)
-    except Exception:
+    except (TypeError, ValueError):
         return None
     if array.shape == (4, 4):
         pose = pose_matrix_to_xyzquat(array)
@@ -1242,7 +1246,7 @@ def _debug_backend_limits(
             "background_streaming_hz": (
                 None
                 if getattr(config, "background_streaming_hz", None) is None
-                else float(getattr(config, "background_streaming_hz"))
+                else float(config.background_streaming_hz)
             ),
             "background_streaming_target_admission_mode": getattr(
                 config,
@@ -1488,7 +1492,7 @@ class DeploymentDebugLogger:
                 "step_index": int(step_index),
                 "policy_name": str(policy_name),
                 "policy_output_type": type(policy_output).__name__,
-                "chunk_size": int(len(actions)),
+                "chunk_size": len(actions),
                 "accepted": bool(accepted),
                 "discarded_by_ik": bool(discarded_by_ik),
                 "queue_policy": str(queue_policy),
@@ -1718,7 +1722,7 @@ class ArmStateReader:
                     hardware_qpos = state.get("hardware_qpos")
                     compute_pose = getattr(backend, "compute_tcp_pose", None)
                     if not callable(compute_pose):
-                        raise AttributeError("backend has no compute_tcp_pose")
+                        raise TypeError("backend has no compute_tcp_pose")
                     if hardware_qpos is not None:
                         measured_pose = compute_pose(qpos=hardware_qpos)
                         state["current_tcp_pose"] = measured_pose
@@ -2039,7 +2043,7 @@ def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
     path = Path(path_text).expanduser()
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
-        raise ValueError(f"Gripper task profile {path} must contain a JSON object.")
+        raise TypeError(f"Gripper task profile {path} must contain a JSON object.")
     base_gripper = payload.get("gripper")
     if base_gripper is not None and not isinstance(base_gripper, Mapping):
         raise ValueError(f"Profile {path} field 'gripper' must be an object.")
@@ -2056,7 +2060,7 @@ def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
             item = tasks.get(key)
             if isinstance(item, Mapping):
                 selected = item
-                setattr(args, "_resolved_gripper_task", key)
+                args._resolved_gripper_task = key
                 break
     if selected is not None:
         gripper = selected.get("gripper")
@@ -2151,7 +2155,7 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("gripper telemetry_hz must be > 0.")
     if float(policy["telemetry_command_grace_s"]) < 0.0:
         raise ValueError("gripper telemetry_command_grace_s must be >= 0.")
-    setattr(args, "_resolved_gripper_policy", dict(policy))
+    args._resolved_gripper_policy = dict(policy)
     return dict(policy)
 
 
@@ -2236,7 +2240,7 @@ def _dmtac_backend_configs(
         and side not in disconnected_sides
     )
     if not dmtac_sides:
-        setattr(args, "_dmtac_backend_configs", {})
+        args._dmtac_backend_configs = {}
         return {}
 
     policy = _resolved_gripper_policy(args)
@@ -2276,7 +2280,7 @@ def _dmtac_backend_configs(
                     max_action=float(policy["max_action"]),
                 )
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if bool(getattr(args, "dmtac_config_required", False)):
                 raise RuntimeError(
                     f"Failed to load DMTAC hardware assignment {getattr(args, 'dmtac_config', 'latest')!r}: {exc}"
@@ -2302,8 +2306,8 @@ def _dmtac_backend_configs(
             resolved,
             config=str(getattr(args, "dmtac_config", "latest") or "latest"),
         )
-    setattr(args, "_dmtac_backend_configs", dict(resolved))
-    setattr(args, "dmtac_config_loaded_sides", sorted(resolved))
+    args._dmtac_backend_configs = dict(resolved)
+    args.dmtac_config_loaded_sides = sorted(resolved)
     return dict(resolved)
 
 
@@ -2877,7 +2881,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--arm-canfd-radio",
         type=int,
-        choices=tuple(range(0, 101)),
+        choices=tuple(range(101)),
         default=0,
         help="RM65 Movej_CANFD radio/smoothing value for position deployment.",
     )
@@ -3777,7 +3781,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 def parse_policy_kwargs(text: str) -> dict[str, Any]:
     payload = json.loads(str(text or "{}"))
     if not isinstance(payload, dict):
-        raise ValueError("--policy-kwargs-json must decode to a JSON object.")
+        raise TypeError("--policy-kwargs-json must decode to a JSON object.")
     return payload
 
 
@@ -3965,14 +3969,17 @@ def validate_args(
             "--position-continuous-waypoint-async-precompute requires "
             "--position-continuous-waypoint-experimental-admission."
         )
-    if continuous_waypoint_research:
-        if not bool(args.debug) and not no_debug_deadline_soak:
-            raise ValueError(
-                "continuous waypoint research switch requires --debug so its "
-                "bounded observational results are persisted; the only "
-                "exception is the explicit bounded no-debug deadline-soak "
-                "contract."
-            )
+    if (
+        continuous_waypoint_research
+        and not bool(args.debug)
+        and not no_debug_deadline_soak
+    ):
+        raise ValueError(
+            "continuous waypoint research switch requires --debug so its "
+            "bounded observational results are persisted; the only "
+            "exception is the explicit bounded no-debug deadline-soak "
+            "contract."
+        )
     if path_lift_backend == OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND:
         if active_sides != ("left", "right"):
             if _argument_was_supplied(
@@ -4188,7 +4195,7 @@ def validate_args(
         raise ValueError("--rtc-debug-level summary/trace requires --debug.")
     if rtc_debug_level != RTC_DEBUG_LEVEL_OFF and not rtc_profile_enabled:
         raise ValueError("--rtc-debug-level summary/trace requires an RTC profile.")
-    setattr(args, "_rtc_debug_level", rtc_debug_level)
+    args._rtc_debug_level = rtc_debug_level
     model_transport_profiles = {
         RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
         MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
@@ -4405,7 +4412,7 @@ def validate_args(
         args,
         raw_argv=raw_tokens,
     )
-    setattr(args, "_real_arm_execution_config", execution_config)
+    args._real_arm_execution_config = execution_config
     args.arm_control_mode = execution_config.mode
     args.arm_canfd_follow = execution_config.arm_canfd_follow
     args.arm_control_hz = execution_config.arm_control_hz
@@ -4545,9 +4552,10 @@ def validate_args(
             )
         if not bool(args.arms_enabled):
             raise ValueError("--deploy-fixed-init-* requires arms to be enabled.")
-    if args.policy_qpos_init_dataset or args.policy_qpos_init_parquet:
-        if not bool(args.arms_enabled):
-            raise ValueError("--policy-qpos-init-* requires arms to be enabled.")
+    if (
+        args.policy_qpos_init_dataset or args.policy_qpos_init_parquet
+    ) and not bool(args.arms_enabled):
+        raise ValueError("--policy-qpos-init-* requires arms to be enabled.")
     has_dataset_qpos_start = bool(
         args.policy_qpos_init_dataset
         or args.policy_qpos_init_parquet
@@ -4572,10 +4580,10 @@ def validate_args(
         and bool(args.send_actions)
         and bool(args.arms_enabled)
         and not any(
-            token == "--arm-execution-profile"
-            or token.startswith("--arm-execution-profile=")
-            or token == "--arm-control-mode"
-            or token.startswith("--arm-control-mode=")
+            token in {"--arm-execution-profile", "--arm-control-mode"}
+            or token.startswith(
+                ("--arm-execution-profile=", "--arm-control-mode=")
+            )
             for token in raw_tokens
         )
     ):
@@ -4647,11 +4655,13 @@ def validate_args(
                 )
     if bool(args.send_actions) and hands_enabled:
         for side in end_effector_sides:
-            if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_INSPIRE:
-                if not getattr(args, f"{side}_hand_ip"):
-                    raise ValueError(
-                        f"--send-actions with hands requires --{side}-hand-ip."
-                    )
+            if (
+                _hand_backend_mode_for_side(args, side) == HAND_BACKEND_INSPIRE
+                and not getattr(args, f"{side}_hand_ip")
+            ):
+                raise ValueError(
+                    f"--send-actions with hands requires --{side}-hand-ip."
+                )
     if bool(args.visualize_tactile):
         if any(
             _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
@@ -4809,8 +4819,8 @@ def apply_arm_step_dt_defaults(
         control_hz=float(control_hz),
         action_hz=action_hz,
     )
-    setattr(args, "arm_step_dt_max_scale", float(max_scale))
-    setattr(args, "arm_step_dt_max_scale_auto", bool(auto))
+    args.arm_step_dt_max_scale = float(max_scale)
+    args.arm_step_dt_max_scale_auto = bool(auto)
 
 
 def deploy_arm_command_step_dt_sec(
@@ -5697,7 +5707,7 @@ def select_preview_camera_sources(
                 f"--vis-cam-key {key!r} not found. Available camera keys: {available}"
             )
         return {key: camera_sources[key]}
-    selected_key = "front" if "front" in camera_sources else sorted(camera_sources)[0]
+    selected_key = "front" if "front" in camera_sources else min(camera_sources)
     return {selected_key: camera_sources[selected_key]}
 
 
@@ -7590,7 +7600,8 @@ def main(
             reader = getattr(backend, "read_impedance_force_guard_data", None)
             set_callback = getattr(backend, "set_force_hard_stop_callback", None)
             if not callable(reader) or not callable(set_callback):
-                raise RuntimeError(
+                # Missing backend capability is a runtime integration failure.
+                raise RuntimeError(  # noqa: TRY004
                     f"{side} impedance backend does not expose the force-guard contract"
                 )
             guard_readers[str(side)] = reader
@@ -7624,7 +7635,7 @@ def main(
             config=ImpedanceForceGuardConfig(),
         )
         for side, backend in arm_backends.items():
-            set_callback = getattr(backend, "set_force_hard_stop_callback")
+            set_callback = backend.set_force_hard_stop_callback
             set_callback(impedance_force_guard_monitor.notify_backend_hard_stop)
 
     if position_force_guard_required:
@@ -7632,7 +7643,8 @@ def main(
         for side, backend in arm_backends.items():
             reader = getattr(backend, "read_force_data", None)
             if not callable(reader):
-                raise RuntimeError(
+                # Missing backend capability is a runtime integration failure.
+                raise RuntimeError(  # noqa: TRY004
                     f"{side} position backend does not expose read_force_data"
                 )
             position_guard_readers[str(side)] = reader
@@ -7837,7 +7849,7 @@ def main(
                 "continuous_waypoint_shadow="
                 f"{'on(candidate_path)' if bool(args.position_continuous_waypoint_shadow) else 'off'} "
                 "continuous_waypoint_profile="
-                f"{str(args.position_continuous_waypoint_profile_effective)} "
+                f"{args.position_continuous_waypoint_profile_effective!s} "
                 "continuous_waypoint_experimental_admission="
                 f"{'on(source_cut_atomic)' if bool(args.position_continuous_waypoint_experimental_admission) else 'off'} "
                 "continuous_waypoint_async_precompute="
@@ -8576,7 +8588,8 @@ def main(
                             for side, backend in arm_backends.items():
                                 state = arm_states.get(side)
                                 if not isinstance(state, Mapping):
-                                    raise RuntimeError(
+                                    # This is missing live state, not caller misuse.
+                                    raise RuntimeError(  # noqa: TRY004
                                         f"{side} has no current hardware state for manual re-arm"
                                     )
                                 if not bool(state.get("hardware_read_success", False)):
@@ -8605,7 +8618,8 @@ def main(
                                     None,
                                 )
                                 if not callable(rearm):
-                                    raise RuntimeError(
+                                    # Missing backend capability is a runtime failure.
+                                    raise RuntimeError(  # noqa: TRY004
                                         f"{side} backend does not expose manual impedance re-arm"
                                     )
                                 rearm(qpos)
@@ -8613,9 +8627,8 @@ def main(
                                 start=False
                             )
                             impedance_force_control_enabled = False
-                        except (
-                            Exception
-                        ) as exc:  # noqa: BLE001 - keep the latch on failure.
+                        except Exception as exc:  # noqa: BLE001
+                            # Re-arm failures must preserve the safety latch.
                             try:
                                 emergency_stop_deploy_arm_backends(
                                     arm_backends,
@@ -8687,9 +8700,8 @@ def main(
                             rearm_details = position_deploy_executor.manual_rearm(
                                 observation
                             )
-                        except (
-                            Exception
-                        ) as exc:  # noqa: BLE001 - operator-facing re-arm gate.
+                        except Exception as exc:  # noqa: BLE001
+                            # Convert any re-arm failure into an operator-facing hold.
                             print(
                                 "[Deploy] manual re-arm rejected; re-home is required if feedback is "
                                 f"unavailable/out of domain: {type(exc).__name__}: {exc}"
@@ -9861,7 +9873,7 @@ def main(
                                     0.0,
                                     time.monotonic() - post_state_started,
                                 ) * 1000.0
-                        except Exception as exc:  # noqa: BLE001
+                        except Exception as exc:
                             if plan_cut_proposal is not None:
                                 position_plan_cut_detector.reject(plan_cut_proposal)
                                 plan_cut_proposal = None
@@ -10072,12 +10084,16 @@ def main(
                             )
                         )
                         position_status_parts = [
-                            "position="
-                            f"refs:{reference_count}/queue:{queue_depth}"
-                            f"/missed:{missed_ticks}",
-                            "collision="
-                            f"{collision_status}/d:{collision_distance_text}"
-                            f"/reset:{collision_reset_status}",
+                            (
+                                "position="
+                                f"refs:{reference_count}/queue:{queue_depth}"
+                                f"/missed:{missed_ticks}"
+                            ),
+                            (
+                                "collision="
+                                f"{collision_status}/d:{collision_distance_text}"
+                                f"/reset:{collision_reset_status}"
+                            ),
                         ]
                         hand_attempts = int(
                             position_snapshot.get(
@@ -10309,9 +10325,8 @@ def main(
         if position_deploy_executor is not None:
             try:
                 position_deploy_executor.close()
-            except (
-                Exception
-            ) as exc:  # noqa: BLE001 - inspect worker liveness before backend close.
+            except Exception as exc:  # noqa: BLE001
+                # Preserve worker-state diagnostics for any close failure.
                 close_snapshot = position_deploy_executor.snapshot()
                 position_workers_stopped = not bool(
                     close_snapshot.get("reference_worker_alive")

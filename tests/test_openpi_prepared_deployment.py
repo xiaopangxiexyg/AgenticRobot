@@ -12,10 +12,6 @@ from types import ModuleType
 import numpy as np
 import pytest
 
-from dataset_contracts.normalization import (
-    NormalizationContract,
-    normalization_stats_hash,
-)
 from dataset_contracts.model_continuation import (
     MODEL_CONTINUATION_FLOW_INPAINT_V1,
     MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
@@ -31,6 +27,10 @@ from dataset_contracts.model_continuation_training import (
     ModelContinuationTrainingRunManifest,
     ModelContinuationTrainingSourceBinding,
 )
+from dataset_contracts.normalization import (
+    NormalizationContract,
+    normalization_stats_hash,
+)
 from dataset_contracts.policy_artifact import (
     PolicyArtifactContract,
     PolicyCameraInput,
@@ -44,8 +44,7 @@ from dataset_interface.model_continuation import (
     TEACHER_OVERLAP_PROJECTION_PARAMETERS_HASH_V1,
     ModelContinuationTrainingSamplingSpec,
 )
-from deployments.openpi import prepared_deployment
-from deployments.openpi import prepared_server_runtime
+from deployments.openpi import prepared_deployment, prepared_server_runtime
 from deployments.openpi import server as openpi_server
 from deployments.openpi.artifact_identity import openpi_rtc_artifact_hash
 from deployments.openpi.client import real as openpi_real

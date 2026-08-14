@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_PORT,
-    DMTacGripperBackendConfig,
     GRIPPER_ACTION_MAX,
+    DMTacGripperBackendConfig,
 )
-
 
 DMTAC_ASSIGNMENT_DEFAULT = "latest"
 
