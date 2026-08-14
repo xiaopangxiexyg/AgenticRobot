@@ -818,6 +818,14 @@ class ViveCoordinateCalibrationController:
                 source_stats = self._source.debug_stats()
             except Exception:
                 source_stats = {}
+            source_lifecycle_owned = bool(
+                getattr(self._source, "lifecycle_owned", True)
+            )
+            source_receiver_active = bool(
+                source_stats.get("running")
+                or source_stats.get("worker_alive")
+                or self._source_started
+            )
             try:
                 source_role_by_output_channel = dict(
                     self._source.source_role_by_output_channel
@@ -835,6 +843,8 @@ class ViveCoordinateCalibrationController:
                 "profile_kind": VIVE_COORDINATE_PROFILE_KIND,
                 "lifecycle": "running" if self._started else "stopped",
                 "source_started": bool(self._source_started),
+                "source_lifecycle_owned": source_lifecycle_owned,
+                "source_receiver_active": source_receiver_active,
                 "workflow_active": self._workflow_is_active(),
                 "shutdown_requested": bool(self._shutdown_requested),
                 "motion_authorized": False,

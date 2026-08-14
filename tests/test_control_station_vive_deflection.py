@@ -644,9 +644,13 @@ def test_recalibration_launcher_reuses_viewer_source_and_profile_store(
         with urlopen(f"{state['url']}api/state", timeout=2.0) as response:
             calibration_state = json.loads(response.read().decode("utf-8"))
         assert calibration_state["source_started"] is False
+        assert calibration_state["source_lifecycle_owned"] is False
+        assert calibration_state["source_receiver_active"] is True
         assert calibration_state["active_sides"] == ["left"]
         assert calibration_state["available_active_sides"] == ["left"]
         assert calibration_state["input_preflight"]["ready"] is True
+        live_channel = calibration_state["live_channels"]["left_wrist_pose"]
+        assert live_channel["channel_name"] == "left_wrist_pose"
         controller = launcher._controller
         calibration_gui = launcher._gui
         assert controller is not None
@@ -661,3 +665,105 @@ def test_recalibration_launcher_reuses_viewer_source_and_profile_store(
     finally:
         launcher.close()
     assert source.closed is False
+
+
+@pytest.mark.integration
+def test_recalibration_reads_live_udp_from_the_viewer_owned_source(
+    tmp_path: Path,
+    require_udp_loopback: None,
+) -> None:
+    controller = ViveDeflectionController(
+        _raw_config(
+            vive_host="127.0.0.1",
+            vive_port=0,
+            vive_clock_sync_port=0,
+        )
+    )
+    launcher = ViveDeflectionCalibrationLauncher(
+        source=controller.source,
+        source_role="left_wrist",
+        tracker_name="tracker_1",
+        ui_host="127.0.0.1",
+        ui_port=0,
+        profile_dir=tmp_path,
+    )
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    controller.start()
+    try:
+        assert controller.source.sock is not None
+        address = controller.source.sock.getsockname()
+
+        def send_pose(sequence: int) -> None:
+            packet = {
+                "protocol": "teleop_runtime.vive/v1",
+                "seq": sequence,
+                "sender_timestamp": time.time(),
+                "trackers": [
+                    {
+                        "tracker_name": "tracker_1",
+                        "tracker_role": "left_wrist",
+                        "valid": True,
+                        "pose_matrix_4x4": _pose((0.01 * sequence, 0.0, 0.0)).tolist(),
+                        "error": None,
+                    }
+                ],
+            }
+            sender.sendto(json.dumps(packet).encode("utf-8"), address)
+
+        for sequence in range(1, 4):
+            send_pose(sequence)
+            time.sleep(0.01)
+
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if controller.source.debug_stats()["packet_count"] >= 3:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("viewer-owned VIVE receiver did not read UDP packets")
+
+        launcher.open()
+        calibration_controller = launcher._controller
+        assert calibration_controller is not None
+        state = calibration_controller.snapshot()
+
+        assert state["source_started"] is False
+        assert state["source_lifecycle_owned"] is False
+        assert state["source_receiver_active"] is True
+        assert state["input_preflight"]["ready"] is True
+        assert state["live_channels"]["left_wrist_pose"]["channel_name"] == (
+            "left_wrist_pose"
+        )
+        assert state["source_stats"]["channel_update_counts"] == {
+            "left_wrist_pose": 3
+        }
+
+        # Exercise the actual calibration sampler, not just its idle
+        # preflight.  Fresh UDP packets must advance the aliased channel's
+        # sample identity while the viewer remains the receiver owner.
+        calibration_controller.config.capture_prep_sec = 0.0
+        calibration_controller.config.sweep_capture_sec = 1.0
+        calibration_controller.config.min_sweep_samples = 3
+        calibration_controller.dispatch("begin_calibration")
+        calibration_controller.dispatch("capture")
+        for sequence in range(4, 16):
+            send_pose(sequence)
+            time.sleep(0.025)
+
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            state = calibration_controller.snapshot()
+            samples = state["capture_samples"].get("left_wrist_pose", 0)
+            if samples >= 3:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError(
+                "shared-source calibration sampler did not receive fresh UDP poses"
+            )
+        calibration_controller.dispatch("cancel_calibration")
+    finally:
+        launcher.close()
+        assert controller.source.debug_stats()["worker_alive"] is True
+        controller.close()
+        sender.close()

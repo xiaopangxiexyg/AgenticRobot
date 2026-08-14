@@ -211,9 +211,12 @@ function renderConnection(state, online = true) {
     byId("connectionText").textContent = "GUI OFFLINE";
     return;
   }
-  const active = Boolean(state.source_started);
+  const active = Boolean(state.source_receiver_active);
+  const shared = state.source_lifecycle_owned === false;
   badge.className = "status-pill " + (active ? "live" : "");
-  byId("connectionText").textContent = active ? "VIVE RECEIVER ACTIVE" : "VIEW ONLY";
+  byId("connectionText").textContent = active
+    ? (shared ? "SHARED VIVE RECEIVER ACTIVE" : "VIVE RECEIVER ACTIVE")
+    : "VIVE RECEIVER INACTIVE";
 }
 function normalizedStage(state) {
   const raw = String(state.stage || "");
@@ -310,14 +313,28 @@ function renderChannel(name, cardId, state) {
 function renderLive(state) {
   channelSpecs.forEach((spec) => renderChannel(spec[0], spec[1], state));
   const stats = state.source_stats || {};
-  byId("receiverMetric").textContent = state.source_started ? "connected" : "not started";
+  byId("receiverMetric").textContent = state.source_receiver_active
+    ? (state.source_lifecycle_owned === false ? "connected (shared)" : "connected")
+    : "inactive";
   byId("packetMetric").textContent = display(stats.packet_count);
   byId("sourceDiagnostics").textContent = JSON.stringify({
+    running: stats.running,
+    worker_alive: stats.worker_alive,
+    bind_host: stats.bind_host,
+    port: stats.port,
+    datagram_count: stats.datagram_count,
     packet_count: stats.packet_count,
+    last_datagram_received_at: stats.last_datagram_received_at,
     last_packet_received_at: stats.last_packet_received_at,
     dropped_stale_packet_count: stats.dropped_stale_packet_count,
     recv_error_count: stats.recv_error_count,
+    last_recv_error: stats.last_recv_error,
+    process_error_count: stats.process_error_count,
+    last_process_error: stats.last_process_error,
     channel_update_counts: stats.channel_update_counts,
+    latest_upstream_roles: stats.latest_upstream_roles,
+    upstream_role_update_counts: stats.upstream_role_update_counts,
+    source_role_by_output_channel: state.source_role_by_output_channel,
   }, null, 2);
 }
 function renderMatrix(root, matrix) {
@@ -436,10 +453,10 @@ function render(state) {
   byId("load").disabled = busy || workflowActive || !byId("profileSelect").value;
   byId("begin").disabled = busy || workflowActive || !Boolean((state.input_preflight || {}).ready) || Boolean(state.shutdown_requested);
   byId("exit").disabled = busy || Boolean(state.shutdown_requested);
-  byId("exit").textContent = state.source_started
+  byId("exit").textContent = state.source_lifecycle_owned
     ? "退出标定 / 取消启动" : "关闭标定页";
   const availableSides = state.available_active_sides || ["left", "right"];
-  const sharedSingleSide = Boolean(state.source_started === false)
+  const sharedSingleSide = Boolean(state.source_lifecycle_owned === false)
     && availableSides.length === 1;
   byId("sides").disabled = busy || workflowActive || sharedSingleSide;
   byId("deskTracker").disabled = busy || workflowActive || sharedSingleSide;
@@ -489,7 +506,7 @@ byId("reset").addEventListener("click", () => submit("reset_stage"));
 byId("cancel").addEventListener("click", () => submit("cancel_calibration"));
 byId("swapVive").addEventListener("click", () => submit("swap_vive_sources"));
 byId("exit").addEventListener("click", () => {
-  const message = latest && latest.source_started
+  const message = latest && latest.source_lifecycle_owned
     ? "退出会关闭 VIVE 标定接收器，并取消等待本次标定结果的启动。确定退出吗？"
     : "关闭本标定页？共享的 VIVE 偏转查看器会继续运行。";
   if (window.confirm(message)) submit("close");

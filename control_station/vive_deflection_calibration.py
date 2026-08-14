@@ -8,6 +8,7 @@ owner.
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from pathlib import Path
@@ -33,11 +34,50 @@ class _SingleRoleCalibrationSource:
         if not isinstance(channels, Mapping):
             return {}
         channel = channels.get("wrist_pose")
-        return {} if channel is None else {self.output_channel: channel}
+        if channel is None:
+            return {}
+
+        # The mapping key and the carrier identity must agree.  Returning the
+        # viewer's carrier unchanged made the calibration page expose a
+        # ``left_wrist_pose`` entry whose channel_name was still
+        # ``wrist_pose``.  Besides confusing diagnostics, that leaks the
+        # viewer-local channel name into the reusable calibration workflow.
+        clone = getattr(channel, "copy", None)
+        aliased = clone() if callable(clone) else copy.copy(channel)
+        try:
+            aliased.channel_name = self.output_channel
+        except (AttributeError, TypeError):
+            pass
+        try:
+            aliased.side = self.source_role.removesuffix("_wrist")
+        except (AttributeError, TypeError):
+            pass
+        metadata = getattr(aliased, "metadata", None)
+        if isinstance(metadata, Mapping):
+            aliased.metadata = {
+                **metadata,
+                "shared_source_channel": "wrist_pose",
+            }
+        return {self.output_channel: aliased}
 
     def debug_stats(self) -> dict[str, Any]:
         stats = getattr(self._source, "debug_stats", None)
-        return dict(stats()) if callable(stats) else {}
+        values = dict(stats()) if callable(stats) else {}
+        for field_name in ("channel_update_counts", "last_channel_update_at"):
+            raw = values.get(field_name)
+            if not isinstance(raw, Mapping):
+                continue
+            remapped = dict(raw)
+            if "wrist_pose" in remapped:
+                remapped[self.output_channel] = remapped.pop("wrist_pose")
+            values[field_name] = remapped
+        return values
+
+    @property
+    def lifecycle_owned(self) -> bool:
+        """The viewer, not this adapter, owns receiver start/close."""
+
+        return False
 
     @property
     def source_role_by_output_channel(self) -> dict[str, str]:
