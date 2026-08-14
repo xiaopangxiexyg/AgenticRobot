@@ -2267,6 +2267,7 @@ def _dmtac_backend_configs(
                 dmtac_backend_configs_from_assignment(
                     assignment,
                     active_sides=dmtac_sides,
+                    prefer_existing_by_path_port=bool(disconnected_sides),
                     tactile_backend=str(
                         getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"
                     ),
@@ -5747,6 +5748,99 @@ def hand_state_snapshot(
     return {side: backend.get_state() for side, backend in backends.items()}
 
 
+def _disconnected_gripper_selection_label(sides: set[str] | tuple[str, ...]) -> str:
+    selected = tuple(side for side in ALL_SIDES if side in set(sides))
+    if not selected:
+        return "none"
+    if selected == tuple(ALL_SIDES):
+        return "both"
+    return selected[0]
+
+
+def _hand_backend_startup_diagnostic(
+    *,
+    side: str,
+    backend: EffectorBackend,
+    disconnected_gripper_sides: set[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    state = backend.get_state()
+    selected_sides = set(disconnected_gripper_sides)
+    ready = bool(backend.is_ready())
+    recommended_sides = selected_sides | {side}
+    return {
+        "side": side,
+        "ready": ready,
+        "backend_type": state.get("backend_type", type(backend).__name__),
+        "selected_for_intentional_disconnect": side in selected_sides,
+        "configured_disconnected_gripper_sides": _disconnected_gripper_selection_label(
+            selected_sides
+        ),
+        "backend_intentionally_disconnected": bool(
+            state.get("intentionally_disconnected", False)
+        ),
+        "connect_hardware": state.get("connect_hardware"),
+        "is_connected": state.get("is_connected"),
+        "gripper_is_connected": state.get("gripper_is_connected"),
+        "gripper_port": state.get("gripper_port"),
+        "telemetry_error": state.get("telemetry_error"),
+        "intentional_disconnect_recommendation": (
+            _disconnected_gripper_selection_label(recommended_sides)
+            if not ready
+            else None
+        ),
+    }
+
+
+def _start_hand_backends_checked(
+    backends: Mapping[str, EffectorBackend],
+    *,
+    disconnected_gripper_sides: set[str] | tuple[str, ...],
+    allow_connect_failure: bool,
+    debug: bool,
+) -> None:
+    for side, backend in backends.items():
+        backend.start()
+        diagnostic = _hand_backend_startup_diagnostic(
+            side=side,
+            backend=backend,
+            disconnected_gripper_sides=disconnected_gripper_sides,
+        )
+        ready = bool(diagnostic["ready"])
+        if debug or not ready:
+            print(
+                "[Deploy][HandStartup] "
+                + json.dumps(diagnostic, sort_keys=True, ensure_ascii=False),
+                flush=True,
+            )
+        if ready or allow_connect_failure:
+            continue
+
+        configured_selection = diagnostic[
+            "configured_disconnected_gripper_sides"
+        ]
+        recommendation = diagnostic["intentional_disconnect_recommendation"]
+        if bool(diagnostic["selected_for_intentional_disconnect"]):
+            selection_explanation = (
+                f"{side} was selected for intentional disconnection, but its "
+                "no-I/O backend did not become ready; this is an internal "
+                "configuration error."
+            )
+        else:
+            selection_explanation = (
+                f"{side} remains required because it is not selected by "
+                f"--disconnected-gripper-sides={configured_selection}."
+            )
+        raise RuntimeError(
+            f"{side} hand backend is not ready. {selection_explanation} "
+            f"backend_type={diagnostic['backend_type']!r} "
+            f"port={diagnostic['gripper_port']!r} "
+            f"telemetry_error={diagnostic['telemetry_error']!r}. "
+            f"If {side} is intentionally offline, use "
+            f"--disconnected-gripper-sides {recommendation}; otherwise restore "
+            "that device or correct its configured port."
+        )
+
+
 def hand_action_specs_for_backends(
     args: argparse.Namespace,
     backends: Mapping[str, EffectorBackend],
@@ -7935,12 +8029,12 @@ def main(
                     "press g/H/A to enable it, or use --auto-start.",
                     flush=True,
                 )
-        for side, backend in hand_backends.items():
-            backend.start()
-            if not backend.is_ready() and not bool(args.allow_hand_connect_failure):
-                raise RuntimeError(
-                    f"{side} hand backend is not ready: {backend.get_state()}"
-                )
+        _start_hand_backends_checked(
+            hand_backends,
+            disconnected_gripper_sides=disconnected_gripper_sides,
+            allow_connect_failure=bool(args.allow_hand_connect_failure),
+            debug=bool(args.debug),
+        )
         if hand_state_poller is not None:
             hand_state_poller.start()
         if camera_sources:

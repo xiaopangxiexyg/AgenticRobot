@@ -320,6 +320,7 @@ def dmtac_backend_configs_from_assignment(
     assignment: Mapping[str, Any],
     *,
     active_sides: Sequence[str] = ("left", "right"),
+    prefer_existing_by_path_port: bool = False,
     tactile_backend: str = "cpu",
     speed: float = 1.0,
     torque: float = 0.2,
@@ -337,7 +338,10 @@ def dmtac_backend_configs_from_assignment(
             side=side_name,
             effector_name=f"{side_name}_hand",
             gripper_port=(
-                str(gripper["port"])
+                _assigned_gripper_runtime_port(
+                    gripper,
+                    prefer_existing_by_path_port=prefer_existing_by_path_port,
+                )
                 if gripper is not None
                 else DEFAULT_DMTAC_GRIPPER_PORT
             ),
@@ -353,6 +357,37 @@ def dmtac_backend_configs_from_assignment(
             max_action=float(max_action),
         )
     return configs
+
+
+def _assigned_gripper_runtime_port(
+    gripper: Mapping[str, Any],
+    *,
+    prefer_existing_by_path_port: bool,
+) -> str:
+    configured_port = str(gripper["port"])
+    if not prefer_existing_by_path_port:
+        return configured_port
+
+    # A saved ttyUSB number can change when only one member of a configured
+    # pair is present.  Selecting an intentionally disconnected side forbids a
+    # probing scan of that device, so use the persisted topology alias for the
+    # still-connected side when that alias currently resolves.  Never guess a
+    # different ttyUSB endpoint: if no stable alias exists, backend startup
+    # remains fail-closed on the configured port.
+    aliases = tuple(
+        str(alias)
+        for alias in gripper.get("port_aliases", ())
+        if str(alias)
+    )
+    for alias in aliases:
+        path = Path(alias)
+        if (
+            path.parent.name == "by-path"
+            and path.parent.parent.name == "serial"
+            and path.exists()
+        ):
+            return alias
+    return configured_port
 
 
 def require_dmtac_sides_resolved(

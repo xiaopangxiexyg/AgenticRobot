@@ -1188,6 +1188,7 @@ def test_prepared_client_explicit_position_overlay_resolves_15_60_120(
 
 def test_selected_disconnected_gripper_is_no_io_and_skips_physical_init(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     parser = argparse.ArgumentParser()
     run_policy.add_args(parser)
@@ -1205,11 +1206,18 @@ def test_selected_disconnected_gripper_is_no_io_and_skips_physical_init(
         ]
     )
     active_sides = run_policy.validate_args(args)
+    stable_right_port = tmp_path / "serial" / "by-path" / "right-gripper"
+    stable_right_port.parent.mkdir(parents=True)
+    stable_right_port.touch()
     assignment = {
         "assignments": {
             "right": {
                 "gripper": {
-                    "port": "/dev/serial/by-id/right-gripper",
+                    "port": "/dev/ttyUSB1",
+                    "port_aliases": [
+                        "/dev/ttyUSB1",
+                        str(stable_right_port),
+                    ],
                     "gripper_id": 1,
                     "baudrate": 115200,
                     "timeout": 0.03,
@@ -1244,6 +1252,7 @@ def test_selected_disconnected_gripper_is_no_io_and_skips_physical_init(
     assert disconnected.config.connect_hardware is False
     assert disconnected.config.connect_tactile is False
     assert disconnected.config.send_commands is False
+    assert backends["right"].config.gripper_port == str(stable_right_port)
     disconnected.start()
     assert disconnected.device is None
     assert disconnected.is_ready()

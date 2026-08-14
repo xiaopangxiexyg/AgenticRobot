@@ -1476,6 +1476,97 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(specs["left"]["hand_model"], "dmtac_gripper")
         self.assertEqual(specs["left"]["active_mask"], [True, False, False, False, False, False])
 
+    def test_deploy_hand_startup_failure_explains_unselected_offline_side(self) -> None:
+        class _FakeBackend:
+            def __init__(self, *, ready: bool, state: dict[str, object]) -> None:
+                self.ready = ready
+                self.state = state
+                self.started = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def is_ready(self) -> bool:
+                return self.ready
+
+            def get_state(self) -> dict[str, object]:
+                return dict(self.state)
+
+        left = _FakeBackend(
+            ready=True,
+            state={
+                "backend_type": "dmtac_gripper",
+                "intentionally_disconnected": True,
+                "connect_hardware": False,
+            },
+        )
+        right = _FakeBackend(
+            ready=False,
+            state={
+                "backend_type": "dmtac_gripper",
+                "intentionally_disconnected": False,
+                "connect_hardware": True,
+                "is_connected": False,
+                "gripper_port": "/dev/ttyUSB1",
+                "telemetry_error": "connect_failed: missing /dev/ttyUSB1",
+                "last_command": None,
+            },
+        )
+
+        with patch("builtins.print") as print_mock, self.assertRaises(
+            RuntimeError
+        ) as raised:
+            deploy_run_policy._start_hand_backends_checked(
+                {"left": left, "right": right},
+                disconnected_gripper_sides={"left"},
+                allow_connect_failure=False,
+                debug=False,
+            )
+
+        message = str(raised.exception)
+        self.assertTrue(left.started)
+        self.assertTrue(right.started)
+        self.assertIn("right remains required", message)
+        self.assertIn("--disconnected-gripper-sides=left", message)
+        self.assertIn("--disconnected-gripper-sides both", message)
+        self.assertIn("/dev/ttyUSB1", message)
+        self.assertIn("connect_failed", message)
+        self.assertNotIn("last_command", message)
+        diagnostic_line = str(print_mock.call_args.args[0])
+        self.assertIn("[Deploy][HandStartup]", diagnostic_line)
+        self.assertIn('"side": "right"', diagnostic_line)
+        self.assertIn('"selected_for_intentional_disconnect": false', diagnostic_line)
+
+    def test_deploy_hand_startup_debug_confirms_selected_no_io_side(self) -> None:
+        class _FakeBackend:
+            def start(self) -> None:
+                return None
+
+            def is_ready(self) -> bool:
+                return True
+
+            def get_state(self) -> dict[str, object]:
+                return {
+                    "backend_type": "dmtac_gripper",
+                    "intentionally_disconnected": True,
+                    "connect_hardware": False,
+                    "is_connected": False,
+                }
+
+        with patch("builtins.print") as print_mock:
+            deploy_run_policy._start_hand_backends_checked(
+                {"left": _FakeBackend()},
+                disconnected_gripper_sides={"left"},
+                allow_connect_failure=False,
+                debug=True,
+            )
+
+        diagnostic_line = str(print_mock.call_args.args[0])
+        self.assertIn('"side": "left"', diagnostic_line)
+        self.assertIn('"ready": true', diagnostic_line)
+        self.assertIn('"backend_intentionally_disconnected": true', diagnostic_line)
+        self.assertIn('"configured_disconnected_gripper_sides": "left"', diagnostic_line)
+
     def test_deploy_gripper_task_profile_binds_force_and_speed_to_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             profile_path = Path(tmp_dir) / "gripper_tasks.json"
