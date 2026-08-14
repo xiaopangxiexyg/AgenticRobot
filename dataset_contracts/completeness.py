@@ -272,6 +272,17 @@ _AUTHORITATIVE_POLICY_SOURCE_REQUIRED = frozenset(
         "source_validation",
     }
 )
+_POLICY_RUNTIME_EVENT_TYPES = frozenset(
+    {
+        "policy_inference",
+        "policy_action_emission",
+        "policy_action_projection",
+        "policy_execution_feedback",
+        "policy_context_admission",
+        "policy_context",
+        "policy_context_snapshot",
+    }
+)
 _DIRECT_COMPONENT_COMPOSITION_REQUIRED = frozenset(
     {
         "composition_activation_scope",
@@ -349,6 +360,7 @@ _DIRECT_COMPONENT_COMPOSITION_LEGACY_NOT_APPLICABLE = frozenset(
 )
 _DIRECT_COMPONENT_COMPOSITION_LINEAGE_POLICIES = frozenset(
     {
+        "authoritative_immediate_component_human_composition_lineage_v1",
         "authoritative_immediate_component_policy_human_"
         "composition_lineage_v1",
         "authoritative_scheduled_component_policy_human_"
@@ -776,6 +788,37 @@ TRACE_REQUIREMENT_PROFILES_V1: Mapping[str, TraceRequirementProfile] = MappingPr
                 writer_failure_behavior="mark_uncommitted_continue",
                 lineage_policy_id=(
                     "authoritative_station_pose_composition_session_lineage_v1"
+                ),
+                profile_scope="formal_capture",
+                implementation_status="runtime_integrated",
+            ),
+            _profile(
+                "deployable_sim_immediate_component_human_composer_v1",
+                "deployable_sim_immediate_component_human_composer",
+                required=(
+                    _AUTHORITATIVE_SIM_CORE_REQUIRED
+                    | _IMMEDIATE_COMPONENT_EXECUTION_EVENT_TYPES
+                    | _DIRECT_COMPONENT_HOT_COMPOSITION_REQUIRED
+                    | _AUTHORITATIVE_HUMAN_SOURCE_REQUIRED
+                    | {
+                        "execution_gate_event",
+                        "execution_cancellation",
+                        "execution_cancellation_ack",
+                    }
+                ),
+                not_applicable=(
+                    _AUTHORITATIVE_NOT_APPLICABLE
+                    | _DIRECT_COMPONENT_COMPOSITION_LEGACY_NOT_APPLICABLE
+                    | _SCHEDULED_REFERENCE_EVENT_TYPES
+                    | _POLICY_RUNTIME_EVENT_TYPES
+                    | {"component_execution_target_activation"}
+                ),
+                receipt_policy="required",
+                measurement_policy="required",
+                writer_failure_behavior="mark_uncommitted_continue",
+                lineage_policy_id=(
+                    "authoritative_immediate_component_human_"
+                    "composition_lineage_v1"
                 ),
                 profile_scope="formal_capture",
                 implementation_status="runtime_integrated",

@@ -14,7 +14,7 @@ verified transform; this module must not guess or silently apply one.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 import threading
 from typing import Any, Callable, Mapping
@@ -44,6 +44,8 @@ from robot_motion.action import (
     TargetProcessingFactReference,
 )
 from robot_motion.action.executor import RobotActionResolver, xyzquat_to_matrix
+from robot_motion.deploy.schema import pose_matrix_to_xyzquat
+from robot_motion.pose_smoothing import BimanualPoseSmoother
 from robot_motion.action.proposal import (
     freeze_robot_action,
     robot_action_semantic_payload,
@@ -190,12 +192,21 @@ class MujocoCoupledPoseToQposResolver:
         ik: RM65CanonicalIK,
         *,
         pose_transformer: CanonicalDeskToRuntimePoseTransformer | None = None,
+        target_pose_smoother: BimanualPoseSmoother | None = None,
         pose_target_safety_filter: Callable[[RobotAction], RobotAction] | None = None,
     ) -> None:
         if not isinstance(ik, RM65CanonicalIK):
             raise TypeError("ik must be RM65CanonicalIK.")
         self.ik = ik
         self.pose_transformer = pose_transformer
+        if target_pose_smoother is not None and not isinstance(
+            target_pose_smoother,
+            BimanualPoseSmoother,
+        ):
+            raise TypeError(
+                "target_pose_smoother must be a BimanualPoseSmoother or None."
+            )
+        self.target_pose_smoother = target_pose_smoother
         if pose_target_safety_filter is not None and not callable(
             pose_target_safety_filter
         ):
@@ -271,12 +282,12 @@ class MujocoCoupledPoseToQposResolver:
                 domain="dexteleop.mujoco.transformed_pose_to_qpos_resolver.v1",
             )
         )
-        self.resolver_contract_id = (
+        safety_contract_id = (
             transformed_contract_id
             if safety_filter_hash is None
             else f"{transformed_contract_id}+tcp-envelope-v1"
         )
-        self.resolver_contract_hash = (
+        safety_contract_hash = (
             transformed_contract_hash
             if safety_filter_hash is None
             else canonical_content_hash(
@@ -288,9 +299,43 @@ class MujocoCoupledPoseToQposResolver:
                 domain="dexteleop.mujoco.safe_pose_to_qpos_resolver.v1",
             )
         )
+        smoothing_contract = None
+        if target_pose_smoother is not None:
+            smoothing_contract = dict(target_pose_smoother.config.to_metadata())
+            # Host-specific paths are provenance, not control semantics.
+            smoothing_contract.pop("source_path", None)
+        self.resolver_contract_id = (
+            safety_contract_id
+            if smoothing_contract is None
+            else f"{safety_contract_id}+target-pose-smoothing-v1"
+        )
+        self.resolver_contract_hash = (
+            safety_contract_hash
+            if smoothing_contract is None
+            else canonical_content_hash(
+                {
+                    "base_resolver_contract_hash": safety_contract_hash,
+                    "target_pose_smoothing": smoothing_contract,
+                    "smoothing_stage": (
+                        "after_pose_transform_before_final_pose_safety_and_coupled_ik"
+                    ),
+                },
+                domain=(
+                    "dexteleop.mujoco.smoothed_pose_to_qpos_resolver.v1"
+                ),
+            )
+        )
         self._command_resolver = RobotActionResolver()
         self._lock = threading.RLock()
         self._resolution_by_id: dict[str, MujocoPoseToQposResolution] = {}
+
+    def reset_temporal_state(self) -> None:
+        """Clear stateful target shaping at HOLD/rebuild boundaries."""
+
+        if self.target_pose_smoother is None:
+            return
+        with self._lock:
+            self.target_pose_smoother.reset()
 
     def resolve(
         self,
@@ -307,6 +352,35 @@ class MujocoCoupledPoseToQposResolver:
         else:
             transform_result = self.pose_transformer.transform(safe_action)
             solver_input = transform_result.transformed_action
+        target_pose_smoothing: dict[str, object] = {
+            "enabled": False,
+            "status": "not_configured",
+        }
+        if self.target_pose_smoother is not None:
+            with self._lock:
+                smoothed_targets, target_pose_smoothing = (
+                    self.target_pose_smoother.smooth_pair(
+                        left_target=xyzquat_to_matrix(
+                            solver_input.arm_pose_by_side["left"]
+                        ),
+                        right_target=xyzquat_to_matrix(
+                            solver_input.arm_pose_by_side["right"]
+                        ),
+                        timestamp=solver_input.timestamp,
+                    )
+                )
+            smoothed_vectors = {
+                side: pose_matrix_to_xyzquat(smoothed_targets[side])
+                for side in ("left", "right")
+            }
+            if any(value is None for value in smoothed_vectors.values()):
+                raise ValueError("Target pose smoother produced an invalid pose.")
+            solver_input = freeze_robot_action(
+                replace(
+                    solver_input,
+                    arm_pose_by_side=smoothed_vectors,
+                )
+            )
         if self.pose_target_safety_filter is not None:
             solver_input = freeze_robot_action(
                 self.pose_target_safety_filter(solver_input)
@@ -396,6 +470,21 @@ class MujocoCoupledPoseToQposResolver:
                     if best_attempt is None
                     else best_attempt.get("collision_geometry_2")
                 ),
+                "target_pose_smoothing_enabled": bool(
+                    target_pose_smoothing.get("enabled", False)
+                ),
+                "target_pose_smoothing_left_status": str(
+                    _plain(target_pose_smoothing.get("left", {})).get(
+                        "status",
+                        target_pose_smoothing.get("status", "unknown"),
+                    )
+                ),
+                "target_pose_smoothing_right_status": str(
+                    _plain(target_pose_smoothing.get("right", {})).get(
+                        "status",
+                        target_pose_smoothing.get("status", "unknown"),
+                    )
+                ),
             }
             raise ActionResolutionError(
                 ActionResolutionFailure(
@@ -422,6 +511,7 @@ class MujocoCoupledPoseToQposResolver:
                 if transform_result is None
                 else transform_result.binding_receipt_hash
             ),
+            target_pose_smoothing=target_pose_smoothing,
         )
         command = self._command_resolver.resolve(resolution.output_qpos_action)
         command.metadata.update(
@@ -434,6 +524,9 @@ class MujocoCoupledPoseToQposResolver:
                 "resolver_contract_hash": resolution.resolver_contract_hash,
                 "transform_receipt_id": resolution.transform_receipt_id,
                 "transform_contract_hash": resolution.transform_contract_hash,
+                "target_pose_smoothing": resolution.solver_metadata.get(
+                    "target_pose_smoothing"
+                ),
             }
         )
         with self._lock:
@@ -504,6 +597,7 @@ class MujocoCoupledPoseToQposResolver:
         *,
         transform_receipt_id: str | None,
         transform_contract_hash: str | None,
+        target_pose_smoothing: Mapping[str, object],
     ) -> MujocoPoseToQposResolution:
         output_action_space = (
             BIMANUAL_QPOS_HAND16_V1
@@ -578,7 +672,10 @@ class MujocoCoupledPoseToQposResolver:
                 side: float(value)
                 for side, value in result.orientation_error_rad.items()
             },
-            "solver_metadata": _plain(result.metadata),
+            "solver_metadata": {
+                **dict(_plain(result.metadata or {})),
+                "target_pose_smoothing": _plain(target_pose_smoothing),
+            },
         }
         semantic_hash = canonical_content_hash(
             payload,

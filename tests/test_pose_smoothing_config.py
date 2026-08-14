@@ -35,6 +35,7 @@ def test_default_pose_smoothing_config_loads_from_configs_dir() -> None:
     assert config.source_path is not None
     assert config.source_path.endswith("teleop_runtime/configs/pose_smoothing.json")
     assert config.deadband_translation_m > 0.0
+    assert config == robot_pose_smoothing.RM65_POSITION_TARGET_POSE_SMOOTHING_V1
 
 
 def test_impedance_pose_smoothing_is_lower_latency_and_position_isolated() -> None:

@@ -21,6 +21,7 @@ from robot_motion.action import (
     RobotAction,
 )
 from robot_motion.deploy.schema import pose_matrix_to_xyzquat
+from robot_motion.pose_smoothing import RM65_POSITION_TARGET_POSE_SMOOTHING_V1
 from sim.demonstration_editing import (
     DEMONSTRATION_COMPONENT_ACTION_RECEIPT_BINDING_KIND_V1,
     DemonstrationComponentActionAdapter,
@@ -96,6 +97,16 @@ def test_pose_resolver_identity_records_disabled_collision_constraints() -> None
         "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-"
         "no-collision-v1"
     )
+
+
+def test_sim_hil_target_config_keeps_pose_smoothing_rollback_explicit() -> None:
+    assert MujocoSimHILTargetConfig(
+        task_config_path=Path("task.json")
+    ).target_pose_smoothing_enabled is True
+    assert MujocoSimHILTargetConfig(
+        task_config_path=Path("task.json"),
+        target_pose_smoothing_enabled=False,
+    ).target_pose_smoothing_enabled is False
 
 
 def test_right_cube_lift_profile_uses_pose_and_physical_gripper_qpos() -> None:
@@ -447,6 +458,11 @@ def test_native_component_profile_reaches_one_atomic_mujoco_target() -> None:
     )
     assert target.runtime.config.target_admission_margin_sec == pytest.approx(
         target_config.target_admission_margin_sec
+    )
+    assert target.runtime.pose_resolver.target_pose_smoother is not None
+    assert (
+        target.runtime.pose_resolver.target_pose_smoother.config
+        == RM65_POSITION_TARGET_POSE_SMOOTHING_V1
     )
     current_pose = pose_matrix_to_xyzquat(
         capture_mujoco_sim_hil_tool_tcp_pose_by_side(

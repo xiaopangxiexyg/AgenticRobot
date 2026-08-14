@@ -1714,6 +1714,15 @@ class MujocoDeployRuntime:
             config.policy_node_id: self.observation_adapter
         }
 
+    def reset_pose_resolution_temporal_state(self) -> bool:
+        """Reset lower-owned stateful pose shaping after authoritative HOLD."""
+
+        resolver = self.pose_resolver
+        if resolver is None:
+            return False
+        resolver.reset_temporal_state()
+        return True
+
     def _dispatch_with_context(
         self,
         command,

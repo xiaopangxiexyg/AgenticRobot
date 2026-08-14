@@ -211,6 +211,10 @@ class ViveCoordinateCalibrationConfig:
     # valid coordinate profile; absence of any valid latest profile preserves
     # the first-time calibration flow.
     initial_profile: str | Path | None = None
+    # Standalone calibration normally adopts the topology stored in a loaded
+    # profile. Runtime consumers may instead own a narrower topology and use
+    # the profile only for coordinate transforms.
+    adopt_profile_input_topology: bool = True
 
     def __post_init__(self) -> None:
         self.active_sides = normalize_active_sides(self.active_sides)
@@ -259,6 +263,8 @@ class ViveCoordinateCalibrationConfig:
             if not initial_profile:
                 raise ValueError("initial_profile must be non-empty when supplied.")
             self.initial_profile = Path(initial_profile).expanduser()
+        if not isinstance(self.adopt_profile_input_topology, bool):
+            raise TypeError("adopt_profile_input_topology must be a bool.")
 
 
 class ViveCoordinateCalibrationController:
@@ -271,7 +277,6 @@ class ViveCoordinateCalibrationController:
         source: VivePoseSource | object | None = None,
     ) -> None:
         self.config = config or ViveCoordinateCalibrationConfig()
-        self._source = source or self._build_source()
         self._lock = threading.RLock()
         self._workflow_events: queue.Queue[str] = queue.Queue()
         self._workflow_thread: threading.Thread | None = None
@@ -304,6 +309,10 @@ class ViveCoordinateCalibrationController:
                 self._message = (
                     "未找到有效的 VIVE 坐标 profile；可开始首次标定。"
                 )
+        # Build the source only after an optional profile has either supplied
+        # the standalone calibration topology or been loaded as transform-only
+        # metadata for a runtime-owned topology.
+        self._source = source or self._build_source()
 
     @property
     def source(self) -> object:
@@ -342,7 +351,7 @@ class ViveCoordinateCalibrationController:
                 aux_tracker_name=self.config.auxiliary_tracker_name,
                 swap_operator_sides=False,
             ),
-            ("left", "right"),
+            self.config.active_sides,
         )
         return VivePoseSource(
             tracker_configs=tracker_configs,
@@ -792,10 +801,13 @@ class ViveCoordinateCalibrationController:
         calibration, path = load_coordinate_profile(profile_name, root=self.profile_dir)
         with self._lock:
             self._draft = calibration
-            self.config.active_sides = normalize_active_sides(
-                calibration.metadata.get("active_sides", "both")
-            )
-            self.config.desk_tracker = str(calibration.metadata.get("desk_tracker", "auto"))
+            if self.config.adopt_profile_input_topology:
+                self.config.active_sides = normalize_active_sides(
+                    calibration.metadata.get("active_sides", "both")
+                )
+                self.config.desk_tracker = str(
+                    calibration.metadata.get("desk_tracker", "auto")
+                )
             self._stage, self._phase = "view", "completed"
             self._current_profile_path = str(path)
             self._message = f"已加载 profile：{path.name}。当前仅查看，不会启动执行链。"

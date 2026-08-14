@@ -1723,6 +1723,20 @@ class MujocoSimHILApplication(
             self._last_error = details
             raise
         self._held = True
+        reset_pose_state = getattr(
+            self.runtime,
+            "reset_pose_resolution_temporal_state",
+            None,
+        )
+        if callable(reset_pose_state):
+            try:
+                reset_pose_state()
+            except Exception as reset_error:
+                self._last_error = (
+                    "pose_resolution_temporal_reset_failed_after_lower_hold:"
+                    f"{type(reset_error).__name__}:{reset_error}"
+                )
+                raise RuntimeError(self._last_error) from reset_error
         if deactivation_error is not None:
             self._last_error = (
                 "control_cycle_fence_failed_after_lower_hold:"

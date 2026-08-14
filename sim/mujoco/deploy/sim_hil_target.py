@@ -85,6 +85,7 @@ class MujocoSimHILTargetConfig:
     # joint limits and IK but installs no collision pairs; MuJoCo contact
     # physics itself is unchanged.
     collision_stop_enabled: bool = True
+    target_pose_smoothing_enabled: bool = True
     execution_observation_plan: ExecutionObservationPlan | None = None
     exposed_pose_sides: tuple[str, ...] = ("left", "right")
     # Generic Agent motion must not inherit task-specific scripted reset
@@ -111,6 +112,8 @@ class MujocoSimHILTargetConfig:
             raise TypeError("allow_scripted_task_reset must be a bool.")
         if not isinstance(self.collision_stop_enabled, bool):
             raise TypeError("collision_stop_enabled must be a bool.")
+        if not isinstance(self.target_pose_smoothing_enabled, bool):
+            raise TypeError("target_pose_smoothing_enabled must be a bool.")
         if self.compose_target_hz is not None:
             compose_target_hz = float(self.compose_target_hz)
             if not np.isfinite(compose_target_hz) or compose_target_hz <= 0.0:
@@ -409,6 +412,10 @@ def build_mujoco_sim_hil_target(
         apply_canonical_keyframe_safety,
     )
     from robot_motion.position_control import PositionKeyframeSafetyConfig
+    from robot_motion.pose_smoothing import (
+        RM65_POSITION_TARGET_POSE_SMOOTHING_V1,
+        build_bimanual_pose_smoother,
+    )
     from control_composition.composition import (
         FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
         CompositionStrategyControl,
@@ -613,7 +620,16 @@ def build_mujoco_sim_hil_target(
             ),
             execution_observation_plan=config.execution_observation_plan,
         ),
-        pose_resolver=MujocoCoupledPoseToQposResolver(ik),
+        pose_resolver=MujocoCoupledPoseToQposResolver(
+            ik,
+            target_pose_smoother=(
+                build_bimanual_pose_smoother(
+                    RM65_POSITION_TARGET_POSE_SMOOTHING_V1
+                )
+                if config.target_pose_smoothing_enabled
+                else None
+            ),
+        ),
         shared_safety=shared_safety,
         composition_strategy=contracts.strategy,
         composition_strategy_control_factory=strategy_control_factory,

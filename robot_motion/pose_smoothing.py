@@ -94,6 +94,23 @@ class PoseSmoothingConfig:
         }
 
 
+# Shared position-teleop target shaping used by real RM65 control and Sim-HIL.
+# Keep this profile in robot_motion so simulation does not depend upward on
+# teleop_runtime.  The real-side JSON loader is checked against this contract.
+RM65_POSITION_TARGET_POSE_SMOOTHING_V1 = PoseSmoothingConfig(
+    enabled=True,
+    time_constant_sec=0.025,
+    nominal_dt_sec=0.0666666667,
+    min_dt_sec=0.0,
+    max_dt_sec=0.12,
+    reset_after_gap_sec=0.5,
+    deadband_translation_m=0.0003,
+    deadband_rotation_deg=0.05,
+    snap_translation_m=0.08,
+    snap_rotation_deg=20.0,
+)
+
+
 @dataclass(frozen=True)
 class PoseSmoothingResult:
     pose: np.ndarray
@@ -342,6 +359,7 @@ def build_bimanual_pose_smoother(
 
 __all__ = [
     "SCHEMA_VERSION",
+    "RM65_POSITION_TARGET_POSE_SMOOTHING_V1",
     "BimanualPoseSmoother",
     "PoseSmoother",
     "PoseSmoothingConfig",
