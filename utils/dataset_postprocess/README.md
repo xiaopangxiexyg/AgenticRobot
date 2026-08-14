@@ -43,8 +43,9 @@ python -m utils.dataset_postprocess camera-semantics-materialize \
 `observation.images.left_wrist.*` / `right_wrist.*` Parquet 列族、RGB 视频、wrist depth/mask
 artifact、episode 路径表和设备快照。单侧历史缺帧会保留在对应的物理相机上；不会借用另一侧
 `video_frame_index` 补齐。输出文件均为 fresh inode；每段视频必须通过 Parquet 声明帧数、
-ffprobe 解码帧数和 ffmpeg `-xerror` 全段/尾帧解码后才原子发布，因此应先根据 dry-run 的
-`source_byte_count` 预留完整输出空间。输出中的 materialization receipt 会使现有
+ffprobe 解码帧数和 ffmpeg `-xerror` 全段/尾帧解码后才原子发布。dry-run 在给出可 apply 的
+plan hash 前也会完整验证源视频，因此截断的 hardlink 血缘会在创建 staging 前被拒绝。应先根据
+dry-run 的 `source_byte_count` 预留完整输出空间。输出中的 materialization receipt 会使现有
 `DatasetCameraSemanticResolver` 和普通按 canonical key 读取的 loader 都看到 identity，避免
 organized provenance 再次把已经换名的数据交换一次。
 

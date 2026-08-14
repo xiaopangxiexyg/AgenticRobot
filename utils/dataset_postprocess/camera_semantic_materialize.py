@@ -769,6 +769,13 @@ def plan_camera_semantic_materialization(
     episodes = _episode_records(source)
     files, inventory_hash, byte_count, hardlinked_count = _source_inventory(source)
     tactile_detach_audit = _tactile_detach_audit(source, episodes)
+    # A frozen plan must not authorize copying a source whose declared video
+    # indices no longer match the fully decodable payload.  This matters most
+    # for legacy hardlink lineages, where one truncated inode can appear under
+    # several derived dataset names while their Parquet metadata still advertises
+    # the original frame count.  Validate before returning an applyable hash so
+    # apply never stages a source that is already unrecoverable.
+    _validate_dataset_videos(source, episodes)
     status_counts: Counter[str] = Counter()
     frame_count = 0
     remapped_rows = 0
@@ -887,7 +894,7 @@ def _rewrite_info(
     return output
 
 
-def _validate_materialized_videos(
+def _validate_dataset_videos(
     root: Path,
     episodes: tuple[Mapping[str, Any], ...],
 ) -> tuple[int, int]:
@@ -1122,7 +1129,7 @@ def materialize_camera_semantics(
                 raise CameraSemanticMaterializationError(
                     f"Output episode {episode_index} is not canonical."
                 )
-        video_count, decoded_frames = _validate_materialized_videos(
+        video_count, decoded_frames = _validate_dataset_videos(
             staging, output_episode_tuple
         )
         output_tactile_audit = _tactile_detach_audit(

@@ -433,6 +433,36 @@ def test_apply_requires_frozen_plan_and_never_overwrites(tmp_path: Path) -> None
 
 
 @pytest.mark.optional
+def test_plan_rejects_declared_source_video_frame_mismatch(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _, source_right_video = _write_source_dataset(source)
+    # Parquet still declares two right-wrist frames.  Replacing the payload
+    # models a truncated inode propagated across a legacy hardlink lineage.
+    _write_video(source_right_video, frame_count=1, color="blue")
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "output"
+
+    with pytest.raises(
+        Exception,
+        match=(
+            "Declared/decoded video frame count mismatch: "
+            "episode=0 role=right_wrist declared=2 decoded=1"
+        ),
+    ):
+        plan_camera_semantic_materialization(source, output, registry)
+
+    assert not output.exists()
+    assert not list(
+        tmp_path.glob(f".{output.name}.camera-semantic-stage-*")
+    )
+
+
+@pytest.mark.optional
 def test_materialization_preserves_detached_tactile_graph_without_cold_reads(
     tmp_path: Path,
 ) -> None:
