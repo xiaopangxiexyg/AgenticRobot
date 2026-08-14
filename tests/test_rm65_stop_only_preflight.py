@@ -4,9 +4,8 @@ import argparse
 
 import pytest
 
-from teleop_runtime.debug.rm65_real_debug.run_rm65_stop_only_preflight import (
-    _build_stop_only_backend,
-    _require_explicit_scope,
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
+    build_rm65_policy_arm_qpos_candidate_manifest,
 )
 from teleop_runtime.backends.arms.rm65_dispatch_inventory import (
     build_rm65_arms_only_dispatch_inventory,
@@ -15,8 +14,9 @@ from teleop_runtime.backends.arms.rm65_stop_only_binding import (
     RM65StopOnlyHardwareAuthorization,
     RM65StopOnlyLegacyBinding,
 )
-from teleop_runtime.backends.arms.rm65_candidate_manifest import (
-    build_rm65_policy_arm_qpos_candidate_manifest,
+from teleop_runtime.debug.rm65_real_debug.run_rm65_stop_only_preflight import (
+    _build_stop_only_backend,
+    _require_explicit_scope,
 )
 
 

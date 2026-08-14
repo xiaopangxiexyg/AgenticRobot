@@ -17,9 +17,10 @@ hardware integrations.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.target_runtime import (
@@ -30,7 +31,6 @@ from robot_motion.target_runtime import (
     TargetRuntimeRequirement,
     bind_target_runtime_requirement,
 )
-
 
 TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1 = "dexteleop.target_runtime_profile_spec.v1"
 # The first profile-selection slice already exposed this hash identity.  A
@@ -245,7 +245,7 @@ class TargetRuntimeProfileSpec:
     def from_payload(
         cls,
         payload: Mapping[str, Any],
-    ) -> "TargetRuntimeProfileSpec":
+    ) -> TargetRuntimeProfileSpec:
         if not isinstance(payload, Mapping):
             raise TypeError("payload must be a mapping.")
         if payload.get("schema") != TARGET_RUNTIME_PROFILE_SPEC_SCHEMA_V1:
@@ -503,7 +503,7 @@ class TargetRuntimeProfileBinding:
         spec: TargetRuntimeProfileSpec,
         *,
         provider_entry: TargetRuntimeProviderRegistryEntry,
-    ) -> "TargetRuntimeProfileBinding":
+    ) -> TargetRuntimeProfileBinding:
         if not isinstance(spec, TargetRuntimeProfileSpec):
             raise TypeError("spec must be TargetRuntimeProfileSpec.")
         if not isinstance(provider_entry, TargetRuntimeProviderRegistryEntry):

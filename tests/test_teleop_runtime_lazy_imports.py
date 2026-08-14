@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import teleop_runtime
 import teleop_runtime.deploy as deploy_namespace
@@ -19,16 +19,15 @@ from teleop_runtime.backends.arms import (
 from teleop_runtime.backends.arms import (
     rm65_execution_evidence as canonical_rm65_evidence,
 )
-from teleop_runtime.target_runtime.integrations import (
-    rm65_policy_arm_qpos_candidate as canonical_rm65_target,
-)
 from teleop_runtime.registry import (
     backend_registry,
     retargeter_registry,
     rig_registry,
     source_registry,
 )
-
+from teleop_runtime.target_runtime.integrations import (
+    rm65_policy_arm_qpos_candidate as canonical_rm65_target,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

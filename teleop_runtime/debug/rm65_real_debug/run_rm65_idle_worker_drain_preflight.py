@@ -10,24 +10,16 @@ then sends at most one permit-gated ``Arm_Slow_Stop`` per stationary arm.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
-from pathlib import Path
 import time
 import uuid
+from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 
 from dataset_contracts.completeness import trace_requirement_profile
 from dataset_contracts.control_trace import ControlTraceFact
-from runtime_artifact_paths import (
-    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
-    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
-    ArtifactWriteResolution,
-    RuntimeArtifactLayout,
-    configured_runtime_artifact_layout,
-    resolve_artifact_write_path,
-)
 from robot_motion.action.authoritative_trace import (
     AuthoritativeTraceContext,
     project_execution_cancellation,
@@ -47,12 +39,27 @@ from robot_motion.runtime import (
     ExecutionCancellationRequest,
     acknowledge_worker_epoch_drain,
 )
+from runtime_artifact_paths import (
+    LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
+    RUNTIME_ARTIFACT_LAYOUT_CLI_NAME,
+    ArtifactWriteResolution,
+    RuntimeArtifactLayout,
+    configured_runtime_artifact_layout,
+    resolve_artifact_write_path,
+)
 from teleop_runtime.arm_frames import TOOL_TCP_FRAME
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
+    build_rm65_policy_arm_qpos_candidate_capability,
+    build_rm65_policy_arm_qpos_candidate_manifest,
+)
+from teleop_runtime.backends.arms.rm65_execution_evidence import (
+    build_rm65_execution_evidence_bundle,
+)
 from teleop_runtime.backends.arms.rm65_idle_worker_preflight_binding import (
+    RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1,
     RM65IdleWorkerDrainHardwareAuthorization,
     RM65IdleWorkerDrainPreflightBinding,
-    RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1,
 )
 from teleop_runtime.backends.arms.rm65_worker_drain import (
     drain_rm65_arms_only_workers,
@@ -66,13 +73,6 @@ from teleop_runtime.control_trace import (
 )
 from teleop_runtime.control_trace.rm65_worker_drain import (
     admit_rm65_worker_drain_trace,
-)
-from teleop_runtime.backends.arms.rm65_candidate_manifest import (
-    build_rm65_policy_arm_qpos_candidate_capability,
-    build_rm65_policy_arm_qpos_candidate_manifest,
-)
-from teleop_runtime.backends.arms.rm65_execution_evidence import (
-    build_rm65_execution_evidence_bundle,
 )
 from teleop_runtime.position_control.deploy_executor import (
     PositionDeployExecutor,
@@ -221,22 +221,26 @@ def _close_without_hiding_primary_error(
     if position_executor is not None:
         try:
             position_executor.close()
-        except Exception as exc:  # pragma: no cover - hardware-only evidence
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            # Hardware SDK cleanup failures must not hide the primary error.
             errors.append(f"position_executor:{type(exc).__name__}:{exc}")
     for backend in reversed(backends):
         try:
             backend.close()
-        except Exception as exc:  # pragma: no cover - hardware-only evidence
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            # Hardware SDK cleanup failures must not hide the primary error.
             errors.append(f"{backend.name}:{type(exc).__name__}:{exc}")
     if spool is not None:
         try:
             spool.close()
-        except Exception as exc:  # pragma: no cover - storage-only evidence
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            # Storage cleanup failures must not hide the primary error.
             errors.append(f"control_trace_spool:{type(exc).__name__}:{exc}")
     if health is not None:
         try:
             health.close()
-        except Exception as exc:  # pragma: no cover - storage-only evidence
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            # Storage cleanup failures must not hide the primary error.
             errors.append(f"writer_health_ledger:{type(exc).__name__}:{exc}")
     return errors
 
@@ -398,7 +402,8 @@ def main() -> None:
             backends.append(backend)
             by_side[side] = backend
             if not callable(getattr(backend.arm, "Arm_Slow_Stop", None)):
-                raise RuntimeError(
+                # This is a runtime SDK capability failure, not bad input.
+                raise RuntimeError(  # noqa: TRY004
                     f"{side}: SDK does not expose Arm_Slow_Stop; refusing fallback."
                 )
 
@@ -558,7 +563,8 @@ def main() -> None:
             "capture_commit_eligible": completeness.capture_commit_eligible,
         }
         evidence["status"] = "idle_worker_drain_stop_only_completed"
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001
+        # Preserve terminal evidence and cleanup even for process-level exits.
         primary_error = exc
         evidence["status"] = "failed"
         evidence["error"] = f"{type(exc).__name__}:{exc}"
@@ -582,7 +588,8 @@ def main() -> None:
                     )
                 )
                 durable_sink.flush_pending()
-            except Exception as trace_exc:  # pragma: no cover - evidence only
+            except Exception as trace_exc:  # noqa: BLE001  # pragma: no cover
+                # Evidence failure is secondary to the primary runtime error.
                 evidence["terminal_trace_error"] = (
                     f"{type(trace_exc).__name__}:{trace_exc}"
                 )

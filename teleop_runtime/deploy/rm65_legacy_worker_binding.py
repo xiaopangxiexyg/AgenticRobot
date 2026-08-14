@@ -8,20 +8,18 @@ authorized production composition must use a different maturity state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from teleop_runtime.action import LegacyControlDomainExecutionContext
-from teleop_runtime.backends.arms.rm65_worker_drain import (
-    RM65ArmsOnlyWorkerDrainPlan,
-)
-
 from teleop_runtime.backends.arms.rm65_execution_evidence import (
     RM65ExecutionEvidenceBundle,
 )
-
+from teleop_runtime.backends.arms.rm65_worker_drain import (
+    RM65ArmsOnlyWorkerDrainPlan,
+)
 
 RM65_LEGACY_WORKER_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.rm65_legacy_worker_binding.v1"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -24,7 +25,6 @@ from .contracts import (
     TargetRuntimeOperationRequest,
     TargetRuntimeStatusSnapshot,
 )
-
 
 TARGET_RUNTIME_REQUIREMENT_HASH_DOMAIN_V1 = (
     "dexteleop.target_runtime_requirement.v1"
@@ -171,7 +171,7 @@ class TargetRuntimeBindingReceipt:
                 "ExecutionObservationBinding or None."
             )
         bound_at = float(self.bound_at)
-        if bound_at != bound_at or bound_at in (float("inf"), float("-inf")):
+        if not math.isfinite(bound_at):
             raise ValueError("bound_at must be finite.")
         payload = {
             name: _required(getattr(self, name), name=name)
@@ -261,18 +261,20 @@ def bind_target_runtime_requirement(
         )
 
     observation_binding: ExecutionObservationBinding | None = None
-    if requirement.observation_plan is not None:
-        if requirement.observation_plan.enabled:
-            capability = manifest.execution_observation_capability
-            if capability is None:
-                raise ValueError(
-                    "Target runtime does not provide execution observations."
-                )
-            observation_binding = bind_execution_observation_plan(
-                requirement.observation_plan,
-                capability,
-                bound_at=bound_at,
+    if (
+        requirement.observation_plan is not None
+        and requirement.observation_plan.enabled
+    ):
+        capability = manifest.execution_observation_capability
+        if capability is None:
+            raise ValueError(
+                "Target runtime does not provide execution observations."
             )
+        observation_binding = bind_execution_observation_plan(
+            requirement.observation_plan,
+            capability,
+            bound_at=bound_at,
+        )
 
     return TargetRuntimeBindingReceipt(
         requirement_id=requirement.requirement_id,
@@ -358,7 +360,7 @@ def validate_target_runtime_operation_invocation(
         else LifecycleControlDispatchPermit
     )
     if not isinstance(dispatch_permit, expected_type):
-        raise ValueError("Target runtime operation uses the wrong permit kind.")
+        raise TypeError("Target runtime operation uses the wrong permit kind.")
     if (
         dispatch_permit.runtime_session_id != manifest.runtime_session_id
         or dispatch_permit.control_domain_id != manifest.control_domain_id

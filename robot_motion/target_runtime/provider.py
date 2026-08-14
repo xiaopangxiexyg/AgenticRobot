@@ -10,16 +10,17 @@ or configures a real or simulated target later.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from .binding import TargetRuntimeBindingReceipt
 from .contracts import (
+    TARGET_RUNTIME_PROVIDER_API_V1,
     ResolvedTargetRuntimeManifest,
     TargetRuntimeHandle,
     TargetRuntimeProviderIdentity,
-    TARGET_RUNTIME_PROVIDER_API_V1,
 )
 
 
@@ -94,7 +95,7 @@ class TargetRuntimeHandleRollbackError(RuntimeError):
         reason: str,
         triggering_error: BaseException,
         rollback_error: BaseException,
-        acquisition: "TargetRuntimeHandleAcquisition",
+        acquisition: TargetRuntimeHandleAcquisition,
     ) -> None:
         super().__init__(
             "Target runtime handle rollback failed after "

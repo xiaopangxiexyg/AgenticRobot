@@ -6,13 +6,12 @@ from pathlib import Path
 import pytest
 
 from dataset_contracts.completeness import trace_requirement_profile
-from teleop_runtime.backends.arms.rm65_idle_worker_preflight_binding import (
-    RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1,
-)
 from teleop_runtime.backends.arms.rm65_execution_evidence import (
     resolve_rm65_historical_execution_evidence_contract,
 )
-
+from teleop_runtime.backends.arms.rm65_idle_worker_preflight_binding import (
+    RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1,
+)
 
 _EVIDENCE = (
     Path(__file__).parent

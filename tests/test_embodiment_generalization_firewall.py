@@ -11,7 +11,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SHARED_CONTROL_ROOTS = (
     REPO_ROOT / "control_composition",

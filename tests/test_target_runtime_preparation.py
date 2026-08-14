@@ -12,16 +12,16 @@ from robot_motion.target_runtime import (
 from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
 )
-from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate import (
-    RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
-    RM65PolicyArmQposCandidateTargetConfig,
-    build_rm65_policy_arm_qpos_candidate_target_profile_binding,
-)
 from teleop_runtime.target_runtime import (
     TargetRuntimeProfileBinding,
     TargetRuntimeProfileCatalog,
     TargetRuntimeProfilePreflight,
     prepare_target_runtime_handle,
+)
+from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate import (
+    RM65_POLICY_ARM_QPOS_CANDIDATE_TARGET_PROFILE_ID,
+    RM65PolicyArmQposCandidateTargetConfig,
+    build_rm65_policy_arm_qpos_candidate_target_profile_binding,
 )
 
 # The existing target-runtime contract fixture is deliberately arbitrary:
@@ -255,9 +255,11 @@ def test_preparation_rolls_back_when_initial_status_capture_fails() -> None:
 def test_preparation_context_rolls_back_when_caller_fails() -> None:
     preflight, provider, config = _preflight_and_provider()
 
-    with pytest.raises(RuntimeError, match="fixture caller failed"):
-        with prepare_target_runtime_handle(preflight, config):
-            raise RuntimeError("fixture caller failed")
+    with (
+        pytest.raises(RuntimeError, match="fixture caller failed"),
+        prepare_target_runtime_handle(preflight, config),
+    ):
+        raise RuntimeError("fixture caller failed")
 
     assert provider.rolled_back_handle_count == 1
     assert provider.rollback_reasons == [
@@ -273,9 +275,11 @@ def test_preparation_context_retains_caller_and_rollback_failures() -> None:
 
     provider.rollback_target_runtime_handle_construction = fail_rollback
 
-    with pytest.raises(TargetRuntimeHandleRollbackError) as raised:
-        with prepare_target_runtime_handle(preflight, config):
-            raise RuntimeError("fixture caller failed")
+    with (
+        pytest.raises(TargetRuntimeHandleRollbackError) as raised,
+        prepare_target_runtime_handle(preflight, config),
+    ):
+        raise RuntimeError("fixture caller failed")
 
     assert isinstance(raised.value.triggering_error, RuntimeError)
     assert str(raised.value.triggering_error) == "fixture caller failed"

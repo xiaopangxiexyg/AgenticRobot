@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from typing_extensions import Self
+
 from robot_motion.target_runtime import (
     ResolvedTargetRuntimeManifest,
     TargetRuntimeHandle,
@@ -148,7 +150,7 @@ class TargetRuntimeHandlePreparation:
 
         return self.runtime_handle_acquisition.rollback(reason=reason)
 
-    def __enter__(self) -> "TargetRuntimeHandlePreparation":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(

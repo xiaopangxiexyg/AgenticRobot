@@ -9,10 +9,10 @@ enable, rearm, or force-position startup call.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
 import time
 import uuid
+from dataclasses import asdict
 
 import numpy as np
 
@@ -22,15 +22,15 @@ from robot_motion.rm65.constants import (
 )
 from teleop_runtime.arm_frames import TOOL_TCP_FRAME
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
+    build_rm65_policy_arm_qpos_candidate_manifest,
+)
 from teleop_runtime.backends.arms.rm65_dispatch_inventory import (
     build_rm65_arms_only_dispatch_inventory,
 )
 from teleop_runtime.backends.arms.rm65_stop_only_binding import (
     RM65StopOnlyHardwareAuthorization,
     RM65StopOnlyLegacyBinding,
-)
-from teleop_runtime.backends.arms.rm65_candidate_manifest import (
-    build_rm65_policy_arm_qpos_candidate_manifest,
 )
 
 
@@ -132,7 +132,8 @@ def _close_without_hiding_primary_error(backends: list[RM65ArmBackend]) -> list[
     for backend in reversed(backends):
         try:
             backend.close()
-        except Exception as exc:  # pragma: no cover - hardware-only evidence
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            # Hardware SDK cleanup failures must not hide the primary error.
             errors.append(f"{backend.name}:{type(exc).__name__}:{exc}")
     return errors
 
@@ -189,7 +190,10 @@ def main() -> None:
             backend.start()
             backends.append(backend)
             if not callable(getattr(backend.arm, "Arm_Slow_Stop", None)):
-                raise RuntimeError(f"{side}: SDK does not expose Arm_Slow_Stop; refusing fallback.")
+                # This is a runtime SDK capability failure, not bad input.
+                raise RuntimeError(  # noqa: TRY004
+                    f"{side}: SDK does not expose Arm_Slow_Stop; refusing fallback."
+                )
 
         before: dict[str, np.ndarray] = {}
         for side, backend in by_side.items():
@@ -230,7 +234,8 @@ def main() -> None:
         evidence["binding"] = asdict(binding.snapshot())
         evidence["receipts"] = [asdict(receipt) for receipt in binding.receipts]
         evidence["status"] = "stop_only_completed"
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001
+        # Preserve terminal evidence and cleanup even for process-level exits.
         primary_error = exc
         evidence["status"] = "failed"
         evidence["error"] = f"{type(exc).__name__}:{exc}"

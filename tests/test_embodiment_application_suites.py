@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
+from dataclasses import replace
 
 import pytest
 
 from teleop_runtime.target_runtime import (
     EMBODIMENT_APPLICATION_SUITE_SPEC_SCHEMA_V1,
-    EmbodimentApplicationSurfaceSpec,
     EmbodimentApplicationSuiteBinding,
     EmbodimentApplicationSuiteCatalog,
     EmbodimentApplicationSuiteSpec,
+    EmbodimentApplicationSurfaceSpec,
     LoadedEmbodimentApplicationSurface,
 )
 

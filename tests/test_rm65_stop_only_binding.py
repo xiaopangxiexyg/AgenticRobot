@@ -4,6 +4,9 @@ import numpy as np
 import pytest
 
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
+    build_rm65_policy_arm_qpos_candidate_manifest,
+)
 from teleop_runtime.backends.arms.rm65_control_dispatch_call import (
     RM65ControlDispatchContext,
 )
@@ -16,9 +19,6 @@ from teleop_runtime.backends.arms.rm65_dispatch_inventory import (
 from teleop_runtime.backends.arms.rm65_stop_only_binding import (
     RM65StopOnlyHardwareAuthorization,
     RM65StopOnlyLegacyBinding,
-)
-from teleop_runtime.backends.arms.rm65_candidate_manifest import (
-    build_rm65_policy_arm_qpos_candidate_manifest,
 )
 
 

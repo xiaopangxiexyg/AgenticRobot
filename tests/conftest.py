@@ -18,11 +18,10 @@ handling happens after collection.
 
 from __future__ import annotations
 
-from pathlib import Path
 import socket
+from pathlib import Path
 
 import pytest
-
 
 OPTIONAL_MODULES = frozenset(
     {

@@ -22,10 +22,6 @@ from robot_motion.target_runtime import (
     TargetRuntimeProviderIdentity,
     TargetRuntimeProviderRegistryEntry,
 )
-from ..profiles import (
-    TargetRuntimeProfileBinding,
-    TargetRuntimeProfileCatalog,
-)
 
 from ...backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
@@ -35,7 +31,10 @@ from ...backends.arms.rm65_execution_evidence import (
     RM65ExecutionEvidenceBundle,
     build_rm65_execution_evidence_bundle,
 )
-
+from ..profiles import (
+    TargetRuntimeProfileBinding,
+    TargetRuntimeProfileCatalog,
+)
 
 RM65_POLICY_ARM_QPOS_CANDIDATE_PROVIDER_ID = (
     "dexteleop.rm65_policy_arm_qpos_candidate.preflight"

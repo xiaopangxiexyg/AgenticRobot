@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
-from pathlib import Path
 import subprocess
 import sys
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -24,7 +24,6 @@ from teleop_runtime.target_runtime.integrations.rm65_policy_arm_qpos_candidate i
     build_rm65_policy_arm_qpos_candidate_provider_entry,
     preflight_rm65_policy_arm_qpos_candidate_target,
 )
-
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parent

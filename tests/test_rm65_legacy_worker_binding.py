@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import threading
+
 import numpy as np
 import pytest
 
+from robot_motion.runtime import ExecutionCancellationRequest, WorkerEpochDrainReceipt
+from teleop_runtime.action import LegacyControlOwnerStateTransitionRequest
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.backends.arms.rm65_candidate_manifest import (
     build_rm65_policy_arm_qpos_candidate_manifest,
@@ -12,24 +15,22 @@ from teleop_runtime.backends.arms.rm65_candidate_manifest import (
 from teleop_runtime.backends.arms.rm65_execution_evidence import (
     build_rm65_execution_evidence_bundle,
 )
-from teleop_runtime.deploy.rm65_legacy_worker_binding import (
-    build_fake_only_rm65_legacy_worker_binding,
+from teleop_runtime.backends.arms.rm65_worker_drain import (
+    drain_rm65_arms_only_workers,
 )
+from teleop_runtime.deploy import run_policy
 from teleop_runtime.deploy.rm65_legacy_hold_convergence import (
     RM65LegacyBackendHoldReceipt,
     converge_rm65_legacy_control_stop,
 )
-from teleop_runtime.backends.arms.rm65_worker_drain import (
-    drain_rm65_arms_only_workers,
+from teleop_runtime.deploy.rm65_legacy_worker_binding import (
+    build_fake_only_rm65_legacy_worker_binding,
 )
-from robot_motion.runtime import ExecutionCancellationRequest, WorkerEpochDrainReceipt
-from tests.test_legacy_execution_context import ManualClock, _capability
-from teleop_runtime.deploy import run_policy
-from teleop_runtime.action import LegacyControlOwnerStateTransitionRequest
 from teleop_runtime.position_control.deploy_executor import (
     PositionDeployExecutor,
     PositionDeployExecutorConfig,
 )
+from tests.test_legacy_execution_context import ManualClock, _capability
 from tests.test_position_deploy_executor import (
     _filtered_qpos,
     _observation,

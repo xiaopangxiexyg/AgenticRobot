@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
-import time
-from pathlib import Path
 import json
 import sys
+import time
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -26,15 +26,22 @@ from robot_motion.runtime import (
     ExecutionCancellationRequest,
     acknowledge_worker_epoch_drain,
 )
-from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.backends.arms import rm65 as rm65_module
+from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
+from teleop_runtime.backends.arms.rm65_candidate_manifest import (
+    build_rm65_policy_arm_qpos_candidate_capability,
+    build_rm65_policy_arm_qpos_candidate_manifest,
+)
 from teleop_runtime.backends.arms.rm65_dispatch_call import (
     RM65JointTargetDispatchContext,
 )
+from teleop_runtime.backends.arms.rm65_execution_evidence import (
+    build_rm65_execution_evidence_bundle,
+)
 from teleop_runtime.backends.arms.rm65_idle_worker_preflight_binding import (
+    RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1,
     RM65IdleWorkerDrainHardwareAuthorization,
     RM65IdleWorkerDrainPreflightBinding,
-    RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1,
 )
 from teleop_runtime.backends.arms.rm65_worker_drain import (
     drain_rm65_arms_only_workers,
@@ -48,13 +55,6 @@ from teleop_runtime.control_trace import (
 )
 from teleop_runtime.control_trace.rm65_worker_drain import (
     admit_rm65_worker_drain_trace,
-)
-from teleop_runtime.backends.arms.rm65_candidate_manifest import (
-    build_rm65_policy_arm_qpos_candidate_capability,
-    build_rm65_policy_arm_qpos_candidate_manifest,
-)
-from teleop_runtime.backends.arms.rm65_execution_evidence import (
-    build_rm65_execution_evidence_bundle,
 )
 from teleop_runtime.deploy.rm65_legacy_hold_convergence import (
     compile_rm65_idle_worker_backend_hold_receipt,

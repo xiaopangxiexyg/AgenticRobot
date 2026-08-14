@@ -7,7 +7,6 @@ from teleop_runtime.backends.arms.rm65_execution_evidence import (
     resolve_rm65_historical_execution_evidence_contract,
 )
 
-
 _EVIDENCE = (
     Path(__file__).parent
     / "fixtures/control_core/rm65_m5_8b0_stop_only_field_evidence_2026-07-21.json"

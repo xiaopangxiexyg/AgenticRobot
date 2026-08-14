@@ -14,12 +14,12 @@ real operation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from numbers import Integral
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from numbers import Integral
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ControlExecutionManifest
@@ -36,15 +36,14 @@ from robot_motion.runtime.dispatch_owner import (
     DispatchPermitValidationReceipt,
 )
 from teleop_runtime.action import LegacyControlDomainExecutionContext
-from .rm65_execution_evidence import RM65ExecutionEvidenceBundle
 
 from .rm65_control_dispatch_call import (
     RM65ControlDispatchContext,
     RM65PermittedPreSdkControlAdapter,
 )
+from .rm65_execution_evidence import RM65ExecutionEvidenceBundle
 from .rm65_stop_only_binding import RM65DenyAllMotionDispatchAdapter
 from .rm65_worker_drain import RM65ArmsOnlyWorkerDrainResult
-
 
 RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1 = (
     "m5_8b1_real_a_idle_worker_drain_stop_only_v1"
@@ -125,7 +124,7 @@ class RM65IdleWorkerDrainHardwareAuthorization:
         allowed_sides: tuple[str, ...],
         issued_at: float,
         expires_at: float,
-    ) -> "RM65IdleWorkerDrainHardwareAuthorization":
+    ) -> RM65IdleWorkerDrainHardwareAuthorization:
         if not isinstance(execution_manifest, ControlExecutionManifest):
             raise TypeError("execution_manifest must be a ControlExecutionManifest.")
         if not isinstance(dispatch_inventory, DispatchSeamInventoryManifest):
@@ -640,10 +639,10 @@ class RM65IdleWorkerDrainPreflightBinding:
 
 
 __all__ = [
+    "RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1",
     "RM65IdleWorkerBackendBinding",
     "RM65IdleWorkerDrainHardwareAuthorization",
     "RM65IdleWorkerDrainPreflightBinding",
     "RM65IdleWorkerDrainPreflightSnapshot",
     "RM65IdleWorkerStopCallReceipt",
-    "RM65_IDLE_WORKER_PREFLIGHT_PROFILE_V1",
 ]

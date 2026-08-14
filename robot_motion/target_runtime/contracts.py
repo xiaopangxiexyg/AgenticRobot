@@ -14,9 +14,10 @@ providers remain in their owning packages.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action.execution_handoff import (
@@ -34,7 +35,6 @@ from robot_motion.runtime.dispatch_owner import (
     DispatchPermit,
 )
 from robot_motion.runtime.immutable import deep_freeze
-
 
 TARGET_RUNTIME_PROVIDER_API_V1 = "dexteleop.target_runtime_provider.v1"
 TARGET_RUNTIME_PROVIDER_IDENTITY_HASH_DOMAIN_V1 = (

@@ -4,7 +4,6 @@ from collections.abc import Callable
 from importlib import import_module
 from typing import Generic, TypeVar
 
-
 T = TypeVar("T")
 
 _BUILTIN_MODULES_BY_KIND = {

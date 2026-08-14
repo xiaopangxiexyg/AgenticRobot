@@ -13,12 +13,12 @@ not call it, construct a target handle, start a device, or own its lifecycle.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
-
 
 EMBODIMENT_APPLICATION_SURFACE_SPEC_SCHEMA_V1 = (
     "dexteleop.embodiment_application_surface_spec.v1"
@@ -160,7 +160,7 @@ class EmbodimentApplicationSurfaceSpec:
     def from_payload(
         cls,
         payload: Mapping[str, Any],
-    ) -> "EmbodimentApplicationSurfaceSpec":
+    ) -> EmbodimentApplicationSurfaceSpec:
         if not isinstance(payload, Mapping):
             raise TypeError("surface payload must be a mapping.")
         if payload.get("schema") != EMBODIMENT_APPLICATION_SURFACE_SPEC_SCHEMA_V1:
@@ -315,7 +315,7 @@ class EmbodimentApplicationSuiteSpec:
     def from_payload(
         cls,
         payload: Mapping[str, Any],
-    ) -> "EmbodimentApplicationSuiteSpec":
+    ) -> EmbodimentApplicationSuiteSpec:
         if not isinstance(payload, Mapping):
             raise TypeError("suite payload must be a mapping.")
         if payload.get("schema") != EMBODIMENT_APPLICATION_SUITE_SPEC_SCHEMA_V1:
@@ -551,10 +551,10 @@ __all__ = [
     "EMBODIMENT_APPLICATION_SUITE_SPEC_SCHEMA_V1",
     "EMBODIMENT_APPLICATION_SURFACE_SPEC_HASH_DOMAIN_V1",
     "EMBODIMENT_APPLICATION_SURFACE_SPEC_SCHEMA_V1",
-    "EmbodimentApplicationSurfaceLoader",
-    "EmbodimentApplicationSurfaceSpec",
     "EmbodimentApplicationSuiteBinding",
     "EmbodimentApplicationSuiteCatalog",
     "EmbodimentApplicationSuiteSpec",
+    "EmbodimentApplicationSurfaceLoader",
+    "EmbodimentApplicationSurfaceSpec",
     "LoadedEmbodimentApplicationSurface",
 ]
