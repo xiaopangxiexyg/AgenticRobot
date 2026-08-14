@@ -358,8 +358,8 @@ def build_bimanual_pose_smoother(
 
 
 __all__ = [
-    "SCHEMA_VERSION",
     "RM65_POSITION_TARGET_POSE_SMOOTHING_V1",
+    "SCHEMA_VERSION",
     "BimanualPoseSmoother",
     "PoseSmoother",
     "PoseSmoothingConfig",
