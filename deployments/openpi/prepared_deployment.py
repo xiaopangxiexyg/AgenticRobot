@@ -63,6 +63,9 @@ PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1 = (
 PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2 = (
     "dexteleop.openpi_prepared_prompt_family_training_profile.v2"
 )
+PREPARED_STAGE1_SCENARIO_TRAINING_PROFILE_SCHEMA_V1 = (
+    "dexteleop.openpi_stage1_scenario_training_profile.v1"
+)
 PREPARED_DEPLOYMENT_BINDING_SCHEMA_V1 = (
     "dexteleop.openpi_prepared_deployment_binding.v1"
 )
@@ -84,6 +87,15 @@ PREPARED_DEPLOYMENT_BINDING_HASH_DOMAIN_V1 = (
 PREPARED_PROMPT_CONTRACT_HASH_DOMAIN_V1 = (
     "dexteleop.openpi.prepared_prompt_contract.v1"
 )
+STAGE1_SCENARIO_SELECTION_POLICY_V1 = (
+    "coarse_stage1_nominal_non_abnormal_latest_annotation_v1"
+)
+
+_STAGE1_SCENARIO_REPEAT_WEIGHTS = {
+    "fixed_middle": 1,
+    "initial_multi_choice": 4,
+    "midcourse_interrupt": 6,
+}
 
 _PROFILE_REQUIRED_KEYS = (
     "profile_id",
@@ -145,6 +157,7 @@ def load_prepared_training_profile(path: str | Path) -> dict[str, Any]:
         PREPARED_TRAINING_PROFILE_SCHEMA_V1,
         PREPARED_PROMPT_TRAINING_PROFILE_SCHEMA_V1,
         PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2,
+        PREPARED_STAGE1_SCENARIO_TRAINING_PROFILE_SCHEMA_V1,
     }:
         raise ValueError(f"Unsupported prepared training profile: {source}")
     required_keys = list(_PROFILE_REQUIRED_KEYS)
@@ -162,6 +175,21 @@ def load_prepared_training_profile(path: str | Path) -> dict[str, Any]:
                 "prompt_stage_sampling_policy",
                 "prompt_stage_sampling_seed",
                 "expected_effective_epoch_window_count",
+            )
+        )
+    elif schema == PREPARED_STAGE1_SCENARIO_TRAINING_PROFILE_SCHEMA_V1:
+        required_keys.extend(
+            (
+                "target_progress_step_id",
+                "expected_total_raw_episode_count",
+                "expected_total_raw_frame_count",
+                "expected_total_eligible_episode_count",
+                "expected_prepared_interval_window_count",
+                "expected_prepared_interval_repeated_window_count",
+                "expected_openpi_quality_valid_window_count",
+                "expected_openpi_repeated_epoch_sample_count",
+                "source_mixing_policy",
+                "default_prompt",
             )
         )
     missing = [key for key in required_keys if not profile.get(key)]
@@ -270,6 +298,87 @@ def load_prepared_training_profile(path: str | Path) -> dict[str, Any]:
                 raise ValueError(
                     "Prepared prompt-family profile requires an exact 80/20 split."
                 )
+    elif schema == PREPARED_STAGE1_SCENARIO_TRAINING_PROFILE_SCHEMA_V1:
+        seen_source_ids: set[str] = set()
+        seen_scenario_classes: set[str] = set()
+        raw_episode_count = 0
+        raw_frame_count = 0
+        eligible_episode_count = 0
+        openpi_window_count = 0
+        for item in sources:
+            source_id = str(item.get("source_dataset_id") or "").strip()
+            scenario_class = str(item.get("scenario_class") or "").strip()
+            task_scope = str(item.get("task_scope") or "").strip()
+            expected_task_id = str(item.get("expected_task_id") or "").strip()
+            repeat_weight = int(item.get("repeat_weight", 0))
+            raw_episodes = int(item.get("expected_raw_episode_count", 0))
+            raw_frames = int(item.get("expected_raw_frame_count", 0))
+            eligible_episodes = int(
+                item.get("expected_eligible_episode_count", 0)
+            )
+            openpi_windows = int(
+                item.get("expected_openpi_quality_valid_window_count", 0)
+            )
+            if (
+                not source_id
+                or source_id in seen_source_ids
+                or scenario_class not in _STAGE1_SCENARIO_REPEAT_WEIGHTS
+                or not task_scope
+                or not expected_task_id
+                or repeat_weight
+                != _STAGE1_SCENARIO_REPEAT_WEIGHTS.get(scenario_class)
+                or raw_episodes <= 0
+                or raw_frames <= 0
+                or eligible_episodes <= 0
+                or openpi_windows <= 0
+            ):
+                raise ValueError(
+                    "Prepared Stage1 scenario source requires a unique id, "
+                    "known scenario class, task identity, positive inventory, "
+                    "and exact 1:4:6 repeat weight."
+                )
+            if scenario_class in {
+                "initial_multi_choice",
+                "midcourse_interrupt",
+            } and task_scope != "stage1_only":
+                raise ValueError(
+                    f"Prepared {scenario_class} source must be stage1_only."
+                )
+            seen_source_ids.add(source_id)
+            seen_scenario_classes.add(scenario_class)
+            raw_episode_count += raw_episodes
+            raw_frame_count += raw_frames
+            eligible_episode_count += eligible_episodes
+            openpi_window_count += openpi_windows
+        if seen_scenario_classes != set(_STAGE1_SCENARIO_REPEAT_WEIGHTS):
+            raise ValueError(
+                "Prepared Stage1 scenario profile must include fixed, "
+                "initial-choice, and midcourse-interrupt sources."
+            )
+        expected_totals = (
+            int(profile["expected_total_raw_episode_count"]),
+            int(profile["expected_total_raw_frame_count"]),
+            int(profile["expected_total_eligible_episode_count"]),
+            int(profile["expected_openpi_quality_valid_window_count"]),
+        )
+        actual_totals = (
+            raw_episode_count,
+            raw_frame_count,
+            eligible_episode_count,
+            openpi_window_count,
+        )
+        if actual_totals != expected_totals:
+            raise ValueError(
+                "Prepared Stage1 scenario source inventories differ from "
+                "profile totals."
+            )
+        if str(profile["source_mixing_policy"]) != (
+            "repeat_each_source_window_by_bound_weight_v1"
+        ):
+            raise ValueError(
+                "Prepared Stage1 scenario profile requires exact per-source "
+                "repetition."
+            )
     if (
         profile.get("openpi_observation_mode")
         == OPENPI_STATE_ONLY_PROFILE_V1
@@ -623,6 +732,10 @@ def _validate_checkpoint_training_metadata(
     payload: Mapping[str, Any],
     profile: Mapping[str, Any],
 ) -> None:
+    stage1_scenario_profile = (
+        profile.get("schema")
+        == PREPARED_STAGE1_SCENARIO_TRAINING_PROFILE_SCHEMA_V1
+    )
     prompt_family_profile = (
         profile.get("schema")
         == PREPARED_PROMPT_FAMILY_TRAINING_PROFILE_SCHEMA_V2
@@ -780,6 +893,66 @@ def _validate_checkpoint_training_metadata(
                     prepared.get("held_out_prompts_in_training", True)
                 ),
             )
+    elif stage1_scenario_profile:
+        raw_repeat_weights = prepared.get("source_repeat_weights")
+        if not isinstance(raw_repeat_weights, Sequence) or isinstance(
+            raw_repeat_weights,
+            (str, bytes),
+        ):
+            raise ValueError(
+                "Checkpoint prepared Stage1 scenario binding lacks "
+                "source_repeat_weights."
+            )
+        actual_repeat_weights = tuple(
+            (
+                str(item.get("source_dataset_id") or ""),
+                int(item.get("repeat_weight", 0)),
+            )
+            for item in raw_repeat_weights
+            if isinstance(item, Mapping)
+        )
+        expected_repeat_weights = tuple(
+            (
+                str(item["source_dataset_id"]),
+                int(item["repeat_weight"]),
+            )
+            for item in profile["sources"]
+        )
+        expected_prepared.update(
+            schema="dexteleop.openpi_prepared_skill_binding.v2",
+            skill_id=str(profile["target_skill_id"]),
+            selection_policy_id=STAGE1_SCENARIO_SELECTION_POLICY_V1,
+            source_mixing_policy=str(profile["source_mixing_policy"]),
+            source_repeat_weights=expected_repeat_weights,
+            episode_count=int(profile["expected_total_eligible_episode_count"]),
+            window_count=int(
+                profile["expected_prepared_interval_window_count"]
+            ),
+            prepared_interval_repeated_window_count=int(
+                profile[
+                    "expected_prepared_interval_repeated_window_count"
+                ]
+            ),
+        )
+        actual_prepared.update(
+            schema=str(prepared.get("schema") or ""),
+            skill_id=str(prepared.get("skill_id") or ""),
+            selection_policy_id=str(
+                prepared.get("selection_policy_id") or ""
+            ),
+            source_mixing_policy=str(
+                prepared.get("source_mixing_policy") or ""
+            ),
+            source_repeat_weights=actual_repeat_weights,
+            episode_count=int(prepared.get("episode_count", 0)),
+            window_count=int(prepared.get("window_count", 0)),
+            prepared_interval_repeated_window_count=int(
+                prepared.get(
+                    "prepared_interval_repeated_window_count",
+                    0,
+                )
+            ),
+        )
     else:
         expected_prepared["skill_id"] = str(profile["target_skill_id"])
         actual_prepared["skill_id"] = str(prepared.get("skill_id") or "")
@@ -806,6 +979,68 @@ def _validate_checkpoint_training_metadata(
         raise ValueError(
             "Checkpoint dataset mixing sources disagree with the training profile."
         )
+    if stage1_scenario_profile:
+        expected_source_order = tuple(
+            str(item["source_dataset_id"]) for item in profile["sources"]
+        )
+        expected_repeat_weight_map = {
+            str(item["source_dataset_id"]): int(item["repeat_weight"])
+            for item in profile["sources"]
+        }
+        actual_repeat_weight_map = mixing.get("source_repeat_weights")
+        if not isinstance(actual_repeat_weight_map, Mapping):
+            raise ValueError(
+                "Checkpoint Stage1 scenario mixing lacks source_repeat_weights."
+            )
+        actual_source_weights = tuple(
+            (
+                str(item.get("name") or "").strip(),
+                int(item.get("sample_weight", 0)),
+            )
+            for item in sources
+            if isinstance(item, Mapping)
+        )
+        expected_source_weights = tuple(
+            (source_id, expected_repeat_weight_map[source_id])
+            for source_id in expected_source_order
+        )
+        actual_scenario_mixing = {
+            "schema": str(mixing.get("schema") or ""),
+            "source_mixing_policy": str(
+                mixing.get("source_mixing_policy") or ""
+            ),
+            "source_order": tuple(
+                str(value) for value in mixing.get("source_order", ())
+            ),
+            "each_quality_valid_window_once_per_epoch": bool(
+                mixing.get("each_quality_valid_window_once_per_epoch", True)
+            ),
+            "repeat_each_quality_valid_window_by_source_weight": bool(
+                mixing.get(
+                    "repeat_each_quality_valid_window_by_source_weight",
+                    False,
+                )
+            ),
+            "source_repeat_weights": {
+                str(key): int(value)
+                for key, value in actual_repeat_weight_map.items()
+            },
+            "source_weights": actual_source_weights,
+        }
+        expected_scenario_mixing = {
+            "schema": "dexteleop_v23_bound_source_repeat_v1",
+            "source_mixing_policy": str(profile["source_mixing_policy"]),
+            "source_order": expected_source_order,
+            "each_quality_valid_window_once_per_epoch": False,
+            "repeat_each_quality_valid_window_by_source_weight": True,
+            "source_repeat_weights": expected_repeat_weight_map,
+            "source_weights": expected_source_weights,
+        }
+        if actual_scenario_mixing != expected_scenario_mixing:
+            raise ValueError(
+                "Checkpoint Stage1 scenario dataset mixing disagrees with the "
+                "training profile."
+            )
 
 
 def _validate_artifact_contract(

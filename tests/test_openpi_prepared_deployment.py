@@ -106,6 +106,7 @@ def _fixture(
         "openpi_asset_id": "prepared_model_assets",
         "openpi_num_workers": 4,
         "default_exp_name": "prepared-exp",
+        "default_prompt": "fixture prepared prompt",
     }
     profile_path = root / "profile.json"
     profile_path.write_text(json.dumps(profile), encoding="utf-8")
@@ -795,6 +796,7 @@ class _Data:
     strict_media_integrity: bool
     state_augmentation: object
     dataset_sources: tuple[object, ...]
+    default_prompt: str = "fixture base prompt"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -912,6 +914,7 @@ def test_rebuilt_config_preserves_all_inference_relevant_prepared_fields(
     assert config.data.camera_slots == ("base_0_rgb",)
     assert config.data.state_augmentation == trained_augmentation
     assert config.data.strict_media_integrity is True
+    assert config.data.default_prompt == "fixture prepared prompt"
     assert config.data.dataset_sources[0].name == "source-a"
     assert config.data.dataset_sources[0].front_occlusion_schedule == (
         (0.0, 1.0),
@@ -1515,6 +1518,90 @@ def test_joint_prompt_checkpoint_metadata_is_bound_exactly() -> None:
     with pytest.raises(ValueError, match="disagrees"):
         prepared_deployment._validate_checkpoint_training_metadata(
             payload,
+            profile,
+        )
+
+
+def test_stage1_scenario_checkpoint_metadata_is_bound_exactly() -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "deployments/openpi/configs/training"
+        / "writing_stage1_scenarios_0804_0811_front_h16_absolute_repeat146_v1.json"
+    )
+    profile = prepared_deployment.load_prepared_training_profile(profile_path)
+    repeat_weights = [
+        {
+            "source_dataset_id": item["source_dataset_id"],
+            "repeat_weight": item["repeat_weight"],
+        }
+        for item in profile["sources"]
+    ]
+    payload = {
+        "prepared_skill_training_binding": {
+            "schema": "dexteleop.openpi_prepared_skill_binding.v2",
+            "camera_slot_to_dataset_key": [
+                {
+                    "model_slot": "base_0_rgb",
+                    "dataset_camera_key": "front",
+                }
+            ],
+            "action_horizon": 16,
+            "action_pose_mode": "absolute",
+            "skill_id": profile["target_skill_id"],
+            "selection_policy_id": (
+                prepared_deployment.STAGE1_SCENARIO_SELECTION_POLICY_V1
+            ),
+            "source_mixing_policy": profile["source_mixing_policy"],
+            "source_repeat_weights": repeat_weights,
+            "episode_count": profile["expected_total_eligible_episode_count"],
+            "window_count": profile[
+                "expected_prepared_interval_window_count"
+            ],
+            "prepared_interval_repeated_window_count": profile[
+                "expected_prepared_interval_repeated_window_count"
+            ],
+        },
+        "dataset_mixing": {
+            "schema": "dexteleop_v23_bound_source_repeat_v1",
+            "source_mixing_policy": profile["source_mixing_policy"],
+            "source_order": [
+                item["source_dataset_id"] for item in profile["sources"]
+            ],
+            "each_quality_valid_window_once_per_epoch": False,
+            "repeat_each_quality_valid_window_by_source_weight": True,
+            "source_repeat_weights": {
+                item["source_dataset_id"]: item["repeat_weight"]
+                for item in profile["sources"]
+            },
+            "sources": [
+                {
+                    "name": item["source_dataset_id"],
+                    "dataset_root": item["dataset_root"],
+                    "sample_weight": item["repeat_weight"],
+                }
+                for item in profile["sources"]
+            ],
+        },
+    }
+    prepared_deployment._validate_checkpoint_training_metadata(payload, profile)
+
+    drifted_binding = json.loads(json.dumps(payload))
+    drifted_binding["prepared_skill_training_binding"][
+        "source_repeat_weights"
+    ][-1]["repeat_weight"] = 1
+    with pytest.raises(ValueError, match="prepared binding disagrees"):
+        prepared_deployment._validate_checkpoint_training_metadata(
+            drifted_binding,
+            profile,
+        )
+
+    drifted_mixing = json.loads(json.dumps(payload))
+    drifted_mixing["dataset_mixing"]["source_repeat_weights"][
+        "midcourse_interrupt_2026_08_11"
+    ] = 1
+    with pytest.raises(ValueError, match="dataset mixing disagrees"):
+        prepared_deployment._validate_checkpoint_training_metadata(
+            drifted_mixing,
             profile,
         )
 

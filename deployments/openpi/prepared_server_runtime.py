@@ -238,6 +238,9 @@ def build_prepared_openpi_config(
         strict_media_integrity=True,
         state_augmentation=state_augmentation,
         dataset_sources=source_configs,
+        default_prompt=str(
+            profile.get("default_prompt", base.data.default_prompt)
+        ),
     )
     config_overrides: dict[str, Any] = {
         "name": resolution.openpi_config_name,
@@ -295,12 +298,14 @@ def prepared_config_summary(
         "action_pose_mode": str(config.data.action_pose_mode),
         "last_action_pose_mode": str(config.data.last_action_pose_mode),
         "tail_policy": str(config.data.tail_policy),
+        "default_prompt": str(config.data.default_prompt),
         "layout_hash": str(config.data.layout_hash),
         "layout_path": str(config.data.layout_path),
         "dataset_sources": [
             {
                 "name": str(source.name),
                 "dataset_root": str(source.dataset_root),
+                "sample_weight": int(source.sample_weight),
                 "episode_manifest": str(source.episode_manifest),
             }
             for source in config.data.dataset_sources
@@ -400,6 +405,22 @@ def main(argv: list[str] | None = None) -> int:
         args.policy_artifact_json,
         model_rtc_profile_path=args.model_rtc_profile,
     )
+    profile_default_prompt = str(
+        resolution.profile.get("default_prompt") or ""
+    ).strip()
+    if (
+        args.default_prompt is not None
+        and profile_default_prompt
+        and args.default_prompt != profile_default_prompt
+    ):
+        parser.error(
+            "--default-prompt differs from the prepared training profile."
+        )
+    resolved_default_prompt = (
+        args.default_prompt
+        if args.default_prompt is not None
+        else (profile_default_prompt or None)
+    )
     if resolution.deployment_artifact.model_id != str(args.model):
         parser.error("--model differs from the prepared deployment artifact.")
     profile_openpi_root = Path(
@@ -488,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
             host=str(args.host),
             port=int(args.port),
             checkpoint_dir=None,
-            default_prompt=args.default_prompt,
+            default_prompt=resolved_default_prompt,
             record=bool(args.record),
             enable_rtc_continuation=bool(args.enable_rtc_continuation),
         )

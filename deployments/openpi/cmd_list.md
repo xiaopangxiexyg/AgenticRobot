@@ -14,8 +14,9 @@
 | 类型 | 使用章节 | 允许的入口 |
 | --- | --- | --- |
 | 普通 artifact-backed policy | 第 2～8 节 | 第 4 节选择变量；依次做 server dry-run、contract check、server、no-action，最后才是 L5 |
-| prepared writing stage1 | 第 9 节 | checkpoint 与 stage1 training profile 必须同时绑定 |
+| prepared writing stage1 | 旧模型第 9 节；新 scenario 模型第 19 节 | checkpoint 与对应的 stage1 training profile 必须同时绑定 |
 | prepared writing stage2 | 第 10 节 | checkpoint 与 stage2 training profile 必须同时绑定；连续任务使用 `--no-init-qpos` |
+| prepared writing 当前 Stage1–4 组合 | 第 20 节 | 四个独立 checkpoint/profile；Stage1 qpos-init，Stage2–4 当前姿态接管 |
 | trained model-RTC | 第 11 节 | 仅 conditioned no-action shadow；当前没有动作部署入口 |
 | 老 v1 registry policy | 第 12 节 | legacy registry；不属于 v2 artifact contract |
 | 训练与恢复参考 | 第 13～15 节 | 只在明确要训练时使用，不是部署前置步骤 |
@@ -42,7 +43,8 @@
 
 ## 2. 当前可部署 policy 与 checkpoint
 
-基础清单检查时间：2026-08-06；writing stage2 行于 2026-08-08 单独完成远端只读复核。
+基础清单检查时间：2026-08-06；writing stage2 行于 2026-08-08、新 Stage1 scenario 行于
+2026-08-13 单独完成远端只读复核。
 以下是已经有有效 checkpoint 的 policy。
 
 | Policy/config | 数据与动作语义 | 相机 | 可选 checkpoint step | 部署方式 |
@@ -55,6 +57,7 @@
 | `0712-cube` | v2.2，legacy absolute，16D / 16D，h50 | front + left/right wrist | `11768` | artifact wrapper / registry |
 | `writing-phase1-grap-pen-h16-relative` | v2.3，relative，32D / 16D，h16 | front + left/right wrist | `30000, 60000, 90000, 120000, 150000` | artifact wrapper |
 | `writing-stage1-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第一阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v2` 实验） | checkpoint-bound prepared wrapper |
+| `writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-prepared-v1` | v2.3 Stage1 三类场景，absolute，32D / 16D，h16，13 来源按 1:4:6 重复 | front (`base_0_rgb`) | `30000, 60000`（`-b1-nw4-v1` 实验，2026-08-13 快照） | checkpoint-bound prepared wrapper；第 19 节 |
 | `writing-stage2-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第二阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v1` 实验） | checkpoint-bound prepared wrapper |
 | `dual_rm65_dmgripper` | 老 v1，26D action，h50 | front + left/right wrist | registry 固定 `99999` | legacy registry |
 
@@ -69,6 +72,7 @@
 /home/user/zc/openpi/checkpoints/0712-cube/0712-cube/<STEP>
 /home/user/zc/openpi/checkpoints/writing-phase1-grap-pen-h16-relative/writing-phase1-grap-pen-h16-relative/<STEP>
 /home/user/zc/openpi/checkpoints/writing-stage1-0804-0805-front-h16-absolute-prepared-v1/writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2/<STEP>
+/home/user/zc/openpi/checkpoints/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-prepared-v1/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-b1-nw4-v1/<STEP>
 /home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1/writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1/<STEP>
 ```
 
@@ -1271,3 +1275,477 @@ history 或未执行 chunk，也不会自动判断一个 stage 是否成功完�
 确认动作已停止、当前双臂/夹爪状态满足下一阶段分布，然后重新完成当前姿态 startup 和人工
 ready 放行。no-action 仍按第 7 节规则派生。第 9.2 节断联夹爪选项可以原样追加，不改变文本
 stage 绑定。
+
+## 19. 新 Stage1 scenario 模型（0804–0811，repeat 1:4:6）部署
+
+本节更新 Stage1 模型本身，保留第 9 节的 checkpoint-bound prepared server/client、
+position 15/60/120 Hz、dataset-frame qpos-init、碰撞检查、action queue、force guard 和人工
+`g`/`A` 放行结构。第 9 节旧 `0804–0805` Stage1 命令继续保留，作为显式回退入口；不要把
+旧 profile 与本节 checkpoint 交叉组合。
+
+2026-08-13 对 `dex-remote` 的只读检查确认以下实验目录存在 `30000`、`60000`，两者均有
+`policy_artifact.json` 和 params；`60000` 还确认有本 profile 的 norm stats。下面选择
+`CKPT_STEP=60000`。如果需要部署 `30000`，只改该变量，server 与 client 必须同时重启并使用
+同一个值。
+
+该 checkpoint 绑定 13 个 0804–0811 数据源、2,283 个合格 Episode、222,899 个原始
+prepared 窗口，以及 fixed-middle / initial-multi-choice / midcourse-interrupt 的 1:4:6
+重复权重。prepared wrapper 会在加载模型或创建硬件前核对 profile schema、选择策略、各来源
+路径和重复权重。训练使用的默认文本
+`Pick up the capped brush and present it for uncapping.` 由受 profile hash 约束的
+`default_prompt` 自动恢复，命令中不要再手写 `--default-prompt`。
+
+### 19.1 无硬件绑定检查
+
+此命令只读取 checkpoint/profile 并生成一次性 deployment artifact；不加载模型、不连接
+server、相机、夹爪或机械臂：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=60000
+export OPENPI_CKPT=/home/user/zc/openpi/checkpoints/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-prepared-v1/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-b1-nw4-v1/$CKPT_STEP
+
+python -m deployments.openpi.client.real \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_scenarios_0804_0811_front_h16_absolute_repeat146_v1.json \
+  --contract-check-only
+```
+
+### 19.2 终端 A：新 Stage1 server
+
+```bash
+cd /home/user/zc/DexTeleop
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+export CKPT_STEP=60000
+export OPENPI_CKPT=/home/user/zc/openpi/checkpoints/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-prepared-v1/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-b1-nw4-v1/$CKPT_STEP
+
+python -m deployments.openpi.server \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_scenarios_0804_0811_front_h16_absolute_repeat146_v1.json \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+更换自旧 Stage1 或其他 checkpoint 前，先由原进程 owner 用 `Ctrl+C` 正常停止旧 server，
+确认 `8078` 和对应显存已经释放，再运行本命令。不要让两个 server 争用同一端口或 GPU。
+
+### 19.3 终端 B：新 Stage1 client
+
+首次真机前，先从下方正式命令派生 no-action：删除 `--send-actions` 并添加
+`--max-steps 100`；其余参数不变。no-action 会连接 server、front 相机和状态 backend，但不
+下发动作。通过后才可在完成现场安全检查、急停确认和工作区清空后运行下方正式命令；启动后
+先按 `g` 执行 dataset-frame qpos-init，确认姿态和 ready，再按 `A` 放行 policy：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=60000
+export OPENPI_CKPT=/home/user/zc/openpi/checkpoints/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-prepared-v1/writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-b1-nw4-v1/$CKPT_STEP
+
+python -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile /home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_scenarios_0804_0811_front_h16_absolute_repeat146_v1.json \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage \
+  --policy-qpos-init-episode 0 \
+  --policy-qpos-init-frame 0 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-collision-check \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --send-actions \
+  --debug
+```
+
+第 9.2 节的断联夹爪选项可以原样追加到本节 client，不改变 checkpoint/profile 或 Stage1
+默认文本绑定。这里继续使用既有 0804 Episode 0/frame 0 作为物理 qpos-init 来源；更多训练数据
+只扩展策略分布，不会自动改变机器人启动轨迹。
+
+## 20. 当前四个独立 Stage 模型部署
+
+本节对应四个分别从 π0.5 基座训练的普通 prepared 模型，不是第 18 节的单 checkpoint
+prompt-family 模型，也不是第 11 节 model-RTC。四个阶段不能使用同一个路径模板；必须逐项绑定
+实际训练过的 checkpoint 和对应 profile：
+
+| Stage | 最后一次远端已验证的 checkpoint 实验 | Training profile | 默认 step | 启动姿态 |
+| --- | --- | --- | --- | --- |
+| 1 | `writing-stage1-0804-0805-front-h16-absolute-prepared-v1/...-b1-nw4-meta-v2` | `writing_stage1_0804_0805_front_h16_absolute_v1.json` | `150000` | 0804 Episode 0/frame 0 qpos-init |
+| 2 | `writing-stage2-0804-0805-front-h16-absolute-prepared-v1/...-b1-nw4-meta-v1` | `writing_stage2_0804_0805_front_h16_absolute_v1.json` | `150000` | 当前姿态，`--no-init-qpos` |
+| 3 | `writing-stage3-0804-0806-front-h16-absolute-prepared-v1/...-b1-nw4-meta-v1` | `writing_stage3_0804_0806_front_h16_absolute_v1.json` | `150000` | 当前姿态，`--no-init-qpos` |
+| 4 | `writing-stage4-0804-0806-front-h16-absolute-prepared-v1/...-b1-nw4-meta-v1` | `writing_stage4_0804_0806_front_h16_absolute_v1.json` | `150000` | 当前姿态，`--no-init-qpos` |
+
+下列命令默认 `STAGE=1`，并为每个 Stage 选择表中的默认 step；可以在粘贴命令前分别执行如
+`export STAGE=3`、`export CKPT_STEP=120000` 进行选择。命令会在启动前确认数字 step、profile、
+artifact、params 和对应 norm stats 均存在，因此不存在的 step 会直接退出，不会退回其他模型。
+
+本组合明确选择普通旧 Stage1，不选择第 19 节的 scenario repeat146 模型。Stage1/2
+0804–0805 及 Stage3/4 0804–0806 的 `30000/60000/90000/120000/150000` 均于此前远端
+审计确认；默认统一选择 `150000`。`writing-stage1-0804-0806-.../60000` 并不是已验证
+checkpoint，不能由 Stage3/4 的命名模式推导。所有命令仍在启动前 fail closed。
+
+### 20.1 终端 A：所选 Stage server
+
+每次切换 Stage 或 step，先正常 `Ctrl+C` 停止旧 server，确认 `8078` 和 GPU 已释放，再在
+终端 A 运行：
+
+```bash
+(
+set -euo pipefail
+
+STAGE="${STAGE:-1}"
+
+case "$STAGE" in
+  1)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage1-0804-0805-front-h16-absolute-prepared-v1/writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2
+    ASSET_ID=writing_stage1_0804_0805_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  2)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage2_0804_0805_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1/writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage2_0804_0805_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  3)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage3_0804_0806_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage3-0804-0806-front-h16-absolute-prepared-v1/writing-stage3-0804-0806-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage3_0804_0806_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  4)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage4_0804_0806_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage4-0804-0806-front-h16-absolute-prepared-v1/writing-stage4-0804-0806-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage4_0804_0806_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  *) printf 'Unsupported STAGE: %s (expected 1, 2, 3, or 4)\n' "$STAGE" >&2; exit 2 ;;
+esac
+CKPT_STEP="${CKPT_STEP:-$DEFAULT_CKPT_STEP}"
+case "$CKPT_STEP" in
+  ''|*[!0-9]*|0) printf 'CKPT_STEP must be a positive integer: %s\n' "$CKPT_STEP" >&2; exit 2 ;;
+esac
+
+CHECKPOINT_DIR="$CHECKPOINT_ROOT/$CKPT_STEP"
+
+if [[ ! -f "$PROFILE" ]]; then
+  printf 'Missing training profile: %s\n' "$PROFILE" >&2
+  exit 2
+fi
+if [[ ! -f "$CHECKPOINT_DIR/policy_artifact.json" ]]; then
+  printf 'Missing checkpoint artifact: %s\n' "$CHECKPOINT_DIR/policy_artifact.json" >&2
+  exit 2
+fi
+if [[ ! -d "$CHECKPOINT_DIR/params" ]]; then
+  printf 'Missing checkpoint params: %s\n' "$CHECKPOINT_DIR/params" >&2
+  exit 2
+fi
+if [[ ! -f "$CHECKPOINT_DIR/assets/$ASSET_ID/norm_stats.json" ]]; then
+  printf 'Missing checkpoint norm stats: %s\n' "$CHECKPOINT_DIR/assets/$ASSET_ID/norm_stats.json" >&2
+  exit 2
+fi
+
+cd /home/user/zc/DexTeleop
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+
+printf '[stage%s] serving checkpoint step %s on port 8078; Ctrl+C returns to the current shell\n' "$STAGE" "$CKPT_STEP"
+python -u -m deployments.openpi.server \
+  --checkpoint-dir "$CHECKPOINT_DIR" \
+  --prepared-training-profile "$PROFILE" \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 \
+  --port 8078
+)
+```
+
+### 20.2 终端 B：contract check 与 100-step no-action
+
+此命令先执行完全无硬件的 `--contract-check-only`，通过后再连接 server 和 observation
+backend 运行 100 step，但不包含 `--send-actions`：
+
+```bash
+(
+set -euo pipefail
+
+STAGE="${STAGE:-1}"
+
+case "$STAGE" in
+  1)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage1-0804-0805-front-h16-absolute-prepared-v1/writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2
+    ASSET_ID=writing_stage1_0804_0805_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  2)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage2_0804_0805_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1/writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage2_0804_0805_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  3)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage3_0804_0806_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage3-0804-0806-front-h16-absolute-prepared-v1/writing-stage3-0804-0806-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage3_0804_0806_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  4)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage4_0804_0806_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage4-0804-0806-front-h16-absolute-prepared-v1/writing-stage4-0804-0806-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage4_0804_0806_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  *) printf 'Unsupported STAGE: %s (expected 1, 2, 3, or 4)\n' "$STAGE" >&2; exit 2 ;;
+esac
+CKPT_STEP="${CKPT_STEP:-$DEFAULT_CKPT_STEP}"
+case "$CKPT_STEP" in
+  ''|*[!0-9]*|0) printf 'CKPT_STEP must be a positive integer: %s\n' "$CKPT_STEP" >&2; exit 2 ;;
+esac
+
+CHECKPOINT_DIR="$CHECKPOINT_ROOT/$CKPT_STEP"
+
+if [[ ! -f "$PROFILE" ]]; then
+  printf 'Missing training profile: %s\n' "$PROFILE" >&2
+  exit 2
+fi
+if [[ ! -f "$CHECKPOINT_DIR/policy_artifact.json" ]]; then
+  printf 'Missing checkpoint artifact: %s\n' "$CHECKPOINT_DIR/policy_artifact.json" >&2
+  exit 2
+fi
+if [[ ! -d "$CHECKPOINT_DIR/params" ]]; then
+  printf 'Missing checkpoint params: %s\n' "$CHECKPOINT_DIR/params" >&2
+  exit 2
+fi
+if [[ ! -f "$CHECKPOINT_DIR/assets/$ASSET_ID/norm_stats.json" ]]; then
+  printf 'Missing checkpoint norm stats: %s\n' "$CHECKPOINT_DIR/assets/$ASSET_ID/norm_stats.json" >&2
+  exit 2
+fi
+
+if [[ "$STAGE" == 1 ]]; then
+  QPOS_ARGS=(
+    --policy-qpos-init-dataset /home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage
+    --policy-qpos-init-episode 0
+    --policy-qpos-init-frame 0
+    --policy-qpos-init-source auto
+    --policy-qpos-init-collision-check
+  )
+else
+  QPOS_ARGS=(--no-init-qpos)
+fi
+
+DISCONNECTED_GRIPPER_SIDES="${DISCONNECTED_GRIPPER_SIDES:-}"
+DISCONNECTED_GRIPPER_STATE="${DISCONNECTED_GRIPPER_STATE:-0.0}"
+case "$DISCONNECTED_GRIPPER_SIDES" in
+  '') GRIPPER_ARGS=() ;;
+  left|right|both)
+    GRIPPER_ARGS=(
+      --disconnected-gripper-sides "$DISCONNECTED_GRIPPER_SIDES"
+      --disconnected-gripper-state "$DISCONNECTED_GRIPPER_STATE"
+    )
+    ;;
+  *) printf 'Unsupported DISCONNECTED_GRIPPER_SIDES: %s\n' "$DISCONNECTED_GRIPPER_SIDES" >&2; exit 2 ;;
+esac
+
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+DEXTELEOP_PYTHON="$(command -v python)"
+
+printf '[stage%s] validating the bound artifact, then running 100 no-action steps for checkpoint %s\n' "$STAGE" "$CKPT_STEP"
+"$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
+  --checkpoint-dir "$CHECKPOINT_DIR" \
+  --prepared-training-profile "$PROFILE" \
+  --contract-check-only
+
+"$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir "$CHECKPOINT_DIR" \
+  --prepared-training-profile "$PROFILE" \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  "${QPOS_ARGS[@]}" \
+  "${GRIPPER_ARGS[@]}" \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --max-steps 100 \
+  --debug
+)
+```
+
+### 20.3 终端 B：允许动作的正式 client
+
+只有 20.2、server metadata 和现场安全检查都通过后才运行。Stage1 按 `g` 执行数据首帧
+qpos-init，确认 ready 后按 `A`；Stage2–4 按 `g` 从当前姿态建立 startup reference，确认
+ready 后按 `A`。这不会保留上一阶段的 queue、history 或未执行 chunk：
+
+```bash
+(
+set -euo pipefail
+
+STAGE="${STAGE:-1}"
+
+case "$STAGE" in
+  1)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage1-0804-0805-front-h16-absolute-prepared-v1/writing-stage1-0804-0805-front-h16-absolute-b1-nw4-meta-v2
+    ASSET_ID=writing_stage1_0804_0805_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  2)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage2_0804_0805_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage2-0804-0805-front-h16-absolute-prepared-v1/writing-stage2-0804-0805-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage2_0804_0805_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  3)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage3_0804_0806_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage3-0804-0806-front-h16-absolute-prepared-v1/writing-stage3-0804-0806-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage3_0804_0806_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  4)
+    PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage4_0804_0806_front_h16_absolute_v1.json
+    CHECKPOINT_ROOT=/home/user/zc/openpi/checkpoints/writing-stage4-0804-0806-front-h16-absolute-prepared-v1/writing-stage4-0804-0806-front-h16-absolute-b1-nw4-meta-v1
+    ASSET_ID=writing_stage4_0804_0806_front_h16_absolute_prepared_v1
+    DEFAULT_CKPT_STEP=150000
+    ;;
+  *) printf 'Unsupported STAGE: %s (expected 1, 2, 3, or 4)\n' "$STAGE" >&2; exit 2 ;;
+esac
+CKPT_STEP="${CKPT_STEP:-$DEFAULT_CKPT_STEP}"
+case "$CKPT_STEP" in
+  ''|*[!0-9]*|0) printf 'CKPT_STEP must be a positive integer: %s\n' "$CKPT_STEP" >&2; exit 2 ;;
+esac
+
+CHECKPOINT_DIR="$CHECKPOINT_ROOT/$CKPT_STEP"
+
+if [[ ! -f "$PROFILE" ]]; then
+  printf 'Missing training profile: %s\n' "$PROFILE" >&2
+  exit 2
+fi
+if [[ ! -f "$CHECKPOINT_DIR/policy_artifact.json" ]]; then
+  printf 'Missing checkpoint artifact: %s\n' "$CHECKPOINT_DIR/policy_artifact.json" >&2
+  exit 2
+fi
+if [[ ! -d "$CHECKPOINT_DIR/params" ]]; then
+  printf 'Missing checkpoint params: %s\n' "$CHECKPOINT_DIR/params" >&2
+  exit 2
+fi
+if [[ ! -f "$CHECKPOINT_DIR/assets/$ASSET_ID/norm_stats.json" ]]; then
+  printf 'Missing checkpoint norm stats: %s\n' "$CHECKPOINT_DIR/assets/$ASSET_ID/norm_stats.json" >&2
+  exit 2
+fi
+
+if [[ "$STAGE" == 1 ]]; then
+  QPOS_ARGS=(
+    --policy-qpos-init-dataset /home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage
+    --policy-qpos-init-episode 0
+    --policy-qpos-init-frame 0
+    --policy-qpos-init-source auto
+    --policy-qpos-init-collision-check
+  )
+  printf '[stage1] checkpoint %s: press g for dataset qpos init, confirm ready, then press A\n' "$CKPT_STEP"
+else
+  QPOS_ARGS=(--no-init-qpos)
+  printf '[stage%s] checkpoint %s: press g for current-pose startup, confirm ready, then press A\n' "$STAGE" "$CKPT_STEP"
+fi
+
+DISCONNECTED_GRIPPER_SIDES="${DISCONNECTED_GRIPPER_SIDES:-}"
+DISCONNECTED_GRIPPER_STATE="${DISCONNECTED_GRIPPER_STATE:-0.0}"
+case "$DISCONNECTED_GRIPPER_SIDES" in
+  '') GRIPPER_ARGS=() ;;
+  left|right|both)
+    GRIPPER_ARGS=(
+      --disconnected-gripper-sides "$DISCONNECTED_GRIPPER_SIDES"
+      --disconnected-gripper-state "$DISCONNECTED_GRIPPER_STATE"
+    )
+    ;;
+  *) printf 'Unsupported DISCONNECTED_GRIPPER_SIDES: %s\n' "$DISCONNECTED_GRIPPER_SIDES" >&2; exit 2 ;;
+esac
+
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+DEXTELEOP_PYTHON="$(command -v python)"
+
+"$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir "$CHECKPOINT_DIR" \
+  --prepared-training-profile "$PROFILE" \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  "${QPOS_ARGS[@]}" \
+  "${GRIPPER_ARGS[@]}" \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --send-actions \
+  --debug
+)
+```
+
+默认连接双夹爪。如果某侧明确不在线，在粘贴 20.2/20.3 前设置例如：
+
+```bash
+export DISCONNECTED_GRIPPER_SIDES=left
+export DISCONNECTED_GRIPPER_STATE=0.0
+```
+
+允许值为 `left/right/both`；不设置或设为空即保持默认双夹爪在线。以上命令没有启用 RTC、
+`async_c2`、`auto-start` 或跳过 ready confirm；其他安全和控制结构与第 9 节一致。
