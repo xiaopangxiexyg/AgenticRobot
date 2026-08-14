@@ -23,6 +23,10 @@ from dataset_interface.camera_semantics import (
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
 )
+from dataset_interface.camera_semantic_prepared_view import (
+    is_camera_semantic_prepared_view,
+    load_camera_semantic_prepared_view,
+)
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -71,6 +75,14 @@ def _parser() -> argparse.ArgumentParser:
             "dataset source without creating a trainer or loading model weights."
         ),
     )
+    parser.add_argument(
+        "--allow-camera-prepared-view",
+        action="store_true",
+        help=(
+            "Explicitly allow a non-tactile camera-corrected prepared view. "
+            "The view is rejected by default because it is not a full v2.3 dataset."
+        ),
+    )
     return parser
 
 
@@ -113,7 +125,12 @@ def _uses_wrist_cameras(data_factory: Any) -> bool:
     )
 
 
-def _camera_audits(data_factory: Any, registry: Path) -> list[dict[str, Any]]:
+def _camera_audits(
+    data_factory: Any,
+    registry: Path,
+    *,
+    allow_camera_prepared_view: bool = False,
+) -> list[dict[str, Any]]:
     if not _uses_wrist_cameras(data_factory):
         return []
     binding = load_camera_role_binding(registry)
@@ -124,6 +141,24 @@ def _camera_audits(data_factory: Any, registry: Path) -> list[dict[str, Any]]:
         )
     audits: list[dict[str, Any]] = []
     for root in roots:
+        prepared_view = None
+        if is_camera_semantic_prepared_view(root):
+            if not allow_camera_prepared_view:
+                raise ValueError(
+                    "Camera-semantic prepared views are non-tactile projections, "
+                    "not full v2.3 datasets; pass --allow-camera-prepared-view "
+                    f"to opt in explicitly: {root}"
+                )
+            manifest = load_camera_semantic_prepared_view(
+                root, verify_payload_hashes=True
+            )
+            prepared_view = {
+                "manifest_hash": manifest.manifest_hash,
+                "source_dataset_name": manifest.source_dataset_name,
+                "modalities": ["numeric", "video"],
+                "excluded_modalities": ["tactile"],
+                "full_v23_dataset": False,
+            }
         resolver = DatasetCameraSemanticResolver(root, binding)
         audits.append(
             {
@@ -131,6 +166,7 @@ def _camera_audits(data_factory: Any, registry: Path) -> list[dict[str, Any]]:
                 "frame_index_alignment": (
                     resolver.require_frame_index_alignment()
                 ),
+                "camera_prepared_view": prepared_view,
             }
         )
     return audits
@@ -242,7 +278,11 @@ def main(argv: list[str] | None = None) -> int:
             "Serial-resolved ordinary training requires a versioned "
             f"{_CORRECTED_SUFFIX!r} OpenPI config; historical names remain frozen."
         )
-    audits = _camera_audits(config.data, registry)
+    audits = _camera_audits(
+        config.data,
+        registry,
+        allow_camera_prepared_view=bool(args.allow_camera_prepared_view),
+    )
     sample_checks = _sample_checks(config) if args.sample_check else []
     print(
         json.dumps(

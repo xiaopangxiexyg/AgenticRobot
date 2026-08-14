@@ -23,6 +23,10 @@ from .camera_semantic_materialize import (
     materialize_camera_semantics,
     plan_camera_semantic_materialization,
 )
+from .camera_semantic_prepared_view import (
+    materialize_camera_semantic_prepared_view,
+    plan_camera_semantic_prepared_view,
+)
 from .delete_episodes import delete_episodes, plan_episode_deletion
 from .fault_nan_tail import detect_fault_nan_tail
 from .force_collision_labels import label_force_collisions, plan_force_collision_labels
@@ -231,6 +235,25 @@ def _cmd_camera_semantic_materialize(args: argparse.Namespace) -> int:
     )
     if bool(args.apply):
         result = materialize_camera_semantics(
+            args.dataset_root,
+            args.output_root,
+            args.registry,
+            expected_plan_hash=str(args.expected_plan_hash or ""),
+        )
+        _print_json(result)
+    else:
+        _print_json(plan.to_dict())
+    return 0
+
+
+def _cmd_camera_semantic_prepare_view(args: argparse.Namespace) -> int:
+    plan = plan_camera_semantic_prepared_view(
+        args.dataset_root,
+        args.output_root,
+        args.registry,
+    )
+    if bool(args.apply):
+        result = materialize_camera_semantic_prepared_view(
             args.dataset_root,
             args.output_root,
             args.registry,
@@ -658,6 +681,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     camera_materialize.set_defaults(func=_cmd_camera_semantic_materialize)
+
+    camera_prepare_view = subparsers.add_parser(
+        "camera-semantics-prepare-view",
+        help=(
+            "Plan or build a camera-corrected numeric/video prepared view "
+            "without scanning or copying tactile payloads."
+        ),
+    )
+    camera_prepare_view.add_argument("dataset_root")
+    camera_prepare_view.add_argument("--output-root", required=True)
+    camera_prepare_view.add_argument("--registry", required=True)
+    camera_prepare_view.add_argument(
+        "--expected-plan-hash",
+        default="",
+        help="Required with --apply; copy from the immediately preceding dry-run.",
+    )
+    camera_prepare_view.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Publish a fresh-inode, non-tactile prepared view after strict "
+            "Parquet, camera receipt and full video validation."
+        ),
+    )
+    camera_prepare_view.set_defaults(func=_cmd_camera_semantic_prepare_view)
 
     default_postprocess = subparsers.add_parser(
         "postprocess",

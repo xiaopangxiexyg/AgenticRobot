@@ -62,6 +62,32 @@ manifest hash/大小变化、未知热端文件或不同 artifact graph 都会 f
 `tactile_paths`、inventory 和 receipt，且发布前重新得到完全相同的 detach audit。因此应先完成并
 验证触觉迁出，再物化相机语义；不要把 NAS/cold root 传给相机工具。
 
+如果输出只用于数值 + RGB/depth/mask 训练，不需要成为可独立恢复全部模态的完整 v2.3 数据集，
+可显式使用默认关闭的 `camera-semantics-prepare-view`。它只选择 episode Parquet、相机 artifact
+和训练所需的小型 metadata，不遍历 `tactile/`，也不读取、校验或复制触觉 inventory/payload：
+
+```bash
+python -m utils.dataset_postprocess camera-semantics-prepare-view \
+  DATASET_ROOT \
+  --output-root OUTPUT_ROOT \
+  --registry robot_motion/configs/rm65_camera_registry.json
+
+python -m utils.dataset_postprocess camera-semantics-prepare-view \
+  DATASET_ROOT \
+  --output-root OUTPUT_ROOT \
+  --registry robot_motion/configs/rm65_camera_registry.json \
+  --apply \
+  --expected-plan-hash PLAN_HASH
+```
+
+prepared view 会把物理视频、对应相机自身的整组 `observation.images.<role>.*` Parquet 列以及
+camera artifact 同时归一化，因此允许历史左右腕视频索引不同；不会拿另一侧索引替换缺帧。
+输出使用 fresh inode 并完整解码验证视频，`meta/prepared_views/camera_semantics.json` 明确声明
+`full_v23_dataset=false`、`excluded_modalities=["tactile"]` 和源选择清单 hash。它不是完整数据集，
+不能用于触觉训练、归档恢复或通用 v2.3 校验。OpenPI corrected wrapper 默认拒绝该投影；只有
+调用者同时选择该输出根目录并显式传入 `--allow-camera-prepared-view` 才能训练。原
+`camera-semantics-materialize` 的完整克隆和触觉 retirement 门禁保持不变。
+
 新正式采集的 thread writer 默认采用 `--storage-queue-backpressure-policy block`：相机存储队列
 满时在控制热路径之外背压 sample assembly，不再由每个相机独立丢最旧帧。旧的
 `drop_oldest` 仍是显式兼容选项，但可能重新产生单侧 frame gap；正式数据不应使用。process

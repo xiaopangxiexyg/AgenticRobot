@@ -18,9 +18,16 @@ from dataset_interface.camera_semantics import (
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
 )
+from dataset_interface.camera_semantic_prepared_view import (
+    load_camera_semantic_prepared_view,
+)
 from utils.dataset_postprocess.camera_semantic_materialize import (
     materialize_camera_semantics,
     plan_camera_semantic_materialization,
+)
+from utils.dataset_postprocess.camera_semantic_prepared_view import (
+    materialize_camera_semantic_prepared_view,
+    plan_camera_semantic_prepared_view,
 )
 
 
@@ -158,6 +165,10 @@ def _write_source_dataset(root: Path) -> tuple[Path, Path]:
                 "observation.images.right_wrist.source_frame_index": [20, None, 21],
                 "observation.images.left_wrist.path": [left_video.as_posix()] * 3,
                 "observation.images.right_wrist.path": [right_video.as_posix()] * 3,
+                "observation.tactile.left.payload_path": [
+                    "tactile/episode_000000/left/frames.bin"
+                ]
+                * 3,
                 "observation.wrist_camera.left.pose_base": [[1.0] * 7] * 3,
                 "observation.wrist_camera.right.pose_base": [[2.0] * 7] * 3,
             }
@@ -607,3 +618,121 @@ def test_materialization_rejects_tampered_tactile_inventory(tmp_path: Path) -> N
         plan_camera_semantic_materialization(
             source, tmp_path / "output", registry
         )
+
+
+@pytest.mark.optional
+def test_prepared_view_corrects_mismatched_indices_without_reading_tactile(
+    tmp_path: Path,
+) -> None:
+    pq = pytest.importorskip("pyarrow.parquet")
+    source = tmp_path / "source"
+    source.mkdir()
+    source_left_video, source_right_video = _write_source_dataset(source)
+    source_manifest, _ = _add_detached_tactile_evidence(source)
+    tactile_payload = source_manifest.parent / "frames.bin"
+    tactile_payload.write_bytes(b"hot-tactile-must-not-be-copied")
+    receipt_dir = source / "meta/modality_artifacts/tactile/receipts"
+    shutil.rmtree(receipt_dir)
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "prepared"
+
+    full_plan = plan_camera_semantic_materialization(
+        source, tmp_path / "full", registry
+    )
+    assert full_plan.tactile_detach_audit["safe_for_camera_materialization"] is False
+
+    plan = plan_camera_semantic_prepared_view(source, output, registry)
+    assert plan.tactile_reference_episode_count == 1
+    assert plan.remapped_mismatched_row_count == 2
+    assert plan.to_dict()["tactile_payloads_inspected"] is False
+    result = materialize_camera_semantic_prepared_view(
+        source,
+        output,
+        registry,
+        expected_plan_hash=plan.plan_hash,
+    )
+
+    assert result["validated_video_count"] == 2
+    assert not (output / "tactile").exists()
+    assert not (output / "meta/modality_artifacts/tactile").exists()
+    manifest = load_camera_semantic_prepared_view(
+        output, verify_payload_hashes=True
+    )
+    assert manifest.episode_indices == (0,)
+    assert manifest.plan_hash == plan.plan_hash
+
+    table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
+    assert table.column(
+        "observation.images.left_wrist.video_frame_index"
+    ).to_pylist() == [0, None, 1]
+    assert table.column(
+        "observation.images.right_wrist.video_frame_index"
+    ).to_pylist() == [0, 1, 2]
+    assert not any("tactile" in name for name in table.column_names)
+    episode = json.loads(
+        (output / "meta/episodes.jsonl").read_text(encoding="utf-8")
+    )
+    assert "tactile_paths" not in episode
+    output_left = output / episode["video_paths"]["left_wrist"]
+    output_right = output / episode["video_paths"]["right_wrist"]
+    assert _sha256(output_left) == _sha256(source_right_video)
+    assert _sha256(output_right) == _sha256(source_left_video)
+    assert output_left.stat().st_ino != source_right_video.stat().st_ino
+    assert output_right.stat().st_ino != source_left_video.stat().st_ino
+
+    from deployments.openpi.corrected_train import _camera_audits
+
+    factory = type(
+        "Factory",
+        (),
+        {
+            "camera_slots": ("left_wrist_0_rgb", "right_wrist_0_rgb"),
+            "dataset_sources": (
+                type("Source", (), {"dataset_root": output})(),
+            ),
+        },
+    )()
+    with pytest.raises(ValueError, match="--allow-camera-prepared-view"):
+        _camera_audits(factory, registry)
+    audits = _camera_audits(
+        factory, registry, allow_camera_prepared_view=True
+    )
+    assert audits[0]["camera_prepared_view"]["full_v23_dataset"] is False
+    assert audits[0]["frame_index_alignment"]["remapped_episode_count"] == 0
+
+    output_left.write_bytes(b"tampered")
+    with pytest.raises(Exception, match="file (size|hash) mismatch"):
+        load_camera_semantic_prepared_view(output, verify_payload_hashes=True)
+
+
+@pytest.mark.optional
+def test_prepared_view_rejects_corrupt_video_and_stale_plan(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _, source_right_video = _write_source_dataset(source)
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "prepared"
+
+    plan = plan_camera_semantic_prepared_view(source, output, registry)
+    info_path = source / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["concurrent_change"] = True
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    with pytest.raises(Exception, match="expected-plan-hash"):
+        materialize_camera_semantic_prepared_view(
+            source,
+            output,
+            registry,
+            expected_plan_hash=plan.plan_hash,
+        )
+    assert not output.exists()
+
+    _write_video(source_right_video, frame_count=1, color="blue")
+    with pytest.raises(
+        Exception, match="Declared/decoded video frame count mismatch"
+    ):
+        plan_camera_semantic_prepared_view(source, output, registry)
+    assert not output.exists()
