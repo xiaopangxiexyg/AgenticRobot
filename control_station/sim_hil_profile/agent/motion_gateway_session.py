@@ -53,7 +53,9 @@ from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
 from .motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
+    MujocoAgentTcpTargetResolution,
     mujoco_agent_skill_hold_evidence_from_transition,
+    resolve_tcp_displacement_primitive_target,
 )
 from .observation import MujocoAgentObservationProducer
 from .observation_binding import (
@@ -86,6 +88,7 @@ class MujocoAgentTcpPoseGatewaySession:
     observation_producer: MujocoAgentObservationProducer
     visual_snapshot_provider: MujocoAgentVisualSnapshotProvider
     motion_executor: ReusableStationAgentSkillOperationExecutor
+    cardinal_step_executor: ReusableStationAgentSkillOperationExecutor
     state_executor: PassiveReadSkillExecutor
     history_provider: MujocoAgentTcpPoseHistoryProvider | None
     history_executor: PassiveReadSkillExecutor | None
@@ -140,7 +143,14 @@ class MujocoAgentTcpPoseGatewaySession:
         )
 
     def wait(self, *, timeout_sec: float | None = None) -> bool:
-        return self.motion_executor.wait(timeout_sec=timeout_sec)
+        active = tuple(
+            executor
+            for executor in (self.motion_executor, self.cardinal_step_executor)
+            if executor.active_operation_id is not None
+        )
+        return bool(active) and all(
+            executor.wait(timeout_sec=timeout_sec) for executor in active
+        )
 
     def build_unix_json_server(
         self,
@@ -187,8 +197,24 @@ class MujocoAgentTcpPoseGatewaySession:
                 self.application.close_after_hold()
             return
         self.motion_executor.close_after_hold(hold_receipt=receipt)
-        workers = self.motion_executor.workers
-        if not workers or self.motion_executor.wait(timeout_sec=5.0):
+        cardinal_receipt = self.cardinal_step_executor.request_hold(
+            operation=None,
+            reason="agent_gateway_close_cardinal_step_fence",
+        )
+        if cardinal_receipt.succeeded and cardinal_receipt.proves_motion_or_hold:
+            self.cardinal_step_executor.close_after_hold(
+                hold_receipt=cardinal_receipt
+            )
+        workers = (
+            *self.motion_executor.workers,
+            *self.cardinal_step_executor.workers,
+        )
+        settled = all(
+            executor.active_operation_id is None
+            or executor.wait(timeout_sec=5.0)
+            for executor in (self.motion_executor, self.cardinal_step_executor)
+        )
+        if not workers or settled:
             self.application.close_after_hold()
 
     def close(self) -> AgentGatewayOperationOutcome:
@@ -294,6 +320,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         "1",
     )
     motion_route = motion_entry.route
+    cardinal_step_entry = contract_bundle.route_manifest.route(
+        "motion.step_tcp_cardinal",
+        "1",
+    )
+    cardinal_step_route = cardinal_step_entry.route
     state_entry = contract_bundle.route_manifest.route(
         "state.read_tcp_pose",
         "1",
@@ -345,6 +376,43 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock,
         )
 
+    reference_frame_spec = application.target_frame_profile.frame_graph.frame_by_id[
+        contract_bundle.cardinal_step_profile.reference_frame_id
+    ]
+
+    def cardinal_step_lifecycle_factory(*, request, operation):
+        parameters = request.parameters
+        if not isinstance(parameters, Mapping):
+            raise TypeError("Cardinal-step parameters must be an object.")
+        primitive = contract_bundle.cardinal_step_profile.primitive(
+            str(parameters.get("direction"))
+        )
+
+        def resolve_target(
+            measured_pose: tuple[float, ...],
+        ) -> MujocoAgentTcpTargetResolution:
+            return resolve_tcp_displacement_primitive_target(
+                measured_pose=measured_pose,
+                primitive=primitive,
+                reference_frame_spec=reference_frame_spec,
+            )
+
+        return MujocoAgentTcpPoseSkillLifecycle(
+            application=application,
+            route=cardinal_step_route,
+            deployment_binding=(
+                contract_bundle.cardinal_step_deployment_binding
+            ),
+            evaluation_plan=(
+                contract_bundle.cardinal_step_evaluation_plan
+            ),
+            motion_profile=contract_bundle.motion_profile,
+            request=request,
+            operation=operation,
+            target_resolver=resolve_target,
+            clock=runtime_clock,
+        )
+
     def domain_hold(*, operation, reason):
         transition = application.request_hold(
             reason=reason,
@@ -372,6 +440,34 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             deployment_binding_hash=binding.semantic_content_hash,
         ),
         lifecycle_factory=lifecycle_factory,
+        domain_hold=domain_hold,
+        current_station_revision=lambda: (
+            observation_producer.current_station_revision
+        ),
+        clock=runtime_clock,
+    )
+    cardinal_step_binding = contract_bundle.cardinal_step_deployment_binding
+    cardinal_step_executor = ReusableStationAgentSkillOperationExecutor(
+        port_id=(
+            "agent-gateway:cardinal-step-worker:"
+            + cardinal_step_binding.runtime_session_id
+        ),
+        binding=StationOperationWorkerBinding(
+            worker_id=(
+                "agent-tcp-cardinal-step-worker:"
+                + cardinal_step_binding.runtime_session_id
+            ),
+            executor_id=cardinal_step_binding.executor_id,
+            runtime_session_id=cardinal_step_binding.runtime_session_id,
+            skill_id=cardinal_step_route.skill_id,
+            skill_version=cardinal_step_route.skill_version,
+            route_id=cardinal_step_route.route_id,
+            route_version=cardinal_step_route.route_version,
+            deployment_binding_hash=(
+                cardinal_step_binding.semantic_content_hash
+            ),
+        ),
+        lifecycle_factory=cardinal_step_lifecycle_factory,
         domain_hold=domain_hold,
         current_station_revision=lambda: (
             observation_producer.current_station_revision
@@ -433,6 +529,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         )
     execution_port_by_route_hash = {
         motion_route.semantic_content_hash: motion_executor,
+        cardinal_step_route.semantic_content_hash: cardinal_step_executor,
         state_entry.route.semantic_content_hash: state_executor,
     }
     if history_entry is not None and history_executor is not None:
@@ -456,11 +553,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         access_policy_id="agent-access:tcp-pose:" + binding.runtime_session_id,
         allowed_client_ids=clients,
         allowed_modes=(contract_bundle.route_manifest.current_mode,),
-        max_request_timeout_ms=motion_route.max_operation_duration_ms,
+        max_request_timeout_ms=max(
+            motion_route.max_operation_duration_ms,
+            cardinal_step_route.max_operation_duration_ms,
+        ),
         max_grant_lifetime_sec=30.0,
     )
     admissions_by_route_hash = {
         motion_route.semantic_content_hash: retention,
+        cardinal_step_route.semantic_content_hash: retention,
         state_entry.route.semantic_content_hash: retention,
     }
     if history_entry is not None:
@@ -500,6 +601,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         observation_producer=observation_producer,
         visual_snapshot_provider=visual_snapshot_provider,
         motion_executor=motion_executor,
+        cardinal_step_executor=cardinal_step_executor,
         state_executor=state_executor,
         history_provider=history_provider,
         history_executor=history_executor,

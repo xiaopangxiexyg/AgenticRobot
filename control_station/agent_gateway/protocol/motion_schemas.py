@@ -23,6 +23,7 @@ from .skill_catalog import (
 )
 
 TCP_POSE_TARGET_SKILL_ID_V1 = "motion.move_tcp_to_pose"
+TCP_CARDINAL_STEP_SKILL_ID_V1 = "motion.step_tcp_cardinal"
 REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1 = (
     "motion.replay_registered_tcp_pose_trajectory"
 )
@@ -31,9 +32,19 @@ INLINE_TCP_TRAJECTORY_SKILL_ID_V1 = (
 )
 
 AGENT_MOTION_SCHEMA_KINDS_V1 = (
+    "cardinal_tcp_step",
     "inline_tcp_pose_trajectory",
     "registered_tcp_pose_trajectory",
     "tcp_pose_target",
+)
+
+CARDINAL_TCP_STEP_DIRECTIONS_V1 = (
+    "forward",
+    "backward",
+    "left",
+    "right",
+    "up",
+    "down",
 )
 
 
@@ -262,6 +273,106 @@ def tcp_pose_target_schema_entry_v1(
     )
 
 
+def cardinal_tcp_step_schema_entry_v1(
+    *,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    allowed_component_ids: tuple[str, ...],
+    allowed_reference_frame_ids: tuple[str, ...],
+    reference_frame_spec_hash: str,
+    frame_graph_hash: str,
+    tool_config_hash: str,
+    calibration_hash: str,
+    primitive_catalog_hash: str,
+    allowed_directions: tuple[str, ...] = CARDINAL_TCP_STEP_DIRECTIONS_V1,
+) -> AgentSkillSchemaEntry:
+    """Publish one bounded semantic step over a lower-owned primitive catalog.
+
+    The request names only the component and semantic direction.  Exact frame,
+    calibration and primitive-catalog identities are immutable profile facts;
+    callers repeat them for lineage but cannot choose an alternative value.
+    Distance, target derivation, safety, IK and dispatch remain lower-owned.
+    """
+
+    components = _component_ids(allowed_component_ids)
+    frames = _component_ids(allowed_reference_frame_ids)
+    directions = tuple(
+        _required(value, field_name="allowed_direction")
+        for value in allowed_directions
+    )
+    if not directions or len(set(directions)) != len(directions):
+        raise ValueError("allowed_directions must be non-empty and unique.")
+    unknown = sorted(set(directions) - set(CARDINAL_TCP_STEP_DIRECTIONS_V1))
+    if unknown:
+        raise ValueError(f"Unsupported cardinal TCP directions: {unknown}.")
+    exact_hashes = {
+        "reference_frame_spec_hash": reference_frame_spec_hash,
+        "frame_graph_hash": frame_graph_hash,
+        "tool_config_hash": tool_config_hash,
+        "calibration_hash": calibration_hash,
+        "primitive_catalog_hash": primitive_catalog_hash,
+    }
+    parameter_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "component_id": {"type": "string", "enum": list(components)},
+            "direction": {"type": "string", "enum": list(directions)},
+            "reference_frame_id": {"type": "string", "enum": list(frames)},
+            "reference_frame_spec_hash": {
+                "const": _required(
+                    exact_hashes["reference_frame_spec_hash"],
+                    field_name="reference_frame_spec_hash",
+                )
+            },
+            "controlled_frame_id": {"const": "tool_tcp"},
+            "frame_graph_hash": {
+                "const": _required(
+                    exact_hashes["frame_graph_hash"],
+                    field_name="frame_graph_hash",
+                )
+            },
+            "tool_config_hash": {
+                "const": _required(
+                    exact_hashes["tool_config_hash"],
+                    field_name="tool_config_hash",
+                )
+            },
+            "calibration_hash": {
+                "const": _required(
+                    exact_hashes["calibration_hash"],
+                    field_name="calibration_hash",
+                )
+            },
+            "primitive_catalog_hash": {
+                "const": _required(
+                    exact_hashes["primitive_catalog_hash"],
+                    field_name="primitive_catalog_hash",
+                )
+            },
+        },
+        "required": [
+            "component_id",
+            "direction",
+            "reference_frame_id",
+            "reference_frame_spec_hash",
+            "controlled_frame_id",
+            "frame_graph_hash",
+            "tool_config_hash",
+            "calibration_hash",
+            "primitive_catalog_hash",
+        ],
+    }
+    return _schema_entry(
+        skill_id=TCP_CARDINAL_STEP_SKILL_ID_V1,
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameter_schema,
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+    )
+
+
 def registered_tcp_trajectory_schema_entry_v1(
     *,
     skill_definition_hash: str,
@@ -478,6 +589,9 @@ def validate_agent_motion_parameters_v1(
     schema_kind: str,
     parameters: Mapping[str, Any],
     allowed_component_ids: tuple[str, ...] = (),
+    allowed_cardinal_directions: tuple[
+        str, ...
+    ] = CARDINAL_TCP_STEP_DIRECTIONS_V1,
     limits: InlineTcpTrajectoryLimits | None = None,
 ) -> None:
     """Validate cross-field constraints JSON Schema cannot express."""
@@ -513,6 +627,22 @@ def validate_agent_motion_parameters_v1(
         return
 
     components = _component_ids(allowed_component_ids)
+    if schema_kind == "cardinal_tcp_step":
+        component_id = parameters.get("component_id")
+        if component_id not in components:
+            raise ValueError("Cardinal TCP step selects an unsupported component.")
+        directions = tuple(allowed_cardinal_directions)
+        if (
+            not directions
+            or len(set(directions)) != len(directions)
+            or set(directions) - set(CARDINAL_TCP_STEP_DIRECTIONS_V1)
+        ):
+            raise ValueError(
+                "allowed_cardinal_directions must be a non-empty cardinal subset."
+            )
+        if parameters.get("direction") not in directions:
+            raise ValueError("Cardinal TCP step selects an unsupported direction.")
+        return
     if schema_kind == "tcp_pose_target":
         _poses_by_component(
             parameters.get("pose_targets_by_component"),
@@ -618,10 +748,13 @@ def validate_agent_motion_route_schema_v1(
 
 __all__ = [
     "AGENT_MOTION_SCHEMA_KINDS_V1",
+    "CARDINAL_TCP_STEP_DIRECTIONS_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
     "REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1",
+    "TCP_CARDINAL_STEP_SKILL_ID_V1",
     "TCP_POSE_TARGET_SKILL_ID_V1",
     "InlineTcpTrajectoryLimits",
+    "cardinal_tcp_step_schema_entry_v1",
     "inline_tcp_trajectory_schema_entry_v1",
     "registered_tcp_trajectory_schema_entry_v1",
     "tcp_pose_target_schema_entry_v1",

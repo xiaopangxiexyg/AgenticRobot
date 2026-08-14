@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -27,14 +28,80 @@ from control_station.agent_gateway.runtime.station_operation_worker import (
     StationLifecycleExecutionCompletion,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.target_safety import TCPPoseEnvelopeSelection
 from robot_motion.action import ComponentAction
+from robot_motion.coordinate_frames import CoordinateFrameSpec
+from robot_motion.primitives import TCPPoseDisplacementPrimitive
+from robot_motion.relative_action import (
+    pose_matrix_to_xyzquat,
+    xyzquat_to_pose_matrix,
+)
+from robot_motion.target_safety import TCPPoseEnvelopeSelection
 
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
     MujocoAgentTcpPoseDeploymentBinding,
     MujocoAgentTcpPoseMotionProfile,
 )
+
+
+@dataclass(frozen=True)
+class MujocoAgentTcpTargetResolution:
+    """One lower-derived absolute target and its immutable semantic evidence."""
+
+    target_pose: tuple[float, ...]
+    evidence_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "target_pose",
+            _pose(self.target_pose, field_name="target_pose"),
+        )
+        refs = tuple(
+            sorted(
+                {
+                    _required(value, field_name="evidence_ref")
+                    for value in self.evidence_refs
+                }
+            )
+        )
+        if not refs:
+            raise ValueError("A derived TCP target requires semantic evidence.")
+        object.__setattr__(self, "evidence_refs", refs)
+
+
+def resolve_tcp_displacement_primitive_target(
+    *,
+    measured_pose: tuple[float, ...],
+    primitive: TCPPoseDisplacementPrimitive,
+    reference_frame_spec: CoordinateFrameSpec,
+) -> MujocoAgentTcpTargetResolution:
+    """Resolve one pure primitive at the lower Skill activation boundary."""
+
+    if not isinstance(primitive, TCPPoseDisplacementPrimitive):
+        raise TypeError("primitive must be a TCP displacement primitive.")
+    if not isinstance(reference_frame_spec, CoordinateFrameSpec):
+        raise TypeError("reference_frame_spec must be typed.")
+    target = primitive.apply(
+        xyzquat_to_pose_matrix(
+            measured_pose,
+            name="tcp_displacement_activation_pose",
+        ),
+        reference_frame_spec=reference_frame_spec,
+    )
+    return MujocoAgentTcpTargetResolution(
+        target_pose=tuple(
+            float(value)
+            for value in pose_matrix_to_xyzquat(
+                target.target_pose,
+                name="tcp_displacement_target_pose",
+            )
+        ),
+        evidence_refs=(
+            "tcp-displacement-primitive:" + primitive.semantic_content_hash,
+            "tcp-displacement-target:" + target.semantic_content_hash,
+        ),
+    )
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -133,6 +200,9 @@ class MujocoAgentTcpPoseSkillLifecycle:
         motion_profile: MujocoAgentTcpPoseMotionProfile,
         request: AgentSkillRequest,
         operation: AgentSkillOperation,
+        target_resolver: (
+            Callable[[tuple[float, ...]], MujocoAgentTcpTargetResolution] | None
+        ) = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -186,8 +256,12 @@ class MujocoAgentTcpPoseSkillLifecycle:
         parameters = request.parameters
         if not isinstance(parameters, Mapping):
             raise TypeError("request.parameters must be a mapping.")
+        if target_resolver is not None and not callable(target_resolver):
+            raise TypeError("target_resolver must be callable or None.")
         poses = parameters.get("pose_targets_by_component")
-        if not isinstance(poses, Mapping) or set(poses) != {"right_arm"}:
+        if target_resolver is None and (
+            not isinstance(poses, Mapping) or set(poses) != {"right_arm"}
+        ):
             raise ValueError("TCP pose lifecycle requires exactly right_arm.")
         exact = {
             "reference_frame_id": motion_profile.reference_frame_id,
@@ -209,15 +283,24 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self.motion_profile = motion_profile
         self.request = request
         self.operation = operation
-        self.target_pose = _pose(
-            poses["right_arm"],
-            field_name="pose_targets_by_component.right_arm",
+        self._target_resolver = target_resolver
+        self.target_pose: tuple[float, ...] | None = (
+            None
+            if target_resolver is not None
+            else _pose(
+                poses["right_arm"],
+                field_name="pose_targets_by_component.right_arm",
+            )
         )
-        self.action = ComponentAction(
-            action_schema=application.runtime.action_schema,
-            values_by_component={
-                "right_arm": np.asarray(self.target_pose, dtype=np.float32),
-            },
+        self.action: ComponentAction | None = (
+            None
+            if self.target_pose is None
+            else ComponentAction(
+                action_schema=application.runtime.action_schema,
+                values_by_component={
+                    "right_arm": np.asarray(self.target_pose, dtype=np.float32),
+                },
+            )
         )
         self.clock = clock
         self.sleep = sleep
@@ -228,7 +311,11 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 {
                     "operation_id": operation.operation_id,
                     "request_hash": request.semantic_content_hash,
-                    "target_pose": self.target_pose,
+                    "target_semantics": (
+                        "lower_resolved_at_activation"
+                        if target_resolver is not None
+                        else self.target_pose
+                    ),
                 },
                 domain="dexteleop.agent_skill.mujoco_tcp_goal_id.v1",
             )
@@ -254,6 +341,8 @@ class MujocoAgentTcpPoseSkillLifecycle:
             raise ValueError("TCP pose lifecycle request/operation mismatch.")
 
     def _within_terminal_tolerance(self, pose: tuple[float, ...]) -> bool:
+        if self.target_pose is None:
+            raise RuntimeError("TCP target has not been resolved.")
         translation, rotation = _pose_error(pose, self.target_pose)
         return bool(
             translation <= self.motion_profile.translation_tolerance_m
@@ -284,6 +373,21 @@ class MujocoAgentTcpPoseSkillLifecycle:
             )
         measured = self._capture_pose()
         self._activation_measured_pose = measured
+        if self._target_resolver is not None:
+            resolution = self._target_resolver(measured)
+            if not isinstance(resolution, MujocoAgentTcpTargetResolution):
+                raise TypeError("target_resolver returned an invalid resolution.")
+            self.target_pose = resolution.target_pose
+            self.action = ComponentAction(
+                action_schema=self.application.runtime.action_schema,
+                values_by_component={
+                    "right_arm": np.asarray(self.target_pose, dtype=np.float32),
+                },
+            )
+            with self._lock:
+                self._execution_refs.update(resolution.evidence_refs)
+        if self.target_pose is None or self.action is None:
+            raise RuntimeError("TCP target resolution did not produce an action.")
         translation, rotation = _pose_error(measured, self.target_pose)
         if (
             translation > self.motion_profile.max_translation_delta_m
@@ -506,6 +610,8 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 final_pose=final_pose,
             )
 
+        if self.action is None:
+            raise RuntimeError("TCP pose lifecycle has no resolved action.")
         for cycle in range(self.motion_profile.max_control_cycles):
             if bool(cancel_requested()):
                 hold = self._hold(reason="tcp_pose_operation_cancelled")
@@ -592,9 +698,12 @@ class MujocoAgentTcpPoseSkillLifecycle:
             },
             domain="dexteleop.agent_skill.mujoco_tcp_terminal_state.v1",
         )
+        if len(self.evaluation_plan.evaluator_specs) != 1:
+            raise RuntimeError("TCP target evaluation requires one exact evaluator.")
+        evaluator_identity = self.evaluation_plan.evaluator_specs[0]
         evaluator_spec = self.evaluation_plan.evaluator(
-            "motion.tcp_pose_arrival_rule",
-            "1",
+            evaluator_identity.evaluator_id,
+            evaluator_identity.evaluator_version,
         )
         refs = self._execution_evidence_refs()
         evaluator_receipt = SkillEvaluationReceipt(
@@ -697,5 +806,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
 
 __all__ = [
     "MujocoAgentTcpPoseSkillLifecycle",
+    "MujocoAgentTcpTargetResolution",
     "mujoco_agent_skill_hold_evidence_from_transition",
+    "resolve_tcp_displacement_primitive_target",
 ]

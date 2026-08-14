@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from collection_runtime.source_observation_history import SQLiteSourceObservationHistoryStore
+from collection_runtime.source_observation_history import (
+    SQLiteSourceObservationHistoryStore,
+)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ExecutionObservationPlan
 from robot_motion.target_safety import (
@@ -35,6 +37,7 @@ from sim.mujoco.deploy import (
 
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
+    MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
     MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
@@ -210,7 +213,10 @@ def _build_standard_tcp_pose_envelope_runtime(
         envelope_id=MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,
         profile=profile,
         constraint_set_hash=constraint_set_hash,
-        allowed_route_ids=(MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,),
+        allowed_route_ids=(
+            MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
+            MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+        ),
     )
     return TCPPoseEnvelopeSafetyRuntime(
         catalog_entries=(entry,),

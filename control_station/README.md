@@ -90,6 +90,35 @@ The CLI runner remains in the stable facade; none of these modules owns device
 workers, composition algorithms, canonical safety, IK, dispatch, or dataset
 persistence.
 
+### Agent Gateway semantic motion surface
+
+The default-off MuJoCo Agent Gateway profile publishes one shared lower motion
+domain with separate versioned Skills for absolute TCP targets and semantic
+cardinal steps. `motion.move_tcp_to_pose@1` accepts an exact lower target,
+whereas `motion.step_tcp_cardinal@1` accepts one of `forward`, `backward`,
+`left`, `right`, `up`, or `down`. The latter binds the existing pure
+`robot_motion` short-step catalog: exactly 3 cm along the reviewed target
+reference-frame axes with unchanged TCP orientation.
+
+The cardinal target is resolved from the measured TCP pose only when its Skill
+is activated. The Route schema pins the component, frame, tool, calibration,
+and primitive-catalog identities, but does not expose distance or an absolute
+target as caller-authored values. Both motion Routes share the existing
+authoritative application, safety/IK/reference/dispatch owner and domain-HOLD
+boundary; each has its own Route, evaluator, timeout and operation worker.
+
+The first formal MuJoCo safety-envelope runtime intentionally publishes only
+the independently reviewed `standard` profile, and its Route allowlist covers
+both motion Skills. Preview absolute/relative workspace JSON files are visual
+review inputs, not runtime safety profiles. `strict` or `relaxed` may be added
+later as separate reviewed lower profiles without changing the Skill schema;
+they must not be synthesized by scaling `standard`.
+
+New primitive families should reuse the same Gateway catalog, admission and
+domain-HOLD path while retaining their own semantic Skill/schema when their
+initiation, effect, termination or evidence differs. Do not add a raw generic
+motion-command escape hatch or another safety/controller owner.
+
 The standalone `python -m control_station vive-deflection` application is a
 read-only VIVE input viewer. It opens one VIVE pose receiver and a loopback
 GUI, loads the latest source-compatible Control Station VIVE coordinate

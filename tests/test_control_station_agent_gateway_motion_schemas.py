@@ -5,10 +5,13 @@ from dataclasses import replace
 import pytest
 
 from control_station.agent_gateway.protocol.motion_schemas import (
+    CARDINAL_TCP_STEP_DIRECTIONS_V1,
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
     REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1,
+    TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
     InlineTcpTrajectoryLimits,
+    cardinal_tcp_step_schema_entry_v1,
     inline_tcp_trajectory_schema_entry_v1,
     registered_tcp_trajectory_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
@@ -121,6 +124,52 @@ def test_tcp_pose_profile_can_explicitly_exclude_duration_semantics() -> None:
     assert "requested_duration_ms" not in schema["properties"]
     assert "requested_duration_ms" not in schema["required"]
     assert schema["additionalProperties"] is False
+
+
+def test_cardinal_tcp_step_exposes_direction_but_pins_lower_profile_facts() -> None:
+    entry = cardinal_tcp_step_schema_entry_v1(
+        skill_definition_hash="definition:tcp-cardinal-step:v1",
+        parameter_profile_id="right-arm-cardinal-short-step-v1",
+        parameter_profile_hash="profile:right-arm-cardinal-short-step-v1",
+        allowed_component_ids=("right_arm",),
+        allowed_reference_frame_ids=("right_arm_base",),
+        reference_frame_spec_hash="frame-spec:right-arm-base",
+        frame_graph_hash="frame-graph:fixture",
+        tool_config_hash="tool-config:fixture",
+        calibration_hash="calibration:fixture",
+        primitive_catalog_hash="primitive-catalog:fixture",
+    )
+    assert entry.skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1
+    schema = entry.to_wire()["parameter_schema"]
+    assert tuple(schema["properties"]["direction"]["enum"]) == (
+        CARDINAL_TCP_STEP_DIRECTIONS_V1
+    )
+    assert "distance_m" not in schema["properties"]
+    assert schema["properties"]["primitive_catalog_hash"] == {
+        "const": "primitive-catalog:fixture"
+    }
+    parameters = {
+        "component_id": "right_arm",
+        "direction": "up",
+        "reference_frame_id": "right_arm_base",
+        "reference_frame_spec_hash": "frame-spec:right-arm-base",
+        "controlled_frame_id": "tool_tcp",
+        "frame_graph_hash": "frame-graph:fixture",
+        "tool_config_hash": "tool-config:fixture",
+        "calibration_hash": "calibration:fixture",
+        "primitive_catalog_hash": "primitive-catalog:fixture",
+    }
+    validate_agent_motion_parameters_v1(
+        schema_kind="cardinal_tcp_step",
+        parameters=parameters,
+        allowed_component_ids=("right_arm",),
+    )
+    with pytest.raises(ValueError, match="unsupported direction"):
+        validate_agent_motion_parameters_v1(
+            schema_kind="cardinal_tcp_step",
+            parameters={**parameters, "direction": "diagonal"},
+            allowed_component_ids=("right_arm",),
+        )
 
 
 def test_registered_real_trajectory_schema_accepts_only_immutable_reference() -> None:

@@ -17,6 +17,8 @@ from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluatorSpec,
 )
 from control_station.agent_gateway.protocol.motion_schemas import (
+    CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    cardinal_tcp_step_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
@@ -61,6 +63,11 @@ from robot_motion.action import (
     ExecutionProfileExclusion,
     build_control_execution_manifest,
 )
+from robot_motion.primitives import (
+    CARDINAL_TCP_SHORT_STEP_PRIMITIVES,
+    TCPPoseDisplacementPrimitive,
+    cardinal_tcp_short_step,
+)
 
 from .state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
 
@@ -70,6 +77,15 @@ MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1 = (
 )
 MUJOCO_AGENT_TCP_POSE_PARAMETER_PROFILE_ID_V1 = (
     "right-arm-bounded-tool-tcp-target-v1"
+)
+MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1 = (
+    "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
+)
+MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1 = (
+    "control-station.mujoco-agent-tcp-cardinal-step.v1"
+)
+MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1 = (
+    "right-arm-cardinal-tool-tcp-short-step-v1"
 )
 MUJOCO_AGENT_TCP_POSE_STATE_ROUTE_ID_V1 = (
     "sim.mujoco.rm65.agent_skill_passive_tcp_pose"
@@ -228,6 +244,95 @@ class MujocoAgentTcpPoseMotionProfile:
             },
             domain="dexteleop.agent_skill.mujoco_tcp_pose_profile.v1",
         )
+
+
+@dataclass(frozen=True)
+class MujocoAgentTcpCardinalStepProfile:
+    """Exact lower primitive catalog and frame binding for cardinal TCP steps."""
+
+    component_id: str
+    reference_frame_id: str
+    reference_frame_spec_hash: str
+    frame_graph_hash: str
+    tool_config_hash: str
+    calibration_hash: str
+    primitives: tuple[TCPPoseDisplacementPrimitive, ...] = (
+        CARDINAL_TCP_SHORT_STEP_PRIMITIVES
+    )
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "component_id",
+            "reference_frame_id",
+            "reference_frame_spec_hash",
+            "frame_graph_hash",
+            "tool_config_hash",
+            "calibration_hash",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+        if self.component_id != "right_arm":
+            raise ValueError("The first MuJoCo cardinal-step profile binds right_arm.")
+        primitives = tuple(self.primitives)
+        if any(
+            not isinstance(item, TCPPoseDisplacementPrimitive)
+            for item in primitives
+        ):
+            raise TypeError("primitives must contain TCP displacement primitives.")
+        directions = tuple(item.direction.value for item in primitives)
+        if set(directions) != set(CARDINAL_TCP_STEP_DIRECTIONS_V1) or len(
+            directions
+        ) != len(set(directions)):
+            raise ValueError(
+                "Cardinal-step profile requires one primitive per direction."
+            )
+        object.__setattr__(
+            self,
+            "primitives",
+            tuple(sorted(primitives, key=lambda item: item.direction.value)),
+        )
+
+    @property
+    def primitive_catalog_hash(self) -> str:
+        return canonical_content_hash(
+            tuple(item.to_payload() for item in self.primitives),
+            domain="dexteleop.robot_motion.tcp_displacement_catalog.v1",
+        )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "profile_id": (
+                    MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1
+                ),
+                "component_id": self.component_id,
+                "reference_frame_id": self.reference_frame_id,
+                "reference_frame_spec_hash": self.reference_frame_spec_hash,
+                "controlled_frame_id": "tool_tcp",
+                "frame_graph_hash": self.frame_graph_hash,
+                "tool_config_hash": self.tool_config_hash,
+                "calibration_hash": self.calibration_hash,
+                "primitive_catalog_hash": self.primitive_catalog_hash,
+                "primitives": tuple(item.to_payload() for item in self.primitives),
+                "anchor_semantics": "lower_measured_pose_at_skill_activation",
+            },
+            domain="dexteleop.agent_skill.mujoco_tcp_cardinal_step_profile.v1",
+        )
+
+    def primitive(self, direction: str) -> TCPPoseDisplacementPrimitive:
+        selected = cardinal_tcp_short_step(direction)
+        matching = tuple(
+            item
+            for item in self.primitives
+            if item.semantic_content_hash == selected.semantic_content_hash
+        )
+        if len(matching) != 1:
+            raise ValueError("Direction is absent from the exact primitive profile.")
+        return matching[0]
 
 
 @dataclass(frozen=True)
@@ -527,9 +632,12 @@ class MujocoAgentTcpPoseContractBundle:
     schema_catalog: AgentSkillSchemaCatalog
     route_manifest: SkillRouteManifest
     deployment_binding: MujocoAgentTcpPoseDeploymentBinding
+    cardinal_step_deployment_binding: MujocoAgentTcpPoseDeploymentBinding
     state_deployment_binding: MujocoPassiveTcpPoseStateDeploymentBinding
     motion_profile: MujocoAgentTcpPoseMotionProfile
+    cardinal_step_profile: MujocoAgentTcpCardinalStepProfile
     evaluation_plan: SkillEvaluationPlan
+    cardinal_step_evaluation_plan: SkillEvaluationPlan
     payload_validators: AgentSkillPayloadValidatorRegistry
     station_manifest: ControlStationRunManifest
     execution_manifest: Any
@@ -549,6 +657,10 @@ class MujocoAgentTcpPoseContractBundle:
             "motion.move_tcp_to_pose",
             "1",
         )
+        cardinal_step_entry = self.route_manifest.route(
+            "motion.step_tcp_cardinal",
+            "1",
+        )
         state_entry = self.route_manifest.route("state.read_tcp_pose", "1")
         if motion_entry.deployment_binding.deployment_binding_hash != (
             self.deployment_binding.semantic_content_hash
@@ -558,10 +670,24 @@ class MujocoAgentTcpPoseContractBundle:
             self.state_deployment_binding.semantic_content_hash
         ):
             raise ValueError("State Route uses another deployment binding.")
+        if cardinal_step_entry.deployment_binding.deployment_binding_hash != (
+            self.cardinal_step_deployment_binding.semantic_content_hash
+        ):
+            raise ValueError(
+                "Cardinal-step Route uses another deployment binding."
+            )
         if motion_entry.evaluation_plan_hash != (
             self.evaluation_plan.semantic_content_hash
         ):
             raise ValueError("Motion Route uses another evaluation plan.")
+        if cardinal_step_entry.evaluation_plan_hash != (
+            self.cardinal_step_evaluation_plan.semantic_content_hash
+        ):
+            raise ValueError("Cardinal-step Route uses another evaluation plan.")
+        if self.cardinal_step_profile.reference_frame_id != (
+            self.motion_profile.reference_frame_id
+        ):
+            raise ValueError("Cardinal-step and motion profiles use another frame.")
         history_parts = (
             self.history_profile,
             self.history_source_binding,
@@ -958,6 +1084,105 @@ def _motion_validators(
     )
 
 
+def _cardinal_step_validators(
+    *,
+    route: SkillExecutionRoute,
+    profile: MujocoAgentTcpCardinalStepProfile,
+) -> AgentSkillPayloadValidatorSet:
+    parameter_fields = {
+        "component_id",
+        "direction",
+        "reference_frame_id",
+        "reference_frame_spec_hash",
+        "controlled_frame_id",
+        "frame_graph_hash",
+        "tool_config_hash",
+        "calibration_hash",
+        "primitive_catalog_hash",
+    }
+
+    def validate_parameters(payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping) or set(payload) != parameter_fields:
+            raise ValueError(
+                "Cardinal TCP step must exactly match its profile schema."
+            )
+        validate_agent_motion_parameters_v1(
+            schema_kind="cardinal_tcp_step",
+            parameters=payload,
+            allowed_component_ids=(profile.component_id,),
+            allowed_cardinal_directions=tuple(
+                item.direction.value for item in profile.primitives
+            ),
+        )
+        exact = {
+            "component_id": profile.component_id,
+            "reference_frame_id": profile.reference_frame_id,
+            "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+            "controlled_frame_id": "tool_tcp",
+            "frame_graph_hash": profile.frame_graph_hash,
+            "tool_config_hash": profile.tool_config_hash,
+            "calibration_hash": profile.calibration_hash,
+            "primitive_catalog_hash": profile.primitive_catalog_hash,
+        }
+        for field_name, expected in exact.items():
+            if payload[field_name] != expected:
+                raise ValueError(f"Cardinal TCP step {field_name} mismatch.")
+        profile.primitive(str(payload["direction"]))
+
+    def validate_execution_result(payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "execution_receipt_refs",
+            "final_measured_state_hash",
+        }:
+            raise ValueError("Cardinal TCP step result schema mismatch.")
+        refs = payload["execution_receipt_refs"]
+        if (
+            not isinstance(refs, (tuple, list))
+            or not refs
+            or len(refs) != len(set(refs))
+            or any(not isinstance(item, str) or not item for item in refs)
+        ):
+            raise ValueError("execution_receipt_refs must be non-empty and unique.")
+        _required(
+            payload["final_measured_state_hash"],
+            field_name="final_measured_state_hash",
+        )
+
+    def validate_task_evaluation(payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "aggregate_evaluation_receipt_ref",
+            "task_outcome",
+        }:
+            raise ValueError("Cardinal TCP step task evaluation schema mismatch.")
+        _required(
+            payload["aggregate_evaluation_receipt_ref"],
+            field_name="aggregate_evaluation_receipt_ref",
+        )
+        if payload["task_outcome"] not in {
+            "failed",
+            "inconclusive",
+            "succeeded",
+        }:
+            raise ValueError("Unsupported cardinal TCP step task_outcome.")
+
+    return AgentSkillPayloadValidatorSet(
+        validator_id=(
+            "payload-validator:mujoco-agent-tcp-cardinal-step:"
+            + profile.semantic_content_hash
+        ),
+        skill_id=route.skill_id,
+        skill_version=route.skill_version,
+        route_id=route.route_id,
+        route_version=route.route_version,
+        parameter_schema_hash=route.parameter_schema_hash,
+        execution_result_schema_hash=route.execution_result_schema_hash,
+        task_evaluation_schema_hash=route.task_evaluation_schema_hash,
+        validate_parameters=validate_parameters,
+        validate_execution_result=validate_execution_result,
+        validate_task_evaluation=validate_task_evaluation,
+    )
+
+
 def _state_validators(
     *,
     route: SkillExecutionRoute,
@@ -1184,6 +1409,21 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         calibration_hash=exact["calibration_hash"],
         physics_ticks_per_control_cycle=max(1, round(physics_hz / decision_hz)),
     )
+    cardinal_step_profile = MujocoAgentTcpCardinalStepProfile(
+        component_id="right_arm",
+        reference_frame_id=profile.reference_frame_id,
+        reference_frame_spec_hash=profile.reference_frame_spec_hash,
+        frame_graph_hash=profile.frame_graph_hash,
+        tool_config_hash=profile.tool_config_hash,
+        calibration_hash=profile.calibration_hash,
+    )
+    if any(
+        item.distance_m > profile.max_translation_delta_m
+        for item in cardinal_step_profile.primitives
+    ):
+        raise ValueError(
+            "Cardinal TCP primitive exceeds the lower motion delta profile."
+        )
     definition = SkillDefinition(
         skill_id="motion.move_tcp_to_pose",
         skill_version="1",
@@ -1230,6 +1470,72 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         requires_task_evaluation=True,
     )
     validate_agent_motion_route_schema_v1(route=route, schema_entry=schema_entry)
+    cardinal_step_definition = SkillDefinition(
+        skill_id="motion.step_tcp_cardinal",
+        skill_version="1",
+        skill_kind="motion",
+        summary=(
+            "Move one tool_tcp by the reviewed lower short-step primitive in "
+            "a semantic workspace direction."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=("right_arm",),
+        parameter_semantics_id="tcp_cardinal_short_step.direction.v1",
+        execution_result_semantics_id="component_action_execution.v1",
+        task_outcome_semantics_id="tcp_pose_arrival.v1",
+        entry_predicate_ids=("route_ready.v1", "measured_start_pose_valid.v1"),
+        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
+    )
+    cardinal_step_schema = cardinal_tcp_step_schema_entry_v1(
+        skill_definition_hash=cardinal_step_definition.semantic_content_hash,
+        parameter_profile_id=(
+            MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1
+        ),
+        parameter_profile_hash=cardinal_step_profile.semantic_content_hash,
+        allowed_component_ids=("right_arm",),
+        allowed_reference_frame_ids=(profile.reference_frame_id,),
+        reference_frame_spec_hash=profile.reference_frame_spec_hash,
+        frame_graph_hash=profile.frame_graph_hash,
+        tool_config_hash=profile.tool_config_hash,
+        calibration_hash=profile.calibration_hash,
+        primitive_catalog_hash=cardinal_step_profile.primitive_catalog_hash,
+        allowed_directions=tuple(
+            item.direction.value for item in cardinal_step_profile.primitives
+        ),
+    )
+    cardinal_step_route = SkillExecutionRoute(
+        skill_id=cardinal_step_definition.skill_id,
+        skill_version=cardinal_step_definition.skill_version,
+        skill_definition_hash=(
+            cardinal_step_definition.semantic_content_hash
+        ),
+        route_id=MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+        route_version="1",
+        parameter_schema_hash=cardinal_step_schema.parameter_schema_hash,
+        execution_result_schema_hash=(
+            cardinal_step_schema.execution_result_schema_hash
+        ),
+        task_evaluation_schema_hash=(
+            cardinal_step_schema.task_evaluation_schema_hash
+        ),
+        allowed_parameter_profiles=cardinal_step_schema.parameter_profiles,
+        control_effect_class="motion",
+        privilege_tier="t1_sim_or_no_motion",
+        supported_modes=("sim_active",),
+        target_kind="sim",
+        may_move_robot=True,
+        may_open_publication=False,
+        requires_operator_confirmation=False,
+        requires_deadman=False,
+        max_operation_duration_ms=10_000,
+        cancellation_policy="hold_on_cancel_disconnect_or_timeout",
+        requires_task_evaluation=True,
+    )
+    validate_agent_motion_route_schema_v1(
+        route=cardinal_step_route,
+        schema_entry=cardinal_step_schema,
+    )
     safety_runtime = getattr(application, "tcp_pose_envelope_runtime", None)
     safety_envelope_refs = (
         ()
@@ -1287,6 +1593,49 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         ),
         safety_envelope_refs=safety_envelope_refs,
     )
+    cardinal_step_binding = MujocoAgentTcpPoseDeploymentBinding(
+        deployment_binding_id=(
+            "sim.mujoco.agent_tcp_cardinal_step:" + exact["runtime_session_id"]
+        ),
+        deployment_binding_version="1",
+        route_hash=cardinal_step_route.semantic_content_hash,
+        runtime_session_id=exact["runtime_session_id"],
+        control_domain_id=exact["control_domain_id"],
+        target_binding_id=target_binding.binding_id,
+        station_manifest_hash=station.semantic_content_hash,
+        execution_manifest_hash=execution.semantic_content_hash,
+        execution_domain_binding_hash=target_binding.semantic_content_hash,
+        target_runtime_action_contract_hash=(
+            target_binding.target_runtime_action_contract_hash
+        ),
+        component_target_capability_hash=(
+            runtime.component_target_capability.semantic_content_hash
+        ),
+        action_schema_hash=runtime.action_schema.semantic_content_hash,
+        observation_binding_id=exact["observation_binding_id"],
+        observation_binding_hash=exact["observation_binding_hash"],
+        observation_plan_hash=exact["observation_plan_hash"],
+        observation_capability_hash=exact["observation_capability_hash"],
+        pose_schema_hash=exact["pose_schema_hash"],
+        motion_profile_hash=profile.semantic_content_hash,
+        reference_frame_id=profile.reference_frame_id,
+        reference_frame_spec_hash=profile.reference_frame_spec_hash,
+        frame_graph_hash=profile.frame_graph_hash,
+        tool_config_hash=profile.tool_config_hash,
+        calibration_hash=profile.calibration_hash,
+        trace_requirement_profile_id=station.trace_requirement_profile_id,
+        executor_id=MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
+        explicit_exclusions=(
+            "agent_authored_distance",
+            "hand_control",
+            "hardware_backend",
+            "model_inference",
+            "second_dispatch_owner",
+            "trajectory_streaming",
+            "upper_target_derivation",
+        ),
+        safety_envelope_refs=safety_envelope_refs,
+    )
     evaluator_input_hash = canonical_content_hash(
         {
             "input": "measured_tcp_pose_after_lower_hold",
@@ -1324,6 +1673,45 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         missing_evidence_policy="fail",
         disagreement_policy="aggregation_policy",
         task_outcome_schema_hash=schema_entry.task_evaluation_schema_hash,
+    )
+    cardinal_evaluator = SkillEvaluatorSpec(
+        evaluator_id="motion.tcp_cardinal_step_arrival_rule",
+        evaluator_version="1",
+        evaluator_kind="rule_based",
+        input_evidence_schema_hash=evaluator_input_hash,
+        output_schema_hash=cardinal_step_schema.task_evaluation_schema_hash,
+        role="required",
+        execution_location="gateway_worker",
+        deadline_ms=1_000,
+        failure_policy="veto",
+        evidence_domain_id=exact["control_domain_id"],
+        configuration_hash=canonical_content_hash(
+            {
+                "motion_profile_hash": profile.semantic_content_hash,
+                "cardinal_step_profile_hash": (
+                    cardinal_step_profile.semantic_content_hash
+                ),
+            },
+            domain="dexteleop.agent_skill.tcp_cardinal_step_evaluator.v1",
+        ),
+    )
+    cardinal_step_evaluation_plan = SkillEvaluationPlan(
+        evaluation_plan_id="motion.tcp_cardinal_step_arrival_rule",
+        evaluation_plan_version="1",
+        skill_definition_hash=(
+            cardinal_step_definition.semantic_content_hash
+        ),
+        route_hash=cardinal_step_route.semantic_content_hash,
+        deployment_binding_hash=cardinal_step_binding.semantic_content_hash,
+        evaluator_specs=(cardinal_evaluator,),
+        aggregation_policy_id="motion.single_required_rule.v1",
+        aggregation_policy_hash=aggregation_hash,
+        required_evaluation_deadline_ms=1_000,
+        missing_evidence_policy="fail",
+        disagreement_policy="aggregation_policy",
+        task_outcome_schema_hash=(
+            cardinal_step_schema.task_evaluation_schema_hash
+        ),
     )
 
     state_definition = tcp_pose_state_definition_v1(
@@ -1531,8 +1919,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             domain="dexteleop.agent_state.mujoco_tcp_pose_history_availability.v1",
         )
 
-    definition_items = [definition, state_definition]
-    schema_items = [schema_entry, state_schema]
+    definition_items = [definition, cardinal_step_definition, state_definition]
+    schema_items = [schema_entry, cardinal_step_schema, state_schema]
     if history_definition is not None and history_schema is not None:
         definition_items.append(history_definition)
         schema_items.append(history_schema)
@@ -1570,6 +1958,28 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             deployment_binding=binding.to_ref(),
             evaluation_plan_hash=evaluation_plan.semantic_content_hash,
             availability_hash=motion_availability,
+        ),
+        SkillRouteManifestEntry(
+            route=cardinal_step_route,
+            deployment_binding=cardinal_step_binding.to_ref(),
+            evaluation_plan_hash=(
+                cardinal_step_evaluation_plan.semantic_content_hash
+            ),
+            availability_hash=canonical_content_hash(
+                {
+                    "status": "configured_requires_activation_preflight",
+                    "route_hash": cardinal_step_route.semantic_content_hash,
+                    "deployment_binding_hash": (
+                        cardinal_step_binding.semantic_content_hash
+                    ),
+                    "cardinal_step_profile_hash": (
+                        cardinal_step_profile.semantic_content_hash
+                    ),
+                },
+                domain=(
+                    "dexteleop.agent_skill.mujoco_tcp_cardinal_step_availability.v1"
+                ),
+            ),
         ),
         SkillRouteManifestEntry(
             route=state_route,
@@ -1632,6 +2042,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             schema_entry=schema_entry,
             profile=profile,
         ),
+        _cardinal_step_validators(
+            route=cardinal_step_route,
+            profile=cardinal_step_profile,
+        ),
         _state_validators(
             route=state_route,
             schema_entry=state_schema,
@@ -1665,9 +2079,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         schema_catalog=schemas,
         route_manifest=manifest,
         deployment_binding=binding,
+        cardinal_step_deployment_binding=cardinal_step_binding,
         state_deployment_binding=state_binding,
         motion_profile=profile,
+        cardinal_step_profile=cardinal_step_profile,
         evaluation_plan=evaluation_plan,
+        cardinal_step_evaluation_plan=cardinal_step_evaluation_plan,
         payload_validators=validators,
         station_manifest=station,
         execution_manifest=execution,
@@ -1678,6 +2095,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
 
 
 __all__ = [
+    "MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1",
+    "MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1",
+    "MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_HISTORY_BINDING_HASH_DOMAIN_V1",
     "MUJOCO_AGENT_TCP_POSE_HISTORY_EXECUTOR_ID_V1",
@@ -1693,6 +2113,7 @@ __all__ = [
     "MUJOCO_AGENT_TCP_POSE_STATE_PROFILE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_STATE_ROUTE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1",
+    "MujocoAgentTcpCardinalStepProfile",
     "MujocoAgentTcpPoseContractBundle",
     "MujocoAgentTcpPoseDeploymentBinding",
     "MujocoAgentTcpPoseHistoryProfile",

@@ -41,7 +41,11 @@ from control_station.sim_hil_profile.agent.motion_gateway_session import (
 from control_station.sim_hil_profile.agent.motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
+    resolve_tcp_displacement_primitive_target,
 )
+from robot_motion.coordinate_frames import CoordinateFrameSpec
+from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
+from robot_motion.primitives import cardinal_tcp_short_step
 from sim.mujoco.deploy import (
     MujocoDirectComponentProposalSource,
     MujocoSimHILTargetConfig,
@@ -69,6 +73,32 @@ def _profile_and_schema():
         physics_ticks_per_control_cycle=3,
     )
     return motion_profile, target_profile.action_schema
+
+
+def test_cardinal_step_target_is_derived_from_lower_activation_pose() -> None:
+    resolution = resolve_tcp_displacement_primitive_target(
+        measured_pose=(0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0),
+        primitive=cardinal_tcp_short_step("up"),
+        reference_frame_spec=CoordinateFrameSpec(
+            frame_id="right_arm_base",
+            frame_version="fixture",
+            semantic_parameters={
+                "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+            },
+        ),
+    )
+
+    assert resolution.target_pose == pytest.approx(
+        (0.4, -0.1, 0.53, 0.0, 0.0, 0.0, 1.0)
+    )
+    assert any(
+        item.startswith("tcp-displacement-primitive:")
+        for item in resolution.evidence_refs
+    )
+    assert any(
+        item.startswith("tcp-displacement-target:")
+        for item in resolution.evidence_refs
+    )
 
 
 def _contracts(motion_profile):
@@ -351,6 +381,73 @@ def test_tcp_pose_lifecycle_dispatches_through_lower_and_finishes_under_hold() -
     assert calls["release"] == [operation.operation_id]
 
 
+def test_lifecycle_resolves_cardinal_target_at_lower_activation_boundary() -> None:
+    motion_profile, action_schema = _profile_and_schema()
+    route, binding, evaluation_plan = _contracts(motion_profile)
+    start_pose = (0.38, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    target_pose = (0.41, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    request, operation = _request_and_operation(
+        route,
+        binding,
+        motion_profile,
+        start_pose,
+    )
+    application, calls = _fake_application(
+        action_schema,
+        start_pose=start_pose,
+        target_pose=target_pose,
+    )
+    reference_frame = CoordinateFrameSpec(
+        frame_id="right_arm_base",
+        frame_version="fixture",
+        semantic_parameters={
+            "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+        },
+    )
+    lifecycle = MujocoAgentTcpPoseSkillLifecycle(
+        application=application,
+        route=route,
+        deployment_binding=binding,
+        evaluation_plan=evaluation_plan,
+        motion_profile=motion_profile,
+        request=request,
+        operation=operation,
+        target_resolver=lambda measured: (
+            resolve_tcp_displacement_primitive_target(
+                measured_pose=measured,
+                primitive=cardinal_tcp_short_step("forward"),
+                reference_frame_spec=reference_frame,
+            )
+        ),
+        clock=lambda: 12.0,
+        sleep=lambda _seconds: None,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    lifecycle.close()
+
+    assert activation.succeeded
+    assert lifecycle.target_pose == pytest.approx(target_pose)
+    assert completion.succeeded
+    submitted = calls["submit"][0]["action"].values_by_component[
+        "right_arm"
+    ].values
+    assert submitted == pytest.approx(target_pose)
+    assert any(
+        ref.startswith("tcp-displacement-target:")
+        for ref in completion.execution_receipt_refs
+    )
+
+
 def test_hold_evidence_never_claims_unstarted_runtime_is_held() -> None:
     evidence = mujoco_agent_skill_hold_evidence_from_transition(
         None,
@@ -522,6 +619,10 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "motion.move_tcp_to_pose",
         "1",
     )
+    cardinal_step_entry = bundle.route_manifest.route(
+        "motion.step_tcp_cardinal",
+        "1",
+    )
     state_entry = bundle.route_manifest.route("state.read_tcp_pose", "1")
     schema_entry = bundle.schema_catalog.entry(
         "motion.move_tcp_to_pose",
@@ -538,6 +639,21 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
     }
+    cardinal_parameters = {
+        "component_id": "right_arm",
+        "direction": "up",
+        "reference_frame_id": bundle.cardinal_step_profile.reference_frame_id,
+        "reference_frame_spec_hash": (
+            bundle.cardinal_step_profile.reference_frame_spec_hash
+        ),
+        "controlled_frame_id": "tool_tcp",
+        "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
+        "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
+        "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
+        "primitive_catalog_hash": (
+            bundle.cardinal_step_profile.primitive_catalog_hash
+        ),
+    }
 
     assert bundle.route_manifest.current_mode == "sim_active"
     assert motion_entry.route.control_effect_class == "motion"
@@ -545,6 +661,14 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert motion_entry.route.route_id == (
         "sim.mujoco.rm65.agent_skill_tcp_pose"
     )
+    assert cardinal_step_entry.route.control_effect_class == "motion"
+    assert cardinal_step_entry.route.route_id == (
+        "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
+    )
+    assert "distance_m" not in bundle.schema_catalog.entry(
+        "motion.step_tcp_cardinal",
+        "1",
+    ).parameter_schema["properties"]
     assert state_entry.route.control_effect_class == "read_only"
     assert "requested_duration_ms" not in schema_entry.parameter_schema[
         "properties"
@@ -557,6 +681,15 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         route=motion_entry.route,
         payload=parameters,
     )
+    bundle.payload_validators.validate_parameters(
+        route=cardinal_step_entry.route,
+        payload=cardinal_parameters,
+    )
+    with pytest.raises(ValueError, match="unsupported direction"):
+        bundle.payload_validators.validate_parameters(
+            route=cardinal_step_entry.route,
+            payload={**cardinal_parameters, "direction": "diagonal"},
+        )
     with pytest.raises(ValueError, match="exactly match"):
         bundle.payload_validators.validate_parameters(
             route=motion_entry.route,
@@ -584,6 +717,9 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         for item in session.service.executor_registry.bindings
     }
     assert route_to_port["motion.move_tcp_to_pose"] is session.motion_executor
+    assert route_to_port["motion.step_tcp_cardinal"] is (
+        session.cardinal_step_executor
+    )
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
     assert not motion_application.started
 
@@ -624,6 +760,10 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "motion.move_tcp_to_pose",
         "1",
     )
+    cardinal_entry = bundle.route_manifest.route(
+        "motion.step_tcp_cardinal",
+        "1",
+    )
     parameters = {
         "pose_targets_by_component": {
             "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
@@ -634,6 +774,21 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "frame_graph_hash": "frame-graph:fixture",
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
+    }
+    cardinal_parameters = {
+        "component_id": bundle.cardinal_step_profile.component_id,
+        "direction": "forward",
+        "reference_frame_id": bundle.cardinal_step_profile.reference_frame_id,
+        "reference_frame_spec_hash": (
+            bundle.cardinal_step_profile.reference_frame_spec_hash
+        ),
+        "controlled_frame_id": "tool_tcp",
+        "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
+        "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
+        "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
+        "primitive_catalog_hash": (
+            bundle.cardinal_step_profile.primitive_catalog_hash
+        ),
     }
 
     source_slot = bundle.station_manifest.source_slots[0]
@@ -679,6 +834,11 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         for spec in toolkit.get_tools_spec()
         if spec["name"].startswith("dex__motion_move_tcp_to_pose")
     )
+    cardinal_spec = next(
+        spec
+        for spec in toolkit.get_tools_spec()
+        if spec["name"].startswith("dex__motion_step_tcp_cardinal")
+    )
 
     assert set(motion_spec["input_schema"]["properties"]) == set(parameters)
     assert "requested_duration_ms" not in motion_spec["input_schema"][
@@ -691,5 +851,17 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
     assert response["accepted"]
     assert client.submitted_requests[0]["route_hash"] == (
         motion_entry.route.semantic_content_hash
+    )
+    assert set(cardinal_spec["input_schema"]["properties"]) == set(
+        cardinal_parameters
+    )
+    assert "distance_m" not in cardinal_spec["input_schema"]["properties"]
+    cardinal_response = toolkit.execute_tool(
+        cardinal_spec["name"],
+        cardinal_parameters,
+    ).result
+    assert cardinal_response["accepted"]
+    assert client.submitted_requests[1]["route_hash"] == (
+        cardinal_entry.route.semantic_content_hash
     )
     consumer_session.close()
