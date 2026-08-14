@@ -49,6 +49,11 @@ dry-run 的 `source_byte_count` 预留完整输出空间。输出中的 material
 `DatasetCameraSemanticResolver` 和普通按 canonical key 读取的 loader 都看到 identity，避免
 organized provenance 再次把已经换名的数据交换一次。
 
+2026-07-30 已确认的 wrist RGB hardlink write-through 事故数据不能靠左右物化恢复；其中被
+截断的视频通常只剩 1--2 帧，而 Parquet 仍声明完整 episode 帧数。相关数据必须先从独立副本
+恢复或重新采集，禁止绕过上述源视频门禁。事故范围、根因和恢复边界见
+[`deployments/openpi/DATASET_MEDIA_INCIDENT_20260730.md`](../../deployments/openpi/DATASET_MEDIA_INCIDENT_20260730.md)。
+
 相机物化不会读取或复制冷端触觉 payload。含 `tactile_paths` 的数据集只有在 hot 端状态与已
 验证 retirement receipt 一致时才允许 `--apply`：`payload-only` 必须只剩完整、独立 inode 的
 manifest，`whole-prefix` 必须不存在整个 `tactile/`。dry-run 的 `tactile_detach_audit` 会明确
