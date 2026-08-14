@@ -135,8 +135,8 @@ manifest、payload hash 和 inventory 为准，不能只信 tar/zip 进程退出
 不可变内容：
 
 ```text
-dataset base fingerprint
-episodes.jsonl hash
+source binding profile = modality_reference_projection_v1
+tactile reference projection hash（episode_index + tactile_paths）
 modality key = tactile
 logical prefixes = [tactile/]
 episode/sides/sensor keys
@@ -147,8 +147,8 @@ format profile summary（允许 mixed；不能把某一种 codec 作为可拆卸
 inventory content hash
 ```
 
-其中 dataset name 与 task/profile 绑定沿用 `dataset base fingerprint` 中已有的 canonical
-内容，不在 inventory 中再保存一套可分叉的重复身份字段。
+兼容字段名沿用早期 `dataset fingerprint / episode catalog hash`，但由显式 profile 决定含义；
+新 inventory 不再绑定 dataset name、task/profile 或其他模态字段，也不保存一套重复身份。
 
 它只描述“哪些字节属于该逻辑数据集”，不保存 `/mnt/...` 之类本地路径。
 
@@ -472,9 +472,13 @@ SELF_CONTAINED
 没有这些 sidecar 时继续按 `SELF_CONTAINED_LEGACY` 处理；缺文件却没有 verified inventory 时
 必须报告损坏，不能猜测成 detached。
 
-现有 `source_dataset_base_fingerprint()` 只绑定 `meta/info.json`、`tasks.jsonl` 和
-`modality_validity.json`，不会因增加 sidecar 或移动 payload 改变。inventory 另外绑定完整
-`episodes.jsonl` SHA-256，防止它被错误用于后来继续追加过 Episode 的同名数据集。
+新写入 inventory 使用显式 `modality_reference_projection_v1` 绑定：第一个兼容字段保存触觉投影
+合同声明 hash，第二个兼容字段只保存 `episode_index + tactile_paths` 的 canonical hash，计数也只统计
+存在触觉引用的 Episode。manifest/payload 的路径、size 和 SHA-256 仍由 artifact records 独立绑定。
+因此 task 名、视频/Parquet 路径、非触觉 Episode 字段或其他 dataset metadata 的调整不会使触觉
+导出失效；任何 `tactile_paths`、tactile manifest 或 tactile payload 变化仍然 fail closed。旧 inventory
+保持原 semantic hash 和 reader 兼容；当旧的整数据集身份因无关字段变化而失配时，只允许在当前
+触觉引用投影与旧 inventory manifest graph 完全一致时兼容通过。
 
 ### 14.3 最少新增的合同
 
@@ -636,7 +640,7 @@ python -m utils.dataset_postprocess modality-detach \
 
 第一次运行永远是只读 proposal，输出：
 
-- dataset base fingerprint、`episodes.jsonl` hash 和 Episode 数；
+- tactile binding profile、触觉引用投影 hash 和含触觉引用的 Episode 数；
 - payload 文件数、总字节数、预计 hot 释放空间；
 - hot/cold `st_dev`、容量、同 inode/hardlink 风险；
 - inventory hash 和一次性 plan hash；
@@ -1100,7 +1104,7 @@ dataset_root/
 现有 `ModalityArtifactInventoryV1` 已经包含：
 
 - `logical_prefixes=["tactile"]`；
-- dataset base fingerprint 与 `episodes.jsonl` hash；
+- 显式 source binding profile 与触觉引用投影 hash（旧字段名仅为兼容保留）；
 - 每个 manifest/payload 的相对路径、size、SHA-256；
 - Episode、side、sensor key 和 frame count。
 
@@ -1126,13 +1130,14 @@ availability 必须同时使用 inventory 和完成 receipt，不能只根据目
 | manifest 在、全部 payload 不在 | `retire_hot_payloads` complete | 兼容 `DETACHED_VERIFIED` |
 | 手工移走整个目录但没有 receipt | 无 | `INCOMPLETE_OR_CORRUPT` |
 | 目录存在但缺一部分文件 | 任意 | `INCOMPLETE_OR_CORRUPT` |
-| inventory 对应的 catalog 已变化 | 任意 | `STALE_INVENTORY` |
+| catalog 的触觉引用投影已变化 | 任意 | `STALE_INVENTORY` |
+| 仅其他模态引用或非触觉 metadata 变化 | 任意 | 不改变触觉 inventory 可用性 |
 | 目录外出现 inventory 未拥有的 tactile 文件 | 任意 | `INCOMPLETE_OR_CORRUPT` |
 
 whole-prefix detached 时，core-only validator 不再要求 hot manifest；它改为验证：
 
 1. inventory hash 与 schema；
-2. dataset fingerprint、Episode catalog hash/count；
+2. source binding profile、触觉引用投影 hash/count；
 3. whole-tree detach receipt 和无 pending transaction；
 4. inventory 的所有逻辑路径都位于唯一的 `tactile/` 前缀；
 5. hot `tactile/` 整体缺失，而不是部分缺失。
@@ -1159,8 +1164,10 @@ tactile/ 下不能存在 catalog/manifest 未拥有的文件
 ```
 
 新采集数据天然 whole-prefix eligible，但只有无 active Episode、无 finalization、无 writer/reader、
-catalog 冻结后才能执行 detach。detached root 继续禁止追加 Episode；放回并完整校验后才恢复 capture
-admission。这避免为了“可搬目录”修改正式数采频率或 Episode lifecycle。
+触觉引用与触觉 artifact graph 冻结后才能执行 detach；其他模态可以独立维护。detached root 继续
+禁止追加会写触觉的 Episode；放回并通过触觉 graph 校验后才恢复 capture admission。完整 v2.3
+validator 仍可作为独立的数据集质量检查，但不再是触觉 export/detach/rehydrate 的准入条件。这避免
+为了“可搬目录”修改正式数采频率或 Episode lifecycle，也避免无关模态维护阻塞已验证的触觉迁移。
 
 ### 17.5 既有数据迁移
 
@@ -1329,8 +1336,9 @@ inventory hash，旧 inventory 不被改写，并会随 Episode catalog 更新�
   inventory tracking，成功提交后发布新 inventory。旧 inventory 仍保留但不再被当作当前状态；
 - tactile compact 和 UMI temporal alignment/裁剪会改写 payload，必须重新计算 exact stored-byte hash；
   若原数据集已跟踪 inventory，则变换在提交/切换 staged root 前发布新的 immutable revision；
-- 会改变 Episode catalog、manifest 或 payload 的工具不得继承“current”身份；catalog 变化使旧
-  inventory stale，manifest/payload 变化则必须发布新 inventory 或让 admission fail closed；
+- 会改变 `tactile_paths`、tactile manifest 或 tactile payload 的工具不得继承“current”身份；仅其他
+  模态字段变化不影响触觉 inventory，触觉投影或触觉 artifact 变化则必须发布新 inventory 或让
+  admission fail closed；
 - 完整 v2.3 validation 在 detached 时继续失败；不能为冷存储放宽；
 - numeric/video prepared training view 在 `DETACHED_VERIFIED` 时可读，且 source inventory 不包含
   tactile；tactile-enabled view 必须先 rehydrate 或显式绑定已验证 external root；

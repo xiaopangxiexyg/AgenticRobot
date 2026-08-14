@@ -6,9 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dataset_contracts.modality_artifacts import ModalityArtifactInventoryV1
-from dataset_interface.episode_curation import source_dataset_base_fingerprint
-
-from .inventory import _load_episode_records, _sha256_file
+from .inventory import _sha256_file, inventory_source_binding_matches
 
 
 SELF_CONTAINED = "SELF_CONTAINED"
@@ -89,18 +87,8 @@ def resolve_modality_availability(
             len(tuple(a for a in inventory.artifacts if a.role == "payload")),
             f"unsupported detachment scope: {detachment_scope!r}",
         )
-    catalog_path = root / "meta" / "episodes.jsonl"
     try:
-        episodes = _load_episode_records(catalog_path)
-        base_matches = (
-            source_dataset_base_fingerprint(root)
-            == inventory.source_dataset_base_fingerprint
-        )
-        catalog_matches = (
-            _sha256_file(catalog_path)
-            == inventory.source_episode_catalog_sha256
-            and len(episodes) == inventory.source_episode_count
-        )
+        source_binding_matches = inventory_source_binding_matches(root, inventory)
     except (OSError, ValueError) as exc:
         return ModalityAvailability(
             INCOMPLETE_OR_CORRUPT,
@@ -109,13 +97,13 @@ def resolve_modality_availability(
             len(tuple(a for a in inventory.artifacts if a.role == "payload")),
             f"cannot validate source identity: {type(exc).__name__}: {exc}",
         )
-    if not base_matches or not catalog_matches:
+    if not source_binding_matches:
         return ModalityAvailability(
             STALE_INVENTORY,
             inventory.semantic_content_hash,
             0,
             len(tuple(a for a in inventory.artifacts if a.role == "payload")),
-            "dataset base fingerprint or episode catalog changed",
+            "source modality reference binding changed",
         )
 
     manifests = tuple(a for a in inventory.artifacts if a.role == "manifest")

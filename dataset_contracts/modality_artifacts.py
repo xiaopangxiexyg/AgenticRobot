@@ -42,6 +42,14 @@ MODALITY_STORAGE_TRANSFER_STATUSES_V1 = (
     "complete",
     "failed",
 )
+MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1 = (
+    "dataset_base_and_full_episode_catalog_v1"
+)
+MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1 = "modality_reference_projection_v1"
+MODALITY_SOURCE_BINDING_PROFILES_V1 = (
+    MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1,
+    MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1,
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -170,6 +178,7 @@ class ModalityArtifactInventoryV1:
     logical_prefixes: tuple[str, ...]
     artifacts: tuple[ModalityArtifactRecordV1, ...]
     schema_version: str = MODALITY_ARTIFACT_INVENTORY_SCHEMA_V1
+    source_binding_profile: str = MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1
 
     def __post_init__(self) -> None:
         if self.schema_version != MODALITY_ARTIFACT_INVENTORY_SCHEMA_V1:
@@ -201,6 +210,15 @@ class ModalityArtifactInventoryV1:
                 "source_episode_count must be non-negative"
             )
         object.__setattr__(self, "source_episode_count", episode_count)
+        source_binding_profile = str(self.source_binding_profile or "").strip()
+        if source_binding_profile not in MODALITY_SOURCE_BINDING_PROFILES_V1:
+            raise ModalityArtifactContractError(
+                "unsupported source_binding_profile: "
+                f"{source_binding_profile!r}"
+            )
+        object.__setattr__(
+            self, "source_binding_profile", source_binding_profile
+        )
         prefixes = tuple(
             _logical_path(value, field="logical_prefixes")
             for value in self.logical_prefixes
@@ -242,7 +260,7 @@ class ModalityArtifactInventoryV1:
         return sum(item.size_bytes for item in self.artifacts)
 
     def semantic_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "modality_key": self.modality_key,
             "source_dataset_base_fingerprint": self.source_dataset_base_fingerprint,
@@ -253,6 +271,14 @@ class ModalityArtifactInventoryV1:
             "file_count": self.file_count,
             "total_bytes": self.total_bytes,
         }
+        # Preserve the exact semantic hash of already-published V1 inventories.
+        # The additive field is emitted only by the new modality-scoped writer.
+        if (
+            self.source_binding_profile
+            != MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1
+        ):
+            payload["source_binding_profile"] = self.source_binding_profile
+        return payload
 
     @property
     def semantic_content_hash(self) -> str:
@@ -288,6 +314,10 @@ class ModalityArtifactInventoryV1:
             artifacts=tuple(
                 ModalityArtifactRecordV1.from_dict(item)
                 for item in raw_artifacts
+            ),
+            source_binding_profile=payload.get(
+                "source_binding_profile",
+                MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1,
             ),
         )
         if int(payload.get("file_count", -1)) != inventory.file_count:
@@ -439,6 +469,9 @@ __all__ = [
     "MODALITY_STORAGE_TRANSFER_RECEIPT_HASH_DOMAIN_V1",
     "MODALITY_STORAGE_TRANSFER_RECEIPT_SCHEMA_V1",
     "MODALITY_STORAGE_TRANSFER_STATUSES_V1",
+    "MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1",
+    "MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1",
+    "MODALITY_SOURCE_BINDING_PROFILES_V1",
     "ModalityArtifactContractError",
     "ModalityArtifactInventoryV1",
     "ModalityArtifactRecordV1",

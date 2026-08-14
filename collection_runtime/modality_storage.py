@@ -1,9 +1,11 @@
 """Transactional cold-storage operations for detachable dataset modalities.
 
 The production CLI is deliberately dry-run first.  The strict detach/rehydrate
-functions require the exact plan hash and dataset fingerprint emitted by the
-preceding proposal; the managed move freezes the same plan inside one explicit
-apply invocation.  None of them rewrite capture facts or tactile manifests.
+functions require the exact plan hash and source-binding confirmation emitted
+by the preceding proposal; the managed move freezes the same plan inside one
+explicit apply invocation.  Compatibility field names still say "dataset
+fingerprint", but new tactile inventories bind only their tactile reference
+projection.  None of these operations rewrite capture facts or manifests.
 """
 
 from __future__ import annotations
@@ -49,7 +51,6 @@ from dataset_interface.modality_artifacts import (
     verified_detachment_scope,
     verify_modality_artifact_inventory,
 )
-from dataset_interface.validation import validate_v23_core_dataset, validate_v23_dataset
 
 from .dataset_layout import sanitize_dataset_name_for_path
 from .modality_inventory import (
@@ -668,14 +669,6 @@ def _cold_artifact_root(cold_root: Path, inventory: ModalityArtifactInventoryV1)
     )
 
 
-def _require_full_v23(dataset_root: Path) -> None:
-    report = validate_v23_dataset(dataset_root)
-    if not report.ok:
-        raise ModalityStorageError(
-            "strict v2.3 validation failed: " + "; ".join(report.errors[:5])
-        )
-
-
 def _paths_overlap(left: Path, right: Path) -> bool:
     try:
         left.relative_to(right)
@@ -1059,7 +1052,7 @@ def _plan(
     detachment_scope: str,
     require_distinct_device: bool,
     min_free_bytes: int,
-    source_validation_mode: str = "strict_v23",
+    source_validation_mode: str = "tactile_inventory",
     cold_staging_namespace: str = "",
 ) -> ModalityStoragePlan:
     root = _safe_resolved(dataset_root)
@@ -1144,21 +1137,7 @@ def _plan(
         errors.append(f"rehydrate requires DETACHED_VERIFIED, got {availability}")
     try:
         if source_is_hot:
-            if source_validation_mode.startswith("legacy_"):
-                _verify_tactile_reader(root, inventory)
-            else:
-                _require_full_v23(root)
-        else:
-            core = validate_v23_core_dataset(
-                root,
-                verified_inventories=(inventory,),
-                verified_detachment_scopes={inventory.modality_key: scope},
-            )
-            if not core.ok:
-                raise ModalityStorageError(
-                    "core-only v2.3 validation failed: "
-                    + "; ".join(core.errors[:5])
-                )
+            _verify_tactile_reader(root, inventory)
     except Exception as exc:
         errors.append(str(exc))
     if artifact_root.exists() and not source_is_hot:
@@ -1174,6 +1153,7 @@ def _plan(
                 artifact_root=artifact_root,
             )
             _exact_artifact_tree(artifact_root, inventory)
+            _verify_tactile_reader(artifact_root, inventory)
         except Exception as exc:
             errors.append(f"cold artifact root is not reusable: {exc}")
     return ModalityStoragePlan(
@@ -1243,7 +1223,7 @@ def plan_modality_detach(
             if legacy_scan_payload_hashes
             else "legacy_inventory"
             if allow_legacy_hardlinked_source
-            else "strict_v23"
+            else "tactile_inventory"
         ),
     )
 
@@ -1297,7 +1277,7 @@ def plan_modality_export(
             if legacy_scan_payload_hashes
             else "legacy_inventory"
             if allow_legacy_source
-            else "strict_v23"
+            else "tactile_inventory"
         ),
         cold_staging_namespace=cold_staging_namespace,
     )
@@ -1339,7 +1319,7 @@ def _assert_confirmation(
     if plan.plan_hash != str(expected_plan_hash):
         raise ModalityStorageError("plan hash changed; generate a fresh proposal")
     if plan.dataset_fingerprint != str(confirm_dataset_fingerprint):
-        raise ModalityStorageError("dataset fingerprint confirmation mismatch")
+        raise ModalityStorageError("source binding confirmation mismatch")
 
 
 def _verify_independent_copy(
@@ -1541,6 +1521,7 @@ def _restore_drill(
                 source_episode_count=inventory.source_episode_count,
                 logical_prefixes=inventory.logical_prefixes,
                 artifacts=tuple(group),
+                source_binding_profile=inventory.source_binding_profile,
             )
             _copy_inventory_artifacts(artifact_root, drill, group_inventory)
             verify_modality_artifact_inventory(
@@ -1969,10 +1950,7 @@ def export_modality(
             ),
             require_single_link=False,
         )
-        if allow_legacy_source:
-            _verify_tactile_reader(root, inventory)
-        else:
-            _require_full_v23(root)
+        _verify_tactile_reader(root, inventory)
         artifact_root = Path(plan.cold_artifact_root)
         receipt_path = _export_shadow(
             root,
@@ -1991,8 +1969,6 @@ def export_modality(
             allow_disjoint_active_collection=allow_disjoint_active_collection,
             active_collection_dataset_roots=explicit_active_roots,
         )
-        if not allow_legacy_source:
-            _require_full_v23(root)
         current = build_modality_artifact_inventory(
             root,
             payload_hash_mode=(
@@ -2060,15 +2036,6 @@ def detach_modality(
             active_collection_dataset_roots=explicit_active_roots,
         )
         recover_modality_storage_transaction(root)
-        if allow_legacy_hardlinked_source:
-            legacy_inventory = build_modality_artifact_inventory(
-                root,
-                payload_hash_mode=payload_hash_mode,
-                require_single_link=False,
-            )
-            _verify_tactile_reader(root, legacy_inventory)
-        else:
-            _require_full_v23(root)
         plan = plan_modality_detach(
             root,
             cold_root,
@@ -2106,10 +2073,7 @@ def detach_modality(
             allow_disjoint_active_collection=allow_disjoint_active_collection,
             active_collection_dataset_roots=explicit_active_roots,
         )
-        if allow_legacy_hardlinked_source:
-            _verify_tactile_reader(root, inventory)
-        else:
-            _require_full_v23(root)
+        _verify_tactile_reader(root, inventory)
         receipt_paths.append(
             _restore_drill(
                 root,
@@ -2124,8 +2088,9 @@ def detach_modality(
             allow_disjoint_active_collection=allow_disjoint_active_collection,
             active_collection_dataset_roots=explicit_active_roots,
         )
-        # Rebuild before the destructive boundary; any changed manifest/catalog
-        # produces another inventory hash and aborts the frozen plan.
+        # Rebuild before the destructive boundary. Only tactile references,
+        # manifests, and payload identity are frozen by this plan; unrelated
+        # dataset metadata and other modality references may evolve safely.
         if build_modality_artifact_inventory(
             root,
             payload_hash_mode=payload_hash_mode,
@@ -2283,18 +2248,6 @@ def _completed_managed_move_result(
     )
     _exact_artifact_tree(artifact_root, inventory)
     _verify_tactile_reader(artifact_root, inventory)
-    core = validate_v23_core_dataset(
-        dataset_root,
-        verified_inventories=(inventory,),
-        verified_detachment_scopes={
-            inventory.modality_key: WHOLE_PREFIX_DETACH,
-        },
-    )
-    if not core.ok:
-        raise ModalityStorageError(
-            "core-only v2.3 validation failed: " + "; ".join(core.errors[:5])
-        )
-
     payload_count, payload_bytes = _payload_summary(inventory)
     recovered_plan = ModalityStoragePlan(
         operation="detach",
@@ -2313,7 +2266,7 @@ def _completed_managed_move_result(
         payload_file_count=payload_count,
         payload_bytes=payload_bytes,
         restore_drill_peak_bytes=_restore_drill_peak_bytes(inventory),
-        source_validation_mode="strict_v23",
+        source_validation_mode="tactile_inventory",
         availability=SELF_CONTAINED,
         min_free_bytes=int(min_free_bytes),
         ready=True,
@@ -2449,7 +2402,7 @@ def _rehydrate_swap(
         _fsync_directory(dataset_root)
         _fsync_directory(dataset_root.parent)
         verify_modality_artifact_inventory(dataset_root, inventory)
-        _require_full_v23(dataset_root)
+        _verify_tactile_reader(dataset_root, inventory)
         receipt = _receipt(
             operation="rehydrate",
             operation_id=operation_id,

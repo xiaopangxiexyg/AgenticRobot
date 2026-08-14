@@ -7,6 +7,8 @@ from .inventory import (
     PAYLOAD_HASH_REQUIRE_SEALED,
     PAYLOAD_HASH_SCAN,
     build_modality_artifact_inventory,
+    inventory_source_binding_matches,
+    modality_source_binding,
     verify_modality_artifact_inventory,
 )
 from .availability import (
@@ -40,6 +42,8 @@ __all__ = [
     "PAYLOAD_HASH_REQUIRE_SEALED",
     "PAYLOAD_HASH_SCAN",
     "build_modality_artifact_inventory",
+    "inventory_source_binding_matches",
+    "modality_source_binding",
     "verify_modality_artifact_inventory",
     "DETACHMENT_SCOPES",
     "DETACHED_VERIFIED",

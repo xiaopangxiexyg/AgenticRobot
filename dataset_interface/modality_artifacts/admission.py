@@ -7,8 +7,10 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
-from dataset_contracts.modality_artifacts import ModalityArtifactInventoryV1
-from dataset_interface.episode_curation import source_dataset_base_fingerprint
+from dataset_contracts.modality_artifacts import (
+    MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1,
+    ModalityArtifactInventoryV1,
+)
 
 from .availability import (
     DETACHED_VERIFIED,
@@ -16,11 +18,11 @@ from .availability import (
     SELF_CONTAINED,
 )
 from .inventory import (
-    _load_episode_records,
     _read_json_object,
     _resolve_existing_file,
     _safe_relative_path,
     _sha256_file,
+    inventory_source_binding_matches,
 )
 
 
@@ -289,16 +291,9 @@ def assert_dataset_capture_writable(
         if inventory_dir.is_dir()
         else ()
     )
-    try:
-        current_catalog_sha256 = _sha256_file(catalog_path)
-        current_episode_count = len(_load_episode_records(catalog_path))
-        current_base_fingerprint = source_dataset_base_fingerprint(root)
-    except (OSError, ValueError) as exc:
-        raise DatasetCaptureWritableError(
-            f"cannot inspect current dataset identity before capture: {exc}"
-        ) from exc
-
-    identity_candidates: list[ModalityArtifactInventoryV1] = []
+    identity_candidates_by_graph: dict[
+        tuple[object, ...], ModalityArtifactInventoryV1
+    ] = {}
     for path in inventory_paths:
         try:
             inventory = ModalityArtifactInventoryV1.from_dict(_read_object(path))
@@ -306,17 +301,34 @@ def assert_dataset_capture_writable(
             raise DatasetCaptureWritableError(
                 f"invalid modality inventory sidecar {path}: {exc}"
             ) from exc
-        if (
-            inventory.source_episode_catalog_sha256 == current_catalog_sha256
-            and inventory.source_episode_count == current_episode_count
-            and inventory.source_dataset_base_fingerprint
-            == current_base_fingerprint
-        ):
-            identity_candidates.append(inventory)
+        try:
+            binding_matches = inventory_source_binding_matches(root, inventory)
+        except (OSError, ValueError) as exc:
+            raise DatasetCaptureWritableError(
+                "cannot inspect current tactile reference binding before capture: "
+                f"{exc}"
+            ) from exc
+        if binding_matches:
+            graph_key: tuple[object, ...] = (
+                inventory.modality_key,
+                inventory.logical_prefixes,
+                inventory.artifacts,
+            )
+            existing = identity_candidates_by_graph.get(graph_key)
+            if (
+                existing is None
+                or inventory.source_binding_profile
+                == MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1
+            ):
+                # A scoped inventory may coexist with a legacy inventory for
+                # the exact same tactile graph. Treat those as one candidate
+                # and prefer the explicit scoped contract. Different graphs
+                # remain distinct and retain the ambiguity fail-closed check.
+                identity_candidates_by_graph[graph_key] = inventory
 
     discovered_hot = _discovered_tactile_files(root)
     inspected_current: list[tuple[ModalityArtifactInventoryV1, str, str]] = []
-    for inventory in identity_candidates:
+    for inventory in identity_candidates_by_graph.values():
         status, reason = _capture_inventory_hot_status(
             root,
             inventory,

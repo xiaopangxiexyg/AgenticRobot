@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -102,17 +101,10 @@ def _compressions(root: Path) -> list[str]:
 
 @pytest.fixture
 def offline_storage_validation() -> object:
-    def validation_ok(*_args: object, **_kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(ok=True, errors=[])
-
-    with (
-        mock.patch.object(storage, "_require_full_v23", return_value=None),
-        mock.patch.object(
-            storage,
-            "validate_v23_core_dataset",
-            side_effect=validation_ok,
-        ),
-        mock.patch.object(storage, "_active_collection_processes", return_value=()),
+    with mock.patch.object(
+        storage,
+        "_active_collection_processes",
+        return_value=(),
     ):
         yield
 

@@ -9,6 +9,8 @@ import re
 from typing import Any, Mapping
 
 from dataset_contracts.modality_artifacts import (
+    MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1,
+    MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1,
     ModalityArtifactInventoryV1,
     ModalityArtifactRecordV1,
 )
@@ -29,6 +31,12 @@ PAYLOAD_HASH_MODES = (
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STORED_HASH_PROFILE_V1 = "stored_bytes_sha256_v1"
+_MODALITY_BINDING_DECLARATION_SCHEMA_V1 = (
+    "dexteleop.modality_source_binding_declaration.v1"
+)
+_MODALITY_REFERENCE_PROJECTION_SCHEMA_V1 = (
+    "dexteleop.modality_episode_reference_projection.v1"
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -40,6 +48,17 @@ def _sha256_file(path: Path) -> str:
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _safe_relative_path(value: Any, *, field: str, prefix: str) -> str:
@@ -140,6 +159,156 @@ def _load_episode_records(path: Path) -> tuple[Mapping[str, Any], ...]:
         seen_indices.add(index)
         records.append(value)
     return tuple(records)
+
+
+def _modality_reference_projection(
+    episodes: tuple[Mapping[str, Any], ...],
+    *,
+    modality: str,
+) -> tuple[dict[str, Any], ...]:
+    if modality != "tactile":
+        raise ModalityArtifactInventoryError(
+            f"unsupported modality reference projection: {modality!r}"
+        )
+    projected: list[dict[str, Any]] = []
+    for episode in episodes:
+        episode_index = int(episode["episode_index"])
+        tactile_paths = episode.get("tactile_paths", {})
+        if not isinstance(tactile_paths, Mapping):
+            raise ModalityArtifactInventoryError(
+                f"episode {episode_index} tactile_paths must be an object"
+            )
+        references = {
+            str(side): _safe_relative_path(
+                value,
+                field=f"episode {episode_index} tactile_paths.{side}",
+                prefix="tactile",
+            )
+            for side, value in sorted(
+                tactile_paths.items(), key=lambda item: str(item[0])
+            )
+        }
+        if references:
+            projected.append(
+                {
+                    "episode_index": episode_index,
+                    "tactile_paths": references,
+                }
+            )
+    return tuple(projected)
+
+
+def modality_source_binding(
+    dataset_root: str | Path,
+    *,
+    modality: str = "tactile",
+    episodes: tuple[Mapping[str, Any], ...] | None = None,
+) -> tuple[str, str, int]:
+    """Return a modality-scoped binding without hashing unrelated metadata.
+
+    The declaration hash identifies the projection contract.  The reference
+    hash covers only episode identity and the selected modality's logical
+    references.  Payload and manifest byte identity remains owned by artifact
+    records in the inventory itself.
+    """
+
+    root = Path(dataset_root).expanduser().resolve()
+    records = (
+        _load_episode_records(root / "meta" / "episodes.jsonl")
+        if episodes is None
+        else episodes
+    )
+    projection = _modality_reference_projection(records, modality=modality)
+    declaration_hash = _canonical_sha256(
+        {
+            "schema": _MODALITY_BINDING_DECLARATION_SCHEMA_V1,
+            "modality_key": modality,
+            "logical_prefixes": [modality],
+        }
+    )
+    reference_hash = _canonical_sha256(
+        {
+            "schema": _MODALITY_REFERENCE_PROJECTION_SCHEMA_V1,
+            "modality_key": modality,
+            "episodes": list(projection),
+        }
+    )
+    return declaration_hash, reference_hash, len(projection)
+
+
+def _inventory_reference_projection(
+    inventory: ModalityArtifactInventoryV1,
+) -> tuple[dict[str, Any], ...]:
+    episode_references: dict[int, dict[str, str]] = {}
+    for artifact in inventory.artifacts:
+        if artifact.role != "manifest":
+            continue
+        if artifact.episode_index is None or artifact.side is None:
+            raise ModalityArtifactInventoryError(
+                "manifest artifact lacks episode/side reference identity"
+            )
+        side_map = episode_references.setdefault(int(artifact.episode_index), {})
+        side = str(artifact.side)
+        if side in side_map:
+            raise ModalityArtifactInventoryError(
+                f"duplicate manifest side binding for episode {artifact.episode_index}: {side}"
+            )
+        side_map[side] = artifact.logical_path
+    return tuple(
+        {
+            "episode_index": episode_index,
+            "tactile_paths": dict(sorted(side_map.items())),
+        }
+        for episode_index, side_map in sorted(episode_references.items())
+    )
+
+
+def inventory_source_binding_matches(
+    dataset_root: str | Path,
+    inventory: ModalityArtifactInventoryV1,
+) -> bool:
+    """Check the binding profile while preserving legacy inventory hashes.
+
+    Legacy inventories first retain their exact original identity check.  If
+    unrelated dataset metadata changed, a compatibility fallback accepts them
+    only when the current modality reference projection exactly equals the
+    manifest graph already committed in the inventory.
+    """
+
+    root = Path(dataset_root).expanduser().resolve()
+    catalog_path = root / "meta" / "episodes.jsonl"
+    episodes = _load_episode_records(catalog_path)
+    if (
+        inventory.source_binding_profile
+        == MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1
+    ):
+        declaration, references, count = modality_source_binding(
+            root,
+            modality=inventory.modality_key,
+            episodes=episodes,
+        )
+        return (
+            declaration == inventory.source_dataset_base_fingerprint
+            and references == inventory.source_episode_catalog_sha256
+            and count == inventory.source_episode_count
+        )
+    if (
+        inventory.source_binding_profile
+        != MODALITY_SOURCE_BINDING_PROFILE_LEGACY_V1
+    ):
+        return False
+    legacy_matches = (
+        source_dataset_base_fingerprint(root)
+        == inventory.source_dataset_base_fingerprint
+        and _sha256_file(catalog_path)
+        == inventory.source_episode_catalog_sha256
+        and len(episodes) == inventory.source_episode_count
+    )
+    if legacy_matches:
+        return True
+    return _modality_reference_projection(
+        episodes, modality=inventory.modality_key
+    ) == _inventory_reference_projection(inventory)
 
 
 def _record_for_file(
@@ -368,13 +537,19 @@ def build_modality_artifact_inventory(
             f"unowned tactile files are not inventory-safe: {extra[:5]}"
         )
     ordered = tuple(artifacts[path] for path in sorted(artifacts))
+    declaration_hash, reference_hash, reference_count = modality_source_binding(
+        root,
+        modality="tactile",
+        episodes=episodes,
+    )
     return ModalityArtifactInventoryV1(
         modality_key="tactile",
-        source_dataset_base_fingerprint=source_dataset_base_fingerprint(root),
-        source_episode_catalog_sha256=_sha256_file(catalog_path),
-        source_episode_count=len(episodes),
+        source_dataset_base_fingerprint=declaration_hash,
+        source_episode_catalog_sha256=reference_hash,
+        source_episode_count=reference_count,
         logical_prefixes=("tactile",),
         artifacts=ordered,
+        source_binding_profile=MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1,
     )
 
 
@@ -387,14 +562,10 @@ def verify_modality_artifact_inventory(
     """Verify catalog identity and every artifact byte without modifying data."""
 
     root = Path(dataset_root).expanduser().resolve()
-    catalog_path = root / "meta" / "episodes.jsonl"
-    episodes = _load_episode_records(catalog_path)
-    if source_dataset_base_fingerprint(root) != inventory.source_dataset_base_fingerprint:
-        raise ModalityArtifactInventoryError("source dataset base fingerprint changed")
-    if _sha256_file(catalog_path) != inventory.source_episode_catalog_sha256:
-        raise ModalityArtifactInventoryError("source episode catalog changed")
-    if len(episodes) != inventory.source_episode_count:
-        raise ModalityArtifactInventoryError("source episode count changed")
+    if not inventory_source_binding_matches(root, inventory):
+        raise ModalityArtifactInventoryError(
+            "source modality reference binding changed"
+        )
     storage_root = (
         root
         if artifact_root is None
@@ -424,5 +595,7 @@ __all__ = [
     "PAYLOAD_HASH_REQUIRE_SEALED",
     "PAYLOAD_HASH_SCAN",
     "build_modality_artifact_inventory",
+    "inventory_source_binding_matches",
+    "modality_source_binding",
     "verify_modality_artifact_inventory",
 ]

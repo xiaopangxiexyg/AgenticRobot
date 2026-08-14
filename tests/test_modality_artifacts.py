@@ -8,6 +8,7 @@ import shutil
 import pytest
 
 from dataset_contracts.modality_artifacts import (
+    MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1,
     ModalityArtifactContractError,
     ModalityArtifactInventoryV1,
     ModalityStorageTransferReceiptV1,
@@ -28,6 +29,7 @@ from dataset_interface.modality_artifacts import (
     verify_modality_artifact_inventory,
     verified_detachment_scope,
 )
+from dataset_interface.episode_curation import source_dataset_base_fingerprint
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -105,6 +107,10 @@ def test_tactile_inventory_round_trip_and_mixed_codec_graph(tmp_path: Path) -> N
     inventory = build_modality_artifact_inventory(root)
 
     assert inventory.modality_key == "tactile"
+    assert (
+        inventory.source_binding_profile
+        == MODALITY_SOURCE_BINDING_PROFILE_SCOPED_V1
+    )
     assert inventory.file_count == 3
     assert [item.role for item in inventory.artifacts].count("manifest") == 1
     assert [item.role for item in inventory.artifacts].count("payload") == 2
@@ -241,10 +247,9 @@ def test_availability_fails_closed_for_partial_extra_and_stale_states(
     root = _dataset(tmp_path / "stale")
     inventory = build_modality_artifact_inventory(root)
     catalog = root / "meta" / "episodes.jsonl"
-    catalog.write_text(
-        catalog.read_text(encoding="utf-8").rstrip() + " \n",
-        encoding="utf-8",
-    )
+    record = json.loads(catalog.read_text(encoding="utf-8"))
+    record["tactile_paths"]["left"] = "tactile/changed/manifest.json"
+    catalog.write_text(json.dumps(record) + "\n", encoding="utf-8")
     stale = resolve_modality_availability(root, inventory)
     assert stale.status == STALE_INVENTORY
     assert stale.core_training_eligible is False
@@ -305,15 +310,29 @@ def test_inventory_rejects_symlink_and_hardlink_artifacts(tmp_path: Path) -> Non
         build_modality_artifact_inventory(root)
 
 
-def test_inventory_detects_catalog_or_payload_mutation(tmp_path: Path) -> None:
+def test_inventory_ignores_unrelated_metadata_but_detects_tactile_mutation(
+    tmp_path: Path,
+) -> None:
     root = _dataset(tmp_path / "dataset")
     inventory = build_modality_artifact_inventory(root)
     catalog = root / "meta" / "episodes.jsonl"
-    catalog.write_text(
-        catalog.read_text(encoding="utf-8").rstrip() + " \n",
+    record = json.loads(catalog.read_text(encoding="utf-8"))
+    record["video_paths"] = {"front": "videos/front/new.mp4"}
+    record["frame_count"] = 99
+    catalog.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    _write_json(root / "meta/info.json", {"episode_count": 1, "task": "renamed"})
+    (root / "meta/tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task": "renamed"}) + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ModalityArtifactInventoryError, match="catalog changed"):
+    _write_json(root / "meta/modality_validity.json", {"video": "updated"})
+
+    assert build_modality_artifact_inventory(root) == inventory
+    verify_modality_artifact_inventory(root, inventory)
+
+    record["tactile_paths"]["left"] = "tactile/changed/manifest.json"
+    catalog.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(ModalityArtifactInventoryError, match="reference binding"):
         verify_modality_artifact_inventory(root, inventory)
 
     root = _dataset(tmp_path / "payload")
@@ -323,6 +342,42 @@ def test_inventory_detects_catalog_or_payload_mutation(tmp_path: Path) -> None:
     payload.write_bytes(bytes([original[0] ^ 0x01]) + original[1:])
     with pytest.raises(ModalityArtifactInventoryError, match="hash changed"):
         verify_modality_artifact_inventory(root, inventory)
+
+
+def test_legacy_inventory_keeps_its_hash_and_uses_safe_scoped_fallback(
+    tmp_path: Path,
+) -> None:
+    root = _dataset(tmp_path / "dataset")
+    scoped = build_modality_artifact_inventory(root)
+    catalog = root / "meta/episodes.jsonl"
+    legacy = ModalityArtifactInventoryV1(
+        modality_key="tactile",
+        source_dataset_base_fingerprint=source_dataset_base_fingerprint(root),
+        source_episode_catalog_sha256=hashlib.sha256(
+            catalog.read_bytes()
+        ).hexdigest(),
+        source_episode_count=1,
+        logical_prefixes=("tactile",),
+        artifacts=scoped.artifacts,
+    )
+    legacy_payload = legacy.to_dict()
+    legacy_hash = legacy.semantic_content_hash
+    assert "source_binding_profile" not in legacy_payload
+    assert ModalityArtifactInventoryV1.from_dict(legacy_payload) == legacy
+    assert ModalityArtifactInventoryV1.from_dict(
+        legacy_payload
+    ).semantic_content_hash == legacy_hash
+
+    record = json.loads(catalog.read_text(encoding="utf-8"))
+    record["video_paths"] = {"front": "videos/front/repacked.mp4"}
+    catalog.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    _write_json(root / "meta/info.json", {"episode_count": 1, "task": "renamed"})
+    verify_modality_artifact_inventory(root, legacy)
+
+    record["tactile_paths"]["left"] = "tactile/changed/manifest.json"
+    catalog.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(ModalityArtifactInventoryError, match="reference binding"):
+        verify_modality_artifact_inventory(root, legacy)
 
 
 def test_inventory_contract_rejects_tampered_summary_hash(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ from collection_runtime import modality_storage as storage
 from collection_runtime.tactile_recompression import (
     recompress_tactile_zstd_in_place,
 )
+from dataset_contracts.modality_artifacts import ModalityArtifactInventoryV1
+from dataset_interface.episode_curation import source_dataset_base_fingerprint
 from dataset_interface.modality_artifacts import (
     DETACHED_VERIFIED,
     SELF_CONTAINED,
@@ -95,10 +98,6 @@ def _artifact_snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
-def _validation_ok(*_args: object, **_kwargs: object) -> SimpleNamespace:
-    return SimpleNamespace(ok=True, errors=[])
-
-
 def test_fsync_retries_transient_network_filesystem_error() -> None:
     transient = BlockingIOError(errno.EAGAIN, "try again")
     with (
@@ -172,14 +171,10 @@ def test_cold_staging_namespace_is_path_safe_and_preserves_default_names() -> No
 
 @pytest.fixture
 def offline_validation() -> object:
-    with (
-        mock.patch.object(storage, "_require_full_v23", return_value=None),
-        mock.patch.object(
-            storage,
-            "validate_v23_core_dataset",
-            side_effect=_validation_ok,
-        ),
-        mock.patch.object(storage, "_active_collection_processes", return_value=()),
+    with mock.patch.object(
+        storage,
+        "_active_collection_processes",
+        return_value=(),
     ):
         yield
 
@@ -351,26 +346,21 @@ def test_legacy_export_is_explicit_and_still_rejects_invalid_tactile_payload(
     root = _dataset(tmp_path / "legacy-dataset")
     cold = tmp_path / "cold"
     cold.mkdir()
-    with mock.patch.object(
-        storage,
-        "_require_full_v23",
-        side_effect=storage.ModalityStorageError("not native v2.3"),
-    ):
-        strict = storage.plan_modality_export(
-            root,
-            cold,
-            require_distinct_device=False,
-            min_free_bytes=0,
-        )
-        legacy = storage.plan_modality_export(
-            root,
-            cold,
-            require_distinct_device=False,
-            min_free_bytes=0,
-            allow_legacy_source=True,
-        )
-    assert not strict.ready
-    assert strict.source_validation_mode == "strict_v23"
+    strict = storage.plan_modality_export(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+    )
+    legacy = storage.plan_modality_export(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        allow_legacy_source=True,
+    )
+    assert strict.ready, strict.errors
+    assert strict.source_validation_mode == "tactile_inventory"
     assert legacy.ready, legacy.errors
     assert legacy.source_validation_mode == "legacy_inventory"
     assert strict.plan_hash != legacy.plan_hash
@@ -600,21 +590,30 @@ def test_capture_admission_filters_historical_inventories_without_payload_rehash
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _dataset(tmp_path / "tracked-history")
-    historical = build_modality_artifact_inventory(root)
+    current = build_modality_artifact_inventory(root)
+    catalog = root / "meta/episodes.jsonl"
+    historical = ModalityArtifactInventoryV1(
+        modality_key="tactile",
+        source_dataset_base_fingerprint=source_dataset_base_fingerprint(root),
+        source_episode_catalog_sha256=hashlib.sha256(
+            catalog.read_bytes()
+        ).hexdigest(),
+        source_episode_count=1,
+        logical_prefixes=("tactile",),
+        artifacts=current.artifacts,
+    )
     inventory_dir = root / "meta/modality_artifacts/tactile/inventories"
     _write_json(
         inventory_dir / f"{historical.semantic_content_hash}.json",
         historical.to_dict(),
     )
 
-    # A catalog-byte change makes the first immutable revision historical while
-    # leaving its finalized tactile graph untouched.
-    catalog = root / "meta/episodes.jsonl"
-    catalog.write_text(
-        catalog.read_text(encoding="utf-8").rstrip() + " \n",
-        encoding="utf-8",
-    )
-    current = build_modality_artifact_inventory(root)
+    # The new scoped inventory may coexist with a legacy whole-dataset-bound
+    # inventory for the exact same tactile graph. An unrelated catalog change
+    # invalidates only the legacy fast path; admission safely coalesces them.
+    record = json.loads(catalog.read_text(encoding="utf-8"))
+    record["video_paths"] = {"front": "videos/front/repacked.mp4"}
+    catalog.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
     _write_json(
         inventory_dir / f"{current.semantic_content_hash}.json",
         current.to_dict(),
@@ -636,12 +635,12 @@ def test_capture_admission_filters_historical_inventories_without_payload_rehash
     manifest_relative = next(
         item.logical_path for item in current.artifacts if item.role == "manifest"
     )
-    assert hashed_paths.count("meta/episodes.jsonl") == 1
+    assert "meta/episodes.jsonl" not in hashed_paths
     assert manifest_relative in hashed_paths
     assert payload_relative not in hashed_paths
 
 
-def test_wrong_confirmation_and_catalog_change_cannot_reach_retirement(
+def test_wrong_confirmation_and_tactile_change_cannot_reach_retirement(
     tmp_path: Path,
     offline_validation: object,
 ) -> None:
@@ -669,11 +668,11 @@ def test_wrong_confirmation_and_catalog_change_cannot_reach_retirement(
     assert _artifact_snapshot(root) == before
     assert not (root / "meta/modality_artifacts/tactile/inventories").exists()
 
-    catalog = root / "meta/episodes.jsonl"
-    catalog.write_text(
-        catalog.read_text(encoding="utf-8").rstrip() + " \n",
-        encoding="utf-8",
-    )
+    manifest = next((root / "tactile").rglob("manifest.json"))
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_payload["tactile_revision"] = 2
+    _write_json(manifest, manifest_payload)
+    changed_before_apply = _artifact_snapshot(root)
     with pytest.raises(storage.ModalityStorageError, match="plan hash changed"):
         storage.detach_modality(
             root,
@@ -684,7 +683,7 @@ def test_wrong_confirmation_and_catalog_change_cannot_reach_retirement(
             min_free_bytes=0,
             confirm_no_active_readers=True,
         )
-    assert _artifact_snapshot(root) == before
+    assert _artifact_snapshot(root) == changed_before_apply
 
 
 def test_missing_reader_confirmation_is_zero_write_rejection(
@@ -850,7 +849,7 @@ def test_explicit_legacy_hardlink_detach_preserves_sibling_and_is_rehydratable(
     assert payload.stat().st_ino != sibling_link.stat().st_ino
 
 
-def test_legacy_detach_plan_uses_reader_validation_not_native_v23(
+def test_detach_plans_use_tactile_reader_validation_only(
     tmp_path: Path,
     offline_validation: object,
 ) -> None:
@@ -858,29 +857,24 @@ def test_legacy_detach_plan_uses_reader_validation_not_native_v23(
     cold = tmp_path / "cold"
     cold.mkdir()
 
-    with mock.patch.object(
-        storage,
-        "_require_full_v23",
-        side_effect=AssertionError("native v2.3 validation must not run"),
-    ):
-        legacy = storage.plan_modality_detach(
-            root,
-            cold,
-            require_distinct_device=False,
-            min_free_bytes=0,
-            allow_legacy_hardlinked_source=True,
-        )
-        strict = storage.plan_modality_detach(
-            root,
-            cold,
-            require_distinct_device=False,
-            min_free_bytes=0,
-        )
+    legacy = storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        allow_legacy_hardlinked_source=True,
+    )
+    strict = storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+    )
 
     assert legacy.ready, legacy.errors
     assert legacy.source_validation_mode == "legacy_inventory"
-    assert strict.ready is False
-    assert "native v2.3 validation must not run" in strict.errors
+    assert strict.ready, strict.errors
+    assert strict.source_validation_mode == "tactile_inventory"
 
 
 def test_legacy_scan_detach_binds_actual_bytes_when_sealed_hash_is_stale(
@@ -971,7 +965,7 @@ def test_restore_drill_failure_keeps_hot_payload_and_never_retires(
 
     with mock.patch.object(
         storage,
-        "_verify_tactile_reader",
+        "_restore_drill",
         side_effect=ValueError("injected drill failure"),
     ):
         with pytest.raises(ValueError, match="injected drill failure"):
@@ -996,14 +990,13 @@ def test_restore_drill_failure_keeps_hot_payload_and_never_retires(
     assert operations == {"export_shadow"}
 
 
-def test_catalog_change_after_restore_drill_aborts_before_retirement(
+def test_unrelated_catalog_change_after_restore_drill_does_not_abort_retirement(
     tmp_path: Path,
     offline_validation: object,
 ) -> None:
     root = _dataset(tmp_path / "dataset")
     cold = tmp_path / "cold"
     cold.mkdir()
-    before = _artifact_snapshot(root)
     plan = storage.plan_modality_detach(
         root,
         cold,
@@ -1022,6 +1015,48 @@ def test_catalog_change_after_restore_drill_aborts_before_retirement(
         return receipt
 
     with mock.patch.object(storage, "_restore_drill", side_effect=drill_then_change_catalog):
+        result = storage.detach_modality(
+            root,
+            cold,
+            expected_plan_hash=plan.plan_hash,
+            confirm_dataset_fingerprint=plan.dataset_fingerprint,
+            require_distinct_device=False,
+            min_free_bytes=0,
+            confirm_no_active_readers=True,
+        )
+
+    assert result.final_status == DETACHED_VERIFIED
+
+
+def test_tactile_manifest_change_after_restore_drill_aborts_before_retirement(
+    tmp_path: Path,
+    offline_validation: object,
+) -> None:
+    root = _dataset(tmp_path / "dataset")
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    before = _artifact_snapshot(root)
+    plan = storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+    )
+    original_drill = storage._restore_drill
+
+    def drill_then_change_manifest(*args: object, **kwargs: object) -> Path:
+        receipt = original_drill(*args, **kwargs)  # type: ignore[arg-type]
+        manifest = next((root / "tactile").rglob("manifest.json"))
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["tactile_revision"] = 2
+        _write_json(manifest, payload)
+        return receipt
+
+    with mock.patch.object(
+        storage,
+        "_restore_drill",
+        side_effect=drill_then_change_manifest,
+    ):
         with pytest.raises(storage.ModalityStorageError, match="changed after shadow"):
             storage.detach_modality(
                 root,
@@ -1033,7 +1068,8 @@ def test_catalog_change_after_restore_drill_aborts_before_retirement(
                 confirm_no_active_readers=True,
             )
 
-    assert _artifact_snapshot(root) == before
+    assert (root / "tactile").is_dir()
+    assert set(_artifact_snapshot(root)) == set(before)
 
 
 def test_partial_cold_target_is_rejected_in_read_only_plan(
@@ -1136,8 +1172,8 @@ def test_rehydrate_validation_failure_rolls_back_to_detached(
 
     with mock.patch.object(
         storage,
-        "_require_full_v23",
-        side_effect=storage.ModalityStorageError("injected full validation failure"),
+        "_verify_tactile_reader",
+        side_effect=storage.ModalityStorageError("injected tactile validation failure"),
     ):
         with pytest.raises(storage.ModalityStorageError, match="injected"):
             storage.rehydrate_modality(
