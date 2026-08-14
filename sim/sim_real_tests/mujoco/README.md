@@ -5,6 +5,24 @@ They may depend on `sim.mujoco` and `robot_motion`, but must not import
 `teleop_runtime` or real hardware drivers. Keep model-only FK/IK/qpos checks in
 `../rm65/` so they remain fast and can run without constructing `mjModel`.
 
+## Cardinal TCP displacement primitives
+
+`tcp_displacement_primitives_closed_loop.py` executes the six fixed 3 cm
+`robot_motion.primitives` translations through the existing 60 Hz coupled IK,
+120 Hz qcmd, and 1000 Hz MuJoCo physics chain. The left arm completes
+forward/backward/left/right/up/down first; the right arm then repeats the same
+sequence. Every primitive starts from and returns to the measured simulation
+anchor, so direction or frame mistakes do not accumulate across cases.
+
+`view_tcp_displacement_primitives.py` replays the physical trace with a target
+star at each arm anchor. Red denotes +/-X, green +/-Y, blue +/-Z, magenta the
+left actual TCP trail, cyan the right actual TCP trail, and yellow the active
+target.
+
+```bash
+python -m sim.sim_real_tests.mujoco.view_tcp_displacement_primitives
+```
+
 ## Active TCP-pose envelope closed loop
 
 `tcp_pose_envelope_closed_loop.py` binds the backend-neutral TCP target
