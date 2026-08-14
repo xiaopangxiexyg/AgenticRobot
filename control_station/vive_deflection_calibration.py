@@ -11,8 +11,9 @@ from __future__ import annotations
 import copy
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .vive_calibration import (
     ViveCoordinateCalibrationConfig,
@@ -251,7 +252,8 @@ class ViveDeflectionCalibrationLauncher:
             return
         try:
             receipt = dict(applier(resolved))
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
+            # Profile appliers are integration callbacks with varied failures.
             with self._lock:
                 self._apply_error = f"{type(error).__name__}:{error}"
             return

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import socket
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -13,9 +13,11 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-import control_station.vive_calibration_profiles as vive_calibration_profiles
-from control_composition.observability import project_pose_matrix_deflection
-from control_composition.observability import projectable_pose_matrix
+from control_composition.observability import (
+    project_pose_matrix_deflection,
+    projectable_pose_matrix,
+)
+from control_station import vive_calibration_profiles
 from control_station.trajectory_guidance_webgl import (
     TRAJECTORY_GUIDANCE_WEBGL_JS,
 )
@@ -30,14 +32,14 @@ from control_station.vive_deflection import (
     _build_vive_source,
     _load_coordinate_profile_for_source,
 )
-from control_station.vive_deflection_cli import main
 from control_station.vive_deflection_calibration import (
     ViveDeflectionCalibrationLauncher,
 )
+from control_station.vive_deflection_cli import main
 from control_station.vive_deflection_gui import (
+    _HTML,
     ViveDeflectionGui,
     _Handler,
-    _HTML,
     _Server,
 )
 

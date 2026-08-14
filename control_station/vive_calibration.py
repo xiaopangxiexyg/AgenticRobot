@@ -14,18 +14,19 @@ import math
 import queue
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any
 
 from project_paths import control_station_vive_coordinate_profiles_dir
 from teleop_runtime.calibration import SIGNED_SWEEP_DEFAULT_POST_YAW_DEG
+from teleop_runtime.real_teleop.side_mapping import build_vive_tracker_configs_for_args
 from teleop_runtime.real_teleop.vive_calibration_runtime import (
     ViveCoordinateCalibrationContext,
     calibrate_vive_coordinate_profile,
 )
-from teleop_runtime.real_teleop.side_mapping import build_vive_tracker_configs_for_args
 from teleop_runtime.sources.pose import VivePoseSource
 from teleop_runtime.transforms import as_pose_matrix
 
@@ -39,7 +40,6 @@ from .vive_calibration_profiles import (
     normalize_active_sides,
     save_coordinate_profile,
 )
-
 
 _DEFAULT_VIVE_PORT = 9999
 _DEFAULT_CLOCK_SYNC_PORT = 10001
@@ -430,7 +430,7 @@ class ViveCoordinateCalibrationController:
                 self._stage = _CAPTURE_STAGE_TO_STAGE.get(stage, self._stage)
             if "capture_phase" in updates:
                 self._phase = str(updates["capture_phase"])
-            if "control_hint" in updates and updates["control_hint"]:
+            if updates.get("control_hint"):
                 self._message = str(updates["control_hint"])
 
     def dispatch(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
@@ -560,7 +560,8 @@ class ViveCoordinateCalibrationController:
             raise RuntimeError("Cannot swap VIVE sources during capture.")
         swap = getattr(self._source, "swap_left_right_source_roles", None)
         if not callable(swap):
-            raise RuntimeError(
+            # Missing runtime capability is not caller argument misuse.
+            raise RuntimeError(  # noqa: TRY004
                 "The selected VIVE source does not support left/right swapping."
             )
         receipt = dict(swap())
@@ -605,7 +606,8 @@ class ViveCoordinateCalibrationController:
         if channels is None:
             try:
                 channels = self._source.get_latest_channels()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
+                # VIVE backends may surface SDK-specific read failures.
                 return {
                     "ready": False,
                     "checked_at": checked_at,
@@ -757,7 +759,8 @@ class ViveCoordinateCalibrationController:
                 self._draft = self._new_draft()
                 self._current_profile_path = ""
                 self._ui_state = {}
-        except Exception as exc:  # Surface workflow failures in the GUI.
+        except Exception as exc:  # noqa: BLE001
+            # Surface arbitrary workflow/backend failures in the GUI state.
             with self._lock:
                 self._stage, self._phase = "error", "error"
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -807,16 +810,19 @@ class ViveCoordinateCalibrationController:
             }
             try:
                 profile = coordinate_profile_view(self._draft)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
+                # Snapshot publication is best effort; retain the minimal view.
                 pass
             try:
                 channels = self._source.get_latest_channels()
-            except Exception:
+            except Exception:  # noqa: BLE001
+                # Device status is optional for a best-effort GUI snapshot.
                 channels = {}
             input_preflight = self._input_preflight(channels=channels, now=now)
             try:
                 source_stats = self._source.debug_stats()
-            except Exception:
+            except Exception:  # noqa: BLE001
+                # Backend diagnostics are optional for snapshot publication.
                 source_stats = {}
             source_lifecycle_owned = bool(
                 getattr(self._source, "lifecycle_owned", True)
@@ -830,7 +836,8 @@ class ViveCoordinateCalibrationController:
                 source_role_by_output_channel = dict(
                     self._source.source_role_by_output_channel
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
+                # Role projection is optional for snapshot publication.
                 source_role_by_output_channel = {}
             capture_samples = self._ui_state.get("capture_samples")
             if capture_samples is None:

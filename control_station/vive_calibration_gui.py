@@ -14,7 +14,6 @@ from urllib.parse import urlsplit
 
 from .vive_calibration import ViveCoordinateCalibrationController
 
-
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
@@ -565,7 +564,7 @@ class _CalibrationHandler(BaseHTTPRequestHandler):
     def controller(self) -> ViveCoordinateCalibrationController:
         controller = self.server.controller
         if not isinstance(controller, ViveCoordinateCalibrationController):
-            raise RuntimeError("Calibration GUI controller is invalid.")
+            raise TypeError("Calibration GUI controller is invalid.")
         return controller
 
     def log_message(self, _format: str, *_args: object) -> None:
@@ -600,7 +599,7 @@ class _CalibrationHandler(BaseHTTPRequestHandler):
         payload = json.dumps(_json_safe(value), ensure_ascii=False, allow_nan=False).encode("utf-8")
         self._send(status, payload, "application/json; charset=utf-8")
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path in {"/", "/index.html"}:
             nonce = secrets.token_urlsafe(18)
@@ -617,7 +616,7 @@ class _CalibrationHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         if urlsplit(self.path).path != "/api/event":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -627,13 +626,14 @@ class _CalibrationHandler(BaseHTTPRequestHandler):
                 raise ValueError("request body must be between 1 and 32768 bytes")
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
             if not isinstance(payload, dict):
-                raise ValueError("request body must be an object")
+                raise TypeError("request body must be an object")
             event = payload.pop("event", "")
             if not isinstance(event, str) or not event.strip():
                 raise ValueError("event must be a non-empty string")
             self.controller.dispatch(event, payload)
             self._send_json(HTTPStatus.OK, {"accepted": True, "state": self.controller.snapshot()})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
+            # The HTTP boundary translates all request failures into JSON errors.
             self._send_json(HTTPStatus.BAD_REQUEST, {"accepted": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
