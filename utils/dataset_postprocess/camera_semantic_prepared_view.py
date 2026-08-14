@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import asdict, dataclass
 import hashlib
 import os
-from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Iterable, Mapping
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
 
 from dataset_contracts.camera_semantic_prepared_view import (
     CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
@@ -37,21 +38,21 @@ from .camera_semantic_materialize import (
     CameraSemanticMaterializationError,
     _camera_role_in_path,
     _camera_snapshot_from_binding,
+    _declared_video_frame_count,
     _episode_index_in_path,
     _episode_records,
     _frame_index_mismatch_count,
     _fresh_copy,
     _fsync_directory,
+    _index_values,
     _map_camera_artifact_path,
+    _parquet_module,
     _resolution_maps,
     _rewrite_camera_json,
     _rewrite_episode_record,
     _rewrite_info,
-    _parquet_module,
     _rewrite_parquet,
     _safe_relative_path,
-    _declared_video_frame_count,
-    _index_values,
     _video_probe_frame_count,
     _write_json_fsync,
     _write_jsonl_fsync,

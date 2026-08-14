@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
 
 from .canonical_encoding import canonical_content_hash
-
 
 CAMERA_SEMANTIC_PREPARED_VIEW_SCHEMA_V1 = (
     "dexteleop.camera_semantic_prepared_view.v1"
@@ -66,7 +66,7 @@ class CameraSemanticPreparedViewFileV1:
     @classmethod
     def from_dict(
         cls, value: Mapping[str, Any]
-    ) -> "CameraSemanticPreparedViewFileV1":
+    ) -> CameraSemanticPreparedViewFileV1:
         return cls(
             relative_path=str(value.get("relative_path") or ""),
             size_bytes=int(value.get("size_bytes", -1)),
@@ -107,9 +107,13 @@ class CameraSemanticPreparedViewManifestV1:
             path
             for path in paths
             if path == "tactile"
-            or path.startswith("tactile/")
-            or path.startswith("meta/modality_artifacts/tactile/")
-            or path.startswith("meta/tactile_bundle_v1/")
+            or path.startswith(
+                (
+                    "tactile/",
+                    "meta/modality_artifacts/tactile/",
+                    "meta/tactile_bundle_v1/",
+                )
+            )
         )
         if forbidden:
             raise CameraSemanticPreparedViewContractError(
@@ -194,7 +198,7 @@ class CameraSemanticPreparedViewManifestV1:
     @classmethod
     def from_dict(
         cls, value: Mapping[str, Any]
-    ) -> "CameraSemanticPreparedViewManifestV1":
+    ) -> CameraSemanticPreparedViewManifestV1:
         if str(value.get("schema") or "") != CAMERA_SEMANTIC_PREPARED_VIEW_SCHEMA_V1:
             raise CameraSemanticPreparedViewContractError(
                 "Unsupported camera-semantic prepared-view schema."

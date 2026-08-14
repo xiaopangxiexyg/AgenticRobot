@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -13,13 +13,13 @@ from dataset_contracts.modality_artifacts import (
     ModalityArtifactRecordV1,
     ModalityStorageTransferReceiptV1,
 )
+from dataset_interface.camera_semantic_prepared_view import (
+    load_camera_semantic_prepared_view,
+)
 from dataset_interface.camera_semantics import (
     CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH,
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
-)
-from dataset_interface.camera_semantic_prepared_view import (
-    load_camera_semantic_prepared_view,
 )
 from utils.dataset_postprocess.camera_semantic_materialize import (
     materialize_camera_semantics,
@@ -29,7 +29,6 @@ from utils.dataset_postprocess.camera_semantic_prepared_view import (
     materialize_camera_semantic_prepared_view,
     plan_camera_semantic_prepared_view,
 )
-
 
 LEFT_SERIAL = "260522278055"
 RIGHT_SERIAL = "261122273924"

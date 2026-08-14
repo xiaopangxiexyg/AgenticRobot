@@ -14,20 +14,20 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
-from typing import Any, Sequence
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
+from dataset_interface.camera_semantic_prepared_view import (
+    is_camera_semantic_prepared_view,
+    load_camera_semantic_prepared_view,
+)
 from dataset_interface.camera_semantics import (
     CAMERA_ROLE_REGISTRY_ENV,
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
 )
-from dataset_interface.camera_semantic_prepared_view import (
-    is_camera_semantic_prepared_view,
-    load_camera_semantic_prepared_view,
-)
-
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CAMERA_ROLE_REGISTRY = (
@@ -314,8 +314,8 @@ __all__ = [
     "_camera_audits",
     "_camera_slots",
     "_dataset_roots",
-    "_split_args",
     "_sample_checks",
+    "_split_args",
     "_uses_wrist_cameras",
     "main",
 ]

@@ -5,20 +5,19 @@ import json
 from pathlib import Path
 from typing import Any
 
+from collection_runtime.tactile_bundle_materialize import (
+    materialize_tactile_bundle,
+    plan_tactile_bundle_materialization,
+)
 from collection_runtime.tactile_postprocess import (
     TACTILE_MAINTENANCE_TARGETS,
     TACTILE_TARGET_COMPRESSED_HOT,
     apply_tactile_postprocess,
     plan_tactile_postprocess,
 )
-from collection_runtime.tactile_bundle_materialize import (
-    materialize_tactile_bundle,
-    plan_tactile_bundle_materialization,
-)
 from dataset_interface.tactile_bundle import attach_tactile_bundle
 from dataset_interface.validation import validate_v23_dataset
 
-from .causal_align import causal_align_dataset, plan_causal_align
 from .camera_semantic_materialize import (
     materialize_camera_semantics,
     plan_camera_semantic_materialization,
@@ -27,6 +26,7 @@ from .camera_semantic_prepared_view import (
     materialize_camera_semantic_prepared_view,
     plan_camera_semantic_prepared_view,
 )
+from .causal_align import causal_align_dataset, plan_causal_align
 from .delete_episodes import delete_episodes, plan_episode_deletion
 from .fault_nan_tail import detect_fault_nan_tail
 from .force_collision_labels import label_force_collisions, plan_force_collision_labels
@@ -34,6 +34,8 @@ from .hardlink_dedupe import apply_hardlink_dedupe, plan_hardlink_dedupe
 from .io import episode_records, parquet_path_for_record, read_parquet_rows
 from .modality_storage import (
     DEFAULT_MIN_FREE_BYTES as DEFAULT_MODALITY_STORAGE_MIN_FREE_BYTES,
+)
+from .modality_storage import (
     detach_modality,
     export_modality,
     modality_storage_status,
@@ -51,7 +53,11 @@ from .stutter_segments import (
 )
 from .tactile_compact import (
     DEFAULT_CHUNK_FRAMES as DEFAULT_TACTILE_COMPACT_CHUNK_FRAMES,
+)
+from .tactile_compact import (
     DEFAULT_MIN_FREE_BYTES as DEFAULT_TACTILE_COMPACT_MIN_FREE_BYTES,
+)
+from .tactile_compact import (
     compact_tactile_dataset_in_place,
     plan_tactile_compaction,
 )
@@ -60,8 +66,8 @@ from .tactile_recompress import (
     plan_tactile_zstd_recompression,
     recompress_tactile_zstd_in_place,
 )
-from .umi_next_state_arm_action import migrate_umi_arm_action_to_next_observation
 from .trim_nan_tails import plan_nan_tail_trim, trim_nan_tails
+from .umi_next_state_arm_action import migrate_umi_arm_action_to_next_observation
 from .v21_to_v22 import (
     convert_v21_dataset_to_v22,
     load_v22_layout_json,
