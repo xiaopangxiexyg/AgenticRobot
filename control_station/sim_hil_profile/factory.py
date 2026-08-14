@@ -414,6 +414,7 @@ def build_application_graph(
         compose_target_hz=config.compose_target_hz,
         target_admission_margin_sec=config.target_admission_margin_sec,
         collision_stop_enabled=config.sim_collision_stop_enabled,
+        target_pose_smoothing_enabled=config.target_pose_smoothing_enabled,
         execution_observation_plan=execution_observation_plan,
         exposed_pose_sides=("right",),
     )

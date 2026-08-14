@@ -6,12 +6,20 @@ from types import SimpleNamespace
 
 import pytest
 
+from control_station.control_trace import project_exclusive_hitl_switch
+from control_station.hitl import (
+    EXCLUSIVE_HITL_HUMAN_TO_POLICY,
+    EXCLUSIVE_HITL_POLICY_TO_HUMAN,
+    ExclusiveHITLSwitchEvidence,
+)
 from control_station.sim_hil import (
     MujocoSimHILApplication,
     MujocoSimHILApplicationConfig,
 )
 from control_station.sim_hil_acceptance import (
+    SIM_HIL_ACCEPTANCE_TRACE_REQUIREMENT_PROFILE_V1,
     SIM_HIL_ACCEPTANCE_STAGES_V1,
+    SIM_HIL_HUMAN_DEMONSTRATION_TRACE_REQUIREMENT_PROFILE_V1,
     STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1,
     STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1,
     SimHILAcceptanceController,
@@ -19,14 +27,10 @@ from control_station.sim_hil_acceptance import (
     SimHILAcceptanceTraceCapture,
     StationControlTraceEpisodeSessionCapture,
     StationControlTraceFinalizationReceipt,
+    sim_hil_trace_requirement_profile_for_capture_profile,
     sim_hil_acceptance_intent_from_json,
 )
-from control_station.hitl import (
-    EXCLUSIVE_HITL_HUMAN_TO_POLICY,
-    EXCLUSIVE_HITL_POLICY_TO_HUMAN,
-    ExclusiveHITLSwitchEvidence,
-)
-from control_station.control_trace import project_exclusive_hitl_switch
+from dataset_contracts.completeness import TRACE_REQUIREMENT_PROFILES_V1
 from dataset_contracts.control_trace import ControlTraceFact
 from teleop_runtime.control_trace import (
     CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1,
@@ -83,6 +87,40 @@ def test_acceptance_capture_compatibility_names_resolve_to_lower_owner(
         assert generic.clock_domain_id == "generic.monotonic"
     finally:
         generic.close()
+
+
+def test_human_demo_selects_a_human_only_trace_requirement_profile() -> None:
+    acceptance_profile = TRACE_REQUIREMENT_PROFILES_V1[
+        SIM_HIL_ACCEPTANCE_TRACE_REQUIREMENT_PROFILE_V1
+    ]
+    human_profile = TRACE_REQUIREMENT_PROFILES_V1[
+        SIM_HIL_HUMAN_DEMONSTRATION_TRACE_REQUIREMENT_PROFILE_V1
+    ]
+
+    assert sim_hil_trace_requirement_profile_for_capture_profile(
+        "acceptance"
+    ) == acceptance_profile.profile_id
+    assert sim_hil_trace_requirement_profile_for_capture_profile(
+        "human_demonstration"
+    ) == human_profile.profile_id
+    assert human_profile.profile_scope == "formal_capture"
+    assert human_profile.implementation_status == "runtime_integrated"
+    assert human_profile.required_event_types == (
+        acceptance_profile.required_event_types - {"policy_action_emission"}
+    )
+    assert {
+        "policy_inference",
+        "policy_action_emission",
+        "policy_action_projection",
+        "policy_execution_feedback",
+        "policy_context_admission",
+        "policy_context",
+        "policy_context_snapshot",
+    } <= human_profile.not_applicable_event_types
+    assert "human_command_emission" in human_profile.required_event_types
+
+    with pytest.raises(ValueError, match="capture_profile"):
+        sim_hil_trace_requirement_profile_for_capture_profile("unknown")
 
 
 class _FakeApplication:

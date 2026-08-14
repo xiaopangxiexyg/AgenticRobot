@@ -92,6 +92,12 @@ SIM_HIL_SELECTABLE_CONTROL_PROFILES = (
 SIM_HIL_ACCEPTANCE_TRACE_RUNTIME_CAPACITY_V1 = (
     CONTROL_TRACE_SESSION_CAPTURE_RUNTIME_CAPACITY_V1
 )
+SIM_HIL_ACCEPTANCE_TRACE_REQUIREMENT_PROFILE_V1 = (
+    "deployable_sim_immediate_component_policy_human_composer_v1"
+)
+SIM_HIL_HUMAN_DEMONSTRATION_TRACE_REQUIREMENT_PROFILE_V1 = (
+    "deployable_sim_immediate_component_human_composer_v1"
+)
 STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1 = (
     CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1
 )
@@ -99,6 +105,21 @@ STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1 = (
     CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1
 )
 StationControlTraceFinalizationReceipt = ControlTraceSessionFinalizationReceipt
+
+
+def sim_hil_trace_requirement_profile_for_capture_profile(
+    capture_profile: str,
+) -> str:
+    """Select the trace contract owned by one application capture mode."""
+
+    normalized = _required(capture_profile, name="capture_profile")
+    if normalized == SIM_HIL_CAPTURE_PROFILE_ACCEPTANCE_V1:
+        return SIM_HIL_ACCEPTANCE_TRACE_REQUIREMENT_PROFILE_V1
+    if normalized == SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1:
+        return SIM_HIL_HUMAN_DEMONSTRATION_TRACE_REQUIREMENT_PROFILE_V1
+    raise ValueError(
+        "capture_profile must be acceptance or human_demonstration."
+    )
 
 
 class StationControlTraceEpisodeSessionCapture(ControlTraceEpisodeSessionCapture):
@@ -119,7 +140,7 @@ class StationControlTraceEpisodeSessionCapture(ControlTraceEpisodeSessionCapture
         runtime_session_id: str = "control-station-sim-hil-ppo-session",
         control_domain_id: str = "mujoco-sim-hil",
         trace_requirement_profile_id: str = (
-            "deployable_sim_immediate_component_policy_human_composer_v1"
+            SIM_HIL_ACCEPTANCE_TRACE_REQUIREMENT_PROFILE_V1
         ),
         clock_domain_id: str = "mujoco.sim_hil.monotonic",
         capture_purpose: str = "sim_hil_acceptance",
@@ -3071,7 +3092,9 @@ __all__ = [
     "SIM_HIL_ACCEPTANCE_INTENT_SCHEMA_V1",
     "SIM_HIL_ACCEPTANCE_STAGES_V1",
     "SIM_HIL_ACCEPTANCE_STATUS_SCHEMA_V1",
+    "SIM_HIL_ACCEPTANCE_TRACE_REQUIREMENT_PROFILE_V1",
     "SIM_HIL_CONTROL_MODES_V1",
+    "SIM_HIL_HUMAN_DEMONSTRATION_TRACE_REQUIREMENT_PROFILE_V1",
     "SIM_HIL_HUMAN_TIMEOUT_FALLBACKS_V1",
     "STATION_CONTROL_TRACE_FINALIZATION_HASH_DOMAIN_V1",
     "STATION_CONTROL_TRACE_TERMINAL_RECEIPT_HASH_DOMAIN_V1",
@@ -3081,5 +3104,6 @@ __all__ = [
     "SimHILAcceptanceTraceCapture",
     "StationControlTraceEpisodeSessionCapture",
     "StationControlTraceFinalizationReceipt",
+    "sim_hil_trace_requirement_profile_for_capture_profile",
     "sim_hil_acceptance_intent_from_json",
 ]

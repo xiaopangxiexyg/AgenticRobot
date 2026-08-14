@@ -323,6 +323,17 @@ def test_collision_stop_gui_allows_only_sim_reset() -> None:
     assert "|| Boolean(value.held)" in _HTML
 
 
+def test_human_demo_collision_end_keeps_runtime_reset_available() -> None:
+    assert "$('runtime-controls').hidden = humanDemonstration" in _HTML
+    assert "$('demo-rebuild').textContent = ended" in _HTML
+    assert "? 'Reset 仿真'" in _HTML
+    assert (
+        "$('demo-rebuild').disabled = acceptanceBusy || "
+        "!demoRuntimeConstructed" in _HTML
+    )
+    assert "!demoRuntimeConstructed || ended" not in _HTML
+
+
 def test_operator_gui_separates_journey_safety_and_lifecycle_actions() -> None:
     for element_id in (
         "operator-journey",
@@ -407,6 +418,24 @@ def test_human_demo_preview_keeps_human_detached_from_human_only_contract() -> N
     ) is True
 
 
+def test_human_demo_capture_factory_binds_the_human_only_trace_contract(
+    tmp_path: Path,
+) -> None:
+    capture = sim_hil_module._build_acceptance_trace_capture(
+        tmp_path,
+        capture_profile="human_demonstration",
+    )
+    try:
+        assert capture.trace_runtime.profile.profile_id == (
+            "deployable_sim_immediate_component_human_composer_v1"
+        )
+        assert capture.status()["trace_session_id"].startswith(
+            "sim-hil-human-demonstration-"
+        )
+    finally:
+        capture.close(now=10.0)
+
+
 def test_control_gui_prioritizes_operator_workflow_over_raw_diagnostics() -> None:
     assert 'id="operator-guidance"' in _HTML
     assert 'id="operator-primary-action"' in _HTML
@@ -448,11 +477,17 @@ def test_sim_hil_rate_cli_exposes_profile_and_compose_cadence() -> None:
     assert default_config.compose_target_hz == 30.0
     assert default_config.blend_failure_grace_sec == pytest.approx(0.0)
     assert default_config.sim_collision_stop_enabled is True
+    assert default_config.target_pose_smoothing_enabled is True
 
     collision_allowed = _config_from_args(
         build_arg_parser().parse_args(["--no-sim-collision-stop"])
     )
     assert collision_allowed.sim_collision_stop_enabled is False
+
+    unsmoothed = _config_from_args(
+        build_arg_parser().parse_args(["--no-target-pose-smoothing"])
+    )
+    assert unsmoothed.target_pose_smoothing_enabled is False
 
     args = build_arg_parser().parse_args(
         [
@@ -547,6 +582,9 @@ def test_sim_hil_setup_controller_receives_selected_initial_profile(
 
     assert setup is constructed[0]
     assert setup.config.initial_profile == selected
+    assert setup.config.active_sides == ("right",)
+    assert setup.config.desk_tracker == "auto"
+    assert setup.config.adopt_profile_input_topology is False
     assert setup.started is True
 
 
@@ -1411,6 +1449,36 @@ def test_application_latches_when_lower_gate_holds_or_hold_transition_fails() ->
         app.hold(reason="fault injection")
     assert app._held is True
     assert app._last_error == "RuntimeError:lower hold failed"
+
+
+def test_application_hold_resets_lower_pose_resolution_temporal_state() -> None:
+    calls: list[str] = []
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(
+            reset_pose_resolution_temporal_state=lambda: calls.append(
+                "pose.reset"
+            )
+        ),
+        composition=SimpleNamespace(
+            request_hold=lambda *, reason: calls.append(f"hold:{reason}")
+        ),
+        policy_source=SimpleNamespace(),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app._started = True
+
+    app.hold(reason="operator_hold")
+
+    assert calls == [
+        "hold:sim_hil_application:operator_hold",
+        "pose.reset",
+    ]
+    assert app._held is True
 
 
 def test_application_does_not_latch_on_target_lifecycle_skip() -> None:

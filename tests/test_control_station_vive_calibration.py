@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from control_station.sim_hil_profile.status import _vive_receiver_status
 from control_station.vive_calibration import (
     ViveCoordinateCalibrationConfig,
     ViveCoordinateCalibrationController,
@@ -25,7 +26,10 @@ from control_station.vive_calibration_profiles import (
     save_coordinate_profile,
     validate_coordinate_profile,
 )
-from project_paths import calibration_profiles_dir, control_station_vive_coordinate_profiles_dir
+from project_paths import (
+    calibration_profiles_dir,
+    control_station_vive_coordinate_profiles_dir,
+)
 from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
 from teleop_runtime.real_teleop.vive_calibration_runtime import (
     ViveCoordinateCalibrationContext,
@@ -373,6 +377,115 @@ def test_controller_initial_latest_profile_is_loaded_for_setup_and_runtime(
         assert state["stage"] == "view"
         assert state["phase"] == "completed"
         assert state["profile"]["profile_name"] == "restart_latest"
+    finally:
+        controller.close()
+
+
+def test_runtime_owned_single_side_topology_is_not_expanded_by_loaded_profile(
+    tmp_path: Path,
+) -> None:
+    calibration = new_coordinate_calibration(
+        active_sides=("left", "right"),
+        desk_tracker="left_wrist",
+    )
+    calibration.set_world_to_desk(np.eye(4))
+    calibration.set_tracker_offset("left_wrist", np.eye(4))
+    calibration.set_tracker_offset("right_wrist", np.eye(4))
+    calibration.metadata["profile_ready"] = True
+    saved = save_coordinate_profile(
+        calibration,
+        root=tmp_path,
+        profile_name="legacy_bilateral",
+    )
+
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            desk_tracker="auto",
+            profile_dir=tmp_path,
+            initial_profile=saved,
+            adopt_profile_input_topology=False,
+            vive_port=0,
+            vive_clock_sync_port=0,
+        )
+    )
+    try:
+        source = controller.source
+        source.swap_left_right_source_roles()
+        source._process_received_batch(
+            [
+                (
+                    _vive_role_packet(right_valid=False),
+                    time.time(),
+                    time.monotonic(),
+                    ("192.0.2.10", 4000),
+                )
+            ]
+        )
+
+        state = controller.snapshot()
+        assert state["profile"]["active_sides"] == ["left", "right"]
+        assert state["active_sides"] == ["right"]
+        assert state["desk_tracker"] == "auto"
+        assert state["input_preflight"]["required_channels"] == [
+            "right_wrist_pose"
+        ]
+        assert state["input_preflight"]["ready"] is True
+        assert state["source_role_by_output_channel"] == {
+            "right_wrist_pose": "left_wrist"
+        }
+
+        receiver = _vive_receiver_status(
+            SimpleNamespace(sources=(source,)),
+            required_output_channels=("right_wrist_pose",),
+        )
+        assert receiver["trackers"]["left"][
+            "selected_for_required_output_channels"
+        ] == ["right_wrist_pose"]
+        assert receiver["trackers"]["right"][
+            "selected_for_required_output_channels"
+        ] == []
+        assert receiver["trackers"]["right"]["sender_error"] == (
+            "single_tracker_mode:not_connected"
+        )
+    finally:
+        controller.close()
+
+
+def test_standalone_controller_still_adopts_loaded_profile_topology(
+    tmp_path: Path,
+) -> None:
+    calibration = new_coordinate_calibration(
+        active_sides=("left", "right"),
+        desk_tracker="left_wrist",
+    )
+    calibration.set_world_to_desk(np.eye(4))
+    calibration.set_tracker_offset("left_wrist", np.eye(4))
+    calibration.set_tracker_offset("right_wrist", np.eye(4))
+    calibration.metadata["profile_ready"] = True
+    saved = save_coordinate_profile(
+        calibration,
+        root=tmp_path,
+        profile_name="standalone_bilateral",
+    )
+
+    controller = ViveCoordinateCalibrationController(
+        ViveCoordinateCalibrationConfig(
+            active_sides=("right",),
+            profile_dir=tmp_path,
+            initial_profile=saved,
+            vive_port=0,
+            vive_clock_sync_port=0,
+        )
+    )
+    try:
+        state = controller.snapshot()
+        assert state["active_sides"] == ["left", "right"]
+        assert state["desk_tracker"] == "left_wrist"
+        assert controller.source.source_role_by_output_channel == {
+            "left_wrist_pose": "left_wrist",
+            "right_wrist_pose": "right_wrist",
+        }
     finally:
         controller.close()
 

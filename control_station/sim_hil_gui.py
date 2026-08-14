@@ -988,8 +988,16 @@ _HTML = """<!doctype html>
         acceptanceBusy && acceptance.operation_cancel_available
       );
       $('demo-capture-home').disabled = acceptanceBusy || !started || !held || ended;
-      $('demo-rebuild').disabled = acceptanceBusy
-        || !(value.startup || {}).mujoco_constructed || ended;
+      const demoRuntimeConstructed = Boolean(
+        (value.startup || {}).mujoco_constructed
+      );
+      $('demo-rebuild').textContent = ended
+        ? 'Reset 仿真'
+        : '放弃当前回合并重新准备';
+      $('demo-rebuild').disabled = acceptanceBusy || !demoRuntimeConstructed;
+      $('demo-rebuild').title = ended
+        ? '当前 episode 已终止；销毁旧 MuJoCo target 并返回准备阶段。'
+        : '销毁当前 MuJoCo target，abort 未封存记录并返回准备阶段。';
       $('demo-abandon').disabled = acceptanceBusy;
       $('human-demo-recovery').hidden = capture.status === 'committed';
       if (ended) $('human-demo-recovery').open = true;

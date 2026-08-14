@@ -494,6 +494,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--target-pose-smoothing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply the shared real-RM65 pre-IK pose smoothing profile in "
+            "Sim-HIL (default: enabled). Use --no-target-pose-smoothing "
+            "for an explicit raw-pose A/B rollback."
+        ),
+    )
+    parser.add_argument(
         "--target-admission-margin-sec",
         type=float,
         default=0.05,
@@ -639,6 +649,7 @@ def _config_from_args(args: argparse.Namespace) -> MujocoSimHILApplicationConfig
         defer_human_input=exclusive_hitl,
         execution_difference_enabled=bool(args.execution_difference),
         sim_collision_stop_enabled=bool(args.sim_collision_stop),
+        target_pose_smoothing_enabled=bool(args.target_pose_smoothing),
         mujoco_viewer_enabled=(
             bool(args.acceptance_gui)
             if args.mujoco_viewer is None
@@ -800,6 +811,9 @@ def _run_dry_run(
             position_control_profile_name=config.position_control_profile_name,
             compose_target_hz=config.compose_target_hz,
             target_admission_margin_sec=config.target_admission_margin_sec,
+            target_pose_smoothing_enabled=(
+                config.target_pose_smoothing_enabled
+            ),
             exposed_pose_sides=("right",),
         )
     )
@@ -1062,6 +1076,7 @@ def _build_sim_hil_vive_setup_controller(
         ViveCoordinateCalibrationConfig(
             active_sides=("right",),
             desk_tracker="auto",
+            adopt_profile_input_topology=False,
             vive_port=config.vive_port,
             vive_clock_sync_port=config.vive_clock_sync_port,
             initial_profile=config.vive_coordinate_profile_path,
@@ -1283,6 +1298,35 @@ def _sim_hil_bootstrap_status(
     }
 
 
+def _build_acceptance_trace_capture(
+    root: Path,
+    *,
+    capture_profile: str,
+) -> Any:
+    """Bind an application capture mode to one explicit trace contract."""
+
+    from .sim_hil_acceptance import (
+        SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1,
+        SimHILAcceptanceTraceCapture,
+        sim_hil_trace_requirement_profile_for_capture_profile,
+    )
+
+    return SimHILAcceptanceTraceCapture(
+        root,
+        trace_requirement_profile_id=(
+            sim_hil_trace_requirement_profile_for_capture_profile(
+                capture_profile
+            )
+        ),
+        capture_purpose=(
+            "sim_hil_human_demonstration"
+            if capture_profile
+            == SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1
+            else "sim_hil_acceptance"
+        ),
+    )
+
+
 def _run_acceptance_gui(
     args: argparse.Namespace,
     config: MujocoSimHILApplicationConfig,
@@ -1291,11 +1335,7 @@ def _run_acceptance_gui(
 
     import secrets
 
-    from .sim_hil_acceptance import (
-        SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1,
-        SimHILAcceptanceController,
-        SimHILAcceptanceTraceCapture,
-    )
+    from .sim_hil_acceptance import SimHILAcceptanceController
     from .sim_hil_gui import SimHILStatusServer
 
     capture = None
@@ -1305,14 +1345,9 @@ def _run_acceptance_gui(
     try:
         storage_resolution = resolve_acceptance_root(args)
         capture_profile = str(args.capture_profile)
-        capture = SimHILAcceptanceTraceCapture(
+        capture = _build_acceptance_trace_capture(
             storage_resolution.path,
-            capture_purpose=(
-                "sim_hil_human_demonstration"
-                if capture_profile
-                == SIM_HIL_CAPTURE_PROFILE_HUMAN_DEMONSTRATION_V1
-                else "sim_hil_acceptance"
-            ),
+            capture_profile=capture_profile,
         )
         _write_acceptance_storage_receipt(
             session_root=capture.session_root,

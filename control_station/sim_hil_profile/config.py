@@ -121,6 +121,9 @@ class MujocoSimHILApplicationConfig:
     # rejection path; disabled allows MuJoCo contacts without stopping the
     # Sim-HIL episode. This never applies to a real-robot target.
     sim_collision_stop_enabled: bool = True
+    # Reuse the real RM65 pre-IK target-shaping contract by default.  This
+    # remains independently switchable for A/B diagnosis and rollback.
+    target_pose_smoothing_enabled: bool = True
     mujoco_viewer_enabled: bool = False
     status_host: str = DEFAULT_STATUS_HOST
     status_port: int = DEFAULT_STATUS_PORT
@@ -128,6 +131,8 @@ class MujocoSimHILApplicationConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.sim_collision_stop_enabled, bool):
             raise TypeError("sim_collision_stop_enabled must be a bool.")
+        if not isinstance(self.target_pose_smoothing_enabled, bool):
+            raise TypeError("target_pose_smoothing_enabled must be a bool.")
         for name in (
             "checkpoint_path",
             "task_config_path",

@@ -19,6 +19,7 @@ from robot_motion.pose_frame_profiles import (
     default_rm65_workspace_near_boundary_collection_pose_frame_contract,
     default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
 )
+from robot_motion.pose_smoothing import BimanualPoseSmoother, PoseSmoothingConfig
 from robot_motion.position_control import ExecutionCapabilityProfile
 from sim.contracts import TimingSpec
 from sim.mujoco.adapters import (
@@ -167,6 +168,76 @@ def test_pose_resolution_preserves_safe_pose_and_emits_separate_qpos_command() -
     # Resolution is pure with respect to the MuJoCo plant.
     np.testing.assert_allclose(scene.qpos["left"], np.zeros(6))
     np.testing.assert_allclose(scene.qpos["right"], np.zeros(6))
+
+
+def test_pose_resolution_smooths_before_ik_and_resets_temporal_state() -> None:
+    scene = _Scene()
+    planner = _Planner()
+    smoother = BimanualPoseSmoother(
+        PoseSmoothingConfig(
+            time_constant_sec=1.0,
+            nominal_dt_sec=0.1,
+            max_dt_sec=0.1,
+            deadband_translation_m=0.0,
+            deadband_rotation_deg=0.0,
+            snap_translation_m=0.0,
+            snap_rotation_deg=0.0,
+        )
+    )
+    resolver = MujocoCoupledPoseToQposResolver(
+        RM65CanonicalIK(scene, planner),
+        target_pose_smoother=smoother,
+    )
+
+    first = _pose_action()
+    resolver.resolve(first)
+    moved = RobotAction(
+        action_space=first.action_space,
+        timestamp=10.1,
+        arm_pose_by_side={
+            side: np.asarray([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            for side in ("left", "right")
+        },
+        frame_by_effector=first.frame_by_effector,
+        controlled_frame_by_effector=first.controlled_frame_by_effector,
+        source=first.source,
+    )
+
+    command = resolver.resolve(moved)
+    resolution = resolver.resolution_for_command(command)
+    solver_x = float(
+        resolution.solver_input_pose_action.arm_pose_by_side["left"][0]
+    )
+    assert 0.0 < solver_x < 0.1
+    assert float(
+        resolution.input_safe_action.arm_pose_by_side["left"][0]
+    ) == pytest.approx(0.1)
+    assert resolution.solver_metadata["target_pose_smoothing"]["left"][
+        "status"
+    ] == "smoothed"
+    assert planner.targets[1]["left"][0, 3] == pytest.approx(solver_x)
+
+    resolver.reset_temporal_state()
+    reset_target = RobotAction(
+        action_space=moved.action_space,
+        timestamp=10.2,
+        arm_pose_by_side={
+            side: np.asarray([0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            for side in ("left", "right")
+        },
+        frame_by_effector=moved.frame_by_effector,
+        controlled_frame_by_effector=moved.controlled_frame_by_effector,
+        source=moved.source,
+    )
+    reset_resolution = resolver.resolution_for_command(
+        resolver.resolve(reset_target)
+    )
+    assert float(
+        reset_resolution.solver_input_pose_action.arm_pose_by_side["left"][0]
+    ) == pytest.approx(0.2)
+    assert reset_resolution.solver_metadata["target_pose_smoothing"]["left"][
+        "status"
+    ] == "initialized"
 
 
 def test_pose_resolution_preserves_safe_q6_gripper_components() -> None:
