@@ -70,7 +70,8 @@ manifest hash/大小变化、未知热端文件或不同 artifact graph 都会 f
 python -m utils.dataset_postprocess camera-semantics-prepare-view \
   DATASET_ROOT \
   --output-root OUTPUT_ROOT \
-  --registry robot_motion/configs/rm65_camera_registry.json
+  --registry robot_motion/configs/rm65_camera_registry.json \
+  --dry-run
 
 python -m utils.dataset_postprocess camera-semantics-prepare-view \
   DATASET_ROOT \

@@ -247,6 +247,8 @@ def _cmd_camera_semantic_materialize(args: argparse.Namespace) -> int:
 
 
 def _cmd_camera_semantic_prepare_view(args: argparse.Namespace) -> int:
+    if bool(args.apply) and bool(args.dry_run):
+        raise ValueError("--apply and --dry-run are mutually exclusive.")
     plan = plan_camera_semantic_prepared_view(
         args.dataset_root,
         args.output_root,
@@ -692,6 +694,14 @@ def build_parser() -> argparse.ArgumentParser:
     camera_prepare_view.add_argument("dataset_root")
     camera_prepare_view.add_argument("--output-root", required=True)
     camera_prepare_view.add_argument("--registry", required=True)
+    camera_prepare_view.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Explicit no-write marker; planning is already the default and "
+            "this flag is useful for remote safety wrappers."
+        ),
+    )
     camera_prepare_view.add_argument(
         "--expected-plan-hash",
         default="",
