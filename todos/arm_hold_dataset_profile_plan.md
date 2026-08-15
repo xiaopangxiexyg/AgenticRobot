@@ -468,7 +468,7 @@ cohort 中均为 0。三个 source 各读取一个真实 `front_state` sample �
 3. 在同一 split 上比较 majority、persistence、state/front/front+state。
 4. loss/sampling 消融写入独立 experiment config，不改 dataset profile。
 
-2026-08-06 已完成 P3 的最小实现与真实数据 GPU smoke：独立的 `model.arm_hold`
+2026-08-06 已完成 P3 的最小实现与真实数据 GPU smoke；该实现现归属 `policy_learning.arm_hold`，
 仅提供小型 RGB encoder、state MLP、并行 `[H,2]` head、单一 masked weighted BCE 和
 input-free constant baseline，不是新的生产 entrypoint，也不依赖 OpenPI adapter。三源各取一个
 真实 `front_state` window 组成 batch，在已有 OpenPI venv 的空闲 GPU 上完成前向、反向和一步

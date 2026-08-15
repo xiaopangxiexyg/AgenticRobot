@@ -1,4 +1,8 @@
-"""Training-only batch order for the frozen arm-hold window inventory."""
+"""Training batch order for the frozen arm-hold window inventory.
+
+This module owns only deterministic traversal of dataset-interface window
+identities. It does not define a learner, loss, optimizer, or runtime policy.
+"""
 
 from __future__ import annotations
 

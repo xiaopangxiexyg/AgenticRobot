@@ -1104,7 +1104,7 @@ RTC是跨层feature，不新增跨`robot_motion`、`deployments`、`teleop_runti
 `rtc/` package，也不让`robot_motion`完整承载model-RTC。在线计划因果进入`robot_motion.deploy.rtc`内部子包；
 版本化continuation训练/artifact schema进入`dataset_contracts`，离线派生view进入`dataset_interface`；
 model-neutral encoding/protocol进入`deployments.client`，具体模型provider进入`deployments/<model>/client`；
-learner/sampler/loss最终属于future `model/`。现有`rtc_protocol.py`、`rtc_runtime.py`等flat module保持兼容并渐进迁移，
+learner/sampler/loss最终属于 `policy_learning/`。现有`rtc_protocol.py`、`rtc_runtime.py`等flat module保持兼容并渐进迁移，
 不得一次性搬迁、建立新production entrypoint或让下层包反向依赖`deployments`。
 
 `PolicyAsyncExecutionProfile`历史上同时绑定producer cadence与position/send/lookahead application设置，其字段和hash
@@ -1146,7 +1146,7 @@ model-RTC必须把“同一语义”与“同一owner”分开：训练、在线
 | episode/window→artifact-action training prefix/target/mask view、teacher/recorded source provenance | `dataset_interface` | normalization、framework tensor、learner、runtime plan、episode writer |
 | injected codec编排、capability negotiation、model envelope、encoding/consumption receipt validation | `deployments.client` | model-specific数值codec、plan advancement、worker ownership、target/safety/dispatch |
 | OpenPI/其它模型的artifact-bound双向codec、normalization、输入字段、loaded-instance capability、continuation sampler和transport | `deployments/<model>/client`或对应模型工程 | 通用RTC调度、dataset schema、robot execution |
-| optimizer、loss、noise/corruption schedule、训练loop | future `model/`或仓库外模型工程 | deployment runtime、motion authority |
+| optimizer、loss、noise/corruption schedule、训练loop | `policy_learning/`或仓库外模型工程 | deployment runtime、motion authority |
 
 首个pure data contract暂定`ModelContinuationDataContractV1`，至少冻结：
 
@@ -1352,7 +1352,7 @@ RTC-4b-B provider工作在MRTC-D1/D2/R1/C1通过前暂停扩大。任何批次�
 - 将teacher prefix称为真实old plan，或从decoded action反推缺失的model-output provenance；
 - 让dataset projection、debug observer或model receipt取得target/reference/safety/dispatch authority；
 - 以model-RTC需求反向改变raw-RTC `continuation=none`或`sync_queue_v1`默认行为；
-- 在尚无learner工作时提前创建`model/` runtime entrypoint。
+- 把本地 artifact 根 `model/` 创建成 Python runtime entrypoint。
 
 ### 4.7 表示 gate
 

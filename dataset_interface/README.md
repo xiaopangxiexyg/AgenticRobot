@@ -17,6 +17,11 @@ training configuration must declare it explicitly after inspecting
 paired states `01` and `10` is perfectly complementary and must not be treated
 as evidence for independent `00` or `11` behavior.
 
+`dataset_interface.arm_hold_sampling` owns deterministic Episode-local window
+batch order and optional exposure repetition. Learner definitions, tensor
+collation, losses, and prediction evaluation remain in
+`policy_learning.arm_hold`.
+
 ## Control-composition projection boundary
 
 `dataset_interface.composition_control_trace` is the optional adapter from

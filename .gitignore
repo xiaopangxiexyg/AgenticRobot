@@ -114,6 +114,10 @@ hardware/VIVE/VIVE_sender.zip
 *.safetensors
 *.mp4
 
+# Local policy model artifacts; source code belongs in policy_learning/.
+/model/*
+!/model/README.md
+
 UV_conversion
 paper_fold_datasets/
 test_left_fix_datasets/

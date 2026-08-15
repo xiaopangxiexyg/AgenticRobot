@@ -554,7 +554,7 @@ Learning Extension 的目标落位如下，等 M7 再创建或扩展：
 dataset_contracts/{source_device,embodiment,training_run}.py
 dataset_contracts/policy_artifact.py          # v2.4 provenance/compatibility extension
 dataset_interface/training_view.py
-model/                                        # learner，仍不是 production control entrypoint
+policy_learning/                              # learner，仍不是 production control entrypoint
 ```
 
 ### 6. 暂不创建的文件
@@ -564,7 +564,7 @@ model/                                        # learner，仍不是 production c
 - `sim/mujoco/deploy/*`；
 - `dataset_contracts/training_view.py`、`task_reward.py`、`domain.py`；
 - `dataset_interface/training_view.py`、native stream window reader；
-- `model/` learner、DAgger/RL loop；
+- `policy_learning/` learner、DAgger/RL loop；
 - 通用 RPC/共享内存 transport；
 - 新的顶层 control kernel 或第二个 dispatcher。
 

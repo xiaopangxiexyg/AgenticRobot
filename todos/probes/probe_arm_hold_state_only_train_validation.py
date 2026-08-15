@@ -23,12 +23,17 @@ if str(_PROJECT_ROOT) not in sys.path:
 _FRONT_HISTORY_FREE_RUNNING_BATCH_LIMIT = 64
 
 from dataset_interface.arm_hold_split_manifest import load_arm_hold_split_manifest
+from dataset_interface.arm_hold_sampling import (
+    arm_hold_natural_plus_random_once_batches,
+    arm_hold_natural_plus_transition_once_batches,
+    arm_hold_natural_window_batches,
+)
 from dataset_interface.arm_hold_windows import (
     ArmHoldWindowInventory,
     ArmHoldWindowReader,
     build_arm_hold_window_inventory,
 )
-from model.arm_hold import (
+from policy_learning.arm_hold import (
     ArmHoldBaseline,
     ArmHoldBaselineConfig,
     ArmHoldLossConfig,
@@ -37,9 +42,6 @@ from model.arm_hold import (
     arm_hold_fixed_lead_sequence_evaluation,
     arm_hold_free_running_evaluation,
     arm_hold_offset_zero_evaluation,
-    arm_hold_natural_plus_random_once_batches,
-    arm_hold_natural_plus_transition_once_batches,
-    arm_hold_natural_window_batches,
     arm_hold_tensor_batch,
     arm_hold_loss,
     arm_hold_window_evaluation,

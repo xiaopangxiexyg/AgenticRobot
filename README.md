@@ -41,6 +41,8 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 - `collection_runtime/`：与设备、控制和 GUI 解耦的实时采集生命周期与持久化机制。
 - `teleop_runtime/`：真实遥操、GUI/headless orchestration、来源绑定的采集适配和 policy deploy frontend。
 - `dataset_contracts/`、`dataset_interface/`：纯数据合约与数据适配。
+- `policy_learning/`：框架内 learner、loss、训练 batch adapter 与离线模型评估。
+- `model/`：本地策略权重、checkpoint 与运行 sidecar；不是 Python 源码包。
 - `deployments/`：模型 client、协议和 artifact 集成。
 - `control_station/`：组合 human/replay/policy/dataset/sim/real target 的应用层。
 - `legacy/`、`docs/legacy/`：已确认归档的代码或说明，不是生产入口。

@@ -1,4 +1,4 @@
-"""Lightweight, model-framework-local arm-hold baselines."""
+"""Lightweight policy-learning baselines and evaluation helpers."""
 
 from .baseline import (
     ARM_HOLD_DWELL_BUCKET_THRESHOLDS,
@@ -26,11 +26,6 @@ from .free_running import (
     ArmHoldFreeRunningError,
     arm_hold_free_running_evaluation,
     arm_hold_offset_zero_evaluation,
-)
-from .sampling import (
-    arm_hold_natural_plus_random_once_batches,
-    arm_hold_natural_plus_transition_once_batches,
-    arm_hold_natural_window_batches,
 )
 from .sequence_evaluation import (
     ARM_HOLD_CHUNK_SEQUENCE_SCHEMA,
@@ -64,9 +59,6 @@ __all__ = [
     "arm_hold_free_running_evaluation",
     "arm_hold_offset_zero_evaluation",
     "arm_hold_fixed_lead_sequence_evaluation",
-    "arm_hold_natural_plus_random_once_batches",
-    "arm_hold_natural_plus_transition_once_batches",
-    "arm_hold_natural_window_batches",
     "arm_hold_tensor_batch",
     "arm_hold_window_evaluation",
     "arm_hold_loss",

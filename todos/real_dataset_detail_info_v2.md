@@ -1685,7 +1685,7 @@ V25-3 不阻塞任何 Plus 里程碑；它必须分别声明 proposal、admissio
 #### V25-4：多粒度研究与选择性重生成
 
 Plus-3 完成后即可用最小 curation 数据做研究预览，不等待通用 detector 或 ControlTrace；
-正式 V2.5 结论仍必须使用充分链路 profile。该阶段属于未来 `model/`，不是当前 runtime entrypoint。
+正式 V2.5 结论仍必须使用充分链路 profile。该阶段属于 `policy_learning/`，不是当前 runtime entrypoint。
 V2.5 首轮固定：
 
 - 1 个 contact-rich 任务；

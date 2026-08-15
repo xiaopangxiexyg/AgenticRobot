@@ -21,7 +21,7 @@ from dataset_interface.arm_hold_windows import (
     ArmHoldWindowReader,
     build_arm_hold_window_inventory,
 )
-from model.arm_hold import (
+from policy_learning.arm_hold import (
     ArmHoldBaseline,
     ArmHoldBaselineConfig,
     arm_hold_constant_logits,

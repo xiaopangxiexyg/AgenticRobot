@@ -58,7 +58,13 @@ is experimental.
   validation interfaces. It may depend on `dataset_contracts` and pure domain
   contracts, but must not become a device/control runtime or authoritative
   episode owner, and must not import `control_station`.
-- `model/`: future policy/learner/DAgger/RL package, not a current runtime entrypoint.
+- `policy_learning/`: framework-local learner definitions, losses, training
+  batch adapters, and offline model evaluation. It may depend on
+  `dataset_contracts` and `dataset_interface`, but must not own robot-motion
+  semantics, deployment, safety, authority, dispatch, or hardware resources.
+- `model/`: local policy weights, checkpoints, and runtime sidecars only. It is
+  not a Python package or a source-code owner; versioned artifact contracts and
+  integration remain under `deployments/`.
 - `legacy/`: confirmed-archived code/docs only; production code must not import it.
 - `tests/` and `todos/`: verification and planning; neither is runtime code.
 

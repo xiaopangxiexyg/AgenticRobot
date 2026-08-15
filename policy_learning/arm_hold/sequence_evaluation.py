@@ -1,4 +1,4 @@
-"""Arm-hold sequence metrics on two explicit, non-interchangeable timelines.
+"""Learning metrics on two explicit, non-interchangeable arm-hold timelines.
 
 Fixed-lead evaluation follows one horizon column across rolling observations.
 Chunk evaluation follows the horizon inside each independently produced plan.
