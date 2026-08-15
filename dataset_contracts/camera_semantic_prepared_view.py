@@ -114,10 +114,12 @@ class CameraSemanticPreparedViewManifestV1:
                     "meta/tactile_bundle_v1/",
                 )
             )
+            or any(part.endswith(".lock") for part in path.split("/"))
         )
         if forbidden:
             raise CameraSemanticPreparedViewContractError(
-                "A camera-only prepared view cannot contain tactile artifacts."
+                "A camera-only prepared view cannot contain tactile artifacts "
+                "or runtime lock files."
             )
         object.__setattr__(self, "source_dataset_name", name)
         object.__setattr__(

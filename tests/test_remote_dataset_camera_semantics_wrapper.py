@@ -186,3 +186,45 @@ def test_wrapper_refuses_existing_apply_output_before_python(tmp_path: Path) -> 
     assert result.returncode != 0
     assert "Refusing existing output path" in result.stderr
     assert not capture.exists()
+
+
+def test_wrapper_resolves_named_env_from_standard_remote_prefix(
+    tmp_path: Path,
+) -> None:
+    env, capture = _fake_remote_environment(tmp_path)
+    command, source, output, registry = _base_command(tmp_path)
+    activate = (
+        Path(env["FAKE_REMOTE_HOME"])
+        / "miniconda3/envs/dexteleop310/bin/activate"
+    )
+    activate.parent.mkdir(parents=True)
+    activate.write_text(
+        "export DEXTELEOP_TEST_NAMED_ENV_ACTIVATED=1\n",
+        encoding="utf-8",
+    )
+    command[command.index("--project"):command.index("--project")] = [
+        "--env",
+        "dexteleop310",
+    ]
+
+    result = subprocess.run(
+        [*command, "--dry-run"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _captured_python_args(capture) == [
+        "-u",
+        "-m",
+        "utils.dataset_postprocess",
+        "camera-semantics-prepare-view",
+        str(source),
+        "--output-root",
+        str(output),
+        "--registry",
+        str(registry),
+        "--dry-run",
+    ]

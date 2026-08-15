@@ -80,6 +80,11 @@ def load_camera_semantic_prepared_view(
             )
         if path.is_file() and path != manifest_path:
             relative = path.relative_to(root)
+            if any(part.endswith(".lock") for part in relative.parts):
+                raise CameraSemanticPreparedViewContractError(
+                    "Camera-semantic prepared view contains a runtime lock file: "
+                    f"{relative.as_posix()}"
+                )
             if (
                 relative.parts
                 and relative.parts[0] == "meta"

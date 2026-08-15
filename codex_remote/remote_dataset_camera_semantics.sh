@@ -198,11 +198,39 @@ resolve_remote_path() {
 activate_env() {
   local requested="$1"
   local conda_sh
+  local named_env
   [[ -n "$requested" ]] || return 0
   if [[ -d "$requested" && -f "$requested/bin/activate" ]]; then
     # shellcheck disable=SC1090
     source "$requested/bin/activate"
     return 0
+  fi
+  if [[ "$requested" != */* ]]; then
+    for named_env in \
+      "$HOME/miniconda3/envs/$requested" \
+      "$HOME/anaconda3/envs/$requested" \
+      "$HOME/mambaforge/envs/$requested" \
+      "/opt/conda/envs/$requested"; do
+      if [[ -d "$named_env" && -f "$named_env/bin/activate" ]]; then
+        # shellcheck disable=SC1090
+        source "$named_env/bin/activate"
+        return 0
+      fi
+      if [[ -d "$named_env" && -x "$named_env/bin/python" ]]; then
+        for conda_sh in \
+          "$HOME/anaconda3/etc/profile.d/conda.sh" \
+          "$HOME/miniconda3/etc/profile.d/conda.sh" \
+          "$HOME/mambaforge/etc/profile.d/conda.sh" \
+          "/opt/conda/etc/profile.d/conda.sh"; do
+          if [[ -f "$conda_sh" ]]; then
+            # shellcheck disable=SC1090
+            source "$conda_sh"
+            conda activate "$named_env"
+            return 0
+          fi
+        done
+      fi
+    done
   fi
   for conda_sh in \
     "$HOME/anaconda3/etc/profile.d/conda.sh" \

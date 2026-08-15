@@ -89,6 +89,14 @@ camera artifact 同时归一化，因此允许历史左右腕视频索引不同�
 调用者同时选择该输出根目录并显式传入 `--allow-camera-prepared-view` 才能训练。原
 `camera-semantics-materialize` 的完整克隆和触觉 retirement 门禁保持不变。
 
+prepared view 也不会复制 `.lock` 等运行时文件；manifest 和严格 loader 都会拒绝这类文件。
+已经发布但不符合上述合同的试点目录不得继续放在默认可选目录中。先运行
+`camera-semantics-quarantine-invalid-view VIEW --audit-root AUDIT_ROOT` 生成冻结计划，随后携带
+完全一致的 `--expected-plan-hash --apply`，只会在同一文件系统内原子移动到审计目录。该命令
+要求严格 loader 明确返回 contract error；I/O 错误、有效视图、符号链接、跨设备和已存在目标
+均 fail closed，并且不会删除或覆盖目录。远端操作使用固定的
+`codex_remote/remote_dataset_camera_quarantine.sh`。
+
 新正式采集的 thread writer 默认采用 `--storage-queue-backpressure-policy block`：相机存储队列
 满时在控制热路径之外背压 sample assembly，不再由每个相机独立丢最旧帧。旧的
 `drop_oldest` 仍是显式兼容选项，但可能重新产生单侧 frame gap；正式数据不应使用。process

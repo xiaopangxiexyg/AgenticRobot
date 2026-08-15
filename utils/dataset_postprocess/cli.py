@@ -25,6 +25,8 @@ from .camera_semantic_materialize import (
 from .camera_semantic_prepared_view import (
     materialize_camera_semantic_prepared_view,
     plan_camera_semantic_prepared_view,
+    plan_invalid_camera_prepared_view_quarantine,
+    quarantine_invalid_camera_prepared_view,
 )
 from .causal_align import causal_align_dataset, plan_causal_align
 from .delete_episodes import delete_episodes, plan_episode_deletion
@@ -270,6 +272,23 @@ def _cmd_camera_semantic_prepare_view(args: argparse.Namespace) -> int:
         _print_json(result)
     else:
         _print_json(plan.to_dict())
+    return 0
+
+
+def _cmd_camera_semantic_quarantine_invalid_view(
+    args: argparse.Namespace,
+) -> int:
+    plan = plan_invalid_camera_prepared_view_quarantine(
+        args.prepared_view_root,
+        args.audit_root,
+    )
+    if bool(args.apply):
+        plan = quarantine_invalid_camera_prepared_view(
+            args.prepared_view_root,
+            args.audit_root,
+            expected_plan_hash=str(args.expected_plan_hash or ""),
+        )
+    _print_json({**plan.to_dict(), "applied": bool(args.apply)})
     return 0
 
 
@@ -722,6 +741,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     camera_prepare_view.set_defaults(func=_cmd_camera_semantic_prepare_view)
+
+    camera_quarantine = subparsers.add_parser(
+        "camera-semantics-quarantine-invalid-view",
+        help=(
+            "Prove a prepared view is invalid, then optionally move it "
+            "atomically into a same-filesystem audit directory."
+        ),
+    )
+    camera_quarantine.add_argument("prepared_view_root")
+    camera_quarantine.add_argument("--audit-root", required=True)
+    camera_quarantine.add_argument(
+        "--expected-plan-hash",
+        default="",
+        help="Required with --apply; copy from the immediately preceding plan.",
+    )
+    camera_quarantine.add_argument("--apply", action="store_true")
+    camera_quarantine.set_defaults(
+        func=_cmd_camera_semantic_quarantine_invalid_view
+    )
 
     default_postprocess = subparsers.add_parser(
         "postprocess",

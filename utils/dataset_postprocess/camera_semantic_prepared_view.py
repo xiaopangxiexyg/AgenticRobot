@@ -14,6 +14,7 @@ from typing import Any
 
 from dataset_contracts.camera_semantic_prepared_view import (
     CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
+    CameraSemanticPreparedViewContractError,
     CameraSemanticPreparedViewFileV1,
     CameraSemanticPreparedViewManifestV1,
 )
@@ -64,6 +65,23 @@ class CameraSemanticPreparedViewError(CameraSemanticMaterializationError):
     """Raised when a non-tactile camera view cannot be built safely."""
 
 
+@dataclass(frozen=True)
+class InvalidCameraPreparedViewQuarantinePlan:
+    source_root: str
+    audit_root: str
+    destination_root: str
+    source_manifest_sha256: str
+    claimed_manifest_hash: str
+    source_inventory_hash: str
+    file_count: int
+    total_bytes: int
+    invalid_reason: str
+    plan_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 _EXCLUDED_META_PREFIXES = (
     Path("meta/modality_artifacts/tactile"),
     Path("meta/prepared_views"),
@@ -80,6 +98,8 @@ def _sha256_file(path: Path) -> str:
 
 
 def _is_excluded_path(relative: Path) -> bool:
+    if any(part.endswith(".lock") for part in relative.parts):
+        return True
     tactile_metadata = (
         bool(relative.parts)
         and relative.parts[0] == "meta"
@@ -252,6 +272,124 @@ def _source_dataset_identity(root: Path) -> str:
         info,
         domain="dexteleop.camera_semantic_prepared_source_dataset.v1",
     )
+
+
+def plan_invalid_camera_prepared_view_quarantine(
+    source_root: str | Path,
+    audit_root: str | Path,
+) -> InvalidCameraPreparedViewQuarantinePlan:
+    """Plan a recoverable same-filesystem quarantine for a proven-invalid view."""
+
+    source = Path(source_root).expanduser().resolve()
+    audit = Path(audit_root).expanduser().resolve()
+    if not source.is_dir() or source.is_symlink():
+        raise CameraSemanticPreparedViewError(
+            f"Invalid prepared-view quarantine source is missing or unsafe: {source}"
+        )
+    manifest_path = source / CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise CameraSemanticPreparedViewError(
+            "Quarantine requires an existing non-symlink prepared-view manifest: "
+            f"{manifest_path}"
+        )
+    raw_manifest = read_json(manifest_path)
+    claimed_manifest_hash = str(raw_manifest.get("manifest_hash", "")).strip()
+    if len(claimed_manifest_hash) != 64 or any(
+        char not in "0123456789abcdef" for char in claimed_manifest_hash
+    ):
+        raise CameraSemanticPreparedViewError(
+            "Quarantine requires a lowercase 64-hex claimed manifest_hash."
+        )
+    try:
+        load_camera_semantic_prepared_view(source, verify_payload_hashes=True)
+    except CameraSemanticPreparedViewContractError as exc:
+        invalid_reason = f"{type(exc).__name__}: {exc}"
+    else:
+        raise CameraSemanticPreparedViewError(
+            "Refusing to quarantine a valid camera-semantic prepared view."
+        )
+
+    entries: list[dict[str, Any]] = []
+    total_bytes = 0
+    for path in sorted(source.rglob("*")):
+        if path.is_symlink():
+            raise CameraSemanticPreparedViewError(
+                f"Quarantine refuses prepared views containing symlinks: {path}"
+            )
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        total_bytes += int(stat.st_size)
+        entries.append(
+            {
+                "path": path.relative_to(source).as_posix(),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+                "device": int(stat.st_dev),
+                "inode": int(stat.st_ino),
+                "nlink": int(stat.st_nlink),
+            }
+        )
+    inventory_hash = canonical_content_hash(
+        entries,
+        domain="dexteleop.invalid_camera_prepared_view_inventory.v1",
+    )
+    destination = audit / f"{source.name}.invalid-{inventory_hash[:12]}"
+    payload = {
+        "source_root": str(source),
+        "audit_root": str(audit),
+        "destination_root": str(destination),
+        "source_manifest_sha256": _sha256_file(manifest_path),
+        "claimed_manifest_hash": claimed_manifest_hash,
+        "source_inventory_hash": inventory_hash,
+        "file_count": len(entries),
+        "total_bytes": total_bytes,
+        "invalid_reason": invalid_reason,
+    }
+    return InvalidCameraPreparedViewQuarantinePlan(
+        **payload,
+        plan_hash=canonical_content_hash(
+            payload,
+            domain="dexteleop.invalid_camera_prepared_view_quarantine_plan.v1",
+        ),
+    )
+
+
+def quarantine_invalid_camera_prepared_view(
+    source_root: str | Path,
+    audit_root: str | Path,
+    *,
+    expected_plan_hash: str,
+) -> InvalidCameraPreparedViewQuarantinePlan:
+    plan = plan_invalid_camera_prepared_view_quarantine(source_root, audit_root)
+    if plan.plan_hash != str(expected_plan_hash).strip():
+        raise CameraSemanticPreparedViewError(
+            "Invalid prepared-view quarantine expected-plan-hash mismatch: "
+            f"expected={expected_plan_hash} actual={plan.plan_hash}"
+        )
+    source = Path(plan.source_root)
+    audit = Path(plan.audit_root)
+    destination = Path(plan.destination_root)
+    if destination.exists() or destination.is_symlink():
+        raise CameraSemanticPreparedViewError(
+            f"Quarantine destination already exists: {destination}"
+        )
+    existing_audit_parent = audit
+    while not existing_audit_parent.exists():
+        if existing_audit_parent.parent == existing_audit_parent:
+            raise CameraSemanticPreparedViewError(
+                f"Cannot resolve quarantine audit filesystem: {audit}"
+            )
+        existing_audit_parent = existing_audit_parent.parent
+    if source.stat().st_dev != existing_audit_parent.stat().st_dev:
+        raise CameraSemanticPreparedViewError(
+            "Quarantine requires source and audit root on the same filesystem."
+        )
+    audit.mkdir(parents=True, exist_ok=True)
+    os.replace(source, destination)
+    _fsync_directory(destination.parent)
+    _fsync_directory(source.parent)
+    return plan
 
 
 def _validate_all_episode_videos(

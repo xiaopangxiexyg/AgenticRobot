@@ -28,6 +28,8 @@ from utils.dataset_postprocess.camera_semantic_materialize import (
 from utils.dataset_postprocess.camera_semantic_prepared_view import (
     materialize_camera_semantic_prepared_view,
     plan_camera_semantic_prepared_view,
+    plan_invalid_camera_prepared_view_quarantine,
+    quarantine_invalid_camera_prepared_view,
 )
 
 LEFT_SERIAL = "260522278055"
@@ -467,6 +469,13 @@ def test_plan_rejects_declared_source_video_frame_mismatch(
         plan_camera_semantic_materialization(source, output, registry)
 
     assert not output.exists()
+
+    _write_video(source_right_video, frame_count=1, color="blue")
+    with pytest.raises(
+        Exception, match="Declared/decoded video frame count mismatch"
+    ):
+        plan_camera_semantic_prepared_view(source, output, registry)
+    assert not output.exists()
     assert not list(
         tmp_path.glob(f".{output.name}.camera-semantic-stage-*")
     )
@@ -638,6 +647,8 @@ def test_prepared_view_corrects_mismatched_indices_without_reading_tactile(
         json.dumps({"tactile_payload": "must-not-be-projected"}),
         encoding="utf-8",
     )
+    runtime_lock = source / "meta/.modality_validity.lock"
+    runtime_lock.write_text("", encoding="utf-8")
     (source / "meta/modality_validity.json").write_text(
         json.dumps(
             {
@@ -685,11 +696,17 @@ def test_prepared_view_corrects_mismatched_indices_without_reading_tactile(
     assert not (output / "tactile").exists()
     assert not (output / "meta/modality_artifacts/tactile").exists()
     assert not (output / "meta/tactile_recompression").exists()
+    assert not (output / "meta/.modality_validity.lock").exists()
     manifest = load_camera_semantic_prepared_view(
         output, verify_payload_hashes=True
     )
     assert manifest.episode_indices == (0,)
     assert manifest.plan_hash == plan.plan_hash
+    assert not any(
+        part.endswith(".lock")
+        for record in manifest.files
+        for part in record.relative_path.split("/")
+    )
 
     table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
     assert table.column(
@@ -747,6 +764,12 @@ def test_prepared_view_corrects_mismatched_indices_without_reading_tactile(
     assert audits[0]["camera_prepared_view"]["full_v23_dataset"] is False
     assert audits[0]["frame_index_alignment"]["remapped_episode_count"] == 0
 
+    injected_lock = output / "meta/runtime.lock"
+    injected_lock.write_text("", encoding="utf-8")
+    with pytest.raises(Exception, match="runtime lock file"):
+        load_camera_semantic_prepared_view(output, verify_payload_hashes=True)
+    injected_lock.unlink()
+
     output_left.write_bytes(b"tampered")
     with pytest.raises(Exception, match="file (size|hash) mismatch"):
         load_camera_semantic_prepared_view(output, verify_payload_hashes=True)
@@ -776,9 +799,67 @@ def test_prepared_view_rejects_corrupt_video_and_stale_plan(tmp_path: Path) -> N
         )
     assert not output.exists()
 
-    _write_video(source_right_video, frame_count=1, color="blue")
-    with pytest.raises(
-        Exception, match="Declared/decoded video frame count mismatch"
-    ):
-        plan_camera_semantic_prepared_view(source, output, registry)
-    assert not output.exists()
+
+def test_invalid_prepared_view_quarantine_is_exact_and_recoverable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "prepared_views/bad_trial"
+    manifest = source / "meta/prepared_views/camera_semantics.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps({"manifest_hash": "a" * 64, "schema": "invalid"}),
+        encoding="utf-8",
+    )
+    (source / "meta/tactile_recompression").mkdir(parents=True)
+    (source / "meta/tactile_recompression/run.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    audit = tmp_path / "prepared_views/_invalid_audit"
+
+    plan = plan_invalid_camera_prepared_view_quarantine(source, audit)
+    assert "unsupported" in plan.invalid_reason.lower()
+    with pytest.raises(Exception, match="expected-plan-hash mismatch"):
+        quarantine_invalid_camera_prepared_view(
+            source,
+            audit,
+            expected_plan_hash="b" * 64,
+        )
+    assert source.is_dir()
+
+    applied = quarantine_invalid_camera_prepared_view(
+        source,
+        audit,
+        expected_plan_hash=plan.plan_hash,
+    )
+    assert not source.exists()
+    destination = Path(applied.destination_root)
+    assert destination.is_dir()
+    assert (destination / "meta/tactile_recompression/run.json").is_file()
+
+
+def test_invalid_prepared_view_quarantine_does_not_treat_io_failure_as_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "prepared_views/transient_failure"
+    manifest = source / "meta/prepared_views/camera_semantics.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps({"manifest_hash": "c" * 64, "schema": "invalid"}),
+        encoding="utf-8",
+    )
+
+    def fail_io(*_args: object, **_kwargs: object) -> object:
+        raise OSError("transient read failure")
+
+    monkeypatch.setattr(
+        "utils.dataset_postprocess.camera_semantic_prepared_view."
+        "load_camera_semantic_prepared_view",
+        fail_io,
+    )
+    with pytest.raises(OSError, match="transient read failure"):
+        plan_invalid_camera_prepared_view_quarantine(
+            source,
+            tmp_path / "prepared_views/_invalid_audit",
+        )
+    assert source.is_dir()

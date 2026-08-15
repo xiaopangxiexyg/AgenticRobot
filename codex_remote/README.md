@@ -1079,6 +1079,7 @@ remote_ps.sh
 remote_view.sh
 remote_sync_check.sh
 remote_dataset_camera_semantics.sh
+remote_dataset_camera_quarantine.sh
 ```
 
 示例：
@@ -1097,6 +1098,10 @@ remote_dataset_camera_semantics.sh
   --source-root /data/source_dataset \
   --output-root /data/camera_semantic_prepared_views/source_dataset \
   --registry /data/frozen_camera_role_registry.json --dry-run
+./remote_dataset_camera_quarantine.sh -H dex-remote \
+  --project '~/DexTeleop' --env dexteleop310 \
+  --view-root /data/camera_semantic_prepared_views/bad_trial \
+  --audit-root /data/camera_semantic_prepared_views/_invalid_audit
 ```
 
 ### 实际同步和执行模型
@@ -1171,6 +1176,12 @@ remote_dataset_camera_semantics.sh
   或任意参数透传；默认只做完整 dry-run。`--apply` 必须携带前一次计划给出的
   64 位 `--expected-plan-hash`，并在远端 Python 启动前拒绝已存在的输出目录。
   它不改变通用 Python wrapper 的控制风险检测，也不能调用设备或机器人入口。
+
+remote_dataset_camera_quarantine.sh
+  是错误 prepared view 的可恢复隔离入口。它先用严格 loader 证明目标无效，
+  再生成包含目录清单的计划；只有携带完全一致的 `--expected-plan-hash`
+  才会在同一文件系统内原子改名到审计目录。有效视图、符号链接、跨文件系统、
+  已存在目标均会被拒绝；该入口不删除或覆盖任何数据。
 ```
 
 示例安全流程：
