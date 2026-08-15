@@ -25,6 +25,9 @@ Isaac Gym 单独看第 6 节；MuJoCo/SAPIEN 看第 7 节；只有设备权限�
 - [`environment.yml`](./environment.yml)：conda 基础层，包括 Python、NumPy、SciPy 和 Pinocchio；
 - [`uv.lock`](./uv.lock)：九个 extras 的 PyPI 版本、来源与 hash 锁定结果；
 - [`scripts/install_conda_env.sh`](./scripts/install_conda_env.sh)：创建、更新和验收完整环境的入口。
+- [`scripts/dev_environment_doctor.py`](./scripts/dev_environment_doctor.py)：只读检查当前 worktree 的
+  源码解析、Conda 依赖、锁文件和可选 SDK；
+- [`scripts/verify_dev_base.sh`](./scripts/verify_dev_base.sh)：多人开发基座的统一无硬件门禁；
 - [`scripts/install_annotation_env.sh`](./scripts/install_annotation_env.sh)：创建或同步独立标注环境的入口。
 
 Isaac Gym、OpenPI server 和真实设备的系统驱动不属于 `uv.lock` 的可移植范围；它们的边界和安装方式
@@ -119,6 +122,10 @@ python scripts/export_annotation_projection.py \
   `assets/DM_Tac_SDK_Publish_1.2.10`；没有 SDK 时可使用 `--skip-vendor-sdk`；
 - 以下命令从仓库根目录执行。
 
+DexTeleop 源码不会安装到共享 Conda 环境中。多个 worktree 可以共享同一套依赖，但每个终端
+必须在自己认领的 worktree 根目录运行项目命令，具体协作约定见
+[`CONTRIBUTING.md`](./CONTRIBUTING.md)。
+
 首次创建完整环境：
 
 ```bash
@@ -160,7 +167,8 @@ bash scripts/install_conda_env.sh --update
 ```
 
 `--update` 会按新的 `environment.yml` 更新并清理 conda 包，再按新的 `uv.lock` 安装 PyPI 包；它不会
-自动卸载环境中曾经手工安装、但已不在锁文件中的 PyPI 包。若需要彻底清除这类残留，建议删除并重建环境：
+自动卸载环境中曾经手工安装、但已不在锁文件中的其他 PyPI 包；它会移除旧的 DexTeleop
+editable 安装，避免共享环境固定指向某个 worktree。若需要彻底清除其他残留，建议删除并重建环境：
 
 ```bash
 export DEXTELEOP_ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
@@ -174,10 +182,11 @@ bash scripts/install_conda_env.sh --env-name "$DEXTELEOP_ENV_NAME"
 
 1. 创建 Python 3.10、NumPy、SciPy、conda-forge Pinocchio 基础环境；
 2. 使用 `uv.lock` 的 hash 锁定结果安装全部九个 PyPI 依赖分组；
-3. 以 editable 方式安装本仓库；
+3. 移除可能把共享环境固定到单个 checkout 的旧 DexTeleop editable 安装；
 4. 以 `--no-deps` 安装 `pin-pink==4.2.0`，避免错误拉取 pip 包 `pin`；
-5. 以 editable 方式安装本地 `dmrobotics==1.2.10` SDK（除非使用 `--skip-vendor-sdk`）；
-6. 执行核心、仿真、数据集和硬件模块导入检查。
+5. 以 editable 方式安装仓库外共享的 `dmrobotics==1.2.10` SDK（除非使用
+   `--skip-vendor-sdk`）；
+6. 执行核心依赖导入检查和共享 worktree 环境诊断。
 
 ## 4. 依赖分组与特殊包
 
@@ -193,17 +202,9 @@ bash scripts/install_conda_env.sh --env-name "$DEXTELEOP_ENV_NAME"
 | `vla_scratch` | 直接运行 vla-scratch 原生 ZMQ client 所需的 `pyzmq`；不包含模型/server | 是 |
 | `hardware` | RealSense、串口、Modbus、USB、DM-Tac SDK 运行库 | 是 |
 
-extras 也可以在已有 Python 3.10 环境中按需安装，例如：
-
-```bash
-python -m pip install -e '.[annotation]'
-python -m pip install -e '.[core,test]'
-python -m pip install -e '.[core,dataset]'
-python -m pip install -e '.[core,vla_scratch]'
-```
-
-按需安装只适合临时减少 PyPI 依赖；它不会安装 conda-only 的 `pinocchio`、特殊处理的 `pin-pink` 或
-本地厂商 SDK。正式复现和真机部署应使用本章的安装脚本，确保所有组件进入同一个 `dexteleop310`。
+extras 是生成锁文件和安装完整依赖时使用的依赖分组，不要求把 DexTeleop 打包或 editable
+安装。需要轻量后期标注时使用第 2 节的独立脚本；其余共享开发、复现和真机环境统一使用
+本章的 Conda 安装脚本，避免多个 worktree 争抢 editable 映射。
 
 不要安装 pip 包 `pin`。`pip check` 可能报告 `pin-pink requires pin`，这是 `pin-pink` 上游 metadata
 与 conda-forge Pinocchio 命名不一致造成的已知例外；安装脚本已经刻意使用 `--no-deps`。
@@ -218,26 +219,18 @@ DexTeleop 侧安装 `pyzmq`。
 
 ## 5. 主环境验证
 
-激活环境后，从仓库根目录执行基本 smoke test：
+激活环境后，从当前 worktree 根目录执行只读环境诊断：
 
 ```bash
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 cd "${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}"
 
-PYTHONNOUSERSITE=1 python - <<'PY'
-import importlib.metadata as metadata
-import importlib.util
-import sys
-
-assert sys.version_info[:2] == (3, 10), sys.version
-for name in ("numpy", "scipy", "pinocchio", "pink", "qpsolvers", "mujoco", "gymnasium", "torch", "pyarrow"):
-    assert importlib.util.find_spec(name) is not None, name
-
-for distribution in ("dexteleop", "pin-pink", "mujoco", "torch", "pyarrow"):
-    print(distribution, metadata.version(distribution))
-print("DexTeleop environment imports ok")
-PY
+PYTHONNOUSERSITE=1 python scripts/dev_environment_doctor.py
 ```
+
+该命令不会导入项目 runtime 或初始化设备。默认情况下，缺少 DM-Tac SDK 只会警告；真机开发
+可以设置 `DEXTELEOP_DMTAC_SDK_ROOT` 并加 `--require-vendor-sdk`。若发现历史 editable 映射，
+诊断器会同时确认当前根目录仍解析到本 worktree；重新运行安装脚本可移除该映射。
 
 检查关键包没有从 `~/.local` user-site 加载：
 
@@ -256,6 +249,9 @@ PY
 项目测试统一关闭 user-site 和外部 pytest 插件：
 
 ```bash
+# 共享开发基座门禁：环境、锁、源码解析和核心包边界，不连接硬件。
+bash scripts/verify_dev_base.sh
+
 # 修改后最快的默认回归层：纯进程内单元测试。
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   python -m pytest -m 'unit and not optional' -q

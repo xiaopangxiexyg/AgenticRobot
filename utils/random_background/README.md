@@ -1,5 +1,9 @@
 # Random Background Augmentation
 
+可复用增强、mask reader、photometric、occlusion 与 real-image provider 的 canonical
+实现位于 `dataset_interface.random_background`。本目录只保留离线下载、索引、预览和样例生成
+命令，以及旧 Python import path 的薄兼容导出；新库代码不要再依赖 `utils` 路径。
+
 用于把 wrist/depth mask 之外的背景替换为随机像素纹理。默认生成的是“空间相关的乱序像素”，不是纯白噪声：包含低频光照、块级乱序、patch mosaic、轻微相机噪声和模糊。
 
 原因：
@@ -41,7 +45,7 @@ python -m utils.random_background.generate_samples \
 训练中启用新增真实图片池：
 
 ```python
-from utils.random_background import (
+from dataset_interface.random_background import (
     LocalImageBackgroundProvider,
     RandomBackgroundAugmentConfig,
     RandomBackgroundVideoAugmenter,
@@ -64,7 +68,7 @@ augmenter = RandomBackgroundVideoAugmenter(
 在线合成：
 
 ```python
-from utils.random_background import apply_random_background
+from dataset_interface.random_background import apply_random_background
 
 # keep_mask > 0 is foreground to preserve.
 augmented_bgr = apply_random_background(frame_bgr, keep_mask, seed=episode_index * 100000 + frame_index)
@@ -73,7 +77,7 @@ augmented_bgr = apply_random_background(frame_bgr, keep_mask, seed=episode_index
 视频序列建议使用时间一致背景，而不是每帧独立随机：
 
 ```python
-from utils.random_background import temporal_background_from_episode
+from dataset_interface.random_background import temporal_background_from_episode
 
 stream = temporal_background_from_episode(
     width=640,
@@ -98,7 +102,7 @@ for frame_index, frame_bgr in enumerate(frames):
 需要更强相机运动时可以直接构造 spec：
 
 ```python
-from utils.random_background import TemporalBackgroundSpec, TemporalRandomBackground
+from dataset_interface.random_background import TemporalBackgroundSpec, TemporalRandomBackground
 
 stream = TemporalRandomBackground(
     TemporalBackgroundSpec(
@@ -118,7 +122,7 @@ stream = TemporalRandomBackground(
 如果已经有一批背景 PNG，可以显式读取并传入：
 
 ```python
-from utils.random_background import apply_random_background, load_background
+from dataset_interface.random_background import apply_random_background, load_background
 
 bg = load_background("utils/random_background/generated/random_bg_0000_block_shuffle.png")
 augmented_bgr = apply_random_background(frame_bgr, keep_mask, background=bg)
@@ -139,7 +143,7 @@ final 合成阶段不额外添加 proxy/body mask
 也就是 `mask > 0` 的像素保留原始 RGB，`mask == 0` 的背景替换为随机背景。
 
 ```python
-from utils.random_background import (
+from dataset_interface.random_background import (
     MaskReaderCache,
     RandomBackgroundAugmentConfig,
     RandomBackgroundVideoAugmenter,
@@ -175,7 +179,7 @@ augmented_bgr = augmenter.apply(
 也可以直接用 manifest helper：
 
 ```python
-from utils.random_background import augment_sample_from_paths
+from dataset_interface.random_background import augment_sample_from_paths
 
 augmented_bgr = augment_sample_from_paths(
     rgb_bgr,
@@ -210,7 +214,7 @@ front 固定边界替换**完成后**作用于完整 BGR 图像，随后才交�
 mask 的几何、不会新增离线视频或 Parquet 字段，也不会把 mask 当作模型输入的一部分。
 
 ```python
-from utils.random_background import PhotometricAugmentConfig, RandomBackgroundAugmentConfig
+from dataset_interface.random_background import PhotometricAugmentConfig, RandomBackgroundAugmentConfig
 
 augmentation = RandomBackgroundAugmentConfig(
     provider="mixed",
@@ -244,7 +248,7 @@ view-occlusion 增强。
 平移、翻转或透视；固定 resize 或保持宽高比的 letterbox 应在遮挡后执行。
 
 ```python
-from utils.random_background import RandomBackgroundAugmentConfig, ViewOcclusionConfig
+from dataset_interface.random_background import RandomBackgroundAugmentConfig, ViewOcclusionConfig
 
 augmentation = RandomBackgroundAugmentConfig(
     view_occlusion=ViewOcclusionConfig(enabled=True),
@@ -286,7 +290,7 @@ kernel 也只准备一次。`apply_batch(...)` 复用同一计划，不会额外
 然后将被选中的边界替换为随机背景。
 
 ```python
-from utils.random_background import FixedBorderMaskConfig, RandomBackgroundAugmentConfig
+from dataset_interface.random_background import FixedBorderMaskConfig, RandomBackgroundAugmentConfig
 
 augmentation = RandomBackgroundAugmentConfig(
     provider="mixed",

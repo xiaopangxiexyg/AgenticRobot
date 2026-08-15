@@ -7,7 +7,7 @@ from pathlib import Path
 
 _SCRIPT = (
     Path(__file__).resolve().parents[1]
-    / "todos/probes/export_realman_tactile_to_nas.py"
+    / "scripts/probes/export_realman_tactile_to_nas.py"
 )
 _SPEC = importlib.util.spec_from_file_location("export_realman_tactile_to_nas", _SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None

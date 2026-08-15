@@ -10,10 +10,10 @@
 | [Position A/B report](./reports/position_ab_report.md) | 已有 capture 的离线分析结果 | [遥操数采说明](../real/TELEOP_COLLECTION.md) |
 | [2026-07-22 命令清点](./reports/command_inventory_2026-07-22.md) | 重组前入口与散落来源快照 | [当前 docs 入口](../README.md) |
 | [2026-07-17 框架复核](./reports/framework_review_20260717.md) | 当时目录、入口、契约和迁移状态的只读快照 | [当前 docs 入口](../README.md) / 各 package README |
-| [2026-08-03 项目结构审计](./reports/project_structure_audit_20260803.md) | P0 实施前的规模、边界与问题快照 | [当前 P0 结构治理计划](../../todos/dexteleop_p0_structure_remediation_plan_20260803.md) / [`AGENTS.md`](../../AGENTS.md) |
+| [2026-08-03 项目结构审计](./reports/project_structure_audit_20260803.md) | P0 实施前的规模、边界与问题快照 | [当前 P0 结构治理计划](../architecture/plans/dexteleop_p0_structure_remediation_plan_20260803.md) / [`AGENTS.md`](../../AGENTS.md) |
 | [2026-08-06 tests 整理记录](./reports/tests_reorganization_20260806.md) | marker、路径试点、兼容恢复和冻结区记录 | [当前 tests 规则](../../tests/README.md) |
-| [2026-07-21 RTC 研究备忘](./reports/rtc_research_memo_20260721.md) | 异步 action chunk、时间对齐和缓冲方案的早期调研 | [当前 RTC 计划](../../todos/dexteleop_rtc_landing_plan.md) / [`DEPLOY_SCHEMA.md`](../../DEPLOY_SCHEMA.md) |
-| [2026-08-02 HITL 研究备忘](./reports/hitl_research_memo_20260802.md) | latched nominal chunk、residual、rebase 和 handback 的早期方案 | [当前 HITL 计划](../../todos/hitl_chunk_relative_migration_plan.md) |
+| [2026-07-21 RTC 研究备忘](./reports/rtc_research_memo_20260721.md) | 异步 action chunk、时间对齐和缓冲方案的早期调研 | [当前 RTC 计划](../architecture/plans/dexteleop_rtc_landing_plan.md) / [`DEPLOY_SCHEMA.md`](../../DEPLOY_SCHEMA.md) |
+| [2026-08-02 HITL 研究备忘](./reports/hitl_research_memo_20260802.md) | latched nominal chunk、residual、rebase 和 handback 的早期方案 | [当前 HITL 计划](../architecture/plans/hitl_chunk_relative_migration_plan.md) |
 | [旧根 README 站点流程](./root/README_site_pipeline_2026-07-22.md) | 重组前 589 行设备、SAPIEN、真机短测、GUI 数采和回放流程 | [当前 docs 入口](../README.md) |
 | [v2.3 旧站点验收](./acceptance/ACCEPTANCE_V23_site_2026-07-22.md) | 固定主机/checkpoint/测试数量及含 auto-start 的历史 A/B 表 | [当前 v2.3 验收](../data/ACCEPTANCE_V23.md) |
 
@@ -30,6 +30,6 @@
   命令也从该路径加载，避免维护两份参数。
 - `README.md`、`README_ENV.md`：仍承担项目入口和环境权威，只增加 docs 导航。
 - `docs/data/ACCEPTANCE_V23.md`：当前可移植验收模板；旧站点版本已归档到本目录。
-- `todos/`：只保留活动计划；历史审计、实验报告和稳定说明按实际 owner 迁出，
+- 本地 `todos/`：不进入 Git；需要团队共享的计划、历史审计、实验报告和稳定说明按实际 owner 进入 `docs/`，
   但是否完成不能只按文件名判断。
 - 各 package `README.md`：仍是模块参数和技术边界的权威来源。

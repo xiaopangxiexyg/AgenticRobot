@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from utils.dataset_postprocess.wrist_cam_adjust.depth import DepthRangeMaskConfig, mask_manifest_payload, pack_binary_mask
-from utils.random_background import (
+from dataset_interface.random_background import (
     FixedBorderMaskConfig,
     LocalImageBackgroundProvider,
     MaskReaderCache,

@@ -17,7 +17,7 @@ from .metadata import DexTeleopDatasetIndex, InvalidTrainingDataError, TrainingE
 from .missing_views import MissingViewResolver
 from .sample import FrameRequest, MaskedFrameSample
 from .video_source import VideoReaderCache
-from utils.random_background import (
+from .random_background import (
     LocalImageBackgroundProvider,
     RandomBackgroundVideoAugmenter,
     default_real_image_root,

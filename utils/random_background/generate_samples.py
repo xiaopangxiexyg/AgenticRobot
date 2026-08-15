@@ -6,8 +6,11 @@ from pathlib import Path
 
 import numpy as np
 
-from .background import BackgroundMode, generate_background
-from .real_image_provider import LocalImageBackgroundProvider, RealImageBackgroundConfig
+from dataset_interface.random_background.background import BackgroundMode, generate_background
+from dataset_interface.random_background.real_image_provider import (
+    LocalImageBackgroundProvider,
+    RealImageBackgroundConfig,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

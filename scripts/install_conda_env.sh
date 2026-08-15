@@ -90,9 +90,9 @@ conda run --no-capture-output --name "$ENV_NAME" \
 PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
   python -m pip install --no-cache-dir --require-hashes --requirement "$PIP_LOCK_REQUIREMENTS"
 
-echo "[dexteleop-env] Installing the repository in editable mode"
+echo "[dexteleop-env] Removing any repository editable install"
 PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
-  python -m pip install --no-cache-dir --no-deps --editable "$REPO_ROOT"
+  python -m pip uninstall --yes dexteleop
 
 echo "[dexteleop-env] Installing pin-pink without its obsolete pip 'pin' dependency"
 PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
@@ -103,6 +103,14 @@ if ((SKIP_VENDOR_SDK == 0)); then
   PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
     python -m pip install --no-cache-dir --no-deps --editable "$SDK_ROOT"
 fi
+
+echo "[dexteleop-env] Running shared-worktree environment checks"
+DOCTOR_ARGS=(--reject-repo-editable --vendor-sdk-root "$SDK_ROOT")
+if ((SKIP_VENDOR_SDK == 0)); then
+  DOCTOR_ARGS+=(--require-vendor-sdk)
+fi
+PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
+  python scripts/dev_environment_doctor.py "${DOCTOR_ARGS[@]}"
 
 echo "[dexteleop-env] Running import smoke test"
 PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" python - <<'PY'
@@ -153,4 +161,5 @@ fi
 echo
 echo "[dexteleop-env] Installation complete. Activate it with:"
 echo "  conda activate $ENV_NAME"
+echo "[dexteleop-env] Run project commands from the root of the selected worktree."
 echo "[dexteleop-env] Note: pip check reports pin-pink's intentional missing 'pin' metadata dependency."

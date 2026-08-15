@@ -13,7 +13,7 @@ from utils.dataset_postprocess.wrist_cam_adjust.final_mask import compose_final_
 from utils.dataset_postprocess.wrist_cam_adjust.geometry_mask.dataset import (
     _base_from_stored_pose_by_side,
 )
-from utils.random_background.mask_io import BitpackMaskReader
+from dataset_interface.random_background.mask_io import BitpackMaskReader
 
 
 def test_desk_absolute_pose_contract_is_mapped_back_to_each_arm_base() -> None:

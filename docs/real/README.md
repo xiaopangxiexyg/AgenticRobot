@@ -13,6 +13,7 @@
 | [DEPLOY](./DEPLOY.md) | 通用 deploy 合约和验收 |
 | [OPENPI](./OPENPI.md) | OpenPI 两进程部署 |
 | [UMI](./UMI.md) | UMI 配置、标定和数采 |
+| [共享实施计划](./plans/README.md) | 被当前报告或架构文档引用、但尚未完成的真实系统工作 |
 
 ## 0. 运行前确认
 

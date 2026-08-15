@@ -1,7 +1,8 @@
 # 环境安装与基础检查
 
 从仓库根执行。依赖、更新、完整测试层级、独立环境和权限说明统一见
-[`README_ENV.md`](../../README_ENV.md)。
+[`README_ENV.md`](../../README_ENV.md)。多人并行修改先按
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md) 认领独立 worktree。
 
 ## 1. 创建或修复环境
 
@@ -26,12 +27,16 @@ export DEXTELEOP_ROOT="$PWD"
 export DEXTELEOP_ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
 eval "$(conda shell.bash hook)"
 conda activate "$DEXTELEOP_ENV_NAME"
+python scripts/dev_environment_doctor.py
 ```
 
 `/path/to/DexTeleop` 必须替换为本机 clone 路径。`conda shell.bash hook` 只初始化当前 shell，
 不依赖 Conda 的安装目录，也不修改 shell 配置；持久化设置见
 [`README_ENV.md`](../../README_ENV.md)。安装时若使用了 `--env-name NAME`，把
 `DEXTELEOP_ENV_NAME` 设置为同一个名称即可。
+
+多个 worktree 可以共享同一个 Conda 依赖环境，但所有项目命令都必须从各自 worktree 根目录
+运行；安装脚本不会把 DexTeleop editable 绑定到其中某一个 worktree。
 
 ## 2. 入口检查（R0）
 
@@ -52,6 +57,14 @@ UMI 子命令需要单独检查。
 环境检查通过后，按 [硬件入口的第 1 节](../hardware/README.md)运行唯一的全设备只读检查。
 
 ## 4. 最快单元测试（R0）
+
+共享开发基座的环境与包边界检查：
+
+```bash
+bash scripts/verify_dev_base.sh
+```
+
+只运行默认单元测试：
 
 ```bash
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \

@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .real_image_provider import write_image_manifest
+from dataset_interface.random_background.real_image_provider import write_image_manifest
 
 
 VALIDATION_IDS_URL = "https://storage.googleapis.com/openimages/2018_04/validation/validation-images-with-rotation.csv"

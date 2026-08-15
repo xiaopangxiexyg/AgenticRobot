@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal, Mapping
 
 from dataset_contracts.camera_semantics import CameraRoleBinding
-from utils.random_background import RandomBackgroundAugmentConfig
+from .random_background import RandomBackgroundAugmentConfig
 
 
 ImageLayout = Literal["bgr_hwc_uint8", "rgb_hwc_uint8", "rgb_chw_float32"]

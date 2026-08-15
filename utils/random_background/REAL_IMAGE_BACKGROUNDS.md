@@ -37,7 +37,7 @@ python -m utils.random_background.index_real_backgrounds \
 训练中使用：
 
 ```python
-from utils.random_background import (
+from dataset_interface.random_background import (
     LocalImageBackgroundProvider,
     RandomBackgroundAugmentConfig,
     RandomBackgroundVideoAugmenter,

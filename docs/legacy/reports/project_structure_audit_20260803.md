@@ -5,7 +5,7 @@
 范围：当前 `/home/zc/HandMotion/Developing/DexTeleop` 工作区；以工作区实际内容为准，不把 `HEAD` 当作当前运行行为
 
 当前结构治理以
-[`todos/dexteleop_p0_structure_remediation_plan_20260803.md`](../../../todos/dexteleop_p0_structure_remediation_plan_20260803.md)
+[`dexteleop_p0_structure_remediation_plan_20260803.md`](../../architecture/plans/dexteleop_p0_structure_remediation_plan_20260803.md)
 和项目 [`AGENTS.md`](../../../AGENTS.md) 为准。本文保留审计时点的规模、问题与证据，
 不得把其中的行数、测试数量或并行状态解释为当前事实。
 

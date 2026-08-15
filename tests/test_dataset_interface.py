@@ -20,7 +20,7 @@ from dataset_interface import (
 from dataset_interface.adapters.torch import TorchMaskedAugmentDataset
 from dataset_interface.mask_source import FinalMaskSource
 from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.core import WRIST_DEPTH_MASK_FORMAT, pack_binary_mask
-from utils.random_background import (
+from dataset_interface.random_background import (
     FixedBorderMaskConfig,
     PhotometricAugmentConfig,
     RandomBackgroundAugmentConfig,

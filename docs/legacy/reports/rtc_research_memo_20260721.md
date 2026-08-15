@@ -2,7 +2,7 @@
 
 > 历史状态：本文保留 RTC 方案形成前的行业调研和设计动机，不是 DexTeleop RTC 的
 > 实施规范。正式边界、阶段、contract 和验收见
-> [`dexteleop_rtc_landing_plan.md`](../../../todos/dexteleop_rtc_landing_plan.md)；当前实现、链路和阶段 gate 图见
+> [`dexteleop_rtc_landing_plan.md`](../../architecture/plans/dexteleop_rtc_landing_plan.md)；当前实现、链路和阶段 gate 图见
 > [`dexteleop_rtc_visual_guide.md`](../../architecture/dexteleop_rtc_visual_guide.md)。若两者冲突，以架构主线、control-core
 > landing plan 和 RTC landing plan 为准；尤其当前 relative pose 使用固定 chunk-start TCP anchor，不使用本文
 > 第六节示例中的 chained-delta 累计公式。

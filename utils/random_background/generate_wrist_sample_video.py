@@ -8,13 +8,13 @@ from typing import Any
 import cv2
 import numpy as np
 
-from utils.random_background import (
+from dataset_interface.random_background import (
     LocalImageBackgroundProvider,
     PhotometricAugmentConfig,
     RandomBackgroundAugmentConfig,
     RandomBackgroundVideoAugmenter,
 )
-from utils.random_background.mask_io import BitpackMaskReader
+from dataset_interface.random_background.mask_io import BitpackMaskReader
 
 
 DEFAULT_FINAL_MASK_ROOT = Path(

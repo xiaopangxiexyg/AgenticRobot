@@ -60,7 +60,9 @@ is experimental.
   episode owner, and must not import `control_station`.
 - `model/`: future policy/learner/DAgger/RL package, not a current runtime entrypoint.
 - `legacy/`: confirmed-archived code/docs only; production code must not import it.
-- `tests/` and `todos/`: verification and planning; neither is runtime code.
+- `tests/`: verification, never runtime code. Root `todos/` is Git-ignored local planning state;
+  tracked code, tests, and documentation must not import or link to it. Plans that require shared
+  review belong under the owning `docs/**/plans/` directory.
 
 Shared code should depend toward `control_composition`, `robot_motion`, and pure
 data contracts. `control_composition` depends downward on `robot_motion`; the

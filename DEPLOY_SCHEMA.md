@@ -3,7 +3,7 @@
 本文档是 policy 与 DexTeleop deployment runtime 之间的规范契约。它定义模型输入、模型输出、
 artifact/session identity 和兼容边界；不定义 dataset 磁盘格式，也不授予硬件 dispatch 权限。
 离线数据以 [`DATASET_SCHEMA.md`](DATASET_SCHEMA.md) 为准，RTC 实施过程以
-[`todos/dexteleop_rtc_landing_plan.md`](todos/dexteleop_rtc_landing_plan.md) 为准。
+[`dexteleop_rtc_landing_plan.md`](docs/architecture/plans/dexteleop_rtc_landing_plan.md) 为准。
 
 规范文字使用以下含义：`MUST`/“必须”是启动或推理时的硬约束，`MUST NOT`/“不得”表示
 fail-closed 条件，`SHOULD`/“应”是兼容性建议，`MAY`/“可”表示可选能力。JSON/Python 示例
@@ -716,7 +716,7 @@ adapter 必须从已加载模型实例导出 capability、request spec、artifac
 不得按 model name、checkpoint name、config name 或固定维度猜测。通用入口是结构化
 `RtcModelRuntimeAdapter`/`SimpleRtcModelRuntimeAdapter`；具体 worker/session/transport lifecycle 见
 [`deployments/client/README.md`](deployments/client/README.md) 和
-[`todos/dexteleop_rtc_landing_plan.md`](todos/dexteleop_rtc_landing_plan.md)。
+[`dexteleop_rtc_landing_plan.md`](docs/architecture/plans/dexteleop_rtc_landing_plan.md)。
 
 对于无自定义 session/reconnect 生命周期且直接返回完整 chunk 的接口，优先使用
 `create_final_chunk_rtc_runtime_adapter()`：框架只提供 instance-derived `FinalChunkRtcBinding`、input preparation、
