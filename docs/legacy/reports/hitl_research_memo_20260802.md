@@ -2,7 +2,7 @@
 
 > 历史状态：本文保留当前 HITL migration plan 形成前的研究动机、候选状态机和
 > 评估设想，不再作为实施事实源。当前边界、成熟度和下一阶段以
-> [`hitl_chunk_relative_migration_plan.md`](../../../todos/hitl_chunk_relative_migration_plan.md)
+> [`hitl_chunk_relative_migration_plan.md`](../../architecture/plans/hitl_chunk_relative_migration_plan.md)
 > 为准；发生冲突时以当前代码、合同和该计划为准。
 
 当前主线应明确调整为：

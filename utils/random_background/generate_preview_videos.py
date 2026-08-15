@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .background import (
+from dataset_interface.random_background.background import (
     apply_random_background,
     generate_background,
     temporal_background_from_episode,

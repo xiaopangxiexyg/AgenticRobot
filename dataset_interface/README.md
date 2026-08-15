@@ -439,7 +439,7 @@ mask == 0 替换/增强背景
 from pathlib import Path
 
 from dataset_interface import DatasetInterfaceConfig, MaskConfig, MaskedFramePipeline
-from utils.random_background import FixedBorderMaskConfig, RandomBackgroundAugmentConfig
+from dataset_interface.random_background import FixedBorderMaskConfig, RandomBackgroundAugmentConfig
 
 config = DatasetInterfaceConfig(
     dataset_root=Path("datasets/2026-07-09_vive_rm65_real_teleop"),
@@ -525,7 +525,7 @@ epoch 内静态，不同 epoch 可确定性重采样。设
 平移、旋转、翻转、cutout 或随机黑块。
 
 ```python
-from utils.random_background import PhotometricAugmentConfig, RandomBackgroundAugmentConfig
+from dataset_interface.random_background import PhotometricAugmentConfig, RandomBackgroundAugmentConfig
 
 training_augmentation = RandomBackgroundAugmentConfig(
     provider="mixed",
@@ -558,7 +558,7 @@ resolution 图像；模型侧应随后只做固定 resize/letterbox 和 normaliz
 random resized crop。
 
 ```python
-from utils.random_background import ViewOcclusionConfig
+from dataset_interface.random_background import ViewOcclusionConfig
 
 config = DatasetInterfaceConfig(
     dataset_root=...,

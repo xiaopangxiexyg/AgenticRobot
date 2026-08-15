@@ -6,11 +6,11 @@
 
 本文是以下事实文档的可视化索引，不新增 contract、实施授权或验收结论：
 
-- [`dexteleop_architecture_planning.md`](../../todos/dexteleop_architecture_planning.md)：长期架构与数据语义；
-- [`dexteleop_control_core_landing_plan.md`](../../todos/dexteleop_control_core_landing_plan.md)：文件落位、迁移批次、前提和回滚。
-- [`dexteleop_rtc_landing_plan.md`](../../todos/dexteleop_rtc_landing_plan.md)：异步 action chunk/RTC producer；
+- [`dexteleop_architecture_planning.md`](plans/dexteleop_architecture_planning.md)：长期架构与数据语义；
+- [`dexteleop_control_core_landing_plan.md`](plans/dexteleop_control_core_landing_plan.md)：文件落位、迁移批次、前提和回滚。
+- [`dexteleop_rtc_landing_plan.md`](plans/dexteleop_rtc_landing_plan.md)：异步 action chunk/RTC producer；
 - [`dexteleop_rtc_visual_guide.md`](dexteleop_rtc_visual_guide.md)：RTC 当前实现、顺序兼容、时间对齐与阶段 gate 图；
-- [`dexteleop_control_station_plan.md`](../../todos/dexteleop_control_station_plan.md)：统一实验台、GUI与source/target迁移。
+- [`dexteleop_control_station_plan.md`](plans/dexteleop_control_station_plan.md)：统一实验台、GUI与source/target迁移。
 
 状态图例：
 
@@ -1113,7 +1113,7 @@ fast weights、noise adapter 或 replay 真机 authority。
 | ControlTrace runtime | `teleop_runtime/control_trace/` |
 | persistent contracts/readers | `dataset_contracts/`、`dataset_interface/` |
 | authoritative sim fixtures/backend | `sim/mujoco/` |
-| async action chunk / RTC | [`dexteleop_rtc_visual_guide.md`](dexteleop_rtc_visual_guide.md)、[`dexteleop_rtc_landing_plan.md`](../../todos/dexteleop_rtc_landing_plan.md) |
-| unified Control Station / GUI | [`dexteleop_control_station_plan.md`](../../todos/dexteleop_control_station_plan.md) |
-| detailed target architecture | [`dexteleop_architecture_planning.md`](../../todos/dexteleop_architecture_planning.md) |
-| exact batches and rollback | [`dexteleop_control_core_landing_plan.md`](../../todos/dexteleop_control_core_landing_plan.md) |
+| async action chunk / RTC | [`dexteleop_rtc_visual_guide.md`](dexteleop_rtc_visual_guide.md)、[`dexteleop_rtc_landing_plan.md`](plans/dexteleop_rtc_landing_plan.md) |
+| unified Control Station / GUI | [`dexteleop_control_station_plan.md`](plans/dexteleop_control_station_plan.md) |
+| detailed target architecture | [`dexteleop_architecture_planning.md`](plans/dexteleop_architecture_planning.md) |
+| exact batches and rollback | [`dexteleop_control_core_landing_plan.md`](plans/dexteleop_control_core_landing_plan.md) |

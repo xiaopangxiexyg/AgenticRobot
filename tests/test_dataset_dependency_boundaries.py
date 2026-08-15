@@ -111,6 +111,27 @@ def test_dataset_contracts_has_no_application_or_tooling_dependencies() -> None:
     assert violations == {}
 
 
+def test_dataset_interface_has_no_application_or_tooling_dependencies() -> None:
+    forbidden = {
+        "collection_runtime",
+        "control_station",
+        "deployments",
+        "hardware",
+        "model",
+        "sim",
+        "teleop_runtime",
+        "utils",
+    }
+    violations = {
+        str(path.relative_to(REPO_ROOT)): sorted(
+            {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
+        )
+        for path in _python_files(REPO_ROOT / "dataset_interface")
+        if {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
+    }
+    assert violations == {}
+
+
 def test_offline_postprocess_has_no_static_runtime_dependency() -> None:
     forbidden = {
         "teleop_runtime",
@@ -184,6 +205,22 @@ def test_legacy_data_paths_reexport_the_shared_contract_objects() -> None:
     assert schema_v21._ARM_MODE_FLOAT64_COLUMNS is parquet_contract.ARM_MODE_FLOAT64_COLUMNS
     assert schema_v21._ARM_MODE_INT64_COLUMNS is parquet_contract.ARM_MODE_INT64_COLUMNS
     assert schema_v21._ARM_MODE_STRING_COLUMNS is parquet_contract.ARM_MODE_STRING_COLUMNS
+
+
+def test_legacy_random_background_paths_reexport_dataset_owned_objects() -> None:
+    from dataset_interface.random_background import (
+        RandomBackgroundAugmentConfig as CanonicalAugmentConfig,
+    )
+    from dataset_interface.random_background.mask_io import (
+        BitpackMaskReader as CanonicalMaskReader,
+    )
+    from utils.random_background import (
+        RandomBackgroundAugmentConfig as LegacyAugmentConfig,
+    )
+    from utils.random_background.mask_io import BitpackMaskReader as LegacyMaskReader
+
+    assert LegacyAugmentConfig is CanonicalAugmentConfig
+    assert LegacyMaskReader is CanonicalMaskReader
 
 
 def test_shared_manifest_does_not_embed_an_offline_implementation_path() -> None:

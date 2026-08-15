@@ -293,7 +293,7 @@ profile 或 profiled/unprofiled progress Episode。
 conda activate dexteleop310
 cd /home/zc/HandMotion/Developing/DexTeleop
 
-python -m todos.probes.generate_refinement_annotation_mock \
+python -m scripts.generate_refinement_annotation_mock \
   --output datasets/mock_refinement_annotation_test \
   --background-root utils/random_background \
   --seed 2502

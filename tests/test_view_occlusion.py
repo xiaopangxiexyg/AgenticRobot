@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from utils.random_background import (
+from dataset_interface.random_background import (
     BlobOcclusionConfig,
     GridOcclusionConfig,
     PhotometricAugmentConfig,

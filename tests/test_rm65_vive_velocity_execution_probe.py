@@ -11,7 +11,7 @@ from scipy.spatial.transform import Rotation
 def _load_probe_module():
     path = (
         Path(__file__).resolve().parents[1]
-        / "todos"
+        / "scripts"
         / "probes"
         / "rm65_vive_velocity_execution_probe.py"
     )

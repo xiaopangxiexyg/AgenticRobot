@@ -4,8 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from .background import save_background_set
-from .real_image_provider import write_image_manifest
+from dataset_interface.random_background.background import save_background_set
+from dataset_interface.random_background.real_image_provider import write_image_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:

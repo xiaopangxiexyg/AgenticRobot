@@ -66,8 +66,8 @@ hardware = [
     "transforms3d==0.4.1",
     "evdev>=1.7,<2",
     "pyudev==0.24.4",
-    # Runtime dependencies of the bundled DM-Tac SDK.  The SDK itself is a
-    # local editable install performed by scripts/install_conda_env.sh.
+    # Runtime dependencies of the separately supplied DM-Tac SDK.  The SDK
+    # itself is an editable install performed by scripts/install_conda_env.sh.
     "h5py==3.16.0",
     "cryptography>=41,<50",
     "grpcio==1.81.1",
@@ -87,7 +87,6 @@ include = [
     "dataset_interface*",
     "deployments*",
     "hardware*",
-    "rm65_inspire_tac*",
     "robot_motion*",
     "sim*",
     "teleop_runtime*",

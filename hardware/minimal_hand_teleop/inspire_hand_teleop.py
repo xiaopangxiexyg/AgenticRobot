@@ -22,9 +22,10 @@ from hardware.teleop_hand.hand_q6_reader import (
     Q6_ORDER,
     SingleHandQ6Reader,
 )
-from teleop_runtime.hand_mapping import (
+from robot_motion.action.hand_mapping import (
     DEFAULT_INSPIRE_HAND_JOINT_ORDER,
     TARGET_INSPIRE_HAND_Q6_ORDER,
+    map_q6_to_dexhand_target,
 )
 
 ReaderType = Union[SingleHandQ6Reader, BimanualHandQ6Reader]
@@ -237,12 +238,13 @@ class InspireHandTeleopBridge:
         if source.shape != (6,):
             raise ValueError(f"Expected source q6 shape (6,), got {source.shape}")
 
-        source = np.clip(source, 0.0, 1.0)
-        source = source[self.joint_order]
-
-        target = 1.0 - source if self.invert else source.copy()
-        target = target * self.gain + self.bias
-        target = np.clip(target, 0.0, 1.0)
+        target = map_q6_to_dexhand_target(
+            source,
+            joint_order=self.joint_order,
+            invert=self.invert,
+            gain=self.gain,
+            bias=self.bias,
+        ).target_q6
 
         if self.filtered_cmd is None or self.alpha >= 1.0:
             self.filtered_cmd = target

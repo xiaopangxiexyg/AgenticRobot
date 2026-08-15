@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .metadata import DexTeleopDatasetIndex
-from utils.random_background.mask_io import BitpackMaskReader
+from .random_background.mask_io import BitpackMaskReader
 
 
 def episode_tag(episode_index: int) -> str:

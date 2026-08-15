@@ -113,4 +113,4 @@ VIVE pose intent
 
 该功能必须 default-off，保留当前 position profile 的原子回退，并继续使用独立的
 canonical force emergency-stop guard。详细所有权、数据和分阶段合同见
-`todos/rm65_60hz_teleop_force_admittance_feasibility.md`。
+`docs/real/plans/rm65_60hz_teleop_force_admittance_feasibility.md`。

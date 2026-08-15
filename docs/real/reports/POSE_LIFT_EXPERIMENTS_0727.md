@@ -624,7 +624,7 @@ dynamic slack。当前没有整体优于 V4 的选择。
 
 ### 3.14 官方 RM65 全解 IK 与分层控制探针
 
-在 V4–V11 的局部 Pink 路线没有得到整体支配解后，新增了两个 `todos/probes/` 下的
+在 V4–V11 的局部 Pink 路线没有得到整体支配解后，新增了两个 `scripts/probes/` 下的
 纯离线探针：
 
 - `rm65_official_all_ik_probe.py`：核查官方全解、全部候选、SDK/URDF FK、求解延迟、
@@ -763,7 +763,7 @@ explicit 60 Hz qref interpolation contract
 
 `source Pose all-IK → joint interpolation` 解决的是几何分支，不应把线性
 qref 直接解释成可下发 qcmd。为隔离时间律问题，新增纯离线探针
-`todos/probes/rm65_qref_dynamics_probe.py`。它读取 parquet 中：
+`scripts/probes/rm65_qref_dynamics_probe.py`。它读取 parquet 中：
 
 - `action.reference.*.q_ref`；
 - `position.transport.*.last_accepted_qpos`；
@@ -967,7 +967,7 @@ official source all-IK
 + 0.05 s jerk ramp
 ```
 
-其中候选配对逻辑已从 `todos/probes/` 抽为
+其中候选配对逻辑已从 `scripts/probes/` 抽为
 `robot_motion.rm65.select_nearest_collision_safe_rm65_ik_pair`。它只比较已产生的
 双臂候选并调用 canonical validation callback，不初始化 SDK、不持有 planner state、
 clock、cursor、authority 或 dispatch；探针已经改为调用这份共享实现并在 ep96 复核

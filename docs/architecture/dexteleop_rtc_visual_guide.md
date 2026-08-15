@@ -8,9 +8,9 @@
 它是以下文档的图示索引，不新增 contract、真机授权或 motion authority；显式 raw-RTC caller 仍只作为
 default-off、`send_actions=false` 的部署接线：
 
-- [`dexteleop_architecture_planning.md`](../../todos/dexteleop_architecture_planning.md)：长期控制、时间、authority 与 trace 语义；
-- [`dexteleop_control_core_landing_plan.md`](../../todos/dexteleop_control_core_landing_plan.md)：当前主批次、前提、回滚和真机 gate；
-- [`dexteleop_rtc_landing_plan.md`](../../todos/dexteleop_rtc_landing_plan.md)：RTC-0–RTC-7 的详细 contract 与验收矩阵；
+- [`dexteleop_architecture_planning.md`](plans/dexteleop_architecture_planning.md)：长期控制、时间、authority 与 trace 语义；
+- [`dexteleop_control_core_landing_plan.md`](plans/dexteleop_control_core_landing_plan.md)：当前主批次、前提、回滚和真机 gate；
+- [`dexteleop_rtc_landing_plan.md`](plans/dexteleop_rtc_landing_plan.md)：RTC-0–RTC-7 的详细 contract 与验收矩阵；
 - [`dexteleop_architecture_visual_guide.md`](dexteleop_architecture_visual_guide.md)：全项目控制、数据与训练闭环；
 - [`RTC 异步 Action Chunk 研究备忘`](../legacy/reports/rtc_research_memo_20260721.md)：
   历史研究材料，不是实施规范。
@@ -79,7 +79,7 @@ raw-RTC 的隐含前置条件；两者均不取得 teleop/replay 或真机 dispa
 | downstream D-LA pre-motion lookahead gate | ⏳ later | 属于target-side preview协议；完成前RTC profile不得重新启用position lookahead |
 | RTC-4a generic protocol/client seam | ✅ pure/local only | scheduler/continuation分轴、capability/envelope/receipt与两个local backend迁移fixture；无具体模型或transport |
 | RTC-4b-A OpenPI raw-RTC final-chunk adapter | ✅ offline/fake transport | artifact/server/input/output/V22 codec完整绑定；只声明`continuation=none`；adapter本身不创建websocket、worker或frontend |
-| RTC-4b-T3 OpenPI raw-RTC caller | 🟡 real no-action shadow / authority pending | 既有OpenPI launcher仅在显式raw profile创建adapter；`--rtc-real-shadow`才允许live endpoints，并将RM65/DMTAC/hand置为observation-only；R-R4已验证真实observation→transport→timed-plan/emission→bounded drain，仍无action send authority；[local evidence](../../todos/evidence/rtc/rtc_4b_t3_openpi_raw_rtc_local_evidence_v1.json) · [R-R4 default](../../todos/evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json) · [R-R4 drain](../../todos/evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json) |
+| RTC-4b-T3 OpenPI raw-RTC caller | 🟡 real no-action shadow / authority pending | 既有OpenPI launcher仅在显式raw profile创建adapter；`--rtc-real-shadow`才允许live endpoints，并将RM65/DMTAC/hand置为observation-only；R-R4已验证真实observation→transport→timed-plan/emission→bounded drain，仍无action send authority；[local evidence](evidence/rtc/rtc_4b_t3_openpi_raw_rtc_local_evidence_v1.json) · [R-R4 default](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json) · [R-R4 drain](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json) |
 | raw-RTC action representation | 🟡 OpenPI absolute + relative live no-action complete | R-A1/R-R1均在plan前形成chunk-bound typed result；R-R2完成same-chunk sync/RTC gold，R-R4完成真实observation→worker→timed-plan→drained no-action shadow；正式target/safety与motion仍未接 |
 | RTC-4b-T0 generic worker bridge | ✅ local/fake backend | core迁入`robot_motion.deploy`；通用client executor接bounded worker→timed plan，2/4/8 horizon与blocked backend通过；无target caller |
 | RTC-4b-T1 transport lifecycle | ✅ local/fake transport | typed cancel/close receipt、hook隔离、worker drain事实、pending/failed-close re-arm拒绝与fresh reconnect；无server/network |
@@ -104,15 +104,15 @@ OpenPI/default deploy/position/MuJoCo兼容矩阵为`160 passed, 1 skipped`；mo
 `0.80 s`，8个transport phase receipt全部completed。精确边界和hash见对应evidence。2026-07-22先前主线
 deployment/OpenPI/position/MuJoCo兼容矩阵为`154 passed, 1 skipped`。
 T2b原始范围、source SHA、chunk/metadata hash与服务清理事实记录在
-[`rtc_4b_t2b_openpi_live_no_action_evidence_v1.json`](../../todos/evidence/rtc/rtc_4b_t2b_openpi_live_no_action_evidence_v1.json)。
+[`rtc_4b_t2b_openpi_live_no_action_evidence_v1.json`](evidence/rtc/rtc_4b_t2b_openpi_live_no_action_evidence_v1.json)。
 T2d通用组合边界、source SHA和回归命令记录在
-[`rtc_4b_t2d_framework_composition_local_evidence_v1.json`](../../todos/evidence/rtc/rtc_4b_t2d_framework_composition_local_evidence_v1.json)。
+[`rtc_4b_t2d_framework_composition_local_evidence_v1.json`](evidence/rtc/rtc_4b_t2d_framework_composition_local_evidence_v1.json)。
 T2e只读基线审计、processed-sample binding与原生ZMQ no-model loopback记录在
-[`rtc_4b_t2e_vla_scratch_additive_local_evidence_v1.json`](../../todos/evidence/rtc/rtc_4b_t2e_vla_scratch_additive_local_evidence_v1.json)。
+[`rtc_4b_t2e_vla_scratch_additive_local_evidence_v1.json`](evidence/rtc/rtc_4b_t2e_vla_scratch_additive_local_evidence_v1.json)。
 T2f artifact-derived三相机/双臂canonical sample、baseline类型消费和环境边界记录在
-[`rtc_4b_t2f_vla_scratch_dataset_view_local_evidence_v1.json`](../../todos/evidence/rtc/rtc_4b_t2f_vla_scratch_dataset_view_local_evidence_v1.json)。
+[`rtc_4b_t2f_vla_scratch_dataset_view_local_evidence_v1.json`](evidence/rtc/rtc_4b_t2f_vla_scratch_dataset_view_local_evidence_v1.json)。
 T2g 独立进程 virtual-policy server/client 与现有 wire contract 记录在
-[`rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json`](../../todos/evidence/rtc/rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json)。
+[`rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json`](evidence/rtc/rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json)。
 T2g 为 `/tmp` scoped probe，不改变 `192 passed` 的纯 RTC 回归计数。
 RTC-3c/4a evidence中的`152 passed, 1 skipped`是当时测试集的历史计数。
 2026-07-23新增typed canonical payload、互斥result/keyframe、receipt一致性与G0→G1→G2→G3 gold ladder后，首轮定向
@@ -129,9 +129,9 @@ OpenPI relative adapter接线后，adapter/launcher定向矩阵为`69 passed`，
 `150000` artifact已通过本地新config解析。R-R2进一步用registered relative `149999/h50`形成真实response：
 same-chunk sync/RTC解码误差为零，warm worker inference约`1.19 s`，41个control ticks最大约`18.9 ms`，
 result唯一接纳并只形成一个no-action emission。记录见
-[`rtc_rr1_openpi_relative_adapter_local_evidence_v1.json`](../../todos/evidence/rtc/rtc_rr1_openpi_relative_adapter_local_evidence_v1.json)
+[`rtc_rr1_openpi_relative_adapter_local_evidence_v1.json`](evidence/rtc/rtc_rr1_openpi_relative_adapter_local_evidence_v1.json)
 与
-[`rtc_rr2_openpi_relative_live_no_action_evidence_v1.json`](../../todos/evidence/rtc/rtc_rr2_openpi_relative_live_no_action_evidence_v1.json)。
+[`rtc_rr2_openpi_relative_live_no_action_evidence_v1.json`](evidence/rtc/rtc_rr2_openpi_relative_live_no_action_evidence_v1.json)。
 此前`103 passed`与`94 passed, 1 skipped`保留为历史台账。control-core 最新全量台账同时记录
 先前MuJoCo actuation profile v1→v2 的 config/test/real2sim hash漂移已收口；2026-07-21全量为
 `2605 passed, 6 skipped`，RTC与CS-2 baseline恢复green，可以继续签署
@@ -951,11 +951,11 @@ flowchart TB
   request/18次response、10次merge接纳、9个唯一formal emission，1次TTL拒绝和7次`no_eligible_future`；control budget
   exceedance为0，`send_actions=false`、lookahead disabled、dispatch/action-step均为0。默认`worker_stop_timeout_sec=0`
   使最后一个in-flight request在close留下`ABANDONED_UNDRAINED`，因此该批只闭合真实输入/transport/admission shadow，
-  不提升drained close或motion readiness；详见[scoped R-R4 evidence](../../todos/evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json)。
+  不提升drained close或motion readiness；详见[scoped R-R4 evidence](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json)。
 - R-R4 drain-gate复跑显式设置`request_validity_steps=50`、`worker_stop_timeout_sec=2`：900个30 Hz step内8次
   request/response，7次merge接纳、1次cold TTL拒绝、253个唯一formal emission；control tick最大`16.80 ms`且零超预算，
   close为`DRAINED/thread_exited=true`，仍无dispatch/action-step。该结果闭合real no-action shadow的transport/admission/
-  drain部分，但canonical safety/IK、target acceptance和motion authority仍是独立gate；详见[drain-gate evidence](../../todos/evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json)。
+  drain部分，但canonical safety/IK、target acceptance和motion authority仍是独立gate；详见[drain-gate evidence](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json)。
 - R-S1只做target-side sim集成，等待sim2real observation contract，不在RTC侧新增MuJoCo→Real observation adapter；
 - R-M1再以loaded-instance capability接可选continuation provider、offline dataset与latency/memory profile；
   不使用checkpoint/config白名单，OpenPI只是候选之一，失败不影响raw-RTC；
@@ -1117,7 +1117,7 @@ cancellation/epoch/owner transition。RTC worker 不建立第二个 writer lifec
 | OpenPI transport lifecycle/deadline tests | `tests/test_openpi_rtc_transport_lifecycle.py`、`tests/test_rtc_transport_deadline_contract.py` | fake websocket；覆盖legacy call shape、timeout/cancel/reconnect；无模型/设备 |
 | OpenPI localhost loopback tests | `tests/test_openpi_rtc_localhost_loopback.py` | 实际websocket + synthetic final chunk；无OpenPI model/GPU/observation/action send |
 | OpenPI optional model seam | remote `src/openpi/models/pi0.py`、`src/openpi/policies/policy.py` | RTC-4b-B1；独立sampler/infer，default-off且无server caller |
-| OpenPI B1 evidence | `todos/evidence/rtc/rtc_4b_b1_openpi_remote_source_evidence_v1.json` | 16 passed、2 deselected；V22 10 passed、3 skipped；Ruff green |
+| OpenPI B1 evidence | `docs/architecture/evidence/rtc/rtc_4b_b1_openpi_remote_source_evidence_v1.json` | 16 passed、2 deselected；V22 10 passed、3 skipped；Ruff green |
 | vla-scratch canonical dataset view | `dataset_interface/vla_scratch.py`（RTC-4b-T2f） | artifact-derived ordered cameras + canonical pose chunk→existing processed keys；无模型/transport/runtime owner |
 | vla-scratch dataset-view tests | `tests/test_vla_scratch_dexteleop_dataset_view.py` | 5 passed；完整双臂三相机、history、identity与fail-closed边界 |
 | vla-scratch process-boundary probe | `/tmp/dexteleop_vla_scratch_process_boundary_probe.py`（RTC-4b-T2g） | 一个 virtual `BasePolicy` 模型实例 + native `ServePolicy` wrapper + native `ZmqPolicyClient`；独立进程wire-only evidence |
@@ -1130,16 +1130,16 @@ cancellation/epoch/owner transition。RTC worker 不建立第二个 writer lifec
 | split parity/order tests | `tests/test_deploy_rtc_prediction_admission.py` | 4 tests |
 | producer state/race/profile tests | `tests/test_deploy_rtc_producer_state.py` | 8 tests |
 | frontend long-run/lifecycle tests | `tests/test_deploy_rtc_frontend_shadow.py` | 6 tests |
-| scoped evidence | `todos/evidence/rtc/rtc_3c_local_evidence_v1.json` | non-formal/local-only |
-| RTC-4a scoped evidence | `todos/evidence/rtc/rtc_4a_model_agnostic_local_evidence_v1.json` | non-formal/local-only；无模型/transport/设备 |
-| RTC-4b-A scoped evidence | `todos/evidence/rtc/rtc_4b_a_openpi_final_chunk_local_evidence_v1.json` | non-formal/offline fake transport；无server/frontend/sim/设备 |
-| RTC-4b-T1 scoped evidence | `todos/evidence/rtc/rtc_4b_t1_transport_lifecycle_local_evidence_v1.json` | non-formal/local fake transport；无live server/真实observation/action send |
-| RTC-4b-T2a scoped evidence | `todos/evidence/rtc/rtc_4b_t2a_transport_deadline_local_evidence_v1.json` | non-formal/fake + localhost no-model websocket |
-| RTC-4b-T2b scoped evidence | `todos/evidence/rtc/rtc_4b_t2b_openpi_live_no_action_evidence_v1.json` | non-formal/remote existing-server + synthetic observation；无worker/plan/real observation/action send |
-| RTC-4b-T2c scoped evidence | `todos/evidence/rtc/rtc_4b_t2c_openpi_live_worker_plan_no_action_evidence_v1.json` | non-formal/remote existing-server + synthetic observation + bounded worker + unique timed plan；零emission/legacy pop/action send |
-| OpenPI relative R-R2 live evidence | `todos/evidence/rtc/rtc_rr2_openpi_relative_live_no_action_evidence_v1.json` | registered relative checkpoint + synthetic三相机 + same-chunk sync/RTC gold + bounded worker/timed-plan/单emission；无target/safety/position/dispatch/action send |
-| RTC-4b-T2f scoped evidence | `todos/evidence/rtc/rtc_4b_t2f_vla_scratch_dataset_view_local_evidence_v1.json` | non-formal/local synthetic artifact/arrays + unchanged baseline type probe；无真实episode/model/GPU/action send |
-| RTC-4b-T2g scoped evidence | `todos/evidence/rtc/rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json` | non-formal/local cross-process one virtual model instance + server wrapper + native ZMQ；无checkpoint/GPU/真实observation/action send |
+| scoped evidence | `docs/architecture/evidence/rtc/rtc_3c_local_evidence_v1.json` | non-formal/local-only |
+| RTC-4a scoped evidence | `docs/architecture/evidence/rtc/rtc_4a_model_agnostic_local_evidence_v1.json` | non-formal/local-only；无模型/transport/设备 |
+| RTC-4b-A scoped evidence | `docs/architecture/evidence/rtc/rtc_4b_a_openpi_final_chunk_local_evidence_v1.json` | non-formal/offline fake transport；无server/frontend/sim/设备 |
+| RTC-4b-T1 scoped evidence | `docs/architecture/evidence/rtc/rtc_4b_t1_transport_lifecycle_local_evidence_v1.json` | non-formal/local fake transport；无live server/真实observation/action send |
+| RTC-4b-T2a scoped evidence | `docs/architecture/evidence/rtc/rtc_4b_t2a_transport_deadline_local_evidence_v1.json` | non-formal/fake + localhost no-model websocket |
+| RTC-4b-T2b scoped evidence | `docs/architecture/evidence/rtc/rtc_4b_t2b_openpi_live_no_action_evidence_v1.json` | non-formal/remote existing-server + synthetic observation；无worker/plan/real observation/action send |
+| RTC-4b-T2c scoped evidence | `docs/architecture/evidence/rtc/rtc_4b_t2c_openpi_live_worker_plan_no_action_evidence_v1.json` | non-formal/remote existing-server + synthetic observation + bounded worker + unique timed plan；零emission/legacy pop/action send |
+| OpenPI relative R-R2 live evidence | `docs/architecture/evidence/rtc/rtc_rr2_openpi_relative_live_no_action_evidence_v1.json` | registered relative checkpoint + synthetic三相机 + same-chunk sync/RTC gold + bounded worker/timed-plan/单emission；无target/safety/position/dispatch/action send |
+| RTC-4b-T2f scoped evidence | `docs/architecture/evidence/rtc/rtc_4b_t2f_vla_scratch_dataset_view_local_evidence_v1.json` | non-formal/local synthetic artifact/arrays + unchanged baseline type probe；无真实episode/model/GPU/action send |
+| RTC-4b-T2g scoped evidence | `docs/architecture/evidence/rtc/rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json` | non-formal/local cross-process one virtual model instance + server wrapper + native ZMQ；无checkpoint/GPU/真实observation/action send |
 
 ---
 

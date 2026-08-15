@@ -69,8 +69,6 @@ sim/outputs/
 utils/random_background/generated/
 utils/random_background/samples/
 utils/random_background/real_images/
-codex_remote/*
-!codex_remote/remote_dataset_camera_quarantine.sh
 # Ignore the root code archive without hiding versioned documentation under docs/legacy.
 /legacy/
 
@@ -131,3 +129,6 @@ test_left_fix_datasets_waping_fixed/
 SKILL_PROMPT.md
 YOUR_SKILL.md
 scripts/temp_cmd/
+
+# Personal task planning; shared plans belong under the owning docs/**/plans/ path.
+/todos/

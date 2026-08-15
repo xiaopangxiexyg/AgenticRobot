@@ -3,8 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from todos.probes.compare_rm65_official_ik_rates import PoseTrack, RolloutArtifact
-from todos.probes.view_rm65_deploy_ik_rate_comparison_mujoco import (
+from scripts.probes.compare_rm65_official_ik_rates import PoseTrack, RolloutArtifact
+from scripts.probes.view_rm65_deploy_ik_rate_comparison_mujoco import (
     _auto_select_chunk,
     _advance_gripper_source_state,
     _gripper_targets_by_source_index,
@@ -298,7 +298,7 @@ def test_cli_treats_keyboard_interrupt_as_clean_viewer_shutdown(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(
-        "todos.probes.view_rm65_deploy_ik_rate_comparison_mujoco.main",
+        "scripts.probes.view_rm65_deploy_ik_rate_comparison_mujoco.main",
         lambda _argv=None: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 

@@ -8,6 +8,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 
 | 目标 | 当前入口 |
 |---|---|
+| 多人开发、worktree 与提交门禁 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
 | 安装环境、入口检查 | [`docs/setup/`](./docs/setup/README.md) |
 | 真机遥操、正式数采、replay、deploy | [`docs/real/`](./docs/real/README.md) |
 | MuJoCo、VIVE sim teleop、dataset replay | [`docs/sim/`](./docs/sim/README.md) |

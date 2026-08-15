@@ -4,7 +4,7 @@ import argparse
 
 import pytest
 
-from todos.probes.probe_arm_hold_front_state_batch_benchmark import (
+from scripts.probes.probe_arm_hold_front_state_batch_benchmark import (
     _batch_sizes,
     _case_indices,
 )

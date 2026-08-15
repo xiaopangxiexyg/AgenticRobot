@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from collection_runtime.modality_storage import ModalityStorageError
-from todos.probes import detach_verified_realman_tactile as probe
+from scripts.probes import detach_verified_realman_tactile as probe
 
 
 def test_wait_for_global_collection_quiescence_waits_until_empty() -> None:

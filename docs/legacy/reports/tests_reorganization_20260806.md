@@ -67,7 +67,7 @@ tests/
 2. 所有导入 `control_station` 或 `control_composition` 的测试。
 3. 文件名或直接 import 涉及 `HITL/HIL`、`sim_hil`、human、residual、trajectory、RTC、ControlTrace 的测试。
 4. `docs/HIL/README.md`、`docs/legacy/reports/hitl_research_memo_20260802.md`、
-   `todos/hitl_chunk_relative_migration_plan.md` 点名的测试。
+   `docs/architecture/plans/hitl_chunk_relative_migration_plan.md` 点名的测试。
 5. 与上述测试互相 import helper、共享 fixture，或被活动计划/命令按精确路径引用的测试。
 
 当前机械扫描得到 110 个 HITL/direct-or-shared 测试；与 66 个 dirty/untracked 测试合并后，冻结并集至少 154 个。剩余约 310 个文件只是“可继续审计”，不等于已经获准搬迁。
