@@ -106,8 +106,38 @@ policy, and lookahead submissions; the reference worker derives
 `position_command` work and the selected RM65 backend worker derives
 `backend_command` work. One no-I/O fake-SDK test proves the exact owner epoch and
 generation reach the backend pre-SDK guard. Missing or stale work fails closed.
-The current binding is still `fake_only_unbound`, rejects hardware, and has only
-a one-step dry-run plus pure in-memory publication proof. RealTeleop, measured
-pose production, Gateway daemon lifetime, policy-motion worker HOLD/drain proof,
-and a production real launcher remain unbound. Zero, constants, or Gateway-
-generated epochs must not be used to make the attachment appear authoritative.
+The policy-deploy binding is still `fake_only_unbound`, rejects hardware, and
+has only a one-step dry-run plus pure in-memory publication proof. Its
+policy-motion worker HOLD/drain proof and a production real launcher remain
+unbound. Zero, constants, or Gateway-generated epochs must not be used to make
+the attachment appear authoritative.
+
+## Attach-only Agent primitive motion
+
+The top-level real profile now has a separate default-off 6+3 primitive path.
+`agent_gateway.profiles.real.motion_factory` preflights four exact
+`t2_real_motion` Routes (six cardinal directions plus three fixed level
+orientations), prepares one `RealAgentMotionPort`, assembles the Gateway
+service, and only then attaches that same port to the existing RealTeleop
+Session. It returns a replacement `RealTeleopComponents`; a composition root
+must use that returned aggregate. The ordinary component builder and CLI do not
+enable this path.
+
+The existing RealTeleop control thread remains the sole effect owner. It applies
+queued activation/HOLD requests, builds the selected absolute tool-TCP target
+through the existing coupled retargeter, and sends the result through the
+Session's existing command filter, pre-dispatch guard, admission, Rig dispatch,
+recorder, and `hold_hardware()` paths. After the normal hardware-state reads,
+the same control frame may publish those already-read joint values through the
+existing FK owner as the measured TCP cut; the Gateway performs no extra
+backend read.
+
+The Gateway side requires an exact RUNNING/READY lower-owner provider, fresh
+measured cuts, a route-covering lower safety-envelope reference, and a one-use
+request-bound operator Grant. It evaluates convergence only from distinct
+lower cuts after dispatch and declares success only after lower-confirmed HOLD.
+The current tests drive all nine cases with an in-memory owner/control loop.
+They establish code wiring and fail-HOLD behavior, not deployed-cell envelope
+correctness, production owner-state wiring, daemon lifecycle, or safe physical
+motion. Those production facts remain deliberately unbound until a reviewed
+launcher supplies them.
