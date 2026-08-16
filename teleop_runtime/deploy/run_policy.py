@@ -227,6 +227,7 @@ from ..target_safety.tcp_pose_envelope_runtime import (
     load_tcp_pose_envelope_file_spec,
 )
 from .action_dispatch import (
+    command_effector_kind_subset,
     dispatch_position_discrete_command_checked as _dispatch_position_discrete_command_checked,
 )
 from .action_execution import (
