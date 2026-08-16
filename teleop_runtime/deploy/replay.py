@@ -1340,6 +1340,33 @@ class DatasetReplayPolicy:
         }
 
 
+def debug_replay_execution_exhausted(
+    policy: Any,
+    *,
+    queued_actions: int,
+) -> bool:
+    """Stop non-loop replay after its decoded final chunk is consumed."""
+
+    wrapped_policy = getattr(policy, "policy", policy)
+    if not isinstance(wrapped_policy, DatasetReplayPolicy):
+        return False
+    return (
+        not bool(wrapped_policy.loop)
+        and bool(wrapped_policy.finished)
+        and int(queued_actions) <= 0
+    )
+
+
+def skip_startup_replay_frames(policy: Any, count: int = 1) -> int:
+    """Advance a replay source when it supports startup-frame skipping."""
+
+    wrapped_policy = getattr(policy, "policy", policy)
+    skip = getattr(wrapped_policy, "skip_startup_frames", None)
+    if not callable(skip):
+        return 0
+    return int(skip(count))
+
+
 def _restrict_replay_end_effector_metadata(
     metadata: Mapping[str, Any],
     end_effector_sides: Sequence[str],
