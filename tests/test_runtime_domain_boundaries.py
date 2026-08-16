@@ -78,6 +78,24 @@ def _legacy_mujoco_composition_calls(path: Path) -> set[str]:
     return violations
 
 
+def _private_mujoco_composition_topology_calls(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    calls: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        receiver = node.func.value
+        if not (
+            isinstance(receiver, ast.Attribute)
+            and receiver.attr == "_topology"
+            and isinstance(receiver.value, ast.Attribute)
+            and receiver.value.attr == "_composition_binding"
+        ):
+            continue
+        calls.add(node.func.attr)
+    return calls
+
+
 def _violations(
     root: Path,
     forbidden_roots: set[str],
@@ -189,6 +207,28 @@ def test_optional_sim_deploy_integrations_do_not_spread_into_simulation_core() -
     ) == {}
 
 
+def test_sim_hil_strategy_control_construction_is_application_owned() -> None:
+    sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
+    station_composition = (
+        REPO_ROOT / "control_station" / "composition" / "mujoco_sim_hil.py"
+    )
+    station_factory = (
+        REPO_ROOT / "control_station" / "sim_hil_profile" / "factory.py"
+    )
+    strategy_control_constructors = {
+        "CompositionStrategyControl",
+        "TimeWindowRetentionSpec",
+        "build_initial_strategy_revision",
+    }
+
+    assert "control_composition" not in _absolute_import_roots(sim_target)
+    assert _called_names(sim_target).isdisjoint(strategy_control_constructors)
+    assert strategy_control_constructors <= _called_names(station_composition)
+    assert "build_mujoco_sim_hil_strategy_control_factory" in _called_names(
+        station_factory
+    )
+
+
 def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> None:
     target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
     composition_binding = (
@@ -215,6 +255,59 @@ def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> N
     }
     assert "build_mujoco_composition_runtime_binding" in imported_symbols
     assert imported_symbols.isdisjoint(implementation_constructors)
+
+
+def test_mujoco_target_runtime_delegates_pure_promotion_policy() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+    promotion_policy = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "composition_promotion.py"
+    )
+
+    assert "MujocoCompositionPromotionPolicy" in _called_names(target_runtime)
+    assert _absolute_import_roots(promotion_policy) == {
+        "__future__",
+        "dataclasses",
+        "robot_motion",
+    }
+
+    stateful_owner_operations = {
+        "admit_evaluated_composition",
+        "admit_proposal",
+        "run_decision",
+        "send_commands",
+    }
+    assert _attribute_names(promotion_policy).isdisjoint(
+        stateful_owner_operations
+    )
+    assert stateful_owner_operations & _attribute_names(target_runtime) == {
+        "admit_evaluated_composition",
+        "admit_proposal",
+        "run_decision",
+        "send_commands",
+    }
+    runtime_tree = ast.parse(
+        target_runtime.read_text(encoding="utf-8"),
+        filename=str(target_runtime),
+    )
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == "step"
+        for node in ast.walk(runtime_tree)
+    )
+    policy_source = promotion_policy.read_text(encoding="utf-8")
+    runtime_source = target_runtime.read_text(encoding="utf-8")
+    assert "_next_composite_proposal_sequence" not in policy_source
+    assert "_composition_promotion_envelope_by_evaluation_id" not in policy_source
+    assert "_next_composite_proposal_sequence" in runtime_source
+    assert "_composition_promotion_envelope_by_evaluation_id" in runtime_source
+
+
+def test_mujoco_runtime_uses_private_composition_topology_only_for_admission() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+
+    assert _private_mujoco_composition_topology_calls(target_runtime) == {
+        "admit_evaluated_composition"
+    }
+    assert "evaluate_composition_shadow" in _called_names(target_runtime)
 
 
 def test_control_station_uses_explicit_mujoco_composition_port() -> None:

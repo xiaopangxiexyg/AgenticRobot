@@ -10,6 +10,7 @@ from control_composition.composition import (
 )
 from control_station.composition import (
     build_component_keyed_mujoco_sim_hil_contracts,
+    build_mujoco_sim_hil_strategy_control_factory,
 )
 import numpy as np
 import pytest
@@ -443,6 +444,9 @@ def test_native_component_profile_reaches_one_atomic_mujoco_target() -> None:
     target = build_mujoco_sim_hil_target(
         config=target_config,
         contracts=contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(contracts)
+        ),
         hand_specs_by_side={
             "right": HandActionSpec.dmtac_gripper("right"),
         },

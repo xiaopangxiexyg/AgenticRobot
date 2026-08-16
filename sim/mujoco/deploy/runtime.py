@@ -128,6 +128,7 @@ from robot_motion.deploy import (
 
 from ..adapters import MujocoPositionExecutionRig
 from .composition_binding import build_mujoco_composition_runtime_binding
+from .composition_promotion import MujocoCompositionPromotionPolicy
 from .measurement import (
     MujocoQposMeasurement,
     build_mujoco_backend_measurement,
@@ -1137,6 +1138,14 @@ class MujocoDeployRuntime:
                 arm_action_specs_by_side=pose_input_arm_specs,
                 hand_action_specs_by_side=self._compound_hand_specs,
             )
+        self._composition_promotion_policy = MujocoCompositionPromotionPolicy(
+            catalog=self.catalog,
+            action_schema=self.action_schema,
+            compound_authority_profile=self._compound_composer_authority_profile,
+            decision_hz=config.decision_hz,
+            proposal_horizon_sec=config.proposal_horizon_sec,
+            reference_activation_profile_id=config.reference_activation_profile_id,
+        )
         self.reference_action_schema_hash = _bimanual_qpos_catalog(
             hand_sides
         ).semantic_content_hash
@@ -3187,17 +3196,7 @@ class MujocoDeployRuntime:
                 "Composer authority is not enabled for this sim runtime."
             )
         strategy_control = self.composition_port.strategy_control
-        if strategy_control is None:
-            evaluation = self._composition_binding._topology.evaluate_composition(
-                spec=spec,
-                target_effective_at=target_effective_at,
-                required_context_channels=required_context_channels,
-                source_difference_spec=source_difference_spec,
-                residual_anchor_lifecycle_scope_id=(
-                    residual_anchor_lifecycle_scope_id
-                ),
-            )
-        else:
+        if strategy_control is not None:
             latest_revision = strategy_control.latest_revision
             latest_spec_hash = (
                 latest_revision.composition_spec.semantic_content_hash
@@ -3206,16 +3205,15 @@ class MujocoDeployRuntime:
                 raise ValueError(
                     "Hot composition submission requested another " "CompositionSpec."
                 )
-            evaluation = (
-                self._composition_binding._topology.evaluate_hot_composition(
-                    target_effective_at=target_effective_at,
-                    required_context_channels=required_context_channels,
-                    source_difference_spec=source_difference_spec,
-                    residual_anchor_lifecycle_scope_id=(
-                        residual_anchor_lifecycle_scope_id
-                    ),
-                )
-            )
+        evaluation = self.composition_port.evaluate_composition_shadow(
+            spec=spec,
+            target_effective_at=target_effective_at,
+            required_context_channels=required_context_channels,
+            source_difference_spec=source_difference_spec,
+            residual_anchor_lifecycle_scope_id=(
+                residual_anchor_lifecycle_scope_id
+            ),
+        )
         if (
             evaluation.composition_evaluation.output_status != "ready"
             or evaluation.composition_evaluation.composed_candidate is None
@@ -3227,113 +3225,6 @@ class MujocoDeployRuntime:
             component_coverage=component_coverage,
             selection_groups=selection_groups,
         )
-
-    def _validate_composition_promotion_scope(
-        self,
-        *,
-        component_coverage: tuple[str, ...] | None,
-        selection_groups: tuple[str, ...] | None,
-        action: RobotAction,
-    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        if not isinstance(action, ComponentAction):
-            raise TypeError("Composed candidate must be a ComponentAction.")
-        catalog_by_component = self.catalog.component_by_id
-        if component_coverage is None and selection_groups is None:
-            if self._compound_composer_authority_profile is None:
-                # The ordinary composer profile follows the exact typed
-                # candidate instead of assuming a bimanual-arm topology.
-                # Catalog and coupled-group validation below still reject an
-                # unknown or partial physical ownership scope.
-                coverage = action.component_coverage
-                groups = tuple(
-                    dict.fromkeys(
-                        catalog_by_component[component].selection_group_id
-                        for component in coverage
-                        if component in catalog_by_component
-                    )
-                )
-            else:
-                coverage = self._compound_composer_authority_profile.component_coverage
-                groups = self._compound_composer_authority_profile.selection_groups
-        elif component_coverage is None or selection_groups is None:
-            raise ValueError(
-                "component_coverage and selection_groups must be provided " "together."
-            )
-        else:
-            coverage = tuple(str(value).strip() for value in component_coverage)
-            groups = tuple(str(value).strip() for value in selection_groups)
-        if (
-            not coverage
-            or not groups
-            or any(not value for value in (*coverage, *groups))
-            or len(coverage) != len(set(coverage))
-            or len(groups) != len(set(groups))
-        ):
-            raise ValueError(
-                "Composition promotion scope must be non-empty and unique."
-            )
-        unknown_components = tuple(
-            component for component in coverage if component not in catalog_by_component
-        )
-        if unknown_components:
-            raise ValueError(
-                "Composition promotion scope contains components outside the "
-                f"active MuJoCo catalog: {unknown_components!r}."
-            )
-        catalog_order = tuple(
-            component.component_id
-            for component in self.catalog.components
-            if component.component_id in coverage
-        )
-        if coverage != catalog_order:
-            raise ValueError(
-                "Composition component_coverage must follow catalog order."
-            )
-        expected_groups = tuple(
-            dict.fromkeys(
-                catalog_by_component[component].selection_group_id
-                for component in coverage
-            )
-        )
-        if groups != expected_groups:
-            raise ValueError(
-                "Composition selection_groups must exactly match component "
-                "catalog ownership."
-            )
-        for group in groups:
-            members = self.catalog.components_for_group(group)
-            if members and members[0].coupled:
-                covered_members = {
-                    component
-                    for component in coverage
-                    if catalog_by_component[component].selection_group_id == group
-                }
-                required_members = {component.component_id for component in members}
-                if covered_members != required_members:
-                    raise ValueError(
-                        "Composition promotion cannot partially cover coupled "
-                        f"selection group {group!r}."
-                    )
-        if (
-            action.action_schema.semantic_content_hash
-            != self.action_schema.semantic_content_hash
-        ):
-            raise ValueError("Composed action uses another runtime action schema.")
-        action_coverage = action.component_coverage
-        if coverage != action_coverage:
-            raise ValueError(
-                "Composition promotion scope must exactly match the composed "
-                "action components."
-            )
-        if self._compound_composer_authority_profile is not None and (
-            coverage != self._compound_composer_authority_profile.component_coverage
-            or groups != self._compound_composer_authority_profile.selection_groups
-        ):
-            raise ValueError(
-                "Conservative compound composer authority requires the exact "
-                "all-required component/group scope."
-            )
-        return coverage, groups
 
     def submit_evaluated_composition(
         self,
@@ -3354,7 +3245,7 @@ class MujocoDeployRuntime:
         action = evaluation.composition_evaluation.composed_candidate
         if evaluation.composition_evaluation.output_status != "ready" or action is None:
             raise ValueError("Only a ready composition evaluation may be promoted.")
-        coverage, groups = self._validate_composition_promotion_scope(
+        self._composition_promotion_policy.validate_scope(
             component_coverage=component_coverage,
             selection_groups=selection_groups,
             action=action,
@@ -3364,14 +3255,8 @@ class MujocoDeployRuntime:
         )
         if composition_supported_until is None:
             raise ValueError("Ready composition evaluation has no support deadline.")
-        requested_until = evaluation.input_snapshot.target_effective_at + (
-            1.0 / self.config.decision_hz
-            if (
-                self._compound_composer_authority_profile is not None
-                and self.config.reference_activation_profile_id
-                == SCHEDULED_REFERENCE_SEGMENT_SIM_V1
-            )
-            else self.config.proposal_horizon_sec
+        requested_until = self._composition_promotion_policy.requested_effective_until(
+            target_effective_at=evaluation.input_snapshot.target_effective_at
         )
         evaluation_id = evaluation.composition_evaluation.composition_evaluation_id
         cached_envelope = self._composition_promotion_envelope_by_evaluation_id.get(

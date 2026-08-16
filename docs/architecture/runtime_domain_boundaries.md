@@ -59,9 +59,17 @@ lower domains must not import application/profile layers
   context/input/eligibility/dynamic-parameter admission 与 shadow evaluation。Control Station 已经由该 port
   调用这些能力；`policy_topology` / `composition_strategy_control` 分别保留为同一底层 topology/strategy
   对象的兼容视图。
-- proposal promotion、target state、canonical safety 和 dispatch 继续只由 `MujocoDeployRuntime` 持有；窄
-  port 不暴露这些操作。旧 composition 提交/评估方法目前仅保留为薄兼容转发，相关构造配置仍是后续边界
-  债务。composition 依赖禁止扩散到 sim contracts、task、physics、actuation 和基础 runtime。
+- dynamic Sim-HIL strategy revision、alpha control 和其 retention factory 由
+  `control_station.composition.mujoco_sim_hil` 构造；`sim.mujoco.deploy.sim_hil_target` 只接收 application
+  提供的 callable，动态 contract 缺少该 binding 时在 target 资源构造前 fail-closed，不再在 sim 内重建
+  application composition 语义。
+- proposal promotion 的 target catalog/group/schema 与期限策略已收敛到
+  `sim.mujoco.deploy.composition_promotion`；它是无状态 target policy，不做 admission、序号推进、authority、
+  safety 或 dispatch。proposal 幂等缓存、admission、target state、canonical safety 和 dispatch 继续只由
+  `MujocoDeployRuntime` 持有，窄 port 不暴露这些操作。旧 composition 提交/评估方法目前仅保留为薄兼容
+  转发；兼容 `compose_and_submit()` 的 evaluation 也统一通过该窄 port，只有 target-owned proposal
+  admission 可直接进入私有 topology。其余 information/source-eligibility 构造配置仍是后续边界债务。
+  composition 依赖禁止扩散到 sim contracts、task、physics、actuation 和基础 runtime。
 - `control_station/composition` 仍是 compatibility-scoped 的应用装配区。迁移时只保留 source/target/profile
   绑定，可复用控制语义回到 `control_composition`，MuJoCo 事实与执行回到 `sim`。
 

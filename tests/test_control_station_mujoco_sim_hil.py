@@ -14,6 +14,7 @@ import control_station.sim_hil as sim_hil_module
 from control_composition.composition import hand_action_spec_semantic_hash
 from control_composition import GuaranteedNextComponentAction
 from control_composition.activation import build_composition_activation_scope
+from control_composition.retention import TimeWindowRetentionSpec
 from dataset_contracts.completeness import (
     TRACE_REQUIREMENT_PROFILES_V1,
     evaluate_control_trace_lineage,
@@ -41,7 +42,9 @@ from control_station.composition import (
     MujocoSimHILPreflightReport,
     MujocoSimHILProfileConfig,
     MujocoSimHILReadinessEvidence,
+    build_component_keyed_mujoco_sim_hil_contracts,
     build_default_mujoco_sim_hil_contracts,
+    build_mujoco_sim_hil_strategy_control_factory,
     build_scoped_mujoco_sim_hil_composition,
 )
 from control_station.composition.mujoco_policy_human_residual import (
@@ -76,6 +79,9 @@ from robot_motion.coordinate_frames import (
     CoordinateFrameSpec,
 )
 from robot_motion.runtime import EffectorCommand, TeleopCommand
+from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
+from robot_motion.runtime.identity import ClockDomainDescriptor
+from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
 from robot_motion.deploy import NormalizedAction, PolicyActionEmission
 from robot_motion.diagnostics import TeleopRunState
 from sim.mujoco.deploy import (
@@ -536,6 +542,78 @@ def test_human_attachment_is_allowed_during_nonexecuting_viewer_preview() -> Non
 
 def _hand_specs() -> dict[str, HandActionSpec]:
     return {side: HandActionSpec.dmtac_gripper(side) for side in ("left", "right")}
+
+
+def test_dynamic_sim_hil_target_requires_application_strategy_control_factory() -> None:
+    hands = _hand_specs()
+    schema = build_mujoco_pose_action_schema(hands)
+    contracts = build_component_keyed_mujoco_sim_hil_contracts(
+        schema,
+        composer_producer_id="fixture-composer",
+        proposal_ttl_sec=0.1,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="application-supplied composition_strategy_control_factory",
+    ):
+        build_mujoco_sim_hil_target(
+            config=MujocoSimHILTargetConfig(
+                task_config_path=Path("not-read-before-composition-binding.json"),
+                realtime_worker=False,
+            ),
+            contracts=contracts,
+            hand_specs_by_side=hands,
+        )
+
+
+def test_application_strategy_control_factory_preserves_contract_identity() -> None:
+    hands = _hand_specs()
+    schema = build_mujoco_pose_action_schema(hands)
+    contracts = build_component_keyed_mujoco_sim_hil_contracts(
+        schema,
+        composer_producer_id="fixture-composer",
+        proposal_ttl_sec=0.1,
+    )
+    factory = build_mujoco_sim_hil_strategy_control_factory(contracts)
+    assert factory is not None
+    coordinator = ControlAdmissionCoordinator(
+        "fixture-control-domain",
+        clock_domain=ClockDomainDescriptor(
+            clock_domain_id="fixture-clock",
+            runtime_session_id="fixture-session",
+            boot_id="fixture-boot",
+            reset_epoch=0,
+        ),
+        clock=lambda: 10.0,
+    )
+    producer_epochs = ProducerEpochRegistry(
+        runtime_session_id="fixture-session",
+        coordinator=coordinator,
+    )
+
+    control = factory(coordinator, producer_epochs, 10.0)
+    revision = control.latest_revision
+
+    assert revision.runtime_session_id == "fixture-session"
+    assert revision.control_domain_id == "fixture-control-domain"
+    assert revision.available_clock_domain_id == "fixture-clock"
+    assert revision.composition_spec is contracts.composition_spec
+    assert revision.strategy_spec is contracts.strategy_spec
+    assert revision.component_rule_set is contracts.component_rule_set
+    assert revision.dynamic_parameter_contract is (
+        contracts.dynamic_parameter_contract
+    )
+    assert dict(revision.initial_alpha_by_component) == dict(
+        contracts.initial_alpha_by_component
+    )
+    assert control.retention_spec == TimeWindowRetentionSpec(
+        spec_id="mujoco-sim-hil-strategy-control-window-v1",
+        history_window_sec=2.0,
+        max_future_lead_sec=1.0,
+        max_effective_duration_sec=1.0,
+        max_late_arrival_sec=0.0,
+    )
 
 
 def test_sim_hil_readiness_accepts_canonical_debug_only_enum() -> None:
@@ -1638,6 +1716,9 @@ def test_sim_hil_target_separates_policy_source_and_compose_controller_rates() -
             composer_producer_id=composer_id,
         ),
         contracts=contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(contracts)
+        ),
         hand_specs_by_side=hands,
     )
     try:
@@ -1697,6 +1778,9 @@ def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> N
             composer_producer_id=composer_id,
         ),
         contracts=contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(contracts)
+        ),
         hand_specs_by_side=hands,
     )
     try:
@@ -1819,6 +1903,9 @@ def test_sim_hil_target_accepts_a_profile_selected_compose_rate() -> None:
             compose_target_hz=45.0,
         ),
         contracts=contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(contracts)
+        ),
         hand_specs_by_side=hands,
     )
     try:
@@ -1876,6 +1963,11 @@ def test_sim_hil_target_installs_profile_role_specific_input_schemas() -> None:
             realtime_worker=False,
         ),
         contracts=profile.sim_hil_contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(
+                profile.sim_hil_contracts
+            )
+        ),
         hand_specs_by_side=hands,
         composition_input_action_schema_by_role=(profile.input_action_schema_by_role),
     )
@@ -1961,6 +2053,11 @@ def test_sim_hil_human_transform_anchors_with_identity_then_submits_relative() -
             realtime_worker=False,
         ),
         contracts=profile.sim_hil_contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(
+                profile.sim_hil_contracts
+            )
+        ),
         hand_specs_by_side=hands,
         composition_input_action_schema_by_role=(profile.input_action_schema_by_role),
     )
@@ -2100,6 +2197,9 @@ def test_sim_hil_target_binds_non_off_execution_observation_plan() -> None:
             execution_observation_plan=plan,
         ),
         contracts=contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(contracts)
+        ),
         hand_specs_by_side=hands,
         execution_observation_sink=sink,
         trace_sink=trace_facts.append,
