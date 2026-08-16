@@ -14,8 +14,10 @@ from typing import Any
 import numpy as np
 
 from robot_motion.rm65 import (
+    RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_ARM_CONTROL_MODE_IMPEDANCE,
     RM65_ARM_CONTROL_MODE_POSITION,
+    build_rm65_pose_lift_ik_tuning,
     normalize_rm65_arm_control_mode,
 )
 from robot_motion.rm65.assets import require_asset_path
@@ -42,6 +44,19 @@ DEPLOY_ARM_STEP_DT_ALPHA = 0.25
 DEPLOY_ARM_STEP_DT_MAX_SCALE = 3.0
 DEPLOY_ARM_STEP_DT_STALL_RESET_SEC = 0.25
 DEPLOY_MAX_ARM_JOINT_STEP_RAD = float(np.deg2rad(6.0))
+
+
+def _position_deploy_ik_tuning(args: argparse.Namespace):
+    """Bind the formal action-to-qref objective without source-side shaping."""
+
+    return build_rm65_pose_lift_ik_tuning(
+        position_control_profile=(
+            str(getattr(args, "position_control_profile_resolved", ""))
+            or RM65_BIMANUAL_POSITION_V1_NAME
+        ),
+        pose_lift_profile=str(args.pose_lift_profile),
+        orientation_weight=float(args.position_ik_orientation_weight),
+    )
 
 
 def effective_arm_control_hz(args: argparse.Namespace) -> float:
@@ -392,6 +407,7 @@ __all__ = [
     "DEPLOY_ARM_STEP_DT_STALL_RESET_SEC",
     "DEPLOY_MAX_ARM_JOINT_STEP_RAD",
     "DEPLOY_RM65_ARM_MAX_ANGVEL",
+    "_position_deploy_ik_tuning",
     "annotate_deploy_arm_command_limits",
     "apply_arm_step_dt_defaults",
     "build_arm_backends",

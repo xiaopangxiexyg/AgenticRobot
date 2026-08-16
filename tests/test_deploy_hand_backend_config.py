@@ -15,6 +15,7 @@ _MIGRATED_NAMES = (
     "_dmtac_tactile_enabled",
     "_hand_backend_mode",
     "_hand_backend_mode_for_side",
+    "_hands_enabled",
     "_load_gripper_task_profile",
     "_profile_value",
     "_resolved_gripper_policy",
@@ -55,6 +56,29 @@ def test_hand_backend_mode_resolution_preserves_default_override_and_errors() ->
     args.hand_backend = "unsupported"
     with pytest.raises(ValueError, match="Unsupported hand backend 'unsupported'"):
         hand_backend_config._hand_backend_mode(args)
+
+
+def test_hands_enabled_preserves_explicit_backend_and_observation_precedence() -> None:
+    base = {
+        "hands_enabled": None,
+        "hand_backend": "inspire",
+        "left_hand_backend": None,
+        "right_hand_backend": None,
+        "left_hand_ip": "",
+        "right_hand_ip": "",
+        "visualize_tactile": False,
+    }
+
+    assert hand_backend_config._hands_enabled(argparse.Namespace(**base)) is False
+    assert hand_backend_config._hands_enabled(
+        argparse.Namespace(**{**base, "right_hand_backend": "dmtac-gripper"})
+    ) is True
+    assert hand_backend_config._hands_enabled(
+        argparse.Namespace(**{**base, "left_hand_ip": "192.0.2.10"})
+    ) is True
+    assert hand_backend_config._hands_enabled(
+        argparse.Namespace(**{**base, "hands_enabled": False, "left_hand_ip": "set"})
+    ) is False
 
 
 def test_resolved_gripper_policy_preserves_defaults_and_copying_cache() -> None:

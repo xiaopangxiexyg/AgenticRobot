@@ -70,6 +70,17 @@ def _hand_backend_mode_for_side(args: argparse.Namespace, side: str) -> str:
     return mode
 
 
+def _hands_enabled(args: argparse.Namespace) -> bool:
+    if args.hands_enabled is not None:
+        return bool(args.hands_enabled)
+    if any(
+        _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+        for side in ALL_SIDES
+    ):
+        return True
+    return bool(args.left_hand_ip or args.right_hand_ip or args.visualize_tactile)
+
+
 def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
     path_text = str(getattr(args, "gripper_task_profile", "") or "").strip()
     if not path_text:
@@ -264,6 +275,7 @@ __all__ = [
     "_dmtac_tactile_enabled",
     "_hand_backend_mode",
     "_hand_backend_mode_for_side",
+    "_hands_enabled",
     "_load_gripper_task_profile",
     "_profile_value",
     "_resolved_gripper_policy",

@@ -128,7 +128,6 @@ from robot_motion.rm65 import (
     RM65_QREF_ACCELERATION_COMFORT_75_V1,
     RM65_QREF_ACCELERATION_HARD_V1,
     RM65_QREF_ACCELERATION_PROFILE_CHOICES,
-    build_rm65_pose_lift_ik_tuning,
     normalize_rm65_arm_control_mode,
     resolve_rm65_pose_lift_profile,
     resolve_rm65_qref_acceleration_profile,
@@ -255,6 +254,7 @@ from .arm_backend_runtime import (
     effective_arm_canfd_follow,
     effective_arm_control_hz,
     effective_position_reference_hz,
+    _position_deploy_ik_tuning,
     resolve_arm_step_dt_max_scale,
     resolve_position_reference_and_command_hz as _resolve_position_reference_and_command_hz,
 )
@@ -343,6 +343,7 @@ from .hand_backend_config import (
     _dmtac_tactile_enabled,
     _hand_backend_mode,
     _hand_backend_mode_for_side,
+    _hands_enabled,
     _load_gripper_task_profile,
     _profile_value,
     _resolved_gripper_policy,
@@ -375,6 +376,7 @@ from .policy_qpos_init import (
 from .policy_binding import (
     bind_policy_pose_mode_from_artifact as _bind_policy_pose_mode_from_artifact,
     build_policy_observation_contract as _policy_observation_contract,
+    parse_policy_kwargs,
 )
 from .position_plan_cut import (
     DeploymentPositionPlanCutDetector,
@@ -1987,37 +1989,6 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--visualize-tactile", action="store_true")
     parser.add_argument("--tactile-vis-value-scale", type=float, default=0.05)
     parser.add_argument("--tactile-vis-size", type=int, default=640)
-
-
-def parse_policy_kwargs(text: str) -> dict[str, Any]:
-    payload = json.loads(str(text or "{}"))
-    if not isinstance(payload, dict):
-        raise TypeError("--policy-kwargs-json must decode to a JSON object.")
-    return payload
-
-
-def _hands_enabled(args: argparse.Namespace) -> bool:
-    if args.hands_enabled is not None:
-        return bool(args.hands_enabled)
-    if any(
-        _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
-        for side in ALL_SIDES
-    ):
-        return True
-    return bool(args.left_hand_ip or args.right_hand_ip or args.visualize_tactile)
-
-
-def _position_deploy_ik_tuning(args: argparse.Namespace):
-    """Bind the formal action-to-qref objective without source-side shaping."""
-
-    return build_rm65_pose_lift_ik_tuning(
-        position_control_profile=(
-            str(getattr(args, "position_control_profile_resolved", ""))
-            or RM65_BIMANUAL_POSITION_V1_NAME
-        ),
-        pose_lift_profile=str(args.pose_lift_profile),
-        orientation_weight=float(args.position_ik_orientation_weight),
-    )
 
 
 def validate_args(

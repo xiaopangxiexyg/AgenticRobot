@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from teleop_runtime.deploy import policy_binding, run_policy
 
 
@@ -38,6 +40,19 @@ def test_run_policy_preserves_policy_binding_compatibility_exports() -> None:
         run_policy._policy_observation_contract
         is policy_binding.build_policy_observation_contract
     )
+    assert run_policy.parse_policy_kwargs is policy_binding.parse_policy_kwargs
+
+
+def test_policy_kwargs_parser_preserves_object_only_contract() -> None:
+    assert policy_binding.parse_policy_kwargs("") == {}
+    assert policy_binding.parse_policy_kwargs('{"host": "127.0.0.1"}') == {
+        "host": "127.0.0.1"
+    }
+    with pytest.raises(
+        TypeError,
+        match="--policy-kwargs-json must decode to a JSON object",
+    ):
+        policy_binding.parse_policy_kwargs("[]")
 
 
 def test_observation_binding_prefers_artifact_identity_and_collects_layout_keys() -> None:
