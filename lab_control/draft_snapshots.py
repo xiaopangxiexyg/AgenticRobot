@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from . import git
-from .queue_profiles import DRAFT_EXECUTION_CLASSES, QueueProfile
+from .queue_profiles import QueueProfile
 from .snapshot_resolution import resolve_clean_snapshot_identity
 from .workspace import (
     LabError,
@@ -569,10 +569,6 @@ def create_draft_snapshot_identity(
     if "draft" not in profile.snapshot_modes:
         raise LabError(
             f"queue Profile does not allow draft snapshots: {profile.profile_id}"
-        )
-    if profile.execution_class not in DRAFT_EXECUTION_CLASSES:
-        raise LabError(
-            f"draft snapshots cannot use execution class {profile.execution_class}"
         )
     inspection = workspace_manager.inspect_task(task_id)
     if inspection.get("status") != "ACTIVE":

@@ -44,6 +44,13 @@ def test_repository_framework_boundary_is_clean() -> None:
     report = enforce_framework_boundary(root, policy=policy)
 
     assert report["status"] == "PASSED"
+    assert {
+        "GPU",
+        "device_access",
+        "service_receipt",
+        "execution_class",
+        "execution_topology",
+    }.issubset(policy.forbidden_core_literals)
     assert int(report["core_file_count"]) >= 1
     assert int(report["controlled_file_count"]) >= int(report["core_file_count"])
 

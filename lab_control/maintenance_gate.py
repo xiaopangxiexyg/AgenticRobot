@@ -20,8 +20,8 @@ from .workspace import (
     validate_task_id,
 )
 
-MAINTENANCE_RESERVATION_SCHEMA_ID = "lab.maintenance-reservation.v1"
-MANAGED_RUNTIME_GATE_SCHEMA_ID = "lab.managed-runtime-start-gate.v1"
+MAINTENANCE_RESERVATION_SCHEMA_ID = "lab.maintenance-reservation.v2"
+MANAGED_RUNTIME_GATE_SCHEMA_ID = "lab.managed-runtime-start-gate.v2"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -178,7 +178,6 @@ def validate_maintenance_reservation(
         "status",
         "managed_runtime_starts_blocked",
         "unmanaged_runtime_authorized",
-        "device_access",
         "acquired_at",
         "expires_at",
         "released_at",
@@ -201,7 +200,6 @@ def validate_maintenance_reservation(
         or (status == "RELEASED" and released_at is None)
         or receipt.get("managed_runtime_starts_blocked") is not (status == "ACTIVE")
         or receipt.get("unmanaged_runtime_authorized") is not False
-        or receipt.get("device_access") is not False
     ):
         raise LabError("maintenance reservation identity or authority is unsafe")
     reservation_id = receipt.get("reservation_id")
@@ -309,7 +307,6 @@ def acquire_checkout_maintenance_reservation(
             "status": "ACTIVE",
             "managed_runtime_starts_blocked": True,
             "unmanaged_runtime_authorized": False,
-            "device_access": False,
             "acquired_at": acquired.isoformat(),
             "expires_at": (acquired + timedelta(seconds=validity_seconds)).isoformat(),
             "released_at": None,
@@ -347,7 +344,6 @@ def assert_managed_runtime_start_allowed(
             "policy_sha256": target.policy_sha256,
             "allowed": True,
             "active_maintenance_reservation": None,
-            "device_access": False,
         }
         return {**content, "receipt_sha256": _hash(content)}
 

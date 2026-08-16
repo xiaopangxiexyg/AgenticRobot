@@ -44,19 +44,17 @@ def _write_queue_profile(
     root: Path,
     *,
     repositories: list[str],
-    execution_class: str = "offline",
     snapshot_modes: list[str] | None = None,
 ) -> None:
     (root / "draft-check.json").write_text(
         json.dumps(
             {
-                "schema": "lab.queue-profile.v2",
+                "schema": "lab.queue-profile.v3",
                 "profile_id": "draft-check",
                 "description": "Project-neutral synthetic snapshot fixture",
                 "target_id": "test-target",
                 "risk_level": "R0",
                 "snapshot_modes": snapshot_modes or ["clean", "draft"],
-                "execution_class": execution_class,
                 "repositories": repositories,
                 "command_ids": ["contract-suite"],
                 "capabilities": ["python"],
@@ -192,7 +190,7 @@ def test_draft_snapshot_preserves_workspace_and_stages_exact_source(
     submission = json.loads(capsys.readouterr().out)
     request = submission["request"]
     raw_repository = request["snapshot"]["repositories"]["Controller"]
-    assert request["schema"] == "lab.run-request.v3"
+    assert request["schema"] == "lab.run-request.v4"
     assert request["snapshot"]["snapshot_mode"] == "draft"
     assert request["evidence_tier"] == "Development"
     assert raw_repository["synthetic"] is True
@@ -276,12 +274,14 @@ def test_draft_profile_authorization_and_untracked_secret_fail_closed(
             include_untracked={"Controller": [".env"]},
         )
 
-    _write_queue_profile(
-        queue_root,
-        repositories=["Controller"],
-        execution_class="control",
-    )
-    with pytest.raises(LabError, match="cannot grant draft snapshots to control"):
+    profile = load_queue_profile(queue_root, "draft-check")
+    assert profile.snapshot_modes == ("clean", "draft")
+
+    profile_path = queue_root / "draft-check.json"
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    payload["execution_class"] = "project-specific"
+    profile_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(LabError, match="unexpected shape"):
         load_queue_profile(queue_root, "draft-check")
 
 

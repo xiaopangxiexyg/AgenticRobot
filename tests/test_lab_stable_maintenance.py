@@ -110,7 +110,6 @@ def test_guarded_fast_forward_records_idle_evidence_and_releases_gate(
     assert receipt["network_used"] is False
     assert receipt["task_worktrees_updated"] is False
     assert receipt["submodules_updated"] is False
-    assert receipt["device_access"] is False
     assert git.current_commit(target.checkout_path) == incoming
     assert git.status_short(target.checkout_path) == ()
     assert receipt["released_reservation"]["status"] == "RELEASED"

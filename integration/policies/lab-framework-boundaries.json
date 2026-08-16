@@ -15,7 +15,12 @@
   "forbidden_core_literals": [
     "AgenticRobot",
     "RPent",
-    "OpenPI"
+    "OpenPI",
+    "GPU",
+    "device_access",
+    "service_receipt",
+    "execution_class",
+    "execution_topology"
   ],
   "max_controlled_file_bytes": 262144
 }

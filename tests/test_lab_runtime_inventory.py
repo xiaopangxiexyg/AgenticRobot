@@ -58,7 +58,6 @@ def test_inventory_detects_only_owner_checkout_dependencies(tmp_path: Path) -> N
     assert receipt["owner_pids_scanned"] == [101, 102]
     assert receipt["foreign_pids_skipped"] == 1
     assert receipt["processes_modified"] is False
-    assert receipt["device_access"] is False
     assert validate_checkout_runtime_inventory(receipt, checkout_path=checkout) == receipt
 
 

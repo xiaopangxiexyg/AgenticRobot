@@ -31,7 +31,7 @@ from .workspace import (
 )
 
 LINKED_SYNC_PLAN_SCHEMA_ID = "lab.linked-checkout-sync-plan.v1"
-LINKED_SYNC_RECEIPT_SCHEMA_ID = "lab.linked-checkout-sync-receipt.v1"
+LINKED_SYNC_RECEIPT_SCHEMA_ID = "lab.linked-checkout-sync-receipt.v2"
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -338,7 +338,6 @@ def _persist_outcome(
         "lfs_smudge_enabled": False,
         "rebase_reset_clean_used": False,
         "processes_signalled": False,
-        "device_access": False,
         "executor_pid": os.getpid(),
     }
     receipt = {**content, "receipt_sha256": _hash(content)}

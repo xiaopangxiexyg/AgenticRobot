@@ -20,7 +20,7 @@ from .workspace import (
     validate_task_id,
 )
 
-PROJECT_GUARDED_SYNC_SCHEMA_ID = "lab.project-guarded-sync-receipt.v1"
+PROJECT_GUARDED_SYNC_SCHEMA_ID = "lab.project-guarded-sync-receipt.v2"
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -151,7 +151,6 @@ def apply_guarded_project_checkout(
             "lfs_smudge_enabled": False,
             "large_assets_downloaded": False,
             "processes_signalled": False,
-            "device_access": False,
             "executor_pid": os.getpid(),
         }
         receipt = {
@@ -209,7 +208,6 @@ def apply_guarded_project_checkout(
         "lfs_smudge_enabled": False,
         "large_assets_downloaded": False,
         "processes_signalled": False,
-        "device_access": False,
         "executor_pid": os.getpid(),
     }
     receipt = {**content, "receipt_sha256": _hash(content)}

@@ -59,7 +59,8 @@ explicit fetched ref + confirmed plan hash
 - `task_worktrees_updated=false`；
 - `submodules_updated=false`；
 - `lfs_smudge_enabled=false`；
-- `processes_signalled=false`、`device_access=false`。
+- `processes_signalled=false`；维护门只证明 checkout 进程依赖已静止，不对项目运行资源作任何声明。去除旧专用字段后，
+  inventory/reservation/maintenance/guarded-sync receipt 均升级为 v2，旧 v1 fail closed。
 
 命令是幂等的：计划已经是 `NOOP` 时返回 `UP_TO_DATE` 并留下无 mutation receipt，不申请维护窗口。
 

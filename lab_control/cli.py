@@ -22,7 +22,6 @@ from .inspection import (
     enrich_task_inspection,
 )
 from .linked_sync import apply_linked_project_checkout, plan_linked_project_checkout
-from .orchestration import OrchestrationManager
 from .project_maintenance import apply_guarded_project_checkout
 from .project_sync import fetch_project_sync, plan_project_sync
 from .run_requests import RunRequestManager
@@ -301,37 +300,6 @@ def _build_parser() -> argparse.ArgumentParser:
     runner_stage.add_argument("request_id")
     runner_stage.add_argument("--slot-root")
     runner_stage.add_argument("--json", action="store_true")
-
-    orchestrate = subcommands.add_parser(
-        "orchestrate",
-        help="plan and reserve a protected multi-node Run without executing it",
-    )
-    orchestrate_commands = orchestrate.add_subparsers(
-        dest="orchestrate_command", required=True
-    )
-    orchestrate_plan = orchestrate_commands.add_parser("plan")
-    orchestrate_plan.add_argument("request_id")
-    orchestrate_plan.add_argument("distributed_profile_id")
-    orchestrate_plan.add_argument("--json", action="store_true")
-    orchestrate_reserve = orchestrate_commands.add_parser("reserve")
-    orchestrate_reserve.add_argument("request_id")
-    orchestrate_reserve.add_argument("distributed_profile_id")
-    orchestrate_reserve.add_argument("--orchestrator", required=True)
-    orchestrate_reserve.add_argument("--ttl-seconds", type=int, default=3600)
-    orchestrate_reserve.add_argument("--json", action="store_true")
-    orchestrate_inspect = orchestrate_commands.add_parser("inspect")
-    orchestrate_inspect.add_argument("request_id")
-    orchestrate_inspect.add_argument("--json", action="store_true")
-    orchestrate_barrier = orchestrate_commands.add_parser("barrier")
-    orchestrate_barrier.add_argument("request_id")
-    orchestrate_barrier.add_argument("reservation_id")
-    orchestrate_barrier.add_argument("--json", action="store_true")
-    orchestrate_release = orchestrate_commands.add_parser("release")
-    orchestrate_release.add_argument("request_id")
-    orchestrate_release.add_argument("reservation_id")
-    orchestrate_release.add_argument("--actor", required=True)
-    orchestrate_release.add_argument("--reason", required=True)
-    orchestrate_release.add_argument("--json", action="store_true")
     return parser
 
 
@@ -675,50 +643,6 @@ def _runner_coordinator(manager: WorkspaceManager) -> RunnerCoordinator:
             ),
         ),
     )
-
-
-def _orchestration_manager(manager: WorkspaceManager) -> OrchestrationManager:
-    requests = RunRequestManager(manager)
-    configured_runner_root = manager.environ.get("LAB_RUNNER_PROFILE_ROOT")
-    runner_root = (
-        Path(configured_runner_root).expanduser().resolve()
-        if configured_runner_root
-        else manager.control_repository / "integration" / "runners"
-    )
-    configured_distributed_root = manager.environ.get(
-        "LAB_DISTRIBUTED_PROFILE_ROOT"
-    )
-    distributed_root = (
-        Path(configured_distributed_root).expanduser().resolve()
-        if configured_distributed_root
-        else manager.control_repository / "integration" / "distributed-profiles"
-    )
-    configured_state_root = manager.environ.get("LAB_ORCHESTRATION_STATE_ROOT")
-    return OrchestrationManager(
-        requests.store,
-        distributed_profile_root=distributed_root,
-        queue_profile_root=requests.profile_root,
-        runner_profile_root=runner_root,
-        state_root=(
-            Path(configured_state_root).expanduser().resolve()
-            if configured_state_root
-            else None
-        ),
-    )
-
-
-def _print_orchestration(payload: dict[str, object]) -> None:
-    print(f"Schema: {payload.get('schema')}")
-    if payload.get("request_id") is not None:
-        print(f"Request: {payload.get('request_id')}")
-    if payload.get("reservation_id") is not None:
-        print(f"Reservation: {payload.get('reservation_id')}")
-    assignments = payload.get("assignments")
-    if isinstance(assignments, list):
-        print(f"Assignments: {len(assignments)}")
-    services = payload.get("services")
-    if isinstance(services, list):
-        print(f"Services: {len(services)}")
 
 
 def _recommended_profiles(
@@ -1291,38 +1215,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(claim, indent=2, sort_keys=True))
             else:
                 _print_runner_claim(claim)
-            return 0
-
-        if arguments.command == "orchestrate":
-            orchestration = _orchestration_manager(manager)
-            if arguments.orchestrate_command == "plan":
-                orchestration_payload = orchestration.plan(
-                    arguments.request_id, arguments.distributed_profile_id
-                )
-            elif arguments.orchestrate_command == "reserve":
-                orchestration_payload = orchestration.reserve(
-                    arguments.request_id,
-                    arguments.distributed_profile_id,
-                    orchestrator_id=arguments.orchestrator,
-                    ttl_seconds=arguments.ttl_seconds,
-                )
-            elif arguments.orchestrate_command == "inspect":
-                orchestration_payload = orchestration.inspect(arguments.request_id)
-            elif arguments.orchestrate_command == "barrier":
-                orchestration_payload = orchestration.ready_barrier(
-                    arguments.request_id, arguments.reservation_id
-                )
-            else:
-                orchestration_payload = orchestration.release(
-                    arguments.request_id,
-                    arguments.reservation_id,
-                    actor=arguments.actor,
-                    reason=arguments.reason,
-                )
-            if arguments.json:
-                _emit(orchestration_payload, as_json=True)
-            else:
-                _print_orchestration(orchestration_payload)
             return 0
 
         if arguments.command == "runs":

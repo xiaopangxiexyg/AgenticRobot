@@ -23,8 +23,8 @@ from .stable_sync import (
 )
 from .workspace import LabError
 
-MAINTENANCE_RECEIPT_SCHEMA_ID = "lab.maintenance-receipt.v1"
-GUARDED_SYNC_RECEIPT_SCHEMA_ID = "lab.guarded-stable-sync-receipt.v1"
+MAINTENANCE_RECEIPT_SCHEMA_ID = "lab.maintenance-receipt.v2"
+GUARDED_SYNC_RECEIPT_SCHEMA_ID = "lab.guarded-stable-sync-receipt.v2"
 InventoryCollector = Callable[[Path], dict[str, object]]
 
 
@@ -106,8 +106,6 @@ def build_maintenance_receipt(
         "stable_checkout_idle": True,
         "active_checkout_processes": [],
         "network_used": False,
-        "device_access": False,
-        "motion_safety_claimed": False,
         "issued_at": issued.isoformat(),
         "expires_at": (issued + timedelta(seconds=validity_seconds)).isoformat(),
     }
@@ -136,8 +134,6 @@ def validate_maintenance_receipt(
         "stable_checkout_idle",
         "active_checkout_processes",
         "network_used",
-        "device_access",
-        "motion_safety_claimed",
         "issued_at",
         "expires_at",
         "receipt_sha256",
@@ -155,8 +151,6 @@ def validate_maintenance_receipt(
         or receipt.get("stable_checkout_idle") is not True
         or receipt.get("active_checkout_processes") != []
         or receipt.get("network_used") is not False
-        or receipt.get("device_access") is not False
-        or receipt.get("motion_safety_claimed") is not False
     ):
         raise LabError("maintenance receipt identity or idle envelope is unsafe")
     inventory = validate_checkout_runtime_inventory(
@@ -247,7 +241,6 @@ def guarded_stable_checkout_fast_forward(
         "task_worktrees_updated": False,
         "submodules_updated": False,
         "lfs_smudge_enabled": False,
-        "device_access": False,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
     return {**content, "receipt_sha256": _hash(content)}

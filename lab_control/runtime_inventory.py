@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .workspace import LabError
 
-RUNTIME_INVENTORY_SCHEMA_ID = "lab.checkout-runtime-inventory.v1"
+RUNTIME_INVENTORY_SCHEMA_ID = "lab.checkout-runtime-inventory.v2"
 MAX_PROCESS_FILE_BYTES = 8 * 1024 * 1024
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -145,7 +145,6 @@ def collect_checkout_runtime_inventory(
         "dependencies": dependencies,
         "inventory_complete": not inaccessible,
         "processes_modified": False,
-        "device_access": False,
         "observed_at": datetime.now(timezone.utc).isoformat(),
     }
     return {
@@ -173,7 +172,6 @@ def validate_checkout_runtime_inventory(
         "dependencies",
         "inventory_complete",
         "processes_modified",
-        "device_access",
         "observed_at",
         "receipt_sha256",
     }:
@@ -192,7 +190,6 @@ def validate_checkout_runtime_inventory(
         or receipt.get("inventory_complete") is not True
         or receipt.get("inaccessible_owner_pids") != []
         or receipt.get("processes_modified") is not False
-        or receipt.get("device_access") is not False
     ):
         raise LabError("runtime inventory receipt is incomplete or unsafe")
     if not 1 <= max_age_seconds <= 60:

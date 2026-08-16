@@ -167,20 +167,16 @@ staging from Git objects already present on the runner. Staging must not fetch,
 run checkout filters/hooks, enable LFS smudge, execute project commands, or
 grant network/GPU/service/device authority. An incomplete slot is quarantined;
 never repair it with reset/clean or an implicit fetch.
-M4 adds Development-only synthetic Git draft snapshots for protected offline,
-simulation, or compute Queue Profiles. Capture must not move the Task branch,
+M4 adds Development-only synthetic Git draft snapshots for Queue Profiles that
+explicitly allow draft source. Capture must not move the Task branch,
 HEAD, real index, or working tree. Untracked source is deny-by-default and must
 be explicitly allowlisted; sensitive, ignored, escaping, special, and oversized
-content remains excluded or rejected. Draft evidence cannot verify, observe or
-control devices, or authorize a release. Synthetic object transport and command
-execution remain unavailable.
-M5 adds clean-only distributed Queue Profiles, immutable distributed Run
-identity, atomic logical runner/slot/resource reservations, ServiceReceipts,
-and a dependency ready barrier. Ordinary single-node runners must reject a
-distributed Run. These receipts do not start, stop, authenticate, or own any
-real process, host, GPU, device, or network endpoint; unmanaged runtime state
-remains outside the protocol. Do not describe M5 as deployed distributed
-execution or resource authority.
+content remains excluded or rejected. Draft evidence cannot authorize formal
+verification or release. Synthetic object transport and command execution
+remain unavailable. Queue/Runner contracts must stay project-independent: they
+select an exact source snapshot and a protected command ID, but must not model
+GPU, device, service, model, process topology, or other command-internal runtime
+semantics. Those belong to the invoked system/project command.
 
 Use one active development branch per Task/repository. Record consecutive
 implementation milestones as commits, docs, tags, and Run evidence instead of
