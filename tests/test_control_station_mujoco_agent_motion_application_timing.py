@@ -42,8 +42,11 @@ def test_submit_and_step_places_new_proposal_after_its_admission_cut(
 
     runtime = SimpleNamespace(
         clock=lambda: 10.0,
-        core=SimpleNamespace(
-            config=SimpleNamespace(decision_schedule=schedule),
+        authoritative_port=SimpleNamespace(
+            profile=SimpleNamespace(
+                target_lead_time_sec=schedule.target_lead_time_sec,
+                decision_period_sec=schedule.period_sec,
+            ),
         ),
         submit_component_action=submit_component_action,
         step=step,
@@ -98,7 +101,7 @@ def test_first_safety_profile_activation_establishes_lower_hold_before_ready() -
             status="ready"
         ),
         transition_execution_gate=transition,
-        core=SimpleNamespace(
+        authoritative_port=SimpleNamespace(
             capture_receiver_state=lambda: SimpleNamespace(
                 current_execution_epoch=1
             )

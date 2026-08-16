@@ -43,12 +43,12 @@ def _composition(*, human_alpha: float = 0.0) -> MujocoSimHILComposition:
         reference_activation_spec=SimpleNamespace(
             activation_mode="immediate_target"
         ),
-        core=SimpleNamespace(
-            config=SimpleNamespace(
-                active_selection_groups=("left_arm", "right_arm"),
-                authority_policy=_hashed("authority-policy:test"),
-                decision_schedule=_hashed("decision-schedule:test"),
-            )
+        authoritative_port=SimpleNamespace(
+            profile=SimpleNamespace(
+                selection_group_ids=("left_arm", "right_arm"),
+                authority_policy_hash="authority-policy:test",
+                decision_schedule_hash="decision-schedule:test",
+            ),
         ),
     )
     policy_binding = SimpleNamespace(

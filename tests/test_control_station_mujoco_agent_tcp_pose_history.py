@@ -100,16 +100,12 @@ def _build_application(monkeypatch):
             representation_by_component={"right_arm": "cartesian_pose"},
             schema_hash_by_component={"right_arm": "pose-schema:history-fixture"},
         ),
-        core=SimpleNamespace(
-            config=SimpleNamespace(
-                active_selection_groups=("arms",),
-                authority_policy=SimpleNamespace(
-                    semantic_content_hash="authority-policy:history-fixture"
-                ),
-                decision_schedule=SimpleNamespace(
-                    semantic_content_hash="decision-schedule:history-fixture"
-                ),
-            )
+        authoritative_port=SimpleNamespace(
+            profile=SimpleNamespace(
+                selection_group_ids=("arms",),
+                authority_policy_hash="authority-policy:history-fixture",
+                decision_schedule_hash="decision-schedule:history-fixture",
+            ),
         ),
         clock=lambda: state["time"],
     )

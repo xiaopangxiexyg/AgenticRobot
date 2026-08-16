@@ -198,7 +198,7 @@ class MujocoAgentSkillMotionApplication:
                     raise TCPPoseEnvelopeLifecycleError(
                         "lower execution gate must be HOLD before safety activation"
                     )
-                receiver = self.runtime.core.capture_receiver_state()
+                receiver = self.runtime.authoritative_port.capture_receiver_state()
                 execution_epoch = int(receiver.current_execution_epoch)
                 safety_activation = self.tcp_pose_envelope_runtime.activate(
                     selection=safety_selection,
@@ -231,7 +231,7 @@ class MujocoAgentSkillMotionApplication:
                 )
             except Exception:
                 if safety_activation is not None:
-                    receiver = self.runtime.core.capture_receiver_state()
+                    receiver = self.runtime.authoritative_port.capture_receiver_state()
                     self.tcp_pose_envelope_runtime.deactivate_after_hold(
                         operation_id=normalized_id,
                         next_execution_epoch=int(receiver.current_execution_epoch),
@@ -266,7 +266,7 @@ class MujocoAgentSkillMotionApplication:
             if self._active_operation_id != normalized_id:
                 raise ValueError("Operation does not own the Agent motion session.")
             now = float(self.runtime.clock())
-            schedule = self.runtime.core.config.decision_schedule
+            profile = self.runtime.authoritative_port.profile
             # A direct proposal is not visible to a control cut captured at
             # the timestamp sampled immediately before its admission.  The
             # immediate-reference schedule has zero configured target lead,
@@ -278,8 +278,8 @@ class MujocoAgentSkillMotionApplication:
             target_at = (
                 now
                 + max(
-                    float(schedule.target_lead_time_sec),
-                    float(schedule.period_sec),
+                    float(profile.target_lead_time_sec),
+                    float(profile.decision_period_sec),
                 )
             )
             admission = self.runtime.submit_component_action(
@@ -378,7 +378,7 @@ class MujocoAgentSkillMotionApplication:
                 force_cancellation=True,
             )
             if self.tcp_pose_envelope_runtime is not None:
-                receiver = self.runtime.core.capture_receiver_state()
+                receiver = self.runtime.authoritative_port.capture_receiver_state()
                 hold_refs = tuple(getattr(transition, "lower_event_ids", ()))
                 if not hold_refs:
                     raise TCPPoseEnvelopeLifecycleError(
@@ -408,7 +408,7 @@ class MujocoAgentSkillMotionApplication:
             raise TypeError("scene_projector must be callable.")
         with self._lock:
             captured_at = float(self.runtime.clock())
-            receiver = self.runtime.core.capture_receiver_state()
+            receiver = self.runtime.authoritative_port.capture_receiver_state()
             owner_generation = receiver.current_owner_generation
             if owner_generation is None:
                 raise RuntimeError("Passive cut requires the lower dispatch owner.")
@@ -431,10 +431,9 @@ class MujocoAgentSkillMotionApplication:
                     gate_status = "not_started"
                     gate_epoch = 0
                 projection = self.runtime.rig.capture_scene(scene_projector)
-            coordinator = self.runtime.core.coordinator
-            control_cut = coordinator.capture_cut(
+            control_cut = self.runtime.capture_control_cut(
                 cutoff_at=float(self.runtime.clock())
-            ).cut
+            )
             return MujocoSimHILPassiveApplicationCut(
                 captured_at=captured_at,
                 authority_epoch=int(receiver.current_authority_epoch),

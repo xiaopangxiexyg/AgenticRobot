@@ -406,10 +406,10 @@ class MujocoPoseComposerAuthorityComposition:
             self._human_fact_time_by_emission_id.clear()
             self._step_by_decision_key.clear()
             self._composition_activation_scope = scope
-            self.runtime.core.record_external_facts(
+            self.runtime.authoritative_port.record_external_facts(
                 (
                     project_composition_activation_scope(
-                        self.runtime.core.trace_context,
+                        self.runtime.authoritative_port.trace_context,
                         scope,
                     ),
                 )
@@ -541,7 +541,7 @@ class MujocoPoseComposerAuthorityComposition:
                 occurred_at=effective_from,
                 clock_domain_id=self.runtime.config.clock_domain_id,
             )
-            self.runtime.core.record_external_facts(source_facts)
+            self.runtime.authoritative_port.record_external_facts(source_facts)
             source_fact_hash_by_id = {
                 fact.fact_id: fact.semantic_content_hash
                 for fact in source_facts
@@ -632,7 +632,9 @@ class MujocoPoseComposerAuthorityComposition:
                     raise ValueError(
                         "Replay source fact ID was reused with new payload."
                     )
-            self.runtime.core.record_external_facts(tuple(new_source_facts))
+            self.runtime.authoritative_port.record_external_facts(
+                tuple(new_source_facts)
+            )
             source_fact_hash_by_id = {
                 fact.fact_id: fact.semantic_content_hash
                 for fact in source_facts
@@ -705,7 +707,7 @@ class MujocoPoseComposerAuthorityComposition:
             hold: ExecutionGateTransitionOutcome | None = None
             blocked_reason: str | None = None
             error_text: str | None = None
-            gate_snapshot = self.runtime.core.capture_execution_gate_snapshot(
+            gate_snapshot = self.runtime.capture_execution_gate_snapshot(
                 now=target
             )
             if gate_snapshot.status != "ready":
@@ -728,10 +730,10 @@ class MujocoPoseComposerAuthorityComposition:
                         spec=self.composition_spec,
                         gate_spec=self.authority_gate_spec,
                     )
-                    self.runtime.core.record_external_facts(
+                    self.runtime.authoritative_port.record_external_facts(
                         (
                             project_composition_authority_disposition(
-                                self.runtime.core.trace_context,
+                                self.runtime.authoritative_port.trace_context,
                                 disposition,
                                 occurred_at=float(self.runtime.clock()),
                             ),
@@ -901,7 +903,7 @@ def build_cs6b1i_pose_composition_session_manifest(
             runtime.execution_capability.semantic_content_hash
         ),
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        selection_group_ids=runtime.core.config.active_selection_groups,
+        selection_group_ids=runtime.authoritative_port.profile.selection_group_ids,
         owner_registry_id=authoritative_owner_registry_id(runtime),
         authority_epoch_source_id=authoritative_authority_epoch_source_id(runtime),
         execution_epoch_source_id=authoritative_execution_epoch_source_id(runtime),
@@ -1027,9 +1029,9 @@ def build_cs6b1i_pose_composition_session_manifest(
                 explicit_exclusions=("direct_contributor_proposal_fallback",),
             ),
         ),
-        authority_policy_hash=runtime.core.config.authority_policy.semantic_content_hash,
+        authority_policy_hash=runtime.authoritative_port.profile.authority_policy_hash,
         decision_schedule_hash=(
-            runtime.core.config.decision_schedule.semantic_content_hash
+            runtime.authoritative_port.profile.decision_schedule_hash
         ),
         trace_requirement_profile_id=(
             CS6B1I_COMPOSITION_SESSION_TRACE_PROFILE_ID_V1
@@ -1481,7 +1483,7 @@ class ScopedMujocoPoseCompositionSession:
             raise RuntimeError(
                 "Composition contributors must be preflighted."
             )
-        gate = self.data_plane.runtime.core.capture_execution_gate_snapshot(
+        gate = self.data_plane.runtime.capture_execution_gate_snapshot(
             now=float(self.clock())
         )
         if gate.status != "ready":
@@ -1513,7 +1515,9 @@ class ScopedMujocoPoseCompositionSession:
             )
         cancellation = hold.cancellation
         runtime = self.data_plane.runtime
-        execution_before = runtime.core.execution_epochs.snapshot()
+        execution_before = (
+            runtime.authoritative_port.capture_execution_epoch_snapshot()
+        )
         if (
             execution_before.fault_latched
             or execution_before.execution_epoch != cancellation.execution_epoch
@@ -1533,7 +1537,7 @@ class ScopedMujocoPoseCompositionSession:
             raise RuntimeError("Composition rearm measured state is stale.")
 
         composer_id = runtime.config.composer_producer_id
-        prior_producer_epoch = runtime.core.producer_epochs.current_epoch(
+        prior_producer_epoch = runtime.authoritative_port.current_producer_epoch(
             composer_id
         )
         if prior_producer_epoch is None:
@@ -1543,8 +1547,8 @@ class ScopedMujocoPoseCompositionSession:
             producer_epoch=prior_producer_epoch + 1,
             reason=f"cs6b1i_rearm_activation:{spec.rearm_spec_id}",
         )
-        receiver_before = runtime.core.capture_receiver_state()
-        authority_event = runtime.core.admit_authority_event(
+        receiver_before = runtime.authoritative_port.capture_receiver_state()
+        authority_event = runtime.authoritative_port.admit_authority_event(
             event_type="mode",
             control_mode=runtime.config.initial_control_mode,
             reason=f"cs6b1i_rearm_authority_epoch:{spec.rearm_spec_id}",

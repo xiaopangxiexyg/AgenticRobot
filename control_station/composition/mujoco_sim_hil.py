@@ -2933,7 +2933,7 @@ def build_mujoco_sim_hil_agent_skill_station_manifest(
             runtime.execution_capability.semantic_content_hash
         ),
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        selection_group_ids=runtime.core.config.active_selection_groups,
+        selection_group_ids=runtime.authoritative_port.profile.selection_group_ids,
         owner_registry_id=authoritative_owner_registry_id(runtime),
         authority_epoch_source_id=authoritative_authority_epoch_source_id(
             runtime
@@ -3088,10 +3088,10 @@ def build_mujoco_sim_hil_agent_skill_station_manifest(
             ),
         ),
         authority_policy_hash=(
-            runtime.core.config.authority_policy.semantic_content_hash
+            runtime.authoritative_port.profile.authority_policy_hash
         ),
         decision_schedule_hash=(
-            runtime.core.config.decision_schedule.semantic_content_hash
+            runtime.authoritative_port.profile.decision_schedule_hash
         ),
         trace_requirement_profile_id=trace_profile,
         capture_policy_id="agent_skill_episode_lower_trace_owner_v1",

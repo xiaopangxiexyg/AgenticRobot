@@ -182,7 +182,9 @@ class MujocoPolicySkillMotionApplication:
                     raise TCPPoseEnvelopeLifecycleError(
                         "Policy Skill requires an exact lower safety selection."
                     )
-                receiver = self.runtime.core.capture_receiver_state()
+                receiver = (
+                    self.runtime.authoritative_port.capture_receiver_state()
+                )
                 execution_epoch = int(receiver.current_execution_epoch)
                 safety_activation = self.tcp_pose_envelope_runtime.activate(
                     selection=safety_selection,
@@ -215,7 +217,9 @@ class MujocoPolicySkillMotionApplication:
                 )
             except Exception:
                 if safety_activation is not None:
-                    receiver = self.runtime.core.capture_receiver_state()
+                    receiver = (
+                        self.runtime.authoritative_port.capture_receiver_state()
+                    )
                     self.tcp_pose_envelope_runtime.deactivate_after_hold(
                         operation_id=normalized_id,
                         next_execution_epoch=int(receiver.current_execution_epoch),
@@ -301,7 +305,9 @@ class MujocoPolicySkillMotionApplication:
             self._held = True
             self.policy_source.reset_for_activation()
             if self.tcp_pose_envelope_runtime is not None:
-                receiver = self.runtime.core.capture_receiver_state()
+                receiver = (
+                    self.runtime.authoritative_port.capture_receiver_state()
+                )
                 hold_refs = tuple(getattr(transition, "lower_event_ids", ()))
                 if not hold_refs:
                     raise TCPPoseEnvelopeLifecycleError(

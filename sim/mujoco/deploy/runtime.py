@@ -132,6 +132,7 @@ from .contact_trace import project_mujoco_forbidden_contact_guard_result
 from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
 )
+from .authoritative_port import MujocoAuthoritativeTargetPort
 from .reference_trace import (
     project_execution_target_admission,
     project_group_generation_activation,
@@ -1628,6 +1629,7 @@ class MujocoDeployRuntime:
             trace_sink=trace_sink,
             clock=clock,
         )
+        self.authoritative_port = MujocoAuthoritativeTargetPort(self.core)
         self.reference_receiver: MujocoScheduledQposReferenceReceiver | None = None
         if self.reference_activation_spec.activation_mode == "scheduled_segment":
             receiver_args = {

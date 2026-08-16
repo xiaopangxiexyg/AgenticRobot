@@ -11,7 +11,7 @@ from typing import Callable, Protocol
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import (
-    AuthoritativeControlRuntime,
+    AuthoritativeReceiverStateSnapshot,
     ExecutionGateTransitionOutcome,
 )
 from robot_motion.runtime.execution_gate import ExecutionGateSnapshot
@@ -35,9 +35,25 @@ class StationTargetRuntimeConfig(Protocol):
     control_domain_id: str
 
 
+class StationAuthoritativeProfile(Protocol):
+    initial_control_mode: str
+
+
+class StationAuthoritativePort(Protocol):
+    profile: StationAuthoritativeProfile
+
+    def capture_receiver_state(self) -> AuthoritativeReceiverStateSnapshot: ...
+
+
 class StationAuthoritativeRuntime(Protocol):
-    core: AuthoritativeControlRuntime
+    authoritative_port: StationAuthoritativePort
     config: StationTargetRuntimeConfig
+
+    def capture_execution_gate_snapshot(
+        self,
+        *,
+        now: float | None = None,
+    ) -> ExecutionGateSnapshot: ...
 
     def transition_execution_gate(
         self,
@@ -110,7 +126,7 @@ def capture_authoritative_execution_gate_snapshot(
 ) -> ExecutionGateSnapshot:
     """Read the receiver-owned gate through its public authoritative seam."""
 
-    return composition.runtime.core.capture_execution_gate_snapshot()
+    return composition.runtime.capture_execution_gate_snapshot()
 
 
 class StationAuthoritativeTargetAdapterBase:
@@ -181,7 +197,7 @@ class StationAuthoritativeTargetAdapterBase:
             raise RuntimeError("Composition lacks a Station lifecycle binding.")
         if require_started and not self.composition.started:
             raise RuntimeError("Authoritative target has not been connected and started.")
-        receiver = self.composition.runtime.core.capture_receiver_state()
+        receiver = self.composition.runtime.authoritative_port.capture_receiver_state()
         if (
             receiver.runtime_session_id
             != self.composition.runtime.config.runtime_session_id
@@ -192,7 +208,7 @@ class StationAuthoritativeTargetAdapterBase:
         ):
             raise RuntimeError("Live target owner binding no longer matches Station.")
         if (
-            self.composition.runtime.core.config.initial_control_mode
+            self.composition.runtime.authoritative_port.profile.initial_control_mode
             != self.expected_control_mode
         ):
             raise RuntimeError("Scoped Station binding control mode no longer matches.")
@@ -205,7 +221,7 @@ class StationAuthoritativeTargetAdapterBase:
         lower_event_ids: tuple[str, ...] = (),
         evidence_status: str,
     ) -> StationOperationResultDraft:
-        receiver = self.composition.runtime.core.capture_receiver_state()
+        receiver = self.composition.runtime.authoritative_port.capture_receiver_state()
         gate = capture_authoritative_execution_gate_snapshot(self.composition)
         payload = {
             "source_intent_id": intent.intent_id,
@@ -271,6 +287,8 @@ class StationAuthoritativeTargetAdapterBase:
 __all__ = [
     "MUJOCO_STATION_EVIDENCE_HASH_DOMAIN_V1",
     "StationAuthoritativeDataPlane",
+    "StationAuthoritativePort",
+    "StationAuthoritativeProfile",
     "StationAuthoritativeRuntime",
     "StationAuthoritativeTargetAdapterBase",
     "StationTargetBindingReceipt",

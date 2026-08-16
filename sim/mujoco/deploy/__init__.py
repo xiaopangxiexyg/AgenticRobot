@@ -67,6 +67,10 @@ from .policy_skill_target import (
     MujocoPolicySkillMotionTarget,
     build_mujoco_policy_skill_motion_target,
 )
+from .authoritative_port import (
+    MujocoAuthoritativeProfileSnapshot,
+    MujocoAuthoritativeTargetPort,
+)
 from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
     ResolvedQposReferenceAdmissionResult,
@@ -141,6 +145,8 @@ __all__ = [
     "MujocoCompositionRuntimeConfig",
     "MujocoComponentExecutionBinding",
     "MujocoDeployRuntime",
+    "MujocoAuthoritativeProfileSnapshot",
+    "MujocoAuthoritativeTargetPort",
     "MujocoDirectComponentProposalSource",
     "MujocoPolicyActionChunkSubmission",
     "MujocoPolicyEmissionSubmission",

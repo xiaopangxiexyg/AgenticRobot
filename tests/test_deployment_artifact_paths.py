@@ -7,6 +7,7 @@ import time
 import pytest
 
 from project_paths import repo_path
+from teleop_runtime.deploy import debug_logger
 from teleop_runtime.deploy import run_policy
 
 
@@ -84,6 +85,16 @@ def test_deployment_debug_defaults_to_legacy_root() -> None:
     assert resolution.source == "legacy"
 
 
+def test_run_policy_reexports_canonical_debug_logger_runtime() -> None:
+    for name in (
+        "DeploymentDebugLogger",
+        "RuntimeArtifactLayout",
+        "canonical_deployment_debug_root",
+        "resolve_deployment_debug_root",
+    ):
+        assert getattr(run_policy, name) is getattr(debug_logger, name)
+
+
 def test_deployment_debug_canonical_layout_allocates_one_run_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -116,7 +127,7 @@ def test_deployment_debug_canonical_layout_is_explicit_opt_in(
 ) -> None:
     canonical = tmp_path / "canonical-run"
     monkeypatch.setattr(
-        run_policy,
+        debug_logger,
         "canonical_deployment_debug_root",
         lambda *, now=None: canonical,
     )

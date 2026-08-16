@@ -37,7 +37,7 @@ from dataset_contracts import (
 from dataset_contracts.pose_chunk import PoseActionChunkContract
 from dataset_contracts.pose_training import PoseTrainingDataContract
 from teleop_runtime.deploy.actions import normalize_policy_output
-from teleop_runtime.deploy import cli as deploy_cli
+from teleop_runtime.deploy import camera_runtime, cli as deploy_cli
 from teleop_runtime.deploy.observation import DeploymentObservation
 from teleop_runtime.deploy import run_policy
 from teleop_runtime.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
@@ -133,6 +133,19 @@ class _V22FakeTransport(_FakeTransport):
 
 
 class OpenPICommonDeployTest(unittest.TestCase):
+    def test_run_policy_reexports_canonical_camera_runtime(self) -> None:
+        for name in (
+            "DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC",
+            "DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST",
+            "REAL_TELEOP_CAMERA_START_STAGGER_SEC",
+            "build_camera_sources",
+            "resolve_policy_camera_input_keys",
+            "run_camera_startup_self_check",
+            "select_preview_camera_sources",
+            "start_camera_sources",
+        ):
+            self.assertIs(getattr(run_policy, name), getattr(camera_runtime, name))
+
     def test_openpi_policy_artifact_selects_protocol_keys_and_dimensions(self) -> None:
         layout = PolicyIOLayout.legacy_v21_q6()
         artifact = PolicyArtifactContract(
@@ -338,10 +351,10 @@ class OpenPICommonDeployTest(unittest.TestCase):
             "right_wrist": object(),
         }
         with mock.patch(
-            "teleop_runtime.deploy.run_policy.load_realsense_camera_config_map",
+            "teleop_runtime.deploy.camera_runtime.load_realsense_camera_config_map",
             return_value=configs,
         ), mock.patch(
-            "teleop_runtime.deploy.run_policy.RealSenseRGBSource",
+            "teleop_runtime.deploy.camera_runtime.RealSenseRGBSource",
             side_effect=lambda config: config,
         ):
             sources = run_policy.build_camera_sources(
@@ -358,7 +371,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
             camera_config="unused.json",
             camera_keep_last=4,
         )
-        config = run_policy.RealSenseRGBCameraConfig(
+        config = camera_runtime.RealSenseRGBCameraConfig(
             serial="123",
             camera_key="left_wrist",
             keep_last=2,
@@ -366,10 +379,10 @@ class OpenPICommonDeployTest(unittest.TestCase):
             startup_warmup_policy="legacy",
         )
         with mock.patch(
-            "teleop_runtime.deploy.run_policy.load_realsense_camera_config_map",
+            "teleop_runtime.deploy.camera_runtime.load_realsense_camera_config_map",
             return_value={"left_wrist": config},
         ), mock.patch(
-            "teleop_runtime.deploy.run_policy.RealSenseRGBSource",
+            "teleop_runtime.deploy.camera_runtime.RealSenseRGBSource",
             side_effect=lambda value: value,
         ):
             sources = run_policy.build_camera_sources(
@@ -407,7 +420,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
         )
 
         with mock.patch(
-            "teleop_runtime.deploy.run_policy.RealSenseRGBSource",
+            "teleop_runtime.deploy.camera_runtime.RealSenseRGBSource",
             side_effect=lambda config: config,
         ):
             sources = run_policy.build_camera_sources(args)

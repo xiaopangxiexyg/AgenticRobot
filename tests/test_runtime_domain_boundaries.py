@@ -71,6 +71,20 @@ def _attribute_names(path: Path) -> set[str]:
     }
 
 
+def _runtime_core_access_lines(path: Path) -> tuple[int, ...]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return tuple(
+        sorted(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "core"
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "runtime"
+        )
+    )
+
+
 def _annotated_class_fields(path: Path, class_name: str) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in tree.body:
@@ -586,3 +600,13 @@ def test_control_station_uses_explicit_mujoco_composition_port() -> None:
         if _legacy_mujoco_composition_calls(path)
     }
     assert legacy_call_violations == {}
+
+
+def test_control_station_does_not_reach_into_authoritative_runtime_core() -> None:
+    violations = {
+        str(path.relative_to(REPO_ROOT)): list(_runtime_core_access_lines(path))
+        for path in _python_files(REPO_ROOT / "control_station")
+        if _runtime_core_access_lines(path)
+    }
+
+    assert violations == {}

@@ -32,6 +32,9 @@ from robot_motion.deploy.session_contract import (
     resolve_deploy_session_contract,
 )
 from robot_motion.relative_action import compare_pose_chunks
+from teleop_runtime.deploy.arm_state_reader import (
+    ArmStateReader as CanonicalArmStateReader,
+)
 from teleop_runtime.deploy.run_policy import ArmStateReader
 from teleop_runtime.deploy.startup_init import resolve_startup_init_action
 
@@ -51,6 +54,10 @@ def _observation(*, actual_x: float = 0.1) -> DeploymentObservation:
             }
         },
     )
+
+
+def test_run_policy_reexports_canonical_arm_state_reader() -> None:
+    assert ArmStateReader is CanonicalArmStateReader
 
 
 def _action(x: float) -> NormalizedAction:

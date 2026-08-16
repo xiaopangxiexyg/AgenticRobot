@@ -174,7 +174,7 @@ def build_cs2c_sync_policy_mujoco_manifest(
             runtime.execution_capability.semantic_content_hash
         ),
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        selection_group_ids=runtime.core.config.active_selection_groups,
+        selection_group_ids=runtime.authoritative_port.profile.selection_group_ids,
         owner_registry_id=authoritative_owner_registry_id(runtime),
         authority_epoch_source_id=authoritative_authority_epoch_source_id(runtime),
         execution_epoch_source_id=authoritative_execution_epoch_source_id(runtime),
@@ -216,8 +216,8 @@ def build_cs2c_sync_policy_mujoco_manifest(
                 ),
             ),
         ),
-        authority_policy_hash=runtime.core.config.authority_policy.semantic_content_hash,
-        decision_schedule_hash=runtime.core.config.decision_schedule.semantic_content_hash,
+        authority_policy_hash=runtime.authoritative_port.profile.authority_policy_hash,
+        decision_schedule_hash=runtime.authoritative_port.profile.decision_schedule_hash,
         trace_requirement_profile_id=trace_profile_id,
         capture_policy_id="capture_not_owned_by_cs2c_v1",
         allowed_intent_kinds=(
@@ -416,7 +416,7 @@ def validate_policy_data_plane_binding(
         raise ValueError(f"{scope_label} forbids replay authority.")
     if runtime.config.enable_composer_authority:
         raise ValueError(f"{scope_label} forbids composer authority.")
-    if runtime.core.config.initial_control_mode != "policy":
+    if runtime.authoritative_port.profile.initial_control_mode != "policy":
         raise ValueError(f"{scope_label} requires exact policy control mode.")
     if (
         binding.producer_id != runtime.config.producer_id
@@ -425,11 +425,11 @@ def validate_policy_data_plane_binding(
         or binding.policy_clock_domain_id != runtime.config.clock_domain_id
     ):
         raise ValueError("Policy emission binding targets another runtime.")
-    owner_snapshot = runtime.core.dispatch_owners.snapshot()
+    owner_snapshot = runtime.authoritative_port.capture_dispatch_owner_snapshot()
     token = owner_snapshot.current_token
     if token is None or token.owner_kind != "shared_arbitration_runtime":
         raise ValueError("MuJoCo target lacks shared authoritative owner token.")
-    execution_snapshot = runtime.core.execution_epochs.snapshot()
+    execution_snapshot = runtime.authoritative_port.capture_execution_epoch_snapshot()
     payload = {
         "manifest_hash": manifest.semantic_content_hash,
         "source_binding_hash": binding.semantic_content_hash,
@@ -443,10 +443,10 @@ def validate_policy_data_plane_binding(
         ),
         "component_catalog_hash": runtime.catalog.semantic_content_hash,
         "authority_policy_hash": (
-            runtime.core.config.authority_policy.semantic_content_hash
+            runtime.authoritative_port.profile.authority_policy_hash
         ),
         "decision_schedule_hash": (
-            runtime.core.config.decision_schedule.semantic_content_hash
+            runtime.authoritative_port.profile.decision_schedule_hash
         ),
         "owner_token_id": token.token_id,
         "owner_token_hash": token.semantic_content_hash,
