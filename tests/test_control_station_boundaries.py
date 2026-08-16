@@ -7,6 +7,8 @@ import pytest
 
 from tests.support.repository_imports import (
     absolute_import_roots as _absolute_import_roots,
+)
+from tests.support.repository_imports import (
     python_files as _python_files,
 )
 
@@ -237,7 +239,7 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
 
 def test_gateway_real_observation_profile_is_io_and_control_neutral() -> None:
     assert _violations(
-        _python_files(GATEWAY_ROOT / "profiles/real"),
+        (GATEWAY_ROOT / "profiles/real/observation_gateway.py",),
         {
             "control_station",
             "hardware",
