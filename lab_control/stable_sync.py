@@ -28,6 +28,46 @@ def _is_ancestor(repository: Path, older: str, newer: str) -> bool:
     raise LabError(f"cannot compare stable sync commits: {detail}")
 
 
+def validate_stable_sync_plan(plan: object) -> dict[str, object]:
+    """Validate the complete, content-addressed stable-sync plan envelope."""
+
+    if not isinstance(plan, dict) or set(plan) != {
+        "schema",
+        "canonical_identity",
+        "repository",
+        "branch",
+        "remote_ref",
+        "current_branch",
+        "local_commit",
+        "local_tree_oid",
+        "remote_commit",
+        "remote_tree_oid",
+        "dirty",
+        "action",
+        "network_used",
+        "worktree_files_copied",
+        "rebase_reset_clean_permitted",
+        "plan_sha256",
+    }:
+        raise LabError("stable sync plan has an unexpected shape")
+    if plan.get("schema") != STABLE_SYNC_PLAN_SCHEMA_ID:
+        raise LabError("stable sync plan is invalid")
+    supplied_hash = plan.get("plan_sha256")
+    content = {key: value for key, value in plan.items() if key != "plan_sha256"}
+    if (
+        not isinstance(supplied_hash, str)
+        or hashlib.sha256(_canonical_json(content)).hexdigest() != supplied_hash
+    ):
+        raise LabError("stable sync plan hash mismatch")
+    if (
+        plan.get("network_used") is not False
+        or plan.get("worktree_files_copied") is not False
+        or plan.get("rebase_reset_clean_permitted") is not False
+    ):
+        raise LabError("stable sync plan permits an unsafe operation")
+    return plan
+
+
 def plan_stable_checkout_sync(
     repository: Path,
     *,
@@ -95,21 +135,16 @@ def apply_stable_checkout_fast_forward(
 ) -> dict[str, object]:
     """Apply one unchanged FAST_FORWARD_READY plan; never fetch/rebase/reset/clean."""
 
-    if not isinstance(plan, dict) or plan.get("schema") != STABLE_SYNC_PLAN_SCHEMA_ID:
-        raise LabError("stable sync plan is invalid")
-    supplied_hash = plan.get("plan_sha256")
-    content = {key: value for key, value in plan.items() if key != "plan_sha256"}
-    if (
-        not isinstance(supplied_hash, str)
-        or hashlib.sha256(_canonical_json(content)).hexdigest() != supplied_hash
-    ):
-        raise LabError("stable sync plan hash mismatch")
-    if plan.get("action") != "FAST_FORWARD_READY":
-        raise LabError(f"stable sync plan is not applicable: {plan.get('action')}")
-    repository_value = plan.get("repository")
-    identity = plan.get("canonical_identity")
-    branch = plan.get("branch")
-    remote_ref = plan.get("remote_ref")
+    validated = validate_stable_sync_plan(plan)
+    supplied_hash = validated["plan_sha256"]
+    if validated.get("action") != "FAST_FORWARD_READY":
+        raise LabError(
+            f"stable sync plan is not applicable: {validated.get('action')}"
+        )
+    repository_value = validated.get("repository")
+    identity = validated.get("canonical_identity")
+    branch = validated.get("branch")
+    remote_ref = validated.get("remote_ref")
     if not all(isinstance(value, str) and value for value in (
         repository_value,
         identity,
@@ -131,7 +166,7 @@ def apply_stable_checkout_fast_forward(
         "remote_tree_oid",
         "action",
     ):
-        if current.get(field) != plan.get(field):
+        if current.get(field) != validated.get(field):
             raise LabError(f"stable sync state changed after planning: {field}")
     repository = Path(str(repository_value))
     git.run_git(repository, ["merge", "--ff-only", str(remote_ref)])
@@ -143,8 +178,8 @@ def apply_stable_checkout_fast_forward(
     )
     if (
         verified.get("action") != "NOOP"
-        or verified.get("local_commit") != plan.get("remote_commit")
-        or verified.get("local_tree_oid") != plan.get("remote_tree_oid")
+        or verified.get("local_commit") != validated.get("remote_commit")
+        or verified.get("local_tree_oid") != validated.get("remote_tree_oid")
     ):
         raise LabError("stable sync fast-forward failed final identity verification")
     receipt_content: dict[str, object] = {
@@ -154,7 +189,7 @@ def apply_stable_checkout_fast_forward(
         "repository": repository_value,
         "branch": branch,
         "remote_ref": remote_ref,
-        "before_commit": plan["local_commit"],
+        "before_commit": validated["local_commit"],
         "after_commit": verified["local_commit"],
         "after_tree_oid": verified["local_tree_oid"],
         "fast_forwarded": True,

@@ -11,7 +11,10 @@
       "tests/test_lab_m2_runs.py",
       "tests/test_lab_stable_sync.py",
       "tests/test_lab_project_sync.py",
-      "tests/test_lab_m3a_trusted_fetch.py"
+      "tests/test_lab_m3a_trusted_fetch.py",
+      "tests/test_lab_runtime_inventory.py",
+      "tests/test_lab_stable_maintenance.py",
+      "tests/test_lab_project_maintenance.py"
     ],
     "lab-m1": [
       "tests/test_lab_m1_workspace.py",
@@ -24,6 +27,11 @@
       "tests/test_lab_stable_sync.py",
       "tests/test_lab_project_sync.py",
       "tests/test_lab_m3a_trusted_fetch.py"
+    ],
+    "lab-m3b": [
+      "tests/test_lab_runtime_inventory.py",
+      "tests/test_lab_stable_maintenance.py",
+      "tests/test_lab_project_maintenance.py"
     ]
   }
 }

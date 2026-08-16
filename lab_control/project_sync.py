@@ -380,7 +380,7 @@ def plan_project_sync(
     return {**content, "plan_sha256": _hash_document(content)}
 
 
-def _validate_plan(plan: object) -> dict[str, object]:
+def validate_project_sync_plan(plan: object) -> dict[str, object]:
     if not isinstance(plan, dict) or plan.get("schema") != PROJECT_SYNC_PLAN_SCHEMA_ID:
         raise LabError("project sync plan is invalid")
     supplied_hash = plan.get("plan_sha256")
@@ -530,7 +530,7 @@ def fetch_project_sync(
 ) -> dict[str, object]:
     """Fetch exact stable refs for a plan; never update any checkout."""
 
-    validated = _validate_plan(plan)
+    validated = validate_project_sync_plan(plan)
     if not 1 <= timeout_seconds <= 300:
         raise LabError("project sync fetch timeout must be between 1 and 300 seconds")
     if validated.get("project_manifest_sha256") != manager.project.sha256:

@@ -15,6 +15,7 @@ from .inspection import (
     enrich_change_inspection,
     enrich_task_inspection,
 )
+from .project_maintenance import apply_guarded_project_checkout
 from .project_sync import fetch_project_sync, plan_project_sync
 from .runs import CANDIDATE_EVIDENCE_TIER, DEVELOPMENT_EVIDENCE_TIER, RunManager
 from .workspace import LabError, TaskPlan, WorkspaceManager
@@ -119,6 +120,14 @@ def _build_parser() -> argparse.ArgumentParser:
         if command_name == "fetch":
             command.add_argument("--timeout-seconds", type=int, default=120)
         command.add_argument("--json", action="store_true")
+    sync_apply = sync_commands.add_parser(
+        "apply",
+        help="guard one unlinked stable checkout and apply an exact fast-forward",
+    )
+    sync_apply.add_argument("--repo", required=True)
+    sync_apply.add_argument("--confirm-plan-sha256", required=True)
+    sync_apply.add_argument("--reservation-id", required=True)
+    sync_apply.add_argument("--json", action="store_true")
 
     open_parser = subcommands.add_parser(
         "open", help="open a Task workspace or an exact Run snapshot"
@@ -358,6 +367,19 @@ def _print_sync(payload: dict[str, object]) -> None:
     print("Checkout/worktree updates: none")
 
 
+def _print_guarded_sync(payload: dict[str, object]) -> None:
+    guarded = payload.get("guarded_sync")
+    stable = guarded.get("stable_sync_receipt") if isinstance(guarded, dict) else None
+    print(f"Project: {payload.get('project_id')}")
+    print(f"Repository: {payload.get('repository')}")
+    print(f"Status: {payload.get('status')}")
+    if isinstance(stable, dict):
+        print(f"Before: {stable.get('before_commit')}")
+        print(f"After:  {stable.get('after_commit')}")
+    print(f"Receipt: {payload.get('receipt_path')}")
+    print("Network/LFS/submodule/task-worktree updates: none")
+
+
 def _print_run(payload: dict[str, object]) -> None:
     outcome = payload.get("outcome")
     classification = (
@@ -568,6 +590,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     manager.control_repository / "stack" / "baseline.json",
                 )
             ).expanduser().resolve()
+            if arguments.sync_command == "apply":
+                raw_name = arguments.repo
+                name = manager.repository_aliases.get(raw_name.casefold(), raw_name)
+                sync_plan = plan_project_sync(
+                    manager,
+                    baseline_path=baseline_path,
+                    repository_names=(name,),
+                )
+                sync_payload = apply_guarded_project_checkout(
+                    manager,
+                    sync_plan,
+                    repository=name,
+                    confirmed_plan_sha256=arguments.confirm_plan_sha256,
+                    reservation_id=arguments.reservation_id,
+                )
+                if arguments.json:
+                    _emit(sync_payload, as_json=True)
+                else:
+                    _print_guarded_sync(sync_payload)
+                return 0
             sync_plan = plan_project_sync(
                 manager,
                 baseline_path=baseline_path,
