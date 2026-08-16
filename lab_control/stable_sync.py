@@ -136,7 +136,56 @@ def apply_stable_checkout_fast_forward(
     """Apply one unchanged FAST_FORWARD_READY plan; never fetch/rebase/reset/clean."""
 
     validated = validate_stable_sync_plan(plan)
-    supplied_hash = validated["plan_sha256"]
+    head_receipt = apply_stable_checkout_head_fast_forward(validated)
+    repository_value = validated["repository"]
+    identity = validated["canonical_identity"]
+    branch = validated["branch"]
+    remote_ref = validated["remote_ref"]
+    repository = Path(str(repository_value))
+    verified = plan_stable_checkout_sync(
+        repository,
+        expected_identity=str(identity),
+        branch=str(branch),
+        remote_ref=str(remote_ref),
+    )
+    if (
+        verified.get("action") != "NOOP"
+        or verified.get("local_commit") != validated.get("remote_commit")
+        or verified.get("local_tree_oid") != validated.get("remote_tree_oid")
+    ):
+        raise LabError("stable sync fast-forward failed final identity verification")
+    receipt_content: dict[str, object] = {
+        "schema": "lab.stable-sync-receipt.v1",
+        "plan_sha256": validated["plan_sha256"],
+        "head_update_receipt_sha256": head_receipt["receipt_sha256"],
+        "canonical_identity": identity,
+        "repository": repository_value,
+        "branch": branch,
+        "remote_ref": remote_ref,
+        "before_commit": validated["local_commit"],
+        "after_commit": verified["local_commit"],
+        "after_tree_oid": verified["local_tree_oid"],
+        "fast_forwarded": True,
+        "checkout_clean_verified": True,
+        "network_used": False,
+        "worktree_files_copied": False,
+        "rebase_reset_clean_used": False,
+        "lfs_smudge_enabled": False,
+    }
+    return {
+        **receipt_content,
+        "receipt_sha256": hashlib.sha256(
+            _canonical_json(receipt_content)
+        ).hexdigest(),
+    }
+
+
+def apply_stable_checkout_head_fast_forward(
+    plan: object,
+) -> dict[str, object]:
+    """Advance HEAD/tree but defer worktree-clean verification for linked children."""
+
+    validated = validate_stable_sync_plan(plan)
     if validated.get("action") != "FAST_FORWARD_READY":
         raise LabError(
             f"stable sync plan is not applicable: {validated.get('action')}"
@@ -169,33 +218,41 @@ def apply_stable_checkout_fast_forward(
         if current.get(field) != validated.get(field):
             raise LabError(f"stable sync state changed after planning: {field}")
     repository = Path(str(repository_value))
-    git.run_git(repository, ["merge", "--ff-only", str(remote_ref)])
-    verified = plan_stable_checkout_sync(
+    git.run_git(
         repository,
-        expected_identity=str(identity),
-        branch=str(branch),
-        remote_ref=str(remote_ref),
+        ["-c", "submodule.recurse=false", "merge", "--ff-only", str(remote_ref)],
+        environment={
+            "GIT_LFS_SKIP_SMUDGE": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
     )
+    after_commit = git.current_commit(repository)
+    after_tree_oid = git.tree_oid(repository)
     if (
-        verified.get("action") != "NOOP"
-        or verified.get("local_commit") != validated.get("remote_commit")
-        or verified.get("local_tree_oid") != validated.get("remote_tree_oid")
+        git.origin_identity(repository) != identity
+        or git.current_branch(repository) != branch
+        or after_commit != validated.get("remote_commit")
+        or after_tree_oid != validated.get("remote_tree_oid")
     ):
-        raise LabError("stable sync fast-forward failed final identity verification")
+        raise LabError("stable sync HEAD/tree fast-forward verification failed")
     receipt_content: dict[str, object] = {
-        "schema": "lab.stable-sync-receipt.v1",
-        "plan_sha256": supplied_hash,
+        "schema": "lab.stable-sync-head-receipt.v1",
+        "plan_sha256": validated["plan_sha256"],
         "canonical_identity": identity,
         "repository": repository_value,
         "branch": branch,
         "remote_ref": remote_ref,
         "before_commit": validated["local_commit"],
-        "after_commit": verified["local_commit"],
-        "after_tree_oid": verified["local_tree_oid"],
+        "after_commit": after_commit,
+        "after_tree_oid": after_tree_oid,
         "fast_forwarded": True,
+        "checkout_clean_verified": False,
+        "followup_verification_required": True,
         "network_used": False,
         "worktree_files_copied": False,
         "rebase_reset_clean_used": False,
+        "submodules_updated": False,
+        "lfs_smudge_enabled": False,
     }
     return {
         **receipt_content,

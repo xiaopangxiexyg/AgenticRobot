@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,6 +24,7 @@ def run_git(
     arguments: Iterable[str],
     *,
     check: bool = True,
+    environment: Mapping[str, str] | None = None,
 ) -> GitResult:
     command = [
         "git",
@@ -32,11 +34,15 @@ def run_git(
         str(repository),
         *arguments,
     ]
+    process_environment = dict(os.environ)
+    if environment is not None:
+        process_environment.update(environment)
     completed = subprocess.run(
         command,
         check=False,
         capture_output=True,
         text=True,
+        env=process_environment,
     )
     if check and completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()

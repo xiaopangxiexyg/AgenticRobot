@@ -173,6 +173,7 @@ def validate_maintenance_reservation(
         "plan_sha256",
         "local_commit",
         "local_tree_oid",
+        "checkout_status",
         "reservation_id",
         "status",
         "managed_runtime_starts_blocked",
@@ -193,6 +194,8 @@ def validate_maintenance_reservation(
         or not _SHA256_PATTERN.fullmatch(str(receipt.get("plan_sha256", "")))
         or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("local_commit", "")))
         or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("local_tree_oid", "")))
+        or not isinstance(receipt.get("checkout_status"), list)
+        or not all(isinstance(item, str) for item in receipt["checkout_status"])
         or status not in {"ACTIVE", "RELEASED"}
         or (status == "ACTIVE" and released_at is not None)
         or (status == "RELEASED" and released_at is None)
@@ -230,9 +233,6 @@ def acquire_maintenance_reservation(
     reservation_id: str,
     validity_seconds: int = 120,
 ) -> dict[str, object]:
-    validate_task_id(reservation_id)
-    if not 5 <= validity_seconds <= 300:
-        raise LabError("maintenance reservation validity must be between 5 and 300 seconds")
     validated_plan = _validate_target_plan(target, plan)
     if validated_plan.get("action") != "FAST_FORWARD_READY":
         raise LabError("maintenance reservation requires a fast-forward-ready plan")
@@ -244,6 +244,44 @@ def acquire_maintenance_reservation(
     )
     if current != validated_plan:
         raise LabError("stable sync state changed before maintenance reservation")
+    return acquire_checkout_maintenance_reservation(
+        target,
+        operation_plan_sha256=str(validated_plan["plan_sha256"]),
+        local_commit=str(validated_plan["local_commit"]),
+        local_tree_oid=str(validated_plan["local_tree_oid"]),
+        expected_status=(),
+        reservation_id=reservation_id,
+        validity_seconds=validity_seconds,
+    )
+
+
+def acquire_checkout_maintenance_reservation(
+    target: StableCheckoutTarget,
+    *,
+    operation_plan_sha256: str,
+    local_commit: str,
+    local_tree_oid: str,
+    expected_status: tuple[str, ...],
+    reservation_id: str,
+    validity_seconds: int = 120,
+) -> dict[str, object]:
+    """Reserve one clean checkout for a trusted, content-addressed operation plan."""
+
+    validate_task_id(reservation_id)
+    if not 5 <= validity_seconds <= 300:
+        raise LabError("maintenance reservation validity must be between 5 and 300 seconds")
+    if not _SHA256_PATTERN.fullmatch(operation_plan_sha256):
+        raise LabError("maintenance operation plan has an invalid hash")
+    if not re.fullmatch(r"[0-9a-f]{40}", local_commit) or not re.fullmatch(
+        r"[0-9a-f]{40}", local_tree_oid
+    ):
+        raise LabError("maintenance operation has an invalid checkout identity")
+    if (
+        git.current_commit(target.checkout_path) != local_commit
+        or git.tree_oid(target.checkout_path) != local_tree_oid
+        or git.status_short(target.checkout_path) != expected_status
+    ):
+        raise LabError("checkout changed before maintenance reservation")
     with _locked_state(target) as state_path:
         existing = _load_state(state_path)
         if existing is not None:
@@ -263,9 +301,10 @@ def acquire_maintenance_reservation(
             "schema": MAINTENANCE_RESERVATION_SCHEMA_ID,
             "target": target.identity(),
             "policy_sha256": target.policy_sha256,
-            "plan_sha256": validated_plan["plan_sha256"],
-            "local_commit": validated_plan["local_commit"],
-            "local_tree_oid": validated_plan["local_tree_oid"],
+            "plan_sha256": operation_plan_sha256,
+            "local_commit": local_commit,
+            "local_tree_oid": local_tree_oid,
+            "checkout_status": list(expected_status),
             "reservation_id": reservation_id,
             "status": "ACTIVE",
             "managed_runtime_starts_blocked": True,

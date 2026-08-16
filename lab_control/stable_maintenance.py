@@ -75,6 +75,7 @@ def build_maintenance_receipt(
         reservation.get("plan_sha256") != validated_plan.get("plan_sha256")
         or reservation.get("local_commit") != validated_plan.get("local_commit")
         or reservation.get("local_tree_oid") != validated_plan.get("local_tree_oid")
+        or reservation.get("checkout_status") != []
     ):
         raise LabError("maintenance reservation does not bind the stable sync plan")
     if not 1 <= validity_seconds <= 60:
@@ -174,6 +175,7 @@ def validate_maintenance_receipt(
         or reservation.get("plan_sha256") != receipt.get("plan_sha256")
         or reservation.get("local_commit") != receipt.get("local_commit")
         or reservation.get("local_tree_oid") != receipt.get("local_tree_oid")
+        or reservation.get("checkout_status") != []
     ):
         raise LabError("maintenance receipt does not bind its evidence")
     issued = _timestamp(receipt.get("issued_at"), label="issued_at")

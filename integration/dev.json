@@ -14,7 +14,8 @@
       "tests/test_lab_m3a_trusted_fetch.py",
       "tests/test_lab_runtime_inventory.py",
       "tests/test_lab_stable_maintenance.py",
-      "tests/test_lab_project_maintenance.py"
+      "tests/test_lab_project_maintenance.py",
+      "tests/test_lab_linked_sync.py"
     ],
     "lab-m1": [
       "tests/test_lab_m1_workspace.py",
@@ -32,6 +33,9 @@
       "tests/test_lab_runtime_inventory.py",
       "tests/test_lab_stable_maintenance.py",
       "tests/test_lab_project_maintenance.py"
+    ],
+    "lab-m3c": [
+      "tests/test_lab_linked_sync.py"
     ]
   }
 }

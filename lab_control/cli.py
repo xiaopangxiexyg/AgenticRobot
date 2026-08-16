@@ -15,6 +15,7 @@ from .inspection import (
     enrich_change_inspection,
     enrich_task_inspection,
 )
+from .linked_sync import apply_linked_project_checkout, plan_linked_project_checkout
 from .project_maintenance import apply_guarded_project_checkout
 from .project_sync import fetch_project_sync, plan_project_sync
 from .runs import CANDIDATE_EVIDENCE_TIER, DEVELOPMENT_EVIDENCE_TIER, RunManager
@@ -128,6 +129,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_apply.add_argument("--confirm-plan-sha256", required=True)
     sync_apply.add_argument("--reservation-id", required=True)
     sync_apply.add_argument("--json", action="store_true")
+    sync_linked_plan = sync_commands.add_parser(
+        "plan-linked",
+        help="plan one stable parent and its direct pinned children",
+    )
+    sync_linked_plan.add_argument("--repo", required=True)
+    sync_linked_plan.add_argument("--json", action="store_true")
+    sync_linked_apply = sync_commands.add_parser(
+        "apply-linked",
+        help="apply one confirmed parent/gitlink-child checkout plan",
+    )
+    sync_linked_apply.add_argument("--repo", required=True)
+    sync_linked_apply.add_argument("--confirm-plan-sha256", required=True)
+    sync_linked_apply.add_argument("--reservation-id", required=True)
+    sync_linked_apply.add_argument("--json", action="store_true")
 
     open_parser = subcommands.add_parser(
         "open", help="open a Task workspace or an exact Run snapshot"
@@ -380,6 +395,26 @@ def _print_guarded_sync(payload: dict[str, object]) -> None:
     print("Network/LFS/submodule/task-worktree updates: none")
 
 
+def _print_linked_sync(payload: dict[str, object]) -> None:
+    print(f"Project: {payload.get('project_id')}")
+    print(f"Root repository: {payload.get('root_repository')}")
+    print(f"Action/status: {payload.get('action', payload.get('status'))}")
+    print(f"Plan: {payload.get('plan_sha256', payload.get('linked_plan_sha256'))}")
+    children = payload.get("children")
+    if isinstance(children, dict):
+        for name, raw in children.items():
+            if isinstance(raw, dict):
+                print(
+                    f"  {name}: {str(raw.get('current_commit', ''))[:12]} -> "
+                    f"{str(raw.get('target_commit', ''))[:12]}"
+                )
+    if payload.get("receipt_path"):
+        print(f"Receipt: {payload.get('receipt_path')}")
+    if payload.get("error"):
+        print(f"QUARANTINED: {payload.get('error')}")
+    print("Network/fetch/LFS/reset/clean/task-worktree updates: none")
+
+
 def _print_run(payload: dict[str, object]) -> None:
     outcome = payload.get("outcome")
     classification = (
@@ -590,6 +625,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                     manager.control_repository / "stack" / "baseline.json",
                 )
             ).expanduser().resolve()
+            if arguments.sync_command in {"plan-linked", "apply-linked"}:
+                raw_name = arguments.repo
+                name = manager.repository_aliases.get(raw_name.casefold(), raw_name)
+                project_plan = plan_project_sync(
+                    manager,
+                    baseline_path=baseline_path,
+                    repository_names=(name,),
+                )
+                linked_plan = plan_linked_project_checkout(
+                    manager,
+                    project_plan,
+                    root_repository=name,
+                )
+                if arguments.sync_command == "apply-linked":
+                    sync_payload = apply_linked_project_checkout(
+                        manager,
+                        linked_plan,
+                        confirmed_plan_sha256=arguments.confirm_plan_sha256,
+                        reservation_id=arguments.reservation_id,
+                    )
+                else:
+                    sync_payload = linked_plan
+                if arguments.json:
+                    _emit(sync_payload, as_json=True)
+                else:
+                    _print_linked_sync(sync_payload)
+                return (
+                    0
+                    if sync_payload.get("status")
+                    in {None, "COMPLETE", "UP_TO_DATE"}
+                    else 1
+                )
             if arguments.sync_command == "apply":
                 raw_name = arguments.repo
                 name = manager.repository_aliases.get(raw_name.casefold(), raw_name)

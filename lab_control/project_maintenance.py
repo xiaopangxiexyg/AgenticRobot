@@ -31,7 +31,7 @@ def _hash(payload: object) -> str:
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
-def _persist_receipt(
+def persist_project_sync_receipt(
     manager: WorkspaceManager,
     receipt: dict[str, object],
 ) -> None:
@@ -158,7 +158,7 @@ def apply_guarded_project_checkout(
             **noop_content,
             "receipt_sha256": _hash(noop_content),
         }
-        _persist_receipt(manager, receipt)
+        persist_project_sync_receipt(manager, receipt)
         return receipt
     host_id = manager.environ.get(
         "LAB_HOST_ID",
@@ -213,5 +213,5 @@ def apply_guarded_project_checkout(
         "executor_pid": os.getpid(),
     }
     receipt = {**content, "receipt_sha256": _hash(content)}
-    _persist_receipt(manager, receipt)
+    persist_project_sync_receipt(manager, receipt)
     return receipt
