@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -23,7 +24,6 @@ from .artifact_contracts import (
     agent_artifact_wire_schemas_v2,
 )
 from .version import AGENT_SKILL_PROTOCOL_VERSION_V2
-
 
 AGENT_GATEWAY_EVENT_HASH_DOMAIN_V2 = "dexteleop.agent_gateway.event.v2"
 AGENT_GATEWAY_EVENT_BATCH_HASH_DOMAIN_V2 = (
@@ -209,6 +209,18 @@ class AgentGatewayEventBatch:
             or events[-1].sequence > self.latest_sequence
         ):
             raise ValueError("Event sequences lie outside the requested batch.")
+        if events and any(
+            current.sequence != previous.sequence + 1
+            for previous, current in pairwise(events)
+        ):
+            raise ValueError("events must have contiguous sequences.")
+        if self.requested_after_sequence < self.latest_sequence and not events:
+            raise ValueError("events must not be empty while unread events remain.")
+        if events and events[0].sequence != max(
+            self.requested_after_sequence + 1,
+            self.oldest_available_sequence,
+        ):
+            raise ValueError("events do not start at the retained cursor boundary.")
         expected_gap = self.requested_after_sequence + 1 < (
             self.oldest_available_sequence
         )

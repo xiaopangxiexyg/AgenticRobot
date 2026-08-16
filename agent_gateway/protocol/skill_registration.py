@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from .skill_catalog import (
     AgentSkillSchemaCatalog,
@@ -124,6 +124,15 @@ def build_skill_registration_catalogs(
     )
     if len(set(identities)) != len(identities):
         raise ValueError("Skill registration identities must be unique.")
+    items = tuple(
+        sorted(
+            items,
+            key=lambda item: (
+                item.definition.skill_id,
+                item.definition.skill_version,
+            ),
+        )
+    )
     return SkillRegistrationCatalogBundle(
         definition_catalog=SkillDefinitionCatalog(
             catalog_id=definition_catalog_id,

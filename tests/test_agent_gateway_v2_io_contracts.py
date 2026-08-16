@@ -27,7 +27,6 @@ from agent_gateway.protocol.skill_io_contracts import (
 )
 from agent_gateway.protocol.version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
-
 _SHA_A = "a" * 64
 
 
@@ -302,3 +301,44 @@ def test_events_are_bounded_notifications_with_explicit_cursor_gaps() -> None:
         replace(event, payload={"oversized": "x" * 70_000})
     with pytest.raises(ValueError, match="gap_detected does not match"):
         replace(batch, gap_detected=False)
+
+
+def test_event_batch_rejects_hidden_sequence_gaps_or_missing_unread_events() -> None:
+    def event(sequence: int) -> AgentGatewayEvent:
+        return AgentGatewayEvent(
+            runtime_session_id="runtime:test",
+            sequence=sequence,
+            event_kind="operation_updated",
+            emitted_at=float(sequence),
+            operation_id="operation:one",
+            operation_hash="operation-hash:one",
+            payload={"status": "admitted"},
+        )
+
+    with pytest.raises(ValueError, match="contiguous"):
+        AgentGatewayEventBatch(
+            runtime_session_id="runtime:test",
+            requested_after_sequence=0,
+            oldest_available_sequence=1,
+            latest_sequence=3,
+            gap_detected=False,
+            events=(event(1), event(3)),
+        )
+    with pytest.raises(ValueError, match="must not be empty"):
+        AgentGatewayEventBatch(
+            runtime_session_id="runtime:test",
+            requested_after_sequence=0,
+            oldest_available_sequence=1,
+            latest_sequence=1,
+            gap_detected=False,
+            events=(),
+        )
+    with pytest.raises(ValueError, match="retained cursor boundary"):
+        AgentGatewayEventBatch(
+            runtime_session_id="runtime:test",
+            requested_after_sequence=0,
+            oldest_available_sequence=2,
+            latest_sequence=3,
+            gap_detected=True,
+            events=(event(3),),
+        )

@@ -201,6 +201,180 @@ def test_hash_mismatch_quarantines_staging_and_never_publishes_ref(
             store.artifact(expected.artifact_id)
 
 
+def test_incomplete_commit_remains_resumable(tmp_path: Path) -> None:
+    data = b"complete-me"
+    artifact = _artifact(data)
+    with _store(tmp_path / "store") as store:
+        lease = store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:incomplete",
+            artifact=artifact,
+            now=0.0,
+        )
+        first = data[:4]
+        store.write_upload_chunk(
+            upload_id=lease.upload_id,
+            client_id=lease.client_id,
+            runtime_session_id=lease.runtime_session_id,
+            offset=0,
+            data=first,
+            now=1.0,
+        )
+
+        with pytest.raises(ArtifactStoreConflictError, match="incomplete"):
+            store.commit_upload(
+                upload_id=lease.upload_id,
+                client_id=lease.client_id,
+                runtime_session_id=lease.runtime_session_id,
+                now=2.0,
+            )
+        assert store.upload(lease.upload_id).state == "staging"
+
+        store.write_upload_chunk(
+            upload_id=lease.upload_id,
+            client_id=lease.client_id,
+            runtime_session_id=lease.runtime_session_id,
+            offset=len(first),
+            data=data[len(first) :],
+            now=3.0,
+        )
+        assert store.commit_upload(
+            upload_id=lease.upload_id,
+            client_id=lease.client_id,
+            runtime_session_id=lease.runtime_session_id,
+            now=4.0,
+        ) == artifact
+
+
+def test_upload_idempotency_never_replays_across_runtime_sessions(
+    tmp_path: Path,
+) -> None:
+    with _store(tmp_path / "store") as store:
+        store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:first",
+            idempotency_key="upload:session-bound",
+            artifact=_artifact(b"session-bound"),
+            now=0.0,
+        )
+        with pytest.raises(ArtifactStoreConflictError, match="runtime session"):
+            store.begin_upload(
+                client_id="rpent:local",
+                runtime_session_id="runtime:second",
+                idempotency_key="upload:session-bound",
+                artifact=_artifact(b"session-bound"),
+                now=1.0,
+            )
+
+
+def test_reupload_repairs_a_quarantined_corrupt_cas_blob(tmp_path: Path) -> None:
+    data = b"repairable"
+    artifact = _artifact(data)
+    with _store(tmp_path / "store") as store:
+        _upload(store, data=data, key="upload:original")
+        path = store.managed_read_path(artifact.artifact_id)
+        path.chmod(0o600)
+        path.write_bytes(b"corrupted!")
+        with pytest.raises(ArtifactStoreIntegrityError, match="failed verification"):
+            store.managed_read_path(artifact.artifact_id)
+
+        lease = store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:repair",
+            artifact=artifact,
+            now=10.0,
+        )
+        store.write_upload_chunk(
+            upload_id=lease.upload_id,
+            client_id=lease.client_id,
+            runtime_session_id=lease.runtime_session_id,
+            offset=0,
+            data=data,
+            now=11.0,
+        )
+        assert store.commit_upload(
+            upload_id=lease.upload_id,
+            client_id=lease.client_id,
+            runtime_session_id=lease.runtime_session_id,
+            now=12.0,
+        ) == artifact
+        assert store.managed_read_path(artifact.artifact_id).read_bytes() == data
+
+
+def test_concurrent_same_artifact_commit_preserves_materialization(
+    tmp_path: Path,
+) -> None:
+    data = b"same-artifact"
+    artifact = _artifact(data)
+    with _store(tmp_path / "store") as store:
+        leases = tuple(
+            store.begin_upload(
+                client_id=client,
+                runtime_session_id="runtime:test",
+                idempotency_key="upload:same",
+                artifact=artifact,
+                now=0.0,
+            )
+            for client in ("rpent:first", "rpent:second")
+        )
+        for lease in leases:
+            store.write_upload_chunk(
+                upload_id=lease.upload_id,
+                client_id=lease.client_id,
+                runtime_session_id=lease.runtime_session_id,
+                offset=0,
+                data=data,
+                now=1.0,
+            )
+        store.commit_upload(
+            upload_id=leases[0].upload_id,
+            client_id=leases[0].client_id,
+            runtime_session_id=leases[0].runtime_session_id,
+            now=2.0,
+        )
+        receipt = AgentArtifactMaterializationReceipt(
+            receipt_id="receipt:first-copy",
+            artifact_id=artifact.artifact_id,
+            client_id="rpent:first",
+            runtime_session_id="runtime:test",
+            durable_store_id="rpent:experience",
+            durable_object_ref="artifact:first-copy",
+            materialized_at=3.0,
+            verified_sha256=artifact.sha256,
+        )
+        store.record_materialization(receipt)
+
+        store.commit_upload(
+            upload_id=leases[1].upload_id,
+            client_id=leases[1].client_id,
+            runtime_session_id=leases[1].runtime_session_id,
+            now=4.0,
+        )
+        assert store.artifact(artifact.artifact_id).materialization_receipt_hash == (
+            receipt.semantic_content_hash
+        )
+
+
+def test_available_artifact_reuse_refreshes_handoff_retention(tmp_path: Path) -> None:
+    artifact = _artifact(b"reuse")
+    with _store(tmp_path / "store") as store:
+        _upload(store, data=b"reuse", key="upload:first", now=0.0)
+        original = store.artifact(artifact.artifact_id)
+        reused = store.begin_upload(
+            client_id="rpent:other",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:reuse",
+            artifact=artifact,
+            now=90.0,
+        )
+        refreshed = store.artifact(artifact.artifact_id)
+        assert reused.committed
+        assert refreshed.minimum_retention_until > original.minimum_retention_until
+        assert refreshed.handoff_deadline > original.handoff_deadline
+
+
 def test_quota_is_reserved_before_bytes_are_accepted(tmp_path: Path) -> None:
     with _store(tmp_path / "store", quota_bytes=12) as store:
         store.begin_upload(

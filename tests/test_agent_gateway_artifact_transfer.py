@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,10 @@ from agent_gateway.protocol.artifact_contracts import AgentArtifactRef
 from agent_gateway.protocol.session_contracts import (
     AgentGatewaySessionCapabilities,
 )
-from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.runtime.artifact_store import (
+    ArtifactStoreConflictError,
+    RecoverableAgentArtifactStore,
+)
 from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
 
 
@@ -368,5 +373,242 @@ def test_empty_artifact_can_commit_and_ack_without_data_chunks(
             now=4.0,
         )
         assert receipt.transferred_bytes == 0
+    finally:
+        store.close()
+
+
+def test_failed_and_replayed_upload_calls_do_not_exhaust_the_grant(
+    tmp_path: Path,
+) -> None:
+    data = b"four"
+    store, broker = _runtime(tmp_path)
+    try:
+        lease = store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:retry-budget",
+            artifact=_artifact(data),
+            now=0.0,
+        )
+        grant = broker.issue_write_grant(
+            lease=lease,
+            mechanism="chunked_rpc",
+            now=1.0,
+        )
+        with pytest.raises(ArtifactStoreConflictError, match="incomplete"):
+            broker.commit_write(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                now=2.0,
+            )
+        with pytest.raises(ValueError, match="empty"):
+            broker.write_chunk(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                offset=0,
+                data=b"",
+                now=2.0,
+            )
+        for _ in range(3):
+            broker.write_chunk(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                offset=0,
+                data=data,
+                now=3.0,
+            )
+        artifact, _ = broker.commit_write(
+            grant_id=grant.grant_id,
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            now=4.0,
+        )
+        assert artifact == _artifact(data)
+    finally:
+        store.close()
+
+
+def test_download_ack_requires_complete_byte_coverage_and_allows_replay(
+    tmp_path: Path,
+) -> None:
+    data = b"abcdefgh"
+    store, broker = _runtime(tmp_path)
+    try:
+        artifact = _artifact(data)
+        lease = store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:coverage",
+            artifact=artifact,
+            now=0.0,
+        )
+        for offset in range(0, len(data), 4):
+            store.write_upload_chunk(
+                upload_id=lease.upload_id,
+                client_id=lease.client_id,
+                runtime_session_id=lease.runtime_session_id,
+                offset=offset,
+                data=data[offset : offset + 4],
+                now=1.0 + offset,
+            )
+        store.commit_upload(
+            upload_id=lease.upload_id,
+            client_id=lease.client_id,
+            runtime_session_id=lease.runtime_session_id,
+            now=10.0,
+        )
+        grant = broker.issue_read_grant(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            artifact_id=artifact.artifact_id,
+            mechanism="chunked_rpc",
+            now=11.0,
+        )
+        for _ in range(grant.max_uses + 1):
+            with pytest.raises(ValueError, match="outside"):
+                broker.read_chunk(
+                    grant_id=grant.grant_id,
+                    client_id="rpent:local",
+                    runtime_session_id="runtime:test",
+                    offset=len(data),
+                    max_bytes=4,
+                    now=12.0,
+                )
+        for _ in range(3):
+            assert broker.read_chunk(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                offset=0,
+                max_bytes=4,
+                now=12.0,
+            ) == data[:4]
+        with pytest.raises(ValueError, match="complete byte coverage"):
+            broker.acknowledge_read(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                transferred_bytes=len(data),
+                verified_sha256=artifact.sha256,
+                now=13.0,
+            )
+        assert broker.read_chunk(
+            grant_id=grant.grant_id,
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            offset=4,
+            max_bytes=4,
+            now=14.0,
+        ) == data[4:]
+        assert broker.acknowledge_read(
+            grant_id=grant.grant_id,
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            transferred_bytes=len(data),
+            verified_sha256=artifact.sha256,
+            now=15.0,
+        ).status == "completed"
+    finally:
+        store.close()
+
+
+def test_new_grant_refreshes_stale_upload_lease_progress(tmp_path: Path) -> None:
+    data = b"abcdefgh"
+    store, broker = _runtime(tmp_path)
+    try:
+        stale = store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:stale-lease",
+            artifact=_artifact(data),
+            now=0.0,
+        )
+        first = broker.issue_write_grant(
+            lease=stale,
+            mechanism="chunked_rpc",
+            now=1.0,
+            ttl_sec=2.0,
+        )
+        broker.write_chunk(
+            grant_id=first.grant_id,
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            offset=0,
+            data=data[:4],
+            now=2.0,
+        )
+
+        resumed = broker.issue_write_grant(
+            lease=stale,
+            mechanism="chunked_rpc",
+            now=3.0,
+        )
+        assert resumed.grant_id != first.grant_id
+        assert resumed.byte_offset == 4
+        assert resumed.max_bytes == 4
+    finally:
+        store.close()
+
+
+def test_concurrent_commit_issues_exactly_one_success_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = b"commit-once"
+    store, broker = _runtime(tmp_path)
+    try:
+        lease = store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:commit-once",
+            artifact=_artifact(data),
+            now=0.0,
+        )
+        grant = broker.issue_write_grant(
+            lease=lease,
+            mechanism="chunked_rpc",
+            now=1.0,
+        )
+        for offset in range(0, len(data), 4):
+            broker.write_chunk(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                offset=offset,
+                data=data[offset : offset + 4],
+                now=2.0,
+            )
+
+        rendezvous = threading.Barrier(2)
+        consume_use = broker._consume_use
+
+        def synchronized_consume(state) -> None:
+            consume_use(state)
+            rendezvous.wait(timeout=1.0)
+
+        monkeypatch.setattr(broker, "_consume_use", synchronized_consume)
+
+        def commit():
+            return broker.commit_write(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                now=3.0,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = tuple(executor.submit(commit) for _ in range(2))
+        successes = []
+        failures = []
+        for future in futures:
+            try:
+                successes.append(future.result())
+            except PermissionError as error:
+                failures.append(error)
+        assert len(successes) == 1
+        assert len(failures) == 1
     finally:
         store.close()

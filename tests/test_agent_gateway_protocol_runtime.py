@@ -51,14 +51,17 @@ def _strict_empty_schema() -> dict[str, object]:
     }
 
 
-def _registration() -> tuple[
+def _registration(
+    *,
+    skill_id: str = "perception.capture_depth",
+) -> tuple[
     SkillRegistrationTemplate,
     SkillDefinitionCatalog,
     AgentSkillSchemaCatalog,
     SkillIOCatalog,
 ]:
     definition = SkillDefinition(
-        skill_id="perception.capture_depth",
+        skill_id=skill_id,
         skill_version="1",
         skill_kind="inspection",
         summary="Capture one finite depth observation.",
@@ -143,6 +146,22 @@ def _registration() -> tuple[
         catalogs.schema_catalog,
         catalogs.io_catalog,
     )
+
+
+def test_registration_builder_canonicalizes_input_order() -> None:
+    later = _registration(skill_id="test.skill_z")[0]
+    earlier = _registration(skill_id="test.skill_a")[0]
+
+    catalogs = build_skill_registration_catalogs((later, earlier))
+
+    expected = ("test.skill_a", "test.skill_z")
+    assert tuple(
+        item.skill_id for item in catalogs.definition_catalog.skill_definitions
+    ) == expected
+    assert tuple(item.skill_id for item in catalogs.schema_catalog.schema_entries) == (
+        expected
+    )
+    assert tuple(item.skill_id for item in catalogs.io_catalog.io_contracts) == expected
 
 
 def _artifact_runtime(tmp_path: Path):

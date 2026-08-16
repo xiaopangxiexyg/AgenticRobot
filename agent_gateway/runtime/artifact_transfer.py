@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import math
 import os
 import threading
-from dataclasses import dataclass
-from typing import Any
 import uuid
+from dataclasses import dataclass, field
+from typing import Any
 
 from agent_gateway.protocol._contract_validation import (
     finite_number,
@@ -24,6 +23,7 @@ from agent_gateway.protocol.artifact_contracts import (
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 
 from .artifact_store import (
+    ArtifactStoreIntegrityError,
     ArtifactUploadLease,
     RecoverableAgentArtifactStore,
 )
@@ -35,6 +35,8 @@ class _GrantState:
     use_count: int = 0
     upload_id: str | None = None
     completed: bool = False
+    completion_claimed: bool = False
+    read_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 class ArtifactTransferCapacityError(RuntimeError):
@@ -178,7 +180,6 @@ class AgentArtifactTransferBroker:
                 "v2 read grants cover the complete Artifact; resume uses chunk offsets."
             )
         grant_id = f"grant:{uuid.uuid4().hex}"
-        chunk_uses = max(1, math.ceil(bounded / self.max_chunk_bytes))
         locator: dict[str, Any]
         max_uses: int
         if selected == "local_path":
@@ -190,7 +191,8 @@ class AgentArtifactTransferBroker:
             max_uses = 1
         else:
             locator = {"transfer_id": grant_id}
-            max_uses = chunk_uses
+            # Successful reads that add no new byte coverage do not consume a use.
+            max_uses = max(1, bounded)
         grant = AgentArtifactAccessGrant(
             grant_id=grant_id,
             artifact=record.artifact,
@@ -218,6 +220,15 @@ class AgentArtifactTransferBroker:
     ) -> AgentArtifactAccessGrant:
         if not isinstance(lease, ArtifactUploadLease):
             raise TypeError("lease must be an ArtifactUploadLease.")
+        current = self.store.upload(lease.upload_id)
+        if (
+            current.client_id != lease.client_id
+            or current.runtime_session_id != lease.runtime_session_id
+            or current.idempotency_key != lease.idempotency_key
+            or current.artifact != lease.artifact
+        ):
+            raise PermissionError("Upload lease metadata does not match the store.")
+        lease = current
         if lease.committed or lease.state != "staging":
             raise ValueError("Only a staging upload may receive a write grant.")
         if lease.runtime_session_id != self.session_capabilities.runtime_session_id:
@@ -240,7 +251,8 @@ class AgentArtifactTransferBroker:
             raise ValueError("Upload lease expires before the access grant.")
         grant_id = f"grant:{uuid.uuid4().hex}"
         remaining = lease.artifact.byte_length - lease.received_bytes
-        max_uses = math.ceil(remaining / self.max_chunk_bytes) + 1
+        # Each advancing write contributes at least one byte; commit needs one use.
+        max_uses = max(1, remaining + 1)
         locator = {"transfer_id": grant_id, "upload_id": lease.upload_id}
         grant = AgentArtifactAccessGrant(
             grant_id=grant_id,
@@ -271,7 +283,6 @@ class AgentArtifactTransferBroker:
         runtime_session_id: str,
         direction: str,
         now: float,
-        consume_use: bool,
     ) -> _GrantState:
         normalized_grant = identifier(grant_id, field_name="grant_id")
         client = identifier(client_id, field_name="client_id")
@@ -282,19 +293,85 @@ class AgentArtifactTransferBroker:
             if state is None:
                 raise KeyError(f"Unknown Artifact access grant: {normalized_grant!r}.")
             grant = state.grant
-            if state.completed:
+            if state.completed or state.completion_claimed:
                 raise PermissionError("Artifact access grant is already completed.")
             if grant.client_id != client or grant.runtime_session_id != session:
-                raise PermissionError("Artifact access grant belongs to another client.")
+                raise PermissionError(
+                    "Artifact access grant belongs to another client."
+                )
             if grant.direction != direction:
                 raise PermissionError("Artifact access grant direction mismatch.")
             if timestamp >= grant.expires_at:
                 raise PermissionError("Artifact access grant has expired.")
-            if consume_use:
-                if state.use_count >= grant.max_uses:
-                    raise PermissionError("Artifact access grant use limit is exhausted.")
-                state.use_count += 1
             return state
+
+    def _consume_use(self, state: _GrantState) -> None:
+        with self._lock:
+            if self._grants.get(state.grant.grant_id) is not state:
+                raise PermissionError("Artifact access grant is no longer active.")
+            if state.completed or state.completion_claimed:
+                raise PermissionError("Artifact access grant is already completed.")
+            if state.use_count >= state.grant.max_uses:
+                raise PermissionError("Artifact access grant use limit is exhausted.")
+            state.use_count += 1
+
+    def _refund_use(self, state: _GrantState) -> None:
+        with self._lock:
+            if (
+                self._grants.get(state.grant.grant_id) is state
+                and state.use_count > 0
+            ):
+                state.use_count -= 1
+
+    def _claim_completion(self, state: _GrantState) -> None:
+        with self._lock:
+            if self._grants.get(state.grant.grant_id) is not state:
+                raise PermissionError("Artifact access grant is no longer active.")
+            if state.completed or state.completion_claimed:
+                raise PermissionError("Artifact access grant is already completed.")
+            state.completion_claimed = True
+
+    def _release_completion(self, state: _GrantState) -> None:
+        with self._lock:
+            state.completion_claimed = False
+
+    def _finish_completion(self, state: _GrantState) -> None:
+        with self._lock:
+            state.completion_claimed = False
+            state.completed = True
+
+    @staticmethod
+    def _range_is_covered(
+        ranges: list[tuple[int, int]],
+        start: int,
+        end: int,
+    ) -> bool:
+        return any(
+            existing_start <= start and end <= existing_end
+            for existing_start, existing_end in ranges
+        )
+
+    def _record_read_range(
+        self,
+        state: _GrantState,
+        *,
+        start: int,
+        end: int,
+    ) -> bool:
+        with self._lock:
+            before = sum(
+                range_end - range_start
+                for range_start, range_end in state.read_ranges
+            )
+            merged: list[tuple[int, int]] = []
+            for range_start, range_end in sorted((*state.read_ranges, (start, end))):
+                if merged and range_start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], range_end))
+                else:
+                    merged.append((range_start, range_end))
+            state.read_ranges = merged
+            after = sum(range_end - range_start for range_start, range_end in merged)
+            return after > before
 
     def read_chunk(
         self,
@@ -312,7 +389,6 @@ class AgentArtifactTransferBroker:
             runtime_session_id=runtime_session_id,
             direction="read",
             now=now,
-            consume_use=True,
         )
         grant = state.grant
         if grant.mechanism != "chunked_rpc":
@@ -325,12 +401,37 @@ class AgentArtifactTransferBroker:
         if not grant.byte_offset <= requested_offset < grant_end:
             raise ValueError("offset lies outside the access grant.")
         size = min(requested_bytes, grant_end - requested_offset)
-        path = self.store.managed_read_path(grant.artifact.artifact_id)
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        end = requested_offset + size
+        with self._lock:
+            replay = self._range_is_covered(
+                state.read_ranges,
+                requested_offset,
+                end,
+            )
+        if not replay:
+            self._consume_use(state)
         try:
-            return os.pread(descriptor, size, requested_offset)
-        finally:
-            os.close(descriptor)
+            path = self.store.managed_read_path(grant.artifact.artifact_id)
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                data = os.pread(descriptor, size, requested_offset)
+            finally:
+                os.close(descriptor)
+            if len(data) != size:
+                raise ArtifactStoreIntegrityError(
+                    "Artifact read returned partial bytes."
+                )
+        except BaseException:
+            if not replay:
+                self._refund_use(state)
+            raise
+        if not replay and not self._record_read_range(
+            state,
+            start=requested_offset,
+            end=end,
+        ):
+            self._refund_use(state)
+        return data
 
     def write_chunk(
         self,
@@ -348,18 +449,26 @@ class AgentArtifactTransferBroker:
             runtime_session_id=runtime_session_id,
             direction="write",
             now=now,
-            consume_use=True,
         )
         if state.grant.mechanism != "chunked_rpc" or state.upload_id is None:
             raise ValueError("write_chunk requires a chunked_rpc upload grant.")
-        return self.store.write_upload_chunk(
-            upload_id=state.upload_id,
-            client_id=client_id,
-            runtime_session_id=runtime_session_id,
-            offset=offset,
-            data=data,
-            now=now,
-        )
+        before = self.store.upload(state.upload_id)
+        self._consume_use(state)
+        try:
+            current = self.store.write_upload_chunk(
+                upload_id=state.upload_id,
+                client_id=client_id,
+                runtime_session_id=runtime_session_id,
+                offset=offset,
+                data=data,
+                now=now,
+            )
+        except BaseException:
+            self._refund_use(state)
+            raise
+        if current.received_bytes == before.received_bytes:
+            self._refund_use(state)
+        return current
 
     def commit_write(
         self,
@@ -375,16 +484,25 @@ class AgentArtifactTransferBroker:
             runtime_session_id=runtime_session_id,
             direction="write",
             now=now,
-            consume_use=True,
         )
         if state.upload_id is None:
             raise ValueError("Write grant is not bound to an upload.")
-        artifact = self.store.commit_upload(
-            upload_id=state.upload_id,
-            client_id=client_id,
-            runtime_session_id=runtime_session_id,
-            now=now,
-        )
+        self._consume_use(state)
+        claimed = False
+        try:
+            self._claim_completion(state)
+            claimed = True
+            artifact = self.store.commit_upload(
+                upload_id=state.upload_id,
+                client_id=client_id,
+                runtime_session_id=runtime_session_id,
+                now=now,
+            )
+        except BaseException:
+            if claimed:
+                self._release_completion(state)
+            self._refund_use(state)
+            raise
         receipt = AgentArtifactTransferReceipt(
             receipt_id=f"receipt:{uuid.uuid4().hex}",
             grant_id=state.grant.grant_id,
@@ -398,8 +516,7 @@ class AgentArtifactTransferBroker:
             completed_at=now,
             reason_code="upload_committed_and_verified",
         )
-        with self._lock:
-            state.completed = True
+        self._finish_completion(state)
         return artifact, receipt
 
     def acknowledge_read(
@@ -418,7 +535,6 @@ class AgentArtifactTransferBroker:
             runtime_session_id=runtime_session_id,
             direction="read",
             now=now,
-            consume_use=False,
         )
         grant = state.grant
         count = nonnegative_integer(
@@ -428,10 +544,19 @@ class AgentArtifactTransferBroker:
         digest = sha256_digest(verified_sha256, field_name="verified_sha256")
         if count != grant.max_bytes or digest != grant.artifact.sha256:
             raise ValueError("Read acknowledgement does not match the grant bytes.")
-        if grant.mechanism == "chunked_rpc" and grant.max_bytes > 0 and (
-            state.use_count == 0
-        ):
-            raise ValueError("Read acknowledgement requires at least one data read.")
+        if grant.mechanism == "chunked_rpc" and grant.max_bytes > 0:
+            grant_end = grant.byte_offset + grant.max_bytes
+            with self._lock:
+                complete = self._range_is_covered(
+                    state.read_ranges,
+                    grant.byte_offset,
+                    grant_end,
+                )
+            if not complete:
+                raise ValueError(
+                    "Read acknowledgement requires complete byte coverage."
+                )
+        self._claim_completion(state)
         receipt = AgentArtifactTransferReceipt(
             receipt_id=f"receipt:{uuid.uuid4().hex}",
             grant_id=grant.grant_id,
@@ -445,8 +570,7 @@ class AgentArtifactTransferBroker:
             completed_at=now,
             reason_code="download_acknowledged_and_verified",
         )
-        with self._lock:
-            state.completed = True
+        self._finish_completion(state)
         return receipt
 
     def expire_grants(self, *, now: float) -> tuple[str, ...]:

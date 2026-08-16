@@ -12,13 +12,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import sqlite3
 import stat
 import threading
-from dataclasses import dataclass
-from typing import Any
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
 
 from agent_gateway.protocol._contract_validation import (
     finite_number,
@@ -29,7 +28,6 @@ from agent_gateway.protocol.artifact_contracts import (
     AgentArtifactMaterializationReceipt,
     AgentArtifactRef,
 )
-
 
 ARTIFACT_STORE_SCHEMA_VERSION_V1 = 1
 ARTIFACT_STORE_STATES_V1 = (
@@ -401,6 +399,10 @@ class RecoverableAgentArtifactStore:
                 (client, idempotency),
             ).fetchone()
             if existing is not None:
+                if existing["runtime_session_id"] != session:
+                    raise ArtifactStoreConflictError(
+                        "Upload idempotency key belongs to another runtime session."
+                    )
                 if existing["artifact_ref_json"] != encoded_ref:
                     raise ArtifactStoreConflictError(
                         "Upload idempotency key is bound to another Artifact."
@@ -415,6 +417,17 @@ class RecoverableAgentArtifactStore:
             expires_at = timestamp + self.staging_ttl_sec
             if available is not None and available["state"] == "available":
                 with self._connection:
+                    self._connection.execute(
+                        "UPDATE artifacts SET "
+                        "minimum_retention_until = MAX(minimum_retention_until, ?), "
+                        "handoff_deadline = MAX(handoff_deadline, ?) "
+                        "WHERE artifact_id = ?",
+                        (
+                            timestamp + self.minimum_retention_sec,
+                            timestamp + self.handoff_retention_sec,
+                            artifact.artifact_id,
+                        ),
+                    )
                     self._connection.execute(
                         "INSERT INTO uploads VALUES (?, ?, ?, ?, ?, NULL, "
                         "'available', ?, ?, ?)",
@@ -528,7 +541,9 @@ class RecoverableAgentArtifactStore:
             raise TypeError("data must be bytes-like.")
         chunk = bytes(data)
         if not chunk or len(chunk) > self.max_chunk_bytes:
-            raise ValueError("Artifact upload chunk is empty or exceeds max_chunk_bytes.")
+            raise ValueError(
+                "Artifact upload chunk is empty or exceeds max_chunk_bytes."
+            )
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a non-negative integer.")
 
@@ -575,7 +590,9 @@ class RecoverableAgentArtifactStore:
                     return self._upload_lease(row)
                 written = os.pwrite(descriptor, chunk, offset)
                 if written != len(chunk):
-                    raise ArtifactStoreIntegrityError("Artifact chunk write was partial.")
+                    raise ArtifactStoreIntegrityError(
+                        "Artifact chunk write was partial."
+                    )
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
@@ -613,6 +630,8 @@ class RecoverableAgentArtifactStore:
                 )
             if timestamp >= row["expires_at"]:
                 raise ArtifactStoreConflictError("Artifact upload lease has expired.")
+            if row["received_bytes"] != artifact.byte_length:
+                raise ArtifactStoreConflictError("Artifact upload is incomplete.")
             with self._connection:
                 self._connection.execute(
                     "UPDATE uploads SET state = 'verifying' WHERE upload_id = ?",
@@ -634,10 +653,10 @@ class RecoverableAgentArtifactStore:
                         existing_size != artifact.byte_length
                         or existing_digest != artifact.sha256
                     ):
-                        raise ArtifactStoreIntegrityError(
-                            "Existing CAS bytes fail immutable verification."
-                        )
-                    staging_path.unlink()
+                        os.chmod(staging_path, 0o400)
+                        os.replace(staging_path, blob_path)
+                    else:
+                        staging_path.unlink()
                 elif candidate != blob_path:
                     os.chmod(staging_path, 0o400)
                     os.replace(staging_path, blob_path)
@@ -671,9 +690,12 @@ class RecoverableAgentArtifactStore:
                     "artifact_ref_json = excluded.artifact_ref_json, "
                     "sha256 = excluded.sha256, byte_length = excluded.byte_length, "
                     "state = 'available', available_at = excluded.available_at, "
-                    "minimum_retention_until = excluded.minimum_retention_until, "
-                    "handoff_deadline = excluded.handoff_deadline, "
-                    "materialization_receipt_hash = NULL, expired_at = NULL, "
+                    "minimum_retention_until = MAX("
+                    "artifacts.minimum_retention_until, "
+                    "excluded.minimum_retention_until), "
+                    "handoff_deadline = MAX(artifacts.handoff_deadline, "
+                    "excluded.handoff_deadline), "
+                    "expired_at = NULL, "
                     "deletion_reason = NULL",
                     (
                         artifact.artifact_id,
@@ -765,7 +787,9 @@ class RecoverableAgentArtifactStore:
             self._ensure_open()
             record = self.artifact(normalized_artifact)
             if not record.available:
-                raise ArtifactStoreConflictError("Only available Artifacts may be pinned.")
+                raise ArtifactStoreConflictError(
+                    "Only available Artifacts may be pinned."
+                )
             existing = self._connection.execute(
                 "SELECT * FROM artifact_pins WHERE pin_id = ?",
                 (normalized_pin,),
