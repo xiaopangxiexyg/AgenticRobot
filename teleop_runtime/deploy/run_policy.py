@@ -389,7 +389,12 @@ from .rtc_step_fanout import (
     RtcPolicyEmissionPublisher,
 )
 from .safety_shadow import evaluate_policy_legacy_aligned_safety
-from .startup_init import StartupInitializer, resolve_startup_init_action
+from .startup_init import (
+    StartupInitializer,
+    finish_policy_qpos_init_reference_cut as _finish_policy_qpos_init_reference_cut,
+    reset_startup_initializer as _reset_startup_initializer,
+    resolve_startup_init_action,
+)
 
 DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 # Deployment runs the vision policy at roughly 15 Hz on the RM65 profile.  A
@@ -3657,51 +3662,6 @@ def _validate_debug_replay_arm_control_mode(
     if contract.warning:
         print(f"[ReplayMode] WARNING: {contract.warning}", flush=True)
     return payload
-
-
-def _reset_startup_initializer(
-    startup_initializer: StartupInitializer,
-    *,
-    current_pose_start_allowed: bool,
-) -> bool:
-    """Reset startup init without inventing motion for an allowed current start.
-
-    ``init-source=current`` resolves its target from the same live observation
-    that supplies its start action.  When the caller has explicitly admitted a
-    current-qpos start, replaying that no-op through the Cartesian position
-    stream is both redundant and semantically wrong: it creates a new motion
-    stream without a source-plan cut.  Keep non-current startup targets intact.
-    """
-
-    startup_initializer.reset()
-    current_startup_satisfied = (
-        bool(current_pose_start_allowed)
-        and startup_initializer.enabled
-        and str(startup_initializer.source).strip().lower() == "current"
-    )
-    if current_startup_satisfied:
-        startup_initializer.mark_complete()
-    return current_startup_satisfied
-
-
-def _finish_policy_qpos_init_reference_cut(
-    startup_initializer: StartupInitializer,
-) -> tuple[np.ndarray, bool]:
-    """Cut dataset-frame pose history before live Cartesian execution.
-
-    The caller suppresses action generation for the qpos-init completion loop.
-    An all-NaN ``last_action`` then makes the freshly sampled observation in
-    the next loop the safety/reference anchor. A ``current`` startup init is a
-    no-op after qpos init, so it is completed without submitting that same pose
-    through IK for another initialization interval.
-    """
-
-    last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
-    current_startup_satisfied = _reset_startup_initializer(
-        startup_initializer,
-        current_pose_start_allowed=True,
-    )
-    return last_action, current_startup_satisfied
 
 
 def _announce_policy_qpos_init_complete(
