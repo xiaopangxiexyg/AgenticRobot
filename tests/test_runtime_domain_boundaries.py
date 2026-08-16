@@ -31,6 +31,17 @@ def _absolute_import_roots(path: Path) -> set[str]:
     return roots
 
 
+def _module_level_absolute_import_roots(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    roots: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.add(node.module.split(".", 1)[0])
+    return roots
+
+
 def _called_names(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     names: set[str] = set()
@@ -87,10 +98,14 @@ def _call_keyword_names_in_function(
         for node in ast.walk(function)
         if isinstance(node, ast.Call)
         and (
-            isinstance(node.func, ast.Name)
-            and node.func.id == called_name
-            or isinstance(node.func, ast.Attribute)
-            and node.func.attr == called_name
+            (
+                isinstance(node.func, ast.Name)
+                and node.func.id == called_name
+            )
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == called_name
+            )
         )
     ]
     if len(calls) != 1:
@@ -333,6 +348,20 @@ def test_general_mujoco_target_does_not_opt_into_composition_runtime() -> None:
 
     assert "composition_runtime_config" in sim_hil_runtime_keywords
     assert "composition_runtime_config" not in agent_skill_runtime_keywords
+
+
+def test_general_mujoco_runtime_does_not_eagerly_import_composition() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+    composition_binding = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "composition_binding.py"
+    )
+
+    assert "control_composition" not in _module_level_absolute_import_roots(
+        target_runtime
+    )
+    assert "control_composition" in _module_level_absolute_import_roots(
+        composition_binding
+    )
 
 
 def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> None:

@@ -45,3 +45,23 @@ for package_name in {package_names}:
     result = _run_isolated_python(source)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_general_mujoco_deploy_import_does_not_load_composition_runtime() -> None:
+    source = """
+import sys
+
+import sim.mujoco.deploy as deploy
+
+assert "control_composition" not in sys.modules
+assert "MujocoCompositionRuntimeConfig" not in deploy.__dict__
+assert "MujocoExecutionDifferenceObserver" not in deploy.__dict__
+assert deploy.MujocoDeployRuntime.__module__ == "sim.mujoco.deploy.runtime"
+
+config_type = deploy.MujocoCompositionRuntimeConfig
+assert config_type.__module__ == "sim.mujoco.deploy.composition_binding"
+assert "control_composition" in sys.modules
+"""
+    result = _run_isolated_python(source)
+
+    assert result.returncode == 0, result.stderr

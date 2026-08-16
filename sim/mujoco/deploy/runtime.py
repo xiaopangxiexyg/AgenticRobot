@@ -6,29 +6,9 @@ import math
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from dataset_contracts.control_trace import ControlTraceFact
-from control_composition.activation import CompositionActivationScope
-from control_composition.eligibility import (
-    CompositionSourceEligibilityDraft,
-    CompositionSourceEligibilitySpec,
-)
-from control_composition.composition import (
-    CompositionContextDraft,
-    CompositionInputBatchDraft,
-    CompositionInputDraft,
-    CompositionSpec,
-    FormalCompositionStrategy,
-    CompositionStrategyControl,
-)
-from control_composition.observability import SourceDifferenceSpec
-from control_composition.residual_anchor_lifecycle import (
-    ResidualAnchorLifecycleAdmissionReceipt,
-    ResidualAnchorLifecycleDraft,
-    ResidualAnchorLifecycleSpec,
-)
-from control_composition.runtime import CompositeProposalSubmission
 from dataset_contracts.replay import (
     REPLAY_EXECUTION_MODE_SIM_AUTHORITY,
     TargetRuntimeActionContract,
@@ -126,22 +106,12 @@ from robot_motion.deploy import (
 )
 
 from ..adapters import MujocoPositionExecutionRig
-from .composition_binding import (
-    MujocoCompositionRuntimeBinding,
-    MujocoCompositionRuntimeConfig,
-    build_mujoco_composition_runtime_binding,
-)
 from .composition_promotion import MujocoCompositionPromotionPolicy
 from .measurement import (
     MujocoQposMeasurement,
     build_mujoco_backend_measurement,
     build_mujoco_qpos_measurement_from_execution_cut,
     capture_mujoco_qpos_measurement,
-)
-from .execution_difference import (
-    project_mujoco_immediate_execution_reference_sample,
-    project_mujoco_execution_measurement_observation,
-    project_mujoco_execution_reference_sample,
 )
 from .execution_pose_observation import (
     MUJOCO_FK_POSE_MEASUREMENT_STAGE_ID,
@@ -157,6 +127,7 @@ from .pose_resolution import (
     build_mujoco_component_execution_target,
     build_mujoco_pose_qpos_execution_target,
 )
+
 from .contact_trace import project_mujoco_forbidden_contact_guard_result
 from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
@@ -175,6 +146,33 @@ from .reference_trace import (
     project_safety_anchor_commit_evidence,
     project_safety_anchor_commit_candidate,
 )
+
+if TYPE_CHECKING:
+    from control_composition.activation import CompositionActivationScope
+    from control_composition.composition import (
+        CompositionContextDraft,
+        CompositionInputBatchDraft,
+        CompositionInputDraft,
+        CompositionSpec,
+        CompositionStrategyControl,
+        FormalCompositionStrategy,
+    )
+    from control_composition.eligibility import (
+        CompositionSourceEligibilityDraft,
+        CompositionSourceEligibilitySpec,
+    )
+    from control_composition.observability import SourceDifferenceSpec
+    from control_composition.residual_anchor_lifecycle import (
+        ResidualAnchorLifecycleAdmissionReceipt,
+        ResidualAnchorLifecycleDraft,
+        ResidualAnchorLifecycleSpec,
+    )
+    from control_composition.runtime import CompositeProposalSubmission
+
+    from .composition_binding import (
+        MujocoCompositionRuntimeBinding,
+        MujocoCompositionRuntimeConfig,
+    )
 
 
 @dataclass(frozen=True)
@@ -925,15 +923,21 @@ class MujocoDeployRuntime:
     ) -> None:
         self.rig = rig
         self.config = config
-        if composition_runtime_config is not None and not isinstance(
-            composition_runtime_config,
-            MujocoCompositionRuntimeConfig,
+        if composition_runtime_config is not None:
+            from .composition_binding import MujocoCompositionRuntimeConfig
+
+            if not isinstance(
+                composition_runtime_config,
+                MujocoCompositionRuntimeConfig,
+            ):
+                raise TypeError(
+                    "composition_runtime_config must be a "
+                    "MujocoCompositionRuntimeConfig or None."
+                )
+        if (
+            config.enable_composer_authority
+            and composition_runtime_config is None
         ):
-            raise TypeError(
-                "composition_runtime_config must be a "
-                "MujocoCompositionRuntimeConfig or None."
-            )
-        if config.enable_composer_authority and composition_runtime_config is None:
             raise ValueError(
                 "Composer authority requires an explicit "
                 "composition_runtime_config."
@@ -1630,6 +1634,10 @@ class MujocoDeployRuntime:
                 )
         self._composition_binding: MujocoCompositionRuntimeBinding | None = None
         if self.composition_runtime_config is not None:
+            from .composition_binding import (
+                build_mujoco_composition_runtime_binding,
+            )
+
             self._composition_binding = build_mujoco_composition_runtime_binding(
                 runtime_session_id=config.runtime_session_id,
                 control_domain_id=config.control_domain_id,
@@ -2154,6 +2162,12 @@ class MujocoDeployRuntime:
         plan = self.config.execution_observation_plan
         if binding is None or plan is None:
             return
+        from .execution_difference import (
+            project_mujoco_immediate_execution_reference_sample,
+            project_mujoco_execution_measurement_observation,
+            project_mujoco_execution_reference_sample,
+        )
+
         pose_projector = (
             self._execution_pose_observation_projector
             if self._execution_observation_representation == "cartesian_pose"
@@ -3133,7 +3147,8 @@ class MujocoDeployRuntime:
         target_effective_at: float,
         required_channels: tuple[str, ...],
     ):
-        return self._require_composition_port().capture_composition_context_snapshot(
+        port = self._require_composition_port()
+        return port.capture_composition_context_snapshot(
             target_effective_at=target_effective_at,
             required_channels=required_channels,
         )
