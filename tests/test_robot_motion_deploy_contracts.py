@@ -303,7 +303,11 @@ def test_teleop_deploy_defaults_use_robot_motion_common_pipeline() -> None:
     assert "from robot_motion.deploy.observation import" in run_policy_source
     assert "from robot_motion.deploy.runtime import (" in run_policy_source
     assert "    PolicyDeployRuntime," in run_policy_source
-    assert "    resolve_policy_action_pose_mode_from_artifact," in run_policy_source
+    assert "from .policy_binding import (" in run_policy_source
+    policy_binding_source = (
+        repo_root / "teleop_runtime/deploy/policy_binding.py"
+    ).read_text(encoding="utf-8")
+    assert "resolve_policy_action_pose_mode_from_artifact" in policy_binding_source
     assert "from deployments.client.policy import load_policy" in run_policy_source
     assert "policy_deploy_runtime.predict_and_queue(" in run_policy_source
     assert "policy_deploy_runtime.prepare_next_action(" in run_policy_source

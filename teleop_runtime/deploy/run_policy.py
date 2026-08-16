@@ -73,9 +73,6 @@ from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
     build_deployment_observation,
 )
-from robot_motion.deploy.observation_view import (
-    default_deploy_policy_observation_contract,
-)
 from robot_motion.deploy.pose_adapter import (
     convert_policy_absolute_vector_to_runtime_raw,
 )
@@ -94,7 +91,6 @@ from robot_motion.deploy.session_contract import (
     POLICY_CONTRACT_V22_NATIVE,
     RuntimeEndEffectorCapability,
     resolve_deploy_session_contract,
-    resolve_policy_action_pose_mode_from_artifact,
 )
 from robot_motion.pose_frame_profiles import (
     default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
@@ -347,6 +343,10 @@ from .policy_qpos_init import (
     DeployPolicyQposInitController,
     DeployPolicyQposInitSettings,
     load_deploy_policy_qpos_init_plan,
+)
+from .policy_binding import (
+    bind_policy_pose_mode_from_artifact as _bind_policy_pose_mode_from_artifact,
+    build_policy_observation_contract as _policy_observation_contract,
 )
 from .position_plan_cut import (
     DeploymentPositionPlanCutDetector,
@@ -3657,68 +3657,6 @@ def _validate_debug_replay_arm_control_mode(
     if contract.warning:
         print(f"[ReplayMode] WARNING: {contract.warning}", flush=True)
     return payload
-
-
-def _bind_policy_pose_mode_from_artifact(
-    args: argparse.Namespace,
-    policy_artifact: Any,
-    *,
-    raw_argv: list[str],
-) -> None:
-    """Compatibility wrapper around the shared artifact binding contract."""
-
-    explicit = any(
-        token == "--policy-action-pose-mode"
-        or token.startswith("--policy-action-pose-mode=")
-        for token in raw_argv
-    )
-    args.policy_action_pose_mode = resolve_policy_action_pose_mode_from_artifact(
-        policy_artifact,
-        configured_mode=str(args.policy_action_pose_mode),
-        explicit=explicit,
-    )
-
-
-def _policy_observation_contract(
-    *,
-    policy: Any,
-    policy_artifact: Any,
-    deploy_layout: Any,
-    pose_mode: str,
-) -> Any:
-    """Bind the strict actor view to this artifact/layout and its adapter needs."""
-
-    effective_layout = deploy_layout
-    if effective_layout is None:
-        wrapped_policy = getattr(policy, "policy", None)
-        policy_config = getattr(wrapped_policy, "config", None)
-        effective_layout = getattr(policy_config, "policy_io_layout", None)
-    hand_state_keys: set[str] = set()
-    if effective_layout is not None:
-        for side in ALL_SIDES:
-            spec = effective_layout.end_effector(side)
-            if spec.present:
-                hand_state_keys.add(str(spec.state_source_field))
-            channel = effective_layout.channel("state", side)
-            for token in channel.tokens:
-                if token.source_metadata_key:
-                    hand_state_keys.add(str(token.source_metadata_key))
-
-    if policy_artifact is not None:
-        artifact_hash = canonical_content_hash(
-            policy_artifact.to_dict(),
-            domain="dexteleop.policy_observation_artifact_binding.v1",
-        )
-        binding_id = f"artifact={artifact_hash}"
-    elif effective_layout is not None:
-        binding_id = f"layout={effective_layout.layout_hash};model=unversioned"
-    else:
-        binding_id = f"policy={getattr(policy, 'name', 'unknown')}"
-    return default_deploy_policy_observation_contract(
-        binding_id=binding_id,
-        last_action_pose_mode=str(pose_mode),
-        compatibility_hand_state_keys=tuple(sorted(hand_state_keys)),
-    )
 
 
 def _reset_startup_initializer(
