@@ -13,12 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import select
 import sys
-import termios
 import threading
 import time
-import tty
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -26,8 +23,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from typing_extensions import Self
-
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.layout import episode_id_from_index
 from dataset_contracts.policy_artifact import policy_artifact_from_metadata
@@ -284,6 +279,7 @@ from .camera_runtime import (
     start_camera_sources,
 )
 from .cli_args import argument_was_supplied as _argument_was_supplied
+from .console_runtime import LoopRate, NonBlockingKeyboard
 from .debug_payload import (
     DEPLOY_DEBUG_PAYLOAD_COMPACT,
     DEPLOY_DEBUG_PAYLOAD_FULL,
@@ -413,45 +409,6 @@ class _PreparedActionExecution:
     dispatch_completed: bool
     asynchronous: bool = False
     position_source_index: int | None = None
-
-
-class NonBlockingKeyboard:
-    def __init__(self):
-        self._fd: int | None = None
-        self._old_settings: list[Any] | None = None
-
-    def __enter__(self) -> Self:
-        if sys.stdin.isatty():
-            self._fd = sys.stdin.fileno()
-            self._old_settings = termios.tcgetattr(self._fd)
-            tty.setcbreak(self._fd)
-        return self
-
-    def poll(self) -> str | None:
-        if self._fd is None:
-            return None
-        readable, _, _ = select.select([sys.stdin], [], [], 0.0)
-        if not readable:
-            return None
-        return sys.stdin.read(1)
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if self._fd is not None and self._old_settings is not None:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
-
-
-class LoopRate:
-    def __init__(self):
-        self._last: float | None = None
-        self.hz = 0.0
-
-    def tick(self, now: float) -> float:
-        if self._last is not None:
-            dt = max(float(now - self._last), 1e-9)
-            instant = 1.0 / dt
-            self.hz = instant if self.hz <= 0.0 else 0.2 * instant + 0.8 * self.hz
-        self._last = float(now)
-        return float(self.hz)
 
 
 def _positive_float(text: str) -> float:
