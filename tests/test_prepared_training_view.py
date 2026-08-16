@@ -397,6 +397,78 @@ def test_visual_prepared_view_never_requires_detached_tactile_payload(
     )
 
 
+def test_prepared_training_view_excludes_source_training_invalid_episode(
+    tmp_path: Path,
+) -> None:
+    profiles = _profiles()
+    invalid_source = tmp_path / "invalid-source"
+    valid_source = tmp_path / "valid-source"
+    invalid_identity = _dataset(
+        invalid_source,
+        episode_uuid="episode-invalid-video",
+        episode_index=0,
+        profiles=profiles,
+        annotate=False,
+    )
+    valid_identity = _dataset(
+        valid_source,
+        episode_uuid="episode-valid-video",
+        episode_index=0,
+        profiles=profiles,
+        annotate=False,
+    )
+    (invalid_source / "meta/modality_validity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "dexteleop.modality_validity.v1",
+                "training": {
+                    "episodes": {
+                        "0": {
+                            "valid": False,
+                            "reason": "required camera video failed integrity validation",
+                        }
+                    }
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = build_prepared_training_view(
+        tmp_path / "organized",
+        (
+            PreparedSourceDataset("invalid", invalid_source),
+            PreparedSourceDataset("valid", valid_source),
+        ),
+    )
+    loaded = load_prepared_training_view(result.view_root)
+
+    assert result.episode_count == 1
+    assert loaded.episodes["episode_capture_identity_hash"].to_pylist() == [
+        valid_identity
+    ]
+    source_payload = canonical_source_payload(result.view_root)
+    excluded_by_source = {
+        row["source_dataset_id"]: row[
+            "training_validity_excluded_episode_indices"
+        ]
+        for row in source_payload["sources"]
+    }
+    assert excluded_by_source == {"invalid": [0], "valid": []}
+
+    with pytest.raises(
+        PreparedTrainingViewError,
+        match="not found or are excluded",
+    ):
+        build_prepared_training_view(
+            tmp_path / "explicit-invalid",
+            (PreparedSourceDataset("invalid", invalid_source),),
+            include_episode_identities=(invalid_identity,),
+        )
+
+
 def test_prepared_view_camera_selection_is_hash_bound_and_inventory_scoped(
     tmp_path: Path,
 ) -> None:

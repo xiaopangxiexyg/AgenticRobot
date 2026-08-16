@@ -172,7 +172,12 @@ class EpisodeRecord:
 class DexTeleopDatasetIndex:
     """Fast metadata resolver for DexTeleop/LeRobot-style datasets."""
 
-    def __init__(self, dataset_root: str | Path):
+    def __init__(
+        self,
+        dataset_root: str | Path,
+        *,
+        parse_capture_contract: bool = True,
+    ):
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.episodes_path = self.dataset_root / "meta" / "episodes.jsonl"
         self.info_path = self.dataset_root / "meta" / "info.json"
@@ -182,7 +187,7 @@ class DexTeleopDatasetIndex:
         capture_payload = self.modality_validity.get("capture")
         self.capture_modality_contract = (
             CaptureModalityContract()
-            if capture_payload is None
+            if capture_payload is None or not parse_capture_contract
             else CaptureModalityContract.from_dict(capture_payload)
         )
         records = [EpisodeRecord(self.dataset_root, row) for row in _read_jsonl(self.episodes_path)]

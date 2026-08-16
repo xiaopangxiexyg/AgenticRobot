@@ -22,6 +22,7 @@ from dataset_interface.camera_semantics import (
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
 )
+from dataset_interface.metadata import DexTeleopDatasetIndex
 from utils.dataset_postprocess.camera_semantic_materialize import (
     materialize_camera_semantics,
     plan_camera_semantic_materialization,
@@ -31,6 +32,10 @@ from utils.dataset_postprocess.camera_semantic_prepared_view import (
     plan_camera_semantic_prepared_view,
     plan_invalid_camera_prepared_view_quarantine,
     quarantine_invalid_camera_prepared_view,
+)
+from utils.dataset_postprocess.camera_video_integrity_training import (
+    apply_camera_video_integrity_training_exclusions,
+    plan_camera_video_integrity_training_exclusions,
 )
 
 LEFT_SERIAL = "260522278055"
@@ -568,6 +573,17 @@ def test_prepared_view_marks_and_excludes_corrupt_video_episode(
     _, source_right_video = _write_source_dataset(source)
     _duplicate_episode_zero_as_one(source)
     _write_video(source_right_video, frame_count=1, color="blue")
+    (source / "meta/modality_validity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "dexteleop.modality_validity.v1",
+                "gripper_force_profile": {"profile_id": "preserve-me"},
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     registry = tmp_path / "registry.json"
     _write_registry(registry)
     output = tmp_path / "prepared"
@@ -660,6 +676,56 @@ def test_prepared_view_marks_and_excludes_corrupt_video_episode(
     assert audit["included_episode_count"] == 1
     assert audit["excluded_corrupt_video_episode_count"] == 1
     assert audit["excluded_corrupt_video_episode_indices"] == [0]
+
+    training_plan = plan_camera_video_integrity_training_exclusions(
+        source,
+        output,
+    )
+    assert training_plan.excluded_episode_indices == (0,)
+    assert training_plan.source_inventory_verified is True
+    assert training_plan.idempotent is False
+    applied = apply_camera_video_integrity_training_exclusions(
+        source,
+        output,
+        expected_plan_hash=training_plan.plan_hash,
+    )
+    assert applied.plan_hash == training_plan.plan_hash
+    source_index = DexTeleopDatasetIndex(source)
+    assert not source_index.training_eligibility(
+        0, camera_keys=("right_wrist",)
+    ).eligible
+    assert source_index.training_eligibility(
+        1, camera_keys=("right_wrist",)
+    ).eligible
+    source_validity = json.loads(
+        (source / "meta/modality_validity.json").read_text(encoding="utf-8")
+    )
+    assert source_validity["gripper_force_profile"] == {
+        "profile_id": "preserve-me"
+    }
+    exclusion_evidence = source_validity["training"][
+        "camera_video_integrity_exclusions"
+    ]
+    assert (
+        exclusion_evidence["receipt"]["receipt_hash"]
+        == training_plan.video_integrity_exclusions_hash
+    )
+    repeated = plan_camera_video_integrity_training_exclusions(source, output)
+    assert repeated.idempotent is True
+    assert repeated.source_inventory_verified is False
+
+    source_factory = type(
+        "Factory",
+        (),
+        {
+            "camera_slots": ("left_wrist_0_rgb", "right_wrist_0_rgb"),
+            "dataset_sources": (
+                type("Source", (), {"dataset_root": source})(),
+            ),
+        },
+    )()
+    with pytest.raises(ValueError, match="modality_validity.json"):
+        _camera_audits(source_factory, registry)
 
     receipt["issues"][0]["decoded_frame_count"] = 2
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")

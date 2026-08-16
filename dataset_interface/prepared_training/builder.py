@@ -14,6 +14,7 @@ from dataset_contracts.canonical_encoding import (
 )
 
 from ..episode_curation import source_dataset_base_fingerprint
+from ..metadata import DexTeleopDatasetIndex
 from ..progress_annotation_jobs import list_progress_annotation_work_items
 from ..progress_skill_projection import (
     SkillProjectionCatalog,
@@ -205,17 +206,28 @@ def _resolve_inputs(
     seen_input_identities: set[str] = set()
     for source in sorted(sources, key=lambda item: item.source_dataset_id):
         fingerprint = source_dataset_base_fingerprint(source.dataset_root)
-        source_rows.append(
-            {
-                "source_dataset_id": source.source_dataset_id,
-                "source_root_locator": relative_locator(
-                    root=organized_root,
-                    target=source.dataset_root,
-                ),
-                "source_dataset_fingerprint": fingerprint,
-            }
+        dataset_index = DexTeleopDatasetIndex(
+            source.dataset_root,
+            parse_capture_contract=False,
         )
+        excluded_episode_indices: list[int] = []
         for item in list_progress_annotation_work_items(source.dataset_root):
+            requested_cameras = (
+                ()
+                if "video" not in modalities
+                else (
+                    tuple(sorted(item.video_paths))
+                    if camera_selection is None
+                    else camera_selection
+                )
+            )
+            eligibility = dataset_index.training_eligibility(
+                item.episode_index,
+                camera_keys=requested_cameras,
+            )
+            if not eligibility.eligible:
+                excluded_episode_indices.append(item.episode_index)
+                continue
             if included is not None and item.episode_identity_hash not in included:
                 continue
             seen_input_identities.add(item.episode_identity_hash)
@@ -230,14 +242,28 @@ def _resolve_inputs(
                     camera_selection=camera_selection,
                 )
             )
-    if not prepared:
-        raise PreparedTrainingViewError(
-            "No sealed stage-profiled Episodes matched the selection."
+        source_rows.append(
+            {
+                "source_dataset_id": source.source_dataset_id,
+                "source_root_locator": relative_locator(
+                    root=organized_root,
+                    target=source.dataset_root,
+                ),
+                "source_dataset_fingerprint": fingerprint,
+                "training_validity_excluded_episode_indices": sorted(
+                    set(excluded_episode_indices)
+                ),
+            }
         )
     if included is not None and seen_input_identities != included:
         raise PreparedTrainingViewError(
-            "Requested Episode identities were not found: "
+            "Requested Episode identities were not found or are excluded by "
+            "the source training-validity policy: "
             f"{sorted(included - seen_input_identities)}."
+        )
+    if not prepared:
+        raise PreparedTrainingViewError(
+            "No sealed stage-profiled Episodes matched the selection."
         )
     unused = sorted(set(selection) - seen_input_identities)
     if unused:

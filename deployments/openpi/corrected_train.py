@@ -28,6 +28,7 @@ from dataset_interface.camera_semantics import (
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
 )
+from dataset_interface.metadata import DexTeleopDatasetIndex
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CAMERA_ROLE_REGISTRY = (
@@ -174,6 +175,34 @@ def _camera_audits(
                 "excluded_modalities": ["tactile"],
                 "full_v23_dataset": False,
             }
+        dataset_index = DexTeleopDatasetIndex(
+            root,
+            parse_capture_contract=False,
+        )
+        requested_camera_keys = tuple(
+            camera_key
+            for camera_key in ("front", "left_wrist", "right_wrist")
+            if any(
+                camera_key in slot for slot in _camera_slots(data_factory)
+            )
+        )
+        invalid_episode_indices = tuple(
+            episode_index
+            for episode_index in dataset_index.episode_indices
+            if not dataset_index.training_eligibility(
+                episode_index,
+                camera_keys=requested_camera_keys,
+            ).eligible
+        )
+        if invalid_episode_indices:
+            raise ValueError(
+                "Corrected OpenPI refuses a source root containing Episodes "
+                "excluded by meta/modality_validity.json; build/use a prepared "
+                "view that physically omits them: "
+                f"root={root} invalid_episode_indices="
+                f"{list(invalid_episode_indices[:20])} "
+                f"invalid_count={len(invalid_episode_indices)}"
+            )
         resolver = DatasetCameraSemanticResolver(root, binding)
         audits.append(
             {
@@ -182,6 +211,11 @@ def _camera_audits(
                     resolver.require_frame_index_alignment()
                 ),
                 "camera_prepared_view": prepared_view,
+                "training_validity": {
+                    "eligible_episode_count": len(dataset_index.episode_indices),
+                    "requested_camera_keys": list(requested_camera_keys),
+                    "invalid_episode_count": 0,
+                },
             }
         )
     return audits

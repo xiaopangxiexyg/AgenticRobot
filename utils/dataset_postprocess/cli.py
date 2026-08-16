@@ -34,6 +34,10 @@ from .camera_semantic_promotion import (
     promote_camera_semantic_dataset,
     rollback_camera_semantic_promotion,
 )
+from .camera_video_integrity_training import (
+    apply_camera_video_integrity_training_exclusions,
+    plan_camera_video_integrity_training_exclusions,
+)
 from .causal_align import causal_align_dataset, plan_causal_align
 from .delete_episodes import delete_episodes, plan_episode_deletion
 from .fault_nan_tail import detect_fault_nan_tail
@@ -292,6 +296,23 @@ def _cmd_camera_semantic_quarantine_invalid_view(
         plan = quarantine_invalid_camera_prepared_view(
             args.prepared_view_root,
             args.audit_root,
+            expected_plan_hash=str(args.expected_plan_hash or ""),
+        )
+    _print_json({**plan.to_dict(), "applied": bool(args.apply)})
+    return 0
+
+
+def _cmd_camera_video_integrity_mark_training_invalid(
+    args: argparse.Namespace,
+) -> int:
+    plan = plan_camera_video_integrity_training_exclusions(
+        args.dataset_root,
+        args.prepared_view_root,
+    )
+    if bool(args.apply):
+        plan = apply_camera_video_integrity_training_exclusions(
+            args.dataset_root,
+            args.prepared_view_root,
             expected_plan_hash=str(args.expected_plan_hash or ""),
         )
     _print_json({**plan.to_dict(), "applied": bool(args.apply)})
@@ -801,6 +822,27 @@ def build_parser() -> argparse.ArgumentParser:
     camera_quarantine.add_argument("--apply", action="store_true")
     camera_quarantine.set_defaults(
         func=_cmd_camera_semantic_quarantine_invalid_view
+    )
+
+    camera_training_invalid = subparsers.add_parser(
+        "camera-video-integrity-mark-training-invalid",
+        help=(
+            "Project a verified prepared-view corrupt-video receipt into the "
+            "source dataset training-validity policy."
+        ),
+    )
+    camera_training_invalid.add_argument("dataset_root")
+    camera_training_invalid.add_argument(
+        "--prepared-view-root", required=True
+    )
+    camera_training_invalid.add_argument(
+        "--expected-plan-hash",
+        default="",
+        help="Required with --apply; copy from the immediately preceding plan.",
+    )
+    camera_training_invalid.add_argument("--apply", action="store_true")
+    camera_training_invalid.set_defaults(
+        func=_cmd_camera_video_integrity_mark_training_invalid
     )
 
     camera_promote = subparsers.add_parser(

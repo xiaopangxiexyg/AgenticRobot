@@ -137,6 +137,27 @@ prepared view 也不会复制 `.lock` 等运行时文件；manifest 和严格 lo
 均 fail closed，并且不会删除或覆盖目录。远端操作使用固定的
 `codex_remote/remote_dataset_camera_quarantine.sh`。
 
+若 prepared view 的完整视频解码门禁排除了损坏 episode，应把同一份 hash-bound exclusion
+receipt 原子投影回源数据集的 `meta/modality_validity.json`，而不是手工抄 episode 列表：
+
+```bash
+python -m utils.dataset_postprocess \
+  camera-video-integrity-mark-training-invalid DATASET_ROOT \
+  --prepared-view-root CAMERA_PREPARED_VIEW_ROOT
+
+python -m utils.dataset_postprocess \
+  camera-video-integrity-mark-training-invalid DATASET_ROOT \
+  --prepared-view-root CAMERA_PREPARED_VIEW_ROOT \
+  --apply --expected-plan-hash PLAN_HASH
+```
+
+该操作只改一个 metadata 文件，保留既有 capture、gripper 等字段；每个坏 episode 会被标成
+`training.episodes.<index>.valid=false`，并嵌入完整 exclusion receipt。首次 apply 前必须证明源
+camera/numeric inventory 与 prepared view 生成时完全相同；重复运行是幂等的。普通 OpenPI
+corrected 入口会 fail closed 拒绝仍包含无效 episode 的完整源根目录，prepared-training view
+构建器会按所选 camera 过滤这些 episode。这样损坏视频不能因绕过 camera-only prepared view
+再次进入训练/测试。
+
 新正式采集的 thread writer 默认采用 `--storage-queue-backpressure-policy block`：相机存储队列
 满时在控制热路径之外背压 sample assembly，不再由每个相机独立丢最旧帧。旧的
 `drop_oldest` 仍是显式兼容选项，但可能重新产生单侧 frame gap；正式数据不应使用。process

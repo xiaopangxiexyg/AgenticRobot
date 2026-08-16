@@ -49,6 +49,43 @@ def is_camera_semantic_prepared_view(dataset_root: str | Path) -> bool:
     return camera_semantic_prepared_view_manifest_path(dataset_root).is_file()
 
 
+def load_camera_semantic_video_integrity_exclusions(
+    dataset_root: str | Path,
+    *,
+    verify_payload_hashes: bool = True,
+) -> tuple[
+    CameraSemanticPreparedViewManifestV1,
+    CameraSemanticVideoIntegrityExclusionsV1 | None,
+]:
+    """Load a prepared view and its optional, hash-bound exclusion receipt."""
+
+    root = Path(dataset_root).expanduser().resolve()
+    manifest = load_camera_semantic_prepared_view(
+        root,
+        verify_payload_hashes=verify_payload_hashes,
+    )
+    if not manifest.excluded_episode_indices:
+        return manifest, None
+    payload = json.loads(
+        (
+            root
+            / CAMERA_SEMANTIC_VIDEO_INTEGRITY_EXCLUSIONS_RELATIVE_PATH
+        ).read_text(encoding="utf-8")
+    )
+    if not isinstance(payload, dict):
+        raise CameraSemanticPreparedViewContractError(
+            "Video-integrity exclusions receipt must be an object."
+        )
+    receipt = CameraSemanticVideoIntegrityExclusionsV1.from_dict(payload)
+    # load_camera_semantic_prepared_view already verifies this relationship;
+    # keep the assertion local so callers receive a complete typed contract.
+    if receipt.receipt_hash != manifest.video_integrity_exclusions_hash:
+        raise CameraSemanticPreparedViewContractError(
+            "Video-integrity exclusions receipt differs from the prepared-view manifest."
+        )
+    return manifest, receipt
+
+
 def load_camera_semantic_prepared_view(
     dataset_root: str | Path,
     *,
@@ -216,4 +253,5 @@ __all__ = [
     "camera_semantic_prepared_view_manifest_path",
     "is_camera_semantic_prepared_view",
     "load_camera_semantic_prepared_view",
+    "load_camera_semantic_video_integrity_exclusions",
 ]

@@ -1081,6 +1081,7 @@ remote_sync_check.sh
 remote_dataset_camera_semantics.sh
 remote_dataset_camera_quarantine.sh
 remote_dataset_camera_promotion.sh
+remote_dataset_camera_training_validity.sh
 remote_dataset_tactile_storage.sh
 ```
 
@@ -1110,6 +1111,11 @@ remote_dataset_tactile_storage.sh
   --corrected-root /data/corrected_full \
   --retirement-root /data/retired_swapped \
   --registry /data/frozen_camera_role_registry.json --dry-run
+./remote_dataset_camera_training_validity.sh -H dex-remote \
+  --project '~/DexTeleop' --env dexteleop310 \
+  --dataset-root /data/source_dataset \
+  --prepared-view-root /data/camera_semantic_prepared_views/source_dataset \
+  --dry-run
 ./remote_dataset_tactile_storage.sh -H dex-remote \
   --project '~/DexTeleop' --env dexteleop310 \
   --detach-whole-prefix --dataset-root /data/source_dataset \
@@ -1202,6 +1208,12 @@ remote_dataset_camera_promotion.sh
   必须为 `SELF_CONTAINED`。apply 必须绑定 plan hash 并确认无 reader；此模式回滚前还必须先把
   当前 canonical 严格拆离。回滚只接受已发布事务文件和新的冻结 plan hash。它不提供删除、覆盖
   或任意参数透传。
+
+remote_dataset_camera_training_validity.sh
+  是损坏相机 episode 训练排除的固定 L3 metadata 入口。它只接受严格 loader 已验证的
+  camera prepared view exclusion receipt，首次写入前重新绑定完整源 camera/numeric inventory，
+  再在 `.modality_validity.lock` 下原子更新 `meta/modality_validity.json`。apply 必须绑定冻结的
+  plan hash 并确认无 reader；它不改视频、Parquet、触觉 payload，也不接受任意参数透传。
 
 remote_dataset_tactile_storage.sh
   是触觉模块可恢复拆装的专用 L3 非运动入口。它只允许只读 status、固定
