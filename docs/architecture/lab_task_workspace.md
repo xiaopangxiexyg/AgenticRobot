@@ -1054,7 +1054,7 @@ package receipt 使用可移植 archive 文件名而非本机绝对路径，并�
 的白名单路径、mode、size、SHA-256；路径穿越、symlink/hardlink、重复/额外/缺失文件都会拒绝。验证结果
 仍明确 `extracted=false`、`executed=false`，因此传输完成也不等于已安装。
 
-当前框架代码已形成未推送的本地 task commit，但仍不位于 clean protected `main == origin/main`，因此
+当前框架代码已形成并普通 push 到 task branch，但仍不位于 clean protected `main == origin/main`，因此
 此命令在真实仓库会按设计拒绝，不能把开发中控制面伪装成受保护部署版本。后续必须先 review/push/merge
 到 protected `origin/main`，再生成包；安全解包、远端原子
 激活和 rollback 尚未实现，不能手工 scp/tar 替代。

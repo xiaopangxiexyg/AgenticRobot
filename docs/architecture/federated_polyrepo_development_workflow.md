@@ -65,7 +65,7 @@ AgenticRobot、RPent、openpi 稳定目录随后仅通过显式 `pull --ff-only`
 `openpi dexteleop/integration@0d2d7f4e...`。OpenPI gitlink 已从最新 AgenticRobot main 重建为独立 v2
 候选 `task/AR-openpi-submodule-v2@fa53dec8...`；框架 task commit 位于其上一层，development baseline
 只固定 v2 gitlink parent，不形成引用自身的循环 lock。旧 `82566f8f...` 分支不 force-push，保留为历史
-回滚证据。上述新 task branches 当前尚未 push/PR/merge，远端状态仍以最后一次只读审计为准。
+回滚证据。四个新 task branches 已普通 push，但尚未 PR/merge；远端执行主机状态仍以最后一次只读审计为准。
 已实现命令的准确边界见 [`lab_task_workspace.md`](./lab_task_workspace.md)，不得以本规划的目标描述
 代替实现证据。
 

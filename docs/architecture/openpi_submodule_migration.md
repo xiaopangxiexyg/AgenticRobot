@@ -1,6 +1,6 @@
 # OpenPI `model/openpi` Submodule 迁移说明
 
-- 状态：基于最新 `main` 的 v2 迁移候选已建立在本机，尚未 push/合并到 protected `main`
+- 状态：基于最新 `main` 的 v2 迁移候选已 push，尚未 PR/合并到 protected `main`
 - Parent candidate：`AgenticRobot@fa53dec8ccbd8691ac79f32c16500dca401044df`
 - Child pin：`Openpi@0d2d7f4e5526cca5f65e17b34f17ca8adad17407`
 - Candidate branch：`task/AR-openpi-submodule-v2`
@@ -63,7 +63,7 @@ setuptools package discovery 不包含 `model*`；OpenPI 继续从自己的 `src
   保留为历史回滚证据，不 force-push。
 - 2026-08-16 三个稳定 checkout 经显式 `pull --ff-only` 更新并保持 clean；随后从最新
   `AgenticRobot main@0f8bd913...` 创建 v2 候选 `fa53dec8...`。v2 同样只含 `.gitmodules` 与 gitlink，
-  没有复制源码或大文件，当前只存在于本机任务分支。
+  没有复制源码或大文件，已普通 push 到同名任务分支且未 force-push。
 - v2 Task worktree 的 child 已在 `GIT_LFS_SKIP_SMUDGE=1`、`--no-fetch` 下固定到
   `openpi@0d2d7f4e...`；稳定 main 仍保留旧 checkout 作为 ignored、只读恢复来源，不把它当作 main 的
   tracked submodule 或版本事实。
@@ -153,7 +153,8 @@ release acceptance 默认在 merged candidate 上重跑；旧 `82566f8f...` 和�
 - [x] project manifest 默认定位 `model/openpi`。
 - [x] generic nested Workspace、base mismatch、uninitialized clean snapshot 有自动测试。
 - [x] development baseline v2 绑定 v2 parent tree/repository link。
-- [ ] v2 branch push/PR review/merge；记录 merged parent commit/tree。
+- [x] v2 branch 普通 push；旧候选未 force-push。
+- [ ] PR review/merge；记录 merged parent commit/tree。
 - [ ] 远端 runtime/ignored content preservation receipts。
 - [ ] 远端 clean submodule staging 与 canonical path 切换。
 - [ ] merged baseline + remote fetch/source-anchor receipts。
