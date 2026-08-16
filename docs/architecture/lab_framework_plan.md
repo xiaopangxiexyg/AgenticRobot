@@ -122,14 +122,18 @@ allocator、device gateway client 和 reviewed command adapter。被测试 paylo
 | M3f-g | durable Request、幂等状态机、Runner claim、artifact receipt | 已实现协议 |
 | M3h | transport envelope 与 exact clean snapshot staging | 已实现本地协议 |
 | M4 | synthetic draft Git snapshot，仅 offline/sim/compute | 已实现本地协议 |
-| M5 | 分布式 Profile、组合预留、ServiceReceipt | 下一切片 |
-| M6 | 设备 observe、fixture/attempt/quarantine | 待实现 |
+| M5 | 分布式 Profile、组合预留、ServiceReceipt | 已实现本地协议 |
+| M6 | 设备 observe、fixture/attempt/quarantine | 下一切片 |
 | M7 | 设备 control、authority handoff、release evidence | 待实现 |
 | M8 | 确有需要时的远端 hosted development | 待实现 |
 
 M4 已在 M3h 之上实现 synthetic Git draft capture：不移动用户 branch/index/worktree，显式 allowlist untracked，
 child-first 固定嵌套仓 gitlink，并生成 Development-only durable Request。它仍只从本机已有 Git objects 物化
 detached slot，不连接真实远端、不传输 objects、不下载大文件、不运行项目命令，也不授予 GPU/设备权限。
+
+M5 增加受保护 distributed topology、跨 runner 的全有或全无逻辑 slot/resource reservation、绑定 exact source 与
+runtime identity 的 ServiceReceipt，以及依赖 ready barrier。它仍是无网络、无命令执行的本地协议；未登记进程和
+真实资源不受其控制。
 
 ## 第二部分：当前项目的组合与双机拓扑
 
@@ -197,10 +201,11 @@ task/AR-lab-framework-v2      M1 以后连续的框架集成线
 | `50293755` | M3f durable Run requests |
 | `ecfa3c6c` | M3g trusted Runner claims |
 | `ac08f03e` | M3h authenticated transport 与 exact staging |
+| `22b58121` | M4 synthetic draft Git snapshot |
 
 已被替代但需留档的早期项目专用 prototype 固定在 annotated tag
 `archive/lab-control-bootstrap-20260816`；它不是可继续开发或部署的框架分支。
 
-当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。下一阶段先实现项目无关的分布式 Profile、
-组合资源预留和 ServiceReceipt 协议；真实接入仍须以 clean source/test anchor 做无 GPU、无设备预检，最后才逐步
+当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。下一阶段进入设备 observe 所需的 fixture、
+Attempt/outcome 和 quarantine 协议；真实接入仍须以 clean source/test anchor 做无 GPU、无设备预检，最后才逐步
 启用受保护的计算 Profile。

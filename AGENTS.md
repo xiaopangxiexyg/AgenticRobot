@@ -174,6 +174,13 @@ be explicitly allowlisted; sensitive, ignored, escaping, special, and oversized
 content remains excluded or rejected. Draft evidence cannot verify, observe or
 control devices, or authorize a release. Synthetic object transport and command
 execution remain unavailable.
+M5 adds clean-only distributed Queue Profiles, immutable distributed Run
+identity, atomic logical runner/slot/resource reservations, ServiceReceipts,
+and a dependency ready barrier. Ordinary single-node runners must reject a
+distributed Run. These receipts do not start, stop, authenticate, or own any
+real process, host, GPU, device, or network endpoint; unmanaged runtime state
+remains outside the protocol. Do not describe M5 as deployed distributed
+execution or resource authority.
 
 Use one active development branch per Task/repository. Record consecutive
 implementation milestones as commits, docs, tags, and Run evidence instead of

@@ -20,7 +20,8 @@ from .run_requests import (
 from .runs import CANDIDATE_EVIDENCE_TIER, DEVELOPMENT_EVIDENCE_TIER
 from .workspace import LabError, validate_task_id
 
-RUNNER_PROFILE_SCHEMA_ID = "lab.runner-profile.v1"
+LEGACY_RUNNER_PROFILE_SCHEMA_ID = "lab.runner-profile.v1"
+RUNNER_PROFILE_SCHEMA_ID = "lab.runner-profile.v2"
 RUNNER_CLAIM_SCHEMA_ID = "lab.runner-claim.v1"
 RUNNER_INSPECTION_SCHEMA_ID = "lab.runner-inspection.v1"
 ARTIFACT_RECEIPT_SCHEMA_ID = "lab.artifact-receipt.v1"
@@ -75,9 +76,11 @@ def _string_ids(value: object, *, label: str) -> tuple[str, ...]:
 class RunnerProfile:
     runner_id: str
     description: str
+    host_id: str
     target_ids: tuple[str, ...]
     slots: tuple[str, ...]
     capabilities: tuple[str, ...]
+    resources: tuple[str, ...]
     accepted_risk_levels: tuple[str, ...]
     accepted_evidence_tiers: tuple[str, ...]
     path: Path
@@ -87,9 +90,11 @@ class RunnerProfile:
         return {
             "runner_id": self.runner_id,
             "profile_sha256": self.sha256,
+            "host_id": self.host_id,
             "target_ids": list(self.target_ids),
             "slots": list(self.slots),
             "capabilities": list(self.capabilities),
+            "resources": list(self.resources),
             "accepted_risk_levels": list(self.accepted_risk_levels),
             "accepted_evidence_tiers": list(self.accepted_evidence_tiers),
         }
@@ -111,7 +116,7 @@ def load_runner_profile(profile_root: Path, runner_id: str) -> RunnerProfile:
         payload = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise LabError(f"cannot read runner Profile {path}: {exc}") from exc
-    expected = {
+    common = {
         "schema",
         "runner_id",
         "description",
@@ -121,10 +126,17 @@ def load_runner_profile(profile_root: Path, runner_id: str) -> RunnerProfile:
         "accepted_risk_levels",
         "accepted_evidence_tiers",
     }
-    if not isinstance(payload, dict) or set(payload) != expected:
+    if not isinstance(payload, dict):
         raise LabError(f"runner Profile has an unexpected shape: {path}")
-    if payload.get("schema") != RUNNER_PROFILE_SCHEMA_ID:
+    schema = payload.get("schema")
+    if schema == LEGACY_RUNNER_PROFILE_SCHEMA_ID:
+        expected = common
+    elif schema == RUNNER_PROFILE_SCHEMA_ID:
+        expected = {*common, "host_id", "resources"}
+    else:
         raise LabError(f"unsupported runner Profile schema: {path}")
+    if set(payload) != expected:
+        raise LabError(f"runner Profile has an unexpected shape: {path}")
     if payload.get("runner_id") != runner_id:
         raise LabError(f"runner Profile identity mismatch: {path}")
     description = payload.get("description")
@@ -135,6 +147,19 @@ def load_runner_profile(profile_root: Path, runner_id: str) -> RunnerProfile:
     capabilities = _string_ids(
         payload.get("capabilities"), label="runner capabilities"
     )
+    if schema == LEGACY_RUNNER_PROFILE_SCHEMA_ID:
+        host_id = runner_id
+        resources: tuple[str, ...] = ()
+    else:
+        host_id = validate_task_id(str(payload.get("host_id", "")))
+        raw_resources = payload.get("resources")
+        if not isinstance(raw_resources, list) or not all(
+            isinstance(resource, str) and resource for resource in raw_resources
+        ):
+            raise LabError(f"runner resources must be a string list: {path}")
+        if len(raw_resources) != len(set(raw_resources)):
+            raise LabError(f"runner resources contain duplicates: {path}")
+        resources = tuple(validate_task_id(resource) for resource in raw_resources)
     raw_risks = _string_ids(
         payload.get("accepted_risk_levels"), label="accepted risk levels"
     )
@@ -151,9 +176,11 @@ def load_runner_profile(profile_root: Path, runner_id: str) -> RunnerProfile:
     return RunnerProfile(
         runner_id=runner_id,
         description=description,
+        host_id=host_id,
         target_ids=target_ids,
         slots=slots,
         capabilities=capabilities,
+        resources=resources,
         accepted_risk_levels=raw_risks,
         accepted_evidence_tiers=evidence_tiers,
         path=path,
@@ -179,6 +206,8 @@ def _request_compatibility(
         return [f"trusted queue Profile unavailable: {exc}"]
 
     reasons: list[str] = []
+    if raw_profile.get("execution_topology", "single") == "distributed":
+        reasons.append("distributed request requires the composite orchestrator")
     if raw_profile.get("sha256") != profile.sha256:
         reasons.append("queue Profile hash differs from the trusted runner copy")
     if validated.get("target_id") != profile.target_id:

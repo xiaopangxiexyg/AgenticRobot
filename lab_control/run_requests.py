@@ -31,7 +31,8 @@ from .workspace import (
 
 LEGACY_RUN_REQUEST_SCHEMA_ID = "lab.run-request.v1"
 PREVIOUS_RUN_REQUEST_SCHEMA_ID = "lab.run-request.v2"
-RUN_REQUEST_SCHEMA_ID = "lab.run-request.v3"
+DRAFT_RUN_REQUEST_SCHEMA_ID = "lab.run-request.v3"
+RUN_REQUEST_SCHEMA_ID = "lab.run-request.v4"
 REQUEST_STATE_SCHEMA_ID = "lab.run-request-state.v1"
 REQUEST_EVENT_SCHEMA_ID = "lab.run-request-event.v1"
 REQUEST_SUBMISSION_SCHEMA_ID = "lab.run-request-submission.v1"
@@ -342,6 +343,8 @@ def build_run_request(
             raise LabError(
                 f"queue Profile rejects draft snapshots: {profile.profile_id}"
             )
+        schema = DRAFT_RUN_REQUEST_SCHEMA_ID
+    elif profile.execution_topology == "distributed":
         schema = RUN_REQUEST_SCHEMA_ID
     else:
         schema = PREVIOUS_RUN_REQUEST_SCHEMA_ID
@@ -353,6 +356,13 @@ def build_run_request(
     }
     if draft:
         profile_identity["execution_class"] = profile.execution_class
+    elif profile.execution_topology == "distributed":
+        profile_identity.update(
+            {
+                "execution_class": profile.execution_class,
+                "execution_topology": "distributed",
+            }
+        )
     content: dict[str, object] = {
         "schema": schema,
         "task_id": task_id,
@@ -391,6 +401,7 @@ def validate_run_request(payload: object) -> dict[str, object]:
     if schema not in {
         LEGACY_RUN_REQUEST_SCHEMA_ID,
         PREVIOUS_RUN_REQUEST_SCHEMA_ID,
+        DRAFT_RUN_REQUEST_SCHEMA_ID,
         RUN_REQUEST_SCHEMA_ID,
     }:
         raise LabError("unsupported Run request schema")
@@ -410,8 +421,10 @@ def validate_run_request(payload: object) -> dict[str, object]:
         "risk_level",
         "command_ids",
     }
-    if schema == RUN_REQUEST_SCHEMA_ID:
+    if schema == DRAFT_RUN_REQUEST_SCHEMA_ID:
         profile_fields.add("execution_class")
+    elif schema == RUN_REQUEST_SCHEMA_ID:
+        profile_fields.update({"execution_class", "execution_topology"})
     if not isinstance(raw_profile, dict) or set(raw_profile) != profile_fields:
         raise LabError("Run request Profile has an unexpected shape")
     validate_task_id(str(raw_profile.get("profile_id", "")))
@@ -428,12 +441,21 @@ def validate_run_request(payload: object) -> dict[str, object]:
         raise LabError("Run request command IDs are invalid")
     for command_id in command_ids:
         validate_task_id(str(command_id))
-    if schema == RUN_REQUEST_SCHEMA_ID:
+    if schema == DRAFT_RUN_REQUEST_SCHEMA_ID:
         execution_class = raw_profile.get("execution_class")
         if execution_class not in {"offline", "simulation", "compute"}:
             raise LabError("draft Run request has an invalid execution class")
         if evidence_tier != DEVELOPMENT_EVIDENCE_TIER:
             raise LabError("draft Run request must use Development evidence")
+    elif schema == RUN_REQUEST_SCHEMA_ID:
+        if raw_profile.get("execution_topology") != "distributed":
+            raise LabError("Run request v4 requires distributed execution topology")
+        if raw_profile.get("execution_class") not in {
+            "offline",
+            "simulation",
+            "compute",
+        }:
+            raise LabError("distributed Run request has an invalid execution class")
     capabilities = payload.get("capabilities")
     if (
         not isinstance(capabilities, list)
@@ -450,11 +472,14 @@ def validate_run_request(payload: object) -> dict[str, object]:
         "repository_links",
         "baseline",
     }
-    if schema == RUN_REQUEST_SCHEMA_ID:
+    if schema == DRAFT_RUN_REQUEST_SCHEMA_ID:
         snapshot_fields.update({"snapshot_mode", "draft"})
     if not isinstance(raw_snapshot, dict) or set(raw_snapshot) != snapshot_fields:
         raise LabError("Run request snapshot has an unexpected shape")
-    if schema == RUN_REQUEST_SCHEMA_ID and raw_snapshot.get("snapshot_mode") != "draft":
+    if (
+        schema == DRAFT_RUN_REQUEST_SCHEMA_ID
+        and raw_snapshot.get("snapshot_mode") != "draft"
+    ):
         raise LabError("Run request v3 requires a draft snapshot")
     normalized_snapshot = _portable_snapshot(
         str(raw_snapshot.get("snapshot_id", "")), raw_snapshot
