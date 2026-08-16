@@ -187,6 +187,16 @@ def _request_compatibility(
         reasons.append("request risk differs from the trusted queue Profile")
     if raw_profile.get("command_ids") != list(profile.command_ids):
         reasons.append("request commands differ from the trusted queue Profile")
+    snapshot_mode = str(raw_snapshot.get("snapshot_mode", "clean"))
+    if snapshot_mode not in profile.snapshot_modes:
+        reasons.append(
+            "request snapshot mode is not allowed by the trusted queue Profile"
+        )
+    if (
+        snapshot_mode == "draft"
+        and raw_profile.get("execution_class") != profile.execution_class
+    ):
+        reasons.append("request execution class differs from the trusted queue Profile")
     if validated.get("capabilities") != list(profile.capabilities):
         reasons.append("request capabilities differ from the trusted queue Profile")
     raw_repositories = raw_snapshot.get("repositories")

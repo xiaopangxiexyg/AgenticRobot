@@ -167,6 +167,13 @@ staging from Git objects already present on the runner. Staging must not fetch,
 run checkout filters/hooks, enable LFS smudge, execute project commands, or
 grant network/GPU/service/device authority. An incomplete slot is quarantined;
 never repair it with reset/clean or an implicit fetch.
+M4 adds Development-only synthetic Git draft snapshots for protected offline,
+simulation, or compute Queue Profiles. Capture must not move the Task branch,
+HEAD, real index, or working tree. Untracked source is deny-by-default and must
+be explicitly allowlisted; sensitive, ignored, escaping, special, and oversized
+content remains excluded or rejected. Draft evidence cannot verify, observe or
+control devices, or authorize a release. Synthetic object transport and command
+execution remain unavailable.
 
 Use one active development branch per Task/repository. Record consecutive
 implementation milestones as commits, docs, tags, and Run evidence instead of

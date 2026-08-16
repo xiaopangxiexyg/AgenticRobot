@@ -87,8 +87,8 @@ Resolve -> Reserve -> Prepare -> Preflight -> Setup -> Start
 ```
 
 - 本地快速测试可在暂停写入的开发 worktree 中执行，但结果明确标记 source stability。
-- 长测试、可视化、GPU 或远端测试基于 exact clean commit；后续可增加 synthetic Git draft snapshot，但不能用于
-  `verify`、设备 control 或 release。
+- 长测试、可视化、GPU 或远端测试默认基于 exact clean commit；Development 快测可使用受保护 Profile 显式授权的
+  synthetic Git draft snapshot，但不能用于 `verify`、设备 observe/control 或 release。
 - 远端 runner 先验证受保护 Queue Profile、Runner Profile、control-plane identity 和 slot claim；不能直接执行
   Request 中的任意 argv 或 shell。
 - Run 自建服务优先使用 per-Run endpoint 并生成 ServiceReceipt；连接已有服务必须验证 receipt 完全匹配；未登记
@@ -121,14 +121,15 @@ allocator、device gateway client 和 reviewed command adapter。被测试 paylo
 | M3d-e | protected control-plane 外置安装与合并检查 | 已实现候选 |
 | M3f-g | durable Request、幂等状态机、Runner claim、artifact receipt | 已实现协议 |
 | M3h | transport envelope 与 exact clean snapshot staging | 已实现本地协议 |
-| M4 | synthetic draft Git snapshot，仅 offline/sim/GPU-only | 下一切片 |
-| M5 | 分布式 Profile、组合预留、ServiceReceipt | 待实现 |
+| M4 | synthetic draft Git snapshot，仅 offline/sim/compute | 已实现本地协议 |
+| M5 | 分布式 Profile、组合预留、ServiceReceipt | 下一切片 |
 | M6 | 设备 observe、fixture/attempt/quarantine | 待实现 |
 | M7 | 设备 control、authority handoff、release evidence | 待实现 |
 | M8 | 确有需要时的远端 hosted development | 待实现 |
 
-M3h 已实现项目无关、无命令执行的协议：受认证 request envelope、完整性/重放校验，以及只从本机已有 Git objects
-物化 exact clean detached slot。它不连接真实远端、不下载大文件、不运行项目命令，也不授予 GPU/设备权限。
+M4 已在 M3h 之上实现 synthetic Git draft capture：不移动用户 branch/index/worktree，显式 allowlist untracked，
+child-first 固定嵌套仓 gitlink，并生成 Development-only durable Request。它仍只从本机已有 Git objects 物化
+detached slot，不连接真实远端、不传输 objects、不下载大文件、不运行项目命令，也不授予 GPU/设备权限。
 
 ## 第二部分：当前项目的组合与双机拓扑
 
@@ -195,9 +196,11 @@ task/AR-lab-framework-v2      M1 以后连续的框架集成线
 | `67bb0b75` | M3e merge gate |
 | `50293755` | M3f durable Run requests |
 | `ecfa3c6c` | M3g trusted Runner claims |
+| `ac08f03e` | M3h authenticated transport 与 exact staging |
 
 已被替代但需留档的早期项目专用 prototype 固定在 annotated tag
 `archive/lab-control-bootstrap-20260816`；它不是可继续开发或部署的框架分支。
 
-当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。后续先在临时、本地、项目无关测试仓库中
-完成 M3h，再以一个 clean source/test anchor 做无 GPU、无设备的远端预检，最后才逐步启用远端 GPU Profile。
+当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。下一阶段先实现项目无关的分布式 Profile、
+组合资源预留和 ServiceReceipt 协议；真实接入仍须以 clean source/test anchor 做无 GPU、无设备预检，最后才逐步
+启用受保护的计算 Profile。

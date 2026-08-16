@@ -238,6 +238,18 @@ def _build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="submit a durable queued Run request without executing it here",
         )
+        command.add_argument(
+            "--draft",
+            action="store_true",
+            help="capture a synthetic Development snapshot without moving branch/index",
+        )
+        command.add_argument(
+            "--include-untracked",
+            action="append",
+            default=[],
+            metavar="REPOSITORY=PATH",
+            help="include one exact non-ignored untracked file in a draft snapshot",
+        )
         command.add_argument("--json", action="store_true")
 
     runs = subcommands.add_parser("runs", help="list recorded local Runs")
@@ -670,6 +682,27 @@ def _recommended_profiles(
     return list(profiles)
 
 
+def _draft_untracked_assignments(
+    manager: WorkspaceManager, assignments: Sequence[str]
+) -> dict[str, list[str]]:
+    parsed: dict[str, list[str]] = {}
+    for assignment in assignments:
+        if "=" not in assignment:
+            raise LabError(
+                f"draft untracked include must use REPOSITORY=PATH: {assignment!r}"
+            )
+        raw_repository, path = assignment.split("=", 1)
+        repository = manager.repository_aliases.get(
+            raw_repository.casefold(), raw_repository
+        )
+        if repository not in manager.catalog:
+            raise LabError(f"unknown draft repository: {raw_repository!r}")
+        if not path:
+            raise LabError(f"empty draft untracked path for {repository}")
+        parsed.setdefault(repository, []).append(path)
+    return parsed
+
+
 def _run_recommended_profiles(
     manager: WorkspaceManager,
     task_id: str,
@@ -1041,6 +1074,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if arguments.command == "verify"
                 else DEVELOPMENT_EVIDENCE_TIER
             )
+            if arguments.draft:
+                if arguments.command != "test" or not arguments.detach:
+                    raise LabError(
+                        "draft snapshots require 'lab test --detach' and cannot verify"
+                    )
+                if arguments.recommended:
+                    raise LabError(
+                        "draft snapshots currently require one explicit Queue Profile"
+                    )
+                payload = RunRequestManager(manager).submit_draft_profile(
+                    arguments.task_id,
+                    arguments.profile_id,
+                    evidence_tier=evidence_tier,
+                    include_untracked=_draft_untracked_assignments(
+                        manager, arguments.include_untracked
+                    ),
+                )
+                if arguments.json:
+                    _emit(payload, as_json=True)
+                else:
+                    _print_request_submission(payload)
+                return 0
+            if arguments.include_untracked:
+                raise LabError("--include-untracked requires --draft")
             if arguments.detach:
                 if arguments.recommended:
                     raise LabError(

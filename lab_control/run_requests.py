@@ -6,11 +6,12 @@ import json
 import os
 import re
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .draft_snapshots import create_draft_snapshot_identity
 from .queue_profiles import QueueProfile, load_queue_profile
 from .runs import (
     CANDIDATE_EVIDENCE_TIER,
@@ -29,7 +30,8 @@ from .workspace import (
 )
 
 LEGACY_RUN_REQUEST_SCHEMA_ID = "lab.run-request.v1"
-RUN_REQUEST_SCHEMA_ID = "lab.run-request.v2"
+PREVIOUS_RUN_REQUEST_SCHEMA_ID = "lab.run-request.v2"
+RUN_REQUEST_SCHEMA_ID = "lab.run-request.v3"
 REQUEST_STATE_SCHEMA_ID = "lab.run-request-state.v1"
 REQUEST_EVENT_SCHEMA_ID = "lab.run-request-event.v1"
 REQUEST_SUBMISSION_SCHEMA_ID = "lab.run-request-submission.v1"
@@ -129,7 +131,7 @@ def _portable_snapshot(
             )
             for path, commit in sorted(raw_submodules.items())
         }
-        repositories[name] = {
+        repository: dict[str, object] = {
             "commit": _validate_oid(
                 raw_repository.get("commit"), label=f"repository commit {name}"
             ),
@@ -138,6 +140,43 @@ def _portable_snapshot(
             ),
             "submodules": submodules,
         }
+        if identity.get("snapshot_mode") == "draft":
+            synthetic = raw_repository.get("synthetic")
+            if not isinstance(synthetic, bool):
+                raise LabError(f"invalid draft synthetic marker: {name}")
+            included = raw_repository.get("included_untracked")
+            excluded = raw_repository.get("excluded_untracked")
+            if (
+                not isinstance(included, list)
+                or not isinstance(excluded, list)
+                or not all(isinstance(path, str) for path in (*included, *excluded))
+                or len(included) != len(set(included))
+                or len(excluded) != len(set(excluded))
+                or set(included) & set(excluded)
+                or included != sorted(included)
+                or excluded != sorted(excluded)
+            ):
+                raise LabError(f"invalid draft untracked paths: {name}")
+            base_commit = _validate_oid(
+                raw_repository.get("base_commit"),
+                label=f"draft base commit {name}",
+            )
+            commit = str(repository["commit"])
+            if synthetic == (base_commit == commit):
+                raise LabError(f"draft synthetic/base identity mismatch: {name}")
+            repository.update(
+                {
+                    "base_commit": base_commit,
+                    "synthetic": synthetic,
+                    "included_untracked": [
+                        validate_submodule_path(path) for path in included
+                    ],
+                    "excluded_untracked": [
+                        validate_submodule_path(path) for path in excluded
+                    ],
+                }
+            )
+        repositories[name] = repository
 
     raw_links = identity.get("repository_links", [])
     if not isinstance(raw_links, list):
@@ -189,12 +228,43 @@ def _portable_snapshot(
                 raw_baseline["sha256"], label="baseline SHA-256"
             ),
         }
-    return {
+    portable: dict[str, object] = {
         "snapshot_id": snapshot_id,
         "repositories": repositories,
         "repository_links": links,
         "baseline": baseline,
     }
+    snapshot_mode = identity.get("snapshot_mode", "clean")
+    if snapshot_mode == "draft":
+        raw_draft = identity.get("draft")
+        if not isinstance(raw_draft, dict) or set(raw_draft) != {
+            "schema",
+            "ref_namespace",
+            "capture_sha256",
+        }:
+            raise LabError("draft snapshot metadata has an unexpected shape")
+        expected_namespace = f"refs/lab/snapshots/{snapshot_id}"
+        if (
+            raw_draft.get("schema") != "lab.synthetic-draft.v1"
+            or raw_draft.get("ref_namespace") != expected_namespace
+        ):
+            raise LabError("draft snapshot metadata identity mismatch")
+        portable.update(
+            {
+                "snapshot_mode": "draft",
+                "draft": {
+                    "schema": "lab.synthetic-draft.v1",
+                    "ref_namespace": expected_namespace,
+                    "capture_sha256": _validate_sha256(
+                        raw_draft.get("capture_sha256"),
+                        label="draft capture SHA-256",
+                    ),
+                },
+            }
+        )
+    elif snapshot_mode != "clean":
+        raise LabError(f"unsupported Run request snapshot mode: {snapshot_mode}")
+    return portable
 
 
 def validate_control_plane_identity(
@@ -264,16 +334,30 @@ def build_run_request(
     if evidence_tier not in {DEVELOPMENT_EVIDENCE_TIER, CANDIDATE_EVIDENCE_TIER}:
         raise LabError(f"unsupported queued evidence tier: {evidence_tier}")
     snapshot = _portable_snapshot(snapshot_id, snapshot_identity)
+    draft = snapshot.get("snapshot_mode") == "draft"
+    if draft:
+        if evidence_tier != DEVELOPMENT_EVIDENCE_TIER:
+            raise LabError("draft snapshots only produce Development evidence")
+        if "draft" not in profile.snapshot_modes:
+            raise LabError(
+                f"queue Profile rejects draft snapshots: {profile.profile_id}"
+            )
+        schema = RUN_REQUEST_SCHEMA_ID
+    else:
+        schema = PREVIOUS_RUN_REQUEST_SCHEMA_ID
+    profile_identity: dict[str, object] = {
+        "profile_id": profile.profile_id,
+        "sha256": profile.sha256,
+        "risk_level": profile.risk_level,
+        "command_ids": list(profile.command_ids),
+    }
+    if draft:
+        profile_identity["execution_class"] = profile.execution_class
     content: dict[str, object] = {
-        "schema": RUN_REQUEST_SCHEMA_ID,
+        "schema": schema,
         "task_id": task_id,
         "snapshot": snapshot,
-        "profile": {
-            "profile_id": profile.profile_id,
-            "sha256": profile.sha256,
-            "risk_level": profile.risk_level,
-            "command_ids": list(profile.command_ids),
-        },
+        "profile": profile_identity,
         "target_id": profile.target_id,
         "capabilities": list(profile.capabilities),
         "evidence_tier": evidence_tier,
@@ -304,7 +388,11 @@ def validate_run_request(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != expected:
         raise LabError("Run request has an unexpected shape")
     schema = payload.get("schema")
-    if schema not in {LEGACY_RUN_REQUEST_SCHEMA_ID, RUN_REQUEST_SCHEMA_ID}:
+    if schema not in {
+        LEGACY_RUN_REQUEST_SCHEMA_ID,
+        PREVIOUS_RUN_REQUEST_SCHEMA_ID,
+        RUN_REQUEST_SCHEMA_ID,
+    }:
         raise LabError("unsupported Run request schema")
     validate_task_id(str(payload.get("task_id", "")))
     validate_task_id(str(payload.get("target_id", "")))
@@ -313,15 +401,18 @@ def validate_run_request(payload: object) -> dict[str, object]:
         raise LabError("Run request has an invalid evidence tier")
     validate_control_plane_identity(
         payload.get("control_plane"),
-        require_install_manifest_identity=schema == RUN_REQUEST_SCHEMA_ID,
+        require_install_manifest_identity=schema != LEGACY_RUN_REQUEST_SCHEMA_ID,
     )
     raw_profile = payload.get("profile")
-    if not isinstance(raw_profile, dict) or set(raw_profile) != {
+    profile_fields = {
         "profile_id",
         "sha256",
         "risk_level",
         "command_ids",
-    }:
+    }
+    if schema == RUN_REQUEST_SCHEMA_ID:
+        profile_fields.add("execution_class")
+    if not isinstance(raw_profile, dict) or set(raw_profile) != profile_fields:
         raise LabError("Run request Profile has an unexpected shape")
     validate_task_id(str(raw_profile.get("profile_id", "")))
     _validate_sha256(raw_profile.get("sha256"), label="Profile SHA-256")
@@ -337,6 +428,12 @@ def validate_run_request(payload: object) -> dict[str, object]:
         raise LabError("Run request command IDs are invalid")
     for command_id in command_ids:
         validate_task_id(str(command_id))
+    if schema == RUN_REQUEST_SCHEMA_ID:
+        execution_class = raw_profile.get("execution_class")
+        if execution_class not in {"offline", "simulation", "compute"}:
+            raise LabError("draft Run request has an invalid execution class")
+        if evidence_tier != DEVELOPMENT_EVIDENCE_TIER:
+            raise LabError("draft Run request must use Development evidence")
     capabilities = payload.get("capabilities")
     if (
         not isinstance(capabilities, list)
@@ -347,13 +444,18 @@ def validate_run_request(payload: object) -> dict[str, object]:
     for capability in capabilities:
         validate_task_id(str(capability))
     raw_snapshot = payload.get("snapshot")
-    if not isinstance(raw_snapshot, dict) or set(raw_snapshot) != {
+    snapshot_fields = {
         "snapshot_id",
         "repositories",
         "repository_links",
         "baseline",
-    }:
+    }
+    if schema == RUN_REQUEST_SCHEMA_ID:
+        snapshot_fields.update({"snapshot_mode", "draft"})
+    if not isinstance(raw_snapshot, dict) or set(raw_snapshot) != snapshot_fields:
         raise LabError("Run request snapshot has an unexpected shape")
+    if schema == RUN_REQUEST_SCHEMA_ID and raw_snapshot.get("snapshot_mode") != "draft":
+        raise LabError("Run request v3 requires a draft snapshot")
     normalized_snapshot = _portable_snapshot(
         str(raw_snapshot.get("snapshot_id", "")), raw_snapshot
     )
@@ -1048,6 +1150,8 @@ class RunRequestManager:
     ) -> dict[str, object]:
         RunManager(self.workspace_manager).validate_evidence_tier(evidence_tier)
         profile = load_queue_profile(self.profile_root, profile_id)
+        if "clean" not in profile.snapshot_modes:
+            raise LabError(f"queue Profile rejects clean snapshots: {profile_id}")
         snapshot_id, snapshot_identity = resolve_clean_snapshot_identity(
             self.workspace_manager,
             task_id=task_id,
@@ -1055,6 +1159,52 @@ class RunRequestManager:
             profile_sha256=profile.sha256,
             repositories=profile.repositories,
             baseline_path=self.baseline_path,
+        )
+        request = build_run_request(
+            task_id=task_id,
+            snapshot_id=snapshot_id,
+            snapshot_identity=snapshot_identity,
+            profile=profile,
+            evidence_tier=evidence_tier,
+            control_plane=control_plane_identity(
+                self.workspace_manager.control_repository,
+                install_manifest_path=(
+                    Path(configured_install_manifest)
+                    if (
+                        configured_install_manifest
+                        := self.workspace_manager.environ.get(
+                            "LAB_CONTROL_PLANE_INSTALL_MANIFEST"
+                        )
+                    )
+                    else None
+                ),
+            ),
+        )
+        state, created = self.store.submit(request)
+        return {
+            "schema": REQUEST_SUBMISSION_SCHEMA_ID,
+            "created": created,
+            "request": request,
+            "state": state,
+        }
+
+    def submit_draft_profile(
+        self,
+        task_id: str,
+        profile_id: str,
+        *,
+        evidence_tier: str,
+        include_untracked: Mapping[str, Sequence[str]],
+    ) -> dict[str, object]:
+        if evidence_tier != DEVELOPMENT_EVIDENCE_TIER:
+            raise LabError("draft snapshots only produce Development evidence")
+        profile = load_queue_profile(self.profile_root, profile_id)
+        snapshot_id, snapshot_identity = create_draft_snapshot_identity(
+            self.workspace_manager,
+            task_id=task_id,
+            profile=profile,
+            baseline_path=self.baseline_path,
+            include_untracked=include_untracked,
         )
         request = build_run_request(
             task_id=task_id,
