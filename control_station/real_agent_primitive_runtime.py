@@ -7,7 +7,6 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
 
 from agent_gateway.profiles.real.motion_factory import (
     RealAgentPrimitiveRealTeleopAttachment,
@@ -39,7 +38,6 @@ from teleop_runtime.real_teleop.agent_motion_port import (
     RealAgentMotionPortConfig,
 )
 from teleop_runtime.real_teleop.components import RealTeleopComponents
-
 
 REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN = "AUTHORIZE_ONE_REAL_TCP_PRIMITIVE"
 REAL_AGENT_PRIMITIVE_ACTIONS = (
@@ -185,7 +183,7 @@ def _actual_binding_hashes(
         calibration_payload,
         domain="dexteleop.real_agent_motion.runtime_calibration.v1",
     )
-    tool_hashes = dict(getattr(envelope_profile, "tool_frame_binding_hash_by_side"))
+    tool_hashes = dict(envelope_profile.tool_frame_binding_hash_by_side)
     tool_config_hash = canonical_content_hash(
         {"side": side, "tool_frame_binding_hash": tool_hashes[side]},
         domain="dexteleop.real_agent_motion.tool_config.v1",
@@ -207,10 +205,7 @@ def _actual_binding_hashes(
             "collision_avoidance_mode": str(
                 getattr(args, "collision_avoidance_mode", "") or ""
             ),
-            "envelope_profile_hash": getattr(
-                envelope_profile,
-                "semantic_content_hash",
-            ),
+            "envelope_profile_hash": envelope_profile.semantic_content_hash,
             "frame_graph_hash": frame_graph.semantic_content_hash,
         },
         domain="dexteleop.real_agent_motion.execution_manifest.v1",

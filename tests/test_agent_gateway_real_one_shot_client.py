@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from typing import ClassVar
 
 from agent_gateway.profiles.real import one_shot_client
 
 
 class _FakeClient:
-    instances = []
+    instances: ClassVar[list[_FakeClient]] = []
 
     def __init__(self, *, socket_path: str, timeout_sec: float) -> None:
         self.socket_path = socket_path

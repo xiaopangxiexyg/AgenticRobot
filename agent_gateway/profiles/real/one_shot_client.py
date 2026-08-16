@@ -8,17 +8,18 @@ import socket
 import struct
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
-from agent_gateway.transport.unix_transport import (
-    AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
-)
 from agent_gateway.skills.motion.definition import (
     TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
+)
+from agent_gateway.transport.unix_transport import (
+    AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.primitives import (
@@ -218,7 +219,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             )
         operation = submission.get("operation")
         if not isinstance(operation, Mapping):
-            raise RuntimeError("Gateway returned no admitted operation.")
+            raise TypeError("Gateway returned no admitted operation.")
         operation_id = str(operation["operation_id"])
         deadline = time.monotonic() + float(args.operation_timeout_sec) + 3.0
         while str(operation["status"]) not in _TERMINAL_STATUSES:
@@ -242,7 +243,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
                 )
             operation = outcome.get("operation")
             if not isinstance(operation, Mapping):
-                raise RuntimeError("Gateway returned no owned operation.")
+                raise TypeError("Gateway returned no owned operation.")
         return operation
     finally:
         client.close()
