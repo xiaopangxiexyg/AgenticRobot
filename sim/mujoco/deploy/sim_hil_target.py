@@ -417,7 +417,10 @@ def build_mujoco_sim_hil_target(
             "MuJoCo Sim-HIL requires source-eligibility admission."
         )
     expected_information_plan = getattr(contracts, "information_plan", None)
-    if composition_runtime_config.information_plan is not expected_information_plan:
+    if (
+        composition_runtime_config.information_plan
+        is not expected_information_plan
+    ):
         raise ValueError(
             "composition_runtime_config must preserve the contracts' "
             "information_plan identity."
