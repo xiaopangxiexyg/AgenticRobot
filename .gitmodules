@@ -1,0 +1,3 @@
+[submodule "model/openpi"]
+	path = model/openpi
+	url = git@github.com:CYBER-QAQ/Openpi.git
