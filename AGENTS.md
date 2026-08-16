@@ -149,6 +149,13 @@ across clones. Task branches move `active` -> `ready-for-integration`;
 integration branches move `integrating` -> `validated-for-mainline`; `blocked`
 and `superseded` are not selectable candidate states.
 
+At each coherent phase boundary, validate and commit intended versioned
+changes before yielding or handoff. Tracked dirty status means work remains
+active and is not integration-ready. If the task continues, keep the branch
+`active` but clean and record its checkpoint tip, validation, and next scope;
+when complete, use `ready-for-integration`. Never commit generated artifacts,
+secrets, caches, or unrelated user work merely to make status clean.
+
 Path separation does not resolve semantic overlap. Give each versioned schema,
 public API/export/entrypoint, and ownership or safety contract one active owner;
 resolve ordering before dependent work continues. Treat an old-base overlap as
