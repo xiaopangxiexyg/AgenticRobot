@@ -40,6 +40,9 @@
     ],
     "lab-m3d": [
       "tests/test_lab_control_install.py"
+    ],
+    "lab-m3e": [
+      "tests/test_lab_framework_boundary.py"
     ]
   }
 }

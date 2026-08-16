@@ -8,6 +8,10 @@
 - [`lab` M1：项目无关的多仓 Task Workspace](./lab_m1_task_workspace.md)
 - [`lab` M2：本地 exact clean Run](./lab_m2_local_runs.md)
 - [`lab` M3a：commit-based stable sync](./lab_m3a_stable_sync.md)
+- [`lab` M3b：稳定 checkout 维护门](./lab_m3b_maintenance_sync.md)
+- [`lab` M3c：父仓与 gitlink 子仓协调更新](./lab_m3c_gitlink_sync.md)
+- [`lab` M3d：受保护控制面外置安装](./lab_m3d_control_install.md)
+- [`lab` M3e：protected-main 合并检查](./lab_m3e_merge_gates.md)
 
 ## 文档边界
 

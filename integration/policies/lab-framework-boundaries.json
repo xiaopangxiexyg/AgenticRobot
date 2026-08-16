@@ -1,0 +1,21 @@
+{
+  "schema": "lab.framework-boundary.v1",
+  "core_globs": [
+    "lab_control/**/*.py"
+  ],
+  "controlled_globs": [
+    ".github/workflows/lab-control.yml",
+    "dev",
+    "docs/architecture/lab_*.md",
+    "integration/**/*.json",
+    "lab",
+    "stack/**/*.json",
+    "tests/test_lab_*.py"
+  ],
+  "forbidden_core_literals": [
+    "AgenticRobot",
+    "RPent",
+    "OpenPI"
+  ],
+  "max_controlled_file_bytes": 262144
+}
