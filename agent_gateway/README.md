@@ -58,7 +58,8 @@ directory, and contain no existing endpoint at the selected path.
 ## Skill and execution boundary
 
 The default-off MuJoCo profile publishes one lower motion domain with separate
-versioned Skills for absolute TCP targets and semantic cardinal steps.
+versioned Skills for absolute TCP targets, semantic cardinal steps, and fixed
+level orientations.
 `motion.move_tcp_to_pose@1` accepts an exact lower target;
 `motion.step_tcp_cardinal@1` accepts `forward`, `backward`, `left`, `right`,
 `up`, or `down`. The cardinal target is resolved from measured TCP state only
@@ -68,12 +69,17 @@ trusted deployment facts.
 
 Target-independent motion semantics and payload schemas live in
 `skills/motion`. They also define fixed level-orientation Skills for forward,
-forward-left 30 degrees, and forward-right 30 degrees. The current
-single-right-arm no-model launcher does not publish those Routes because its
-frame binding and reviewed safety profile do not establish the required
-canonical desk axes and full heading range. A future launcher must publish its
-own exact observation, frame, safety-envelope, IK, and dispatch bindings before
-making them Active.
+forward-left 30 degrees, and forward-right 30 degrees. Together, the cardinal
+Skill's six enum choices and the three fixed-orientation Skill identities expose
+nine bounded lower primitives. The current single-right-arm no-model launcher
+publishes all nine through exact MuJoCo Routes. Cardinal directions and absolute
+headings are resolved in the canonical Station frame, then transformed into the
+right-arm execution frame; the arm-base frame is not relabelled as canonical
+desk axes. Fixed orientations use their own route-scoped safety envelope because
+they preserve translation but may require a larger angular correction than a
+cardinal step or generic small pose move. Publication still grants no motion by
+itself: activation preflight, lower safety, IK, dispatch, evaluation, and HOLD
+remain mandatory.
 
 Target-independent CubeLift semantics live in `skills/cube_lift`. The MuJoCo
 Route, deployment, lifecycle executor, observation binding, evidence, and

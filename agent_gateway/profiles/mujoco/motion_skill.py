@@ -29,7 +29,7 @@ from agent_gateway.runtime.station_operation_worker import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
-from robot_motion.coordinate_frames import CoordinateFrameSpec
+from robot_motion.coordinate_frames import CoordinateFrameGraph, CoordinateFrameSpec
 from robot_motion.primitives import (
     LevelTCPOrientationPrimitive,
     TCPPoseDisplacementPrimitive,
@@ -38,7 +38,11 @@ from robot_motion.relative_action import (
     pose_matrix_to_xyzquat,
     xyzquat_to_pose_matrix,
 )
-from robot_motion.target_safety import TCPPoseEnvelopeSelection
+from robot_motion.target_safety import (
+    TCPPoseEnvelopeLifecycleError,
+    TCPPoseEnvelopeSafetyRuntime,
+    TCPPoseEnvelopeSelection,
+)
 
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
@@ -78,6 +82,8 @@ def resolve_tcp_displacement_primitive_target(
     measured_pose: tuple[float, ...],
     primitive: TCPPoseDisplacementPrimitive,
     reference_frame_spec: CoordinateFrameSpec,
+    frame_graph: CoordinateFrameGraph | None = None,
+    measured_reference_frame_id: str | None = None,
 ) -> MujocoAgentTcpTargetResolution:
     """Resolve one pure primitive at the lower Skill activation boundary."""
 
@@ -85,24 +91,33 @@ def resolve_tcp_displacement_primitive_target(
         raise TypeError("primitive must be a TCP displacement primitive.")
     if not isinstance(reference_frame_spec, CoordinateFrameSpec):
         raise TypeError("reference_frame_spec must be typed.")
+    measured_matrix = xyzquat_to_pose_matrix(
+        measured_pose,
+        name="tcp_displacement_activation_pose",
+    )
+    anchor, execution_from_primitive, frame_evidence = _resolve_primitive_frames(
+        measured_pose=measured_matrix,
+        primitive_reference_frame_spec=reference_frame_spec,
+        frame_graph=frame_graph,
+        measured_reference_frame_id=measured_reference_frame_id,
+    )
     target = primitive.apply(
-        xyzquat_to_pose_matrix(
-            measured_pose,
-            name="tcp_displacement_activation_pose",
-        ),
+        anchor,
         reference_frame_spec=reference_frame_spec,
     )
+    execution_target = execution_from_primitive @ target.target_pose
     return MujocoAgentTcpTargetResolution(
         target_pose=tuple(
             float(value)
             for value in pose_matrix_to_xyzquat(
-                target.target_pose,
+                execution_target,
                 name="tcp_displacement_target_pose",
             )
         ),
         evidence_refs=(
             "tcp-displacement-primitive:" + primitive.semantic_content_hash,
             "tcp-displacement-target:" + target.semantic_content_hash,
+            *frame_evidence,
         ),
     )
 
@@ -112,6 +127,8 @@ def resolve_level_tcp_orientation_primitive_target(
     measured_pose: tuple[float, ...],
     primitive: LevelTCPOrientationPrimitive,
     reference_frame_spec: CoordinateFrameSpec,
+    frame_graph: CoordinateFrameGraph | None = None,
+    measured_reference_frame_id: str | None = None,
 ) -> MujocoAgentTcpTargetResolution:
     """Resolve one fixed absolute horizontal heading at activation.
 
@@ -124,24 +141,92 @@ def resolve_level_tcp_orientation_primitive_target(
         raise TypeError("primitive must be a fixed level TCP orientation.")
     if not isinstance(reference_frame_spec, CoordinateFrameSpec):
         raise TypeError("reference_frame_spec must be typed.")
+    measured_matrix = xyzquat_to_pose_matrix(
+        measured_pose,
+        name="tcp_level_orientation_activation_pose",
+    )
+    anchor, execution_from_primitive, frame_evidence = _resolve_primitive_frames(
+        measured_pose=measured_matrix,
+        primitive_reference_frame_spec=reference_frame_spec,
+        frame_graph=frame_graph,
+        measured_reference_frame_id=measured_reference_frame_id,
+    )
     target = primitive.apply(
-        xyzquat_to_pose_matrix(
-            measured_pose,
-            name="tcp_level_orientation_activation_pose",
-        ),
+        anchor,
         reference_frame_spec=reference_frame_spec,
     )
+    execution_target = execution_from_primitive @ target.target_pose
     return MujocoAgentTcpTargetResolution(
         target_pose=tuple(
             float(value)
             for value in pose_matrix_to_xyzquat(
-                target.target_pose,
+                execution_target,
                 name="tcp_level_orientation_target_pose",
             )
         ),
         evidence_refs=(
             "tcp-level-orientation-primitive:" + primitive.semantic_content_hash,
             "tcp-level-orientation-target:" + target.semantic_content_hash,
+            *frame_evidence,
+        ),
+    )
+
+
+def _resolve_primitive_frames(
+    *,
+    measured_pose: np.ndarray,
+    primitive_reference_frame_spec: CoordinateFrameSpec,
+    frame_graph: CoordinateFrameGraph | None,
+    measured_reference_frame_id: str | None,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    """Move an execution-frame measurement into and back out of Skill axes.
+
+    MuJoCo executes arm targets in ``*_arm_base`` coordinates, while semantic
+    cardinal/orientation primitives are defined in the canonical station/desk
+    axes.  Keeping the two frames explicit prevents a rotated arm base from
+    silently changing ``forward`` or a fixed absolute heading.
+    """
+
+    primitive_frame_id = primitive_reference_frame_spec.frame_id
+    execution_frame_id = (
+        primitive_frame_id
+        if measured_reference_frame_id is None
+        else _required(
+            measured_reference_frame_id,
+            field_name="measured_reference_frame_id",
+        )
+    )
+    if execution_frame_id == primitive_frame_id:
+        return measured_pose, np.eye(4, dtype=np.float64), ()
+    if not isinstance(frame_graph, CoordinateFrameGraph):
+        raise TypeError(
+            "frame_graph is required when primitive and measured frames differ."
+        )
+    registered_spec = frame_graph.frame_by_id.get(primitive_frame_id)
+    if (
+        registered_spec is None
+        or registered_spec.semantic_content_hash
+        != primitive_reference_frame_spec.semantic_content_hash
+    ):
+        raise ValueError(
+            "primitive reference frame is not the exact frame-graph member."
+        )
+    primitive_from_execution = frame_graph.resolve(
+        execution_frame_id,
+        primitive_frame_id,
+    )
+    execution_from_primitive = frame_graph.resolve(
+        primitive_frame_id,
+        execution_frame_id,
+    )
+    return (
+        primitive_from_execution.matrix_target_source @ measured_pose,
+        execution_from_primitive.matrix_target_source,
+        (
+            "tcp-primitive-frame-resolution:"
+            + primitive_from_execution.semantic_content_hash,
+            "tcp-execution-frame-resolution:"
+            + execution_from_primitive.semantic_content_hash,
         ),
     )
 
@@ -245,6 +330,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
         target_resolver: (
             Callable[[tuple[float, ...]], MujocoAgentTcpTargetResolution] | None
         ) = None,
+        parameter_lineage: Mapping[str, str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -300,6 +386,32 @@ class MujocoAgentTcpPoseSkillLifecycle:
             raise TypeError("request.parameters must be a mapping.")
         if target_resolver is not None and not callable(target_resolver):
             raise TypeError("target_resolver must be callable or None.")
+        lineage = (
+            {
+                "reference_frame_id": motion_profile.reference_frame_id,
+                "reference_frame_spec_hash": (
+                    motion_profile.reference_frame_spec_hash
+                ),
+                "controlled_frame_id": "tool_tcp",
+                "frame_graph_hash": motion_profile.frame_graph_hash,
+                "tool_config_hash": motion_profile.tool_config_hash,
+                "calibration_hash": motion_profile.calibration_hash,
+            }
+            if parameter_lineage is None
+            else dict(parameter_lineage)
+        )
+        required_lineage_fields = {
+            "reference_frame_id",
+            "reference_frame_spec_hash",
+            "controlled_frame_id",
+            "frame_graph_hash",
+            "tool_config_hash",
+            "calibration_hash",
+        }
+        if set(lineage) != required_lineage_fields:
+            raise ValueError(
+                "parameter_lineage must exactly contain the motion lineage fields."
+            )
         poses = parameters.get("pose_targets_by_component")
         if target_resolver is None:
             if not isinstance(poses, Mapping) or len(poses) != 1:
@@ -334,15 +446,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 "TCP pose lifecycle component does not match the deployment "
                 "binding."
             )
-        exact = {
-            "reference_frame_id": motion_profile.reference_frame_id,
-            "reference_frame_spec_hash": motion_profile.reference_frame_spec_hash,
-            "controlled_frame_id": "tool_tcp",
-            "frame_graph_hash": motion_profile.frame_graph_hash,
-            "tool_config_hash": motion_profile.tool_config_hash,
-            "calibration_hash": motion_profile.calibration_hash,
-        }
-        for field_name, expected in exact.items():
+        for field_name, expected in lineage.items():
             if parameters.get(field_name) != expected:
                 raise ValueError(f"TCP pose lifecycle {field_name} mismatch.")
 
@@ -356,6 +460,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self.request = request
         self.operation = operation
         self._target_resolver = target_resolver
+        self.parameter_lineage = lineage
         self.target_pose: tuple[float, ...] | None = (
             None
             if target_resolver is not None
@@ -499,7 +604,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                     constraint_set_hash=request.safety_constraint_set_hash,
                 )
                 if request.has_safety_profile_selection
-                else safety_runtime.default_selection()
+                else self._route_bound_default_safety_selection(safety_runtime)
             )
             transition = self.application.activate_operation(
                 operation_id=operation.operation_id,
@@ -524,6 +629,53 @@ class MujocoAgentTcpPoseSkillLifecycle:
             lower_operation_id=self._lower_operation_id,
             evidence_refs=tuple(sorted(self._execution_refs)),
             lower_hold_confirmed=False,
+        )
+
+    def _route_bound_default_safety_selection(
+        self,
+        safety_runtime: TCPPoseEnvelopeSafetyRuntime,
+    ) -> TCPPoseEnvelopeSelection:
+        """Select the sole envelope pinned by this exact deployment binding."""
+
+        refs = tuple(self.deployment_binding.safety_envelope_refs)
+        if len(refs) != 1:
+            raise TCPPoseEnvelopeLifecycleError(
+                "A motion deployment without an explicit request selection must "
+                "pin exactly one safety envelope."
+            )
+        ref = refs[0]
+        matches = tuple(
+            entry
+            for entry in safety_runtime.catalog_entries
+            if entry.semantic_content_hash == ref.content_hash
+            and entry.envelope_id == ref.object_id
+        )
+        if len(matches) != 1:
+            raise TCPPoseEnvelopeLifecycleError(
+                "The deployment-bound safety envelope is absent from lower runtime."
+            )
+        entry = matches[0]
+        if self.route.route_id not in entry.allowed_route_ids:
+            raise TCPPoseEnvelopeLifecycleError(
+                "The deployment-bound safety envelope rejects this Route."
+            )
+        profile_hash = canonical_content_hash(
+            {
+                "source": "lower_route_binding_single_envelope_default",
+                "deployment_binding_hash": (
+                    self.deployment_binding.semantic_content_hash
+                ),
+                "deployment_envelope_hash": entry.semantic_content_hash,
+                "constraint_set_hash": entry.constraint_set_hash,
+            },
+            domain="dexteleop.lower_route_bound_safety_profile.v1",
+        )
+        return TCPPoseEnvelopeSelection(
+            safety_profile_id="lower-route-bound.standard@1",
+            safety_profile_hash=profile_hash,
+            deployment_envelope_id=entry.envelope_id,
+            deployment_envelope_hash=entry.semantic_content_hash,
+            constraint_set_hash=entry.constraint_set_hash,
         )
 
     @staticmethod

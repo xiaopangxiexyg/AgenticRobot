@@ -26,6 +26,12 @@ from agent_gateway.profiles.mujoco.motion_gateway_session import (
 from control_station.sim_hil_profile.application import (
     MujocoSimHILPassiveApplicationCut,
 )
+from robot_motion.coordinate_frames import (
+    CoordinateFrameGraph,
+    CoordinateFrameSpec,
+    RigidFrameTransformSpec,
+)
+from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.runtime.control_admission import ControlCut
 from sim.mujoco.deploy import (
     MujocoDirectComponentProposalSource,
@@ -109,6 +115,31 @@ def _build_application(monkeypatch):
         ),
         clock=lambda: state["time"],
     )
+    frame_graph = CoordinateFrameGraph(
+        graph_id="frame-graph:history-fixture",
+        frames=(
+            CoordinateFrameSpec(frame_id="right_arm_base"),
+            CoordinateFrameSpec(
+                frame_id="mujoco_sim_hil/station",
+                semantic_parameters={
+                    "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+                },
+            ),
+        ),
+        transforms=(
+            RigidFrameTransformSpec(
+                transform_id="history-fixture:right-arm-base-to-station",
+                source_frame_id="right_arm_base",
+                target_frame_id="mujoco_sim_hil/station",
+                matrix_target_source=(
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+            ),
+        ),
+    )
     application = object.__new__(MujocoAgentSkillMotionApplication)
     application.__dict__.update(
         runtime=runtime,
@@ -116,14 +147,8 @@ def _build_application(monkeypatch):
         calibration_hash="calibration:agent-history-fixture",
         target_frame_profile=SimpleNamespace(
             reference_frame_by_component={"right_arm": "right_arm_base"},
-            frame_graph=SimpleNamespace(
-                semantic_content_hash="frame-graph:history-fixture",
-                frame_by_id={
-                    "right_arm_base": SimpleNamespace(
-                        semantic_content_hash="frame-spec:right-arm-base:history"
-                    )
-                },
-            ),
+            canonical_reference_frame_id="mujoco_sim_hil/station",
+            frame_graph=frame_graph,
         ),
         tool_frame_profile=SimpleNamespace(
             semantic_content_hash="tool-config:history-fixture",

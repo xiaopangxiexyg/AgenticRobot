@@ -23,6 +23,15 @@ profile explicitly binds a Station application port.
   import `control_station`, `sim`, deployment adapters, and lower motion APIs
   only to assemble one exact application leaf through typed ports.
 
+Semantic primitive axes and lower execution coordinates must remain explicit.
+When a Skill is defined in canonical Station/desk axes but the lower owner
+executes in an arm-base frame, the concrete profile must bind an exact typed
+frame graph and transform the measured anchor and resolved target across that
+graph. Do not attach a canonical axis contract to a rotated arm-base frame.
+Each motion Route must pin exactly one compatible lower safety envelope; a
+larger fixed-orientation range must not silently widen the generic/cardinal
+envelope.
+
 The Gateway never owns an upper planner, RPent Task/Program/Memory/Experience,
 canonical robot authority, safety, IK, reference, dispatch, or dataset episode
 lifecycle. Admission, an operation terminal state, a disconnect ACK, or a

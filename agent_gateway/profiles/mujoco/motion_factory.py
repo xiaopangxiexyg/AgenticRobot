@@ -38,6 +38,8 @@ from sim.mujoco.deploy import (
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
     MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
@@ -61,6 +63,9 @@ MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1 = (
 )
 MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1 = (
     "mujoco.agent_tcp_pose.safety.standard.v1"
+)
+MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1 = (
+    "mujoco.agent_tcp_pose.safety.fixed_orientation.v1"
 )
 
 
@@ -158,10 +163,11 @@ def _build_standard_tcp_pose_envelope_runtime(
     prepared: Any,
     target_config: MujocoSimHILTargetConfig,
 ) -> TCPPoseEnvelopeSafetyRuntime:
-    """Bind the existing v1 motion bounds as one exact lower envelope.
+    """Bind separate lower envelopes for bounded pose and fixed heading Routes.
 
-    This intentionally publishes only ``standard``.  Strict/relaxed profiles
-    require independently reviewed values; they are not derived by scaling.
+    Absolute-heading primitives need the full SO(3) activation range while
+    preserving translation exactly.  They therefore cannot weaken the 15 deg
+    envelope used by the generic pose and cardinal-step Routes.
     """
 
     target_profile = prepared.target_frame_profile
@@ -209,7 +215,7 @@ def _build_standard_tcp_pose_envelope_runtime(
         },
         domain="dexteleop.mujoco.agent_tcp_pose_constraint_set.v1",
     )
-    entry = TCPPoseEnvelopeCatalogEntry(
+    standard_entry = TCPPoseEnvelopeCatalogEntry(
         envelope_id=MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,
         profile=profile,
         constraint_set_hash=constraint_set_hash,
@@ -218,8 +224,48 @@ def _build_standard_tcp_pose_envelope_runtime(
             MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
         ),
     )
+    orientation_profile = TCPPoseEnvelopeProfile(
+        profile_id="mujoco-agent-tcp-fixed-orientation-envelope-v1",
+        target_frame_binding_hash=target_binding_hash,
+        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
+        reference_frame_by_side={"right": reference_frame},
+        side_config_by_side={
+            "right": TCPPoseEnvelopeSideConfig(
+                absolute_min_xyz_m=(bounds[0], bounds[2], bounds[4]),
+                absolute_max_xyz_m=(bounds[1], bounds[3], bounds[5]),
+                relative_min_xyz_m=(0.0, 0.0, 0.0),
+                relative_max_xyz_m=(0.0, 0.0, 0.0),
+                relative_axes="canonical_axes",
+                max_rotation_rad=(
+                    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1
+                ),
+            )
+        },
+    )
+    orientation_constraint_set_hash = canonical_content_hash(
+        {
+            "tcp_pose_envelope_profile_hash": (
+                orientation_profile.semantic_content_hash
+            ),
+            "absolute_heading_primitives_only": True,
+            "translation_must_equal_activation_anchor": True,
+            "canonical_keyframe_safety_retained": True,
+            "coupled_ik_safety_retained": True,
+        },
+        domain=(
+            "dexteleop.mujoco.agent_tcp_fixed_orientation_constraint_set.v1"
+        ),
+    )
+    orientation_entry = TCPPoseEnvelopeCatalogEntry(
+        envelope_id=MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,
+        profile=orientation_profile,
+        constraint_set_hash=orientation_constraint_set_hash,
+        allowed_route_ids=tuple(
+            MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
+        ),
+    )
     return TCPPoseEnvelopeSafetyRuntime(
-        catalog_entries=(entry,),
+        catalog_entries=(standard_entry, orientation_entry),
         target_frame_binding_hash=target_binding_hash,
         tool_frame_binding_hash_by_side={"right": tool_binding_hash},
         reference_frame_by_side={"right": reference_frame},
@@ -366,6 +412,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
 
 
 __all__ = [
+    "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_CALIBRATION_HASH_DOMAIN_V1",
     "MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1",

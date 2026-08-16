@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -29,12 +30,16 @@ from agent_gateway.profiles.mujoco.motion_application import (
     MujocoAgentSkillMotionStep,
 )
 from agent_gateway.profiles.mujoco.motion_deployment import (
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1,
     MujocoAgentTcpPoseDeploymentBinding,
     MujocoAgentTcpPoseMotionProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
 )
 from agent_gateway.profiles.mujoco.motion_factory import (
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,
+    MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,
+    _build_standard_tcp_pose_envelope_runtime,
     mujoco_agent_tcp_pose_execution_observation_plan_v1,
     validate_mujoco_agent_tcp_pose_target_config,
 )
@@ -47,9 +52,14 @@ from agent_gateway.profiles.mujoco.motion_skill import (
     resolve_level_tcp_orientation_primitive_target,
     resolve_tcp_displacement_primitive_target,
 )
-from robot_motion.coordinate_frames import CoordinateFrameSpec
+from robot_motion.coordinate_frames import (
+    CoordinateFrameGraph,
+    CoordinateFrameSpec,
+    RigidFrameTransformSpec,
+)
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.primitives import cardinal_tcp_short_step, level_tcp_orientation
+from robot_motion.relative_action import xyzquat_to_pose_matrix
 from sim.mujoco.deploy import (
     MujocoDirectComponentProposalSource,
     MujocoSimHILTargetConfig,
@@ -157,6 +167,120 @@ def test_fixed_level_orientation_is_absolute_and_preserves_tcp_position() -> Non
     assert any(
         item.startswith("tcp-level-orientation-primitive:")
         for item in first.evidence_refs
+    )
+
+
+def _rotated_station_graph() -> tuple[CoordinateFrameGraph, CoordinateFrameSpec]:
+    station = CoordinateFrameSpec(
+        frame_id="station",
+        semantic_parameters={
+            "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+        },
+    )
+    graph = CoordinateFrameGraph(
+        graph_id="rotated-station-fixture",
+        frames=(CoordinateFrameSpec(frame_id="right_arm_base"), station),
+        transforms=(
+            RigidFrameTransformSpec(
+                transform_id="right-base-to-station",
+                source_frame_id="right_arm_base",
+                target_frame_id="station",
+                matrix_target_source=(
+                    (0.0, -1.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+            ),
+        ),
+    )
+    return graph, station
+
+
+def test_cardinal_step_uses_station_axes_not_rotated_arm_base_axes() -> None:
+    graph, station = _rotated_station_graph()
+    resolution = resolve_tcp_displacement_primitive_target(
+        measured_pose=(1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0),
+        primitive=cardinal_tcp_short_step("forward"),
+        reference_frame_spec=station,
+        frame_graph=graph,
+        measured_reference_frame_id="right_arm_base",
+    )
+
+    assert resolution.target_pose[:3] == pytest.approx((1.0, -0.03, 0.5))
+    assert sum(
+        item.startswith("tcp-primitive-frame-resolution:")
+        for item in resolution.evidence_refs
+    ) == 1
+    assert sum(
+        item.startswith("tcp-execution-frame-resolution:")
+        for item in resolution.evidence_refs
+    ) == 1
+
+
+def test_fixed_orientation_is_defined_in_station_then_returned_in_arm_base() -> None:
+    graph, station = _rotated_station_graph()
+    primitive = level_tcp_orientation("center_forward")
+    resolution = resolve_level_tcp_orientation_primitive_target(
+        measured_pose=(1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0),
+        primitive=primitive,
+        reference_frame_spec=station,
+        frame_graph=graph,
+        measured_reference_frame_id="right_arm_base",
+    )
+    target_in_base = xyzquat_to_pose_matrix(
+        resolution.target_pose,
+        name="fixed_orientation_target_in_base",
+    )
+    target_in_station, _resolution = graph.transform_pose_matrix(
+        target_in_base,
+        source_reference_frame_id="right_arm_base",
+        target_reference_frame_id="station",
+    )
+
+    assert resolution.target_pose[:3] == pytest.approx((1.0, 0.0, 0.5))
+    assert target_in_station[:3, :3] == pytest.approx(
+        primitive.target_rotation_reference
+    )
+
+
+def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope() -> None:
+    runtime = _build_standard_tcp_pose_envelope_runtime(
+        prepared=SimpleNamespace(
+            target_frame_profile=SimpleNamespace(
+                semantic_content_hash="target-frame-profile:fixture",
+                reference_frame_by_component={"right_arm": "right_arm_base"},
+            ),
+            tool_frame_profile=SimpleNamespace(
+                binding_by_component={
+                    "right_arm": SimpleNamespace(
+                        semantic_content_hash="tool-binding:right-arm:fixture"
+                    )
+                },
+            ),
+        ),
+        target_config=SimpleNamespace(clock_domain_id="clock:mujoco:fixture"),
+    )
+    entry_by_id = {entry.envelope_id: entry for entry in runtime.catalog_entries}
+    standard = entry_by_id[MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1]
+    orientation = entry_by_id[
+        MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1
+    ]
+
+    assert standard.profile.side_config_by_side["right"].max_rotation_rad == (
+        pytest.approx(0.2617993877991494)
+    )
+    assert orientation.profile.side_config_by_side["right"].max_rotation_rad == (
+        pytest.approx(3.141592653589793)
+    )
+    assert orientation.profile.side_config_by_side[
+        "right"
+    ].relative_min_xyz_m == (0.0, 0.0, 0.0)
+    assert set(orientation.allowed_route_ids) == set(
+        MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
+    )
+    assert set(standard.allowed_route_ids).isdisjoint(
+        orientation.allowed_route_ids
     )
 
 
@@ -708,27 +832,58 @@ def _build_no_model_contract_bundle_fixture(
         ),
         clock=lambda: 10.0,
     )
+    frame_graph = CoordinateFrameGraph(
+        graph_id="frame-graph:fixture",
+        frames=(
+            CoordinateFrameSpec(frame_id="right_arm_base"),
+            CoordinateFrameSpec(
+                frame_id="mujoco_sim_hil/station",
+                semantic_parameters={
+                    "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+                },
+            ),
+        ),
+        transforms=(
+            RigidFrameTransformSpec(
+                transform_id="fixture:right-arm-base-to-station",
+                source_frame_id="right_arm_base",
+                target_frame_id="mujoco_sim_hil/station",
+                matrix_target_source=(
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+            ),
+        ),
+    )
     application = SimpleNamespace(
         runtime=runtime,
         task_config=SimpleNamespace(physics_hz=1_000.0),
         calibration_hash="calibration:agent-motion-bundle-fixture",
         target_frame_profile=SimpleNamespace(
+            semantic_content_hash="target-frame-profile:fixture",
             reference_frame_by_component={"right_arm": "right_arm_base"},
-            frame_graph=SimpleNamespace(
-                semantic_content_hash="frame-graph:fixture",
-                frame_by_id={
-                    "right_arm_base": SimpleNamespace(
-                        semantic_content_hash="frame-spec:right-arm-base"
-                    )
-                },
-            ),
+            canonical_reference_frame_id="mujoco_sim_hil/station",
+            frame_graph=frame_graph,
         ),
         tool_frame_profile=SimpleNamespace(
             semantic_content_hash="tool-config:fixture",
             binding_by_component={
-                "right_arm": SimpleNamespace(controlled_frame_id="tool_tcp")
+                "right_arm": SimpleNamespace(
+                    controlled_frame_id="tool_tcp",
+                    semantic_content_hash="tool-binding:right-arm:fixture",
+                )
             },
         ),
+    )
+    application.tcp_pose_envelope_runtime = (
+        _build_standard_tcp_pose_envelope_runtime(
+            prepared=application,
+            target_config=SimpleNamespace(
+                clock_domain_id=runtime.config.clock_domain_id,
+            ),
+        )
     )
     captured_manifest_args = {}
 
@@ -786,10 +941,12 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "pose_targets_by_component": {
             "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
         },
-        "reference_frame_id": "right_arm_base",
-        "reference_frame_spec_hash": "frame-spec:right-arm-base",
+        "reference_frame_id": bundle.motion_profile.reference_frame_id,
+        "reference_frame_spec_hash": (
+            bundle.motion_profile.reference_frame_spec_hash
+        ),
         "controlled_frame_id": "tool_tcp",
-        "frame_graph_hash": "frame-graph:fixture",
+        "frame_graph_hash": bundle.motion_profile.frame_graph_hash,
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
     }
@@ -819,12 +976,20 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert cardinal_step_entry.route.route_id == (
         "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
     )
+    assert bundle.cardinal_step_profile.reference_frame_id == (
+        "mujoco_sim_hil/station"
+    )
+    assert bundle.cardinal_step_profile.execution_reference_frame_id == (
+        "right_arm_base"
+    )
+    assert tuple(
+        item.object_id
+        for item in bundle.cardinal_step_deployment_binding.safety_envelope_refs
+    ) == (MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,)
     published_skill_ids = {
         entry.route.skill_id for entry in bundle.route_manifest.skill_routes
     }
-    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1).isdisjoint(
-        published_skill_ids
-    )
+    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= published_skill_ids
     assert "distance_m" not in bundle.schema_catalog.entry(
         "motion.step_tcp_cardinal",
         "1",
@@ -845,6 +1010,52 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         route=cardinal_step_entry.route,
         payload=cardinal_parameters,
     )
+    for orientation_contract in bundle.fixed_orientation_contracts:
+        orientation_profile = orientation_contract.profile
+        orientation_route = bundle.route_manifest.route(
+            orientation_profile.skill_id,
+            "1",
+        ).route
+        assert orientation_route.route_id == (
+            MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[
+                orientation_profile.skill_id
+            ]
+        )
+        assert orientation_profile.reference_frame_id == "mujoco_sim_hil/station"
+        assert orientation_profile.execution_reference_frame_id == "right_arm_base"
+        assert tuple(
+            item.object_id
+            for item in orientation_contract.deployment_binding.safety_envelope_refs
+        ) == (MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,)
+        assert orientation_contract.motion_profile.max_translation_delta_m == (
+            pytest.approx(1e-6)
+        )
+        assert orientation_contract.motion_profile.max_rotation_delta_rad == (
+            pytest.approx(math.pi)
+        )
+        orientation_parameters = {
+            "component_id": orientation_profile.component_id,
+            "reference_frame_id": orientation_profile.reference_frame_id,
+            "reference_frame_spec_hash": (
+                orientation_profile.reference_frame_spec_hash
+            ),
+            "controlled_frame_id": "tool_tcp",
+            "frame_graph_hash": orientation_profile.frame_graph_hash,
+            "tool_config_hash": orientation_profile.tool_config_hash,
+            "calibration_hash": orientation_profile.calibration_hash,
+            "primitive_hash": (
+                orientation_profile.primitive.semantic_content_hash
+            ),
+        }
+        bundle.payload_validators.validate_parameters(
+            route=orientation_route,
+            payload=orientation_parameters,
+        )
+        with pytest.raises(ValueError, match="exactly match"):
+            bundle.payload_validators.validate_parameters(
+                route=orientation_route,
+                payload={**orientation_parameters, "yaw_deg": 30.0},
+            )
     with pytest.raises(ValueError, match="unsupported direction"):
         bundle.payload_validators.validate_parameters(
             route=cardinal_step_entry.route,
@@ -880,7 +1091,11 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert route_to_port["motion.step_tcp_cardinal"] is (
         session.cardinal_step_executor
     )
-    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1).isdisjoint(route_to_port)
+    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= set(route_to_port)
+    for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
+        assert route_to_port[skill_id] is session.fixed_orientation_executors[
+            skill_id
+        ]
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
     assert not motion_application.started
 
@@ -929,10 +1144,12 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "pose_targets_by_component": {
             "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
         },
-        "reference_frame_id": "right_arm_base",
-        "reference_frame_spec_hash": "frame-spec:right-arm-base",
+        "reference_frame_id": bundle.motion_profile.reference_frame_id,
+        "reference_frame_spec_hash": (
+            bundle.motion_profile.reference_frame_spec_hash
+        ),
         "controlled_frame_id": "tool_tcp",
-        "frame_graph_hash": "frame-graph:fixture",
+        "frame_graph_hash": bundle.motion_profile.frame_graph_hash,
         "tool_config_hash": "tool-config:fixture",
         "calibration_hash": "calibration:agent-motion-bundle-fixture",
     }
