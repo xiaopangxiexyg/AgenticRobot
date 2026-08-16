@@ -200,6 +200,8 @@ task/AR-lab-framework-v2      M1 以后连续的框架集成线
 | `ecfa3c6c` | M3g trusted Runner claims |
 | `ac08f03e` | M3h authenticated transport 与 exact staging |
 | `22b58121` | M4 synthetic draft Git snapshot |
+| `104c17a1` | 收敛执行边界，撤回资源/服务编排 prototype |
+| `e4367d1a` | M5 受信 staged system command execution |
 
 已被替代但需留档的早期项目专用 prototype 固定在 annotated tag
 `archive/lab-control-bootstrap-20260816`；它不是可继续开发或部署的框架分支。
