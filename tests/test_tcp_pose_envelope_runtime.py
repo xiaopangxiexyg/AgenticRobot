@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -529,3 +530,31 @@ def test_profile_loader_rejects_unknown_fields_and_inactive_sides(
             retargeter=retargeter,
             active_sides=("left",),
         )
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_real_agent_primitive_relative_tight_profiles_are_strict_runtime_specs(
+    side,
+) -> None:
+    calibration, retargeter, _ = _fixture()
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "control_station"
+        / "real_teleop"
+        / "configs"
+        / f"agent_primitive_{side}_relative_tight_v1.json"
+    )
+
+    profile = load_tcp_pose_envelope_profile(
+        path,
+        calibration=calibration,
+        retargeter=retargeter,
+        active_sides=(side,),
+    )
+
+    assert profile.enabled_sides == (side,)
+    config = profile.side_config_by_side[side]
+    assert config.relative_min_xyz_m == pytest.approx((-0.1, -0.1, -0.1))
+    assert config.relative_max_xyz_m == pytest.approx((0.1, 0.1, 0.1))
+    assert config.relative_axes == "canonical_axes"
+    assert config.max_rotation_rad == pytest.approx(np.deg2rad(45.0))

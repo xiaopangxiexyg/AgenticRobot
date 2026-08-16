@@ -22,6 +22,7 @@ from .control_loop import (
     RealTeleopControlLoopContext,
     run_real_teleop_control_loop,
 )
+from .components import RealTeleopComponents
 from .device_retry_runtime import build_device_retry_runtime
 from .diagnostic_setup import (
     initialize_control_debug_runtime_metadata,
@@ -36,6 +37,7 @@ from .foot_pad_controls import (
 )
 from .gripper_warmup_runtime import build_gripper_warmup_probe_runtime
 from .position_episode_debug import build_position_episode_debug_runtime
+from .runtime_extension import RealTeleopRuntimeExtension
 from .position_admittance_shadow import (
     POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
     POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
@@ -340,6 +342,13 @@ def run_real_teleop(
     progress_application: ProgressApplicationPort | None = None,
     input_batch_prioritizer: RealTeleopInputBatchPrioritizer | None = None,
 ) -> None:
+    runtime_extension: RealTeleopRuntimeExtension | None = getattr(
+        args,
+        "_real_teleop_runtime_extension",
+        None,
+    )
+    if hasattr(args, "_real_teleop_runtime_extension"):
+        delattr(args, "_real_teleop_runtime_extension")
     position_admittance_rotation_active = bool(
         getattr(args, "position_admittance_rotation_active", False)
     )
@@ -483,6 +492,16 @@ def run_real_teleop(
         register_component_cleanup=_register_component_startup_cleanup,
     )
     components = startup_component_assembly.components
+    if runtime_extension is not None:
+        attach_components = getattr(runtime_extension, "attach_components", None)
+        if not callable(attach_components):
+            raise TypeError("runtime_extension lacks attach_components().")
+        components = attach_components(components)
+        if not isinstance(components, RealTeleopComponents):
+            raise TypeError(
+                "runtime_extension.attach_components() must return "
+                "RealTeleopComponents."
+            )
     tactile_visualizer = startup_component_assembly.tactile_visualizer
     init_controller_available = (
         getattr(components, "init_arm_controller", None) is not None
@@ -2365,6 +2384,12 @@ def run_real_teleop(
 
         def current_visualization_state() -> tuple[object | None, bool, object | None]:
             return camera_previewer, bool(camera_preview_active), tactile_visualizer
+
+        if runtime_extension is not None:
+            start_extension = getattr(runtime_extension, "start", None)
+            if not callable(start_extension):
+                raise TypeError("runtime_extension lacks start().")
+            start_extension(components=components)
 
         run_real_teleop_control_loop(
             RealTeleopControlLoopContext(

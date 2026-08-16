@@ -8,8 +8,11 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from agent_gateway.protocol.contracts import AgentObservationSnapshot
-from agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
+from agent_gateway.protocol.contracts import AgentObservationSnapshot, AgentSkillRequest
+from agent_gateway.runtime.access_policy import (
+    AgentSkillAccessPolicy,
+    SkillExecutionGrant,
+)
 from agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
@@ -296,6 +299,9 @@ class RealAgentPrimitiveGatewaySession:
         self,
         *,
         authenticated_client_id: str,
+        grant_resolver: (
+            Callable[[AgentSkillRequest], SkillExecutionGrant | None] | None
+        ) = None,
     ) -> BoundAgentGatewayWireAdapter:
         return BoundAgentGatewayWireAdapter(
             authenticated_client_id=authenticated_client_id,
@@ -309,6 +315,7 @@ class RealAgentPrimitiveGatewaySession:
                 self.observation_producer.current_station_revision
             ),
             operation_launcher=self.service.launch_operation,
+            grant_resolver=grant_resolver,
         )
 
     def build_unix_json_server(
@@ -319,6 +326,9 @@ class RealAgentPrimitiveGatewaySession:
         socket_mode: int = 0o600,
         max_frame_bytes: int = 2 * 1024 * 1024,
         peer_idle_timeout_sec: float = 10.0,
+        grant_resolver: (
+            Callable[[AgentSkillRequest], SkillExecutionGrant | None] | None
+        ) = None,
     ) -> AgentGatewayUnixJsonServer:
         peer_map = AgentGatewayUnixPeerClientMap(client_id_by_uid)
         if set(peer_map.client_id_by_uid.values()) != set(
@@ -329,7 +339,8 @@ class RealAgentPrimitiveGatewaySession:
             socket_path=socket_path,
             peer_client_map=peer_map,
             facade_factory=lambda client_id: self.wire_adapter(
-                authenticated_client_id=client_id
+                authenticated_client_id=client_id,
+                grant_resolver=grant_resolver,
             ),
             close_gateway=self.close,
             socket_mode=socket_mode,

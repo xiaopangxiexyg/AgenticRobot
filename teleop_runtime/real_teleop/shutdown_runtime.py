@@ -326,6 +326,24 @@ def shutdown_real_teleop_runtime(
         shutdown_steps.append(
             ("human_action_shadow", components.human_shadow_frontend.close)
         )
+    runtime_extension = runtime_state.get("runtime_extension")
+    if runtime_extension is not None:
+        close_before_session = getattr(
+            runtime_extension,
+            "close_before_session",
+            None,
+        )
+        if not callable(close_before_session):
+            raise TypeError("runtime_extension lacks close_before_session().")
+        shutdown_steps.append(
+            (
+                "runtime_extension.before_session",
+                lambda: close_before_session(
+                    components=components,
+                    terminal_error=terminal_error,
+                ),
+            )
+        )
     shutdown_steps.append(("teleop_session", components.session.close))
     if actuator_trace_recorder is not None:
         def close_actuator_trace(

@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--runtime-session-id",
-        default="dexteleop-agent-mujoco-tcp-pose",
-        help="lower-owned runtime session identity published in the manifest",
+        default=None,
+        help=(
+            "optional explicit lower runtime session identity; omitting it "
+            "creates a unique identity for this Gateway process"
+        ),
     )
     parser.add_argument(
         "--control-domain-id",
@@ -121,6 +125,12 @@ def _absolute_path(parser: argparse.ArgumentParser, value: Path, *, flag: str) -
     # the caller-selected endpoint parent itself instead of receiving a path
     # whose symlink identity was erased by this CLI.
     return Path(os.path.abspath(expanded))
+
+
+def _resolved_runtime_session_id(explicit: str | None) -> str:
+    if explicit is not None:
+        return explicit
+    return "dexteleop-agent-mujoco-tcp-pose:" + uuid.uuid4().hex
 
 
 def _ready_payload(*, session: Any, socket_path: Path, client_id: str) -> dict[str, Any]:
@@ -191,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--client-uid must be non-negative")
     if args.max_retained_operations <= 0:
         parser.error("--max-retained-operations must be positive")
+    runtime_session_id = _resolved_runtime_session_id(args.runtime_session_id)
     history_storage = None
     if args.history_root is not None:
         history_storage = MujocoAgentTcpPoseHistoryStorageConfig(
@@ -206,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     target_config = MujocoSimHILTargetConfig(
         task_config_path=task_config,
         realtime_worker=not args.no_realtime_worker,
-        runtime_session_id=args.runtime_session_id,
+        runtime_session_id=runtime_session_id,
         control_domain_id=args.control_domain_id,
         execution_observation_plan=(
             mujoco_agent_tcp_pose_execution_observation_plan_v1()
@@ -252,11 +263,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     server_thread_started = False
     try:
-        server_thread.start()
-        server_thread_started = True
+        # Construction is deliberately default-off.  This explicit lower-owned
+        # boundary starts MuJoCo and proves HOLD before any client can observe a
+        # ready endpoint or before history capture touches the runtime.
+        session.application.start_observation_ready()
         if session.history_recorder is not None:
             session.history_recorder.capture_once()
             session.history_recorder.start()
+        server_thread.start()
+        server_thread_started = True
         print(
             json.dumps(
                 _ready_payload(

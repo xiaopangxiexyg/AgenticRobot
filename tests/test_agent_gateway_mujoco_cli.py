@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_gateway.profiles.mujoco.gateway_cli import _stopped_payload
+from agent_gateway.profiles.mujoco.gateway_cli import (
+    _resolved_runtime_session_id,
+    _stopped_payload,
+    build_parser,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
@@ -58,3 +62,30 @@ def test_activated_gateway_requires_lower_hold_proof() -> None:
     assert missing["safe_shutdown_basis"] == "missing_lower_hold_proof"
     assert proved["safe_shutdown"] is True
     assert proved["safe_shutdown_basis"] == "lower_hold_proved"
+
+
+def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None:
+    parser = build_parser()
+    common = [
+        "--socket-path",
+        "/absolute/gateway.sock",
+        "--task-config",
+        "/absolute/task.json",
+    ]
+
+    assert parser.parse_args(common).runtime_session_id is None
+    assert (
+        parser.parse_args(
+            [*common, "--runtime-session-id", "runtime:operator-selected"]
+        ).runtime_session_id
+        == "runtime:operator-selected"
+    )
+    first = _resolved_runtime_session_id(None)
+    second = _resolved_runtime_session_id(None)
+    assert first.startswith("dexteleop-agent-mujoco-tcp-pose:")
+    assert second.startswith("dexteleop-agent-mujoco-tcp-pose:")
+    assert first != second
+    assert (
+        _resolved_runtime_session_id("runtime:operator-selected")
+        == "runtime:operator-selected"
+    )

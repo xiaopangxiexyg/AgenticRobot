@@ -110,8 +110,9 @@ def bind_legacy_support(namespace: Mapping[str, object]) -> None:
     )
 
 
-def parse_real_teleop_args() -> argparse.Namespace:
-    parser = build_real_teleop_argument_parser()
+def _parse_real_teleop_args(
+    parser: argparse.ArgumentParser,
+) -> argparse.Namespace:
     raw_argv = list(sys.argv[1:])
     args = parser.parse_args()
     if not str(getattr(args, "dataset_root", "")).strip():
@@ -940,4 +941,25 @@ def parse_real_teleop_args() -> argparse.Namespace:
         parser.error("--vive-clock-sync-startup-timeout-sec must be >= 0.")
     return args
 
-__all__ = ["bind_legacy_support", "parse_real_teleop_args"]
+
+def parse_real_teleop_args() -> argparse.Namespace:
+    """Preserve the frozen canonical parser entrypoint."""
+
+    return _parse_real_teleop_args(build_real_teleop_argument_parser())
+
+
+def parse_real_teleop_args_with_parser(
+    parser: argparse.ArgumentParser,
+) -> argparse.Namespace:
+    """Resolve a Station-extended canonical parser without duplicating rules."""
+
+    if not isinstance(parser, argparse.ArgumentParser):
+        raise TypeError("parser must be an argparse.ArgumentParser.")
+    return _parse_real_teleop_args(parser)
+
+
+__all__ = [
+    "bind_legacy_support",
+    "parse_real_teleop_args",
+    "parse_real_teleop_args_with_parser",
+]

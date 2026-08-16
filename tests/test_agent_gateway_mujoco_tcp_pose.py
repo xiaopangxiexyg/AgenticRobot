@@ -479,6 +479,63 @@ def _hold_transition():
     )
 
 
+def _lifecycle_application(runtime):
+    application = object.__new__(MujocoAgentSkillMotionApplication)
+    application.runtime = runtime
+    application._lock = threading.RLock()
+    application._started = False
+    application._held = False
+    application._closed = False
+    application._active_operation_id = None
+    return application
+
+
+def test_observation_ready_startup_starts_runtime_and_proves_lower_hold() -> None:
+    calls: list[object] = []
+    transition = _hold_transition()
+    runtime = SimpleNamespace(
+        start=lambda: calls.append("start"),
+        transition_execution_gate=lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or transition
+        ),
+    )
+    application = _lifecycle_application(runtime)
+
+    outcome = application.start_observation_ready()
+
+    assert outcome is transition
+    assert application.started
+    assert application.held
+    assert calls == [
+        "start",
+        (
+            ("hold",),
+            {
+                "reason": "agent_gateway_observation_ready_startup",
+                "source_event_ids": ("agent-gateway-observation-ready",),
+                "force_cancellation": True,
+            },
+        ),
+    ]
+
+
+def test_observation_ready_startup_fails_closed_without_lower_hold_proof() -> None:
+    runtime = SimpleNamespace(
+        start=lambda: None,
+        transition_execution_gate=lambda *_args, **_kwargs: SimpleNamespace(
+            snapshot=SimpleNamespace(status="hold"),
+            lower_event_ids=(),
+        ),
+    )
+    application = _lifecycle_application(runtime)
+
+    with pytest.raises(RuntimeError, match="did not prove HOLD"):
+        application.start_observation_ready()
+
+    assert application.started
+    assert not application.held
+
+
 def _fake_application(
     action_schema,
     *,

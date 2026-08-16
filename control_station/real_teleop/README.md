@@ -112,7 +112,7 @@ policy-motion worker HOLD/drain proof and a production real launcher remain
 unbound. Zero, constants, or Gateway-generated epochs must not be used to make
 the attachment appear authoritative.
 
-## Attach-only Agent primitive motion
+## Default-off real Agent primitive motion
 
 The top-level real profile now has a separate default-off 6+3 primitive path.
 `agent_gateway.profiles.real.motion_factory` preflights four exact
@@ -120,8 +120,11 @@ The top-level real profile now has a separate default-off 6+3 primitive path.
 orientations), prepares one `RealAgentMotionPort`, assembles the Gateway
 service, and only then attaches that same port to the existing RealTeleop
 Session. It returns a replacement `RealTeleopComponents`; a composition root
-must use that returned aggregate. The ordinary component builder and CLI do not
-enable this path.
+must use that returned aggregate. The canonical GUI entrypoint exposes this
+only behind `--agent-primitive-skill-only` plus an exact side, action, private
+Unix socket, Active TCP envelope, position-control mode, and explicit operator
+confirmation. Ordinary GUI invocations remain unchanged and do not attach or
+advertise any Agent motion Route.
 
 The existing RealTeleop control thread remains the sole effect owner. It applies
 queued activation/HOLD requests, builds the selected absolute tool-TCP target
@@ -132,12 +135,30 @@ the same control frame may publish those already-read joint values through the
 existing FK owner as the measured TCP cut; the Gateway performs no extra
 backend read.
 
-The Gateway side requires an exact RUNNING/READY lower-owner provider, fresh
+In Skill-only mode the Agent port is the Session's sole command override. An
+idle, completed, disconnected, or held Gateway therefore emits an explicit
+no-command override and cannot fall back to a Vive arm command. The Vive source
+may still be present for the existing GUI/runtime-Home and health lifecycle; it
+does not retain competing motion authority.
+
+The Gateway side requires an exact RUNNING/READY lower-owner cut published by
+that same RealTeleop control frame, fresh
 measured cuts, a route-covering lower safety-envelope reference, and a one-use
-request-bound operator Grant. It evaluates convergence only from distinct
+request-bound operator Grant. The local Unix adapter mints that grant atomically
+only for the one side/action pre-authorized when the process started; the client
+never receives reusable grant material. It evaluates convergence only from distinct
 lower cuts after dispatch and declares success only after lower-confirmed HOLD.
-The current tests drive all nine cases with an in-memory owner/control loop.
-They establish code wiring and fail-HOLD behavior, not deployed-cell envelope
-correctness, production owner-state wiring, daemon lifecycle, or safe physical
-motion. Those production facts remain deliberately unbound until a reviewed
-launcher supplies them.
+Disconnect, timeout, cancellation, runtime exit, and normal completion converge
+through the same lower HOLD seam before Session/backend teardown. The current
+tests drive all nine cases with an in-memory owner/control loop and additionally
+cover exclusive idle behavior, fresh owner cuts, Unix one-use grant binding,
+server teardown, and the strict relative-envelope files. They establish wiring
+and fail-HOLD behavior, not safe physical motion; the first real run remains an
+operator-supervised 3 cm single-arm test.
+
+The reviewed test envelope files are
+`configs/agent_primitive_left_relative_tight_v1.json` and
+`configs/agent_primitive_right_relative_tight_v1.json`. Each binds the runtime
+Home TCP as the anchor, allows ±10 cm in canonical desk axes, and limits total
+rotation from that anchor to 45 degrees. They are separate because a single-arm
+runtime refuses profile entries for inactive sides.

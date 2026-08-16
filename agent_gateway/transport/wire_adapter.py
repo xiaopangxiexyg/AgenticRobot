@@ -10,6 +10,7 @@ registered executor.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from ..protocol.contracts import (
@@ -180,6 +181,14 @@ class BoundAgentGatewayWireAdapter:
         )
         if grant is not None and not isinstance(grant, SkillExecutionGrant):
             raise TypeError("grant_resolver returned an invalid grant.")
+        if grant is not None and request.skill_execution_grant_id is None:
+            # An application-local operator resolver may atomically mint the
+            # exact request-bound one-use grant.  The external client never
+            # receives reusable grant material and cannot select another ID.
+            request = replace(
+                request,
+                skill_execution_grant_id=grant.grant_id,
+            )
         outcome = self.service.submit_request(
             request=request,
             current_station_revision=self._revision(),

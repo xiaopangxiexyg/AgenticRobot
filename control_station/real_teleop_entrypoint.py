@@ -766,12 +766,22 @@ def _toggle_collection_round_trip_phase(args: argparse.Namespace) -> bool:
 from teleop_runtime.real_teleop.cli_resolution import (
     bind_legacy_support as _bind_cli_resolution_support,
     parse_real_teleop_args,
+    parse_real_teleop_args_with_parser,
+)
+from control_station.real_agent_primitive_runtime import (
+    add_real_agent_primitive_arguments,
+    build_real_agent_primitive_extension,
+    validate_real_agent_primitive_arguments,
 )
 
 
 def parse_args() -> argparse.Namespace:
     _bind_cli_resolution_support(globals())
-    return parse_real_teleop_args()
+    parser = build_real_teleop_argument_parser()
+    add_real_agent_primitive_arguments(parser)
+    args = parse_real_teleop_args_with_parser(parser)
+    validate_real_agent_primitive_arguments(args, parser)
+    return args
 
 
 # Compatibility bridge: retain the established entrypoint helper names while
@@ -1725,6 +1735,8 @@ def main() -> None:
     try:
         args = parse_args()
         _bind_real_teleop_runtime_support(globals())
+        runtime_extension = build_real_agent_primitive_extension(args)
+        args._real_teleop_runtime_extension = runtime_extension
         run_real_teleop(
             args,
             progress_application=build_real_teleop_progress_application(args),

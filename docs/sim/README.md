@@ -43,7 +43,10 @@ replay-authoritative CS-6b1f 验证。它与 RTC 和真机机械臂 deployment �
 
 该入口只启动 DexTeleop 自有的 MuJoCo、下层 motion owner 与本地 Unix Gateway；
 不启动 RPent、Planner 或真机设备。socket 父目录必须预先存在、不是符号链接且不可
-world-writable；已有 socket 不会被自动删除。历史数据显式落在调用方选择的本地目录。
+world-writable；已有 socket 不会被自动删除。每次启动默认生成唯一 runtime session
+identity；只有受控复现时才显式传入 `--runtime-session-id`。历史数据显式落在调用方
+选择的 catalog 目录，并按本次不可变 source binding 自动分区；不会把不同 Gateway
+会话写入同一 SQLite source store。
 
 ```bash
 export RPENT_ROOT=/absolute/path/to/RPent

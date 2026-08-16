@@ -149,6 +149,42 @@ class MujocoAgentSkillMotionApplication:
         with self._lock:
             return self._active_operation_id
 
+    def start_observation_ready(self) -> Any:
+        """Start MuJoCo and prove HOLD before exposing passive reads.
+
+        Construction remains default-off.  The dedicated lower launcher calls
+        this explicit lifecycle boundary before it exposes the Gateway, so
+        observation and optional history capture see one running lower runtime
+        while motion admission remains closed.
+        """
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+            if self._active_operation_id is not None:
+                raise RuntimeError(
+                    "Observation-ready startup requires no active operation."
+                )
+            if not self._started:
+                self.runtime.start()
+                self._started = True
+            transition = self.runtime.transition_execution_gate(
+                "hold",
+                reason="agent_gateway_observation_ready_startup",
+                source_event_ids=("agent-gateway-observation-ready",),
+                force_cancellation=True,
+            )
+            lower_event_ids = tuple(getattr(transition, "lower_event_ids", ()))
+            if (
+                str(getattr(transition.snapshot, "status", "")) != "hold"
+                or not lower_event_ids
+            ):
+                raise RuntimeError(
+                    "Lower runtime did not prove HOLD during Gateway startup."
+                )
+            self._held = True
+            return transition
+
     def activate_operation(
         self,
         *,

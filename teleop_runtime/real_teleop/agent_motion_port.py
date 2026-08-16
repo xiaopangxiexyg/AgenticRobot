@@ -76,6 +76,7 @@ class RealAgentMotionPortConfig:
     component_id_by_side: Mapping[str, str]
     execution_frame_id: str
     execution_frame_spec_hash: str
+    exclusive_command_claim: bool = False
 
     def __post_init__(self) -> None:
         active_sides = tuple(str(side).strip().lower() for side in self.active_sides)
@@ -112,6 +113,114 @@ class RealAgentMotionPortConfig:
                 self.execution_frame_spec_hash,
                 field_name="execution_frame_spec_hash",
             ),
+        )
+        object.__setattr__(
+            self,
+            "exclusive_command_claim",
+            bool(self.exclusive_command_claim),
+        )
+
+
+@dataclass(frozen=True)
+class RealAgentMotionOwnerIdentity:
+    """Exact identities owned by one attached RealTeleop command port."""
+
+    runtime_session_id: str
+    control_domain_id: str
+    embodiment_instance_id: str
+    target_binding_id: str
+    execution_manifest_hash: str
+    backend_inventory_hash: str
+    clock_domain_id: str
+
+    def __post_init__(self) -> None:
+        for field_name in self.__dataclass_fields__:
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            self.__dict__,
+            domain="dexteleop.real_agent_motion.owner_identity.v1",
+        )
+
+
+@dataclass(frozen=True)
+class RealAgentMotionOwnerCut:
+    """Lower-owned command-override state captured at a control-loop cut."""
+
+    identity: RealAgentMotionOwnerIdentity
+    owner_token_id: str
+    owner_kind: str
+    owner_generation: int
+    authority_epoch: int
+    execution_epoch: int
+    lifecycle_state: str
+    execution_gate: str
+    owner_state_revision: int
+    captured_at: float
+    attachment_evidence_ref: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, RealAgentMotionOwnerIdentity):
+            raise TypeError("identity must be RealAgentMotionOwnerIdentity.")
+        for field_name in (
+            "owner_token_id",
+            "owner_kind",
+            "lifecycle_state",
+            "execution_gate",
+            "attachment_evidence_ref",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+        for field_name in (
+            "owner_generation",
+            "authority_epoch",
+            "execution_epoch",
+            "owner_state_revision",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer.")
+        object.__setattr__(
+            self,
+            "captured_at",
+            _finite(self.captured_at, field_name="captured_at"),
+        )
+        expected_gate = {
+            "running": "ready",
+            "hold": "hold",
+            "fault": "fault",
+        }.get(self.lifecycle_state)
+        if expected_gate != self.execution_gate:
+            raise ValueError("owner lifecycle_state/execution_gate mismatch.")
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "identity_hash": self.identity.semantic_content_hash,
+                **{
+                    name: value
+                    for name, value in self.__dict__.items()
+                    if name != "identity"
+                },
+            },
+            domain="dexteleop.real_agent_motion.owner_cut.v1",
+        )
+
+    @property
+    def evidence_refs(self) -> tuple[str, ...]:
+        return (
+            self.attachment_evidence_ref,
+            "real-agent-motion-owner-cut:" + self.semantic_content_hash,
         )
 
 
@@ -311,9 +420,16 @@ class RealAgentMotionPort:
         *,
         config: RealAgentMotionPortConfig,
         target_builder: RealAgentMotionTargetBuilder,
+        owner_identity: RealAgentMotionOwnerIdentity | None = None,
     ) -> None:
         self.config = config
         self._target_builder = target_builder
+        if owner_identity is not None and not isinstance(
+            owner_identity,
+            RealAgentMotionOwnerIdentity,
+        ):
+            raise TypeError("owner_identity must be typed or None.")
+        self._owner_identity = owner_identity
         self._lock = threading.Lock()
         self._revision = 0
         self._phase = RealAgentMotionPhase.INACTIVE
@@ -330,6 +446,103 @@ class RealAgentMotionPort:
         self._hold_applied_at: float | None = None
         self._hold_succeeded: bool | None = None
         self._fault: str | None = None
+        self._owner_attachment_evidence_ref: str | None = None
+        self._owner_token_id: str | None = None
+        self._owner_state_revision = 0
+        self._owner_execution_epoch = 1
+        self._latest_owner_cut: RealAgentMotionOwnerCut | None = None
+
+    def confirm_exclusive_attachment(self) -> str:
+        """Confirm that this port is the Session's sole command override."""
+
+        if not self.config.exclusive_command_claim:
+            raise RuntimeError("exclusive attachment requires exclusive_command_claim.")
+        if self._owner_identity is None:
+            raise RuntimeError("exclusive attachment requires owner_identity.")
+        with self._lock:
+            if self._owner_attachment_evidence_ref is not None:
+                return self._owner_attachment_evidence_ref
+            binding_hash = canonical_content_hash(
+                {
+                    "owner_identity_hash": self._owner_identity.semantic_content_hash,
+                    "active_sides": self.config.active_sides,
+                    "component_id_by_side": dict(self.config.component_id_by_side),
+                    "execution_frame_id": self.config.execution_frame_id,
+                    "execution_frame_spec_hash": (
+                        self.config.execution_frame_spec_hash
+                    ),
+                    "exclusive_command_claim": True,
+                },
+                domain="dexteleop.real_agent_motion.exclusive_attachment.v1",
+            )
+            self._owner_token_id = "real-agent-motion-owner:" + binding_hash
+            self._owner_attachment_evidence_ref = (
+                "real-agent-motion-exclusive-attachment:" + binding_hash
+            )
+            self._advance_revision()
+            return self._owner_attachment_evidence_ref
+
+    def publish_owner_state(
+        self,
+        *,
+        session: RealAgentMotionOwnerSession,
+        captured_at: float,
+    ) -> RealAgentMotionOwnerCut:
+        """Publish the actual Session/port ownership state for this loop cut."""
+
+        timestamp = _finite(captured_at, field_name="captured_at")
+        session_state = getattr(getattr(session, "state_machine", None), "state", None)
+        with self._lock:
+            if (
+                self._owner_identity is None
+                or self._owner_token_id is None
+                or self._owner_attachment_evidence_ref is None
+            ):
+                raise RuntimeError("real Agent owner is not exclusively attached.")
+            if self._phase == RealAgentMotionPhase.FAULTED or session_state in {
+                TeleopRunState.FAULT,
+                TeleopRunState.ESTOP,
+            }:
+                lifecycle_state, execution_gate = "fault", "fault"
+            elif (
+                session_state in {TeleopRunState.ARMED, TeleopRunState.RUNNING}
+                and self._phase
+                not in {
+                    RealAgentMotionPhase.HOLD_REQUESTED,
+                    RealAgentMotionPhase.HOLD_APPLYING,
+                    RealAgentMotionPhase.HELD,
+                }
+            ):
+                lifecycle_state, execution_gate = "running", "ready"
+            else:
+                lifecycle_state, execution_gate = "hold", "hold"
+            prior = self._latest_owner_cut
+            if prior is not None and timestamp < prior.captured_at:
+                raise ValueError("owner captured_at timestamp regressed.")
+            # This call is one actual owner-loop cut. Publish a fresh revision
+            # even when lifecycle labels are unchanged; otherwise a stable
+            # RUNNING state eventually becomes stale to the observer.
+            self._owner_state_revision += 1
+            cut = RealAgentMotionOwnerCut(
+                identity=self._owner_identity,
+                owner_token_id=self._owner_token_id,
+                owner_kind="realteleop_exclusive_agent_motion_port",
+                owner_generation=1,
+                authority_epoch=1,
+                execution_epoch=self._owner_execution_epoch,
+                lifecycle_state=lifecycle_state,
+                execution_gate=execution_gate,
+                owner_state_revision=self._owner_state_revision,
+                captured_at=timestamp,
+                attachment_evidence_ref=self._owner_attachment_evidence_ref,
+            )
+            self._latest_owner_cut = cut
+            self._advance_revision()
+            return cut
+
+    def latest_owner_state(self) -> RealAgentMotionOwnerCut | None:
+        with self._lock:
+            return self._latest_owner_cut
 
     def _advance_revision(self) -> None:
         self._revision += 1
@@ -608,6 +821,7 @@ class RealAgentMotionPort:
             self._pending = None
             if hold_succeeded:
                 self._phase = RealAgentMotionPhase.HELD
+                self._owner_execution_epoch += 1
             else:
                 self._phase = RealAgentMotionPhase.FAULTED
                 self._fault = (
@@ -631,7 +845,11 @@ class RealAgentMotionPort:
                 RealAgentMotionPhase.INACTIVE,
                 RealAgentMotionPhase.HELD,
             }:
-                return None
+                return (
+                    TeleopCommandOverride(command=None)
+                    if self.config.exclusive_command_claim
+                    else None
+                )
             if self._phase != RealAgentMotionPhase.ACTIVE:
                 return TeleopCommandOverride(command=None)
             assert self._active is not None
@@ -761,6 +979,8 @@ class RealAgentMotionPort:
 __all__ = [
     "RealAgentMotionActivation",
     "RealAgentMotionMeasuredPoseCut",
+    "RealAgentMotionOwnerCut",
+    "RealAgentMotionOwnerIdentity",
     "RealAgentMotionPhase",
     "RealAgentMotionPort",
     "RealAgentMotionPortConfig",

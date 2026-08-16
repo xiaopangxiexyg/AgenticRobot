@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 import agent_gateway.profiles.mujoco.motion_deployment as deployment
-from collection_runtime.source_observation_history import SQLiteSourceObservationHistoryStore
+from collection_runtime.source_observation_history import (
+    SourceObservationHistoryBinding,
+    SQLiteSourceObservationHistoryStore,
+)
 from agent_gateway.profiles.mujoco.motion_application import (
     MujocoAgentSkillMotionApplication,
 )
@@ -215,6 +218,17 @@ def _build_application(monkeypatch):
     return application, state
 
 
+def _history_binding(*, runtime_session_id: str) -> SourceObservationHistoryBinding:
+    return SourceObservationHistoryBinding(
+        source_id="planning-history.test-source.v1",
+        runtime_session_id=runtime_session_id,
+        clock_domain_id="clock:history-partition",
+        channels=("tcp_pose",),
+        capture_profile_hash="profile:history-partition",
+        source_contract={"contract_id": "history-partition-test.v1"},
+    )
+
+
 def _history_profile() -> MujocoAgentTcpPoseHistoryProfile:
     return MujocoAgentTcpPoseHistoryProfile(
         max_samples=4,
@@ -407,6 +421,28 @@ def test_factory_history_storage_config_is_explicit_and_side_effect_free(
     config = MujocoAgentTcpPoseHistoryStorageConfig(root=root)
     assert config.root == root
     assert not root.exists()
+
+
+def test_factory_history_storage_partitions_exact_source_bindings(
+    tmp_path: Path,
+) -> None:
+    first = _history_binding(runtime_session_id="runtime:history-partition:first")
+    second = _history_binding(runtime_session_id="runtime:history-partition:second")
+    config = MujocoAgentTcpPoseHistoryStorageConfig(
+        root=(tmp_path / "history-catalog").resolve()
+    )
+
+    first_root = config.store_root_for(first)
+    second_root = config.store_root_for(second)
+
+    assert first_root == (
+        config.root / "source_bindings" / first.semantic_content_hash
+    )
+    assert second_root == (
+        config.root / "source_bindings" / second.semantic_content_hash
+    )
+    assert first_root != second_root
+    assert not config.root.exists()
 
 
 def test_collection_history_module_keeps_source_and_application_boundaries() -> None:
