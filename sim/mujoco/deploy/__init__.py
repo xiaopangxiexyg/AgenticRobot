@@ -1,5 +1,7 @@
 """Deployable MuJoCo frontend using the shared authoritative control core."""
 
+from importlib import import_module
+
 from .contact_trace import (
     MUJOCO_CONTACT_GUARD_ID_V1,
     project_mujoco_forbidden_contact_guard_result,
@@ -25,18 +27,6 @@ from .pose_kinematics import (
     MujocoPoseKinematicsBinding,
     MujocoPoseObservationProjector,
     build_mujoco_pose_observation_projector,
-)
-from .execution_difference import (
-    MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID,
-    MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH,
-    MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID,
-    MujocoExecutionDifferenceObserver,
-    MujocoExecutionDifferenceSnapshot,
-    build_mujoco_qpos_execution_difference_observation,
-    project_mujoco_execution_measurement_observation,
-    project_mujoco_immediate_execution_reference_sample,
-    project_mujoco_execution_reference_frame,
-    project_mujoco_execution_reference_sample,
 )
 from .component_action_profile import (
     MujocoComponentActionRobotActionV1Materializer,
@@ -71,7 +61,6 @@ from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
     ResolvedQposReferenceAdmissionResult,
 )
-from .composition_binding import MujocoCompositionRuntimeConfig
 from .rtc_policy import (
     DeterministicVirtualPolicyRtcRunner,
     VirtualBimanualQposPolicy,
@@ -100,6 +89,41 @@ from .policy_rollout import (
     MujocoPolicyRolloutConfig,
     MujocoPolicyRolloutError,
 )
+
+
+_LAZY_EXPORTS = {
+    "MujocoCompositionRuntimeConfig": (
+        ".composition_binding",
+        "MujocoCompositionRuntimeConfig",
+    ),
+    **{
+        name: (".execution_difference", name)
+        for name in (
+            "MUJOCO_QPOS_EXECUTION_DIFFERENCE_CAPABILITY_ID",
+            "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_HASH",
+            "MUJOCO_QPOS_EXECUTION_DIFFERENCE_PAYLOAD_CONTRACT_ID",
+            "MujocoExecutionDifferenceObserver",
+            "MujocoExecutionDifferenceSnapshot",
+            "build_mujoco_qpos_execution_difference_observation",
+            "project_mujoco_execution_measurement_observation",
+            "project_mujoco_immediate_execution_reference_sample",
+            "project_mujoco_execution_reference_frame",
+            "project_mujoco_execution_reference_sample",
+        )
+    },
+}
+
+
+def __getattr__(name: str):
+    """Load opt-in composition integrations only when requested."""
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = target
+    value = getattr(import_module(module_name, __name__), attribute_name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "build_mujoco_pose_action_schema",

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import numpy as np
 
@@ -48,7 +48,8 @@ from robot_motion.position_control import (
 )
 from robot_motion.rm65 import endpoint_to_tool_transform, load_rm65_tool_profile
 
-from .composition_binding import MujocoCompositionRuntimeConfig
+if TYPE_CHECKING:
+    from .composition_binding import MujocoCompositionRuntimeConfig
 
 
 _POSITION_CONTROL_PROFILES_BY_NAME = {
@@ -391,6 +392,8 @@ def build_mujoco_sim_hil_target(
     opaque binding.  This target factory only uses its already-built strategy
     and compound authority profile; it does not define composition semantics.
     """
+
+    from .composition_binding import MujocoCompositionRuntimeConfig
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
