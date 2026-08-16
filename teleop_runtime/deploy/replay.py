@@ -40,6 +40,7 @@ from robot_motion.replay.trajectory import (
 )
 
 from ..collection.schema_v21 import chunk_id_from_episode_index, episode_id_from_index
+from ..execution_mode_contract import validate_dataset_arm_control_mode
 from .policy import LoadedPolicy
 
 
@@ -1338,6 +1339,53 @@ class DatasetReplayPolicy:
                 "output_pose_mode": self.output_pose_mode,
             },
         }
+
+
+def debug_replay_execution_exhausted(
+    policy: Any,
+    *,
+    queued_actions: int,
+) -> bool:
+    """Stop non-loop replay after its decoded final chunk is consumed."""
+
+    wrapped_policy = getattr(policy, "policy", policy)
+    if not isinstance(wrapped_policy, DatasetReplayPolicy):
+        return False
+    return (
+        not bool(wrapped_policy.loop)
+        and bool(wrapped_policy.finished)
+        and int(queued_actions) <= 0
+    )
+
+
+def skip_startup_replay_frames(policy: Any, count: int = 1) -> int:
+    """Advance a replay source when it supports startup-frame skipping."""
+
+    wrapped_policy = getattr(policy, "policy", policy)
+    skip = getattr(wrapped_policy, "skip_startup_frames", None)
+    if not callable(skip):
+        return 0
+    return int(skip(count))
+
+
+def bind_debug_replay_arm_control_mode(
+    policy: Any,
+    *,
+    selected_mode: Any,
+    hardware_output: bool,
+) -> tuple[dict[str, Any], str | None]:
+    """Validate replay execution mode and bind its receipt to policy metadata."""
+
+    contract = validate_dataset_arm_control_mode(
+        getattr(policy, "metadata", {}),
+        selected_mode=selected_mode,
+        hardware_output=bool(hardware_output),
+    )
+    payload = contract.to_dict()
+    metadata = getattr(policy, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata["dataset_arm_control_mode_contract"] = dict(payload)
+    return payload, contract.warning
 
 
 def _restrict_replay_end_effector_metadata(

@@ -482,3 +482,48 @@ class StartupInitializer:
         state = "done" if self.completed else ("wait" if self.started_at is None else f"{100.0 * self.progress:.0f}%")
         wait_suffix = "" if self.completed or not self.wait_reason else f",wait={self.wait_reason}"
         return f"init={state}:{self.source}{wait_suffix}"
+
+
+def reset_startup_initializer(
+    startup_initializer: StartupInitializer,
+    *,
+    current_pose_start_allowed: bool,
+) -> bool:
+    """Reset startup init without inventing motion for an allowed current start.
+
+    ``init-source=current`` resolves its target from the same live observation
+    that supplies its start action.  When the caller has explicitly admitted a
+    current-qpos start, replaying that no-op through the Cartesian position
+    stream is both redundant and semantically wrong: it creates a new motion
+    stream without a source-plan cut.  Keep non-current startup targets intact.
+    """
+
+    startup_initializer.reset()
+    current_startup_satisfied = (
+        bool(current_pose_start_allowed)
+        and startup_initializer.enabled
+        and str(startup_initializer.source).strip().lower() == "current"
+    )
+    if current_startup_satisfied:
+        startup_initializer.mark_complete()
+    return current_startup_satisfied
+
+
+def finish_policy_qpos_init_reference_cut(
+    startup_initializer: StartupInitializer,
+) -> tuple[np.ndarray, bool]:
+    """Cut dataset-frame pose history before live Cartesian execution.
+
+    The caller suppresses action generation for the qpos-init completion loop.
+    An all-NaN ``last_action`` then makes the freshly sampled observation in
+    the next loop the safety/reference anchor. A ``current`` startup init is a
+    no-op after qpos init, so it is completed without submitting that same pose
+    through IK for another initialization interval.
+    """
+
+    last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
+    current_startup_satisfied = reset_startup_initializer(
+        startup_initializer,
+        current_pose_start_allowed=True,
+    )
+    return last_action, current_startup_satisfied

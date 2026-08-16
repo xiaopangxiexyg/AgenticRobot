@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+from teleop_runtime.deploy import impedance_runtime
 from teleop_runtime.deploy.run_policy import (
     enable_impedance_force_control_backends,
     warm_start_impedance_force_control_backends,
 )
+
+
+def test_run_policy_preserves_impedance_runtime_exports() -> None:
+    assert (
+        enable_impedance_force_control_backends
+        is impedance_runtime.enable_impedance_force_control_backends
+    )
+    assert (
+        warm_start_impedance_force_control_backends
+        is impedance_runtime.warm_start_impedance_force_control_backends
+    )
 
 
 class _FakeImpedanceBackend:

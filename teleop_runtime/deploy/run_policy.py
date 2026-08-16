@@ -73,9 +73,6 @@ from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
     build_deployment_observation,
 )
-from robot_motion.deploy.observation_view import (
-    default_deploy_policy_observation_contract,
-)
 from robot_motion.deploy.pose_adapter import (
     convert_policy_absolute_vector_to_runtime_raw,
 )
@@ -94,7 +91,6 @@ from robot_motion.deploy.session_contract import (
     POLICY_CONTRACT_V22_NATIVE,
     RuntimeEndEffectorCapability,
     resolve_deploy_session_contract,
-    resolve_policy_action_pose_mode_from_artifact,
 )
 from robot_motion.pose_frame_profiles import (
     default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
@@ -195,7 +191,6 @@ from ..defaults import (
     DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
     DEFAULT_TELEOP_SAMPLE_HZ,
 )
-from ..execution_mode_contract import validate_dataset_arm_control_mode
 from ..hand_mapping import parse_tactile_regions
 from ..interfaces import EffectorBackend
 from ..log_utils import ChangeGate
@@ -343,20 +338,35 @@ from .impedance_force_guard import (
     ImpedanceForceGuardMonitor,
     bimanual_emergency_stop,
 )
+from .impedance_runtime import (
+    enable_impedance_force_control_backends,
+    warm_start_impedance_force_control_backends,
+)
 from .policy_qpos_init import (
     DeployPolicyQposInitController,
     DeployPolicyQposInitSettings,
     load_deploy_policy_qpos_init_plan,
 )
+from .policy_binding import (
+    bind_policy_pose_mode_from_artifact as _bind_policy_pose_mode_from_artifact,
+    build_policy_observation_contract as _policy_observation_contract,
+)
 from .position_plan_cut import (
     DeploymentPositionPlanCutDetector,
     prepare_position_plan_cut_for_action_step as _prepare_position_plan_cut_for_action_step,
 )
+from .position_stream_handoff import (
+    defer_position_action_after_synchronous_prediction as _defer_position_action_after_synchronous_prediction,
+    hold_active_position_stream_for_synchronous_chunk_gap as _hold_active_position_stream_for_synchronous_chunk_gap,
+    position_source_tail_pending_before_synchronous_chunk_gap as _position_source_tail_pending_before_synchronous_chunk_gap,
+)
 from .replay import (
-    DatasetReplayPolicy,
+    bind_debug_replay_arm_control_mode,
+    debug_replay_execution_exhausted as _debug_replay_execution_exhausted,
     infer_replay_action_hz,
     load_dataset_replay_policy,
     resolve_replay_parquet_path,
+    skip_startup_replay_frames as _skip_startup_replay_frames,
 )
 from .resource_lifecycle import PolicyDeployResourceLifecycle
 from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
@@ -383,7 +393,12 @@ from .rtc_step_fanout import (
     RtcPolicyEmissionPublisher,
 )
 from .safety_shadow import evaluate_policy_legacy_aligned_safety
-from .startup_init import StartupInitializer, resolve_startup_init_action
+from .startup_init import (
+    StartupInitializer,
+    finish_policy_qpos_init_reference_cut as _finish_policy_qpos_init_reference_cut,
+    reset_startup_initializer as _reset_startup_initializer,
+    resolve_startup_init_action,
+)
 
 DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 # Deployment runs the vision policy at roughly 15 Hz on the RM65 profile.  A
@@ -3433,60 +3448,6 @@ def request_policy_inference_soft_hold(
     return receipts
 
 
-def _defer_position_action_after_synchronous_prediction(
-    *,
-    prediction_accepted: bool,
-    position_executor_enabled: bool,
-) -> bool:
-    """Keep a newly predicted position chunk for the next observation cut.
-
-    Legacy policy inference is synchronous.  A slow inference therefore ages
-    the observation that was used to request it, even though the model output
-    itself remains valid.  The first position command must not reuse that
-    frozen observation as the authoritative collision-planner reset state.
-    Deferring consumption by one control-loop iteration lets the frontend
-    acquire a fresh dual-arm measurement without weakening collision-reset
-    freshness or changing the queued action chunk.
-    """
-
-    return bool(prediction_accepted and position_executor_enabled)
-
-
-def _hold_active_position_stream_for_synchronous_chunk_gap(
-    position_executor: PositionDeployExecutor | None,
-) -> bool:
-    """End an exhausted synchronous chunk without faulting its executor.
-
-    The legacy OpenPI client performs inference synchronously.  With a full
-    chunk execution policy, the position stream can therefore be active while
-    the policy queue has just become empty.  Waiting for inference inside that
-    active stream would trip the executor's missing-keyframe watchdog.  Clear
-    the stream first so the arms enter the existing bounded Hold path; the next
-    chunk must then establish a fresh collision reset before it can move.
-    """
-
-    if position_executor is None:
-        return False
-    tail_status = position_executor.source_tail_drain_status()
-    if bool(tail_status.get("required")) and not bool(tail_status.get("drained")):
-        return False
-    if not bool(position_executor.snapshot().get("active")):
-        return False
-    position_executor.clear()
-    return True
-
-
-def _position_source_tail_pending_before_synchronous_chunk_gap(
-    position_executor: PositionDeployExecutor | None,
-) -> bool:
-    """Keep the upper chunk boundary open until motion emitted its tail."""
-
-    if position_executor is None:
-        return False
-    status = position_executor.source_tail_drain_status()
-    return bool(status.get("required")) and not bool(status.get("drained"))
-
-
 def emergency_stop_deploy_arm_backends(
     arm_backends: Mapping[str, EffectorBackend],
     *,
@@ -3651,188 +3612,18 @@ def _send_legacy_deployment_action_commands(
             hand_backend.send_command(hand_command)
 
 
-def enable_impedance_force_control_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    ready_timeout_sec: float = 1.0,
-) -> None:
-    for side, backend in arm_backends.items():
-        enable = getattr(backend, "enable_force_control", None)
-        if not callable(enable):
-            continue
-        enable()
-        wait_ready = getattr(backend, "wait_until_force_control_ready", None)
-        if callable(wait_ready):
-            wait_ready(timeout_sec=float(ready_timeout_sec))
-        print(f"[Deploy] {side} impedance force control enabled.", flush=True)
-
-
-def warm_start_impedance_force_control_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-) -> tuple[str, ...]:
-    """Prepare impedance controllers without starting their periodic output loops.
-
-    The pose-impedance backend performs force-sensor setup and captures its
-    initial safe reference in ``warm_start_force_control``.  Starting the
-    40 Hz loop is deliberately a separate, explicit action: otherwise a
-    deployment which is still waiting for ``g`` would already issue hold
-    commands and continuously run IK.
-    """
-
-    warmed_sides: list[str] = []
-    for side, backend in arm_backends.items():
-        warm_start = getattr(backend, "warm_start_force_control", None)
-        if not callable(warm_start):
-            continue
-        warm_start()
-        warmed_sides.append(str(side))
-    return tuple(warmed_sides)
-
-
-def _debug_replay_execution_exhausted(policy: Any, *, queued_actions: int) -> bool:
-    """Stop non-loop replay after its already-decoded final chunk is consumed."""
-
-    wrapped_policy = getattr(policy, "policy", policy)
-    if not isinstance(wrapped_policy, DatasetReplayPolicy):
-        return False
-    return (
-        not bool(wrapped_policy.loop)
-        and bool(wrapped_policy.finished)
-        and int(queued_actions) <= 0
-    )
-
-
-def _skip_startup_replay_frames(policy: Any, count: int = 1) -> int:
-    wrapped_policy = getattr(policy, "policy", policy)
-    skip = getattr(wrapped_policy, "skip_startup_frames", None)
-    if not callable(skip):
-        return 0
-    return int(skip(count))
-
-
 def _validate_debug_replay_arm_control_mode(
     policy: Any,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    contract = validate_dataset_arm_control_mode(
-        getattr(policy, "metadata", {}),
+    payload, warning = bind_debug_replay_arm_control_mode(
+        policy,
         selected_mode=args.arm_control_mode,
         hardware_output=bool(args.send_actions),
     )
-    payload = contract.to_dict()
-    metadata = getattr(policy, "metadata", None)
-    if isinstance(metadata, dict):
-        metadata["dataset_arm_control_mode_contract"] = dict(payload)
-    if contract.warning:
-        print(f"[ReplayMode] WARNING: {contract.warning}", flush=True)
+    if warning:
+        print(f"[ReplayMode] WARNING: {warning}", flush=True)
     return payload
-
-
-def _bind_policy_pose_mode_from_artifact(
-    args: argparse.Namespace,
-    policy_artifact: Any,
-    *,
-    raw_argv: list[str],
-) -> None:
-    """Compatibility wrapper around the shared artifact binding contract."""
-
-    explicit = any(
-        token == "--policy-action-pose-mode"
-        or token.startswith("--policy-action-pose-mode=")
-        for token in raw_argv
-    )
-    args.policy_action_pose_mode = resolve_policy_action_pose_mode_from_artifact(
-        policy_artifact,
-        configured_mode=str(args.policy_action_pose_mode),
-        explicit=explicit,
-    )
-
-
-def _policy_observation_contract(
-    *,
-    policy: Any,
-    policy_artifact: Any,
-    deploy_layout: Any,
-    pose_mode: str,
-) -> Any:
-    """Bind the strict actor view to this artifact/layout and its adapter needs."""
-
-    effective_layout = deploy_layout
-    if effective_layout is None:
-        wrapped_policy = getattr(policy, "policy", None)
-        policy_config = getattr(wrapped_policy, "config", None)
-        effective_layout = getattr(policy_config, "policy_io_layout", None)
-    hand_state_keys: set[str] = set()
-    if effective_layout is not None:
-        for side in ALL_SIDES:
-            spec = effective_layout.end_effector(side)
-            if spec.present:
-                hand_state_keys.add(str(spec.state_source_field))
-            channel = effective_layout.channel("state", side)
-            for token in channel.tokens:
-                if token.source_metadata_key:
-                    hand_state_keys.add(str(token.source_metadata_key))
-
-    if policy_artifact is not None:
-        artifact_hash = canonical_content_hash(
-            policy_artifact.to_dict(),
-            domain="dexteleop.policy_observation_artifact_binding.v1",
-        )
-        binding_id = f"artifact={artifact_hash}"
-    elif effective_layout is not None:
-        binding_id = f"layout={effective_layout.layout_hash};model=unversioned"
-    else:
-        binding_id = f"policy={getattr(policy, 'name', 'unknown')}"
-    return default_deploy_policy_observation_contract(
-        binding_id=binding_id,
-        last_action_pose_mode=str(pose_mode),
-        compatibility_hand_state_keys=tuple(sorted(hand_state_keys)),
-    )
-
-
-def _reset_startup_initializer(
-    startup_initializer: StartupInitializer,
-    *,
-    current_pose_start_allowed: bool,
-) -> bool:
-    """Reset startup init without inventing motion for an allowed current start.
-
-    ``init-source=current`` resolves its target from the same live observation
-    that supplies its start action.  When the caller has explicitly admitted a
-    current-qpos start, replaying that no-op through the Cartesian position
-    stream is both redundant and semantically wrong: it creates a new motion
-    stream without a source-plan cut.  Keep non-current startup targets intact.
-    """
-
-    startup_initializer.reset()
-    current_startup_satisfied = (
-        bool(current_pose_start_allowed)
-        and startup_initializer.enabled
-        and str(startup_initializer.source).strip().lower() == "current"
-    )
-    if current_startup_satisfied:
-        startup_initializer.mark_complete()
-    return current_startup_satisfied
-
-
-def _finish_policy_qpos_init_reference_cut(
-    startup_initializer: StartupInitializer,
-) -> tuple[np.ndarray, bool]:
-    """Cut dataset-frame pose history before live Cartesian execution.
-
-    The caller suppresses action generation for the qpos-init completion loop.
-    An all-NaN ``last_action`` then makes the freshly sampled observation in
-    the next loop the safety/reference anchor. A ``current`` startup init is a
-    no-op after qpos init, so it is completed without submitting that same pose
-    through IK for another initialization interval.
-    """
-
-    last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
-    current_startup_satisfied = _reset_startup_initializer(
-        startup_initializer,
-        current_pose_start_allowed=True,
-    )
-    return last_action, current_startup_satisfied
 
 
 def _announce_policy_qpos_init_complete(
