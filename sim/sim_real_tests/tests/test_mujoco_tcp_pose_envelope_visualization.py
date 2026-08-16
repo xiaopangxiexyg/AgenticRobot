@@ -17,6 +17,9 @@ from sim.sim_real_tests.mujoco.view_tcp_pose_envelope import (  # noqa: E402
 )
 
 
+pytestmark = [pytest.mark.integration, pytest.mark.optional]
+
+
 class _FakeViewerHandle:
     def __init__(self, user_scene) -> None:
         self.user_scn = user_scene

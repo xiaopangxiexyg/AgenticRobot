@@ -217,6 +217,7 @@ def _write_exact_pose_log(path: Path) -> Path:
     return path
 
 
+@pytest.mark.slow_sim
 def test_exact_pose_force_trace_passes_shared_ik_closed_loop(
     tmp_path: Path,
 ) -> None:
@@ -257,6 +258,7 @@ def test_exact_pose_force_trace_passes_shared_ik_closed_loop(
     assert config["max_output_slew_m_s"] == (0.005,) * 3
 
 
+@pytest.mark.slow_sim
 def test_exact_pose_force_trace_passes_normal_profile_shared_ik_closed_loop(
     tmp_path: Path,
 ) -> None:

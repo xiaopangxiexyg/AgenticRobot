@@ -196,6 +196,7 @@ def test_fk_pose_observations_keep_qpos_and_model_lineage() -> None:
     assert MUJOCO_FK_POSE_MEASUREMENT_STAGE_ID == "mujoco.measured_qpos_fk_pose"
 
 
+@pytest.mark.slow_sim
 def test_sim_hil_target_binds_and_emits_requested_fk_pose_measurement() -> None:
     class Sink:
         def __init__(self) -> None:

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from sim.sim_real_tests.core import SimRealScenarioResult
 from sim.sim_real_tests.rm65 import load_random_pose_ik_transition_config
+
+
+pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
 def test_scenario_result_is_json_ready() -> None:

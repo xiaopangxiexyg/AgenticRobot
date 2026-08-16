@@ -497,6 +497,7 @@ def test_policy_skill_target_rejects_unbound_policy_ingress_before_prepare() -> 
         )
 
 
+@pytest.mark.slow_sim
 def test_native_component_profile_reaches_one_atomic_mujoco_target() -> None:
     target_config = MujocoSimHILTargetConfig(
         task_config_path=Path(

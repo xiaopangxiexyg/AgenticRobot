@@ -12,6 +12,9 @@ from sim.sim_real_tests.rm65 import (  # noqa: E402
 )
 
 
+pytestmark = [pytest.mark.integration, pytest.mark.optional]
+
+
 def test_random_reachable_pose_ik_then_collision_safe_qpos_transition() -> None:
     result = run_random_pose_ik_qpos_transition(
         RM65RandomPoseIkTransitionConfig(seed=17, sample_count=2)

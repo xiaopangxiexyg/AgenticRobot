@@ -814,6 +814,7 @@ def test_single_vive_gripper_source_contract_uses_target_component_ids() -> None
 
 
 @pytest.mark.optional
+@pytest.mark.slow_sim
 def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
     monkeypatch,
     tmp_path: Path,

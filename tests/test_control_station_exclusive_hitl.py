@@ -26,7 +26,7 @@ from tests.test_control_station_sim_hil_device_adapters import (
 )
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.unit, pytest.mark.contract, pytest.mark.slow_sim]
 
 
 class _ResetCountingVirtualPolicy(_VirtualAllocationPolicySource):

@@ -112,6 +112,7 @@ def test_identified_dmtac_profile_freezes_bilateral_stage_semantics() -> None:
     assert profile.contact_tuning.solimp is None
 
 
+@pytest.mark.slow_sim
 def test_gripper_executor_delays_then_acceleration_limits_force_limited_ctrl() -> None:
     pytest.importorskip("mujoco")
     scene, _arm_profile, profile = _scene()
@@ -156,6 +157,7 @@ def test_gripper_executor_delays_then_acceleration_limits_force_limited_ctrl() -
     assert np.all(scene.model.actuator_forcerange[actuator_ids, 1] == 20.0)
 
 
+@pytest.mark.slow_sim
 def test_identified_executor_full_stroke_matches_trace_envelope_on_both_sides() -> None:
     pytest.importorskip("mujoco")
     scene, _arm_profile, profile = _scene()
@@ -193,6 +195,7 @@ def test_identified_executor_full_stroke_matches_trace_envelope_on_both_sides() 
     assert full_measured_time == {"left": 0.850, "right": 0.904}
 
 
+@pytest.mark.slow_sim
 def test_gripper_hold_cancels_commands_still_in_transport_delay() -> None:
     pytest.importorskip("mujoco")
     scene, _arm_profile, profile = _scene()
@@ -212,6 +215,7 @@ def test_gripper_hold_cancels_commands_still_in_transport_delay() -> None:
     assert executor.snapshot()["pending_delayed_targets"] == 0
 
 
+@pytest.mark.slow_sim
 def test_15_60_120_rig_dispatches_q6_gripper_on_same_physics_owner() -> None:
     pytest.importorskip("mujoco")
     scene, arm_profile, gripper_profile = _scene()
@@ -271,6 +275,7 @@ def test_15_60_120_rig_dispatches_q6_gripper_on_same_physics_owner() -> None:
     rig.close()
 
 
+@pytest.mark.slow_sim
 def test_scheduled_q6_gripper_waits_for_guarded_arm_reference_activation() -> None:
     pytest.importorskip("mujoco")
     scene, arm_profile, gripper_profile = _scene()
@@ -344,6 +349,7 @@ def test_scheduled_q6_gripper_waits_for_guarded_arm_reference_activation() -> No
 
 
 @pytest.mark.parametrize("hold_before_activation", [False, True])
+@pytest.mark.slow_sim
 def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
     hold_before_activation: bool,
     tmp_path,

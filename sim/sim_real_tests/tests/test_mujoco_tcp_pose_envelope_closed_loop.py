@@ -12,6 +12,10 @@ from sim.sim_real_tests.mujoco import (  # noqa: E402
 )
 
 
+pytestmark = [pytest.mark.integration, pytest.mark.optional]
+
+
+@pytest.mark.slow_sim
 def test_active_tcp_pose_envelope_in_physical_position_chain() -> None:
     result = run_tcp_pose_envelope_active_closed_loop()
 

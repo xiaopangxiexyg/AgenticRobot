@@ -74,6 +74,7 @@ def test_physical_cube_lift_uses_tcp_pose_action_contract() -> None:
 
 
 @pytest.mark.optional
+@pytest.mark.slow_sim
 def test_scene_freejoint_helper_resets_center_cube_and_reports_table_contact() -> None:
     pytest.importorskip("mujoco")
     config = CubeLiftTaskConfig.load(TASK_CONFIG_PATH)
@@ -254,6 +255,7 @@ def test_normal_v2_lift_requires_bilateral_finger_contact() -> None:
 
 
 @pytest.mark.optional
+@pytest.mark.slow_sim
 def test_cube_lift_hundred_random_headless_resets_remain_finite() -> None:
     pytest.importorskip("gymnasium")
     rng = np.random.default_rng(20260715)
