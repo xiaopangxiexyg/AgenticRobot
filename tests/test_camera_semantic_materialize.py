@@ -180,6 +180,11 @@ def _write_source_dataset(root: Path) -> tuple[Path, Path]:
                 * 3,
                 "observation.wrist_camera.left.pose_base": [[1.0] * 7] * 3,
                 "observation.wrist_camera.right.pose_base": [[2.0] * 7] * 3,
+                "observation.numeric.nan_probe": [
+                    [1.0, float("nan")],
+                    [2.0, 3.0],
+                    [float("nan"), 4.0],
+                ],
             }
         ),
         root / parquet,

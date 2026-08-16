@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -168,6 +169,35 @@ def _legacy_info(root: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
+def _semantic_value_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return left.keys() == right.keys() and all(
+            _semantic_value_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _semantic_value_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    try:
+        if math.isnan(left) and math.isnan(right):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return bool(left == right)
+
+
+def _arrow_column_semantically_equal(expected: Any, corrected: Any) -> bool:
+    if expected.type != corrected.type:
+        return False
+    if expected.equals(corrected):
+        return True
+    # Arrow treats equal-position NaN values as unequal. Materialization reads
+    # and rewrites Parquet, so compare decoded values while admitting only that
+    # one IEEE semantic equivalence; every finite/non-numeric value stays exact.
+    return _semantic_value_equal(expected.to_pylist(), corrected.to_pylist())
+
+
 def _require_legacy_parquet_pair(
     source: Path,
     corrected: Path,
@@ -263,7 +293,9 @@ def _require_legacy_parquet_pair(
             else:
                 expected_column = source_column.combine_chunks()
             corrected_column = corrected_table.column(corrected_name).combine_chunks()
-            if not expected_column.equals(corrected_column):
+            if not _arrow_column_semantically_equal(
+                expected_column, corrected_column
+            ):
                 raise CameraSemanticPromotionError(
                     f"Legacy episode {episode_index} column {corrected_name!r} "
                     "differs from the exact camera-semantic transform"
