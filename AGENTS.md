@@ -147,6 +147,13 @@ the M2 local exact-clean Run boundary documented in
 Profiles in detached snapshots; it does not create dirty snapshots, synchronize
 checkouts, contact remote hosts, allocate GPU/service/device resources, or grant
 device authority. `./dev` is the repository-local quick test/doctor adapter.
+M3a adds only `lab sync inspect|fetch` plus a library-only guarded
+fast-forward primitive as documented in
+`docs/architecture/lab_m3a_stable_sync.md`. Fetch may update protected
+remote-tracking refs, but it must not move stable checkouts, recurse into
+submodules, enable LFS smudge, or transfer Task/runtime content. Automatic
+checkout application remains unavailable until the runtime maintenance gate is
+implemented and deployed.
 
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,

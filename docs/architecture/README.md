@@ -7,6 +7,7 @@
 - [数采、一般部署、混合控制与仿真的运行域边界](./runtime_domain_boundaries.md)
 - [`lab` M1：项目无关的多仓 Task Workspace](./lab_m1_task_workspace.md)
 - [`lab` M2：本地 exact clean Run](./lab_m2_local_runs.md)
+- [`lab` M3a：commit-based stable sync](./lab_m3a_stable_sync.md)
 
 ## 文档边界
 

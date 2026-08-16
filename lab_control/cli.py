@@ -15,6 +15,7 @@ from .inspection import (
     enrich_change_inspection,
     enrich_task_inspection,
 )
+from .project_sync import fetch_project_sync, plan_project_sync
 from .runs import CANDIDATE_EVIDENCE_TIER, DEVELOPMENT_EVIDENCE_TIER, RunManager
 from .workspace import LabError, TaskPlan, WorkspaceManager
 from .writer_lease import WriterLeaseManager
@@ -103,6 +104,21 @@ def _build_parser() -> argparse.ArgumentParser:
     writer_release.add_argument("--actor", required=True)
     writer_release.add_argument("--lease-id", required=True)
     writer_release.add_argument("--json", action="store_true")
+
+    sync = subcommands.add_parser(
+        "sync",
+        help="inspect or fetch Git metadata without moving any checkout",
+    )
+    sync_commands = sync.add_subparsers(dest="sync_command", required=True)
+    for command_name, help_text in (
+        ("inspect", "inspect stable refs, gitlinks and active Task writers"),
+        ("fetch", "fetch stable refs without checkout, LFS or submodules"),
+    ):
+        command = sync_commands.add_parser(command_name, help=help_text)
+        command.add_argument("--repos", type=_repository_list)
+        if command_name == "fetch":
+            command.add_argument("--timeout-seconds", type=int, default=120)
+        command.add_argument("--json", action="store_true")
 
     open_parser = subcommands.add_parser(
         "open", help="open a Task workspace or an exact Run snapshot"
@@ -310,6 +326,38 @@ def _print_writer(payload: dict[str, object]) -> None:
     print(f"Lease: {payload.get('lease_id')}")
 
 
+def _print_sync(payload: dict[str, object]) -> None:
+    post_fetch = payload.get("post_fetch_plan")
+    plan = post_fetch if isinstance(post_fetch, dict) else payload
+    print(f"Project: {plan.get('project_id')}")
+    if payload.get("schema") == "lab.project-sync-fetch.v1":
+        print(f"Fetch: {payload.get('status')}")
+    print(f"Metadata readiness: {plan.get('fetch_status')}")
+    print(f"Stable checkout status: {plan.get('checkout_sync_status')}")
+    print("Fetch order: " + ", ".join(plan.get("fetch_order", [])))
+    repositories = plan.get("repositories")
+    if isinstance(repositories, dict):
+        for name in plan.get("fetch_order", []):
+            repository = repositories.get(name)
+            if not isinstance(repository, dict):
+                continue
+            writers = repository.get("active_writers")
+            writer_count = len(writers) if isinstance(writers, list) else 0
+            print(
+                f"  {name}: fetch={repository.get('fetch_action')} "
+                f"checkout={repository.get('checkout_sync_action')} "
+                f"writers={writer_count}"
+            )
+            blocker = repository.get("blocker")
+            if blocker:
+                print(f"    BLOCKED: {blocker}")
+    failures = payload.get("failures")
+    if isinstance(failures, dict):
+        for name, failure in failures.items():
+            print(f"  FETCH FAILED {name}: {failure}")
+    print("Checkout/worktree updates: none")
+
+
 def _print_run(payload: dict[str, object]) -> None:
     outcome = payload.get("outcome")
     classification = (
@@ -512,6 +560,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 _print_writer(payload)
             return 0
+
+        if arguments.command == "sync":
+            baseline_path = Path(
+                manager.environ.get(
+                    "LAB_BASELINE_LOCK",
+                    manager.control_repository / "stack" / "baseline.json",
+                )
+            ).expanduser().resolve()
+            sync_plan = plan_project_sync(
+                manager,
+                baseline_path=baseline_path,
+                repository_names=arguments.repos or (),
+            )
+            sync_payload = (
+                fetch_project_sync(
+                    manager,
+                    sync_plan,
+                    timeout_seconds=arguments.timeout_seconds,
+                )
+                if arguments.sync_command == "fetch"
+                else sync_plan
+            )
+            if arguments.json:
+                _emit(sync_payload, as_json=True)
+            else:
+                _print_sync(sync_payload)
+            if arguments.sync_command == "fetch":
+                return 0 if sync_payload.get("status") == "COMPLETE" else 1
+            return 0 if sync_payload.get("fetch_status") == "READY" else 1
 
         if arguments.command == "open":
             if bool(arguments.task_id) == bool(arguments.run_id):

@@ -10,6 +10,9 @@
           "tests/test_lab_m1_workspace.py",
           "tests/test_lab_m2_runs.py",
           "tests/test_lab_writer_lease.py",
+          "tests/test_lab_stable_sync.py",
+          "tests/test_lab_project_sync.py",
+          "tests/test_lab_m3a_trusted_fetch.py",
           "integration/dev.json",
           "integration/project.json",
           "integration/environments/**",
@@ -17,7 +20,8 @@
           "stack/baseline.json",
           "stack/impact-rules.json",
           "docs/architecture/lab_m1_task_workspace.md",
-          "docs/architecture/lab_m2_local_runs.md"
+          "docs/architecture/lab_m2_local_runs.md",
+          "docs/architecture/lab_m3a_stable_sync.md"
         ]
       },
       "profiles": [
