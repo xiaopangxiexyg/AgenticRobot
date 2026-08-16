@@ -41,13 +41,6 @@ from .hand_spec import (
     hand_action_specs_metadata,
     normalize_hand_action_specs,
 )
-from .human_component_residual import (
-    HUMAN_COMPONENT_RESIDUAL_ADAPTER_HASH_DOMAIN_DEVELOPMENT,
-    HumanComponentResidualAdaptationReceipt,
-    HumanComponentResidualAdapter,
-    HumanComponentResidualAnchor,
-    HumanComponentResidualResult,
-)
 from .human_joint_residual import (
     HUMAN_JOINT_POSITION_RESIDUAL_ALGORITHM_DEVELOPMENT,
     HumanJointPositionResidualAdapter,
@@ -186,6 +179,13 @@ _LAZY_HUMAN_COMPOSITION_EXPORTS = {
     "adapt_human_emission_to_component_action",
     "adapt_human_emission_to_composition_input",
 }
+_LAZY_HUMAN_COMPONENT_RESIDUAL_EXPORTS = {
+    "HUMAN_COMPONENT_RESIDUAL_ADAPTER_HASH_DOMAIN_DEVELOPMENT",
+    "HumanComponentResidualAdaptationReceipt",
+    "HumanComponentResidualAdapter",
+    "HumanComponentResidualAnchor",
+    "HumanComponentResidualResult",
+}
 _LAZY_PASSIVE_TELEOP_EXPORTS = {
     "AttachablePassiveTeleopComponentSource",
     "PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1",
@@ -221,6 +221,10 @@ def __getattr__(name: str):
         from . import human_composition_input
 
         return getattr(human_composition_input, name)
+    if name in _LAZY_HUMAN_COMPONENT_RESIDUAL_EXPORTS:
+        from . import human_component_residual
+
+        return getattr(human_component_residual, name)
     if name in _LAZY_PASSIVE_TELEOP_EXPORTS:
         from . import passive_teleop
 
