@@ -271,8 +271,8 @@ class MujocoPolicyHumanAllocationBindingFactory:
             profile=self.station_profiles.allocation_context,
             allocation_runtime=allocation_runtime,
             publication_barrier=self.publication_barrier,
-            admit_context=runtime.submit_composition_context,
-            resolve_context=runtime.resolve_composition_context,
+            admit_context=runtime.composition_port.admit_composition_context,
+            resolve_context=runtime.composition_port.resolve_composition_context,
             worker_name=f"{bundle.config.profile_id}-allocation-context",
         )
         lifecycle_spec = bundle.composition_contracts.residual_anchor_lifecycle_spec
@@ -282,7 +282,7 @@ class MujocoPolicyHumanAllocationBindingFactory:
             profile=self.station_profiles.derived_input,
             activation_scope=activation_scope,
             publication_barrier=self.publication_barrier,
-            admit_batch=lambda batch: runtime.submit_composition_inputs(
+            admit_batch=lambda batch: runtime.composition_port.admit_composition_inputs(
                 batch,
                 activation_scope=activation_scope,
             ),
@@ -294,10 +294,12 @@ class MujocoPolicyHumanAllocationBindingFactory:
             ],
             lifecycle_scope_id=config.allocation_scope_id,
             lifecycle_spec=lifecycle_spec,
-            admit_lifecycle=lambda draft: runtime.submit_residual_anchor_lifecycle(
-                draft,
-                spec=lifecycle_spec,
-                activation_scope=activation_scope,
+            admit_lifecycle=lambda draft: (
+                runtime.composition_port.admit_residual_anchor_lifecycle(
+                    draft,
+                    spec=lifecycle_spec,
+                    activation_scope=activation_scope,
+                )
             ),
         )
         human_controller = MujocoPolicyHumanAllocationInputController(

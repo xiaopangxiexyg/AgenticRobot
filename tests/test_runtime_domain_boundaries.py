@@ -31,6 +31,53 @@ def _absolute_import_roots(path: Path) -> set[str]:
     return roots
 
 
+def _called_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            names.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            names.add(node.func.attr)
+    return names
+
+
+def _attribute_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+
+
+def _legacy_mujoco_composition_calls(path: Path) -> set[str]:
+    legacy_methods = {
+        "capture_composition_context_snapshot",
+        "evaluate_composition_shadow",
+        "resolve_composition_context",
+        "submit_composition_context",
+        "submit_composition_input",
+        "submit_composition_inputs",
+        "submit_composition_source_eligibility",
+        "submit_residual_anchor_lifecycle",
+    }
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    violations: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in legacy_methods:
+            continue
+        receiver = node.func.value
+        if not (
+            isinstance(receiver, ast.Attribute)
+            and receiver.attr == "composition_port"
+        ):
+            violations.add(node.func.attr)
+    return violations
+
+
 def _violations(
     root: Path,
     forbidden_roots: set[str],
@@ -140,3 +187,57 @@ def test_optional_sim_deploy_integrations_do_not_spread_into_simulation_core() -
         {"control_composition"},
         excluded=integration_files,
     ) == {}
+
+
+def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+    composition_binding = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "composition_binding.py"
+    )
+    implementation_constructors = {
+        "CompositionControlTraceEmitter",
+        "ControlCompositionRuntime",
+        "TimeWindowRetentionSpec",
+    }
+
+    assert _called_names(target_runtime).isdisjoint(implementation_constructors)
+    assert implementation_constructors <= _called_names(composition_binding)
+
+    runtime_tree = ast.parse(
+        target_runtime.read_text(encoding="utf-8"),
+        filename=str(target_runtime),
+    )
+    imported_symbols = {
+        alias.name
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "build_mujoco_composition_runtime_binding" in imported_symbols
+    assert imported_symbols.isdisjoint(implementation_constructors)
+
+
+def test_control_station_uses_explicit_mujoco_composition_port() -> None:
+    legacy_runtime_views = {
+        "_topology",
+        "composition_strategy_control",
+        "policy_topology",
+    }
+    violations = {
+        str(path.relative_to(REPO_ROOT)): sorted(
+            _attribute_names(path) & legacy_runtime_views
+        )
+        for path in _python_files(REPO_ROOT / "control_station")
+        if _attribute_names(path) & legacy_runtime_views
+    }
+
+    assert violations == {}
+
+    legacy_call_violations = {
+        str(path.relative_to(REPO_ROOT)): sorted(
+            _legacy_mujoco_composition_calls(path)
+        )
+        for path in _python_files(REPO_ROOT / "control_station")
+        if _legacy_mujoco_composition_calls(path)
+    }
+    assert legacy_call_violations == {}

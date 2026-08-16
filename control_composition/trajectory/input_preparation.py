@@ -10,14 +10,19 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Protocol, runtime_checkable
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action.component_action import ComponentAction
+from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
 
-from ..composition import CompositionInputAdmissionReceipt, CompositionSpec
+from ..activation import CompositionActivationScope
+from ..composition import (
+    CompositionInputAdmissionReceipt,
+    CompositionInputDraft,
+    CompositionSpec,
+)
 from ..composition.input_adapter import build_composition_input_draft
-from ..runtime import ControlCompositionRuntime
 from .contracts import (
     TRAJECTORY_EDITING_MODE_PASS_THROUGH,
     TRAJECTORY_EDITING_MODE_RESIDUAL_ACTIVE,
@@ -43,6 +48,22 @@ TRAJECTORY_COMPOSITION_INPUT_ADMISSION_MODES_DEVELOPMENT = frozenset(
 TRAJECTORY_COMPOSITION_INPUT_PREPARATION_STATUSES_DEVELOPMENT = frozenset(
     {"ready", "no_action", "invalid"}
 )
+
+
+@runtime_checkable
+class TrajectoryCompositionInputReceiver(Protocol):
+    """Minimum receiver surface needed for trajectory input preparation."""
+
+    runtime_session_id: str
+    control_domain_id: str
+    coordinator: ControlAdmissionCoordinator
+
+    def admit_composition_input(
+        self,
+        draft: CompositionInputDraft,
+        *,
+        activation_scope: CompositionActivationScope | None = None,
+    ) -> CompositionInputAdmissionReceipt: ...
 
 
 def _required(value: object, *, name: str) -> str:
@@ -247,7 +268,7 @@ def _result(
 
 
 def prepare_trajectory_composition_inputs(
-    runtime: ControlCompositionRuntime,
+    runtime: TrajectoryCompositionInputReceiver,
     *,
     state: TrajectoryEditingState,
     target_effective_at: float,
@@ -267,8 +288,10 @@ def prepare_trajectory_composition_inputs(
 ) -> TrajectoryCompositionInputPreparation:
     """Derive and admit one exact nominal/residual pair without evaluation."""
 
-    if not isinstance(runtime, ControlCompositionRuntime):
-        raise TypeError("runtime must be a ControlCompositionRuntime.")
+    if not isinstance(runtime, TrajectoryCompositionInputReceiver):
+        raise TypeError(
+            "runtime must implement TrajectoryCompositionInputReceiver."
+        )
     if not isinstance(state, TrajectoryEditingState):
         raise TypeError("state must be a TrajectoryEditingState.")
     if not isinstance(composition_spec, CompositionSpec):
@@ -557,6 +580,7 @@ __all__ = [
     "TRAJECTORY_COMPOSITION_INPUT_ADMISSION_MODES_DEVELOPMENT",
     "TRAJECTORY_COMPOSITION_INPUT_PREPARATION_HASH_DOMAIN_DEVELOPMENT",
     "TRAJECTORY_COMPOSITION_INPUT_PREPARATION_STATUSES_DEVELOPMENT",
+    "TrajectoryCompositionInputReceiver",
     "TrajectoryCompositionInputPreparation",
     "prepare_trajectory_composition_inputs",
 ]

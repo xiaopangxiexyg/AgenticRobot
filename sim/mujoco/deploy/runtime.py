@@ -9,9 +9,6 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 from dataset_contracts.control_trace import ControlTraceFact
-from dataset_interface.composition_control_trace import (
-    CompositionControlTraceEmitter,
-)
 from control_composition.activation import CompositionActivationScope
 from control_composition.information import CompositionInformationPlan
 from control_composition.eligibility import (
@@ -32,11 +29,7 @@ from control_composition.residual_anchor_lifecycle import (
     ResidualAnchorLifecycleDraft,
     ResidualAnchorLifecycleSpec,
 )
-from control_composition.retention import TimeWindowRetentionSpec
-from control_composition.runtime import (
-    CompositeProposalSubmission,
-    ControlCompositionRuntime,
-)
+from control_composition.runtime import CompositeProposalSubmission
 from dataset_contracts.replay import (
     REPLAY_EXECUTION_MODE_SIM_AUTHORITY,
     TargetRuntimeActionContract,
@@ -134,6 +127,7 @@ from robot_motion.deploy import (
 )
 
 from ..adapters import MujocoPositionExecutionRig
+from .composition_binding import build_mujoco_composition_runtime_binding
 from .measurement import (
     MujocoQposMeasurement,
     build_mujoco_backend_measurement,
@@ -1612,32 +1606,7 @@ class MujocoDeployRuntime:
                     rig,
                     **receiver_args,
                 )
-        self._composition_trace_emitter = CompositionControlTraceEmitter(
-            trace_context=self.core.trace_context,
-            trace_sink=self.core.record_external_facts,
-        )
-        composition_strategy_control = None
-        if composition_strategy_control_factory is not None:
-            if composition_strategy is None:
-                raise ValueError(
-                    "A composition strategy control factory requires a "
-                    "formal composition strategy."
-                )
-            composition_strategy_control = composition_strategy_control_factory(
-                self.core.coordinator,
-                self.core.producer_epochs,
-                float(clock()),
-            )
-            if not isinstance(
-                composition_strategy_control,
-                CompositionStrategyControl,
-            ):
-                raise TypeError(
-                    "composition_strategy_control_factory must return "
-                    "CompositionStrategyControl."
-                )
-        self.composition_strategy_control = composition_strategy_control
-        self.policy_topology = ControlCompositionRuntime(
+        self._composition_binding = build_mujoco_composition_runtime_binding(
             runtime_session_id=config.runtime_session_id,
             control_domain_id=config.control_domain_id,
             embodiment_instance_id=config.embodiment_instance_id,
@@ -1645,38 +1614,32 @@ class MujocoDeployRuntime:
             producer_epochs=self.core.producer_epochs,
             action_schema=self.action_schema,
             input_action_schema_by_role=(composition_input_action_schema_by_role),
-            event_emitter=self._composition_trace_emitter,
+            trace_context=self.core.trace_context,
+            trace_sink=self.core.record_external_facts,
             proposal_admitter=self.core.admit_proposal,
-            context_retention_spec=TimeWindowRetentionSpec(
-                spec_id="mujoco-composition-context-latest-v1",
-                history_window_sec=max(0.02, 1.0 / config.decision_hz),
-                max_future_lead_sec=1.0,
-                max_effective_duration_sec=1.0,
-                max_late_arrival_sec=0.0,
-            ),
-            composition_input_retention_spec=TimeWindowRetentionSpec(
-                spec_id="mujoco-composition-input-latest-v1",
-                history_window_sec=max(0.02, 1.0 / config.decision_hz),
-                max_future_lead_sec=1.0,
-                max_effective_duration_sec=1.0,
-                max_late_arrival_sec=0.0,
-            ),
-            source_eligibility_retention_spec=(
-                TimeWindowRetentionSpec(
-                    spec_id="mujoco-composition-source-eligibility-latest-v1",
-                    history_window_sec=max(0.02, 1.0 / config.decision_hz),
-                    max_future_lead_sec=1.0,
-                    max_effective_duration_sec=1.0,
-                    max_late_arrival_sec=0.0,
-                )
-                if config.enable_composition_source_eligibility
-                else None
+            decision_hz=config.decision_hz,
+            enable_source_eligibility=(
+                config.enable_composition_source_eligibility
             ),
             information_plan=config.composition_information_plan,
             composition_strategy=composition_strategy,
-            strategy_control=composition_strategy_control,
+            composition_strategy_control_factory=(
+                composition_strategy_control_factory
+            ),
             clock=clock,
+            started=lambda: bool(getattr(self, "_started", False)),
         )
+        self._composition_trace_emitter = (
+            self._composition_binding.trace_emitter
+        )
+        self.composition_strategy_control = (
+            self._composition_binding.strategy_control
+        )
+        self.composition_port = self._composition_binding
+        # Historical callers used ``policy_topology`` for the composition
+        # receiver. Keep it as an identity-preserving compatibility view while
+        # new application bindings use the role-specific port name.
+        self.policy_topology = self._composition_binding._topology
         self._started = False
         self._latest_target_execution_step: AuthoritativeControlStep | None = None
         self._last_dispatch_context: (
@@ -2477,7 +2440,7 @@ class MujocoDeployRuntime:
     def composition_strategy(self) -> FormalCompositionStrategy | None:
         """Expose the injected lower-owned composition implementation seam."""
 
-        return self.policy_topology.composition_strategy
+        return self.composition_port.composition_strategy
 
     def start(self) -> None:
         if self._started:
@@ -3109,9 +3072,7 @@ class MujocoDeployRuntime:
         return bundle
 
     def submit_composition_context(self, draft: CompositionContextDraft):
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.admit_composition_context(draft)
+        return self.composition_port.admit_composition_context(draft)
 
     def resolve_composition_context(self, context_id: str):
         """Resolve one admitted context for exact publisher reconciliation.
@@ -3120,9 +3081,7 @@ class MujocoDeployRuntime:
         retention, or reinterpret a duplicate admission.
         """
 
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.contexts.record_by_id(context_id)
+        return self.composition_port.resolve_composition_context(context_id)
 
     def capture_composition_context_snapshot(
         self,
@@ -3130,9 +3089,7 @@ class MujocoDeployRuntime:
         target_effective_at: float,
         required_channels: tuple[str, ...],
     ):
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.capture_composition_context_snapshot(
+        return self.composition_port.capture_composition_context_snapshot(
             target_effective_at=target_effective_at,
             required_channels=required_channels,
         )
@@ -3143,9 +3100,7 @@ class MujocoDeployRuntime:
         *,
         activation_scope: CompositionActivationScope | None = None,
     ):
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.admit_composition_input(
+        return self.composition_port.admit_composition_input(
             draft,
             activation_scope=activation_scope,
         )
@@ -3158,9 +3113,7 @@ class MujocoDeployRuntime:
     ):
         """Atomically admit one same-source multi-role composition batch."""
 
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.admit_composition_inputs(
+        return self.composition_port.admit_composition_inputs(
             batch,
             activation_scope=activation_scope,
         )
@@ -3169,9 +3122,7 @@ class MujocoDeployRuntime:
         self,
         draft: CompositionSourceEligibilityDraft,
     ):
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.admit_source_eligibility(draft)
+        return self.composition_port.admit_source_eligibility(draft)
 
     def submit_residual_anchor_lifecycle(
         self,
@@ -3182,9 +3133,7 @@ class MujocoDeployRuntime:
     ) -> ResidualAnchorLifecycleAdmissionReceipt:
         """Forward one anchor lifecycle fact to the shared receiver store."""
 
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.admit_residual_anchor_lifecycle(
+        return self.composition_port.admit_residual_anchor_lifecycle(
             draft,
             spec=spec,
             activation_scope=activation_scope,
@@ -3205,45 +3154,19 @@ class MujocoDeployRuntime:
     ):
         """Evaluate a composition cut without proposal, authority, or dispatch."""
 
-        if not self._started:
-            raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        if self.composition_strategy_control is None:
-            submission = self.policy_topology.evaluate_composition(
-                spec=spec,
-                target_effective_at=target_effective_at,
-                required_context_channels=required_context_channels,
-                cutoff_at=cutoff_at,
-                control_cut=control_cut,
-                source_difference_spec=source_difference_spec,
-                activation_scope=activation_scope,
-                source_eligibility_spec=source_eligibility_spec,
-                residual_anchor_lifecycle_scope_id=(
-                    residual_anchor_lifecycle_scope_id
-                ),
-            )
-        else:
-            if (
-                spec.semantic_content_hash
-                != self.composition_strategy_control.latest_revision.composition_spec.semantic_content_hash
-            ):
-                raise ValueError(
-                    "Hot composition evaluation requested another " "CompositionSpec."
-                )
-            submission = self.policy_topology.evaluate_hot_composition(
-                target_effective_at=target_effective_at,
-                required_context_channels=required_context_channels,
-                cutoff_at=cutoff_at,
-                control_cut=control_cut,
-                source_difference_spec=source_difference_spec,
-                activation_scope=activation_scope,
-                source_eligibility_spec=source_eligibility_spec,
-                residual_anchor_lifecycle_scope_id=(
-                    residual_anchor_lifecycle_scope_id
-                ),
-            )
-        if submission.proposal_admission is not None:
-            raise RuntimeError("Shadow composition unexpectedly admitted a proposal.")
-        return submission
+        return self.composition_port.evaluate_composition_shadow(
+            spec=spec,
+            target_effective_at=target_effective_at,
+            required_context_channels=required_context_channels,
+            cutoff_at=cutoff_at,
+            control_cut=control_cut,
+            source_difference_spec=source_difference_spec,
+            activation_scope=activation_scope,
+            source_eligibility_spec=source_eligibility_spec,
+            residual_anchor_lifecycle_scope_id=(
+                residual_anchor_lifecycle_scope_id
+            ),
+        )
 
     def compose_and_submit(
         self,
@@ -3263,8 +3186,9 @@ class MujocoDeployRuntime:
             raise RuntimeError(
                 "Composer authority is not enabled for this sim runtime."
             )
-        if self.composition_strategy_control is None:
-            evaluation = self.policy_topology.evaluate_composition(
+        strategy_control = self.composition_port.strategy_control
+        if strategy_control is None:
+            evaluation = self._composition_binding._topology.evaluate_composition(
                 spec=spec,
                 target_effective_at=target_effective_at,
                 required_context_channels=required_context_channels,
@@ -3274,20 +3198,23 @@ class MujocoDeployRuntime:
                 ),
             )
         else:
-            if (
-                spec.semantic_content_hash
-                != self.composition_strategy_control.latest_revision.composition_spec.semantic_content_hash
-            ):
+            latest_revision = strategy_control.latest_revision
+            latest_spec_hash = (
+                latest_revision.composition_spec.semantic_content_hash
+            )
+            if spec.semantic_content_hash != latest_spec_hash:
                 raise ValueError(
                     "Hot composition submission requested another " "CompositionSpec."
                 )
-            evaluation = self.policy_topology.evaluate_hot_composition(
-                target_effective_at=target_effective_at,
-                required_context_channels=required_context_channels,
-                source_difference_spec=source_difference_spec,
-                residual_anchor_lifecycle_scope_id=(
-                    residual_anchor_lifecycle_scope_id
-                ),
+            evaluation = (
+                self._composition_binding._topology.evaluate_hot_composition(
+                    target_effective_at=target_effective_at,
+                    required_context_channels=required_context_channels,
+                    source_difference_spec=source_difference_spec,
+                    residual_anchor_lifecycle_scope_id=(
+                        residual_anchor_lifecycle_scope_id
+                    ),
+                )
             )
         if (
             evaluation.composition_evaluation.output_status != "ready"
@@ -3463,14 +3390,16 @@ class MujocoDeployRuntime:
                 promotion_until,
                 promotion_policy_node_id,
             ) = cached_envelope
-        submission = self.policy_topology.admit_evaluated_composition(
-            evaluation,
-            runtime_session_id=self.config.runtime_session_id,
-            producer_id=self.config.composer_producer_id,
-            producer_epoch=self._composer_producer_epoch,
-            sequence=promotion_sequence,
-            effective_until=promotion_until,
-            policy_node_id=promotion_policy_node_id,
+        submission = (
+            self._composition_binding._topology.admit_evaluated_composition(
+                evaluation,
+                runtime_session_id=self.config.runtime_session_id,
+                producer_id=self.config.composer_producer_id,
+                producer_epoch=self._composer_producer_epoch,
+                sequence=promotion_sequence,
+                effective_until=promotion_until,
+                policy_node_id=promotion_policy_node_id,
+            )
         )
         if (
             submission.proposal_admission is not None

@@ -193,7 +193,7 @@ class MujocoPolicyHumanAllocationInputAdmission:
                     fact.semantic_content_hash for fact in facts
                 ),
             )
-            receipt = self.runtime.submit_composition_input(
+            receipt = self.runtime.composition_port.admit_composition_input(
                 draft,
                 activation_scope=self.activation_scope,
             )

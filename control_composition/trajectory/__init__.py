@@ -94,6 +94,7 @@ from .input_preparation import (
     TRAJECTORY_COMPOSITION_INPUT_ADMISSION_MODES_DEVELOPMENT,
     TRAJECTORY_COMPOSITION_INPUT_PREPARATION_HASH_DOMAIN_DEVELOPMENT,
     TRAJECTORY_COMPOSITION_INPUT_PREPARATION_STATUSES_DEVELOPMENT,
+    TrajectoryCompositionInputReceiver,
     TrajectoryCompositionInputPreparation,
     prepare_trajectory_composition_inputs,
 )
@@ -211,6 +212,7 @@ __all__ = [
     "TRAJECTORY_COMPOSITION_INPUT_PREPARATION_HASH_DOMAIN_DEVELOPMENT",
     "TRAJECTORY_COMPOSITION_INPUT_PREPARATION_STATUSES_DEVELOPMENT",
     "TrajectoryCompositionInputPreparation",
+    "TrajectoryCompositionInputReceiver",
     "prepare_trajectory_composition_inputs",
     "TRAJECTORY_INTENT_PREVIEW_CLASSES_DEVELOPMENT",
     "TRAJECTORY_INTENT_PREVIEW_CLASS_PRODUCER_LOCKED",
