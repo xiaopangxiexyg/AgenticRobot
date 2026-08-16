@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import ast
 import io
-from pathlib import Path
 import tokenize
+from configparser import ConfigParser
+from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,18 @@ PRODUCTION_SOURCE_ROOTS = (
     "teleop_runtime",
     "utils",
 )
+
+
+def _registered_submodule_roots() -> tuple[Path, ...]:
+    parser = ConfigParser()
+    parser.read(REPO_ROOT / ".gitmodules", encoding="utf-8")
+    return tuple(
+        REPO_ROOT / parser.get(section, "path")
+        for section in parser.sections()
+    )
+
+
+PRODUCTION_SOURCE_SUBMODULE_ROOTS = _registered_submodule_roots()
 
 # Transitional debt budget.  Entries may be removed as readers and writers are
 # migrated, but new production files must use the canonical path contract or an
@@ -87,6 +100,10 @@ def _iter_production_sources() -> list[Path]:
             if "legacy" not in path.relative_to(REPO_ROOT).parts
             and "tests" not in path.relative_to(REPO_ROOT).parts
             and "__pycache__" not in path.relative_to(REPO_ROOT).parts
+            and not any(
+                root in path.parents
+                for root in PRODUCTION_SOURCE_SUBMODULE_ROOTS
+            )
         )
     return sorted(set(sources))
 
