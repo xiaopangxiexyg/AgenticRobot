@@ -15,6 +15,18 @@
 | [UMI](./UMI.md) | UMI 配置、标定和数采 |
 | [共享实施计划](./plans/README.md) | 被当前报告或架构文档引用、但尚未完成的真实系统工作 |
 
+## 执行模式边界
+
+- canonical human teleop、`teleop_runtime.deploy` 和 `teleop_runtime.replay` 默认分别使用自己的
+  source、生命周期、safety/executor 与真实 backend，不经过 `control_composition`。
+- replay 的真机模式仍由 replay executor 推进唯一 cursor/plan，并由 `ReplayHardwareRig` 派发；
+  GUI 中启用被动 shadow 或 trace 不会创建第二个 authority/dispatch owner。
+- 两个或更多 human/policy/replay source 同时参与选择、融合或 handoff 时，必须由显式
+  Control Station composition/profile 装配，并继续把 candidate 交给原 target 的唯一
+  canonical safety/dispatch owner；当前页面不宣称一个通用的真实多源启动命令。
+
+完整依赖方向和验证范围见[运行域与可拆分边界](../architecture/runtime_domain_boundaries.md)。
+
 ## 0. 运行前确认
 
 - 从仓库根目录使用 Bash 或 zsh，并已按 [统一环境前缀](../README.md#命令约定) 激活
@@ -43,7 +55,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 `VIVE_RECEIVER_IP` 是运行接收端的主机地址；sender 与接收端不在同一机器时尤其不能沿用
 别人的 IP。
 
-### 1.2 GUI composition root（M）
+### 1.2 GUI real-teleop root（M）
 
 ```bash
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
