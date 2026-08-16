@@ -235,12 +235,18 @@ def _publish_real_agent_motion_measured_cut(
         )
     if not measured_timestamps:
         return None
-    return port.publish_measured_qpos_pair(
+    cut = port.publish_measured_qpos_pair(
         qpos_by_side=qpos_by_side,
         measured_at=min(measured_timestamps),
         available_at=max(float(available_at), max(measured_timestamps)),
         source_evidence_refs=tuple(evidence_refs),
     )
+    if port.config.exclusive_command_claim:
+        port.publish_owner_state(
+            session=getattr(components, "session"),
+            captured_at=cut.available_at,
+        )
+    return cut
 
 
 class _LegacyFunctionProxy:

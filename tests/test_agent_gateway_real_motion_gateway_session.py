@@ -24,6 +24,7 @@ from agent_gateway.profiles.real.observation_gateway import (
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.access_policy import issue_skill_execution_grant
+from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
@@ -436,3 +437,83 @@ def test_real_factory_attaches_gateway_and_realteleop_to_one_lower_port() -> Non
         "motion.step_tcp_cardinal",
         *FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     }
+
+
+def test_wire_adapter_atomically_binds_one_use_grant_to_exact_request() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:wire",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(
+            bundle,
+            captured_at=clock(),
+        ),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+    observation = gateway.observation_producer.capture_and_publish(gateway.service)
+    assert observation.accepted and observation.snapshot is not None
+    request = _request(
+        bundle,
+        observation.snapshot,
+        skill_id="motion.step_tcp_cardinal",
+        direction="forward",
+    )
+    assert request.skill_execution_grant_id is None
+
+    issued = []
+
+    def grant_resolver(parsed_request):
+        route = bundle.route_manifest.route(
+            parsed_request.skill_id,
+            parsed_request.skill_version,
+            parsed_request.route_id,
+            parsed_request.route_version,
+        ).route
+        grant = issue_skill_execution_grant(
+            access_policy=gateway.service.access_policy,
+            manifest=bundle.route_manifest,
+            route=route,
+            request=parsed_request,
+            operator_authorization_receipt_id="operator-confirmation:wire",
+            client_id=CLIENT_ID,
+            parameter_profile_id=parsed_request.parameter_profile_id,
+            parameter_profile_hash=parsed_request.parameter_profile_hash,
+            max_invocations=1,
+            issued_at=clock(),
+            expires_at=clock() + 5.0,
+        )
+        issued.append(grant)
+        return grant
+
+    adapter = BoundAgentGatewayWireAdapter(
+        authenticated_client_id=CLIENT_ID,
+        definition_catalog=bundle.definition_catalog,
+        schema_catalog=bundle.schema_catalog,
+        service=gateway.service,
+        publish_observation=lambda: gateway.observation_producer.capture_and_publish(
+            gateway.service
+        ),
+        current_station_revision=lambda: (
+            gateway.observation_producer.current_station_revision
+        ),
+        operation_launcher=lambda _operation_id: SimpleNamespace(
+            accepted=True,
+            status="intentionally_not_launched_in_admission_test",
+        ),
+        grant_resolver=grant_resolver,
+    )
+    result = adapter.submit_skill_request(request.to_wire())
+
+    assert result["accepted"] is True
+    assert len(issued) == 1
+    operation = result["operation"]
+    assert operation is not None
+    assert operation["status"] == "admitted"

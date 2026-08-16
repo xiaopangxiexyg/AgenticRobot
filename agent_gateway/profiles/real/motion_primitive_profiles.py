@@ -762,6 +762,7 @@ def build_real_agent_primitive_contract_bundle(
             "component_id_by_side": dict(port_config.component_id_by_side),
             "execution_frame_id": port_config.execution_frame_id,
             "execution_frame_spec_hash": port_config.execution_frame_spec_hash,
+            "exclusive_command_claim": port_config.exclusive_command_claim,
             "command_path": "teleop_session_filter_guard_admission_dispatch",
             "hold_path": "teleop_session_owner_hold",
         },

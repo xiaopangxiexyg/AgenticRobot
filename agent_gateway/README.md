@@ -64,14 +64,21 @@ The MuJoCo launcher starts no RPent planner and connects no real device. Its
 socket parent must already exist, resolve to a real non-world-writable
 directory, and contain no existing endpoint at the selected path.
 
-There is intentionally no real-motion CLI. A reviewed composition root calls
+The Gateway package still has no direct real-device launcher. A reviewed
+composition root calls
 `agent_gateway.profiles.real.motion_factory.attach_real_agent_primitive_gateway`
 with exact observation/owner identities, frame graph, lower motion-port
 configuration, safety-envelope references, and allowed clients. That function
 starts no socket, thread, control loop, device, or motion. It returns a new
 RealTeleop component aggregate and a Gateway session sharing one lower port;
 the caller must run the returned aggregate in the existing RealTeleop owner
-loop before it may expose a transport.
+loop before it may expose a transport. The canonical RealTeleop application now
+provides that default-off composition behind
+`--agent-primitive-skill-only`; `agent_gateway.profiles.real.one_shot_client`
+is only the authenticated one-request Unix client and never initializes or
+dispatches hardware itself. The server pre-authorizes exactly one side/action,
+atomically binds one one-use Grant to that request, and disables Vive command
+fallback for the entire Skill-only process.
 
 ## Skill and execution boundary
 
@@ -110,10 +117,10 @@ fault, and Gateway close all use that same lower HOLD boundary.
 
 The real Gateway does not treat the existing foot switches as an Agent
 deadman, and it cannot manufacture owner epochs, frame/calibration identities,
-or safety-envelope facts. The current integration is a programmatic,
-default-off code path. The ordinary RealTeleop CLI does not advertise or start
-it, and the repository's offline fake-owner tests are not real-hardware
-validation.
+or safety-envelope facts. Those facts come from the attached lower RealTeleop
+owner and its Active final pre-IK TCP envelope. Ordinary RealTeleop invocations
+do not advertise or start the Gateway, and the repository's offline tests are
+not real-hardware validation.
 
 Target-independent CubeLift semantics live in `skills/cube_lift`. The MuJoCo
 Route, deployment, lifecycle executor, observation binding, evidence, and

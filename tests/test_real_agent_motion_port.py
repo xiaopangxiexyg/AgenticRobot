@@ -11,6 +11,7 @@ from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.real_teleop.agent_motion_port import (
     RealAgentMotionActivation,
     RealAgentMotionMeasuredPoseCut,
+    RealAgentMotionOwnerIdentity,
     RealAgentMotionPhase,
     RealAgentMotionPort,
     RealAgentMotionPortConfig,
@@ -390,3 +391,45 @@ def test_control_frame_publishes_only_existing_hardware_measurements() -> None:
     )
     assert missing is None
     assert port.latest_measured_pose() is cut
+
+
+def test_exclusive_port_blocks_human_fallback_and_publishes_fresh_owner_cuts() -> None:
+    identity = RealAgentMotionOwnerIdentity(
+        runtime_session_id="real-session:test",
+        control_domain_id="real-domain:test",
+        embodiment_instance_id="rm65:test",
+        target_binding_id="tool-tcp:test",
+        execution_manifest_hash="execution-manifest:test",
+        backend_inventory_hash="backend-inventory:test",
+        clock_domain_id="wall-clock:test",
+    )
+    port = RealAgentMotionPort(
+        config=RealAgentMotionPortConfig(
+            active_sides=("right",),
+            component_id_by_side={"right": "right-tool-tcp"},
+            execution_frame_id="dual-arm-solver-world",
+            execution_frame_spec_hash="solver-world-spec-hash-1",
+            exclusive_command_claim=True,
+        ),
+        target_builder=_TargetBuilder(),
+        owner_identity=identity,
+    )
+    session = _Session(TeleopRunState.ARMED)
+
+    idle = port.command_for_observation(TeleopObservation(timestamp=1.0), 1.0)
+    assert isinstance(idle, TeleopCommandOverride)
+    assert idle.command is None
+    with pytest.raises(RuntimeError, match="not exclusively attached"):
+        port.publish_owner_state(session=session, captured_at=1.0)
+
+    evidence = port.confirm_exclusive_attachment()
+    first = port.publish_owner_state(session=session, captured_at=1.0)
+    second = port.publish_owner_state(session=session, captured_at=1.1)
+
+    assert evidence in first.evidence_refs
+    assert first.lifecycle_state == "running"
+    assert first.execution_gate == "ready"
+    assert second.owner_state_revision == first.owner_state_revision + 1
+    assert second.captured_at == pytest.approx(1.1)
+    with pytest.raises(ValueError, match="timestamp regressed"):
+        port.publish_owner_state(session=session, captured_at=1.05)

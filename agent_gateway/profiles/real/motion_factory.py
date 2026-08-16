@@ -8,7 +8,10 @@ from dataclasses import dataclass
 
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from robot_motion.coordinate_frames import CoordinateFrameGraph
-from teleop_runtime.real_teleop.agent_motion_port import RealAgentMotionPortConfig
+from teleop_runtime.real_teleop.agent_motion_port import (
+    RealAgentMotionOwnerIdentity,
+    RealAgentMotionPortConfig,
+)
 from teleop_runtime.real_teleop.agent_motion_runtime import (
     attach_prepared_real_agent_motion_port,
     build_real_agent_motion_port,
@@ -58,7 +61,7 @@ def attach_real_agent_primitive_gateway(
     frame_graph: CoordinateFrameGraph,
     primitive_reference_frame_id: str,
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
-    owner_state_provider: Callable[[], RealControlOwnerState],
+    owner_state_provider: Callable[[], RealControlOwnerState] | None = None,
     allowed_client_ids: tuple[str, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     max_retained_operations: int = 16,
@@ -80,11 +83,55 @@ def attach_real_agent_primitive_gateway(
         safety_envelope_refs=safety_envelope_refs,
         convergence_profile=convergence_profile,
     )
-    port = build_real_agent_motion_port(components, config=port_config)
+    owner_identity = RealAgentMotionOwnerIdentity(
+        runtime_session_id=observation_attachment.runtime_session_id,
+        control_domain_id=observation_attachment.control_domain_id,
+        embodiment_instance_id=observation_attachment.embodiment_instance_id,
+        target_binding_id=observation_attachment.target_binding_id,
+        execution_manifest_hash=observation_attachment.execution_manifest_hash,
+        backend_inventory_hash=observation_attachment.backend_inventory_hash,
+        clock_domain_id=observation_attachment.clock_domain_id,
+    )
+    port = build_real_agent_motion_port(
+        components,
+        config=port_config,
+        owner_identity=owner_identity,
+    )
+
+    def lower_owner_state_provider() -> RealControlOwnerState:
+        cut = port.latest_owner_state()
+        if cut is None:
+            raise RuntimeError("No lower RealTeleop owner cut is available.")
+        identity = cut.identity
+        return RealControlOwnerState(
+            runtime_session_id=identity.runtime_session_id,
+            control_domain_id=identity.control_domain_id,
+            embodiment_instance_id=identity.embodiment_instance_id,
+            target_binding_id=identity.target_binding_id,
+            execution_manifest_hash=identity.execution_manifest_hash,
+            backend_inventory_hash=identity.backend_inventory_hash,
+            clock_domain_id=identity.clock_domain_id,
+            owner_token_id=cut.owner_token_id,
+            owner_kind=cut.owner_kind,
+            owner_generation=cut.owner_generation,
+            authority_epoch=cut.authority_epoch,
+            execution_epoch=cut.execution_epoch,
+            lifecycle_state=cut.lifecycle_state,
+            execution_gate=cut.execution_gate,
+            owner_state_revision=cut.owner_state_revision,
+            captured_at=cut.captured_at,
+            source_owner_state_hash=cut.semantic_content_hash,
+            evidence_refs=cut.evidence_refs,
+        )
+
     gateway = assemble_real_agent_primitive_gateway_session(
         contract_bundle=bundle,
         port=port,
-        owner_state_provider=owner_state_provider,
+        owner_state_provider=(
+            lower_owner_state_provider
+            if owner_state_provider is None
+            else owner_state_provider
+        ),
         allowed_client_ids=allowed_client_ids,
         max_retained_operations=max_retained_operations,
         clock=clock,

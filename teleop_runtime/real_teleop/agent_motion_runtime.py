@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from .agent_motion_port import RealAgentMotionPort, RealAgentMotionPortConfig
+from .agent_motion_port import (
+    RealAgentMotionOwnerIdentity,
+    RealAgentMotionPort,
+    RealAgentMotionPortConfig,
+)
 from .components import RealTeleopComponents
 
 
@@ -39,6 +43,7 @@ def build_real_agent_motion_port(
     components: RealTeleopComponents,
     *,
     config: RealAgentMotionPortConfig,
+    owner_identity: RealAgentMotionOwnerIdentity | None = None,
 ) -> RealAgentMotionPort:
     """Validate and build the lower port without mutating the Session."""
 
@@ -46,6 +51,7 @@ def build_real_agent_motion_port(
     return RealAgentMotionPort(
         config=config,
         target_builder=components.dual_arm_retargeter,
+        owner_identity=owner_identity,
     )
 
 
@@ -74,6 +80,8 @@ def attach_prepared_real_agent_motion_port(
 
     session.command_override_provider = port.command_for_observation
     session.command_dispatch_admission = combined_admission
+    if port.config.exclusive_command_claim:
+        port.confirm_exclusive_attachment()
     return replace(components, agent_motion_port=port)
 
 
