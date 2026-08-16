@@ -145,6 +145,17 @@ across clones. Task branches move `active` -> `ready-for-integration`;
 integration branches move `integrating` -> `validated-for-mainline`; `blocked`
 and `superseded` are not selectable candidate states.
 
+At every coherent phase boundary, validate and commit all intended versioned
+changes before yielding, waiting for another task, starting a distinct phase,
+or handing work to an integrator. A task worktree with tracked modifications is
+still actively changing and must not be selected for integration. If the wider
+task continues, keep the branch `active` but leave it clean and record the
+checkpoint tip, completed validation, and next write scope in its description;
+when the task is complete, move the clean pinned commit to
+`ready-for-integration`. Do not commit generated outputs, secrets, caches, or
+unrelated user work merely to make a status clean; preserve and declare such
+artifacts separately.
+
 Path separation does not resolve semantic overlap. Give each versioned schema,
 public API/export/entrypoint, and ownership or safety contract one active owner;
 resolve ordering before dependent work continues. Treat an old-base overlap as
