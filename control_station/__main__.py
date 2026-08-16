@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
 
         return int(refinement_annotation_main(values[1:]))
     if values and values[0] == "agent-gateway-mujoco":
-        from .sim_hil_profile.agent.gateway_cli import (
+        from agent_gateway.profiles.mujoco.gateway_cli import (
             main as agent_gateway_mujoco_main,
         )
 

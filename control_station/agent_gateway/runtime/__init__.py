@@ -1,1 +1,1 @@
-"""Server-side admission, operation, execution, and revision runtime."""
+"""Compatibility namespace; import runtime APIs from `agent_gateway`."""

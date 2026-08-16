@@ -1,1 +1,1 @@
-"""Explicit transport adapters over one bound Agent Gateway runtime."""
+"""Compatibility namespace; import transports from `agent_gateway`."""

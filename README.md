@@ -30,6 +30,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
   `python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui`
 - Headless/compatibility collection：`python -m teleop_runtime.collection`
 - Policy deployment：`python -m teleop_runtime.deploy`
+- External Agent Gateway（MuJoCo profile）：`python -m agent_gateway mujoco`
 
 这里只声明入口身份；可直接运行的完整参数、前置条件和风险等级见对应 `docs/` 页面。
 
@@ -46,6 +47,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 - `model/`：本地策略权重、checkpoint 与运行 sidecar；不是 Python 源码包。
 - `deployments/`：模型 client、协议和 artifact 集成。
 - `control_station/`：组合 human/replay/policy/dataset/sim/real target 的应用层。
+- `agent_gateway/`：上层框架中立的 Skill 协议、接入、operation runtime，以及具体 Gateway profile；不拥有底层 authority、安全、IK 或 dispatch。
 - `legacy/`、`docs/legacy/`：已确认归档的代码或说明，不是生产入口。
 
 更严格的所有权、验证和安全规则见 [`AGENTS.md`](./AGENTS.md)。

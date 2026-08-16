@@ -80,6 +80,7 @@ hardware = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
+    "agent_gateway*",
     "collection_runtime*",
     "control_composition*",
     "control_station*",

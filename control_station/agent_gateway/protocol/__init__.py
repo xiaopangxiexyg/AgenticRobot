@@ -1,1 +1,1 @@
-"""Versioned public Agent Gateway protocol contracts and schemas."""
+"""Compatibility namespace; import public contracts from `agent_gateway`."""

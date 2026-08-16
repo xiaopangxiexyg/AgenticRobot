@@ -50,12 +50,15 @@ export RPENT_ROOT=/absolute/path/to/RPent
 mkdir -p "${RPENT_ROOT}/temp/runtime/sim_gateway"
 chmod 700 "${RPENT_ROOT}/temp/runtime/sim_gateway"
 
-python -m control_station agent-gateway-mujoco \
+python -m agent_gateway mujoco \
   --socket-path "${RPENT_ROOT}/temp/runtime/sim_gateway/gateway.sock" \
   --task-config "${PWD}/sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json" \
   --client-id rpent.dexteleop \
   --history-root "${RPENT_ROOT}/temp/runtime/sim_gateway/history"
 ```
+
+历史命令 `python -m control_station agent-gateway-mujoco ...` 仅保留为薄兼容转发；
+Gateway 实现、Skill 定义和 MuJoCo executor 均由顶层 `agent_gateway` 包持有。
 
 ready JSON 会发布 exact target/mode/session/domain 与 Route、station、execution
 manifest hashes。RPent 通过同一个 socket attach；未来 real deployment 使用另外的

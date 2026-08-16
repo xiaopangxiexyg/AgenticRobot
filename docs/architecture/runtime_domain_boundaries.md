@@ -4,7 +4,7 @@
 这里的“可拆分”指：每条主链有独立 owner、单向依赖和稳定装配口，可以由不同开发者并行修改，
 也可以在发布时明确说明包含了哪些运行域，而不需要复制 authority、dispatch、episode 或设备生命周期。
 
-## 四条主链
+## 五条主链
 
 | 主链 | 领域内核 | 应用装配 | 不应吸收的责任 |
 | --- | --- | --- | --- |
@@ -12,6 +12,7 @@
 | 一般部署 | `robot_motion.deploy` 提供动作、队列和执行契约；`deployments` 提供模型 client、协议和 artifact | `teleop_runtime.deploy` 绑定真实 observation、backend、安全与唯一 dispatch | `control_composition` session、MuJoCo runtime、第二套执行环 |
 | 混合遥操与策略部署 | `control_composition` 提供 backend-neutral 的 source admission、组合、handoff、lineage 和非权威差异 | 当前由 `control_station.composition` / Sim-HIL profile 绑定 human、policy/replay 与 target | 模型 worker、replay cursor、canonical safety、dispatch、episode commit |
 | 模拟环境 | `sim.contracts`、`sim.rm65`、`sim.mujoco` 提供场景、状态、task、物理和 sim target | 仿真 CLI 或 Control Station 的显式 sim profile | 真实设备初始化、`teleop_runtime`、真实硬件 backend |
+| 外部 Agent Skill | `agent_gateway.protocol/runtime/transport` 提供上层框架中立的 Skill/schema、接入、admission、reconciliation 和 operation control plane；`agent_gateway.skills` 提供目标无关 Skill 定义 | `agent_gateway.profiles` 绑定具体 application、observation、executor、Route 和 deployment | 上层 Planner/Task/Memory、caller-authored route binding、canonical safety/IK/dispatch、episode owner |
 
 依赖方向是：
 
@@ -21,6 +22,7 @@ dataset_contracts / robot_motion
           |-- collection_runtime <-- teleop_runtime.collection
           |-- deployments ------- <-- teleop_runtime.deploy
           |-- control_composition <-- control_station composition profile
+          |-- agent_gateway core  <-- agent_gateway concrete profile
           `-- sim --------------- <-- sim CLI / control_station sim profile
 
 application/profile layers may compose multiple lower domains
@@ -40,6 +42,7 @@ lower domains must not import application/profile layers
 - 仿真 target 实现状态、物理和执行，composition 只提交 candidate，不能成为仿真 dispatch owner；
 - 数采观察唯一控制链并提交给唯一 episode owner，不能为了混合控制再建 writer/lifecycle；
 - `control_station` 可以构造多个 lower package，但 lower package 不得反向导入它。
+- `agent_gateway` core 不导入 Control Station、sim、硬件、teleop、model deployment 或上层 Agent framework；具体 profile 可以通过 typed port 装配这些应用事实，但 lower package 不得反向导入 Gateway。
 
 任何跨域适配器都应能回答三个问题：输入由谁推进、最终 authority/dispatch 由谁拥有、资源由谁关闭。
 如果答案出现两个 owner，应先修正所有权，而不是增加同步队列或兼容状态。
@@ -68,6 +71,7 @@ source 同时参与动作选择、融合或 handoff 时，应用/profile 必须�
 - `teleop_runtime.deploy`、canonical real-teleop frontend 和 `teleop_runtime.replay` 的默认单源入口当前不会
   eager-load `control_composition`；显式 composition binding 仍按需加载。
 - `control_composition` 当前不依赖 collection、model/provider、sim、hardware、teleop 或 Control Station。
+- `agent_gateway` 已是顶层包：`protocol/runtime/transport` 保持上层框架与具体 backend 中立，目标无关 Skill 定义位于 `skills/`，当前 MuJoCo application、motion/policy executor、observation 和 CubeLift deployment 位于 `profiles/mujoco/`；default-off 的真实 TCP-pose 只读 attachment 位于 `profiles/real/`。历史 `control_station` import 与 CLI 只保留无状态兼容转发。
 - `sim` 当前不依赖真实 teleop、hardware、collection runtime、model provider 或 Control Station；OpenPI 与
   MuJoCo observation 的接线由 `control_station.sim_hil_profile.openpi_policy_source` 持有。
 - no-model Agent-skill 模拟目标由 `sim.mujoco.deploy.agent_skill_target` 持有，不再与 composition-specific

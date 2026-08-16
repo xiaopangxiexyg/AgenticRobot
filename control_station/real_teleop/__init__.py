@@ -1,6 +1,6 @@
 """RealTeleop-specific Control Station application policy."""
 
-from .agent_observation_gateway import (
+from agent_gateway.profiles.real.observation_gateway import (
     REAL_TCP_POSE_STATE_MAX_MEASUREMENT_AGE_MS_V1,
     REAL_TCP_POSE_STATE_ROUTE_ID_V1,
     RealControlOwnerState,

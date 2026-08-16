@@ -12,6 +12,7 @@ from tests.support.repository_imports import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATION_ROOT = REPO_ROOT / "control_station"
+GATEWAY_ROOT = REPO_ROOT / "agent_gateway"
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
@@ -54,6 +55,7 @@ def test_station_application_core_does_not_import_concrete_data_planes() -> None
             core_paths,
             {
                 "deployments",
+                "agent_gateway",
                 "hardware",
                 "numpy",
                 "scipy",
@@ -66,10 +68,30 @@ def test_station_application_core_does_not_import_concrete_data_planes() -> None
 
 
 def test_agent_gateway_does_not_import_upper_framework_packages() -> None:
-    gateway_paths = _python_files(STATION_ROOT / "agent_gateway")
+    gateway_paths = _python_files(GATEWAY_ROOT)
     assert _violations(
         gateway_paths,
         {"rpent", "rpent_dexteleop"},
+    ) == {}
+
+
+def test_agent_gateway_core_is_application_and_backend_neutral() -> None:
+    gateway_core_paths = (
+        *_python_files(GATEWAY_ROOT / "protocol"),
+        *_python_files(GATEWAY_ROOT / "runtime"),
+        *_python_files(GATEWAY_ROOT / "transport"),
+    )
+    assert _violations(
+        tuple(gateway_core_paths),
+        {
+            "control_station",
+            "deployments",
+            "hardware",
+            "numpy",
+            "scipy",
+            "sim",
+            "teleop_runtime",
+        },
     ) == {}
 
 
@@ -177,18 +199,37 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/sim_hil.py": ["sim"],
         "control_station/real_teleop_entrypoint.py": ["sim"],
         "control_station/rm65_calibration_debug_application.py": ["sim"],
-        # Concrete Agent application bindings remain Station leaves; the
-        # simulator, execution, safety, and dispatch owners stay below them.
-        "control_station/sim_hil_profile/agent/gateway_cli.py": ["sim"],
-        "control_station/sim_hil_profile/agent/motion_application.py": ["sim"],
-        "control_station/sim_hil_profile/agent/motion_factory.py": ["sim"],
-        "control_station/sim_hil_profile/agent/observation.py": ["sim"],
-        "control_station/sim_hil_profile/agent/policy_application.py": ["sim"],
-        "control_station/sim_hil_profile/agent/policy_factory.py": ["sim"],
-        "control_station/sim_hil_profile/tasks/cube_lift/deployment.py": ["sim"],
         "control_station/sim_hil_profile/factory.py": ["sim"],
         "control_station/sim_hil_profile/openpi_policy_source.py": ["sim"],
     }
+
+
+def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
+    assert _violations(
+        _python_files(GATEWAY_ROOT),
+        {"sim"},
+    ) == {
+        "agent_gateway/profiles/mujoco/gateway_cli.py": ["sim"],
+        "agent_gateway/profiles/mujoco/motion_application.py": ["sim"],
+        "agent_gateway/profiles/mujoco/motion_factory.py": ["sim"],
+        "agent_gateway/profiles/mujoco/observation.py": ["sim"],
+        "agent_gateway/profiles/mujoco/policy_application.py": ["sim"],
+        "agent_gateway/profiles/mujoco/policy_factory.py": ["sim"],
+        "agent_gateway/profiles/mujoco/skills/cube_lift/deployment.py": ["sim"],
+    }
+
+
+def test_gateway_real_observation_profile_is_io_and_control_neutral() -> None:
+    assert _violations(
+        _python_files(GATEWAY_ROOT / "profiles/real"),
+        {
+            "control_station",
+            "hardware",
+            "robot_motion",
+            "sim",
+            "teleop_runtime",
+        },
+    ) == {}
 
 
 def test_station_numerical_source_debt_is_explicit_and_cannot_spread() -> None:
@@ -201,9 +242,15 @@ def test_station_numerical_source_debt_is_explicit_and_cannot_spread() -> None:
             "numpy",
             "scipy",
         ],
-        # Thin typed-payload materialization for the concrete Agent profile;
-        # no reusable numerical control algorithm is owned here.
-        "control_station/sim_hil_profile/agent/motion_skill.py": ["numpy"],
+    }
+
+
+def test_gateway_numerical_dependency_is_confined_to_motion_executor() -> None:
+    assert _violations(
+        _python_files(GATEWAY_ROOT),
+        {"numpy", "scipy"},
+    ) == {
+        "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
     }
 
 
@@ -240,6 +287,26 @@ def test_lower_packages_do_not_reverse_depend_on_control_station() -> None:
         "teleop_runtime/debug/run_vive_rm65_calibration_debug.py": ["control_station"],
         "teleop_runtime/debug/run_vive_rm65_real_teleop.py": ["control_station"],
     }
+
+
+def test_lower_packages_do_not_reverse_depend_on_agent_gateway() -> None:
+    violations: dict[str, list[str]] = {}
+    for package_name in (
+        "collection_runtime",
+        "control_composition",
+        "dataset_contracts",
+        "dataset_interface",
+        "deployments",
+        "hardware",
+        "robot_motion",
+        "sim",
+        "teleop_runtime",
+    ):
+        package_root = REPO_ROOT / package_name
+        if not package_root.exists():
+            continue
+        violations.update(_violations(_python_files(package_root), {"agent_gateway"}))
+    assert violations == {}
 
 
 def test_historic_command_shims_are_thin_and_hold_no_runtime_owner() -> None:
