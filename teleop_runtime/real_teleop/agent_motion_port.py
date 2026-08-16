@@ -365,6 +365,11 @@ class RealAgentMotionPort:
         with self._lock:
             return self._snapshot_locked()
 
+    def is_bound_to_target_builder(self, target_builder: object) -> bool:
+        """Return whether this port was prepared for the exact lower solver."""
+
+        return self._target_builder is target_builder
+
     def submit_activation(
         self,
         activation: RealAgentMotionActivation,

@@ -8,18 +8,11 @@ from .agent_motion_port import RealAgentMotionPort, RealAgentMotionPortConfig
 from .components import RealTeleopComponents
 
 
-def attach_real_agent_motion_port(
+def _validate_attachment(
     components: RealTeleopComponents,
     *,
     config: RealAgentMotionPortConfig,
-) -> RealTeleopComponents:
-    """Attach one lower port without adding a second command/dispatch owner.
-
-    The ordinary component builder never calls this function.  A production
-    composition root must opt in with an exact execution-frame/component
-    binding before it publishes any real motion Route.
-    """
-
+) -> None:
     if not isinstance(components, RealTeleopComponents):
         raise TypeError("components must be RealTeleopComponents.")
     if not isinstance(config, RealAgentMotionPortConfig):
@@ -41,7 +34,35 @@ def attach_real_agent_motion_port(
             "RealTeleop already has a command override provider; ownership is ambiguous."
         )
 
-    port = RealAgentMotionPort(config=config, target_builder=target_builder)
+
+def build_real_agent_motion_port(
+    components: RealTeleopComponents,
+    *,
+    config: RealAgentMotionPortConfig,
+) -> RealAgentMotionPort:
+    """Validate and build the lower port without mutating the Session."""
+
+    _validate_attachment(components, config=config)
+    return RealAgentMotionPort(
+        config=config,
+        target_builder=components.dual_arm_retargeter,
+    )
+
+
+def attach_prepared_real_agent_motion_port(
+    components: RealTeleopComponents,
+    *,
+    port: RealAgentMotionPort,
+) -> RealTeleopComponents:
+    """Attach a preflighted port as the Session's only command override."""
+
+    if not isinstance(port, RealAgentMotionPort):
+        raise TypeError("port must be RealAgentMotionPort.")
+    _validate_attachment(components, config=port.config)
+    if not port.is_bound_to_target_builder(components.dual_arm_retargeter):
+        raise ValueError("Prepared Agent motion port target builder mismatch.")
+
+    session = components.session
     previous_admission = session.command_dispatch_admission
 
     def combined_admission(command, observation, now):
@@ -56,4 +77,24 @@ def attach_real_agent_motion_port(
     return replace(components, agent_motion_port=port)
 
 
-__all__ = ["attach_real_agent_motion_port"]
+def attach_real_agent_motion_port(
+    components: RealTeleopComponents,
+    *,
+    config: RealAgentMotionPortConfig,
+) -> RealTeleopComponents:
+    """Attach one lower port without adding a second command/dispatch owner.
+
+    The ordinary component builder never calls this function.  A production
+    composition root must opt in with an exact execution-frame/component
+    binding before it publishes any real motion Route.
+    """
+
+    port = build_real_agent_motion_port(components, config=config)
+    return attach_prepared_real_agent_motion_port(components, port=port)
+
+
+__all__ = [
+    "attach_prepared_real_agent_motion_port",
+    "attach_real_agent_motion_port",
+    "build_real_agent_motion_port",
+]
