@@ -58,7 +58,7 @@ from sim.mujoco.ik import RM65CanonicalIK
 from sim.mujoco.scene import MujocoScene
 
 
-pytestmark = [pytest.mark.unit, pytest.mark.contract]
+pytestmark = [pytest.mark.unit, pytest.mark.contract, pytest.mark.slow_sim]
 
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"

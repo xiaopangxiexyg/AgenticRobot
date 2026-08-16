@@ -40,7 +40,29 @@ python -m pytest -q -m "integration and not optional and not hardware"
 The current `pytest.ini` default discovers the root `tests/` directory.
 Package-local suites under `sim/sim_real_tests/tests` and `hardware/*/tests`
 remain separate until their dependency and hardware semantics have been
-audited.  Do not treat a successful default run as coverage of those suites.
+audited. The sim-real suite now carries the same marker vocabulary and exposes
+its own fast/full commands in `sim/sim_real_tests/README.md`, but it is still
+selected only by an explicit path. Do not treat a successful default run as
+coverage of those suites.
+
+## Cost gates in parallel worktrees
+
+Use the fast unit selector plus the exact tests for the owner being changed on
+ordinary feature worktrees. Run the relevant exact `slow_sim` node there only
+when the change can affect it. Run the broad `slow_sim` selection and the
+package-local sim-real full suite once on the designated integration worktree;
+do not make every parallel worktree repeat the same physical closed loops.
+
+`slow_sim` assignment is evidence-based and node-specific. Measure the exact
+node on the designated worktree, keep its unfiltered acceptance behavior
+unchanged, and add the marker only when simulation, shared IK replay,
+simulation-side model loading, or a physical closed loop creates material
+repeated cost. A module-level marker is valid only when every collected node in
+that module has been measured into the same tier. A filename, loop bound,
+optional dependency, or `mujoco` import alone is not sufficient evidence. Do
+not share `.pytest_cache` between worktrees or enable repository-wide test
+parallelism without first proving that the selected tests are hermetic and
+resource-independent.
 
 ## Marker semantics
 

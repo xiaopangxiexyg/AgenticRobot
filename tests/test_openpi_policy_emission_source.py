@@ -466,6 +466,7 @@ def test_openpi_right_scope_enters_native_mujoco_target_without_composition() ->
         runtime.close()
 
 
+@pytest.mark.slow_sim
 def test_sim_hil_openpi_dry_run_is_offline_and_reports_explicit_projection(
     tmp_path,
     capsys,

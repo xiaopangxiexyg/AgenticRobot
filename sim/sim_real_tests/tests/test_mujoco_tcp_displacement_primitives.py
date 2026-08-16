@@ -26,6 +26,9 @@ from sim.sim_real_tests.mujoco.view_tcp_displacement_primitives import (
 )
 
 
+pytestmark = [pytest.mark.integration, pytest.mark.optional]
+
+
 class _FakeViewerHandle:
     def __init__(self, user_scene) -> None:
         self.user_scn = user_scene
@@ -193,6 +196,7 @@ def test_station_desk_axes_reverse_world_xy_but_not_world_z() -> None:
     )
 
 
+@pytest.mark.slow_sim
 def test_both_arms_execute_every_primitive_in_physical_mujoco_chain() -> None:
     result = run_cardinal_tcp_primitives_active_closed_loop()
 

@@ -28,6 +28,7 @@ def test_cube_drop_cli_defaults_to_canonical_contract_without_loading_gui() -> N
     assert args.repeat_every == pytest.approx(0.0)
 
 
+@pytest.mark.slow_sim
 def test_isolated_drop_keeps_only_contract_ground_table_and_object() -> None:
     contract = SimulationContract.load(CONTRACT_PATH)
     scene = build_isolated_drop_scene(contract)
@@ -55,6 +56,7 @@ def test_isolated_drop_keeps_only_contract_ground_table_and_object() -> None:
 
 
 @pytest.mark.optional
+@pytest.mark.slow_sim
 def test_isolated_contract_cube_falls_and_settles_on_urdf_table() -> None:
     mujoco = pytest.importorskip("mujoco")
     contract = SimulationContract.load(CONTRACT_PATH)
