@@ -12,9 +12,11 @@ from robot_motion.coordinate_profiles import TargetFrameProfile, ToolFrameProfil
 from .sim_hil_target import (
     MujocoSimHILPreparedTarget,
     MujocoSimHILTargetConfig,
+    prepare_mujoco_sim_hil_target,
+)
+from .target_measurement import (
     build_mujoco_sim_hil_pose_observation_projector,
     capture_mujoco_sim_hil_safety_anchor,
-    prepare_mujoco_sim_hil_target,
 )
 
 

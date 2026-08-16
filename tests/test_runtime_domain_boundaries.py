@@ -55,6 +55,15 @@ def _called_names(path: Path) -> set[str]:
     return names
 
 
+def _top_level_defined_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
 def _attribute_names(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     return {
@@ -355,6 +364,26 @@ def test_general_mujoco_target_does_not_opt_into_composition_runtime() -> None:
         sim_target
     )
     assert "control_composition" not in _absolute_import_roots(agent_target)
+
+
+def test_mujoco_target_measurement_has_one_shared_owner() -> None:
+    sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
+    agent_target = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "agent_skill_target.py"
+    )
+    target_measurement = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "target_measurement.py"
+    )
+    shared_symbols = {
+        "build_mujoco_sim_hil_coordinate_profiles",
+        "build_mujoco_sim_hil_pose_observation_projector",
+        "capture_mujoco_sim_hil_safety_anchor",
+        "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
+    }
+
+    assert shared_symbols <= _top_level_defined_names(target_measurement)
+    assert shared_symbols.isdisjoint(_top_level_defined_names(sim_target))
+    assert shared_symbols.isdisjoint(_top_level_defined_names(agent_target))
 
 
 def test_general_mujoco_runtime_does_not_eagerly_import_composition() -> None:

@@ -86,3 +86,25 @@ assert (
     result = _run_isolated_python(source)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_target_measurement_legacy_exports_are_identity_preserving() -> None:
+    source = """
+import sim.mujoco.deploy as deploy
+from sim.mujoco.deploy import sim_hil_target
+from sim.mujoco.deploy import target_measurement
+
+names = (
+    "build_mujoco_sim_hil_coordinate_profiles",
+    "build_mujoco_sim_hil_pose_observation_projector",
+    "capture_mujoco_sim_hil_safety_anchor",
+    "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
+)
+for name in names:
+    owner_value = getattr(target_measurement, name)
+    assert getattr(sim_hil_target, name) is owner_value
+    assert getattr(deploy, name) is owner_value
+"""
+    result = _run_isolated_python(source)
+
+    assert result.returncode == 0, result.stderr
