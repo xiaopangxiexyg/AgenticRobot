@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import importlib.util
+from importlib.machinery import ModuleSpec, PathFinder
 from pathlib import Path
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repository_package_spec(namespace: str, package_dir: Path) -> ModuleSpec | None:
+    # Do not let an editable install from another linked worktree satisfy this
+    # repository-layout assertion.
+    return PathFinder.find_spec(namespace, [str(package_dir.parent)])
 
 
 @pytest.mark.parametrize(
@@ -25,6 +31,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
             REPO_ROOT / "sim" / ("mujoco_" + "real2sim"),
         ),
         (
+            "sim.rm65.real2sim",
+            REPO_ROOT / "sim" / "rm65" / "real2sim",
+            ".".join(("sim", "real2sim")),
+            REPO_ROOT / "sim" / "real2sim",
+        ),
+        (
             "utils.wrist_cam_fixed_mask",
             REPO_ROOT / "utils" / "wrist_cam_fixed_mask",
             ".".join(("utils", "wrist_cam_" + "fix_mask")),
@@ -39,6 +51,6 @@ def test_only_canonical_package_remains(
     legacy_dir: Path,
 ) -> None:
     assert canonical_dir.is_dir()
-    assert importlib.util.find_spec(canonical_namespace) is not None
+    assert _repository_package_spec(canonical_namespace, canonical_dir) is not None
     assert not legacy_dir.exists()
-    assert importlib.util.find_spec(legacy_namespace) is None
+    assert _repository_package_spec(legacy_namespace, legacy_dir) is None
