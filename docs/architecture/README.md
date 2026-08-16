@@ -4,7 +4,11 @@
 
 - [控制、数据与训练闭环图示](./dexteleop_architecture_visual_guide.md)
 - [实时 Action Chunk（RTC）图示](./dexteleop_rtc_visual_guide.md)
-- [数采、一般部署、混合控制与仿真的运行域边界](./runtime_domain_boundaries.md)
+- [单源直通、多源组合及数采/部署/仿真的运行域边界](./runtime_domain_boundaries.md)
+
+其中运行域边界页区分 deploy、human teleop、replay 的默认单源直通模式与显式多源
+`control_composition` profile。它只记录当前代码、import contract 和入口解析已经建立的边界；
+被动 trace/shadow 不被算作多源控制。
 
 ## 文档边界
 

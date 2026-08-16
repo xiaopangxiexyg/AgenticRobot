@@ -51,9 +51,8 @@ lower domains must not import application/profile layers
 | 执行模式 | source/入口 | 最终执行 owner | `control_composition` |
 | --- | --- | --- | --- |
 | 单源策略部署 | `teleop_runtime.deploy` | 既有 deploy safety/executor 与真实 backend | 不加载、不创建 |
-| 单源真人遥操 | canonical GUI/headless real-teleop frontend | 既有 real-teleop session、Rig 与真实 backend | 不加载、不创建 |
+| 单源真人遥操 | canonical real-teleop frontend | 既有 real-teleop session、Rig 与真实 backend | 不加载、不创建 |
 | 单源 replay | `teleop_runtime.replay` | replay executor、`ReplayHardwareRig` 与真实 backend | 不加载、不创建 |
-| 单源 Agent-skill | 当前仅有 MuJoCo direct target；真机 target 暂缓 | target runtime 的 canonical safety、IK 与 dispatch | direct target 不加载、不创建 |
 | 多源组合 | 显式 Control Station composition/Sim-HIL profile | 同一个 target runtime；composition 只产生 candidate | profile 显式加载并创建 |
 
 被动 observer、ControlTrace、difference 或 shadow 不会因为记录了 source/output 事实就变成多源控制；
@@ -67,6 +66,8 @@ source 同时参与动作选择、融合或 handoff 时，应用/profile 必须�
   `teleop_runtime.deploy.openpi_application` 持有。前者不得重新加入参数解析、设备配置或运行循环。
 - `teleop_runtime.deploy`、canonical real-teleop frontend 和 `teleop_runtime.replay` 的默认单源入口当前不会
   eager-load `control_composition`；显式 composition binding 仍按需加载。
+- `tests/test_runtime_domain_boundaries.py` 在干净解释器中分别导入上述三个单源入口，并以显式 MuJoCo
+  composition binding 作为正向对照；该证据证明 import/contract 边界，不代表真机运动验收。
 - `control_composition` 当前不依赖 collection、model/provider、sim、hardware、teleop 或 Control Station。
 - `sim` 当前不依赖真实 teleop、hardware、collection runtime、model provider 或 Control Station；OpenPI 与
   MuJoCo observation 的接线由 `control_station.sim_hil_profile.openpi_policy_source` 持有。

@@ -19,7 +19,8 @@
 ## 2. GUI human teleop / 正式采集入口
 
 可直接复制的入口见 [real README 的第 1.2 节](./README.md)。它只是
-canonical composition root；实际站点应显式提供设备、profile、dataset 和 debug 参数。
+canonical GUI real-teleop/collection root；实际站点应显式提供设备、profile、dataset 和 debug 参数。
+这里装配多个设备与数据资源不等于多源控制，默认 human teleop 链不会创建 `control_composition`。
 不要从旧日志中复制一串未命名的调参 flag。
 
 ## 3. 正式 position profile

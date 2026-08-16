@@ -12,9 +12,12 @@
 | 设备、USB、标定 | [hardware](./hardware/README.md) | [设备与标定](./hardware/DEVICES_AND_CALIBRATION.md)、[DMTAC/Q6](./hardware/DMTAC.md) |
 | 数据格式、后处理、分析、测试、验收 | [data](./data/README.md) | [v2.5-p2 数据格式](./data/v25p2/README.md)、[数据集内容与交付](./data/v25p2/DATASET_CONTENT_AND_HANDOFF.md)、[长程任务细粒度阶段标注](./real/LONG_HORIZON_STAGE_ANNOTATION.md)、[后处理与测试](./data/POSTPROCESS_AND_TESTING.md)、[v2.3 验收](./data/ACCEPTANCE_V23.md) |
 | 跨层端到端指南 | [showcase](./showcase/README.md) | 已落地合同、训练接口和部署链路的贯通说明；不作为新的运行入口 |
+| 执行模式与模块边界 | [architecture](./architecture/README.md) | [单源直通、多源组合与运行域边界](./architecture/runtime_domain_boundaries.md)；不作为新的运行入口 |
 | 被替代命令和历史报告 | [legacy](./legacy/README.md) | 仅用于追溯和复现实验 |
 
 跨模块的只读架构与 RTC 图示集中在 [architecture](./architecture/README.md)；它们不是运行入口，也不新增实施契约。
+当前 deploy、human teleop 和 replay 的默认模式各自直达既有 target owner；只有显式多源 profile 才加载
+`control_composition`。被动 trace/shadow 不改变这个分类。
 
 ## 使用方式
 
@@ -63,6 +66,7 @@
 | Canonical 入口检查 | `python -m teleop_runtime.debug.run_vive_rm65_real_teleop --help` | R0 |
 | Headless collection 检查 | `python -m teleop_runtime.collection --help` | R0 |
 | Policy deploy 检查 | `python -m teleop_runtime.deploy --help` | R0 |
+| Direct replay 入口检查 | `python -m teleop_runtime.replay --help` | R0 |
 | MuJoCo replay 检查 | `python -m sim.mujoco.replay --help` | R0 |
 | 最快单元测试 | `PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -m 'unit and not optional' -q` | R0 |
 | 统一设备只读检查 | `python -m teleop_runtime.configure_devices --check` | H1 |

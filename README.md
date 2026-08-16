@@ -14,6 +14,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 | MuJoCo、VIVE sim teleop、dataset replay | [`docs/sim/`](./docs/sim/README.md) |
 | 设备枚举、USB、标定 | [`docs/hardware/`](./docs/hardware/README.md) |
 | 数据后处理、分析、测试、验收 | [`docs/data/`](./docs/data/README.md) |
+| 单源直通、多源组合与模块所有权 | [`docs/architecture/runtime_domain_boundaries.md`](./docs/architecture/runtime_domain_boundaries.md) |
 | 被替代命令与历史报告 | [`docs/legacy/`](./docs/legacy/README.md) |
 
 环境依赖和锁文件的完整说明仍以 [`README_ENV.md`](./README_ENV.md) 为准。
@@ -33,6 +34,22 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 
 这里只声明入口身份；可直接运行的完整参数、前置条件和风险等级见对应 `docs/` 页面。
 
+## 执行模式
+
+deploy、human teleop 和 replay 默认都是各自 owner 持有的**单源直通模式**；只有两个或更多
+source 同时参与选择、融合或 handoff 时，应用/profile 才显式创建 `control_composition`。
+
+| 模式 | 当前入口或装配 | 最终执行 owner | `control_composition` |
+|---|---|---|---|
+| Human teleop | canonical GUI real-teleop 入口 | real-teleop session、Rig 与真实 backend | 默认不加载 |
+| Policy deploy | `python -m teleop_runtime.deploy` | deploy safety/executor 与真实 backend | 默认不加载 |
+| Replay | 支持入口 `python -m teleop_runtime.replay` | replay executor、`ReplayHardwareRig` 与真实 backend | 默认不加载 |
+| 多源控制 | 显式 Control Station composition/Sim-HIL profile | 原 target 的唯一 safety/dispatch owner | profile 显式加载 |
+
+被动 observer、ControlTrace、difference 或 shadow 不会因为记录了多类事实就成为多源控制，也不得
+取得 authority 或 dispatch token。
+详细依赖与验证边界见[运行域与可拆分边界](./docs/architecture/runtime_domain_boundaries.md)。
+
 ## 目录边界
 
 - `control_composition/`：与本体、sim、遥操设备和模型实现解耦的多源控制组合、session/handoff 与差异观测；只产生 proposal candidate 和 lineage，不拥有 authority、安全或执行。
@@ -40,12 +57,12 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 - `hardware/`：厂商 SDK 与设备 backend。
 - `sim/`：仿真 backend、task 和 adapter；不得依赖 `teleop_runtime` 或真实硬件。
 - `collection_runtime/`：与设备、控制和 GUI 解耦的实时采集生命周期与持久化机制。
-- `teleop_runtime/`：真实遥操、GUI/headless orchestration、来源绑定的采集适配和 policy deploy frontend。
+- `teleop_runtime/`：真实遥操、GUI/headless orchestration、来源绑定的采集适配、replay 和 policy deploy frontend。
 - `dataset_contracts/`、`dataset_interface/`：纯数据合约与数据适配。
 - `policy_learning/`：框架内 learner、loss、训练 batch adapter 与离线模型评估。
 - `model/`：本地策略权重、checkpoint 与运行 sidecar；不是 Python 源码包。
 - `deployments/`：模型 client、协议和 artifact 集成。
-- `control_station/`：组合 human/replay/policy/dataset/sim/real target 的应用层。
+- `control_station/`：显式多源组合和 GUI/application profile 的应用叶子；不替代各单源入口或 lower owner。
 - `legacy/`、`docs/legacy/`：已确认归档的代码或说明，不是生产入口。
 
 更严格的所有权、验证和安全规则见 [`AGENTS.md`](./AGENTS.md)。
