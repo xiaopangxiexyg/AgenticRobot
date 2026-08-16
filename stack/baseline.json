@@ -1,13 +1,13 @@
 {
-  "baseline_id": "baseline-20260815-openpi-submodule-candidate",
+  "baseline_id": "baseline-20260816-openpi-submodule-v2-candidate",
   "repositories": {
     "AgenticRobot": {
       "canonical_identity": "CYBER-QAQ/AgenticRobot",
-      "commit": "82566f8fb73becfb9395eb2693522f81094c5ab9",
+      "commit": "fa53dec8ccbd8691ac79f32c16500dca401044df",
       "submodules": {
         "model/openpi": "0d2d7f4e5526cca5f65e17b34f17ca8adad17407"
       },
-      "tree_oid": "0141c12ebae267cd7c823e94b1c67ab0006aa727"
+      "tree_oid": "f8da71be90e311bedeec764a642ca0dc9d80b4fa"
     },
     "RPent": {
       "canonical_identity": "CYBER-QAQ/RPent",

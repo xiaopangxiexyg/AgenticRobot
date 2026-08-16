@@ -58,6 +58,14 @@ transport 的计划入口改指 `control-plane/current/projectctl`，避免从�
 working tree 仍在祖先 `b7a20748...` 并有未提交框架改动，因此不会在该目录自动 ff-only；独立分支
 `task/AR-openpi-submodule@82566f8f...` 已从 `ad1771...` 形成并推送。development baseline v2 只引用该
 候选；合并后必须以新 parent commit/tree 重建 Candidate/Release baseline。
+
+2026-08-16 P0 更新：本机三仓未提交的框架入口已分别形成本地 task commits/worktrees；原
+AgenticRobot、RPent、openpi 稳定目录随后仅通过显式 `pull --ff-only` 更新并保持 Git clean，当前分别为
+`AgenticRobot main@0f8bd913...`、`RPent main@90ed3678...`、
+`openpi dexteleop/integration@0d2d7f4e...`。OpenPI gitlink 已从最新 AgenticRobot main 重建为独立 v2
+候选 `task/AR-openpi-submodule-v2@fa53dec8...`；框架 task commit 位于其上一层，development baseline
+只固定 v2 gitlink parent，不形成引用自身的循环 lock。旧 `82566f8f...` 分支不 force-push，保留为历史
+回滚证据。上述新 task branches 当前尚未 push/PR/merge，远端状态仍以最后一次只读审计为准。
 已实现命令的准确边界见 [`lab_task_workspace.md`](./lab_task_workspace.md)，不得以本规划的目标描述
 代替实现证据。
 
@@ -1338,6 +1346,10 @@ lock 不记录 AgenticRobot 自身 commit，避免自引用；主项目 release 
 | 远端设备相关进程 | `DexTeleop_0803` 有运行约 3 天 14 小时的 `hardware.foot_pad --recalibrate` | 非本轮进程；不停止、不接管，设备测试/lease 前先解决 owner 与状态 |
 | 远端工具 | AgenticRobot `codex_remote/` 有 SSH wrapper 与 L0-L5 安全规则 | Codex 继续只在本机；远端是受控执行/GPU/硬件 host |
 
+2026-08-16 本机更新不改写上述 point-in-time 远端审计：三个本机稳定 checkout 已 clean/ff-only 到各自
+最新上游；框架、RPent/OpenPI `./dev` 和 v2 gitlink 分别位于隔离 task worktrees。远端没有随本机 pull
+自动移动，也没有进行 working-tree 文件同步。
+
 当前关系：
 
 ```text
@@ -2434,9 +2446,9 @@ provenance 和 baseline resolver 仍属于 M2，因此 M1 只能视为 bootstrap
 gitlink”分开；`lab sync inspect` 从 baseline repository-link DAG 自动展开依赖、按 child-before-parent
 显示顺序、只汇总持有未过期 actor lease 的 active Task writers，并分别报告 fetch readiness 与 management checkout ff-only readiness；
 `lab sync fetch` 仅按精确 refspec 更新 remote-tracking refs，禁 LFS/tag/递归 submodule，fetch 前后强制
-核对 branch/HEAD/tree/status 不变。真实本机三仓 fetch 已验证 RPent remote ref 可从
-`0e6cb9df...` 前进到 `185cd13d...`，而 dirty AgenticRobot/RPent 与 detached `model/openpi` checkout
-均未移动。该能力尚未部署为远端定时任务，也不提供用户层 checkout apply；已有受信
+核对 branch/HEAD/tree/status 不变。2026-08-16 在先形成 task checkpoint 后，三个稳定目录由用户明确
+授权的显式 `pull --ff-only` 更新并保持 clean；这不是后台自动 apply，也没有移动 task worktree。该能力
+尚未部署为远端定时任务，也不提供普通 Agent 的 checkout apply；已有受信
 maintenance reservation + ff-only 流程仍是唯一 apply 边界。
 
 ### M2：本机 clean 测试与 Run（bootstrap working tree 部分实现）
@@ -2456,7 +2468,7 @@ override resolver 现已用受信 `stack/baseline.json` 固定三仓 commit/tree
 的有向无环依赖，父 gitlink 可派生未修改子仓 revision，父/子 Task overrides 冲突会在 snapshot 前
 拒绝，关系继续进入远端 request/outbox identity。clean resolver 直接读取 exact commit tree 的 gitlink，
 不再把“开发 worktree 未初始化 child”误判为版本不确定。当前 development baseline 已升级 v2 并固定
-已推送候选 `82566f8f.../model/openpi@0d2d7f4e...`；它不是 protected main/release，合并后须重新固定
+本机 v2 候选 `fa53dec8.../model/openpi@0d2d7f4e...`；它不是 protected main/release，合并后须重新固定
 新的 parent commit/tree，不能沿用 Task evidence。
 轻量 provenance Profile 已实现；openpi repo-local `./dev doctor/test` 尚在其未合并开发工作区，完整 heavy environment 尚未实现，因此
 M2 仍是部分完成。三仓 per-repository environment binding 与 source overlay/provenance 已落地：受信

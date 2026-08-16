@@ -1437,7 +1437,7 @@ def test_checked_in_baseline_pins_all_three_repositories() -> None:
 
     assert (
         baseline.baseline_id
-        == "baseline-20260815-openpi-submodule-candidate"
+        == "baseline-20260816-openpi-submodule-v2-candidate"
     )
     assert set(baseline.repositories) == {"AgenticRobot", "RPent", "openpi"}
     assert all(len(pin.commit) == 40 for pin in baseline.repositories.values())

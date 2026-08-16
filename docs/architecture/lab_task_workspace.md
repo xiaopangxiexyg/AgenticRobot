@@ -406,7 +406,7 @@ snapshot/Run 以及 `lab.remote-request.v2`、`lab.remote-outbox.v2`，远端请
 child commit 和 link commit 相等。clean snapshot 从 exact commit tree 读取 gitlink，不要求开发
 worktree 为只做审视而预先下载/初始化所有 child；执行槽 materialize 时才要求本机已有 exact objects。
 v1 baseline 继续兼容但不能声明 links。当前 development baseline 已升级为 v2，固定已推送的迁移候选
-`AgenticRobot@82566f8f... -> model/openpi@0d2d7f4e...`；其 ID 明确带 `candidate`，只用于开发期解析。
+`AgenticRobot@fa53dec8... -> model/openpi@0d2d7f4e...`；其 ID 明确带 `candidate`，只用于开发期解析。
 合并或 rebase 后 parent commit/tree 会改变，必须重新生成 Candidate/Release baseline 和证据，不能把这个
 Task branch commit 冒充 protected main/release。
 
@@ -1054,8 +1054,9 @@ package receipt 使用可移植 archive 文件名而非本机绝对路径，并�
 的白名单路径、mode、size、SHA-256；路径穿越、symlink/hardlink、重复/额外/缺失文件都会拒绝。验证结果
 仍明确 `extracted=false`、`executed=false`，因此传输完成也不等于已安装。
 
-当前框架代码仍是未提交 working tree，因此此命令在真实仓库会按设计拒绝，不能把开发中控制面伪装成
-受保护部署版本。后续必须先 review/commit/push 到 protected `origin/main`，再生成包；安全解包、远端原子
+当前框架代码已形成未推送的本地 task commit，但仍不位于 clean protected `main == origin/main`，因此
+此命令在真实仓库会按设计拒绝，不能把开发中控制面伪装成受保护部署版本。后续必须先 review/push/merge
+到 protected `origin/main`，再生成包；安全解包、远端原子
 激活和 rollback 尚未实现，不能手工 scp/tar 替代。
 
 Preparation Profile 现固定 control-plane install root 为

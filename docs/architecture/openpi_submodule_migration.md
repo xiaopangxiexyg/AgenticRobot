@@ -1,9 +1,9 @@
 # OpenPI `model/openpi` Submodule 迁移说明
 
-- 状态：迁移候选已建立，尚未合并到 protected `main`
-- Parent candidate：`AgenticRobot@82566f8fb73becfb9395eb2693522f81094c5ab9`
+- 状态：基于最新 `main` 的 v2 迁移候选已建立在本机，尚未 push/合并到 protected `main`
+- Parent candidate：`AgenticRobot@fa53dec8ccbd8691ac79f32c16500dca401044df`
 - Child pin：`Openpi@0d2d7f4e5526cca5f65e17b34f17ca8adad17407`
-- Candidate branch：`task/AR-openpi-submodule`
+- Candidate branch：`task/AR-openpi-submodule-v2`
 - 远端执行主机：`user@192.168.70.116`
 
 本文只定义 Git/source 迁移。它不改变模型、训练、推理、GPU、设备、checkpoint 或服务合同，也不授权
@@ -14,10 +14,10 @@
 ```text
 AgenticRobot/                         # parent repository
 ├── .gitmodules
-├── model/                            # AgenticRobot-owned Python/source namespace
-│   ├── __init__.py
-│   ├── arm_hold/
+├── model/                            # non-package artifact/external-source boundary
+│   ├── README.md
 │   └── openpi/                       # mode 160000 child repository checkout
+├── policy_learning/                  # AgenticRobot-owned learner source
 └── ...
 
 RPent/                                # independent sibling repository
@@ -59,14 +59,17 @@ setuptools package discovery 不包含 `model*`；OpenPI 继续从自己的 `src
 
 ## 3. 本机已完成的部分
 
-- 活动 AgenticRobot working tree 已登记 `.gitmodules` 和 `model/openpi@0d2d7f4e...`；child 与两个嵌套
-  submodule 均由已有本机 Git objects、`--no-fetch`、禁 LFS 初始化，状态 clean/detached。
-- 为避免把落后且 dirty 的活动 `main@b7a20748...` 与框架改动混入迁移，另从
-  `origin/main@ad1771da...` 创建独立 worktree/branch。
-- `82566f8f...` 只包含 `.gitmodules` 和一个 gitlink，已经推送；没有源码复制或大文件。
-- `integration/project.json` v2 将 child 默认路径相对 control checkout 解析为 `model/openpi`；这是通用
+- 旧候选 `task/AR-openpi-submodule@82566f8f...` 只包含 `.gitmodules` 和一个 gitlink，已经推送；它
+  保留为历史回滚证据，不 force-push。
+- 2026-08-16 三个稳定 checkout 经显式 `pull --ff-only` 更新并保持 clean；随后从最新
+  `AgenticRobot main@0f8bd913...` 创建 v2 候选 `fa53dec8...`。v2 同样只含 `.gitmodules` 与 gitlink，
+  没有复制源码或大文件，当前只存在于本机任务分支。
+- v2 Task worktree 的 child 已在 `GIT_LFS_SKIP_SMUDGE=1`、`--no-fetch` 下固定到
+  `openpi@0d2d7f4e...`；稳定 main 仍保留旧 checkout 作为 ignored、只读恢复来源，不把它当作 main 的
+  tracked submodule 或版本事实。
+- `integration/project.json` v3 将 child 默认路径相对 control checkout 解析为 `model/openpi`；这是通用
   `path_base` 机制，不是框架核心中的项目特例。
-- `stack/baseline.json` v2 将 parent candidate gitlink 与独立 child commit 相等性绑定。其 baseline ID
+- `stack/baseline.json` v2 将 v2 parent candidate gitlink 与独立 child commit 相等性绑定。其 baseline ID
   明确为 `candidate`，不得提升为 merge/release evidence。
 
 ## 4. Task / Workspace 行为
@@ -138,18 +141,19 @@ baseline ID/hash
 ```
 
 复用证据的最低条件是源码 tree、Profile、control plane、environment 和 assets 全部内容等价。设备或
-release acceptance 默认在 merged candidate 上重跑；`82566f8f...` 的开发期证据不能自动升级。
+release acceptance 默认在 merged candidate 上重跑；旧 `82566f8f...` 和新 `fa53dec8...` 的开发期证据
+都不能自动升级。
 
 ## 8. 验收清单
 
-- [x] 独立 migration branch/commit，不夹带业务代码或框架工作树。
+- [x] 基于最新 main 的独立 migration branch/commit，不夹带业务代码或框架工作树。
 - [x] `.gitmodules` 无浮动 branch。
 - [x] parent gitlink 与 audited child commit 相等。
 - [x] 本机 child 和嵌套 child clean、detached、no-fetch/禁 LFS 初始化。
 - [x] project manifest 默认定位 `model/openpi`。
 - [x] generic nested Workspace、base mismatch、uninitialized clean snapshot 有自动测试。
-- [x] development baseline v2 绑定真实 parent tree/repository link。
-- [ ] PR review/merge；记录 merged parent commit/tree。
+- [x] development baseline v2 绑定 v2 parent tree/repository link。
+- [ ] v2 branch push/PR review/merge；记录 merged parent commit/tree。
 - [ ] 远端 runtime/ignored content preservation receipts。
 - [ ] 远端 clean submodule staging 与 canonical path 切换。
 - [ ] merged baseline + remote fetch/source-anchor receipts。
