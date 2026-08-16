@@ -115,6 +115,7 @@ policy output (15 Hz)
   reference 步长限位，以及限位后 endpoint collision recheck；不含时序平滑。
 - `robot_motion/position_control/interpolation.py`: sim/real 共用 qref→qcmd
   planner；sim/real 只在最后 qcmd sink 分叉。
+- `robot_motion/rm65/control_mode.py`: deploy/replay 共用 RM65 position/impedance 模式名与历史别名归一化；各 application 仍自行解析频率、profile 和设备生命周期。
 - `teleop_runtime/position_control/deploy_executor.py`: real-only 在线 60 Hz worker、chunk 编排、暂停/故障 hold 与 backend dispatch 边界。
 - `teleop_runtime/deploy/arm_state_reader.py`: deployment-facing arm 状态刷新节拍和 bounded causal snapshot history；backend 继续持有设备状态/FK，reader 不持有控制、安全或 dispatch。
 - `teleop_runtime/deploy/camera_runtime.py`: policy artifact 相机键绑定、部署侧 source 构造与启动准入适配；正式 RealSense 启动/重试和 freshness gate 继续复用 `teleop_runtime.real_teleop.camera_runtime`，本模块不另建相机生命周期所有者。

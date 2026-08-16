@@ -8,6 +8,12 @@ import numpy as np
 
 from hardware.rm65.calibration_profiles import ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD
 from robot_motion.rm65.assets import require_asset_path
+from robot_motion.rm65.control_mode import (
+    RM65_ARM_CONTROL_MODE_IMPEDANCE,
+    RM65_ARM_CONTROL_MODE_POSITION,
+    RM65_ARM_CONTROL_MODES,
+    normalize_rm65_arm_control_mode as _normalize_rm65_arm_control_mode,
+)
 from robot_motion.action import RobotAction, RobotActionResolver
 from robot_motion.deploy.schema import ARM_JOINT_DOF
 from robot_motion.runtime import EffectorCommand, TeleopCommand, run_best_effort_cleanup
@@ -46,26 +52,12 @@ _SINGULARITY_GATE_HOLD_STATUSES = frozenset(
 )
 DEFAULT_POSITION_COLLISION_STATE_MAX_AGE_SEC = 0.25
 DEFAULT_POSITION_COLLISION_STATE_PAIR_MAX_SKEW_SEC = 0.05
-RM65_ARM_CONTROL_MODE_POSITION = "position"
-RM65_ARM_CONTROL_MODE_IMPEDANCE = "impedance"
-RM65_ARM_CONTROL_MODES = (RM65_ARM_CONTROL_MODE_POSITION, RM65_ARM_CONTROL_MODE_IMPEDANCE)
 
 
 def normalize_rm65_arm_control_mode(value: object) -> str:
-    text = str(value or RM65_ARM_CONTROL_MODE_POSITION).strip().lower().replace("-", "_")
-    aliases = {
-        "pos": RM65_ARM_CONTROL_MODE_POSITION,
-        "movej": RM65_ARM_CONTROL_MODE_POSITION,
-        "canfd": RM65_ARM_CONTROL_MODE_POSITION,
-        "force": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-        "force_control": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-        "admittance": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-        "force_admittance": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-    }
-    mode = aliases.get(text, text)
-    if mode not in RM65_ARM_CONTROL_MODES:
-        raise ValueError(f"Unsupported replay RM65 arm control mode {value!r}; expected one of {RM65_ARM_CONTROL_MODES}.")
-    return mode
+    """Compatibility wrapper preserving replay-specific validation text."""
+
+    return _normalize_rm65_arm_control_mode(value, error_context="replay ")
 
 
 def default_arm_control_hz_for_mode(mode: object) -> float:

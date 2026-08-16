@@ -18,6 +18,12 @@ from .defaults import (
     RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
     RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
 )
+from .control_mode import (
+    RM65_ARM_CONTROL_MODE_IMPEDANCE,
+    RM65_ARM_CONTROL_MODE_POSITION,
+    RM65_ARM_CONTROL_MODES,
+    normalize_rm65_arm_control_mode,
+)
 from .qref_acceleration_profile import (
     RM65_QREF_ACCELERATION_COMFORT_35_V1,
     RM65_QREF_ACCELERATION_COMFORT_50_V1,
@@ -217,6 +223,9 @@ __all__ = [
     "ARM_DOF",
     "ARM_LINK6_FRAME",
     "ArmQposSpec",
+    "RM65_ARM_CONTROL_MODE_IMPEDANCE",
+    "RM65_ARM_CONTROL_MODE_POSITION",
+    "RM65_ARM_CONTROL_MODES",
     "DEFAULT_LEFT_ARM_QPOS",
     "DEFAULT_COLLISION_SCENE",
     "DEFAULT_RIGHT_ARM_QPOS",
@@ -376,6 +385,7 @@ __all__ = [
     "load_world_from_arm_base_transforms",
     "load_qpos_target",
     "load_rm65_tool_profile",
+    "normalize_rm65_arm_control_mode",
     "normalize_side",
     "normalize_sides",
     "plan_dual_arm_constrained_qpos_transition",

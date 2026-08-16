@@ -129,6 +129,9 @@ from robot_motion.rm65 import (
     LEGACY_POSITION_CONTROL_PROFILE_NAME,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
+    RM65_ARM_CONTROL_MODE_IMPEDANCE,
+    RM65_ARM_CONTROL_MODE_POSITION,
+    RM65_ARM_CONTROL_MODES,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_POSE_LIFT_PROFILE_CHOICES,
     RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
@@ -141,6 +144,7 @@ from robot_motion.rm65 import (
     RM65_QREF_ACCELERATION_HARD_V1,
     RM65_QREF_ACCELERATION_PROFILE_CHOICES,
     build_rm65_pose_lift_ik_tuning,
+    normalize_rm65_arm_control_mode,
     resolve_rm65_pose_lift_profile,
     resolve_rm65_qref_acceleration_profile,
 )
@@ -344,12 +348,6 @@ DEPLOY_ARM_STEP_DT_ALPHA = 0.25
 DEPLOY_ARM_STEP_DT_MAX_SCALE = 3.0
 DEPLOY_ARM_STEP_DT_STALL_RESET_SEC = 0.25
 DEPLOY_MAX_ARM_JOINT_STEP_RAD = float(np.deg2rad(6.0))
-RM65_ARM_CONTROL_MODE_POSITION = "position"
-RM65_ARM_CONTROL_MODE_IMPEDANCE = "impedance"
-RM65_ARM_CONTROL_MODES = (
-    RM65_ARM_CONTROL_MODE_POSITION,
-    RM65_ARM_CONTROL_MODE_IMPEDANCE,
-)
 
 
 @dataclass(frozen=True)
@@ -360,27 +358,6 @@ class _PreparedActionExecution:
     dispatch_completed: bool
     asynchronous: bool = False
     position_source_index: int | None = None
-
-
-def normalize_rm65_arm_control_mode(value: object) -> str:
-    text = (
-        str(value or RM65_ARM_CONTROL_MODE_POSITION).strip().lower().replace("-", "_")
-    )
-    aliases = {
-        "pos": RM65_ARM_CONTROL_MODE_POSITION,
-        "movej": RM65_ARM_CONTROL_MODE_POSITION,
-        "canfd": RM65_ARM_CONTROL_MODE_POSITION,
-        "force": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-        "force_control": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-        "admittance": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-        "force_admittance": RM65_ARM_CONTROL_MODE_IMPEDANCE,
-    }
-    mode = aliases.get(text, text)
-    if mode not in RM65_ARM_CONTROL_MODES:
-        raise ValueError(
-            f"Unsupported RM65 arm control mode {value!r}; expected one of {RM65_ARM_CONTROL_MODES}."
-        )
-    return mode
 
 
 def effective_arm_control_hz(args: argparse.Namespace) -> float:
