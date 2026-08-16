@@ -33,6 +33,7 @@ from sim.mujoco.adapters import (
     MujocoPositionExecutionRig,
 )
 from sim.mujoco.deploy import (
+    MujocoCompositionRuntimeConfig,
     MujocoCoupledPoseToQposResolver,
     MujocoDeployConfig,
     MujocoDeployRuntime,
@@ -235,6 +236,7 @@ def test_shadow_composition_rejects_components_outside_runtime_schema() -> None:
         pose_resolver=MujocoCoupledPoseToQposResolver(
             RM65CanonicalIK(scene, ShadowPlanner())
         ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(),
         composition_strategy=strategy,
         clock=clock,
     )
