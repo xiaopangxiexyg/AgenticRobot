@@ -177,6 +177,12 @@ remain unavailable. Queue/Runner contracts must stay project-independent: they
 select an exact source snapshot and a protected command ID, but must not model
 GPU, device, service, model, process topology, or other command-internal runtime
 semantics. Those belong to the invoked system/project command.
+M5 adds only protected runner command maps and direct argv execution in an exact
+staged snapshot. Requests may select command IDs but cannot carry argv or shell;
+the host-local map is outside the tested payload. The executor records exit,
+timeout, cancellation, source stability, logs, and content receipts. It does not
+prepare environments, allocate runtime resources, manage services, contact a
+remote host, or interpret project-specific results.
 
 Use one active development branch per Task/repository. Record consecutive
 implementation milestones as commits, docs, tags, and Run evidence instead of

@@ -333,3 +333,37 @@ class ExactSnapshotStager:
                 except git.GitError:
                     pass
             raise
+
+    def validate_staged(
+        self, request_id: str, runner_id: str
+    ) -> tuple[dict[str, object], Path]:
+        """Revalidate a claimed staged source tree and return its request root."""
+
+        validate_task_id(request_id)
+        validate_task_id(runner_id)
+        claim, _, _ = self.coordinator.validated_claim(request_id, runner_id)
+        request = self.coordinator.store.load_request(request_id)
+        slot_id = validate_task_id(str(claim.get("slot_id", "")))
+        request_root = self.slot_root / slot_id / request_id
+        receipt_path = request_root / _RECEIPT_FILENAME
+        if (
+            request_root.is_symlink()
+            or not request_root.is_dir()
+            or receipt_path.is_symlink()
+            or not receipt_path.is_file()
+        ):
+            raise LabError(f"snapshot slot is incomplete/quarantined: {request_root}")
+        try:
+            raw_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LabError(f"cannot read snapshot stage receipt: {exc}") from exc
+        receipt = self._validate_receipt(raw_receipt, request=request, claim=claim)
+        attached = self.coordinator.store.load_attachment(
+            request_id, "snapshot-stage-receipt"
+        )
+        if attached != receipt:
+            raise LabError("staged snapshot receipt differs from durable attachment")
+        self._validate_materialized_sources(
+            receipt, request_root=request_root, request=request
+        )
+        return receipt, request_root

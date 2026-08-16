@@ -38,6 +38,9 @@ runner 主机上的受保护映射再将 `integration-suite` 转换为固定命�
 `/opt/project-tests/integration-suite`。Request 不能携带任意 shell 字符串，Task 对映射文件的修改也不能自动改变
 受信 runner。命令可以自行调用系统已有的任何合法能力；`lab` 只把其输出当作不透明执行结果和 artifact。
 
+当前本地 runner 入口为 `lab runner execute <runner-id> <request-id>`，具体合同见
+[`lab_m5_command_execution.md`](lab_m5_command_execution.md)。
+
 最小执行生命周期因此收敛为：
 
 ```text

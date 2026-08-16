@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .baseline import load_baseline_lock
+from .command_execution import TrustedCommandExecutor
 from .control_install import (
     inspect_control_plane_install,
     install_control_plane,
@@ -300,6 +301,15 @@ def _build_parser() -> argparse.ArgumentParser:
     runner_stage.add_argument("request_id")
     runner_stage.add_argument("--slot-root")
     runner_stage.add_argument("--json", action="store_true")
+    runner_execute = runner_commands.add_parser(
+        "execute",
+        help="invoke protected system commands in one staged snapshot",
+    )
+    runner_execute.add_argument("runner_id")
+    runner_execute.add_argument("request_id")
+    runner_execute.add_argument("--slot-root")
+    runner_execute.add_argument("--command-root")
+    runner_execute.add_argument("--json", action="store_true")
     return parser
 
 
@@ -617,6 +627,28 @@ def _print_snapshot_stage(payload: dict[str, object]) -> None:
     print(f"Repositories: {len(repositories) if isinstance(repositories, dict) else 0}")
     print("Network access: false")
     print("LFS smudge: false")
+
+
+def _print_command_execution(payload: dict[str, object]) -> None:
+    print(f"Request: {payload.get('request_id')}")
+    print(f"Runner: {payload.get('runner_id')}")
+    print(f"Slot: {payload.get('slot_id')}")
+    print(f"Classification: {payload.get('classification')}")
+    commands = payload.get("commands")
+    print(f"Commands: {len(commands) if isinstance(commands, list) else 0}")
+
+
+def _runner_slot_root(manager: WorkspaceManager, configured: str | None) -> Path:
+    return (
+        Path(configured)
+        if configured
+        else Path(
+            manager.environ.get(
+                "LAB_RUNNER_SLOT_ROOT",
+                manager.state_root / "runner-slots",
+            )
+        )
+    ).expanduser().resolve()
 
 
 def _runner_coordinator(manager: WorkspaceManager) -> RunnerCoordinator:
@@ -1186,18 +1218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _print_runner_inspection(runner_payload)
                 return 0
             if arguments.runner_command == "stage":
-                slot_root = (
-                    Path(arguments.slot_root).expanduser().resolve()
-                    if arguments.slot_root
-                    else Path(
-                        manager.environ.get(
-                            "LAB_RUNNER_SLOT_ROOT",
-                            manager.state_root / "runner-slots",
-                        )
-                    )
-                    .expanduser()
-                    .resolve()
-                )
+                slot_root = _runner_slot_root(manager, arguments.slot_root)
                 staged = ExactSnapshotStager(
                     coordinator,
                     repository_catalog=manager.catalog,
@@ -1207,6 +1228,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _emit(staged, as_json=True)
                 else:
                     _print_snapshot_stage(staged)
+                return 0
+            if arguments.runner_command == "execute":
+                slot_root = _runner_slot_root(manager, arguments.slot_root)
+                command_root = (
+                    Path(arguments.command_root)
+                    if arguments.command_root
+                    else Path(
+                        manager.environ.get(
+                            "LAB_RUNNER_COMMAND_ROOT",
+                            manager.control_repository
+                            / "integration"
+                            / "runner-commands",
+                        )
+                    )
+                ).expanduser().resolve()
+                stager = ExactSnapshotStager(
+                    coordinator,
+                    repository_catalog=manager.catalog,
+                    slot_root=slot_root,
+                )
+                execution = TrustedCommandExecutor(
+                    coordinator,
+                    stager,
+                    command_root=command_root,
+                ).execute(arguments.request_id, arguments.runner_id)
+                if arguments.json:
+                    _emit(execution, as_json=True)
+                else:
+                    _print_command_execution(execution)
                 return 0
             claim = coordinator.claim_next(
                 arguments.runner_id, arguments.slot_id

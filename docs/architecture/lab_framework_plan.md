@@ -119,8 +119,8 @@ command adapter。被测试 payload 可包含仓库源码及 repo-local tests，
 | M3f-g | durable Request、幂等状态机、Runner claim、artifact receipt | 已实现协议 |
 | M3h | transport envelope 与 exact clean snapshot staging | 已实现本地协议 |
 | M4 | synthetic draft Git snapshot | 已实现本地协议 |
-| M5 | staged snapshot 的受信 command adapter、状态与日志 | 下一切片 |
-| M6 | 已认证本地/远端 transport、Git object 传输与 artifact 回收 | 待实现 |
+| M5 | staged snapshot 的受信 command adapter、状态与日志 | 已实现本地协议 |
+| M6 | 已认证本地/远端 transport、Git object 传输与 artifact 回收 | 下一切片 |
 | M7 | 自动同步策略、evidence promotion 与保留/清理 | 待实现 |
 | M8 | 确有需要时的远端 hosted development | 待实现 |
 
@@ -128,9 +128,10 @@ M4 已在 M3h 之上实现 synthetic Git draft capture：不移动用户 branch/
 child-first 固定嵌套仓 gitlink，并生成 Development-only durable Request。它仍只从本机已有 Git objects 物化
 detached slot，不连接真实远端、不传输 objects、不下载大文件，也不运行项目命令。
 
-曾实现的 M5 分布式资源编排 prototype 已撤回：代码管理框架不应理解服务拓扑或资源类别。后续 M5 只打通“exact
-staged source -> protected command ID -> 系统命令 -> 通用结果”这条项目无关纵向链路。详细边界见
-[`lab_execution_boundary.md`](lab_execution_boundary.md)。
+曾实现的 M5 分布式资源编排 prototype 已撤回：代码管理框架不应理解服务拓扑或资源类别。修正后的 M5 已打通
+“exact staged source -> protected command ID -> 系统命令 -> 通用结果”这条项目无关纵向链路，并支持日志 receipt、
+fail-fast、timeout、取消和幂等读取。详细边界见 [`lab_execution_boundary.md`](lab_execution_boundary.md)，实现合同见
+[`lab_m5_command_execution.md`](lab_m5_command_execution.md)。
 
 ## 第二部分：当前项目的组合与双机拓扑
 
@@ -203,6 +204,5 @@ task/AR-lab-framework-v2      M1 以后连续的框架集成线
 已被替代但需留档的早期项目专用 prototype 固定在 annotated tag
 `archive/lab-control-bootstrap-20260816`；它不是可继续开发或部署的框架分支。
 
-当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。下一阶段实现通用 command adapter：在已
-staged 的 exact source 中调用 host-local allowlist 对应的系统命令，记录状态、退出码与日志。随后才接入经过认证的
-远端 transport；命令内部需要什么环境或外部能力不由 `lab` 解析。
+当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。下一阶段接入经过认证的本地/远端
+transport 与受限 Git object/artifact 传输；命令内部需要什么环境或外部能力继续不由 `lab` 解析。
