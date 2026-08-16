@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -37,6 +38,20 @@ from robot_motion.deploy import build_deployment_observation
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_HAND_SLICES
 from robot_motion.pose_frame_profiles import (
     default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
+)
+from sim.contracts import TimingSpec
+from sim.mujoco.adapters import (
+    MujocoPositionExecutionConfig,
+    MujocoPositionExecutionRig,
+)
+from sim.mujoco.config import GripperSpec
+from sim.mujoco.deploy import (
+    MujocoComponentActionRobotActionV1Materializer,
+    MujocoDeployConfig,
+    MujocoDeployRuntime,
+    MujocoRobotActionV1ComponentIngressAdapter,
+    build_mujoco_component_execution_binding,
+    build_rm65_right_cube_lift_component_target_profile,
 )
 
 
@@ -145,6 +160,44 @@ class _FakeStatePolicy:
                 )
                 actions[index, ACTION_HAND_SLICES[side]] = 0.25
         return actions
+
+
+class _FakeMujocoTargetScene:
+    arm_specs = {"left": object(), "right": object()}
+    gripper_specs = {
+        "right_gripper": GripperSpec(
+            name="right_gripper",
+            joint_names=(
+                "right_gripper_left_finger_joint",
+                "right_gripper_right_finger_joint",
+            ),
+            open_qpos=(0.0, 0.0),
+            closed_qpos=(-0.035, -0.035),
+            side="right",
+        )
+    }
+
+    def __init__(self) -> None:
+        self.qpos = {
+            "left": np.zeros(6, dtype=float),
+            "right": np.zeros(6, dtype=float),
+        }
+
+    def get_arm_qpos(self, side: str) -> np.ndarray:
+        return self.qpos[side].copy()
+
+    def step_kinematic_direct_qpos_debug(
+        self,
+        qpos_by_side,
+        *,
+        gripper_close_by_name,
+        zero_controlled_qvel,
+    ) -> None:
+        del gripper_close_by_name, zero_controlled_qvel
+        self.qpos = {
+            side: np.asarray(qpos, dtype=float).reshape(6).copy()
+            for side, qpos in qpos_by_side.items()
+        }
 
 
 def test_openpi_client_deferred_connect_waits_for_worker_predict(
@@ -295,6 +348,122 @@ def test_openpi_source_observes_bimanual_state_and_emits_explicit_right_scope() 
         assert policy.calls == 1
     finally:
         source.close()
+
+
+def test_openpi_right_scope_enters_native_mujoco_target_without_composition() -> None:
+    policy = _FakeStatePolicy()
+    next_step = 0
+
+    def capture(*, step_index=None):
+        nonlocal next_step
+        selected = next_step if step_index is None else int(step_index)
+        next_step = selected + 1
+        return _observation(selected)
+
+    source = build_openpi_policy_emission_source(
+        OpenPIEmissionSourceConfig(
+            policy_artifact=_artifact(),
+            runtime_pose_frame_contract=(
+                default_rm65_workspace_near_boundary_runtime_pose_frame_contract()
+            ),
+            output_active_sides=("right",),
+            model_observation_sides=("left", "right"),
+            action_hz=50.0,
+            policy_hz=50.0,
+            prediction_request_queue_threshold=1,
+        ),
+        observation_capture=capture,
+        policy=policy,
+    )
+    scene = _FakeMujocoTargetScene()
+    profile = build_rm65_right_cube_lift_component_target_profile(
+        scene,
+        SimpleNamespace(
+            controlled_side="right",
+            right_gripper_name="right_gripper",
+        ),
+    )
+    materializer = MujocoComponentActionRobotActionV1Materializer(
+        scene,
+        profile,
+        hand_action_spec_by_component={
+            "right_gripper": HandActionSpec.dmtac_gripper("right")
+        },
+        support_arm_pose_provider=lambda: {
+            "left": np.asarray(
+                [0.2, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0],
+                dtype=np.float32,
+            )
+        },
+        support_arm_sides=("left",),
+        support_pose_contract_id="test.measured-left-support.v1",
+    )
+    ingress = MujocoRobotActionV1ComponentIngressAdapter(
+        scene,
+        profile,
+        component_id_by_effector={
+            "right_arm": "right_arm",
+            "right_hand": "right_gripper",
+        },
+    )
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=TimingSpec(
+                sample_hz=50.0,
+                policy_hz=50.0,
+                reference_hz=100.0,
+                ik_hz=100.0,
+                command_hz=100.0,
+                physics_hz=1000.0,
+            ),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+    )
+    runtime = MujocoDeployRuntime(
+        rig,
+        MujocoDeployConfig(
+            runtime_session_id="openpi-native-target-test",
+            control_domain_id="openpi-native-target-domain",
+            embodiment_instance_id="openpi-native-target-instance",
+            policy_node_id="openpi-policy",
+            decision_hz=50.0,
+            clock_domain_id="local_monotonic",
+        ),
+        component_execution_binding=build_mujoco_component_execution_binding(
+            profile,
+            materializer,
+            policy_action_ingress=ingress,
+        ),
+        clock=time.monotonic,
+    )
+
+    runtime.start()
+    source.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        emission = None
+        while emission is None and time.monotonic() < deadline:
+            emission = source.step(now=time.monotonic())
+            time.sleep(0.002)
+        assert emission is not None
+
+        submission = runtime.submit_policy_action_emission(emission)
+
+        assert submission.proposal_admission is not None
+        assert submission.proposal_admission.accepted is True
+        assert runtime.action_schema.component_ids == (
+            "right_arm",
+            "right_gripper",
+        )
+        assert runtime.composition_runtime_config is None
+        assert runtime.composition_port is None
+    finally:
+        source.close()
+        runtime.close()
 
 
 def test_sim_hil_openpi_dry_run_is_offline_and_reports_explicit_projection(
