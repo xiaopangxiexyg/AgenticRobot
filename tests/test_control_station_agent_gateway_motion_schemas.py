@@ -6,12 +6,16 @@ import pytest
 
 from control_station.agent_gateway.protocol.motion_schemas import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
     REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1,
     TCP_CARDINAL_STEP_SKILL_ID_V1,
+    TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
     InlineTcpTrajectoryLimits,
     cardinal_tcp_step_schema_entry_v1,
+    fixed_level_tcp_orientation_schema_entry_v1,
+    fixed_level_tcp_orientation_skill_definition_v1,
     inline_tcp_trajectory_schema_entry_v1,
     registered_tcp_trajectory_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
@@ -170,6 +174,81 @@ def test_cardinal_tcp_step_exposes_direction_but_pins_lower_profile_facts() -> N
             parameters={**parameters, "direction": "diagonal"},
             allowed_component_ids=("right_arm",),
         )
+
+
+def test_fixed_level_orientation_exposes_no_relative_rotation_parameter() -> None:
+    entry = fixed_level_tcp_orientation_schema_entry_v1(
+        skill_id=TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
+        skill_definition_hash="definition:tcp-level-left-30:v1",
+        parameter_profile_id="right-arm-fixed-level-orientation-v1",
+        parameter_profile_hash="profile:right-arm-fixed-level-orientation-v1",
+        allowed_component_ids=("left_arm", "right_arm"),
+        allowed_reference_frame_ids=("left_arm_base", "right_arm_base"),
+        reference_frame_spec_hash="frame-spec:right-arm-base",
+        frame_graph_hash="frame-graph:fixture",
+        tool_config_hash="tool-config:fixture",
+        calibration_hash="calibration:fixture",
+        primitive_hash="primitive:fixed-level-left-30",
+    )
+    schema = entry.parameter_schema
+    assert entry.skill_id == TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["component_id"]["enum"] == (
+        "left_arm",
+        "right_arm",
+    )
+    assert {
+        "angle",
+        "angle_deg",
+        "delta_rotation",
+        "heading",
+        "rotation",
+        "yaw",
+        "yaw_deg",
+    }.isdisjoint(schema["properties"])
+    parameters = {
+        "component_id": "right_arm",
+        "reference_frame_id": "right_arm_base",
+        "reference_frame_spec_hash": "frame-spec:right-arm-base",
+        "controlled_frame_id": "tool_tcp",
+        "frame_graph_hash": "frame-graph:fixture",
+        "tool_config_hash": "tool-config:fixture",
+        "calibration_hash": "calibration:fixture",
+        "primitive_hash": "primitive:fixed-level-left-30",
+    }
+    validate_agent_motion_parameters_v1(
+        schema_kind="fixed_level_tcp_orientation",
+        parameters=parameters,
+        allowed_component_ids=("left_arm", "right_arm"),
+    )
+    validate_agent_motion_parameters_v1(
+        schema_kind="fixed_level_tcp_orientation",
+        parameters={**parameters, "component_id": "left_arm"},
+        allowed_component_ids=("left_arm", "right_arm"),
+    )
+    with pytest.raises(ValueError, match="cannot carry an angle"):
+        validate_agent_motion_parameters_v1(
+            schema_kind="fixed_level_tcp_orientation",
+            parameters={**parameters, "yaw_deg": 5.0},
+            allowed_component_ids=("left_arm", "right_arm"),
+        )
+
+
+def test_fixed_level_orientation_definitions_select_either_arm_absolutely() -> None:
+    for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
+        definition = fixed_level_tcp_orientation_skill_definition_v1(
+            skill_id=skill_id,
+        )
+        summary = definition.summary.lower()
+        assert definition.controlled_component_ids == (
+            "left_arm",
+            "right_arm",
+        )
+        assert "selected left or right arm" in summary
+        assert "horizontal desk plane" in summary
+        assert "fixed absolute" in summary
+        assert "not a relative rotation" in summary
+        assert "do not accumulate yaw" in summary
 
 
 def test_registered_real_trajectory_schema_accepts_only_immutable_reference() -> None:

@@ -17,6 +17,9 @@ from control_station.agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
 )
+from control_station.agent_gateway.protocol.motion_schemas import (
+    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+)
 from control_station.agent_gateway.protocol.skill_catalog import (
     SkillExecutionRoute,
     SkillParameterProfileRef,
@@ -41,11 +44,12 @@ from control_station.sim_hil_profile.agent.motion_gateway_session import (
 from control_station.sim_hil_profile.agent.motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
+    resolve_level_tcp_orientation_primitive_target,
     resolve_tcp_displacement_primitive_target,
 )
 from robot_motion.coordinate_frames import CoordinateFrameSpec
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
-from robot_motion.primitives import cardinal_tcp_short_step
+from robot_motion.primitives import cardinal_tcp_short_step, level_tcp_orientation
 from sim.mujoco.deploy import (
     MujocoDirectComponentProposalSource,
     MujocoSimHILTargetConfig,
@@ -53,26 +57,52 @@ from sim.mujoco.deploy import (
 )
 
 
-def _profile_and_schema():
+def _profile_and_schema(component_id: str = "right_arm"):
+    side = component_id.removesuffix("_arm")
     target_profile = build_mujoco_pose_component_target_profile(
         SimpleNamespace(arm_specs={"left": object(), "right": object()}),
-        profile_id="fixture.agent_tcp_pose.right_arm.v1",
-        arm_side_by_component={"right_arm": "right"},
-        arm_reference_frame_by_component={"right_arm": "right_arm_base"},
-        arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
-        selection_group_by_component={"right_arm": "arms"},
+        profile_id=f"fixture.agent_tcp_pose.{component_id}.v1",
+        arm_side_by_component={component_id: side},
+        arm_reference_frame_by_component={component_id: f"{side}_arm_base"},
+        arm_controlled_frame_by_component={component_id: "tool_tcp"},
+        selection_group_by_component={component_id: "arms"},
     )
     motion_profile = MujocoAgentTcpPoseMotionProfile(
-        reference_frame_id="right_arm_base",
-        reference_frame_spec_hash="frame-spec:right-arm-base",
+        reference_frame_id=f"{side}_arm_base",
+        reference_frame_spec_hash=f"frame-spec:{side}-arm-base",
         frame_graph_hash="frame-graph:fixture",
         tool_config_hash="tool-config:fixture",
         calibration_hash="calibration:fixture",
+        component_id=component_id,
         stable_measurement_count=2,
         max_control_cycles=4,
         physics_ticks_per_control_cycle=3,
     )
     return motion_profile, target_profile.action_schema
+
+
+def _dual_arm_action_schema():
+    target_profile = build_mujoco_pose_component_target_profile(
+        SimpleNamespace(arm_specs={"left": object(), "right": object()}),
+        profile_id="fixture.agent_tcp_pose.dual_arm.v1",
+        arm_side_by_component={
+            "left_arm": "left",
+            "right_arm": "right",
+        },
+        arm_reference_frame_by_component={
+            "left_arm": "left_arm_base",
+            "right_arm": "right_arm_base",
+        },
+        arm_controlled_frame_by_component={
+            "left_arm": "tool_tcp",
+            "right_arm": "tool_tcp",
+        },
+        selection_group_by_component={
+            "left_arm": "arms",
+            "right_arm": "arms",
+        },
+    )
+    return target_profile.action_schema
 
 
 def test_cardinal_step_target_is_derived_from_lower_activation_pose() -> None:
@@ -98,6 +128,35 @@ def test_cardinal_step_target_is_derived_from_lower_activation_pose() -> None:
     assert any(
         item.startswith("tcp-displacement-target:")
         for item in resolution.evidence_refs
+    )
+
+
+def test_fixed_level_orientation_is_absolute_and_preserves_tcp_position() -> None:
+    frame = CoordinateFrameSpec(
+        frame_id="right_arm_base",
+        frame_version="fixture",
+        semantic_parameters={
+            "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+        },
+    )
+    primitive = level_tcp_orientation("forward_left_30")
+    first = resolve_level_tcp_orientation_primitive_target(
+        measured_pose=(0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0),
+        primitive=primitive,
+        reference_frame_spec=frame,
+    )
+    second = resolve_level_tcp_orientation_primitive_target(
+        measured_pose=(0.2, 0.3, 0.6, 0.5, 0.5, 0.5, 0.5),
+        primitive=primitive,
+        reference_frame_spec=frame,
+    )
+
+    assert first.target_pose[:3] == pytest.approx((0.4, -0.1, 0.5))
+    assert second.target_pose[:3] == pytest.approx((0.2, 0.3, 0.6))
+    assert first.target_pose[3:] == pytest.approx(second.target_pose[3:])
+    assert any(
+        item.startswith("tcp-level-orientation-primitive:")
+        for item in first.evidence_refs
     )
 
 
@@ -157,6 +216,7 @@ def _contracts(motion_profile):
         trace_requirement_profile_id="trace-profile:fixture",
         executor_id=MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1,
         explicit_exclusions=("hand_control", "requested_duration"),
+        component_id=motion_profile.component_id,
     )
     evaluator = SkillEvaluatorSpec(
         evaluator_id="motion.tcp_pose_arrival_rule",
@@ -188,7 +248,14 @@ def _contracts(motion_profile):
     return route, binding, evaluation_plan
 
 
-def _request_and_operation(route, binding, motion_profile, target_pose):
+def _request_and_operation(
+    route,
+    binding,
+    motion_profile,
+    target_pose,
+    *,
+    component_id: str = "right_arm",
+):
     request = AgentSkillRequest(
         client_id="rpent:fixture",
         request_id="request:agent-tcp-pose:1",
@@ -207,7 +274,7 @@ def _request_and_operation(route, binding, motion_profile, target_pose):
         parameter_profile_id=route.allowed_parameter_profiles[0].parameter_profile_id,
         parameter_profile_hash=motion_profile.semantic_content_hash,
         parameters={
-            "pose_targets_by_component": {"right_arm": list(target_pose)},
+            "pose_targets_by_component": {component_id: list(target_pose)},
             "reference_frame_id": motion_profile.reference_frame_id,
             "reference_frame_spec_hash": (
                 motion_profile.reference_frame_spec_hash
@@ -262,7 +329,13 @@ def _hold_transition():
     )
 
 
-def _fake_application(action_schema, *, start_pose, target_pose):
+def _fake_application(
+    action_schema,
+    *,
+    start_pose,
+    target_pose,
+    component_id: str = "right_arm",
+):
     application = object.__new__(MujocoAgentSkillMotionApplication)
     application.runtime = SimpleNamespace(
         action_schema=action_schema,
@@ -280,7 +353,7 @@ def _fake_application(action_schema, *, start_pose, target_pose):
     }
 
     def capture():
-        return {"right_arm": poses.pop(0)}
+        return {component_id: poses.pop(0)}
 
     def activate_operation(*, operation_id):
         calls["activate"].append(operation_id)
@@ -446,6 +519,91 @@ def test_lifecycle_resolves_cardinal_target_at_lower_activation_boundary() -> No
         ref.startswith("tcp-displacement-target:")
         for ref in completion.execution_receipt_refs
     )
+
+
+@pytest.mark.parametrize("component_id", ("left_arm", "right_arm"))
+def test_lifecycle_resolves_fixed_level_orientation_for_either_arm(
+    component_id: str,
+) -> None:
+    motion_profile, _single_arm_action_schema = _profile_and_schema(component_id)
+    action_schema = _dual_arm_action_schema()
+    motion_profile = replace(
+        motion_profile,
+        max_rotation_delta_rad=1.2,
+    )
+    route, binding, evaluation_plan = _contracts(motion_profile)
+    side = component_id.removesuffix("_arm")
+    reference_frame = CoordinateFrameSpec(
+        frame_id=f"{side}_arm_base",
+        frame_version="fixture",
+        semantic_parameters={
+            "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+        },
+    )
+    primitive = level_tcp_orientation("forward_left_30")
+    center_resolution = resolve_level_tcp_orientation_primitive_target(
+        measured_pose=(0.38, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0),
+        primitive=level_tcp_orientation("center_forward"),
+        reference_frame_spec=reference_frame,
+    )
+    anchor_pose = center_resolution.target_pose
+    target_resolution = resolve_level_tcp_orientation_primitive_target(
+        measured_pose=anchor_pose,
+        primitive=primitive,
+        reference_frame_spec=reference_frame,
+    )
+    target_pose = target_resolution.target_pose
+    request, operation = _request_and_operation(
+        route,
+        binding,
+        motion_profile,
+        target_pose,
+        component_id=component_id,
+    )
+    application, calls = _fake_application(
+        action_schema,
+        start_pose=anchor_pose,
+        target_pose=target_pose,
+        component_id=component_id,
+    )
+    lifecycle = MujocoAgentTcpPoseSkillLifecycle(
+        application=application,
+        route=route,
+        deployment_binding=binding,
+        evaluation_plan=evaluation_plan,
+        motion_profile=motion_profile,
+        request=request,
+        operation=operation,
+        target_resolver=lambda measured: (
+            resolve_level_tcp_orientation_primitive_target(
+                measured_pose=measured,
+                primitive=primitive,
+                reference_frame_spec=reference_frame,
+            )
+        ),
+        clock=lambda: 12.0,
+        sleep=lambda _seconds: None,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    lifecycle.close()
+
+    assert activation.succeeded
+    assert completion.succeeded
+    assert binding.component_id == component_id
+    assert lifecycle.action is not None
+    assert lifecycle.action.component_coverage == (component_id,)
+    assert lifecycle.action.value(component_id).values == pytest.approx(target_pose)
+    assert calls["hold"]
 
 
 def test_hold_evidence_never_claims_unstarted_runtime_is_held() -> None:
@@ -665,6 +823,12 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert cardinal_step_entry.route.route_id == (
         "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
     )
+    published_skill_ids = {
+        entry.route.skill_id for entry in bundle.route_manifest.skill_routes
+    }
+    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1).isdisjoint(
+        published_skill_ids
+    )
     assert "distance_m" not in bundle.schema_catalog.entry(
         "motion.step_tcp_cardinal",
         "1",
@@ -720,6 +884,7 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert route_to_port["motion.step_tcp_cardinal"] is (
         session.cardinal_step_executor
     )
+    assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1).isdisjoint(route_to_port)
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
     assert not motion_application.started
 
