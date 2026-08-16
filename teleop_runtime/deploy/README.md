@@ -116,6 +116,7 @@ policy output (15 Hz)
 - `robot_motion/position_control/interpolation.py`: sim/real 共用 qref→qcmd
   planner；sim/real 只在最后 qcmd sink 分叉。
 - `teleop_runtime/position_control/deploy_executor.py`: real-only 在线 60 Hz worker、chunk 编排、暂停/故障 hold 与 backend dispatch 边界。
+- `teleop_runtime/deploy/arm_state_reader.py`: deployment-facing arm 状态刷新节拍和 bounded causal snapshot history；backend 继续持有设备状态/FK，reader 不持有控制、安全或 dispatch。
 - `teleop_runtime/deploy/dispatch.py`: 当前真机 launcher 的 `TeleopCommand` 到 arm/hand backend 分发；这是 real-specific 代码，不应迁到 `robot_motion`，sim launcher 应实现自己的 dispatcher。
 - `teleop_runtime/deploy/actions.py`: 仍保留旧 `ActionSafetyFilter.filter()` direct-command path 作为 legacy 封存入口；新代码应使用 `filter_normalized()`。
 
