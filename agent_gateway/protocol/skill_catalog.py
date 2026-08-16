@@ -22,7 +22,16 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-AGENT_SKILL_PROTOCOL_VERSION_V1 = "dexteleop.agent_skill.v1"
+from .session_contracts import (
+    DEFAULT_AGENT_SKILL_RESOURCE_CLAIMS_V2,
+    SkillResourceClaim,
+)
+from .skill_io_contracts import (
+    SkillIOCatalog,
+    inline_only_skill_io_catalog_for_routes,
+    inline_only_skill_io_contract,
+)
+from .version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
 AGENT_SKILL_TARGET_KINDS_V1 = ("null", "real", "sim")
 AGENT_SKILL_INTENDED_TARGET_KINDS_V1 = (
@@ -81,33 +90,33 @@ AMBIGUOUS_LIFECYCLE_SKILL_IDS_V1 = (
 MAX_AGENT_SKILL_TIMEOUT_MS_V1 = 86_400_000
 MAX_AGENT_SKILL_JSON_DEPTH_V1 = 16
 
-AGENT_SKILL_DEFINITION_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.definition.v1"
+AGENT_SKILL_DEFINITION_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.definition.v2"
 )
-AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.definition_catalog.v1"
+AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.definition_catalog.v2"
 )
-AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.schema_entry.v1"
+AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.schema_entry.v2"
 )
-AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.schema_catalog.v1"
+AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.schema_catalog.v2"
 )
-AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.schema_document.v1"
+AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.schema_document.v2"
 )
-AGENT_SKILL_ROUTE_HASH_DOMAIN_V1 = "dexteleop.agent_skill.route.v1"
-AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.deployment_binding_ref.v1"
+AGENT_SKILL_ROUTE_HASH_DOMAIN_V2 = "dexteleop.agent_skill.route.v2"
+AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.deployment_binding_ref.v2"
 )
-AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.cross_target_deployment_review_ref.v1"
+AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.cross_target_deployment_review_ref.v2"
 )
-AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.route_manifest_entry.v1"
+AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.route_manifest_entry.v2"
 )
-AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.route_manifest.v1"
+AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.route_manifest.v2"
 )
 
 _NAMESPACED_IDENTIFIER_PATTERN = re.compile(
@@ -310,7 +319,7 @@ def agent_skill_schema_document_hash(
     strict = _strict_object_schema(schema, field_name=f"{kind}_schema")
     return canonical_content_hash(
         _thaw_json(strict),
-        domain=f"{AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V1}.{kind}",
+        domain=f"{AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V2}.{kind}",
     )
 
 
@@ -420,7 +429,7 @@ class SkillDefinition:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(include_hash=False),
-            domain=AGENT_SKILL_DEFINITION_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_DEFINITION_HASH_DOMAIN_V2,
         )
 
     def to_wire(self, *, include_hash: bool = True) -> dict[str, Any]:
@@ -456,10 +465,10 @@ class SkillDefinitionCatalog:
     catalog_id: str
     catalog_version: str
     skill_definitions: tuple[SkillDefinition, ...]
-    protocol_version: str = AGENT_SKILL_PROTOCOL_VERSION_V1
+    protocol_version: str = AGENT_SKILL_PROTOCOL_VERSION_V2
 
     def __post_init__(self) -> None:
-        if self.protocol_version != AGENT_SKILL_PROTOCOL_VERSION_V1:
+        if self.protocol_version != AGENT_SKILL_PROTOCOL_VERSION_V2:
             raise ValueError(f"Unsupported protocol: {self.protocol_version!r}.")
         object.__setattr__(
             self,
@@ -512,7 +521,7 @@ class SkillDefinitionCatalog:
                     item.semantic_content_hash for item in self.skill_definitions
                 ),
             },
-            domain=AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V2,
         )
 
     def to_wire(self) -> dict[str, Any]:
@@ -645,7 +654,7 @@ class AgentSkillSchemaEntry:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(include_hash=False),
-            domain=AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2,
         )
 
     def profile(self, parameter_profile_id: str) -> SkillParameterProfileRef:
@@ -687,10 +696,10 @@ class AgentSkillSchemaCatalog:
     catalog_id: str
     catalog_version: str
     schema_entries: tuple[AgentSkillSchemaEntry, ...]
-    protocol_version: str = AGENT_SKILL_PROTOCOL_VERSION_V1
+    protocol_version: str = AGENT_SKILL_PROTOCOL_VERSION_V2
 
     def __post_init__(self) -> None:
-        if self.protocol_version != AGENT_SKILL_PROTOCOL_VERSION_V1:
+        if self.protocol_version != AGENT_SKILL_PROTOCOL_VERSION_V2:
             raise ValueError(f"Unsupported protocol: {self.protocol_version!r}.")
         object.__setattr__(
             self,
@@ -736,7 +745,7 @@ class AgentSkillSchemaCatalog:
                     item.semantic_content_hash for item in self.schema_entries
                 ),
             },
-            domain=AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V2,
         )
 
     def to_wire(self) -> dict[str, Any]:
@@ -774,6 +783,10 @@ class SkillExecutionRoute:
     cancellation_policy: str
     max_concurrent_operations: int = 1
     requires_task_evaluation: bool = False
+    skill_io_contract_hash: str | None = None
+    resource_claims: tuple[SkillResourceClaim, ...] = (
+        DEFAULT_AGENT_SKILL_RESOURCE_CLAIMS_V2
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "skill_id", validate_skill_id(self.skill_id))
@@ -885,9 +898,8 @@ class SkillExecutionRoute:
         concurrency = _positive_integer(
             self.max_concurrent_operations,
             field_name="max_concurrent_operations",
+            maximum=64,
         )
-        if concurrency != 1:
-            raise ValueError("Agent skill protocol v1 requires one active operation.")
         object.__setattr__(self, "max_concurrent_operations", concurrency)
         object.__setattr__(
             self,
@@ -897,6 +909,36 @@ class SkillExecutionRoute:
                 field_name="requires_task_evaluation",
             ),
         )
+        io_contract_hash = self.skill_io_contract_hash
+        if io_contract_hash is None:
+            io_contract_hash = inline_only_skill_io_contract(
+                skill_id=self.skill_id,
+                skill_version=self.skill_version,
+                skill_definition_hash=self.skill_definition_hash,
+                parameter_schema_hash=self.parameter_schema_hash,
+                execution_result_schema_hash=self.execution_result_schema_hash,
+                task_evaluation_schema_hash=self.task_evaluation_schema_hash,
+            ).semantic_content_hash
+        object.__setattr__(
+            self,
+            "skill_io_contract_hash",
+            _required(io_contract_hash, field_name="skill_io_contract_hash"),
+        )
+        claims = tuple(self.resource_claims)
+        if not claims or any(
+            not isinstance(claim, SkillResourceClaim) for claim in claims
+        ):
+            raise ValueError(
+                "resource_claims must contain at least one SkillResourceClaim."
+            )
+        claim_ids = tuple(claim.resource_id for claim in claims)
+        if claim_ids != tuple(sorted(claim_ids)) or len(set(claim_ids)) != len(
+            claim_ids
+        ):
+            raise ValueError(
+                "resource_claims must be uniquely sorted by resource_id."
+            )
+        object.__setattr__(self, "resource_claims", claims)
 
         if target_kind == "null" and modes != ("dry_run",):
             raise ValueError("A null Route only supports dry_run mode.")
@@ -1010,7 +1052,7 @@ class SkillExecutionRoute:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(include_hash=False),
-            domain=AGENT_SKILL_ROUTE_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_ROUTE_HASH_DOMAIN_V2,
         )
 
     def to_wire(self, *, include_hash: bool = True) -> dict[str, Any]:
@@ -1040,6 +1082,10 @@ class SkillExecutionRoute:
             "cancellation_policy": self.cancellation_policy,
             "max_concurrent_operations": self.max_concurrent_operations,
             "requires_task_evaluation": self.requires_task_evaluation,
+            "skill_io_contract_hash": self.skill_io_contract_hash,
+            "resource_claims": [
+                claim.to_wire() for claim in self.resource_claims
+            ],
         }
         if include_hash:
             payload["route_hash"] = self.semantic_content_hash
@@ -1094,7 +1140,7 @@ class CrossTargetDeploymentReviewRef:
         return canonical_content_hash(
             self.to_wire(include_hash=False),
             domain=(
-                AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V1
+                AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V2
             ),
         )
 
@@ -1232,7 +1278,7 @@ class SkillDeploymentBindingRef:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(include_reference_hash=False),
-            domain=AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V2,
         )
 
     def to_wire(self, *, include_reference_hash: bool = True) -> dict[str, Any]:
@@ -1304,7 +1350,7 @@ class SkillRouteManifestEntry:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(include_hash=False),
-            domain=AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V2,
         )
 
     def to_wire(self, *, include_hash: bool = True) -> dict[str, Any]:
@@ -1335,10 +1381,11 @@ class SkillRouteManifest:
     supported_transport_features: tuple[str, ...]
     skill_routes: tuple[SkillRouteManifestEntry, ...]
     explicit_exclusions: tuple[str, ...] = ()
-    protocol_version: str = AGENT_SKILL_PROTOCOL_VERSION_V1
+    skill_io_catalog_hash: str | None = None
+    protocol_version: str = AGENT_SKILL_PROTOCOL_VERSION_V2
 
     def __post_init__(self) -> None:
-        if self.protocol_version != AGENT_SKILL_PROTOCOL_VERSION_V1:
+        if self.protocol_version != AGENT_SKILL_PROTOCOL_VERSION_V2:
             raise ValueError(
                 f"Unsupported agent skill protocol: {self.protocol_version!r}."
             )
@@ -1460,6 +1507,29 @@ class SkillRouteManifest:
                 )
             ),
         )
+        io_catalog_hash = self.skill_io_catalog_hash
+        if io_catalog_hash is None:
+            inline_catalog = inline_only_skill_io_catalog_for_routes(
+                entry.route for entry in self.skill_routes
+            )
+            for entry in self.skill_routes:
+                contract = inline_catalog.contract(
+                    entry.route.skill_id,
+                    entry.route.skill_version,
+                )
+                if entry.route.skill_io_contract_hash != (
+                    contract.semantic_content_hash
+                ):
+                    raise ValueError(
+                        "Custom Artifact I/O Routes require an explicit "
+                        "skill_io_catalog_hash."
+                    )
+            io_catalog_hash = inline_catalog.semantic_content_hash
+        object.__setattr__(
+            self,
+            "skill_io_catalog_hash",
+            _required(io_catalog_hash, field_name="skill_io_catalog_hash"),
+        )
         object.__setattr__(
             self,
             "explicit_exclusions",
@@ -1522,6 +1592,7 @@ class SkillRouteManifest:
                     self.skill_definition_catalog_hash
                 ),
                 "skill_schema_catalog_hash": self.skill_schema_catalog_hash,
+                "skill_io_catalog_hash": self.skill_io_catalog_hash,
                 "target_binding_id": self.target_binding_id,
                 "target_kind": self.target_kind,
                 "current_mode": self.current_mode,
@@ -1533,7 +1604,7 @@ class SkillRouteManifest:
                 ),
                 "explicit_exclusions": self.explicit_exclusions,
             },
-            domain=AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V2,
         )
 
     def to_wire(self) -> dict[str, Any]:
@@ -1545,6 +1616,7 @@ class SkillRouteManifest:
             "execution_manifest_hash": self.execution_manifest_hash,
             "skill_definition_catalog_hash": self.skill_definition_catalog_hash,
             "skill_schema_catalog_hash": self.skill_schema_catalog_hash,
+            "skill_io_catalog_hash": self.skill_io_catalog_hash,
             "target_binding_id": self.target_binding_id,
             "target_kind": self.target_kind,
             "current_mode": self.current_mode,
@@ -1562,6 +1634,7 @@ def validate_skill_route_catalog_closure(
     definition_catalog: SkillDefinitionCatalog,
     schema_catalog: AgentSkillSchemaCatalog,
     route_manifest: SkillRouteManifest,
+    io_catalog: SkillIOCatalog | None = None,
 ) -> None:
     """Fail closed unless every advertised Route closes over exact catalogs."""
 
@@ -1571,6 +1644,12 @@ def validate_skill_route_catalog_closure(
         raise TypeError("schema_catalog must be an AgentSkillSchemaCatalog.")
     if not isinstance(route_manifest, SkillRouteManifest):
         raise TypeError("route_manifest must be a SkillRouteManifest.")
+    if io_catalog is None:
+        io_catalog = inline_only_skill_io_catalog_for_routes(
+            entry.route for entry in route_manifest.skill_routes
+        )
+    elif not isinstance(io_catalog, SkillIOCatalog):
+        raise TypeError("io_catalog must be a SkillIOCatalog or None.")
     if (
         route_manifest.skill_definition_catalog_hash
         != definition_catalog.semantic_content_hash
@@ -1578,6 +1657,8 @@ def validate_skill_route_catalog_closure(
         raise ValueError("Skill definition catalog hash mismatch.")
     if route_manifest.skill_schema_catalog_hash != schema_catalog.semantic_content_hash:
         raise ValueError("Agent Skill schema catalog hash mismatch.")
+    if route_manifest.skill_io_catalog_hash != io_catalog.semantic_content_hash:
+        raise ValueError("Agent Skill I/O catalog hash mismatch.")
     for advertised in route_manifest.skill_routes:
         route = advertised.route
         try:
@@ -1642,6 +1723,24 @@ def validate_skill_route_catalog_closure(
         )
         if not all(schema_checks):
             raise ValueError("Route schema hashes do not close over schema catalog.")
+        try:
+            io_contract = io_catalog.contract(
+                route.skill_id,
+                route.skill_version,
+            )
+        except KeyError as error:
+            raise ValueError("Route references an unknown Skill I/O contract.") from error
+        io_checks = (
+            io_contract.skill_definition_hash == route.skill_definition_hash,
+            io_contract.parameter_schema_hash == route.parameter_schema_hash,
+            io_contract.execution_result_schema_hash
+            == route.execution_result_schema_hash,
+            io_contract.task_evaluation_schema_hash
+            == route.task_evaluation_schema_hash,
+            io_contract.semantic_content_hash == route.skill_io_contract_hash,
+        )
+        if not all(io_checks):
+            raise ValueError("Route I/O hashes do not close over I/O catalog.")
         catalog_profiles = {
             (item.parameter_profile_id, item.parameter_profile_hash): item
             for item in schema_entry.parameter_profiles
@@ -1659,21 +1758,21 @@ __all__ = [
     "AGENT_SKILL_CANCELLATION_POLICIES_V1",
     "AGENT_SKILL_CONTROL_EFFECT_CLASSES_V1",
     "AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_POLICIES_V1",
-    "AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V1",
-    "AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V1",
-    "AGENT_SKILL_DEFINITION_HASH_DOMAIN_V1",
-    "AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V1",
+    "AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V2",
+    "AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V2",
+    "AGENT_SKILL_DEFINITION_HASH_DOMAIN_V2",
+    "AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V2",
     "AGENT_SKILL_KINDS_V1",
     "AGENT_SKILL_INTENDED_TARGET_KINDS_V1",
     "AGENT_SKILL_MODES_V1",
     "AGENT_SKILL_PRIVILEGE_TIERS_V1",
-    "AGENT_SKILL_PROTOCOL_VERSION_V1",
-    "AGENT_SKILL_ROUTE_HASH_DOMAIN_V1",
-    "AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V1",
-    "AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V1",
-    "AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V1",
-    "AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V1",
-    "AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V1",
+    "AGENT_SKILL_PROTOCOL_VERSION_V2",
+    "AGENT_SKILL_ROUTE_HASH_DOMAIN_V2",
+    "AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V2",
+    "AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V2",
+    "AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V2",
+    "AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V2",
+    "AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2",
     "AGENT_SKILL_TARGET_KINDS_V1",
     "AMBIGUOUS_LIFECYCLE_SKILL_IDS_V1",
     "AgentSkillSchemaCatalog",
@@ -1687,6 +1786,7 @@ __all__ = [
     "SkillDeploymentBindingRef",
     "SkillDeploymentSafetyEnvelopeRef",
     "SkillExecutionRoute",
+    "SkillIOCatalog",
     "SkillParameterProfileRef",
     "SkillRouteManifest",
     "SkillRouteManifestEntry",
