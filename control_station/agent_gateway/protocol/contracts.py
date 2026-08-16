@@ -1,4 +1,4 @@
-"""Pure external wire contracts for the RPent-to-DexTeleop Skill boundary.
+"""Pure external wire contracts for the upper-agent-to-DexTeleop Skill boundary.
 
 The records in this module describe Route discovery, immutable requests,
 low-rate observation snapshots, and operation status.  They do not own a
@@ -2325,7 +2325,7 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
 
 
 def agent_skill_schema_snapshot_document() -> dict[str, Any]:
-    """Return the portable schema snapshot consumed by RPent."""
+    """Return the portable schema snapshot consumed by upper Agent clients."""
 
     enums = {
         "ambiguous_lifecycle_skill_ids": list(

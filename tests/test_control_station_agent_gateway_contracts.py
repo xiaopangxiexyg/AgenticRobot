@@ -164,6 +164,21 @@ def test_manifest_is_order_stable_and_hashes_exact_route_bindings() -> None:
     assert first.protocol_version == AGENT_SKILL_PROTOCOL_VERSION_V1
 
 
+def test_skill_request_identity_is_upper_framework_neutral() -> None:
+    route = _route()
+    manifest = _manifest(route)
+    payload = _request_payload(manifest, route)
+    payload["client_id"] = "other-upper:planner-1"
+
+    request = agent_skill_request_from_json(payload)
+
+    assert request.client_id == "other-upper:planner-1"
+    assert request.to_wire() == {
+        **payload,
+        "skill_execution_grant_id": None,
+    }
+
+
 def test_request_json_shape_binds_route_and_detaches_parameters() -> None:
     route = _route()
     manifest = _manifest(route)

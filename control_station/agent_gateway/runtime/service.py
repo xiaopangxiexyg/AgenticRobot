@@ -1,4 +1,4 @@
-"""Bounded application/CAS facade for the RPent Agent Gateway contract.
+"""Bounded application/CAS facade for the external Agent Gateway contract.
 
 Submission performs access assessment and bounded application admission only;
 it never runs an operation body.  An explicit worker invokes the typed

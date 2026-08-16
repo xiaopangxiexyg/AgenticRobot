@@ -92,6 +92,15 @@ persistence.
 
 ### Agent Gateway semantic motion surface
 
+The Gateway is an upper-framework-neutral Skill provider. Its wire requests do
+not contain an RPent Task, Program, Planner, Memory, Experience, or upper
+SkillAttempt object. RPent is the first reviewed consumer, not a required
+runtime dependency. Another upper framework may consume the same catalog and
+submit requests when its client identity is explicitly allowed, but it must
+preserve exact request identity, idempotency, reconciliation and lower-owned
+operation/HOLD truth. The Gateway does not adapt an upper framework's planner
+or task model and never exposes a controller bypass for compatibility.
+
 The default-off MuJoCo Agent Gateway profile publishes one shared lower motion
 domain with separate versioned Skills for absolute TCP targets and semantic
 cardinal steps. `motion.move_tcp_to_pose@1` accepts an exact lower target,
