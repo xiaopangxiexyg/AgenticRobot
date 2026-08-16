@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import MISSING, fields
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,10 @@ from teleop_runtime.real_teleop.agent_motion_port import (
     RealAgentMotionPort,
     RealAgentMotionPortConfig,
 )
+from teleop_runtime.real_teleop.agent_motion_runtime import (
+    attach_real_agent_motion_port,
+)
+from teleop_runtime.real_teleop.components import RealTeleopComponents
 from teleop_runtime.session import TeleopCommandOverride
 
 
@@ -90,6 +95,23 @@ def _port(builder: _TargetBuilder | None = None) -> RealAgentMotionPort:
         ),
         target_builder=builder or _TargetBuilder(),
     )
+
+
+def _components_for_attachment(
+    *,
+    session: object,
+    target_builder: object,
+) -> RealTeleopComponents:
+    values = {}
+    for item in fields(RealTeleopComponents):
+        if item.default is MISSING and item.default_factory is MISSING:
+            values[item.name] = None
+    values.update(
+        session=session,
+        active_sides=("right",),
+        dual_arm_retargeter=target_builder,
+    )
+    return RealTeleopComponents(**values)
 
 
 def test_owner_activation_builds_through_coupled_target_solver() -> None:
@@ -214,3 +236,52 @@ def test_coupled_target_failure_is_latched_for_session_fail_hold() -> None:
     assert snapshot.operation_id == "operation-1"
     assert snapshot.fault is not None
     assert "coupled IK rejected target" in snapshot.fault
+
+
+def test_attachment_composes_existing_admission_and_remains_explicit() -> None:
+    admission_calls = []
+
+    def existing_admission(command, observation, now):
+        del command, observation, now
+        admission_calls.append("existing")
+        return True
+
+    session = SimpleNamespace(
+        command_override_provider=None,
+        command_dispatch_admission=existing_admission,
+    )
+    target_builder = _TargetBuilder()
+    original = _components_for_attachment(
+        session=session,
+        target_builder=target_builder,
+    )
+    assert original.agent_motion_port is None
+
+    attached = attach_real_agent_motion_port(
+        original,
+        config=RealAgentMotionPortConfig(
+            active_sides=("right",),
+            component_id_by_side={"right": "right-tool-tcp"},
+            execution_frame_id="dual-arm-solver-world",
+            execution_frame_spec_hash="solver-world-spec-hash-1",
+        ),
+    )
+
+    assert original.agent_motion_port is None
+    assert attached.agent_motion_port is not None
+    assert session.command_override_provider == (
+        attached.agent_motion_port.command_for_observation
+    )
+    human_command = TeleopCommand()
+    assert session.command_dispatch_admission(
+        human_command,
+        TeleopObservation(timestamp=1.0),
+        1.0,
+    )
+    assert admission_calls == ["existing"]
+
+    with pytest.raises(RuntimeError, match="already has an Agent motion port"):
+        attach_real_agent_motion_port(
+            attached,
+            config=attached.agent_motion_port.config,
+        )

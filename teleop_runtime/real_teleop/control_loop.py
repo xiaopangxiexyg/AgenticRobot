@@ -736,6 +736,37 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     pending_progress_arm_transition: PendingProgressArmTransition | None = None
     progress_arm_entry_episode_hash = ""
     next_idle_tactile_compression_tick_at = 0.0
+    agent_motion_port = getattr(components, "agent_motion_port", None)
+    agent_motion_last_phase = (
+        None
+        if agent_motion_port is None
+        else agent_motion_port.snapshot().phase.value
+    )
+
+    def synchronize_agent_motion_owner_state(
+        snapshot: object,
+        *,
+        now: float,
+    ) -> None:
+        """Mirror a newly terminal lower Agent state into the normal UI Hold."""
+
+        nonlocal agent_motion_last_phase
+        phase = str(getattr(getattr(snapshot, "phase", None), "value", ""))
+        previous = agent_motion_last_phase
+        agent_motion_last_phase = phase
+        if phase not in {"held", "faulted"} or phase == previous:
+            return
+        reason = (
+            "agent_motion_owner_fault"
+            if phase == "faulted"
+            else "agent_motion_owner_hold"
+        )
+        _request_safety_hold_best_effort(
+            clutch_input,
+            reason=reason,
+            log=_log,
+            now=now,
+        )
 
     def reset_position_admittance_shadow(
         *,
@@ -2715,6 +2746,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             return False
 
         phase_recorder = loop_phase_timer.record if loop_phase_timer is not None else None
+        if agent_motion_port is not None:
+            agent_motion_snapshot = agent_motion_port.apply_owner_requests(
+                session=components.session,
+                now=loop_start,
+            )
+            synchronize_agent_motion_owner_state(
+                agent_motion_snapshot,
+                now=loop_start,
+            )
         try:
             step_result = components.session.run_step(
                 now=loop_start,
@@ -2759,6 +2799,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 continue
             raise
         mark_loop_phase("loop.session_run_step")
+        if agent_motion_port is not None:
+            agent_motion_snapshot = agent_motion_port.observe_session_step(
+                command=step_result.command,
+                command_dispatched=step_result.command_dispatched,
+            )
+            synchronize_agent_motion_owner_state(
+                agent_motion_snapshot,
+                now=loop_start,
+            )
         startup_continuity = (
             None
             if step_result.command is None

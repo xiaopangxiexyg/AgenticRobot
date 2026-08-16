@@ -2495,6 +2495,7 @@ def build_real_teleop_components(
         human_shadow_frontend=human_shadow_frontend,
         temporary_safety_limiter=temporary_safety_limiter,
         position_admittance_endpoint_guard=position_admittance_endpoint_guard,
+        agent_motion_port=None,
         fix_arm_controller=fix_arm_controller,
         init_arm_controller=init_arm_controller,
         position_reference_publisher=position_reference_publisher,

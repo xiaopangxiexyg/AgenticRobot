@@ -1,0 +1,59 @@
+"""Default-off composition of the real Agent motion port into RealTeleop."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+from .agent_motion_port import RealAgentMotionPort, RealAgentMotionPortConfig
+from .components import RealTeleopComponents
+
+
+def attach_real_agent_motion_port(
+    components: RealTeleopComponents,
+    *,
+    config: RealAgentMotionPortConfig,
+) -> RealTeleopComponents:
+    """Attach one lower port without adding a second command/dispatch owner.
+
+    The ordinary component builder never calls this function.  A production
+    composition root must opt in with an exact execution-frame/component
+    binding before it publishes any real motion Route.
+    """
+
+    if not isinstance(components, RealTeleopComponents):
+        raise TypeError("components must be RealTeleopComponents.")
+    if not isinstance(config, RealAgentMotionPortConfig):
+        raise TypeError("config must be RealAgentMotionPortConfig.")
+    if components.agent_motion_port is not None:
+        raise RuntimeError("RealTeleop already has an Agent motion port.")
+    target_builder = components.dual_arm_retargeter
+    if target_builder is None:
+        raise RuntimeError(
+            "Real Agent motion requires the existing coupled dual-arm target solver."
+        )
+    if set(config.active_sides) != set(components.active_sides):
+        raise ValueError(
+            "Agent motion active_sides must exactly match RealTeleop authority."
+        )
+    session = components.session
+    if session.command_override_provider is not None:
+        raise RuntimeError(
+            "RealTeleop already has a command override provider; ownership is ambiguous."
+        )
+
+    port = RealAgentMotionPort(config=config, target_builder=target_builder)
+    previous_admission = session.command_dispatch_admission
+
+    def combined_admission(command, observation, now):
+        if not port.admit_command(command, observation, now):
+            return False
+        if previous_admission is None:
+            return True
+        return bool(previous_admission(command, observation, now))
+
+    session.command_override_provider = port.command_for_observation
+    session.command_dispatch_admission = combined_admission
+    return replace(components, agent_motion_port=port)
+
+
+__all__ = ["attach_real_agent_motion_port"]

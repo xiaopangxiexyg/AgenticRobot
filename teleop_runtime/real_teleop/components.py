@@ -52,6 +52,7 @@ class RealTeleopComponents:
     human_shadow_frontend: HumanShadowFrontend | None
     temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None
     position_admittance_endpoint_guard: PositionAdmittanceEndpointExcursionGuard | None
+    agent_motion_port: RealAgentMotionPort | None
     fix_arm_controller: FixArmCommandController | None
     init_arm_controller: InitArmCommandController | None
     position_reference_publisher: PositionReferencePublisher | None
