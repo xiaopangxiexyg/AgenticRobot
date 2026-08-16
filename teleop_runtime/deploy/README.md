@@ -116,6 +116,28 @@ policy output (15 Hz)
 - `robot_motion/position_control/interpolation.py`: sim/real 共用 qref→qcmd
   planner；sim/real 只在最后 qcmd sink 分叉。
 - `robot_motion/rm65/control_mode.py`: deploy/replay 共用 RM65 position/impedance 模式名与历史别名归一化；各 application 仍自行解析频率、profile 和设备生命周期。
+- `teleop_runtime/deploy/run_policy.py`: deploy application root，仍拥有参数校验后的
+  资源装配顺序、policy/action queue 推进、主控制循环和有序清理。下列模块是它调用的
+  单职责 collaborator，不是新的入口、控制循环或并行 authority。
+- `teleop_runtime/deploy/policy_binding.py`: 把 CLI、policy artifact 和 model-I/O layout
+  绑定到 lower-owned policy observation/action contract；不加载模型或推进 queue。
+- `teleop_runtime/deploy/arm_backend_runtime.py`: 从已解析 profile 构造 RM65 backend 和
+  command timing metadata；不启动/关闭设备，也不拥有 dispatch、authority 或 safety。
+- `teleop_runtime/deploy/hand_backend_config.py` 与 `hand_backend_runtime.py`: 前者只解析
+  hand/gripper profile 和 backend config，后者负责具体 backend 实例化与 checked startup；
+  application root 仍决定启动/关闭顺序，dispatch 仍由执行路径拥有。
+- `teleop_runtime/deploy/runtime_timing.py`: 按 CLI、artifact metadata 或 replay 数据解析
+  effective action/policy rate；不持有 loop clock、worker 或 queue cursor。
+- `teleop_runtime/deploy/cli_value_parsers.py`: deploy 参数的纯值转换与历史私有符号兼容；
+  通用数值 parser 复用 `teleop_runtime/cli_value_parsers.py`，导入时不初始化 backend。
+- `teleop_runtime/dmtac_tactile_fields.py`: DMTac tactile 合法字段、别名、默认 shape 与
+  calibration requirement 的纯契约；设备实现继续从历史 backend 路径兼容导出这些名称。
+- `teleop_runtime/deploy/action_execution.py`: 只把一个已经 canonical-prepared 的 action
+  路由到既有 direct dispatch 或 position-reference executor；不消费 policy queue、不重做
+  canonical safety，也不独立推进 reference plan。
+- `teleop_runtime/deploy/arm_safety_runtime.py`: 对 deploy 的 HOLD/soft-HOLD/Arm_Stop 请求做
+  mode gate 和双臂 fanout；backend 仍唯一拥有硬件 stop、latched state 与 acknowledgement，
+  `impedance_force_guard.py` 只负责阻抗采样监视并兼容导出旧 stop helper。
 - `teleop_runtime/position_control/deploy_executor.py`: real-only 在线 60 Hz worker、chunk 编排、暂停/故障 hold 与 backend dispatch 边界。
 - `teleop_runtime/deploy/arm_state_reader.py`: deployment-facing arm 状态刷新节拍和 bounded causal snapshot history；backend 继续持有设备状态/FK，reader 不持有控制、安全或 dispatch。
 - `teleop_runtime/deploy/camera_runtime.py`: policy artifact 相机键绑定、部署侧 source 构造与启动准入适配；正式 RealSense 启动/重试和 freshness gate 继续复用 `teleop_runtime.real_teleop.camera_runtime`，本模块不另建相机生命周期所有者。
