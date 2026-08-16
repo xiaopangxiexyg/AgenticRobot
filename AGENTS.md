@@ -62,9 +62,13 @@ is experimental.
   batch adapters, and offline model evaluation. It may depend on
   `dataset_contracts` and `dataset_interface`, but must not own robot-motion
   semantics, deployment, safety, authority, dispatch, or hardware resources.
-- `model/`: local policy weights, checkpoints, and runtime sidecars only. It is
-  not a Python package or a source-code owner; versioned artifact contracts and
-  integration remain under `deployments/`.
+- `model/`: local policy weights, checkpoints, runtime sidecars, and explicitly
+  pinned external source boundaries only. It is not a Python package or an
+  AgenticRobot source-code owner; versioned artifact contracts and integration
+  remain under `deployments/`. `model/openpi` is the independently owned OpenPI
+  Git submodule: its gitlink is the source-version boundary, it keeps its own
+  Python/runtime environment, and AgenticRobot code must not treat it as the
+  `model.openpi` package or vendor its generated/runtime assets.
 - `legacy/`: confirmed-archived code/docs only; production code must not import it.
 - `tests/`: verification, never runtime code. Root `todos/` is Git-ignored local planning state;
   tracked code, tests, and documentation must not import or link to it. Plans that require shared
