@@ -27,6 +27,10 @@ def test_run_policy_reexports_deployment_arm_backend_owner() -> None:
         run_policy._resolve_position_reference_and_command_hz
         is arm_backend_runtime.resolve_position_reference_and_command_hz
     )
+    assert (
+        run_policy._position_deploy_ik_tuning
+        is arm_backend_runtime._position_deploy_ik_tuning
+    )
 
 
 def test_deployment_arm_backend_owner_does_not_control_resource_lifecycle() -> None:

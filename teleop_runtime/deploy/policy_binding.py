@@ -9,6 +9,7 @@ advance policy queues, or own action/safety semantics.
 from __future__ import annotations
 
 import argparse
+import json
 from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -20,6 +21,13 @@ from robot_motion.deploy.schema import ALL_SIDES
 from robot_motion.deploy.session_contract import (
     resolve_policy_action_pose_mode_from_artifact,
 )
+
+
+def parse_policy_kwargs(text: str) -> dict[str, Any]:
+    payload = json.loads(str(text or "{}"))
+    if not isinstance(payload, dict):
+        raise TypeError("--policy-kwargs-json must decode to a JSON object.")
+    return payload
 
 
 def bind_policy_pose_mode_from_artifact(
@@ -87,4 +95,5 @@ def build_policy_observation_contract(
 __all__ = [
     "bind_policy_pose_mode_from_artifact",
     "build_policy_observation_contract",
+    "parse_policy_kwargs",
 ]

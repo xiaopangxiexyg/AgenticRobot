@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ..backends.grippers import DMTAC_TACTILE_FIELDS
+from ..dmtac_tactile_fields import DMTAC_TACTILE_FIELDS
 from ..cli_value_parsers import (
     _alpha_float,
     _non_negative_int,

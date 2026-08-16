@@ -11,7 +11,8 @@ import re
 
 import numpy as np
 
-from ..backends.grippers import normalize_dmtac_tactile_fields
+from ..cli_value_parsers import _positive_int
+from ..dmtac_tactile_fields import normalize_dmtac_tactile_fields
 
 def _non_negative_float(text: str) -> float:
     value = float(text)
@@ -53,12 +54,6 @@ def _positive_finite_float_arg(text: str) -> float:
     value = float(text)
     if not np.isfinite(value) or value <= 0.0:
         raise argparse.ArgumentTypeError("value must be positive and finite")
-    return value
-
-def _positive_int(text: str) -> int:
-    value = int(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("value must be positive")
     return value
 
 def _dmtac_worker_cpu_affinity(text: str) -> tuple[int, ...]:

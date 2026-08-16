@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +103,6 @@ from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_CHOICES,
     POSITION_PLAN_SPLICE_DYNAMICS_OFF,
     POSITION_PLAN_SPLICE_DYNAMICS_PROFILE_CHOICES,
-    PositionSourcePlanCut,
     PositionStreamStartAcquisitionConfig,
     resolve_position_plan_splice_dynamics_config,
 )
@@ -129,7 +128,6 @@ from robot_motion.rm65 import (
     RM65_QREF_ACCELERATION_COMFORT_75_V1,
     RM65_QREF_ACCELERATION_HARD_V1,
     RM65_QREF_ACCELERATION_PROFILE_CHOICES,
-    build_rm65_pose_lift_ik_tuning,
     normalize_rm65_arm_control_mode,
     resolve_rm65_pose_lift_profile,
     resolve_rm65_qref_acceleration_profile,
@@ -163,13 +161,8 @@ from ..backends.arms import (
     RM65ImpedanceArmBackend,
 )
 from ..backends.grippers import (
-    DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
-    DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
-    DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
     DMTAC_TACTILE_FIELDS,
-    GRIPPER_ACTION_MAX,
     DMTacGripperBackendConfig,
-    normalize_dmtac_tactile_fields,
 )
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
@@ -206,7 +199,6 @@ from ..position_control import (
     POSITION_PATH_LIFT_BACKEND_CHOICES,
     PositionDeployExecutor,
     PositionDeployExecutorConfig,
-    PositionDeployExecutorFault,
     apply_rm65_position_profile_defaults,
     build_official_all_ik_governor_from_started_backends,
     build_position_collision_planner_from_started_backends,
@@ -238,6 +230,10 @@ from .action_dispatch import (
     command_effector_kind_subset,
     dispatch_position_discrete_command_checked as _dispatch_position_discrete_command_checked,
 )
+from .action_execution import (
+    PreparedActionExecution as _PreparedActionExecution,
+    PreparedActionExecutor,
+)
 from .arbiter_shadow import (
     ARBITER_SHADOW_MODE_SHADOW,
     ARBITER_SHADOW_MODES_M3,
@@ -259,8 +255,15 @@ from .arm_backend_runtime import (
     effective_arm_canfd_follow,
     effective_arm_control_hz,
     effective_position_reference_hz,
+    _position_deploy_ik_tuning,
     resolve_arm_step_dt_max_scale,
     resolve_position_reference_and_command_hz as _resolve_position_reference_and_command_hz,
+)
+from .arm_safety_runtime import (
+    emergency_stop_deploy_arm_backends,
+    emergency_stop_position_deploy_on_keyboard_interrupt as _emergency_stop_position_deploy_on_keyboard_interrupt,
+    hold_deploy_arm_backends,
+    request_policy_inference_soft_hold,
 )
 from .arm_state_reader import ArmStateReader
 from .camera_runtime import (
@@ -274,6 +277,21 @@ from .camera_runtime import (
     start_camera_sources,
 )
 from .cli_args import argument_was_supplied as _argument_was_supplied
+from .cli_value_parsers import (
+    _non_negative_float,
+    _non_negative_int,
+    _parse_active_sides,
+    _parse_arm_max_angvel,
+    _parse_disconnected_gripper_sides,
+    _parse_dmtac_tactile_fields,
+    _parse_end_effector_sides,
+    _parse_float_tuple,
+    _parse_qpos6,
+    _parse_vector3,
+    _positive_float,
+    _positive_int,
+    _unit_interval_float,
+)
 from .console_runtime import LoopRate, NonBlockingKeyboard
 from .debug_payload import (
     DEPLOY_DEBUG_PAYLOAD_COMPACT,
@@ -317,10 +335,20 @@ from .dispatch import (
     POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
     POSITION_REFERENCE_DISPATCH_AUDIT_POST,
     dispatch_position_reference_command,
-    dispatch_teleop_command,
     require_arm_backends_ready_for_position_dispatch,
 )
 from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
+from .hand_backend_config import (
+    GRIPPER_POLICY_DEFAULTS,
+    _apply_gripper_policy_to_dmtac_config,
+    _dmtac_tactile_enabled,
+    _hand_backend_mode,
+    _hand_backend_mode_for_side,
+    _hands_enabled,
+    _load_gripper_task_profile,
+    _profile_value,
+    _resolved_gripper_policy,
+)
 from .hand_backend_runtime import (
     HAND_BACKEND_CHOICES,
     HAND_BACKEND_DMTAC_GRIPPER,
@@ -336,7 +364,6 @@ from .impedance_force_guard import (
     ImpedanceForceGuardConfig,
     ImpedanceForceGuardFault,
     ImpedanceForceGuardMonitor,
-    bimanual_emergency_stop,
 )
 from .impedance_runtime import (
     enable_impedance_force_control_backends,
@@ -350,6 +377,7 @@ from .policy_qpos_init import (
 from .policy_binding import (
     bind_policy_pose_mode_from_artifact as _bind_policy_pose_mode_from_artifact,
     build_policy_observation_contract as _policy_observation_contract,
+    parse_policy_kwargs,
 )
 from .position_plan_cut import (
     DeploymentPositionPlanCutDetector,
@@ -363,9 +391,7 @@ from .position_stream_handoff import (
 from .replay import (
     bind_debug_replay_arm_control_mode,
     debug_replay_execution_exhausted as _debug_replay_execution_exhausted,
-    infer_replay_action_hz,
     load_dataset_replay_policy,
-    resolve_replay_parquet_path,
     skip_startup_replay_frames as _skip_startup_replay_frames,
 )
 from .resource_lifecycle import PolicyDeployResourceLifecycle
@@ -392,6 +418,12 @@ from .rtc_step_fanout import (
     RtcFrontendStepFanout,
     RtcPolicyEmissionPublisher,
 )
+from .runtime_timing import (
+    _action_hz_reference,
+    _runtime_action_keyframe_period_sec,
+    resolve_effective_action_hz,
+    resolve_effective_policy_hz,
+)
 from .safety_shadow import evaluate_policy_legacy_aligned_safety
 from .startup_init import (
     StartupInitializer,
@@ -401,439 +433,6 @@ from .startup_init import (
 )
 
 DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
-# Deployment runs the vision policy at roughly 15 Hz on the RM65 profile.  A
-# 100 ms observation gate leaves only one half-frame of jitter budget at that
-# rate, so keep a deployment-specific margin without changing collection's
-# stricter sampling contract.
-GRIPPER_POLICY_DEFAULTS = {
-    "output_dim": 0,
-    "speed": 0.2,
-    "torque": 0.2,
-    "max_action": GRIPPER_ACTION_MAX,
-    "send_threshold": 0.002,
-    "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
-    "continuous_grasp": True,
-    "telemetry_hz": DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
-    "telemetry_command_grace_s": DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
-}
-@dataclass(frozen=True)
-class _PreparedActionExecution:
-    accepted: bool
-    mode: str
-    dispatch_attempted: bool
-    dispatch_completed: bool
-    asynchronous: bool = False
-    position_source_index: int | None = None
-
-
-def _positive_float(text: str) -> float:
-    value = float(text)
-    if value <= 0.0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return value
-
-
-def _unit_interval_float(text: str) -> float:
-    value = float(text)
-    if not 0.0 < value <= 1.0:
-        raise argparse.ArgumentTypeError("value must be in (0, 1]")
-    return value
-
-
-def _non_negative_int(text: str) -> int:
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("value must be >= 0")
-    return value
-
-
-def _positive_int(text: str) -> int:
-    value = int(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return value
-
-
-def _parse_dmtac_tactile_fields(text: str) -> tuple[str, ...]:
-    try:
-        return normalize_dmtac_tactile_fields(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-
-
-def _parse_active_sides(value: str | list[str] | tuple[str, ...]) -> tuple[str, ...]:
-    if isinstance(value, (list, tuple)):
-        parts = [
-            part.strip().lower()
-            for item in value
-            for part in str(item).replace(",", " ").split()
-            if part.strip()
-        ]
-    else:
-        parts = [
-            part.strip().lower()
-            for part in str(value).replace(",", " ").split()
-            if part.strip()
-        ]
-    if not parts:
-        raise argparse.ArgumentTypeError(
-            "active-sides must be one of: left, right, both"
-        )
-    if parts == ["both"]:
-        return ("left", "right")
-    invalid = sorted(set(parts) - set(ALL_SIDES))
-    if invalid:
-        raise argparse.ArgumentTypeError(
-            "active-sides must be one of: left, right, both"
-        )
-    return tuple(side for side in ALL_SIDES if side in set(parts))
-
-
-def _parse_disconnected_gripper_sides(
-    value: str | list[str] | tuple[str, ...],
-) -> tuple[str, ...]:
-    if isinstance(value, (list, tuple)):
-        parts = [
-            part.strip().lower()
-            for item in value
-            for part in str(item).replace(",", " ").split()
-            if part.strip()
-        ]
-    else:
-        parts = [
-            part.strip().lower()
-            for part in str(value).replace(",", " ").split()
-            if part.strip()
-        ]
-    if not parts or parts == ["none"]:
-        return ()
-    if parts == ["both"]:
-        return tuple(ALL_SIDES)
-    invalid = sorted(set(parts) - set(ALL_SIDES))
-    if invalid:
-        raise argparse.ArgumentTypeError(
-            "disconnected-gripper-sides must be none, left, right, or both"
-        )
-    return tuple(side for side in ALL_SIDES if side in set(parts))
-
-
-def _parse_end_effector_sides(
-    value: str | list[str] | tuple[str, ...],
-    *,
-    active_sides: tuple[str, ...],
-    hands_enabled: bool,
-) -> tuple[str, ...]:
-    if isinstance(value, (list, tuple)):
-        parts = [
-            part.strip().lower()
-            for item in value
-            for part in str(item).replace(",", " ").split()
-            if part.strip()
-        ]
-    else:
-        parts = [
-            part.strip().lower()
-            for part in str(value).replace(",", " ").split()
-            if part.strip()
-        ]
-    if not parts or parts == ["active"]:
-        return tuple(active_sides) if hands_enabled else ()
-    if parts == ["none"]:
-        return ()
-    if parts == ["both"]:
-        parts = ["left", "right"]
-    invalid = set(parts) - set(ALL_SIDES)
-    if invalid:
-        raise argparse.ArgumentTypeError(
-            "end-effector-sides must be active, none, left, right, or both"
-        )
-    if not hands_enabled:
-        raise ValueError("--end-effector-sides requires hands to be enabled.")
-    requested = set(parts)
-    unavailable = requested - set(active_sides)
-    if unavailable:
-        raise ValueError(
-            "--end-effector-sides must be a subset of --active-sides, got "
-            + ",".join(sorted(unavailable))
-        )
-    return tuple(side for side in ALL_SIDES if side in requested)
-
-
-def _parse_float_tuple(text: str, *, length: int, name: str) -> tuple[float, ...]:
-    parts = [part.strip() for part in str(text).split(",") if part.strip()]
-    if len(parts) != int(length):
-        raise argparse.ArgumentTypeError(
-            f"{name} must contain {length} comma-separated floats"
-        )
-    try:
-        values = tuple(float(part) for part in parts)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid {name}: {text}") from exc
-    return values
-
-
-def _non_negative_float(text: str) -> float:
-    value = float(text)
-    if value < 0.0:
-        raise argparse.ArgumentTypeError("value must be non-negative")
-    return value
-
-
-def _parse_vector3(
-    value: str | list[str] | tuple[object, ...]
-) -> tuple[float, float, float]:
-    if isinstance(value, (list, tuple)):
-        parts = [
-            part.strip()
-            for item in value
-            for part in str(item).replace(",", " ").split()
-            if part.strip()
-        ]
-        text = " ".join(parts)
-    else:
-        text = str(value)
-        parts = [
-            part.strip() for part in text.replace(",", " ").split() if part.strip()
-        ]
-    if len(parts) != 3:
-        raise argparse.ArgumentTypeError("vector3 must contain 3 floats")
-    try:
-        values = tuple(float(part) for part in parts)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid vector3: {text}") from exc
-    return (values[0], values[1], values[2])
-
-
-def _parse_qpos6(text: str) -> tuple[float, ...]:
-    return _parse_float_tuple(text, length=6, name="qpos6")
-
-
-def _parse_arm_max_angvel(text: str) -> tuple[float, ...]:
-    parts = [part.strip() for part in str(text).split(",") if part.strip()]
-    if not parts:
-        raise argparse.ArgumentTypeError("arm max angvel must contain 1 or 6 floats")
-    try:
-        values = [float(part) for part in parts]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid arm max angvel: {text}") from exc
-    if len(values) == 1:
-        if values[0] <= 0.0:
-            raise argparse.ArgumentTypeError("arm max angvel must be positive")
-        return (float(values[0]),) * 6
-    if len(values) != 6 or any(value <= 0.0 for value in values):
-        raise argparse.ArgumentTypeError(
-            "arm max angvel must contain 1 or 6 positive floats"
-        )
-    return tuple(float(value) for value in values)
-
-
-def _hand_backend_mode(args: argparse.Namespace) -> str:
-    mode = str(
-        getattr(args, "hand_backend", HAND_BACKEND_INSPIRE) or HAND_BACKEND_INSPIRE
-    )
-    if mode not in HAND_BACKEND_CHOICES:
-        raise ValueError(
-            f"Unsupported hand backend {mode!r}; expected one of {HAND_BACKEND_CHOICES}."
-        )
-    return mode
-
-
-def _hand_backend_mode_for_side(args: argparse.Namespace, side: str) -> str:
-    side = str(side).strip().lower()
-    if side not in ALL_SIDES:
-        raise ValueError(f"Unsupported hand backend side {side!r}.")
-    override = getattr(args, f"{side}_hand_backend", None)
-    mode = _hand_backend_mode(args) if override in (None, "") else str(override)
-    if mode not in HAND_BACKEND_CHOICES:
-        raise ValueError(
-            f"Unsupported {side} hand backend {mode!r}; expected one of {HAND_BACKEND_CHOICES}."
-        )
-    return mode
-
-
-def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
-    path_text = str(getattr(args, "gripper_task_profile", "") or "").strip()
-    if not path_text:
-        return {}
-    path = Path(path_text).expanduser()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise TypeError(f"Gripper task profile {path} must contain a JSON object.")
-    base_gripper = payload.get("gripper")
-    if base_gripper is not None and not isinstance(base_gripper, Mapping):
-        raise ValueError(f"Profile {path} field 'gripper' must be an object.")
-    selected: Mapping[str, Any] | None = None
-    tasks = payload.get("tasks")
-    if isinstance(tasks, Mapping):
-        task_keys = (
-            str(getattr(args, "gripper_task", "") or ""),
-            str(getattr(args, "task_id", "") or ""),
-            str(getattr(args, "task_name", "") or ""),
-            str(getattr(args, "task", "") or ""),
-        )
-        for key in task_keys:
-            item = tasks.get(key)
-            if isinstance(item, Mapping):
-                selected = item
-                args._resolved_gripper_task = key
-                break
-    if selected is not None:
-        gripper = selected.get("gripper")
-        if gripper is not None and not isinstance(gripper, Mapping):
-            raise ValueError(
-                f"Profile {path} selected task field 'gripper' must be an object."
-            )
-        merged = dict(base_gripper) if isinstance(base_gripper, Mapping) else {}
-        merged.update(dict(gripper) if isinstance(gripper, Mapping) else dict(selected))
-        return merged
-    if isinstance(base_gripper, Mapping):
-        return dict(base_gripper)
-    if "gripper" in payload:
-        raise ValueError(f"Profile {path} field 'gripper' must be an object.")
-    return dict(payload)
-
-
-def _profile_value(profile: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in profile:
-            return profile[key]
-    return None
-
-
-def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
-    cached = getattr(args, "_resolved_gripper_policy", None)
-    if isinstance(cached, dict):
-        return dict(cached)
-
-    profile = _load_gripper_task_profile(args)
-    policy: dict[str, Any] = dict(GRIPPER_POLICY_DEFAULTS)
-    profile_keys = {
-        "output_dim": ("output_dim", "gripper_slot"),
-        "speed": ("speed",),
-        "torque": ("torque", "force"),
-        "max_action": ("max_action", "max_close"),
-        "send_threshold": ("send_threshold",),
-        "command_hz": ("command_hz", "max_command_hz"),
-        "continuous_grasp": ("continuous_grasp", "continuous"),
-        "telemetry_hz": ("telemetry_hz",),
-        "telemetry_command_grace_s": ("telemetry_command_grace_s",),
-        "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
-        "tactile_compute_profile": (
-            "tactile_compute_profile",
-            "dmtac_tactile_compute_profile",
-        ),
-    }
-    for key, aliases in profile_keys.items():
-        value = _profile_value(profile, *aliases)
-        if value is not None:
-            policy[key] = value
-
-    cli_overrides = {
-        "output_dim": getattr(args, "gripper_output_dim", None),
-        "speed": getattr(args, "gripper_speed", None),
-        "torque": getattr(args, "gripper_torque", None),
-        "max_action": getattr(args, "gripper_max_action", None),
-        "send_threshold": getattr(args, "gripper_send_threshold", None),
-        "command_hz": getattr(args, "gripper_command_hz", None),
-        "continuous_grasp": getattr(args, "gripper_continuous_grasp", None),
-        "telemetry_hz": getattr(args, "gripper_telemetry_hz", None),
-        "telemetry_command_grace_s": getattr(
-            args, "gripper_telemetry_command_grace_s", None
-        ),
-    }
-    for key, value in cli_overrides.items():
-        if value is not None:
-            policy[key] = value
-
-    policy["output_dim"] = int(policy["output_dim"])
-    policy["speed"] = float(policy["speed"])
-    policy["torque"] = float(policy["torque"])
-    policy["max_action"] = float(policy["max_action"])
-    policy["send_threshold"] = float(policy["send_threshold"])
-    policy["command_hz"] = float(policy["command_hz"])
-    policy["continuous_grasp"] = bool(policy["continuous_grasp"])
-    policy["telemetry_hz"] = float(policy["telemetry_hz"])
-    policy["telemetry_command_grace_s"] = float(policy["telemetry_command_grace_s"])
-    if policy.get("tactile_fields") is not None:
-        policy["tactile_fields"] = normalize_dmtac_tactile_fields(
-            policy["tactile_fields"]
-        )
-    if policy.get("tactile_compute_profile") is not None:
-        policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
-    if int(policy["output_dim"]) != 0:
-        raise ValueError("dmtac-gripper output_dim/gripper_slot must be 0.")
-    if float(policy["send_threshold"]) < 0.0:
-        raise ValueError("gripper send_threshold must be >= 0.")
-    if float(policy["command_hz"]) <= 0.0:
-        raise ValueError("gripper command_hz must be > 0.")
-    if float(policy["telemetry_hz"]) <= 0.0:
-        raise ValueError("gripper telemetry_hz must be > 0.")
-    if float(policy["telemetry_command_grace_s"]) < 0.0:
-        raise ValueError("gripper telemetry_command_grace_s must be >= 0.")
-    args._resolved_gripper_policy = dict(policy)
-    return dict(policy)
-
-
-def _dmtac_tactile_enabled(args: argparse.Namespace) -> bool:
-    explicit = getattr(args, "dmtac_tactile", None)
-    if explicit is not None:
-        return bool(explicit)
-    return True
-
-
-def _apply_gripper_policy_to_dmtac_config(
-    config: DMTacGripperBackendConfig,
-    *,
-    args: argparse.Namespace,
-    policy: Mapping[str, Any],
-) -> DMTacGripperBackendConfig:
-    config.speed = float(policy["speed"])
-    config.torque = float(policy["torque"])
-    config.max_action = float(policy["max_action"])
-    config.command_dim = int(policy["output_dim"])
-    config.send_threshold = float(policy["send_threshold"])
-    config.command_hz = float(policy["command_hz"])
-    config.continuous_grasp = bool(policy["continuous_grasp"])
-    config.telemetry_hz = float(policy["telemetry_hz"])
-    config.gripper_telemetry_command_grace_s = float(
-        policy.get(
-            "telemetry_command_grace_s",
-            DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
-        )
-    )
-    tactile_timeout_ms = getattr(args, "dmtac_tactile_timeout_ms", None)
-    if tactile_timeout_ms is not None:
-        config.tactile_timeout_ms = int(tactile_timeout_ms)
-    tactile_wait_for_new = getattr(args, "dmtac_tactile_wait_for_new", None)
-    if tactile_wait_for_new is not None:
-        config.tactile_wait_for_new = bool(tactile_wait_for_new)
-    tactile_fields = getattr(args, "dmtac_tactile_fields", None)
-    if tactile_fields is None:
-        tactile_fields = policy.get("tactile_fields")
-    if tactile_fields is not None:
-        config.tactile_fields = normalize_dmtac_tactile_fields(tactile_fields)
-    tactile_compute_profile = getattr(args, "dmtac_tactile_compute_profile", None)
-    if tactile_compute_profile:
-        config.tactile_compute_profile = str(tactile_compute_profile)
-    elif policy.get("tactile_compute_profile"):
-        config.tactile_compute_profile = str(policy["tactile_compute_profile"])
-    if bool(getattr(args, "dmtac_tactile_sequential_read", False)):
-        config.tactile_parallel_read = False
-    if not _dmtac_tactile_enabled(args):
-        config.connect_tactile = False
-        config.tactile_ids = ()
-    if bool(getattr(args, "rtc_real_shadow", False)):
-        # Live raw-RTC shadow may read gripper/tactile observations, but its
-        # startup must not clear faults, write speed/torque, open the gripper,
-        # reset tactile calibration, or accept a command through a bypass API.
-        config.observation_only = True
-        config.send_commands = False
-        config.clear_fault_on_start = False
-        config.open_on_start = False
-        config.tactile_reset_on_start = False
-        config.tactile_warmup_frames = 0
-    config.enable_telemetry = bool(config.connect_hardware or config.connect_tactile)
-    return config
 
 
 def _dmtac_backend_configs(
@@ -2393,37 +1992,6 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tactile-vis-size", type=int, default=640)
 
 
-def parse_policy_kwargs(text: str) -> dict[str, Any]:
-    payload = json.loads(str(text or "{}"))
-    if not isinstance(payload, dict):
-        raise TypeError("--policy-kwargs-json must decode to a JSON object.")
-    return payload
-
-
-def _hands_enabled(args: argparse.Namespace) -> bool:
-    if args.hands_enabled is not None:
-        return bool(args.hands_enabled)
-    if any(
-        _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
-        for side in ALL_SIDES
-    ):
-        return True
-    return bool(args.left_hand_ip or args.right_hand_ip or args.visualize_tactile)
-
-
-def _position_deploy_ik_tuning(args: argparse.Namespace):
-    """Bind the formal action-to-qref objective without source-side shaping."""
-
-    return build_rm65_pose_lift_ik_tuning(
-        position_control_profile=(
-            str(getattr(args, "position_control_profile_resolved", ""))
-            or RM65_BIMANUAL_POSITION_V1_NAME
-        ),
-        pose_lift_profile=str(args.pose_lift_profile),
-        orientation_weight=float(args.position_ik_orientation_weight),
-    )
-
-
 def validate_args(
     args: argparse.Namespace,
     *,
@@ -3320,175 +2888,20 @@ def validate_args(
     return active_sides
 
 
-def _runtime_action_keyframe_period_sec(args: argparse.Namespace) -> float:
-    """Bind RTC runtime timing without changing the legacy sync default."""
-
-    profile_id = str(getattr(args, "rtc_profile", "off")).strip()
-    if profile_id == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1:
-        return 1.0 / RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz
-    if profile_id == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
-        return 1.0 / RAW_RTC_FINAL_CHUNK_PROFILE_V1.action_hz
-    if profile_id == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
-        return 1.0 / MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1.action_hz
-    # Preserve the historical PolicyDeployRuntimeConfig default for sync_queue_v1.
-    return 1.0 / 15.0
-
-
-def _action_hz_reference(
-    args: argparse.Namespace,
-) -> tuple[Path | None, Path | None, int, int, int | None]:
-    dataset = args.action_hz_dataset or args.debug_replay_dataset
-    parquet = args.action_hz_parquet or args.debug_replay_parquet
-    episode = (
-        int(args.action_hz_episode)
-        if args.action_hz_episode is not None
-        else int(args.debug_replay_episode)
-    )
-    start_index = (
-        int(args.action_hz_start_index)
-        if args.action_hz_start_index is not None
-        else int(args.debug_replay_start_index)
-    )
-    end_index = (
-        int(args.action_hz_end_index)
-        if args.action_hz_end_index is not None
-        else args.debug_replay_end_index
-    )
-    return dataset, parquet, episode, start_index, end_index
-
-
-def resolve_effective_action_hz(
-    args: argparse.Namespace, policy: Any | None = None
-) -> tuple[float, dict[str, Any]]:
-    explicit = float(args.action_hz)
-    if explicit > 0.0:
-        return explicit, {"source": "cli.action_hz", "hz": explicit}
-
-    if policy is not None:
-        estimate = getattr(policy, "metadata", {}).get("action_hz_estimate")
-        if isinstance(estimate, Mapping):
-            hz = float(estimate.get("hz", 0.0) or 0.0)
-            if hz > 0.0:
-                return hz, dict(estimate)
-
-    dataset, parquet, episode, start_index, end_index = _action_hz_reference(args)
-    if dataset or parquet:
-        path, metadata = resolve_replay_parquet_path(
-            dataset_root=dataset,
-            parquet_path=parquet,
-            episode_index=int(episode),
-        )
-        estimate = infer_replay_action_hz(
-            parquet_path=path,
-            dataset_root=dataset,
-            episode_index=int(episode),
-            start_index=int(start_index),
-            end_index=end_index,
-            resolved_metadata=metadata,
-        )
-        hz = float(estimate.get("hz", 0.0) or 0.0)
-        if hz > 0.0:
-            estimate = dict(estimate)
-            estimate["source_path"] = str(path)
-            return hz, estimate
-
-    default_hz = float(args.hz)
-    return default_hz, {"source": "cli.hz", "hz": default_hz}
-
-
-def resolve_effective_policy_hz(
-    args: argparse.Namespace, *, action_hz: float, action_hz_source: str
-) -> tuple[float, str]:
-    if args.policy_hz is not None:
-        return float(args.policy_hz), "cli.policy_hz"
-    return float(action_hz), "action_hz"
-
-
-def hold_deploy_arm_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    reason: str,
-) -> None:
-    """Request all configured real arm backends to hold before reporting errors."""
-
-    errors: list[str] = []
-    for side, backend in arm_backends.items():
-        try:
-            backend.hold_motion(str(reason))
-        except Exception as exc:  # noqa: BLE001 - attempt every active side.
-            errors.append(f"{side}: {type(exc).__name__}: {exc}")
-    if errors:
-        raise RuntimeError("deploy arm hold failed: " + "; ".join(errors))
-
-
-def request_policy_inference_soft_hold(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    reason: str,
-) -> dict[str, dict[str, object]]:
-    """Freeze measured arm state while synchronous policy inference is pending.
-
-    The hook is optional so position-only and non-RM65 backends retain their
-    existing semantics.  An implemented backend must fail closed when it
-    cannot produce a valid measured snapshot.
-    """
-
-    receipts: dict[str, dict[str, object]] = {}
-    for side, backend in arm_backends.items():
-        request = getattr(backend, "request_policy_inference_soft_hold", None)
-        if not callable(request):
-            receipts[str(side)] = {
-                "active": False,
-                "status": "unsupported",
-                "backend_type": type(backend).__name__,
-            }
-            continue
-        receipt = request(str(reason))
-        receipts[str(side)] = dict(receipt or {})
-    return receipts
-
-
-def emergency_stop_deploy_arm_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    reason: str,
-) -> None:
-    """Request a concurrent, latched emergency stop on every active arm."""
-
-    errors = bimanual_emergency_stop(arm_backends, reason=str(reason))
-    if errors:
-        raise RuntimeError(
-            "deploy bimanual emergency stop was not acknowledged by all active arms: "
-            + "; ".join(f"{side}={detail}" for side, detail in sorted(errors.items()))
-        )
-
-
 def emergency_stop_position_deploy_on_keyboard_interrupt(
     args: argparse.Namespace,
     *,
     send_actions: bool,
     arm_backends: Mapping[str, EffectorBackend],
 ) -> bool:
-    """Request Arm_Stop for an active real-position deployment.
+    """Compatibility wrapper preserving the run_policy monkeypatch seam."""
 
-    Returns False for dry-run, arm-disabled, non-position, or backend-free
-    processes so Ctrl+C retains its ordinary resource-cleanup behavior there.
-    Any incomplete real-arm acknowledgement is intentionally propagated.
-    """
-
-    if not (
-        bool(send_actions)
-        and bool(getattr(args, "arms_enabled", False))
-        and normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
-        == RM65_ARM_CONTROL_MODE_POSITION
-        and arm_backends
-    ):
-        return False
-    emergency_stop_deploy_arm_backends(
-        arm_backends,
-        reason="keyboard_interrupt",
+    return _emergency_stop_position_deploy_on_keyboard_interrupt(
+        args,
+        send_actions=send_actions,
+        arm_backends=arm_backends,
+        emergency_stop=emergency_stop_deploy_arm_backends,
     )
-    return True
 
 
 def build_hand_backends(
@@ -4527,6 +3940,7 @@ def main(
                 },
             )
     position_deploy_executor: PositionDeployExecutor | None = None
+    position_worker_binding: RM65LegacyWorkerExecutionBinding | None = None
     position_plan_cut_detector = (
         DeploymentPositionPlanCutDetector()
         if bool(args.position_plan_splice_governor)
@@ -4797,187 +4211,6 @@ def main(
             event_name = str(event.pop("event", "unknown"))
             debug_logger.log_event(f"position_executor_{event_name}", event)
 
-    def execute_prepared_action(
-        canonical_action: Any,
-        observation: Any,
-        *,
-        policy_name: str,
-        source_decision_id: str | None = None,
-        source_reference_segment_id: str | None = None,
-        lookahead_canonical_action: Any | None = None,
-        lookahead_observation: Any | None = None,
-        second_lookahead_canonical_action: Any | None = None,
-        second_lookahead_observation: Any | None = None,
-        third_lookahead_canonical_action: Any | None = None,
-        third_lookahead_observation: Any | None = None,
-        source_plan_cut: PositionSourcePlanCut | None = None,
-        phase_timing: dict[str, Any] | None = None,
-    ) -> _PreparedActionExecution:
-        command = getattr(canonical_action, "command", None)
-        if command is None or not command.commands:
-            return _PreparedActionExecution(
-                accepted=False,
-                mode="no_command",
-                dispatch_attempted=False,
-                dispatch_completed=False,
-            )
-        if position_deploy_executor is None:
-            direct_dispatch_started = time.monotonic()
-            if send_actions:
-                dispatch_teleop_command(
-                    command,
-                    arm_backends=arm_backends,
-                    hand_backends=hand_backends,
-                )
-            if phase_timing is not None:
-                phase_timing["direct_dispatch_ms"] = max(
-                    0.0,
-                    time.monotonic() - direct_dispatch_started,
-                ) * 1000.0
-            return _PreparedActionExecution(
-                accepted=True,
-                mode="direct" if send_actions else "dry_run",
-                dispatch_attempted=bool(send_actions),
-                dispatch_completed=bool(send_actions),
-            )
-
-        arm_command = command_effector_kind_subset(command, kind="arm")
-        hand_command = command_effector_kind_subset(command, kind="hand")
-        lookahead_hand_command = None
-        if lookahead_canonical_action is not None:
-            lookahead_hand_command = command_effector_kind_subset(
-                getattr(lookahead_canonical_action, "command", None),
-                kind="hand",
-            )
-        if arm_command is not None:
-            execution_work_item = None
-            lookahead_execution_work_item = None
-            if position_worker_binding is not None:
-                if not source_decision_id or not source_reference_segment_id:
-                    raise RuntimeError(
-                        "epoch-mediated position submission requires exact source lineage"
-                    )
-                submit_legacy_owner_state(
-                    lifecycle_state="running",
-                    execution_gate="ready",
-                    reason="legacy_reference_work_admission",
-                    source_event_ids=(
-                        str(source_decision_id),
-                        str(source_reference_segment_id),
-                    ),
-                )
-                execution_work_item = (
-                    position_worker_binding.context.create_reference_segment_work_item(
-                        source_decision_id=str(source_decision_id),
-                        source_reference_segment_id=str(
-                            source_reference_segment_id
-                        ),
-                    )
-                )
-                if lookahead_canonical_action is not None:
-                    lookahead_execution_work_item = (
-                        position_worker_binding.context.create_reference_segment_work_item(
-                            source_decision_id=str(source_decision_id),
-                            source_reference_segment_id=(
-                                str(source_reference_segment_id) + ":lookahead"
-                            ),
-                        )
-                    )
-            position_submit_started = time.monotonic()
-            try:
-                source_index = position_deploy_executor.submit(
-                    canonical_action.filtered,
-                    observation,
-                    policy_name=str(policy_name),
-                    discrete_command=hand_command,
-                    lookahead_filtered=(
-                        None
-                        if lookahead_canonical_action is None
-                        else lookahead_canonical_action.filtered
-                    ),
-                    lookahead_observation=lookahead_observation,
-                    lookahead_discrete_command=lookahead_hand_command,
-                    second_lookahead_filtered=(
-                        None
-                        if second_lookahead_canonical_action is None
-                        else second_lookahead_canonical_action.filtered
-                    ),
-                    second_lookahead_observation=second_lookahead_observation,
-                    third_lookahead_filtered=(
-                        None
-                        if third_lookahead_canonical_action is None
-                        else third_lookahead_canonical_action.filtered
-                    ),
-                    third_lookahead_observation=third_lookahead_observation,
-                    execution_work_item=execution_work_item,
-                    lookahead_execution_work_item=lookahead_execution_work_item,
-                    source_plan_cut=source_plan_cut,
-                )
-            except PositionDeployExecutorFault:
-                fault_stage = str(
-                    position_deploy_executor.snapshot().get("fault_stage") or ""
-                )
-                if fault_stage in {
-                    "safety_gate",
-                    "15hz_keyframe_safety",
-                    "reference_anchor_safety",
-                    "target_pose_envelope",
-                }:
-                    return _PreparedActionExecution(
-                        accepted=False,
-                        mode="position_safety_fault_latched",
-                        dispatch_attempted=False,
-                        dispatch_completed=False,
-                    )
-                raise
-            finally:
-                if phase_timing is not None:
-                    phase_timing["position_submit_ms"] = max(
-                        0.0,
-                        time.monotonic() - position_submit_started,
-                    ) * 1000.0
-            return _PreparedActionExecution(
-                accepted=True,
-                mode=(
-                    "position_async_queue" if send_actions else "position_dry_run_queue"
-                ),
-                dispatch_attempted=False,
-                dispatch_completed=False,
-                asynchronous=True,
-                position_source_index=int(source_index),
-            )
-        elif send_actions and hand_command is not None:
-            # A hand-only command has no arm keyframe whose causal reference
-            # clock could carry it. Mixed arm+hand actions are queued together
-            # above so both become effective on the same logical reference tick.
-            try:
-                require_arm_backends_ready_for_position_dispatch(
-                    arm_backends,
-                    require_background_target=False,
-                    stage="pre_direct_hand_only_dispatch",
-                    required_sides=active_sides,
-                )
-                dispatch_teleop_command(
-                    hand_command,
-                    arm_backends={},
-                    hand_backends=hand_backends,
-                )
-            except Exception:
-                position_deploy_executor.clear()
-                raise
-            return _PreparedActionExecution(
-                accepted=True,
-                mode="position_hand_only_direct",
-                dispatch_attempted=True,
-                dispatch_completed=True,
-            )
-        return _PreparedActionExecution(
-            accepted=bool(hand_command is not None),
-            mode="position_hand_only_dry_run",
-            dispatch_attempted=False,
-            dispatch_completed=False,
-        )
-
     def latch_canonical_safety_fault(
         canonical_action: Any,
         observation: Any,
@@ -5205,6 +4438,16 @@ def main(
                 },
             )
         return outcome
+
+    prepared_action_executor = PreparedActionExecutor(
+        position_deploy_executor=position_deploy_executor,
+        send_actions=send_actions,
+        arm_backends=arm_backends,
+        hand_backends=hand_backends,
+        active_sides=active_sides,
+        position_worker_binding=position_worker_binding,
+        submit_legacy_owner_state=submit_legacy_owner_state,
+    )
 
     resource_lifecycle = PolicyDeployResourceLifecycle(
         debug_logger=debug_logger,
@@ -6243,7 +5486,7 @@ def main(
                                     canonical_action.command is not None
                                     and canonical_action.command.commands
                                 ):
-                                    execution = execute_prepared_action(
+                                    execution = prepared_action_executor.execute(
                                         canonical_action,
                                         observation,
                                         policy_name="startup_init",
@@ -7101,7 +6344,7 @@ def main(
                                         time.monotonic() - plan_cut_prepare_started,
                                     ) * 1000.0
                                 execute_prepared_started = time.monotonic()
-                                execution = execute_prepared_action(
+                                execution = prepared_action_executor.execute(
                                     canonical_action,
                                     observation,
                                     policy_name=policy.name,

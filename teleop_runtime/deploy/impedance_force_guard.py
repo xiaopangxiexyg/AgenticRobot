@@ -7,12 +7,13 @@ authoritative bimanual emergency-stop path, independent of the policy loop.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 import threading
 import time
 from typing import Any, Callable, Mapping
+
+from .arm_safety_runtime import bimanual_emergency_stop
 
 
 @dataclass(frozen=True)
@@ -438,45 +439,6 @@ class ImpedanceForceGuardMonitor:
         except Exception as exc:  # noqa: BLE001 - the fault remains latched.
             with self._lock:
                 self._emergency_stop_error = f"{type(exc).__name__}: {exc}"
-
-
-def bimanual_emergency_stop(
-    backends_by_side: Mapping[str, Any],
-    *,
-    reason: str,
-) -> dict[str, str]:
-    """Request Arm_Stop on every configured arm without serializing sides."""
-
-    del reason
-
-    def stop_one(side: str, backend: Any) -> tuple[str, str | None]:
-        try:
-            stop = getattr(backend, "emergency_stop", None)
-            if not callable(stop):
-                raise AttributeError("backend does not expose emergency_stop")
-            stop()
-        except Exception as exc:  # noqa: BLE001 - still stop the other side.
-            return side, f"{type(exc).__name__}: {exc}"
-        return side, None
-
-    items = [(str(side), backend) for side, backend in backends_by_side.items()]
-    if len(items) <= 1:
-        results = [stop_one(side, backend) for side, backend in items]
-    else:
-        with ThreadPoolExecutor(
-            max_workers=len(items),
-            thread_name_prefix="rm65_deploy_bimanual_emergency_stop",
-        ) as executor:
-            futures = [
-                executor.submit(stop_one, side, backend)
-                for side, backend in items
-            ]
-            results = [future.result() for future in futures]
-    return {
-        side: detail
-        for side, detail in results
-        if detail is not None
-    }
 
 
 __all__ = [

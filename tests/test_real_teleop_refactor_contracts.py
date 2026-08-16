@@ -2144,6 +2144,7 @@ def test_debug_ik_payload_module_preserves_legacy_identity_and_import_boundary()
 
 
 def test_batch_two_cli_parsers_and_debug_primitives_are_pure() -> None:
+    assert cli_value_parsers._positive_int is shared_cli_value_parsers._positive_int
     assert cli_value_parsers._non_negative_float("0.5") == 0.5
     assert cli_value_parsers._canfd_trajectory_mode("2") == 2
     assert cli_value_parsers._canfd_radio("100") == 100
