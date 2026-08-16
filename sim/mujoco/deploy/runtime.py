@@ -3196,17 +3196,7 @@ class MujocoDeployRuntime:
                 "Composer authority is not enabled for this sim runtime."
             )
         strategy_control = self.composition_port.strategy_control
-        if strategy_control is None:
-            evaluation = self._composition_binding._topology.evaluate_composition(
-                spec=spec,
-                target_effective_at=target_effective_at,
-                required_context_channels=required_context_channels,
-                source_difference_spec=source_difference_spec,
-                residual_anchor_lifecycle_scope_id=(
-                    residual_anchor_lifecycle_scope_id
-                ),
-            )
-        else:
+        if strategy_control is not None:
             latest_revision = strategy_control.latest_revision
             latest_spec_hash = (
                 latest_revision.composition_spec.semantic_content_hash
@@ -3215,16 +3205,15 @@ class MujocoDeployRuntime:
                 raise ValueError(
                     "Hot composition submission requested another " "CompositionSpec."
                 )
-            evaluation = (
-                self._composition_binding._topology.evaluate_hot_composition(
-                    target_effective_at=target_effective_at,
-                    required_context_channels=required_context_channels,
-                    source_difference_spec=source_difference_spec,
-                    residual_anchor_lifecycle_scope_id=(
-                        residual_anchor_lifecycle_scope_id
-                    ),
-                )
-            )
+        evaluation = self.composition_port.evaluate_composition_shadow(
+            spec=spec,
+            target_effective_at=target_effective_at,
+            required_context_channels=required_context_channels,
+            source_difference_spec=source_difference_spec,
+            residual_anchor_lifecycle_scope_id=(
+                residual_anchor_lifecycle_scope_id
+            ),
+        )
         if (
             evaluation.composition_evaluation.output_status != "ready"
             or evaluation.composition_evaluation.composed_candidate is None

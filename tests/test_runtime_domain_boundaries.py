@@ -78,6 +78,24 @@ def _legacy_mujoco_composition_calls(path: Path) -> set[str]:
     return violations
 
 
+def _private_mujoco_composition_topology_calls(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    calls: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        receiver = node.func.value
+        if not (
+            isinstance(receiver, ast.Attribute)
+            and receiver.attr == "_topology"
+            and isinstance(receiver.value, ast.Attribute)
+            and receiver.value.attr == "_composition_binding"
+        ):
+            continue
+        calls.add(node.func.attr)
+    return calls
+
+
 def _violations(
     root: Path,
     forbidden_roots: set[str],
@@ -259,6 +277,15 @@ def test_mujoco_target_runtime_delegates_pure_promotion_policy() -> None:
     assert "_composition_promotion_envelope_by_evaluation_id" not in policy_source
     assert "_next_composite_proposal_sequence" in runtime_source
     assert "_composition_promotion_envelope_by_evaluation_id" in runtime_source
+
+
+def test_mujoco_runtime_uses_private_composition_topology_only_for_admission() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+
+    assert _private_mujoco_composition_topology_calls(target_runtime) == {
+        "admit_evaluated_composition"
+    }
+    assert "evaluate_composition_shadow" in _called_names(target_runtime)
 
 
 def test_control_station_uses_explicit_mujoco_composition_port() -> None:
