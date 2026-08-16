@@ -121,16 +121,17 @@ LAB_HOME=/path/to/lab-root
 Task worktree放在 `AR-0143/AgenticRobot/model/openpi`。OpenPI 的 Python/CUDA/模型资产不会被合并进
 AgenticRobot 环境；`model/openpi` 也不是 `model.openpi` Python package。
 
-当前 PR 依赖顺序为：
+基于 `origin/main@fba0189b` 重建后的评审依赖顺序为：
 
 ```text
 origin/main
-  └── task/AR-openpi-submodule-v2       # gitlink + ownership boundary
-        └── task/AR-lab-m1-workspace    # 本文描述的 M1
+  └── task/AR-openpi-submodule-v3       # gitlink + ownership boundary
+        └── task/AR-lab-m1-workspace-v2 # 本文描述的 M1
 ```
 
-合并前必须先审阅并合并 submodule v2；随后把 M1 重基到新的 protected `main`，重新运行测试，再合并
-M1。远端 `/home/user/zc/AgenticRobot` 的旧混合目录不作为这个流程的写入目标，也不会用 reset/clean
+合并时必须先审阅并合并 submodule v3；随后只在新的 protected `main` 上重放 M1 并重新运行测试，不能直接
+合并堆叠分支带入已合并的父层。远端 `/home/user/zc/AgenticRobot` 的旧混合目录不作为这个流程的写入目标，
+也不会用 reset/clean
 强行改造；远端 staging 与 clean source anchor 属于 M3。
 
 ## 验证

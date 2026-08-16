@@ -104,12 +104,12 @@ stack/baseline.json
 `lab_control/` 核心不含 AgenticRobot、RPent、OpenPI、GPU、模型或设备名称。OpenPI 的版本关系由
 AgenticRobot `model/openpi` gitlink 与 baseline `repository_links` 表达；M2 不下载或运行 OpenPI。
 
-当前评审依赖顺序：
+基于 `origin/main@fba0189b` 重建后的评审依赖顺序：
 
 ```text
-task/AR-openpi-submodule-v2
-  └── task/AR-lab-m1-workspace
-        └── task/AR-lab-m2-local-runs
+task/AR-openpi-submodule-v3
+  └── task/AR-lab-m1-workspace-v2
+        └── task/AR-lab-m2-local-runs-v2
 ```
 
 每层合并后，下一层都必须重基到新的 protected `main` 并重新生成 baseline parent identity。当前

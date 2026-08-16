@@ -117,12 +117,12 @@ RPent/main (独立 sibling)
 评审顺序：
 
 ```text
-task/AR-openpi-submodule-v2
-  └── task/AR-lab-m1-workspace
-        └── task/AR-lab-m2-local-runs
-              └── task/AR-lab-m3a-stable-sync
-                    └── task/AR-lab-m3b-maintenance-sync
-                          └── task/AR-lab-m3c-gitlink-sync
+task/AR-openpi-submodule-v3
+  └── task/AR-lab-m1-workspace-v2
+        └── task/AR-lab-m2-local-runs-v2
+              └── task/AR-lab-m3a-stable-sync-v2
+                    └── task/AR-lab-m3b-maintenance-sync-v2
+                          └── task/AR-lab-m3c-gitlink-sync-v2
 ```
 
 ## 验证

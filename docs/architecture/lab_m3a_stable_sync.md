@@ -116,10 +116,10 @@ M3a 不会对它执行 pull/reset/clean。后续应在新路径创建 clean mana
 当前 stacked review 顺序：
 
 ```text
-task/AR-openpi-submodule-v2
-  └── task/AR-lab-m1-workspace
-        └── task/AR-lab-m2-local-runs
-              └── task/AR-lab-m3a-stable-sync
+task/AR-openpi-submodule-v3
+  └── task/AR-lab-m1-workspace-v2
+        └── task/AR-lab-m2-local-runs-v2
+              └── task/AR-lab-m3a-stable-sync-v2
 ```
 
 只有前层进入 protected `main` 并刷新 baseline 后，M3a 才能进入远端部署候选。

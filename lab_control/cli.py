@@ -9,6 +9,12 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from .baseline import load_baseline_lock
+from .control_install import (
+    inspect_control_plane_install,
+    install_control_plane,
+    plan_control_plane_install,
+)
 from .environments import inspect_environments
 from .inspection import (
     attach_run_comparison,
@@ -24,7 +30,12 @@ from .writer_lease import WriterLeaseManager
 
 
 def _control_repository() -> Path:
-    return Path(__file__).resolve().parents[1]
+    configured = os.environ.get("LAB_CONTROL_REPOSITORY_ROOT")
+    return (
+        Path(configured).expanduser().resolve()
+        if configured
+        else Path(__file__).resolve().parents[1]
+    )
 
 
 def _repository_list(value: str) -> list[str]:
@@ -40,6 +51,20 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Task-oriented multi-repository workspace control plane.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
+
+    control = subcommands.add_parser(
+        "control",
+        help="manage the external protected lab control-plane installation",
+    )
+    control_commands = control.add_subparsers(dest="control_command", required=True)
+    for command_name in ("plan-install", "status"):
+        command = control_commands.add_parser(command_name)
+        command.add_argument("--install-root")
+        command.add_argument("--json", action="store_true")
+    control_install = control_commands.add_parser("install")
+    control_install.add_argument("--install-root")
+    control_install.add_argument("--confirm-plan-sha256", required=True)
+    control_install.add_argument("--json", action="store_true")
 
     change = subcommands.add_parser("change", help="manage multi-Task Change groups")
     change_commands = change.add_subparsers(dest="change_command", required=True)
@@ -415,6 +440,17 @@ def _print_linked_sync(payload: dict[str, object]) -> None:
     print("Network/fetch/LFS/reset/clean/task-worktree updates: none")
 
 
+def _print_control_install(payload: dict[str, object]) -> None:
+    print(f"Status/action: {payload.get('status', payload.get('action'))}")
+    print(f"Commit: {payload.get('current_commit', payload.get('commit'))}")
+    print(f"Install root: {payload.get('install_root')}")
+    if payload.get("plan_sha256"):
+        print(f"Plan: {payload.get('plan_sha256')}")
+    if payload.get("wrapper_path"):
+        print(f"Wrapper: {payload.get('wrapper_path')}")
+    print("Network/task payload/LFS downloads: none")
+
+
 def _print_run(payload: dict[str, object]) -> None:
     outcome = payload.get("outcome")
     classification = (
@@ -545,6 +581,56 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         manager = WorkspaceManager(control_repository=_control_repository())
+        if arguments.command == "control":
+            install_root = (
+                Path(arguments.install_root).expanduser().resolve()
+                if arguments.install_root
+                else Path(
+                    manager.environ.get(
+                        "LAB_CONTROL_PLANE_ROOT",
+                        manager.state_root / "control-plane",
+                    )
+                )
+                .expanduser()
+                .resolve()
+            )
+            if arguments.control_command == "status":
+                payload = inspect_control_plane_install(install_root)
+            else:
+                baseline_path = Path(
+                    manager.environ.get(
+                        "LAB_BASELINE_LOCK",
+                        manager.control_repository / "stack" / "baseline.json",
+                    )
+                ).expanduser().resolve()
+                baseline = load_baseline_lock(baseline_path)
+                control_name = manager.project.control_repository
+                pin = baseline.repositories.get(control_name)
+                if pin is None:
+                    raise LabError(
+                        f"baseline lacks control repository: {control_name}"
+                    )
+                control_repository = manager.catalog[control_name]
+                control_plan = plan_control_plane_install(
+                    control_repository,
+                    managed_control_repository=control_repository,
+                    expected_identity=pin.canonical_identity,
+                    protected_branch=manager.project.stable_branches[control_name],
+                    install_root=install_root,
+                )
+                payload = (
+                    install_control_plane(
+                        control_plan,
+                        confirmed_plan_sha256=arguments.confirm_plan_sha256,
+                    )
+                    if arguments.control_command == "install"
+                    else control_plan
+                )
+            if arguments.json:
+                _emit(payload, as_json=True)
+            else:
+                _print_control_install(payload)
+            return 0
         if arguments.command == "change":
             if arguments.change_command == "create":
                 payload = manager.create_change(arguments.change_id, title=arguments.title)
