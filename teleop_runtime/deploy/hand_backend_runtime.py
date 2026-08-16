@@ -26,11 +26,11 @@ from ..backends.grippers import (
 from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
 from ..hand_mapping import parse_tactile_regions
 from ..interfaces import EffectorBackend
-
-
-HAND_BACKEND_INSPIRE = "inspire"
-HAND_BACKEND_DMTAC_GRIPPER = "dmtac-gripper"
-HAND_BACKEND_CHOICES = (HAND_BACKEND_INSPIRE, HAND_BACKEND_DMTAC_GRIPPER)
+from .hand_backend_config import (
+    HAND_BACKEND_CHOICES,
+    HAND_BACKEND_DMTAC_GRIPPER,
+    HAND_BACKEND_INSPIRE,
+)
 
 
 def build_hand_backends(
