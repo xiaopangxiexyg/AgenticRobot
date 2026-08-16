@@ -12,7 +12,7 @@ import argparse
 
 from robot_motion.deploy.schema import ALL_SIDES
 
-from ..backends.grippers import normalize_dmtac_tactile_fields
+from ..dmtac_tactile_fields import normalize_dmtac_tactile_fields
 
 
 def _positive_float(text: str) -> float:

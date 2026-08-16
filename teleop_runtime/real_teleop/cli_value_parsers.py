@@ -11,7 +11,7 @@ import re
 
 import numpy as np
 
-from ..backends.grippers import normalize_dmtac_tactile_fields
+from ..dmtac_tactile_fields import normalize_dmtac_tactile_fields
 
 def _non_negative_float(text: str) -> float:
     value = float(text)
