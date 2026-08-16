@@ -71,6 +71,11 @@ manifest hash/大小变化、未知热端文件或不同 artifact graph 都会 f
 retirement 目录；事务文件记录两侧目录 inode、核心文件 guard、物化 receipt、计划 hash 和
 回滚位置：
 
+默认晋升门禁仍要求原生 DexTeleop v2.3。对于明确标注旧 `format` 的历史数据，可在 dry-run
+和 apply 中都显式增加 `--allow-legacy-format-preserving`。该路径会逐项验证 `info.json`、
+`episodes.jsonl`、全部 Parquet 列和完整视频解码仅发生声明的左右腕相机语义变换；源和纠正
+根的 `format` 必须完全一致。它不会写入 v2.3 声明，也不会把旧格式伪装为 schema 升级。
+
 ```bash
 python -m utils.dataset_postprocess camera-semantics-promote \
   CANONICAL_SWAPPED_ROOT \

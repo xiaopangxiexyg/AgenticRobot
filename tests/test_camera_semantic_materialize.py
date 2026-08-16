@@ -14,6 +14,7 @@ from dataset_contracts.modality_artifacts import (
     ModalityArtifactRecordV1,
     ModalityStorageTransferReceiptV1,
 )
+from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from dataset_interface.camera_semantic_prepared_view import (
     load_camera_semantic_prepared_view,
 )
@@ -23,6 +24,7 @@ from dataset_interface.camera_semantics import (
     load_camera_role_binding,
 )
 from dataset_interface.metadata import DexTeleopDatasetIndex
+from utils.dataset_postprocess import camera_semantic_promotion as promotion
 from utils.dataset_postprocess.camera_semantic_materialize import (
     materialize_camera_semantics,
     plan_camera_semantic_materialization,
@@ -1115,3 +1117,97 @@ def test_invalid_prepared_view_quarantine_does_not_treat_io_failure_as_proof(
             tmp_path / "prepared_views/_invalid_audit",
         )
     assert source.is_dir()
+
+
+@pytest.mark.optional
+def test_legacy_promotion_is_explicit_and_exactly_format_preserving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_source_dataset(source)
+    info_path = source / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["format"] = "lerobot_v2.1_style"
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    corrected = tmp_path / "corrected"
+    materialization = plan_camera_semantic_materialization(
+        source, corrected, registry
+    )
+    materialize_camera_semantics(
+        source,
+        corrected,
+        registry,
+        expected_plan_hash=materialization.plan_hash,
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_require_modality_pair",
+        lambda *_args: (
+            "inventory",
+            "payload_only",
+            "SELF_CONTAINED",
+            "SELF_CONTAINED",
+        ),
+    )
+    retirement = tmp_path / "retirement"
+
+    with pytest.raises(Exception, match="strict v2.3 validation failed"):
+        promotion.plan_camera_semantic_promotion(
+            source, corrected, retirement, registry
+        )
+
+    plan = promotion.plan_camera_semantic_promotion(
+        source,
+        corrected,
+        retirement,
+        registry,
+        allow_legacy_format_preserving=True,
+    )
+    assert plan.dataset_validation_mode == "legacy_format_preserving"
+    assert plan.source_dataset_format == "lerobot_v2.1_style"
+    assert plan.corrected_dataset_format == "lerobot_v2.1_style"
+    assert len(plan.legacy_format_preserving_contract_hash) == 64
+
+    corrected_parquet = corrected / "data/chunk-000/episode_000000.parquet"
+    table = pq.read_table(corrected_parquet)
+    frame_index = table.column("frame_index").to_pylist()
+    frame_index[1] = 99
+    table = table.set_column(
+        table.column_names.index("frame_index"),
+        "frame_index",
+        pa.array(frame_index, type=table.column("frame_index").type),
+    )
+    pq.write_table(table, corrected_parquet)
+    source_resolver = DatasetCameraSemanticResolver(
+        source, load_camera_role_binding(registry)
+    )
+    with pytest.raises(Exception, match="exact camera-semantic transform"):
+        promotion._require_legacy_format_preserving_pair(
+            source,
+            corrected,
+            source_resolver=source_resolver,
+        )
+
+
+def test_legacy_promotion_never_accepts_native_v23_declaration(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "format": "legacy-label",
+                "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(Exception, match="cannot use legacy promotion"):
+        promotion._legacy_info(root, label="source")

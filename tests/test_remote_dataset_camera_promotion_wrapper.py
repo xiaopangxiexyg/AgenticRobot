@@ -79,6 +79,15 @@ def test_promote_plan_and_apply_are_fixed_and_hash_bound(tmp_path: Path) -> None
     result = subprocess.run(base, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert _args(capture)[3:5] == ["camera-semantics-promote", str(source)]
+    assert "--allow-legacy-format-preserving" not in _args(capture)
+    result = subprocess.run(
+        [*base, "--allow-legacy-format-preserving"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _args(capture)[-1] == "--allow-legacy-format-preserving"
     plan_hash = "a" * 64
     result = subprocess.run(
         [
@@ -150,6 +159,10 @@ def test_wrapper_rejects_passthrough_and_unconfirmed_apply(tmp_path: Path) -> No
         ([*base, "--apply"], "requires a lowercase 64-hex"),
         ([*base, "--", "--arbitrary"], "passthrough"),
         ([*base, "--allow-overwrite"], "unknown argument"),
+        (
+            [*base, "--allow-legacy-format-preserving"],
+            "only valid with --promote",
+        ),
     )
     for command, expected in cases:
         if capture.exists():

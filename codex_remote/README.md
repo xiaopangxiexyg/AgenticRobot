@@ -1122,6 +1122,10 @@ remote_dataset_tactile_storage.sh
   --cold-root /independent/cold/root --dry-run
 ```
 
+相机 promotion 默认只接受原生 v2.3。历史旧格式只能在 dry-run 和 apply 两次命令中都显式
+加入 `--allow-legacy-format-preserving`；该选项只允许经过逐列、逐清单和完整视频验证的
+格式保持型左右腕纠正，不执行 schema 迁移，也不会把旧数据声明为 v2.3。
+
 ### 实际同步和执行模型
 
 常见真机开发时，本地工作目录可能已通过确认过的

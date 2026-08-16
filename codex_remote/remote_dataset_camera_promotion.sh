@@ -19,6 +19,7 @@ MODE="dry-run"
 MODE_EXPLICIT=false
 EXPECTED_PLAN_HASH=""
 CONFIRM_NO_ACTIVE_READERS=false
+ALLOW_LEGACY_FORMAT_PRESERVING=false
 
 usage() {
   cat <<'EOF'
@@ -30,6 +31,15 @@ Usage:
     --retirement-root /data/retired_swapped \
     --registry /path/camera_registry.json --dry-run
 
+  # Explicit legacy format-preserving promotion (default is strict v2.3):
+  remote_dataset_camera_promotion.sh -H user@host \
+    --project /path/DexTeleop --env /path/env --promote \
+    --dataset-root /data/canonical_old \
+    --corrected-root /data/corrected_full \
+    --retirement-root /data/retired_swapped \
+    --registry /path/camera_registry.json \
+    --allow-legacy-format-preserving --dry-run
+
   remote_dataset_camera_promotion.sh -H user@host \
     --project /path/DexTeleop --env /path/env --rollback \
     --transaction /data/retired_swapped/.transactions/PLAN.json --dry-run
@@ -38,10 +48,12 @@ Apply requires:
   ... --apply --expected-plan-hash SHA256 --confirm-no-active-readers
 
 Safety: fixed L3 non-motion dataset transaction. Promotion is admitted only
-for independent, self-contained, strict-v2.3 roots where the old dataset is
-proven swapped and the materialized dataset is identity. It atomically retains
-the old root under retirement; rollback is a separate hash-bound operation.
-No deletion, overwrite, legacy break-glass, device, or arbitrary passthrough is
+for independent, self-contained roots where the old dataset is proven swapped
+and the materialized dataset is identity. Strict v2.3 is the default. The
+explicit legacy option requires an exact format-preserving camera transform and
+does not claim or upgrade the dataset to v2.3. Promotion atomically retains the
+old root under retirement; rollback is a separate hash-bound operation. No
+deletion, overwrite, schema migration, device, or arbitrary passthrough is
 exposed.
 EOF
   common_ssh_usage
@@ -83,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --transaction) TRANSACTION_PATH="$2"; shift 2 ;;
     --expected-plan-hash) EXPECTED_PLAN_HASH="$2"; shift 2 ;;
     --confirm-no-active-readers) CONFIRM_NO_ACTIVE_READERS=true; shift ;;
+    --allow-legacy-format-preserving) ALLOW_LEGACY_FORMAT_PRESERVING=true; shift ;;
     --dry-run)
       [[ "$MODE_EXPLICIT" != "true" ]] || die "choose exactly one of --dry-run or --apply"
       MODE="dry-run"; MODE_EXPLICIT=true; shift
@@ -114,6 +127,8 @@ else
   path_arg "--transaction" "$TRANSACTION_PATH"
   [[ -z "$DATASET_ROOT$CORRECTED_ROOT$RETIREMENT_ROOT$REGISTRY_PATH" ]] || \
     die "dataset roots and registry are only valid with --promote"
+  [[ "$ALLOW_LEGACY_FORMAT_PRESERVING" == "false" ]] || \
+    die "--allow-legacy-format-preserving is only valid with --promote"
 fi
 
 if [[ "$MODE" == "apply" ]]; then
@@ -135,7 +150,8 @@ printf '[operation] %s mode=%s timeout_sec=%s\n' "$OPERATION" "$MODE" "$TIMEOUT_
 remote_bash \
   "$PROJECT" "$ENV_NAME" "$PYTHON_BIN" "$TIMEOUT_SEC" "$OPERATION" "$MODE" \
   "$DATASET_ROOT" "$CORRECTED_ROOT" "$RETIREMENT_ROOT" "$REGISTRY_PATH" \
-  "$TRANSACTION_PATH" "$EXPECTED_PLAN_HASH" <<'REMOTE'
+  "$TRANSACTION_PATH" "$EXPECTED_PLAN_HASH" \
+  "$ALLOW_LEGACY_FORMAT_PRESERVING" <<'REMOTE'
 set -Eeuo pipefail
 project=$1
 env_name=$2
@@ -149,6 +165,7 @@ retirement_root=$9
 registry_path=${10}
 transaction_path=${11}
 expected_plan_hash=${12}
+allow_legacy_format_preserving=${13}
 
 resolve_path() {
   case "$1" in
@@ -201,6 +218,9 @@ if [[ "$operation" == "promote" ]]; then
     --retirement-root "$retirement_root"
     --registry "$registry_path"
   )
+  if [[ "$allow_legacy_format_preserving" == "true" ]]; then
+    cmd+=(--allow-legacy-format-preserving)
+  fi
 else
   transaction_path="$(resolve_path "$transaction_path")"
   cmd=(

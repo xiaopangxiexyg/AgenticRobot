@@ -320,11 +320,13 @@ def _cmd_camera_video_integrity_mark_training_invalid(
 
 
 def _cmd_camera_semantic_promote(args: argparse.Namespace) -> int:
+    allow_legacy = bool(args.allow_legacy_format_preserving)
     plan = plan_camera_semantic_promotion(
         args.dataset_root,
         args.corrected_root,
         args.retirement_root,
         args.registry,
+        allow_legacy_format_preserving=allow_legacy,
     )
     if bool(args.apply):
         result = promote_camera_semantic_dataset(
@@ -334,6 +336,7 @@ def _cmd_camera_semantic_promote(args: argparse.Namespace) -> int:
             args.registry,
             expected_plan_hash=str(args.expected_plan_hash or ""),
             confirm_no_active_readers=bool(args.confirm_no_active_readers),
+            allow_legacy_format_preserving=allow_legacy,
         )
         _print_json(result)
     else:
@@ -857,6 +860,15 @@ def build_parser() -> argparse.ArgumentParser:
     camera_promote.add_argument("--retirement-root", required=True)
     camera_promote.add_argument("--registry", required=True)
     camera_promote.add_argument("--expected-plan-hash", default="")
+    camera_promote.add_argument(
+        "--allow-legacy-format-preserving",
+        action="store_true",
+        help=(
+            "Explicitly admit a legacy source/corrected pair only after exact "
+            "format-preserving camera transform validation. This does not "
+            "upgrade or claim native DexTeleop v2.3."
+        ),
+    )
     camera_promote.add_argument(
         "--confirm-no-active-readers", action="store_true"
     )
