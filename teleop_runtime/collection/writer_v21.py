@@ -64,6 +64,10 @@ from dataset_contracts.wrist_depth import (
     pack_binary_mask,
     raw_depth_manifest_payload,
 )
+from dataset_interface.collection_pose_storage import (
+    bind_collection_row_pose_storage,
+    validate_v23_collection_row_actual_tcp,
+)
 from dataset_interface.modality_artifacts import (
     assert_dataset_capture_integrity_compatible,
 )
@@ -78,10 +82,6 @@ from ..action import (
 from ..recording import _to_serializable
 from .arm_mode_labels import ARM_MODE_IDS, ARM_MODE_SCHEMA
 from .hand_state_polling import hand_state_tactile_arrays
-from .pose_storage import (
-    bind_collection_row_pose_storage,
-    validate_v23_collection_row_actual_tcp,
-)
 from .row_encoder import CollectionRowEncoder
 from .sample_assembler import CollectorSample
 from .schema_v21 import (

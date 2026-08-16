@@ -519,6 +519,10 @@ GUI 正式数采和 headless/兼容数采都接受：
 - `pose_storage_frame=desk_absolute`：只在 row 构造后的深拷贝上执行各 side
   raw→canonical-desk，不修改 `TeleopCommand`、backend state 或位控 target。
 
+该 detached-row 适配与因果字段校验由
+`dataset_interface.collection_pose_storage` 统一实现；collection writer 只决定调用时机，
+历史 `teleop_runtime.collection.pose_storage` 路径保留为对象一致的兼容导出。
+
 历史 Vive `desk/T_D_B` 不等于 canonical dataset desk，不能直接作为这里的 contract。
 单臂 RM65 不会复用双臂 station 外参，必须为其安装方式提供独立 contract。需要兼容旧
 v2.2/raw 落盘时显式传 `--no-pose-frame-contract`；v2.3 强制 raw 则显式传对应的

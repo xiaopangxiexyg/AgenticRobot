@@ -11,16 +11,20 @@ from dataset_contracts.pose_frames import (
     PoseFrameContractError,
     PoseSourceProfile,
 )
+from dataset_contracts.v22 import PolicyIOLayout
+from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from dataset_contracts.v23_validation import (
     V23RowValidationError,
     validate_v23_row_causal_snapshots,
 )
-from dataset_interface.validation import validate_v23_dataset
-from dataset_contracts.v22 import PolicyIOLayout
-from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
-from teleop_runtime.collection.pose_storage import (
+from dataset_interface.collection_pose_storage import (
     bind_collection_row_pose_storage,
     validate_v23_collection_row_actual_tcp,
+)
+from dataset_interface.validation import validate_v23_dataset
+from teleop_runtime.collection.pose_storage import (
+    bind_collection_row_pose_storage as legacy_bind_pose_storage,
+    validate_v23_collection_row_actual_tcp as legacy_validate_actual_tcp,
 )
 from teleop_runtime.collection.sample_assembler import CollectorSample
 from teleop_runtime.collection.writer_v21 import (
@@ -28,6 +32,21 @@ from teleop_runtime.collection.writer_v21 import (
     LeRobotV21Writer,
     LeRobotV21WriterConfig,
 )
+
+
+def test_legacy_pose_storage_imports_are_object_identical_data_exports() -> None:
+    assert (
+        legacy_bind_pose_storage
+        is bind_collection_row_pose_storage
+    )
+    assert (
+        legacy_validate_actual_tcp
+        is validate_v23_collection_row_actual_tcp
+    )
+    assert (
+        bind_collection_row_pose_storage.__module__
+        == "dataset_interface.collection_pose_storage"
+    )
 
 
 def _translation(x: float) -> np.ndarray:

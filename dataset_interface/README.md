@@ -1,5 +1,15 @@
 # Dataset Interface
 
+## Collection pose storage boundary
+
+`dataset_interface.collection_pose_storage` owns the detached-row adaptation
+that binds a v2.3 collection row to its declared pose storage frame, plus the
+fail-closed validation that measured TCP copies are causal and internally
+consistent before storage. It accepts only data mappings and pose contracts;
+it owns no collection Episode, writer lifecycle, device state, control command,
+or dispatch. `teleop_runtime.collection.pose_storage` is a compatibility export
+only, while the concrete teleop writer decides when to call this boundary.
+
 ## Arm hold-intent derived view
 
 `dataset_interface.arm_hold` projects the optional v2.3 arm-mode columns into
