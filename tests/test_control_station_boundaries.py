@@ -95,6 +95,22 @@ def test_agent_gateway_core_is_application_and_backend_neutral() -> None:
     ) == {}
 
 
+def test_agent_gateway_skill_definitions_are_target_and_backend_neutral() -> None:
+    assert _violations(
+        _python_files(GATEWAY_ROOT / "skills"),
+        {
+            "control_station",
+            "deployments",
+            "hardware",
+            "numpy",
+            "robot_motion",
+            "scipy",
+            "sim",
+            "teleop_runtime",
+        },
+    ) == {}
+
+
 def test_hitl_core_is_backend_model_topology_and_trace_neutral() -> None:
     hitl_paths = _python_files(STATION_ROOT / "hitl")
     assert _violations(

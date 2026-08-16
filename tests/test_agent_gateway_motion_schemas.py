@@ -4,7 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from agent_gateway.protocol.motion_schemas import (
+from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
+from agent_gateway.skills.motion.definition import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
@@ -12,17 +13,20 @@ from agent_gateway.protocol.motion_schemas import (
     TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
+    cardinal_tcp_step_skill_definition_v1,
+    fixed_level_tcp_orientation_skill_definition_v1,
+    tcp_pose_target_skill_definition_v1,
+)
+from agent_gateway.skills.motion.schemas import (
     InlineTcpTrajectoryLimits,
     cardinal_tcp_step_schema_entry_v1,
     fixed_level_tcp_orientation_schema_entry_v1,
-    fixed_level_tcp_orientation_skill_definition_v1,
     inline_tcp_trajectory_schema_entry_v1,
     registered_tcp_trajectory_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
 )
-from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
 
 
 def _limits() -> InlineTcpTrajectoryLimits:
@@ -249,6 +253,42 @@ def test_fixed_level_orientation_definitions_select_either_arm_absolutely() -> N
         assert "fixed absolute" in summary
         assert "not a relative rotation" in summary
         assert "do not accumulate yaw" in summary
+
+
+def test_motion_skill_definition_hashes_survive_the_package_migration() -> None:
+    definitions = (
+        tcp_pose_target_skill_definition_v1(
+            controlled_component_ids=("right_arm",),
+        ),
+        cardinal_tcp_step_skill_definition_v1(
+            controlled_component_ids=("right_arm",),
+        ),
+        *(
+            fixed_level_tcp_orientation_skill_definition_v1(skill_id=skill_id)
+            for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
+        ),
+    )
+
+    assert {
+        definition.skill_id: definition.semantic_content_hash
+        for definition in definitions
+    } == {
+        "motion.move_tcp_to_pose": (
+            "bbd59b2858b986b695d9a1e47bd057b37be875dc018286050cb9c6d37a19663c"
+        ),
+        "motion.step_tcp_cardinal": (
+            "c6e28fbde6b016a48d7510debf1465d90b6073f5160bd3885f852ab0811bba89"
+        ),
+        "motion.set_tcp_level_forward": (
+            "6e263d603c35da25f11f6ff6cfd0d5a2896e542d04a4bded262fd1bd648de351"
+        ),
+        "motion.set_tcp_level_forward_left_30": (
+            "a1faeff5337562453b64301284a8ba3500b8bf76d822eadaaac28f4c13acba34"
+        ),
+        "motion.set_tcp_level_forward_right_30": (
+            "0d8852424cf94bf5e1b75caedc642be037c2a0393d7137ba9e0a6566cb8133a5"
+        ),
+    }
 
 
 def test_registered_real_trajectory_schema_accepts_only_immutable_reference() -> None:

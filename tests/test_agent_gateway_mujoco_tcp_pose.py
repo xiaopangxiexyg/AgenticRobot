@@ -17,12 +17,12 @@ from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
 )
-from agent_gateway.protocol.motion_schemas import (
-    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
-)
 from agent_gateway.protocol.skill_catalog import (
     SkillExecutionRoute,
     SkillParameterProfileRef,
+)
+from agent_gateway.skills.motion.definition import (
+    FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from agent_gateway.profiles.mujoco.motion_application import (
     MujocoAgentSkillMotionApplication,

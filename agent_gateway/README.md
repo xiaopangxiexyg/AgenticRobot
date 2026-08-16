@@ -19,8 +19,11 @@ not caller-authored Agent input.
   injected lower operation/HOLD ports.
 - `transport/`: authenticated bounded transports and the transport-neutral wire
   adapter. The current local transport uses Unix peer credentials.
-- `skills/`: target-independent Skill definitions. These definitions do not
-  select a concrete route, frame, device, safety envelope, or deployment.
+- `skills/`: target-independent Skill definitions and Skill-specific payload
+  schemas. `skills/motion` owns Agent-visible motion identities and schemas;
+  pure pose primitives remain lower-owned by `robot_motion.primitives`.
+  Skills do not select a concrete route, frame, device, safety envelope, or
+  deployment.
 - `profiles/`: exact application/deployment bindings and executors. The current
   `profiles/mujoco` package owns the no-model TCP-pose Gateway application and
   its motion, observation, visual snapshot, policy-Skill, and CubeLift bindings.
@@ -63,8 +66,9 @@ when the lower Skill is activated. Distance, frame/tool/calibration identities,
 primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
 trusted deployment facts.
 
-The reusable motion schema also defines fixed level-orientation Skills for
-forward, forward-left 30 degrees, and forward-right 30 degrees. The current
+Target-independent motion semantics and payload schemas live in
+`skills/motion`. They also define fixed level-orientation Skills for forward,
+forward-left 30 degrees, and forward-right 30 degrees. The current
 single-right-arm no-model launcher does not publish those Routes because its
 frame binding and reviewed safety profile do not establish the required
 canonical desk axes and full heading range. A future launcher must publish its
@@ -93,6 +97,8 @@ Existing imports under `control_station.agent_gateway`,
 `control_station.sim_hil_profile.agent`, `control_station.tasks.cube_lift`, and
 `control_station.sim_hil_profile.tasks.cube_lift`, plus the historic real
 observation Gateway module, are thin re-export shims.
+`agent_gateway.protocol.motion_schemas` is also a temporary compatibility
+re-export; new motion-Skill code imports `agent_gateway.skills.motion`.
 New code must import the canonical `agent_gateway.*` modules. Compatibility
 modules may be removed only after production, test, documentation, and external
 consumer audits establish that their callers have migrated.

@@ -16,16 +16,8 @@ from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
 )
-from agent_gateway.protocol.motion_schemas import (
-    CARDINAL_TCP_STEP_DIRECTIONS_V1,
-    cardinal_tcp_step_schema_entry_v1,
-    tcp_pose_target_schema_entry_v1,
-    validate_agent_motion_parameters_v1,
-    validate_agent_motion_route_schema_v1,
-)
 from agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
-    SkillDefinition,
     SkillDefinitionCatalog,
     SkillDeploymentBindingRef,
     SkillDeploymentSafetyEnvelopeRef,
@@ -43,6 +35,17 @@ from agent_gateway.protocol.state_schemas import (
     validate_agent_state_parameters_v1,
     validate_agent_state_result_v1,
     validate_agent_state_route_schema_v1,
+)
+from agent_gateway.skills.motion.definition import (
+    cardinal_tcp_step_skill_definition_v1,
+    tcp_pose_target_skill_definition_v1,
+)
+from agent_gateway.skills.motion.schemas import (
+    CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    cardinal_tcp_step_schema_entry_v1,
+    tcp_pose_target_schema_entry_v1,
+    validate_agent_motion_parameters_v1,
+    validate_agent_motion_route_schema_v1,
 )
 from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorRegistry,
@@ -1439,19 +1442,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise ValueError(
             "Cardinal TCP primitive exceeds the lower motion delta profile."
         )
-    definition = SkillDefinition(
-        skill_id="motion.move_tcp_to_pose",
-        skill_version="1",
-        skill_kind="motion",
-        summary="Move right_arm tool_tcp to one bounded absolute pose proposal.",
-        intended_target_kind="target_agnostic",
-        cross_target_deployment_policy="not_applicable",
+    definition = tcp_pose_target_skill_definition_v1(
         controlled_component_ids=("right_arm",),
-        parameter_semantics_id="tcp_pose_target.absolute.xyz_quat_xyzw.v1",
-        execution_result_semantics_id="component_action_execution.v1",
-        task_outcome_semantics_id="tcp_pose_arrival.v1",
-        entry_predicate_ids=("route_ready.v1", "measured_start_pose_valid.v1"),
-        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
     )
     schema_entry = tcp_pose_target_schema_entry_v1(
         skill_definition_hash=definition.semantic_content_hash,
@@ -1485,22 +1477,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         requires_task_evaluation=True,
     )
     validate_agent_motion_route_schema_v1(route=route, schema_entry=schema_entry)
-    cardinal_step_definition = SkillDefinition(
-        skill_id="motion.step_tcp_cardinal",
-        skill_version="1",
-        skill_kind="motion",
-        summary=(
-            "Move one tool_tcp by the reviewed lower short-step primitive in "
-            "a semantic workspace direction."
-        ),
-        intended_target_kind="target_agnostic",
-        cross_target_deployment_policy="not_applicable",
+    cardinal_step_definition = cardinal_tcp_step_skill_definition_v1(
         controlled_component_ids=("right_arm",),
-        parameter_semantics_id="tcp_cardinal_short_step.direction.v1",
-        execution_result_semantics_id="component_action_execution.v1",
-        task_outcome_semantics_id="tcp_pose_arrival.v1",
-        entry_predicate_ids=("route_ready.v1", "measured_start_pose_valid.v1"),
-        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
     )
     cardinal_step_schema = cardinal_tcp_step_schema_entry_v1(
         skill_definition_hash=cardinal_step_definition.semantic_content_hash,

@@ -16,7 +16,9 @@ profile explicitly binds a Station application port.
   bound runtime facade. It does not reinterpret Skill or motion semantics.
 - `skills/` owns target-independent Skill definitions and payload/result
   schemas. It must not select concrete devices, frames, safety envelopes,
-  routes, deployments, or controller parameters.
+  routes, deployments, or controller parameters. Pure motion primitives remain
+  in `robot_motion.primitives`; Skills may name bounded semantic choices but
+  must not duplicate primitive execution, safety, IK, or dispatch.
 - `profiles/` owns concrete application and deployment bindings. A profile may
   import `control_station`, `sim`, deployment adapters, and lower motion APIs
   only to assemble one exact application leaf through typed ports.
@@ -31,9 +33,11 @@ transport response must not be presented as lower-confirmed HOLD evidence.
 Historic `control_station.agent_gateway`,
 `control_station.sim_hil_profile.agent`, and Station CubeLift Skill paths are
 forwarding shims only. The historic RealTeleop observation Gateway module is
-also a compatibility re-export. New production imports and tests must use
-`agent_gateway.*`; shims must not duplicate implementation, state, schemas, or
-resource ownership.
+also a compatibility re-export. The former
+`agent_gateway.protocol.motion_schemas` owner is a compatibility re-export for
+`agent_gateway.skills.motion.schemas`. New production imports and tests must
+use the owning `agent_gateway.*` path; shims must not duplicate implementation,
+state, schemas, or resource ownership.
 
 Preserve public wire field names, schema/hash domains, Skill/Route/deployment
 identities, idempotency behavior, and fail-closed cancellation semantics during

@@ -17,8 +17,17 @@ from agent_gateway.profiles.real.observation_gateway import (
     RealTcpPoseObservationProducer as CanonicalRealObservationProducer,
 )
 from agent_gateway.protocol.contracts import AgentSkillRequest as CanonicalRequest
+from agent_gateway.protocol.motion_schemas import (
+    cardinal_tcp_step_schema_entry_v1 as CompatibleMotionSchema,
+)
+from agent_gateway.skills.motion.schemas import (
+    cardinal_tcp_step_schema_entry_v1 as CanonicalMotionSchema,
+)
 from control_station.agent_gateway.protocol.contracts import (
     AgentSkillRequest as CompatibleRequest,
+)
+from control_station.agent_gateway.protocol.motion_schemas import (
+    cardinal_tcp_step_schema_entry_v1 as HistoricMotionSchema,
 )
 from control_station.sim_hil_profile.agent.motion_factory import (
     build_mujoco_agent_tcp_pose_gateway_session as compatible_session_factory,
@@ -39,6 +48,8 @@ def test_historic_imports_preserve_canonical_object_identity() -> None:
     assert compatible_session_factory is canonical_session_factory
     assert CompatibleCubeLiftLifecycle is CanonicalCubeLiftLifecycle
     assert CompatibleRealObservationProducer is CanonicalRealObservationProducer
+    assert CompatibleMotionSchema is CanonicalMotionSchema
+    assert HistoricMotionSchema is CanonicalMotionSchema
 
 
 def test_historic_gateway_modules_are_thin_reexports() -> None:
@@ -67,6 +78,22 @@ def test_historic_gateway_modules_are_thin_reexports() -> None:
             if isinstance(node, ast.ImportFrom) and node.module
         }
         assert imported_roots <= {"agent_gateway"}, path
+
+
+def test_former_gateway_motion_schema_owner_is_a_thin_reexport() -> None:
+    path = REPO_ROOT / "agent_gateway/protocol/motion_schemas.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    assert not any(
+        isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in ast.walk(tree)
+    )
+    imported_roots = {
+        node.module.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert imported_roots == {"agent_gateway"}
 
 
 def test_top_level_gateway_is_in_package_discovery() -> None:
