@@ -15,6 +15,7 @@ from robot_motion.action import (
 )
 from control_station.composition.mujoco_sim_hil import (
     build_component_keyed_mujoco_sim_hil_contracts,
+    build_mujoco_sim_hil_composition_runtime_config,
     build_mujoco_sim_hil_strategy_control_factory,
 )
 from sim.mujoco.deploy import (
@@ -255,6 +256,9 @@ def test_sim_hil_target_binds_and_emits_requested_fk_pose_measurement() -> None:
     target = build_mujoco_sim_hil_target(
         config=config,
         contracts=contracts,
+        composition_runtime_config=(
+            build_mujoco_sim_hil_composition_runtime_config(contracts)
+        ),
         composition_strategy_control_factory=(
             build_mujoco_sim_hil_strategy_control_factory(contracts)
         ),

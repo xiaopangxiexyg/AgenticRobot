@@ -79,7 +79,10 @@ from robot_motion.runtime.control_admission import (
     ControlCut,
 )
 from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
-from sim.mujoco.deploy import MujocoDeployRuntime
+from sim.mujoco.deploy import (
+    MujocoCompositionRuntimeConfig,
+    MujocoDeployRuntime,
+)
 from teleop_runtime.action.human_proposal import (
     HumanCommandEmission,
     HumanProposalAdapter,
@@ -366,6 +369,22 @@ MujocoSimHILStrategyControlFactory = Callable[
     [ControlAdmissionCoordinator, ProducerEpochRegistry, float],
     CompositionStrategyControl,
 ]
+
+
+def build_mujoco_sim_hil_composition_runtime_config(
+    contracts: object,
+) -> MujocoCompositionRuntimeConfig:
+    """Select the composition receiver features required by Sim-HIL.
+
+    Every Sim-HIL composition consumes source state and action on one causal
+    cut.  Allocation profiles additionally supply their application-owned
+    information plan; plain mixed-control contracts intentionally supply none.
+    """
+
+    return MujocoCompositionRuntimeConfig(
+        enable_source_eligibility=True,
+        information_plan=getattr(contracts, "information_plan", None),
+    )
 
 
 def build_mujoco_sim_hil_strategy_control_factory(
@@ -3326,6 +3345,7 @@ __all__ = [
     "build_default_mujoco_sim_hil_contracts",
     "build_mujoco_sim_hil_agent_skill_execution_manifest",
     "build_mujoco_sim_hil_agent_skill_station_manifest",
+    "build_mujoco_sim_hil_composition_runtime_config",
     "build_mujoco_sim_hil_policy_binding",
     "build_mujoco_sim_hil_strategy_control_factory",
     "build_scoped_mujoco_sim_hil_composition",

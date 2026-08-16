@@ -29,6 +29,7 @@ from control_station.composition import (
     MujocoTrajectoryPublicationProfile,
     MujocoTrajectoryPublicationRequest,
     build_mujoco_sim_hil_policy_binding,
+    build_mujoco_sim_hil_composition_runtime_config,
     build_mujoco_sim_hil_strategy_control_factory,
     build_scoped_mujoco_sim_hil_composition,
 )
@@ -360,6 +361,11 @@ def _build_running_fixture():
     target = build_mujoco_sim_hil_target(
         config=target_config,
         contracts=residual_profile.sim_hil_contracts,
+        composition_runtime_config=(
+            build_mujoco_sim_hil_composition_runtime_config(
+                residual_profile.sim_hil_contracts
+            )
+        ),
         composition_strategy_control_factory=(
             build_mujoco_sim_hil_strategy_control_factory(
                 residual_profile.sim_hil_contracts

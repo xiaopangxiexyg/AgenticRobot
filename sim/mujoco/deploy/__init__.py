@@ -71,6 +71,7 @@ from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
     ResolvedQposReferenceAdmissionResult,
 )
+from .composition_binding import MujocoCompositionRuntimeConfig
 from .rtc_policy import (
     DeterministicVirtualPolicyRtcRunner,
     VirtualBimanualQposPolicy,
@@ -103,6 +104,7 @@ from .policy_rollout import (
 __all__ = [
     "build_mujoco_pose_action_schema",
     "MujocoDeployConfig",
+    "MujocoCompositionRuntimeConfig",
     "MujocoComponentExecutionBinding",
     "MujocoDeployRuntime",
     "MujocoDirectComponentProposalSource",
