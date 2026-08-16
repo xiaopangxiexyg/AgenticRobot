@@ -490,17 +490,25 @@ class MujocoAllocationProposalPublicationController:
             raise RuntimeError("Allocation context publication is not active.")
         with self._lock:
             cut = self.runtime.capture_control_cut(cutoff_at=cutoff_at)
-            evaluation = self.runtime.evaluate_composition_shadow(
-                spec=self.composition_spec,
-                target_effective_at=target_effective_at,
-                required_context_channels=(self.profile.allocation_context_channel,),
-                control_cut=cut,
-                source_difference_spec=self.source_difference_spec,
-                activation_scope=self.activation_scope,
-                source_eligibility_spec=self.source_eligibility_spec,
-                residual_anchor_lifecycle_scope_id=(
-                    self.allocation_publication_port.allocation_runtime.allocation_scope_id
-                ),
+            allocation_runtime = (
+                self.allocation_publication_port.allocation_runtime
+            )
+            assert allocation_runtime is not None
+            evaluation = (
+                self.runtime.composition_port.evaluate_composition_shadow(
+                    spec=self.composition_spec,
+                    target_effective_at=target_effective_at,
+                    required_context_channels=(
+                        self.profile.allocation_context_channel,
+                    ),
+                    control_cut=cut,
+                    source_difference_spec=self.source_difference_spec,
+                    activation_scope=self.activation_scope,
+                    source_eligibility_spec=self.source_eligibility_spec,
+                    residual_anchor_lifecycle_scope_id=(
+                        allocation_runtime.allocation_scope_id
+                    ),
+                )
             )
             context_snapshot = evaluation.context_snapshot
             context = (

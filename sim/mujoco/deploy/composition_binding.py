@@ -12,11 +12,26 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from control_composition.activation import CompositionActivationScope
 from control_composition.composition import (
+    CompositionContextDraft,
+    CompositionDynamicParameterDraft,
+    CompositionInputBatchDraft,
+    CompositionInputDraft,
+    CompositionSpec,
     CompositionStrategyControl,
     FormalCompositionStrategy,
 )
+from control_composition.eligibility import (
+    CompositionSourceEligibilityDraft,
+    CompositionSourceEligibilitySpec,
+)
 from control_composition.information import CompositionInformationPlan
+from control_composition.observability import SourceDifferenceSpec
+from control_composition.residual_anchor_lifecycle import (
+    ResidualAnchorLifecycleDraft,
+    ResidualAnchorLifecycleSpec,
+)
 from control_composition.retention import TimeWindowRetentionSpec
 from control_composition.runtime import ControlCompositionRuntime
 from dataset_contracts.control_trace import ControlTraceFact
@@ -25,17 +40,183 @@ from dataset_interface.composition_control_trace import (
 )
 from robot_motion.action import ComponentActionSchema
 from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
-from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
+from robot_motion.runtime.control_admission import (
+    ControlAdmissionCoordinator,
+    ControlCut,
+)
 from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
 
 
 @dataclass(frozen=True)
 class MujocoCompositionRuntimeBinding:
-    """Installed composition adapter over one authoritative MuJoCo runtime."""
+    """Lifecycle-gated composition port over one authoritative MuJoCo target.
+
+    This port admits and evaluates composition-owned state only. Proposal
+    promotion, authority, canonical safety, target execution, and dispatch are
+    intentionally absent and remain on ``MujocoDeployRuntime``.
+    """
 
     trace_emitter: CompositionControlTraceEmitter
     strategy_control: CompositionStrategyControl | None
-    topology: ControlCompositionRuntime
+    _topology: ControlCompositionRuntime
+    started: Callable[[], bool]
+
+    def _require_started(self) -> None:
+        if not self.started():
+            raise RuntimeError("MujocoDeployRuntime.start() is required.")
+
+    @property
+    def composition_strategy(self) -> FormalCompositionStrategy | None:
+        return self._topology.composition_strategy
+
+    @property
+    def runtime_session_id(self) -> str:
+        return self._topology.runtime_session_id
+
+    @property
+    def control_domain_id(self) -> str:
+        return self._topology.control_domain_id
+
+    @property
+    def coordinator(self) -> ControlAdmissionCoordinator:
+        return self._topology.coordinator
+
+    @property
+    def source_eligibility(self):
+        return self._topology.source_eligibility
+
+    @property
+    def input_action_schema_by_role(self) -> Mapping[str, ComponentActionSchema]:
+        return self._topology.input_action_schema_by_role
+
+    def admit_composition_context(self, draft: CompositionContextDraft):
+        self._require_started()
+        return self._topology.admit_composition_context(draft)
+
+    def resolve_composition_context(self, context_id: str):
+        """Resolve one admitted context without advancing receiver state."""
+
+        self._require_started()
+        return self._topology.contexts.record_by_id(context_id)
+
+    def capture_composition_context_snapshot(
+        self,
+        *,
+        target_effective_at: float,
+        required_channels: tuple[str, ...],
+    ):
+        self._require_started()
+        return self._topology.capture_composition_context_snapshot(
+            target_effective_at=target_effective_at,
+            required_channels=required_channels,
+        )
+
+    def admit_composition_input(
+        self,
+        draft: CompositionInputDraft,
+        *,
+        activation_scope: CompositionActivationScope | None = None,
+    ):
+        self._require_started()
+        return self._topology.admit_composition_input(
+            draft,
+            activation_scope=activation_scope,
+        )
+
+    def admit_composition_inputs(
+        self,
+        batch: CompositionInputBatchDraft,
+        *,
+        activation_scope: CompositionActivationScope | None = None,
+    ):
+        self._require_started()
+        return self._topology.admit_composition_inputs(
+            batch,
+            activation_scope=activation_scope,
+        )
+
+    def admit_source_eligibility(
+        self,
+        draft: CompositionSourceEligibilityDraft,
+    ):
+        self._require_started()
+        return self._topology.admit_source_eligibility(draft)
+
+    def admit_residual_anchor_lifecycle(
+        self,
+        draft: ResidualAnchorLifecycleDraft,
+        *,
+        spec: ResidualAnchorLifecycleSpec,
+        activation_scope: CompositionActivationScope,
+    ):
+        self._require_started()
+        return self._topology.admit_residual_anchor_lifecycle(
+            draft,
+            spec=spec,
+            activation_scope=activation_scope,
+        )
+
+    def admit_dynamic_parameters(self, draft: CompositionDynamicParameterDraft):
+        self._require_started()
+        return self._topology.admit_dynamic_parameters(draft)
+
+    def evaluate_composition_shadow(
+        self,
+        *,
+        spec: CompositionSpec,
+        target_effective_at: float,
+        required_context_channels: tuple[str, ...] = (),
+        cutoff_at: float | None = None,
+        control_cut: ControlCut | None = None,
+        source_difference_spec: SourceDifferenceSpec | None = None,
+        activation_scope: CompositionActivationScope | None = None,
+        source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+        residual_anchor_lifecycle_scope_id: str | None = None,
+    ):
+        """Evaluate one composition cut without proposal or target authority."""
+
+        self._require_started()
+        if self.strategy_control is None:
+            submission = self._topology.evaluate_composition(
+                spec=spec,
+                target_effective_at=target_effective_at,
+                required_context_channels=required_context_channels,
+                cutoff_at=cutoff_at,
+                control_cut=control_cut,
+                source_difference_spec=source_difference_spec,
+                activation_scope=activation_scope,
+                source_eligibility_spec=source_eligibility_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
+            )
+        else:
+            latest_revision = self.strategy_control.latest_revision
+            latest_spec_hash = (
+                latest_revision.composition_spec.semantic_content_hash
+            )
+            if spec.semantic_content_hash != latest_spec_hash:
+                raise ValueError(
+                    "Hot composition evaluation requested another "
+                    "CompositionSpec."
+                )
+            submission = self._topology.evaluate_hot_composition(
+                target_effective_at=target_effective_at,
+                required_context_channels=required_context_channels,
+                cutoff_at=cutoff_at,
+                control_cut=control_cut,
+                source_difference_spec=source_difference_spec,
+                activation_scope=activation_scope,
+                source_eligibility_spec=source_eligibility_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
+            )
+        if submission.proposal_admission is not None:
+            raise RuntimeError(
+                "Shadow composition unexpectedly admitted a proposal."
+            )
+        return submission
 
 
 def build_mujoco_composition_runtime_binding(
@@ -62,6 +243,7 @@ def build_mujoco_composition_runtime_binding(
         | None
     ),
     clock: Callable[[], float],
+    started: Callable[[], bool],
 ) -> MujocoCompositionRuntimeBinding:
     """Build the optional mixed-control adapter without target ownership."""
 
@@ -131,7 +313,8 @@ def build_mujoco_composition_runtime_binding(
     return MujocoCompositionRuntimeBinding(
         trace_emitter=trace_emitter,
         strategy_control=strategy_control,
-        topology=topology,
+        _topology=topology,
+        started=started,
     )
 
 

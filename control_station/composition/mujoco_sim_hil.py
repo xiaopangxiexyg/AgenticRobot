@@ -1859,7 +1859,7 @@ class MujocoSimHILComposition:
             sequence = self._next_source_status_sequence_by_role[role]
             producer_id, producer_epoch = producer_by_role[role]
             source_slot_id = self._source_eligibility_spec.source_slot_by_role[role]
-            receipt = self.runtime.submit_composition_source_eligibility(
+            receipt = self.runtime.composition_port.admit_source_eligibility(
                 CompositionSourceEligibilityDraft(
                     runtime_session_id=self.runtime.config.runtime_session_id,
                     control_domain_id=self.runtime.config.control_domain_id,
@@ -2253,7 +2253,7 @@ class MujocoSimHILComposition:
                         fact.semantic_content_hash for fact in facts
                     ),
                 )
-                receipt = self.runtime.submit_composition_input(
+                receipt = self.runtime.composition_port.admit_composition_input(
                     draft,
                     activation_scope=self._activation_scope,
                 )
@@ -2427,7 +2427,7 @@ class MujocoSimHILComposition:
                             **transform_audit_metadata,
                         },
                     )
-                    receipt = self.runtime.submit_composition_input(
+                    receipt = self.runtime.composition_port.admit_composition_input(
                         draft,
                         activation_scope=self._activation_scope,
                     )
@@ -2591,13 +2591,17 @@ class MujocoSimHILComposition:
                     control_cut = self.runtime.capture_control_cut(
                         cutoff_at=float(self.runtime.clock())
                     )
-                    evaluation = self.runtime.evaluate_composition_shadow(
-                        spec=self.contracts.composition_spec,
-                        target_effective_at=target,
-                        control_cut=control_cut,
-                        source_difference_spec=self.source_difference_spec,
-                        activation_scope=self._activation_scope,
-                        source_eligibility_spec=(self._source_eligibility_spec),
+                    evaluation = (
+                        self.runtime.composition_port.evaluate_composition_shadow(
+                            spec=self.contracts.composition_spec,
+                            target_effective_at=target,
+                            control_cut=control_cut,
+                            source_difference_spec=self.source_difference_spec,
+                            activation_scope=self._activation_scope,
+                            source_eligibility_spec=(
+                                self._source_eligibility_spec
+                            ),
+                        )
                     )
                     self._validate_expected_input_selection(
                         evaluation,

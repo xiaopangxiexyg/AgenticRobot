@@ -385,7 +385,7 @@ class MujocoAllocationShadowController:
         assert self.allocation_spec is not None
         assert self.activation_scope is not None
         cut = self.runtime.capture_control_cut(cutoff_at=cutoff_at)
-        submission = self.runtime.evaluate_composition_shadow(
+        submission = self.runtime.composition_port.evaluate_composition_shadow(
             spec=self.composition_spec,
             target_effective_at=float(target_effective_at),
             required_context_channels=(self.profile.allocation_context_channel,),
@@ -502,7 +502,9 @@ class MujocoAllocationShadowController:
                 if point.output_status == "ready":
                     raise ValueError("Ready allocation preview has no decision.")
                 continue
-            admitted = self.runtime.resolve_composition_context(context.context_id)
+            admitted = self.runtime.composition_port.resolve_composition_context(
+                context.context_id
+            )
             if (
                 admitted is None
                 or admitted.semantic_content_hash != context.semantic_content_hash

@@ -456,7 +456,7 @@ class MujocoPoseComposerAuthorityComposition:
             == parent_fact_hash
         ):
             return previous
-        receipt = self.runtime.submit_composition_input(
+        receipt = self.runtime.composition_port.admit_composition_input(
             CompositionInputDraft(
                 runtime_session_id=self.runtime.config.runtime_session_id,
                 control_domain_id=self.runtime.config.control_domain_id,
@@ -714,11 +714,13 @@ class MujocoPoseComposerAuthorityComposition:
                 )
             else:
                 try:
-                    evaluation = self.runtime.evaluate_composition_shadow(
-                        spec=self.composition_spec,
-                        target_effective_at=target,
-                        source_difference_spec=self.source_difference_spec,
-                        activation_scope=self._composition_activation_scope,
+                    evaluation = (
+                        self.runtime.composition_port.evaluate_composition_shadow(
+                            spec=self.composition_spec,
+                            target_effective_at=target,
+                            source_difference_spec=self.source_difference_spec,
+                            activation_scope=self._composition_activation_scope,
+                        )
                     )
                     disposition = decide_composition_authority_disposition(
                         evaluation.input_snapshot,

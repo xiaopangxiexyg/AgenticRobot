@@ -1622,7 +1622,7 @@ class MujocoHumanReplayHandoffComposition:
     ) -> CompositionInputAdmissionReceipt:
         if self.pose_fusion_shadow_spec is None:
             raise RuntimeError("Pose fusion composition shadow is not enabled.")
-        receipt = self.runtime.submit_composition_input(
+        receipt = self.runtime.composition_port.admit_composition_input(
             CompositionInputDraft(
                 runtime_session_id=self.runtime.config.runtime_session_id,
                 control_domain_id=self.runtime.config.control_domain_id,
@@ -2064,7 +2064,7 @@ class MujocoHumanReplayHandoffComposition:
             ),
         )
         try:
-            submission = self.runtime.evaluate_composition_shadow(
+            submission = self.runtime.composition_port.evaluate_composition_shadow(
                 spec=spec,
                 target_effective_at=(
                     snapshot.decision_schedule_tick.target_effective_at

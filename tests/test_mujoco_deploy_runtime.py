@@ -207,8 +207,8 @@ def build_runtime(
 def test_composition_binding_preserves_runtime_compatibility_views() -> None:
     runtime, _scene, _clock = build_runtime()
 
-    assert runtime.composition_port is runtime._composition_binding.topology
-    assert runtime.policy_topology is runtime.composition_port
+    assert runtime.composition_port is runtime._composition_binding
+    assert runtime.policy_topology is runtime._composition_binding._topology
     assert (
         runtime.composition_strategy_control
         is runtime.composition_port.strategy_control
@@ -217,6 +217,19 @@ def test_composition_binding_preserves_runtime_compatibility_views() -> None:
         runtime._composition_trace_emitter
         is runtime._composition_binding.trace_emitter
     )
+    assert not hasattr(runtime.composition_port, "topology")
+    with pytest.raises(
+        RuntimeError,
+        match=r"MujocoDeployRuntime\.start\(\) is required",
+    ):
+        runtime.composition_port.resolve_composition_context("not-admitted")
+    for authority_operation in (
+        "admit_evaluated_composition",
+        "submit_evaluated_composition",
+        "transition_execution_gate",
+        "step",
+    ):
+        assert not hasattr(runtime.composition_port, authority_operation)
 
 
 def test_authoritative_runtime_can_adopt_one_transferred_owner_and_epoch_source() -> None:
