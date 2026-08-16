@@ -303,7 +303,7 @@ class MujocoPoseComposerAuthorityComposition:
         target_hash = runtime.target_runtime_action_contract.semantic_content_hash
         if replay.target_runtime_contract.semantic_content_hash != target_hash:
             raise ValueError("Replay contributor was assessed against another target.")
-        formal_strategy = runtime.policy_topology.composition_strategy
+        formal_strategy = runtime.composition_port.composition_strategy
         formal_strategy_spec_hash = (
             None
             if formal_strategy is None

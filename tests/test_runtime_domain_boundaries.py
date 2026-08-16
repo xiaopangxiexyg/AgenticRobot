@@ -44,6 +44,13 @@ def _called_names(path: Path) -> set[str]:
     return names
 
 
+def _attribute_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+
+
 def _violations(
     root: Path,
     forbidden_roots: set[str],
@@ -181,3 +188,16 @@ def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> N
     }
     assert "build_mujoco_composition_runtime_binding" in imported_symbols
     assert imported_symbols.isdisjoint(implementation_constructors)
+
+
+def test_control_station_uses_explicit_mujoco_composition_port() -> None:
+    legacy_runtime_views = {"policy_topology", "composition_strategy_control"}
+    violations = {
+        str(path.relative_to(REPO_ROOT)): sorted(
+            _attribute_names(path) & legacy_runtime_views
+        )
+        for path in _python_files(REPO_ROOT / "control_station")
+        if _attribute_names(path) & legacy_runtime_views
+    }
+
+    assert violations == {}

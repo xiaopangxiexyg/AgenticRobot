@@ -443,7 +443,7 @@ class MujocoTrajectoryPublicationController:
                     "Trajectory session and Sim-HIL composition activation differ."
                 )
             inputs = prepare_trajectory_composition_inputs(
-                self.composition.runtime.policy_topology,
+                self.composition.runtime.composition_port,
                 state=state,
                 target_effective_at=request.target_effective_at,
                 composition_spec=self.composition_spec,

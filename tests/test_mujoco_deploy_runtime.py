@@ -207,10 +207,11 @@ def build_runtime(
 def test_composition_binding_preserves_runtime_compatibility_views() -> None:
     runtime, _scene, _clock = build_runtime()
 
-    assert runtime.policy_topology is runtime._composition_binding.topology
+    assert runtime.composition_port is runtime._composition_binding.topology
+    assert runtime.policy_topology is runtime.composition_port
     assert (
         runtime.composition_strategy_control
-        is runtime._composition_binding.strategy_control
+        is runtime.composition_port.strategy_control
     )
     assert (
         runtime._composition_trace_emitter

@@ -1329,7 +1329,7 @@ class MujocoSimHILComposition:
             raise ValueError("MuJoCo Sim-HIL requires shared pose execution.")
         if not runtime.explicit_shared_safety:
             raise ValueError("MuJoCo Sim-HIL requires explicit shared safety.")
-        if runtime.policy_topology.source_eligibility is None:
+        if runtime.composition_port.source_eligibility is None:
             raise ValueError("MuJoCo Sim-HIL requires source-eligibility admission.")
         self._source_eligibility_spec.validate_composition_spec(
             self.contracts.composition_spec
@@ -1573,7 +1573,7 @@ class MujocoSimHILComposition:
         installed_role_schema_hashes = {
             role: schema.semantic_content_hash
             for role, schema in (
-                runtime.policy_topology.input_action_schema_by_role.items()
+                runtime.composition_port.input_action_schema_by_role.items()
             )
         }
         if (
@@ -1601,7 +1601,7 @@ class MujocoSimHILComposition:
                 "composer producers."
             )
         dynamic_contract = self.contracts.dynamic_parameter_contract
-        strategy_control = runtime.composition_strategy_control
+        strategy_control = runtime.composition_port.strategy_control
         if (dynamic_contract is None) != (strategy_control is None):
             raise ValueError("Sim-HIL dynamic blend contract/runtime control mismatch.")
         if dynamic_contract is not None:
@@ -1948,7 +1948,7 @@ class MujocoSimHILComposition:
         with self._lock:
             self._require_started()
             contract = self.contracts.dynamic_parameter_contract
-            strategy_control = self.runtime.composition_strategy_control
+            strategy_control = self.runtime.composition_port.strategy_control
             if contract is None or strategy_control is None:
                 raise RuntimeError("This Sim-HIL profile has no dynamic blend control.")
             if isinstance(alpha, Mapping):
@@ -1977,7 +1977,7 @@ class MujocoSimHILComposition:
                 else _finite(effective_from, name="effective_from")
             )
             revision = strategy_control.latest_revision
-            receipt = self.runtime.policy_topology.admit_dynamic_parameters(
+            receipt = self.runtime.composition_port.admit_dynamic_parameters(
                 CompositionDynamicParameterDraft(
                     runtime_session_id=self.runtime.config.runtime_session_id,
                     control_domain_id=self.runtime.config.control_domain_id,

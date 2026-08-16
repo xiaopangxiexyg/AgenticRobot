@@ -1634,7 +1634,11 @@ class MujocoDeployRuntime:
         self.composition_strategy_control = (
             self._composition_binding.strategy_control
         )
-        self.policy_topology = self._composition_binding.topology
+        self.composition_port = self._composition_binding.topology
+        # Historical callers used ``policy_topology`` for the composition
+        # receiver. Keep it as an identity-preserving compatibility view while
+        # new application bindings use the role-specific port name.
+        self.policy_topology = self.composition_port
         self._started = False
         self._latest_target_execution_step: AuthoritativeControlStep | None = None
         self._last_dispatch_context: (
@@ -2435,7 +2439,7 @@ class MujocoDeployRuntime:
     def composition_strategy(self) -> FormalCompositionStrategy | None:
         """Expose the injected lower-owned composition implementation seam."""
 
-        return self.policy_topology.composition_strategy
+        return self.composition_port.composition_strategy
 
     def start(self) -> None:
         if self._started:
