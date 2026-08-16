@@ -1723,8 +1723,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--debug",
         action="store_true",
         help=(
-            "Write deployment action/pose debug JSONL under "
-            "teleop_records/deployment_debug by default."
+            "Write deployment action/pose debug JSONL to the resolved "
+            "deployment debug root."
         ),
     )
     parser.add_argument(

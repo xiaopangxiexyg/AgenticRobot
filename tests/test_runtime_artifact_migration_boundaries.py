@@ -47,7 +47,7 @@ LEGACY_ARTIFACT_ROOT_ALLOWLIST = frozenset(
         "teleop_runtime/configs/rm65_arm_ips.py",
         "teleop_runtime/debug/rm65_real_debug/run_rm65_idle_worker_drain_preflight.py",
         "control_station/real_teleop_entrypoint.py",
-        "teleop_runtime/deploy/run_policy.py",
+        "teleop_runtime/deploy/debug_logger.py",
         "teleop_runtime/episodes.py",
         "teleop_runtime/position_control/config.py",
         "teleop_runtime/real_teleop/actuator_command_trace.py",

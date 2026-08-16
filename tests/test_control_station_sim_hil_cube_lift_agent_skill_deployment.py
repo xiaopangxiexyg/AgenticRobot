@@ -115,6 +115,13 @@ def _composition() -> MujocoSimHILComposition:
         reference_activation_spec=SimpleNamespace(
             activation_mode="immediate_target"
         ),
+        authoritative_port=SimpleNamespace(
+            profile=SimpleNamespace(
+                selection_group_ids=("left_arm", "right_arm"),
+                authority_policy_hash="authority-policy:test",
+                decision_schedule_hash="decision-schedule:test",
+            )
+        ),
         core=SimpleNamespace(
             config=SimpleNamespace(
                 active_selection_groups=("left_arm", "right_arm"),
@@ -464,14 +471,15 @@ def test_application_passive_cut_is_no_start_no_step_and_uses_existing_owner() -
             runtime_session_id=RUNTIME_SESSION_ID,
             control_domain_id=CONTROL_DOMAIN_ID,
         ),
-        core=SimpleNamespace(
+        authoritative_port=SimpleNamespace(
             capture_receiver_state=lambda: SimpleNamespace(
                 runtime_session_id=RUNTIME_SESSION_ID,
                 control_domain_id=CONTROL_DOMAIN_ID,
                 current_owner_generation=6,
                 current_authority_epoch=7,
                 current_execution_epoch=8,
-            )
+            ),
+            capture_control_cut=lambda *, cutoff_at: None,
         ),
         rig=SimpleNamespace(capture_scene=capture_scene),
     )
