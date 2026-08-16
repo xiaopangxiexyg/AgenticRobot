@@ -4,11 +4,6 @@ from .contact_trace import (
     MUJOCO_CONTACT_GUARD_ID_V1,
     project_mujoco_forbidden_contact_guard_result,
 )
-from .async_topology import (
-    AsyncHarnessRelease,
-    AsyncHarnessSubmissionReceipt,
-    DeterministicAsyncTopologyHarness,
-)
 from .observation import MujocoPolicyObservationAdapter
 from .deployment_observation import (
     MujocoDeploymentObservationAdapter,
@@ -162,9 +157,6 @@ __all__ = [
     "VirtualPolicyRequestSubmission",
     "VirtualRtcDecisionResult",
     "VirtualRtcPlanInvalidationReceipt",
-    "AsyncHarnessRelease",
-    "AsyncHarnessSubmissionReceipt",
-    "DeterministicAsyncTopologyHarness",
     "DecodedPolicy",
     "DeployRuntime",
     "DeploymentObservationSource",

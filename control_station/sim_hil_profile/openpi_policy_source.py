@@ -1,4 +1,4 @@
-"""MuJoCo observation binding for the generic OpenPI emission source.
+"""Sim-HIL application binding for MuJoCo observations and OpenPI emissions.
 
 Only scene sampling is simulator-specific.  Artifact validation, model
 transport, chunk scheduling and emission creation remain in their lower-owned
@@ -22,11 +22,13 @@ from robot_motion.pose_frame_profiles import (
     default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
 )
 
-from .deployment_observation import (
+from sim.mujoco.deploy.deployment_observation import (
     MujocoDeploymentObservationAdapter,
     MujocoDeploymentObservationConfig,
 )
-from .sim_hil_target import capture_mujoco_sim_hil_tool_tcp_pose_by_side
+from sim.mujoco.deploy.sim_hil_target import (
+    capture_mujoco_sim_hil_tool_tcp_pose_by_side,
+)
 
 
 @dataclass(frozen=True)

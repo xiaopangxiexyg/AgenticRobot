@@ -183,7 +183,7 @@ def _build_application(
 
     policy_source_builder = None
     if config.policy_backend == "openpi_state":
-        from sim.mujoco.deploy.openpi_policy_source import (
+        from control_station.sim_hil_profile.openpi_policy_source import (
             build_mujoco_openpi_state_policy_source,
         )
 
@@ -204,9 +204,9 @@ def _build_application(
 def _mujoco_openpi_state_policy_source_profile(
     config: MujocoSimHILApplicationConfig,
 ) -> Any:
-    """Project Station CLI selection into the lower concrete adapter profile."""
+    """Project Station CLI selection into its Sim-HIL provider binding."""
 
-    from sim.mujoco.deploy.openpi_policy_source import (
+    from control_station.sim_hil_profile.openpi_policy_source import (
         MujocoOpenPIStatePolicySourceProfile,
     )
 
@@ -767,7 +767,7 @@ def _run_dry_run(
             "output_active_sides": ["right"],
         }
     else:
-        from sim.mujoco.deploy.openpi_policy_source import (
+        from control_station.sim_hil_profile.openpi_policy_source import (
             preflight_mujoco_openpi_state_policy_source,
         )
 
