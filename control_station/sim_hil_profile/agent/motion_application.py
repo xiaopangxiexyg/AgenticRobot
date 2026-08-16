@@ -21,8 +21,8 @@ from robot_motion.target_safety import (
     TCPPoseEnvelopeSafetyRuntime,
     TCPPoseEnvelopeSelection,
 )
-from sim.mujoco.deploy.sim_hil_target import (
-    MujocoAgentSkillMotionTarget,
+from sim.mujoco.deploy.agent_skill_target import MujocoAgentSkillMotionTarget
+from sim.mujoco.deploy.target_measurement import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
 from sim.mujoco.rgb_snapshot import (

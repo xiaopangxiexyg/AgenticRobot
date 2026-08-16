@@ -38,7 +38,7 @@ from robot_motion.runtime.observation_cut import (
     ObservationCutRecord,
     ObservationSampleRef,
 )
-from sim.mujoco.deploy.sim_hil_target import (
+from sim.mujoco.deploy.target_measurement import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
 
