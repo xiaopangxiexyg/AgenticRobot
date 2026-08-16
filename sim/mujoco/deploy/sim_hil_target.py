@@ -48,6 +48,8 @@ from robot_motion.position_control import (
 )
 from robot_motion.rm65 import endpoint_to_tool_transform, load_rm65_tool_profile
 
+from .composition_binding import MujocoCompositionRuntimeConfig
+
 
 _POSITION_CONTROL_PROFILES_BY_NAME = {
     profile.name: profile
@@ -376,6 +378,7 @@ def build_mujoco_sim_hil_target(
         str, ComponentActionSchema
     ]
     | None = None,
+    composition_runtime_config: MujocoCompositionRuntimeConfig | None = None,
     composition_strategy_control_factory: Callable[..., Any] | None = None,
     prepared_target: MujocoSimHILPreparedTarget | None = None,
     component_execution_binding: Any | None = None,
@@ -396,6 +399,29 @@ def build_mujoco_sim_hil_target(
         "strategy",
     ):
         raise TypeError("contracts must expose authority_profile and strategy.")
+    if composition_runtime_config is None:
+        raise ValueError(
+            "MuJoCo Sim-HIL requires an application-supplied "
+            "composition_runtime_config."
+        )
+    if not isinstance(
+        composition_runtime_config,
+        MujocoCompositionRuntimeConfig,
+    ):
+        raise TypeError(
+            "composition_runtime_config must be a "
+            "MujocoCompositionRuntimeConfig."
+        )
+    if not composition_runtime_config.enable_source_eligibility:
+        raise ValueError(
+            "MuJoCo Sim-HIL requires source-eligibility admission."
+        )
+    expected_information_plan = getattr(contracts, "information_plan", None)
+    if composition_runtime_config.information_plan is not expected_information_plan:
+        raise ValueError(
+            "composition_runtime_config must preserve the contracts' "
+            "information_plan identity."
+        )
     if composition_strategy_control_factory is not None and not callable(
         composition_strategy_control_factory
     ):
@@ -569,12 +595,6 @@ def build_mujoco_sim_hil_target(
             target_admission_margin_sec=(
                 config.target_admission_margin_sec
             ),
-            enable_composition_source_eligibility=True,
-            composition_information_plan=getattr(
-                contracts,
-                "information_plan",
-                None,
-            ),
             execution_observation_plan=config.execution_observation_plan,
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(
@@ -588,6 +608,7 @@ def build_mujoco_sim_hil_target(
             ),
         ),
         shared_safety=shared_safety,
+        composition_runtime_config=composition_runtime_config,
         composition_strategy=contracts.strategy,
         composition_strategy_control_factory=(
             composition_strategy_control_factory
