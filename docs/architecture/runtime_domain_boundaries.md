@@ -54,6 +54,15 @@ lower domains must not import application/profile layers
   MuJoCo observation 的接线由 `control_station.sim_hil_profile.openpi_policy_source` 持有。
 - no-model Agent-skill 模拟目标由 `sim.mujoco.deploy.agent_skill_target` 持有，不再与 composition-specific
   Sim-HIL target 实现在同一文件；原 `sim_hil_target` symbol 保留为按需加载、对象 identity 不变的兼容出口。
+- Agent-skill 与 composition Sim-HIL 共用的坐标身份、FK observation 和场景测量由
+  `sim.mujoco.deploy.target_measurement` 持有；两个 target factory 只消费这些无状态 adapter，原
+  `sim_hil_target` 与 package-root 导出保持同一对象的兼容视图。
+- 两类 target 共用的 scene load/reset、actuation/timing profile 与 prepared-resource 生命周期由
+  `sim.mujoco.deploy.target_preparation` 持有；`sim_hil_target` 和 `agent_skill_target` 都只在已准备资源上
+  绑定各自 runtime，旧配置、prepared target 和 prepare 函数导出保持 identity 不变。
+- 两类 target 共用、但不执行资源生命周期的选择 contract 由 `sim.mujoco.deploy.target_config` 单独持有；
+  preparation 与两个 runtime factory 均依赖该配置，旧 `sim_hil_target`、`target_preparation` 和 package-root
+  配置导出仍指向同一类型。
 - deterministic async composition harness 已移到 `tests/support/mujoco_async_topology.py`，不再作为
   `sim.mujoco.deploy` 的运行时导出或发布内容。
 - `sim/mujoco/deploy/composition_binding.py` 现在集中构造可选 composition runtime、retention 和 trace

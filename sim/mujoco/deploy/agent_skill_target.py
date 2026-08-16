@@ -9,12 +9,14 @@ from typing import Any, Callable, Mapping
 from robot_motion.action import ExecutionObservationSink
 from robot_motion.coordinate_profiles import TargetFrameProfile, ToolFrameProfile
 
-from .sim_hil_target import (
+from .target_config import MujocoSimHILTargetConfig
+from .target_preparation import (
     MujocoSimHILPreparedTarget,
-    MujocoSimHILTargetConfig,
+    prepare_mujoco_sim_hil_target,
+)
+from .target_measurement import (
     build_mujoco_sim_hil_pose_observation_projector,
     capture_mujoco_sim_hil_safety_anchor,
-    prepare_mujoco_sim_hil_target,
 )
 
 

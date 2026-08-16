@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -199,6 +200,48 @@ def _write_source_dataset(root: Path) -> tuple[Path, Path]:
         json.dumps(episode) + "\n", encoding="utf-8"
     )
     return root / left_video, root / right_video
+
+
+def _duplicate_episode_zero_as_one(root: Path) -> None:
+    def replace_episode_path(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {
+                str(key): replace_episode_path(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [replace_episode_path(item) for item in value]
+        if isinstance(value, str):
+            return value.replace("episode_000000", "episode_000001")
+        return value
+
+    episodes_path = root / "meta/episodes.jsonl"
+    source_episode = json.loads(episodes_path.read_text(encoding="utf-8"))
+    duplicate = replace_episode_path(source_episode)
+    assert isinstance(duplicate, dict)
+    duplicate["episode_index"] = 1
+    for key in ("parquet_path", "video_paths", "wrist_depth_mask_paths"):
+        raw = source_episode[key]
+        values = raw.values() if isinstance(raw, Mapping) else (raw,)
+        for source_relative in values:
+            source_path = root / str(source_relative)
+            target_path = root / str(
+                replace_episode_path(str(source_relative))
+            )
+            if source_path.name == "manifest.json":
+                shutil.copytree(source_path.parent, target_path.parent)
+            else:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, target_path)
+    episodes_path.write_text(
+        json.dumps(source_episode) + "\n" + json.dumps(duplicate) + "\n",
+        encoding="utf-8",
+    )
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["episode_count"] = 2
+    info["frame_count"] = 6
+    info_path.write_text(json.dumps(info), encoding="utf-8")
 
 
 def _add_detached_tactile_evidence(root: Path) -> tuple[Path, str]:
@@ -471,14 +514,157 @@ def test_plan_rejects_declared_source_video_frame_mismatch(
     assert not output.exists()
 
     _write_video(source_right_video, frame_count=1, color="blue")
-    with pytest.raises(
-        Exception, match="Declared/decoded video frame count mismatch"
-    ):
-        plan_camera_semantic_prepared_view(source, output, registry)
-    assert not output.exists()
+    empty_plan = plan_camera_semantic_prepared_view(source, output, registry)
+    assert empty_plan.source_episode_count == 1
+    assert empty_plan.episode_count == 0
+    assert empty_plan.excluded_episode_indices == (0,)
+    result = materialize_camera_semantic_prepared_view(
+        source,
+        output,
+        registry,
+        expected_plan_hash=empty_plan.plan_hash,
+    )
+    assert result["validated_video_count"] == 0
+    empty_manifest = load_camera_semantic_prepared_view(
+        output, verify_payload_hashes=True
+    )
+    assert empty_manifest.episode_indices == ()
+    assert empty_manifest.excluded_episode_indices == (0,)
+    validity = json.loads(
+        (output / "meta/modality_validity.json").read_text(encoding="utf-8")
+    )
+    assert validity["training"]["valid"] is False
+
+    from deployments.openpi.corrected_train import _camera_audits
+
+    factory = type(
+        "Factory",
+        (),
+        {
+            "camera_slots": ("left_wrist_0_rgb", "right_wrist_0_rgb"),
+            "dataset_sources": (
+                type("Source", (), {"dataset_root": output})(),
+            ),
+        },
+    )()
+    with pytest.raises(ValueError, match="cannot enter training/testing"):
+        _camera_audits(
+            factory,
+            registry,
+            allow_camera_prepared_view=True,
+        )
     assert not list(
         tmp_path.glob(f".{output.name}.camera-semantic-stage-*")
     )
+
+
+@pytest.mark.optional
+def test_prepared_view_marks_and_excludes_corrupt_video_episode(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "source"
+    source.mkdir()
+    _, source_right_video = _write_source_dataset(source)
+    _duplicate_episode_zero_as_one(source)
+    _write_video(source_right_video, frame_count=1, color="blue")
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "prepared"
+
+    plan = plan_camera_semantic_prepared_view(source, output, registry)
+    assert plan.source_episode_count == 2
+    assert plan.episode_count == 1
+    assert plan.frame_count == 3
+    assert plan.excluded_episode_indices == (0,)
+    assert plan.excluded_episode_count == 1
+    assert plan.video_integrity_exclusions_hash is not None
+    assert [item.to_dict() for item in plan.video_integrity_issues] == [
+        {
+            "episode_index": 0,
+            "camera_key": "right_wrist",
+            "relative_path": (
+                "videos/chunk-000/observation.images.right_wrist/"
+                "episode_000000.mp4"
+            ),
+            "reason": "declared_decoded_frame_count_mismatch",
+            "declared_frame_count": 2,
+            "decoded_frame_count": 1,
+            "detail": (
+                "Parquet video-frame indices and the fully decoded payload "
+                "report different frame counts."
+            ),
+        }
+    ]
+
+    result = materialize_camera_semantic_prepared_view(
+        source,
+        output,
+        registry,
+        expected_plan_hash=plan.plan_hash,
+    )
+    assert result["validated_video_count"] == 2
+    manifest = load_camera_semantic_prepared_view(
+        output, verify_payload_hashes=True
+    )
+    assert manifest.episode_indices == (1,)
+    assert manifest.excluded_episode_indices == (0,)
+    assert (
+        manifest.video_integrity_exclusions_hash
+        == plan.video_integrity_exclusions_hash
+    )
+    output_episodes = [
+        json.loads(line)
+        for line in (output / "meta/episodes.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [row["episode_index"] for row in output_episodes] == [1]
+    output_info = json.loads(
+        (output / "meta/info.json").read_text(encoding="utf-8")
+    )
+    assert output_info["episode_count"] == 1
+    assert output_info["frame_count"] == 3
+    receipt_path = (
+        output
+        / "meta/prepared_views/camera_semantics_video_integrity_exclusions.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["included_episode_indices"] == [1]
+    assert receipt["excluded_episode_indices"] == [0]
+    assert receipt["receipt_hash"] == plan.video_integrity_exclusions_hash
+    assert not (
+        output
+        / "videos/chunk-000/observation.images.right_wrist/episode_000000.mp4"
+    ).exists()
+
+    from deployments.openpi.corrected_train import _camera_audits
+
+    factory = type(
+        "Factory",
+        (),
+        {
+            "camera_slots": ("left_wrist_0_rgb", "right_wrist_0_rgb"),
+            "dataset_sources": (
+                type("Source", (), {"dataset_root": output})(),
+            ),
+        },
+    )()
+    audits = _camera_audits(
+        factory,
+        registry,
+        allow_camera_prepared_view=True,
+    )
+    audit = audits[0]["camera_prepared_view"]
+    assert audit["included_episode_count"] == 1
+    assert audit["excluded_corrupt_video_episode_count"] == 1
+    assert audit["excluded_corrupt_video_episode_indices"] == [0]
+
+    receipt["issues"][0]["decoded_frame_count"] = 2
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(Exception, match="receipt hash mismatch"):
+        load_camera_semantic_prepared_view(output, verify_payload_hashes=False)
 
 
 @pytest.mark.optional

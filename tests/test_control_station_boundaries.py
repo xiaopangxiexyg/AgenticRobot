@@ -5,26 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.repository_imports import (
+    absolute_import_roots as _absolute_import_roots,
+    python_files as _python_files,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATION_ROOT = REPO_ROOT / "control_station"
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
-
-
-def _python_files(root: Path) -> tuple[Path, ...]:
-    return tuple(
-        sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
-    )
-
-
-def _absolute_import_roots(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    roots: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            roots.add(node.module.split(".", 1)[0])
-    return roots
 
 
 def _relative(path: Path) -> str:
@@ -187,6 +175,8 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/sim_hil_profile/agent/motion_application.py": ["sim"],
         "control_station/sim_hil_profile/agent/motion_factory.py": ["sim"],
         "control_station/sim_hil_profile/agent/observation.py": ["sim"],
+        "control_station/sim_hil_profile/agent/policy_application.py": ["sim"],
+        "control_station/sim_hil_profile/agent/policy_factory.py": ["sim"],
         "control_station/sim_hil_profile/tasks/cube_lift/deployment.py": ["sim"],
         "control_station/sim_hil_profile/factory.py": ["sim"],
         "control_station/sim_hil_profile/openpi_policy_source.py": ["sim"],

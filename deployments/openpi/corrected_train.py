@@ -152,9 +152,24 @@ def _camera_audits(
             manifest = load_camera_semantic_prepared_view(
                 root, verify_payload_hashes=True
             )
+            if not manifest.episode_indices:
+                raise ValueError(
+                    "Camera-semantic prepared view has no video-integrity-"
+                    f"admitted episodes and cannot enter training/testing: {root}"
+                )
             prepared_view = {
                 "manifest_hash": manifest.manifest_hash,
                 "source_dataset_name": manifest.source_dataset_name,
+                "included_episode_count": len(manifest.episode_indices),
+                "excluded_corrupt_video_episode_count": len(
+                    manifest.excluded_episode_indices
+                ),
+                "excluded_corrupt_video_episode_indices": list(
+                    manifest.excluded_episode_indices
+                ),
+                "video_integrity_exclusions_hash": (
+                    manifest.video_integrity_exclusions_hash
+                ),
                 "modalities": ["numeric", "video"],
                 "excluded_modalities": ["tactile"],
                 "full_v23_dataset": False,

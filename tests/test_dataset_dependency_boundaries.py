@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from functools import lru_cache
 import os
 from pathlib import Path
 import subprocess
@@ -12,76 +13,27 @@ from dataset_contracts import parquet as parquet_contract
 from dataset_contracts.stats import EpisodeStatsAccumulator
 from dataset_contracts.tactile import ChunkedTactileStream
 from dataset_contracts.wrist_depth import DepthRangeMaskConfig, mask_manifest_payload
-
+from tests.support.repository_imports import (
+    absolute_import_roots as _absolute_import_roots,
+    dynamic_import_modules as _dynamic_imports,
+    imported_modules as _imported_modules,
+    python_files,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _absolute_import_roots(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    roots: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            roots.add(node.module.split(".", 1)[0])
-    return roots
+def _parsed_tree(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
 def _python_files(root: Path) -> list[Path]:
-    return sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
+    return list(python_files(root))
 
 
-def _dynamic_imports(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    importlib_names = {"importlib"}
-    import_module_names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == "importlib":
-                    importlib_names.add(alias.asname or alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
-            for alias in node.names:
-                if alias.name == "import_module":
-                    import_module_names.add(alias.asname or alias.name)
-
-    imports: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        function = node.func
-        is_import_module = (
-            isinstance(function, ast.Attribute)
-            and isinstance(function.value, ast.Name)
-            and function.value.id in importlib_names
-            and function.attr == "import_module"
-        ) or (
-            isinstance(function, ast.Name)
-            and function.id in import_module_names
-        )
-        is_builtin_import = isinstance(function, ast.Name) and function.id == "__import__"
-        if not (is_import_module or is_builtin_import):
-            continue
-        module = node.args[0]
-        if isinstance(module, ast.Constant) and isinstance(module.value, str):
-            imports.add(module.value)
-    return imports
-
-
-def _imported_modules(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    modules = set(_dynamic_imports(path))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            modules.add(node.module)
-    return modules
-
-
+@lru_cache(maxsize=None)
 def _is_declared_diagnostic_bridge(path: Path) -> bool:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = _parsed_tree(path)
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
@@ -184,14 +136,16 @@ def test_runtime_and_sim_do_not_import_offline_postprocess_implementation() -> N
 
 
 def test_legacy_data_paths_reexport_the_shared_contract_objects() -> None:
+    from sim.mujoco.replay.dataset_writer import \
+        DepthRangeMaskConfig as SimWriterDepthConfig
     from teleop_runtime.collection import schema_v21
-    from teleop_runtime.collection.stats import EpisodeStatsAccumulator as RuntimeStats
-    from teleop_runtime.collection.writer_v21 import DepthRangeMaskConfig as WriterDepthConfig
+    from teleop_runtime.collection.stats import \
+        EpisodeStatsAccumulator as RuntimeStats
+    from teleop_runtime.collection.writer_v21 import \
+        DepthRangeMaskConfig as WriterDepthConfig
     from teleop_runtime.replay.media import _ChunkedTactileStream
-    from sim.mujoco.replay.dataset_writer import DepthRangeMaskConfig as SimWriterDepthConfig
-    from utils.dataset_postprocess.wrist_cam_adjust.depth import (
-        DepthRangeMaskConfig as OfflineDepthConfig,
-    )
+    from utils.dataset_postprocess.wrist_cam_adjust.depth import \
+        DepthRangeMaskConfig as OfflineDepthConfig
 
     assert RuntimeStats is EpisodeStatsAccumulator
     assert WriterDepthConfig is DepthRangeMaskConfig
@@ -208,16 +162,14 @@ def test_legacy_data_paths_reexport_the_shared_contract_objects() -> None:
 
 
 def test_legacy_random_background_paths_reexport_dataset_owned_objects() -> None:
-    from dataset_interface.random_background import (
-        RandomBackgroundAugmentConfig as CanonicalAugmentConfig,
-    )
-    from dataset_interface.random_background.mask_io import (
-        BitpackMaskReader as CanonicalMaskReader,
-    )
-    from utils.random_background import (
-        RandomBackgroundAugmentConfig as LegacyAugmentConfig,
-    )
-    from utils.random_background.mask_io import BitpackMaskReader as LegacyMaskReader
+    from dataset_interface.random_background import \
+        RandomBackgroundAugmentConfig as CanonicalAugmentConfig
+    from dataset_interface.random_background.mask_io import \
+        BitpackMaskReader as CanonicalMaskReader
+    from utils.random_background import \
+        RandomBackgroundAugmentConfig as LegacyAugmentConfig
+    from utils.random_background.mask_io import \
+        BitpackMaskReader as LegacyMaskReader
 
     assert LegacyAugmentConfig is CanonicalAugmentConfig
     assert LegacyMaskReader is CanonicalMaskReader

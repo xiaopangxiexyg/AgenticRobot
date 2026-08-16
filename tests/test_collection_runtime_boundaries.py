@@ -7,6 +7,11 @@ import sys
 
 import pytest
 
+from tests.support.repository_imports import (
+    absolute_import_modules as _absolute_import_modules,
+    absolute_import_roots as _absolute_import_roots,
+    python_files as _python_files,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COLLECTION_RUNTIME_ROOT = REPO_ROOT / "collection_runtime"
@@ -33,34 +38,6 @@ VERSIONED_RUNTIME_SHIMS = frozenset(
     )
 )
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
-
-
-def _python_files(root: Path) -> tuple[Path, ...]:
-    return tuple(
-        sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
-    )
-
-
-def _absolute_import_roots(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    roots: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            roots.add(node.module.split(".", 1)[0])
-    return roots
-
-
-def _absolute_import_modules(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    modules: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            modules.add(node.module)
-    return modules
 
 
 def test_collection_runtime_does_not_reverse_depend_on_application_planes() -> None:

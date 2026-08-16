@@ -9,8 +9,10 @@ from typing import Any
 
 from dataset_contracts.camera_semantic_prepared_view import (
     CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
+    CAMERA_SEMANTIC_VIDEO_INTEGRITY_EXCLUSIONS_RELATIVE_PATH,
     CameraSemanticPreparedViewContractError,
     CameraSemanticPreparedViewManifestV1,
+    CameraSemanticVideoIntegrityExclusionsV1,
 )
 
 
@@ -71,6 +73,50 @@ def load_camera_semantic_prepared_view(
             "Camera-semantic prepared-view manifest must be an object."
         )
     manifest = CameraSemanticPreparedViewManifestV1.from_dict(payload)
+    exclusions_path = (
+        root / CAMERA_SEMANTIC_VIDEO_INTEGRITY_EXCLUSIONS_RELATIVE_PATH
+    )
+    exclusions = None
+    if manifest.excluded_episode_indices:
+        if not exclusions_path.is_file() or exclusions_path.is_symlink():
+            raise CameraSemanticPreparedViewContractError(
+                "Prepared view excludes corrupt-video episodes but its "
+                "integrity receipt is missing."
+            )
+        try:
+            exclusions_payload = json.loads(
+                exclusions_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CameraSemanticPreparedViewContractError(
+                f"Cannot read video-integrity exclusions receipt: {exc}"
+            ) from exc
+        if not isinstance(exclusions_payload, dict):
+            raise CameraSemanticPreparedViewContractError(
+                "Video-integrity exclusions receipt must be an object."
+            )
+        exclusions = CameraSemanticVideoIntegrityExclusionsV1.from_dict(
+            exclusions_payload
+        )
+        if (
+            exclusions.receipt_hash
+            != manifest.video_integrity_exclusions_hash
+            or exclusions.source_dataset_name != manifest.source_dataset_name
+            or exclusions.source_dataset_identity_hash
+            != manifest.source_dataset_identity_hash
+            or exclusions.selected_source_inventory_hash
+            != manifest.selected_source_inventory_hash
+            or exclusions.included_episode_indices != manifest.episode_indices
+            or exclusions.excluded_episode_indices
+            != manifest.excluded_episode_indices
+        ):
+            raise CameraSemanticPreparedViewContractError(
+                "Video-integrity exclusions receipt differs from the prepared-view manifest."
+            )
+    elif exclusions_path.exists() or exclusions_path.is_symlink():
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared view contains an undeclared video-integrity exclusions receipt."
+        )
 
     actual_files: set[str] = set()
     for path in sorted(root.rglob("*")):
@@ -137,6 +183,12 @@ def load_camera_semantic_prepared_view(
     if tuple(sorted(episode_indices)) != manifest.episode_indices:
         raise CameraSemanticPreparedViewContractError(
             "Prepared-view episode coverage differs from the manifest."
+        )
+    if exclusions is not None and set(episode_indices) & set(
+        exclusions.excluded_episode_indices
+    ):
+        raise CameraSemanticPreparedViewContractError(
+            "A video-integrity-excluded episode remains in the prepared-view catalog."
         )
     if (root / "tactile").exists():
         raise CameraSemanticPreparedViewContractError(

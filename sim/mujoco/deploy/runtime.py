@@ -188,6 +188,11 @@ class MujocoComponentExecutionBinding:
     edge explicit (for example ``right_gripper -> right_hand``).
     ``support_only_output_effectors`` are measured context required by a
     downstream coupled solver but absent from the authoritative input.
+
+    ``policy_action_ingress`` is an optional target-owned representation edge
+    for legacy policy ``RobotAction`` emissions.  It is deliberately attached
+    to the selected execution binding: policy sources do not choose component
+    routes, and the adapter owns neither proposal authority nor target safety.
     """
 
     binding_id: str
@@ -198,6 +203,8 @@ class MujocoComponentExecutionBinding:
     materializer: Callable[..., RobotAction]
     output_effector_by_component: Mapping[str, str]
     support_only_output_effectors: tuple[str, ...] = ()
+    policy_action_ingress: Callable[[RobotAction], ComponentAction] | None = None
+    policy_action_ingress_contract_hash: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -269,6 +276,26 @@ class MujocoComponentExecutionBinding:
             MappingProxyType(output_map),
         )
         object.__setattr__(self, "support_only_output_effectors", support)
+        ingress = self.policy_action_ingress
+        ingress_hash = self.policy_action_ingress_contract_hash
+        if (ingress is None) != (ingress_hash is None):
+            raise ValueError(
+                "policy_action_ingress and its contract hash must be supplied "
+                "together."
+            )
+        if ingress is not None:
+            if not callable(ingress):
+                raise TypeError("policy_action_ingress must be callable.")
+            normalized_hash = str(ingress_hash).strip()
+            if not normalized_hash:
+                raise ValueError(
+                    "policy_action_ingress_contract_hash must be non-empty."
+                )
+            object.__setattr__(
+                self,
+                "policy_action_ingress_contract_hash",
+                normalized_hash,
+            )
 
 
 @dataclass(frozen=True)
@@ -2728,15 +2755,55 @@ class MujocoDeployRuntime:
 
         action = emission.pre_safety_robot_action
         validation = emission.source_validation
+        component_action: ComponentAction | None = None
         if action is not None and validation is not None and validation.accepted:
-            if action.action_space != self.catalog.action_space:
-                raise ValueError(
-                    "Policy emission action does not match the MuJoCo execution profile."
+            binding = self.component_execution_binding
+            ingress = None if binding is None else binding.policy_action_ingress
+            if ingress is None:
+                if action.action_space != self.catalog.action_space:
+                    raise ValueError(
+                        "Policy emission action does not match the MuJoCo "
+                        "execution profile."
+                    )
+                expected_effectors = {
+                    component.effector_name
+                    for component in self.catalog.components
+                }
+                if set(action.active_effectors) != expected_effectors:
+                    raise ValueError(
+                        "Policy emission must exactly cover its MuJoCo "
+                        "execution profile."
+                    )
+                component_action = project_robot_action_v1_to_component_action(
+                    action,
+                    action_schema=self.action_schema,
                 )
-            if set(action.active_effectors) != {"left_arm", "right_arm"}:
-                raise ValueError(
-                    "CS-2c requires one atomic coupled bimanual policy emission."
-                )
+            else:
+                try:
+                    component_action = ingress(action)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Policy emission is incompatible with its bound "
+                        "component ingress."
+                    ) from exc
+                if not isinstance(component_action, ComponentAction):
+                    raise TypeError(
+                        "Bound policy_action_ingress must return ComponentAction."
+                    )
+                if (
+                    component_action.action_schema.semantic_content_hash
+                    != self.action_schema.semantic_content_hash
+                ):
+                    raise ValueError(
+                        "Bound policy ingress returned another action schema."
+                    )
+                if component_action.component_coverage != (
+                    self.action_schema.component_ids
+                ):
+                    raise ValueError(
+                        "Policy emission must exactly cover its bound native "
+                        "component profile."
+                    )
 
         self.core.record_external_facts(
             project_policy_action_emission(
@@ -2757,11 +2824,11 @@ class MujocoDeployRuntime:
             or emission.representation_receipt is None
         ):
             return MujocoPolicyEmissionSubmission(emission, None)
-        coverage = tuple(
-            component.component_id
-            for component in self.catalog.components
-            if component.effector_name in action.active_effectors
-        )
+        if component_action is None:
+            raise RuntimeError(
+                "Accepted policy emission did not produce a component action."
+            )
+        coverage = component_action.component_coverage
         selection_groups = tuple(
             group
             for group in self.catalog.selection_group_ids
@@ -2772,6 +2839,17 @@ class MujocoDeployRuntime:
         )
 
         sequence = self._next_proposal_sequence
+        audit_metadata = {
+            "policy_action_emission_id": emission.emission_id,
+        }
+        binding = self.component_execution_binding
+        if (
+            binding is not None
+            and binding.policy_action_ingress_contract_hash is not None
+        ):
+            audit_metadata["policy_action_ingress_contract_hash"] = (
+                binding.policy_action_ingress_contract_hash
+            )
         draft = ActionProposalDraft(
             runtime_session_id=self.config.runtime_session_id,
             control_domain_id=self.config.control_domain_id,
@@ -2780,10 +2858,7 @@ class MujocoDeployRuntime:
             producer_id=self.config.producer_id,
             producer_epoch=self.config.producer_epoch,
             sequence=sequence,
-            action=project_robot_action_v1_to_component_action(
-                action,
-                action_schema=self.action_schema,
-            ),
+            action=component_action,
             produced_at=emission.produced_at,
             produced_clock_domain_id=emission.produced_clock_domain_id,
             effective_from=emission.effective_from,
@@ -2798,7 +2873,7 @@ class MujocoDeployRuntime:
             representation_trace_id=(
                 emission.representation_receipt.representation_trace_id
             ),
-            audit_metadata={"policy_action_emission_id": emission.emission_id},
+            audit_metadata=audit_metadata,
         )
         receipt = self.core.admit_proposal(
             draft,

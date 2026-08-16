@@ -45,19 +45,27 @@ from .pose_resolution import (
     build_mujoco_pose_qpos_execution_target,
 )
 from .sim_hil_target import (
-    MujocoSimHILPreparedTarget,
     MujocoSimHILTarget,
-    MujocoSimHILTargetConfig,
+    build_mujoco_sim_hil_target,
+)
+from .target_config import MujocoSimHILTargetConfig
+from .target_preparation import (
+    MujocoSimHILPreparedTarget,
+    prepare_mujoco_sim_hil_target,
+)
+from .target_measurement import (
     build_mujoco_sim_hil_coordinate_profiles,
     build_mujoco_sim_hil_pose_observation_projector,
-    build_mujoco_sim_hil_target,
     capture_mujoco_sim_hil_safety_anchor,
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
-    prepare_mujoco_sim_hil_target,
 )
 from .agent_skill_target import (
     MujocoAgentSkillMotionTarget,
     build_mujoco_agent_skill_motion_target,
+)
+from .policy_skill_target import (
+    MujocoPolicySkillMotionTarget,
+    build_mujoco_policy_skill_motion_target,
 )
 from .resolved_reference_receiver import (
     MujocoScheduledResolvedQposReferenceReceiver,
@@ -170,6 +178,7 @@ __all__ = [
     "build_mujoco_pose_qpos_execution_target",
     "MujocoSimHILTarget",
     "MujocoAgentSkillMotionTarget",
+    "MujocoPolicySkillMotionTarget",
     "MujocoSimHILTargetConfig",
     "MujocoSimHILPreparedTarget",
     "build_mujoco_sim_hil_coordinate_profiles",
@@ -197,6 +206,7 @@ __all__ = [
     "MujocoRobotActionV1ComponentIngressAdapter",
     "build_mujoco_component_execution_binding",
     "build_mujoco_agent_skill_motion_target",
+    "build_mujoco_policy_skill_motion_target",
     "build_mujoco_pose_component_target_profile",
     "build_mujoco_pose_qpos_component_target_profile",
     "build_rm65_right_cube_lift_component_target_profile",
