@@ -8,7 +8,7 @@ This directory contains only OpenPI-specific client pieces:
 - OpenPI-to-sim adapter bound to the shared `robot_motion.deploy` contract
 - artifact-bound OpenPI raw-RTC final-chunk adapter (`continuation=none` only)
 - default-off OpenPI model-RTC v3 provider binding
-- OpenPI startup command wrappers
+- OpenPI protocol and server/client adapters used by application launchers
 
 The generic remote-policy contract, action chunk, and runtime glue live in
 `deployments.client`.
@@ -56,8 +56,10 @@ The command above expands to the generic real deploy loop with:
 --policy deployments.openpi.client.policy:create_policy
 ```
 
-`teleop_runtime` still owns real hardware IO and dispatch, but it does not
-import or know about OpenPI.
+`teleop_runtime.deploy.openpi_application` owns the real application binding and
+imports these OpenPI adapters. `deployments.openpi.client.real` remains only as
+the supported historical command path; it must not regain a hardware loop or
+real-runtime ownership.
 
 By default `--model` and `--checkpoint-step` are informational hints and are not
 used to reject an upstream model instance. The downstream gate checks the

@@ -145,12 +145,16 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
     }
 
 
-def test_station_model_specific_preflight_debt_is_explicit_and_cannot_spread() -> None:
+def test_station_model_specific_bindings_are_explicit_and_cannot_spread() -> None:
     assert _violations(
         _python_files(STATION_ROOT),
         {"deployments"},
     ) == {
         "control_station/preflight/openpi_rtc.py": ["deployments"],
+        # Concrete Sim-HIL application binding. Model transport and artifact
+        # semantics remain deployments-owned; Station only connects the
+        # provider to the selected simulated observation/target profile.
+        "control_station/sim_hil_profile/openpi_policy_source.py": ["deployments"],
     }
     assert not (STATION_ROOT / "composition/openpi_rtc_source_preflight.py").exists()
 
@@ -185,6 +189,7 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/sim_hil_profile/agent/observation.py": ["sim"],
         "control_station/sim_hil_profile/tasks/cube_lift/deployment.py": ["sim"],
         "control_station/sim_hil_profile/factory.py": ["sim"],
+        "control_station/sim_hil_profile/openpi_policy_source.py": ["sim"],
     }
 
 

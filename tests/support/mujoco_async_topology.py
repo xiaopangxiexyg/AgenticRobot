@@ -20,7 +20,7 @@ from control_composition.composition import (
 )
 from robot_motion.runtime.immutable import deep_freeze
 
-from .runtime import MujocoDeployRuntime
+from sim.mujoco.deploy.runtime import MujocoDeployRuntime
 
 
 ASYNC_JOB_KINDS_V1 = frozenset(

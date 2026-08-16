@@ -14,10 +14,10 @@ from robot_motion.action import (
 from sim.contracts import TimingSpec
 from sim.mujoco.adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRig
 from sim.mujoco.deploy import (
-    DeterministicAsyncTopologyHarness,
     MujocoDeployConfig,
     MujocoDeployRuntime,
 )
+from tests.support.mujoco_async_topology import DeterministicAsyncTopologyHarness
 
 
 class ManualClock:

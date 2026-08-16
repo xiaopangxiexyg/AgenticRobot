@@ -84,7 +84,7 @@ C2 路径。CPU 隔离在 no-action/full-load deadline soak 通过前不解除�
 | --- | --- | --- | --- |
 | `python -m teleop_runtime.deploy` / `teleop_runtime.deploy.cli.main` | 推荐的 shell CLI | `teleop_runtime.deploy` 真机部署运行时 | 调用同一 `run_policy.main`，不另建控制环。 |
 | `python -m teleop_runtime.deploy.run_policy` / `run_policy.main` | **受支持**的直接与程序化入口 | `teleop_runtime.deploy` 真机部署运行时 | OpenPI real launcher 当前直接依赖；未来若收敛调用面，应迁向上述 canonical CLI wrapper 或其稳定 API。 |
-| `python -m deployments.openpi.client.real` | **受支持**的 OpenPI 专用薄入口 | `deployments.openpi.client` 负责 OpenPI 参数/transport；`teleop_runtime.deploy` 负责真机 I/O 和 dispatch | 直接组装 OpenPI policy 后交给 `run_policy.main`，不实现第二套控制循环。 |
+| `python -m deployments.openpi.client.real` | **受支持**的 OpenPI 历史命令入口 | `teleop_runtime.deploy.openpi_application` 负责真实部署装配；`deployments.openpi.client` 只负责 OpenPI transport/adapter | 兼容模块只转发到现有 `run_policy.main` 控制循环。 |
 
 本仓库目前没有 `CODEOWNERS` 或个人维护人清单；上表的模块责任边界就是当前可审计的
 owner 记录。`run_policy` 没有已宣布的结束日期，兼容期持续到所有直接调用方完成迁移、

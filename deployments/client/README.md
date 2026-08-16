@@ -250,7 +250,7 @@ the same generic seam and advertises `continuation=none` only. This does not
 make OpenPI part of the generic protocol and does not wire a production caller.
 
 Current production note: `deployments.openpi.client.real` is a thin supported
-launcher over the supported `teleop_runtime.deploy.run_policy` runtime; the generic
+compatibility entrypoint into `teleop_runtime.deploy.openpi_application`; the generic
 `DeploymentClientRuntime` in this package is a composition contract, not the
 current RM65 hardware loop. Position-control work must therefore keep common
 planning in `robot_motion` and connect it at that existing real-runtime

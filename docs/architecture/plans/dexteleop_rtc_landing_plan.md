@@ -476,7 +476,7 @@ RTC ownership与Control Station现明确分离：RTC core只位于`robot_motion/
 RTC-4b-T0/T1/T2a/T2b/T2c/T2d/T2e/T2f/T2g/T2h实现与测试依赖闭包。
 
 选择了第7.2节的窄 harness方案：RTC completion、plan merge与due pop需要同一个plan owner和control-loop顺序，
-不把这些职责塞进现有通用`DeterministicAsyncTopologyHarness`。两个fixture都使用显式ManualClock，但RTC runner是
+不把这些职责塞进测试专用`DeterministicAsyncTopologyHarness`。两个fixture都使用显式ManualClock，但RTC runner是
 RTC completion唯一事实源，不会同时把同一个policy result交给通用async harness调度。
 
 production默认caller仍是同步路径；只有显式RTC profile进入RTC-3c本地shadow coordinator。它未增加
@@ -804,7 +804,7 @@ OpenPI checkout 内的 `scripts/serve_dexteleop_policy.py`。服务端 RTC 改�
 `_next_policy_chunk_target_at` 做 append 型连续排程；它没有推理请求、late completion、旧计划 mutable suffix replacement
 和 latency crop。RTC fixture 不应让旧/新整个 chunk 同时提前进入 Arbiter，再依赖 proposal overlap 偶然解决替换。
 
-[`sim/mujoco/deploy/async_topology.py`](../../../sim/mujoco/deploy/async_topology.py) 是受限、确定性的 completion harness，
+[`tests/support/mujoco_async_topology.py`](../../../tests/support/mujoco_async_topology.py) 是受限、确定性的 completion harness，
 目前覆盖 context/composition/decision/restart/gate，不是 OS/GPU scheduler。RTC 应复用它的 causal completion 模式，
 增加 typed policy-chunk-result job 或建立同目录下同性质的窄 harness；二者只能选择一个，不能复制两套 async truth。
 

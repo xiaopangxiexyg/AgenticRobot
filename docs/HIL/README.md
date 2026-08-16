@@ -756,8 +756,9 @@ fail closed；`--allow-task-config-mismatch` 只用于碰撞回归诊断，不�
 
 该接入分为三层：`robot_motion.deploy.ThreadedPolicyEmissionSource` 是后端无关的
 非阻塞 chunk/emission source；`deployments.openpi.client` 只负责 prepared artifact、
-OpenPI 协议和 v2.2 action codec；`sim.mujoco.deploy.openpi_policy_source` 只把
-MuJoCo scene 采样为通用 `DeploymentObservation`。Station 只选择 profile；composition、下游 safety、IK、reference
+OpenPI 协议和 v2.2 action codec；
+`control_station.sim_hil_profile.openpi_policy_source` 在应用层把 MuJoCo scene
+采样为通用 `DeploymentObservation` 并绑定所选 provider。composition、下游 safety、IK、reference
 和 MuJoCo dispatch 均沿用已有链路，默认 `temp_ppo` 路径不变。
 
 先在模型机从 checkpoint 与训练 profile 生成一次 prepared deployment artifact，并做
