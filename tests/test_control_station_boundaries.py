@@ -65,6 +65,14 @@ def test_station_application_core_does_not_import_concrete_data_planes() -> None
     )
 
 
+def test_agent_gateway_does_not_import_upper_framework_packages() -> None:
+    gateway_paths = _python_files(STATION_ROOT / "agent_gateway")
+    assert _violations(
+        gateway_paths,
+        {"rpent", "rpent_dexteleop"},
+    ) == {}
+
+
 def test_hitl_core_is_backend_model_topology_and_trace_neutral() -> None:
     hitl_paths = _python_files(STATION_ROOT / "hitl")
     assert _violations(

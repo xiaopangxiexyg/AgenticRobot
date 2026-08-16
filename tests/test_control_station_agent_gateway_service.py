@@ -203,10 +203,14 @@ def _manifest(
     )
 
 
-def _policy(*, mode: str = "dry_run") -> AgentSkillAccessPolicy:
+def _policy(
+    *,
+    mode: str = "dry_run",
+    allowed_client_ids: tuple[str, ...] = ("rpent:b2a",),
+) -> AgentSkillAccessPolicy:
     return AgentSkillAccessPolicy(
         access_policy_id="agent-access:b2a-service",
-        allowed_client_ids=("rpent:b2a",),
+        allowed_client_ids=allowed_client_ids,
         allowed_modes=(mode,),
         max_request_timeout_ms=1_000,
         max_grant_lifetime_sec=30.0,
@@ -258,6 +262,7 @@ def _request(
     timeout_ms: int = 500,
     grant_id: str | None = None,
     snapshot_id: str = "snapshot:b2a:4",
+    client_id: str = "rpent:b2a",
 ) -> AgentSkillRequest:
     entry = manifest.route(
         capability.skill_id,
@@ -267,7 +272,7 @@ def _request(
     )
     profile = capability.allowed_parameter_profiles[0]
     return AgentSkillRequest(
-        client_id="rpent:b2a",
+        client_id=client_id,
         request_id=request_id,
         idempotency_key=key,
         client_sequence=sequence,
@@ -333,6 +338,7 @@ def _service(
     cancellation_policy: str = "cancel_only",
     requires_task_evaluation: bool = False,
     port=None,
+    allowed_client_ids: tuple[str, ...] = ("rpent:b2a",),
 ):
     clock = _ManualClock()
     capability = _capability(
@@ -344,7 +350,7 @@ def _service(
         port = DeterministicNoIoAgentSkillOperationPort(clock=clock)
     service = NoIoAgentGatewayService(
         manifest=manifest,
-        access_policy=_policy(),
+        access_policy=_policy(allowed_client_ids=allowed_client_ids),
         operation_port=port,
         operation_store=BoundedInMemoryAgentSkillOperationStore(
             max_retained_operations=4
@@ -443,6 +449,27 @@ def test_submit_admits_but_does_not_call_port_or_execute_operation() -> None:
     assert not submission.operation.terminal
     assert port.receipts == ()
     assert service.get_active_operation() is submission.operation
+
+
+def test_gateway_admits_a_policy_allowed_non_rpent_upper_client() -> None:
+    external_client_id = "other-upper:planner-1"
+    service, port, _, manifest, capability = _service(
+        allowed_client_ids=(external_client_id,),
+    )
+
+    submission = service.submit_request(
+        request=_request(
+            manifest,
+            capability,
+            client_id=external_client_id,
+        ),
+        current_station_revision=4,
+        now=10.0,
+    )
+
+    assert submission.accepted
+    assert submission.operation.status == "admitted"
+    assert port.receipts == ()
 
 
 def test_observation_receiver_binds_session_manifest_revision_and_request() -> None:
