@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import time
 from argparse import Namespace
 from dataclasses import MISSING, fields
 from types import SimpleNamespace
-import time
 
 import numpy as np
 import pytest
@@ -217,8 +217,10 @@ def test_skill_only_extension_shutdown_confirms_hold_before_session_close(
     assert attached.agent_motion_port.snapshot().phase.value == "held"
     assert attached.session.holds == [
         (
-            "real Agent motion operation real-agent-domain-hold:2: "
-            "real_agent_primitive_runtime_shutdown",
+            (
+                "real Agent motion operation real-agent-domain-hold:2: "
+                "real_agent_primitive_runtime_shutdown"
+            ),
             False,
         )
     ]

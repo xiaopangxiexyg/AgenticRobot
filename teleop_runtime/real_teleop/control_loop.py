@@ -243,7 +243,7 @@ def _publish_real_agent_motion_measured_cut(
     )
     if port.config.exclusive_command_claim:
         port.publish_owner_state(
-            session=getattr(components, "session"),
+            session=components.session,
             captured_at=cut.available_at,
         )
     return cut

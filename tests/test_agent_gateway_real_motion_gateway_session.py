@@ -24,11 +24,11 @@ from agent_gateway.profiles.real.observation_gateway import (
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.access_policy import issue_skill_execution_grant
-from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.motion.schemas import CARDINAL_TCP_STEP_DIRECTIONS_V1
+from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
     CoordinateFrameSpec,
