@@ -1,4 +1,4 @@
-"""Offline free-running evaluation for the lightweight arm-hold baseline.
+"""Offline free-running evaluation for the lightweight arm-hold learner.
 
 The training reader can expose the previous canonical collected label for
 teacher forcing.  This module measures the separate case where a model must

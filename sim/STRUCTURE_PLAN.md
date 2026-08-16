@@ -12,7 +12,7 @@
 - 模型制品、数据集、运行产物和测试的组织方式；
 - 现有代码向目标结构渐进迁移的方法。
 
-本规划采用顶层目录 `model/` 表示通用学习域。其语义与原规划中的 `learning/` 完全相同：它不仅存放网络定义，还负责 RL、BC、训练、在线采样、评估和模型导出。不得把 `model/` 理解为只存放神经网络层的目录。
+本规划采用顶层目录 `policy_learning/` 表示通用学习域：它负责网络定义、RL、BC、训练、在线采样、评估和模型导出。`model/` 只保留本地策略权重、checkpoint 与运行 sidecar，不是 Python 源码包。
 
 当前数据集执行器、仿真场景和任务实现可以继续使用临时版本。近期实现优先级仍然是 MuJoCo 批量采样效率和稳定性，目录调整不得以牺牲热路径性能或造成大规模无收益迁移为代价。
 
@@ -21,7 +21,7 @@
 长期架构遵循以下原则：
 
 1. `sim/` 产生仿真经验，但不拥有 PPO、SAC、BC 等训练算法。
-2. `model/` 训练和评估策略，但算法层不感知 MuJoCo 内部结构。
+2. `policy_learning/` 训练和评估策略，但算法层不感知 MuJoCo 内部结构。
 3. `robot_motion/` 统一 sim/real 的动作语义和部署运行时，但不包含训练、仿真或真实硬件实现。
 4. `PolicyArtifactContract` 统一模型输入输出，`dataset_contracts/` 统一 sim/real 的数据格式及格式绑定 I/O。
 5. 文件归属应由“允许哪些模块依赖它”决定，而不是由“当前是谁在调用它”决定。
@@ -32,7 +32,8 @@
 DexTeleop/
 ├── robot_motion/          # sim/real 共用运动、动作和部署运行时
 ├── sim/                   # 纯仿真：环境、任务、物理后端、渲染
-├── model/                 # RL、BC、训练、在线采样、评估和导出
+├── policy_learning/       # RL、BC、训练、在线采样、评估和导出代码
+├── model/                 # 本地策略权重、checkpoint 与运行 sidecar
 ├── dataset_contracts/     # 数据格式、Policy I/O 契约及格式绑定读写
 ├── dataset_interface/     # 训练侧数据读取、增强和窗口采样
 ├── deployments/          # 模型服务、客户端和模型族集成
@@ -47,8 +48,8 @@ DexTeleop/
 |---|---|
 | `mjModel`、`mjData`、contact、`mj_step` | `sim/mujoco/` |
 | reward、termination、reset、domain randomization | `sim/tasks/` |
-| PPO、SAC、BC loss、optimizer、rollout buffer | `model/` |
-| policy forward、网络结构、checkpoint loader | `model/policies/` |
+| PPO、SAC、BC loss、optimizer、rollout buffer | `policy_learning/` |
+| policy forward、网络结构、checkpoint loader | `policy_learning/policies/` |
 | 数据 schema、字段定义、版本兼容 | `dataset_contracts/` |
 | canonical parquet、episode writer、manifest writer | `dataset_contracts/io/` |
 | augmentation、trajectory window sampling | `dataset_interface/` |
@@ -124,12 +125,12 @@ sim/
 - `TaskSpec`：动作、观测、reward、termination 语义；
 - `EnvFactory`：可序列化的 worker 构建入口。
 
-公共协议不得暴露 `mjModel` 或 `mjData`，否则 `model/` 会被迫依赖 MuJoCo。
+公共协议不得暴露 `mjModel` 或 `mjData`，否则 `policy_learning/` 会被迫依赖 MuJoCo。
 
-## 5. `model/` 的目标结构
+## 5. `policy_learning/` 的目标结构
 
 ```text
-model/
+policy_learning/
 ├── README.md
 ├── core/
 │   ├── protocols.py           # Policy、Learner、Sampler 协议
@@ -185,11 +186,11 @@ model/
     └── evaluation/
 ```
 
-### 5.1 `model/` 的明确语义
+### 5.1 `policy_learning/` 的明确语义
 
-`model/` 是完整学习域，包含在线 RL、BC、离线学习、数据混合、policy 网络、训练适配、checkpoint、评估、导出和训练任务编排。
+`policy_learning/` 是完整学习源码域，包含在线 RL、BC、离线学习、数据混合、policy 网络、训练适配、checkpoint 读写适配、评估、导出和训练任务编排。实际权重与 checkpoint 文件写入本地 `model/` artifact 根，不在 `model/` 中放置 Python 实现。
 
-`model/policies/` 才是专门存放可推理模型定义的子目录。它必须保持 inference-safe：不得导入 MuJoCo、真实硬件、trainer 或 dataset loader。部署代码如需本地加载原生模型，只允许依赖这个轻量子包及其明确依赖，不能通过 `model/__init__.py` 隐式加载完整训练栈。
+`policy_learning/policies/` 才是专门存放可推理模型定义的子目录。它必须保持 inference-safe：不得导入 MuJoCo、真实硬件、trainer 或 dataset loader。部署代码如需本地加载原生模型，只允许依赖这个轻量子包及其明确依赖；`model/` 不提供 `__init__.py` 或任何隐式源码入口。
 
 OpenPI 等外部模型族可继续位于 `deployments/<model_family>/`，不为形式统一强行迁移。
 
@@ -198,9 +199,9 @@ OpenPI 等外部模型族可继续位于 `deployments/<model_family>/`，不为�
 正确关系：
 
 ```text
-model/algorithms/rl/ppo
+policy_learning/algorithms/rl/ppo
     ↓
-model/core + model/data
+policy_learning/core + policy_learning/data
     ↓
 ScalarEnv/VectorEnv protocol
 ```
@@ -208,9 +209,9 @@ ScalarEnv/VectorEnv protocol
 只有组合层可以接入具体仿真：
 
 ```text
-model/runners/train_rl.py
+policy_learning/runners/train_rl.py
     ↓
-model/sampling
+policy_learning/sampling
     ↓
 sim 的公共环境接口
 ```
@@ -351,7 +352,7 @@ dataset_contracts/
 
 “同一模型”不只是同一个 checkpoint，还必须保证输入字段、图像顺序和预处理、state 顺序和单位、action 维度和单位、action frame、absolute/relative 语义、TCP、control frequency、action horizon 和 normalization 完全一致。
 
-这些内容继续由现有 `PolicyIOLayout` 和 `PolicyArtifactContract` 统一约束，不得在 `sim/` 或 `model/` 中建立第二套部署契约。
+这些内容继续由现有 `PolicyIOLayout` 和 `PolicyArtifactContract` 统一约束，不得在 `sim/`、`policy_learning/` 或本地 `model/` artifact 根中建立第二套部署契约。
 
 ```text
 SimObservationSource ─┐
@@ -429,23 +430,23 @@ sim ───────────────┤
 deployments ───────┘
 
 sim ──→ robot_motion
-model/policies ──→ dataset_contracts
-model algorithms ──→ model/core + model/data + model/policies
-model runners/sampling ──→ sim + dataset_interface
-deployments ──→ robot_motion + model/policies（仅本地原生模型）
+policy_learning/policies ──→ dataset_contracts
+policy_learning/algorithms ──→ policy_learning/core + policy_learning/data + policy_learning/policies
+policy_learning/runners,sampling ──→ sim + dataset_interface
+deployments ──→ robot_motion + policy_learning/policies（仅本地原生模型）
 teleop_runtime ──→ robot_motion + dataset_contracts/io + deployments client
 ```
 
-`model/algorithms` 只依赖 `model/core`、`model/data` 和抽象协议；`model/runners`、`model/sampling` 或 source adapter 才能依赖 `sim` 和 `dataset_interface`。
+`policy_learning/algorithms` 只依赖 `policy_learning/core`、`policy_learning/data` 和抽象协议；`policy_learning/runners`、`policy_learning/sampling` 或 source adapter 才能依赖 `sim` 和 `dataset_interface`。
 
 硬性禁止：
 
-- `robot_motion` 导入 `sim`、`model`、`teleop_runtime`；
+- `robot_motion` 导入 `sim`、`policy_learning`、`model`、`teleop_runtime`；
 - `dataset_contracts` 导入运行时、硬件、Torch 或 MuJoCo；
 - `dataset_contracts/io` 导入 MuJoCo、真实设备 SDK、采集 runtime 或训练代码；
 - `sim` 包含 PPO、SAC、BC trainer；
-- `model/algorithms` 导入 `mujoco` 或 `sim.mujoco`；
-- `model/policies` 导入仿真、硬件、trainer 或 dataset loader；
+- `policy_learning/algorithms` 导入 `mujoco` 或 `sim.mujoco`；
+- `policy_learning/policies` 导入仿真、硬件、trainer 或 dataset loader；
 - `deployments` 包含训练循环和训练数据增强；
 - 生产代码依赖 `tests/`；
 - 使用无明确边界的 `utils.py`、`common.py`、`helpers.py` 持续堆积逻辑。
@@ -477,10 +478,10 @@ teleop_runtime ──→ robot_motion + dataset_contracts/io + deployments clien
 sim/configs/scenes/
 sim/configs/tasks/
 sim/configs/runtimes/
-model/configs/rl/
-model/configs/bc/
-model/configs/policies/
-model/configs/collection/
+policy_learning/configs/rl/
+policy_learning/configs/bc/
+policy_learning/configs/policies/
+policy_learning/configs/collection/
 deployments/configs/
 ```
 
@@ -500,7 +501,7 @@ deployments/configs/
 tests/
 ├── unit/
 │   ├── sim/
-│   ├── model/
+│   ├── policy_learning/
 │   ├── dataset_contracts/
 │   └── robot_motion/
 ├── integration/
@@ -549,7 +550,7 @@ tests/
 - MuJoCo 与真实采集通过 adapter 使用同一 writer；
 - 建立原子提交、中断恢复和完整性校验。
 
-### 阶段 2：建立最小 `model/`
+### 阶段 2：建立最小 `policy_learning/`
 
 优先实现 `PolicyBatch`、`TrajectoryBatch`、offline dataset source、BC runner、checkpoint/training manifest 和 artifact exporter。BC 依赖面较小，适合先验证数据、训练、导出和部署契约的完整链路。
 
@@ -595,8 +596,8 @@ tests/
 
 1. 包含 MuJoCo 数据结构或 API：进入 `sim/mujoco/`。
 2. 描述 task reward/reset/termination：进入 `sim/tasks/`。
-3. 包含 loss、optimizer、gradient、rollout/replay buffer：进入 `model/`。
-4. 只描述可独立推理的 policy 网络：进入 `model/policies/`。
+3. 包含 loss、optimizer、gradient、rollout/replay buffer：进入 `policy_learning/`。
+4. 只描述可独立推理的 policy 网络：进入 `policy_learning/policies/`。
 5. 定义稳定数据字段或 Policy I/O：进入 `dataset_contracts/`。
 6. 实现 canonical 格式绑定的数据持久化：进入 `dataset_contracts/io/`；采集编排留在数据来源侧。
 7. 实现训练侧采样或增强：进入 `dataset_interface/`。
@@ -612,7 +613,7 @@ tests/
 2. 持续优化批量 step、reset、IPC、模型缓存和 worker 生命周期；
 3. 建立稳定的吞吐、扩展性和长时间运行基线；
 4. 用 import boundary test 阻止架构继续恶化；
-5. 先新增 `model/` 和 `dataset_contracts/io/` 的最小骨架，再逐个迁移调用方；
+5. 先新增 `policy_learning/` 和 `dataset_contracts/io/` 的最小骨架，再逐个迁移调用方；
 6. 不进行一次性大规模目录重排；
 7. 每次迁移保持兼容入口、测试通过且性能不回退。
 

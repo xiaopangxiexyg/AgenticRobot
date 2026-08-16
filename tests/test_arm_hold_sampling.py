@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataset_interface.arm_hold_windows import ArmHoldWindowLocation
-from model.arm_hold import (
+from dataset_interface.arm_hold_sampling import (
     arm_hold_natural_plus_random_once_batches,
     arm_hold_natural_plus_transition_once_batches,
     arm_hold_natural_window_batches,
 )
+from dataset_interface.arm_hold_windows import ArmHoldWindowLocation
 
 
 def _locations() -> tuple[ArmHoldWindowLocation, ...]:

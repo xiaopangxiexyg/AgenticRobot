@@ -87,6 +87,7 @@ include = [
     "dataset_interface*",
     "deployments*",
     "hardware*",
+    "policy_learning*",
     "robot_motion*",
     "sim*",
     "teleop_runtime*",

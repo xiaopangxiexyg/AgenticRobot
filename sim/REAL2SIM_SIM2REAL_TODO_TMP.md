@@ -127,9 +127,9 @@ sim/rm65/  ── RM65 embodiment: reusable actuator + evidence + SAPIEN preview
 | `sim/rm65/real2sim/` | RM65 数据索引、拟合/验证 manifest、fidelity claim | 证据属于 embodiment，不再占用 `sim/real2sim` 顶层 |
 | `sim/rm65/sapien_renderer.py` | SAPIEN RM65 renderer/preview | 只做 operator/debug preview，不是 canonical task physics |
 | `sim/mujoco/actuation/` | 将通用 RM65 target 写入 MuJoCo actuator，并读取 measured qpos | 后端适配层，不拥有 RM65 transport/filter 语义 |
-| `sim/mujoco_temp_pipeline/` | 临时 PPO smoke/evaluate/play/checkpoint/records | 不是长期 `model/` 包，也不是 real deployment policy |
+| `sim/mujoco_temp_pipeline/` | 临时 PPO smoke/evaluate/play/checkpoint/records | 不是长期 `policy_learning/` 包，也不是 real deployment policy |
 
-`sim/STRUCTURE_PLAN.md` 规划的顶层 `model/` 当前仍不存在。PPO/BC/SAC 等长期训练域不应因为临时 pipeline 已出现就直接把 `sim/` 变成训练包。
+`sim/STRUCTURE_PLAN.md` 规划的顶层 `policy_learning/` 当前只有最小 arm-hold learner。PPO/BC/SAC 等长期训练域不应因为临时 pipeline 已出现就直接把 `sim/` 变成训练包；`model/` 只用于本地策略权重和 checkpoint。
 
 ### 2.2 后端结论
 
@@ -403,7 +403,7 @@ CubeLiftVectorExecutor / CubeLiftVectorEnv
 
 它明确使用 privileged state、right arm/right gripper、`contact_latch_debug`，并被文档标为 temporary simulation-only。`--allow-task-config-mismatch` 只允许 legacy collision diagnostic，不能把不匹配 checkpoint 当作正常训练/评测结果。
 
-当前没有证据证明该临时 pipeline 已在本轮环境完成训练、稳定成功率或 sim2real。它也不应成为正式 `model/` 入口；长期 PPO/BC/SAC、rollout buffer、模型 artifact 和评测应迁移到规划中的 `model/`/`deployments/` 边界。
+当前没有证据证明该临时 pipeline 已在本轮环境完成训练、稳定成功率或 sim2real。它也不应成为正式 `policy_learning/` 入口；长期 PPO/BC/SAC、rollout buffer 和评测应迁移到 `policy_learning/`，模型 artifact 合约与集成属于 `deployments/`，本地权重文件属于 `model/`。
 
 ## 8. 数据、媒体与跨域对齐
 
@@ -485,7 +485,7 @@ TODO：建立 `CrossDomainRunManifest` 或等价纯数据 contract，绑定 `Sim
 - [ ] 统一 legacy media writer 与 native v2.2 writer 的 provenance/episode/manifest envelope；明确哪些媒体只属于诊断，哪些可以进入训练。
 - [ ] 建 golden real/sim paired episode 和多视角 comparison report；同时比较 timestamp、qpos/TCP、RGB/depth 几何、object/contact 和 freshness，不只拼视频。
 - [ ] 规定 state-privileged task 与 camera-policy observation 的边界，避免把 31D cube pose/velocity 偷喂给视觉 policy。
-- [ ] 保持 `sim/mujoco_temp_pipeline` 为临时包，明确 checkpoint/records/checkpoint mismatch 的生命周期；长期 PPO/BC/SAC 放入规划的 `model/`，policy artifact 通过 `deployments`/`PolicyArtifactContract` 输出。
+- [ ] 保持 `sim/mujoco_temp_pipeline` 为临时包，明确 checkpoint/records/checkpoint mismatch 的生命周期；长期 PPO/BC/SAC 放入规划的 `policy_learning/`，policy artifact 通过 `deployments`/`PolicyArtifactContract` 输出，本地权重写入 `model/`。
 - [ ] 建立 Python 3.10、无硬件、可选 MuJoCo、可选媒体库、target SDK 的 CI/本地验收矩阵。
 
 ## 11. 推荐推进顺序

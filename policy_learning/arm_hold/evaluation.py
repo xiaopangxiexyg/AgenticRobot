@@ -1,4 +1,4 @@
-"""Aggregate metrics for independent arm-hold window predictions.
+"""Learning metrics for independent arm-hold window predictions.
 
 The report intentionally stays at the admitted-window level.  It does not
 reconstruct one authoritative Episode timeline from overlapping windows, so
