@@ -1197,9 +1197,11 @@ remote_dataset_camera_quarantine.sh
 
 remote_dataset_camera_promotion.sh
   是完整相机纠正数据接替 canonical 路径的固定 L3 事务入口。它只接受经过严格
-  v2.3、全视频解码、相机 swapped→identity、同触觉 inventory、独立 inode 和同文件系统证明
-  的晋升，旧目录会保留在 retirement root。apply 必须绑定 plan hash 并确认无 reader；回滚只
-  接受已发布事务文件和新的冻结 plan hash。它不提供删除、覆盖或任意参数透传。
+  v2.3/core-v2.3、全视频解码、相机 swapped→identity、同触觉 inventory、独立 inode 和同文件
+  系统证明的晋升，旧目录会保留在 retirement root。旧源可为 `DETACHED_VERIFIED`，但纠正输出
+  必须为 `SELF_CONTAINED`。apply 必须绑定 plan hash 并确认无 reader；此模式回滚前还必须先把
+  当前 canonical 严格拆离。回滚只接受已发布事务文件和新的冻结 plan hash。它不提供删除、覆盖
+  或任意参数透传。
 
 remote_dataset_tactile_storage.sh
   是触觉模块可恢复拆装的专用 L3 非运动入口。它只允许只读 status、固定

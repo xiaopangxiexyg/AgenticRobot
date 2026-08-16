@@ -15,7 +15,12 @@ from dataset_interface.camera_semantics import (
     DatasetCameraSemanticResolver,
     load_camera_role_binding,
 )
-from dataset_interface.validation import validate_v23_dataset
+from dataset_interface.modality_artifacts import (
+    DETACHED_VERIFIED,
+    MODALITY_ARTIFACT_SIDECAR_RELATIVE,
+    SELF_CONTAINED,
+)
+from dataset_interface.validation import validate_v23_core_dataset, validate_v23_dataset
 
 from .camera_semantic_materialize import (
     _episode_records,
@@ -25,7 +30,7 @@ from .camera_semantic_materialize import (
     _write_json_fsync,
 )
 from .io import read_json
-from .modality_storage import modality_storage_status
+from .modality_storage import load_modality_inventory, modality_storage_status
 
 
 PROMOTION_PLAN_SCHEMA = "dexteleop.camera_semantic_promotion_plan.v1"
@@ -104,8 +109,25 @@ def _materialization_receipt(corrected: Path) -> Mapping[str, Any]:
     return value
 
 
-def _require_v23(root: Path, *, label: str) -> tuple[int, int, int]:
-    report = validate_v23_dataset(root)
+def _require_v23(
+    root: Path,
+    *,
+    label: str,
+    tactile_status: str,
+    tactile_inventory_hash: str,
+    tactile_detachment_scope: str,
+) -> tuple[int, int, int]:
+    if tactile_status == DETACHED_VERIFIED:
+        inventory = load_modality_inventory(root, tactile_inventory_hash)
+        report = validate_v23_core_dataset(
+            root,
+            verified_inventories=(inventory,),
+            verified_detachment_scopes={
+                inventory.modality_key: tactile_detachment_scope,
+            },
+        )
+    else:
+        report = validate_v23_dataset(root)
     if not report.ok:
         raise CameraSemanticPromotionError(
             f"{label} strict v2.3 validation failed: {report.errors[:5]}"
@@ -115,29 +137,93 @@ def _require_v23(root: Path, *, label: str) -> tuple[int, int, int]:
     return int(report.frame_count), int(video_count), int(decoded_frames)
 
 
-def _require_modality_pair(source: Path, corrected: Path) -> tuple[str, str]:
+def _require_modality_pair(
+    source: Path,
+    corrected: Path,
+) -> tuple[str, str, str, str]:
     source_status = modality_storage_status(source)
     corrected_status = modality_storage_status(corrected)
+    source_state = str(source_status.get("status") or "")
+    corrected_state = str(corrected_status.get("status") or "")
+    if source_state not in {SELF_CONTAINED, DETACHED_VERIFIED}:
+        raise CameraSemanticPromotionError(
+            f"source tactile must be SELF_CONTAINED or DETACHED_VERIFIED: {source_status}"
+        )
+    if corrected_state != SELF_CONTAINED:
+        raise CameraSemanticPromotionError(
+            f"corrected tactile must be SELF_CONTAINED: {corrected_status}"
+        )
     for label, status in (("source", source_status), ("corrected", corrected_status)):
-        if str(status.get("status")) != "SELF_CONTAINED":
-            raise CameraSemanticPromotionError(
-                f"{label} tactile must be SELF_CONTAINED: {status}"
-            )
         if bool(status.get("pending_transaction")):
             raise CameraSemanticPromotionError(
                 f"{label} tactile has a pending storage transaction"
             )
-        if not bool(status.get("tactile_read_eligible")):
-            raise CameraSemanticPromotionError(
-                f"{label} tactile is not reader eligible"
-            )
+    if source_state == DETACHED_VERIFIED and not bool(
+        source_status.get("production_detached_verified")
+    ):
+        raise CameraSemanticPromotionError(
+            "source tactile detach lacks production retirement evidence"
+        )
+    if not bool(corrected_status.get("tactile_read_eligible")):
+        raise CameraSemanticPromotionError(
+            "corrected tactile is not reader eligible"
+        )
+    if source_state == SELF_CONTAINED and not bool(
+        source_status.get("tactile_read_eligible")
+    ):
+        raise CameraSemanticPromotionError(
+            "self-contained source tactile is not reader eligible"
+        )
+    source_scope = str(source_status.get("detachment_scope") or "")
     source_inventory = str(source_status.get("inventory_hash") or "")
     corrected_inventory = str(corrected_status.get("inventory_hash") or "")
     if not source_inventory or source_inventory != corrected_inventory:
         raise CameraSemanticPromotionError(
             "Source and corrected datasets do not bind the same tactile inventory"
         )
-    return source_inventory, str(source_status.get("detachment_scope") or "")
+    return source_inventory, source_scope, source_state, corrected_state
+
+
+def _rollback_guard_inventory(root: Path) -> str:
+    """Hash immutable dataset structure while ignoring tactile lifecycle state.
+
+    Rehydrate/detach cycles intentionally add storage receipts and toggle the
+    tactile tree.  Those changes are admitted separately through the exact
+    tactile inventory and availability contract.  All other dataset files must
+    retain their original inode/size/mtime identity before an atomic rollback.
+    """
+
+    entries: list[dict[str, Any]] = []
+    sidecar = MODALITY_ARTIFACT_SIDECAR_RELATIVE.parts
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise CameraSemanticPromotionError(
+                f"Promotion rollback guard refuses dataset symlinks: {path}"
+            )
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] == "tactile":
+            continue
+        if relative.parts[: len(sidecar)] == sidecar:
+            suffix = relative.parts[len(sidecar) :]
+            if suffix and suffix[0] in {"receipts", "active_transaction.json"}:
+                continue
+        metadata = path.stat()
+        entries.append(
+            {
+                "path": relative.as_posix(),
+                "size": int(metadata.st_size),
+                "mtime_ns": int(metadata.st_mtime_ns),
+                "device": int(metadata.st_dev),
+                "inode": int(metadata.st_ino),
+                "nlink": int(metadata.st_nlink),
+            }
+        )
+    return canonical_content_hash(
+        entries,
+        domain="dexteleop.camera_semantic_promotion_rollback_guard.v1",
+    )
 
 
 @dataclass(frozen=True)
@@ -151,8 +237,13 @@ class CameraSemanticPromotionPlan:
     materialization_receipt_hash: str
     materialization_plan_hash: str
     tactile_inventory_hash: str
+    tactile_detachment_scope: str
+    source_tactile_status: str
+    corrected_tactile_status: str
     source_inventory_hash: str
     corrected_inventory_hash: str
+    source_rollback_guard_hash: str
+    corrected_rollback_guard_hash: str
     source_root_device: int
     source_root_inode: int
     corrected_root_device: int
@@ -247,15 +338,25 @@ def plan_camera_semantic_promotion(
                 f"Source episode {episode_index} differs from its materialization receipt"
             )
 
+    tactile_inventory, tactile_scope, source_tactile_status, corrected_tactile_status = (
+        _require_modality_pair(source, corrected)
+    )
     source_frames, source_videos, source_decoded = _require_v23(
-        source, label="source"
+        source,
+        label="source",
+        tactile_status=source_tactile_status,
+        tactile_inventory_hash=tactile_inventory,
+        tactile_detachment_scope=tactile_scope,
     )
     corrected_frames, corrected_videos, corrected_decoded = _require_v23(
-        corrected, label="corrected"
+        corrected,
+        label="corrected",
+        tactile_status=corrected_tactile_status,
+        tactile_inventory_hash=tactile_inventory,
+        tactile_detachment_scope=tactile_scope,
     )
     if source_frames != corrected_frames:
         raise CameraSemanticPromotionError("Source/corrected frame counts differ")
-    tactile_inventory, _ = _require_modality_pair(source, corrected)
     source_files, source_inventory, _, source_hardlinks = _source_inventory(source)
     corrected_files, corrected_inventory, _, corrected_hardlinks = _source_inventory(
         corrected
@@ -292,8 +393,13 @@ def plan_camera_semantic_promotion(
         materialization_receipt_hash=receipt_hash,
         materialization_plan_hash=str(receipt.get("plan_hash") or ""),
         tactile_inventory_hash=tactile_inventory,
+        tactile_detachment_scope=tactile_scope,
+        source_tactile_status=source_tactile_status,
+        corrected_tactile_status=corrected_tactile_status,
         source_inventory_hash=source_inventory,
         corrected_inventory_hash=corrected_inventory,
+        source_rollback_guard_hash=_rollback_guard_inventory(source),
+        corrected_rollback_guard_hash=_rollback_guard_inventory(corrected),
         source_root_device=int(source_stat.st_dev),
         source_root_inode=int(source_stat.st_ino),
         corrected_root_device=int(corrected_stat.st_dev),
@@ -418,6 +524,9 @@ def promote_camera_semantic_dataset(
                 "transaction_path": str(transaction_path),
                 "transaction_hash": completed["transaction_hash"],
                 "rollback_available": True,
+                "rollback_requires_canonical_detach": bool(
+                    plan.source_tactile_status == DETACHED_VERIFIED
+                ),
             }
         except BaseException:
             _rollback_failed_apply(plan)
@@ -483,6 +592,53 @@ def plan_camera_semantic_promotion_rollback(
         raise CameraSemanticPromotionError("Canonical root no longer matches promoted data")
     if _root_inode(retired) != int(plan["source_root_inode"]):
         raise CameraSemanticPromotionError("Retired root no longer matches original data")
+    expected_canonical_guard = str(plan.get("corrected_rollback_guard_hash") or "")
+    expected_retired_guard = str(plan.get("source_rollback_guard_hash") or "")
+    if expected_canonical_guard:
+        if _rollback_guard_inventory(canonical) != expected_canonical_guard:
+            raise CameraSemanticPromotionError(
+                "Canonical core files changed after promotion"
+            )
+        if _rollback_guard_inventory(retired) != expected_retired_guard:
+            raise CameraSemanticPromotionError(
+                "Retired core files changed after promotion"
+            )
+    else:
+        _, canonical_inventory, _, canonical_hardlinks = _source_inventory(canonical)
+        _, retired_inventory, _, retired_hardlinks = _source_inventory(retired)
+        if canonical_hardlinks or retired_hardlinks:
+            raise CameraSemanticPromotionError(
+                "Legacy promotion rollback refuses new hardlinks"
+            )
+        if canonical_inventory != str(plan["corrected_inventory_hash"]):
+            raise CameraSemanticPromotionError(
+                "Canonical files changed after promotion"
+            )
+        if retired_inventory != str(plan["source_inventory_hash"]):
+            raise CameraSemanticPromotionError(
+                "Retired files changed after promotion"
+            )
+    source_was_detached = str(plan.get("source_tactile_status") or "") == DETACHED_VERIFIED
+    if source_was_detached:
+        canonical_status = modality_storage_status(canonical)
+        retired_status = modality_storage_status(retired)
+        for label, status in (("canonical", canonical_status), ("retired", retired_status)):
+            if str(status.get("status") or "") != DETACHED_VERIFIED:
+                raise CameraSemanticPromotionError(
+                    f"{label} tactile must be DETACHED_VERIFIED before rollback"
+                )
+            if bool(status.get("pending_transaction")) or not bool(
+                status.get("production_detached_verified")
+            ):
+                raise CameraSemanticPromotionError(
+                    f"{label} tactile detach is not rollback eligible"
+                )
+            if str(status.get("inventory_hash") or "") != str(
+                plan["tactile_inventory_hash"]
+            ):
+                raise CameraSemanticPromotionError(
+                    f"{label} tactile inventory changed after promotion"
+                )
     return CameraSemanticPromotionRollbackPlan(
         transaction_path=str(path),
         transaction_hash=claimed_hash,

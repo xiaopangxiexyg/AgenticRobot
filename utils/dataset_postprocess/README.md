@@ -64,9 +64,12 @@ manifest hash/大小变化、未知热端文件或不同 artifact graph 都会 f
 
 完整物化输出在按同一 inventory 放回触觉、通过严格 v2.3 校验和全视频解码后，可用
 `camera-semantics-promote` 原子接替原 canonical 路径。晋升只接受同文件系统上相互独立、无
-共享 inode 的两个完整数据集：原路径必须被证明为 `swapped`，新路径必须被证明为
-`identity`，两侧触觉 inventory 必须完全相同且都可独立读取。原数据不会删除，而是移动到
-显式 retirement 目录；事务文件记录两侧目录 inode、物化 receipt、计划 hash 和回滚位置：
+共享 inode 的两个数据集：原路径必须被证明为 `swapped`，新路径必须被证明为 `identity`，
+两侧触觉 inventory 必须完全相同。空间充足时两侧都可为 `SELF_CONTAINED`；批量维护时推荐让
+旧源保持带完整 retirement evidence 的 `DETACHED_VERIFIED`，只把纠正输出恢复为
+`SELF_CONTAINED`，从而在热盘始终最多保存一份触觉。原数据不会删除，而是移动到显式
+retirement 目录；事务文件记录两侧目录 inode、核心文件 guard、物化 receipt、计划 hash 和
+回滚位置：
 
 ```bash
 python -m utils.dataset_postprocess camera-semantics-promote \
@@ -85,8 +88,10 @@ python -m utils.dataset_postprocess camera-semantics-promote \
   --confirm-no-active-readers
 ```
 
-晋升后应分别复核 canonical 的严格 v2.3、相机 `identity`、触觉 reader eligibility，并先 dry-run
-回滚计划。需要恢复旧数据时只使用事务文件，不手工改名：
+晋升后应分别复核 canonical 的严格 v2.3、相机 `identity` 和触觉 reader eligibility。若晋升时
+旧源已拆离，回滚前必须先把当前 canonical 按相同 inventory 严格拆离；回滚计划会拒绝仍含热端
+触觉的 canonical、任何 pending transaction、inventory 变化和非触觉核心文件漂移。随后只使用
+事务文件换回旧目录，不手工改名，并在换回后按冷端 inventory 恢复旧 canonical：
 
 ```bash
 python -m utils.dataset_postprocess camera-semantics-rollback-promotion \
